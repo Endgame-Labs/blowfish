@@ -520,6 +520,22 @@ impl KeyStore {
         cache.keys.insert(id.clone(), key);
         Ok((info, format!("bf_{id}_{secret}")))
     }
+    // Key management must obey the same authority boundary as delegation. Otherwise
+    // a tenant's key manager can enumerate and revoke another tenant's keys.
+    fn can_manage(principal: &Principal, key: &KeyInfo) -> bool {
+        principal.super_key
+            || (key.roles.iter().all(|role| principal.roles.contains(role))
+                && principal.namespace_prefixes.as_ref().is_none_or(|parent| {
+                    key.namespace_prefixes.as_ref().is_some_and(|child| {
+                        child
+                            .iter()
+                            .all(|c| parent.iter().any(|p| c.starts_with(p)))
+                    })
+                })
+                && principal
+                    .expires_at
+                    .is_none_or(|expiry| key.expires_at.is_some_and(|child| child <= expiry)))
+    }
     /// Return active key metadata; usage timestamps are local to this process.
     pub async fn list_keys(&self, principal: &Principal) -> Result<Vec<KeyInfo>, AuthError> {
         self.authorize(principal, Action::ManageKeys, None)?;
@@ -527,7 +543,7 @@ impl KeyStore {
         let mut result: Vec<_> = cache
             .keys
             .values()
-            .filter(|k| !cache.revoked.contains(&k.info.id))
+            .filter(|k| !cache.revoked.contains(&k.info.id) && Self::can_manage(principal, &k.info))
             .map(|k| {
                 let mut info = k.info.clone();
                 info.last_used_at = cache.last_used.get(&info.id).copied();
@@ -554,7 +570,12 @@ impl KeyStore {
         let _guard = self.inner.mutation.lock().await;
         {
             let cache = self.inner.cache.read().await;
-            if !cache.keys.contains_key(id) || cache.revoked.contains(id) {
+            if cache.revoked.contains(id)
+                || cache
+                    .keys
+                    .get(id)
+                    .is_none_or(|key| !Self::can_manage(principal, &key.info))
+            {
                 return Err(AuthError::NotFound);
             }
         }
@@ -690,6 +711,50 @@ mod tests {
             Err(AuthError::Unauthorized)
         ));
     }
+    #[tokio::test]
+    async fn scoped_managers_cannot_inspect_or_revoke_more_powerful_keys() {
+        let (ks, root) = setup(Arc::new(InMemory::new())).await;
+        let (_, token) = ks
+            .create_key(
+                spec(vec![Role::Keys, Role::Read], Some(vec!["tenant-"])),
+                &root,
+            )
+            .await
+            .unwrap();
+        let manager = ks.authenticate(&token).await.unwrap();
+        for request in [
+            spec(vec![Role::Read], None),
+            spec(vec![Role::Read], Some(vec!["other-"])),
+            spec(vec![Role::Admin], Some(vec!["tenant-"])),
+            spec(vec![Role::Keys], Some(vec![""])),
+        ] {
+            let (key, token) = ks.create_key(request, &root).await.unwrap();
+            assert!(
+                !ks.list_keys(&manager)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|k| k.id == key.id)
+            );
+            assert!(matches!(
+                ks.get_key(&manager, &key.id).await,
+                Err(AuthError::NotFound)
+            ));
+            assert!(matches!(
+                ks.revoke_key(&manager, &key.id).await,
+                Err(AuthError::NotFound)
+            ));
+            assert!(ks.authenticate(&token).await.is_ok());
+        }
+        let (child, token) = ks
+            .create_key(spec(vec![Role::Read], Some(vec!["tenant-child"])), &manager)
+            .await
+            .unwrap();
+        assert!(ks.get_key(&manager, &child.id).await.is_ok());
+        ks.revoke_key(&manager, &child.id).await.unwrap();
+        assert!(ks.authenticate(&token).await.is_err());
+    }
+
     #[test]
     fn role_matrix() {
         use Action::*;
