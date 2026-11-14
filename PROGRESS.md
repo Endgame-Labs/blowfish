@@ -4,6 +4,15 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **`bf-vector` merged.** It provides vector distance math and the IVF index with RaBitQ.
+  - **Distances:** SIMD kernels for f32 and f16, covering cosine and squared Euclidean distance.
+  - **Index build:** deterministic seeded k-means, with a two-level centroid tree from 262k vectors.
+  - **Codes:** RaBitQ 1-bit codes with correction factors and error bounds.
+  - **Format:** checksummed immutable `.bfv` blobs, with coalesced range reads.
+  - **Search:** filter-aware, with an exact fallback when the filter is selective.
+  - **Quality:** recall@10 is **0.973** on 100k GloVe vectors with held-out queries.
+  - **Speed:** on 1M×768 vectors, p50 is 5 ms at nprobe 16 and 20 ms at nprobe 128 (warm, in memory).
+    The engine integration comes in wave 2.
 - **`bf-text` merged.** It covers tokenization, BM25 scoring, and the immutable posting-list segment
   format.
   - **Tokenizer:** `word_v4` is built on turbopuffer's own published tokenizer crate, `alyze`. It
