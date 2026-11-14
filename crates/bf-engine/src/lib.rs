@@ -1,4 +1,4 @@
-//! Exhaustive reference engine. Object storage is authoritative; memory is a replay cache.
+//! Immutable segment indexes with a WAL overlay and an exhaustive reference evaluator.
 mod filter;
 mod indexed;
 mod indexer;
@@ -174,7 +174,9 @@ impl Engine {
                         "max_staleness_seconds must be between 1 and 3600",
                     ));
                 }
-                state.seq == 0 || state.refreshed.elapsed().as_secs() >= *max_staleness_seconds
+                state.seq == 0
+                    || state.refreshed.elapsed().as_secs() >= *max_staleness_seconds
+                    || state.refreshed.elapsed() >= self.0.config.retention.div_f64(2.0)
             }
         };
         let cap = matches!(consistency, Consistency::Eventual { .. })
@@ -192,6 +194,19 @@ impl Engine {
             .await?;
         }
         if !state.exists {
+            if cap.is_some()
+                && Wal::new(self.0.store.clone(), ns)
+                    .map_err(log_error)?
+                    .head()
+                    .await
+                    .map_err(log_error)?
+                    > state.seq
+            {
+                return Err(ApiError::new(
+                    409,
+                    "eventual WAL tail exceeds the scan limit; wait for indexing",
+                ));
+            }
             return Err(ApiError::not_found(ns));
         }
         Ok((state.clone(), warm))
@@ -240,7 +255,7 @@ impl Engine {
             .submit(Operation::Write(Box::new(request), copy))
             .await?
     }
-    /// Query a consistent snapshot using exhaustive evaluation, including multi-query RRF.
+    /// Search a consistent segment-and-tail snapshot, including multi-query RRF.
     pub async fn query(&self, ns: &str, request: QueryRequest) -> Result<QueryResponse, ApiError> {
         let start = Instant::now();
         let (state, warm) = self.snapshot(ns, &request.consistency).await?;
@@ -310,9 +325,9 @@ impl Engine {
     /// Namespace metadata, with fully expanded schema settings.
     pub async fn metadata(&self, ns: &str) -> Result<Value, ApiError> {
         let (s, _) = self.snapshot(ns, &Consistency::Strong).await?;
-        let s = snapshot::materialize(&self.0.store, &s).await?;
+        let totals = snapshot::statistics(&self.0.store, &s).await?;
         Ok(
-            json!({"schema":s.schema,"approx_logical_bytes":logical_bytes(&s),"approx_row_count":s.docs.len(),"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}}),
+            json!({"schema":s.schema,"approx_logical_bytes":totals.logical_bytes,"approx_row_count":totals.rows,"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}}),
         )
     }
     /// Schema endpoint representation, including nullable settings and `ann: true`.
@@ -399,28 +414,22 @@ impl Engine {
             json!({"namespaces":found.iter().map(|ns|json!({"id":ns})).collect::<Vec<_>>(),"next_cursor":next}),
         )
     }
-    /// Prefetch the WAL and schema into the node cache.
+    /// Prefetch the manifest, WAL tail, and schema into the node cache.
     pub async fn warm(&self, ns: &str) -> Result<(), ApiError> {
         self.snapshot(ns, &Consistency::Strong).await?;
         Ok(())
     }
-    /// Describe the exhaustive reference plan after validating the query.
+    /// Describe the indexed snapshot plan after validating the query.
     pub async fn explain(&self, ns: &str, request: QueryRequest) -> Result<Value, ApiError> {
         self.query(ns, request).await?;
         Ok(
-            json!({"plan_text":"Object-store WAL replay → exhaustive namespace scan → filter → exact rank/aggregate → projection"}),
+            json!({"plan_text":"Manifest snapshot + WAL tail → live/filter bitmaps → segment ANN/BM25 or scalar evaluation → newest-wins merge → projection"}),
         )
     }
-    /// Exact-search recall is one; optionally return the sampled ground-truth rows.
+    /// Compare ANN with exact search on one snapshot and optionally return ground-truth rows.
     pub async fn recall(&self, ns: &str, request: Value) -> Result<Value, ApiError> {
         query::recall(self, ns, request).await
     }
-}
-fn logical_bytes(s: &NamespaceState) -> usize {
-    s.docs
-        .values()
-        .map(|d| serde_json::to_vec(d).expect("document serializes").len())
-        .sum()
 }
 fn storage_error(e: bf_storage::Error) -> ApiError {
     tracing::error!(error=?e,"storage operation failed");

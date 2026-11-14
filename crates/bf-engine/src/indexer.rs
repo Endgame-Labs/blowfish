@@ -90,15 +90,42 @@ pub(crate) fn start(engine: &Engine) {
     let weak = std::sync::Arc::downgrade(&engine.0);
     let interval = engine.0.config.index_interval.max(Duration::from_millis(1));
     tokio::spawn(async move {
+        let mut last_gc = std::time::Instant::now();
+        let mut discover = true;
         loop {
             tokio::time::sleep(interval).await;
             let Some(inner) = weak.upgrade() else { break };
             let engine = Engine(inner);
+            let gc_due = last_gc.elapsed()
+                >= engine
+                    .0
+                    .config
+                    .retention
+                    .div_f64(2.0)
+                    .clamp(Duration::from_secs(1), Duration::from_secs(60));
+            if discover || gc_due {
+                if let Ok(objects) = engine.0.store.list("ns/").await {
+                    let names: std::collections::BTreeSet<_> = objects
+                        .iter()
+                        .filter_map(|o| o.key.strip_prefix("ns/").and_then(|s| s.split('/').next()))
+                        .collect();
+                    for name in names {
+                        let _ = engine.handle(name).await;
+                    }
+                }
+                discover = false;
+            }
             let names: Vec<_> = engine.0.namespaces.lock().await.keys().cloned().collect();
             for ns in names {
                 if let Err(e) = engine.index_namespace(&ns, false).await {
                     tracing::warn!(error=%e, "background indexing deferred");
                 }
+                if gc_due && let Err(e) = engine.collect_garbage(&ns).await {
+                    tracing::warn!(error=%e,"background garbage collection deferred");
+                }
+            }
+            if gc_due {
+                last_gc = std::time::Instant::now();
             }
         }
     });
@@ -185,6 +212,7 @@ impl Engine {
             created_at: state.created_at,
             indexed_through: 0,
             indexer_epoch: 0,
+            deleted: false,
             segments: vec![],
             stats: Default::default(),
             updated_at: None,
@@ -276,6 +304,12 @@ impl Engine {
                     let removed = segment::documents(store, &seg, &deleted).await?;
                     adjust(&mut manifest.stats, &removed, false, &state.schema);
                     retire(&mut manifest, seg.live.key.clone());
+                    if keep.is_empty() {
+                        for file in seg.files.values() {
+                            retire(&mut manifest, file.key.clone());
+                        }
+                        continue;
+                    }
                     segment::set_live(store, &mut seg, &keep).await?;
                 }
                 segments.push(seg);
@@ -325,6 +359,7 @@ impl Engine {
             }
             segments
         };
+        manifest.deleted = false;
         manifest.segments = segments;
         manifest.schema = state.schema.clone();
         manifest.distance_metric = state.metric;
@@ -348,26 +383,68 @@ impl Engine {
     /// Permanent WAL slot records continue to fence every stale writer.
     pub async fn collect_garbage(&self, ns: &str) -> Result<usize, ApiError> {
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
-        let Some((_, manifest)) = wal.latest_manifest().await.map_err(log_error)? else {
+        let Some((sequence, mut manifest)) = wal.latest_manifest().await.map_err(log_error)? else {
             return Ok(0);
         };
         let grace = chrono::Duration::from_std(self.0.config.retention)
             .unwrap_or(chrono::Duration::hours(1));
         let cutoff = Utc::now() - grace;
-        let mut deleted = 0;
-        for file in &manifest.retired {
-            if file.retired_at <= cutoff {
-                self.0
-                    .store
-                    .delete(&file.key)
-                    .await
-                    .map_err(storage_error)?;
-                deleted += 1;
+        let mut checkpoint = NamespaceState::default();
+        catch_up(&wal, &mut checkpoint).await?;
+        if checkpoint.manifest_seq != sequence {
+            return Ok(0);
+        }
+        let deleting = !checkpoint.exists && !manifest.deleted;
+        if deleting {
+            for seg in manifest.segments.clone() {
+                for file in seg.files.values().chain(std::iter::once(&seg.live)) {
+                    retire(&mut manifest, file.key.clone());
+                }
+            }
+            manifest.segments.clear();
+            manifest.stats = NamespaceStats::default();
+            manifest.deleted = true;
+            manifest.indexed_through = checkpoint.seq;
+        }
+        let mut protected = std::collections::BTreeSet::new();
+        for seg in &manifest.segments {
+            protected.extend(
+                seg.files
+                    .values()
+                    .chain(std::iter::once(&seg.live))
+                    .map(|f| f.key.clone()),
+            );
+        }
+        for retired in &manifest.retired {
+            if retired.retired_at > cutoff {
+                protected.insert(retired.key.clone());
             }
         }
-        // Publication time, not the last indexed write time, starts the WAL grace period.
-        // Use a retained manifest old enough to be safe; newer checkpoints may still
-        // be needed by an in-flight reader of their predecessors.
+        let slot = self
+            .0
+            .store
+            .get(&format!("ns/{ns}/manifest/{sequence:020}.json"))
+            .await
+            .map_err(storage_error)?;
+        let slot: serde_json::Value =
+            serde_json::from_slice(&slot).map_err(segment::index_error)?;
+        if let Some(key) = slot.get("payload").and_then(serde_json::Value::as_str) {
+            protected.insert(key.to_owned());
+        }
+        // Take the candidate inventory BEFORE claiming a newer epoch. This fences
+        // paused builders of these files, without sweeping a newer builder's files.
+        let mut candidates = std::collections::BTreeSet::new();
+        for prefix in [
+            format!("ns/{ns}/segments/"),
+            format!("ns/{ns}/manifest-data/"),
+            format!("ns/{ns}/indexer/"),
+        ] {
+            for object in self.0.store.list(&prefix).await.map_err(storage_error)? {
+                if object.last_modified <= cutoff && !protected.contains(&object.key) {
+                    candidates.insert(object.key);
+                }
+            }
+        }
         let through = manifest
             .checkpoints
             .iter()
@@ -375,10 +452,41 @@ impl Engine {
             .map(|(seq, _)| *seq)
             .max()
             .unwrap_or(0);
+        if candidates.is_empty() && through == 0 && !deleting {
+            return Ok(0);
+        }
+        let epoch = manifest.indexer_epoch;
+        manifest.indexer_epoch += 1;
+        let claim = match wal.publish_fenced(sequence, epoch, &manifest).await {
+            Ok(s) => s,
+            Err(bf_wal::Error::Fenced) => return Ok(0),
+            Err(e) => return Err(log_error(e)),
+        };
+        // The winner owns no reusable file names. Repeating deletes after a crash is safe.
+        for key in &candidates {
+            self.0.store.delete(key).await.map_err(storage_error)?;
+        }
         if through > 0 {
             wal.prune_payloads(through).await.map_err(log_error)?;
         }
-        Ok(deleted)
+        let Some((latest, mut manifest)) = wal.latest_manifest().await.map_err(log_error)? else {
+            return Ok(candidates.len());
+        };
+        if latest != claim {
+            return Ok(candidates.len());
+        }
+        manifest
+            .retired
+            .retain(|file| !candidates.contains(&file.key));
+        manifest.checkpoints.retain(|(seq, _)| *seq > through);
+        match wal
+            .publish_fenced(claim, manifest.indexer_epoch, &manifest)
+            .await
+        {
+            Ok(_) | Err(bf_wal::Error::Fenced) => {}
+            Err(e) => return Err(log_error(e)),
+        }
+        Ok(candidates.len())
     }
 }
 fn tier(state: &NamespaceState, count: usize) -> Vec<String> {

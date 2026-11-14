@@ -19,18 +19,27 @@ pub(crate) async fn catch_up(
                 return Err(ApiError::new(500, "unsupported manifest format"));
             }
             if m.indexed_through > 0 && generation > state.manifest_seq {
-                *state = NamespaceState {
-                    seq: m.indexed_through,
-                    exists: true,
-                    schema: m.schema,
-                    metric: m.distance_metric,
-                    created_at: m.created_at,
-                    updated_at: m.updated_at.unwrap_or(m.created_at),
-                    segments: m.segments,
-                    indexed_through: m.indexed_through,
-                    manifest_seq: generation,
-                    stats: m.stats,
-                    ..Default::default()
+                *state = if m.deleted {
+                    NamespaceState {
+                        seq: m.indexed_through,
+                        indexed_through: m.indexed_through,
+                        manifest_seq: generation,
+                        ..Default::default()
+                    }
+                } else {
+                    NamespaceState {
+                        seq: m.indexed_through,
+                        exists: true,
+                        schema: m.schema,
+                        metric: m.distance_metric,
+                        created_at: m.created_at,
+                        updated_at: m.updated_at.unwrap_or(m.created_at),
+                        segments: m.segments,
+                        indexed_through: m.indexed_through,
+                        manifest_seq: generation,
+                        stats: m.stats,
+                        ..Default::default()
+                    }
                 };
             }
             state.manifest_seq = generation;
@@ -162,4 +171,32 @@ pub(crate) async fn for_writes(
             .extend(segment::documents(store, seg, &rows).await?);
     }
     Ok(full)
+}
+
+/// Exact row and logical-byte totals without materializing unaffected segment rows.
+pub(crate) async fn statistics(
+    store: &Storage,
+    state: &NamespaceState,
+) -> Result<bf_wal::NamespaceStats, ApiError> {
+    let mut stats = state.stats.clone();
+    if !state.shadowed.is_empty() {
+        for seg in &state.segments {
+            let rows = segment::lookup_many(store, seg, &state.shadowed).await?
+                & segment::live(store, seg).await?;
+            let old = segment::documents(store, seg, &rows).await?;
+            stats.rows = stats.rows.saturating_sub(old.len() as u64);
+            let bytes: u64 = old
+                .values()
+                .map(|d| serde_json::to_vec(d).expect("document serializes").len() as u64)
+                .sum();
+            stats.logical_bytes = stats.logical_bytes.saturating_sub(bytes);
+        }
+    }
+    stats.rows += state.docs.len() as u64;
+    stats.logical_bytes += state
+        .docs
+        .values()
+        .map(|d| serde_json::to_vec(d).expect("document serializes").len() as u64)
+        .sum::<u64>();
+    Ok(stats)
 }

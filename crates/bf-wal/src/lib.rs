@@ -65,6 +65,10 @@ const SLOT_VERSION: u8 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitRecord {
     write_id: Uuid,
+    // New payload keys identify their attempted slot, making abandoned payloads
+    // reclaimable once that slot is permanently occupied and checkpointed.
+    #[serde(default)]
+    payload_seq: Option<u64>,
     committed_at: DateTime<Utc>,
     tombstone: bool,
 }
@@ -91,6 +95,9 @@ pub struct Manifest {
     pub created_at: DateTime<Utc>,
     pub indexed_through: u64,
     pub indexer_epoch: u64,
+    /// A tombstone checkpoint retains ordering without retaining namespace contents.
+    #[serde(default)]
+    pub deleted: bool,
     #[serde(default)]
     pub segments: Vec<Segment>,
     /// Namespace totals as of `indexed_through`.
@@ -164,7 +171,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("unsupported or corrupt WAL format")]
     Format,
-    #[error("WAL payload was reclaimed after namespace deletion")]
+    #[error("WAL payload was reclaimed after checkpointing or namespace deletion")]
     Pruned,
     #[error("indexer was fenced by a newer manifest")]
     Fenced,
@@ -193,10 +200,19 @@ impl Wal {
     fn payload_key(&self, id: Uuid) -> String {
         format!("ns/{}/wal-data/{id}.wal", self.namespace)
     }
+    fn staged_payload_key(&self, seq: u64, id: Uuid) -> String {
+        format!("ns/{}/wal-data/{seq:020}-{id}.wal", self.namespace)
+    }
+    fn record_payload_key(&self, record: &CommitRecord) -> String {
+        record
+            .payload_seq
+            .map(|seq| self.staged_payload_key(seq, record.write_id))
+            .unwrap_or_else(|| self.payload_key(record.write_id))
+    }
     /// Attempt a slot. The payload is durable before the slot's conditional commit.
     /// Callers must catch up and revalidate after `Conflict`.
     pub async fn append(&self, seq: u64, entry: &WalEntry) -> Result<CreateResult, Error> {
-        let payload_key = self.payload_key(entry.write_id);
+        let payload_key = self.staged_payload_key(seq, entry.write_id);
         if !entry.tombstone {
             self.store
                 .create_with_id(&payload_key, entry.encode()?, entry.write_id)
@@ -204,6 +220,7 @@ impl Wal {
         }
         let record = CommitRecord {
             write_id: entry.write_id,
+            payload_seq: Some(seq),
             committed_at: entry.committed_at,
             tombstone: entry.tombstone,
         };
@@ -219,7 +236,13 @@ impl Wal {
     }
     async fn record(&self, seq: u64) -> Result<Option<CommitRecord>, Error> {
         match self.store.get(&self.key(seq)).await {
-            Ok(bytes) => Ok(Some(CommitRecord::decode(&bytes)?)),
+            Ok(bytes) => {
+                let record = CommitRecord::decode(&bytes)?;
+                if record.payload_seq.is_some_and(|attempt| attempt != seq) {
+                    return Err(Error::Format);
+                }
+                Ok(Some(record))
+            }
             Err(bf_storage::Error::NotFound) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -233,7 +256,7 @@ impl Wal {
                 tombstone: true,
             });
         }
-        let bytes = match self.store.get(&self.payload_key(record.write_id)).await {
+        let bytes = match self.store.get(&self.record_payload_key(record)).await {
             Ok(bytes) => bytes,
             Err(bf_storage::Error::NotFound) => return Err(Error::Pruned),
             Err(e) => return Err(e.into()),
@@ -429,9 +452,23 @@ impl Wal {
             if let Some(record) = self.record(seq).await?
                 && !record.tombstone
             {
-                self.store
-                    .delete(&self.payload_key(record.write_id))
-                    .await?;
+                self.store.delete(&self.record_payload_key(&record)).await?;
+            }
+        }
+        for object in self
+            .store
+            .list(&format!("ns/{}/wal-data/", self.namespace))
+            .await?
+        {
+            let attempt = object
+                .key
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.split_once('-'))
+                .filter(|(seq, _)| seq.len() == 20)
+                .and_then(|(seq, _)| seq.parse::<u64>().ok());
+            if attempt.is_some_and(|seq| seq <= through) {
+                self.store.delete(&object.key).await?;
             }
         }
         Ok(())
@@ -462,7 +499,8 @@ impl Wal {
             };
         Ok(Some((seq, manifest)))
     }
-    /// Erase document-bearing payloads and old manifests through a committed tombstone.
+    /// Erase document-bearing payloads through a committed tombstone.
+    /// The indexer retires segment files and manifest payloads separately.
     /// Tiny slot records remain occupied, fencing stale writers without retaining documents.
     pub async fn cleanup_deleted(&self, tombstone_seq: u64) -> Result<(), Error> {
         if !self
@@ -472,15 +510,7 @@ impl Wal {
         {
             return Err(Error::Format);
         }
-        for seq in 1..tombstone_seq {
-            if let Some(record) = self.record(seq).await?
-                && !record.tombstone
-            {
-                self.store
-                    .delete(&self.payload_key(record.write_id))
-                    .await?;
-            }
-        }
+        self.prune_payloads(tombstone_seq - 1).await?;
         // Manifest generations have their own sequence space. Keep their CAS
         // fences; readers replay the tombstone after any older checkpoint.
         Ok(())

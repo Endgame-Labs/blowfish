@@ -1,4 +1,4 @@
-//! Fail each persistent mutation, including ambiguous successful PUTs and GC deletes.
+//! Fail reads, listings, and mutations, including ambiguous successful PUTs and GC deletes.
 use async_trait::async_trait;
 use bf_engine::{Engine, EngineConfig};
 use bf_storage::Storage;
@@ -71,7 +71,15 @@ impl ObjectStore for Faults {
         self.inner.put_multipart_opts(path, opts).await
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> StoreResult<GetResult> {
-        self.inner.get_opts(path, opts).await
+        let fail = self.hit();
+        if fail && !self.after.load(Ordering::SeqCst) {
+            return failure();
+        }
+        let result = self.inner.get_opts(path, opts).await?;
+        if fail {
+            return failure();
+        }
+        Ok(result)
     }
     fn delete_stream(
         &self,
@@ -89,7 +97,11 @@ impl ObjectStore for Faults {
         }
     }
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
-        self.inner.list(prefix)
+        if self.hit() {
+            futures::stream::once(async { failure() }).boxed()
+        } else {
+            self.inner.list(prefix)
+        }
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> StoreResult<ListResult> {
         self.inner.list_with_delimiter(prefix).await
@@ -167,7 +179,6 @@ async fn acknowledged_writes_survive_every_commit_index_compact_and_gc_mutation(
                 faults.arm(0, false);
                 drop(e);
                 let recovered = Engine::with_config(store, config());
-                eprintln!("stage={stage} position={position} after={after} recovery");
                 let found = rows(&recovered).await;
                 assert!(
                     found.contains(&1),
@@ -180,7 +191,6 @@ async fn acknowledged_writes_survive_every_commit_index_compact_and_gc_mutation(
                 }
                 recovered.index_namespace("crash", true).await.unwrap();
                 recovered.collect_garbage("crash").await.unwrap();
-                eprintln!("stage={stage} position={position} after={after} post-GC");
                 assert_eq!(found, rows(&recovered).await);
                 position += 1;
             }

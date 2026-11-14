@@ -42,6 +42,7 @@ async fn versioned_slots_conflicts_tail_and_manifest() {
         created_at: chrono::Utc::now(),
         indexed_through: 0,
         indexer_epoch: 0,
+        deleted: false,
         segments: vec![],
         stats: Default::default(),
         updated_at: None,
@@ -100,6 +101,7 @@ async fn epoch_claims_fence_stalled_indexers_and_checkpoint_regression() {
         created_at: chrono::Utc::now(),
         indexed_through: 0,
         indexer_epoch: 1,
+        deleted: false,
         segments: vec![],
         stats: Default::default(),
         updated_at: None,
@@ -125,4 +127,43 @@ async fn epoch_claims_fence_stalled_indexers_and_checkpoint_regression() {
         wal.publish_fenced(3, 2, &manifest).await,
         Err(Error::Fenced)
     ));
+}
+
+#[tokio::test]
+async fn checkpoint_gc_collects_abandoned_payloads_only_for_fenced_slots() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let wal = Wal::new(store.clone(), "orphan").unwrap();
+    wal.append(1, &WalEntry::new(vec![])).await.unwrap();
+    let abandoned = WalEntry::new(vec![]);
+    let orphan = format!("ns/orphan/wal-data/{:020}-{}.wal", 1, abandoned.write_id);
+    store
+        .create_with_id(&orphan, abandoned.encode().unwrap(), abandoned.write_id)
+        .await
+        .unwrap();
+    let future = WalEntry::new(vec![]);
+    let pending = format!("ns/orphan/wal-data/{:020}-{}.wal", 2, future.write_id);
+    store
+        .create_with_id(&pending, future.encode().unwrap(), future.write_id)
+        .await
+        .unwrap();
+    wal.prune_payloads(1).await.unwrap();
+    assert!(matches!(
+        store.get(&orphan).await,
+        Err(bf_storage::Error::NotFound)
+    ));
+    assert!(store.get(&pending).await.is_ok());
+    assert_eq!(
+        wal.append(1, &abandoned).await.unwrap(),
+        CreateResult::Conflict
+    );
+    assert_eq!(wal.append(2, &future).await.unwrap(), CreateResult::Created);
+    assert_eq!(
+        wal.read(2).await.unwrap().unwrap().write_id,
+        future.write_id
+    );
 }

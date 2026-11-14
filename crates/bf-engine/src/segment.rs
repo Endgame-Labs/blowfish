@@ -339,7 +339,10 @@ pub(crate) async fn build(
                 }
             }
             let bytes = builder.finish().map_err(index_error)?;
-            let metadata_len = 72;
+            // bf-text v1 stores the document-length region offset at footer byte 32.
+            let footer = &bytes[bytes.len() - 72..];
+            let lengths_offset = u64::from_le_bytes(footer[32..40].try_into().expect("v1 footer"));
+            let metadata_len = bytes.len() as u64 - lengths_offset;
             files.insert(
                 format!("fts:{name}"),
                 put_file(
@@ -597,6 +600,32 @@ pub(crate) fn filter_rows<'a>(
                 let values: Vec<(Value, RoaringBitmap)> =
                     decode(&read_block(&reader, &col.blocks[0]).await?)?;
                 let mut out = RoaringBitmap::new();
+                // Sorted dictionary runs permit binary seeks for scalar ranges.
+                // Canonicalization preserves datetime, UUID, and exact integer ordering.
+                use bf_types::FilterOp::*;
+                if matches!(op, Eq | NotEq | Lt | Lte | Gt | Gte) {
+                    let operand =
+                        if let Some(t) = schema.get(attribute).and_then(|s| s.data_type.as_ref()) {
+                            crate::write::normalize_value(value, t)?
+                        } else {
+                            value.clone()
+                        };
+                    let low = values.partition_point(|(v, _)| filter::compare(v, &operand).is_lt());
+                    let high =
+                        values.partition_point(|(v, _)| !filter::compare(v, &operand).is_gt());
+                    let range = match op {
+                        Eq | NotEq => low..high,
+                        Lt => 0..low,
+                        Lte => 0..high,
+                        Gt => high..values.len(),
+                        Gte => low..values.len(),
+                        _ => unreachable!(),
+                    };
+                    for (_, rows) in &values[range] {
+                        out |= rows;
+                    }
+                    return Ok(if *op == NotEq { live - out } else { out & live });
+                }
                 for (value, rows) in values {
                     let doc = Document::from_iter([(attribute.clone(), value)]);
                     if filter::matches(f, Some(&doc), None, schema)? {

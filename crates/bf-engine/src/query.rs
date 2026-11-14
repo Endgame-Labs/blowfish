@@ -868,7 +868,9 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
             rank_by: Some(rank.clone()),
             top_k: Some(top),
             filters: filters.clone(),
-            include_attributes: Some(IncludeAttributes::All(true)),
+            include_attributes: Some(IncludeAttributes::All(
+                request.get("include_ground_truth") == Some(&json!(true)),
+            )),
             ..Default::default()
         };
         if !matches!(rank, RankBy::Vector { .. }) {

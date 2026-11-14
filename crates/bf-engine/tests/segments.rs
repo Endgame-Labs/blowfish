@@ -80,6 +80,15 @@ async fn checkpoints_overlay_compaction_gc_and_cold_reopen_match_reference() {
             json!({"rank_by":["text","BM25","fox bird"],"top_k":10}),
             json!({"rank_by":["Sum",[["text","BM25","bird"],["Max",[["Attribute","n"],0]]]],"top_k":10}),
             json!({"aggregate_by":{"count":["Count"],"sum":["Sum","n"]},"group_by":["n"]}),
+            json!({"aggregate_by":{"count":["Count"],"min":["Min","n"],"max":["Max","n"]}}),
+            json!({"aggregate_by":{"count":["Count"]},"group_by":[{"tag":["ForEachUnique","tags"]}]}),
+            json!({"rank_by":["Product",2,["text","BM25","bird"]],"top_k":10}),
+            json!({"rank_by":["Max",[["text","BM25","fox"],["n","Eq",1]]],"top_k":10}),
+            json!({"rank_by":["Saturate",["Attribute","n"],{"midpoint":2}],"top_k":10}),
+            json!({"rank_by":["Decay",["Dist",["Attribute","n"],5],{"midpoint":2}],"top_k":10}),
+            json!({"rank_by":["n","Eq",1],"top_k":10}),
+            json!({"rank_by":["id","desc"],"limit":{"total":5,"per":{"attributes":["n"],"limit":1}},"offset":1}),
+            json!({"rank_by":["id","asc"],"top_k":5,"exclude_attributes":["small","tags"],"vector_encoding":"base64"}),
             json!({"rank_by":["id","asc"],"top_k":10,"filters":["text","ContainsAllTokens","fox"]}),
             json!({"queries":[{"rank_by":["vector","ANN",[1.0,2.0]],"top_k":5},{"rank_by":["text","BM25","fox"],"top_k":5}],"rerank_by":["RRF"],"limit":5}),
         ] {
@@ -327,4 +336,154 @@ async fn cjk_tokenizers_and_pre_tokenized_phrase_filters_use_indexes() {
     write(&e,json!({"schema":{"text":{"type":"[]string","full_text_search":{"tokenizer":"pre_tokenized_array"}}},"upsert_rows":[{"id":1,"text":["A","B","C"]}]})).await;
     e.index_namespace("test", true).await.unwrap();
     assert_eq!(query(&e,json!({"rank_by":["id","asc"],"top_k":5,"filters":["text","ContainsTokenSequence",["B","C"]]})).await["rows"],json!([{"id":1}]));
+}
+
+#[tokio::test]
+async fn gc_fences_orphan_builders_and_erases_deleted_namespace_segments() {
+    let e = node().await;
+    write(&e, initial()).await;
+    e.index_namespace("test", true).await.unwrap();
+    let wal = Wal::new(e.storage().clone(), "test").unwrap();
+    let (sequence, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    let orphan = "ns/test/segments/abandoned/docs.bfc";
+    e.storage().create(orphan, "unpublished").await.unwrap();
+    e.collect_garbage("test").await.unwrap();
+    assert!(matches!(
+        e.storage().get(orphan).await,
+        Err(bf_storage::Error::NotFound)
+    ));
+    assert!(matches!(
+        wal.publish_fenced(sequence, manifest.indexer_epoch, &manifest)
+            .await,
+        Err(bf_wal::Error::Fenced)
+    ));
+    e.delete_namespace("test").await.unwrap();
+    e.collect_garbage("test").await.unwrap();
+    e.collect_garbage("test").await.unwrap();
+    assert!(
+        e.storage()
+            .list("ns/test/segments/")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let cold = Engine::with_config(
+        e.storage().clone(),
+        EngineConfig {
+            indexing: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(cold.schema("test").await.unwrap_err().status, 404);
+    write(&cold, json!({"upsert_rows":[{"id":"fresh","n":9}]})).await;
+    cold.index_namespace("test", true).await.unwrap();
+    assert_eq!(
+        query(&cold, json!({"rank_by":["id","asc"],"top_k":5})).await["rows"],
+        json!([{"id":"fresh"}])
+    );
+}
+
+#[tokio::test]
+async fn eventual_tail_cap_and_segment_checksum_fail_closed() {
+    let e = node().await;
+    write(&e, initial()).await;
+    let bounded = Engine::with_config(
+        e.storage().clone(),
+        EngineConfig {
+            indexing: false,
+            eventual_tail_bytes: 1,
+            ..Default::default()
+        },
+    );
+    let q: QueryRequest = serde_json::from_value(
+        json!({"rank_by":["id","asc"],"top_k":100,"consistency":{"level":"eventual"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        bounded.query("test", q.clone()).await.unwrap_err().status,
+        409
+    );
+    e.index_namespace("test", true).await.unwrap();
+    assert_eq!(
+        bounded
+            .query("test", q.clone())
+            .await
+            .unwrap()
+            .result
+            .rows
+            .unwrap()
+            .len(),
+        30
+    );
+    write(&e, json!({"deletes":[1]})).await;
+    assert_eq!(
+        bounded
+            .query("test", q)
+            .await
+            .unwrap()
+            .result
+            .rows
+            .unwrap()
+            .len(),
+        30
+    );
+    assert_eq!(
+        query(&bounded, json!({"aggregate_by":{"n":["Count"]}})).await["aggregations"]["n"],
+        29
+    );
+    let (_, m) = Wal::new(e.storage().clone(), "test")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap();
+    let file = &m.segments[0].files["docs"];
+    let mut bytes = e.storage().get(&file.key).await.unwrap().to_vec();
+    bytes[0] ^= 1;
+    e.storage().put(&file.key, bytes).await.unwrap();
+    let q: QueryRequest = serde_json::from_value(
+        json!({"rank_by":["id","asc"],"top_k":100,"include_attributes":true}),
+    )
+    .unwrap();
+    assert!(bounded.query("test", q).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexed_conditional_writes_remain_serializable_across_nodes_and_compaction() {
+    let e = node().await;
+    write(&e, initial()).await;
+    e.index_namespace("test", true).await.unwrap();
+    let mut workers = vec![];
+    for _ in 0..2 {
+        let node = Engine::with_config(
+            e.storage().clone(),
+            EngineConfig {
+                indexing: false,
+                ..Default::default()
+            },
+        );
+        workers.push(tokio::spawn(async move {
+            for _ in 0..20 {
+                loop {
+                    let row=query(&node,json!({"rank_by":["id","asc"],"filters":["id","Eq",0],"top_k":1,"include_attributes":["n"]})).await;
+                    let n=row["rows"][0]["n"].as_u64().unwrap();
+                    let result=node.write("test",serde_json::from_value(json!({"patch_rows":[{"id":0,"n":n+1}],"patch_condition":["n","Eq",n]})).unwrap()).await.unwrap();
+                    if result.rows_affected==1 {break;}
+                }
+            }
+        }));
+    }
+    let indexer = e.clone();
+    let maintenance = tokio::spawn(async move {
+        for _ in 0..12 {
+            indexer.index_namespace("test", true).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+    for worker in workers {
+        worker.await.unwrap();
+    }
+    maintenance.await.unwrap();
+    e.index_namespace("test", true).await.unwrap();
+    assert_eq!(query(&e,json!({"rank_by":["id","asc"],"filters":["id","Eq",0],"top_k":1,"include_attributes":["n"]})).await["rows"][0]["n"],40);
 }
