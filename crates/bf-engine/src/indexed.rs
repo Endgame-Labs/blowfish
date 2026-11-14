@@ -469,7 +469,7 @@ async fn prepare_scalar(
             let top = if all { allowed.len() as usize } else { k };
             let hits = if let Some(reader) = indexes.get(attribute) {
                 reader
-                    .search(&query, stats, &cfg, top, Some(&allowed))
+                    .search_prefetched(&query, stats, &cfg, top, Some(&allowed))
                     .await
                     .map_err(segment::index_error)?
             } else {

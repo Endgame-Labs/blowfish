@@ -59,7 +59,7 @@ files checked into source control.
 | `disk_bytes` | 64 GiB | Budget for payload files, including 40-byte checksum headers |
 | `block_size` | 1 MiB | Aligned logical block size in bytes |
 | `max_coalesce_blocks` | 8 | Maximum adjacent missing blocks in one GET |
-| `fetch_concurrency` | 16 | Global maximum simultaneous cache-fill requests |
+| `fetch_concurrency` | 64 | Global maximum simultaneous cache-fill requests |
 | `prefetch_concurrency` | 4 | Maximum accepted background hints |
 | `namespace` | derived by `Storage::open` | Stable identity for the backend/bucket |
 
@@ -133,3 +133,10 @@ BF_CACHE_BENCH_DISK_ONLY=1 cargo run -p bf-storage --release --example cache_ben
 ```
 
 Use only a disposable development bucket. Endpoint and profile values stay in the environment.
+
+`BackendStats` provides task-scoped request diagnostics without a metrics recorder.
+Enter `stats.scope("snapshot", future)` or `stats.scope("search", future)`, propagate
+the same `Arc` explicitly to spawned tasks, and call `snapshot()` after completion.
+Measurements include not-found requests, physical transferred bytes, and summed
+backend durations. Concurrent request durations overlap. Engine diagnostics use
+this API to distinguish consistency requests from uncached immutable reads.

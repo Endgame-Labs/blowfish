@@ -40,7 +40,7 @@ pub struct CacheConfig {
     pub block_size: usize,
     /// Maximum blocks coalesced into one backend GET (default 8).
     pub max_coalesce_blocks: usize,
-    /// Maximum simultaneous cache-fill GETs across all readers (default 16).
+    /// Maximum simultaneous cache-fill GETs across all readers (default 64).
     pub fetch_concurrency: usize,
     /// Maximum background warming tasks; excess hints are rejected (default 4).
     pub prefetch_concurrency: usize,
@@ -72,7 +72,7 @@ impl Default for CacheConfig {
             namespace: None,
             block_size: 1 << 20,
             max_coalesce_blocks: 8,
-            fetch_concurrency: 16,
+            fetch_concurrency: 64,
             prefetch_concurrency: 4,
         }
     }

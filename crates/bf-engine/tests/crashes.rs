@@ -23,6 +23,9 @@ struct Faults {
     operation: AtomicUsize,
     fail_at: AtomicUsize,
     after: AtomicBool,
+    pause_copy: AtomicBool,
+    copy_paused: tokio::sync::Notify,
+    resume_copy: tokio::sync::Notify,
 }
 impl Faults {
     fn arm(&self, at: usize, after: bool) {
@@ -53,6 +56,12 @@ impl ObjectStore for Faults {
         payload: PutPayload,
         opts: PutOptions,
     ) -> StoreResult<PutResult> {
+        if path.as_ref().starts_with("ns/paused/wal/")
+            && self.pause_copy.swap(false, Ordering::SeqCst)
+        {
+            self.copy_paused.notify_one();
+            self.resume_copy.notified().await;
+        }
         let fail = self.hit();
         if fail && !self.after.load(Ordering::SeqCst) {
             return failure();
@@ -198,6 +207,57 @@ async fn acknowledged_writes_survive_every_commit_index_compact_and_gc_mutation(
     }
 }
 
+// A timeout-only pin collector would delete these segments while the copier is
+// suspended after source-epoch validation and before the destination WAL CAS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_copier_survives_source_deletion_and_crashing_collectors() {
+    for after in [false, true] {
+        for boundary in [0, 1, 4, 8, 16, 32] {
+            let faults = Arc::new(Faults::default());
+            let store = Storage::from_backend(faults.clone(), Path::default(), false, false)
+                .await
+                .unwrap();
+            let engine = Engine::with_config(store.clone(), config());
+            write(&engine, 1).await.unwrap();
+            engine.index_namespace("crash", true).await.unwrap();
+            faults.pause_copy.store(true, Ordering::SeqCst);
+            let copier = engine.clone();
+            let copy = tokio::spawn(async move {
+                copier
+                    .write(
+                        "paused",
+                        serde_json::from_value(json!({"branch_from_namespace":"crash"})).unwrap(),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), faults.copy_paused.notified())
+                .await
+                .unwrap();
+            engine.delete_namespace("crash").await.unwrap();
+            faults.arm(boundary, after);
+            let _ = engine.collect_garbage("crash").await;
+            faults.arm(0, false);
+            // A collector restart must still retain the suspended copy's pin.
+            let recovered = Engine::with_config(store.clone(), config());
+            recovered.collect_garbage("crash").await.unwrap();
+            faults.resume_copy.notify_one();
+            copy.await.unwrap().unwrap();
+            let cold = Engine::with_config(store, config());
+            let result = cold
+                .query(
+                    "paused",
+                    serde_json::from_value(json!({"rank_by":["id","asc"],"top_k":10})).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.result.rows.unwrap()[0]["id"],
+                1,
+                "boundary={boundary}, after={after}"
+            );
+        }
+    }
+}
 #[tokio::test]
 async fn acknowledged_branches_survive_failures_and_source_deletion() {
     for after in [false, true] {

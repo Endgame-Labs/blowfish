@@ -125,3 +125,11 @@ Observed on an 8-vCPU Linux worker: **39,401,769 bytes** (39.40 bytes/document),
 **14.285 seconds** to build, **3.863 ms p50**, and **6.543 ms p95**. The mean query
 read 66.5 blocks and pruned 69.8 row windows. Results depend on hardware, corpus,
 query selectivity, and concurrency.
+
+`SegmentReader::prefetch_plan(query, allowed)` computes posting ranges from the
+resident dictionary, including final-prefix expansions, and excludes positions.
+`search_prefetched` fetches this plan through `RangeRead::read_batch` in one batch
+before scoring. Override `read_batch` to coalesce cache blocks on remote stores.
+Fetched postings stay local to the query, including with byte caching disabled.
+Demand-driven `search` retains block-max I/O pruning; batching can fetch more
+bytes for broad terms in exchange for fewer dependent network stages.

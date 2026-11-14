@@ -49,6 +49,7 @@ pub(crate) struct NamespaceState {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub refreshed: Instant,
+    pub checkpoint_refreshed: Instant,
 }
 impl Default for NamespaceState {
     fn default() -> Self {
@@ -70,6 +71,7 @@ impl Default for NamespaceState {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             refreshed: Instant::now(),
+            checkpoint_refreshed: Instant::now(),
         }
     }
 }
@@ -108,6 +110,18 @@ impl NamespaceState {
         self.seq = seq;
         self.tail_bytes += serde_json::to_vec(entry).expect("WAL serializes").len() as u64;
     }
+}
+/// Query-local diagnostics; backend durations sum overlapping requests.
+#[derive(Clone, Debug)]
+pub struct QueryDiagnostics {
+    /// Time spent obtaining a consistent namespace snapshot.
+    pub snapshot_elapsed: std::time::Duration,
+    /// Time spent queuing, searching, and assembling results.
+    pub execution_elapsed: std::time::Duration,
+    /// Backend requests by stage and operation.
+    pub backend: Vec<bf_storage::BackendMeasurement>,
+    /// Logical cache-byte accounting, separate from physical backend bytes.
+    pub cache: bf_storage::CacheStatsSnapshot,
 }
 struct Handle {
     state: Arc<Mutex<NamespaceState>>,
@@ -211,7 +225,35 @@ impl Engine {
         if over_cap {
             *state = NamespaceState::default();
         }
-        if refresh || over_cap {
+        let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
+        // A retained checkpoint remains valid independently of newer index publications.
+        // Bound its age separately from WAL freshness, so repeated strong reads cannot
+        // keep a reclaimed checkpoint alive indefinitely.
+        let checkpoint_valid = state.seq > 0
+            && state.checkpoint_refreshed.elapsed() < self.0.config.retention.div_f64(2.0);
+        let unchanged = if matches!(consistency, Consistency::Strong) && checkpoint_valid {
+            let observed = (state.seq, state.manifest_seq);
+            // Keep independent consistency requests off the namespace state lock.
+            // Reconcile after the HEAD so a concurrent commit cannot be overwritten.
+            drop(state);
+            let head = self.0.store.head(&wal.key(observed.0 + 1)).await;
+            state = handle.state.lock().await;
+            match head {
+                Err(bf_storage::Error::NotFound)
+                    if (state.seq, state.manifest_seq) == observed
+                        && state.checkpoint_refreshed.elapsed()
+                            < self.0.config.retention.div_f64(2.0) =>
+                {
+                    state.refreshed = Instant::now();
+                    true
+                }
+                Err(bf_storage::Error::NotFound) | Ok(_) => false,
+                Err(error) => return Err(storage_error(error)),
+            }
+        } else {
+            false
+        };
+        if (refresh || over_cap) && !unchanged {
             snapshot::catch_up(
                 &Wal::new(self.0.store.clone(), ns).map_err(log_error)?,
                 &mut state,
@@ -295,35 +337,65 @@ impl Engine {
     }
     /// Search a consistent segment-and-tail snapshot, including multi-query RRF.
     pub async fn query(&self, ns: &str, request: QueryRequest) -> Result<QueryResponse, ApiError> {
+        self.query_with_diagnostics(ns, request)
+            .await
+            .map(|(response, _)| response)
+    }
+    /// Search with query-local backend counts, transferred bytes, and stage timings.
+    /// Diagnostics are separate from the turbopuffer wire response.
+    pub async fn query_with_diagnostics(
+        &self,
+        ns: &str,
+        request: QueryRequest,
+    ) -> Result<(QueryResponse, QueryDiagnostics), ApiError> {
         let start = Instant::now();
-        let (state, _) = self.snapshot(ns, &request.consistency).await?;
-        let execution = Instant::now();
-        let store = self.0.store.clone();
-        let config = self.0.config.clone();
-        let search_state = state.clone();
-        let search_request = request.clone();
-        let runtime = tokio::runtime::Handle::current();
+        let backend = Arc::new(bf_storage::BackendStats::default());
         let stats = Arc::new(bf_storage::CacheStats::default());
         let context = read_cache::ReadContext {
             cache: self.0.read_cache.clone(),
             stats: stats.clone(),
+            backend: backend.clone(),
         };
-        let permit = self
-            .0
-            .queries
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(segment::index_error)?;
-        let mut response = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            runtime.block_on(read_cache::scope(
-                context,
-                indexed::execute(&store, &search_state, &search_request, &config, false),
-            ))
-        })
-        .await
-        .map_err(segment::index_error)??;
+        let cached = if matches!(request.consistency, Consistency::Strong) {
+            let handle = self.handle(ns).await?;
+            let state = handle.state.lock().await;
+            (state.exists
+                && state.seq > 0
+                && state.checkpoint_refreshed.elapsed() < self.0.config.retention.div_f64(2.0))
+            .then(|| state.clone())
+        } else {
+            None
+        };
+        let snapshot = async {
+            let result = backend
+                .scope("snapshot", self.snapshot(ns, &request.consistency))
+                .await;
+            (result, start.elapsed())
+        };
+        // Search immutable files while checking the WAL. Only accept speculative
+        // results when the refreshed snapshot has the same WAL and manifest version.
+        // A concurrent write, index publication, or deletion discards even errors
+        // from the old search, and executes against the refreshed state instead.
+        let (state, mut response, execution_elapsed, snapshot_elapsed) =
+            if let Some(cached) = cached {
+                let ((snapshot, elapsed), searched) = tokio::join!(
+                    snapshot,
+                    self.search_snapshot(&cached, &request, context.clone())
+                );
+                let (state, _) = snapshot?;
+                let (response, execution) =
+                    if state.seq == cached.seq && state.manifest_seq == cached.manifest_seq {
+                        searched?
+                    } else {
+                        self.search_snapshot(&state, &request, context).await?
+                    };
+                (state, response, execution, elapsed)
+            } else {
+                let (snapshot, elapsed) = snapshot.await;
+                let (state, _) = snapshot?;
+                let (response, execution) = self.search_snapshot(&state, &request, context).await?;
+                (state, response, execution, elapsed)
+            };
         if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
             && (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1_000_000.0
                 < self.0.config.recall_sample_rate
@@ -342,6 +414,7 @@ impl Engine {
                 let context = read_cache::ReadContext {
                     cache,
                     stats: Arc::default(),
+                    backend: Arc::default(),
                 };
                 let _ = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
@@ -361,7 +434,7 @@ impl Engine {
             cache_hit_ratio: stats.cache_hit_ratio(),
             cache_temperature: stats.temperature().into(),
             server_total_ms: start.elapsed().as_millis() as u64,
-            query_execution_ms: execution.elapsed().as_millis() as u64,
+            query_execution_ms: execution_elapsed.as_millis() as u64,
             exhaustive_search_count: state.docs.len() as u64,
             approx_namespace_size: state.stats.rows + state.docs.len() as u64,
             last_included_write_at: Some(
@@ -370,7 +443,43 @@ impl Engine {
                     .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
             ),
         };
-        Ok(response)
+        let diagnostics = QueryDiagnostics {
+            snapshot_elapsed,
+            execution_elapsed,
+            backend: backend.snapshot(),
+            cache: stats.snapshot(),
+        };
+        Ok((response, diagnostics))
+    }
+    async fn search_snapshot(
+        &self,
+        state: &NamespaceState,
+        request: &QueryRequest,
+        context: read_cache::ReadContext,
+    ) -> Result<(QueryResponse, std::time::Duration), ApiError> {
+        let start = Instant::now();
+        let store = self.0.store.clone();
+        let config = self.0.config.clone();
+        let state = state.clone();
+        let request = request.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let permit = self
+            .0
+            .queries
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(segment::index_error)?;
+        let response = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            runtime.block_on(read_cache::scope(
+                context,
+                indexed::execute(&store, &state, &request, &config, false),
+            ))
+        })
+        .await
+        .map_err(segment::index_error)??;
+        Ok((response, start.elapsed()))
     }
     /// Run the exhaustive reference evaluator on the same persistent snapshot machinery.
     pub async fn query_exhaustive(
@@ -497,6 +606,7 @@ impl Engine {
         let context = read_cache::ReadContext {
             cache: self.0.read_cache.clone(),
             stats: Arc::default(),
+            backend: Arc::default(),
         };
         let permit = self
             .0

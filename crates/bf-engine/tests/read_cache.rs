@@ -29,6 +29,11 @@ struct Counting {
     delay: AtomicBool,
     fail: AtomicBool,
     short: AtomicBool,
+    pause_head: AtomicBool,
+    head_started: tokio::sync::Notify,
+    resume_head: tokio::sync::Notify,
+    wal_active: AtomicUsize,
+    wal_max_active: AtomicUsize,
 }
 impl fmt::Display for Counting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -59,7 +64,23 @@ impl ObjectStore for Counting {
         self.inner.put_multipart_opts(path, opts).await
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> StoreResult<GetResult> {
+        if opts.head
+            && path.as_ref().contains("/wal/")
+            && self.pause_head.swap(false, Ordering::SeqCst)
+        {
+            self.head_started.notify_one();
+            self.resume_head.notified().await;
+        }
         if !path.as_ref().contains("/segments/") {
+            if opts.head && path.as_ref().contains("/wal/") {
+                let active = self.wal_active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.wal_max_active.fetch_max(active, Ordering::SeqCst);
+                let _active = Active(&self.wal_active);
+                if self.delay.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                return self.inner.get_opts(path, opts).await;
+            }
             return self.inner.get_opts(path, opts).await;
         }
         if opts.head {
@@ -178,24 +199,152 @@ async fn cold_ann_has_three_read_stages_no_heads_and_warm_queries_hit_cache() {
     let request =
         serde_json::from_value(json!({"rank_by":["vector","ANN",docs[0]["vector"]],"top_k":10}))
             .unwrap();
-    let warm = engine.query("stages", request).await.unwrap();
+    let (warm, diagnostics) = engine
+        .query_with_diagnostics("stages", request)
+        .await
+        .unwrap();
+    assert_eq!(diagnostics.backend.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics.backend[0].operation, "head");
+    assert_eq!(diagnostics.backend[0].requests, 1);
+    assert_eq!(diagnostics.backend[0].bytes, 0);
     assert_eq!(cold.result.rows, warm.result.rows);
     assert_eq!(backend.ranges.lock().unwrap().len(), reads);
     assert_eq!(warm.performance.cache_hit_ratio, 1.0);
     assert_eq!(warm.performance.cache_temperature, "hot");
+    let eventual = serde_json::from_value(json!({
+        "rank_by":["vector","ANN",docs[0]["vector"]],"top_k":10,
+        "consistency":{"level":"eventual"}
+    }))
+    .unwrap();
+    let (response, diagnostics) = engine
+        .query_with_diagnostics("stages", eventual)
+        .await
+        .unwrap();
+    assert_eq!(warm.result.rows, response.result.rows);
+    assert!(diagnostics.backend.is_empty(), "{diagnostics:?}");
     // A fresh engine and storage handle also keep the text metadata stage together.
     let engine = Engine::with_config(store(backend.clone()).await, config());
     backend.waves.store(0, Ordering::SeqCst);
     let request =
-        serde_json::from_value(json!({"rank_by":["text","BM25","term1"],"top_k":10})).unwrap();
+        serde_json::from_value(json!({"rank_by":["text","BM25","search engine term1"],"top_k":10}))
+            .unwrap();
     let cold = engine.query("stages", request).await.unwrap();
     assert_eq!(cold.result.rows.as_ref().unwrap().len(), 10);
     assert!(backend.waves.load(Ordering::SeqCst) <= 3);
     let reads = backend.ranges.lock().unwrap().len();
     let request =
-        serde_json::from_value(json!({"rank_by":["text","BM25","term1"],"top_k":10})).unwrap();
+        serde_json::from_value(json!({"rank_by":["text","BM25","search engine term1"],"top_k":10}))
+            .unwrap();
     let warm = engine.query("stages", request).await.unwrap();
     assert_eq!(cold.result.rows, warm.result.rows);
     assert_eq!(backend.ranges.lock().unwrap().len(), reads);
     assert_eq!(warm.performance.cache_hit_ratio, 1.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_wal_write_discards_speculative_results() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    writer
+        .write(
+            "race",
+            serde_json::from_value(json!({"upsert_rows":[{"id":1,"n":1}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    writer.index_namespace("race", true).await.unwrap();
+    let reader = Engine::with_config(store(backend.clone()).await, config());
+    let request: bf_types::QueryRequest =
+        serde_json::from_value(json!({"rank_by":["id","asc"],"top_k":1,"include_attributes":true}))
+            .unwrap();
+    reader.query("race", request.clone()).await.unwrap();
+    backend.pause_head.store(true, Ordering::SeqCst);
+    let searching = reader.clone();
+    let task = tokio::spawn(async move { searching.query("race", request).await });
+    tokio::time::timeout(Duration::from_secs(10), backend.head_started.notified())
+        .await
+        .unwrap();
+    writer
+        .write(
+            "race",
+            serde_json::from_value(json!({"patch_rows":[{"id":1,"n":2}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    backend.resume_head.notify_one();
+    let response = task.await.unwrap().unwrap();
+    assert_eq!(response.result.rows.unwrap()[0]["n"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_strong_checks_do_not_extend_checkpoint_retention() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    writer
+        .write(
+            "expiry",
+            serde_json::from_value(json!({"upsert_rows":[{"id":1}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    writer.index_namespace("expiry", true).await.unwrap();
+    let reader = Engine::with_config(
+        store(backend).await,
+        EngineConfig {
+            retention: Duration::from_millis(100),
+            ..config()
+        },
+    );
+    let request: bf_types::QueryRequest =
+        serde_json::from_value(json!({"rank_by":["id","asc"],"top_k":1})).unwrap();
+    reader.query("expiry", request.clone()).await.unwrap();
+    let mut refreshed = false;
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (_, measured) = reader
+            .query_with_diagnostics("expiry", request.clone())
+            .await
+            .unwrap();
+        refreshed |= measured
+            .backend
+            .iter()
+            .any(|entry| entry.operation == "list");
+    }
+    assert!(refreshed, "WAL freshness must not reset checkpoint age");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_strong_queries_check_wal_concurrently() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    writer
+        .write(
+            "parallel",
+            serde_json::from_value(json!({"upsert_rows":[{"id":1}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    writer.index_namespace("parallel", true).await.unwrap();
+    let reader = Engine::with_config(store(backend.clone()).await, config());
+    let request: bf_types::QueryRequest =
+        serde_json::from_value(json!({"rank_by":["id","asc"],"top_k":1})).unwrap();
+    reader.query("parallel", request.clone()).await.unwrap();
+    backend.delay.store(true, Ordering::SeqCst);
+    backend.wal_max_active.store(0, Ordering::SeqCst);
+    futures::future::try_join_all((0..8).map(|_| reader.query("parallel", request.clone())))
+        .await
+        .unwrap();
+    assert!(
+        backend.wal_max_active.load(Ordering::SeqCst) >= 2,
+        "strong checks must not serialize under the namespace lock"
+    );
 }
