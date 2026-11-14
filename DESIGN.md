@@ -1,6 +1,12 @@
 # blowfish design 🐡
 
-Status: draft for review (2026-11-14). Nothing here is built yet.
+Status: approved by Kyle on 2026-11-14 (decisions in §11). Build progress is tracked in `PROGRESS.md`.
+
+**Where blowfish fits:** blowfish is for development, testing, CI, and modest self-hosted deployments,
+so nobody needs a turbopuffer account just to build against the turbopuffer API. It aims to be
+correct, performant, and scalable within reason. For production at serious scale, **we strongly
+recommend turbopuffer itself** as the upgrade path. Because the APIs match, the upgrade is a change of
+base URL and API key.
 
 blowfish is an open-source, self-hostable search engine that speaks the turbopuffer HTTP API. You give
 it an S3-compatible bucket, and it stores everything there: a write-ahead log, immutable index files,
@@ -22,9 +28,10 @@ from is at https://github.com/turbopuffer/turbopuffer-openapi, and it is our pri
    codes, and error shape, so that a compatibility test can diff them.
 2. **Object storage is the only source of truth.** Lose every server and every disk, keep the bucket,
    and you lose nothing that was acknowledged. Nodes are disposable caches.
-3. **Any S3-compatible store.** AWS S3, Cloudflare R2, GCS (through its S3 API or natively), MinIO,
-   SeaweedFS, and the local filesystem for development. The one hard requirement is conditional PUT
-   (`If-None-Match: *`), with a documented fallback for stores that lack it.
+3. **Any S3-compatible store, and nothing else.** AWS S3, Cloudflare R2, GCS (through its S3 API or
+   natively), MinIO, SeaweedFS, and the local filesystem for development. No extra database is ever
+   required. Stores with conditional PUT (`If-None-Match: *`) get multi-node operation; stores without
+   it get single-writer mode (§5.6).
 4. **Simple to self-host.** One static binary and one config file (bucket, credentials, API keys).
    Scale out by running more copies.
 5. **turbopuffer-like economics and latency.** Warm queries in the tens of milliseconds, cold queries
@@ -126,8 +133,9 @@ These come from reading the SDKs and probing the real service (details in `docs/
 - **`prefer: respond-async`:** every SDK sends it. We ignore it and answer synchronously.
 - **Retries without idempotency keys:** a retried write may arrive twice. Upserts, deletes, and plain
   patches are idempotent. Conditional writes are not, which matches turbopuffer.
-- **Auth:** `Authorization: Bearer <key>`. Keys come from config and can be scoped to a namespace
-  prefix and to read-only. An auth-disabled mode exists for local development.
+- **Auth:** `Authorization: Bearer <key>`, with role-based API keys built in (§8.1). An admin
+  super key can do everything, including managing other keys. An auth-disabled mode exists for local
+  development.
 - **Response details:** BM25 and score expressions return `$dist` sorted descending; ANN returns it
   ascending; ordering by attribute omits it. Documents with a score of 0 are dropped. Integer JSON
   infers `int`. The emoji in error strings is optional, but cute.
@@ -261,6 +269,24 @@ a retention window (default 1 hour). The window must be longer than any query's 
 
 The retention window also gives us cheap point-in-time recovery for the last hour.
 
+### 5.6 Stores without conditional writes
+
+At startup, blowfish probes the bucket: it creates a scratch object with `If-None-Match: *`, then
+tries again and expects a 412. If the store ignores the header, blowfish switches to
+**single-writer mode**:
+
+- **One writer process.** Exactly one blowfish process may write the prefix. Every WAL, manifest, and
+  lease write is serialized in that process, which is trivially correct.
+- **Read-only replicas.** Any number of other processes can serve queries with
+  `--read-only`.
+- **Best-effort detection.** The writer holds a heartbeat object (`_system/writer.json`, carrying a
+  random process ID and refreshed every few seconds). A second writer that sees a fresh heartbeat
+  from someone else refuses to start. Without conditional writes this can't be airtight, so the docs
+  say so plainly.
+
+The bucket format is the same in both modes, so moving a dataset to a store with conditional writes
+needs no migration.
+
 ## 6. Indexes
 
 Each segment covers a range of WAL entries and holds the latest version (as of that range) of every
@@ -379,6 +405,56 @@ batch-oriented table format. Frequent small upserts create many versions and fra
 compaction, and it has no notion of a brute-forced WAL tail behind a group-commit writer. We'll
 benchmark against it instead.
 
+### 8.1 API keys, roles, and metrics
+
+**Roles.** They mirror turbopuffer's API-key roles, so client code behaves the same way:
+
+| Role | Can do |
+|---|---|
+| `admin` | everything on its namespaces, including delete |
+| `write` | writes and queries |
+| `read` | queries, metadata, schema, and recall |
+| `list` | list namespaces |
+| `metrics` | read `/metrics` and `/_blowfish/v1/status` (blowfish-only) |
+| `keys` | manage API keys through the admin API, but never mint a key with more power than its own (blowfish-only) |
+
+**Key scope.** Each key has a set of roles, plus an optional list of namespace prefixes it is
+limited to (the default is all namespaces). It also has a name, a creation time, an optional expiry,
+and a last-used time (sampled).
+
+**The super key.** It comes from config or the `BLOWFISH_ADMIN_KEY` environment variable. It can do
+everything, including managing keys and reading metrics, like Cloudflare's global key. It is never
+stored in the bucket.
+
+**Key storage.** Keys live in the bucket under `_system/keys/<key_id>.json`. They are stored as
+SHA-256 hashes (keys are long random tokens, so a slow hash adds nothing), and the plaintext is shown
+once, at creation.
+
+- **Revocation** writes `_system/keys/<key_id>.revoked`.
+- **Propagation:** nodes cache the key set and refresh it every few seconds, so a new or revoked key
+  takes effect everywhere within about 5 seconds, and immediately on the node that handled the change.
+- **Token format:** `bf_<key_id>_<secret>`, so a node can look up the key without scanning.
+
+**Admin API.** It lives under `/_blowfish/v1/` and needs the super key or a key with the `keys` role:
+
+- `POST`, `GET`, and `DELETE /_blowfish/v1/keys[/{id}]`
+- `GET /_blowfish/v1/status`, which reports the storage mode, nodes, and indexing lag
+
+The `blowfish keys` CLI subcommand wraps the same API.
+
+**Metrics.** Prometheus text format at `GET /metrics`. It is served on the main port with the super
+key or a `metrics` role, and optionally on a separate unauthenticated port bound to localhost. Metrics
+cover:
+
+- Requests by endpoint, status, and key name.
+- Latency histograms.
+- Rows written and queried.
+- WAL commit latency and batch sizes.
+- Unindexed bytes per namespace and indexing lag.
+- Cache hits and bytes by tier.
+- Object-store requests by operation and status.
+- Sampled ANN recall.
+
 ## 9. Testing compatibility
 
 The test that matters is: **the official SDKs, the same calls, both servers, and diffed results.**
@@ -421,18 +497,16 @@ M1 is deliberately index-free. It locks down the API semantics (the hard, fiddly
 compatibility) against an implementation that's simple enough to be obviously right, and then every
 later milestone is a performance change that the same test suite guards.
 
-## 11. Open questions
+## 11. Decisions (Kyle, 2026-11-14)
 
-1. **License.** Apache-2.0 (my recommendation, since it matches tantivy, object_store, and SlateDB) or
-   something else?
-2. **Name and API compatibility claims.** We describe blowfish as "compatible with the turbopuffer
-   API". Is that the wording you want, and is the turbopuffer team being told before the repo goes
-   public?
-3. **BM25 score parity.** Should exact `$dist` parity with turbopuffer's BM25 be a hard goal, or is
-   identical ranking enough?
-4. **Stores without conditional writes** (for example Garage). Is a documented "bring a Postgres or
-   SQLite for the commit point" fallback worth building in v1, or do we require conditional PUT?
-5. **Auth model.** Are static API keys from a config file enough for v1, or do you want per-key
-   namespace prefixes and read-only keys (the current plan) or something richer?
-6. **Oracle budget.** The compat suite only needs tiny namespaces, but recording fixtures costs a
-   little on the real account each time. Is an occasional manual re-record the right cadence?
+1. **License:** MIT.
+2. **Positioning:** "compatible with the turbopuffer API". blowfish exists so people can build and
+   test against that API without a turbopuffer account. We strongly recommend turbopuffer as the
+   upgrade path for production scale.
+3. **BM25:** scores reasonably close to turbopuffer's are fine. Ranking should match on ordinary
+   corpora.
+4. **Storage:** 100% turbopuffer-compatible, with no extra moving parts. No Postgres or SQLite
+   fallback: stores without conditional writes run in single-writer mode (§5.6).
+5. **Auth and metrics:** robust role-based API key management and Prometheus metrics out of the box,
+   plus an admin super key (§8.1).
+6. **Scope:** build all milestones, not just M1.

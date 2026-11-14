@@ -23,3 +23,33 @@ instead of guessing.
 - Use `uv` for anything Python.
 - Commit your own changes as you go, and push them. Leave other sessions' uncommitted work alone.
 - Use the Oxford comma in everything you write here: "a, b, and c".
+
+## Layout and conventions
+
+The design is `DESIGN.md`; the build log is `PROGRESS.md` (update it with every commit that changes
+what works). Research notes and the upstream API contract are in `docs/research/`.
+
+Rust workspace, one crate per concern (`crates/`):
+
+| Crate | Owns |
+|---|---|
+| `bf-types` | The data model and the turbopuffer wire types: IDs, values, attribute types, schema, documents, write/query request and response serde, filter and rank_by ASTs, and the API error type |
+| `bf-storage` | The object-store layer: `object_store` wrapper, conditional puts, the startup CAS probe, single-writer mode, and the range-read cache |
+| `bf-wal` | WAL entry format, group commit, tail reading, and the manifest |
+| `bf-engine` | Namespace state, query execution (exhaustive and indexed), segments, the indexer, compaction, and GC |
+| `bf-text` | Tokenizers, BM25, and the posting-list index format. No dependency on other bf crates |
+| `bf-vector` | Distance kernels, IVF with RaBitQ, and its on-disk format. No dependency on other bf crates |
+| `bf-auth` | API keys, roles, and the key store |
+| `blowfish` | The binary: HTTP server (axum), admin API, metrics, CLI, and config |
+
+`compat/` is the Python compatibility suite (run with `uv`), which drives the official turbopuffer SDK
+against blowfish and diffs against recorded turbopuffer responses.
+
+Rules for every change:
+
+- `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` pass before each commit.
+- Small commits with clear messages, authored as the repo's git user, with no AI attribution lines.
+- Stay inside the crate or directory you were asked to work on. If you need a change elsewhere, say so
+  in your final report rather than making it.
+- The real turbopuffer (when a session has access to one) is a paid account: use only tiny namespaces
+  prefixed `blowfish-oracle-`, and delete them when done.
