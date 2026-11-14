@@ -337,6 +337,7 @@ impl<R: RangeRead> Index<R> {
                 check_crc(vbytes, c.row_crcs[i])?;
                 decoded.clear();
                 match self.vector_type() {
+                    VectorType::I8 => decoded.extend(vbytes.iter().map(|x| *x as i8 as f32)),
                     VectorType::F32 => decoded.extend(
                         vbytes
                             .as_chunks::<4>()

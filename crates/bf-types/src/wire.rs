@@ -52,6 +52,9 @@ pub struct WriteRequest {
     pub schema: Option<SchemaUpdate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copy_from_namespace: Option<CopyFrom>,
+    /// Create an independent namespace sharing immutable source segments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_from_namespace: Option<CopyFrom>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub create_namespace: Option<bool>,
     pub return_affected_ids: bool,
@@ -137,6 +140,9 @@ pub struct QueryRequest {
     pub include_attributes: Option<IncludeAttributes>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude_attributes: Option<Vec<String>>,
+    /// Computed values projected onto returned documents (maximum 256).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_attributes: Option<BTreeMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate_by: Option<BTreeMap<String, Aggregate>>,
     #[serde(skip_serializing_if = "Option::is_none")]

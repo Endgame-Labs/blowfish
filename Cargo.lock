@@ -267,6 +267,7 @@ dependencies = [
  "metrics",
  "object_store",
  "regex",
+ "regex-syntax",
  "roaring",
  "serde",
  "serde_json",

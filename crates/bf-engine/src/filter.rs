@@ -23,9 +23,14 @@ pub(crate) fn validate(f: &Filter, schema: &Schema, allow_refs: bool) -> Result<
                 .ok_or_else(|| ApiError::bad(format!("unknown attribute '{attribute}'")))?;
             let t = cfg.data_type.as_ref().expect("normalized schema type");
             if *op == Fuzzy {
-                return Err(ApiError::bad("Fuzzy is not supported by blowfish yet"));
-            }
-            if matches!(
+                if cfg.fuzzy != Some(true) {
+                    return Err(ApiError::bad("fuzzy is not enabled for this attribute"));
+                }
+                if !value.is_string() {
+                    return Err(ApiError::bad("Fuzzy requires a string"));
+                }
+                fuzzy_params(params.as_ref())?;
+            } else if matches!(
                 op,
                 ContainsAllTokens | ContainsAnyToken | ContainsTokenSequence
             ) {
@@ -54,6 +59,14 @@ pub(crate) fn validate(f: &Filter, schema: &Schema, allow_refs: bool) -> Result<
                 )
                 .map_err(|_| ApiError::bad("invalid regular expression"))?;
             } else if matches!(op, Glob | NotGlob | IGlob | NotIGlob) {
+                if !matches!(
+                    t,
+                    AttributeType::Scalar(ScalarType::String)
+                        | AttributeType::Array(ScalarType::String)
+                ) {
+                    return Err(ApiError::bad("Glob requires string or []string attributes"));
+                }
+
                 if cfg.glob != Some(true) && cfg.filterable != Some(true) {
                     return Err(ApiError::bad("glob is not enabled for this attribute"));
                 }
@@ -334,7 +347,12 @@ pub(crate) fn matches(
                         _ => unreachable!(),
                     }
                 }
-                Fuzzy => return Err(ApiError::bad("Fuzzy is not supported by blowfish yet")),
+                Fuzzy => {
+                    let config = fuzzy_params(params.as_ref())?;
+                    strings(actual).iter().any(|s| {
+                        config.matches(s, operand.as_str().expect("validated fuzzy query"))
+                    })
+                }
             })
         }
     }
@@ -347,4 +365,13 @@ fn strings(value: &Value) -> Vec<&str> {
     } else {
         vec![]
     }
+}
+
+pub(crate) fn fuzzy_params(params: Option<&Value>) -> Result<bf_text::FuzzyParams, ApiError> {
+    let params =
+        params.ok_or_else(|| ApiError::bad("Fuzzy requires max_edit_distance parameters"))?;
+    let config: bf_text::FuzzyParams = serde_json::from_value(params.clone())
+        .map_err(|e| ApiError::bad(format!("invalid Fuzzy parameters: {e}")))?;
+    config.validate().map_err(ApiError::bad)?;
+    Ok(config)
 }

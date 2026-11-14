@@ -24,6 +24,8 @@ struct Column {
     blocks: Vec<Block>,
     /// Vector blocks use native f16/f32 little-endian elements, separate from attributes.
     vector: Option<(usize, bool)>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    vector_i8: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Directory {
@@ -148,7 +150,7 @@ pub(crate) async fn put_file(
     }
     Ok(file)
 }
-async fn put_value<T: Serialize>(
+pub(crate) async fn put_value<T: Serialize>(
     store: &Storage,
     key: String,
     value: &T,
@@ -161,13 +163,14 @@ async fn put_value<T: Serialize>(
             Column {
                 blocks: vec![b],
                 vector: None,
+                vector_i8: false,
             },
         )]),
     };
     let (bytes, meta) = finish(body, &dir)?;
     put_file(store, key, bytes, meta).await
 }
-async fn get_value<T: DeserializeOwned>(
+pub(crate) async fn get_value<T: DeserializeOwned>(
     store: &Storage,
     file: &SegmentFile,
 ) -> Result<T, ApiError> {
@@ -221,8 +224,10 @@ pub(crate) async fn build(
     for (name, config) in schema {
         let vector = match config.data_type {
             Some(AttributeType::Vector { dimensions, f16 }) => Some((dimensions, f16)),
+            Some(AttributeType::VectorI8 { dimensions }) => Some((dimensions, false)),
             _ => None,
         };
+        let vector_i8 = matches!(config.data_type, Some(AttributeType::VectorI8 { .. }));
         let mut blocks = vec![];
         for chunk in rows.chunks(BLOCK_ROWS) {
             let data = if let Some((dims, f16)) = vector {
@@ -236,7 +241,9 @@ pub(crate) async fn build(
                             return Err(corrupt());
                         }
                         for x in v {
-                            if f16 {
+                            if vector_i8 {
+                                data.push(x as i8 as u8);
+                            } else if f16 {
                                 data.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
                             } else {
                                 data.extend_from_slice(&x.to_le_bytes());
@@ -250,7 +257,14 @@ pub(crate) async fn build(
             };
             blocks.push(block(&mut body, &data));
         }
-        dir.columns.insert(name.clone(), Column { blocks, vector });
+        dir.columns.insert(
+            name.clone(),
+            Column {
+                blocks,
+                vector,
+                vector_i8,
+            },
+        );
     }
     let (bytes, meta) = finish(body, &dir)?;
     files.insert(
@@ -291,6 +305,7 @@ pub(crate) async fn build(
             Column {
                 blocks: vec![b],
                 vector: None,
+                vector_i8: false,
             },
         );
     }
@@ -300,7 +315,21 @@ pub(crate) async fn build(
         put_file(store, format!("{prefix}/filter.bfx"), bytes, meta).await?,
     );
     for (column, (name, config)) in schema.iter().enumerate() {
-        if let Some(AttributeType::Vector { dimensions, f16 }) = config.data_type {
+        let dense = match config.data_type {
+            Some(AttributeType::Vector { dimensions, f16 }) => Some((
+                dimensions,
+                if f16 {
+                    bf_vector::VectorType::F16
+                } else {
+                    bf_vector::VectorType::F32
+                },
+            )),
+            Some(AttributeType::VectorI8 { dimensions }) => {
+                Some((dimensions, bf_vector::VectorType::I8))
+            }
+            _ => None,
+        };
+        if let Some((dimensions, dtype)) = dense {
             let vectors = rows
                 .iter()
                 .enumerate()
@@ -309,11 +338,7 @@ pub(crate) async fn build(
                 .collect::<Result<Vec<_>, ApiError>>()?;
             let bytes = tokio::task::spawn_blocking(move || {
                 bf_vector::IndexBuilder::new(dimensions, vector_metric(metric))?
-                    .vector_type(if f16 {
-                        bf_vector::VectorType::F16
-                    } else {
-                        bf_vector::VectorType::F32
-                    })
+                    .vector_type(dtype)
                     .build(&vectors)
             })
             .await
@@ -326,6 +351,20 @@ pub(crate) async fn build(
             );
         }
     }
+    for (column, (name, config)) in schema.iter().enumerate() {
+        if config.fuzzy == Some(true) || config.regex == Some(true) || config.glob == Some(true) {
+            files.insert(
+                format!("trigram:{name}"),
+                put_value(
+                    store,
+                    format!("{prefix}/trigram.{column}.bfx"),
+                    &crate::pattern::Trigrams::build(docs, name),
+                )
+                .await?,
+            );
+        }
+    }
+    crate::sparse::build(store, &prefix, schema, docs, &mut files).await?;
     for (column, (name, config)) in schema.iter().enumerate() {
         if let Some(params) = config.text_config() {
             let mut builder = bf_text::SegmentBuilder::with_tokenizer(true, params.tokenizer);
@@ -381,11 +420,12 @@ pub(crate) async fn live(store: &Storage, segment: &Segment) -> Result<RoaringBi
 }
 pub(crate) async fn set_live(
     store: &Storage,
+    ns: &str,
     segment: &mut Segment,
     rows: &RoaringBitmap,
 ) -> Result<(), ApiError> {
     segment.live_generation += 1;
-    let prefix = segment.live.key.rsplit_once('/').ok_or_else(corrupt)?.0;
+    let prefix = format!("ns/{ns}/segments/{}", segment.id);
     // UUID distinguishes concurrent builders before either one wins publication.
     segment.live = put_value(
         store,
@@ -479,9 +519,17 @@ pub(crate) async fn projected_documents(
                     }
                     let mut v = vec![];
                     for _ in 0..dims {
-                        let width = if f16 { 2 } else { 4 };
+                        let width = if col.vector_i8 {
+                            1
+                        } else if f16 {
+                            2
+                        } else {
+                            4
+                        };
                         let bytes = data.get(pos..pos + width).ok_or_else(corrupt)?;
-                        let x = if f16 {
+                        let x = if col.vector_i8 {
+                            bytes[0] as i8 as f32
+                        } else if f16 {
                             half::f16::from_le_bytes(bytes.try_into().unwrap()).to_f32()
                         } else {
                             f32::from_le_bytes(bytes.try_into().unwrap())
@@ -489,7 +537,11 @@ pub(crate) async fn projected_documents(
                         v.push(x);
                         pos += width;
                     }
-                    values.push(Some(serde_json::json!(v)));
+                    values.push(Some(if col.vector_i8 {
+                        serde_json::json!(v.iter().map(|x| *x as i8).collect::<Vec<_>>())
+                    } else {
+                        serde_json::json!(v)
+                    }));
                 }
                 if pos != data.len() {
                     return Err(corrupt());
@@ -580,6 +632,39 @@ pub(crate) fn filter_rows<'a>(
                     }
                     .map_err(index_error)?;
                     return Ok(rows & live);
+                }
+                if matches!(
+                    op,
+                    bf_types::FilterOp::Fuzzy
+                        | bf_types::FilterOp::Regex
+                        | bf_types::FilterOp::Glob
+                        | bf_types::FilterOp::NotGlob
+                        | bf_types::FilterOp::IGlob
+                        | bf_types::FilterOp::NotIGlob
+                ) && let Some(file) = segment.files.get(&format!("trigram:{attribute}"))
+                {
+                    let index: crate::pattern::Trigrams = get_value(store, file).await?;
+                    let candidates = index.candidates(f, live)?;
+                    let columns = std::collections::BTreeSet::from([attribute.clone()]);
+                    let docs =
+                        projected_documents(store, segment, &candidates, Some(&columns)).await?;
+                    let ids = ids(store, segment).await?;
+                    let mut out = RoaringBitmap::new();
+                    for row in &candidates {
+                        if filter::matches(f, docs.get(&ids[row as usize]), None, schema)? {
+                            out.insert(row);
+                        }
+                    }
+                    return Ok(
+                        if matches!(
+                            op,
+                            bf_types::FilterOp::NotGlob | bf_types::FilterOp::NotIGlob
+                        ) {
+                            live - (candidates - out)
+                        } else {
+                            out
+                        },
+                    );
                 }
                 let reader = ObjectReader {
                     store: store.clone(),

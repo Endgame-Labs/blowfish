@@ -8,17 +8,22 @@ use std::collections::BTreeSet;
 pub(crate) fn prepare(
     current: &NamespaceState,
     request: &WriteRequest,
-    copy: Option<&NamespaceState>,
+    copy: Option<&crate::branch::Source>,
 ) -> Result<(WriteBatch, WriteResponse), ApiError> {
     for name in request.extra.keys() {
         if matches!(
             name.as_str(),
-            "branch_from_namespace" | "encryption" | "sharding" | "disable_backpressure"
+            "encryption" | "sharding" | "disable_backpressure"
         ) {
             return Err(ApiError::bad(format!(
                 "{name} is not supported by blowfish yet"
             )));
         }
+    }
+    if request.copy_from_namespace.is_some() && request.branch_from_namespace.is_some() {
+        return Err(ApiError::bad(
+            "copy_from_namespace and branch_from_namespace are mutually exclusive",
+        ));
     }
     if copy.is_some()
         && (request.schema.is_some()
@@ -34,22 +39,32 @@ pub(crate) fn prepare(
             "copy cannot be combined with writes or schema changes",
         ));
     }
-    if let Some(source) = copy {
+    if let Some(copy) = copy {
+        let source = &copy.state;
         if current.exists {
             return Err(ApiError::bad("destination namespace already exists"));
         }
         let now = Utc::now();
         let batch = WriteBatch {
             upserts: source.docs.values().cloned().collect(),
-            deletes: vec![],
+            deletes: source.shadowed.iter().cloned().collect(),
             schema: source.schema.clone(),
             distance_metric: source.metric,
             created_at: now,
             updated_at: now,
         };
         let response = WriteResponse {
-            message: "namespace cloned successfully".into(),
-            rows_affected: batch.upserts.len(),
+            message: if request.branch_from_namespace.is_some() {
+                "namespace branch successful"
+            } else {
+                "namespace cloned successfully"
+            }
+            .into(),
+            rows_affected: if request.branch_from_namespace.is_some() {
+                0
+            } else {
+                copy.rows
+            },
             ..Default::default()
         };
         return Ok((batch, response));
@@ -79,11 +94,11 @@ pub(crate) fn prepare(
                 if name == "id" {
                     return Err(ApiError::bad("cannot drop id"));
                 }
-                if state.schema.get(name).is_some_and(|s| {
-                    s.data_type
-                        .as_ref()
-                        .is_some_and(|t| t.dimensions().is_some())
-                }) {
+                if state
+                    .schema
+                    .get(name)
+                    .is_some_and(|s| s.data_type.as_ref().is_some_and(AttributeType::is_vector))
+                {
                     return Err(ApiError::bad("cannot drop a vector column"));
                 }
                 state.schema.remove(name);
@@ -198,11 +213,7 @@ pub(crate) fn prepare(
     if state
         .schema
         .values()
-        .filter(|s| {
-            s.data_type
-                .as_ref()
-                .is_some_and(|t| t.dimensions().is_some())
-        })
+        .filter(|s| s.data_type.as_ref().is_some_and(AttributeType::is_vector))
         .count()
         > 8
     {
@@ -210,10 +221,7 @@ pub(crate) fn prepare(
     }
     if current.exists {
         for (name, cfg) in &state.schema {
-            if cfg
-                .data_type
-                .as_ref()
-                .is_some_and(|t| t.dimensions().is_some())
+            if cfg.data_type.as_ref().is_some_and(AttributeType::is_vector)
                 && !current.schema.contains_key(name)
             {
                 return Err(ApiError::bad(
@@ -472,6 +480,48 @@ pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value,
     }
     let mismatch = || ApiError::bad(format!("attribute value does not match type {t}"));
     match t {
+        AttributeType::SparseVector => Ok(serde_json::from_str(
+            &serde_json::to_string(&decode_sparse(value)?).expect("sparse vector serializes"),
+        )
+        .expect("valid JSON")),
+        AttributeType::MultiVector { dimensions } => {
+            let vectors = value.as_array().ok_or_else(|| {
+                ApiError::bad("multi-vector value must be an array of f32 vectors")
+            })?;
+            vectors
+                .iter()
+                .map(|v| {
+                    if !v.is_array() {
+                        return Err(ApiError::bad(
+                            "multi-vector arrays do not support base64 encoding",
+                        ));
+                    }
+                    normalize_value(
+                        v,
+                        &AttributeType::Vector {
+                            dimensions: *dimensions,
+                            f16: false,
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array)
+        }
+        AttributeType::VectorI8 { dimensions } => {
+            let v = decode_vector(value)?;
+            if v.len() != *dimensions {
+                return Err(ApiError::bad(format!(
+                    "invalid vector dimensions: expected {dimensions}, got {}",
+                    v.len()
+                )));
+            }
+            if v.iter()
+                .any(|x| x.fract() != 0.0 || !(-128.0..=127.0).contains(x))
+            {
+                return Err(ApiError::bad("an invalid i8 value was passed"));
+            }
+            Ok(json!(v.iter().map(|x| *x as i8).collect::<Vec<_>>()))
+        }
         AttributeType::Vector { dimensions, f16 } => {
             let mut v = decode_vector(value)?;
             if v.len() != *dimensions {

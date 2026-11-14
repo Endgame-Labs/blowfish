@@ -10,6 +10,7 @@ pub(crate) async fn catch_up(
     wal: &Wal,
     state: &mut NamespaceState,
     cap: Option<u64>,
+    store: &Storage,
 ) -> Result<(), ApiError> {
     // Always refresh the manifest before reading a potentially reclaimed tail.
     // A concurrent GC can still race this read; one fresh checkpoint retry resolves it.
@@ -57,7 +58,7 @@ pub(crate) async fn catch_up(
                     if cap.is_some_and(|cap| state.tail_bytes.saturating_add(size) > cap) {
                         break;
                     }
-                    state.replay(seq, &entry);
+                    crate::branch::replay(store, wal, seq, &entry, state).await?;
                 }
                 state.refreshed = Instant::now();
                 return Ok(());

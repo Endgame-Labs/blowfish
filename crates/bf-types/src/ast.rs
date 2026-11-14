@@ -141,6 +141,25 @@ pub enum RankBy {
         vector: Vec<f32>,
         wire_vector: Value,
     },
+    /// Hosted embedding syntax is preserved so execution can return a clear 400.
+    UnsupportedEmbed {
+        attribute: String,
+        exact: bool,
+        expression: Value,
+    },
+    /// Sum of the minimum document-vector distances for each query vector.
+    MultiVector {
+        attribute: String,
+        exact: bool,
+        vectors: Vec<Vec<f32>>,
+        wire_vector: Value,
+    },
+    /// Positive sparse-vector dot-product score, composable in score expressions.
+    SparseVector {
+        attribute: String,
+        vector: std::collections::BTreeMap<String, f32>,
+        wire_vector: Value,
+    },
     Bm25 {
         attribute: String,
         query: Value,
@@ -283,6 +302,30 @@ impl RankBy {
                 }
                 Some("ANN" | "kNN") => {
                     need(3)?;
+                    if a[2].get(0).is_some_and(|v| v == "Embed") {
+                        return Ok(Self::UnsupportedEmbed {
+                            attribute: name.into(),
+                            exact: a[1] == "kNN",
+                            expression: a[2].clone(),
+                        });
+                    }
+                    if a[2]
+                        .as_array()
+                        .is_some_and(|xs| xs.first().is_some_and(Value::is_array))
+                    {
+                        let vectors = a[2]
+                            .as_array()
+                            .expect("array")
+                            .iter()
+                            .map(decode_vector)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        return Ok(Self::MultiVector {
+                            attribute: name.into(),
+                            exact: a[1] == "kNN",
+                            vectors,
+                            wire_vector: a[2].clone(),
+                        });
+                    }
                     Ok(Self::Vector {
                         attribute: name.into(),
                         exact: a[1] == "kNN",
@@ -306,7 +349,12 @@ impl RankBy {
                     })
                 }
                 Some("SparseKNN") => {
-                    Err(ApiError::bad("SparseKNN is not supported by blowfish yet"))
+                    need(3)?;
+                    Ok(Self::SparseVector {
+                        attribute: name.into(),
+                        vector: crate::decode_sparse(&a[2])?,
+                        wire_vector: a[2].clone(),
+                    })
                 }
                 _ => Ok(Self::Filter(Filter::parse(v)?)),
             },
@@ -322,6 +370,22 @@ impl RankBy {
                 wire_vector,
                 ..
             } => json!([attribute, if *exact { "kNN" } else { "ANN" }, wire_vector]),
+            Self::UnsupportedEmbed {
+                attribute,
+                exact,
+                expression,
+            } => json!([attribute, if *exact { "kNN" } else { "ANN" }, expression]),
+            Self::MultiVector {
+                attribute,
+                exact,
+                wire_vector,
+                ..
+            } => json!([attribute, if *exact { "kNN" } else { "ANN" }, wire_vector]),
+            Self::SparseVector {
+                attribute,
+                wire_vector,
+                ..
+            } => json!([attribute, "SparseKNN", wire_vector]),
             Self::Bm25 {
                 attribute,
                 query,

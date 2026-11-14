@@ -9,10 +9,16 @@ mod scoring;
 
 pub use analysis::{
     FtsParams, Language, Token, Tokenizer, matches_all_tokens, matches_any_token,
-    matches_token_sequence, tokenize, tokenize_array,
+    matches_token_sequence, tokenize, tokenize_array, tokenize_spans,
 };
 pub use scoring::{CorpusStats, Query, score_document};
 mod segment;
 pub use segment::{
     MemoryRangeRead, RangeRead, SearchHit, SearchMetrics, SegmentBuilder, SegmentReader,
 };
+
+mod fuzzy;
+pub use fuzzy::{EditDistance, FuzzyParams, substring_distance, substring_matches};
+
+mod highlight;
+pub use highlight::{FragmentBy, fragment_ranges, offset};

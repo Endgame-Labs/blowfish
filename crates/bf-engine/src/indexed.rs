@@ -45,6 +45,9 @@ async fn prepare(
     config: &EngineConfig,
     force_exact: bool,
 ) -> Result<NamespaceState, ApiError> {
+    if matches!(q.rank_by, Some(RankBy::MultiVector { .. })) {
+        return snapshot::materialize(store, state).await;
+    }
     let Some(
         rank @ RankBy::Vector {
             attribute,
@@ -72,6 +75,7 @@ async fn prepare(
             cfg.data_type
                 .as_ref()
                 .is_none_or(|t| t.dimensions().is_none())
+                || q.compute_attributes.is_some()
                 || match &q.include_attributes {
                     Some(IncludeAttributes::All(true)) => true,
                     Some(IncludeAttributes::Names(names)) => names.contains(name),
@@ -212,6 +216,7 @@ async fn prepare_scalar(
             cfg.data_type
                 .as_ref()
                 .is_none_or(|t| t.dimensions().is_none())
+                || q.compute_attributes.is_some()
                 || match &q.include_attributes {
                     Some(IncludeAttributes::All(true)) => true,
                     Some(IncludeAttributes::Names(names)) => names.contains(name),
@@ -302,6 +307,13 @@ async fn prepare_scalar(
                 scores.insert(ids[hit.row as usize].clone(), hit.score as f64);
             }
         }
+        if let Some(rows) =
+            crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out)
+                .await?
+        {
+            selected &= rows;
+        }
+        crate::sparse::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?;
         out.docs
             .extend(segment::projected_documents(store, seg, &selected, Some(&columns)).await?);
     }
@@ -349,5 +361,7 @@ async fn prepare_scalar(
             out.docs.insert(id.clone(), doc.clone());
         }
     }
+    crate::sparse::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out);
+    crate::pattern::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out)?;
     Ok(out)
 }

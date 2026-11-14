@@ -179,3 +179,9 @@ Cold opening measures a new engine loading the manifest and empty tail, with the
 OS page cache retained; it does not include a first ANN query. Retained bytes
 include compacted inputs inside the default one-hour GC window. This run used the
 uncached storage adapter, so it also exposes the cost of per-segment range calls.
+
+Copies and branches share immutable segment files within the same bucket. Only the source's unindexed mutations are copied into the destination WAL. Immutable segment pins and a copy descriptor become durable before the destination WAL CAS, so a cold reader can recover the same references after a crash. New live-row masks belong to the destination namespace. GC rereads cross-namespace pins after claiming its epoch, which protects files inherited by branches, including branches of branches.
+
+Segment pins are currently conservative: obsolete pins remain after compaction, a failed copy, or namespace deletion. This can retain storage indefinitely. Reclaiming them requires proving both that no committed namespace references the files and that no paused copier can still commit its pin. Until that protocol exists, GC favors retention over deleting a referenced segment.
+
+Late interaction accepts `[][N]f32` columns and nested query-vector arrays with `ANN` or `kNN`. It requires cosine distance and ranks by the sum, over query vectors, of the minimum distance to any document vector. Empty document-vector arrays are omitted from ranked results. Immutable segments support this representation, but late-interaction candidate search remains exhaustive. Vector arrays accept and return JSON arrays; base64 vector-array encoding is unsupported.

@@ -10,6 +10,11 @@ pub(crate) fn execute(
     state: &NamespaceState,
     request: &QueryRequest,
 ) -> Result<QueryResponse, ApiError> {
+    if request.rerank_by.as_ref().is_some_and(Value::is_object) {
+        return Err(ApiError::bad(
+            "model rerank_by is not supported by blowfish yet",
+        ));
+    }
     let (result, results) = if let Some(queries) = &request.queries {
         if queries.is_empty() || queries.len() > 16 {
             return Err(ApiError::bad("multi-query requires one to sixteen queries"));
@@ -46,7 +51,7 @@ pub(crate) fn execute(
     } else {
         if request.rerank_by.is_some() {
             return Err(ApiError::bad(
-                "model reranking is not supported by blowfish yet",
+                "model rerank_by is not supported by blowfish yet",
             ));
         }
         (single(state, request, request.vector_encoding)?, None)
@@ -121,15 +126,17 @@ fn single(
     }
     if let Some(f) = &q.filters {
         filter::validate(f, &state.schema, false)?;
+        crate::pattern::ready(f, &state.schema, &state.segments)?;
     }
     if let Some(rank) = &q.rank_by {
         validate_rank(state, rank, false)?;
-        if let RankBy::Vector { exact: true, .. } = rank
+        if let RankBy::Vector { exact: true, .. } | RankBy::MultiVector { exact: true, .. } = rank
             && q.filters.is_none()
         {
             return Err(ApiError::bad("kNN requires filters"));
         }
     }
+    crate::highlight::validate(state, q)?;
     let mut docs = vec![];
     for (id, doc) in &state.docs {
         if q.filters
@@ -258,6 +265,31 @@ fn single(
     for (id, doc) in docs {
         let score = match rank {
             RankBy::Order(_) => None,
+            RankBy::MultiVector {
+                attribute, vectors, ..
+            } => {
+                let Some(values) = doc
+                    .get(attribute)
+                    .and_then(Value::as_array)
+                    .filter(|vs| !vs.is_empty())
+                else {
+                    continue;
+                };
+                let docs = values
+                    .iter()
+                    .map(decode_vector)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(
+                    vectors
+                        .iter()
+                        .map(|q| {
+                            docs.iter()
+                                .map(|d| distance(d, q, state.metric))
+                                .fold(f64::INFINITY, f64::min)
+                        })
+                        .sum(),
+                )
+            }
             RankBy::Vector {
                 attribute, vector, ..
             } => {
@@ -301,7 +333,7 @@ fn single(
                 }
                 cmp
             }
-            RankBy::Vector { .. } => a_score
+            RankBy::Vector { .. } | RankBy::MultiVector { .. } => a_score
                 .expect("distance")
                 .total_cmp(&b_score.expect("distance")),
             _ => b_score.expect("score").total_cmp(&a_score.expect("score")),
@@ -346,8 +378,17 @@ fn attribute<'a>(state: &'a NamespaceState, name: &str) -> Result<&'a AttributeS
         .get(name)
         .ok_or_else(|| ApiError::bad(format!("unknown attribute '{name}'")))
 }
-fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result<(), ApiError> {
+pub(crate) fn validate_rank(
+    state: &NamespaceState,
+    rank: &RankBy,
+    guarded: bool,
+) -> Result<(), ApiError> {
     match rank {
+        RankBy::UnsupportedEmbed { .. } => {
+            return Err(ApiError::bad(
+                "native Embed expressions are not supported by blowfish yet",
+            ));
+        }
         RankBy::Constant(_) => {}
         RankBy::Order(keys) => {
             for key in keys {
@@ -359,21 +400,64 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
                 }
             }
         }
+        RankBy::MultiVector {
+            attribute: name,
+            vectors,
+            ..
+        } => {
+            let Some(AttributeType::MultiVector { dimensions }) =
+                attribute(state, name)?.data_type.as_ref()
+            else {
+                return Err(ApiError::bad(
+                    "multi-vector ANN requires a [][N]f32 attribute with late_interaction enabled",
+                ));
+            };
+            if vectors.is_empty() || vectors.iter().any(|v| v.len() != *dimensions) {
+                return Err(ApiError::bad("invalid multi-vector query dimensions"));
+            }
+        }
         RankBy::Vector {
             attribute: name,
             vector,
             ..
         } => {
+            if matches!(
+                attribute(state, name)?.data_type,
+                Some(AttributeType::MultiVector { .. })
+            ) {
+                return Err(ApiError::bad(
+                    "late-interaction ANN requires an array of query vectors",
+                ));
+            }
             let dims = attribute(state, name)?
                 .data_type
                 .as_ref()
                 .and_then(AttributeType::dimensions)
                 .ok_or_else(|| ApiError::bad("ANN requires a dense-vector attribute"))?;
+            if matches!(
+                attribute(state, name)?.data_type,
+                Some(AttributeType::VectorI8 { .. })
+            ) {
+                crate::write::normalize_value(
+                    &json!(vector),
+                    &AttributeType::VectorI8 { dimensions: dims },
+                )?;
+            }
             if vector.len() != dims {
                 return Err(ApiError::bad(format!(
                     "Invalid query dimensions! Query has dimensions={}, but index has dimensions={dims}",
                     vector.len()
                 )));
+            }
+        }
+        RankBy::SparseVector {
+            attribute: name, ..
+        } => {
+            let cfg = attribute(state, name)?;
+            if cfg.data_type != Some(AttributeType::SparseVector) || cfg.sparse_knn.is_none() {
+                return Err(ApiError::bad(
+                    "SparseKNN requires a {}f16 attribute with sparse_knn enabled",
+                ));
             }
         }
         RankBy::Bm25 {
@@ -397,7 +481,10 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
         }
         RankBy::Sum(xs) | RankBy::Max(xs) => {
             for x in xs {
-                if matches!(x, RankBy::Order(_) | RankBy::Vector { .. }) {
+                if matches!(
+                    x,
+                    RankBy::Order(_) | RankBy::Vector { .. } | RankBy::MultiVector { .. }
+                ) {
                     return Err(ApiError::bad(
                         "score expressions cannot contain order-by or vector distance ranking",
                     ));
@@ -408,7 +495,10 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
         RankBy::Product { expr, .. } => {
             validate_score_child(state, expr, guarded)?;
         }
-        RankBy::Filter(f) => filter::validate(f, &state.schema, false)?,
+        RankBy::Filter(f) => {
+            filter::validate(f, &state.schema, false)?;
+            crate::pattern::ready(f, &state.schema, &state.segments)?;
+        }
         RankBy::Attribute(name) => match attribute(state, name)?.data_type.as_ref() {
             Some(AttributeType::Scalar(ScalarType::Uint)) => {}
             Some(AttributeType::Scalar(ScalarType::Int | ScalarType::Float)) if guarded => {}
@@ -462,7 +552,10 @@ fn validate_score_child(
     rank: &RankBy,
     guarded: bool,
 ) -> Result<(), ApiError> {
-    if matches!(rank, RankBy::Order(_) | RankBy::Vector { .. }) {
+    if matches!(
+        rank,
+        RankBy::Order(_) | RankBy::Vector { .. } | RankBy::MultiVector { .. }
+    ) {
         return Err(ApiError::bad("expected a score expression"));
     }
     validate_rank(state, rank, guarded)
@@ -499,9 +592,23 @@ fn parameter(params: &Value, name: &str, default: f64) -> Result<f64, ApiError> 
     }
     Err(ApiError::bad("score parameter must be numeric"))
 }
-fn score(state: &NamespaceState, doc: &Document, rank: &RankBy) -> Result<f64, ApiError> {
+pub(crate) fn score(
+    state: &NamespaceState,
+    doc: &Document,
+    rank: &RankBy,
+) -> Result<f64, ApiError> {
     Ok(match rank {
         RankBy::Constant(n) => n.as_f64().expect("JSON number fits f64"),
+        RankBy::SparseVector {
+            attribute, vector, ..
+        } => {
+            if let Some(scores) = state.scores.get(&crate::indexed::rank_key(rank)) {
+                let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
+                *scores.get(&id).unwrap_or(&0.0)
+            } else {
+                crate::sparse::dot(doc.get(attribute), vector) as f64
+            }
+        }
         RankBy::Bm25 {
             attribute,
             query,
@@ -553,10 +660,16 @@ fn score(state: &NamespaceState, doc: &Document, rank: &RankBy) -> Result<f64, A
             .fold(0.0, f64::max),
         RankBy::Product { weight, expr, .. } => weight * score(state, doc, expr)?,
         RankBy::Filter(f) => {
-            if filter::matches(f, Some(doc), None, &state.schema)? {
-                1.0
+            if let Some(scores) = state.scores.get(&crate::indexed::rank_key(rank)) {
+                let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
+                *scores.get(&id).unwrap_or(&0.0)
             } else {
-                0.0
+                f64::from(u8::from(filter::matches(
+                    f,
+                    Some(doc),
+                    None,
+                    &state.schema,
+                )?))
             }
         }
         RankBy::Attribute(name) => doc.get(name).and_then(Value::as_f64).unwrap_or(0.0),
@@ -621,11 +734,29 @@ fn project(
     };
     for name in attrs {
         if let Some(value) = doc.get(&name) {
-            let value = if encoding == VectorEncoding::Base64
-                && let Some(AttributeType::Vector { f16, .. }) =
-                    state.schema.get(&name).and_then(|s| s.data_type.as_ref())
-            {
-                json!(encode_vector(&decode_vector(value)?, *f16))
+            let value = if encoding == VectorEncoding::Base64 {
+                match state.schema.get(&name).and_then(|s| s.data_type.as_ref()) {
+                    Some(AttributeType::Vector { f16, .. }) => {
+                        json!(encode_vector(&decode_vector(value)?, *f16))
+                    }
+                    Some(AttributeType::MultiVector { .. }) => {
+                        return Err(ApiError::bad(
+                            "base64 output is not supported for multi-vector arrays",
+                        ));
+                    }
+                    Some(AttributeType::VectorI8 { .. }) => {
+                        use base64::Engine as _;
+                        json!(
+                            base64::prelude::BASE64_STANDARD.encode(
+                                decode_vector(value)?
+                                    .iter()
+                                    .map(|x| *x as i8 as u8)
+                                    .collect::<Vec<_>>()
+                            )
+                        )
+                    }
+                    _ => value.clone(),
+                }
             } else {
                 value.clone()
             };
@@ -640,6 +771,7 @@ fn project(
         }
         row.insert("$dist".into(), json!(dist));
     }
+    crate::highlight::project(state, doc, q, &mut row)?;
     Ok(row)
 }
 fn compare_keys(a: &[Value], b: &[Value]) -> Ordering {
@@ -721,7 +853,7 @@ fn rrf(
 ) -> Result<SingleQueryResult, ApiError> {
     let a = rerank
         .as_array()
-        .ok_or_else(|| ApiError::bad("model reranking is not supported by blowfish yet"))?;
+        .ok_or_else(|| ApiError::bad("model rerank_by is not supported by blowfish yet"))?;
     if a.first() != Some(&json!("RRF")) || a.len() > 2 {
         return Err(ApiError::bad("invalid rerank_by expression"));
     }

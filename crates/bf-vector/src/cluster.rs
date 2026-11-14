@@ -9,10 +9,16 @@ pub enum VectorType {
     F32,
     /// Two-byte IEEE half float.
     F16,
+    /// One-byte signed integer; inputs must be integral and in [-128, 127].
+    I8,
 }
 impl VectorType {
     pub(crate) fn width(self) -> usize {
-        if self == Self::F32 { 4 } else { 2 }
+        match self {
+            Self::F32 => 4,
+            Self::F16 => 2,
+            Self::I8 => 1,
+        }
     }
 }
 
@@ -90,11 +96,18 @@ impl IndexBuilder {
         let mut stored = Vec::with_capacity(rows.len());
         for (row, v) in rows {
             validate(v.as_ref(), self.dims)?;
+            if self.dtype == VectorType::I8
+                && v.as_ref()
+                    .iter()
+                    .any(|x| x.fract() != 0.0 || !(-128.0..=127.0).contains(x))
+            {
+                return Err(Error::InvalidInput("an invalid i8 value was passed".into()));
+            }
             let v: Vec<f32> = v
                 .as_ref()
                 .iter()
                 .map(|x| match self.dtype {
-                    VectorType::F32 => *x,
+                    VectorType::F32 | VectorType::I8 => *x,
                     VectorType::F16 => half::f16::from_f32(*x).to_f32(),
                 })
                 .collect();

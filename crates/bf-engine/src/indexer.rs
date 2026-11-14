@@ -169,7 +169,7 @@ impl Engine {
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
         let state = {
             let mut state = handle.state.lock().await;
-            catch_up(&wal, &mut state).await?;
+            catch_up(&wal, &mut state, &self.0.store).await?;
             state.clone()
         };
         if !state.exists {
@@ -182,10 +182,12 @@ impl Engine {
                 .chain(seg.schema.keys())
                 .any(|name| !segment::seg_text_matches(seg, &state.schema, name))
                 || seg.schema.iter().any(|(name, old)| {
-                    state
-                        .schema
-                        .get(name)
-                        .is_none_or(|new| old.filterable != new.filterable)
+                    state.schema.get(name).is_none_or(|new| {
+                        old.filterable != new.filterable
+                            || old.fuzzy != new.fuzzy
+                            || old.regex != new.regex
+                            || old.glob != new.glob
+                    })
                 })
         });
         let compact = tier(&state, self.0.config.compaction_segments.max(2));
@@ -335,7 +337,7 @@ impl Engine {
                         }
                         continue;
                     }
-                    segment::set_live(store, &mut seg, &keep).await?;
+                    segment::set_live(store, ns, &mut seg, &keep).await?;
                 }
                 segments.push(seg);
             }
@@ -401,7 +403,7 @@ impl Engine {
             Err(e) => return Err(log_error(e)),
         }
         let mut current = handle.state.lock().await;
-        catch_up(&wal, &mut current).await?;
+        catch_up(&wal, &mut current, &self.0.store).await?;
         Ok(true)
     }
     /// Reclaim retired files and checkpointed WAL payloads after the retention window.
@@ -415,7 +417,7 @@ impl Engine {
             .unwrap_or(chrono::Duration::hours(1));
         let cutoff = Utc::now() - grace;
         let mut checkpoint = NamespaceState::default();
-        catch_up(&wal, &mut checkpoint).await?;
+        catch_up(&wal, &mut checkpoint, &self.0.store).await?;
         if checkpoint.manifest_seq != sequence {
             return Ok(0);
         }
@@ -487,6 +489,10 @@ impl Engine {
             Err(bf_wal::Error::Fenced) => return Ok(0),
             Err(e) => return Err(log_error(e)),
         };
+        // Reread durable pins AFTER the epoch claim. A new copier either pinned
+        // before this read, or observes the new epoch and retries its snapshot.
+        let shared = crate::branch::protected(&self.0.store).await?;
+        candidates.retain(|key| !shared.contains(key));
         // The winner owns no reusable file names. Repeating deletes after a crash is safe.
         for key in &candidates {
             self.0.store.delete(key).await.map_err(storage_error)?;

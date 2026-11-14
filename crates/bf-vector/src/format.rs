@@ -71,6 +71,7 @@ pub(crate) fn build_blob(
                 for x in &stored[i].1 {
                     match b.dtype {
                         VectorType::F32 => vectors.extend(x.to_le_bytes()),
+                        VectorType::I8 => vectors.push(*x as i8 as u8),
                         VectorType::F16 => vectors.extend(half::f16::from_f32(*x).to_le_bytes()),
                     }
                 }
@@ -153,7 +154,14 @@ fn encode_metadata(m: &Metadata) -> Result<Vec<u8>> {
             1
         },
     );
-    put_u32(&mut out, if m.dtype == VectorType::F32 { 0 } else { 1 });
+    put_u32(
+        &mut out,
+        match m.dtype {
+            VectorType::F32 => 0,
+            VectorType::F16 => 1,
+            VectorType::I8 => 2,
+        },
+    );
     out.extend(m.seed.to_le_bytes());
     put_u32(&mut out, u32::from(m.flat));
     put_u32(&mut out, m.clusters.len() as u32);
@@ -250,6 +258,7 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
     let dtype = match p.u32()? {
         0 => VectorType::F32,
         1 => VectorType::F16,
+        2 => VectorType::I8,
         _ => return Err(bad("invalid vector type")),
     };
     let seed = p.u64()?;

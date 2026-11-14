@@ -1,9 +1,14 @@
 //! Immutable segment indexes with a WAL overlay and an exhaustive reference evaluator.
+mod branch;
 mod filter;
+mod highlight;
 mod indexed;
 mod indexer;
+mod pattern;
+mod plan;
 mod segment;
 mod snapshot;
+mod sparse;
 pub use indexer::EngineConfig;
 mod metadata;
 mod query;
@@ -116,7 +121,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct Engine(Arc<Inner>);
 enum Operation {
-    Write(Box<WriteRequest>, Option<Box<NamespaceState>>),
+    Write(Box<WriteRequest>, Option<Box<branch::Source>>),
     Delete,
 }
 impl Engine {
@@ -202,6 +207,7 @@ impl Engine {
                 &Wal::new(self.0.store.clone(), ns).map_err(log_error)?,
                 &mut state,
                 cap,
+                &self.0.store,
             )
             .await?;
         }
@@ -230,7 +236,11 @@ impl Engine {
         }
         self.check_writable(ns).await?;
         let handle = self.handle(ns).await?;
-        let copy = if let Some(source) = &request.copy_from_namespace {
+        let copy = if let Some(source) = request
+            .copy_from_namespace
+            .as_ref()
+            .or(request.branch_from_namespace.as_ref())
+        {
             let source = match source {
                 CopyFrom::Name(s) => s,
                 CopyFrom::Config {
@@ -254,17 +264,14 @@ impl Engine {
                 return Err(ApiError::bad("cannot copy a namespace to itself"));
             }
             Some(Box::new(
-                snapshot::materialize(
-                    &self.0.store,
-                    &self.snapshot(source, &Consistency::Strong).await?.0,
-                )
-                .await?,
+                self.copy_source(source, ns, request.branch_from_namespace.is_some())
+                    .await?,
             ))
         } else {
             None
         };
         let inherited_read_only = if let Some(source) = &copy {
-            self.settings_for_copy(&request, source).await?
+            self.settings_for_copy(&request, &source.state).await?
         } else {
             false
         };
@@ -349,6 +356,9 @@ impl Engine {
         let (s, _) = self.snapshot(ns, &Consistency::Strong).await?;
         let totals = snapshot::statistics(&self.0.store, &s).await?;
         let mut metadata = json!({"schema":s.schema,"approx_logical_bytes":totals.logical_bytes,"approx_row_count":totals.rows,"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}});
+        if let Some(lineage) = branch::lineage(&self.0.store, ns, s.created_at).await? {
+            metadata["branching"] = serde_json::to_value(lineage).expect("lineage serializes");
+        }
         self.decorate_metadata(ns, &s.created_at.to_rfc3339(), &mut metadata)
             .await?;
         Ok(metadata)
@@ -444,10 +454,9 @@ impl Engine {
     }
     /// Describe the indexed snapshot plan after validating the query.
     pub async fn explain(&self, ns: &str, request: QueryRequest) -> Result<Value, ApiError> {
-        self.query(ns, request).await?;
-        Ok(
-            json!({"plan_text":"Manifest snapshot + exhaustive WAL tail → live/filter bitmaps → segment ANN/BM25 or scalar evaluation → newest-wins merge → projection"}),
-        )
+        self.query(ns, request.clone()).await?;
+        let (state, _) = self.snapshot(ns, &request.consistency).await?;
+        Ok(json!({"plan_text":plan::explain(&state,&request,&self.0.config)}))
     }
     /// Compare ANN with exact search on one snapshot and optionally return ground-truth rows.
     pub async fn recall(&self, ns: &str, request: Value) -> Result<Value, ApiError> {
@@ -469,8 +478,8 @@ fn log_error(e: bf_wal::Error) -> ApiError {
         _ => ApiError::new(500, "stored WAL is corrupt or unsupported"),
     }
 }
-async fn catch_up(wal: &Wal, state: &mut NamespaceState) -> Result<(), ApiError> {
-    snapshot::catch_up(wal, state, None).await
+async fn catch_up(wal: &Wal, state: &mut NamespaceState, store: &Storage) -> Result<(), ApiError> {
+    snapshot::catch_up(wal, state, None, store).await
 }
 async fn commit_worker(
     wal: Wal,
@@ -490,12 +499,18 @@ async fn commit_worker(
             p
         };
         let deleting = matches!(first.request, Operation::Delete);
+        let barrier = deleting || matches!(first.request, Operation::Write(_, Some(_)));
         let mut pending = vec![first];
-        if !deleting {
+        if !barrier {
             tokio::task::yield_now().await;
             while pending.len() < 128 {
                 match receiver.try_recv() {
-                    Ok(p) if matches!(p.request, Operation::Delete) => {
+                    Ok(p)
+                        if matches!(
+                            p.request,
+                            Operation::Delete | Operation::Write(_, Some(_))
+                        ) =>
+                    {
                         carry = Some(p);
                         break;
                     }
@@ -507,7 +522,7 @@ async fn commit_worker(
         let start = Instant::now();
         let mut current = state.lock().await;
         let committed = loop {
-            if let Err(e) = catch_up(&wal, &mut current).await {
+            if let Err(e) = catch_up(&wal, &mut current, &store).await {
                 break Err(e);
             }
             if deleting {
@@ -550,6 +565,9 @@ async fn commit_worker(
                 match write::prepare(&working, req, copy.as_deref()) {
                     Ok((batch, result)) => {
                         working.apply(&batch);
+                        if let Some(source) = copy {
+                            branch::install_source(&mut working, source);
+                        }
                         batches.push(batch);
                         results.push(Ok(result));
                     }
@@ -559,12 +577,19 @@ async fn commit_worker(
             if batches.is_empty() {
                 break Ok(results);
             }
-            let entry = WalEntry::new(batches);
+            let mut entry = WalEntry::new(batches);
+            if let Operation::Write(_, Some(source)) = &pending[0].request
+                && let Err(e) = branch::stage(&store, &wal, &mut entry, source).await
+            {
+                break Err(e);
+            }
             match wal.append(current.seq + 1, &entry).await {
                 Ok(CreateResult::Conflict) => continue,
                 Ok(_) => {
                     let seq = current.seq + 1;
-                    current.replay(seq, &entry);
+                    if let Err(e) = branch::replay(&store, &wal, seq, &entry, &mut current).await {
+                        break Err(e);
+                    }
                     current.refreshed = Instant::now();
                     break Ok(results);
                 }

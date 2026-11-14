@@ -94,6 +94,12 @@ pub fn validate_namespace(ns: &str) -> Result<(), ApiError> {
 
 /// Decode a numeric vector or base64 little-endian f32 vector, rejecting NaN and infinity.
 pub fn decode_vector(value: &Value) -> Result<Vec<f32>, ApiError> {
+    if value.get(0).is_some_and(|v| v == "Embed") {
+        return Err(ApiError::bad(
+            "native Embed expressions are not supported by blowfish yet",
+        ));
+    }
+
     use base64::Engine;
     let values = if let Some(s) = value.as_str() {
         let bytes = base64::engine::general_purpose::STANDARD
@@ -155,4 +161,28 @@ pub fn datetime_millis(value: &str) -> Result<i64, ApiError> {
         .and_then(|d| d.and_hms_opt(0, 0, 0))
         .map(|d| d.and_utc().timestamp_millis())
         .ok_or_else(|| ApiError::bad("invalid datetime"))
+}
+
+/// Decode sparse wire weights, rounding to f16 and rejecting zero, negative,
+/// underflowed, or overflowing values, as required by SparseKNN.
+pub fn decode_sparse(
+    value: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, f32>, ApiError> {
+    value
+        .as_object()
+        .ok_or_else(|| ApiError::bad("sparse vector must be an object"))?
+        .iter()
+        .map(|(dim, value)| {
+            let weight = value
+                .as_f64()
+                .ok_or_else(|| ApiError::bad("sparse vector requires positive f16 weights"))?;
+            let weight = half::f16::from_f64(weight).to_f32();
+            if !weight.is_finite() || weight <= 0.0 {
+                return Err(ApiError::bad(
+                    "sparse vector weights must be positive and finite after f16 conversion",
+                ));
+            }
+            Ok((dim.clone(), weight))
+        })
+        .collect()
 }

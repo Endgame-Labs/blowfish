@@ -34,15 +34,40 @@ impl ScalarType {
 pub enum AttributeType {
     Scalar(ScalarType),
     Array(ScalarType),
-    Vector { dimensions: usize, f16: bool },
+    Vector {
+        dimensions: usize,
+        f16: bool,
+    },
+    /// Dense vector stored as signed eight-bit integers.
+    VectorI8 {
+        dimensions: usize,
+    },
+    /// Variable-length arrays of f32 vectors for late interaction.
+    MultiVector {
+        dimensions: usize,
+    },
+    /// Sparse string-keyed positive f16 weights.
+    SparseVector,
 }
 impl AttributeType {
     /// Dense-vector dimensions, if this is a vector.
     pub fn dimensions(&self) -> Option<usize> {
         match self {
-            Self::Vector { dimensions, .. } => Some(*dimensions),
+            Self::Vector { dimensions, .. }
+            | Self::VectorI8 { dimensions }
+            | Self::MultiVector { dimensions } => Some(*dimensions),
             _ => None,
         }
+    }
+    /// Whether this is a dense, sparse, or multi-vector column.
+    pub fn is_vector(&self) -> bool {
+        matches!(
+            self,
+            Self::Vector { .. }
+                | Self::VectorI8 { .. }
+                | Self::MultiVector { .. }
+                | Self::SparseVector
+        )
     }
     /// Infer a type from the first non-null value.
     pub fn infer(name: &str, value: &Value) -> Result<Self, ApiError> {
@@ -79,6 +104,9 @@ impl AttributeType {
 impl fmt::Display for AttributeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MultiVector { dimensions } => write!(f, "[][{dimensions}]f32"),
+            Self::VectorI8 { dimensions } => write!(f, "[{dimensions}]i8"),
+            Self::SparseVector => f.write_str("{}f16"),
             Self::Scalar(t) => f.write_str(t.name()),
             Self::Array(t) => write!(f, "[]{}", t.name()),
             Self::Vector { dimensions, f16 } => {
@@ -90,6 +118,19 @@ impl fmt::Display for AttributeType {
 impl FromStr for AttributeType {
     type Err = ApiError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(dense) = s.strip_prefix("[][") {
+            let dense = format!("[{dense}");
+            if let Ok(Self::Vector {
+                dimensions,
+                f16: false,
+            }) = dense.parse()
+            {
+                return Ok(Self::MultiVector { dimensions });
+            }
+        }
+        if s == "{}f16" {
+            return Ok(Self::SparseVector);
+        }
         let (array, name) = s.strip_prefix("[]").map_or((false, s), |s| (true, s));
         let scalar = match name {
             "string" => Some(ScalarType::String),
@@ -111,13 +152,17 @@ impl FromStr for AttributeType {
         }
         if !array
             && let Some((dims, element)) = s.strip_prefix('[').and_then(|s| s.split_once(']'))
-            && matches!(element, "f32" | "f16")
+            && matches!(element, "f32" | "f16" | "i8")
             && let Ok(dimensions) = dims.parse::<usize>()
             && (1..=10752).contains(&dimensions)
         {
-            return Ok(Self::Vector {
-                dimensions,
-                f16: element == "f16",
+            return Ok(if element == "i8" {
+                Self::VectorI8 { dimensions }
+            } else {
+                Self::Vector {
+                    dimensions,
+                    f16: element == "f16",
+                }
             });
         }
         Err(ApiError::bad(format!(
@@ -204,9 +249,51 @@ impl AttributeSchema {
             self.filterable = None;
             return Ok(());
         }
-        if t.dimensions().is_some() {
-            self.ann = Some(json!({"distance_metric":metric}));
-            self.filterable = None;
+        if self
+            .full_text_search
+            .as_ref()
+            .is_some_and(|v| v != false && !v.is_null())
+            && !matches!(
+                t,
+                AttributeType::Scalar(ScalarType::String)
+                    | AttributeType::Array(ScalarType::String)
+            )
+        {
+            return Err(ApiError::bad(
+                "full_text_search requires string or []string",
+            ));
+        }
+        if matches!(t, AttributeType::MultiVector { .. })
+            && metric != DistanceMetric::CosineDistance
+        {
+            return Err(ApiError::bad(
+                "ANN over vector arrays requires distance_metric cosine_distance",
+            ));
+        }
+        if *t == AttributeType::SparseVector {
+            if self.filterable == Some(true) {
+                return Err(ApiError::bad("sparse vectors cannot be filterable"));
+            }
+            self.filterable = Some(false);
+            if let Some(config) = &self.sparse_knn
+                && (config.get("distance_metric").and_then(Value::as_str) != Some("dot_product")
+                    || config.as_object().is_none_or(|o| o.len() != 1))
+            {
+                return Err(ApiError::bad(
+                    "sparse_knn requires distance_metric dot_product",
+                ));
+            }
+        } else if t.dimensions().is_some() {
+            self.ann = Some(if matches!(t, AttributeType::MultiVector { .. }) {
+                json!({"distance_metric":metric,"late_interaction":true})
+            } else {
+                json!({"distance_metric":metric})
+            });
+            self.filterable = if matches!(t, AttributeType::VectorI8 { .. }) {
+                Some(false)
+            } else {
+                None
+            };
         } else {
             if self
                 .full_text_search
@@ -248,9 +335,26 @@ impl AttributeSchema {
             self.filterable
                 .get_or_insert(!indexed && *t != AttributeType::Scalar(ScalarType::Bytes));
         }
-        if self.embed.as_ref().is_some_and(|v| !v.is_null()) || self.sparse_knn.is_some() {
+        if (self.regex == Some(true) || self.glob == Some(true) || self.fuzzy == Some(true))
+            && !matches!(
+                t,
+                AttributeType::Scalar(ScalarType::String)
+                    | AttributeType::Array(ScalarType::String)
+            )
+        {
             return Err(ApiError::bad(
-                "native embedding and sparse vectors are not supported by blowfish yet",
+                "regex, glob, and fuzzy indexes require string attributes",
+            ));
+        }
+        if self.regex == Some(true) && *t != AttributeType::Scalar(ScalarType::String) {
+            return Err(ApiError::bad("regex requires a string attribute"));
+        }
+        if self.sparse_knn.is_some() && *t != AttributeType::SparseVector {
+            return Err(ApiError::bad("sparse_knn requires a {}f16 attribute"));
+        }
+        if self.embed.as_ref().is_some_and(|v| !v.is_null()) {
+            return Err(ApiError::bad(
+                "native Embed configuration is not supported by blowfish yet",
             ));
         }
         Ok(())
@@ -259,6 +363,8 @@ impl AttributeSchema {
     pub fn schema_value(&self) -> Value {
         let mut v = serde_json::to_value(self).expect("schema serializes");
         let o = v.as_object_mut().expect("object");
+        // The legacy endpoint predates sparse ranking; metadata retains this setting.
+        o.remove("sparse_knn");
         o.entry("filterable").or_insert(Value::Null);
         o.entry("full_text_search").or_insert(Value::Null);
         if self
