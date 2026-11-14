@@ -141,7 +141,7 @@ async fn endpoints_sdk_overloads_and_json_errors() {
         explain["plan_text"]
             .as_str()
             .unwrap()
-            .contains("exhaustive")
+            .contains("WAL tail rows")
     );
     let (_, copy) = call(
         &app,

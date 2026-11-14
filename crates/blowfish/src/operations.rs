@@ -22,7 +22,11 @@ pub(super) fn authorize_copy(
     p: &Principal,
     request: &WriteRequest,
 ) -> Result<(), HttpError> {
-    if let Some(source) = &request.copy_from_namespace {
+    // Copies and branches both read the source namespace, so both need Query access to it.
+    for source in [&request.copy_from_namespace, &request.branch_from_namespace]
+        .into_iter()
+        .flatten()
+    {
         let source = match source {
             CopyFrom::Name(name) => name,
             CopyFrom::Config {

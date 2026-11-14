@@ -538,3 +538,53 @@ async fn extras_routes_enforce_roles_and_copy_source_scope() {
         403
     );
 }
+#[tokio::test]
+async fn branch_requires_source_scope() {
+    let app = app().await;
+    seed(&app, "private").await;
+    let scoped = create(&app, &["write"], json!(["public-"])).await;
+    for source in [json!("private"), json!({"source_namespace":"private"})] {
+        assert_eq!(
+            call(
+                &app,
+                scoped["token"].as_str(),
+                "POST",
+                "/v2/namespaces/public-branch",
+                json!({"branch_from_namespace":source})
+            )
+            .await
+            .0,
+            403
+        );
+    }
+    // Nothing was created by the rejected branches.
+    let (status, _) = call(
+        &app,
+        Some(SUPER),
+        "GET",
+        "/v1/namespaces/public-branch/schema",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404);
+    // A key that can read the source may branch it.
+    let broad = create(&app, &["write", "read"], Value::Null).await;
+    let (status, body) = call(
+        &app,
+        broad["token"].as_str(),
+        "POST",
+        "/v2/namespaces/public-branch",
+        json!({"branch_from_namespace":"private"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, rows) = call(
+        &app,
+        Some(SUPER),
+        "POST",
+        "/v2/namespaces/public-branch/query",
+        json!({"rank_by":["vector","ANN",[1.0,0.0]],"top_k":1}),
+    )
+    .await;
+    assert_eq!(rows["rows"][0]["id"], 1);
+}
