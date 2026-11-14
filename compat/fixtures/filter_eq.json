@@ -1,0 +1,18 @@
+{
+  "rows": [
+    {
+      "id": 2,
+      "n": 2,
+      "name": "beta",
+      "tags": [
+        "blue"
+      ],
+      "text": "quick dog",
+      "vector": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    }
+  ]
+}

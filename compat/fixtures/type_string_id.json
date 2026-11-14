@@ -1,0 +1,6 @@
+{
+  "message": "documents committed successfully",
+  "rows_affected": 1,
+  "rows_upserted": 1,
+  "status": "OK"
+}

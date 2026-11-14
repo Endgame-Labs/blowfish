@@ -1,0 +1,7 @@
+{
+  "error": {
+    "category": "id_type",
+    "message": "💔 namespace ID type is uint, but you sent string; you are not allowed to mix ID types in the same namespace",
+    "status": 400
+  }
+}

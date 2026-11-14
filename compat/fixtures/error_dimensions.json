@@ -1,0 +1,7 @@
+{
+  "error": {
+    "category": "dimensions",
+    "message": "💔 Invalid query dimensions! Query has dimensions=1, but index has dimensions=3",
+    "status": 400
+  }
+}

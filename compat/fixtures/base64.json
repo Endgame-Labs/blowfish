@@ -1,0 +1,40 @@
+{
+  "rows": [
+    {
+      "id": 1,
+      "n": 1,
+      "name": "alpha",
+      "tags": [
+        "red",
+        "blue"
+      ],
+      "text": "quick brown fox",
+      "vector": "AACAPwAAAAAAAAAA"
+    },
+    {
+      "id": 2,
+      "n": 2,
+      "name": "beta",
+      "tags": [
+        "blue"
+      ],
+      "text": "quick dog",
+      "vector": "AAAAAAAAgD8AAAAA"
+    },
+    {
+      "id": 3,
+      "n": 3,
+      "name": "gamma",
+      "tags": [],
+      "text": "slow fox",
+      "vector": "AAAAAAAAAAAAAIA/"
+    },
+    {
+      "id": 4,
+      "n": 4,
+      "name": "delta",
+      "text": "brown dog",
+      "vector": "AAAAPwAAAD8AAAAA"
+    }
+  ]
+}
