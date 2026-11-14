@@ -249,7 +249,7 @@ async fn auth_and_invalid_json() {
 async fn gzip_requests_and_responses() {
     let app = app(None).await;
     let text = "hello fish ".repeat(1000);
-    let body = json!({"upsert_rows":[{"id":1,"text":text}]}).to_string();
+    let body = json!({"schema":{"text":{"type":"string","filterable":false}},"upsert_rows":[{"id":1,"text":text}]}).to_string();
     let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
     gz.write_all(body.as_bytes()).unwrap();
     let response = app

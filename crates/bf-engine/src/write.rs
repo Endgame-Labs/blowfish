@@ -346,6 +346,12 @@ pub(crate) fn prepare(
             }
         }
     }
+    // Patches can individually fit while growing the resulting document past its cap.
+    for id in upserted.iter().chain(&patched) {
+        if let Some(doc) = state.docs.get(id) {
+            validate_document_size(doc, &state.schema)?;
+        }
+    }
     response.rows_affected = upserted.len() + patched.len() + deleted.len();
     response.rows_upserted = (!upserted.is_empty()).then_some(upserted.len());
     response.rows_patched = (!patched.is_empty()).then_some(patched.len());
@@ -456,7 +462,7 @@ fn normalize_id(value: &Value, schema: &mut Schema) -> Result<Id, ApiError> {
     Ok(id)
 }
 fn normalize_document(doc: &mut Document, schema: &Schema) -> Result<(), ApiError> {
-    for (name, value) in doc {
+    for (name, value) in doc.iter_mut() {
         if value.is_null() {
             continue;
         }
@@ -470,8 +476,71 @@ fn normalize_document(doc: &mut Document, schema: &Schema) -> Result<(), ApiErro
             cfg.data_type.as_ref().expect("normalized schema type"),
         )?;
     }
+    validate_document_size(doc, schema)
+}
+// Measure logical values after normalization, independent of JSON escaping and wire encoding.
+fn value_bytes(value: &Value, t: &AttributeType) -> usize {
+    if value.is_null() {
+        return 0;
+    }
+    match t {
+        AttributeType::Scalar(ScalarType::String) => value.as_str().map_or(0, str::len),
+        AttributeType::Scalar(ScalarType::Bytes) => value.as_str().map_or(0, |s| {
+            s.len() / 4 * 3 - s.bytes().rev().take_while(|b| *b == b'=').count()
+        }),
+        AttributeType::Scalar(ScalarType::Bool) => 1,
+        AttributeType::Scalar(ScalarType::Uuid) => 16,
+        AttributeType::Scalar(_) => 8,
+        AttributeType::Vector { dimensions, f16 } => dimensions * if *f16 { 2 } else { 4 },
+        AttributeType::VectorI8 { dimensions } => *dimensions,
+        AttributeType::MultiVector { dimensions } => {
+            value.as_array().map_or(0, |v| v.len() * dimensions * 4)
+        }
+        AttributeType::SparseVector => value
+            .as_object()
+            .map_or(0, |v| v.keys().map(|k| k.len() + 2).sum()),
+        AttributeType::Array(scalar) => value.as_array().map_or(0, |v| {
+            v.iter()
+                .map(|v| value_bytes(v, &AttributeType::Scalar(*scalar)))
+                .sum()
+        }),
+    }
+}
+fn validate_document_size(doc: &Document, schema: &Schema) -> Result<(), ApiError> {
+    let mut total = 0usize;
+    for (name, value) in doc {
+        if value.is_null() {
+            continue;
+        }
+        let cfg = &schema[name];
+        let t = cfg.data_type.as_ref().expect("normalized schema type");
+        let size = value_bytes(value, t);
+        if size > 8 * 1024 * 1024 {
+            return Err(ApiError::bad("attribute value exceeds 8 MiB"));
+        }
+        if cfg.filterable == Some(true) {
+            let largest = match t {
+                AttributeType::Array(scalar) => value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| value_bytes(v, &AttributeType::Scalar(*scalar)))
+                    .max()
+                    .unwrap_or(0),
+                _ => size,
+            };
+            if largest > 4096 {
+                return Err(ApiError::bad("filterable value exceeds 4 KiB"));
+            }
+        }
+        total += name.len() + size;
+        if total > 64 * 1024 * 1024 {
+            return Err(ApiError::bad("document exceeds 64 MiB"));
+        }
+    }
     Ok(())
 }
+
 /// Validate and canonicalize a non-null attribute or filter operand.
 pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value, ApiError> {
     use base64::Engine as _;
