@@ -40,19 +40,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let queries: usize = argument("--queries", "20").parse()?;
     let recall_queries: usize = argument("--recall-queries", "10").parse()?;
     let nprobe: usize = argument("--nprobe", "128").parse()?;
-    if rows == 0 || batch == 0 || queries == 0 || recall_queries == 0 {
+    if rows == 0 || batch == 0 || queries == 0 {
         return Err("counts must be positive".into());
     }
     let default_url = format!("file:///tmp/blowfish-bench-{}", uuid::Uuid::new_v4());
     let url = argument("--url", &default_url);
-    if !url.starts_with("file://") {
-        return Err("benchmark requires a local file:// store".into());
-    }
-    let store = Storage::open(&StorageConfig {
+    let storage_config = StorageConfig {
         url,
+        endpoint: std::env::var("BENCH_ENDPOINT").ok(),
+        profile: std::env::var("BENCH_PROFILE").ok(),
+        region: std::env::var("BENCH_REGION").ok(),
+        cache: bf_storage::CacheConfig {
+            block_size: argument("--cache-block-bytes", "65536").parse()?,
+            ..Default::default()
+        },
         ..Default::default()
-    })
-    .await?;
+    };
+    let store = Storage::open(&storage_config).await?;
     let config = EngineConfig {
         indexing: false,
         recall_sample_rate: 0.0,
@@ -62,11 +66,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let compaction_segments = config.compaction_segments;
     let engine = Engine::with_config(store.clone(), config.clone());
-    let ns = format!("bench-{}", uuid::Uuid::new_v4());
+    let reuse = argument("--reuse", "");
+    let ns = if reuse.is_empty() {
+        format!("bench-{}", uuid::Uuid::new_v4())
+    } else {
+        reuse.clone()
+    };
     let start = Instant::now();
     let mut writing = Duration::ZERO;
     let mut indexing = Duration::ZERO;
-    for first in (0..rows).step_by(batch) {
+    let mut write_ms = vec![];
+    for first in (0..if reuse.is_empty() { rows } else { 0 }).step_by(batch) {
         let docs: Vec<_> = (first..(first+batch).min(rows)).map(|id|json!({
             "id":id,"vector":vector(id,dims),"text":format!("term{} term{} search engine",id%4096,(id*17+7)%4096),"bucket":id%16
         })).collect();
@@ -79,6 +89,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let tick = Instant::now();
         engine.write(&ns, request).await?;
         writing += tick.elapsed();
+        write_ms.push(tick.elapsed().as_secs_f64() * 1000.0);
         let tick = Instant::now();
         engine.index_namespace(&ns, true).await?;
         indexing += tick.elapsed();
@@ -100,28 +111,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?
         .ok_or("missing checkpoint")?;
     let live_segments = manifest.segments.len();
+    drop(engine);
+    let query_store = Storage::open(&StorageConfig {
+        read_only: true,
+        ..storage_config.clone()
+    })
+    .await?;
+    let engine = Engine::with_config(query_store, config.clone());
+    let mut cold_ann_ms = 0.0;
+    let mut cold_bm25_ms = 0.0;
+    let mut ann_execution_ms = vec![];
+    let mut bm25_execution_ms = vec![];
     let mut ann_ms = vec![];
     let mut bm25_ms = vec![];
+    let consistency = if argument("--consistency", "strong") == "eventual" {
+        json!({"level":"eventual"})
+    } else {
+        json!({"level":"strong"})
+    };
     for i in 0..queries + 3 {
         let mut query = vector((i * 7919) % rows, dims);
         let mut noise = i as u64 + 991;
         for x in &mut query {
             *x += random(&mut noise) * 0.01;
         }
-        let request: QueryRequest =
-            serde_json::from_value(json!({"rank_by":["vector","ANN",query],"top_k":10}))?;
+        let request: QueryRequest = serde_json::from_value(
+            json!({"rank_by":["vector","ANN",query],"top_k":10,"consistency":consistency}),
+        )?;
         let tick = Instant::now();
         let response = engine.query(&ns, request).await?;
         assert_eq!(response.performance.exhaustive_search_count, 0);
+        if i == 0 {
+            cold_ann_ms = tick.elapsed().as_secs_f64() * 1000.0;
+        }
         if i >= 3 {
+            ann_execution_ms.push(response.performance.query_execution_ms as f64);
             ann_ms.push(tick.elapsed().as_secs_f64() * 1000.0);
         }
         let request: QueryRequest = serde_json::from_value(
-            json!({"rank_by":["text","BM25",format!("term{} term{}",i%4096,(i*17+7)%4096)],"top_k":10}),
+            json!({"rank_by":["text","BM25",format!("term{} term{}",i%4096,(i*17+7)%4096)],"top_k":10,"consistency":consistency}),
         )?;
         let tick = Instant::now();
-        engine.query(&ns, request).await?;
+        let response = engine.query(&ns, request).await?;
+        if i == 0 {
+            cold_bm25_ms = tick.elapsed().as_secs_f64() * 1000.0;
+        }
         if i >= 3 {
+            bm25_execution_ms.push(response.performance.query_execution_ms as f64);
             bm25_ms.push(tick.elapsed().as_secs_f64() * 1000.0);
         }
         eprintln!("timed query {}/{}", i + 1, queries + 3);
@@ -152,6 +188,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
+            "namespace":ns,"cold_ann_ms":cold_ann_ms,"cold_bm25_ms":cold_bm25_ms,
+            "ann_execution_p50_ms":percentile(&mut ann_execution_ms,0.5),"bm25_execution_p50_ms":percentile(&mut bm25_execution_ms,0.5),
+            "write_batch_p50_ms":if write_ms.is_empty() { None } else { Some(percentile(&mut write_ms,0.5)) },
             "rows":rows,"dimensions":dims,"batch_rows":batch,"compaction_segments":compaction_segments,"live_segments":live_segments,"queries":queries,"recall_queries":recall_queries,"nprobe":nprobe,
             "write_rows_per_second":rows as f64/writing.as_secs_f64(),"write_seconds":writing.as_secs_f64(),
             "index_seconds":indexing.as_secs_f64(),"load_wall_seconds":load_seconds,

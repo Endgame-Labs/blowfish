@@ -2,6 +2,7 @@
 mod filter;
 mod indexed;
 mod indexer;
+mod read_cache;
 mod segment;
 mod snapshot;
 pub use indexer::EngineConfig;
@@ -108,6 +109,8 @@ struct Handle {
 }
 struct Inner {
     store: Storage,
+    read_cache: Arc<read_cache::DecodedCache>,
+    queries: Arc<tokio::sync::Semaphore>,
     config: EngineConfig,
     owner: uuid::Uuid,
     namespaces: Mutex<HashMap<String, Arc<Handle>>>,
@@ -127,6 +130,11 @@ impl Engine {
     /// Configure indexing, tail limits, retention, and ANN behavior explicitly.
     pub fn with_config(store: Storage, config: EngineConfig) -> Self {
         let engine = Self(Arc::new(Inner {
+            read_cache: Arc::new(read_cache::DecodedCache::new(
+                config.decoded_cache_bytes,
+                config.search_concurrency,
+            )),
+            queries: Arc::new(tokio::sync::Semaphore::new(config.query_concurrency.max(1))),
             store,
             config,
             owner: uuid::Uuid::new_v4(),
@@ -280,20 +288,30 @@ impl Engine {
     /// Search a consistent segment-and-tail snapshot, including multi-query RRF.
     pub async fn query(&self, ns: &str, request: QueryRequest) -> Result<QueryResponse, ApiError> {
         let start = Instant::now();
-        let (state, warm) = self.snapshot(ns, &request.consistency).await?;
+        let (state, _) = self.snapshot(ns, &request.consistency).await?;
         let execution = Instant::now();
         let store = self.0.store.clone();
         let config = self.0.config.clone();
         let search_state = state.clone();
         let search_request = request.clone();
         let runtime = tokio::runtime::Handle::current();
+        let stats = Arc::new(bf_storage::CacheStats::default());
+        let context = read_cache::ReadContext {
+            cache: self.0.read_cache.clone(),
+            stats: stats.clone(),
+        };
+        let permit = self
+            .0
+            .queries
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(segment::index_error)?;
         let mut response = tokio::task::spawn_blocking(move || {
-            runtime.block_on(indexed::execute(
-                &store,
-                &search_state,
-                &search_request,
-                &config,
-                false,
+            let _permit = permit;
+            runtime.block_on(read_cache::scope(
+                context,
+                indexed::execute(&store, &search_state, &search_request, &config, false),
             ))
         })
         .await
@@ -306,21 +324,34 @@ impl Engine {
             let config = self.0.config.clone();
             let sample = state.clone();
             let ann = response.clone();
-            let runtime = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
-                runtime.block_on(async move {
-                    if let Ok(exact) =
-                        indexed::execute(&store, &sample, &request, &config, true).await
-                    {
-                        metrics::histogram!("blowfish_ann_recall")
-                            .record(indexed::recall(&ann, &exact));
-                    }
+            let cache = self.0.read_cache.clone();
+            let queries = self.0.queries.clone();
+            tokio::spawn(async move {
+                let Ok(permit) = queries.acquire_owned().await else {
+                    return;
+                };
+                let runtime = tokio::runtime::Handle::current();
+                let context = read_cache::ReadContext {
+                    cache,
+                    stats: Arc::default(),
+                };
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    runtime.block_on(read_cache::scope(context, async move {
+                        if let Ok(exact) =
+                            indexed::execute(&store, &sample, &request, &config, true).await
+                        {
+                            metrics::histogram!("blowfish_ann_recall")
+                                .record(indexed::recall(&ann, &exact));
+                        }
+                    }));
                 })
+                .await;
             });
         }
         response.performance = QueryPerformance {
-            cache_hit_ratio: if warm { 1.0 } else { 0.0 },
-            cache_temperature: if warm { "hot" } else { "cold" }.into(),
+            cache_hit_ratio: stats.cache_hit_ratio(),
+            cache_temperature: stats.temperature().into(),
             server_total_ms: start.elapsed().as_millis() as u64,
             query_execution_ms: execution.elapsed().as_millis() as u64,
             exhaustive_search_count: state.docs.len() as u64,
@@ -451,7 +482,29 @@ impl Engine {
     }
     /// Compare ANN with exact search on one snapshot and optionally return ground-truth rows.
     pub async fn recall(&self, ns: &str, request: Value) -> Result<Value, ApiError> {
-        query::recall(self, ns, request).await
+        let engine = self.clone();
+        let ns = ns.to_owned();
+        let context = read_cache::ReadContext {
+            cache: self.0.read_cache.clone(),
+            stats: Arc::default(),
+        };
+        let permit = self
+            .0
+            .queries
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(segment::index_error)?;
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            runtime.block_on(read_cache::scope(
+                context,
+                query::recall(&engine, &ns, request),
+            ))
+        })
+        .await
+        .map_err(segment::index_error)?
     }
 }
 fn storage_error(e: bf_storage::Error) -> ApiError {

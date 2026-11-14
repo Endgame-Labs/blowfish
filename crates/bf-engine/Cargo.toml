@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures = "=0.3.34"
 bf-text = { path = "../bf-text" }
 async-trait = "=0.1.92"
 bf-vector = { path = "../bf-vector" }
@@ -30,6 +31,5 @@ uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
 async-trait = "=0.1.92"
-futures = "=0.3.34"
 object_store = "=0.14.2"
 tempfile = "3.27.0"

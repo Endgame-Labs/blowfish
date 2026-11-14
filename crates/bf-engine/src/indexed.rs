@@ -2,6 +2,7 @@
 use crate::{EngineConfig, NamespaceState, filter, query, segment, snapshot};
 use bf_storage::Storage;
 use bf_types::*;
+use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,6 +46,66 @@ async fn prepare(
     config: &EngineConfig,
     force_exact: bool,
 ) -> Result<NamespaceState, ApiError> {
+    let Some(context) = crate::read_cache::context().filter(|_| state.segments.len() > 1) else {
+        return prepare_one(store, state, q, config, force_exact).await;
+    };
+    let mut base = state.clone();
+    base.docs.clear();
+    base.segments.clear();
+    let base = std::sync::Arc::new(base);
+    let parts = futures::stream::iter(state.segments.iter().cloned().map(|segment| {
+        let context = context.clone();
+        let store = store.clone();
+        let config = config.clone();
+        let q = q.clone();
+        let base = base.clone();
+        async move {
+            let permit = context
+                .cache
+                .workers
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(segment::index_error)?;
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let mut state = (*base).clone();
+                state.segments.push(segment);
+                runtime.block_on(crate::read_cache::scope(
+                    context,
+                    prepare_one(&store, &state, &q, &config, force_exact),
+                ))
+            })
+            .await
+            .map_err(segment::index_error)?
+        }
+    }))
+    .buffer_unordered(config.search_concurrency.max(1));
+    let mut out = (*base).clone();
+    futures::pin_mut!(parts);
+    while let Some(part) = parts.try_next().await? {
+        out.docs.extend(part.docs);
+        for (rank, scores) in part.scores {
+            out.scores.entry(rank).or_default().extend(scores);
+        }
+    }
+    let mut tail = state.clone();
+    tail.segments.clear();
+    let part = prepare_one(store, &tail, q, config, force_exact).await?;
+    out.docs.extend(part.docs);
+    for (rank, scores) in part.scores {
+        out.scores.entry(rank).or_default().extend(scores);
+    }
+    Ok(out)
+}
+async fn prepare_one(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+    config: &EngineConfig,
+    force_exact: bool,
+) -> Result<NamespaceState, ApiError> {
     let Some(
         rank @ RankBy::Vector {
             attribute,
@@ -65,7 +126,7 @@ async fn prepare(
     let mut out = state.clone();
     out.docs.clear();
     let mut scores = BTreeMap::new();
-    let columns: BTreeSet<_> = state
+    let mut columns: BTreeSet<_> = state
         .schema
         .iter()
         .filter(|(name, cfg)| {
@@ -83,12 +144,29 @@ async fn prepare(
         })
         .map(|(name, _)| name.clone())
         .collect();
+    if q.filters.is_none()
+        && q.include_attributes.is_none()
+        && q.exclude_attributes.is_none()
+        && q.limit.as_ref().and_then(Limit::per).is_none()
+    {
+        columns.clear();
+    }
     for seg in &state.segments {
-        let allowed = snapshot::allowed(store, state, seg, q.filters.as_ref()).await?;
+        let file = seg.files.get(&format!("ann:{attribute}"));
+        let (allowed, index, ids) = tokio::try_join!(
+            snapshot::allowed(store, state, seg, q.filters.as_ref()),
+            async {
+                match file {
+                    Some(file) => segment::vector_index(store, file).await.map(Some),
+                    None => Ok(None),
+                }
+            },
+            segment::ids(store, seg),
+        )?;
         if allowed.is_empty() {
             continue;
         }
-        let Some(file) = seg.files.get(&format!("ann:{attribute}")) else {
+        let Some(index) = index else {
             // Version-one document-only segments remain readable during rollout.
             let docs = segment::documents(store, seg, &allowed).await?;
             for (id, mut doc) in docs {
@@ -103,13 +181,6 @@ async fn prepare(
             }
             continue;
         };
-        let reader = segment::ObjectReader {
-            store: store.clone(),
-            file: file.clone(),
-        };
-        let index = bf_vector::Index::open_with_metadata_len(reader, file.metadata_len)
-            .await
-            .map_err(segment::index_error)?;
         let top = if all { allowed.len() as usize } else { k };
         let hits = if *exact || force_exact || all {
             index.exact_search(vector, top, Some(&allowed)).await
@@ -127,7 +198,6 @@ async fn prepare(
                 .await
         }
         .map_err(segment::index_error)?;
-        let ids = segment::ids(store, seg).await?;
         let rows: RoaringBitmap = hits.iter().map(|(row, _)| *row).collect();
         for (row, score) in hits {
             scores.insert(ids[row as usize].clone(), score as f64);
@@ -205,7 +275,7 @@ async fn prepare_scalar(
     let all = !plain_text || q.limit.as_ref().and_then(Limit::per).is_some();
     let mut out = state.clone();
     out.docs.clear();
-    let columns: BTreeSet<_> = state
+    let mut columns: BTreeSet<_> = state
         .schema
         .iter()
         .filter(|(name, cfg)| {
@@ -223,11 +293,45 @@ async fn prepare_scalar(
         })
         .map(|(name, _)| name.clone())
         .collect();
+    if plain_text
+        && q.filters.is_none()
+        && q.include_attributes.is_none()
+        && q.exclude_attributes.is_none()
+        && q.limit.as_ref().and_then(Limit::per).is_none()
+    {
+        columns.clear();
+    }
     for clause in &clauses {
         out.scores.entry(rank_key(clause)).or_default();
     }
     for seg in &state.segments {
-        let allowed = snapshot::allowed(store, state, seg, q.filters.as_ref()).await?;
+        let open_text = async {
+            futures::future::try_join_all(clauses.iter().filter_map(|clause| {
+                let RankBy::Bm25 { attribute, .. } = clause else {
+                    return None;
+                };
+                if !segment::seg_text_matches(seg, &state.schema, attribute) {
+                    return None;
+                }
+                let file = seg.files.get(&format!("fts:{attribute}"))?;
+                Some(async move {
+                    Ok::<_, ApiError>((attribute.clone(), segment::text_index(store, file).await?))
+                })
+            }))
+            .await
+            .map(|entries| entries.into_iter().collect::<BTreeMap<_, _>>())
+        };
+        let (allowed, indexes, ids) = tokio::try_join!(
+            snapshot::allowed(store, state, seg, q.filters.as_ref()),
+            open_text,
+            async {
+                if clauses.is_empty() {
+                    Ok(None)
+                } else {
+                    segment::ids(store, seg).await.map(Some)
+                }
+            },
+        )?;
         if allowed.is_empty() {
             continue;
         }
@@ -235,11 +339,6 @@ async fn prepare_scalar(
             allowed.clone()
         } else {
             RoaringBitmap::new()
-        };
-        let ids = if clauses.is_empty() {
-            vec![]
-        } else {
-            segment::ids(store, seg).await?
         };
         for clause in &clauses {
             let RankBy::Bm25 {
@@ -259,16 +358,7 @@ async fn prepare_scalar(
             );
             let stats = state.corpus.get(attribute).cloned().unwrap_or_default();
             let top = if all { allowed.len() as usize } else { k };
-            let hits = if segment::seg_text_matches(seg, &state.schema, attribute)
-                && let Some(file) = seg.files.get(&format!("fts:{attribute}"))
-            {
-                let reader =
-                    bf_text::SegmentReader::open(std::sync::Arc::new(segment::ObjectReader {
-                        store: store.clone(),
-                        file: file.clone(),
-                    }))
-                    .await
-                    .map_err(segment::index_error)?;
+            let hits = if let Some(reader) = indexes.get(attribute) {
                 reader
                     .search(&query, &stats, &cfg, top, Some(&allowed))
                     .await
@@ -279,7 +369,7 @@ async fn prepare_scalar(
                     segment::projected_documents(store, seg, &allowed, Some(&columns)).await?;
                 let mut hits = vec![];
                 for row in &allowed {
-                    let value = docs[&ids[row as usize]]
+                    let value = docs[&ids.as_ref().expect("text IDs")[row as usize]]
                         .get(attribute)
                         .unwrap_or(&serde_json::Value::Null);
                     let score = bf_text::score_document(
@@ -299,7 +389,10 @@ async fn prepare_scalar(
             let scores = out.scores.entry(rank_key(clause)).or_default();
             for hit in hits {
                 selected.insert(hit.row);
-                scores.insert(ids[hit.row as usize].clone(), hit.score as f64);
+                scores.insert(
+                    ids.as_ref().expect("text IDs")[hit.row as usize].clone(),
+                    hit.score as f64,
+                );
             }
         }
         out.docs

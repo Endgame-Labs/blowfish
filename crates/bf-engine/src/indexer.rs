@@ -8,6 +8,13 @@ use std::{collections::BTreeMap, time::Duration};
 /// Node-local indexing and query tuning. No option changes the durable write ordering.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
+    /// Byte budget for decoded immutable segment metadata (conservative resident charges).
+    /// Zero disables admission. In-flight queries can pin evicted entries until completion.
+    pub decoded_cache_bytes: u64,
+    /// Maximum concurrent segment scoring tasks across all queries on this engine.
+    pub search_concurrency: usize,
+    /// Maximum concurrent query drivers; each runs outside the Tokio reactor.
+    pub query_concurrency: usize,
     /// Disable indexing to keep a WAL-only differential reference node.
     pub indexing: bool,
     /// Minimum distinct tail mutations before a background flush.
@@ -38,6 +45,9 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            decoded_cache_bytes: 512 << 20,
+            search_concurrency: 8,
+            query_concurrency: 8,
             indexing: true,
             index_rows: 1000,
             index_bytes: 8 * 1024 * 1024,

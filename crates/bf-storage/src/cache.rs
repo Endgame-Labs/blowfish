@@ -113,6 +113,11 @@ impl CacheStats {
     pub fn temperature(&self) -> &'static str {
         self.snapshot().temperature()
     }
+    /// Account for logical bytes supplied by a caller's decoded in-memory cache.
+    /// Use the encoded size of the cached metadata, not its resident allocation size.
+    pub fn record_memory_hit(&self, bytes: u64) {
+        self.record(Tier::Memory, bytes);
+    }
     fn record(&self, tier: Tier, bytes: u64) {
         let counter = match tier {
             Tier::Memory => &self.memory,

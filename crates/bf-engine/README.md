@@ -179,3 +179,56 @@ Cold opening measures a new engine loading the manifest and empty tail, with the
 OS page cache retained; it does not include a first ANN query. Retained bytes
 include compacted inputs inside the default one-hour GC window. This run used the
 uncached storage adapter, so it also exposes the cost of per-segment range calls.
+
+## M5 performance investigation
+
+The benchmark accepts `--reuse <namespace>` to query an existing corpus, and
+`--recall-queries 0` to isolate query profiling from the exhaustive recall scan.
+`--consistency eventual` separates index execution from strong snapshot refresh.
+First-query measurements use a newly opened storage handle, so both engine and
+byte caches start empty; the operating system page cache remains uncontrolled.
+S3 runs take `BENCH_ENDPOINT`, `BENCH_PROFILE`, and `BENCH_REGION` from the
+benchmark environment. Keep private deployment settings out of this document.
+
+### WAL commit safety
+
+Document-bearing commits currently require two sequential conditional PUTs:
+the independently erasable payload, followed by the permanent slot fence. An
+inline payload cannot be erased by deleting its slot: a writer paused before its
+conditional create could then occupy that old sequence, violating serializability.
+Leaving the inline payload in the fence instead violates namespace deletion and
+checkpoint GC's physical-erasure guarantee. Replacing the slot with a redacted
+record would require a new mutable-slot protocol, including retry-identity
+handling, reader compatibility, concurrent GC, and old-writer behavior. The
+current protocol promises immutable slot records and only probes conditional
+create, not conditional replacement. Consequently, M5 retains two PUTs for data
+rather than changing the durable protocol without those guarantees. Tombstones
+already need one PUT because their slot carries no document data.
+
+Profiling the retained million-row corpus with Linux `perf record -F 499
+--call-graph dwarf,8192` found ID deserialization at 4.99% of sampled cycles,
+JSON sequence checks at 3.51%, integer parsing at 2.73%, byte-vector decoding at
+2.44%, and number parsing at 2.31%. RaBitQ estimation accounted for 4.27%, and
+query-table preparation for 3.55%. Repeated metadata decoding and per-range
+HEAD/header probing therefore preceded kernel tuning. Sampling perturbs timings;
+profiled latencies are not used as benchmark results.
+
+Immutable reads now use `Storage::range_reader_with_length` and batched cache
+reads. `StorageConfig.cache` controls byte-cache memory, disk, block size, and I/O
+concurrency. `EngineConfig.decoded_cache_bytes` separately bounds a node-local LRU
+of decoded directories, IDs/blooms, live masks, filter dictionaries, IVF metadata,
+and text readers. Its default is 512 MiB, with conservative serialized-size charges
+of 16 times metadata bytes (32 times filter dictionaries). Active queries can pin
+evicted entries until they finish. Zero disables decoded admission. Cache keys
+include immutable object generations; storage handles and decoded caches must not
+be shared across unrelated backends. Performance fields report per-query logical
+bytes, including decoded metadata hits, instead of guessing from namespace age.
+
+`query_concurrency` and `search_concurrency` each default to eight. Query drivers
+and segment scorers use bounded blocking tasks, keeping CPU work off Tokio reactor
+threads. Independent masks, IDs, and index metadata open together; ANN code reads
+and rerank vectors each use one coalesced batch. The counting-store regression
+requires exactly three cold ANN read stages, zero HEADs, and zero backend reads
+for an identical warm query. It also tests a cold single-term BM25 query within
+three stages. General BM25 queries can still need additional posting-block stages:
+bf-text exposes demand-driven posting reads, not a public batch-prefetch plan.
