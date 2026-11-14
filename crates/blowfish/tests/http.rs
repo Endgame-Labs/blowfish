@@ -177,6 +177,7 @@ async fn endpoints_sdk_overloads_and_json_errors() {
     let (status, error) = call(&app, "GET", "/unknown", Value::Null).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(error["status"], "error");
+    assert_eq!(error["error"], "unknown route");
     assert_eq!(
         call(&app, "PATCH", "/", json!({})).await.0,
         StatusCode::METHOD_NOT_ALLOWED
