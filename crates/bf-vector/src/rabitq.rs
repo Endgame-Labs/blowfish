@@ -136,7 +136,7 @@ impl RaBitQ {
     }
 
     pub(crate) fn estimate_rotated(&self, code: &RaBitQCode, q: &[f64]) -> DistanceEstimate {
-        // Byte lookup tables allow summing eight signed coordinates per code byte.
+        // The public reference path keeps all query coordinates at full precision.
         let dot = q
             .iter()
             .enumerate()
@@ -170,6 +170,56 @@ impl Rng {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
         z ^ (z >> 31)
+    }
+}
+
+/// Query-local lookup tables; eight signs are accumulated per byte.
+pub(crate) struct PreparedQuery {
+    tables: Vec<[f64; 256]>,
+    norm2: f64,
+}
+impl PreparedQuery {
+    pub(crate) fn new(q: &[f64]) -> Self {
+        let tables = q
+            .chunks(8)
+            .map(|chunk| {
+                let mut table = [0.; 256];
+                table[0] = -chunk.iter().sum::<f64>();
+                for bits in 1usize..256 {
+                    let bit = bits.trailing_zeros() as usize;
+                    table[bits] =
+                        table[bits & (bits - 1)] + 2. * chunk.get(bit).copied().unwrap_or(0.);
+                }
+                table
+            })
+            .collect();
+        Self {
+            tables,
+            norm2: q.iter().map(|x| x * x).sum(),
+        }
+    }
+    pub(crate) fn estimate(
+        &self,
+        norm: f64,
+        alpha: f64,
+        bits: &[u8],
+        padded: usize,
+    ) -> DistanceEstimate {
+        let dot = self
+            .tables
+            .iter()
+            .zip(bits)
+            .map(|(table, b)| table[*b as usize])
+            .sum::<f64>()
+            / (padded as f64).sqrt();
+        let distance = norm * norm + self.norm2 - 2. * norm * dot / alpha;
+        let margin = 1e-10 * (norm * norm + self.norm2 + distance.abs() + 1.);
+        DistanceEstimate {
+            distance,
+            error_bound: 2. * norm * (1. - alpha * alpha).max(0.).sqrt() / alpha
+                * self.norm2.sqrt()
+                + margin,
+        }
     }
 }
 

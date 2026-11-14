@@ -1,6 +1,15 @@
 //! Object-storage-friendly vector distances, immutable IVF indexes, and exact search.
 
+mod cluster;
 mod distance;
+mod format;
+mod index;
+mod reader;
+pub use bytes::Bytes;
+pub use cluster::{BuildParams, IndexBuilder, VectorType};
+pub use format::{FORMAT_VERSION, metadata_len};
+pub use index::{Index, SearchParams};
+pub use reader::RangeRead;
 mod rabitq;
 pub use rabitq::{DistanceEstimate, RaBitQ, RaBitQCode};
 
