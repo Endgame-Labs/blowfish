@@ -1,4 +1,7 @@
 //! HTTP adapter for the exhaustive engine, with replaceable authorization.
+mod legacy;
+mod operations;
+
 use axum::{
     Extension, Json, Router,
     extract::{
@@ -85,9 +88,25 @@ pub fn router(engine: Engine, auth: KeyStore, options: ServerOptions) -> Router 
         .route("/_blowfish/v1/keys/{id}", get(get_key).delete(revoke_key))
         .route("/v1/namespaces", get(list))
         .route("/v2/namespaces/{ns}", post(write).delete(delete_namespace))
+        .route("/v2/namespaces/{ns}/async", post(operations::start_copy))
+        .route(
+            "/v1/namespaces/{ns}/operations/{token}",
+            get(operations::poll),
+        )
+        .route(
+            "/v1/namespaces/{ns}",
+            post(legacy::write)
+                .get(legacy::export)
+                .head(legacy::head)
+                .delete(legacy::delete),
+        )
+        .route("/v1/namespaces/{ns}/query", post(legacy::query))
         .route("/v2/namespaces/{ns}/query", post(query))
         .route("/v2/namespaces/{ns}/metadata", get(metadata))
-        .route("/v1/namespaces/{ns}/metadata", get(metadata))
+        .route(
+            "/v1/namespaces/{ns}/metadata",
+            get(metadata).patch(patch_metadata),
+        )
         .route(
             "/v1/namespaces/{ns}/schema",
             get(schema).post(update_schema),
@@ -267,11 +286,23 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
                 "/_blowfish/v1/status" => Some(Action::ReadMetrics),
                 "/_blowfish/v1/keys" | "/_blowfish/v1/keys/{id}" => Some(Action::ManageKeys),
                 "/v1/namespaces" => Some(Action::ListNamespaces),
-                "/v2/namespaces/{ns}" if request.method() == Method::DELETE => {
+                "/v1/namespaces/{ns}" | "/v2/namespaces/{ns}"
+                    if request.method() == Method::DELETE =>
+                {
                     Some(Action::DeleteNamespace)
                 }
-                "/v2/namespaces/{ns}" => Some(Action::Write),
+                "/v1/namespaces/{ns}" if request.method() == Method::POST => Some(Action::Write),
+                "/v1/namespaces/{ns}" if request.method() == Method::HEAD => {
+                    Some(Action::ReadMetadata)
+                }
+                "/v1/namespaces/{ns}"
+                | "/v1/namespaces/{ns}/query"
+                | "/v1/namespaces/{ns}/operations/{token}" => Some(Action::Query),
+                "/v2/namespaces/{ns}" | "/v2/namespaces/{ns}/async" => Some(Action::Write),
                 "/v2/namespaces/{ns}/query" => Some(Action::Query),
+                "/v1/namespaces/{ns}/metadata" if request.method() == Method::PATCH => {
+                    Some(Action::WriteSchema)
+                }
                 "/v1/namespaces/{ns}/metadata" | "/v2/namespaces/{ns}/metadata" => {
                     Some(Action::ReadMetadata)
                 }
@@ -332,17 +363,20 @@ async fn write(
     State(s): State<AppState>,
     Path(ns): Path<String>,
     Extension(p): Extension<Principal>,
+    headers: HeaderMap,
     input: Result<Json<WriteRequest>, JsonRejection>,
-) -> Result<Json<WriteResponse>, HttpError> {
+) -> Result<Response, HttpError> {
     let request = body(input)?;
-    if let Some(source) = &request.copy_from_namespace {
-        let source = match source {
-            CopyFrom::Name(name) => name,
-            CopyFrom::Config {
-                source_namespace, ..
-            } => source_namespace,
-        };
-        s.auth.authorize(&p, Action::Query, Some(source))?;
+    operations::authorize_copy(&s, &p, &request)?;
+    if request.copy_from_namespace.is_some()
+        && headers.get_all("prefer").iter().any(|v| {
+            v.to_str().is_ok_and(|v| {
+                v.split(',')
+                    .any(|p| p.trim().eq_ignore_ascii_case("respond-async"))
+            })
+        })
+    {
+        return operations::start(s, ns, request, true).await;
     }
     let response = s.engine.write(&ns, request).await?;
     for (kind, count) in [
@@ -353,7 +387,7 @@ async fn write(
         metrics::counter!("blowfish_write_rows_total", "operation" => kind)
             .increment(count.unwrap_or(0) as u64);
     }
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 async fn query(
     State(s): State<AppState>,
@@ -399,6 +433,13 @@ async fn metadata(
     Path(ns): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
     Ok(Json(s.engine.metadata(&ns).await?))
+}
+async fn patch_metadata(
+    State(s): State<AppState>,
+    Path(ns): Path<String>,
+    input: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Value>, HttpError> {
+    Ok(Json(s.engine.patch_metadata(&ns, body(input)?).await?))
 }
 async fn schema(
     State(s): State<AppState>,

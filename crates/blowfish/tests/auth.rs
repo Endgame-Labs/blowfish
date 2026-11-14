@@ -451,3 +451,90 @@ fn key_cli_help_validates_global_arguments() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("--json"));
 }
+
+#[tokio::test]
+async fn extras_routes_enforce_roles_and_copy_source_scope() {
+    let app = app().await;
+    seed(&app, "allowed-extras").await;
+    seed(&app, "hidden-source").await;
+    let read = create(&app, &["read"], json!(["allowed-"])).await;
+    let writer = create(&app, &["write"], json!(["allowed-"])).await;
+    for (method, path, value) in [
+        (
+            "PATCH",
+            "/v1/namespaces/allowed-extras/metadata",
+            json!({"read_only":true}),
+        ),
+        (
+            "POST",
+            "/v1/namespaces/allowed-extras",
+            json!({"ids":[1],"vectors":[null]}),
+        ),
+        (
+            "POST",
+            "/v2/namespaces/allowed-copy/async",
+            json!({"copy_from_namespace":"allowed-extras"}),
+        ),
+    ] {
+        assert_eq!(
+            call(&app, read["token"].as_str(), method, path, value)
+                .await
+                .0,
+            403
+        );
+    }
+    for path in [
+        "/v2/namespaces/allowed-copy/async",
+        "/v2/namespaces/allowed-copy",
+        "/v1/namespaces/allowed-copy",
+    ] {
+        assert_eq!(
+            call(
+                &app,
+                writer["token"].as_str(),
+                "POST",
+                path,
+                json!({"copy_from_namespace":"hidden-source"})
+            )
+            .await
+            .0,
+            403
+        );
+    }
+    assert_eq!(
+        call(
+            &app,
+            read["token"].as_str(),
+            "GET",
+            "/v1/namespaces/allowed-extras",
+            Value::Null
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            &app,
+            read["token"].as_str(),
+            "POST",
+            "/v1/namespaces/allowed-extras/query",
+            json!({"rank_by":["id","asc"]})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            &app,
+            read["token"].as_str(),
+            "GET",
+            "/v1/namespaces/hidden-source/operations/invalid",
+            Value::Null
+        )
+        .await
+        .0,
+        403
+    );
+}
