@@ -320,3 +320,46 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn missing_and_empty_fields_have_distinct_corpus_statistics() {
+    let p = FtsParams::default();
+    let mut builder = SegmentBuilder::new(true);
+    builder.add_document(&tokenize("fox fox", &p)).unwrap();
+    builder.add_document(&[]).unwrap();
+    builder.add_missing_document().unwrap();
+    let reader = open(builder.finish().unwrap());
+    assert_eq!(reader.num_docs(), 3);
+    assert_eq!(reader.doc_lengths(), &[2, 1, 0]);
+    assert_eq!(reader.stats().total_docs, 2);
+    assert_eq!(reader.stats().average_doc_length, 1.5);
+    let q = Query::new(tokenize("fox", &p), false);
+    let hits = block_on(reader.search(&q, &reader.stats(), &p, 10, None)).unwrap();
+    let stats = CorpusStats::from_documents(&[tokenize("fox fox", &p), vec![]]);
+    assert!(
+        (hits[0].score - score_document(&tokenize("fox fox", &p), &q, &stats, &p)).abs() < 1e-6
+    );
+    let all = block_on(reader.contains_all_tokens(&Query::default())).unwrap();
+    assert_eq!(all.len(), 3);
+}
+
+struct ShortRead(MemoryRangeRead);
+#[async_trait::async_trait]
+impl RangeRead for ShortRead {
+    async fn read(&self, range: Range<u64>) -> io::Result<Bytes> {
+        let bytes = self.0.read(range).await?;
+        Ok(bytes.slice(..bytes.len().saturating_sub(1)))
+    }
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+}
+
+#[test]
+fn truncated_range_responses_return_unexpected_eof() {
+    let source = ShortRead(MemoryRangeRead::from(build(&[], false, Tokenizer::WordV4)));
+    let error = block_on(SegmentReader::open(Arc::new(source)))
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+}

@@ -518,7 +518,8 @@ impl SegmentReader {
     pub fn num_docs(&self) -> u32 {
         self.lengths.len() as u32
     }
-    /// Per-row normalization lengths (retained tokens, with a minimum of one).
+    /// Per-row normalization lengths. Present fields have a minimum of one;
+    /// missing fields have length zero.
     pub fn doc_lengths(&self) -> &[u32] {
         &self.lengths
     }

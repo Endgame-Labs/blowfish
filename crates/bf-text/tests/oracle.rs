@@ -24,11 +24,8 @@ fn analyze(value: &Value, params: &FtsParams) -> Vec<Token> {
 fn expanded_defaults_match_oracle() {
     let expected = json!({"k1":1.2,"b":0.75,"k3":8.0,"ascii_folding":false,"case_sensitive":false,"language":"english","stemming":false,"remove_stopwords":false,"tokenizer":"word_v4","max_token_length":39});
     let params: FtsParams = serde_json::from_value(true.into()).unwrap();
-    // JSON serialization of f32 may round through f64 in Value; compare serialized wire JSON.
-    assert_eq!(
-        serde_json::to_string(&params).unwrap(),
-        serde_json::to_string(&serde_json::from_value::<FtsParams>(expected).unwrap()).unwrap()
-    );
+    let wire: Value = serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
+    assert_eq!(wire, expected);
     assert_eq!(params, FtsParams::default());
     for invalid in [
         json!(false),
@@ -141,5 +138,58 @@ fn tokenizer_filter_parity() {
         "{} mismatches:\n{}",
         mismatches.len(),
         mismatches.join("\n")
+    );
+}
+
+#[test]
+fn cjk_and_pretokenized_metadata_roundtrip() {
+    for (tokenizer, case_sensitive, max_length) in [
+        ("smartcn", false, json!(39)),
+        ("kuromoji", false, json!(39)),
+        ("nori", false, json!(39)),
+        ("pre_tokenized_array", true, Value::Null),
+    ] {
+        let expected = json!({"k1":1.2,"b":0.75,"k3":8.0,"ascii_folding":false,"case_sensitive":case_sensitive,"language":null,"stemming":false,"remove_stopwords":false,"tokenizer":tokenizer,"max_token_length":max_length});
+        let params: FtsParams = serde_json::from_value(json!({"tokenizer":tokenizer})).unwrap();
+        let wire: Value = serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
+        assert_eq!(wire, expected);
+        assert_eq!(serde_json::from_value::<FtsParams>(wire).unwrap(), params);
+    }
+    let p: FtsParams = serde_json::from_value(json!({"tokenizer":"pre_tokenized_array"})).unwrap();
+    let token = "é".repeat(300);
+    assert_eq!(
+        tokenize_array(&[token.as_str(), "Foo Bar"], &p)
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>(),
+        vec![token.as_str(), "Foo Bar"]
+    );
+}
+
+#[test]
+fn token_length_is_checked_before_normalization_expands_it() {
+    let params = FtsParams {
+        max_token_length: 1,
+        ascii_folding: true,
+        ..FtsParams::default()
+    };
+    // Unicode lowercase and ASCII folding can expand a single original character.
+    assert_eq!(
+        tokenize("Æ İ", &params)
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ae", "i̇"]
+    );
+    let params = FtsParams {
+        max_token_length: 2,
+        ..FtsParams::default()
+    };
+    assert_eq!(
+        tokenize("éé ééé ok", &params)
+            .iter()
+            .map(|t| (t.text.as_str(), t.position))
+            .collect::<Vec<_>>(),
+        vec![("éé", 0), ("ok", 2)]
     );
 }

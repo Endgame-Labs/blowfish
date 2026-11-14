@@ -4,7 +4,9 @@ Independent text analysis, BM25 scoring, and immutable full-text segments. No ot
 blowfish crate is a dependency.
 
 `FtsParams` accepts `true` or the full-text schema object, expands the defaults,
-and validates incompatible parameters. `tokenize` analyzes a string, and
+and validates incompatible parameters. Expanded metadata preserves null language
+for CJK/pre-tokenized fields and null token-length limits for pre-tokenized fields.
+`tokenize` analyzes a string, and
 `tokenize_array` keeps ordinary array elements separate for phrases. With
 `pre_tokenized_array`, each supplied element is a literal token in one sequence.
 `Token` retains its normalized text, position, and array element number.

@@ -2,7 +2,7 @@ use alyze::analyze::{
     AnalysisOptions, Analyzer, LanguageWithStopwords, ReusableBuffer, StemmingLanguage,
     StopwordRemoval, TokenizerOptions,
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// A documented turbopuffer tokenizer. Historic versions approximate old Unicode tables.
@@ -85,7 +85,7 @@ impl Language {
 ///
 /// `false` belongs to the engine's disabled-FTS schema variant and is rejected here.
 /// Call [`Self::validate`] after constructing or modifying parameters in Rust.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FtsParams {
     /// Document-term saturation, positive and finite.
     pub k1: f32,
@@ -97,7 +97,8 @@ pub struct FtsParams {
     pub ascii_folding: bool,
     /// Preserve case.
     pub case_sensitive: bool,
-    /// Language for stemming and stopword removal.
+    /// Language for stemming and stopword removal. Ignored and serialized as null
+    /// for pre-tokenized and CJK dictionary fields.
     pub language: Language,
     /// Enable Snowball stemming.
     pub stemming: bool,
@@ -106,6 +107,7 @@ pub struct FtsParams {
     /// Persist this explicitly to preserve namespace behavior.
     pub tokenizer: Tokenizer,
     /// Maximum token length in Unicode scalar values, as measured by the live oracle.
+    /// Ignored and serialized as null for pre-tokenized fields.
     pub max_token_length: u8,
 }
 
@@ -126,6 +128,34 @@ impl Default for FtsParams {
     }
 }
 
+impl Serialize for FtsParams {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(11))?;
+        map.serialize_entry("k1", &self.k1)?;
+        map.serialize_entry("b", &self.b)?;
+        map.serialize_entry("k3", &self.k3)?;
+        map.serialize_entry("ascii_folding", &self.ascii_folding)?;
+        map.serialize_entry("case_sensitive", &self.case_sensitive)?;
+        let language = (!matches!(
+            self.tokenizer,
+            Tokenizer::PreTokenizedArray
+                | Tokenizer::Smartcn
+                | Tokenizer::Kuromoji
+                | Tokenizer::Nori
+        ))
+        .then_some(self.language);
+        map.serialize_entry("language", &language)?;
+        map.serialize_entry("stemming", &self.stemming)?;
+        map.serialize_entry("remove_stopwords", &self.remove_stopwords)?;
+        map.serialize_entry("tokenizer", &self.tokenizer)?;
+        map.serialize_entry(
+            "max_token_length",
+            &(self.tokenizer != Tokenizer::PreTokenizedArray).then_some(self.max_token_length),
+        )?;
+        map.end()
+    }
+}
+
 impl<'de> Deserialize<'de> for FtsParams {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
@@ -138,7 +168,9 @@ impl<'de> Deserialize<'de> for FtsParams {
         let mut p = Self::default();
         macro_rules! field {
             ($($name:ident),+) => { $(if let Some(v) = object.get(stringify!($name)) {
-                p.$name = serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?;
+                if !(v.is_null() && matches!(stringify!($name),"language" | "max_token_length")) {
+                    p.$name = serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?;
+                }
             })+ }
         }
         field!(
@@ -154,7 +186,7 @@ impl<'de> Deserialize<'de> for FtsParams {
             max_token_length
         );
         if p.tokenizer == Tokenizer::PreTokenizedArray {
-            if object.contains_key("language")
+            if object.get("language").is_some_and(|v| !v.is_null())
                 || object.get("case_sensitive") == Some(&false.into())
             {
                 return Err(serde::de::Error::custom(
@@ -166,15 +198,11 @@ impl<'de> Deserialize<'de> for FtsParams {
         if matches!(
             p.tokenizer,
             Tokenizer::Smartcn | Tokenizer::Kuromoji | Tokenizer::Nori
-        ) && [
-            "language",
-            "case_sensitive",
-            "stemming",
-            "remove_stopwords",
-            "ascii_folding",
-        ]
-        .iter()
-        .any(|key| object.contains_key(*key))
+        ) && (object.get("language").is_some_and(|v| !v.is_null())
+            || p.case_sensitive
+            || p.stemming
+            || p.remove_stopwords
+            || p.ascii_folding)
         {
             return Err(serde::de::Error::custom(
                 "CJK dictionary tokenizers do not accept normalization options",
@@ -209,6 +237,16 @@ impl FtsParams {
         }
         if self.remove_stopwords && self.language.stopwords().is_none() {
             return Err("stopword removal is unavailable for this language".into());
+        }
+        if matches!(
+            self.tokenizer,
+            Tokenizer::Smartcn | Tokenizer::Kuromoji | Tokenizer::Nori
+        ) && (self.case_sensitive
+            || self.stemming
+            || self.remove_stopwords
+            || self.ascii_folding)
+        {
+            return Err("CJK dictionary tokenizers do not accept normalization options".into());
         }
         if self.tokenizer == Tokenizer::PreTokenizedArray && !self.case_sensitive {
             return Err("pre_tokenized_array requires case sensitivity".into());
@@ -320,7 +358,12 @@ pub fn tokenize_array<T: AsRef<str>>(texts: &[T], params: &FtsParams) -> Vec<Tok
             }
         } else {
             analyzer.analyze(text.as_ref(), &mut buffer, |token| {
-                if token.text.chars().count() <= params.max_token_length as usize {
+                let cjk = matches!(
+                    params.tokenizer,
+                    Tokenizer::Smartcn | Tokenizer::Kuromoji | Tokenizer::Nori
+                );
+                // Standard analysis checks original length before case/ASCII expansion.
+                if !cjk || token.text.chars().count() <= params.max_token_length as usize {
                     tokens.push(Token {
                         text: token.text.into(),
                         position: token.position as u32,
