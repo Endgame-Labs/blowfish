@@ -5,6 +5,7 @@ mod highlight;
 mod indexed;
 mod indexer;
 mod pattern;
+mod plan;
 mod segment;
 mod snapshot;
 mod sparse;
@@ -447,10 +448,9 @@ impl Engine {
     }
     /// Describe the indexed snapshot plan after validating the query.
     pub async fn explain(&self, ns: &str, request: QueryRequest) -> Result<Value, ApiError> {
-        self.query(ns, request).await?;
-        Ok(
-            json!({"plan_text":"Manifest snapshot + exhaustive WAL tail → live/filter bitmaps → segment ANN/BM25 or scalar evaluation → newest-wins merge → projection"}),
-        )
+        self.query(ns, request.clone()).await?;
+        let (state, _) = self.snapshot(ns, &request.consistency).await?;
+        Ok(json!({"plan_text":plan::explain(&state,&request,&self.0.config)}))
     }
     /// Compare ANN with exact search on one snapshot and optionally return ground-truth rows.
     pub async fn recall(&self, ns: &str, request: Value) -> Result<Value, ApiError> {
