@@ -1,14 +1,26 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! Object-storage-friendly vector distances, immutable IVF indexes, and exact search.
+
+mod distance;
+mod rabitq;
+pub use rabitq::{DistanceEstimate, RaBitQ, RaBitQCode};
+
+pub use distance::{Metric, decode_base64_f32, encode_base64_f32, exact_search, recall_at_k};
+pub use half::f16;
+pub use roaring::RoaringBitmap;
+
+/// Errors from input validation, index decoding, and range reads.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The supplied input violates the vector API contract.
+    #[error("invalid vector input: {0}")]
+    InvalidInput(String),
+    /// An index is truncated, corrupt, or uses an unsupported format.
+    #[error("invalid vector index: {0}")]
+    InvalidFormat(String),
+    /// The storage reader failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+/// Result type used throughout the crate.
+pub type Result<T> = std::result::Result<T, Error>;
