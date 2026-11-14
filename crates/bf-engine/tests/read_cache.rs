@@ -32,6 +32,8 @@ struct Counting {
     pause_head: AtomicBool,
     head_started: tokio::sync::Notify,
     resume_head: tokio::sync::Notify,
+    wal_active: AtomicUsize,
+    wal_max_active: AtomicUsize,
 }
 impl fmt::Display for Counting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -70,6 +72,15 @@ impl ObjectStore for Counting {
             self.resume_head.notified().await;
         }
         if !path.as_ref().contains("/segments/") {
+            if opts.head && path.as_ref().contains("/wal/") {
+                let active = self.wal_active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.wal_max_active.fetch_max(active, Ordering::SeqCst);
+                let _active = Active(&self.wal_active);
+                if self.delay.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                return self.inner.get_opts(path, opts).await;
+            }
             return self.inner.get_opts(path, opts).await;
         }
         if opts.head {
@@ -306,4 +317,34 @@ async fn repeated_strong_checks_do_not_extend_checkpoint_retention() {
             .any(|entry| entry.operation == "list");
     }
     assert!(refreshed, "WAL freshness must not reset checkpoint age");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_strong_queries_check_wal_concurrently() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    writer
+        .write(
+            "parallel",
+            serde_json::from_value(json!({"upsert_rows":[{"id":1}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    writer.index_namespace("parallel", true).await.unwrap();
+    let reader = Engine::with_config(store(backend.clone()).await, config());
+    let request: bf_types::QueryRequest =
+        serde_json::from_value(json!({"rank_by":["id","asc"],"top_k":1})).unwrap();
+    reader.query("parallel", request.clone()).await.unwrap();
+    backend.delay.store(true, Ordering::SeqCst);
+    backend.wal_max_active.store(0, Ordering::SeqCst);
+    futures::future::try_join_all((0..8).map(|_| reader.query("parallel", request.clone())))
+        .await
+        .unwrap();
+    assert!(
+        backend.wal_max_active.load(Ordering::SeqCst) >= 2,
+        "strong checks must not serialize under the namespace lock"
+    );
 }

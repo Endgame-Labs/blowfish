@@ -231,13 +231,23 @@ impl Engine {
         // keep a reclaimed checkpoint alive indefinitely.
         let checkpoint_valid = state.seq > 0
             && state.checkpoint_refreshed.elapsed() < self.0.config.retention.div_f64(2.0);
-        let unchanged = if refresh && !over_cap && checkpoint_valid {
-            match self.0.store.head(&wal.key(state.seq + 1)).await {
-                Err(bf_storage::Error::NotFound) => {
+        let unchanged = if matches!(consistency, Consistency::Strong) && checkpoint_valid {
+            let observed = (state.seq, state.manifest_seq);
+            // Keep independent consistency requests off the namespace state lock.
+            // Reconcile after the HEAD so a concurrent commit cannot be overwritten.
+            drop(state);
+            let head = self.0.store.head(&wal.key(observed.0 + 1)).await;
+            state = handle.state.lock().await;
+            match head {
+                Err(bf_storage::Error::NotFound)
+                    if (state.seq, state.manifest_seq) == observed
+                        && state.checkpoint_refreshed.elapsed()
+                            < self.0.config.retention.div_f64(2.0) =>
+                {
                     state.refreshed = Instant::now();
                     true
                 }
-                Ok(_) => false,
+                Err(bf_storage::Error::NotFound) | Ok(_) => false,
                 Err(error) => return Err(storage_error(error)),
             }
         } else {
