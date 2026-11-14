@@ -23,8 +23,9 @@ resolve the same snapshot: live rows in segments plus a newest-wins tail.
 | `delete_namespace`, `list_namespaces`, `warm`, `explain` | Namespace lifecycle, prefetch, and plan inspection |
 
 Point writes use sorted ID dictionaries and bloom filters to fetch affected rows.
-By-filter writes, schema drops, and namespace copies use temporary materialized
-snapshots. Metadata adjusts checkpoint counts using only tail-shadowed IDs.
+By-filter writes and namespace copies use temporary materialized snapshots.
+Schema drops commit metadata without copying surviving vectors into the WAL;
+background rebuilds process one segment at a time. Metadata adjusts checkpoint counts using only tail-shadowed IDs.
 
 ## Immutable formats and publication
 
@@ -87,7 +88,7 @@ edge case still apply.
 
 Order-by, aggregates, and general score expressions currently materialize eligible
 scalar rows for reference result assembly. Streaming scalar result merging and
-bounded by-filter/schema-rebuild materialization remain performance improvements.
+bounded by-filter materialization remain performance improvements.
 The exhaustive diagnostic path deliberately materializes the full snapshot.
 
 ## Tuning and integration

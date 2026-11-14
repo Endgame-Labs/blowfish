@@ -487,3 +487,45 @@ async fn indexed_conditional_writes_remain_serializable_across_nodes_and_compact
     e.index_namespace("test", true).await.unwrap();
     assert_eq!(query(&e,json!({"rank_by":["id","asc"],"filters":["id","Eq",0],"top_k":1,"include_attributes":["n"]})).await["rows"][0]["n"],40);
 }
+
+#[tokio::test]
+async fn schema_drops_do_not_copy_surviving_vectors_into_the_wal() {
+    let e = node().await;
+    write(&e, initial()).await;
+    e.index_namespace("test", true).await.unwrap();
+    write(&e, json!({"schema":{"tags":{"drop":true}}})).await;
+    let wal = Wal::new(e.storage().clone(), "test").unwrap();
+    let entry = wal.read(wal.head().await.unwrap()).await.unwrap().unwrap();
+    assert!(entry.batches[0].upserts.is_empty());
+    for indexed in [false, true] {
+        if indexed {
+            e.index_namespace("test", true).await.unwrap();
+        }
+        let result = query(
+            &e,
+            json!({"rank_by":["id","asc"],"top_k":100,"include_attributes":true}),
+        )
+        .await;
+        assert_eq!(result["rows"].as_array().unwrap().len(), 30);
+        assert!(
+            result["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row.get("tags").is_none())
+        );
+    }
+    write(&e, json!({"patch_rows":[{"id":0,"n":99}]})).await;
+    let result = query(
+        &e,
+        json!({"rank_by":["vector","ANN",[1.0,2.0]],"top_k":30,"include_attributes":true}),
+    )
+    .await;
+    assert!(
+        result["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row.get("tags").is_none())
+    );
+}

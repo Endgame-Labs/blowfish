@@ -68,6 +68,11 @@ impl Default for NamespaceState {
 impl NamespaceState {
     fn apply(&mut self, b: &WriteBatch) {
         self.exists = true;
+        if self.schema.keys().any(|name| !b.schema.contains_key(name)) {
+            for doc in self.docs.values_mut() {
+                doc.retain(|name, _| b.schema.contains_key(name));
+            }
+        }
         self.schema = b.schema.clone();
         self.metric = b.distance_metric;
         self.created_at = b.created_at;
@@ -423,7 +428,7 @@ impl Engine {
     pub async fn explain(&self, ns: &str, request: QueryRequest) -> Result<Value, ApiError> {
         self.query(ns, request).await?;
         Ok(
-            json!({"plan_text":"Manifest snapshot + WAL tail → live/filter bitmaps → segment ANN/BM25 or scalar evaluation → newest-wins merge → projection"}),
+            json!({"plan_text":"Manifest snapshot + exhaustive WAL tail → live/filter bitmaps → segment ANN/BM25 or scalar evaluation → newest-wins merge → projection"}),
         )
     }
     /// Compare ANN with exact search on one snapshot and optionally return ground-truth rows.

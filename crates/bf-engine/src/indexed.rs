@@ -91,7 +91,8 @@ async fn prepare(
         let Some(file) = seg.files.get(&format!("ann:{attribute}")) else {
             // Version-one document-only segments remain readable during rollout.
             let docs = segment::documents(store, seg, &allowed).await?;
-            for (id, doc) in docs {
+            for (id, mut doc) in docs {
+                doc.retain(|name, _| state.schema.contains_key(name));
                 if let Some(v) = doc.get(attribute) {
                     scores.insert(
                         id.clone(),
@@ -273,7 +274,9 @@ async fn prepare_scalar(
                     .await
                     .map_err(segment::index_error)?
             } else {
-                let docs = segment::documents(store, seg, &allowed).await?;
+                let columns = BTreeSet::from([attribute.clone()]);
+                let docs =
+                    segment::projected_documents(store, seg, &allowed, Some(&columns)).await?;
                 let mut hits = vec![];
                 for row in &allowed {
                     let value = docs[&ids[row as usize]]

@@ -361,7 +361,15 @@ pub(crate) fn prepare(
         upserts: state
             .docs
             .iter()
-            .filter(|(id, doc)| current.docs.get(id) != Some(doc))
+            .filter(|(id, doc)| {
+                current.docs.get(id).is_none_or(|old| {
+                    // A schema drop hides stored columns; it must not duplicate every
+                    // surviving vector into a giant schema-only WAL entry.
+                    old.iter()
+                        .filter(|(name, _)| state.schema.contains_key(*name))
+                        .ne(doc.iter())
+                })
+            })
             .map(|(_, doc)| doc.clone())
             .collect(),
         deletes: current

@@ -181,6 +181,12 @@ impl Engine {
                 .keys()
                 .chain(seg.schema.keys())
                 .any(|name| !segment::seg_text_matches(seg, &state.schema, name))
+                || seg.schema.iter().any(|(name, old)| {
+                    state
+                        .schema
+                        .get(name)
+                        .is_none_or(|new| old.filterable != new.filterable)
+                })
         });
         let compact = tier(&state, self.0.config.compaction_segments.max(2));
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild {
@@ -270,30 +276,49 @@ impl Engine {
             manifest.stats = NamespaceStats::default();
         }
         let segments = if rebuild {
-            let full = snapshot::materialize(store, &state).await?;
+            let mut rebuilt = vec![];
+            manifest.stats = NamespaceStats::default();
             for seg in &state.segments {
+                let live = snapshot::allowed(store, &state, seg, None).await?;
+                let mut docs = segment::documents(store, seg, &live).await?;
+                for doc in docs.values_mut() {
+                    doc.retain(|name, _| state.schema.contains_key(name));
+                }
+                adjust(&mut manifest.stats, &docs, true, &state.schema);
+                if !docs.is_empty() {
+                    rebuilt.push(
+                        segment::build(
+                            store,
+                            ns,
+                            &state.schema,
+                            state.metric,
+                            &docs,
+                            seg.wal_start,
+                            seg.wal_end,
+                        )
+                        .await?,
+                    );
+                }
                 for file in seg.files.values().chain(std::iter::once(&seg.live)) {
                     retire(&mut manifest, file.key.clone());
                 }
             }
-            manifest.stats = NamespaceStats::default();
-            adjust(&mut manifest.stats, &full.docs, true, &state.schema);
-            if full.docs.is_empty() {
-                vec![]
-            } else {
-                vec![
+            if !state.docs.is_empty() {
+                adjust(&mut manifest.stats, &state.docs, true, &state.schema);
+                rebuilt.push(
                     segment::build(
                         store,
                         ns,
                         &state.schema,
                         state.metric,
-                        &full.docs,
-                        1,
+                        &state.docs,
+                        state.indexed_through + 1,
                         state.seq,
                     )
                     .await?,
-                ]
+                );
             }
+            rebuilt
         } else {
             let mut segments = vec![];
             for mut seg in state.segments.clone() {

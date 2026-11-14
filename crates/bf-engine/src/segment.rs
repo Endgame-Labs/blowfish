@@ -587,7 +587,8 @@ pub(crate) fn filter_rows<'a>(
                 };
                 let dir = directory(&reader).await?;
                 let Some(col) = dir.columns.get(attribute) else {
-                    let docs = documents(store, segment, live).await?;
+                    let columns = std::collections::BTreeSet::from([attribute.clone()]);
+                    let docs = projected_documents(store, segment, live, Some(&columns)).await?;
                     let ids = ids(store, segment).await?;
                     let mut out = RoaringBitmap::new();
                     for row in live {

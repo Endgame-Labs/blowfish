@@ -96,9 +96,26 @@ pub(crate) async fn global_stats(
             .iter()
             .any(|f| !segment::seg_text_matches(seg, &state.schema, f))
     }) {
-        let mut full = crate::snapshot::materialize(store, state).await?;
-        reference_stats(&mut full);
-        return Ok(full.corpus);
+        let mut stats = NamespaceStats::default();
+        for seg in &state.segments {
+            let live = crate::snapshot::allowed(store, state, seg, None).await?;
+            for doc in segment::projected_documents(store, seg, &live, Some(&fields))
+                .await?
+                .values()
+            {
+                adjust(&mut stats, doc, &state.schema, true);
+            }
+        }
+        for doc in state.docs.values() {
+            adjust(&mut stats, doc, &state.schema, true);
+        }
+        return Ok(fields
+            .into_iter()
+            .map(|name| {
+                let c = stats.text.get(&name).map(corpus).unwrap_or_default();
+                (name, c)
+            })
+            .collect());
     }
     let mut stats = state.stats.clone();
     if !state.shadowed.is_empty() {

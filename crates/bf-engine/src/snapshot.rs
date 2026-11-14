@@ -117,13 +117,7 @@ pub(crate) async fn for_writes(
         let Operation::Write(req, _) = &p.request else {
             continue;
         };
-        if req.delete_by_filter.is_some()
-            || req.patch_by_filter.is_some()
-            || req
-                .schema
-                .as_ref()
-                .is_some_and(|s| s.values().any(|v| v.expanded().drop))
-        {
+        if req.delete_by_filter.is_some() || req.patch_by_filter.is_some() {
             return materialize(store, state).await;
         }
         for row in req
@@ -169,6 +163,9 @@ pub(crate) async fn for_writes(
         let rows = segment::lookup_many(store, seg, &wanted).await? & live;
         full.docs
             .extend(segment::documents(store, seg, &rows).await?);
+    }
+    for doc in full.docs.values_mut() {
+        doc.retain(|name, _| state.schema.contains_key(name));
     }
     Ok(full)
 }
