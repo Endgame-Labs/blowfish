@@ -1,0 +1,5 @@
+:80 {
+    reverse_proxy node1:8000 node2:8000 node3:8000 {
+        lb_policy round_robin
+    }
+}

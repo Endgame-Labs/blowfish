@@ -24,6 +24,8 @@ docker compose --profile s3 up --build --wait blowfish-s3
 curl --fail http://127.0.0.1:8001/_blowfish/v1/status
 ```
 
+The first image build may take longer than a minute. Once built, the local stack starts with the same command.
+
 That profile starts SeaweedFS with a precreated `blowfish` bucket, disposable demo credentials,
 and a separate blowfish at port 8001. Startup probes conditional writes; status should report
 `multi_writer`. The profile is a local test setup. `docker compose --profile s3 down` stops services,

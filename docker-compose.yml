@@ -14,7 +14,7 @@ services:
       - blowfish-data:/data
   seaweedfs:
     image: chrislusf/seaweedfs:4.53
-    profiles: [s3]
+    profiles: [s3, multinode]
     command: [mini, -dir=/data, -ip=seaweedfs, -ip.bind=0.0.0.0]
     environment:
       # Public, disposable demo credentials. Replace for any nonlocal deployment.
@@ -43,6 +43,43 @@ services:
     depends_on:
       seaweedfs:
         condition: service_healthy
+  node1: &multinode
+    <<: *blowfish
+    profiles: [multinode]
+    environment:
+      <<: *blowfish-env
+      BLOWFISH_STORAGE_URL: s3://blowfish/multinode
+      BLOWFISH_STORAGE_ENDPOINT: http://seaweedfs:8333
+      BLOWFISH_STORAGE_REGION: us-east-1
+      BLOWFISH_INDEX_ROWS: 2
+      BLOWFISH_INDEX_INTERVAL_MS: 50
+      AWS_ACCESS_KEY_ID: blowfish-demo
+      AWS_SECRET_ACCESS_KEY: blowfish-demo-secret
+    ports:
+      - "127.0.0.1:8101:8000"
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+  node2:
+    <<: *multinode
+    ports:
+      - "127.0.0.1:8102:8000"
+  node3:
+    <<: *multinode
+    ports:
+      - "127.0.0.1:8103:8000"
+  proxy:
+    image: caddy:2.10.2-alpine
+    profiles: [multinode]
+    ports:
+      - "127.0.0.1:8100:80"
+    volumes:
+      - ./scripts/Caddyfile.multinode:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - node1
+      - node2
+      - node3
+
 volumes:
   blowfish-data:
   seaweed-data:

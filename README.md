@@ -1,7 +1,7 @@
 # blowfish 🐡
 
 An open-source, self-hostable search engine that is compatible with the [turbopuffer](https://turbopuffer.com)
-API. Bring any S3-compatible bucket (AWS S3, Cloudflare R2, GCS, MinIO, ...), point blowfish at it, and it
+API. Bring any S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, ...), point blowfish at it, and it
 does the rest: vector, full-text, and hybrid search over namespaces kept in object storage, with the
 official turbopuffer SDKs working unchanged.
 
@@ -12,6 +12,14 @@ API key.
 
 Status: under construction. See [`DESIGN.md`](DESIGN.md) for the design and [`PROGRESS.md`](PROGRESS.md)
 for where the build is.
+
+## Features
+
+- Dense vector, full-text, and hybrid queries with filters and aggregations.
+- Durable object-storage writes, background indexing, multi-node reads and writes, and API keys.
+- Official SDK compatibility, recorded compatibility fixtures, and Prometheus metrics.
+
+See [compatibility](docs/compatibility.md) for feature status and limitations.
 
 ## Quickstart
 
