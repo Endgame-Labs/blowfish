@@ -215,6 +215,8 @@ def register():
     scenario("error_limit", "query", {"rank_by": ["id", "asc"], "top_k": 10001}, expected_error=True)
 
 
+from compat.operations_legacy import SCENARIOS as OPERATIONS_LEGACY_SCENARIOS
+
 EXTRA_SCENARIOS = ("types_roundtrip", "ann_recall", "copy_string", "copy_object", "list_pagination", "export_full", "raw_invalid_json", "raw_content_type", "raw_unknown_route", "raw_gzip", "raw_unknown_params", "hint_cache_warm", "debug_recall", "explain_query", "order_ties")
 
 
@@ -226,6 +228,9 @@ def execute(c, name):
     namespace = "blowfish-oracle-compat-" + name.replace("_", "-") + "-" + uuid.uuid4().hex[:12]
     ns = c.namespace(namespace)
     try:
+        if name in OPERATIONS_LEGACY_SCENARIOS:
+            from compat.operations_legacy import run
+            return run(c, namespace, name)
         if name in EXTRA_SCENARIOS:
             from compat.extra import run
             return run(c, namespace, name)
@@ -246,7 +251,7 @@ def cleanup(c):
 
 def main():
     register()
-    SCENARIOS.update({name: (None, False) for name in EXTRA_SCENARIOS})
+    SCENARIOS.update({name: (None, False) for name in EXTRA_SCENARIOS + OPERATIONS_LEGACY_SCENARIOS})
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     for cmd in ("record", "check", "diff-live", "cleanup"):

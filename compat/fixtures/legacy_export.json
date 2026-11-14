@@ -1,0 +1,20 @@
+[
+  {
+    "attributes": {
+      "label": "a"
+    },
+    "id": 1,
+    "vector": [
+      1.0,
+      0.0
+    ]
+  },
+  {
+    "attributes": {},
+    "id": 2,
+    "vector": [
+      0.0,
+      1.0
+    ]
+  }
+]

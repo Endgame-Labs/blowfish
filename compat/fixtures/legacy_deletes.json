@@ -1,0 +1,20 @@
+{
+  "after": {
+    "rows": [
+      {
+        "id": 1,
+        "label": "a",
+        "vector": [
+          1.0,
+          0.0
+        ]
+      }
+    ]
+  },
+  "write": {
+    "message": "documents committed successfully",
+    "rows_affected": 1,
+    "rows_deleted": 1,
+    "status": "OK"
+  }
+}

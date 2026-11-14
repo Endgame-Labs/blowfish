@@ -1,0 +1,25 @@
+{
+  "after": {
+    "rows": [
+      {
+        "id": 1,
+        "label": "a",
+        "vector": [
+          1.0,
+          0.0
+        ]
+      }
+    ]
+  },
+  "cleared": true,
+  "denied": {
+    "error": "💔 Writes not permitted. This namespace is read-only.",
+    "status": "error"
+  },
+  "patched": true,
+  "persisted": true,
+  "schema_denied": {
+    "error": "💔 Writes not permitted. This namespace is read-only.",
+    "status": "error"
+  }
+}

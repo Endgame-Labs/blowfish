@@ -22,3 +22,15 @@ The seeded ANN scenario writes 2,000 16-dimensional vectors, runs 20 queries, an
 The TypeScript smoke test installs its locked dependencies with npm and exercises write, ANN, BM25, and metadata using the official SDK. It uses Node from `~/.local/node/bin` when present, or Node on `PATH` otherwise. Its namespace is deleted in a `finally` block.
 
 Metadata `approx_*` fields must be present, non-negative integers. Their values are normalized to zero: turbopuffer's index-derived estimates can lag a write, while blowfish reports exact current counts.
+
+Async-copy, metadata PATCH, and legacy v1 coverage is in `operations_legacy.py`, with 15 additional oracle fixtures (111 scenarios total). The oracle served all tested legacy endpoints when recorded. Explicit async copies assert a 202 token and same-origin `Location`, poll through running to finished, and check both success and failure. Copy writes also exercise the SDK's transparent polling; ordinary writes remain synchronous. Metadata scenarios check read-only writes and schema rejection, clearing read-only, pinning defaults, persistence, and clearing pinning. Legacy scenarios cover column and row writes, null-vector deletes, object filters, copying, base64 query rows, export, and metadata headers. Rust integration tests additionally force export pagination, test independent nodes, test expiration, and check authorization.
+
+Additional SDK checks:
+
+```sh
+uv run --directory compat python sdk_operations_smoke.py http://localhost:8000
+uv run --with 'turbopuffer==0.1.37' python compat/legacy_smoke.py http://localhost:8000
+compat/smoke-ts/run.sh http://localhost:8000
+```
+
+The current Python smoke covers explicit start/poll, synchronous and asyncio transparent polling, and propagation of operation errors. The TypeScript smoke covers explicit start/poll, transparent polling, and metadata updates. The old Python SDK check covers column writes, base64 query responses, float query responses, object filters, HEAD metadata, export, copy, and deletion. Version 0.1.37 leaves base64 query vectors as strings when the response omits `vector_encoding_format`, matching the recorded oracle behavior.

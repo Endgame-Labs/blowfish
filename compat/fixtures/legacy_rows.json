@@ -1,0 +1,27 @@
+{
+  "after": {
+    "rows": [
+      {
+        "id": 1,
+        "label": "a",
+        "vector": [
+          1.0,
+          0.0
+        ]
+      },
+      {
+        "id": 2,
+        "vector": [
+          0.0,
+          1.0
+        ]
+      }
+    ]
+  },
+  "write": {
+    "message": "documents committed successfully",
+    "rows_affected": 2,
+    "rows_upserted": 2,
+    "status": "OK"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "after": {
+    "rows": [
+      {
+        "id": 1,
+        "label": "a",
+        "vector": [
+          1.0,
+          0.0
+        ]
+      },
+      {
+        "id": 2,
+        "vector": [
+          0.0,
+          1.0
+        ]
+      }
+    ]
+  },
+  "copy": {
+    "message": "namespace cloned successfully",
+    "rows_affected": 2,
+    "status": "OK"
+  }
+}
