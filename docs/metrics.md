@@ -22,6 +22,15 @@ histograms describe their measured quantity. Do not label by namespace, object k
 | `blowfish_wal_cas_conflicts_total` | Counter | None | WAL slots won by another writer |
 | `blowfish_wal_bytes_written_total` | Counter | None | Encoded payload and slot bytes newly created; includes losing payloads, excludes retry hits, storage framing, and transport overhead |
 
+| `blowfish_ann_recall` | Histogram | None | Sampled overlap between ANN and exhaustive results |
+| `blowfish_cache_hits_total` | Counter | `tier` | Cache block hits by memory or disk tier |
+| `blowfish_cache_misses_total` | Counter | None | Cache block misses |
+| `blowfish_cache_evictions_total` | Counter | `tier` | Evicted cache blocks |
+| `blowfish_cache_bytes` | Gauge | `tier` | Accounted cache bytes |
+| `blowfish_object_store_requests_total` | Counter | `op`, `status` | Backend operations by outcome |
+| `blowfish_object_store_request_seconds` | Histogram | `op` | Backend operation duration |
+| `blowfish_object_store_bytes_total` | Counter | `op` | Bytes transferred by backend operations |
+
 `route` is the Axum route template, such as `/v2/namespaces/{ns}/query`; unknown routes use
 `unmatched`. `key_name` is the configured key's display name, `super`, `development`, or
 `unauthenticated`. Key names are visible to metrics readers, so avoid confidential names, and limit
@@ -29,9 +38,7 @@ key churn to control cardinality. Metrics appear after first use, and reset on p
 Histograms export the usual `_bucket`, `_sum`, and `_count` series. The in-flight gauge includes the
 scrape itself when scraping the main listener. Counters describe this node, not deployment totals.
 
-Other crates should reserve `blowfish_cache_*` for cache activity and `blowfish_object_store_*` for
-backend operations, using this same facade and base-unit convention. Those metrics are supplied by
-the cache/storage implementation; they are not fabricated by this HTTP adapter.
+Cache and object-store metrics describe this node’s activity.
 
 Example scrape configuration (replace the placeholder through your secret provisioning):
 

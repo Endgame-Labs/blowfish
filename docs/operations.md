@@ -71,3 +71,28 @@ Restore into an empty prefix, copy every object preserving its relative key, con
 and super key, and start a read-only node first. Check status, enumerate namespaces, and run a few
 known queries before starting a writer. Do not restore revoked key records without their revocation
 markers. Test your restore process periodically; successful object copies alone are not enough.
+
+## Multi-node routing and tuning
+
+For a store with working conditional creates, point nodes at the same bucket and prefix, and give
+all nodes the same authentication configuration. Route by namespace using consistent hashing at the
+load balancer to improve cache locality, with healthy-node failover. Correctness does not depend on
+affinity. Monitor object-store errors, WAL conflicts, cache hit rates, and unindexed tail size. Tune
+index thresholds and polling for the workload, and keep the retention period longer than the longest
+reader and any storage replication delay. Smaller thresholds increase indexing and object-store work.
+See [configuration](configuration.md) for the available controls.
+
+Retention is a grace period for obsolete objects, not a point-in-time recovery interface. Recovering
+an earlier state requires a coordinated, consistent snapshot or provider versioning that can restore
+all objects to the same point. Retention alone cannot reconstruct an older manifest, and there is no
+built-in point-in-time restore command. Test provider-specific recovery before relying on it.
+
+The storage fault tests exercise a backend that ignores conditional creates: the probe selects
+single-writer mode, and a second writer is refused. A separate local-store test verifies that a
+read-only instance opens while the writer is active and rejects mutations. These tests do not prove
+that the best-effort heartbeat fences simultaneously starting writers.
+
+On 2026-11-14, `scripts/multinode.sh` passed all 111 recorded compatibility scenarios through
+Caddy and three nodes sharing SeaweedFS. Its restart run verified all 67 acknowledged writes and
+one winning conditional update; 23 interrupted writes were unacknowledged. This is a small local
+smoke and stress run, not a durability or availability guarantee.

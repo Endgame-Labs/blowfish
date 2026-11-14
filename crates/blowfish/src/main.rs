@@ -1,10 +1,10 @@
 //! Standalone blowfish server.
 use bf_auth::KeyStore;
-use bf_engine::Engine;
+use bf_engine::{Engine, EngineConfig};
 use bf_storage::{Storage, StorageConfig};
-use blowfish::{ServerOptions, metrics_router, router};
+use blowfish::{ServerOptions, metrics_router, prometheus_handle, router};
 mod keys;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use std::{path::PathBuf, time::Duration};
 
@@ -45,11 +45,76 @@ enum Command {
         metrics_listen: Option<String>,
         #[arg(long, env = "BLOWFISH_SINGLE_WRITER")]
         single_writer: bool,
+        #[command(flatten)]
+        tuning: Box<TuningArgs>,
     },
+}
+#[derive(Args, Default, Debug)]
+struct TuningArgs {
+    #[arg(long, env = "BLOWFISH_INDEXING")]
+    indexing: Option<bool>,
+    #[arg(long, env = "BLOWFISH_INDEX_ROWS")]
+    index_rows: Option<usize>,
+    #[arg(long, env = "BLOWFISH_INDEX_BYTES")]
+    index_bytes: Option<u64>,
+    #[arg(long, env = "BLOWFISH_INDEX_AGE_MS")]
+    index_age_ms: Option<u64>,
+    #[arg(long, env = "BLOWFISH_INDEX_INTERVAL_MS")]
+    index_interval_ms: Option<u64>,
+    #[arg(long, env = "BLOWFISH_COMPACTION_SEGMENTS")]
+    compaction_segments: Option<usize>,
+    #[arg(long, env = "BLOWFISH_RETENTION_MS")]
+    retention_ms: Option<u64>,
+    #[arg(long, env = "BLOWFISH_LEASE_DURATION_MS")]
+    lease_duration_ms: Option<u64>,
+    #[arg(long, env = "BLOWFISH_MAX_UNINDEXED_BYTES")]
+    max_unindexed_bytes: Option<u64>,
+    #[arg(long, env = "BLOWFISH_EVENTUAL_TAIL_BYTES")]
+    eventual_tail_bytes: Option<u64>,
+    #[arg(long, env = "BLOWFISH_ANN_NPROBE")]
+    ann_nprobe: Option<usize>,
+    #[arg(long, env = "BLOWFISH_ANN_RERANK_FACTOR")]
+    ann_rerank_factor: Option<usize>,
+    #[arg(long, env = "BLOWFISH_RECALL_SAMPLE_RATE")]
+    recall_sample_rate: Option<f64>,
+    #[arg(long, env = "BLOWFISH_CACHE_MEMORY_BYTES")]
+    cache_memory_bytes: Option<u64>,
+    #[arg(long, env = "BLOWFISH_CACHE_DISK_BYTES")]
+    cache_disk_bytes: Option<u64>,
+    #[arg(long, env = "BLOWFISH_CACHE_DISK_DIR")]
+    cache_disk_dir: Option<PathBuf>,
+    #[arg(long, env = "BLOWFISH_CACHE_NAMESPACE")]
+    cache_namespace: Option<String>,
+    #[arg(long, env = "BLOWFISH_CACHE_BLOCK_SIZE")]
+    cache_block_size: Option<usize>,
+    #[arg(long, env = "BLOWFISH_CACHE_MAX_COALESCE_BLOCKS")]
+    cache_max_coalesce_blocks: Option<usize>,
+    #[arg(long, env = "BLOWFISH_CACHE_FETCH_CONCURRENCY")]
+    cache_fetch_concurrency: Option<usize>,
+    #[arg(long, env = "BLOWFISH_CACHE_PREFETCH_CONCURRENCY")]
+    cache_prefetch_concurrency: Option<usize>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct EngineFile {
+    indexing: Option<bool>,
+    index_rows: Option<usize>,
+    index_bytes: Option<u64>,
+    index_age_ms: Option<u64>,
+    index_interval_ms: Option<u64>,
+    compaction_segments: Option<usize>,
+    retention_ms: Option<u64>,
+    lease_duration_ms: Option<u64>,
+    max_unindexed_bytes: Option<u64>,
+    eventual_tail_bytes: Option<u64>,
+    ann_nprobe: Option<usize>,
+    ann_rerank_factor: Option<usize>,
+    recall_sample_rate: Option<f64>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
+    engine: EngineFile,
     storage: StorageConfig,
     storage_url: Option<String>,
     listen: Option<String>,
@@ -82,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         require_auth,
         metrics_listen,
         single_writer,
+        tuning,
     } = command
     else {
         unreachable!()
@@ -116,6 +182,128 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "AUTHENTICATION IS DISABLED: all API, admin, and metrics routes are publicly accessible; development mode only"
         );
     }
+    let mut engine_config = EngineConfig::default();
+    if let Some(value) = tuning.indexing.or(config.engine.indexing) {
+        engine_config.indexing = value;
+    }
+    if let Some(value) = tuning
+        .index_rows
+        .or_else(|| {
+            std::env::var("BF_INDEX_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+        })
+        .or(config.engine.index_rows)
+    {
+        engine_config.index_rows = value;
+    }
+    if let Some(value) = tuning.index_bytes.or(config.engine.index_bytes) {
+        engine_config.index_bytes = value;
+    }
+    if let Some(value) = tuning
+        .index_age_ms
+        .or_else(|| {
+            std::env::var("BF_INDEX_AGE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+        })
+        .or(config.engine.index_age_ms)
+    {
+        engine_config.index_age = Duration::from_millis(value);
+    }
+    if let Some(value) = tuning
+        .index_interval_ms
+        .or_else(|| {
+            std::env::var("BF_INDEX_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+        })
+        .or(config.engine.index_interval_ms)
+    {
+        engine_config.index_interval = Duration::from_millis(value);
+    }
+    if let Some(value) = tuning
+        .compaction_segments
+        .or(config.engine.compaction_segments)
+    {
+        engine_config.compaction_segments = value;
+    }
+    if let Some(value) = tuning.retention_ms.or(config.engine.retention_ms) {
+        engine_config.retention = Duration::from_millis(value);
+    }
+    if let Some(value) = tuning.lease_duration_ms.or(config.engine.lease_duration_ms) {
+        engine_config.lease_duration = Duration::from_millis(value);
+    }
+    if let Some(value) = tuning
+        .max_unindexed_bytes
+        .or_else(|| {
+            std::env::var("BF_MAX_UNINDEXED_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+        })
+        .or(config.engine.max_unindexed_bytes)
+    {
+        engine_config.max_unindexed_bytes = value;
+    }
+    if let Some(value) = tuning
+        .eventual_tail_bytes
+        .or(config.engine.eventual_tail_bytes)
+    {
+        engine_config.eventual_tail_bytes = value;
+    }
+    if let Some(value) = tuning
+        .ann_nprobe
+        .or_else(|| {
+            std::env::var("BF_ANN_NPROBE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+        })
+        .or(config.engine.ann_nprobe)
+    {
+        engine_config.ann_nprobe = value;
+    }
+    if let Some(value) = tuning.ann_rerank_factor.or(config.engine.ann_rerank_factor) {
+        engine_config.ann_rerank_factor = value;
+    }
+    if let Some(value) = tuning
+        .recall_sample_rate
+        .or(config.engine.recall_sample_rate)
+    {
+        engine_config.recall_sample_rate = value;
+    }
+    if let Some(value) = tuning.cache_memory_bytes {
+        config.storage.cache.memory_bytes = value;
+    }
+    if let Some(value) = tuning.cache_disk_bytes {
+        config.storage.cache.disk_bytes = value;
+    }
+    if let Some(value) = tuning.cache_disk_dir {
+        config.storage.cache.disk_dir = Some(value);
+    }
+    if let Some(value) = tuning.cache_namespace {
+        config.storage.cache.namespace = Some(value);
+    }
+    if let Some(value) = tuning.cache_block_size {
+        config.storage.cache.block_size = value;
+    }
+    if let Some(value) = tuning.cache_max_coalesce_blocks {
+        config.storage.cache.max_coalesce_blocks = value;
+    }
+    if let Some(value) = tuning.cache_fetch_concurrency {
+        config.storage.cache.fetch_concurrency = value;
+    }
+    if let Some(value) = tuning.cache_prefetch_concurrency {
+        config.storage.cache.prefetch_concurrency = value;
+    }
+    if !(0.0..=1.0).contains(&engine_config.recall_sample_rate) {
+        return Err("recall_sample_rate must be between 0 and 1".into());
+    }
+    let _ = prometheus_handle();
     let storage = Storage::open(&config.storage).await?;
     let keys = KeyStore::from_storage(
         storage.clone(),
@@ -127,7 +315,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or(config.listen)
         .unwrap_or_else(|| "0.0.0.0:8000".into());
     let app = router(
-        Engine::new(storage.clone()),
+        Engine::with_config(storage.clone(), engine_config),
         keys,
         ServerOptions {
             auth_enabled: admin_key.is_some(),
@@ -170,4 +358,41 @@ async fn shutdown() {
     }
     #[cfg(not(unix))]
     ctrl_c.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_configuration_parses() {
+        let config: Config =
+            toml::from_str(include_str!("../../../blowfish.example.toml")).unwrap();
+        assert_eq!(config.engine.index_rows, Some(1000));
+        assert_eq!(config.storage.cache.block_size, 1 << 20);
+    }
+
+    #[test]
+    fn tuning_flags_accept_values() {
+        let cli = Cli::try_parse_from([
+            "blowfish",
+            "serve",
+            "--indexing",
+            "false",
+            "--index-rows",
+            "2",
+            "--cache-disk-dir",
+            "/tmp/cache",
+            "--recall-sample-rate",
+            "0.5",
+        ])
+        .unwrap();
+        let Command::Serve { tuning, .. } = cli.command else {
+            panic!("expected serve")
+        };
+        assert_eq!(tuning.indexing, Some(false));
+        assert_eq!(tuning.index_rows, Some(2));
+        assert_eq!(tuning.cache_disk_dir, Some(PathBuf::from("/tmp/cache")));
+        assert_eq!(tuning.recall_sample_rate, Some(0.5));
+    }
 }
