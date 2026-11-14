@@ -8,17 +8,22 @@ use std::collections::BTreeSet;
 pub(crate) fn prepare(
     current: &NamespaceState,
     request: &WriteRequest,
-    copy: Option<&NamespaceState>,
+    copy: Option<&crate::branch::Source>,
 ) -> Result<(WriteBatch, WriteResponse), ApiError> {
     for name in request.extra.keys() {
         if matches!(
             name.as_str(),
-            "branch_from_namespace" | "encryption" | "sharding" | "disable_backpressure"
+            "encryption" | "sharding" | "disable_backpressure"
         ) {
             return Err(ApiError::bad(format!(
                 "{name} is not supported by blowfish yet"
             )));
         }
+    }
+    if request.copy_from_namespace.is_some() && request.branch_from_namespace.is_some() {
+        return Err(ApiError::bad(
+            "copy_from_namespace and branch_from_namespace are mutually exclusive",
+        ));
     }
     if copy.is_some()
         && (request.schema.is_some()
@@ -34,22 +39,32 @@ pub(crate) fn prepare(
             "copy cannot be combined with writes or schema changes",
         ));
     }
-    if let Some(source) = copy {
+    if let Some(copy) = copy {
+        let source = &copy.state;
         if current.exists {
             return Err(ApiError::bad("destination namespace already exists"));
         }
         let now = Utc::now();
         let batch = WriteBatch {
             upserts: source.docs.values().cloned().collect(),
-            deletes: vec![],
+            deletes: source.shadowed.iter().cloned().collect(),
             schema: source.schema.clone(),
             distance_metric: source.metric,
             created_at: now,
             updated_at: now,
         };
         let response = WriteResponse {
-            message: "namespace cloned successfully".into(),
-            rows_affected: batch.upserts.len(),
+            message: if request.branch_from_namespace.is_some() {
+                "namespace branch successful"
+            } else {
+                "namespace cloned successfully"
+            }
+            .into(),
+            rows_affected: if request.branch_from_namespace.is_some() {
+                0
+            } else {
+                copy.rows
+            },
             ..Default::default()
         };
         return Ok((batch, response));

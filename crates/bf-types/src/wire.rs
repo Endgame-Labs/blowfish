@@ -52,6 +52,9 @@ pub struct WriteRequest {
     pub schema: Option<SchemaUpdate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copy_from_namespace: Option<CopyFrom>,
+    /// Create an independent namespace sharing immutable source segments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_from_namespace: Option<CopyFrom>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub create_namespace: Option<bool>,
     pub return_affected_ids: bool,

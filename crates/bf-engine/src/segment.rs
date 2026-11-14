@@ -420,11 +420,12 @@ pub(crate) async fn live(store: &Storage, segment: &Segment) -> Result<RoaringBi
 }
 pub(crate) async fn set_live(
     store: &Storage,
+    ns: &str,
     segment: &mut Segment,
     rows: &RoaringBitmap,
 ) -> Result<(), ApiError> {
     segment.live_generation += 1;
-    let prefix = segment.live.key.rsplit_once('/').ok_or_else(corrupt)?.0;
+    let prefix = format!("ns/{ns}/segments/{}", segment.id);
     // UUID distinguishes concurrent builders before either one wins publication.
     segment.live = put_value(
         store,

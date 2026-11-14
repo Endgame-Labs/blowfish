@@ -15,7 +15,12 @@ impl Engine {
         request: &WriteRequest,
         source: &NamespaceState,
     ) -> Result<bool, ApiError> {
-        let name = match request.copy_from_namespace.as_ref().expect("copy source") {
+        let name = match request
+            .copy_from_namespace
+            .as_ref()
+            .or(request.branch_from_namespace.as_ref())
+            .expect("copy source")
+        {
             CopyFrom::Name(name) => name,
             CopyFrom::Config {
                 source_namespace, ..

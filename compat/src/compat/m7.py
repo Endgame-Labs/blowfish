@@ -99,3 +99,30 @@ def register(scenarios):
         return result
 
     scenarios['m7_highlight'] = (highlight, False)
+
+    def branch(ns):
+        from compat.cli import normalize
+        source = ns.id + '-src'
+        parent = ns._client.namespace(source)
+        try:
+            parent.write(upsert_rows=[{'id': 1, 's': 'first'}, {'id': 2, 's': 'second'}])
+            value = ns.write(branch_from_namespace={'source_namespace': source})
+            result = {'branch': normalize(value), 'after': normalize(ns.query(rank_by=['id', 'asc'], top_k=10, include_attributes=True))}
+            parent.write(patch_rows=[{'id': 1, 's': 'source only'}])
+            ns.write(patch_rows=[{'id': 2, 's': 'branch only'}])
+            result['source'] = normalize(parent.query(rank_by=['id', 'asc'], top_k=10, include_attributes=True))
+            parent.delete_all()
+            result['independent'] = normalize(ns.query(rank_by=['id', 'asc'], top_k=10, include_attributes=True))
+            try:
+                ns.write(branch_from_namespace=ns.id)
+                raise AssertionError('nonempty branch succeeded')
+            except turbopuffer.APIStatusError as exc:
+                result['nonempty_status'] = exc.status_code
+            return result
+        finally:
+            try:
+                parent.delete_all()
+            except turbopuffer.NotFoundError:
+                pass
+
+    scenarios['m7_branch'] = (branch, False)

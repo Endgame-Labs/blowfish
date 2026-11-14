@@ -1,0 +1,44 @@
+{
+  "after": {
+    "rows": [
+      {
+        "id": 1,
+        "s": "first"
+      },
+      {
+        "id": 2,
+        "s": "second"
+      }
+    ]
+  },
+  "branch": {
+    "message": "namespace branch successful",
+    "rows_affected": 0,
+    "status": "OK"
+  },
+  "independent": {
+    "rows": [
+      {
+        "id": 1,
+        "s": "first"
+      },
+      {
+        "id": 2,
+        "s": "branch only"
+      }
+    ]
+  },
+  "nonempty_status": 400,
+  "source": {
+    "rows": [
+      {
+        "id": 1,
+        "s": "source only"
+      },
+      {
+        "id": 2,
+        "s": "second"
+      }
+    ]
+  }
+}
