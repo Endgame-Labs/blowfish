@@ -20,3 +20,5 @@ Fixtures retain response structure and results while dropping performance measur
 The seeded ANN scenario writes 2,000 16-dimensional vectors, runs 20 queries, and requires at least 0.9 recall@10 for each query compared with the oracle's recorded top ten. It compares membership, not ranking. The suite also covers namespace pagination, copying, cache warming, recall, export pagination, explicit type round trips, and raw HTTP. Explain responses compare only HTTP status and whether `plan_text` is a string; the oracle may return an error before an index exists. A failed scenario does not prevent later scenarios from running.
 
 The TypeScript smoke test installs its locked dependencies with npm and exercises write, ANN, BM25, and metadata using the official SDK. It uses Node from `~/.local/node/bin` when present, or Node on `PATH` otherwise. Its namespace is deleted in a `finally` block.
+
+Metadata `approx_*` fields must be present, non-negative integers. Their values are normalized to zero: turbopuffer's index-derived estimates can lag a write, while blowfish reports exact current counts.

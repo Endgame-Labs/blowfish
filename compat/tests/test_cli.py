@@ -41,6 +41,14 @@ class ComparisonTests(unittest.TestCase):
         register()
         self.assertGreaterEqual(len(SCENARIOS), 80)
 
+    def test_metadata_estimates_validate_presence_and_integer_type(self):
+        expected = {"approx_row_count": 0, "approx_logical_bytes": 0}
+        self.assertEqual(normalize({"approx_row_count": 4, "approx_logical_bytes": 123}), expected)
+        for invalid in (-1, 1.5, True, None, "4"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                normalize({"approx_row_count": invalid})
+        self.assertTrue(compare(expected, normalize({"approx_row_count": 4})))
+
 
 if __name__ == "__main__":
     unittest.main()

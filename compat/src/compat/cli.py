@@ -78,6 +78,12 @@ def normalize(value, depth=0, require_metrics=True):
         for key, item in value.get("billing", {}).items():
             if key.startswith("billable_") and (not isinstance(item, (int, float)) or isinstance(item, bool)):
                 raise ValueError(f"billing.{key} must be numeric")
+        for key, item in value.items():
+            if key.startswith("approx_") and (type(item) is not int or item < 0):
+                raise ValueError(f"{key} must be a non-negative integer")
+        # Index-derived estimates can lag writes; retain presence and validate
+        # the integer contract while allowing exact counts from blowfish.
+        value = {k: 0 if k.startswith("approx_") else v for k, v in value.items()}
         return {k: normalize(v, depth + 1) for k, v in value.items() if k not in {"performance", "billing", "created_at", "updated_at", "last_write_at", "last_included_write_at", "trace_id", "request_id"}}
     return value
 
