@@ -1,5 +1,6 @@
 //! Exhaustive reference engine. Object storage is authoritative; memory is a replay cache.
 mod filter;
+mod indexed;
 mod indexer;
 mod segment;
 mod snapshot;
@@ -35,6 +36,7 @@ pub(crate) struct NamespaceState {
     pub tail_bytes: u64,
     pub tail_since: Option<DateTime<Utc>>,
     pub stats: bf_wal::NamespaceStats,
+    pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub refreshed: Instant,
@@ -54,6 +56,7 @@ impl Default for NamespaceState {
             tail_bytes: 0,
             tail_since: None,
             stats: Default::default(),
+            scores: BTreeMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             refreshed: Instant::now(),
@@ -240,15 +243,49 @@ impl Engine {
         let start = Instant::now();
         let (state, warm) = self.snapshot(ns, &request.consistency).await?;
         let execution = Instant::now();
-        let full = snapshot::materialize(&self.0.store, &state).await?;
-        let mut response = query::execute(&full, &request)?;
+        let store = self.0.store.clone();
+        let config = self.0.config.clone();
+        let search_state = state.clone();
+        let search_request = request.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let mut response = tokio::task::spawn_blocking(move || {
+            runtime.block_on(indexed::execute(
+                &store,
+                &search_state,
+                &search_request,
+                &config,
+                false,
+            ))
+        })
+        .await
+        .map_err(segment::index_error)??;
+        if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
+            && (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1_000_000.0
+                < self.0.config.recall_sample_rate
+        {
+            let store = self.0.store.clone();
+            let config = self.0.config.clone();
+            let sample = state.clone();
+            let ann = response.clone();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                runtime.block_on(async move {
+                    if let Ok(exact) =
+                        indexed::execute(&store, &sample, &request, &config, true).await
+                    {
+                        metrics::histogram!("blowfish_ann_recall")
+                            .record(indexed::recall(&ann, &exact));
+                    }
+                })
+            });
+        }
         response.performance = QueryPerformance {
             cache_hit_ratio: if warm { 1.0 } else { 0.0 },
             cache_temperature: if warm { "hot" } else { "cold" }.into(),
             server_total_ms: start.elapsed().as_millis() as u64,
             query_execution_ms: execution.elapsed().as_millis() as u64,
             exhaustive_search_count: state.docs.len() as u64,
-            approx_namespace_size: full.docs.len() as u64,
+            approx_namespace_size: state.stats.rows + state.docs.len() as u64,
             last_included_write_at: Some(
                 state
                     .updated_at
@@ -256,6 +293,18 @@ impl Engine {
             ),
         };
         Ok(response)
+    }
+    /// Run the exhaustive reference evaluator on the same persistent snapshot machinery.
+    pub async fn query_exhaustive(
+        &self,
+        ns: &str,
+        request: QueryRequest,
+    ) -> Result<QueryResponse, ApiError> {
+        let (state, _) = self.snapshot(ns, &request.consistency).await?;
+        query::execute(
+            &snapshot::materialize(&self.0.store, &state).await?,
+            &request,
+        )
     }
     /// Namespace metadata, with fully expanded schema settings.
     pub async fn metadata(&self, ns: &str) -> Result<Value, ApiError> {

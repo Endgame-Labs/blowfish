@@ -188,3 +188,58 @@ async fn segment_delete_recreate_and_backpressure() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn ivf_ann_recall_filtered_knn_and_f16_files() {
+    let e = node().await;
+    let mut seed = 42u64;
+    let mut vectors = vec![];
+    let mut rows = vec![];
+    for id in 0..5000 {
+        let vector: Vec<f32> = (0..16)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((seed >> 32) as u32 as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32
+            })
+            .collect();
+        rows.push(json!({"id":id,"vector":vector,"small":[0.3333,1.0],"bucket":id%3}));
+        vectors.push(vector);
+    }
+    write(
+        &e,
+        json!({"distance_metric":"cosine_distance","schema":{"small":"[2]f16"},"upsert_rows":rows}),
+    )
+    .await;
+    e.index_namespace("test", true).await.unwrap();
+    let mut recall = 0.0;
+    for vector in vectors.iter().step_by(251).take(20) {
+        let result = e
+            .recall(
+                "test",
+                json!({"rank_by":["vector","ANN",vector],"top_k":10,"num":1}),
+            )
+            .await
+            .unwrap();
+        recall += result["avg_recall"].as_f64().unwrap();
+        let q: QueryRequest = serde_json::from_value(
+            json!({"rank_by":["vector","kNN",vector],"filters":["bucket","Eq",1],"top_k":10}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(e.query("test", q.clone()).await.unwrap().result).unwrap(),
+            serde_json::to_value(e.query_exhaustive("test", q).await.unwrap().result).unwrap()
+        );
+    }
+    assert!(recall / 20.0 >= 0.95, "mean recall@10 = {}", recall / 20.0);
+    let (_, m) = Wal::new(e.storage().clone(), "test")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap();
+    let f = &m.segments[0].files["ann:small"];
+    let index = bf_vector::Index::open(e.storage().get(&f.key).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(index.vector_type(), bf_vector::VectorType::F16);
+}

@@ -205,6 +205,7 @@ pub(crate) async fn build(
     store: &Storage,
     ns: &str,
     schema: &Schema,
+    metric: bf_types::DistanceMetric,
     docs: &BTreeMap<Id, Document>,
     start: u64,
     end: u64,
@@ -298,6 +299,33 @@ pub(crate) async fn build(
         "filters".into(),
         put_file(store, format!("{prefix}/filter.bfx"), bytes, meta).await?,
     );
+    for (column, (name, config)) in schema.iter().enumerate() {
+        if let Some(AttributeType::Vector { dimensions, f16 }) = config.data_type {
+            let vectors = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| row.get(name).map(|v| (i as u32, v)))
+                .map(|(i, v)| Ok((i, bf_types::decode_vector(v)?)))
+                .collect::<Result<Vec<_>, ApiError>>()?;
+            let bytes = tokio::task::spawn_blocking(move || {
+                bf_vector::IndexBuilder::new(dimensions, vector_metric(metric))?
+                    .vector_type(if f16 {
+                        bf_vector::VectorType::F16
+                    } else {
+                        bf_vector::VectorType::F32
+                    })
+                    .build(&vectors)
+            })
+            .await
+            .map_err(index_error)?
+            .map_err(index_error)?;
+            let meta = bf_vector::metadata_len(&bytes).map_err(index_error)?;
+            files.insert(
+                format!("ann:{name}"),
+                put_file(store, format!("{prefix}/ann.{column}.bfv"), bytes, meta).await?,
+            );
+        }
+    }
     let live = put_value(
         store,
         format!("{prefix}/live.00000000000000000000.bfl"),
@@ -370,6 +398,14 @@ pub(crate) async fn documents(
     segment: &Segment,
     rows: &RoaringBitmap,
 ) -> Result<BTreeMap<Id, Document>, ApiError> {
+    projected_documents(store, segment, rows, None).await
+}
+pub(crate) async fn projected_documents(
+    store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    columns: Option<&std::collections::BTreeSet<String>>,
+) -> Result<BTreeMap<Id, Document>, ApiError> {
     if rows.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -380,6 +416,9 @@ pub(crate) async fn documents(
     let dir = directory(&reader).await?;
     let mut docs: BTreeMap<u32, Document> = rows.iter().map(|row| (row, Document::new())).collect();
     for (name, col) in dir.columns {
+        if name != "id" && columns.is_some_and(|c| !c.contains(&name)) {
+            continue;
+        }
         for (i, b) in col.blocks.iter().enumerate() {
             let first = (i * BLOCK_ROWS) as u32;
             let last = first
@@ -511,4 +550,19 @@ fn segment_id() -> String {
         bits >>= 5;
     }
     String::from_utf8(out.to_vec()).expect("ASCII ULID")
+}
+
+pub(crate) fn vector_metric(metric: bf_types::DistanceMetric) -> bf_vector::Metric {
+    match metric {
+        bf_types::DistanceMetric::CosineDistance => bf_vector::Metric::CosineDistance,
+        bf_types::DistanceMetric::EuclideanSquared => bf_vector::Metric::EuclideanSquared,
+    }
+}
+impl bf_vector::RangeRead for ObjectReader {
+    fn len(&self) -> u64 {
+        self.file.size
+    }
+    async fn read(&self, range: Range<u64>) -> io::Result<Bytes> {
+        ObjectReader::read(self, range).await
+    }
 }

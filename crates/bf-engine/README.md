@@ -50,3 +50,17 @@ by-filter writes, vector/text ranks, expressions, aggregations, RRF, compaction,
 GC, and cold reopen after WAL reclamation. Fault injection fails each persistent
 mutation before and after its durable effect, covering commit, indexing,
 compaction, and GC. Acknowledged writes survive recovery exactly once.
+
+Vector columns now also have `.bfv` indexes built with bf-vector. ANN searches
+segment-local filtered live rows, reranks candidates, scores the tail exactly,
+and merges through the reference result assembler. kNN is exact. The default is
+128 probes and a rerank budget of 64 times k; both are configurable. Large index
+builds and query scoring run on blocking executors. Projection fetches only needed
+vector columns. A zero cosine query retains M1's all-distance-one semantics.
+
+`query_exhaustive` exposes the reference path for differential testing. `_debug/recall`
+compares ANN and exact searches on one snapshot and returns optional ground-truth
+rows. Independently, `recall_sample_rate` defaults to 0.01 and records background
+exact comparisons in the `blowfish_ann_recall` histogram through `metrics`.
+A 5,000-row randomized IVF test requires mean recall@10 >= 0.95, compares filtered
+kNN with exhaustive results, and verifies that f16 indexes persist f16 elements.

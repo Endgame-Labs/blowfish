@@ -248,6 +248,7 @@ impl Engine {
                     store,
                     ns,
                     &state.schema,
+                    state.metric,
                     &state.docs,
                     state.indexed_through + 1,
                     state.seq,
@@ -277,7 +278,10 @@ impl Engine {
                 }
             }
             if !docs.is_empty() {
-                remaining.push(segment::build(store, ns, &state.schema, &docs, start, end).await?);
+                remaining.push(
+                    segment::build(store, ns, &state.schema, state.metric, &docs, start, end)
+                        .await?,
+                );
             }
             segments = remaining;
         }
