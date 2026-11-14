@@ -13,6 +13,11 @@ fn rank_indexes(rank: &RankBy, out: &mut BTreeSet<String>, nprobe: usize) {
                 format!("IVF/RaBitQ ANN: {attribute}, nprobe={nprobe}")
             });
         }
+        RankBy::MultiVector { attribute, .. } => {
+            out.insert(format!(
+                "exhaustive late-interaction vector scan: {attribute}"
+            ));
+        }
         RankBy::SparseVector { attribute, .. } => {
             out.insert(format!("sparse inverted postings: {attribute}"));
         }

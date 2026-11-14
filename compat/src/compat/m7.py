@@ -126,3 +126,21 @@ def register(scenarios):
                 pass
 
     scenarios['m7_branch'] = (branch, False)
+
+    def multivector(ns):
+        try:
+            ns.write(distance_metric='cosine_distance', schema={'tokens': {'type': '[][2]f32', 'ann': {'late_interaction': True}}}, upsert_rows=[
+                {'id': 1, 'tokens': [[1, 0], [0, 1]]}, {'id': 2, 'tokens': [[1, 0]]}, {'id': 3, 'tokens': [[1, 1]]}, {'id': 4, 'tokens': []},
+            ])
+        except turbopuffer.APIStatusError as exc:
+            message = str(exc.body.get('error', '')) if isinstance(exc.body, dict) else ''
+            if exc.status_code == 400 and 'not enabled for this organization' in message:
+                return {'availability': 'organization_gated', 'status': 400, 'error': message}
+            raise
+        value = normalize(ns.query(rank_by=['tokens', 'ANN', [[1, 0], [0, 1]]], top_k=10))
+        import math
+        assert [r['id'] for r in value['rows']] == [1, 3, 2]
+        assert all(math.isclose(r['$dist'], d, abs_tol=1e-6) for r, d in zip(value['rows'], [0.0, 2 * (1 - 1 / math.sqrt(2)), 1.0]))
+        return {'availability': 'supported'}
+
+    scenarios['m7_multivector'] = (multivector, False)

@@ -141,6 +141,13 @@ pub enum RankBy {
         vector: Vec<f32>,
         wire_vector: Value,
     },
+    /// Sum of the minimum document-vector distances for each query vector.
+    MultiVector {
+        attribute: String,
+        exact: bool,
+        vectors: Vec<Vec<f32>>,
+        wire_vector: Value,
+    },
     /// Positive sparse-vector dot-product score, composable in score expressions.
     SparseVector {
         attribute: String,
@@ -289,6 +296,23 @@ impl RankBy {
                 }
                 Some("ANN" | "kNN") => {
                     need(3)?;
+                    if a[2]
+                        .as_array()
+                        .is_some_and(|xs| xs.first().is_some_and(Value::is_array))
+                    {
+                        let vectors = a[2]
+                            .as_array()
+                            .expect("array")
+                            .iter()
+                            .map(decode_vector)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        return Ok(Self::MultiVector {
+                            attribute: name.into(),
+                            exact: a[1] == "kNN",
+                            vectors,
+                            wire_vector: a[2].clone(),
+                        });
+                    }
                     Ok(Self::Vector {
                         attribute: name.into(),
                         exact: a[1] == "kNN",
@@ -328,6 +352,12 @@ impl RankBy {
         match self {
             Self::Constant(n) => Value::Number(n.clone()),
             Self::Vector {
+                attribute,
+                exact,
+                wire_vector,
+                ..
+            } => json!([attribute, if *exact { "kNN" } else { "ANN" }, wire_vector]),
+            Self::MultiVector {
                 attribute,
                 exact,
                 wire_vector,

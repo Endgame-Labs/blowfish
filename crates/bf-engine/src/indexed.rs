@@ -45,6 +45,9 @@ async fn prepare(
     config: &EngineConfig,
     force_exact: bool,
 ) -> Result<NamespaceState, ApiError> {
+    if matches!(q.rank_by, Some(RankBy::MultiVector { .. })) {
+        return snapshot::materialize(store, state).await;
+    }
     let Some(
         rank @ RankBy::Vector {
             attribute,

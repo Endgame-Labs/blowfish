@@ -491,6 +491,29 @@ pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value,
             &serde_json::to_string(&decode_sparse(value)?).expect("sparse vector serializes"),
         )
         .expect("valid JSON")),
+        AttributeType::MultiVector { dimensions } => {
+            let vectors = value.as_array().ok_or_else(|| {
+                ApiError::bad("multi-vector value must be an array of f32 vectors")
+            })?;
+            vectors
+                .iter()
+                .map(|v| {
+                    if !v.is_array() {
+                        return Err(ApiError::bad(
+                            "multi-vector arrays do not support base64 encoding",
+                        ));
+                    }
+                    normalize_value(
+                        v,
+                        &AttributeType::Vector {
+                            dimensions: *dimensions,
+                            f16: false,
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array)
+        }
         AttributeType::VectorI8 { dimensions } => {
             let v = decode_vector(value)?;
             if v.len() != *dimensions {

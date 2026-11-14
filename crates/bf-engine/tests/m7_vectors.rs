@@ -136,3 +136,68 @@ async fn i8_wire_storage_ann_base64_and_validation() {
         );
     }
 }
+
+#[tokio::test]
+async fn late_interaction_sums_per_query_minimum_distances_and_reads_segments() {
+    let e = node().await;
+    write(&e,json!({"distance_metric":"cosine_distance","schema":{"tokens":{"type":"[][2]f32","ann":{"late_interaction":true}}},"upsert_rows":[
+        {"id":1,"tokens":[[1,0],[0,1]]},{"id":2,"tokens":[[1,0]]},{"id":3,"tokens":[[1,1]]},{"id":4,"tokens":[]}]})).await;
+    let rank = json!(["tokens", "ANN", [[1, 0], [0, 1]]]);
+    let expected = rows(&e, rank.clone()).await;
+    assert_eq!(
+        expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 3, 2]
+    );
+    assert_eq!(
+        expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["$dist"].as_f64().unwrap())
+            .collect::<Vec<_>>(),
+        [0.0, (2.0 * (1.0 - 1.0 / 2f32.sqrt())) as f64, 1.0]
+    );
+    e.index_namespace("vectors", true).await.unwrap();
+    assert_eq!(rows(&e, rank).await, expected);
+    let q = json!({"rank_by":["tokens","kNN",[[1,0],[0,1]]],"top_k":10,"filters":["id","Gt",1]});
+    let result = e
+        .query("vectors", serde_json::from_value(q).unwrap())
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap();
+    assert_eq!(result[0]["id"], 3);
+    let invalid = [
+        json!(["tokens", "ANN", [1, 0]]),
+        json!(["tokens", "ANN", [[1, 0, 0]]]),
+        json!(["Sum", [["tokens", "ANN", [[1, 0]]]]]),
+    ];
+    for rank in invalid {
+        assert_eq!(
+            e.query(
+                "vectors",
+                serde_json::from_value(json!({"rank_by":rank,"top_k":10})).unwrap()
+            )
+            .await
+            .unwrap_err()
+            .status,
+            400
+        );
+    }
+    assert_eq!(
+        e.write(
+            "vectors",
+            serde_json::from_value(json!({"upsert_rows":[{"id":5,"tokens":[[1,2,3]]}]})).unwrap()
+        )
+        .await
+        .unwrap_err()
+        .status,
+        400
+    );
+}

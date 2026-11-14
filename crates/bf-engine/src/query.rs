@@ -125,7 +125,7 @@ fn single(
     }
     if let Some(rank) = &q.rank_by {
         validate_rank(state, rank, false)?;
-        if let RankBy::Vector { exact: true, .. } = rank
+        if let RankBy::Vector { exact: true, .. } | RankBy::MultiVector { exact: true, .. } = rank
             && q.filters.is_none()
         {
             return Err(ApiError::bad("kNN requires filters"));
@@ -260,6 +260,31 @@ fn single(
     for (id, doc) in docs {
         let score = match rank {
             RankBy::Order(_) => None,
+            RankBy::MultiVector {
+                attribute, vectors, ..
+            } => {
+                let Some(values) = doc
+                    .get(attribute)
+                    .and_then(Value::as_array)
+                    .filter(|vs| !vs.is_empty())
+                else {
+                    continue;
+                };
+                let docs = values
+                    .iter()
+                    .map(decode_vector)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(
+                    vectors
+                        .iter()
+                        .map(|q| {
+                            docs.iter()
+                                .map(|d| distance(d, q, state.metric))
+                                .fold(f64::INFINITY, f64::min)
+                        })
+                        .sum(),
+                )
+            }
             RankBy::Vector {
                 attribute, vector, ..
             } => {
@@ -303,7 +328,7 @@ fn single(
                 }
                 cmp
             }
-            RankBy::Vector { .. } => a_score
+            RankBy::Vector { .. } | RankBy::MultiVector { .. } => a_score
                 .expect("distance")
                 .total_cmp(&b_score.expect("distance")),
             _ => b_score.expect("score").total_cmp(&a_score.expect("score")),
@@ -365,11 +390,35 @@ pub(crate) fn validate_rank(
                 }
             }
         }
+        RankBy::MultiVector {
+            attribute: name,
+            vectors,
+            ..
+        } => {
+            let Some(AttributeType::MultiVector { dimensions }) =
+                attribute(state, name)?.data_type.as_ref()
+            else {
+                return Err(ApiError::bad(
+                    "multi-vector ANN requires a [][N]f32 attribute with late_interaction enabled",
+                ));
+            };
+            if vectors.is_empty() || vectors.iter().any(|v| v.len() != *dimensions) {
+                return Err(ApiError::bad("invalid multi-vector query dimensions"));
+            }
+        }
         RankBy::Vector {
             attribute: name,
             vector,
             ..
         } => {
+            if matches!(
+                attribute(state, name)?.data_type,
+                Some(AttributeType::MultiVector { .. })
+            ) {
+                return Err(ApiError::bad(
+                    "late-interaction ANN requires an array of query vectors",
+                ));
+            }
             let dims = attribute(state, name)?
                 .data_type
                 .as_ref()
@@ -422,7 +471,10 @@ pub(crate) fn validate_rank(
         }
         RankBy::Sum(xs) | RankBy::Max(xs) => {
             for x in xs {
-                if matches!(x, RankBy::Order(_) | RankBy::Vector { .. }) {
+                if matches!(
+                    x,
+                    RankBy::Order(_) | RankBy::Vector { .. } | RankBy::MultiVector { .. }
+                ) {
                     return Err(ApiError::bad(
                         "score expressions cannot contain order-by or vector distance ranking",
                     ));
@@ -490,7 +542,10 @@ fn validate_score_child(
     rank: &RankBy,
     guarded: bool,
 ) -> Result<(), ApiError> {
-    if matches!(rank, RankBy::Order(_) | RankBy::Vector { .. }) {
+    if matches!(
+        rank,
+        RankBy::Order(_) | RankBy::Vector { .. } | RankBy::MultiVector { .. }
+    ) {
         return Err(ApiError::bad("expected a score expression"));
     }
     validate_rank(state, rank, guarded)
@@ -667,6 +722,11 @@ fn project(
                 match state.schema.get(&name).and_then(|s| s.data_type.as_ref()) {
                     Some(AttributeType::Vector { f16, .. }) => {
                         json!(encode_vector(&decode_vector(value)?, *f16))
+                    }
+                    Some(AttributeType::MultiVector { .. }) => {
+                        return Err(ApiError::bad(
+                            "base64 output is not supported for multi-vector arrays",
+                        ));
                     }
                     Some(AttributeType::VectorI8 { .. }) => {
                         use base64::Engine as _;

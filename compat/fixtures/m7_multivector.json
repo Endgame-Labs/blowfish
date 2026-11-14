@@ -1,0 +1,5 @@
+{
+  "availability": "organization_gated",
+  "error": "💔 attribute 'tokens': ANN over vector arrays is not enabled for this organization",
+  "status": 400
+}

@@ -42,6 +42,10 @@ pub enum AttributeType {
     VectorI8 {
         dimensions: usize,
     },
+    /// Variable-length arrays of f32 vectors for late interaction.
+    MultiVector {
+        dimensions: usize,
+    },
     /// Sparse string-keyed positive f16 weights.
     SparseVector,
 }
@@ -49,7 +53,9 @@ impl AttributeType {
     /// Dense-vector dimensions, if this is a vector.
     pub fn dimensions(&self) -> Option<usize> {
         match self {
-            Self::Vector { dimensions, .. } | Self::VectorI8 { dimensions } => Some(*dimensions),
+            Self::Vector { dimensions, .. }
+            | Self::VectorI8 { dimensions }
+            | Self::MultiVector { dimensions } => Some(*dimensions),
             _ => None,
         }
     }
@@ -88,6 +94,7 @@ impl AttributeType {
 impl fmt::Display for AttributeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MultiVector { dimensions } => write!(f, "[][{dimensions}]f32"),
             Self::VectorI8 { dimensions } => write!(f, "[{dimensions}]i8"),
             Self::SparseVector => f.write_str("{}f16"),
             Self::Scalar(t) => f.write_str(t.name()),
@@ -101,6 +108,16 @@ impl fmt::Display for AttributeType {
 impl FromStr for AttributeType {
     type Err = ApiError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(dense) = s.strip_prefix("[][") {
+            let dense = format!("[{dense}");
+            if let Ok(Self::Vector {
+                dimensions,
+                f16: false,
+            }) = dense.parse()
+            {
+                return Ok(Self::MultiVector { dimensions });
+            }
+        }
         if s == "{}f16" {
             return Ok(Self::SparseVector);
         }
@@ -222,6 +239,13 @@ impl AttributeSchema {
             self.filterable = None;
             return Ok(());
         }
+        if matches!(t, AttributeType::MultiVector { .. })
+            && metric != DistanceMetric::CosineDistance
+        {
+            return Err(ApiError::bad(
+                "ANN over vector arrays requires distance_metric cosine_distance",
+            ));
+        }
         if *t == AttributeType::SparseVector {
             if self.filterable == Some(true) {
                 return Err(ApiError::bad("sparse vectors cannot be filterable"));
@@ -236,7 +260,11 @@ impl AttributeSchema {
                 ));
             }
         } else if t.dimensions().is_some() {
-            self.ann = Some(json!({"distance_metric":metric}));
+            self.ann = Some(if matches!(t, AttributeType::MultiVector { .. }) {
+                json!({"distance_metric":metric,"late_interaction":true})
+            } else {
+                json!({"distance_metric":metric})
+            });
             self.filterable = None;
         } else {
             if self
