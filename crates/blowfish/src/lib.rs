@@ -24,7 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tower_http::{
-    compression::CompressionLayer, decompression::RequestDecompressionLayer, trace::TraceLayer,
+    compression::CompressionLayer, decompression::RequestDecompressionLayer,
+    limit::RequestBodyLimitLayer, trace::TraceLayer,
 };
 
 /// Runtime options for authentication and operational endpoints.
@@ -73,6 +74,14 @@ async fn metrics_endpoint() -> impl IntoResponse {
 }
 /// Construct API, admin, and metrics routes with JSON errors and bearer authorization.
 pub fn router(engine: Engine, auth: KeyStore, options: ServerOptions) -> Router {
+    router_with_body_limit(engine, auth, options, 512 * 1024 * 1024)
+}
+fn router_with_body_limit(
+    engine: Engine,
+    auth: KeyStore,
+    options: ServerOptions,
+    body_limit: usize,
+) -> Router {
     prometheus_handle();
     let state = AppState {
         engine,
@@ -118,10 +127,12 @@ pub fn router(engine: Engine, auth: KeyStore, options: ServerOptions) -> Router 
         .method_not_allowed_fallback(|| async {
             HttpError(ApiError::new(405, "method is not allowed"))
         })
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(body_limit))
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
         .layer(RequestDecompressionLayer::new())
+        // Bound compressed input as well as the decompressed JSON extractor body.
+        .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(middleware::from_fn(json_errors))
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .with_state(state)
@@ -212,6 +223,15 @@ impl IntoResponse for HttpError {
 }
 fn body<T>(result: Result<Json<T>, JsonRejection>) -> Result<T, HttpError> {
     result.map(|Json(v)| v).map_err(|e| {
+        // A streaming compressed-input limit can be wrapped by both tower and axum.
+        // Inspect the source chain so all body-size failures retain HTTP 413.
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+        while let Some(error) = cause {
+            if error.is::<http_body_util::LengthLimitError>() {
+                return HttpError(ApiError::new(413, "request body exceeds size limit"));
+            }
+            cause = error.source();
+        }
         let detail = e.body_text();
         if matches!(e, JsonRejection::JsonSyntaxError(_)) {
             return HttpError(ApiError::bad(format!("💔 {detail}")));
@@ -540,4 +560,57 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    use super::*;
+    use axum::body::Body;
+    use flate2::{Compression, write::GzEncoder};
+    use http_body_util::BodyExt;
+    use std::io::Write;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn bounds_compressed_and_decompressed_bodies_with_json_errors() {
+        let store = bf_storage::Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let keys = KeyStore::from_storage(store.clone(), None, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let app = router_with_body_limit(Engine::new(store), keys, ServerOptions::default(), 1024);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(format!("{{\"x\":\"{}\"}}", "a".repeat(2048)).as_bytes())
+            .unwrap();
+        let bomb = encoder.finish().unwrap();
+        assert!(bomb.len() < 1024);
+        for (payload, encoding, length) in [
+            (bomb, "gzip", None),
+            (vec![b' '; 1025], "identity", None),
+            (vec![], "gzip", Some("1025")),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v2/namespaces/test")
+                .header("content-type", "application/json")
+                .header("content-encoding", encoding);
+            if let Some(length) = length {
+                request = request.header("content-length", length);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(payload)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["status"], "error");
+        }
+    }
 }
