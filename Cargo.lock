@@ -324,6 +324,7 @@ dependencies = [
  "bf-text",
  "chrono",
  "half",
+ "proptest",
  "serde",
  "serde_json",
 ]
