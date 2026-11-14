@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Extras merged. Compat is now 111/111.** That's the original 96 plus 15 new scenarios recorded from
+  turbopuffer.
+  - **Async operations:** `POST /v2/namespaces/{ns}/async` plus operation polling, with state kept in
+    the bucket so any node can answer a poll. Both current SDKs poll transparently.
+  - **`PATCH` metadata:** `read_only` is enforced; pinning is accepted and echoed back but does nothing.
+  - **Legacy v1 API shim:** columnar writes, nested query rows, cursor export, and `HEAD` metadata. It
+    was tested end to end with the old turbopuffer 0.1.37 Python SDK.
 - **Ops merged.** Auth, admin, metrics, packaging, and docs are in:
   - **Auth:** RBAC API keys enforced on every route, plus the super key (`BLOWFISH_ADMIN_KEY`) and
     `--require-auth`. Without a super key, blowfish runs in dev mode with a loud warning.
@@ -111,4 +118,4 @@ Newest first. Each entry says what works now and how it was checked.
 | M4 | Full-text index | library done; engine integration in progress |
 | M5 | Cache and performance | in progress |
 | M6 | Multi-node, auth, metrics, and packaging | in progress |
-| M7 | The "later" list | not started |
+| M7 | The "later" list | in progress (async ops, PATCH metadata, legacy v1 done) |
