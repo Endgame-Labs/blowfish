@@ -660,10 +660,16 @@ pub(crate) fn score(
             .fold(0.0, f64::max),
         RankBy::Product { weight, expr, .. } => weight * score(state, doc, expr)?,
         RankBy::Filter(f) => {
-            if filter::matches(f, Some(doc), None, &state.schema)? {
-                1.0
+            if let Some(scores) = state.scores.get(&crate::indexed::rank_key(rank)) {
+                let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
+                *scores.get(&id).unwrap_or(&0.0)
             } else {
-                0.0
+                f64::from(u8::from(filter::matches(
+                    f,
+                    Some(doc),
+                    None,
+                    &state.schema,
+                )?))
             }
         }
         RankBy::Attribute(name) => doc.get(name).and_then(Value::as_f64).unwrap_or(0.0),

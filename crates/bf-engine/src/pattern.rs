@@ -222,6 +222,88 @@ fn exact_strings(hir: &regex_syntax::hir::Hir) -> Option<Vec<String>> {
     }
 }
 
+fn score_clauses<'a>(rank: &'a bf_types::RankBy, out: &mut Vec<&'a bf_types::RankBy>) {
+    use bf_types::RankBy;
+    match rank {
+        RankBy::Filter(_) => out.push(rank),
+        RankBy::Sum(xs) | RankBy::Max(xs) => {
+            for x in xs {
+                score_clauses(x, out)
+            }
+        }
+        RankBy::Product { expr, .. }
+        | RankBy::Saturate { expr, .. }
+        | RankBy::Decay { expr, .. }
+        | RankBy::Dist { expr, .. } => score_clauses(expr, out),
+        _ => {}
+    }
+}
+pub(crate) async fn segment_scores(
+    store: &bf_storage::Storage,
+    seg: &bf_wal::Segment,
+    rank: Option<&bf_types::RankBy>,
+    allowed: &RoaringBitmap,
+    out: &mut crate::NamespaceState,
+) -> Result<Option<RoaringBitmap>, ApiError> {
+    let mut clauses = vec![];
+    if let Some(rank) = rank {
+        score_clauses(rank, &mut clauses)
+    }
+    if clauses.is_empty() {
+        return Ok(None);
+    }
+    let ids = crate::segment::ids(store, seg).await?;
+    let mut direct = None;
+    for clause in clauses {
+        let bf_types::RankBy::Filter(f) = clause else {
+            unreachable!()
+        };
+        let rows = crate::segment::filter_rows(store, seg, f, &out.schema, allowed).await?;
+        if rank == Some(clause) {
+            direct = Some(rows.clone());
+        }
+        let scores = out
+            .scores
+            .entry(crate::indexed::rank_key(clause))
+            .or_default();
+        for row in rows {
+            scores.insert(ids[row as usize].clone(), 1.0);
+        }
+    }
+    Ok(direct)
+}
+pub(crate) fn tail_scores(
+    rank: Option<&bf_types::RankBy>,
+    docs: &BTreeMap<Id, Document>,
+    out: &mut crate::NamespaceState,
+) -> Result<(), ApiError> {
+    let mut clauses = vec![];
+    if let Some(rank) = rank {
+        score_clauses(rank, &mut clauses)
+    }
+    for clause in clauses {
+        let bf_types::RankBy::Filter(f) = clause else {
+            unreachable!()
+        };
+        let scores = out
+            .scores
+            .entry(crate::indexed::rank_key(clause))
+            .or_default();
+        for (id, doc) in docs {
+            scores.insert(
+                id.clone(),
+                f64::from(u8::from(crate::filter::matches(
+                    f,
+                    Some(doc),
+                    None,
+                    &out.schema,
+                )?)),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

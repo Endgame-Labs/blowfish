@@ -180,3 +180,60 @@ async fn online_regex_and_glob_builds_return_retryable_conflicts() {
         );
     }
 }
+
+#[tokio::test]
+async fn pattern_scores_use_trigram_indexes_and_fail_closed_on_missing_files() {
+    let e = node().await;
+    write(&e,json!({"schema":{"s":{"type":"string","fuzzy":true,"glob":true}},"upsert_rows":[{"id":1,"s":"turbopuffer"},{"id":2,"s":"other"}]})).await;
+    let params = json!({"max_edit_distance":[{"min_query_chars":6,"distance":1}]});
+    let rank = json!([
+        "Sum",
+        [
+            ["s", "Fuzzy", "turbopufer", params],
+            ["s", "Glob", "*puffer*"]
+        ]
+    ]);
+    let q = json!({"rank_by":rank,"top_k":10});
+    let expected = e
+        .query("patterns", serde_json::from_value(q.clone()).unwrap())
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap();
+    assert_eq!(
+        expected,
+        json!([{"id":1,"$dist":2.0}])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()).unwrap())
+            .collect::<Vec<bf_types::Document>>()
+    );
+    e.index_namespace("patterns", true).await.unwrap();
+    assert_eq!(
+        e.query("patterns", serde_json::from_value(q.clone()).unwrap())
+            .await
+            .unwrap()
+            .result
+            .rows
+            .unwrap(),
+        expected
+    );
+    let file = e
+        .storage()
+        .list("ns/patterns/segments/")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|f| f.key.contains("trigram."))
+        .unwrap();
+    e.storage().delete(&file.key).await.unwrap();
+    assert_eq!(
+        e.query("patterns", serde_json::from_value(q).unwrap())
+            .await
+            .unwrap_err()
+            .status,
+        503
+    );
+}

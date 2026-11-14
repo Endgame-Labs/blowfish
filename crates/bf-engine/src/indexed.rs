@@ -307,6 +307,12 @@ async fn prepare_scalar(
                 scores.insert(ids[hit.row as usize].clone(), hit.score as f64);
             }
         }
+        if let Some(rows) =
+            crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out)
+                .await?
+        {
+            selected &= rows;
+        }
         crate::sparse::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?;
         out.docs
             .extend(segment::projected_documents(store, seg, &selected, Some(&columns)).await?);
@@ -356,5 +362,6 @@ async fn prepare_scalar(
         }
     }
     crate::sparse::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out);
+    crate::pattern::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out)?;
     Ok(out)
 }
