@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **`bf-text` merged.** It covers tokenization, BM25 scoring, and the immutable posting-list segment
+  format.
+  - **Tokenizer:** `word_v4` is built on turbopuffer's own published tokenizer crate, `alyze`. It
+    handles all 18 languages and every documented tokenizer.
+  - **Scoring:** BM25 includes `k3` and prefix matches. It is checked against 715 cases recorded
+    from real turbopuffer, 712 of which match. English scores agree to float precision, and the
+    other scores are within 1%. The three exceptions are documented in `crates/bf-text/README.md`.
+  - **Segment format:** an FST dictionary and 128-posting bit-packed blocks searched with block-max
+    MAXSCORE, plus phrase positions and checksums.
+  - **Speed:** on 1M docs, the index takes 39 bytes per doc and a query takes 3.9 ms at p50 (in
+    memory). The engine doesn't use it yet; that's wave 2.
 - **Compat suite expanded to 96 scenarios**, passing 96/96 when run live against real turbopuffer itself.
   New coverage:
   - Namespace listing and cursor pagination, recall, cache warming, copy, and type round-trips (f16
