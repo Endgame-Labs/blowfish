@@ -436,3 +436,22 @@ async fn attribute_scores_accept_a_literal_zero_floor() {
         json!([{"id":2,"$dist":3.0},{"id":3,"$dist":1.0}])
     );
 }
+
+#[tokio::test]
+async fn decay_accepts_signed_numeric_attribute_scores() {
+    let e = engine().await;
+    write(&e, "decay", json!({"schema":{"f":"float"},"upsert_rows":[{"id":1,"n":1,"f":1.0},{"id":2,"n":2,"f":2.0}]})).await.unwrap();
+    for attribute in ["n", "f"] {
+        let result = query(
+            &e,
+            "decay",
+            json!({"rank_by":["Decay",["Attribute",attribute],{"midpoint":2}],"top_k":10}),
+        )
+        .await;
+        let rows = result["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], 1);
+        assert!((rows[0]["$dist"].as_f64().unwrap() - 2.0 / 3.0).abs() < 1e-6);
+        assert_eq!(rows[1]["$dist"], 0.5);
+    }
+}

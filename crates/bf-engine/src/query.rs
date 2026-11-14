@@ -407,16 +407,12 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
             Some(AttributeType::Scalar(ScalarType::Int | ScalarType::Float)) if guarded => {}
             _ => {
                 return Err(ApiError::bad(
-                    "Attribute scores require uint or signed numeric types wrapped in Max or Saturate",
+                    "Attribute scores require uint or signed numeric types wrapped in Max, Saturate, or Decay",
                 ));
             }
         },
         RankBy::Saturate { expr, params } | RankBy::Decay { expr, params } => {
-            validate_score_child(
-                state,
-                expr,
-                matches!(rank, RankBy::Saturate { .. }) || guarded,
-            )?;
+            validate_score_child(state, expr, true)?;
             let midpoint = parameter(params, "midpoint", 1.0)?;
             let exponent = parameter(params, "exponent", 1.0)?;
             if midpoint <= 0.0 || exponent <= 0.0 {
