@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Wave 4 launched:**
+  - **perf:** cache wiring, decoded in-memory segment structures, parallel segment search, streaming
+    order-by and aggregates, single-PUT WAL commits, and R2 cold/warm benchmarks.
+  - **m7:** fuzzy, regex, and glob with trigram indexes; sparse and i8 vectors; `Highlight`; branching;
+    real `explain_query` plans; and multi-vector search.
+  - **multinode:** full config exposure, a three-node compat run on SeaweedFS behind a proxy,
+    kill/restart tests, a single-writer-mode check, a compatibility matrix doc, and GitHub Actions CI.
 - **M2–M4 merged: blowfish is now a real indexed engine.**
   - **Segments:** immutable segments (columnar docs, ID index plus bloom filter, roaring filter
     bitmaps, and live-row generations) published through epoch-fenced manifests.
