@@ -4,6 +4,21 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **M2–M4 merged: blowfish is now a real indexed engine.**
+  - **Segments:** immutable segments (columnar docs, ID index plus bloom filter, roaring filter
+    bitmaps, and live-row generations) published through epoch-fenced manifests.
+  - **Indexer:** a background indexer with row, byte, and age thresholds, tiered compaction, GC with a
+    retention window, and cold starts from the manifest plus the WAL tail. A node never replays full
+    history.
+  - **Indexes:** IVF with RaBitQ (`.bfv`) and BM25 postings (`.bft`, with namespace-wide corpus
+    statistics) per segment. Write backpressure returns 429. Recall sampling is reported as
+    `blowfish_ann_recall`.
+  - **Tests:** fault injection at every storage step (acknowledged writes survive exactly once), and
+    differential tests comparing indexed and exhaustive results.
+  - **Compat:** **111/111 with indexing forced on** (`BF_INDEX_ROWS=1`). 103 Rust tests pass.
+  - **First 1M×768 benchmark (local disk):** recall@10 0.99, ANN p50 238 ms, BM25 p50 113 ms, and cold
+    open 10 ms. The latency comes from reads that bypass the cache and from sequential segment search,
+    which is the next wave.
 - **Extras merged. Compat is now 111/111.** That's the original 96 plus 15 new scenarios recorded from
   turbopuffer.
   - **Async operations:** `POST /v2/namespaces/{ns}/async` plus operation polling, with state kept in
@@ -113,9 +128,9 @@ Newest first. Each entry says what works now and how it was checked.
 | # | Milestone | Status |
 |---|---|---|
 | M1 | Walking skeleton: WAL, full API, exhaustive search, compat harness | ✅ done, compat 96/96 |
-| M2 | Segments, indexer, and GC | in progress |
-| M3 | Vector index (IVF + RaBitQ) | library done; engine integration in progress |
-| M4 | Full-text index | library done; engine integration in progress |
+| M2 | Segments, indexer, and GC | ✅ done |
+| M3 | Vector index (IVF + RaBitQ) | ✅ done (perf tuning next) |
+| M4 | Full-text index | ✅ done (perf tuning next) |
 | M5 | Cache and performance | in progress |
 | M6 | Multi-node, auth, metrics, and packaging | in progress |
 | M7 | The "later" list | in progress (async ops, PATCH metadata, legacy v1 done) |
