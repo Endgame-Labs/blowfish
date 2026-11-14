@@ -309,3 +309,28 @@ async fn permanent_internal_errors_disable_retries() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(response.headers()["x-should-retry"], "false");
 }
+
+#[tokio::test]
+async fn json_routes_require_json_content_type() {
+    let app = app(None).await;
+    for path in ["/v2/namespaces/a", "/v2/namespaces/a/query"] {
+        for content_type in [Some("text/plain"), None] {
+            let mut request = Request::builder().method("POST").uri(path);
+            if let Some(value) = content_type {
+                request = request.header("content-type", value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap(),
+                json!({"status":"error","error":"💔 Expected request with `Content-Type: application/json`"})
+            );
+        }
+    }
+}

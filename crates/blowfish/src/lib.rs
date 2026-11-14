@@ -107,6 +107,12 @@ fn body<T>(result: Result<Json<T>, JsonRejection>) -> Result<T, HttpError> {
         if matches!(e, JsonRejection::JsonSyntaxError(_)) {
             return HttpError(ApiError::bad(format!("💔 {detail}")));
         }
+        if matches!(e, JsonRejection::MissingJsonContentType(_)) {
+            return HttpError(ApiError::new(
+                415,
+                "💔 Expected request with `Content-Type: application/json`",
+            ));
+        }
         if detail.contains("is not supported by blowfish yet")
             || detail.contains("weight must be non-negative")
         {
