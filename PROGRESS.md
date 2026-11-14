@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Compat suite expanded to 96 scenarios**, passing 96/96 when run live against real turbopuffer itself.
+  New coverage:
+  - Namespace listing and cursor pagination, recall, cache warming, copy, and type round-trips (f16
+    vectors included).
+  - Malformed HTTP requests, gzip, and unknown query parameters.
+  - ID-based export.
+  - A seeded 2,000-vector ANN recall@10 check.
+  - A TypeScript SDK smoke test (`compat/smoke-ts/run.sh <base-url>`).
+
+  Two oracle quirks are now captured in the fixtures: successful copies omit `performance`, and
+  `explain_query` returns 400 on a fresh, unindexed namespace.
 - **`compat/` merged.** This is the compatibility suite: 81 scenarios driving the official turbopuffer
   Python SDK, with golden responses recorded from real turbopuffer. It has three commands: `uv run compat
   record`, `uv run compat check --base-url ...`, and `uv run compat diff-live`. Each scenario uses a
