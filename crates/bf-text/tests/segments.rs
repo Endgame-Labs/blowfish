@@ -363,3 +363,49 @@ fn truncated_range_responses_return_unexpected_eof() {
         .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 }
+
+#[test]
+fn prefetched_postings_match_demand_search_with_prefixes_repetition_and_filters() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..2000)
+        .map(|row| {
+            tokenize(
+                &format!("common term{} term{} prefix{}", row % 19, row % 7, row % 11),
+                &params,
+            )
+        })
+        .collect();
+    let reader = open(build(&docs, true, params.tokenizer));
+    let stats = reader.stats();
+    for (text, prefix) in [
+        ("common term1 term1", false),
+        ("term1 pre", true),
+        ("missing", false),
+        ("", false),
+    ] {
+        let query = Query::new(tokenize(text, &params), prefix);
+        let allowed: RoaringBitmap = (130..170).chain(1024..1200).collect();
+        for filter in [None, Some(&allowed)] {
+            let plan = reader.prefetch_plan(&query, filter);
+            assert!(
+                plan.windows(2)
+                    .all(|ranges| ranges[0].end <= ranges[1].start)
+            );
+            assert!(plan.iter().all(|range| range.start < range.end));
+            let actual =
+                block_on(reader.search_prefetched(&query, &stats, &params, 20, filter)).unwrap();
+            let demand = block_on(reader.search(&query, &stats, &params, 20, filter)).unwrap();
+            assert_hits(&actual, &demand);
+            assert_hits(
+                &actual,
+                &expected(&docs, &query, &stats, &params, 20, filter),
+            );
+        }
+    }
+    let query = Query::new(tokenize("common", &params), false);
+    assert!(
+        reader
+            .prefetch_plan(&query, Some(&RoaringBitmap::new()))
+            .is_empty()
+    );
+}

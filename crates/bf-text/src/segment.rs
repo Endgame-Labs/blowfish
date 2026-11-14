@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bitpacking::{BitPacker, BitPacker4x};
 use bytes::Bytes;
 use fst::{IntoStreamer, Streamer};
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, future::try_join_all};
 use roaring::RoaringBitmap;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
@@ -72,6 +72,15 @@ fn verify(data: &[u8], checksum: u32) -> io::Result<()> {
 pub trait RangeRead: Send + Sync {
     /// Read a half-open byte range from the immutable object.
     async fn read(&self, range: Range<u64>) -> io::Result<Bytes>;
+    /// Read independent ranges in request order. Cached backends should override
+    /// this to coalesce aligned blocks before issuing bounded parallel requests.
+    async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        futures::stream::iter(ranges)
+            .map(|range| self.read(range))
+            .buffered(32)
+            .try_collect()
+            .await
+    }
     /// Object length in bytes.
     fn len(&self) -> u64;
     /// Whether the object contains no bytes.
@@ -562,7 +571,13 @@ impl SegmentReader {
     }
     async fn postings(&self, b: &BlockMeta) -> io::Result<Vec<(u32, u32)>> {
         let bytes = read_exact(&*self.source, b.offset..b.offset + b.size as u64).await?;
-        verify(&bytes, b.crc)?;
+        self.decode_postings(b, &bytes)
+    }
+    fn decode_postings(&self, b: &BlockMeta, bytes: &[u8]) -> io::Result<Vec<(u32, u32)>> {
+        if bytes.len() != b.size as usize {
+            return Err(invalid("short posting block"));
+        }
+        verify(bytes, b.crc)?;
         let bits = bytes[0];
         let tf_bits = bytes[1];
         if bits > 32 || tf_bits > 32 || bytes.len() != 2 + 16 * (bits as usize + tf_bits as usize) {
@@ -599,6 +614,42 @@ impl SegmentReader {
         }
         Ok(out)
     }
+    /// Posting payload ranges for exact terms and the final prefix expansion.
+    /// Sorted, unique ranges exclude positions and blocks with no allowed rows.
+    /// Planning only touches the resident dictionary, never the backend.
+    pub fn prefetch_plan(&self, query: &Query, allowed: Option<&RoaringBitmap>) -> Vec<Range<u64>> {
+        let mut ids = std::collections::BTreeSet::new();
+        for term in query.exact_terms().keys() {
+            ids.extend(self.term(term));
+        }
+        if let Some(prefix) = query.prefix() {
+            ids.extend(self.prefix_terms(prefix));
+        }
+        let mut ranges: Vec<_> = ids
+            .into_iter()
+            .flat_map(|id| &self.terms[id].blocks)
+            .filter(|b| allowed.is_none_or(|rows| rows.range(b.first..=b.last).next().is_some()))
+            .map(|b| b.offset..b.offset + b.size as u64)
+            .collect();
+        ranges.sort_unstable_by_key(|range| range.start);
+        ranges.dedup();
+        ranges
+    }
+    /// Batch all posting ranges before scoring. This trades block-max I/O pruning
+    /// for one parallel posting stage, which is useful on remote storage.
+    /// The fetched payloads remain query-local even when the backend cache is disabled.
+    pub async fn search_prefetched(
+        &self,
+        query: &Query,
+        stats: &CorpusStats,
+        params: &FtsParams,
+        k: usize,
+        allowed: Option<&RoaringBitmap>,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.search_internal(query, stats, params, k, allowed, true)
+            .await
+            .map(|(hits, _)| hits)
+    }
     /// Top-k BM25 with namespace-wide statistics, optional live/allowed rows, and
     /// conservative block-max pruning. An empty query or `k == 0` returns no hits.
     pub async fn search(
@@ -621,6 +672,18 @@ impl SegmentReader {
         params: &FtsParams,
         k: usize,
         allowed: Option<&RoaringBitmap>,
+    ) -> io::Result<(Vec<SearchHit>, SearchMetrics)> {
+        self.search_internal(query, stats, params, k, allowed, false)
+            .await
+    }
+    async fn search_internal(
+        &self,
+        query: &Query,
+        stats: &CorpusStats,
+        params: &FtsParams,
+        k: usize,
+        allowed: Option<&RoaringBitmap>,
+        prefetch: bool,
     ) -> io::Result<(Vec<SearchHit>, SearchMetrics)> {
         params.validate().map_err(|e| input(&e))?;
         let mut metrics = SearchMetrics::default();
@@ -669,6 +732,26 @@ impl SegmentReader {
         order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         let mut heap: BinaryHeap<Reverse<SearchHit>> = BinaryHeap::new();
         let mut cache: BTreeMap<(usize, usize), Vec<(u32, u32)>> = BTreeMap::new();
+        if prefetch {
+            let ranges = self.prefetch_plan(query, allowed);
+            let values = self.source.read_batch(ranges.clone()).await?;
+            if values.len() != ranges.len() {
+                return Err(invalid("invalid posting batch length"));
+            }
+            let values: BTreeMap<_, _> = ranges
+                .into_iter()
+                .zip(values)
+                .map(|(r, v)| (r.start, v))
+                .collect();
+            for &id in selections.keys() {
+                for (block, b) in self.terms[id].blocks.iter().enumerate() {
+                    if let Some(bytes) = values.get(&b.offset) {
+                        cache.insert((id, block), self.decode_postings(b, bytes)?);
+                        metrics.blocks_read += 1;
+                    }
+                }
+            }
+        }
         for (window, bound) in order {
             if heap.len() == k && bound < heap.peek().unwrap().0.score as f64 {
                 metrics.windows_pruned += 1;
@@ -689,7 +772,9 @@ impl SegmentReader {
                     .skip(first)
                     .take_while(|(_, b)| b.first < end)
                 {
-                    if !cache.contains_key(&(id, block)) {
+                    if !cache.contains_key(&(id, block))
+                        && allowed.is_none_or(|rows| rows.range(b.first..=b.last).next().is_some())
+                    {
                         needed.push((id, block, b));
                     }
                 }
@@ -710,7 +795,10 @@ impl SegmentReader {
                     .skip(first)
                     .take_while(|(_, b)| b.first < end)
                 {
-                    for &(row, tf) in &cache[&(id, block)] {
+                    let Some(postings) = cache.get(&(id, block)) else {
+                        continue;
+                    };
+                    for &(row, tf) in postings {
                         if row >= start
                             && row < end
                             && allowed.is_none_or(|rows| rows.contains(row))
