@@ -69,7 +69,7 @@ pub fn router(engine: Engine, auth: Arc<dyn Authorizer>) -> Router {
         .route("/v1/namespaces/{ns}/hint_cache_warm", get(warm))
         .route("/v1/namespaces/{ns}/_debug/recall", post(recall))
         .route("/v2/namespaces/{ns}/explain_query", post(explain))
-        .fallback(|| async { HttpError(ApiError::new(404, "route was not found")) })
+        .fallback(|| async { HttpError(ApiError::new(404, "unknown route")) })
         .method_not_allowed_fallback(|| async {
             HttpError(ApiError::new(405, "method is not allowed"))
         })
@@ -104,6 +104,15 @@ impl IntoResponse for HttpError {
 fn body<T>(result: Result<Json<T>, JsonRejection>) -> Result<T, HttpError> {
     result.map(|Json(v)| v).map_err(|e| {
         let detail = e.body_text();
+        if matches!(e, JsonRejection::JsonSyntaxError(_)) {
+            return HttpError(ApiError::bad(format!("💔 {detail}")));
+        }
+        if matches!(e, JsonRejection::MissingJsonContentType(_)) {
+            return HttpError(ApiError::new(
+                415,
+                "💔 Expected request with `Content-Type: application/json`",
+            ));
+        }
         if detail.contains("is not supported by blowfish yet")
             || detail.contains("weight must be non-negative")
         {

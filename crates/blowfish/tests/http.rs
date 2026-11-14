@@ -177,6 +177,7 @@ async fn endpoints_sdk_overloads_and_json_errors() {
     let (status, error) = call(&app, "GET", "/unknown", Value::Null).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(error["status"], "error");
+    assert_eq!(error["error"], "unknown route");
     assert_eq!(
         call(&app, "PATCH", "/", json!({})).await.0,
         StatusCode::METHOD_NOT_ALLOWED
@@ -222,12 +223,19 @@ async fn auth_and_invalid_json() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(
         response.headers()["content-type"]
             .to_str()
             .unwrap()
             .starts_with("application/json")
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["status"], "error");
+    assert_eq!(
+        error["error"],
+        "💔 Failed to parse the request body as JSON: key must be a string at line 1 column 2"
     );
 }
 #[tokio::test]
@@ -301,4 +309,29 @@ async fn permanent_internal_errors_disable_retries() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(response.headers()["x-should-retry"], "false");
+}
+
+#[tokio::test]
+async fn json_routes_require_json_content_type() {
+    let app = app(None).await;
+    for path in ["/v2/namespaces/a", "/v2/namespaces/a/query"] {
+        for content_type in [Some("text/plain"), None] {
+            let mut request = Request::builder().method("POST").uri(path);
+            if let Some(value) = content_type {
+                request = request.header("content-type", value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap(),
+                json!({"status":"error","error":"💔 Expected request with `Content-Type: application/json`"})
+            );
+        }
+    }
 }

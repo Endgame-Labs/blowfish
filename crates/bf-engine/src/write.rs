@@ -342,9 +342,7 @@ pub(crate) fn prepare(
     response.rows_upserted = (!upserted.is_empty()).then_some(upserted.len());
     response.rows_patched = (!patched.is_empty()).then_some(patched.len());
     response.rows_deleted = (!deleted.is_empty()).then_some(deleted.len());
-    if request.delete_by_filter.is_some() || request.patch_by_filter.is_some() {
-        response.rows_remaining = Some(remaining);
-    }
+    response.rows_remaining = remaining.then_some(true);
     if request.upsert_condition.is_some()
         || request.patch_condition.is_some()
         || request.delete_condition.is_some()
@@ -515,7 +513,7 @@ pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value,
                 json!(
                     chrono::DateTime::from_timestamp_millis(ms)
                         .ok_or_else(mismatch)?
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
                 )
             }
             ScalarType::Bytes => {

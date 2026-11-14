@@ -97,7 +97,13 @@ async fn atomic_validation_conditions_and_write_phases() {
     let r=write(&e,"test",json!({"delete_by_filter":["id","Eq",1],"patch_by_filter":{"filters":["n","Gte",0],"patch":{"n":10}},"upsert_rows":[{"id":4,"vector":[1,0,0],"n":3}]})).await.unwrap();
     assert_eq!(r.rows_deleted, Some(1));
     assert_eq!(r.rows_patched, Some(1));
-    assert_eq!(r.rows_remaining, Some(false));
+    assert_eq!(r.rows_remaining, None);
+    assert!(
+        serde_json::to_value(&r)
+            .unwrap()
+            .get("rows_remaining")
+            .is_none()
+    );
     assert_eq!(
         query(
             &e,
@@ -412,5 +418,102 @@ async fn patch_by_filter_cap_is_atomic_and_partial_reports_remaining() {
     assert_eq!(r.rows_remaining, Some(true));
     let r = write(&e, "cap", partial).await.unwrap();
     assert_eq!(r.rows_patched, Some(1));
-    assert_eq!(r.rows_remaining, Some(false));
+    assert_eq!(r.rows_remaining, None);
+    assert!(
+        serde_json::to_value(&r)
+            .unwrap()
+            .get("rows_remaining")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn attribute_scores_accept_a_literal_zero_floor() {
+    let e = engine().await;
+    write(
+        &e,
+        "scores",
+        json!({"upsert_rows":[{"id":1,"n":-2},{"id":2,"n":3},{"id":3,"n":1}]}),
+    )
+    .await
+    .unwrap();
+    let result = query(
+        &e,
+        "scores",
+        json!({"rank_by":["Max",[0,["Attribute","n"]]],"top_k":10}),
+    )
+    .await;
+    assert_eq!(
+        result["rows"],
+        json!([{"id":2,"$dist":3.0},{"id":3,"$dist":1.0}])
+    );
+}
+
+#[tokio::test]
+async fn decay_accepts_signed_numeric_attribute_scores() {
+    let e = engine().await;
+    write(&e, "decay", json!({"schema":{"f":"float"},"upsert_rows":[{"id":1,"n":1,"f":1.0},{"id":2,"n":2,"f":2.0}]})).await.unwrap();
+    for attribute in ["n", "f"] {
+        let result = query(
+            &e,
+            "decay",
+            json!({"rank_by":["Decay",["Attribute",attribute],{"midpoint":2}],"top_k":10}),
+        )
+        .await;
+        let rows = result["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], 1);
+        assert!((rows[0]["$dist"].as_f64().unwrap() - 2.0 / 3.0).abs() < 1e-6);
+        assert_eq!(rows[1]["$dist"], 0.5);
+    }
+}
+
+#[tokio::test]
+async fn foreachunique_distinguishes_missing_and_empty_arrays_and_deduplicates() {
+    let e = engine().await;
+    write(&e, "groups", json!({"schema":{"tags":"[]string"},"upsert_rows":[{"id":1,"tags":["red","blue","blue"]},{"id":2,"tags":["blue"]},{"id":3,"tags":[]},{"id":4},{"id":5,"tags":null}]})).await.unwrap();
+    let result = query(&e, "groups", json!({"aggregate_by":{"c":["Count"]},"group_by":[{"tag":["ForEachUnique","tags"]}],"top_k":10})).await;
+    assert_eq!(
+        result["aggregation_groups"],
+        json!([{"tag":null,"c":2},{"tag":"blue","c":2},{"tag":"red","c":1}])
+    );
+}
+
+#[tokio::test]
+async fn datetimes_emit_nine_fractional_digits_in_rows_arrays_and_metadata() {
+    let e = engine().await;
+    write(&e, "dates", json!({"schema":{"d":"datetime","dates":"[]datetime"},"upsert_rows":[{"id":1,"d":"2024-01-02T04:04:05+01:00","dates":["2024-01-02","2024-01-02T03:04:05.123456789Z"]}]})).await.unwrap();
+    let result = query(
+        &e,
+        "dates",
+        json!({"rank_by":["id","asc"],"top_k":1,"include_attributes":true}),
+    )
+    .await;
+    assert_eq!(result["rows"][0]["d"], "2024-01-02T03:04:05.000000000Z");
+    assert_eq!(
+        result["rows"][0]["dates"],
+        json!([
+            "2024-01-02T00:00:00.000000000Z",
+            "2024-01-02T03:04:05.123000000Z"
+        ])
+    );
+    let metadata = e.metadata("dates").await.unwrap();
+    for value in [
+        &metadata["created_at"],
+        &metadata["updated_at"],
+        &metadata["last_write_at"],
+        &result["performance"]["last_included_write_at"],
+    ] {
+        let text = value.as_str().unwrap();
+        let parsed = chrono::DateTime::parse_from_rfc3339(text).unwrap();
+        assert_eq!(
+            text,
+            parsed.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        );
+    }
+    let result = query(&e, "dates", json!({"aggregate_by":{"first":["Min","d"]}})).await;
+    assert_eq!(
+        result["aggregations"]["first"],
+        "2024-01-02T03:04:05.000000000Z"
+    );
 }

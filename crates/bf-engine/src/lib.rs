@@ -196,7 +196,11 @@ impl Engine {
             query_execution_ms: execution.elapsed().as_millis() as u64,
             exhaustive_search_count: state.docs.len() as u64,
             approx_namespace_size: state.docs.len() as u64,
-            last_included_write_at: Some(state.updated_at.to_rfc3339()),
+            last_included_write_at: Some(
+                state
+                    .updated_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            ),
         };
         Ok(response)
     }
@@ -204,7 +208,7 @@ impl Engine {
     pub async fn metadata(&self, ns: &str) -> Result<Value, ApiError> {
         let (s, _) = self.snapshot(ns, &Consistency::Strong).await?;
         Ok(
-            json!({"schema":s.schema,"approx_logical_bytes":logical_bytes(&s),"approx_row_count":s.docs.len(),"created_at":s.created_at.to_rfc3339(),"updated_at":s.updated_at.to_rfc3339(),"last_write_at":s.updated_at.to_rfc3339(),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}}),
+            json!({"schema":s.schema,"approx_logical_bytes":logical_bytes(&s),"approx_row_count":s.docs.len(),"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}}),
         )
     }
     /// Schema endpoint representation, including nullable settings and `ann: true`.

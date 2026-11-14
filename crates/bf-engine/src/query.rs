@@ -206,7 +206,7 @@ fn single(
                                 .get(attribute)
                                 .and_then(Value::as_array)
                                 .cloned()
-                                .unwrap_or_default();
+                                .unwrap_or_else(|| vec![Value::Null]);
                             v.sort_by(filter::compare);
                             v.dedup();
                             v
@@ -341,6 +341,7 @@ fn attribute<'a>(state: &'a NamespaceState, name: &str) -> Result<&'a AttributeS
 }
 fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result<(), ApiError> {
     match rank {
+        RankBy::Constant(_) => {}
         RankBy::Order(keys) => {
             for key in keys {
                 if !matches!(
@@ -406,16 +407,12 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
             Some(AttributeType::Scalar(ScalarType::Int | ScalarType::Float)) if guarded => {}
             _ => {
                 return Err(ApiError::bad(
-                    "Attribute scores require uint or signed numeric types wrapped in Max or Saturate",
+                    "Attribute scores require uint or signed numeric types wrapped in Max, Saturate, or Decay",
                 ));
             }
         },
         RankBy::Saturate { expr, params } | RankBy::Decay { expr, params } => {
-            validate_score_child(
-                state,
-                expr,
-                matches!(rank, RankBy::Saturate { .. }) || guarded,
-            )?;
+            validate_score_child(state, expr, true)?;
             let midpoint = parameter(params, "midpoint", 1.0)?;
             let exponent = parameter(params, "exponent", 1.0)?;
             if midpoint <= 0.0 || exponent <= 0.0 {
@@ -497,6 +494,7 @@ fn parameter(params: &Value, name: &str, default: f64) -> Result<f64, ApiError> 
 }
 fn score(state: &NamespaceState, doc: &Document, rank: &RankBy) -> Result<f64, ApiError> {
     Ok(match rank {
+        RankBy::Constant(n) => n.as_f64().expect("JSON number fits f64"),
         RankBy::Bm25 {
             attribute,
             query,

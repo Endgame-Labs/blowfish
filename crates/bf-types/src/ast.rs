@@ -133,6 +133,8 @@ pub struct OrderKey {
 /// The exhaustive ranking expression AST.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RankBy {
+    /// A literal numeric score, including the zero floor in `Max` expressions.
+    Constant(serde_json::Number),
     Vector {
         attribute: String,
         exact: bool,
@@ -170,6 +172,9 @@ pub enum RankBy {
 impl RankBy {
     /// Parse all M1 rank tuples, including either Product operand order.
     pub fn parse(v: Value) -> Result<Self, ApiError> {
+        if let Value::Number(n) = v {
+            return Ok(Self::Constant(n));
+        }
         let a = v
             .as_array()
             .ok_or_else(|| ApiError::malformed("rank_by must be an array"))?;
@@ -310,6 +315,7 @@ impl RankBy {
     /// Serialize the AST as API tuples.
     pub fn value(&self) -> Value {
         match self {
+            Self::Constant(n) => Value::Number(n.clone()),
             Self::Vector {
                 attribute,
                 exact,

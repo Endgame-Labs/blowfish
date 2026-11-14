@@ -69,6 +69,8 @@ fn ranking_contract_roundtrips() {
         json!(["Product", 2.0, ["x", "Eq", 1]]),
         json!(["Product", ["x", "Eq", 1], 2.0]),
         json!(["Attribute", "clicks"]),
+        json!(["Max", [0, ["Attribute", "clicks"]]]),
+        json!(["Sum", [1.5, ["Attribute", "clicks"]]]),
         json!(["Saturate",["Attribute","clicks"],{"midpoint":100,"exponent":1}]),
         json!(["Decay",["Dist",["Attribute","published_at"],"2026-02-03T12:13:14"],{"midpoint":"6h"}]),
         json!(["timestamp", "desc"]),
