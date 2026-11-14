@@ -97,7 +97,13 @@ async fn atomic_validation_conditions_and_write_phases() {
     let r=write(&e,"test",json!({"delete_by_filter":["id","Eq",1],"patch_by_filter":{"filters":["n","Gte",0],"patch":{"n":10}},"upsert_rows":[{"id":4,"vector":[1,0,0],"n":3}]})).await.unwrap();
     assert_eq!(r.rows_deleted, Some(1));
     assert_eq!(r.rows_patched, Some(1));
-    assert_eq!(r.rows_remaining, Some(false));
+    assert_eq!(r.rows_remaining, None);
+    assert!(
+        serde_json::to_value(&r)
+            .unwrap()
+            .get("rows_remaining")
+            .is_none()
+    );
     assert_eq!(
         query(
             &e,
@@ -412,7 +418,13 @@ async fn patch_by_filter_cap_is_atomic_and_partial_reports_remaining() {
     assert_eq!(r.rows_remaining, Some(true));
     let r = write(&e, "cap", partial).await.unwrap();
     assert_eq!(r.rows_patched, Some(1));
-    assert_eq!(r.rows_remaining, Some(false));
+    assert_eq!(r.rows_remaining, None);
+    assert!(
+        serde_json::to_value(&r)
+            .unwrap()
+            .get("rows_remaining")
+            .is_none()
+    );
 }
 
 #[tokio::test]
