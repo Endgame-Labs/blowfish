@@ -4,6 +4,18 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **M1 merged: blowfish serves the turbopuffer API.**
+  `blowfish serve --storage-url file:///path` (or `s3://bucket/prefix`) works today.
+  - **Storage:** CAS on object storage, verified on real R2, with single-writer mode as a fallback.
+  - **Writes:** a write-ahead log with group commit that stays serializable across nodes (tested with
+    two engines racing on one namespace).
+  - **Queries:** every write and query feature in DESIGN.md §2, computed by exhaustive scan.
+  - **HTTP:** gzip, turbopuffer-shaped errors, and the official Python SDK smoke test passing.
+  - **First compat run:** **84/96 passing**. The fix worker is closing the remaining 12.
+  - **Known cost:** each commit is two PUTs (a payload, then a small CAS slot record), so that deleting
+    a namespace can physically erase its data. This is a perf follow-up.
+- **Wave 2 launched:** compat fixes (aiming for 96/96); RBAC wiring, the admin API, the keys CLI,
+  Prometheus metrics, Docker, and docs; and the foyer memory+NVMe range cache (M5).
 - **`bf-vector` merged.** It provides vector distance math and the IVF index with RaBitQ.
   - **Distances:** SIMD kernels for f32 and f16, covering cosine and squared Euclidean distance.
   - **Index build:** deterministic seeded k-means, with a two-level centroid tree from 262k vectors.
@@ -67,10 +79,10 @@ Newest first. Each entry says what works now and how it was checked.
 
 | # | Milestone | Status |
 |---|---|---|
-| M1 | Walking skeleton: WAL, full API, exhaustive search, compat harness | in progress |
+| M1 | Walking skeleton: WAL, full API, exhaustive search, compat harness | merged; compat 84/96, fixes in progress |
 | M2 | Segments, indexer, and GC | not started |
 | M3 | Vector index (IVF + RaBitQ) | not started |
 | M4 | Full-text index | not started |
-| M5 | Cache and performance | not started |
-| M6 | Multi-node, auth, metrics, and packaging | not started |
+| M5 | Cache and performance | in progress |
+| M6 | Multi-node, auth, metrics, and packaging | in progress |
 | M7 | The "later" list | not started |
