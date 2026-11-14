@@ -223,6 +223,13 @@ impl Storage {
     pub async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, Error> {
         let path = self.path(key);
         let meta = self.0.backend.head(&path).await?;
+        if meta.size == 0 {
+            return if range == (0..0) {
+                Ok(Bytes::new())
+            } else {
+                Err(Error::Config("invalid object range"))
+            };
+        }
         let prefix = self
             .0
             .backend
@@ -257,10 +264,18 @@ impl Storage {
     /// Replace an object. Only heartbeats and explicit mutable system objects should use this.
     pub async fn put(&self, key: &str, value: impl Into<Bytes>) -> Result<(), Error> {
         self.writable()?;
-        self.0
-            .backend
-            .put(&self.path(key), value.into().into())
-            .await?;
+        let value = value.into();
+        // Escape the reserved prefix so arbitrary overwrite payloads round-trip.
+        let value = if value.starts_with(MAGIC) {
+            let mut encoded = Vec::with_capacity(HEADER + value.len());
+            encoded.extend_from_slice(MAGIC);
+            encoded.extend_from_slice(&[0; 16]);
+            encoded.extend_from_slice(&value);
+            Bytes::from(encoded)
+        } else {
+            value
+        };
+        self.0.backend.put(&self.path(key), value.into()).await?;
         Ok(())
     }
     /// Create with a random retry identity. Conflicts never overwrite an existing object.
@@ -275,7 +290,11 @@ impl Storage {
         write_id: Uuid,
     ) -> Result<CreateResult, Error> {
         self.writable()?;
-        let _guard = self.0.serial.lock().await;
+        let _guard = if self.0.mode == StorageMode::SingleWriter {
+            Some(self.0.serial.lock().await)
+        } else {
+            None
+        };
         let path = self.path(key);
         let value = value.into();
         let mut payload = Vec::with_capacity(HEADER + value.len());
@@ -400,7 +419,7 @@ fn identity(bytes: &[u8], id: Uuid) -> CreateResult {
 }
 async fn probe_backend(backend: &dyn ObjectStore, prefix: &Path) -> Result<bool, Error> {
     let path = Path::from(format!("{prefix}/_system/probe/{}", Uuid::new_v4()));
-    backend
+    match backend
         .put_opts(
             &path,
             Bytes::from_static(b"first").into(),
@@ -409,7 +428,14 @@ async fn probe_backend(backend: &dyn ObjectStore, prefix: &Path) -> Result<bool,
                 ..Default::default()
             },
         )
-        .await?;
+        .await
+    {
+        Ok(_) => {}
+        Err(
+            object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented { .. },
+        ) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
     let second = backend
         .put_opts(
             &path,
@@ -424,7 +450,10 @@ async fn probe_backend(backend: &dyn ObjectStore, prefix: &Path) -> Result<bool,
         Err(
             object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. },
         ) => Ok(true),
-        Ok(_) => Ok(false),
+        Ok(_)
+        | Err(
+            object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented { .. },
+        ) => Ok(false),
         Err(e) => Err(e.into()),
     };
     backend.delete(&path).await?;
