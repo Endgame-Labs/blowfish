@@ -206,7 +206,7 @@ fn single(
                                 .get(attribute)
                                 .and_then(Value::as_array)
                                 .cloned()
-                                .unwrap_or_default();
+                                .unwrap_or_else(|| vec![Value::Null]);
                             v.sort_by(filter::compare);
                             v.dedup();
                             v

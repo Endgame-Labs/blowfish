@@ -455,3 +455,14 @@ async fn decay_accepts_signed_numeric_attribute_scores() {
         assert_eq!(rows[1]["$dist"], 0.5);
     }
 }
+
+#[tokio::test]
+async fn foreachunique_distinguishes_missing_and_empty_arrays_and_deduplicates() {
+    let e = engine().await;
+    write(&e, "groups", json!({"schema":{"tags":"[]string"},"upsert_rows":[{"id":1,"tags":["red","blue","blue"]},{"id":2,"tags":["blue"]},{"id":3,"tags":[]},{"id":4},{"id":5,"tags":null}]})).await.unwrap();
+    let result = query(&e, "groups", json!({"aggregate_by":{"c":["Count"]},"group_by":[{"tag":["ForEachUnique","tags"]}],"top_k":10})).await;
+    assert_eq!(
+        result["aggregation_groups"],
+        json!([{"tag":null,"c":2},{"tag":"blue","c":2},{"tag":"red","c":1}])
+    );
+}
