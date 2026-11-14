@@ -94,6 +94,12 @@ pub fn validate_namespace(ns: &str) -> Result<(), ApiError> {
 
 /// Decode a numeric vector or base64 little-endian f32 vector, rejecting NaN and infinity.
 pub fn decode_vector(value: &Value) -> Result<Vec<f32>, ApiError> {
+    if value.get(0).is_some_and(|v| v == "Embed") {
+        return Err(ApiError::bad(
+            "native Embed expressions are not supported by blowfish yet",
+        ));
+    }
+
     use base64::Engine;
     let values = if let Some(s) = value.as_str() {
         let bytes = base64::engine::general_purpose::STANDARD

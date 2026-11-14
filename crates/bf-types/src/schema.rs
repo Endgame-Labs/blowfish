@@ -326,7 +326,7 @@ impl AttributeSchema {
         }
         if self.embed.as_ref().is_some_and(|v| !v.is_null()) {
             return Err(ApiError::bad(
-                "native embedding is not supported by blowfish yet",
+                "native Embed configuration is not supported by blowfish yet",
             ));
         }
         Ok(())

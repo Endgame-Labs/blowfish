@@ -141,6 +141,12 @@ pub enum RankBy {
         vector: Vec<f32>,
         wire_vector: Value,
     },
+    /// Hosted embedding syntax is preserved so execution can return a clear 400.
+    UnsupportedEmbed {
+        attribute: String,
+        exact: bool,
+        expression: Value,
+    },
     /// Sum of the minimum document-vector distances for each query vector.
     MultiVector {
         attribute: String,
@@ -296,6 +302,13 @@ impl RankBy {
                 }
                 Some("ANN" | "kNN") => {
                     need(3)?;
+                    if a[2].get(0).is_some_and(|v| v == "Embed") {
+                        return Ok(Self::UnsupportedEmbed {
+                            attribute: name.into(),
+                            exact: a[1] == "kNN",
+                            expression: a[2].clone(),
+                        });
+                    }
                     if a[2]
                         .as_array()
                         .is_some_and(|xs| xs.first().is_some_and(Value::is_array))
@@ -357,6 +370,11 @@ impl RankBy {
                 wire_vector,
                 ..
             } => json!([attribute, if *exact { "kNN" } else { "ANN" }, wire_vector]),
+            Self::UnsupportedEmbed {
+                attribute,
+                exact,
+                expression,
+            } => json!([attribute, if *exact { "kNN" } else { "ANN" }, expression]),
             Self::MultiVector {
                 attribute,
                 exact,

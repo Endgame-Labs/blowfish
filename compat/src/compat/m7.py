@@ -144,3 +144,20 @@ def register(scenarios):
         return {'availability': 'supported'}
 
     scenarios['m7_multivector'] = (multivector, False)
+
+    def unsupported_models(ns):
+        ns.write(distance_metric='cosine_distance', upsert_rows=[{'id': 1, 'vector': [1.0, 0.0], 's': 'fox'}])
+        result = []
+        for params in (
+            {'rank_by': ['vector', 'ANN', ['Embed', 'fox', {'model': 'blowfish-unsupported-model'}]], 'top_k': 1},
+            {'rank_by': ['id', 'asc'], 'top_k': 1, 'rerank_by': {'model': 'blowfish-unsupported-model', 'attribute': 's', 'query': 'fox'}},
+        ):
+            try:
+                ns.query(**params)
+                raise AssertionError('unsupported model query succeeded')
+            except turbopuffer.APIStatusError as exc:
+                message = str(exc.body.get('error', '')) if isinstance(exc.body, dict) else ''
+                result.append({'status': exc.status_code, 'message_present': bool(message)})
+        return result
+
+    scenarios['m7_unsupported_models'] = (unsupported_models, False)

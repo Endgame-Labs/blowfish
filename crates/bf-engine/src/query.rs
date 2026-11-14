@@ -10,6 +10,11 @@ pub(crate) fn execute(
     state: &NamespaceState,
     request: &QueryRequest,
 ) -> Result<QueryResponse, ApiError> {
+    if request.rerank_by.as_ref().is_some_and(Value::is_object) {
+        return Err(ApiError::bad(
+            "model rerank_by is not supported by blowfish yet",
+        ));
+    }
     let (result, results) = if let Some(queries) = &request.queries {
         if queries.is_empty() || queries.len() > 16 {
             return Err(ApiError::bad("multi-query requires one to sixteen queries"));
@@ -46,7 +51,7 @@ pub(crate) fn execute(
     } else {
         if request.rerank_by.is_some() {
             return Err(ApiError::bad(
-                "model reranking is not supported by blowfish yet",
+                "model rerank_by is not supported by blowfish yet",
             ));
         }
         (single(state, request, request.vector_encoding)?, None)
@@ -379,6 +384,11 @@ pub(crate) fn validate_rank(
     guarded: bool,
 ) -> Result<(), ApiError> {
     match rank {
+        RankBy::UnsupportedEmbed { .. } => {
+            return Err(ApiError::bad(
+                "native Embed expressions are not supported by blowfish yet",
+            ));
+        }
         RankBy::Constant(_) => {}
         RankBy::Order(keys) => {
             for key in keys {
@@ -837,7 +847,7 @@ fn rrf(
 ) -> Result<SingleQueryResult, ApiError> {
     let a = rerank
         .as_array()
-        .ok_or_else(|| ApiError::bad("model reranking is not supported by blowfish yet"))?;
+        .ok_or_else(|| ApiError::bad("model rerank_by is not supported by blowfish yet"))?;
     if a.first() != Some(&json!("RRF")) || a.len() > 2 {
         return Err(ApiError::bad("invalid rerank_by expression"));
     }

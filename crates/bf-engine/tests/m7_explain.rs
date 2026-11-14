@@ -52,3 +52,45 @@ async fn explain_identifies_real_indexes_segment_count_nprobe_and_tail() {
         assert!(plan.contains(text), "missing {text}: {plan}");
     }
 }
+
+#[tokio::test]
+async fn hosted_model_features_fail_with_clear_runtime_errors() {
+    let e = Engine::with_config(
+        Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+        EngineConfig {
+            indexing: false,
+            ..Default::default()
+        },
+    );
+    e.write("models",serde_json::from_value(json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"vector":[1,0],"s":"fox"}]})).unwrap()).await.unwrap();
+    let queries = [
+        json!({"rank_by":["vector","ANN",["Embed","fox"]],"top_k":1}),
+        json!({"rank_by":["id","asc"],"top_k":1,"rerank_by":{"model":"unknown","attribute":"s","query":"fox"}}),
+        json!({"queries":[{"rank_by":["id","asc"],"top_k":1}],"rerank_by":{"model":"unknown","attribute":"s","query":"fox"},"limit":1}),
+        json!({"rank_by":["id","asc"],"top_k":1,"compute_attributes":{"e":["Embed","fox"]}}),
+    ];
+    for q in queries {
+        let error = e
+            .query("models", serde_json::from_value(q).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("not supported by blowfish yet"));
+        assert!(error.message.contains("Embed") || error.message.contains("rerank_by"));
+    }
+    let error = e
+        .write(
+            "models",
+            serde_json::from_value(json!({"upsert_rows":[{"id":2,"vector":["Embed","fox"]}]}))
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, 400);
+    assert!(error.message.contains("Embed"));
+}

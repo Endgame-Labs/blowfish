@@ -55,6 +55,12 @@ fn is_highlight(v: &Value) -> bool {
     v.get(0).is_some_and(|v| v == "Highlight")
 }
 fn expression(v: &Value) -> Result<RankBy, ApiError> {
+    if v.get(0).is_some_and(|v| v == "Embed") {
+        return Err(ApiError::bad(
+            "native Embed expressions are not supported by blowfish yet",
+        ));
+    }
+
     if v.get(1).is_some_and(|v| v == "VectorDist") {
         let mut v = v.clone();
         v[1] = json!("ANN");
