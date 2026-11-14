@@ -26,7 +26,7 @@ def scenario(name, method, params, *, setup=True, expected_error=False, bm25=Fal
     def run(ns):
         """Execute this scenario's SDK operation."""
         if setup:
-            ns.write(upsert_rows=ROWS, distance_metric="cosine_distance", schema={"text": {"type": "string", "full_text_search": True}})
+            normalize(ns.write(upsert_rows=ROWS, distance_metric="cosine_distance", schema={"text": {"type": "string", "full_text_search": True}}))
         try:
             value = getattr(ns, method)(**params)
         except turbopuffer.APIStatusError as exc:
@@ -43,25 +43,29 @@ def scenario(name, method, params, *, setup=True, expected_error=False, bm25=Fal
                 if key not in result or not isinstance(result[key], dict):
                     raise ValueError(f"{method} response missing object {key}")
         if method == "write" and setup:
-            result = {"write": result, "after": ns.query(rank_by=["id", "asc"], top_k=10, include_attributes=True).model_dump(mode="json", exclude_unset=True)}
+            result = {"write": normalize(result), "after": normalize(ns.query(rank_by=["id", "asc"], top_k=10, include_attributes=True))}
         return normalize(result)
     SCENARIOS[name] = (run, bm25)
 
 
 def error_category(message):
     m = message.lower()
-    for category, terms in [("missing_namespace", ("not found", "does not exist")), ("dimensions", ("dimension",)), ("id_type", ("id type", "mix id")), ("deserialize", ("deserialize", "variant")), ("limit", ("limit", "top_k")), ("type", ("type",))]:
+    for category, terms in [("missing_namespace", ("not found", "does not exist", "no such namespace", "unknown namespace")), ("dimensions", ("dimension", "vector length", "vector size")), ("id_type", ("id type", "mix id", "mixed id", "identifier type")), ("deserialize", ("deserialize", "variant", "unknown operator", "invalid operator")), ("limit", ("limit", "top_k")), ("type", ("type",))]:
         if any(term in m for term in terms):
             return category
     return "other"
 
 
-def normalize(value):
+def normalize(value, depth=0, require_metrics=True):
     if hasattr(value, "model_dump"):
         value = value.model_dump(mode="json", exclude_unset=True)
     if isinstance(value, list):
-        return [normalize(v) for v in value]
+        return [normalize(v, depth + 1) for v in value]
     if isinstance(value, dict):
+        if require_metrics and depth == 0 and any(key in value for key in ("rows", "results", "rows_affected")):
+            for key in ("performance", "billing"):
+                if not isinstance(value.get(key), dict):
+                    raise ValueError(f"response missing object {key}")
         for key in ("performance", "billing"):
             if key in value and not isinstance(value[key], dict):
                 raise ValueError(f"{key} must be an object")
@@ -74,11 +78,11 @@ def normalize(value):
         for key, item in value.get("billing", {}).items():
             if key.startswith("billable_") and (not isinstance(item, (int, float)) or isinstance(item, bool)):
                 raise ValueError(f"billing.{key} must be numeric")
-        return {k: normalize(v) for k, v in value.items() if k not in {"performance", "billing", "created_at", "updated_at", "last_write_at", "last_included_write_at", "trace_id", "request_id"}}
+        return {k: normalize(v, depth + 1) for k, v in value.items() if k not in {"performance", "billing", "created_at", "updated_at", "last_write_at", "last_included_write_at", "trace_id", "request_id"}}
     return value
 
 
-def compare(expected, actual, path="", tol=1e-5):
+def compare(expected, actual, path="", tol=1e-5, tie_attrs=()):
     if path.endswith(".message") and ".error." in path:
         return []
     if path.endswith(".$dist") and isinstance(expected, (float, int)) and isinstance(actual, (float, int)):
@@ -86,12 +90,23 @@ def compare(expected, actual, path="", tol=1e-5):
     if type(expected) is not type(actual):
         return [f"{path}: expected {expected!r}, got {actual!r}"]
     if isinstance(expected, dict):
+        if "recall_queries" in expected and "recall_queries" in actual:
+            left, right = expected["recall_queries"], actual["recall_queries"]
+            if len(left) != len(right):
+                return [f"{path}: query count differs"]
+            issues = []
+            for i, (a, b) in enumerate(zip(left, right)):
+                ids = {row["id"] for row in a}
+                recall = len(ids & {row["id"] for row in b}) / len(ids) if ids else 1.0
+                if len(a) != 10 or len(b) != 10 or recall < 0.9:
+                    issues.append(f"{path}[{i}]: recall@10 {recall:.2f}, lengths {len(a)}, {len(b)}")
+            return issues
         issues = []
         for k in expected.keys() | actual.keys():
             if k not in expected or k not in actual:
                 issues.append(f"{path}.{k}: missing from {'fixture' if k not in expected else 'response'}")
             else:
-                issues.extend(compare(expected[k], actual[k], f"{path}.{k}", tol))
+                issues.extend(compare(expected[k], actual[k], f"{path}.{k}", tol, tie_attrs))
         return issues
     if isinstance(expected, list):
         # Ranking ties have no specified order. Only rearrange runs whose scores
@@ -101,11 +116,15 @@ def compare(expected, actual, path="", tol=1e-5):
             start = 0
             while start < len(rows):
                 row = rows[start]
-                if not isinstance(row, dict) or "$dist" not in row or "id" not in row:
+                if not isinstance(row, dict) or "id" not in row:
+                    start += 1
+                    continue
+                keys = ("$dist",) if "$dist" in row else tie_attrs
+                if not keys or any(k not in row for k in keys):
                     start += 1
                     continue
                 end = start + 1
-                while end < len(rows) and isinstance(rows[end], dict) and rows[end].get("$dist") == row["$dist"] and "id" in rows[end]:
+                while end < len(rows) and isinstance(rows[end], dict) and "id" in rows[end] and all(k in rows[end] and rows[end][k] == row[k] for k in keys):
                     end += 1
                 rows[start:end] = sorted(rows[start:end], key=lambda item: (type(item["id"]).__name__, str(item["id"])))
                 start = end
@@ -113,7 +132,7 @@ def compare(expected, actual, path="", tol=1e-5):
         expected, actual = sort_ties(expected), sort_ties(actual)
         if len(expected) != len(actual):
             return [f"{path}: expected {len(expected)} items, got {len(actual)}"]
-        return [issue for i, (a, b) in enumerate(zip(expected, actual)) for issue in compare(a, b, f"{path}[{i}]", tol)]
+        return [issue for i, (a, b) in enumerate(zip(expected, actual)) for issue in compare(a, b, f"{path}[{i}]", tol, tie_attrs)]
     return [] if expected == actual else [f"{path}: expected {expected!r}, got {actual!r}"]
 
 
@@ -177,13 +196,20 @@ def register():
     scenario("error_limit", "query", {"rank_by": ["id", "asc"], "top_k": 10001}, expected_error=True)
 
 
+EXTRA_SCENARIOS = ("types_roundtrip", "ann_recall", "copy_string", "copy_object", "list_pagination", "export_full", "raw_invalid_json", "raw_content_type", "raw_unknown_route", "raw_gzip", "raw_unknown_params", "hint_cache_warm", "debug_recall", "explain_query", "order_ties")
+
+
 def client(url, key):
     return turbopuffer.Turbopuffer(base_url=url, api_key=key or "dummy", max_retries=0, timeout=15)
 
 
 def execute(c, name):
-    ns = c.namespace("blowfish-oracle-compat-" + name.replace("_", "-") + "-" + uuid.uuid4().hex[:12])
+    namespace = "blowfish-oracle-compat-" + name.replace("_", "-") + "-" + uuid.uuid4().hex[:12]
+    ns = c.namespace(namespace)
     try:
+        if name in EXTRA_SCENARIOS:
+            from compat.extra import run
+            return run(c, namespace, name)
         return SCENARIOS[name][0](ns)
     finally:
         try:
@@ -201,6 +227,7 @@ def cleanup(c):
 
 def main():
     register()
+    SCENARIOS.update({name: (None, False) for name in EXTRA_SCENARIOS})
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     for cmd in ("record", "check", "diff-live", "cleanup"):
@@ -232,7 +259,7 @@ def main():
                 issues = []
             else:
                 actual = execute(target, name)
-                issues = compare(expected, actual, tol=0.02 if SCENARIOS[name][1] else 1e-5)
+                issues = compare(expected, actual, tol=0.02 if SCENARIOS[name][1] else 1e-5, tie_attrs=("n",) if name == "order_ties" else ())
             if issues:
                 failed += 1; print(f"FAIL {name}: " + "; ".join(issues[:8]), flush=True)
             else: print(f"PASS {name}", flush=True)

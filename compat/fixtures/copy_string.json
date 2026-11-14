@@ -1,0 +1,63 @@
+{
+  "after": {
+    "rows": [
+      {
+        "id": 1,
+        "n": 1,
+        "name": "alpha",
+        "tags": [
+          "red",
+          "blue"
+        ],
+        "text": "quick brown fox",
+        "vector": [
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "id": 2,
+        "n": 2,
+        "name": "beta",
+        "tags": [
+          "blue"
+        ],
+        "text": "quick dog",
+        "vector": [
+          0.0,
+          1.0,
+          0.0
+        ]
+      },
+      {
+        "id": 3,
+        "n": 3,
+        "name": "gamma",
+        "tags": [],
+        "text": "slow fox",
+        "vector": [
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      {
+        "id": 4,
+        "n": 4,
+        "name": "delta",
+        "text": "brown dog",
+        "vector": [
+          0.5,
+          0.5,
+          0.0
+        ]
+      }
+    ]
+  },
+  "copy": {
+    "message": "namespace cloned successfully",
+    "rows_affected": 4,
+    "status": "OK"
+  }
+}

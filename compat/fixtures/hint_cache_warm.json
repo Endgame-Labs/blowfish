@@ -1,0 +1,7 @@
+{
+  "body": {
+    "message": "cache warm hint accepted",
+    "status": "ACCEPTED"
+  },
+  "status": 202
+}
