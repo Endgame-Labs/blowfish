@@ -4,6 +4,21 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Ops merged.** Auth, admin, metrics, packaging, and docs are in:
+  - **Auth:** RBAC API keys enforced on every route, plus the super key (`BLOWFISH_ADMIN_KEY`) and
+    `--require-auth`. Without a super key, blowfish runs in dev mode with a loud warning.
+  - **Admin API:** `/_blowfish/v1/keys` and `/_blowfish/v1/status`.
+  - **CLI:** `blowfish keys create|list|revoke`.
+  - **Metrics:** Prometheus at `/metrics`, gated by key, or open on a separate `--metrics-listen` port.
+  - **Docker:** a 63 MB non-root Docker image, and Compose for a local volume or SeaweedFS S3 (which
+    passed the CAS probe).
+  - **Docs:** quickstart, configuration, auth, metrics, and operations under `docs/`.
+- **Cache merged (M5 library).** It has two tiers: memory (moka) and a checksummed disk tier, read in
+  1 MiB aligned blocks. Missing blocks are coalesced into ranged GETs, and concurrent fetches of one
+  block share a single request. It also supports prefetch, object-store and cache metrics, and
+  turbopuffer-style `cache_temperature`. The engine will use it when the index worker's segments land.
+- **Verified on main:** compat **96/96 with auth enforced**, using a key minted by `blowfish keys
+  create`. `/metrics` returns 401 without a key and works with the super key, and unknown keys get 401.
 - **Compat: 96/96 🎉** blowfish M1 passes every scenario against the recorded turbopuffer fixtures,
   and also when diffed live against real turbopuffer. The official Python and TypeScript SDK smoke
   tests pass. The fixes:
