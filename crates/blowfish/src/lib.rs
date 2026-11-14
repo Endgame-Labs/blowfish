@@ -104,6 +104,9 @@ impl IntoResponse for HttpError {
 fn body<T>(result: Result<Json<T>, JsonRejection>) -> Result<T, HttpError> {
     result.map(|Json(v)| v).map_err(|e| {
         let detail = e.body_text();
+        if matches!(e, JsonRejection::JsonSyntaxError(_)) {
+            return HttpError(ApiError::bad(format!("💔 {detail}")));
+        }
         if detail.contains("is not supported by blowfish yet")
             || detail.contains("weight must be non-negative")
         {

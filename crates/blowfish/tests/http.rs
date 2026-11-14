@@ -222,12 +222,19 @@ async fn auth_and_invalid_json() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(
         response.headers()["content-type"]
             .to_str()
             .unwrap()
             .starts_with("application/json")
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["status"], "error");
+    assert_eq!(
+        error["error"],
+        "💔 Failed to parse the request body as JSON: key must be a string at line 1 column 2"
     );
 }
 #[tokio::test]
