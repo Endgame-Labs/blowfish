@@ -1,0 +1,48 @@
+{
+  "after": {
+    "rows": [
+      {
+        "id": 1,
+        "n": 5,
+        "vector": [
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "id": 2,
+        "n": 8,
+        "name": "beta",
+        "tags": [
+          "blue"
+        ],
+        "text": "quick dog",
+        "vector": [
+          0.0,
+          1.0,
+          0.0
+        ]
+      },
+      {
+        "id": 4,
+        "n": 4,
+        "name": "delta",
+        "text": "brown dog",
+        "vector": [
+          0.5,
+          0.5,
+          0.0
+        ]
+      }
+    ]
+  },
+  "write": {
+    "message": "documents committed successfully",
+    "rows_affected": 4,
+    "rows_deleted": 2,
+    "rows_patched": 1,
+    "rows_upserted": 1,
+    "status": "OK"
+  }
+}

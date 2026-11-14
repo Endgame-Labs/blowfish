@@ -1,0 +1,88 @@
+{
+  "approx_logical_bytes": 0,
+  "approx_row_count": 0,
+  "encryption": {
+    "mode": "default"
+  },
+  "index": {
+    "status": "up-to-date"
+  },
+  "schema": {
+    "id": {
+      "type": "uint"
+    },
+    "n": {
+      "filterable": true,
+      "type": "int"
+    },
+    "name": {
+      "filterable": true,
+      "type": "string"
+    },
+    "tags": {
+      "filterable": true,
+      "type": "[]string"
+    },
+    "text": {
+      "filterable": false,
+      "full_text_search": {
+        "ascii_folding": false,
+        "b": 0.75,
+        "case_sensitive": false,
+        "k1": 1.2,
+        "k3": 8.0,
+        "language": "english",
+        "max_token_length": 39,
+        "remove_stopwords": false,
+        "stemming": false,
+        "tokenizer": "word_v4"
+      },
+      "type": "string"
+    },
+    "vector": {
+      "ann": {
+        "distance_metric": "cosine_distance"
+      },
+      "type": "[3]f32"
+    }
+  },
+  "schema_": {
+    "id": {
+      "type": "uint"
+    },
+    "n": {
+      "filterable": true,
+      "type": "int"
+    },
+    "name": {
+      "filterable": true,
+      "type": "string"
+    },
+    "tags": {
+      "filterable": true,
+      "type": "[]string"
+    },
+    "text": {
+      "filterable": false,
+      "full_text_search": {
+        "ascii_folding": false,
+        "b": 0.75,
+        "case_sensitive": false,
+        "k1": 1.2,
+        "k3": 8.0,
+        "language": "english",
+        "max_token_length": 39,
+        "remove_stopwords": false,
+        "stemming": false,
+        "tokenizer": "word_v4"
+      },
+      "type": "string"
+    },
+    "vector": {
+      "ann": {
+        "distance_metric": "cosine_distance"
+      },
+      "type": "[3]f32"
+    }
+  }
+}

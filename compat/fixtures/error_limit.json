@@ -1,0 +1,7 @@
+{
+  "error": {
+    "category": "limit",
+    "message": "💔 limit/top_k must be between 1 and 10000",
+    "status": 400
+  }
+}

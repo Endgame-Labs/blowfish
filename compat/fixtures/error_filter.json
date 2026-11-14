@@ -1,0 +1,7 @@
+{
+  "error": {
+    "category": "deserialize",
+    "message": "💔 Failed to deserialize the JSON body into the target type: data did not match any variant of untagged enum FiltersInput at line 1 column 66",
+    "status": 422
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "id": {
+    "filterable": null,
+    "full_text_search": null,
+    "type": "uint"
+  },
+  "n": {
+    "filterable": true,
+    "full_text_search": null,
+    "type": "int"
+  },
+  "name": {
+    "filterable": true,
+    "full_text_search": null,
+    "type": "string"
+  },
+  "tags": {
+    "filterable": true,
+    "full_text_search": null,
+    "type": "[]string"
+  },
+  "text": {
+    "filterable": false,
+    "full_text_search": {
+      "ascii_folding": false,
+      "b": 0.75,
+      "case_sensitive": false,
+      "k1": 1.2,
+      "k3": 8.0,
+      "language": "english",
+      "max_token_length": 39,
+      "remove_stopwords": false,
+      "stemming": false,
+      "tokenizer": "word_v4"
+    },
+    "type": "string"
+  },
+  "vector": {
+    "ann": true,
+    "filterable": null,
+    "full_text_search": null,
+    "type": "[3]f32"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "rows": [
+    {
+      "id": 1,
+      "n": 1,
+      "name": "alpha",
+      "tags": [
+        "red",
+        "blue"
+      ],
+      "text": "quick brown fox",
+      "vector": [
+        1.0,
+        0.0,
+        0.0
+      ]
+    }
+  ]
+}
