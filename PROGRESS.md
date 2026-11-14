@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Multinode merged.** Every engine and cache setting can now be set in `blowfish.toml`, by CLI flag,
+  or through a `BLOWFISH_*` environment variable. Metrics recording is installed before the engine
+  starts. Tests and docs:
+  - **Multi-node:** `scripts/multinode.sh` runs three nodes on one SeaweedFS bucket behind Caddy
+    round-robin and passes **111/111**.
+  - **Crash test:** a node was killed and restarted during concurrent writes. All 67 acknowledged writes
+    survived, and exactly one conditional update won.
+  - **CI and docs:** a GitHub Actions workflow and `docs/compatibility.md`.
+
+  Point-in-time restore isn't implemented, and the docs now say so; the retention window is only a GC
+  grace period.
 - **Wave 4 launched:**
   - **perf:** cache wiring, decoded in-memory segment structures, parallel segment search, streaming
     order-by and aggregates, single-PUT WAL commits, and R2 cold/warm benchmarks.
