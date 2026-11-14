@@ -4,6 +4,15 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **`bf-auth` merged.** It provides role-based API keys:
+  - **Roles:** turbopuffer's `admin`, `write`, `read`, and `list`, plus blowfish's `metrics` and `keys`.
+  - **Scopes:** keys can be limited to namespace prefixes, and can expire.
+  - **Storage:** SHA-256 hashed secrets with constant-time checks, kept in the bucket under
+    `_system/keys/`, and an external super key.
+  - **Delegation:** a key can never create a key more powerful than itself.
+
+  Revocation reaches other nodes on the next background refresh. The library is tested (`cargo test
+  -p bf-auth`), but the server doesn't use it yet; it gets wired in wave 2.
 - **Wave 1 launched.** Five parallel workers, each in its own git worktree and branch:
   - core (M1: types, storage, WAL, exhaustive engine, and the HTTP server)
   - `bf-text` (tokenizers, BM25, and the posting index)
