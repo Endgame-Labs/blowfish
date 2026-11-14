@@ -17,11 +17,17 @@ The remaining public methods implement metadata, schema updates, namespace listi
 namespace deletion, cache warming, exact recall evaluation, and query explanation.
 `storage()` provides the configured store for operational inspection.
 
+Each WAL slot is a small immutable commit record referencing a compressed batch
+payload in `wal-data/`. The payload is durable before the slot is committed, so a
+crash cannot leave a committed slot without its data. This costs two object creates
+per group, a deliberate M1 correctness tradeoff.
+
 Namespace deletion commits an immutable tombstone, clears cached state, and removes
-non-WAL objects. WAL objects remain as fences: removing an old slot would allow a
-stale writer to recreate it. Physical WAL reclamation belongs with the generation
-and retention protocol in the GC milestone. Recreating the namespace continues its
-sequence after the tombstone and can use a different schema or ID type.
+old batch payloads and manifests. Small slot records remain as fences: removing an
+old slot would allow a stale writer to recreate it. Cold and stale nodes skip to the
+last tombstone before loading payloads. Recreating the namespace continues its
+sequence and can use a different schema or ID type. Uncommitted payloads orphaned
+by a process crash need the later GC milestone.
 
 This is deliberately an in-memory reference implementation. Copying a namespace
 copies its materialized documents into a new WAL batch, and each commit currently

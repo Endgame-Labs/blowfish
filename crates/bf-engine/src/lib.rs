@@ -385,7 +385,7 @@ async fn commit_worker(
                     Ok(_) => {
                         let seq = current.seq + 1;
                         current.replay(seq, &entry);
-                        if let Err(e) = wal.cleanup_deleted().await {
+                        if let Err(e) = wal.cleanup_deleted(seq).await {
                             tracing::warn!(error=?e,"namespace cleanup deferred");
                         }
                         break Ok(vec![Ok(WriteResponse::default())]);

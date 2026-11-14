@@ -47,3 +47,34 @@ async fn versioned_slots_conflicts_tail_and_manifest() {
     a.publish_manifest(1, &manifest).await.unwrap();
     assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 1);
 }
+
+#[tokio::test]
+async fn deletion_erases_payloads_but_fences_old_slots() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let wal = Wal::new(store.clone(), "deleted").unwrap();
+    let first = WalEntry::new(vec![]);
+    wal.append(1, &first).await.unwrap();
+    assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 1);
+    let mut tombstone = WalEntry::new(vec![]);
+    tombstone.tombstone = true;
+    wal.append(2, &tombstone).await.unwrap();
+    // A concurrent recreation can commit before cleanup; it must survive.
+    wal.append(3, &WalEntry::new(vec![])).await.unwrap();
+    wal.cleanup_deleted(2).await.unwrap();
+    assert!(matches!(wal.read(1).await, Err(Error::Pruned)));
+    assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 1);
+    let tail = wal.tail(0).await.unwrap();
+    assert_eq!(tail.len(), 2);
+    assert!(tail[0].1.tombstone);
+    assert_eq!(tail[1].0, 3);
+    assert_eq!(
+        wal.append(1, &WalEntry::new(vec![])).await.unwrap(),
+        CreateResult::Conflict
+    );
+    assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 1);
+}
