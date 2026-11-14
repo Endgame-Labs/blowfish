@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Compat: 96/96 🎉** blowfish M1 passes every scenario against the recorded turbopuffer fixtures,
+  and also when diffed live against real turbopuffer. The official Python and TypeScript SDK smoke
+  tests pass. The fixes:
+  - Numeric constants in score expressions, `Decay` over signed attributes, and `ForEachUnique` null
+    grouping.
+  - `rows_remaining` omission and nanosecond datetimes.
+  - 400 and 415 for malformed requests, and a JSON error for unknown routes.
+
+  Two deliberate differences, both documented in `compat/README.md`:
+  - **Exact metadata counts:** turbopuffer reports 0 until it has indexed; blowfish reports exact counts.
+  - **`explain_query` on unindexed namespaces:** turbopuffer errors; blowfish returns a plan.
 - **M1 merged: blowfish serves the turbopuffer API.**
   `blowfish serve --storage-url file:///path` (or `s3://bucket/prefix`) works today.
   - **Storage:** CAS on object storage, verified on real R2, with single-writer mode as a fallback.
@@ -79,10 +90,10 @@ Newest first. Each entry says what works now and how it was checked.
 
 | # | Milestone | Status |
 |---|---|---|
-| M1 | Walking skeleton: WAL, full API, exhaustive search, compat harness | merged; compat 84/96, fixes in progress |
-| M2 | Segments, indexer, and GC | not started |
-| M3 | Vector index (IVF + RaBitQ) | not started |
-| M4 | Full-text index | not started |
+| M1 | Walking skeleton: WAL, full API, exhaustive search, compat harness | ✅ done, compat 96/96 |
+| M2 | Segments, indexer, and GC | in progress |
+| M3 | Vector index (IVF + RaBitQ) | library done; engine integration in progress |
+| M4 | Full-text index | library done; engine integration in progress |
 | M5 | Cache and performance | in progress |
 | M6 | Multi-node, auth, metrics, and packaging | in progress |
 | M7 | The "later" list | not started |
