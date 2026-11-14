@@ -63,6 +63,36 @@ pub(crate) fn execute(
         billing: QueryBilling::default(),
     })
 }
+// Bound Cartesian expansion before either evaluator visits its combinations.
+pub(crate) fn group_values(
+    doc: &Document,
+    groups: &[GroupBy],
+) -> Result<Vec<Vec<Value>>, ApiError> {
+    let mut combinations = 1usize;
+    let mut result = Vec::with_capacity(groups.len());
+    for group in groups {
+        let values = match group {
+            GroupBy::Attribute(name) => vec![doc.get(name).cloned().unwrap_or(Value::Null)],
+            GroupBy::ForEachUnique { attribute, .. } => {
+                let mut values = doc
+                    .get(attribute)
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Value::Null]);
+                values.sort_by(filter::compare);
+                values.dedup();
+                values
+            }
+        };
+        combinations = combinations
+            .checked_mul(values.len())
+            .filter(|n| *n <= 10000)
+            .ok_or_else(|| ApiError::bad("group_by exceeds 10000 combinations per document"))?;
+        result.push(values);
+    }
+    Ok(result)
+}
+
 fn limits(q: &QueryRequest, required: bool) -> Result<usize, ApiError> {
     if q.top_k.is_some() && q.limit.is_some() {
         return Err(ApiError::bad("top_k and limit are mutually exclusive"));
@@ -180,8 +210,8 @@ fn single(
         }
         if let Some(groups) = &q.group_by {
             let total = limits(q, false)?;
-            if groups.is_empty() {
-                return Err(ApiError::bad("group_by cannot be empty"));
+            if groups.is_empty() || groups.len() > 32 {
+                return Err(ApiError::bad("group_by requires one to 32 keys"));
             }
             let mut labels = vec![];
             for group in groups {
@@ -203,22 +233,7 @@ fn single(
             let mut grouped: HashMap<String, (Vec<Value>, Vec<&Document>)> = HashMap::new();
             for (_, doc) in docs {
                 let mut keys = vec![vec![]];
-                for group in groups {
-                    let values = match group {
-                        GroupBy::Attribute(name) => {
-                            vec![doc.get(name).cloned().unwrap_or(Value::Null)]
-                        }
-                        GroupBy::ForEachUnique { attribute, .. } => {
-                            let mut v = doc
-                                .get(attribute)
-                                .and_then(Value::as_array)
-                                .cloned()
-                                .unwrap_or_else(|| vec![Value::Null]);
-                            v.sort_by(filter::compare);
-                            v.dedup();
-                            v
-                        }
-                    };
+                for values in group_values(doc, groups)? {
                     keys = keys
                         .into_iter()
                         .flat_map(|key| {

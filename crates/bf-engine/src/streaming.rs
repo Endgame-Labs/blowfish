@@ -225,7 +225,7 @@ struct Scan<'a> {
     groups: BTreeMap<GroupKey, Vec<Accumulator>>,
 }
 impl Scan<'_> {
-    fn row(&mut self, id: Id, doc: Document) {
+    fn row(&mut self, id: Id, doc: Document) -> Result<(), ApiError> {
         let k = self.q.total().unwrap_or(10000) + self.q.offset;
         if let Some(RankBy::Order(keys)) = &self.q.rank_by {
             let key = RankKey {
@@ -255,13 +255,21 @@ impl Scan<'_> {
             self.winners
                 .insert(Ranked { key, doc, group }, k, per.map(|p| p.limit));
         } else {
-            self.group_keys(&doc, 0, &mut Vec::new(), k);
+            let values = query::group_values(&doc, self.q.group_by.as_deref().unwrap_or_default())?;
+            self.group_keys(&doc, &values, 0, &mut Vec::new(), k);
         }
+        Ok(())
     }
     // Generate each array-group product incrementally; never materialize its Cartesian product.
-    fn group_keys(&mut self, doc: &Document, depth: usize, key: &mut Vec<Value>, k: usize) {
-        let groups = self.q.group_by.as_deref().unwrap_or_default();
-        if depth == groups.len() {
+    fn group_keys(
+        &mut self,
+        doc: &Document,
+        values: &[Vec<Value>],
+        depth: usize,
+        key: &mut Vec<Value>,
+        k: usize,
+    ) {
+        if depth == values.len() {
             let key = GroupKey(
                 key.clone(),
                 serde_json::to_string(key).expect("group serializes"),
@@ -287,22 +295,9 @@ impl Scan<'_> {
             }
             return;
         }
-        let values = match &groups[depth] {
-            GroupBy::Attribute(name) => vec![doc.get(name).cloned().unwrap_or(Value::Null)],
-            GroupBy::ForEachUnique { attribute, .. } => {
-                let mut values = doc
-                    .get(attribute)
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_else(|| vec![Value::Null]);
-                values.sort_by(filter::compare);
-                values.dedup();
-                values
-            }
-        };
-        for value in values {
-            key.push(value);
-            self.group_keys(doc, depth + 1, key, k);
+        for value in &values[depth] {
+            key.push(value.clone());
+            self.group_keys(doc, values, depth + 1, key, k);
             key.pop();
         }
     }
@@ -352,7 +347,7 @@ async fn scan<'q>(
                 segment::projected_documents(store, seg, &selected, Some(&columns)).await?
             {
                 doc.retain(|name, _| state.schema.contains_key(name));
-                scan.row(id, doc);
+                scan.row(id, doc)?;
             }
         }
     }
@@ -363,7 +358,7 @@ async fn scan<'q>(
             .transpose()?
             .unwrap_or(true)
         {
-            scan.row(id.clone(), doc.clone());
+            scan.row(id.clone(), doc.clone())?;
         }
     }
     Ok(scan)
