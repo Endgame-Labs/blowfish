@@ -22,6 +22,21 @@ pub(crate) fn validate(f: &Filter, schema: &Schema, allow_refs: bool) -> Result<
                 .get(attribute)
                 .ok_or_else(|| ApiError::bad(format!("unknown attribute '{attribute}'")))?;
             let t = cfg.data_type.as_ref().expect("normalized schema type");
+            if matches!(
+                op,
+                Fuzzy
+                    | Regex
+                    | Glob
+                    | NotGlob
+                    | IGlob
+                    | NotIGlob
+                    | ContainsAllTokens
+                    | ContainsAnyToken
+                    | ContainsTokenSequence
+            ) && strings(value).iter().map(|s| s.len()).sum::<usize>() > 8192
+            {
+                return Err(ApiError::bad("text filter query exceeds 8192 bytes"));
+            }
             if *op == Fuzzy {
                 if cfg.fuzzy != Some(true) {
                     return Err(ApiError::bad("fuzzy is not enabled for this attribute"));
@@ -349,13 +364,22 @@ pub(crate) fn matches(
                 }
                 Fuzzy => {
                     let config = fuzzy_params(params.as_ref())?;
-                    strings(actual).iter().any(|s| {
-                        config.matches(s, operand.as_str().expect("validated fuzzy query"))
-                    })
+                    let query = operand.as_str().expect("validated fuzzy query");
+                    let texts = strings(actual);
+                    fuzzy_work(texts.iter().map(|s| s.len()).sum(), query.len())?;
+                    texts.iter().any(|s| config.matches(s, query))
                 }
             })
         }
     }
+}
+// Fuzzy matching uses dynamic programming. Bound work even when an index cannot
+// narrow candidates (and for highlight alignments, which retain match positions).
+pub(crate) fn fuzzy_work(text_bytes: usize, query_bytes: usize) -> Result<(), ApiError> {
+    if text_bytes > 65536 || text_bytes.saturating_mul(query_bytes) > 1_000_000 {
+        return Err(ApiError::bad("fuzzy comparison exceeds work limit"));
+    }
+    Ok(())
 }
 fn strings(value: &Value) -> Vec<&str> {
     if let Some(s) = value.as_str() {
