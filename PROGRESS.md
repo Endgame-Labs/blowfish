@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **perf2 partially merged.** These committed pieces are in:
+  - Per-query backend diagnostics.
+  - Batched, planned BM25 posting reads for cold queries.
+  - Warm strong-consistency WAL checks that run alongside the cached index search.
+  - A paused-copier crash test.
+
+  Verified: 149 Rust tests, and compat **121/121 in both modes**.
+- **⚠️ Workers stopped by low memory.** The VM ran low on memory (likely the 1M×768 benchmark running
+  next to a second worker's build). Claude Code stopped the perf2 and harden workers. Their committed
+  work is safe; their uncommitted work is still in their worktrees. They are paused until Kyle says to
+  resume.
 - **Security audit merged.** An independent pass fixed 11 real issues, each with a regression test.
   - **High:**
     - Scoped `keys` managers could inspect and revoke broader keys.
