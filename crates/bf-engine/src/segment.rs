@@ -160,7 +160,7 @@ async fn directory(reader: &ObjectReader) -> Result<Arc<Directory>, ApiError> {
     let dir = decode_directory(reader, &bytes, start)?;
     Ok(read_cache::insert(
         &reader.file.key,
-        reader.file.metadata_len.saturating_mul(16),
+        reader.file.metadata_len.max(65536).saturating_mul(16),
         dir,
     ))
 }
@@ -581,11 +581,14 @@ pub(crate) async fn projected_documents(
     let reader = ObjectReader::new(store, segment.files.get("docs").ok_or_else(corrupt)?);
     let dir = directory(&reader).await?;
     let mut docs: BTreeMap<u32, Document> = rows.iter().map(|row| (row, Document::new())).collect();
+    let blocks: std::collections::BTreeSet<_> =
+        rows.iter().map(|row| row as usize / BLOCK_ROWS).collect();
     for (name, col) in &dir.columns {
         if name != "id" && columns.is_some_and(|c| !c.contains(name)) {
             continue;
         }
-        for (i, b) in col.blocks.iter().enumerate() {
+        for &i in &blocks {
+            let b = col.blocks.get(i).ok_or_else(corrupt)?;
             let first = (i * BLOCK_ROWS) as u32;
             let last = first
                 .saturating_add(BLOCK_ROWS as u32)

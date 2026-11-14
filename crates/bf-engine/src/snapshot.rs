@@ -41,7 +41,7 @@ pub(crate) async fn catch_up(
                         segments: m.segments,
                         indexed_through: m.indexed_through,
                         manifest_seq: generation,
-                        stats: m.stats,
+                        stats: m.stats.into(),
                         ..Default::default()
                     }
                 };
@@ -179,7 +179,7 @@ pub(crate) async fn statistics(
     store: &Storage,
     state: &NamespaceState,
 ) -> Result<bf_wal::NamespaceStats, ApiError> {
-    let mut stats = state.stats.clone();
+    let mut stats = (*state.stats).clone();
     if !state.shadowed.is_empty() {
         for seg in &state.segments {
             let rows = segment::lookup_many(store, seg, &state.shadowed).await?

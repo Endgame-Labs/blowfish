@@ -274,7 +274,7 @@ impl Engine {
             return Ok(false);
         }
         let store = &self.0.store;
-        manifest.stats = state.stats.clone();
+        manifest.stats = (*state.stats).clone();
         // A tombstone followed by recreation discards every old segment and its statistics.
         if state.segments.is_empty() && !manifest.segments.is_empty() {
             for seg in manifest.segments.clone() {

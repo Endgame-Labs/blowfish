@@ -4,7 +4,10 @@ use bf_storage::Storage;
 use bf_types::*;
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
+};
 
 pub(crate) fn rank_key(rank: &RankBy) -> String {
     rank.value().to_string()
@@ -21,8 +24,44 @@ pub(crate) async fn execute(
     let mut empty = state.clone();
     empty.docs.clear();
     query::execute(&empty, request)?;
+    if crate::streaming::supports(request) {
+        return crate::streaming::execute(store, state, request).await;
+    }
+    // Independent subqueries can each stream without building a union of all candidates.
+    if let Some(queries) = &request.queries
+        && request.rerank_by.is_none()
+    {
+        let mut results = Vec::with_capacity(queries.len());
+        for q in queries {
+            let mut q = q.clone();
+            q.vector_encoding = request.vector_encoding;
+            results.push(
+                Box::pin(execute(store, state, &q, config, force_exact))
+                    .await?
+                    .result,
+            );
+        }
+        return Ok(QueryResponse {
+            result: Default::default(),
+            results: Some(results),
+            performance: Default::default(),
+            billing: Default::default(),
+        });
+    }
     let mut prepared = state.clone();
-    prepared.corpus = crate::text::global_stats(store, state).await?;
+    let mut clauses = vec![];
+    for q in request
+        .queries
+        .as_deref()
+        .unwrap_or(std::slice::from_ref(request))
+    {
+        if let Some(rank) = &q.rank_by {
+            text_clauses(rank, &mut clauses);
+        }
+    }
+    if !clauses.is_empty() {
+        prepared.corpus = crate::text::global_stats(store, state).await?.into();
+    }
     let state = &prepared;
     let mut candidates = state.clone();
     candidates.docs.clear();
@@ -39,6 +78,61 @@ pub(crate) async fn execute(
     }
     query::execute(&candidates, request)
 }
+#[derive(Clone)]
+struct HitKey {
+    score: f64,
+    id: Id,
+    descending: bool,
+}
+impl PartialEq for HitKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for HitKey {}
+impl PartialOrd for HitKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HitKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let cmp = self.score.total_cmp(&other.score);
+        (if self.descending { cmp.reverse() } else { cmp }).then(self.id.cmp(&other.id))
+    }
+}
+/// Keep only the globally competitive candidates while merging segment-local top-k lists.
+fn trim_candidates(state: &mut NamespaceState, q: &QueryRequest) {
+    if q.limit.as_ref().and_then(Limit::per).is_some() {
+        return;
+    }
+    let Some(rank @ (RankBy::Vector { .. } | RankBy::Bm25 { .. })) = &q.rank_by else {
+        return;
+    };
+    let Some(scores) = state.scores.get(&rank_key(rank)) else {
+        return;
+    };
+    let k = q.total().unwrap_or(10) + q.offset;
+    let mut heap = BinaryHeap::new();
+    for (id, score) in scores {
+        let hit = HitKey {
+            id: id.clone(),
+            score: *score,
+            descending: matches!(rank, RankBy::Bm25 { .. }),
+        };
+        if heap.len() < k {
+            heap.push(hit);
+        } else if heap.peek().is_some_and(|worst| hit < *worst) {
+            heap.pop();
+            heap.push(hit);
+        }
+    }
+    let keep: BTreeSet<_> = heap.into_iter().map(|hit| hit.id).collect();
+    state.docs.retain(|id, _| keep.contains(id));
+    for scores in state.scores.values_mut() {
+        scores.retain(|id, _| keep.contains(id));
+    }
+}
 async fn prepare(
     store: &Storage,
     state: &NamespaceState,
@@ -47,7 +141,9 @@ async fn prepare(
     force_exact: bool,
 ) -> Result<NamespaceState, ApiError> {
     let Some(context) = crate::read_cache::context().filter(|_| state.segments.len() > 1) else {
-        return prepare_one(store, state, q, config, force_exact).await;
+        let mut out = prepare_one(store, state, q, config, force_exact).await?;
+        trim_candidates(&mut out, q);
+        return Ok(out);
     };
     let mut base = state.clone();
     base.docs.clear();
@@ -89,6 +185,7 @@ async fn prepare(
         for (rank, scores) in part.scores {
             out.scores.entry(rank).or_default().extend(scores);
         }
+        trim_candidates(&mut out, q);
     }
     let mut tail = state.clone();
     tail.segments.clear();
@@ -97,6 +194,7 @@ async fn prepare(
     for (rank, scores) in part.scores {
         out.scores.entry(rank).or_default().extend(scores);
     }
+    trim_candidates(&mut out, q);
     Ok(out)
 }
 async fn prepare_one(
@@ -356,11 +454,12 @@ async fn prepare_scalar(
                 crate::text::tokens(query, &cfg),
                 crate::text::prefix(params.as_ref()),
             );
-            let stats = state.corpus.get(attribute).cloned().unwrap_or_default();
+            let fallback = bf_text::CorpusStats::default();
+            let stats = state.corpus.get(attribute).unwrap_or(&fallback);
             let top = if all { allowed.len() as usize } else { k };
             let hits = if let Some(reader) = indexes.get(attribute) {
                 reader
-                    .search(&query, &stats, &cfg, top, Some(&allowed))
+                    .search(&query, stats, &cfg, top, Some(&allowed))
                     .await
                     .map_err(segment::index_error)?
             } else {
@@ -375,7 +474,7 @@ async fn prepare_scalar(
                     let score = bf_text::score_document(
                         &crate::text::tokens(value, &cfg),
                         &query,
-                        &stats,
+                        stats,
                         &cfg,
                     );
                     if score > 0.0 {
@@ -425,11 +524,12 @@ async fn prepare_scalar(
                 crate::text::tokens(query, &cfg),
                 crate::text::prefix(params.as_ref()),
             );
-            let stats = state.corpus.get(attribute).cloned().unwrap_or_default();
+            let fallback = bf_text::CorpusStats::default();
+            let stats = state.corpus.get(attribute).unwrap_or(&fallback);
             let score = bf_text::score_document(
                 &crate::text::tokens(doc.get(attribute).unwrap_or(&serde_json::Value::Null), &cfg),
                 &query,
-                &stats,
+                stats,
                 &cfg,
             ) as f64;
             out.scores

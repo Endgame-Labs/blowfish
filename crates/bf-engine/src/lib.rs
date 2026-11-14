@@ -5,6 +5,7 @@ mod indexer;
 mod read_cache;
 mod segment;
 mod snapshot;
+mod streaming;
 pub use indexer::EngineConfig;
 mod metadata;
 mod query;
@@ -37,9 +38,9 @@ pub(crate) struct NamespaceState {
     pub manifest_seq: u64,
     pub tail_bytes: u64,
     pub tail_since: Option<DateTime<Utc>>,
-    pub stats: bf_wal::NamespaceStats,
+    pub stats: Arc<bf_wal::NamespaceStats>,
     pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
-    pub corpus: BTreeMap<String, bf_text::CorpusStats>,
+    pub corpus: Arc<BTreeMap<String, bf_text::CorpusStats>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub refreshed: Instant,
@@ -60,7 +61,7 @@ impl Default for NamespaceState {
             tail_since: None,
             stats: Default::default(),
             scores: BTreeMap::new(),
-            corpus: BTreeMap::new(),
+            corpus: Arc::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             refreshed: Instant::now(),
