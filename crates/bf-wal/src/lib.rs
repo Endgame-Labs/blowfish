@@ -498,6 +498,11 @@ impl Wal {
     }
     /// Read the most recent manifest if one exists.
     pub async fn latest_manifest(&self) -> Result<Option<(u64, Manifest)>, Error> {
+        self.manifest_after(0).await
+    }
+    /// Discover a newer immutable manifest, skipping payload reads and decoding when
+    /// the caller already holds the latest generation. Listing still observes remote publications.
+    pub async fn manifest_after(&self, known: u64) -> Result<Option<(u64, Manifest)>, Error> {
         let objects = self
             .store
             .list(&format!("ns/{}/manifest/", self.namespace))
@@ -512,6 +517,9 @@ impl Wal {
             .and_then(|s| s.strip_suffix(".json"))
             .and_then(|s| s.parse().ok())
             .ok_or(Error::Format)?;
+        if seq <= known {
+            return Ok(None);
+        }
         let bytes = self.store.get(&last.key).await?;
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         let manifest =

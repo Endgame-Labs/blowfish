@@ -14,7 +14,11 @@ pub(crate) async fn catch_up(
     // Always refresh the manifest before reading a potentially reclaimed tail.
     // A concurrent GC can still race this read; one fresh checkpoint retry resolves it.
     for attempt in 0..3 {
-        if let Some((generation, m)) = wal.latest_manifest().await.map_err(log_error)? {
+        if let Some((generation, m)) = wal
+            .manifest_after(state.manifest_seq)
+            .await
+            .map_err(log_error)?
+        {
             if m.format_version != 1 {
                 return Err(ApiError::new(500, "unsupported manifest format"));
             }

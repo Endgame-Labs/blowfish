@@ -51,6 +51,10 @@ async fn versioned_slots_conflicts_tail_and_manifest() {
     };
     a.publish_manifest(1, &manifest).await.unwrap();
     assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 1);
+    assert!(b.manifest_after(1).await.unwrap().is_none());
+    a.publish_manifest(2, &manifest).await.unwrap();
+    assert_eq!(b.manifest_after(1).await.unwrap().unwrap().0, 2);
+    assert!(b.manifest_after(2).await.unwrap().is_none());
 }
 
 #[tokio::test]
