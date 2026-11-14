@@ -192,8 +192,8 @@ impl Engine {
         response.performance = QueryPerformance {
             cache_hit_ratio: if warm { 1.0 } else { 0.0 },
             cache_temperature: if warm { "hot" } else { "cold" }.into(),
-            server_total_ms: start.elapsed().as_secs_f64() * 1000.0,
-            query_execution_ms: execution.elapsed().as_secs_f64() * 1000.0,
+            server_total_ms: start.elapsed().as_millis() as u64,
+            query_execution_ms: execution.elapsed().as_millis() as u64,
             exhaustive_search_count: state.docs.len() as u64,
             approx_namespace_size: state.docs.len() as u64,
             last_included_write_at: Some(state.updated_at.to_rfc3339()),
@@ -446,7 +446,7 @@ async fn commit_worker(
             Ok(results) => {
                 for (p, result) in pending.into_iter().zip(results) {
                     let result = result.map(|mut r| {
-                        r.performance.server_total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        r.performance.server_total_ms = start.elapsed().as_millis() as u64;
                         r
                     });
                     let _ = p.reply.send(result);

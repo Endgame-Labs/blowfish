@@ -169,8 +169,8 @@ pub struct QueryBilling {
 pub struct QueryPerformance {
     pub cache_hit_ratio: f64,
     pub cache_temperature: String,
-    pub server_total_ms: f64,
-    pub query_execution_ms: f64,
+    pub server_total_ms: u64,
+    pub query_execution_ms: u64,
     pub exhaustive_search_count: u64,
     pub approx_namespace_size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,7 +206,7 @@ pub struct WriteBilling {
 /// Measured server write time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WritePerformance {
-    pub server_total_ms: f64,
+    pub server_total_ms: u64,
 }
 /// Atomic write result; operation counters are omitted when zero, matching the oracle.
 #[derive(Debug, Clone, Serialize, Deserialize)]

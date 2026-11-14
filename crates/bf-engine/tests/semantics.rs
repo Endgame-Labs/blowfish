@@ -272,3 +272,145 @@ async fn uuid_datetime_f16_and_flat_column_vectors() {
     let result=query(&e,"typed",json!({"rank_by":["Decay",["Dist",["Attribute","d"],"1970-01-01T06:00:00Z"],{"midpoint":"6h"}],"limit":1})).await;
     assert_eq!(result["rows"][0]["$dist"], 0.5);
 }
+
+#[tokio::test]
+async fn conditional_deletes_ref_new_patches_schema_and_validation_edges() {
+    let e = engine().await;
+    write(&e,"edge",json!({"schema":{"id":"uint","a":"[]int"},"upsert_rows":[{"id":1,"n":1,"a":[]},{"id":2,"n":2,"a":[2]}]})).await.unwrap();
+    let r=write(&e,"edge",json!({"patch_columns":{"id":[1,3],"n":[3,9]},"patch_condition":["n","Lt",{"$ref_new":"n"}]})).await.unwrap();
+    assert_eq!(r.rows_patched, Some(1));
+    let r = write(
+        &e,
+        "edge",
+        json!({"deletes":[1,2],"delete_condition":["n","Eq",2],"return_affected_ids":true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.deleted_ids, vec![Id::Uint(2)]);
+    e.update_schema(
+        "edge",
+        serde_json::from_value(json!({"n":{"type":"int","filterable":false}})).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        e.query(
+            "edge",
+            serde_json::from_value(
+                json!({"rank_by":["id","asc"],"limit":10,"filters":["n","Eq",3]})
+            )
+            .unwrap()
+        )
+        .await
+        .is_err()
+    );
+    e.update_schema(
+        "edge",
+        serde_json::from_value(json!({"a":{"drop":true}})).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !e.metadata("edge").await.unwrap()["schema"]
+            .as_object()
+            .unwrap()
+            .contains_key("a")
+    );
+    assert!(
+        !query(
+            &e,
+            "edge",
+            json!({"rank_by":["id","asc"],"limit":1,"include_attributes":true})
+        )
+        .await["rows"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("a")
+    );
+    assert!(
+        write(&e, "edge", json!({"schema":{"n":"string"}}))
+            .await
+            .is_err()
+    );
+    assert!(
+        write(
+            &e,
+            "vectors",
+            json!({"upsert_rows":[{"id":1,"vector":[1,0]}]})
+        )
+        .await
+        .is_err()
+    );
+    write(
+        &e,
+        "vectors",
+        json!({"distance_metric":"euclidean_squared","upsert_rows":[{"id":1,"vector":[1,0]}]}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        write(
+            &e,
+            "vectors",
+            json!({"patch_rows":[{"id":1,"vector":[0,1]}]})
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        write(
+            &e,
+            "vectors",
+            json!({"patch_by_filter":{"filters":["id","Eq",1],"patch":{"vector":null}}})
+        )
+        .await
+        .is_err()
+    );
+    let result = query(
+        &e,
+        "vectors",
+        json!({"rank_by":["vector","kNN",[0,1]],"filters":["id","Eq",1],"limit":1}),
+    )
+    .await;
+    assert_eq!(result["rows"][0]["$dist"], 2.0);
+    write(&e,"large",json!({"schema":{"u":"uint"},"upsert_rows":[{"id":18446744073709551615_u64,"u":18446744073709551615_u64},{"id":18446744073709551614_u64,"u":0}]})).await.unwrap();
+    let rows = query(
+        &e,
+        "large",
+        json!({"rank_by":["id","asc"],"limit":2,"filters":["u","Gte",0]}),
+    )
+    .await;
+    assert_eq!(rows["rows"][0]["id"], json!(u64::MAX - 1));
+    assert_eq!(
+        query(&e, "large", json!({"aggregate_by":{"sum":["Sum","u"]}})).await["aggregations"]["sum"],
+        json!(u64::MAX)
+    );
+}
+
+#[tokio::test]
+async fn patch_by_filter_cap_is_atomic_and_partial_reports_remaining() {
+    let e = engine().await;
+    let docs: Vec<_> = (0..50_001)
+        .map(|id| json!({"id":id,"done":false}))
+        .collect();
+    write(&e, "cap", json!({"upsert_rows":docs})).await.unwrap();
+    let patch = json!({"patch_by_filter":{"filters":["done","Eq",false],"patch":{"done":true}}});
+    assert!(write(&e, "cap", patch.clone()).await.is_err());
+    assert_eq!(
+        query(
+            &e,
+            "cap",
+            json!({"filters":["done","Eq",false],"aggregate_by":{"c":["Count"]}})
+        )
+        .await["aggregations"]["c"],
+        50_001
+    );
+    let mut partial = patch;
+    partial["patch_by_filter_allow_partial"] = json!(true);
+    let r = write(&e, "cap", partial.clone()).await.unwrap();
+    assert_eq!(r.rows_patched, Some(50_000));
+    assert_eq!(r.rows_remaining, Some(true));
+    let r = write(&e, "cap", partial).await.unwrap();
+    assert_eq!(r.rows_patched, Some(1));
+    assert_eq!(r.rows_remaining, Some(false));
+}
