@@ -44,14 +44,30 @@ impl Trigrams {
     }
     pub fn candidates(&self, f: &Filter, live: &RoaringBitmap) -> Result<RoaringBitmap, ApiError> {
         let Filter::Compare {
-            op: FilterOp::Fuzzy,
-            value,
-            params,
-            ..
+            op, value, params, ..
         } = f
         else {
             return Ok(live.clone());
         };
+        if *op != FilterOp::Fuzzy {
+            let text = value.as_str().expect("validated pattern");
+            let pattern = if *op == FilterOp::Regex {
+                text.to_owned()
+            } else {
+                globset::GlobBuilder::new(text)
+                    .case_insensitive(matches!(op, FilterOp::IGlob | FilterOp::NotIGlob))
+                    .build()
+                    .map_err(|_| ApiError::bad("invalid glob pattern"))?
+                    .regex()
+                    .to_owned()
+            };
+            let hir = regex_syntax::ParserBuilder::new()
+                .utf8(false)
+                .build()
+                .parse(&pattern)
+                .map_err(|_| ApiError::bad("invalid regular expression"))?;
+            return Ok(regex_candidates(&hir, &self.sensitive, live));
+        }
         let config = crate::filter::fuzzy_params(params.as_ref())?;
         let query = value.as_str().expect("validated fuzzy string");
         let Some(distance) = config.distance(query) else {
@@ -98,25 +114,112 @@ pub(crate) fn ready(
             }
         }
         Filter::Not(f) => ready(f, schema, segments)?,
-        Filter::Compare {
-            attribute,
-            op: FilterOp::Fuzzy,
-            ..
-        } if schema.get(attribute).is_some_and(|s| s.fuzzy == Some(true))
-            && segments.iter().any(|seg| {
-                seg.schema
-                    .get(attribute)
-                    .is_some_and(|s| s.fuzzy != Some(true))
-            }) =>
-        {
-            return Err(ApiError::new(
-                409,
-                format!("fuzzy index for '{attribute}' is still being built"),
-            ));
+        Filter::Compare { attribute, op, .. } => {
+            let setting = |cfg: &bf_types::AttributeSchema| match op {
+                FilterOp::Fuzzy => cfg.fuzzy,
+                FilterOp::Regex => cfg.regex,
+                FilterOp::Glob | FilterOp::NotGlob | FilterOp::IGlob | FilterOp::NotIGlob => {
+                    cfg.glob
+                }
+                _ => None,
+            };
+            if schema
+                .get(attribute)
+                .is_some_and(|cfg| setting(cfg) == Some(true))
+                && segments.iter().any(|seg| {
+                    seg.schema
+                        .get(attribute)
+                        .is_some_and(|cfg| setting(cfg) != Some(true))
+                })
+            {
+                return Err(ApiError::new(
+                    409,
+                    format!("{op:?} index for '{attribute}' is still being built"),
+                ));
+            }
         }
-        _ => {}
     }
     Ok(())
+}
+// Extract only mandatory literals. Optional branches contribute the full live
+// set; alternations union candidates, and concatenations intersect them. Every
+// candidate is verified with the original regex/glob matcher before returning.
+fn regex_candidates(
+    hir: &regex_syntax::hir::Hir,
+    postings: &BTreeMap<String, RoaringBitmap>,
+    live: &RoaringBitmap,
+) -> RoaringBitmap {
+    use regex_syntax::hir::HirKind;
+    if let Some(strings) = exact_strings(hir) {
+        let mut out = RoaringBitmap::new();
+        for text in strings {
+            let mut rows = live.clone();
+            for gram in grams(&text) {
+                rows &= postings.get(&gram).cloned().unwrap_or_default();
+            }
+            out |= rows;
+        }
+        return out;
+    }
+    match hir.kind() {
+        HirKind::Concat(xs) => xs
+            .iter()
+            .fold(live.clone(), |rows, x| regex_candidates(x, postings, &rows)),
+        HirKind::Alternation(xs) => xs.iter().fold(RoaringBitmap::new(), |rows, x| {
+            rows | regex_candidates(x, postings, live)
+        }),
+        HirKind::Capture(c) => regex_candidates(&c.sub, postings, live),
+        HirKind::Repetition(r) if r.min > 0 => regex_candidates(&r.sub, postings, live),
+        _ => live.clone(),
+    }
+}
+fn exact_strings(hir: &regex_syntax::hir::Hir) -> Option<Vec<String>> {
+    use regex_syntax::hir::{Class, HirKind};
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => Some(vec![String::new()]),
+        HirKind::Literal(lit) => Some(vec![std::str::from_utf8(&lit.0).ok()?.to_owned()]),
+        HirKind::Class(Class::Unicode(class)) => {
+            let mut values = vec![];
+            for range in class.iter() {
+                if range.end() as u32 - range.start() as u32 > 16 {
+                    return None;
+                }
+                for ch in range.start()..=range.end() {
+                    values.push(ch.to_string());
+                }
+                if values.len() > 16 {
+                    return None;
+                }
+            }
+            Some(values)
+        }
+        HirKind::Capture(c) => exact_strings(&c.sub),
+        HirKind::Concat(xs) => {
+            let mut values = vec![String::new()];
+            for x in xs {
+                let part = exact_strings(x)?;
+                if values.len().checked_mul(part.len())? > 4096 {
+                    return None;
+                }
+                values = values
+                    .iter()
+                    .flat_map(|a| part.iter().map(move |b| format!("{a}{b}")))
+                    .collect();
+            }
+            Some(values)
+        }
+        HirKind::Alternation(xs) => {
+            let mut values = vec![];
+            for x in xs {
+                values.extend(exact_strings(x)?);
+                if values.len() > 4096 {
+                    return None;
+                }
+            }
+            Some(values)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

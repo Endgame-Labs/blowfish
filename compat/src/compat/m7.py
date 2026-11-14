@@ -33,3 +33,16 @@ def register(scenarios):
 
     scenarios['m7_fuzzy'] = (fuzzy, False)
     scenarios['m7_fuzzy_invalid'] = (fuzzy_invalid, False)
+
+    def patterns(ns):
+        ns.write(schema={'s': {'type': 'string', 'regex': True, 'glob': True}, 'scan': {'type': 'string', 'filterable': True}}, upsert_rows=[
+            {'id': 1, 's': 'turbopuffer.txt', 'scan': 'turbopuffer.txt'}, {'id': 2, 's': 'TURBOPUFFER.rs'}, {'id': 3, 's': 'turbofish.txt'}, {'id': 4, 's': 'ſtring.TXT'}, {'id': 5},
+        ])
+        filters = [
+            ['s', 'Regex', r'turbo(puffer|fish)\.txt$'], ['s', 'Regex', '(turbo)?fish|PUFFER'], ['s', 'Regex', '(?i)turbopuffer'],
+            ['s', 'Regex', '^.*$'], ['s', 'Glob', '*puffer.*'], ['s', 'NotGlob', '*puffer.*'], ['s', 'IGlob', '*PUFFER.*'],
+            ['s', 'NotIGlob', '*PUFFER.*'], ['s', 'IGlob', 'STRING.*'], ['scan', 'Glob', '*puffer.*'], ['Not', ['s', 'Regex', 'fish']],
+        ]
+        return [normalize(ns.query(rank_by=['id', 'asc'], top_k=10, filters=f)) for f in filters]
+
+    scenarios['m7_regex_glob'] = (patterns, False)

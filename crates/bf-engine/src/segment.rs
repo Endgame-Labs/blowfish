@@ -327,7 +327,7 @@ pub(crate) async fn build(
         }
     }
     for (column, (name, config)) in schema.iter().enumerate() {
-        if config.fuzzy == Some(true) {
+        if config.fuzzy == Some(true) || config.regex == Some(true) || config.glob == Some(true) {
             files.insert(
                 format!("trigram:{name}"),
                 put_value(
@@ -594,8 +594,15 @@ pub(crate) fn filter_rows<'a>(
                     .map_err(index_error)?;
                     return Ok(rows & live);
                 }
-                if matches!(op, bf_types::FilterOp::Fuzzy)
-                    && let Some(file) = segment.files.get(&format!("trigram:{attribute}"))
+                if matches!(
+                    op,
+                    bf_types::FilterOp::Fuzzy
+                        | bf_types::FilterOp::Regex
+                        | bf_types::FilterOp::Glob
+                        | bf_types::FilterOp::NotGlob
+                        | bf_types::FilterOp::IGlob
+                        | bf_types::FilterOp::NotIGlob
+                ) && let Some(file) = segment.files.get(&format!("trigram:{attribute}"))
                 {
                     let index: crate::pattern::Trigrams = get_value(store, file).await?;
                     let candidates = index.candidates(f, live)?;
@@ -609,7 +616,16 @@ pub(crate) fn filter_rows<'a>(
                             out.insert(row);
                         }
                     }
-                    return Ok(out);
+                    return Ok(
+                        if matches!(
+                            op,
+                            bf_types::FilterOp::NotGlob | bf_types::FilterOp::NotIGlob
+                        ) {
+                            live - (candidates - out)
+                        } else {
+                            out
+                        },
+                    );
                 }
                 let reader = ObjectReader {
                     store: store.clone(),

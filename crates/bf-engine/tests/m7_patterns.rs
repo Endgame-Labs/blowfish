@@ -123,3 +123,60 @@ async fn online_fuzzy_schema_rebuild_and_validation() {
         assert_eq!(e.query("patterns",serde_json::from_value(json!({"rank_by":["id","asc"],"top_k":10,"filters":["s","Fuzzy","turbopuffer",params]})).unwrap()).await.unwrap_err().status,400);
     }
 }
+
+#[tokio::test]
+async fn regex_and_glob_trigrams_preserve_boolean_and_unicode_semantics() {
+    let e = node().await;
+    write(&e,json!({"schema":{"s":{"type":"string","regex":true,"glob":true},"scan":{"type":"string","filterable":true}},"upsert_rows":[
+        {"id":1,"s":"turbopuffer.txt","scan":"turbopuffer.txt"}, {"id":2,"s":"TURBOPUFFER.rs"}, {"id":3,"s":"turbofish.txt"}, {"id":4,"s":"ſtring.TXT"}, {"id":5}]})).await;
+    let filters = [
+        json!(["s", "Regex", "turbo(puffer|fish)\\.txt$"]),
+        json!(["s", "Regex", "(turbo)?fish|PUFFER"]),
+        json!(["s", "Regex", "(?i)turbopuffer"]),
+        json!(["s", "Regex", "^.*$"]),
+        json!(["s", "Glob", "*puffer.*"]),
+        json!(["s", "NotGlob", "*puffer.*"]),
+        json!(["s", "IGlob", "*PUFFER.*"]),
+        json!(["s", "NotIGlob", "*PUFFER.*"]),
+        json!(["s", "IGlob", "STRING.*"]),
+        json!(["scan", "Glob", "*puffer.*"]),
+        json!(["Not", ["s", "Regex", "fish"]]),
+        json!(["Or", [["s", "Glob", "*fish*"], ["s", "Regex", "txt$"]]]),
+    ];
+    let mut expected = vec![];
+    for f in &filters {
+        expected.push(rows(&e, f.clone()).await);
+    }
+    e.index_namespace("patterns", true).await.unwrap();
+    for (f, want) in filters.iter().zip(expected) {
+        assert_eq!(rows(&e, f.clone()).await, want, "{f}");
+    }
+}
+#[tokio::test]
+async fn online_regex_and_glob_builds_return_retryable_conflicts() {
+    for (setting, operator) in [("regex", "Regex"), ("glob", "Glob")] {
+        let e = node().await;
+        write(&e, json!({"upsert_rows":[{"id":1,"s":"turbopuffer"}]})).await;
+        e.index_namespace("patterns", true).await.unwrap();
+        write(&e, json!({"schema":{"s":{setting:true}}})).await;
+        let q = json!({"rank_by":["id","asc"],"top_k":10,"filters":["s",operator,"turbopuffer"]});
+        assert_eq!(
+            e.query("patterns", serde_json::from_value(q.clone()).unwrap())
+                .await
+                .unwrap_err()
+                .status,
+            409
+        );
+        e.index_namespace("patterns", true).await.unwrap();
+        assert_eq!(
+            e.query("patterns", serde_json::from_value(q).unwrap())
+                .await
+                .unwrap()
+                .result
+                .rows
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}

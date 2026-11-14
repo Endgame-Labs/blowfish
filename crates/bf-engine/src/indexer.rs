@@ -183,7 +183,10 @@ impl Engine {
                 .any(|name| !segment::seg_text_matches(seg, &state.schema, name))
                 || seg.schema.iter().any(|(name, old)| {
                     state.schema.get(name).is_none_or(|new| {
-                        old.filterable != new.filterable || old.fuzzy != new.fuzzy
+                        old.filterable != new.filterable
+                            || old.fuzzy != new.fuzzy
+                            || old.regex != new.regex
+                            || old.glob != new.glob
                     })
                 })
         });
