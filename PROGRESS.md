@@ -4,6 +4,20 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **M7 merged: compat is now 121/121 in both normal and forced-indexing modes.**
+  - **Pattern filters:** fuzzy, regex, glob, and iglob, with trigram indexes. They also work as ranking
+    scores.
+  - **Vectors:** sparse f16 vectors with indexed `SparseKNN`, native `i8` vectors, and cosine late
+    interaction over multi-vectors (exhaustive).
+  - **Highlights:** `Highlight` computed attributes with fragment ranking and offsets.
+  - **Branching:** `branch_from_namespace`, with same-bucket copies sharing segments copy-on-write.
+  - **Plans:** real `explain_query` output.
+  - **Hosted models:** clear errors for `Embed` and model reranking.
+
+  I also fixed a security bug found during the merge: a namespace-scoped key could branch an
+  out-of-scope source, because only `copy_from_namespace` checked source access. Both now do, with a
+  regression test that fails without the fix. Known limit: branch pins are never reclaimed, so shared
+  storage from deleted branches is kept indefinitely (documented in the engine README).
 - **Multinode merged.** Every engine and cache setting can now be set in `blowfish.toml`, by CLI flag,
   or through a `BLOWFISH_*` environment variable. Metrics recording is installed before the engine
   starts. Tests and docs:
@@ -151,4 +165,4 @@ Newest first. Each entry says what works now and how it was checked.
 | M4 | Full-text index | ✅ done (perf tuning next) |
 | M5 | Cache and performance | in progress |
 | M6 | Multi-node, auth, metrics, and packaging | in progress |
-| M7 | The "later" list | in progress (async ops, PATCH metadata, legacy v1 done) |
+| M7 | The "later" list | ✅ done (hosted Embed and model rerank intentionally unsupported) |
