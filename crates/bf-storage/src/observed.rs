@@ -18,6 +18,7 @@ impl fmt::Display for Observed {
     }
 }
 fn record<T>(op: &'static str, start: Instant, result: &Result<T>, bytes: u64) {
+    crate::diagnostics::record(op, if result.is_ok() { bytes } else { 0 }, start.elapsed());
     let status = match result {
         Ok(_) => "ok",
         Err(object_store::Error::NotFound { .. }) => "not_found",

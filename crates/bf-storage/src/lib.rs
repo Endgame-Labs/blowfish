@@ -1,6 +1,8 @@
 #![doc = include_str!("../README.md")]
 mod cache;
+mod diagnostics;
 mod disk;
+pub use diagnostics::{BackendMeasurement, BackendStats};
 mod observed;
 use bytes::Bytes;
 pub use cache::{CacheConfig, CacheStats, CacheStatsSnapshot, RangeReader};
