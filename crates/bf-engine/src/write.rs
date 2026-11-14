@@ -94,11 +94,11 @@ pub(crate) fn prepare(
                 if name == "id" {
                     return Err(ApiError::bad("cannot drop id"));
                 }
-                if state.schema.get(name).is_some_and(|s| {
-                    s.data_type
-                        .as_ref()
-                        .is_some_and(|t| t.dimensions().is_some())
-                }) {
+                if state
+                    .schema
+                    .get(name)
+                    .is_some_and(|s| s.data_type.as_ref().is_some_and(AttributeType::is_vector))
+                {
                     return Err(ApiError::bad("cannot drop a vector column"));
                 }
                 state.schema.remove(name);
@@ -213,11 +213,7 @@ pub(crate) fn prepare(
     if state
         .schema
         .values()
-        .filter(|s| {
-            s.data_type
-                .as_ref()
-                .is_some_and(|t| t.dimensions().is_some())
-        })
+        .filter(|s| s.data_type.as_ref().is_some_and(AttributeType::is_vector))
         .count()
         > 8
     {
@@ -225,10 +221,7 @@ pub(crate) fn prepare(
     }
     if current.exists {
         for (name, cfg) in &state.schema {
-            if cfg
-                .data_type
-                .as_ref()
-                .is_some_and(|t| t.dimensions().is_some())
+            if cfg.data_type.as_ref().is_some_and(AttributeType::is_vector)
                 && !current.schema.contains_key(name)
             {
                 return Err(ApiError::bad(

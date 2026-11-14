@@ -263,7 +263,10 @@ impl Engine {
             if source == ns {
                 return Err(ApiError::bad("cannot copy a namespace to itself"));
             }
-            Some(Box::new(self.copy_source(source, ns).await?))
+            Some(Box::new(
+                self.copy_source(source, ns, request.branch_from_namespace.is_some())
+                    .await?,
+            ))
         } else {
             None
         };
@@ -353,6 +356,9 @@ impl Engine {
         let (s, _) = self.snapshot(ns, &Consistency::Strong).await?;
         let totals = snapshot::statistics(&self.0.store, &s).await?;
         let mut metadata = json!({"schema":s.schema,"approx_logical_bytes":totals.logical_bytes,"approx_row_count":totals.rows,"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}});
+        if let Some(lineage) = branch::lineage(&self.0.store, ns, s.created_at).await? {
+            metadata["branching"] = serde_json::to_value(lineage).expect("lineage serializes");
+        }
         self.decorate_metadata(ns, &s.created_at.to_rfc3339(), &mut metadata)
             .await?;
         Ok(metadata)

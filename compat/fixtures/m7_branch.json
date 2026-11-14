@@ -28,6 +28,10 @@
       }
     ]
   },
+  "lineage": {
+    "depth": 1,
+    "parent_is_source": true
+  },
   "nonempty_status": 400,
   "source": {
     "rows": [

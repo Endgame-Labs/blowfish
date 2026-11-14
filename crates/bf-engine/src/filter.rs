@@ -59,6 +59,14 @@ pub(crate) fn validate(f: &Filter, schema: &Schema, allow_refs: bool) -> Result<
                 )
                 .map_err(|_| ApiError::bad("invalid regular expression"))?;
             } else if matches!(op, Glob | NotGlob | IGlob | NotIGlob) {
+                if !matches!(
+                    t,
+                    AttributeType::Scalar(ScalarType::String)
+                        | AttributeType::Array(ScalarType::String)
+                ) {
+                    return Err(ApiError::bad("Glob requires string or []string attributes"));
+                }
+
                 if cfg.glob != Some(true) && cfg.filterable != Some(true) {
                     return Err(ApiError::bad("glob is not enabled for this attribute"));
                 }

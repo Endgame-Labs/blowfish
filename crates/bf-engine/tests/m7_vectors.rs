@@ -201,3 +201,22 @@ async fn late_interaction_sums_per_query_minimum_distances_and_reads_segments() 
         400
     );
 }
+
+#[tokio::test]
+async fn sparse_columns_and_text_indexes_obey_schema_type_rules() {
+    let e = node().await;
+    write(&e,json!({"schema":{"s":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},"upsert_rows":[{"id":1,"s":{"x":1}}]})).await;
+    for body in [
+        json!({"schema":{"s":{"drop":true}}}),
+        json!({"schema":{"s":{"full_text_search":true}}}),
+        json!({"schema":{"new":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}}}),
+    ] {
+        assert_eq!(
+            e.write("vectors", serde_json::from_value(body).unwrap())
+                .await
+                .unwrap_err()
+                .status,
+            400
+        );
+    }
+}

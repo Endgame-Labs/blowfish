@@ -17,6 +17,11 @@ pub(crate) struct Source {
     pub rows: usize,
     pin: String,
 }
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Lineage {
+    pub parent: String,
+    pub depth: u64,
+}
 #[derive(Serialize, Deserialize)]
 struct Pin {
     format_version: u32,
@@ -24,11 +29,15 @@ struct Pin {
     created_at: DateTime<Utc>,
     segments: Vec<Segment>,
     stats: NamespaceStats,
+    #[serde(default)]
+    lineage: Option<Lineage>,
 }
 #[derive(Serialize, Deserialize)]
 struct Commit {
     format_version: u32,
     pin: String,
+    #[serde(default)]
+    created_at: Option<DateTime<Utc>>,
 }
 fn commit_key(wal: &Wal, id: Uuid) -> String {
     let namespace = wal.key(0);
@@ -44,7 +53,12 @@ pub(crate) fn install_source(state: &mut NamespaceState, source: &Source) {
     state.stats = source.state.stats.clone();
 }
 impl Engine {
-    pub(crate) async fn copy_source(&self, source: &str, dest: &str) -> Result<Source, ApiError> {
+    pub(crate) async fn copy_source(
+        &self,
+        source: &str,
+        dest: &str,
+        is_branch: bool,
+    ) -> Result<Source, ApiError> {
         let wal = Wal::new(self.0.store.clone(), source).map_err(log_error)?;
         for _ in 0..16 {
             let state = self.snapshot(source, &Consistency::Strong).await?.0;
@@ -54,6 +68,16 @@ impl Engine {
                 created_at: Utc::now(),
                 segments: state.segments.clone(),
                 stats: state.stats.clone(),
+                lineage: if is_branch {
+                    Some(Lineage {
+                        parent: source.into(),
+                        depth: lineage(&self.0.store, source, state.created_at)
+                            .await?
+                            .map_or(1, |l| l.depth.saturating_add(1)),
+                    })
+                } else {
+                    None
+                },
             };
             let key = format!("ns/{dest}/branch-pins/{}.json", Uuid::new_v4());
             if self
@@ -101,6 +125,7 @@ pub(crate) async fn stage(
     let descriptor = Commit {
         format_version: 1,
         pin: source.pin.clone(),
+        created_at: entry.batches.first().map(|b| b.created_at),
     };
     if store
         .create(
@@ -170,4 +195,29 @@ pub(crate) async fn protected(store: &Storage) -> Result<BTreeSet<String>, ApiEr
         }
     }
     Ok(protected)
+}
+
+/// Lineage belongs to the destination incarnation, independent of its parent.
+pub(crate) async fn lineage(
+    store: &Storage,
+    ns: &str,
+    created_at: DateTime<Utc>,
+) -> Result<Option<Lineage>, ApiError> {
+    for object in store
+        .list(&format!("ns/{ns}/branch-commits/"))
+        .await
+        .map_err(storage_error)?
+    {
+        let descriptor: Commit =
+            serde_json::from_slice(&store.get(&object.key).await.map_err(storage_error)?)
+                .map_err(crate::segment::index_error)?;
+        if descriptor.created_at != Some(created_at) {
+            continue;
+        }
+        let pin: Pin =
+            serde_json::from_slice(&store.get(&descriptor.pin).await.map_err(storage_error)?)
+                .map_err(crate::segment::index_error)?;
+        return Ok(pin.lineage);
+    }
+    Ok(None)
 }

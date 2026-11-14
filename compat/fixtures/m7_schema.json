@@ -1,0 +1,68 @@
+{
+  "metadata": {
+    "approx_logical_bytes": 0,
+    "approx_row_count": 0,
+    "encryption": {
+      "mode": "default"
+    },
+    "index": {
+      "status": "up-to-date"
+    },
+    "schema": {
+      "id": {
+        "type": "uint"
+      },
+      "s": {
+        "filterable": false,
+        "sparse_knn": {
+          "distance_metric": "dot_product"
+        },
+        "type": "{}f16"
+      },
+      "v": {
+        "ann": {
+          "distance_metric": "cosine_distance"
+        },
+        "filterable": false,
+        "type": "[2]i8"
+      }
+    },
+    "schema_": {
+      "id": {
+        "type": "uint"
+      },
+      "s": {
+        "filterable": false,
+        "sparse_knn": {
+          "distance_metric": "dot_product"
+        },
+        "type": "{}f16"
+      },
+      "v": {
+        "ann": {
+          "distance_metric": "cosine_distance"
+        },
+        "filterable": false,
+        "type": "[2]i8"
+      }
+    }
+  },
+  "schema": {
+    "id": {
+      "filterable": null,
+      "full_text_search": null,
+      "type": "uint"
+    },
+    "s": {
+      "filterable": false,
+      "full_text_search": null,
+      "type": "{}f16"
+    },
+    "v": {
+      "ann": true,
+      "filterable": false,
+      "full_text_search": null,
+      "type": "[2]i8"
+    }
+  }
+}

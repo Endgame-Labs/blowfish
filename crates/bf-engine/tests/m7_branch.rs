@@ -62,6 +62,10 @@ async fn copy_and_branch_share_segments_replay_tail_and_survive_source_gc() {
     write(&e,"source",json!({"patch_rows":[{"id":1,"s":"updated"}],"deletes":[2],"upsert_rows":[{"id":4,"s":"fourth"}]})).await;
     let expected = rows(&e, "source").await;
     let r = write(&e, "branch", json!({"branch_from_namespace":"source"})).await;
+    assert_eq!(
+        e.metadata("branch").await.unwrap()["branching"],
+        json!({"parent":"source","depth":1})
+    );
     assert_eq!(r.rows_affected, 0);
     assert_eq!(r.message, "namespace branch successful");
     let r = write(
@@ -70,6 +74,7 @@ async fn copy_and_branch_share_segments_replay_tail_and_survive_source_gc() {
         json!({"copy_from_namespace":{"source_namespace":"source"}}),
     )
     .await;
+    assert!(e.metadata("copy").await.unwrap().get("branching").is_none());
     assert_eq!(r.rows_affected, 3);
     assert!(
         e.storage()
@@ -161,6 +166,10 @@ async fn branch_of_branch_is_independent_after_ancestors_are_deleted() {
     write(&e, "child", json!({"deletes":[2]})).await;
     e.index_namespace("child", true).await.unwrap();
     write(&e, "grandchild", json!({"branch_from_namespace":"child"})).await;
+    assert_eq!(
+        e.metadata("grandchild").await.unwrap()["branching"],
+        json!({"parent":"child","depth":2})
+    );
     e.delete_namespace("root").await.unwrap();
     e.collect_garbage("root").await.unwrap();
     e.delete_namespace("child").await.unwrap();

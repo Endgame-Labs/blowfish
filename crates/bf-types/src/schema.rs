@@ -59,6 +59,16 @@ impl AttributeType {
             _ => None,
         }
     }
+    /// Whether this is a dense, sparse, or multi-vector column.
+    pub fn is_vector(&self) -> bool {
+        matches!(
+            self,
+            Self::Vector { .. }
+                | Self::VectorI8 { .. }
+                | Self::MultiVector { .. }
+                | Self::SparseVector
+        )
+    }
     /// Infer a type from the first non-null value.
     pub fn infer(name: &str, value: &Value) -> Result<Self, ApiError> {
         if name == "vector" {
@@ -239,6 +249,20 @@ impl AttributeSchema {
             self.filterable = None;
             return Ok(());
         }
+        if self
+            .full_text_search
+            .as_ref()
+            .is_some_and(|v| v != false && !v.is_null())
+            && !matches!(
+                t,
+                AttributeType::Scalar(ScalarType::String)
+                    | AttributeType::Array(ScalarType::String)
+            )
+        {
+            return Err(ApiError::bad(
+                "full_text_search requires string or []string",
+            ));
+        }
         if matches!(t, AttributeType::MultiVector { .. })
             && metric != DistanceMetric::CosineDistance
         {
@@ -265,7 +289,11 @@ impl AttributeSchema {
             } else {
                 json!({"distance_metric":metric})
             });
-            self.filterable = None;
+            self.filterable = if matches!(t, AttributeType::VectorI8 { .. }) {
+                Some(false)
+            } else {
+                None
+            };
         } else {
             if self
                 .full_text_search
@@ -335,6 +363,8 @@ impl AttributeSchema {
     pub fn schema_value(&self) -> Value {
         let mut v = serde_json::to_value(self).expect("schema serializes");
         let o = v.as_object_mut().expect("object");
+        // The legacy endpoint predates sparse ranking; metadata retains this setting.
+        o.remove("sparse_knn");
         o.entry("filterable").or_insert(Value::Null);
         o.entry("full_text_search").or_insert(Value::Null);
         if self

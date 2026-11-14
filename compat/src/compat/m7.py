@@ -108,6 +108,8 @@ def register(scenarios):
             parent.write(upsert_rows=[{'id': 1, 's': 'first'}, {'id': 2, 's': 'second'}])
             value = ns.write(branch_from_namespace={'source_namespace': source})
             result = {'branch': normalize(value), 'after': normalize(ns.query(rank_by=['id', 'asc'], top_k=10, include_attributes=True))}
+            metadata = normalize(ns.metadata())
+            result['lineage'] = {'depth': metadata['branching']['depth'], 'parent_is_source': metadata['branching']['parent'] == source}
             parent.write(patch_rows=[{'id': 1, 's': 'source only'}])
             ns.write(patch_rows=[{'id': 2, 's': 'branch only'}])
             result['source'] = normalize(parent.query(rank_by=['id', 'asc'], top_k=10, include_attributes=True))
@@ -161,3 +163,9 @@ def register(scenarios):
         return result
 
     scenarios['m7_unsupported_models'] = (unsupported_models, False)
+
+    def schema_details(ns):
+        ns.write(distance_metric='cosine_distance', schema={'s': {'type': '{}f16', 'sparse_knn': {'distance_metric': 'dot_product'}}, 'v': {'type': '[2]i8', 'ann': True}}, upsert_rows=[{'id': 1, 's': {'a': 1}, 'v': [1, 2]}])
+        return {'schema': normalize(ns.schema()), 'metadata': normalize(ns.metadata())}
+
+    scenarios['m7_schema'] = (schema_details, False)
