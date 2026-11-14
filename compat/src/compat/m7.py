@@ -46,3 +46,15 @@ def register(scenarios):
         return [normalize(ns.query(rank_by=['id', 'asc'], top_k=10, filters=f)) for f in filters]
 
     scenarios['m7_regex_glob'] = (patterns, False)
+
+    def sparse(ns):
+        ns.write(schema={'s': {'type': '{}f16', 'sparse_knn': {'distance_metric': 'dot_product'}}}, upsert_rows=[
+            {'id': 1, 's': {'a': 0.3333, 'b': 2.0}}, {'id': 2, 's': {'b': 1.0}}, {'id': 3, 's': {}}, {'id': 4},
+        ])
+        ranks = [['s', 'SparseKNN', {'a': 0.3333, 'b': 1.0}], ['Sum', [['s', 'SparseKNN', {'a': 0.3333}], ['s', 'SparseKNN', {'b': 1.0}]]], ['Saturate', ['s', 'SparseKNN', {'b': 1.0}], {'midpoint': 2}], ['Max', [['s', 'SparseKNN', {'b': 1.0}], 0]], ['s', 'SparseKNN', {}]]
+        result = [normalize(ns.query(rank_by=r, top_k=10, include_attributes=True)) for r in ranks]
+        ns.write(patch_rows=[{'id': 2, 's': {'b': 10.0}}], deletes=[1])
+        result.append(normalize(ns.query(rank_by=ranks[0], top_k=10, include_attributes=True)))
+        return result
+
+    scenarios['m7_sparse'] = (sparse, False)

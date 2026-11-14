@@ -5,6 +5,7 @@ mod indexer;
 mod pattern;
 mod segment;
 mod snapshot;
+mod sparse;
 pub use indexer::EngineConfig;
 mod metadata;
 mod query;

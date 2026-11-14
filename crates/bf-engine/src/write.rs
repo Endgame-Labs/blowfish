@@ -472,6 +472,10 @@ pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value,
     }
     let mismatch = || ApiError::bad(format!("attribute value does not match type {t}"));
     match t {
+        AttributeType::SparseVector => Ok(serde_json::from_str(
+            &serde_json::to_string(&decode_sparse(value)?).expect("sparse vector serializes"),
+        )
+        .expect("valid JSON")),
         AttributeType::Vector { dimensions, f16 } => {
             let mut v = decode_vector(value)?;
             if v.len() != *dimensions {

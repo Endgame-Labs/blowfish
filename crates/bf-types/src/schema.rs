@@ -34,7 +34,12 @@ impl ScalarType {
 pub enum AttributeType {
     Scalar(ScalarType),
     Array(ScalarType),
-    Vector { dimensions: usize, f16: bool },
+    Vector {
+        dimensions: usize,
+        f16: bool,
+    },
+    /// Sparse string-keyed positive f16 weights.
+    SparseVector,
 }
 impl AttributeType {
     /// Dense-vector dimensions, if this is a vector.
@@ -79,6 +84,7 @@ impl AttributeType {
 impl fmt::Display for AttributeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SparseVector => f.write_str("{}f16"),
             Self::Scalar(t) => f.write_str(t.name()),
             Self::Array(t) => write!(f, "[]{}", t.name()),
             Self::Vector { dimensions, f16 } => {
@@ -90,6 +96,9 @@ impl fmt::Display for AttributeType {
 impl FromStr for AttributeType {
     type Err = ApiError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "{}f16" {
+            return Ok(Self::SparseVector);
+        }
         let (array, name) = s.strip_prefix("[]").map_or((false, s), |s| (true, s));
         let scalar = match name {
             "string" => Some(ScalarType::String),
@@ -204,7 +213,20 @@ impl AttributeSchema {
             self.filterable = None;
             return Ok(());
         }
-        if t.dimensions().is_some() {
+        if *t == AttributeType::SparseVector {
+            if self.filterable == Some(true) {
+                return Err(ApiError::bad("sparse vectors cannot be filterable"));
+            }
+            self.filterable = Some(false);
+            if let Some(config) = &self.sparse_knn
+                && (config.get("distance_metric").and_then(Value::as_str) != Some("dot_product")
+                    || config.as_object().is_none_or(|o| o.len() != 1))
+            {
+                return Err(ApiError::bad(
+                    "sparse_knn requires distance_metric dot_product",
+                ));
+            }
+        } else if t.dimensions().is_some() {
             self.ann = Some(json!({"distance_metric":metric}));
             self.filterable = None;
         } else {
@@ -262,9 +284,12 @@ impl AttributeSchema {
         if self.regex == Some(true) && *t != AttributeType::Scalar(ScalarType::String) {
             return Err(ApiError::bad("regex requires a string attribute"));
         }
-        if self.embed.as_ref().is_some_and(|v| !v.is_null()) || self.sparse_knn.is_some() {
+        if self.sparse_knn.is_some() && *t != AttributeType::SparseVector {
+            return Err(ApiError::bad("sparse_knn requires a {}f16 attribute"));
+        }
+        if self.embed.as_ref().is_some_and(|v| !v.is_null()) {
             return Err(ApiError::bad(
-                "native embedding and sparse vectors are not supported by blowfish yet",
+                "native embedding is not supported by blowfish yet",
             ));
         }
         Ok(())

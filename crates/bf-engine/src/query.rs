@@ -377,6 +377,16 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
                 )));
             }
         }
+        RankBy::SparseVector {
+            attribute: name, ..
+        } => {
+            let cfg = attribute(state, name)?;
+            if cfg.data_type != Some(AttributeType::SparseVector) || cfg.sparse_knn.is_none() {
+                return Err(ApiError::bad(
+                    "SparseKNN requires a {}f16 attribute with sparse_knn enabled",
+                ));
+            }
+        }
         RankBy::Bm25 {
             attribute: name,
             query,
@@ -506,6 +516,16 @@ fn parameter(params: &Value, name: &str, default: f64) -> Result<f64, ApiError> 
 fn score(state: &NamespaceState, doc: &Document, rank: &RankBy) -> Result<f64, ApiError> {
     Ok(match rank {
         RankBy::Constant(n) => n.as_f64().expect("JSON number fits f64"),
+        RankBy::SparseVector {
+            attribute, vector, ..
+        } => {
+            if let Some(scores) = state.scores.get(&crate::indexed::rank_key(rank)) {
+                let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
+                *scores.get(&id).unwrap_or(&0.0)
+            } else {
+                crate::sparse::dot(doc.get(attribute), vector) as f64
+            }
+        }
         RankBy::Bm25 {
             attribute,
             query,

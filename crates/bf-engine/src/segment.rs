@@ -148,7 +148,7 @@ pub(crate) async fn put_file(
     }
     Ok(file)
 }
-async fn put_value<T: Serialize>(
+pub(crate) async fn put_value<T: Serialize>(
     store: &Storage,
     key: String,
     value: &T,
@@ -167,7 +167,7 @@ async fn put_value<T: Serialize>(
     let (bytes, meta) = finish(body, &dir)?;
     put_file(store, key, bytes, meta).await
 }
-async fn get_value<T: DeserializeOwned>(
+pub(crate) async fn get_value<T: DeserializeOwned>(
     store: &Storage,
     file: &SegmentFile,
 ) -> Result<T, ApiError> {
@@ -339,6 +339,7 @@ pub(crate) async fn build(
             );
         }
     }
+    crate::sparse::build(store, &prefix, schema, docs, &mut files).await?;
     for (column, (name, config)) in schema.iter().enumerate() {
         if let Some(params) = config.text_config() {
             let mut builder = bf_text::SegmentBuilder::with_tokenizer(true, params.tokenizer);
