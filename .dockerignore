@@ -1,0 +1,12 @@
+**/.git
+**/target
+**/*.local
+**/*.local.*
+**/.env
+**/.env.*
+**/.aws
+**/.secrets
+**/*credentials*
+**/WORKER_REPORT.md
+compat
+.gitignore

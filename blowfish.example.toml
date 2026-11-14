@@ -1,0 +1,24 @@
+# blowfish 🐡 — copy to blowfish.toml, then run:
+# blowfish serve --config blowfish.toml
+# CLI flags override environment variables, which override this file.
+listen = "0.0.0.0:8000"
+# Prefer BLOWFISH_ADMIN_KEY in your deployment's secret environment.
+# admin_key = "replace-with-a-long-random-secret"
+require_auth = false # Set true outside local development.
+# Optional, unauthenticated Prometheus endpoint. Keep on a trusted interface.
+# metrics_listen = "127.0.0.1:9100"
+# Legacy alias for storage.url; do not set both.
+# storage_url = "file:///tmp/blowfish"
+
+[storage]
+url = "file:///tmp/blowfish" # Also s3://bucket/prefix, or memory:// for disposable tests.
+# S3-compatible service endpoint; AWS S3 uses its normal endpoint when omitted.
+# endpoint = "http://127.0.0.1:8333"
+# region = "us-east-1"
+# profile = "default" # Optional profile in AWS_SHARED_CREDENTIALS_FILE or ~/.aws/credentials.
+read_only = false # Skip the mutating probe, and reject storage writes.
+single_writer = false # Force one writer even if conditional writes are available.
+
+# S3 credentials use AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optionally
+# AWS_SESSION_TOKEN, or the selected AWS profile. Do not put credentials in URLs.
+# Logging is controlled by RUST_LOG, e.g. blowfish=info,bf_engine=info.
