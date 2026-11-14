@@ -4,6 +4,15 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **`compat/` merged.** This is the compatibility suite: 81 scenarios driving the official turbopuffer
+  Python SDK, with golden responses recorded from real turbopuffer. It has three commands: `uv run compat
+  record`, `uv run compat check --base-url ...`, and `uv run compat diff-live`. Each scenario uses a
+  throwaway namespace that is deleted afterward, and I verified that no oracle namespaces were left
+  behind. Known gaps, queued for a follow-up worker:
+  - Scenarios for namespace listing, pagination, recall, and copy.
+  - Round-tripped values for more types.
+  - ANN recall-based comparison.
+  - A TypeScript smoke test (Node isn't installed).
 - **`bf-auth` merged.** It provides role-based API keys:
   - **Roles:** turbopuffer's `admin`, `write`, `read`, and `list`, plus blowfish's `metrics` and `keys`.
   - **Scopes:** keys can be limited to namespace prefixes, and can expire.
