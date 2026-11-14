@@ -46,6 +46,7 @@ async fn versioned_slots_conflicts_tail_and_manifest() {
         stats: Default::default(),
         updated_at: None,
         retired: vec![],
+        checkpoints: vec![],
     };
     a.publish_manifest(1, &manifest).await.unwrap();
     assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 1);
@@ -103,6 +104,7 @@ async fn epoch_claims_fence_stalled_indexers_and_checkpoint_regression() {
         stats: Default::default(),
         updated_at: None,
         retired: vec![],
+        checkpoints: vec![],
     };
     assert_eq!(wal.publish_fenced(0, 0, &manifest).await.unwrap(), 1);
     let stale = manifest.clone();

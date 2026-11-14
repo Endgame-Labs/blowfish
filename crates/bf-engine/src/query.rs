@@ -796,6 +796,7 @@ fn rrf(
 }
 pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<Value, ApiError> {
     let (state, _) = engine.snapshot(ns, &Consistency::Strong).await?;
+    let state = crate::snapshot::materialize(engine.storage(), &state).await?;
     let top = request.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
     let num = request.get("num").and_then(Value::as_u64).unwrap_or(25) as usize;
     if top == 0 || top > 10000 || num == 0 || num > 10000 {

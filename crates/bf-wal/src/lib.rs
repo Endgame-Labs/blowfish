@@ -102,6 +102,9 @@ pub struct Manifest {
     /// Objects retired by a publication, with the start of their retention window.
     #[serde(default)]
     pub retired: Vec<RetiredObject>,
+    /// Publication-time grace periods for reclaiming checkpointed WAL payloads.
+    #[serde(default)]
+    pub checkpoints: Vec<(u64, DateTime<Utc>)>,
 }
 /// Immutable file reference. Lengths exclude the storage retry-identity header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +251,15 @@ impl Wal {
     /// Replay a contiguous tail after `after`, stopping at the first missing slot.
     /// Tombstones let cold and stale nodes skip safely reclaimed document payloads.
     pub async fn tail(&self, after: u64) -> Result<Vec<(u64, WalEntry)>, Error> {
+        self.tail_bounded(after, u64::MAX).await
+    }
+    /// Replay at most `max_bytes` of decoded logical WAL entries. Atomic entries
+    /// are never split; an entry that exceeds the remaining budget stays in the tail.
+    pub async fn tail_bounded(
+        &self,
+        after: u64,
+        max_bytes: u64,
+    ) -> Result<Vec<(u64, WalEntry)>, Error> {
         let mut previous_head = None;
         loop {
             let mut records = vec![];
@@ -259,9 +271,17 @@ impl Wal {
             let start = records.iter().rposition(|(_, r)| r.tombstone).unwrap_or(0);
             let mut entries = vec![];
             let mut pruned = false;
+            let mut included_bytes = 0u64;
             for (seq, record) in records.into_iter().skip(start) {
                 match self.materialize(&record).await {
-                    Ok(entry) => entries.push((seq, entry)),
+                    Ok(entry) => {
+                        let size = serde_json::to_vec(&entry)?.len() as u64;
+                        if included_bytes.saturating_add(size) > max_bytes {
+                            break;
+                        }
+                        included_bytes += size;
+                        entries.push((seq, entry));
+                    }
                     Err(Error::Pruned) => {
                         pruned = true;
                         break;
@@ -304,13 +324,24 @@ impl Wal {
         seq: u64,
         manifest: &Manifest,
     ) -> Result<CreateResult, Error> {
-        Ok(self
+        let identity = Uuid::new_v4();
+        let payload = format!("ns/{}/manifest-data/{identity}.json", self.namespace);
+        self.store
+            .create_with_id(&payload, serde_json::to_vec(manifest)?, identity)
+            .await?;
+        let slot = serde_json::to_vec(&serde_json::json!({"payload":payload}))?;
+        let result = self
             .store
-            .create(
+            .create_with_id(
                 &format!("ns/{}/manifest/{seq:020}.json", self.namespace),
-                serde_json::to_vec(manifest)?,
+                slot,
+                identity,
             )
-            .await?)
+            .await?;
+        if result == CreateResult::Conflict {
+            self.store.delete(&payload).await?;
+        }
+        Ok(result)
     }
     /// Publish against exactly one predecessor. No retry may reuse stale indexer work.
     ///
@@ -336,7 +367,29 @@ impl Wal {
         {
             return Err(Error::Fenced);
         }
-        match self.publish_manifest(predecessor + 1, manifest).await? {
+        let mut manifest = manifest.clone();
+        if predecessor > 0 {
+            let bytes = self
+                .store
+                .get(&format!(
+                    "ns/{}/manifest/{predecessor:020}.json",
+                    self.namespace
+                ))
+                .await?;
+            let slot: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if let Some(payload) = slot.get("payload").and_then(serde_json::Value::as_str) {
+                manifest.retired.push(RetiredObject {
+                    key: payload.to_owned(),
+                    retired_at: Utc::now(),
+                });
+            }
+        }
+        if latest.as_ref().map_or(0, |(_, m)| m.indexed_through) < manifest.indexed_through {
+            manifest
+                .checkpoints
+                .push((manifest.indexed_through, Utc::now()));
+        }
+        match self.publish_manifest(predecessor + 1, &manifest).await? {
             CreateResult::Conflict => Err(Error::Fenced),
             _ => Ok(predecessor + 1),
         }
@@ -396,10 +449,15 @@ impl Wal {
             .and_then(|s| s.strip_suffix(".json"))
             .and_then(|s| s.parse().ok())
             .ok_or(Error::Format)?;
-        Ok(Some((
-            seq,
-            serde_json::from_slice(&self.store.get(&last.key).await?)?,
-        )))
+        let bytes = self.store.get(&last.key).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let manifest =
+            if let Some(payload) = value.get("payload").and_then(serde_json::Value::as_str) {
+                serde_json::from_slice(&self.store.get(payload).await?)?
+            } else {
+                serde_json::from_value(value)?
+            };
+        Ok(Some((seq, manifest)))
     }
     /// Erase document-bearing payloads and old manifests through a committed tombstone.
     /// Tiny slot records remain occupied, fencing stale writers without retaining documents.

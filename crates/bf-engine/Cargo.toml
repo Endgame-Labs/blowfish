@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes = "=1.12.1"
+crc32fast = "=1.5.5"
+roaring = { version = "=0.12.0", features = ["serde"] }
+
 base64 = "0.23.1"
 bf-types = { path = "../bf-types" }
 bf-storage = { path = "../bf-storage" }
@@ -24,4 +28,7 @@ unicode-segmentation = "1.13.2"
 uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
+async-trait = "=0.1.92"
+futures = "=0.3.34"
+object_store = "=0.14.2"
 tempfile = "3.27.0"
