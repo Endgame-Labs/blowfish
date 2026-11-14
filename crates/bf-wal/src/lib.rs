@@ -135,21 +135,44 @@ impl Wal {
     /// Attempt a slot. The payload is durable before the slot's conditional commit.
     /// Callers must catch up and revalidate after `Conflict`.
     pub async fn append(&self, seq: u64, entry: &WalEntry) -> Result<CreateResult, Error> {
+        let started = std::time::Instant::now();
+        let result = self.append_inner(seq, entry).await;
+        metrics::histogram!("blowfish_wal_commit_duration_seconds", "outcome" => match &result { Ok(CreateResult::Conflict) => "conflict", Ok(_) => "success", Err(_) => "error" }).record(started.elapsed().as_secs_f64());
+        result
+    }
+    async fn append_inner(&self, seq: u64, entry: &WalEntry) -> Result<CreateResult, Error> {
         let payload_key = self.payload_key(entry.write_id);
         if !entry.tombstone {
-            self.store
-                .create_with_id(&payload_key, entry.encode()?, entry.write_id)
+            let payload = entry.encode()?;
+            let len = payload.len();
+            let result = self
+                .store
+                .create_with_id(&payload_key, payload, entry.write_id)
                 .await?;
+            if result == CreateResult::Created {
+                metrics::counter!("blowfish_wal_bytes_written_total").increment(len as u64);
+            }
         }
         let record = CommitRecord {
             write_id: entry.write_id,
             committed_at: entry.committed_at,
             tombstone: entry.tombstone,
         };
+        let record = record.encode()?;
+        let record_len = record.len();
         let result = self
             .store
-            .create_with_id(&self.key(seq), record.encode()?, entry.write_id)
+            .create_with_id(&self.key(seq), record, entry.write_id)
             .await?;
+        if result == CreateResult::Created {
+            metrics::counter!("blowfish_wal_bytes_written_total").increment(record_len as u64);
+        }
+        if result == CreateResult::Conflict {
+            metrics::counter!("blowfish_wal_cas_conflicts_total").increment(1);
+        }
+        if result == CreateResult::Created {
+            metrics::histogram!("blowfish_wal_batch_requests").record(entry.batches.len() as f64);
+        }
         if result == CreateResult::Conflict && !entry.tombstone {
             // This UUID belongs only to this attempt; a losing slot cannot reference it.
             self.store.delete(&payload_key).await?;
