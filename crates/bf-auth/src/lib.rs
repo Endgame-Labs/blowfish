@@ -175,6 +175,8 @@ pub enum AuthError {
     InvalidRequest(&'static str),
     #[error("key not found")]
     NotFound,
+    #[error("key authorization data is temporarily unavailable")]
+    Unavailable,
     #[error("key storage error")]
     Storage(#[source] object_store::Error),
     #[error("key storage error")]
@@ -190,6 +192,7 @@ impl AuthError {
             Self::Forbidden => 403,
             Self::InvalidRequest(_) => 400,
             Self::NotFound => 404,
+            Self::Unavailable => 503,
             Self::SharedStorage(bf_storage::Error::ReadOnly) => 403,
             Self::Storage(_) | Self::Data(_) | Self::SharedStorage(_) => 500,
         }
@@ -215,6 +218,7 @@ struct Cache {
     revoked: HashSet<String>,
     negative: HashMap<String, Instant>,
     last_used: HashMap<String, DateTime<Utc>>,
+    refreshed_at: Option<Instant>,
 }
 enum Backend {
     Object(Arc<dyn ObjectStore>),
@@ -373,6 +377,7 @@ impl KeyStore {
         cache.keys = keys;
         cache.revoked = revoked;
         cache.negative.clear();
+        cache.refreshed_at = Some(Instant::now());
         Ok(())
     }
     /// Authenticate a raw bearer token. Pass an empty string for a missing token.
@@ -391,6 +396,14 @@ impl KeyStore {
         }
         let (id, secret) = parse_token(bearer).ok_or(AuthError::Unauthorized)?;
         let mut cache = self.inner.cache.write().await;
+        // A failed refresh must not preserve a revoked credential indefinitely.
+        // Allow one missed refresh; the configured super key remains a recovery path.
+        if cache
+            .refreshed_at
+            .is_none_or(|at| at.elapsed() > self.inner.interval.saturating_mul(2))
+        {
+            return Err(AuthError::Unavailable);
+        }
         if cache.revoked.contains(id) {
             return Err(AuthError::Unauthorized);
         }
@@ -753,6 +766,31 @@ mod tests {
         assert!(ks.get_key(&manager, &child.id).await.is_ok());
         ks.revoke_key(&manager, &child.id).await.unwrap();
         assert!(ks.authenticate(&token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_cannot_authorize_stale_keys_indefinitely() {
+        let backend = Arc::new(InMemory::new());
+        let (ks, root) = setup(backend.clone()).await;
+        let (key, token) = ks
+            .create_key(spec(vec![Role::Read], None), &root)
+            .await
+            .unwrap();
+        // Simulate unreadable authorization data while another node may revoke a key.
+        backend
+            .put(
+                &ks.path(&key.id, "json"),
+                bytes::Bytes::from_static(b"invalid JSON").into(),
+            )
+            .await
+            .unwrap();
+        assert!(ks.refresh().await.is_err());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(matches!(
+            ks.authenticate(&token).await,
+            Err(AuthError::Unavailable)
+        ));
+        assert!(ks.authenticate("super-secret").await.is_ok());
     }
 
     #[test]
