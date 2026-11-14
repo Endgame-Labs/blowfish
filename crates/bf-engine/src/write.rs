@@ -513,7 +513,7 @@ pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value,
                 json!(
                     chrono::DateTime::from_timestamp_millis(ms)
                         .ok_or_else(mismatch)?
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
                 )
             }
             ScalarType::Bytes => {

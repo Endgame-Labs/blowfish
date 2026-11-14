@@ -478,3 +478,42 @@ async fn foreachunique_distinguishes_missing_and_empty_arrays_and_deduplicates()
         json!([{"tag":null,"c":2},{"tag":"blue","c":2},{"tag":"red","c":1}])
     );
 }
+
+#[tokio::test]
+async fn datetimes_emit_nine_fractional_digits_in_rows_arrays_and_metadata() {
+    let e = engine().await;
+    write(&e, "dates", json!({"schema":{"d":"datetime","dates":"[]datetime"},"upsert_rows":[{"id":1,"d":"2024-01-02T04:04:05+01:00","dates":["2024-01-02","2024-01-02T03:04:05.123456789Z"]}]})).await.unwrap();
+    let result = query(
+        &e,
+        "dates",
+        json!({"rank_by":["id","asc"],"top_k":1,"include_attributes":true}),
+    )
+    .await;
+    assert_eq!(result["rows"][0]["d"], "2024-01-02T03:04:05.000000000Z");
+    assert_eq!(
+        result["rows"][0]["dates"],
+        json!([
+            "2024-01-02T00:00:00.000000000Z",
+            "2024-01-02T03:04:05.123000000Z"
+        ])
+    );
+    let metadata = e.metadata("dates").await.unwrap();
+    for value in [
+        &metadata["created_at"],
+        &metadata["updated_at"],
+        &metadata["last_write_at"],
+        &result["performance"]["last_included_write_at"],
+    ] {
+        let text = value.as_str().unwrap();
+        let parsed = chrono::DateTime::parse_from_rfc3339(text).unwrap();
+        assert_eq!(
+            text,
+            parsed.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        );
+    }
+    let result = query(&e, "dates", json!({"aggregate_by":{"first":["Min","d"]}})).await;
+    assert_eq!(
+        result["aggregations"]["first"],
+        "2024-01-02T03:04:05.000000000Z"
+    );
+}
