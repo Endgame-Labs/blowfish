@@ -4,6 +4,11 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Final wave launched:**
+  - **Audit:** an independent security and correctness audit, fixing what it finds, covering RBAC on
+    every route, path traversal into object keys, DoS limits, WAL and GC safety, panics, and secrets.
+  - **perf2:** the R2 warm-path latency, batched cold BM25 prefetch, default tuning, and branch-pin
+    reclamation.
 - **Perf merged (M5).**
   - **Changes:**
     - Segment reads go through the byte cache with known lengths, so no HEAD requests.
