@@ -327,6 +327,19 @@ pub(crate) async fn build(
         }
     }
     for (column, (name, config)) in schema.iter().enumerate() {
+        if config.fuzzy == Some(true) {
+            files.insert(
+                format!("trigram:{name}"),
+                put_value(
+                    store,
+                    format!("{prefix}/trigram.{column}.bfx"),
+                    &crate::pattern::Trigrams::build(docs, name),
+                )
+                .await?,
+            );
+        }
+    }
+    for (column, (name, config)) in schema.iter().enumerate() {
         if let Some(params) = config.text_config() {
             let mut builder = bf_text::SegmentBuilder::with_tokenizer(true, params.tokenizer);
             for row in &rows {
@@ -580,6 +593,23 @@ pub(crate) fn filter_rows<'a>(
                     }
                     .map_err(index_error)?;
                     return Ok(rows & live);
+                }
+                if matches!(op, bf_types::FilterOp::Fuzzy)
+                    && let Some(file) = segment.files.get(&format!("trigram:{attribute}"))
+                {
+                    let index: crate::pattern::Trigrams = get_value(store, file).await?;
+                    let candidates = index.candidates(f, live)?;
+                    let columns = std::collections::BTreeSet::from([attribute.clone()]);
+                    let docs =
+                        projected_documents(store, segment, &candidates, Some(&columns)).await?;
+                    let ids = ids(store, segment).await?;
+                    let mut out = RoaringBitmap::new();
+                    for row in &candidates {
+                        if filter::matches(f, docs.get(&ids[row as usize]), None, schema)? {
+                            out.insert(row);
+                        }
+                    }
+                    return Ok(out);
                 }
                 let reader = ObjectReader {
                     store: store.clone(),

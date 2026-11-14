@@ -248,6 +248,20 @@ impl AttributeSchema {
             self.filterable
                 .get_or_insert(!indexed && *t != AttributeType::Scalar(ScalarType::Bytes));
         }
+        if (self.regex == Some(true) || self.glob == Some(true) || self.fuzzy == Some(true))
+            && !matches!(
+                t,
+                AttributeType::Scalar(ScalarType::String)
+                    | AttributeType::Array(ScalarType::String)
+            )
+        {
+            return Err(ApiError::bad(
+                "regex, glob, and fuzzy indexes require string attributes",
+            ));
+        }
+        if self.regex == Some(true) && *t != AttributeType::Scalar(ScalarType::String) {
+            return Err(ApiError::bad("regex requires a string attribute"));
+        }
         if self.embed.as_ref().is_some_and(|v| !v.is_null()) || self.sparse_knn.is_some() {
             return Err(ApiError::bad(
                 "native embedding and sparse vectors are not supported by blowfish yet",

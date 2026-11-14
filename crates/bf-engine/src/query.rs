@@ -121,6 +121,7 @@ fn single(
     }
     if let Some(f) = &q.filters {
         filter::validate(f, &state.schema, false)?;
+        crate::pattern::ready(f, &state.schema, &state.segments)?;
     }
     if let Some(rank) = &q.rank_by {
         validate_rank(state, rank, false)?;
@@ -408,7 +409,10 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
         RankBy::Product { expr, .. } => {
             validate_score_child(state, expr, guarded)?;
         }
-        RankBy::Filter(f) => filter::validate(f, &state.schema, false)?,
+        RankBy::Filter(f) => {
+            filter::validate(f, &state.schema, false)?;
+            crate::pattern::ready(f, &state.schema, &state.segments)?;
+        }
         RankBy::Attribute(name) => match attribute(state, name)?.data_type.as_ref() {
             Some(AttributeType::Scalar(ScalarType::Uint)) => {}
             Some(AttributeType::Scalar(ScalarType::Int | ScalarType::Float)) if guarded => {}

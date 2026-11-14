@@ -251,6 +251,8 @@ def cleanup(c):
 
 def main():
     register()
+    from compat.m7 import register as register_m7
+    register_m7(SCENARIOS)
     SCENARIOS.update({name: (None, False) for name in EXTRA_SCENARIOS + OPERATIONS_LEGACY_SCENARIOS})
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)

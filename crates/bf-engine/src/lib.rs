@@ -2,6 +2,7 @@
 mod filter;
 mod indexed;
 mod indexer;
+mod pattern;
 mod segment;
 mod snapshot;
 pub use indexer::EngineConfig;

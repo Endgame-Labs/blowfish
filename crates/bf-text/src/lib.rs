@@ -16,3 +16,6 @@ mod segment;
 pub use segment::{
     MemoryRangeRead, RangeRead, SearchHit, SearchMetrics, SegmentBuilder, SegmentReader,
 };
+
+mod fuzzy;
+pub use fuzzy::{EditDistance, FuzzyParams, substring_distance};
