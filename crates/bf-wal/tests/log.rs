@@ -68,7 +68,7 @@ async fn deletion_erases_payloads_but_fences_old_slots() {
     let wal = Wal::new(store.clone(), "deleted").unwrap();
     let first = WalEntry::new(vec![]);
     wal.append(1, &first).await.unwrap();
-    assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 1);
+    assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 0);
     let mut tombstone = WalEntry::new(vec![]);
     tombstone.tombstone = true;
     wal.append(2, &tombstone).await.unwrap();
@@ -76,7 +76,7 @@ async fn deletion_erases_payloads_but_fences_old_slots() {
     wal.append(3, &WalEntry::new(vec![])).await.unwrap();
     wal.cleanup_deleted(2).await.unwrap();
     assert!(matches!(wal.read(1).await, Err(Error::Pruned)));
-    assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 1);
+    assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 0);
     let tail = wal.tail(0).await.unwrap();
     assert_eq!(tail.len(), 2);
     assert!(tail[0].1.tombstone);
@@ -85,7 +85,7 @@ async fn deletion_erases_payloads_but_fences_old_slots() {
         wal.append(1, &WalEntry::new(vec![])).await.unwrap(),
         CreateResult::Conflict
     );
-    assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 1);
+    assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -170,4 +170,89 @@ async fn checkpoint_gc_collects_abandoned_payloads_only_for_fenced_slots() {
         wal.read(2).await.unwrap().unwrap().write_id,
         future.write_id
     );
+}
+
+fn document_entry(text: String) -> WalEntry {
+    let now = chrono::Utc::now();
+    WalEntry::new(vec![WriteBatch {
+        upserts: vec![serde_json::from_value(serde_json::json!({"id":1,"text":text})).unwrap()],
+        deletes: vec![],
+        schema: Default::default(),
+        distance_metric: Default::default(),
+        created_at: now,
+        updated_at: now,
+    }])
+}
+#[tokio::test]
+async fn inline_redaction_is_monotonic_under_retries_and_concurrent_gc() {
+    for single_writer in [false, true] {
+        let store = Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            single_writer,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let wal = Wal::new(store.clone(), "inline").unwrap();
+        let entry = document_entry("erase-this-document".into());
+        assert_eq!(wal.append(1, &entry).await.unwrap(), CreateResult::Created);
+        assert!(store.list("ns/inline/wal-data/").await.unwrap().is_empty());
+        assert_eq!(
+            wal.read(1).await.unwrap().unwrap().batches[0].upserts[0]["text"],
+            "erase-this-document"
+        );
+        let competitor = document_entry("must-never-win".into());
+        for _ in 0..20 {
+            let (a, b, retry, conflict) = tokio::join!(
+                wal.prune_payloads(1),
+                wal.prune_payloads(1),
+                wal.append(1, &entry),
+                wal.append(1, &competitor)
+            );
+            a.unwrap();
+            b.unwrap();
+            assert_eq!(retry.unwrap(), CreateResult::AlreadyCommitted);
+            assert_eq!(conflict.unwrap(), CreateResult::Conflict);
+            assert!(matches!(wal.read(1).await, Err(Error::Pruned)));
+        }
+        let bytes = store.get(&wal.key(1)).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("erase-this-document"));
+        assert_eq!(store.list("ns/inline/wal/").await.unwrap().len(), 1);
+        assert!(store.list("ns/inline/wal-data/").await.unwrap().is_empty());
+    }
+}
+#[tokio::test]
+async fn large_external_and_legacy_v2_payloads_remain_readable_and_erasable() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let wal = Wal::new(store.clone(), "formats").unwrap();
+    let large = document_entry("x".repeat(INLINE_PAYLOAD_BYTES + 1));
+    wal.append(1, &large).await.unwrap();
+    assert_eq!(store.list("ns/formats/wal-data/").await.unwrap().len(), 1);
+    assert_eq!(wal.read(1).await.unwrap().unwrap().write_id, large.write_id);
+    let legacy = document_entry("legacy document".into());
+    let payload = format!("ns/formats/wal-data/{:020}-{}.wal", 2, legacy.write_id);
+    store
+        .create_with_id(&payload, legacy.encode().unwrap(), legacy.write_id)
+        .await
+        .unwrap();
+    let mut record = vec![2];
+    record.extend(serde_json::to_vec(&serde_json::json!({"write_id":legacy.write_id,"payload_seq":2,"committed_at":legacy.committed_at,"tombstone":false})).unwrap());
+    store
+        .create_with_id(&wal.key(2), record, legacy.write_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        wal.read(2).await.unwrap().unwrap().write_id,
+        legacy.write_id
+    );
+    wal.prune_payloads(2).await.unwrap();
+    assert!(matches!(wal.read(1).await, Err(Error::Pruned)));
+    assert!(matches!(wal.read(2).await, Err(Error::Pruned)));
+    assert!(store.list("ns/formats/wal-data/").await.unwrap().is_empty());
+    assert_eq!(store.list("ns/formats/wal/").await.unwrap().len(), 2);
 }

@@ -54,7 +54,8 @@ protocol directly, reusing conditional-create retry identities rather than addin
 a second storage layer.
 
 Manifest slots contain tiny references to immutable payloads. GC retains WAL and
-manifest slot records permanently, preserving their CAS fences. Retirement grace
+manifest slots permanently, preserving their CAS fences. Small WAL entries inline
+their payload, which GC atomically redacts while retaining slot occupancy and retry identity. Retirement grace
 periods begin at publication, including for WAL checkpoints. GC inventories orphan
 segment files before claiming a newer epoch, fencing their paused builders before
 deleting them. Tombstone checkpoints retire deleted namespaces' segments. Empty
@@ -86,9 +87,11 @@ The temporary `text_fallback` module has been removed. bf-text's documented orac
 exceptions for historical Unicode versions, Greek stemming, and a stopword/subword
 edge case still apply.
 
-Order-by, aggregates, and general score expressions currently materialize eligible
-scalar rows for reference result assembly. Streaming scalar result merging and
-bounded by-filter materialization remain performance improvements.
+Scalar order-by scans one 256-row column block at a time and retains bounded top-k
+winners, including diversification. Aggregations retain accumulator states rather
+than documents; group scans retain only the smallest requested group keys and
+expand array products incrementally. General score expressions and by-filter
+writes still materialize eligible rows.
 The exhaustive diagnostic path deliberately materializes the full snapshot.
 
 ## Tuning and integration
@@ -109,11 +112,10 @@ expose these directly without changing the engine API.
 in the background and record `blowfish_ann_recall` through the metrics facade.
 Install a recorder in the binary to export it.
 
-`segment::ObjectReader` isolates range access for both index libraries. This
-worktree's storage interface supplies `Storage::get_range`; when merging the cache
-worker, connect this adapter to its cached range reader. Current range calls can
-include backend HEAD/header requests, and segment searches execute sequentially,
-so this implementation does not yet meet a three-round-trip cold-query budget.
+`segment::ObjectReader` adapts both index libraries to bf-storage's known-length
+range cache. Segment searches run concurrently on bounded blocking workers.
+Independent metadata reads start together, and ANN batches code and rerank ranges.
+See the M5 investigation below for cache budgets and the remaining cold BM25 limit.
 
 ## Validation
 
@@ -192,18 +194,25 @@ benchmark environment. Keep private deployment settings out of this document.
 
 ### WAL commit safety
 
-Document-bearing commits currently require two sequential conditional PUTs:
-the independently erasable payload, followed by the permanent slot fence. An
-inline payload cannot be erased by deleting its slot: a writer paused before its
-conditional create could then occupy that old sequence, violating serializability.
-Leaving the inline payload in the fence instead violates namespace deletion and
-checkpoint GC's physical-erasure guarantee. Replacing the slot with a redacted
-record would require a new mutable-slot protocol, including retry-identity
-handling, reader compatibility, concurrent GC, and old-writer behavior. The
-current protocol promises immutable slot records and only probes conditional
-create, not conditional replacement. Consequently, M5 retains two PUTs for data
-rather than changing the durable protocol without those guarantees. Tombstones
-already need one PUT because their slot carries no document data.
+Entries whose uncompressed JSON is at most 64 KiB now commit with one conditional
+PUT, carrying the payload inside a version-three slot. Larger entries retain the
+two-PUT external-payload path. Readers accept legacy version-two slots.
+
+GC replaces an inline slot with an identical final redacted record, preserving
+its key, write identity, sequence, and timestamp. The overwrite is atomic, and
+never exposes an absent key: a stalled create-only writer therefore still loses.
+Concurrent collectors compute the same redacted bytes; neither can restore data.
+An ambiguous overwrite is resolved by reading back those bytes. A retry of the
+original create still recognizes its identity without restoring the payload.
+Redacted reads return `Pruned`, using the existing checkpoint/tombstone recovery
+path. WAL reads bypass immutable range caches. Tombstones contain no payload.
+
+This extends the immutable-record protocol to **permanent slot occupancy with a
+single monotonic redaction transition**. All nodes reading a prefix must be
+upgraded before version-three writes begin; old binaries fail closed on the new
+slot version. Tests cover concurrent collectors, losing writers, original-write
+retries, lost successful redaction responses, namespace recreation, legacy slots,
+large external payloads, and the engine's crash-injection matrix.
 
 Profiling the retained million-row corpus with Linux `perf record -F 499
 --call-graph dwarf,8192` found ID deserialization at 4.99% of sampled cycles,

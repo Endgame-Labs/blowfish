@@ -414,6 +414,56 @@ impl Storage {
             }
         }
     }
+    /// Atomically redact an occupied permanent fence, retaining its create/retry identity.
+    ///
+    /// This is NOT a general compare-and-swap operation: every concurrent caller for
+    /// this key must supply the identical, final redacted value. The key must never
+    /// be deleted or reused. An overwrite never exposes an absent slot, so stalled
+    /// create-only writers remain fenced, including during concurrent redactions.
+    /// Returns false for a missing fence or a different identity.
+    pub async fn redact_with_id(
+        &self,
+        key: &str,
+        value: impl Into<Bytes>,
+        write_id: Uuid,
+    ) -> Result<bool, Error> {
+        self.writable()?;
+        let _guard = if self.0.mode == StorageMode::SingleWriter {
+            Some(self.0.serial.lock().await)
+        } else {
+            None
+        };
+        let path = self.path(key);
+        let current = match self.0.backend.get(&path).await {
+            Ok(found) => found.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if identity(&current, write_id) != CreateResult::AlreadyCommitted {
+            return Ok(false);
+        }
+        let value = value.into();
+        let mut encoded = Vec::with_capacity(HEADER + value.len());
+        encoded.extend_from_slice(MAGIC);
+        encoded.extend_from_slice(write_id.as_bytes());
+        encoded.extend_from_slice(&value);
+        let encoded = Bytes::from(encoded);
+        if current == encoded {
+            return Ok(true);
+        }
+        match self.0.backend.put(&path, encoded.clone().into()).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                // A lost overwrite response is successful only when the final body is visible.
+                if let Ok(found) = self.0.backend.get(&path).await
+                    && found.bytes().await.is_ok_and(|bytes| bytes == encoded)
+                {
+                    return Ok(true);
+                }
+                Err(e.into())
+            }
+        }
+    }
     /// List objects under a relative prefix, sorted by key.
     pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, Error> {
         let base = self.0.prefix.as_ref();

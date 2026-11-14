@@ -143,3 +143,49 @@ async fn reserved_header_and_empty_objects_roundtrip() {
     store.put("empty", Bytes::new()).await.unwrap();
     assert_eq!(store.get_range("empty", 0..0).await.unwrap(), Bytes::new());
 }
+
+#[tokio::test]
+async fn lost_redaction_response_preserves_the_permanent_retry_fence() {
+    let backend = Arc::new(FaultStore::new(false, false, false));
+    let store = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    store
+        .create_with_id("data/object", "sensitive", id)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .redact_with_id("data/object", "redacted", uuid::Uuid::new_v4())
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get("data/object").await.unwrap(), "sensitive");
+    assert!(
+        !store
+            .redact_with_id("missing", "redacted", id)
+            .await
+            .unwrap()
+    );
+    backend.lose_response.store(true, Ordering::SeqCst);
+    assert!(
+        store
+            .redact_with_id("data/object", "redacted", id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get("data/object").await.unwrap(), "redacted");
+    assert_eq!(
+        store
+            .create_with_id("data/object", "sensitive", id)
+            .await
+            .unwrap(),
+        CreateResult::AlreadyCommitted
+    );
+    assert_eq!(
+        store.create("data/object", "another writer").await.unwrap(),
+        CreateResult::Conflict
+    );
+    assert_eq!(store.get("data/object").await.unwrap(), "redacted");
+}
