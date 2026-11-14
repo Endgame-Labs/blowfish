@@ -6,3 +6,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+alyze = { version = "=0.2.0", features = ["cjk"] }
+async-trait = "=0.1.92"
+bitpacking = "=0.9.3"
+bytes = "=1.12.1"
+crc32fast = "=1.5.5"
+fst = "=0.4.7"
+futures = "=0.3.34"
+roaring = "=0.12.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+unicode-segmentation = "=1.13.3"
+
+[dev-dependencies]
+proptest = "=1.12.0"

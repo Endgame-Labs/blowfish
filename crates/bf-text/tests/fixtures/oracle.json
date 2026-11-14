@@ -1,0 +1,8984 @@
+{
+  "scores": [
+    {
+      "documents": [
+        "the quick brown fox",
+        "lazy dogs sleep all day",
+        "a fox and a dog"
+      ],
+      "query": "fox",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.49917623,
+          "id": 1
+        },
+        {
+          "$dist": 0.45665967,
+          "id": 3
+        }
+      ]
+    },
+    {
+      "documents": [
+        "the quick brown fox",
+        "lazy dogs sleep all day",
+        "a fox and a dog"
+      ],
+      "query": "fox fox",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.89851725,
+          "id": 1
+        },
+        {
+          "$dist": 0.8219874,
+          "id": 3
+        }
+      ]
+    },
+    {
+      "documents": [
+        "the quick brown fox",
+        "lazy dogs sleep all day",
+        "a fox and a dog"
+      ],
+      "query": "fox fox fox",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 1.2252507,
+          "id": 1
+        },
+        {
+          "$dist": 1.1208919,
+          "id": 3
+        }
+      ]
+    },
+    {
+      "documents": [
+        "the quick brown fox",
+        "lazy dogs sleep all day",
+        "a fox and a dog"
+      ],
+      "query": "fo",
+      "last_as_prefix": true,
+      "rows": [
+        {
+          "$dist": 1.0,
+          "id": 1
+        },
+        {
+          "$dist": 1.0,
+          "id": 3
+        }
+      ]
+    },
+    {
+      "documents": [
+        "the quick brown fox",
+        "lazy dogs sleep all day",
+        "a fox and a dog"
+      ],
+      "query": "fox",
+      "last_as_prefix": true,
+      "rows": [
+        {
+          "$dist": 1.0,
+          "id": 1
+        },
+        {
+          "$dist": 1.0,
+          "id": 3
+        }
+      ]
+    },
+    {
+      "documents": [
+        "the quick brown fox",
+        "lazy dogs sleep all day",
+        "a fox and a dog"
+      ],
+      "query": "fox dog",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 1.409642,
+          "id": 3
+        },
+        {
+          "$dist": 0.49917623,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "documents": [
+        "the quick brown fox",
+        "lazy dogs sleep all day",
+        "a fox and a dog"
+      ],
+      "query": "fox do",
+      "last_as_prefix": true,
+      "rows": [
+        {
+          "$dist": 1.4566597,
+          "id": 3
+        },
+        {
+          "$dist": 1.0,
+          "id": 2
+        },
+        {
+          "$dist": 0.49917623,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.9741528,
+          "id": 2
+        },
+        {
+          "$dist": 0.9565264,
+          "id": 3
+        },
+        {
+          "$dist": 0.88896894,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox fox fox",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 2.3911023,
+          "id": 2
+        },
+        {
+          "$dist": 2.3478374,
+          "id": 3
+        },
+        {
+          "$dist": 2.1820147,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox ca",
+      "last_as_prefix": true,
+      "rows": [
+        {
+          "$dist": 1.9565264,
+          "id": 3
+        },
+        {
+          "$dist": 1.0,
+          "id": 4
+        },
+        {
+          "$dist": 1.0,
+          "id": 6
+        },
+        {
+          "$dist": 0.9741528,
+          "id": 2
+        },
+        {
+          "$dist": 0.88896894,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox fox",
+      "last_as_prefix": true,
+      "rows": [
+        {
+          "$dist": 1.9741528,
+          "id": 2
+        },
+        {
+          "$dist": 1.9565264,
+          "id": 3
+        },
+        {
+          "$dist": 1.888969,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "params": {
+        "k1": 2.0,
+        "b": 0.0,
+        "k3": 1.0
+      },
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 1.3862944,
+          "id": 3
+        },
+        {
+          "$dist": 1.0397208,
+          "id": 2
+        },
+        {
+          "$dist": 0.6931472,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "params": {
+        "k1": 2.0,
+        "b": 0.0,
+        "k3": 1.0
+      },
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox fox fox",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 2.0794415,
+          "id": 3
+        },
+        {
+          "$dist": 1.5595812,
+          "id": 2
+        },
+        {
+          "$dist": 1.0397208,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "params": {
+        "k1": 2.0,
+        "b": 0.0,
+        "k3": 1.0
+      },
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox ca",
+      "last_as_prefix": true,
+      "rows": [
+        {
+          "$dist": 2.3862944,
+          "id": 3
+        },
+        {
+          "$dist": 1.0397208,
+          "id": 2
+        },
+        {
+          "$dist": 1.0,
+          "id": 4
+        },
+        {
+          "$dist": 1.0,
+          "id": 6
+        },
+        {
+          "$dist": 0.6931472,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "params": {
+        "k1": 2.0,
+        "b": 0.0,
+        "k3": 1.0
+      },
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox fox",
+      "last_as_prefix": true,
+      "rows": [
+        {
+          "$dist": 2.3862944,
+          "id": 3
+        },
+        {
+          "$dist": 2.0397208,
+          "id": 2
+        },
+        {
+          "$dist": 1.6931472,
+          "id": 1
+        }
+      ]
+    },
+    {
+      "params": {
+        "k1": 0.3,
+        "b": 1.0,
+        "k3": 20.0
+      },
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.7914991,
+          "id": 1
+        },
+        {
+          "$dist": 0.7914991,
+          "id": 2
+        },
+        {
+          "$dist": 0.7681434,
+          "id": 3
+        }
+      ]
+    },
+    {
+      "params": {
+        "k1": 0.3,
+        "b": 1.0,
+        "k3": 20.0
+      },
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox fox fox",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 2.1680193,
+          "id": 1
+        },
+        {
+          "$dist": 2.1680193,
+          "id": 2
+        },
+        {
+          "$dist": 2.1040452,
+          "id": 3
+        }
+      ]
+    },
+    {
+      "params": {
+        "k1": 0.3,
+        "b": 1.0,
+        "k3": 20.0
+      },
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox ca",
+      "last_as_prefix": true,
+      "rows": [
+        {
+          "$dist": 1.7681434,
+          "id": 3
+        },
+        {
+          "$dist": 1.0,
+          "id": 4
+        },
+        {
+          "$dist": 1.0,
+          "id": 6
+        },
+        {
+          "$dist": 0.7914991,
+          "id": 1
+        },
+        {
+          "$dist": 0.7914991,
+          "id": 2
+        }
+      ]
+    },
+    {
+      "params": {
+        "k1": 0.3,
+        "b": 1.0,
+        "k3": 20.0
+      },
+      "documents": [
+        "fox",
+        "fox fox",
+        "fox fox fox fox cat",
+        "cat",
+        "",
+        "dog dog cat"
+      ],
+      "query": "fox fox",
+      "last_as_prefix": true,
+      "rows": [
+        {
+          "$dist": 1.7914991,
+          "id": 1
+        },
+        {
+          "$dist": 1.7914991,
+          "id": 2
+        },
+        {
+          "$dist": 1.7681434,
+          "id": 3
+        }
+      ]
+    },
+    {
+      "params": {
+        "language": "arabic",
+        "stemming": true
+      },
+      "documents": [
+        "الكتابات كتاب"
+      ],
+      "query": "كتاب",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "danish",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "hestene og hest"
+      ],
+      "query": "hest",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "dutch",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "paarden en paard"
+      ],
+      "query": "paard",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "english",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "running and runs"
+      ],
+      "query": "run",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "finnish",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "talossa ja talo"
+      ],
+      "query": "talo",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "french",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "chevaux et cheval"
+      ],
+      "query": "cheval",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "german",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "häuser und haus"
+      ],
+      "query": "haus",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "greek",
+        "stemming": true
+      },
+      "documents": [
+        "ανθρώπων άνθρωπος"
+      ],
+      "query": "ανθρωπ",
+      "last_as_prefix": false,
+      "rows": [],
+      "missing_rows": 2,
+      "known_gap": {
+        "reason": "Snowball Greek stemming differs from the live service.",
+        "local_ids": [
+          1
+        ]
+      }
+    },
+    {
+      "params": {
+        "language": "hungarian",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "házak és ház"
+      ],
+      "query": "ház",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "italian",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "cavalli e cavallo"
+      ],
+      "query": "cavallo",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "norwegian",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "hestene og hest"
+      ],
+      "query": "hest",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "portuguese",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "cavalos e cavalo"
+      ],
+      "query": "cavalo",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "romanian",
+        "stemming": true
+      },
+      "documents": [
+        "cărțile carte"
+      ],
+      "query": "carte",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.28768212,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "russian",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "машины и машина"
+      ],
+      "query": "машина",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "spanish",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "caballos y caballo"
+      ],
+      "query": "caballo",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "swedish",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "hästarna och häst"
+      ],
+      "query": "häst",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "tamil",
+        "stemming": true
+      },
+      "documents": [
+        "மரங்கள் மரம்"
+      ],
+      "query": "மரம்",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.28768212,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    },
+    {
+      "params": {
+        "language": "turkish",
+        "stemming": true
+      },
+      "documents": [
+        "kitaplar kitap"
+      ],
+      "query": "kitap",
+      "last_as_prefix": false,
+      "rows": [
+        {
+          "$dist": 0.39556292,
+          "id": 1
+        }
+      ],
+      "missing_rows": 2
+    }
+  ],
+  "filters": [
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        2
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {},
+      "documents": [
+        "Don't stop: foo-bar foo_bar 3.14 1,234 e.g. café 中文 👩‍💻 🐡",
+        "DON’T foo bar foo bar café",
+        "中文测试 foxes running THE"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v0"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v1"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v2"
+      },
+      "documents": [
+        "foo-bar foo_bar don't 3.14 中文测试 🐡"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "word_v3"
+      },
+      "documents": [
+        "Don't foo_bar 3.14 中文测试 🐡"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "whitespace"
+      },
+      "documents": [
+        "FOO-bar foo, 🐡"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ],
+      "known_gap": {
+        "reason": "Live boolean filter matches t inside removed stopword The; analyzed postings cannot recover removed tokens. BM25 and phrases remain exact.",
+        "local_ids": []
+      }
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "stemming": true,
+        "remove_stopwords": true,
+        "ascii_folding": true
+      },
+      "documents": [
+        "The foxes were running cafés naïve"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "max_token_length": 3
+      },
+      "documents": [
+        "abcd ééé éééé cat dog"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "case_sensitive": true
+      },
+      "documents": [
+        "Fox fox FOX"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "smartcn"
+      },
+      "documents": [
+        "中华人民共和国 上海 北京"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "kuromoji"
+      },
+      "documents": [
+        "東京都 日本語の勉強"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "don't",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "don’t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "don",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "t",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "foo",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "foo_bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "foo-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "3.14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "3",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "14",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "1,234",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "e.g.",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "ééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "éééé",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "cat",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "dog",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "中文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "中",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "文",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "中文测试",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "🐡",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "👩‍💻",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "foxes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "running",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "were",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "cafe",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "cafes",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "naiv",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "Fox",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "FOX",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "FOO-bar",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "foo,",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "中华人民共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "中华",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "人民",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "共和国",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "上海",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "北京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "東京都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "東京",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "都",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "日本語",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "日本",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "語",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "勉強",
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "한국어",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "한국",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "분석",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "nori"
+      },
+      "documents": [
+        "한국어를 분석합니다"
+      ],
+      "query": "분석합니다",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "pre_tokenized_array"
+      },
+      "documents": [
+        [
+          "Foo-bar",
+          "foo bar",
+          "🐡",
+          "A"
+        ]
+      ],
+      "query": [
+        "Foo-bar"
+      ],
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "pre_tokenized_array"
+      },
+      "documents": [
+        [
+          "Foo-bar",
+          "foo bar",
+          "🐡",
+          "A"
+        ]
+      ],
+      "query": [
+        "foo-bar"
+      ],
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "pre_tokenized_array"
+      },
+      "documents": [
+        [
+          "Foo-bar",
+          "foo bar",
+          "🐡",
+          "A"
+        ]
+      ],
+      "query": [
+        "foo bar"
+      ],
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "pre_tokenized_array"
+      },
+      "documents": [
+        [
+          "Foo-bar",
+          "foo bar",
+          "🐡",
+          "A"
+        ]
+      ],
+      "query": [
+        "A"
+      ],
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "tokenizer": "pre_tokenized_array"
+      },
+      "documents": [
+        [
+          "Foo-bar",
+          "foo bar",
+          "🐡",
+          "A"
+        ]
+      ],
+      "query": [
+        "a"
+      ],
+      "operator": "ContainsAllTokens",
+      "ids": []
+    },
+    {
+      "params": {
+        "tokenizer": "pre_tokenized_array"
+      },
+      "documents": [
+        [
+          "Foo-bar",
+          "foo bar",
+          "🐡",
+          "A"
+        ]
+      ],
+      "query": [
+        "🐡"
+      ],
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        [
+          "fox",
+          "dog"
+        ],
+        [
+          "fox dog"
+        ],
+        [
+          "fox the dog"
+        ]
+      ],
+      "query": "fox dog",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        [
+          "fox",
+          "dog"
+        ],
+        [
+          "fox dog"
+        ],
+        [
+          "fox the dog"
+        ]
+      ],
+      "query": "fox dog",
+      "operator": "ContainsTokenSequence",
+      "ids": [
+        2
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        [
+          "fox",
+          "dog"
+        ],
+        [
+          "fox dog"
+        ],
+        [
+          "fox the dog"
+        ]
+      ],
+      "query": "fox the dog",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        [
+          "fox",
+          "dog"
+        ],
+        [
+          "fox dog"
+        ],
+        [
+          "fox the dog"
+        ]
+      ],
+      "query": "fox the dog",
+      "operator": "ContainsTokenSequence",
+      "ids": [
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        [
+          "fox",
+          "dog"
+        ],
+        [
+          "fox dog"
+        ],
+        [
+          "fox the dog"
+        ]
+      ],
+      "query": "the",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        3
+      ]
+    },
+    {
+      "params": {},
+      "documents": [
+        [
+          "fox",
+          "dog"
+        ],
+        [
+          "fox dog"
+        ],
+        [
+          "fox the dog"
+        ]
+      ],
+      "query": "the",
+      "operator": "ContainsTokenSequence",
+      "ids": [
+        3
+      ]
+    },
+    {
+      "params": {
+        "language": "arabic",
+        "stemming": true
+      },
+      "documents": [
+        "الكتابات كتاب",
+        "",
+        ""
+      ],
+      "query": "كتاب",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "danish",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "hestene og hest",
+        "",
+        ""
+      ],
+      "query": "hest",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "dutch",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "paarden en paard",
+        "",
+        ""
+      ],
+      "query": "paard",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "english",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "running and runs",
+        "",
+        ""
+      ],
+      "query": "run",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "finnish",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "talossa ja talo",
+        "",
+        ""
+      ],
+      "query": "talo",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "french",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "chevaux et cheval",
+        "",
+        ""
+      ],
+      "query": "cheval",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "german",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "häuser und haus",
+        "",
+        ""
+      ],
+      "query": "haus",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "greek",
+        "stemming": true
+      },
+      "documents": [
+        "ανθρώπων άνθρωπος",
+        "",
+        ""
+      ],
+      "query": "ανθρωπ",
+      "operator": "ContainsAllTokens",
+      "ids": [],
+      "known_gap": {
+        "reason": "The published Snowball Greek stemmer conflates ανθρώπων and ανθρωπ; the live service does not.",
+        "local_ids": [
+          1
+        ]
+      }
+    },
+    {
+      "params": {
+        "language": "hungarian",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "házak és ház",
+        "",
+        ""
+      ],
+      "query": "ház",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "italian",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "cavalli e cavallo",
+        "",
+        ""
+      ],
+      "query": "cavallo",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "norwegian",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "hestene og hest",
+        "",
+        ""
+      ],
+      "query": "hest",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "portuguese",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "cavalos e cavalo",
+        "",
+        ""
+      ],
+      "query": "cavalo",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "romanian",
+        "stemming": true
+      },
+      "documents": [
+        "cărțile carte",
+        "",
+        ""
+      ],
+      "query": "carte",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "russian",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "машины и машина",
+        "",
+        ""
+      ],
+      "query": "машина",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "spanish",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "caballos y caballo",
+        "",
+        ""
+      ],
+      "query": "caballo",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "swedish",
+        "stemming": true,
+        "remove_stopwords": true
+      },
+      "documents": [
+        "hästarna och häst",
+        "",
+        ""
+      ],
+      "query": "häst",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "tamil",
+        "stemming": true
+      },
+      "documents": [
+        "மரங்கள் மரம்",
+        "",
+        ""
+      ],
+      "query": "மரம்",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "params": {
+        "language": "turkish",
+        "stemming": true
+      },
+      "documents": [
+        "kitaplar kitap",
+        "",
+        ""
+      ],
+      "query": "kitap",
+      "operator": "ContainsAllTokens",
+      "ids": [
+        1
+      ]
+    }
+  ]
+}
