@@ -1,17 +1,22 @@
-//! Exhaustive reference engine. Object storage is authoritative; memory is a replay cache.
+//! Immutable segment indexes with a WAL overlay and an exhaustive reference evaluator.
 mod filter;
+mod indexed;
+mod indexer;
+mod segment;
+mod snapshot;
+pub use indexer::EngineConfig;
 mod metadata;
 mod query;
-pub mod text_fallback;
+mod text;
 mod write;
 
 use bf_storage::{CreateResult, Storage};
 use bf_types::*;
-use bf_wal::{GroupCommit, Manifest, Pending, Wal, WalEntry, WriteBatch};
+use bf_wal::{GroupCommit, Pending, Wal, WalEntry, WriteBatch};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::Instant,
 };
@@ -23,7 +28,17 @@ pub(crate) struct NamespaceState {
     pub exists: bool,
     pub schema: Schema,
     pub metric: DistanceMetric,
+    /// Only the unindexed tail stays resident. Materialized views are query-local.
     pub docs: BTreeMap<Id, Document>,
+    pub shadowed: BTreeSet<Id>,
+    pub segments: Vec<bf_wal::Segment>,
+    pub indexed_through: u64,
+    pub manifest_seq: u64,
+    pub tail_bytes: u64,
+    pub tail_since: Option<DateTime<Utc>>,
+    pub stats: bf_wal::NamespaceStats,
+    pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
+    pub corpus: BTreeMap<String, bf_text::CorpusStats>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub refreshed: Instant,
@@ -36,6 +51,15 @@ impl Default for NamespaceState {
             schema: Schema::new(),
             metric: DistanceMetric::default(),
             docs: BTreeMap::new(),
+            shadowed: BTreeSet::new(),
+            segments: vec![],
+            indexed_through: 0,
+            manifest_seq: 0,
+            tail_bytes: 0,
+            tail_since: None,
+            stats: Default::default(),
+            scores: BTreeMap::new(),
+            corpus: BTreeMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             refreshed: Instant::now(),
@@ -45,26 +69,37 @@ impl Default for NamespaceState {
 impl NamespaceState {
     fn apply(&mut self, b: &WriteBatch) {
         self.exists = true;
+        if self.schema.keys().any(|name| !b.schema.contains_key(name)) {
+            for doc in self.docs.values_mut() {
+                doc.retain(|name, _| b.schema.contains_key(name));
+            }
+        }
         self.schema = b.schema.clone();
         self.metric = b.distance_metric;
         self.created_at = b.created_at;
         self.updated_at = b.updated_at;
         for id in &b.deletes {
             self.docs.remove(id);
+            self.shadowed.insert(id.clone());
         }
         for doc in &b.upserts {
-            let id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
+            let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
+            self.shadowed.insert(id.clone());
             self.docs.insert(id, doc.clone());
         }
     }
     fn replay(&mut self, seq: u64, entry: &WalEntry) {
         if entry.tombstone {
+            let manifest_seq = self.manifest_seq;
             *self = Self::default();
+            self.manifest_seq = manifest_seq;
         }
         for batch in &entry.batches {
             self.apply(batch);
         }
+        self.tail_since.get_or_insert(entry.committed_at);
         self.seq = seq;
+        self.tail_bytes += serde_json::to_vec(entry).expect("WAL serializes").len() as u64;
     }
 }
 struct Handle {
@@ -73,6 +108,8 @@ struct Handle {
 }
 struct Inner {
     store: Storage,
+    config: EngineConfig,
+    owner: uuid::Uuid,
     namespaces: Mutex<HashMap<String, Arc<Handle>>>,
 }
 /// Cloneable namespace engine. Separate instances safely share a CAS-capable bucket.
@@ -85,10 +122,18 @@ enum Operation {
 impl Engine {
     /// Use an already-probed store. No writable local state is required.
     pub fn new(store: Storage) -> Self {
-        Self(Arc::new(Inner {
+        Self::with_config(store, EngineConfig::from_env())
+    }
+    /// Configure indexing, tail limits, retention, and ANN behavior explicitly.
+    pub fn with_config(store: Storage, config: EngineConfig) -> Self {
+        let engine = Self(Arc::new(Inner {
             store,
+            config,
+            owner: uuid::Uuid::new_v4(),
             namespaces: Mutex::new(HashMap::new()),
-        }))
+        }));
+        indexer::start(&engine);
+        engine
     }
     /// Access the underlying store for operational inspection.
     pub fn storage(&self) -> &Storage {
@@ -114,7 +159,13 @@ impl Engine {
             commits,
         });
         handles.insert(ns.into(), handle.clone());
-        tokio::spawn(commit_worker(wal, state, receiver));
+        tokio::spawn(commit_worker(
+            wal,
+            state,
+            receiver,
+            self.0.store.clone(),
+            self.0.config.clone(),
+        ));
         Ok(handle)
     }
     async fn snapshot(
@@ -135,17 +186,39 @@ impl Engine {
                         "max_staleness_seconds must be between 1 and 3600",
                     ));
                 }
-                state.seq == 0 || state.refreshed.elapsed().as_secs() >= *max_staleness_seconds
+                state.seq == 0
+                    || state.refreshed.elapsed().as_secs() >= *max_staleness_seconds
+                    || state.refreshed.elapsed() >= self.0.config.retention.div_f64(2.0)
             }
         };
-        if refresh {
-            catch_up(
+        let cap = matches!(consistency, Consistency::Eventual { .. })
+            .then_some(self.0.config.eventual_tail_bytes);
+        let over_cap = cap.is_some_and(|cap| state.tail_bytes > cap);
+        if over_cap {
+            *state = NamespaceState::default();
+        }
+        if refresh || over_cap {
+            snapshot::catch_up(
                 &Wal::new(self.0.store.clone(), ns).map_err(log_error)?,
                 &mut state,
+                cap,
             )
             .await?;
         }
         if !state.exists {
+            if cap.is_some()
+                && Wal::new(self.0.store.clone(), ns)
+                    .map_err(log_error)?
+                    .head()
+                    .await
+                    .map_err(log_error)?
+                    > state.seq
+            {
+                return Err(ApiError::new(
+                    409,
+                    "eventual WAL tail exceeds the scan limit; wait for indexing",
+                ));
+            }
             return Err(ApiError::not_found(ns));
         }
         Ok((state.clone(), warm))
@@ -181,7 +254,11 @@ impl Engine {
                 return Err(ApiError::bad("cannot copy a namespace to itself"));
             }
             Some(Box::new(
-                self.snapshot(source, &Consistency::Strong).await?.0,
+                snapshot::materialize(
+                    &self.0.store,
+                    &self.snapshot(source, &Consistency::Strong).await?.0,
+                )
+                .await?,
             ))
         } else {
             None
@@ -200,19 +277,54 @@ impl Engine {
         }
         Ok(response)
     }
-    /// Query a consistent snapshot using exhaustive evaluation, including multi-query RRF.
+    /// Search a consistent segment-and-tail snapshot, including multi-query RRF.
     pub async fn query(&self, ns: &str, request: QueryRequest) -> Result<QueryResponse, ApiError> {
         let start = Instant::now();
         let (state, warm) = self.snapshot(ns, &request.consistency).await?;
         let execution = Instant::now();
-        let mut response = query::execute(&state, &request)?;
+        let store = self.0.store.clone();
+        let config = self.0.config.clone();
+        let search_state = state.clone();
+        let search_request = request.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let mut response = tokio::task::spawn_blocking(move || {
+            runtime.block_on(indexed::execute(
+                &store,
+                &search_state,
+                &search_request,
+                &config,
+                false,
+            ))
+        })
+        .await
+        .map_err(segment::index_error)??;
+        if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
+            && (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1_000_000.0
+                < self.0.config.recall_sample_rate
+        {
+            let store = self.0.store.clone();
+            let config = self.0.config.clone();
+            let sample = state.clone();
+            let ann = response.clone();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                runtime.block_on(async move {
+                    if let Ok(exact) =
+                        indexed::execute(&store, &sample, &request, &config, true).await
+                    {
+                        metrics::histogram!("blowfish_ann_recall")
+                            .record(indexed::recall(&ann, &exact));
+                    }
+                })
+            });
+        }
         response.performance = QueryPerformance {
             cache_hit_ratio: if warm { 1.0 } else { 0.0 },
             cache_temperature: if warm { "hot" } else { "cold" }.into(),
             server_total_ms: start.elapsed().as_millis() as u64,
             query_execution_ms: execution.elapsed().as_millis() as u64,
             exhaustive_search_count: state.docs.len() as u64,
-            approx_namespace_size: state.docs.len() as u64,
+            approx_namespace_size: state.stats.rows + state.docs.len() as u64,
             last_included_write_at: Some(
                 state
                     .updated_at
@@ -221,10 +333,22 @@ impl Engine {
         };
         Ok(response)
     }
+    /// Run the exhaustive reference evaluator on the same persistent snapshot machinery.
+    pub async fn query_exhaustive(
+        &self,
+        ns: &str,
+        request: QueryRequest,
+    ) -> Result<QueryResponse, ApiError> {
+        let (state, _) = self.snapshot(ns, &request.consistency).await?;
+        let mut full = snapshot::materialize(&self.0.store, &state).await?;
+        text::reference_stats(&mut full);
+        query::execute(&full, &request)
+    }
     /// Namespace metadata, with fully expanded schema settings.
     pub async fn metadata(&self, ns: &str) -> Result<Value, ApiError> {
         let (s, _) = self.snapshot(ns, &Consistency::Strong).await?;
-        let mut metadata = json!({"schema":s.schema,"approx_logical_bytes":logical_bytes(&s),"approx_row_count":s.docs.len(),"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}});
+        let totals = snapshot::statistics(&self.0.store, &s).await?;
+        let mut metadata = json!({"schema":s.schema,"approx_logical_bytes":totals.logical_bytes,"approx_row_count":totals.rows,"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}});
         self.decorate_metadata(ns, &s.created_at.to_rfc3339(), &mut metadata)
             .await?;
         Ok(metadata)
@@ -313,28 +437,22 @@ impl Engine {
             json!({"namespaces":found.iter().map(|ns|json!({"id":ns})).collect::<Vec<_>>(),"next_cursor":next}),
         )
     }
-    /// Prefetch the WAL and schema into the node cache.
+    /// Prefetch the manifest, WAL tail, and schema into the node cache.
     pub async fn warm(&self, ns: &str) -> Result<(), ApiError> {
         self.snapshot(ns, &Consistency::Strong).await?;
         Ok(())
     }
-    /// Describe the exhaustive reference plan after validating the query.
+    /// Describe the indexed snapshot plan after validating the query.
     pub async fn explain(&self, ns: &str, request: QueryRequest) -> Result<Value, ApiError> {
         self.query(ns, request).await?;
         Ok(
-            json!({"plan_text":"Object-store WAL replay → exhaustive namespace scan → filter → exact rank/aggregate → projection"}),
+            json!({"plan_text":"Manifest snapshot + exhaustive WAL tail → live/filter bitmaps → segment ANN/BM25 or scalar evaluation → newest-wins merge → projection"}),
         )
     }
-    /// Exact-search recall is one; optionally return the sampled ground-truth rows.
+    /// Compare ANN with exact search on one snapshot and optionally return ground-truth rows.
     pub async fn recall(&self, ns: &str, request: Value) -> Result<Value, ApiError> {
         query::recall(self, ns, request).await
     }
-}
-fn logical_bytes(s: &NamespaceState) -> usize {
-    s.docs
-        .values()
-        .map(|d| serde_json::to_vec(d).expect("document serializes").len())
-        .sum()
 }
 fn storage_error(e: bf_storage::Error) -> ApiError {
     tracing::error!(error=?e,"storage operation failed");
@@ -352,16 +470,14 @@ fn log_error(e: bf_wal::Error) -> ApiError {
     }
 }
 async fn catch_up(wal: &Wal, state: &mut NamespaceState) -> Result<(), ApiError> {
-    for (seq, entry) in wal.tail(state.seq).await.map_err(log_error)? {
-        state.replay(seq, &entry);
-    }
-    state.refreshed = Instant::now();
-    Ok(())
+    snapshot::catch_up(wal, state, None).await
 }
 async fn commit_worker(
     wal: Wal,
     state: Arc<Mutex<NamespaceState>>,
     mut receiver: tokio::sync::mpsc::Receiver<Pending<Operation, Result<WriteResponse, ApiError>>>,
+    store: Storage,
+    config: EngineConfig,
 ) {
     let mut carry = None;
     loop {
@@ -415,7 +531,16 @@ async fn commit_worker(
                     Err(e) => break Err(log_error(e)),
                 }
             }
-            let mut working = current.clone();
+            if current.tail_bytes >= config.max_unindexed_bytes {
+                break Err(ApiError::new(
+                    429,
+                    "unindexed WAL exceeds backpressure limit",
+                ));
+            }
+            let mut working = match snapshot::for_writes(&store, &current, &pending).await {
+                Ok(s) => s,
+                Err(e) => break Err(e),
+            };
             let mut batches = vec![];
             let mut results = vec![];
             for p in &pending {
@@ -441,23 +566,6 @@ async fn commit_worker(
                     let seq = current.seq + 1;
                     current.replay(seq, &entry);
                     current.refreshed = Instant::now();
-                    if let Some(id_type) =
-                        current.schema.get("id").and_then(|s| s.data_type.clone())
-                    {
-                        let manifest = Manifest {
-                            format_version: 1,
-                            schema: current.schema.clone(),
-                            distance_metric: current.metric,
-                            id_type,
-                            created_at: current.created_at,
-                            indexed_through: 0,
-                            indexer_epoch: 0,
-                            segments: vec![],
-                        };
-                        if let Err(e) = wal.publish_manifest(seq, &manifest).await {
-                            tracing::warn!(error=?e,"manifest publication deferred; WAL remains authoritative");
-                        }
-                    }
                     break Ok(results);
                 }
                 Err(e) => break Err(log_error(e)),

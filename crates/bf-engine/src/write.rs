@@ -177,7 +177,7 @@ pub(crate) fn prepare(
     }
     for cfg in state.schema.values() {
         if let Some(config) = cfg.text_config() {
-            crate::text_fallback::validate_config(&config)?;
+            config.validate().map_err(ApiError::bad)?;
         }
     }
     if !current.exists
@@ -361,7 +361,15 @@ pub(crate) fn prepare(
         upserts: state
             .docs
             .iter()
-            .filter(|(id, doc)| current.docs.get(id) != Some(doc))
+            .filter(|(id, doc)| {
+                current.docs.get(id).is_none_or(|old| {
+                    // A schema drop hides stored columns; it must not duplicate every
+                    // surviving vector into a giant schema-only WAL entry.
+                    old.iter()
+                        .filter(|(name, _)| state.schema.contains_key(*name))
+                        .ne(doc.iter())
+                })
+            })
             .map(|(_, doc)| doc.clone())
             .collect(),
         deletes: current

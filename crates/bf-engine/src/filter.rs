@@ -1,4 +1,4 @@
-use crate::{text_fallback, write::normalize_value};
+use crate::{text, write::normalize_value};
 use bf_types::*;
 use serde_json::Value;
 use std::cmp::Ordering;
@@ -114,6 +114,11 @@ pub(crate) fn validate(f: &Filter, schema: &Schema, allow_refs: bool) -> Result<
                 } else {
                     normalize_value(value, &operand_type)?;
                 }
+            }
+            if *op == ContainsTokenSequence && text::prefix(params.as_ref()) {
+                return Err(ApiError::bad(
+                    "ContainsTokenSequence does not support last_as_prefix",
+                ));
             }
             if let Some(params) = params
                 && params
@@ -313,34 +318,20 @@ pub(crate) fn matches(
                     let config = cfg
                         .and_then(AttributeSchema::text_config)
                         .unwrap_or_default();
-                    let query = text_fallback::tokens(&operand, &config);
-                    let arrays = text_fallback::token_groups(actual, &config);
-                    let prefix = params
-                        .as_ref()
-                        .and_then(|p| p.get("last_as_prefix"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if *op == ContainsTokenSequence {
-                        !query.is_empty()
-                            && arrays.iter().any(|tokens| {
-                                tokens.windows(query.len()).any(|window| window == query)
-                            })
-                    } else {
-                        let token_match = |i: usize, q: &str| {
-                            arrays.iter().flatten().any(|t| {
-                                if prefix && i + 1 == query.len() {
-                                    t.starts_with(q)
-                                } else {
-                                    t == q
-                                }
-                            })
-                        };
-                        if *op == ContainsAllTokens {
-                            !query.is_empty()
-                                && query.iter().enumerate().all(|(i, q)| token_match(i, q))
-                        } else {
-                            query.iter().enumerate().any(|(i, q)| token_match(i, q))
+                    let query = bf_text::Query::new(
+                        text::tokens(&operand, &config),
+                        text::prefix(params.as_ref()),
+                    );
+                    let tokens = text::tokens(actual, &config);
+                    match op {
+                        ContainsAllTokens => {
+                            bf_text::matches_all_tokens(&tokens, &query, config.tokenizer)
                         }
+                        ContainsAnyToken => {
+                            bf_text::matches_any_token(&tokens, &query, config.tokenizer)
+                        }
+                        ContainsTokenSequence => bf_text::matches_token_sequence(&tokens, &query),
+                        _ => unreachable!(),
                     }
                 }
                 Fuzzy => return Err(ApiError::bad("Fuzzy is not supported by blowfish yet")),

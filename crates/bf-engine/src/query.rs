@@ -1,4 +1,4 @@
-use crate::{Engine, NamespaceState, filter, text_fallback};
+use crate::{Engine, NamespaceState, filter, text};
 use bf_types::*;
 use serde_json::{Value, json};
 use std::{
@@ -261,10 +261,17 @@ fn single(
             RankBy::Vector {
                 attribute, vector, ..
             } => {
-                let Some(value) = doc.get(attribute) else {
-                    continue;
-                };
-                Some(distance(&decode_vector(value)?, vector, state.metric))
+                if let Some(scores) = state.scores.get(&crate::indexed::rank_key(rank)) {
+                    let Some(score) = scores.get(id) else {
+                        continue;
+                    };
+                    Some(*score)
+                } else {
+                    let Some(value) = doc.get(attribute) else {
+                        continue;
+                    };
+                    Some(distance(&decode_vector(value)?, vector, state.metric))
+                }
             }
             _ => {
                 let score = score(state, doc, rank)?;
@@ -384,7 +391,7 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
             {
                 return Err(ApiError::bad("full-text query exceeds 8192 bytes"));
             }
-            if cfg.tokenizer == "pre_tokenized_array" && !query.is_array() {
+            if cfg.tokenizer == bf_text::Tokenizer::PreTokenizedArray && !query.is_array() {
                 return Err(ApiError::bad("pre_tokenized_array requires an array query"));
             }
         }
@@ -499,20 +506,39 @@ fn score(state: &NamespaceState, doc: &Document, rank: &RankBy) -> Result<f64, A
             attribute,
             query,
             params,
-        } => text_fallback::score(
-            doc,
-            attribute,
-            query,
-            params
-                .as_ref()
-                .and_then(|p| p.get("last_as_prefix"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            state.docs.values(),
-            &state.schema[attribute]
-                .text_config()
-                .expect("validated FTS"),
-        ),
+        } => {
+            if let Some(scores) = state.scores.get(&crate::indexed::rank_key(rank)) {
+                let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
+                *scores.get(&id).unwrap_or(&0.0)
+            } else {
+                let cfg = state.schema[attribute]
+                    .text_config()
+                    .expect("validated FTS");
+                let query =
+                    bf_text::Query::new(text::tokens(query, &cfg), text::prefix(params.as_ref()));
+                let fallback;
+                let stats = if let Some(stats) = state.corpus.get(attribute) {
+                    stats
+                } else {
+                    fallback = bf_text::CorpusStats::from_documents(
+                        &state
+                            .docs
+                            .values()
+                            .filter_map(|d| d.get(attribute))
+                            .filter(|v| !v.is_null())
+                            .map(|v| text::tokens(v, &cfg))
+                            .collect::<Vec<_>>(),
+                    );
+                    &fallback
+                };
+                bf_text::score_document(
+                    &text::tokens(doc.get(attribute).unwrap_or(&Value::Null), &cfg),
+                    &query,
+                    stats,
+                    &cfg,
+                ) as f64
+            }
+        }
         RankBy::Sum(xs) => xs
             .iter()
             .map(|x| score(state, doc, x))
@@ -564,24 +590,15 @@ fn score(state: &NamespaceState, doc: &Document, rank: &RankBy) -> Result<f64, A
         _ => return Err(ApiError::bad("expected a score expression")),
     })
 }
-fn distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f64 {
-    match metric {
-        DistanceMetric::EuclideanSquared => a
-            .iter()
-            .zip(b)
-            .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
-            .sum(),
-        DistanceMetric::CosineDistance => {
-            let dot: f64 = a.iter().zip(b).map(|(a, b)| *a as f64 * *b as f64).sum();
-            let aa: f64 = a.iter().map(|a| (*a as f64).powi(2)).sum();
-            let bb: f64 = b.iter().map(|b| (*b as f64).powi(2)).sum();
-            if aa == 0.0 || bb == 0.0 {
-                1.0
-            } else {
-                (1.0 - dot / (aa * bb).sqrt()).clamp(0.0, 2.0)
-            }
-        }
+pub(crate) fn distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f64 {
+    if metric == DistanceMetric::CosineDistance
+        && (a.iter().all(|x| *x == 0.0) || b.iter().all(|x| *x == 0.0))
+    {
+        return 1.0;
     }
+    crate::segment::vector_metric(metric)
+        .distance(a, b)
+        .expect("validated vectors") as f64
 }
 fn project(
     state: &NamespaceState,
@@ -796,6 +813,7 @@ fn rrf(
 }
 pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<Value, ApiError> {
     let (state, _) = engine.snapshot(ns, &Consistency::Strong).await?;
+
     let top = request.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
     let num = request.get("num").and_then(Value::as_u64).unwrap_or(25) as usize;
     if top == 0 || top > 10000 || num == 0 || num > 10000 {
@@ -818,11 +836,23 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
             .as_ref()
             .is_some_and(|t| t.dimensions().is_some())
     }) {
-        for doc in state
-            .docs
-            .values()
+        let mut samples: Vec<_> = state.docs.values().take(num).cloned().collect();
+        for seg in &state.segments {
+            if samples.len() >= num {
+                break;
+            }
+            let live = crate::snapshot::allowed(engine.storage(), &state, seg, None).await?;
+            let rows = live.iter().take(num - samples.len()).collect();
+            samples.extend(
+                crate::segment::documents(engine.storage(), seg, &rows)
+                    .await?
+                    .into_values(),
+            );
+        }
+        for doc in samples
+            .iter()
             .cycle()
-            .take(if state.docs.is_empty() { 0 } else { num })
+            .take(if samples.is_empty() { 0 } else { num })
         {
             if let Some(vector) = doc.get(name) {
                 ranks.push(RankBy::parse(json!([name, "ANN", vector]))?);
@@ -830,18 +860,29 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
         }
     }
     let mut count = 0;
+    let mut ann_count = 0;
+    let mut recall_sum = 0.0;
     let mut truth = vec![];
     for rank in &ranks {
         let q = QueryRequest {
             rank_by: Some(rank.clone()),
             top_k: Some(top),
             filters: filters.clone(),
-            include_attributes: Some(IncludeAttributes::All(true)),
+            include_attributes: Some(IncludeAttributes::All(
+                request.get("include_ground_truth") == Some(&json!(true)),
+            )),
             ..Default::default()
         };
-        let rows = single(&state, &q, VectorEncoding::Float)?
-            .rows
-            .expect("rank rows");
+        if !matches!(rank, RankBy::Vector { .. }) {
+            return Err(ApiError::bad("recall requires vector ranking"));
+        }
+        let ann =
+            crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, false).await?;
+        let exact =
+            crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, true).await?;
+        recall_sum += crate::indexed::recall(&ann, &exact);
+        ann_count += ann.result.rows.as_ref().map_or(0, Vec::len);
+        let rows = exact.result.rows.expect("rank rows");
         count += rows.len();
         if let RankBy::Vector { vector, .. } = rank {
             truth.push(json!({"query_vector":vector,"nearest_neighbors":rows}));
@@ -852,7 +893,18 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
     } else {
         count as f64 / ranks.len() as f64
     };
-    let mut response = json!({"avg_recall":1.0,"avg_exhaustive_count":avg,"avg_ann_count":avg});
+    let avg_recall = if ranks.is_empty() {
+        1.0
+    } else {
+        recall_sum / ranks.len() as f64
+    };
+    let avg_ann = if ranks.is_empty() {
+        0.0
+    } else {
+        ann_count as f64 / ranks.len() as f64
+    };
+    let mut response =
+        json!({"avg_recall":avg_recall,"avg_exhaustive_count":avg,"avg_ann_count":avg_ann});
     if request.get("include_ground_truth") == Some(&json!(true)) {
         response
             .as_object_mut()

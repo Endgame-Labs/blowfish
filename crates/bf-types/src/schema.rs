@@ -138,37 +138,8 @@ impl<'de> Deserialize<'de> for AttributeType {
     }
 }
 
-/// Complete full-text settings, with persistent defaults.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FullTextConfig {
-    pub k1: f64,
-    pub b: f64,
-    pub k3: f64,
-    pub ascii_folding: bool,
-    pub case_sensitive: bool,
-    pub language: String,
-    pub stemming: bool,
-    pub remove_stopwords: bool,
-    pub tokenizer: String,
-    pub max_token_length: usize,
-}
-impl Default for FullTextConfig {
-    fn default() -> Self {
-        Self {
-            k1: 1.2,
-            b: 0.75,
-            k3: 8.0,
-            ascii_folding: false,
-            case_sensitive: false,
-            language: "english".into(),
-            stemming: false,
-            remove_stopwords: false,
-            tokenizer: "word_v4".into(),
-            max_token_length: 39,
-        }
-    }
-}
+/// Validated tokenizer and BM25 settings shared with the text-index implementation.
+pub type FullTextConfig = bf_text::FtsParams;
 /// Schema configuration. Optional settings retain their wire representation until normalization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttributeSchema {
@@ -237,7 +208,16 @@ impl AttributeSchema {
             self.ann = Some(json!({"distance_metric":metric}));
             self.filterable = None;
         } else {
-            if let Some(config) = self.text_config() {
+            if self
+                .full_text_search
+                .as_ref()
+                .is_some_and(|v| v != false && !v.is_null())
+            {
+                let config: FullTextConfig =
+                    serde_json::from_value(self.full_text_search.clone().expect("present"))
+                        .map_err(|e| {
+                            ApiError::bad(format!("invalid full_text_search configuration: {e}"))
+                        })?;
                 if !matches!(
                     t,
                     AttributeType::Scalar(ScalarType::String)
@@ -247,21 +227,19 @@ impl AttributeSchema {
                         "full_text_search requires string or []string",
                     ));
                 }
-                if config.k1 <= 0.0
-                    || !(0.0..=1.0).contains(&config.b)
-                    || config.k3 <= 0.0
-                    || !(1..=254).contains(&config.max_token_length)
+                if config.tokenizer == bf_text::Tokenizer::PreTokenizedArray
+                    && *t != AttributeType::Array(ScalarType::String)
                 {
-                    return Err(ApiError::bad("invalid full_text_search parameters"));
+                    return Err(ApiError::bad("pre_tokenized_array requires []string"));
                 }
-                self.full_text_search =
-                    Some(serde_json::to_value(config).expect("text config serializes"));
-            } else if self
-                .full_text_search
-                .as_ref()
-                .is_some_and(|v| !v.is_boolean() && !v.is_null())
-            {
-                return Err(ApiError::bad("invalid full_text_search configuration"));
+                config.validate().map_err(ApiError::bad)?;
+                // String serialization preserves the shortest decimal f32 representation.
+                self.full_text_search = Some(
+                    serde_json::from_str(
+                        &serde_json::to_string(&config).expect("text config serializes"),
+                    )
+                    .expect("valid JSON"),
+                );
             }
             let indexed = self.text_config().is_some()
                 || self.regex == Some(true)
