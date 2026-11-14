@@ -889,6 +889,9 @@ impl bf_vector::RangeRead for ObjectReader {
 
 #[async_trait::async_trait]
 impl bf_text::RangeRead for ObjectReader {
+    async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        ObjectReader::read_batch(self, ranges).await
+    }
     fn len(&self) -> u64 {
         self.file.size
     }

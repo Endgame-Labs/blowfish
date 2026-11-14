@@ -71,6 +71,7 @@ impl DecodedCache {
 pub(crate) struct ReadContext {
     pub cache: Arc<DecodedCache>,
     pub stats: Arc<CacheStats>,
+    pub backend: Arc<bf_storage::BackendStats>,
 }
 tokio::task_local! {
     static CURRENT: ReadContext;
@@ -79,7 +80,10 @@ pub(crate) fn context() -> Option<ReadContext> {
     CURRENT.try_with(Clone::clone).ok()
 }
 pub(crate) async fn scope<T>(context: ReadContext, future: impl Future<Output = T>) -> T {
-    CURRENT.scope(context, future).await
+    let backend = context.backend.clone();
+    backend
+        .scope("search", CURRENT.scope(context, future))
+        .await
 }
 pub(crate) fn stats() -> Arc<CacheStats> {
     CURRENT.try_with(|c| c.stats.clone()).unwrap_or_default()

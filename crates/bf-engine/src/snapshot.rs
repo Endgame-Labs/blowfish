@@ -49,6 +49,7 @@ pub(crate) async fn catch_up(
             }
             state.manifest_seq = generation;
         }
+        state.checkpoint_refreshed = Instant::now();
         match wal
             .tail_bounded(
                 state.seq,

@@ -98,6 +98,9 @@ impl Engine {
                 .map_err(log_error)?
                 .map_or(0, |(g, _)| g);
             if generation != state.manifest_seq {
+                let handle = self.handle(source).await?;
+                let mut current = handle.state.lock().await;
+                crate::catch_up(&wal, &mut current, &self.0.store).await?;
                 continue;
             }
             let rows = snapshot::statistics(&self.0.store, &state).await?.rows as usize;
