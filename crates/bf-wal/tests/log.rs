@@ -43,6 +43,9 @@ async fn versioned_slots_conflicts_tail_and_manifest() {
         indexed_through: 0,
         indexer_epoch: 0,
         segments: vec![],
+        stats: Default::default(),
+        updated_at: None,
+        retired: vec![],
     };
     a.publish_manifest(1, &manifest).await.unwrap();
     assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 1);
@@ -77,4 +80,47 @@ async fn deletion_erases_payloads_but_fences_old_slots() {
         CreateResult::Conflict
     );
     assert_eq!(store.list("ns/deleted/wal-data/").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn epoch_claims_fence_stalled_indexers_and_checkpoint_regression() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let wal = Wal::new(store, "epochs").unwrap();
+    let mut manifest = Manifest {
+        format_version: 1,
+        schema: Default::default(),
+        distance_metric: Default::default(),
+        id_type: "uint".parse().unwrap(),
+        created_at: chrono::Utc::now(),
+        indexed_through: 0,
+        indexer_epoch: 1,
+        segments: vec![],
+        stats: Default::default(),
+        updated_at: None,
+        retired: vec![],
+    };
+    assert_eq!(wal.publish_fenced(0, 0, &manifest).await.unwrap(), 1);
+    let stale = manifest.clone();
+    manifest.indexer_epoch = 2;
+    assert_eq!(wal.publish_fenced(1, 1, &manifest).await.unwrap(), 2);
+    assert!(matches!(
+        wal.publish_fenced(1, 1, &stale).await,
+        Err(Error::Fenced)
+    ));
+    assert!(matches!(
+        wal.publish_fenced(2, 1, &stale).await,
+        Err(Error::Fenced)
+    ));
+    manifest.indexed_through = 10;
+    wal.publish_fenced(2, 2, &manifest).await.unwrap();
+    manifest.indexed_through = 9;
+    assert!(matches!(
+        wal.publish_fenced(3, 2, &manifest).await,
+        Err(Error::Fenced)
+    ));
 }

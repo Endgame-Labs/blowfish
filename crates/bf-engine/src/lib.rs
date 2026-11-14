@@ -435,6 +435,9 @@ async fn commit_worker(
                             indexed_through: 0,
                             indexer_epoch: 0,
                             segments: vec![],
+                            stats: Default::default(),
+                            updated_at: None,
+                            retired: vec![],
                         };
                         if let Err(e) = wal.publish_manifest(seq, &manifest).await {
                             tracing::warn!(error=?e,"manifest publication deferred; WAL remains authoritative");

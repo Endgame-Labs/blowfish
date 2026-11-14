@@ -92,7 +92,60 @@ pub struct Manifest {
     pub indexed_through: u64,
     pub indexer_epoch: u64,
     #[serde(default)]
-    pub segments: Vec<serde_json::Value>,
+    pub segments: Vec<Segment>,
+    /// Namespace totals as of `indexed_through`.
+    #[serde(default)]
+    pub stats: NamespaceStats,
+    /// Last indexed write timestamp; absent on legacy schema-only manifests.
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+    /// Objects retired by a publication, with the start of their retention window.
+    #[serde(default)]
+    pub retired: Vec<RetiredObject>,
+}
+/// Immutable file reference. Lengths exclude the storage retry-identity header.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentFile {
+    pub key: String,
+    pub size: u64,
+    pub metadata_len: u64,
+}
+/// One immutable segment and its current live-row generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Segment {
+    pub id: String,
+    pub wal_start: u64,
+    pub wal_end: u64,
+    pub row_count: u32,
+    pub files: std::collections::BTreeMap<String, SegmentFile>,
+    pub live: SegmentFile,
+    pub live_generation: u64,
+}
+/// Field-level corpus statistics, excluding missing/null fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TextStats {
+    pub documents: u64,
+    pub total_length: u64,
+    pub document_frequencies: std::collections::BTreeMap<String, u64>,
+}
+/// Exact live namespace totals at the indexing checkpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NamespaceStats {
+    pub rows: u64,
+    pub logical_bytes: u64,
+    pub text: std::collections::BTreeMap<String, TextStats>,
+}
+/// A file may be reclaimed only after its retirement grace period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredObject {
+    pub key: String,
+    pub retired_at: DateTime<Utc>,
+}
+/// Ownership is advisory; the manifest generation and epoch are the actual fence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexerLease {
+    pub owner: Uuid,
+    pub expires_at: DateTime<Utc>,
 }
 /// Durable log errors.
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +160,8 @@ pub enum Error {
     Format,
     #[error("WAL payload was reclaimed after namespace deletion")]
     Pruned,
+    #[error("indexer was fenced by a newer manifest")]
+    Fenced,
     #[error(transparent)]
     Api(#[from] ApiError),
 }
@@ -257,6 +312,74 @@ impl Wal {
             )
             .await?)
     }
+    /// Publish against exactly one predecessor. No retry may reuse stale indexer work.
+    ///
+    /// The check and create are safe together: a competing claim must occupy the
+    /// same next slot before it can advance the epoch. A loser is always fenced.
+    pub async fn publish_fenced(
+        &self,
+        predecessor: u64,
+        epoch: u64,
+        manifest: &Manifest,
+    ) -> Result<u64, Error> {
+        let latest = self.latest_manifest().await?;
+        let (sequence, current_epoch) = latest
+            .as_ref()
+            .map(|(s, m)| (*s, m.indexer_epoch))
+            .unwrap_or((0, 0));
+        if sequence != predecessor
+            || current_epoch != epoch
+            || !(manifest.indexer_epoch == epoch || manifest.indexer_epoch == epoch + 1)
+            || latest
+                .as_ref()
+                .is_some_and(|(_, m)| manifest.indexed_through < m.indexed_through)
+        {
+            return Err(Error::Fenced);
+        }
+        match self.publish_manifest(predecessor + 1, manifest).await? {
+            CreateResult::Conflict => Err(Error::Fenced),
+            _ => Ok(predecessor + 1),
+        }
+    }
+    /// Read an advisory lease. Missing leases permit a claim, never an unfenced publish.
+    pub async fn indexer_lease(&self, epoch: u64) -> Result<Option<IndexerLease>, Error> {
+        match self
+            .store
+            .get(&format!("ns/{}/indexer/{epoch:020}.json", self.namespace))
+            .await
+        {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(bf_storage::Error::NotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    /// Record a create-only lease after winning an epoch claim in the manifest log.
+    pub async fn create_lease(
+        &self,
+        epoch: u64,
+        lease: &IndexerLease,
+    ) -> Result<CreateResult, Error> {
+        Ok(self
+            .store
+            .create(
+                &format!("ns/{}/indexer/{epoch:020}.json", self.namespace),
+                serde_json::to_vec(lease)?,
+            )
+            .await?)
+    }
+    /// Reclaim committed payloads through a checkpoint while preserving every slot fence.
+    pub async fn prune_payloads(&self, through: u64) -> Result<(), Error> {
+        for seq in 1..=through {
+            if let Some(record) = self.record(seq).await?
+                && !record.tombstone
+            {
+                self.store
+                    .delete(&self.payload_key(record.write_id))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
     /// Read the most recent manifest if one exists.
     pub async fn latest_manifest(&self) -> Result<Option<(u64, Manifest)>, Error> {
         let objects = self
@@ -297,22 +420,8 @@ impl Wal {
                     .await?;
             }
         }
-        for object in self
-            .store
-            .list(&format!("ns/{}/manifest/", self.namespace))
-            .await?
-        {
-            let seq = object
-                .key
-                .rsplit('/')
-                .next()
-                .and_then(|s| s.strip_suffix(".json"))
-                .and_then(|s| s.parse::<u64>().ok())
-                .ok_or(Error::Format)?;
-            if seq <= tombstone_seq {
-                self.store.delete(&object.key).await?;
-            }
-        }
+        // Manifest generations have their own sequence space. Keep their CAS
+        // fences; readers replay the tombstone after any older checkpoint.
         Ok(())
     }
 }
