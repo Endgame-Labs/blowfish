@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bf-storage = { path = "../bf-storage" }
+bytes = "=1.12.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 object_store = { version = "=0.14.2", features = ["fs"] }

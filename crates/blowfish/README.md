@@ -43,12 +43,16 @@ Flags and environment variables override the config:
 | `--storage-profile` | `BLOWFISH_STORAGE_PROFILE` |
 | `--listen` | `BLOWFISH_LISTEN` |
 | `--admin-key` | `BLOWFISH_ADMIN_KEY` |
+| `--require-auth` | `BLOWFISH_REQUIRE_AUTH` |
+| `--metrics-listen` | `BLOWFISH_METRICS_LISTEN` |
 | `--read-only` | `BLOWFISH_READ_ONLY` |
 | `--single-writer` | `BLOWFISH_SINGLE_WRITER` |
 
 The listener defaults to `0.0.0.0:8000`. If an admin key is configured, every request
 requires `Authorization: Bearer <key>`. Otherwise, authorization is disabled.
-`blowfish::Authorizer` is the adapter seam for the role-based bf-auth implementation.
+`bf-auth::KeyStore` enforces roles and namespace scopes. Use `--require-auth` to make a
+missing super key a startup error. `blowfish keys` manages keys through the admin API.
+See [authentication](../../docs/auth.md) and [metrics](../../docs/metrics.md).
 Logs use `tracing`, controlled by `RUST_LOG`.
 
 Use an official SDK with `TURBOPUFFER_BASE_URL=http://localhost:8000`, any nonempty

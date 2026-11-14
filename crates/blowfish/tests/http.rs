@@ -3,28 +3,35 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use bf_auth::KeyStore;
 use bf_engine::Engine;
 use bf_storage::{Storage, StorageConfig};
-use blowfish::{AdminKeyAuthorizer, router};
+use blowfish::{ServerOptions, router};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
-    sync::Arc,
+    time::Duration,
 };
 use tower::ServiceExt;
 
 async fn app(key: Option<&str>) -> Router {
+    let storage = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let auth = KeyStore::from_storage(storage.clone(), key, Duration::from_secs(5))
+        .await
+        .unwrap();
     router(
-        Engine::new(
-            Storage::open(&StorageConfig {
-                url: "memory://".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        ),
-        Arc::new(AdminKeyAuthorizer::new(key.map(str::to_owned))),
+        Engine::new(storage),
+        auth,
+        ServerOptions {
+            auth_enabled: key.is_some(),
+            storage_url: "memory://".into(),
+        },
     )
 }
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
@@ -297,7 +304,10 @@ async fn permanent_internal_errors_disable_retries() {
         .put("ns/bad/wal/00000000000000000001.wal", "corrupt")
         .await
         .unwrap();
-    let app = router(Engine::new(store), Arc::new(AdminKeyAuthorizer::new(None)));
+    let keys = KeyStore::from_storage(store.clone(), None, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let app = router(Engine::new(store), keys, ServerOptions::default());
     let response = app
         .oneshot(
             Request::builder()

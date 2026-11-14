@@ -1,0 +1,48 @@
+x-blowfish: &blowfish
+  build: .
+  image: blowfish:local
+  restart: unless-stopped
+  environment: &blowfish-env
+    BLOWFISH_ADMIN_KEY: ${BLOWFISH_ADMIN_KEY:-}
+    BLOWFISH_REQUIRE_AUTH: ${BLOWFISH_REQUIRE_AUTH:-false}
+services:
+  blowfish:
+    <<: *blowfish
+    ports:
+      - "127.0.0.1:${BLOWFISH_PORT:-8000}:8000"
+    volumes:
+      - blowfish-data:/data
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.53
+    profiles: [s3]
+    command: [mini, -dir=/data, -ip=seaweedfs, -ip.bind=0.0.0.0]
+    environment:
+      # Public, disposable demo credentials. Replace for any nonlocal deployment.
+      AWS_ACCESS_KEY_ID: blowfish-demo
+      AWS_SECRET_ACCESS_KEY: blowfish-demo-secret
+      S3_BUCKET: blowfish
+    volumes:
+      - seaweed-data:/data
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:9333/cluster/status]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  blowfish-s3:
+    <<: *blowfish
+    profiles: [s3]
+    environment:
+      <<: *blowfish-env
+      BLOWFISH_STORAGE_URL: s3://blowfish/demo
+      BLOWFISH_STORAGE_ENDPOINT: http://seaweedfs:8333
+      BLOWFISH_STORAGE_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: blowfish-demo
+      AWS_SECRET_ACCESS_KEY: blowfish-demo-secret
+    ports:
+      - "127.0.0.1:${BLOWFISH_S3_PORT:-8001}:8000"
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+volumes:
+  blowfish-data:
+  seaweed-data:

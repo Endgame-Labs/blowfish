@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+metrics = "=0.24.6"
 bf-types = { path = "../bf-types" }
 bf-storage = { path = "../bf-storage" }
 chrono = { version = "0.4.45", features = ["serde"] }

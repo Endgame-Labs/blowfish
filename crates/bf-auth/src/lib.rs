@@ -124,12 +124,28 @@ struct StoredKey {
 #[derive(Debug, Clone)]
 pub struct Principal {
     id: String,
+    name: String,
     roles: Vec<Role>,
     namespace_prefixes: Option<Vec<String>>,
     expires_at: Option<DateTime<Utc>>,
     super_key: bool,
 }
 impl Principal {
+    /// Display name used in HTTP metrics.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// Unrestricted identity for explicitly auth-disabled development servers.
+    pub fn development() -> Self {
+        Self {
+            id: "development".into(),
+            name: "development".into(),
+            roles: vec![],
+            namespace_prefixes: None,
+            expires_at: None,
+            super_key: true,
+        }
+    }
     /// Stable identifier, or `super` for the configured super key.
     pub fn id(&self) -> &str {
         &self.id
@@ -161,6 +177,8 @@ pub enum AuthError {
     NotFound,
     #[error("key storage error")]
     Storage(#[source] object_store::Error),
+    #[error("key storage error")]
+    SharedStorage(#[from] bf_storage::Error),
     #[error("invalid key data")]
     Data(#[source] serde_json::Error),
 }
@@ -172,7 +190,8 @@ impl AuthError {
             Self::Forbidden => 403,
             Self::InvalidRequest(_) => 400,
             Self::NotFound => 404,
-            Self::Storage(_) | Self::Data(_) => 500,
+            Self::SharedStorage(bf_storage::Error::ReadOnly) => 403,
+            Self::Storage(_) | Self::Data(_) | Self::SharedStorage(_) => 500,
         }
     }
     /// JSON-compatible error envelope.
@@ -197,8 +216,70 @@ struct Cache {
     negative: HashMap<String, Instant>,
     last_used: HashMap<String, DateTime<Utc>>,
 }
+enum Backend {
+    Object(Arc<dyn ObjectStore>),
+    Shared(bf_storage::Storage),
+}
+impl Backend {
+    async fn list(&self, prefix: &Path) -> Result<Vec<Path>, AuthError> {
+        match self {
+            Self::Object(store) => Ok(store
+                .list(Some(prefix))
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(AuthError::Storage)?
+                .into_iter()
+                .map(|o| o.location)
+                .collect()),
+            Self::Shared(store) => Ok(store
+                .list(prefix.as_ref())
+                .await?
+                .into_iter()
+                .map(|o| Path::from(o.key))
+                .collect()),
+        }
+    }
+    async fn get(&self, path: &Path) -> Result<bytes::Bytes, AuthError> {
+        match self {
+            Self::Object(store) => store
+                .get(path)
+                .await
+                .map_err(AuthError::Storage)?
+                .bytes()
+                .await
+                .map_err(AuthError::Storage),
+            Self::Shared(store) => Ok(store.get(path.as_ref()).await?),
+        }
+    }
+    async fn create(&self, path: &Path, bytes: Vec<u8>) -> Result<(), AuthError> {
+        match self {
+            Self::Object(store) => match store
+                .put_opts(
+                    path,
+                    bytes.into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_)
+                | Err(
+                    object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::Precondition { .. },
+                ) => Ok(()),
+                Err(e) => Err(AuthError::Storage(e)),
+            },
+            Self::Shared(store) => {
+                store.create(path.as_ref(), bytes).await?;
+                Ok(())
+            }
+        }
+    }
+}
 struct Inner {
-    store: Arc<dyn ObjectStore>,
+    store: Backend,
     base: String,
     super_hash: Option<[u8; 32]>,
     interval: Duration,
@@ -214,6 +295,22 @@ impl KeyStore {
     /// Load keys and start periodic refresh. Requires a Tokio runtime and a nonzero interval.
     pub async fn new(
         store: Arc<dyn ObjectStore>,
+        prefix: &str,
+        super_key: Option<&str>,
+        interval: Duration,
+    ) -> Result<Self, AuthError> {
+        Self::open(Backend::Object(store), prefix, super_key, interval).await
+    }
+    /// Use the server's already-probed storage, including its prefix and write protections.
+    pub async fn from_storage(
+        store: bf_storage::Storage,
+        super_key: Option<&str>,
+        interval: Duration,
+    ) -> Result<Self, AuthError> {
+        Self::open(Backend::Shared(store), "", super_key, interval).await
+    }
+    async fn open(
+        store: Backend,
         prefix: &str,
         super_key: Option<&str>,
         interval: Duration,
@@ -249,17 +346,11 @@ impl KeyStore {
     pub async fn refresh(&self) -> Result<(), AuthError> {
         let _guard = self.inner.mutation.lock().await;
         let prefix = Path::from(self.inner.base.clone());
-        let objects = self
-            .inner
-            .store
-            .list(Some(&prefix))
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(AuthError::Storage)?;
+        let objects = self.inner.store.list(&prefix).await?;
         let mut keys = HashMap::new();
         let mut revoked = HashSet::new();
         for obj in objects {
-            let Some(file) = obj.location.filename() else {
+            let Some(file) = obj.filename() else {
                 continue;
             };
             if let Some(id) = file.strip_suffix(".revoked") {
@@ -270,15 +361,7 @@ impl KeyStore {
                 if !valid_id(id) {
                     continue;
                 }
-                let bytes = self
-                    .inner
-                    .store
-                    .get(&obj.location)
-                    .await
-                    .map_err(AuthError::Storage)?
-                    .bytes()
-                    .await
-                    .map_err(AuthError::Storage)?;
+                let bytes = self.inner.store.get(&obj).await?;
                 let key: StoredKey = serde_json::from_slice(&bytes).map_err(AuthError::Data)?;
                 if key.info.id != id {
                     return Err(AuthError::InvalidRequest("stored key ID mismatch"));
@@ -299,6 +382,7 @@ impl KeyStore {
         {
             return Ok(Principal {
                 id: "super".into(),
+                name: "super".into(),
                 roles: vec![],
                 namespace_prefixes: None,
                 expires_at: None,
@@ -333,6 +417,7 @@ impl KeyStore {
         }
         let principal = Principal {
             id: id.to_owned(),
+            name: key.info.name.clone(),
             roles: key.info.roles.clone(),
             namespace_prefixes: key.info.namespace_prefixes.clone(),
             expires_at: key.info.expires_at,
@@ -428,16 +513,8 @@ impl KeyStore {
         let bytes = serde_json::to_vec(&key).map_err(AuthError::Data)?;
         self.inner
             .store
-            .put_opts(
-                &self.path(&id, "json"),
-                bytes.into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(AuthError::Storage)?;
+            .create(&self.path(&id, "json"), bytes)
+            .await?;
         let mut cache = self.inner.cache.write().await;
         cache.negative.remove(&id);
         cache.keys.insert(id.clone(), key);
@@ -481,22 +558,10 @@ impl KeyStore {
                 return Err(AuthError::NotFound);
             }
         }
-        match self
-            .inner
+        self.inner
             .store
-            .put_opts(
-                &self.path(id, "revoked"),
-                Vec::new().into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
-            Err(e) => return Err(AuthError::Storage(e)),
-        }
+            .create(&self.path(id, "revoked"), Vec::new())
+            .await?;
         self.inner.cache.write().await.revoked.insert(id.to_owned());
         Ok(())
     }
@@ -560,6 +625,70 @@ mod tests {
         .unwrap();
         let principal = ks.authenticate("super-secret").await.unwrap();
         (ks, principal)
+    }
+    #[tokio::test]
+    async fn shared_storage_prefix_persistence_and_read_only() {
+        let backend = Arc::new(InMemory::new());
+        let storage = bf_storage::Storage::from_backend(
+            backend.clone(),
+            Path::from("deployment"),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let keys = KeyStore::from_storage(storage, Some("test-super"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let principal = keys.authenticate("test-super").await.unwrap();
+        let (key, token) = keys
+            .create_key(spec(vec![Role::Read], None), &principal)
+            .await
+            .unwrap();
+        let objects = backend
+            .list(Some(&Path::from("deployment/_system/keys")))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(objects.len(), 1);
+        let stored = backend
+            .get(&objects[0].location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&stored).contains(&token));
+        let readonly =
+            bf_storage::Storage::from_backend(backend, Path::from("deployment"), true, false)
+                .await
+                .unwrap();
+        let replica = KeyStore::from_storage(readonly, Some("test-super"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(replica.authenticate(&token).await.unwrap().name(), "test");
+        assert_eq!(
+            replica
+                .revoke_key(&principal, &key.id)
+                .await
+                .unwrap_err()
+                .status_code(),
+            403
+        );
+        assert_eq!(
+            replica
+                .create_key(spec(vec![Role::Read], None), &principal)
+                .await
+                .unwrap_err()
+                .status_code(),
+            403
+        );
+        keys.revoke_key(&principal, &key.id).await.unwrap();
+        replica.refresh().await.unwrap();
+        assert!(matches!(
+            replica.authenticate(&token).await,
+            Err(AuthError::Unauthorized)
+        ));
     }
     #[test]
     fn role_matrix() {

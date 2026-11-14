@@ -13,6 +13,27 @@ API key.
 Status: under construction. See [`DESIGN.md`](DESIGN.md) for the design and [`PROGRESS.md`](PROGRESS.md)
 for where the build is.
 
+## Quickstart
+
+```bash
+docker compose up --build --wait blowfish
+curl --fail http://127.0.0.1:8000/
+```
+
+This local setup uses a persistent volume and disables auth. Set `BLOWFISH_ADMIN_KEY` and
+`BLOWFISH_REQUIRE_AUTH=true` to require API keys. For an S3 test stack, run
+`docker compose --profile s3 up --build --wait blowfish-s3`, then use port 8001.
+
+With Cargo: `cargo run -p blowfish -- serve --storage-url file:///tmp/blowfish`.
+Point official SDKs at `TURBOPUFFER_BASE_URL=http://127.0.0.1:8000`, set a nonempty
+`TURBOPUFFER_API_KEY`, and **unset `TURBOPUFFER_REGION`**.
+
+- [Quickstart and official SDK examples](docs/quickstart.md)
+- [Configuration](docs/configuration.md) and [example TOML](blowfish.example.toml)
+- [API keys, roles, CLI, and admin API](docs/auth.md)
+- [Operations, storage, replicas, and backups](docs/operations.md)
+- [Prometheus metrics](docs/metrics.md)
+
 blowfish is an independent project and is not affiliated with or endorsed by turbopuffer.
 
 License: MIT.
