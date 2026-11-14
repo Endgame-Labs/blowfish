@@ -1,5 +1,9 @@
-//! Object-store access, conditional-create retry identity, and single-writer fallback.
+#![doc = include_str!("../README.md")]
+mod cache;
+mod disk;
+mod observed;
 use bytes::Bytes;
+pub use cache::{CacheConfig, CacheStats, CacheStatsSnapshot, RangeReader};
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
@@ -20,6 +24,10 @@ const HEADER: usize = 24;
 /// Safe storage errors. Backend messages are retained as sources, not displayed to HTTP clients.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("cache prefetch concurrency limit reached")]
+    PrefetchBusy,
+    #[error("shared cache fetch failed")]
+    Shared(#[source] Arc<Error>),
     #[error("object not found")]
     NotFound,
     #[error("object already exists")]
@@ -34,6 +42,16 @@ pub enum Error {
     Backend(#[source] object_store::Error),
     #[error("local storage I/O failed")]
     Io(#[from] std::io::Error),
+}
+impl Error {
+    fn from_shared(error: Arc<Self>) -> Self {
+        match error.as_ref() {
+            Self::NotFound => Self::NotFound,
+            Self::AlreadyExists => Self::AlreadyExists,
+            Self::Config(message) => Self::Config(message),
+            _ => Self::Shared(error),
+        }
+    }
 }
 impl From<object_store::Error> for Error {
     fn from(e: object_store::Error) -> Self {
@@ -69,9 +87,12 @@ pub struct StorageConfig {
     pub profile: Option<String>,
     pub read_only: bool,
     pub single_writer: bool,
+    /// Budgets and concurrency limits for explicitly cached immutable reads.
+    pub cache: CacheConfig,
 }
 struct Inner {
     backend: Arc<dyn ObjectStore>,
+    cache: cache::RangeCache,
     prefix: Path,
     mode: StorageMode,
     read_only: bool,
@@ -98,6 +119,7 @@ impl Storage {
     /// Open a local or S3-compatible URL, probe create semantics, and acquire a fallback heartbeat.
     pub async fn open(config: &StorageConfig) -> Result<Self, Error> {
         let url = url::Url::parse(&config.url).map_err(|_| Error::Config("invalid storage URL"))?;
+        let mut namespace = config.url.clone();
         let (backend, prefix): (Arc<dyn ObjectStore>, Path) = match url.scheme() {
             "file" => {
                 let path = url
@@ -131,23 +153,46 @@ impl Storage {
                         b = b.with_token(token);
                     }
                 }
+                use object_store::aws::AmazonS3ConfigKey;
+                namespace = serde_json::to_string(&(
+                    &config.url,
+                    b.get_config_value(&AmazonS3ConfigKey::S3Endpoint)
+                        .or_else(|| b.get_config_value(&AmazonS3ConfigKey::Endpoint)),
+                    b.get_config_value(&AmazonS3ConfigKey::Region),
+                ))
+                .expect("cache identity serializes");
                 (
                     Arc::new(b.build()?),
                     Path::from_url_path(url.path())
                         .map_err(|_| Error::Config("invalid S3 prefix"))?,
                 )
             }
-            "memory" => (
-                Arc::new(object_store::memory::InMemory::new()),
-                Path::default(),
-            ),
+            "memory" => {
+                // Each open creates a different ephemeral backend, even with the same URL.
+                namespace = format!("memory:{}", Uuid::new_v4());
+                (
+                    Arc::new(object_store::memory::InMemory::new()),
+                    Path::default(),
+                )
+            }
             _ => {
                 return Err(Error::Config(
                     "supported storage schemes are file, s3, and memory",
                 ));
             }
         };
-        Self::from_backend(backend, prefix, config.read_only, config.single_writer).await
+        let mut cache = config.cache.clone();
+        if cache.namespace.is_none() {
+            cache.namespace = Some(namespace);
+        }
+        Self::from_backend_with_cache(
+            backend,
+            prefix,
+            config.read_only,
+            config.single_writer,
+            cache,
+        )
+        .await
     }
     /// Wrap an object_store backend. Read-only instances do not run a mutating CAS probe.
     pub async fn from_backend(
@@ -156,6 +201,30 @@ impl Storage {
         read_only: bool,
         force_single: bool,
     ) -> Result<Self, Error> {
+        Self::from_backend_with_cache(
+            backend,
+            prefix,
+            read_only,
+            force_single,
+            CacheConfig::default(),
+        )
+        .await
+    }
+    /// Wrap a backend with explicit cache budgets. Disk caching requires a stable, unique
+    /// `cache.namespace` identifying the bucket/backend; the storage prefix is added here.
+    pub async fn from_backend_with_cache(
+        backend: Arc<dyn ObjectStore>,
+        prefix: Path,
+        read_only: bool,
+        force_single: bool,
+        mut cache: CacheConfig,
+    ) -> Result<Self, Error> {
+        if let Some(namespace) = &mut cache.namespace {
+            *namespace = serde_json::to_string(&(&namespace, prefix.as_ref()))
+                .expect("cache identity serializes");
+        }
+        let cache = cache::RangeCache::open(cache).await?;
+        let backend: Arc<dyn ObjectStore> = Arc::new(observed::Observed(backend));
         let conditional = if read_only {
             true
         } else {
@@ -168,6 +237,7 @@ impl Storage {
         };
         let store = Self(Arc::new(Inner {
             backend,
+            cache,
             prefix,
             mode,
             read_only,
