@@ -12,3 +12,7 @@ pub use analysis::{
     matches_token_sequence, tokenize, tokenize_array,
 };
 pub use scoring::{CorpusStats, Query, score_document};
+mod segment;
+pub use segment::{
+    MemoryRangeRead, RangeRead, SearchHit, SearchMetrics, SegmentBuilder, SegmentReader,
+};
