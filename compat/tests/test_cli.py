@@ -1,6 +1,6 @@
 import unittest
 
-from compat.cli import compare, error_category, normalize, register, SCENARIOS
+from compat.cli import compare, compare_scenario, error_category, normalize, register, SCENARIOS
 
 
 class ComparisonTests(unittest.TestCase):
@@ -48,6 +48,20 @@ class ComparisonTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 normalize({"approx_row_count": invalid})
         self.assertTrue(compare(expected, normalize({"approx_row_count": 4})))
+
+    def test_explain_accepts_an_unindexed_error_or_a_string_plan(self):
+        oracle = {"status": 400, "object": True, "plan_text_is_string": False, "error_is_string": True}
+        blowfish = {"status": 200, "object": True, "plan_text_is_string": True, "error_is_string": False}
+        for expected in (oracle, blowfish):
+            for actual in (oracle, blowfish):
+                self.assertEqual(compare_scenario("explain_query", expected, actual), [])
+        for invalid in (
+            {**blowfish, "plan_text_is_string": False},
+            {**oracle, "error_is_string": False},
+            {**oracle, "status": 500},
+            {**blowfish, "object": False},
+        ):
+            self.assertTrue(compare_scenario("explain_query", oracle, invalid))
 
 
 if __name__ == "__main__":
