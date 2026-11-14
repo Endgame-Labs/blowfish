@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = "0.1.92"
+metrics = "=0.24.6"
+moka = { version = "=0.12.16", features = ["sync"] }
+sha2 = "=0.11.1"
 bytes = "1.11.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 futures = "0.3.31"
@@ -18,5 +22,4 @@ url = "2.5.8"
 uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
-async-trait = "0.1.92"
 tempfile = "3.27.0"

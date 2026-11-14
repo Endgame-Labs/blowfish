@@ -1,5 +1,9 @@
-//! Object-store access, conditional-create retry identity, and single-writer fallback.
+#![doc = include_str!("../README.md")]
+mod cache;
+mod disk;
+mod observed;
 use bytes::Bytes;
+pub use cache::{CacheConfig, CacheStats, CacheStatsSnapshot, RangeReader};
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
@@ -20,6 +24,10 @@ const HEADER: usize = 24;
 /// Safe storage errors. Backend messages are retained as sources, not displayed to HTTP clients.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("cache prefetch concurrency limit reached")]
+    PrefetchBusy,
+    #[error("shared cache fetch failed")]
+    Shared(#[source] Arc<Error>),
     #[error("object not found")]
     NotFound,
     #[error("object already exists")]
@@ -69,9 +77,11 @@ pub struct StorageConfig {
     pub profile: Option<String>,
     pub read_only: bool,
     pub single_writer: bool,
+    pub cache: CacheConfig,
 }
 struct Inner {
     backend: Arc<dyn ObjectStore>,
+    cache: cache::RangeCache,
     prefix: Path,
     mode: StorageMode,
     read_only: bool,
@@ -147,7 +157,22 @@ impl Storage {
                 ));
             }
         };
-        Self::from_backend(backend, prefix, config.read_only, config.single_writer).await
+        let mut cache = config.cache.clone();
+        if cache.namespace.is_none() {
+            cache.namespace = Some(format!(
+                "{}|{}",
+                config.url,
+                config.endpoint.as_deref().unwrap_or("")
+            ));
+        }
+        Self::from_backend_with_cache(
+            backend,
+            prefix,
+            config.read_only,
+            config.single_writer,
+            cache,
+        )
+        .await
     }
     /// Wrap an object_store backend. Read-only instances do not run a mutating CAS probe.
     pub async fn from_backend(
@@ -156,6 +181,29 @@ impl Storage {
         read_only: bool,
         force_single: bool,
     ) -> Result<Self, Error> {
+        Self::from_backend_with_cache(
+            backend,
+            prefix,
+            read_only,
+            force_single,
+            CacheConfig::default(),
+        )
+        .await
+    }
+    /// Wrap a backend with explicit cache budgets. Disk caching requires a stable, unique
+    /// `cache.namespace` identifying the bucket/backend; the storage prefix is added here.
+    pub async fn from_backend_with_cache(
+        backend: Arc<dyn ObjectStore>,
+        prefix: Path,
+        read_only: bool,
+        force_single: bool,
+        mut cache: CacheConfig,
+    ) -> Result<Self, Error> {
+        if let Some(namespace) = &mut cache.namespace {
+            namespace.push_str(&format!("|{prefix}"));
+        }
+        let cache = cache::RangeCache::open(cache).await?;
+        let backend: Arc<dyn ObjectStore> = Arc::new(observed::Observed(backend));
         let conditional = if read_only {
             true
         } else {
@@ -168,6 +216,7 @@ impl Storage {
         };
         let store = Self(Arc::new(Inner {
             backend,
+            cache,
             prefix,
             mode,
             read_only,
