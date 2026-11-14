@@ -59,12 +59,14 @@ files checked into source control.
 | `disk_bytes` | 64 GiB | Budget for payload files, including 40-byte checksum headers |
 | `block_size` | 1 MiB | Aligned logical block size in bytes |
 | `max_coalesce_blocks` | 8 | Maximum adjacent missing blocks in one GET |
-| `fetch_concurrency` | 16 | Global maximum simultaneous cache-fill GETs |
+| `fetch_concurrency` | 16 | Global maximum simultaneous cache-fill requests |
 | `prefetch_concurrency` | 4 | Maximum accepted background hints |
 | `namespace` | derived by `Storage::open` | Stable identity for the backend/bucket |
 
 `from_backend_with_cache` requires an explicit, stable `namespace` when disk is enabled. Never share
-one identity between different backends. Storage prefixes, block size, logical length, and header
+one identity between different backends. S3 identities include the effective endpoint and region,
+including environment defaults. Fresh `memory://` backends receive unique identities. Storage
+prefixes, block size, logical length, and header
 layout also participate in cache identity. Budget accounting excludes filesystem allocation slack,
 filenames, in-memory indexes, metadata, caller-held output buffers, and in-flight GET buffers. Moka
 applies byte-weighted admission and eviction; maintenance runs after insertion. Zero disables a tier.

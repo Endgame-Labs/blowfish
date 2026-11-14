@@ -190,6 +190,8 @@ impl RangeCache {
             || config.block_size > u32::MAX as usize
             || config.fetch_concurrency == 0
             || config.prefetch_concurrency == 0
+            || config.fetch_concurrency > Semaphore::MAX_PERMITS
+            || config.prefetch_concurrency > Semaphore::MAX_PERMITS
             || config.max_coalesce_blocks == 0
             || config
                 .block_size
@@ -425,10 +427,17 @@ impl RangeReader {
         drop(planning);
         let fetched: Vec<_> = stream::iter(pending)
             .map(|(index, flight)| async move {
-                let bytes = flight.0.clone().await.map_err(Error::Shared)?;
+                let bytes = flight.0.clone().await.map_err(Error::from_shared)?;
                 Ok::<_, Error>((index, bytes))
             })
-            .buffer_unordered(cache.config.fetch_concurrency)
+            // Poll enough block waiters to start all permitted coalesced GETs. The
+            // semaphore still limits actual I/O, including shared and overlapping groups.
+            .buffer_unordered(
+                cache
+                    .config
+                    .fetch_concurrency
+                    .saturating_mul(cache.config.max_coalesce_blocks),
+            )
             .try_collect()
             .await?;
         blocks.extend(fetched);
@@ -488,9 +497,17 @@ impl Storage {
             layout
         } else {
             let path = self.path(key);
+            let _permit = cache
+                .fetches
+                .acquire()
+                .await
+                .expect("cache semaphore stays open");
             let meta = self.0.backend.head(&path).await?;
             let offset = if meta.size >= HEADER as u64 {
                 let prefix = self.0.backend.get_range(&path, 0..HEADER as u64).await?;
+                if prefix.len() != HEADER {
+                    return Err(Error::Config("short object-store header response"));
+                }
                 if prefix.starts_with(MAGIC) {
                     HEADER as u64
                 } else {

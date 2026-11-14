@@ -43,6 +43,16 @@ pub enum Error {
     #[error("local storage I/O failed")]
     Io(#[from] std::io::Error),
 }
+impl Error {
+    fn from_shared(error: Arc<Self>) -> Self {
+        match error.as_ref() {
+            Self::NotFound => Self::NotFound,
+            Self::AlreadyExists => Self::AlreadyExists,
+            Self::Config(message) => Self::Config(message),
+            _ => Self::Shared(error),
+        }
+    }
+}
 impl From<object_store::Error> for Error {
     fn from(e: object_store::Error) -> Self {
         match e {
@@ -77,6 +87,7 @@ pub struct StorageConfig {
     pub profile: Option<String>,
     pub read_only: bool,
     pub single_writer: bool,
+    /// Budgets and concurrency limits for explicitly cached immutable reads.
     pub cache: CacheConfig,
 }
 struct Inner {
@@ -108,6 +119,7 @@ impl Storage {
     /// Open a local or S3-compatible URL, probe create semantics, and acquire a fallback heartbeat.
     pub async fn open(config: &StorageConfig) -> Result<Self, Error> {
         let url = url::Url::parse(&config.url).map_err(|_| Error::Config("invalid storage URL"))?;
+        let mut namespace = config.url.clone();
         let (backend, prefix): (Arc<dyn ObjectStore>, Path) = match url.scheme() {
             "file" => {
                 let path = url
@@ -141,16 +153,28 @@ impl Storage {
                         b = b.with_token(token);
                     }
                 }
+                use object_store::aws::AmazonS3ConfigKey;
+                namespace = serde_json::to_string(&(
+                    &config.url,
+                    b.get_config_value(&AmazonS3ConfigKey::S3Endpoint)
+                        .or_else(|| b.get_config_value(&AmazonS3ConfigKey::Endpoint)),
+                    b.get_config_value(&AmazonS3ConfigKey::Region),
+                ))
+                .expect("cache identity serializes");
                 (
                     Arc::new(b.build()?),
                     Path::from_url_path(url.path())
                         .map_err(|_| Error::Config("invalid S3 prefix"))?,
                 )
             }
-            "memory" => (
-                Arc::new(object_store::memory::InMemory::new()),
-                Path::default(),
-            ),
+            "memory" => {
+                // Each open creates a different ephemeral backend, even with the same URL.
+                namespace = format!("memory:{}", Uuid::new_v4());
+                (
+                    Arc::new(object_store::memory::InMemory::new()),
+                    Path::default(),
+                )
+            }
             _ => {
                 return Err(Error::Config(
                     "supported storage schemes are file, s3, and memory",
@@ -159,11 +183,7 @@ impl Storage {
         };
         let mut cache = config.cache.clone();
         if cache.namespace.is_none() {
-            cache.namespace = Some(format!(
-                "{}|{}",
-                config.url,
-                config.endpoint.as_deref().unwrap_or("")
-            ));
+            cache.namespace = Some(namespace);
         }
         Self::from_backend_with_cache(
             backend,
@@ -200,7 +220,8 @@ impl Storage {
         mut cache: CacheConfig,
     ) -> Result<Self, Error> {
         if let Some(namespace) = &mut cache.namespace {
-            namespace.push_str(&format!("|{prefix}"));
+            *namespace = serde_json::to_string(&(&namespace, prefix.as_ref()))
+                .expect("cache identity serializes");
         }
         let cache = cache::RangeCache::open(cache).await?;
         let backend: Arc<dyn ObjectStore> = Arc::new(observed::Observed(backend));

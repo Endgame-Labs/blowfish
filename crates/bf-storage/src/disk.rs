@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -22,6 +22,7 @@ pub(crate) struct Disk {
     dir: PathBuf,
     budget: u64,
     bytes: u64,
+    reported: u64,
     clock: u64,
     entries: HashMap<String, (u64, u64)>,
     order: BTreeSet<(u64, String)>,
@@ -42,6 +43,7 @@ impl Disk {
             dir,
             budget,
             bytes: 0,
+            reported: 0,
             clock: 0,
             entries: HashMap::new(),
             order: BTreeSet::new(),
@@ -65,8 +67,14 @@ impl Disk {
             disk.track(name, size);
         }
         disk.evict(0)?;
-        metrics::gauge!("blowfish_cache_bytes", "tier" => "disk").increment(disk.bytes as f64);
+        disk.publish_bytes();
         Ok(disk)
+    }
+
+    fn publish_bytes(&mut self) {
+        metrics::gauge!("blowfish_cache_bytes", "tier" => "disk")
+            .increment(self.bytes as f64 - self.reported as f64);
+        self.reported = self.bytes;
     }
 
     fn track(&mut self, name: String, size: u64) {
@@ -102,7 +110,14 @@ impl Disk {
 
     pub(crate) fn get(&mut self, name: &str, expected: usize) -> Option<Bytes> {
         let &(size, clock) = self.entries.get(name)?;
-        let result = fs::read(self.dir.join(name));
+        let result = (|| {
+            let file = File::open(self.dir.join(name))?;
+            let mut bytes = Vec::new();
+            // Corrupt files cannot force an allocation larger than one expected block.
+            file.take((HEADER + expected + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        })();
         let value = result.ok().filter(|v| {
             v.len() == HEADER + expected
                 && &v[..8] == MAGIC
@@ -117,10 +132,8 @@ impl Disk {
                 Some(Bytes::from(value).slice(HEADER..))
             }
             None => {
-                let before = self.bytes;
                 let _ = self.remove(name);
-                metrics::gauge!("blowfish_cache_bytes", "tier" => "disk")
-                    .decrement((before - self.bytes) as f64);
+                self.publish_bytes();
                 None
             }
         }
@@ -131,27 +144,28 @@ impl Disk {
         if size > self.budget || self.entries.contains_key(name) {
             return Ok(());
         }
-        let before = self.bytes;
+        let tmp = self.dir.join(format!("{name}.tmp"));
         // Publish accounting even if an eviction or write fails partway through.
         let result = (|| {
             self.evict(size)?;
-            let tmp = self.dir.join(format!("{name}.tmp"));
             let mut file = File::create(&tmp)?;
             file.write_all(MAGIC)?;
             file.write_all(&Sha256::digest(value))?;
             file.write_all(value)?;
             file.flush()?;
-            fs::rename(tmp, self.dir.join(name))?;
+            fs::rename(&tmp, self.dir.join(name))?;
             self.track(name.to_owned(), size);
             Ok(())
         })();
-        metrics::gauge!("blowfish_cache_bytes", "tier" => "disk")
-            .increment(self.bytes as f64 - before as f64);
+        if result.is_err() {
+            let _ = fs::remove_file(tmp);
+        }
+        self.publish_bytes();
         result
     }
 }
 impl Drop for Disk {
     fn drop(&mut self) {
-        metrics::gauge!("blowfish_cache_bytes", "tier" => "disk").decrement(self.bytes as f64);
+        metrics::gauge!("blowfish_cache_bytes", "tier" => "disk").decrement(self.reported as f64);
     }
 }

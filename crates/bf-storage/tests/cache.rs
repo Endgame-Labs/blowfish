@@ -75,8 +75,9 @@ impl ObjectStore for Counting {
                 source: "injected failure".into(),
             });
         }
+        let head = opts.head;
         let mut result = self.inner.get_opts(path, opts).await?;
-        if self.short.swap(false, Ordering::SeqCst) {
+        if !head && self.short.swap(false, Ordering::SeqCst) {
             result.payload = object_store::GetResultPayload::Stream(
                 futures::stream::once(async { Ok(Bytes::new()) }).boxed(),
             );
@@ -204,7 +205,7 @@ async fn concurrent_readers_share_fetches_and_obey_global_limit() {
         assert_eq!(task.await.unwrap(), data);
     }
     assert_eq!(ranges(&backend).len(), 9);
-    assert!(backend.max_active.load(Ordering::SeqCst) <= 2);
+    assert_eq!(backend.max_active.load(Ordering::SeqCst), 2);
 }
 #[tokio::test]
 async fn metadata_is_single_flight_and_missing_objects_are_not_cached() {
@@ -460,4 +461,139 @@ async fn background_warming_is_bounded_and_populates_cache() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_waiter_finishes_shared_fetch_after_the_original_reader_cancels() {
+    let (store, backend, data) = setup(config()).await;
+    backend.delay.store(true, Ordering::SeqCst);
+    let reader = store
+        .range_reader_with_length("object", data.len() as u64, false)
+        .unwrap();
+    let original = {
+        let reader = reader.clone();
+        tokio::spawn(async move { reader.read(0..192).await })
+    };
+    while backend.active.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let stats = Arc::new(CacheStats::default());
+    let waiter = {
+        let reader = reader.clone();
+        let stats = stats.clone();
+        tokio::spawn(async move { reader.read_with_stats(128..320, &stats).await })
+    };
+    while stats.snapshot().missed_bytes == 0 {
+        tokio::task::yield_now().await;
+    }
+    original.abort();
+    assert!(original.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        data.slice(128..320)
+    );
+    let mut got = ranges(&backend);
+    got.sort_by_key(|r| r.start);
+    assert_eq!(got, vec![0..192, 192..320]);
+}
+
+#[tokio::test]
+async fn metadata_header_failures_are_not_retained_and_length_errors_are_safe() {
+    let (store, backend, _) = setup(config()).await;
+    backend.fail.store(true, Ordering::SeqCst);
+    assert!(store.range_reader("object").await.is_err());
+    backend.short.store(true, Ordering::SeqCst);
+    assert!(store.range_reader("object").await.is_err());
+    let reader = store.range_reader("object").await.unwrap();
+    assert_eq!(reader.len(), 1027);
+    assert!(reader.read_batch(&[]).await.unwrap().is_empty());
+    assert!(
+        store
+            .range_reader_with_length("object", u64::MAX, true)
+            .is_err()
+    );
+    assert!(matches!(
+        store
+            .range_reader_with_length("missing", 1, false)
+            .unwrap()
+            .read(0..1)
+            .await,
+        Err(Error::NotFound)
+    ));
+    let backend = Arc::new(Counting::default());
+    for cfg in [
+        CacheConfig {
+            block_size: 0,
+            ..config()
+        },
+        CacheConfig {
+            fetch_concurrency: 0,
+            ..config()
+        },
+        CacheConfig {
+            prefetch_concurrency: usize::MAX,
+            ..config()
+        },
+        CacheConfig {
+            max_coalesce_blocks: usize::MAX,
+            ..config()
+        },
+        CacheConfig {
+            disk_dir: Some(tempfile::tempdir().unwrap().path().to_owned()),
+            namespace: None,
+            ..config()
+        },
+    ] {
+        assert!(
+            Storage::from_backend_with_cache(backend.clone(), Path::default(), true, false, cfg)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn fresh_memory_backends_never_reuse_persistent_cache_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = bf_storage::StorageConfig {
+        url: "memory://".into(),
+        cache: CacheConfig {
+            disk_dir: Some(dir.path().to_owned()),
+            ..config()
+        },
+        ..Default::default()
+    };
+    let first = Storage::open(&cfg).await.unwrap();
+    first.create("same", "first").await.unwrap();
+    assert_eq!(first.get_cached("same").await.unwrap(), "first");
+    let second = Storage::open(&cfg).await.unwrap();
+    second.create("same", "other").await.unwrap();
+    assert_eq!(second.get_cached("same").await.unwrap(), "other");
+}
+
+#[tokio::test]
+async fn unavailable_disk_writes_do_not_fail_source_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _, data) = setup(CacheConfig {
+        disk_dir: Some(dir.path().to_owned()),
+        namespace: Some("unavailable-disk".into()),
+        memory_bytes: 0,
+        ..config()
+    })
+    .await;
+    let subdir = std::fs::read_dir(dir.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::rename(&subdir, dir.path().join("moved")).unwrap();
+    let reader = store
+        .range_reader_with_length("object", data.len() as u64, false)
+        .unwrap();
+    assert_eq!(reader.read(0..128).await.unwrap(), data.slice(0..128));
 }
