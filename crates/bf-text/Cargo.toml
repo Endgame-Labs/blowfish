@@ -6,3 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+alyze = { version = "=0.2.0", features = ["cjk"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+unicode-segmentation = "=1.13.3"
+
