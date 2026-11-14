@@ -136,3 +136,46 @@ write survives recovery exactly once through commit, indexing, compaction, and G
 The unchanged compatibility suite passes **96/96**, with one-row and one-millisecond
 index thresholds and persisted segment files verified. Official Python and
 TypeScript SDK write, ANN, BM25, and metadata smokes also pass.
+
+## Million-document benchmark
+
+```sh
+RAYON_NUM_THREADS=8 cargo run --release -p bf-engine --example bench -- \
+  --rows 1000000 --dims 768 --batch 5000 --queries 20 --recall-queries 10 \
+  --compaction-segments 4 --url file:///tmp/blowfish-bench
+```
+
+The example creates a fresh namespace, writes bounded batches, waits for indexing,
+and drains eligible compactions before measuring queries. Defaults match the command
+above. Set `--compaction-segments 1000000` to retain the 200 small input segments.
+`--nprobe` controls ANN effort. Results are emitted as JSON; the store remains on
+disk for inspection.
+
+Measured on 2026-11-14 in release mode on an 8-vCPU, 32-GiB Linux worker with an
+AMD EPYC 9354P and eight rayon threads. The corpus is one million f32 vectors of
+768 dimensions, distributed across 256 synthetic clusters, with four text tokens
+per document drawn from 4,096 varying terms and two common terms. Queries perturb
+stored vectors. Both runs use top-10 results, 128 probes, and 64 times k reranking.
+
+| Measurement | Default tiered compaction | 200 input segments retained |
+| --- | ---: | ---: |
+| Live segments | 5 | 200 |
+| Write throughput, excluding generation and indexing | 3,898 rows/s | 3,430 rows/s |
+| Write time | 256.56 s | 291.57 s |
+| Indexing and compaction time | 271.94 s | 130.55 s |
+| Total load wall time | 559.27 s | 460.22 s |
+| ANN p50 / p99 | 238.25 / 275.95 ms | 4,400.25 / 5,888.89 ms |
+| Mean recall@10 | 0.99 | 1.00 |
+| BM25 p50 / p99 | 113.22 / 157.63 ms | 826.92 / 4,669.86 ms |
+| Cold engine open | 9.82 ms | 9.47 ms |
+| Retained segment bytes | 25,668,273,320 | 6,706,241,019 |
+
+Latency uses three warm-up queries followed by 20 timed samples; p99 is the largest
+of those 20 samples, not a sustained service-tail estimate. Recall averages ten
+same-snapshot ANN/exact comparisons. The synthetic corpus is easier than general
+embeddings. The shared worker was not isolated during ingestion.
+
+Cold opening measures a new engine loading the manifest and empty tail, with the
+OS page cache retained; it does not include a first ANN query. Retained bytes
+include compacted inputs inside the default one-hour GC window. This run used the
+uncached storage adapter, so it also exposes the cost of per-segment range calls.
