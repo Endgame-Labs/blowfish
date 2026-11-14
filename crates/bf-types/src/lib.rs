@@ -1,14 +1,158 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! Shared data model and turbopuffer wire contract.
+mod ast;
+mod schema;
+mod wire;
+pub use ast::*;
+pub use schema::*;
+pub use wire::*;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::fmt;
+
+/// A document identifier. UUIDs are canonicalized by namespace schema validation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Id {
+    /// Unsigned integer ID.
+    Uint(u64),
+    /// String ID, including a schema-declared UUID.
+    String(String),
+}
+impl Id {
+    /// Validate the wire size of an ID.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if matches!(self, Self::String(s) if s.len() > 64) {
+            return Err(ApiError::bad("document ID exceeds 64 bytes"));
+        }
+        Ok(())
+    }
+    /// JSON representation, preserving numeric IDs.
+    pub fn value(&self) -> Value {
+        serde_json::to_value(self).expect("ID serializes")
+    }
+}
+/// Flat document, including its required `id` attribute.
+pub type Document = serde_json::Map<String, Value>;
+/// Nullable JSON attribute value; validation is driven by the namespace schema.
+pub type AttributeValue = Value;
+
+/// One error representation used by every layer and HTTP endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiError {
+    /// HTTP status code.
+    pub status: u16,
+    /// Public error message (never credentials or backend URLs).
+    pub message: String,
+}
+impl ApiError {
+    /// Construct an error with an explicit HTTP status.
+    pub fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+    /// Semantic validation failure.
+    pub fn bad(message: impl Into<String>) -> Self {
+        Self::new(400, message)
+    }
+    /// Invalid JSON or tuple grammar.
+    pub fn malformed(message: impl Into<String>) -> Self {
+        Self::new(422, message)
+    }
+    /// A missing namespace.
+    pub fn not_found(ns: &str) -> Self {
+        Self::new(404, format!("namespace '{ns}' was not found"))
+    }
+    /// Safe error body.
+    pub fn body(&self) -> Value {
+        json!({"status":"error", "error":self.message})
+    }
+}
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(f)
+    }
+}
+impl std::error::Error for ApiError {}
+
+/// Validate a namespace before using it in an object key.
+pub fn validate_namespace(ns: &str) -> Result<(), ApiError> {
+    if ns.is_empty()
+        || ns.len() > 128
+        || ns == "."
+        || ns == ".."
+        || !ns
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return Err(ApiError::bad("invalid namespace name"));
+    }
+    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+/// Decode a numeric vector or base64 little-endian f32 vector, rejecting NaN and infinity.
+pub fn decode_vector(value: &Value) -> Result<Vec<f32>, ApiError> {
+    use base64::Engine;
+    let values = if let Some(s) = value.as_str() {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map_err(|_| ApiError::bad("invalid base64 vector"))?;
+        if bytes.len() % 4 != 0 {
+            return Err(ApiError::bad(
+                "base64 vector length must be a multiple of four",
+            ));
+        }
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect()
+    } else if let Some(a) = value.as_array() {
+        a.iter()
+            .map(|x| {
+                x.as_f64()
+                    .map(|n| n as f32)
+                    .ok_or_else(|| ApiError::bad("vector elements must be numbers"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        return Err(ApiError::bad("expected a vector array or base64 string"));
+    };
+    if values.is_empty() || values.iter().any(|n| !n.is_finite()) {
+        return Err(ApiError::bad(
+            "vectors must contain finite numbers and at least one dimension",
+        ));
     }
+    Ok(values)
+}
+/// Encode a vector in its declared element width for responses.
+pub fn encode_vector(values: &[f32], f16: bool) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = if f16 {
+        values
+            .iter()
+            .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+            .collect()
+    } else {
+        values.iter().flat_map(|x| x.to_le_bytes()).collect()
+    };
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+/// ISO-8601 dates and datetimes normalized to UTC milliseconds.
+pub fn datetime_millis(value: &str) -> Result<i64, ApiError> {
+    use chrono::{DateTime, NaiveDate, NaiveDateTime};
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.timestamp_millis());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Ok(dt.and_utc().timestamp_millis());
+    }
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|d| d.and_utc().timestamp_millis())
+        .ok_or_else(|| ApiError::bad("invalid datetime"))
 }

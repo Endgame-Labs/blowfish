@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
-use object_store::{ObjectStore, PutMode, PutOptions, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
