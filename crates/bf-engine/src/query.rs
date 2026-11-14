@@ -131,6 +131,7 @@ fn single(
             return Err(ApiError::bad("kNN requires filters"));
         }
     }
+    crate::highlight::validate(state, q)?;
     let mut docs = vec![];
     for (id, doc) in &state.docs {
         if q.filters
@@ -347,7 +348,11 @@ fn attribute<'a>(state: &'a NamespaceState, name: &str) -> Result<&'a AttributeS
         .get(name)
         .ok_or_else(|| ApiError::bad(format!("unknown attribute '{name}'")))
 }
-fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result<(), ApiError> {
+pub(crate) fn validate_rank(
+    state: &NamespaceState,
+    rank: &RankBy,
+    guarded: bool,
+) -> Result<(), ApiError> {
     match rank {
         RankBy::Constant(_) => {}
         RankBy::Order(keys) => {
@@ -522,7 +527,11 @@ fn parameter(params: &Value, name: &str, default: f64) -> Result<f64, ApiError> 
     }
     Err(ApiError::bad("score parameter must be numeric"))
 }
-fn score(state: &NamespaceState, doc: &Document, rank: &RankBy) -> Result<f64, ApiError> {
+pub(crate) fn score(
+    state: &NamespaceState,
+    doc: &Document,
+    rank: &RankBy,
+) -> Result<f64, ApiError> {
     Ok(match rank {
         RankBy::Constant(n) => n.as_f64().expect("JSON number fits f64"),
         RankBy::SparseVector {
@@ -686,6 +695,7 @@ fn project(
         }
         row.insert("$dist".into(), json!(dist));
     }
+    crate::highlight::project(state, doc, q, &mut row)?;
     Ok(row)
 }
 fn compare_keys(a: &[Value], b: &[Value]) -> Ordering {

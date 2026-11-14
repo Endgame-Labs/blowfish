@@ -80,3 +80,22 @@ def register(scenarios):
         return result
 
     scenarios['m7_i8'] = (i8, False)
+
+    def highlight(ns):
+        ns.write(schema={'s': {'type': 'string', 'full_text_search': True, 'fuzzy': True}, 'a': {'type': '[]string', 'full_text_search': True}}, upsert_rows=[
+            {'id': 1, 's': '🐡 Red fox.\nThe fox runs.\n\nA bird flies.', 'a': ['A fox. Next bird.', 'More fox fox.']}, {'id': 2, 's': 'nothing'},
+        ])
+        result = []
+        for options in ({}, {'include_offsets': 'utf-8'}, {'fragment_by': 'none', 'include_offsets': 'utf-16'}, {'fragment_by': 'word', 'include_offsets': 'codepoints'}, {'fragment_by': 'paragraph', 'include_offsets': 'utf-8'}, {'fragment_limit': 1}, {'rank_fragments_by': ['$fragment', 'BM25', 'bird'], 'include_offsets': 'utf-8'}):
+            value = normalize(ns.query(rank_by=['s', 'BM25', 'fox'], top_k=10, compute_attributes={'h': ['Highlight', 's', options]}))
+            result.append([r['h'] for r in value['rows']])
+        for rank, attribute, options in (
+            (['a', 'BM25', 'fox'], 'a', {'include_offsets': 'utf-8'}),
+            (['s', 'Fuzzy', 'fox', {'max_edit_distance': [{'min_query_chars': 3, 'distance': 0}]}], 's', {'fragment_by': 'none', 'include_offsets': 'utf-8'}),
+            (['id', 'asc'], 's', {'rank_fragments_by': ['$fragment', 'BM25', 'bird'], 'include_offsets': 'utf-8'}),
+        ):
+            value = normalize(ns.query(rank_by=rank, top_k=10, compute_attributes={'h': ['Highlight', attribute, options]}))
+            result.append([r['h'] for r in value['rows']])
+        return result
+
+    scenarios['m7_highlight'] = (highlight, False)

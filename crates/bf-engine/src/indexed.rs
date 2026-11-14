@@ -72,6 +72,7 @@ async fn prepare(
             cfg.data_type
                 .as_ref()
                 .is_none_or(|t| t.dimensions().is_none())
+                || q.compute_attributes.is_some()
                 || match &q.include_attributes {
                     Some(IncludeAttributes::All(true)) => true,
                     Some(IncludeAttributes::Names(names)) => names.contains(name),
@@ -212,6 +213,7 @@ async fn prepare_scalar(
             cfg.data_type
                 .as_ref()
                 .is_none_or(|t| t.dimensions().is_none())
+                || q.compute_attributes.is_some()
                 || match &q.include_attributes {
                     Some(IncludeAttributes::All(true)) => true,
                     Some(IncludeAttributes::Names(names)) => names.contains(name),

@@ -1,0 +1,222 @@
+[
+  [
+    [
+      {
+        "text": "🐡 Red fox."
+      },
+      {
+        "text": "The fox runs."
+      }
+    ]
+  ],
+  [
+    [
+      {
+        "fragment_range": [
+          0,
+          13
+        ],
+        "match_ranges": [
+          [
+            9,
+            12
+          ]
+        ],
+        "text": "🐡 Red fox."
+      },
+      {
+        "fragment_range": [
+          14,
+          27
+        ],
+        "match_ranges": [
+          [
+            18,
+            21
+          ]
+        ],
+        "text": "The fox runs."
+      }
+    ]
+  ],
+  [
+    [
+      {
+        "fragment_range": [
+          0,
+          40
+        ],
+        "match_ranges": [
+          [
+            7,
+            10
+          ],
+          [
+            16,
+            19
+          ]
+        ],
+        "text": "🐡 Red fox.\nThe fox runs.\n\nA bird flies."
+      }
+    ]
+  ],
+  [
+    [
+      {
+        "fragment_range": [
+          6,
+          9
+        ],
+        "match_ranges": [
+          [
+            6,
+            9
+          ]
+        ],
+        "text": "fox"
+      },
+      {
+        "fragment_range": [
+          15,
+          18
+        ],
+        "match_ranges": [
+          [
+            15,
+            18
+          ]
+        ],
+        "text": "fox"
+      }
+    ]
+  ],
+  [
+    [
+      {
+        "fragment_range": [
+          0,
+          13
+        ],
+        "match_ranges": [
+          [
+            9,
+            12
+          ]
+        ],
+        "text": "🐡 Red fox."
+      },
+      {
+        "fragment_range": [
+          14,
+          27
+        ],
+        "match_ranges": [
+          [
+            18,
+            21
+          ]
+        ],
+        "text": "The fox runs."
+      }
+    ]
+  ],
+  [
+    [
+      {
+        "text": "🐡 Red fox."
+      }
+    ]
+  ],
+  [
+    [
+      {
+        "fragment_range": [
+          29,
+          42
+        ],
+        "match_ranges": [
+          [
+            31,
+            35
+          ]
+        ],
+        "text": "A bird flies."
+      }
+    ]
+  ],
+  [
+    [
+      {
+        "array_index": 1,
+        "fragment_range": [
+          0,
+          13
+        ],
+        "match_ranges": [
+          [
+            5,
+            8
+          ],
+          [
+            9,
+            12
+          ]
+        ],
+        "text": "More fox fox."
+      },
+      {
+        "array_index": 0,
+        "fragment_range": [
+          0,
+          6
+        ],
+        "match_ranges": [
+          [
+            2,
+            5
+          ]
+        ],
+        "text": "A fox."
+      }
+    ]
+  ],
+  [
+    [
+      {
+        "fragment_range": [
+          0,
+          42
+        ],
+        "match_ranges": [
+          [
+            9,
+            12
+          ],
+          [
+            18,
+            21
+          ]
+        ],
+        "text": "🐡 Red fox.\nThe fox runs.\n\nA bird flies."
+      }
+    ]
+  ],
+  [
+    [
+      {
+        "fragment_range": [
+          29,
+          42
+        ],
+        "match_ranges": [
+          [
+            31,
+            35
+          ]
+        ],
+        "text": "A bird flies."
+      }
+    ],
+    []
+  ]
+]

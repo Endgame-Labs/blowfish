@@ -1,5 +1,6 @@
 //! Immutable segment indexes with a WAL overlay and an exhaustive reference evaluator.
 mod filter;
+mod highlight;
 mod indexed;
 mod indexer;
 mod pattern;

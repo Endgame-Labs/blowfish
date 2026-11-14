@@ -478,3 +478,41 @@ pub(crate) fn boolean_term_matches(
                 .filter(|s| !s.is_empty())
                 .any(matches))
 }
+
+/// Analyze a scalar string while retaining original, half-open UTF-8 byte ranges.
+/// Normalization, stemming, and stopword removal never change these ranges.
+pub fn tokenize_spans(text: &str, params: &FtsParams) -> Vec<(String, std::ops::Range<usize>)> {
+    if matches!(
+        params.tokenizer,
+        Tokenizer::WordV0 | Tokenizer::WordV1 | Tokenizer::WordV2
+    ) {
+        let mut offset = 0;
+        let mut out = vec![];
+        for word in legacy_words(text, params.tokenizer) {
+            let Some(found) = text[offset..].find(&word) else {
+                continue;
+            };
+            let start = offset + found;
+            let end = start + word.len();
+            offset = end;
+            for token in tokenize(&word, params) {
+                out.push((token.text, start..end));
+            }
+        }
+        return out;
+    }
+    let analyzer = params.analyzer(false);
+    let mut buffer = ReusableBuffer::new();
+    let mut out = vec![];
+    analyzer.analyze(text, &mut buffer, |token| {
+        let cjk = matches!(
+            params.tokenizer,
+            Tokenizer::Smartcn | Tokenizer::Kuromoji | Tokenizer::Nori
+        );
+        if !cjk || token.text.chars().count() <= params.max_token_length as usize {
+            out.push((token.text.to_owned(), token.byte_range));
+        }
+        true
+    });
+    out
+}
