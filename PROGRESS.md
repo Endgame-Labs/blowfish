@@ -4,6 +4,34 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Perf merged (M5).**
+  - **Changes:**
+    - Segment reads go through the byte cache with known lengths, so no HEAD requests.
+    - A decoded-metadata LRU keeps IVF centroids, FSTs, ID indexes, and filter dictionaries in memory
+      (512 MiB default).
+    - Segments are searched in parallel on a blocking worker pool, and scalar order-by, aggregates,
+      and group_by now stream.
+    - Small WAL commits (64 KiB or less) are a **single PUT**: GC later erases the inline payload in
+      place while keeping the slot fence. The WAL slot format is now v3, so upgrade all readers
+      before writers.
+  - **Local 1M×768:**
+
+    | | Before | Now |
+    |---|---|---|
+    | BM25 p50 | 113 ms | **8 ms** |
+    | ANN p50, 32 probes (recall 0.99) | | **23 ms** |
+    | ANN p50, default 128 probes | 238 ms | **47 ms** |
+
+  - **R2, 100k×768:**
+    - Warm ANN p50 is 466 ms and warm BM25 is 190 ms, which still looks too slow. I'm investigating.
+    - Cold ANN takes 1.7 s and cold BM25 0.86 s.
+    - Small-commit p50 is 184 ms, down from 1,017 ms.
+  - **Integration fixes found while merging with m7:**
+    - Highlights lost their source text after indexing, because perf's IDs-only fast path didn't know
+      about `compute_attributes`. Fixed.
+    - A fail-closed test assumed the cache would miss, so it now checks a cold node.
+  - **Verified on main:** 129 Rust tests, and compat **121/121 in both modes**. The Python and
+    TypeScript SDK smoke tests pass in both modes.
 - **M7 merged: compat is now 121/121 in both normal and forced-indexing modes.**
   - **Pattern filters:** fuzzy, regex, glob, and iglob, with trigram indexes. They also work as ranking
     scores.
@@ -163,6 +191,6 @@ Newest first. Each entry says what works now and how it was checked.
 | M2 | Segments, indexer, and GC | ✅ done |
 | M3 | Vector index (IVF + RaBitQ) | ✅ done (perf tuning next) |
 | M4 | Full-text index | ✅ done (perf tuning next) |
-| M5 | Cache and performance | in progress |
+| M5 | Cache and performance | ✅ done locally; R2 warm-path tuning next |
 | M6 | Multi-node, auth, metrics, and packaging | in progress |
 | M7 | The "later" list | ✅ done (hosted Embed and model rerank intentionally unsupported) |
