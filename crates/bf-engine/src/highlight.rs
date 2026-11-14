@@ -151,7 +151,8 @@ pub(crate) fn validate(state: &NamespaceState, q: &QueryRequest) -> Result<(), A
         ));
     }
     for (label, v) in exprs {
-        if label.starts_with('$') || label.len() > 128 || label.is_empty() {
+        // Row identity is required by result merging, RRF, and legacy adapters.
+        if label == "id" || label.starts_with('$') || label.len() > 128 || label.is_empty() {
             return Err(ApiError::bad("invalid computed attribute name"));
         }
         if is_highlight(v) {
