@@ -135,7 +135,7 @@ Fault injection fails each normal-path read, listing, create, and delete before 
 after its effect, including lost successful PUT responses. Every acknowledged
 write survives recovery exactly once through commit, indexing, compaction, and GC.
 
-The unchanged compatibility suite passes **96/96**, with one-row and one-millisecond
+The unchanged compatibility suite passes **111/111**, with one-row and one-millisecond
 index thresholds and persisted segment files verified. Official Python and
 TypeScript SDK write, ANN, BM25, and metadata smokes also pass.
 
@@ -237,7 +237,85 @@ bytes, including decoded metadata hits, instead of guessing from namespace age.
 and segment scorers use bounded blocking tasks, keeping CPU work off Tokio reactor
 threads. Independent masks, IDs, and index metadata open together; ANN code reads
 and rerank vectors each use one coalesced batch. The counting-store regression
-requires exactly three cold ANN read stages, zero HEADs, and zero backend reads
-for an identical warm query. It also tests a cold single-term BM25 query within
+requires exactly three dependent cold ANN read stages, zero HEADs, and zero backend
+reads for an identical warm query. That test uses 512 fetch permits to isolate
+read dependencies; the production default of 16 permits can introduce additional
+network waves inside a batch. It also tests a cold single-term BM25 query within
 three stages. General BM25 queries can still need additional posting-block stages:
 bf-text exposes demand-driven posting reads, not a public batch-prefetch plan.
+
+
+### M5 benchmark results
+
+Measured on the same retained **1M × 768** local corpus and five live segments as
+the M4 table above. Both runs use 64-times-k reranking, top ten, three warm-ups,
+50 measured queries, ten exact recall comparisons, and 64-KiB cache blocks.
+The engine's default remains 128 probes; `BF_ANN_NPROBE=32` (or `--nprobe 32` in
+the benchmark) meets the requested warm target on this synthetic corpus.
+
+| Local file store | M4, 128 probes | M5, 128 probes | M5, 32 probes |
+| --- | ---: | ---: | ---: |
+| ANN p50 / p99 | 238.25 / 275.95 ms | 46.96 / 60.14 ms | **23.42 / 33.14 ms** |
+| BM25 p50 / p99 | 113.22 / 157.63 ms | 8.62 / 14.19 ms | **8.16 / 16.33 ms** |
+| Recall@10 | 0.99 | 0.99 | **0.99** |
+| ANN execution-only p50 | not separated | 43 ms | 19 ms |
+| BM25 execution-only p50 | not separated | 5 ms | 4 ms |
+
+Independent cold engine and storage handles measured **102.55 ms ANN** and
+**68.24 ms BM25** at 32 probes, including namespace discovery. The OS page cache
+was retained. Cold BM25 now runs before the warm workload on a separate storage
+handle, so it does not inherit ANN's ID, live-mask, or byte-cache entries. A run
+concurrent with remote compaction measured 71.14 ms ANN p50; the final table was
+measured after that load finished. These are workload measurements on a shared
+worker, not isolated hardware guarantees. The default 128-probe ANN run still
+exceeds the 30-ms target; probe tuning supplies the documented speed/recall tradeoff.
+
+The **100k × 768 R2** run used four 25,000-row input batches, compacted to one live
+segment, 64 probes, 64-KiB cache blocks, three warm-ups, 20 measured queries, and
+five recall comparisons. Warm denotes the post-warm-up phase with varying vectors
+and terms, not a guarantee that every rerank/posting range is resident. All queries
+used strong consistency. Only a unique
+`dev/perf-bench/` prefix was used, and all its objects were deleted afterward.
+
+| R2 measurement | Result |
+| --- | ---: |
+| Cold ANN / BM25, independent caches | 1,671.31 / 859.99 ms |
+| Warm ANN p50 / p99 | 465.52 / 732.43 ms |
+| Warm BM25 p50 / p99 | 190.30 / 293.60 ms |
+| ANN / BM25 execution-only p50 | 344 / 65 ms |
+| Recall@10 | 1.00 |
+| Load wall time / indexing and compaction | 270.85 / 181.77 s |
+| Write throughput, excluding generation and indexing | 1,188 rows/s |
+| 25,000-row write batch p50 | 20,186.59 ms |
+
+An earlier R2 attempt returned a storage 503 during compaction after ingestion.
+It was cleaned up; a fresh run with error diagnostics enabled completed without
+reproducing the failure. Both attempts' prefixes were deleted. The successful
+cold results include strong refreshes and bounded I/O concurrency; they are not
+three bare network round trips. Achieving that wall-clock budget for arbitrary
+queries still needs bf-text posting-batch planning and sufficiently wide fetch
+concurrency. bf-vector's interleaved code/vector layout also limits coalescing
+across distant clusters.
+
+Small durable writes were measured separately with
+`cargo run --release -p bf-wal --example latency`, using the same environment
+variables plus `BENCH_URL` for a disposable prefix. Each measurement excludes
+three warm-ups and reports the median of 20 document-bearing commits.
+
+| R2 small-write durability measurement | Two-PUT baseline | Inline slot |
+| --- | ---: | ---: |
+| Single conditional-PUT control p50 | 509.80 ms | 173.76 ms |
+| WAL commit p50 | 1,016.84 ms | **183.73 ms** |
+| Commit / contemporaneous PUT control | 1.99× | **1.06×** |
+
+Conditions changed between runs, so the absolute improvement cannot all
+be attributed to the code. The control ratio and the slot/payload regression tests
+show the removed round trip. These are WAL durability latencies, excluding HTTP,
+validation, and indexing; large batches above the inline threshold still use two PUTs.
+
+
+The same small-write example on the local file store measured **0.061 ms WAL
+commit p50**, against **0.053 ms** for its single-PUT control (20 samples, after
+three warm-ups, with the OS cache retained). The million-row local corpus was
+reused for query comparison; its original ingestion-throughput figures above
+remain M4 measurements.

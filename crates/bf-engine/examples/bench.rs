@@ -8,6 +8,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Keep backend diagnostics on stderr, without changing the benchmark's JSON output.
+// Only errors are collected; there is no span allocation or steady-state query tracing.
+struct BenchmarkErrors;
+impl tracing::Subscriber for BenchmarkErrors {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::ERROR
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields;
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                eprintln!("{}={value:?}", field.name());
+            }
+        }
+        event.record(&mut Fields);
+    }
+}
+
 fn argument(name: &str, default: &str) -> String {
     let args: Vec<_> = std::env::args().collect();
     args.windows(2)
@@ -34,6 +59,7 @@ fn percentile(values: &mut [f64], q: f64) -> f64 {
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    tracing::subscriber::set_global_default(BenchmarkErrors)?;
     let rows: usize = argument("--rows", "1000000").parse()?;
     let dims: usize = argument("--dims", "768").parse()?;
     let batch: usize = argument("--batch", "5000").parse()?;
@@ -119,7 +145,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     let engine = Engine::with_config(query_store, config.clone());
     let mut cold_ann_ms = 0.0;
-    let mut cold_bm25_ms = 0.0;
+    // Measure text on its own fresh storage and engine caches, including shared IDs/live masks.
+    let cold_bm25_ms = {
+        let cold_store = Storage::open(&StorageConfig {
+            read_only: true,
+            ..storage_config.clone()
+        })
+        .await?;
+        let cold_text = Engine::with_config(cold_store, config.clone());
+        let request =
+            serde_json::from_value(json!({"rank_by":["text","BM25","term0 term7"],"top_k":10}))?;
+        let tick = Instant::now();
+        cold_text.query(&ns, request).await?;
+        tick.elapsed().as_secs_f64() * 1000.0
+    };
     let mut ann_execution_ms = vec![];
     let mut bm25_execution_ms = vec![];
     let mut ann_ms = vec![];
@@ -153,9 +192,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )?;
         let tick = Instant::now();
         let response = engine.query(&ns, request).await?;
-        if i == 0 {
-            cold_bm25_ms = tick.elapsed().as_secs_f64() * 1000.0;
-        }
         if i >= 3 {
             bm25_execution_ms.push(response.performance.query_execution_ms as f64);
             bm25_ms.push(tick.elapsed().as_secs_f64() * 1000.0);
