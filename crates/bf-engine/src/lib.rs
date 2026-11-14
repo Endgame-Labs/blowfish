@@ -1,5 +1,6 @@
 //! Exhaustive reference engine. Object storage is authoritative; memory is a replay cache.
 mod filter;
+mod metadata;
 mod query;
 pub mod text_fallback;
 mod write;
@@ -154,6 +155,7 @@ impl Engine {
         if self.0.store.is_read_only() {
             return Err(ApiError::new(403, "server is read-only"));
         }
+        self.check_writable(ns).await?;
         let handle = self.handle(ns).await?;
         let copy = if let Some(source) = &request.copy_from_namespace {
             let source = match source {
@@ -184,10 +186,19 @@ impl Engine {
         } else {
             None
         };
-        handle
+        let inherited_read_only = if let Some(source) = &copy {
+            self.settings_for_copy(&request, source).await?
+        } else {
+            false
+        };
+        let response = handle
             .commits
             .submit(Operation::Write(Box::new(request), copy))
-            .await?
+            .await??;
+        if inherited_read_only {
+            self.patch_metadata(ns, json!({"read_only":true})).await?;
+        }
+        Ok(response)
     }
     /// Query a consistent snapshot using exhaustive evaluation, including multi-query RRF.
     pub async fn query(&self, ns: &str, request: QueryRequest) -> Result<QueryResponse, ApiError> {
@@ -213,9 +224,10 @@ impl Engine {
     /// Namespace metadata, with fully expanded schema settings.
     pub async fn metadata(&self, ns: &str) -> Result<Value, ApiError> {
         let (s, _) = self.snapshot(ns, &Consistency::Strong).await?;
-        Ok(
-            json!({"schema":s.schema,"approx_logical_bytes":logical_bytes(&s),"approx_row_count":s.docs.len(),"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}}),
-        )
+        let mut metadata = json!({"schema":s.schema,"approx_logical_bytes":logical_bytes(&s),"approx_row_count":s.docs.len(),"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}});
+        self.decorate_metadata(ns, &s.created_at.to_rfc3339(), &mut metadata)
+            .await?;
+        Ok(metadata)
     }
     /// Schema endpoint representation, including nullable settings and `ann: true`.
     pub async fn schema(&self, ns: &str) -> Result<Value, ApiError> {
