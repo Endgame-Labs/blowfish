@@ -197,3 +197,57 @@ async fn acknowledged_writes_survive_every_commit_index_compact_and_gc_mutation(
         }
     }
 }
+
+#[tokio::test]
+async fn acknowledged_branches_survive_failures_and_source_deletion() {
+    for after in [false, true] {
+        let mut boundaries = 1;
+        let mut position = 0;
+        while position <= boundaries {
+            let faults = Arc::new(Faults::default());
+            let store = Storage::from_backend(faults.clone(), Path::default(), false, false)
+                .await
+                .unwrap();
+            let e = Engine::with_config(store.clone(), config());
+            write(&e, 1).await.unwrap();
+            e.index_namespace("crash", true).await.unwrap();
+            write(&e, 2).await.unwrap();
+            faults.arm(position, after);
+            let acknowledged = e
+                .write(
+                    "branch",
+                    serde_json::from_value(json!({"branch_from_namespace":"crash"})).unwrap(),
+                )
+                .await
+                .is_ok();
+            if position == 0 {
+                boundaries = faults.operation.load(Ordering::SeqCst);
+            }
+            faults.arm(0, false);
+            e.delete_namespace("crash").await.unwrap();
+            e.collect_garbage("crash").await.unwrap();
+            drop(e);
+            if acknowledged {
+                let recovered = Engine::with_config(store, config());
+                let result = recovered
+                    .query(
+                        "branch",
+                        serde_json::from_value(json!({"rank_by":["id","asc"],"top_k":10})).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let ids: Vec<_> = result
+                    .result
+                    .rows
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["id"].as_u64().unwrap())
+                    .collect();
+                assert_eq!(ids, vec![1, 2], "boundary {position}, after {after}");
+                recovered.index_namespace("branch", true).await.unwrap();
+                recovered.collect_garbage("branch").await.unwrap();
+            }
+            position += 1;
+        }
+    }
+}

@@ -588,3 +588,74 @@ async fn branch_requires_source_scope() {
     .await;
     assert_eq!(rows["rows"][0]["id"], 1);
 }
+
+#[tokio::test]
+async fn encoded_names_cannot_escape_scope_or_storage_prefixes() {
+    let app = app().await;
+    let reader = create(&app, &["read"], json!(["allowed-"])).await;
+    seed(&app, "allowed-test").await;
+    assert_eq!(
+        call(
+            &app,
+            reader["token"].as_str(),
+            "GET",
+            "/v1/namespaces/%61llowed-test/schema",
+            Value::Null
+        )
+        .await
+        .0,
+        200
+    );
+    for name in [
+        "%2e%2e",
+        "%2e",
+        "allowed-%2f..%2f_system",
+        "allowed-%5c..",
+        "allowed-%252f",
+        "allowed-%00",
+        "%EF%BC%8E%EF%BC%8E",
+    ] {
+        let path = format!("/v2/namespaces/{name}");
+        assert_eq!(
+            call(
+                &app,
+                Some(SUPER),
+                "POST",
+                &path,
+                json!({"upsert_rows":[{"id":1}]})
+            )
+            .await
+            .0,
+            400,
+            "{name}"
+        );
+    }
+    // Attribute names and document IDs are data, even when they resemble paths.
+    let (status, _) = call(
+        &app,
+        Some(SUPER),
+        "POST",
+        "/v2/namespaces/_system",
+        json!({"upsert_rows":[{"id":"../../keys","../keys/anything":"data"}]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        call(
+            &app,
+            reader["token"].as_str(),
+            "GET",
+            "/v1/namespaces/_system/schema",
+            Value::Null
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        call(&app, Some(SUPER), "GET", "/_blowfish/v1/keys", Value::Null)
+            .await
+            .0,
+        200
+    );
+}
