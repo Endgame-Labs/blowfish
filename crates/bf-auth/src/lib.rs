@@ -175,6 +175,8 @@ pub enum AuthError {
     InvalidRequest(&'static str),
     #[error("key not found")]
     NotFound,
+    #[error("key authorization data is temporarily unavailable")]
+    Unavailable,
     #[error("key storage error")]
     Storage(#[source] object_store::Error),
     #[error("key storage error")]
@@ -190,6 +192,7 @@ impl AuthError {
             Self::Forbidden => 403,
             Self::InvalidRequest(_) => 400,
             Self::NotFound => 404,
+            Self::Unavailable => 503,
             Self::SharedStorage(bf_storage::Error::ReadOnly) => 403,
             Self::Storage(_) | Self::Data(_) | Self::SharedStorage(_) => 500,
         }
@@ -215,6 +218,7 @@ struct Cache {
     revoked: HashSet<String>,
     negative: HashMap<String, Instant>,
     last_used: HashMap<String, DateTime<Utc>>,
+    refreshed_at: Option<Instant>,
 }
 enum Backend {
     Object(Arc<dyn ObjectStore>),
@@ -373,6 +377,7 @@ impl KeyStore {
         cache.keys = keys;
         cache.revoked = revoked;
         cache.negative.clear();
+        cache.refreshed_at = Some(Instant::now());
         Ok(())
     }
     /// Authenticate a raw bearer token. Pass an empty string for a missing token.
@@ -391,6 +396,14 @@ impl KeyStore {
         }
         let (id, secret) = parse_token(bearer).ok_or(AuthError::Unauthorized)?;
         let mut cache = self.inner.cache.write().await;
+        // A failed refresh must not preserve a revoked credential indefinitely.
+        // Allow one missed refresh; the configured super key remains a recovery path.
+        if cache
+            .refreshed_at
+            .is_none_or(|at| at.elapsed() > self.inner.interval.saturating_mul(2))
+        {
+            return Err(AuthError::Unavailable);
+        }
         if cache.revoked.contains(id) {
             return Err(AuthError::Unauthorized);
         }
@@ -520,6 +533,22 @@ impl KeyStore {
         cache.keys.insert(id.clone(), key);
         Ok((info, format!("bf_{id}_{secret}")))
     }
+    // Key management must obey the same authority boundary as delegation. Otherwise
+    // a tenant's key manager can enumerate and revoke another tenant's keys.
+    fn can_manage(principal: &Principal, key: &KeyInfo) -> bool {
+        principal.super_key
+            || (key.roles.iter().all(|role| principal.roles.contains(role))
+                && principal.namespace_prefixes.as_ref().is_none_or(|parent| {
+                    key.namespace_prefixes.as_ref().is_some_and(|child| {
+                        child
+                            .iter()
+                            .all(|c| parent.iter().any(|p| c.starts_with(p)))
+                    })
+                })
+                && principal
+                    .expires_at
+                    .is_none_or(|expiry| key.expires_at.is_some_and(|child| child <= expiry)))
+    }
     /// Return active key metadata; usage timestamps are local to this process.
     pub async fn list_keys(&self, principal: &Principal) -> Result<Vec<KeyInfo>, AuthError> {
         self.authorize(principal, Action::ManageKeys, None)?;
@@ -527,7 +556,7 @@ impl KeyStore {
         let mut result: Vec<_> = cache
             .keys
             .values()
-            .filter(|k| !cache.revoked.contains(&k.info.id))
+            .filter(|k| !cache.revoked.contains(&k.info.id) && Self::can_manage(principal, &k.info))
             .map(|k| {
                 let mut info = k.info.clone();
                 info.last_used_at = cache.last_used.get(&info.id).copied();
@@ -554,7 +583,12 @@ impl KeyStore {
         let _guard = self.inner.mutation.lock().await;
         {
             let cache = self.inner.cache.read().await;
-            if !cache.keys.contains_key(id) || cache.revoked.contains(id) {
+            if cache.revoked.contains(id)
+                || cache
+                    .keys
+                    .get(id)
+                    .is_none_or(|key| !Self::can_manage(principal, &key.info))
+            {
                 return Err(AuthError::NotFound);
             }
         }
@@ -690,6 +724,75 @@ mod tests {
             Err(AuthError::Unauthorized)
         ));
     }
+    #[tokio::test]
+    async fn scoped_managers_cannot_inspect_or_revoke_more_powerful_keys() {
+        let (ks, root) = setup(Arc::new(InMemory::new())).await;
+        let (_, token) = ks
+            .create_key(
+                spec(vec![Role::Keys, Role::Read], Some(vec!["tenant-"])),
+                &root,
+            )
+            .await
+            .unwrap();
+        let manager = ks.authenticate(&token).await.unwrap();
+        for request in [
+            spec(vec![Role::Read], None),
+            spec(vec![Role::Read], Some(vec!["other-"])),
+            spec(vec![Role::Admin], Some(vec!["tenant-"])),
+            spec(vec![Role::Keys], Some(vec![""])),
+        ] {
+            let (key, token) = ks.create_key(request, &root).await.unwrap();
+            assert!(
+                !ks.list_keys(&manager)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|k| k.id == key.id)
+            );
+            assert!(matches!(
+                ks.get_key(&manager, &key.id).await,
+                Err(AuthError::NotFound)
+            ));
+            assert!(matches!(
+                ks.revoke_key(&manager, &key.id).await,
+                Err(AuthError::NotFound)
+            ));
+            assert!(ks.authenticate(&token).await.is_ok());
+        }
+        let (child, token) = ks
+            .create_key(spec(vec![Role::Read], Some(vec!["tenant-child"])), &manager)
+            .await
+            .unwrap();
+        assert!(ks.get_key(&manager, &child.id).await.is_ok());
+        ks.revoke_key(&manager, &child.id).await.unwrap();
+        assert!(ks.authenticate(&token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_cannot_authorize_stale_keys_indefinitely() {
+        let backend = Arc::new(InMemory::new());
+        let (ks, root) = setup(backend.clone()).await;
+        let (key, token) = ks
+            .create_key(spec(vec![Role::Read], None), &root)
+            .await
+            .unwrap();
+        // Simulate unreadable authorization data while another node may revoke a key.
+        backend
+            .put(
+                &ks.path(&key.id, "json"),
+                bytes::Bytes::from_static(b"invalid JSON").into(),
+            )
+            .await
+            .unwrap();
+        assert!(ks.refresh().await.is_err());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(matches!(
+            ks.authenticate(&token).await,
+            Err(AuthError::Unavailable)
+        ));
+        assert!(ks.authenticate("super-secret").await.is_ok());
+    }
+
     #[test]
     fn role_matrix() {
         use Action::*;

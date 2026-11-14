@@ -128,22 +128,37 @@ pub fn substring_matches(
         }
     }
     found.sort_by_key(|(r, d)| (*d, std::cmp::Reverse(r.len()), r.start));
-    let mut out: Vec<std::ops::Range<usize>> = vec![];
+    // Accepted intervals are disjoint. Only the neighboring intervals can overlap
+    // a candidate; a full scan here becomes quadratic on repeated matching text.
+    let mut out = std::collections::BTreeMap::<usize, usize>::new();
     for (range, _) in found {
-        if !out
-            .iter()
-            .any(|old| old.start < range.end && range.start < old.end)
-        {
-            out.push(range)
+        let overlaps_left = out
+            .range(..=range.start)
+            .next_back()
+            .is_some_and(|(_, end)| *end > range.start);
+        let overlaps_right = out
+            .range(range.start..)
+            .next()
+            .is_some_and(|(start, _)| *start < range.end);
+        if !overlaps_left && !overlaps_right {
+            out.insert(range.start, range.end);
         }
     }
-    out.sort_by_key(|r| r.start);
-    out
+    out.into_iter().map(|(start, end)| start..end).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_highlight_matches_keep_disjoint_offsets() {
+        let text = "🐡 ".repeat(10000);
+        let ranges = substring_matches(&text, "🐡", 0, true);
+        assert_eq!(ranges.len(), 10000);
+        for (i, range) in ranges.iter().enumerate() {
+            assert_eq!(*range, i * 5..i * 5 + 4);
+        }
+    }
     #[test]
     fn edits_substrings_and_unicode() {
         for (text, query, distance) in [

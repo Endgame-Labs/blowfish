@@ -151,7 +151,8 @@ pub(crate) fn validate(state: &NamespaceState, q: &QueryRequest) -> Result<(), A
         ));
     }
     for (label, v) in exprs {
-        if label.starts_with('$') || label.len() > 128 || label.is_empty() {
+        // Row identity is required by result merging, RRF, and legacy adapters.
+        if label == "id" || label.starts_with('$') || label.len() > 128 || label.is_empty() {
             return Err(ApiError::bad("invalid computed attribute name"));
         }
         if is_highlight(v) {
@@ -210,6 +211,10 @@ fn matches(
             params,
         }) if attribute == name || attribute == "$fragment" => {
             let cfg = filter::fuzzy_params(params.as_ref())?;
+            filter::fuzzy_work(
+                fragment.len(),
+                value.as_str().expect("validated string").len(),
+            )?;
             if let Some(distance) = cfg.distance(value.as_str().expect("validated string")) {
                 out.extend(bf_text::substring_matches(
                     fragment,
@@ -253,8 +258,16 @@ fn highlights(
             .collect()
     };
     let mut candidates = vec![];
+    let document_bytes = serde_json::to_vec(doc).expect("document serializes").len();
+    let mut cloned_bytes = 0usize;
     for (element, s) in strings.iter().enumerate() {
         for range in bf_text::fragment_ranges(s, params.fragment_by) {
+            // Fragment scoring keeps two document copies per candidate. Reject
+            // amplification before cloning unrelated attributes for every fragment.
+            cloned_bytes = cloned_bytes.saturating_add(document_bytes.saturating_mul(2));
+            if candidates.len() >= 10000 || cloned_bytes > 128 * 1024 * 1024 {
+                return Err(ApiError::bad("highlight candidate work limit exceeded"));
+            }
             let fragment = &s[range.clone()];
             let mut spans = vec![];
             matches(&rank, fragment, name, &fragments, &mut spans)?;

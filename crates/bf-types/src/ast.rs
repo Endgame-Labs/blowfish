@@ -2,6 +2,35 @@ use crate::{ApiError, decode_vector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+// Validate before the recursive parser clones any subtree. This also covers callers
+// deserializing from a Value, where serde_json's text recursion limit does not apply.
+fn check_expression(value: &Value) -> Result<(), ApiError> {
+    let mut pending = vec![(value, 0usize)];
+    let mut nodes = 0usize;
+    while let Some((value, depth)) = pending.pop() {
+        nodes += 1;
+        if depth > 64 || nodes > 65536 {
+            return Err(ApiError::malformed("expression exceeds complexity limits"));
+        }
+        match value {
+            Value::Array(values) => {
+                if pending.len() + values.len() > 65536 {
+                    return Err(ApiError::malformed("expression exceeds complexity limits"));
+                }
+                pending.extend(values.iter().map(|v| (v, depth + 1)));
+            }
+            Value::Object(values) => {
+                if pending.len() + values.len() > 65536 {
+                    return Err(ApiError::malformed("expression exceeds complexity limits"));
+                }
+                pending.extend(values.values().map(|v| (v, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Every v2 comparison and token operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterOp {
@@ -47,6 +76,10 @@ pub enum Filter {
 impl Filter {
     /// Parse the JSON tuple grammar, rejecting unknown operators with 422.
     pub fn parse(v: Value) -> Result<Self, ApiError> {
+        check_expression(&v)?;
+        Self::parse_inner(v)
+    }
+    fn parse_inner(v: Value) -> Result<Self, ApiError> {
         let a = v
             .as_array()
             .ok_or_else(|| ApiError::malformed("filter must be a JSON array"))?;
@@ -60,7 +93,7 @@ impl Filter {
                 .ok_or_else(|| ApiError::malformed("logical filter requires an array of filters"))?
                 .iter()
                 .cloned()
-                .map(Self::parse)
+                .map(Self::parse_inner)
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(if name == "And" {
                 Self::And(fs)
@@ -69,7 +102,7 @@ impl Filter {
             });
         }
         if name == "Not" && a.len() == 2 {
-            return Ok(Self::Not(Box::new(Self::parse(a[1].clone())?)));
+            return Ok(Self::Not(Box::new(Self::parse_inner(a[1].clone())?)));
         }
         if !(3..=4).contains(&a.len()) {
             return Err(ApiError::malformed(
@@ -191,6 +224,10 @@ pub enum RankBy {
 impl RankBy {
     /// Parse all M1 rank tuples, including either Product operand order.
     pub fn parse(v: Value) -> Result<Self, ApiError> {
+        check_expression(&v)?;
+        Self::parse_inner(v)
+    }
+    fn parse_inner(v: Value) -> Result<Self, ApiError> {
         if let Value::Number(n) = v {
             return Ok(Self::Constant(n));
         }
@@ -203,7 +240,7 @@ impl RankBy {
             }
             let mut keys = Vec::new();
             for key in a {
-                match Self::parse(key.clone())? {
+                match Self::parse_inner(key.clone())? {
                     Self::Order(mut k) if k.len() == 1 => keys.append(&mut k),
                     _ => return Err(ApiError::malformed("invalid multi-key order-by")),
                 }
@@ -229,7 +266,7 @@ impl RankBy {
                     .ok_or_else(|| ApiError::malformed("score terms must be an array"))?
                     .iter()
                     .cloned()
-                    .map(Self::parse)
+                    .map(Self::parse_inner)
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(if name == "Sum" {
                     Self::Sum(terms)
@@ -255,7 +292,7 @@ impl RankBy {
                 }
                 Ok(Self::Product {
                     weight,
-                    expr: Box::new(Self::parse(expr.clone())?),
+                    expr: Box::new(Self::parse_inner(expr.clone())?),
                     weight_first,
                 })
             }
@@ -272,7 +309,7 @@ impl RankBy {
                 if !a[2].is_object() {
                     return Err(ApiError::malformed("score parameters must be an object"));
                 }
-                let expr = Box::new(Self::parse(a[1].clone())?);
+                let expr = Box::new(Self::parse_inner(a[1].clone())?);
                 Ok(if name == "Saturate" {
                     Self::Saturate {
                         expr,
@@ -288,7 +325,7 @@ impl RankBy {
             "Dist" => {
                 need(3)?;
                 Ok(Self::Dist {
-                    expr: Box::new(Self::parse(a[1].clone())?),
+                    expr: Box::new(Self::parse_inner(a[1].clone())?),
                     origin: a[2].clone(),
                 })
             }

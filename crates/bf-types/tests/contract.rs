@@ -147,3 +147,30 @@ fn aggregate_group_and_query_wire() {
     assert!(validate_namespace("../x").is_err());
     let _: Value = serde_json::to_value(WriteResponse::default()).unwrap();
 }
+
+#[test]
+fn inferred_dense_and_sparse_vectors_obey_dimension_limits() {
+    for size in [10752, 10753] {
+        let value = serde_json::json!(vec![1.0; size]);
+        let inferred = AttributeType::infer("vector", &value).unwrap();
+        let mut schema = AttributeSchema::new(inferred);
+        assert_eq!(
+            schema
+                .normalize("vector", DistanceMetric::CosineDistance)
+                .is_ok(),
+            size == 10752
+        );
+    }
+    for size in [4096, 4097] {
+        let value = serde_json::Value::Object(
+            (0..size)
+                .map(|i| (i.to_string(), serde_json::json!(1.0)))
+                .collect(),
+        );
+        assert_eq!(decode_sparse(&value).is_ok(), size == 4096);
+        assert_eq!(
+            RankBy::parse(serde_json::json!(["s", "SparseKNN", value])).is_ok(),
+            size == 4096
+        );
+    }
+}
