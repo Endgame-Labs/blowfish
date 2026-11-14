@@ -414,3 +414,25 @@ async fn patch_by_filter_cap_is_atomic_and_partial_reports_remaining() {
     assert_eq!(r.rows_patched, Some(1));
     assert_eq!(r.rows_remaining, Some(false));
 }
+
+#[tokio::test]
+async fn attribute_scores_accept_a_literal_zero_floor() {
+    let e = engine().await;
+    write(
+        &e,
+        "scores",
+        json!({"upsert_rows":[{"id":1,"n":-2},{"id":2,"n":3},{"id":3,"n":1}]}),
+    )
+    .await
+    .unwrap();
+    let result = query(
+        &e,
+        "scores",
+        json!({"rank_by":["Max",[0,["Attribute","n"]]],"top_k":10}),
+    )
+    .await;
+    assert_eq!(
+        result["rows"],
+        json!([{"id":2,"$dist":3.0},{"id":3,"$dist":1.0}])
+    );
+}

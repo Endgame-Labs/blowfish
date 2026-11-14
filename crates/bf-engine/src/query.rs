@@ -341,6 +341,7 @@ fn attribute<'a>(state: &'a NamespaceState, name: &str) -> Result<&'a AttributeS
 }
 fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result<(), ApiError> {
     match rank {
+        RankBy::Constant(_) => {}
         RankBy::Order(keys) => {
             for key in keys {
                 if !matches!(
@@ -497,6 +498,7 @@ fn parameter(params: &Value, name: &str, default: f64) -> Result<f64, ApiError> 
 }
 fn score(state: &NamespaceState, doc: &Document, rank: &RankBy) -> Result<f64, ApiError> {
     Ok(match rank {
+        RankBy::Constant(n) => n.as_f64().expect("JSON number fits f64"),
         RankBy::Bm25 {
             attribute,
             query,
