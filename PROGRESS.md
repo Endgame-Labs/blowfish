@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Always-on deployment documented and verified.** Added systemd and Caddy guidance covering
+  stable release installation, root-only credentials, resource limits, readiness, and redeployment.
+  A live S3-compatible deployment passed official Python SDK upsert, ANN, BM25, and filter checks
+  through Caddy, including query recovery after a restart. Object placement was checked directly,
+  and the test namespace was deleted. Existing upstream private access controls were preserved.
+  Verified: release build, formatting, strict Clippy, and the Rust test suite.
+
 - **perf2 partially merged.** These committed pieces are in:
   - Per-query backend diagnostics.
   - Batched, planned BM25 posting reads for cold queries.

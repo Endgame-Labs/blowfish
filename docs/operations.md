@@ -4,6 +4,94 @@ Object storage is the source of truth. Local process state is disposable; protec
 credentials. Use blowfish for development, testing, and modest deployments. For production at scale,
 we recommend turbopuffer as the upgrade path, using the same SDKs with a different base URL and key.
 
+## Running under systemd with Caddy
+
+Install a release binary outside the checkout so subsequent builds cannot change the deployed
+executable. On a shared build host, check available memory first, and limit Cargo parallelism:
+
+```bash
+free -g
+CARGO_BUILD_JOBS=4 cargo build --release -p blowfish
+sudo install -o root -g root -m 755 target/release/blowfish /usr/local/bin/blowfish.next
+sudo mv /usr/local/bin/blowfish.next /usr/local/bin/blowfish
+```
+
+Create a dedicated system user named `blowfish`, and put configuration in
+`/etc/blowfish/blowfish.toml`, readable by that user. Bind `listen` to `127.0.0.1:8080`, set
+`require_auth = true`, and use a dedicated storage prefix. Put `BLOWFISH_ADMIN_KEY`,
+`AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` in `/etc/blowfish/env`, owned by root with mode
+600. Generate the admin key with a cryptographically secure random generator; never echo it or
+put secrets in command arguments. Systemd reads the environment file before dropping privileges;
+the service user does not need file access to it.
+
+A starting unit at `/etc/systemd/system/blowfish.service` is:
+
+```ini
+[Unit]
+Description=blowfish search service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=blowfish
+Group=blowfish
+EnvironmentFile=/etc/blowfish/env
+ExecStart=/usr/local/bin/blowfish serve --config /etc/blowfish/blowfish.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+StateDirectory=blowfish
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/blowfish
+UMask=0077
+MemoryHigh=6G
+MemoryMax=8G
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Set `storage.cache.disk_dir` under `/var/lib/blowfish`, and configure explicit memory and disk
+cache budgets. A 1 GiB memory cache and a 32 GiB disk cache are a modest starting point on a
+shared 32 GiB host. The process limit covers more than the byte cache: decoded indexes, document
+state, requests, and background work also consume memory. Tune WAL backpressure and concurrency
+for the workload; hitting `MemoryMax` can kill the process.
+
+When an upstream proxy terminates HTTPS, Caddy can listen on an internal HTTP port:
+
+```caddyfile
+:8000 {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Restrict access to this HTTP listener through the host or upstream network policy. For direct
+Internet access, configure a domain and TLS in Caddy instead. Keep any existing upstream access
+controls when adding the service. Avoid logging authorization headers.
+
+Validate the unit and Caddy configuration, run `sudo systemctl daemon-reload`, and enable the
+services with `sudo systemctl enable --now blowfish caddy`. Use
+`sudo journalctl -u blowfish -u caddy -f` for logs. A systemd `active` state does not mean the
+application has finished its storage probe: wait for an authenticated `GET /` through Caddy to
+return 200. Missing credentials should return 401.
+
+For each deployment, record the source commit, retain the previous installed binary for rollback,
+replace the binary atomically, and restart the service deliberately. Verify an SDK write, vector
+search, full-text search, and filter through the proxy; restart, wait for readiness, and repeat the
+queries before deleting the test namespace. Check the object-store prefix directly as well.
+Namespace deletion can retain permanent WAL fences; do not remove these manually.
+
 ## Storage and writers
 
 Implemented backends are local filesystem, S3-compatible object storage, and disposable in-memory
