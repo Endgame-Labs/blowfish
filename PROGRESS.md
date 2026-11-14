@@ -4,6 +4,25 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-14
 
+- **Security audit merged.** An independent pass fixed 11 real issues, each with a regression test.
+  - **High:**
+    - Scoped `keys` managers could inspect and revoke broader keys.
+    - Stale key caches failed open.
+    - Array grouping could expand exponentially.
+    - Highlights could amplify memory.
+    - A computed `id` could corrupt rows and panic RRF.
+  - **Medium:** compressed-body limits, vector dimension caps, value and document size caps,
+    expression depth limits (with a 512-case proptest harness), and fuzzy and highlight work budgets.
+  - **Docs:** `docs/security.md` covers the threat model, a route-by-route auth matrix, limits, and
+    how to report vulnerabilities.
+  - **Secrets:** no credentials or private hostnames anywhere in git history (targeted scan).
+  - **Verified on main:** 143 Rust tests pass, and compat was 121/121 in both modes on the audit
+    branch.
+  - **Open gaps** (being worked next):
+    - **High:** aggregate admission control and namespace-handle eviction.
+    - **Medium:** async operations don't resume after a crash; `read_only` isn't serialized with
+      writes; historical values aren't revalidated when `filterable` is enabled; and branch pins are
+      permanent.
 - **Final wave launched:**
   - **Audit:** an independent security and correctness audit, fixing what it finds, covering RBAC on
     every route, path traversal into object keys, DoS limits, WAL and GC safety, panics, and secrets.
