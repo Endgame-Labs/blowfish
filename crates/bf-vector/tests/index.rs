@@ -355,3 +355,123 @@ proptest! {
         });
     }
 }
+
+#[tokio::test]
+async fn half_ivf_and_identical_vectors() {
+    let input = clustered(2300, 33);
+    let half_rows: Vec<_> = input
+        .iter()
+        .map(|(r, v)| {
+            (
+                *r,
+                v.iter()
+                    .map(|x| bf_vector::f16::from_f32(*x))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let builder = IndexBuilder::new(33, Metric::CosineDistance)
+        .unwrap()
+        .vector_type(VectorType::F16);
+    let blob = builder.build_f16(&half_rows).unwrap();
+    let stored: Vec<_> = half_rows
+        .iter()
+        .map(|(r, v)| (*r, v.iter().map(|x| x.to_f32()).collect::<Vec<_>>()))
+        .collect();
+    let index = Index::open(blob).await.unwrap();
+    let exact = exact_search(&stored, &input[317].1, 10, Metric::CosineDistance, None).unwrap();
+    let ann = index
+        .search(&input[317].1, 10, SearchParams::default(), None)
+        .await
+        .unwrap();
+    assert!(recall_at_k(&ann, &exact) >= 0.95);
+    let identical: Vec<_> = (0..2100).map(|r| (r, vec![1.; 3])).collect();
+    let blob = IndexBuilder::new(3, Metric::EuclideanSquared)
+        .unwrap()
+        .build(&identical)
+        .unwrap();
+    let index = Index::open(blob).await.unwrap();
+    let result = index
+        .search(&[1.; 3], 10, SearchParams::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(result, (0..10).map(|r| (r, 0.)).collect::<Vec<_>>());
+}
+
+/// Supply raw row-major f32-LE files from a public embedding corpus. This is
+/// opt-in so CI neither downloads data nor silently substitutes synthetic data.
+#[test]
+#[ignore = "requires BF_VECTOR_REAL_VECTORS and BF_VECTOR_REAL_QUERIES, both raw 100-dimensional f32-LE"]
+fn real_embedding_recall() {
+    fn load(name: &str) -> Vec<(u32, Vec<f32>)> {
+        let bytes = std::fs::read(std::env::var(name).expect(name)).unwrap();
+        assert_eq!(bytes.len() % 400, 0);
+        bytes
+            .chunks(400)
+            .enumerate()
+            .map(|(i, chunk)| {
+                (
+                    i as u32,
+                    chunk
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_le_bytes(*b))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+    let rows = load("BF_VECTOR_REAL_VECTORS");
+    let queries = load("BF_VECTOR_REAL_QUERIES");
+    assert!(rows.len() >= 100_000);
+    assert!(queries.len() >= 100);
+    futures::executor::block_on(async {
+        let blob = IndexBuilder::new(100, Metric::CosineDistance)
+            .unwrap()
+            .build(&rows)
+            .unwrap();
+        let index = Index::open(blob).await.unwrap();
+        let mut recall = 0.;
+        for (_, q) in queries.iter().take(100) {
+            let ann = index
+                .search(q, 10, SearchParams::default(), None)
+                .await
+                .unwrap();
+            let exact = exact_search(&rows, q, 10, Metric::CosineDistance, None).unwrap();
+            recall += recall_at_k(&ann, &exact);
+        }
+        let recall = recall / 100.;
+        eprintln!("public embedding recall@10: {recall:.4}");
+        assert!(recall >= 0.95, "recall@10 {recall:.4} is below 0.95");
+    });
+}
+
+#[tokio::test]
+async fn corrupt_codes_and_footer_version() {
+    let data = clustered(2100, 8);
+    let builder = IndexBuilder::new(8, Metric::EuclideanSquared).unwrap();
+    let blob = builder.build(&data).unwrap();
+    let meta = metadata_len(&blob).unwrap() as usize;
+    let mut corrupt = blob.clone();
+    corrupt[meta] ^= 1;
+    let index = Index::open(corrupt).await.unwrap();
+    assert!(
+        index
+            .search(
+                &data[9].1,
+                10,
+                SearchParams {
+                    nprobe: usize::MAX,
+                    rerank_factor: 1
+                },
+                None
+            )
+            .await
+            .is_err()
+    );
+    let mut future_version = blob;
+    let offset = future_version.len() - 64 + 8;
+    future_version[offset..offset + 4].copy_from_slice(&2u32.to_le_bytes());
+    assert!(Index::open(future_version).await.is_err());
+}

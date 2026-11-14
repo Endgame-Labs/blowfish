@@ -151,12 +151,12 @@ impl RaBitQ {
             / (self.padded as f64).sqrt();
         let q2 = q.iter().map(|x| x * x).sum::<f64>();
         let distance = code.norm * code.norm + q2 - 2. * code.norm * dot / code.alpha;
-        let perpendicular = q2.sqrt();
+        let query_norm = q2.sqrt();
         let angular_error = (1. - code.alpha * code.alpha).max(0.).sqrt() / code.alpha;
         let margin = 1e-10 * (code.norm * code.norm + q2 + distance.abs() + 1.);
         DistanceEstimate {
             distance,
-            error_bound: 2. * code.norm * angular_error * perpendicular + margin,
+            error_bound: 2. * code.norm * angular_error * query_norm + margin,
         }
     }
 }
@@ -205,12 +205,22 @@ impl PreparedQuery {
         bits: &[u8],
         padded: usize,
     ) -> DistanceEstimate {
-        let dot = self
-            .tables
-            .iter()
-            .zip(bits)
-            .map(|(table, b)| table[*b as usize])
-            .sum::<f64>()
+        // Independent accumulators avoid a long dependent floating-point sum.
+        let (tables, tail) = self.tables.as_chunks::<4>();
+        let (codes, code_tail) = bits.as_chunks::<4>();
+        let mut sums = [0.; 4];
+        for (t, b) in tables.iter().zip(codes) {
+            sums[0] += t[0][b[0] as usize];
+            sums[1] += t[1][b[1] as usize];
+            sums[2] += t[2][b[2] as usize];
+            sums[3] += t[3][b[3] as usize];
+        }
+        let dot = (sums.iter().sum::<f64>()
+            + tail
+                .iter()
+                .zip(code_tail)
+                .map(|(t, b)| t[*b as usize])
+                .sum::<f64>())
             / (padded as f64).sqrt();
         let distance = norm * norm + self.norm2 - 2. * norm * dot / alpha;
         let margin = 1e-10 * (norm * norm + self.norm2 + distance.abs() + 1.);
@@ -236,6 +246,8 @@ mod tests {
             let rq = RaBitQ::new(v.len(), 17).unwrap();
             let code = rq.encode(&v,&c).unwrap();
             let e = rq.estimate(&code,&q,&c).unwrap();
+            let fast = PreparedQuery::new(&rq.residual(&q,&c)).estimate(code.norm,code.alpha,&code.bits,rq.padded);
+            prop_assert!((fast.distance-e.distance).abs() < 1e-8*e.distance.abs().max(1.));
             let truth: f64 = v.iter().zip(&q).map(|(a,b)|(*a as f64-*b as f64).powi(2)).sum();
             prop_assert!((e.distance-truth).abs() <= e.error_bound);
         }

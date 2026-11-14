@@ -24,7 +24,7 @@ pub struct SearchParams {
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            nprobe: 64,
+            nprobe: 128,
             rerank_factor: 64,
         }
     }

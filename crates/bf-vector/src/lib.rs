@@ -1,4 +1,6 @@
 //! Object-storage-friendly vector distances, immutable IVF indexes, and exact search.
+#![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 
 mod cluster;
 mod distance;

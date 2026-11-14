@@ -27,12 +27,34 @@ impl Metric {
         Ok(self.distance_unchecked(a, b))
     }
 
-    /// Distance between stored half-precision vectors. Conversion is exact;
-    /// arithmetic uses the same SIMD f32 kernels as [`Self::distance`].
+    /// Compute directly over half-precision storage using NumKong's native
+    /// runtime-dispatched f16 kernels, without converting or allocating.
     pub fn distance_f16(self, a: &[f16], b: &[f16]) -> Result<f32> {
-        let a: Vec<_> = a.iter().map(|v| v.to_f32()).collect();
-        let b: Vec<_> = b.iter().map(|v| v.to_f32()).collect();
-        self.distance(&a, &b)
+        if a.is_empty() || a.len() != b.len() || a.iter().chain(b).any(|x| !x.is_finite()) {
+            return Err(Error::InvalidInput(
+                "expected matching, nonempty, finite vectors".into(),
+            ));
+        }
+        // SAFETY: both pinned types are repr(transparent) wrappers around u16,
+        // admit all bit patterns, and have the same IEEE binary16 representation.
+        // These shared slices retain the original allocation and lifetime.
+        let as_numkong = |v: &[f16]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<numkong::f16>(), v.len())
+        };
+        let a = as_numkong(a);
+        let b = as_numkong(b);
+        match self {
+            Self::EuclideanSquared => Ok(numkong::f16::sqeuclidean(a, b).unwrap()),
+            Self::CosineDistance => {
+                let aa = numkong::f16::dot(a, a).unwrap() as f64;
+                let bb = numkong::f16::dot(b, b).unwrap() as f64;
+                if aa == 0. || bb == 0. {
+                    return Ok(if aa == bb { 0. } else { 1. });
+                }
+                let ab = numkong::f16::dot(a, b).unwrap() as f64;
+                Ok((1. - ab / (aa.sqrt() * bb.sqrt())).clamp(0., 2.) as f32)
+            }
+        }
     }
 
     pub(crate) fn distance_unchecked(self, a: &[f32], b: &[f32]) -> f32 {
@@ -173,7 +195,10 @@ mod tests {
             let bh: Vec<_> = b.iter().map(|x| f16::from_f32(*x)).collect();
             let af: Vec<_> = ah.iter().map(|x| x.to_f32()).collect();
             let bf: Vec<_> = bh.iter().map(|x| x.to_f32()).collect();
-            prop_assert_eq!(Metric::EuclideanSquared.distance_f16(&ah,&bh).unwrap(), Metric::EuclideanSquared.distance(&af,&bf).unwrap());
+            let got = Metric::EuclideanSquared.distance_f16(&ah,&bh).unwrap();
+            let expected = Metric::EuclideanSquared.distance(&af,&bf).unwrap();
+            prop_assert!((got-expected).abs() <= 2e-5*expected.max(1.));
+            prop_assert!((Metric::CosineDistance.distance_f16(&ah,&bh).unwrap()-scalar_cosine(&af,&bf)).abs() < 2e-5);
             prop_assert_eq!(decode_base64_f32(&encode_base64_f32(&a)).unwrap(), a);
         }
     }
