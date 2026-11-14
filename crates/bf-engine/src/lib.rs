@@ -6,7 +6,7 @@ mod segment;
 mod snapshot;
 pub use indexer::EngineConfig;
 mod query;
-pub mod text_fallback;
+mod text;
 mod write;
 
 use bf_storage::{CreateResult, Storage};
@@ -37,6 +37,7 @@ pub(crate) struct NamespaceState {
     pub tail_since: Option<DateTime<Utc>>,
     pub stats: bf_wal::NamespaceStats,
     pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
+    pub corpus: BTreeMap<String, bf_text::CorpusStats>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub refreshed: Instant,
@@ -57,6 +58,7 @@ impl Default for NamespaceState {
             tail_since: None,
             stats: Default::default(),
             scores: BTreeMap::new(),
+            corpus: BTreeMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             refreshed: Instant::now(),
@@ -301,10 +303,9 @@ impl Engine {
         request: QueryRequest,
     ) -> Result<QueryResponse, ApiError> {
         let (state, _) = self.snapshot(ns, &request.consistency).await?;
-        query::execute(
-            &snapshot::materialize(&self.0.store, &state).await?,
-            &request,
-        )
+        let mut full = snapshot::materialize(&self.0.store, &state).await?;
+        text::reference_stats(&mut full);
+        query::execute(&full, &request)
     }
     /// Namespace metadata, with fully expanded schema settings.
     pub async fn metadata(&self, ns: &str) -> Result<Value, ApiError> {

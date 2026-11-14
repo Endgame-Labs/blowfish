@@ -140,18 +140,24 @@ pub(crate) async fn for_writes(
         }
         wanted.extend(req.deletes.iter().flatten().cloned());
     }
+    if state.schema.get("id").and_then(|s| s.data_type.as_ref())
+        == Some(&AttributeType::Scalar(ScalarType::Uuid))
+    {
+        wanted = wanted
+            .into_iter()
+            .map(|id| match id {
+                Id::String(s) => uuid::Uuid::parse_str(&s)
+                    .map(|id| Id::String(id.to_string()))
+                    .unwrap_or(Id::String(s)),
+                id => id,
+            })
+            .collect();
+    }
     let mut full = state.clone();
     for seg in &state.segments {
         let live = segment::live(store, seg).await?;
-        let mut rows = RoaringBitmap::new();
-        for id in &wanted {
-            if !state.shadowed.contains(id)
-                && let Some(row) = segment::lookup(store, seg, id).await?
-                && live.contains(row)
-            {
-                rows.insert(row);
-            }
-        }
+        let wanted = wanted.difference(&state.shadowed).cloned().collect();
+        let rows = segment::lookup_many(store, seg, &wanted).await? & live;
         full.docs
             .extend(segment::documents(store, seg, &rows).await?);
     }

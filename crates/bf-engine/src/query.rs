@@ -1,4 +1,4 @@
-use crate::{Engine, NamespaceState, filter, text_fallback};
+use crate::{Engine, NamespaceState, filter, text};
 use bf_types::*;
 use serde_json::{Value, json};
 use std::{
@@ -391,7 +391,7 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
             {
                 return Err(ApiError::bad("full-text query exceeds 8192 bytes"));
             }
-            if cfg.tokenizer == "pre_tokenized_array" && !query.is_array() {
+            if cfg.tokenizer == bf_text::Tokenizer::PreTokenizedArray && !query.is_array() {
                 return Err(ApiError::bad("pre_tokenized_array requires an array query"));
             }
         }
@@ -506,20 +506,39 @@ fn score(state: &NamespaceState, doc: &Document, rank: &RankBy) -> Result<f64, A
             attribute,
             query,
             params,
-        } => text_fallback::score(
-            doc,
-            attribute,
-            query,
-            params
-                .as_ref()
-                .and_then(|p| p.get("last_as_prefix"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            state.docs.values(),
-            &state.schema[attribute]
-                .text_config()
-                .expect("validated FTS"),
-        ),
+        } => {
+            if let Some(scores) = state.scores.get(&crate::indexed::rank_key(rank)) {
+                let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
+                *scores.get(&id).unwrap_or(&0.0)
+            } else {
+                let cfg = state.schema[attribute]
+                    .text_config()
+                    .expect("validated FTS");
+                let query =
+                    bf_text::Query::new(text::tokens(query, &cfg), text::prefix(params.as_ref()));
+                let fallback;
+                let stats = if let Some(stats) = state.corpus.get(attribute) {
+                    stats
+                } else {
+                    fallback = bf_text::CorpusStats::from_documents(
+                        &state
+                            .docs
+                            .values()
+                            .filter_map(|d| d.get(attribute))
+                            .filter(|v| !v.is_null())
+                            .map(|v| text::tokens(v, &cfg))
+                            .collect::<Vec<_>>(),
+                    );
+                    &fallback
+                };
+                bf_text::score_document(
+                    &text::tokens(doc.get(attribute).unwrap_or(&Value::Null), &cfg),
+                    &query,
+                    stats,
+                    &cfg,
+                ) as f64
+            }
+        }
         RankBy::Sum(xs) => xs
             .iter()
             .map(|x| score(state, doc, x))

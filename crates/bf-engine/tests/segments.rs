@@ -243,3 +243,88 @@ async fn ivf_ann_recall_filtered_knn_and_f16_files() {
         .unwrap();
     assert_eq!(index.vector_type(), bf_vector::VectorType::F16);
 }
+
+#[tokio::test]
+async fn text_statistics_empty_missing_prefix_positions_and_schema_rebuild() {
+    let e = node().await;
+    write(&e,json!({"schema":{"text":{"type":"[]string","full_text_search":{"stemming":true,"remove_stopwords":true}}},"upsert_rows":[
+        {"id":1,"text":["the jumping fox","red birds"]},{"id":2,"text":[]},{"id":3},{"id":4,"text":["jump fox red"]}
+    ]})).await;
+    e.index_namespace("test", true).await.unwrap();
+    write(
+        &e,
+        json!({"patch_rows":[{"id":1,"text":["red fox birds birds"]}],"deletes":[4]}),
+    )
+    .await;
+    for indexed in [false, true] {
+        if indexed {
+            e.index_namespace("test", true).await.unwrap();
+        }
+        for q in [
+            json!({"rank_by":["text","BM25","red birds"],"top_k":10}),
+            json!({"rank_by":["text","BM25","red bi",{"last_as_prefix":true}],"top_k":10}),
+            json!({"rank_by":["id","asc"],"filters":["text","ContainsTokenSequence","fox birds"],"top_k":10}),
+            json!({"rank_by":["id","asc"],"filters":["text","ContainsAllTokens",""],"top_k":10}),
+            json!({"rank_by":["Decay",["text","BM25","bird"],{"midpoint":1}],"top_k":10}),
+        ] {
+            let q: QueryRequest = serde_json::from_value(q).unwrap();
+            assert_eq!(
+                serde_json::to_value(e.query("test", q.clone()).await.unwrap().result).unwrap(),
+                serde_json::to_value(e.query_exhaustive("test", q).await.unwrap().result).unwrap()
+            );
+        }
+    }
+    let (_, m) = Wal::new(e.storage().clone(), "test")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.stats.text["text"].documents, 2);
+    assert_eq!(m.stats.text["text"].total_length, 5);
+    write(
+        &e,
+        json!({"schema":{"text":{"full_text_search":{"tokenizer":"pre_tokenized_array"}}}}),
+    )
+    .await;
+    let q: QueryRequest = serde_json::from_value(
+        json!({"rank_by":["text","BM25",["red fox birds birds"]],"top_k":10}),
+    )
+    .unwrap();
+    let before = serde_json::to_value(e.query("test", q.clone()).await.unwrap().result).unwrap();
+    e.index_namespace("test", true).await.unwrap();
+    assert_eq!(
+        before,
+        serde_json::to_value(e.query("test", q.clone()).await.unwrap().result).unwrap()
+    );
+    assert_eq!(
+        before,
+        serde_json::to_value(e.query_exhaustive("test", q).await.unwrap().result).unwrap()
+    );
+    let metadata = e.metadata("test").await.unwrap();
+    assert!(metadata["schema"]["text"]["full_text_search"]["language"].is_null());
+    assert!(metadata["schema"]["text"]["full_text_search"]["max_token_length"].is_null());
+}
+
+#[tokio::test]
+async fn cjk_tokenizers_and_pre_tokenized_phrase_filters_use_indexes() {
+    for (tokenizer, text, term) in [
+        ("smartcn", "我是中国人", "中国"),
+        ("kuromoji", "東京の猫", "東京"),
+        ("nori", "한국 사람", "한국"),
+    ] {
+        let e = node().await;
+        write(&e,json!({"schema":{"text":{"type":"string","full_text_search":{"tokenizer":tokenizer}}},"upsert_rows":[{"id":1,"text":text}]})).await;
+        e.index_namespace("test", true).await.unwrap();
+        let q: QueryRequest =
+            serde_json::from_value(json!({"rank_by":["text","BM25",term],"top_k":10})).unwrap();
+        assert_eq!(
+            serde_json::to_value(e.query("test", q.clone()).await.unwrap().result).unwrap(),
+            serde_json::to_value(e.query_exhaustive("test", q).await.unwrap().result).unwrap()
+        );
+    }
+    let e = node().await;
+    write(&e,json!({"schema":{"text":{"type":"[]string","full_text_search":{"tokenizer":"pre_tokenized_array"}}},"upsert_rows":[{"id":1,"text":["A","B","C"]}]})).await;
+    e.index_namespace("test", true).await.unwrap();
+    assert_eq!(query(&e,json!({"rank_by":["id","asc"],"top_k":5,"filters":["text","ContainsTokenSequence",["B","C"]]})).await["rows"],json!([{"id":1}]));
+}

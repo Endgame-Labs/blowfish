@@ -177,7 +177,7 @@ pub(crate) fn prepare(
     }
     for cfg in state.schema.values() {
         if let Some(config) = cfg.text_config() {
-            crate::text_fallback::validate_config(&config)?;
+            config.validate().map_err(ApiError::bad)?;
         }
     }
     if !current.exists

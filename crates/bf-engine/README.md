@@ -64,3 +64,24 @@ rows. Independently, `recall_sample_rate` defaults to 0.01 and records backgroun
 exact comparisons in the `blowfish_ann_recall` histogram through `metrics`.
 A 5,000-row randomized IVF test requires mean recall@10 >= 0.95, compares filtered
 kNN with exhaustive results, and verifies that f16 indexes persist f16 elements.
+
+Full-text fields have bf-text `.bft` indexes with positions. BM25 and token filters
+use their posting readers; score expressions reuse per-clause BM25 scores with the
+existing exact expression evaluator. Namespace-wide statistics count present empty
+fields as length one and exclude missing/null fields. Checkpoint statistics exclude
+deleted rows, and query snapshots subtract rows shadowed by the tail before adding
+the tail's counts. Scores therefore do not depend on segment boundaries. Parameter
+changes rebuild indexes, and transitional queries use the current analyzer on raw
+columns until a matching index is published. All documented tokenizers, including
+CJK dictionaries and pre-tokenized arrays, use bf-text's validated parameters.
+
+The temporary `text_fallback` module has been removed. `bf-types::FullTextConfig`
+is now the shared bf-text parameter type. Scalar queries use filter bitmaps and
+column blocks; order-by, aggregates, and general score expressions still materialize
+eligible scalar rows for reference result assembly. This preserves exact behavior,
+though streaming aggregate/order-by merging remains a performance improvement.
+
+The full-text integration passed the unchanged **96/96** compatibility suite with
+one-row/one-millisecond index thresholds. Additional tests compare indexed and
+exhaustive scoring across empty/missing fields, shadowed rows, deletions, prefix
+queries, phrase boundaries, CJK tokenizers, and tokenizer rebuilds.

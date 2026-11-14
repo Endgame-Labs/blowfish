@@ -120,6 +120,9 @@ pub struct Segment {
     pub wal_start: u64,
     pub wal_end: u64,
     pub row_count: u32,
+    /// Build-time schema allows queries to detect indexes needing a schema rebuild.
+    #[serde(default)]
+    pub schema: Schema,
     pub files: std::collections::BTreeMap<String, SegmentFile>,
     pub live: SegmentFile,
     pub live_generation: u64,

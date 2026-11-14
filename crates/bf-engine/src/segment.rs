@@ -326,6 +326,32 @@ pub(crate) async fn build(
             );
         }
     }
+    for (column, (name, config)) in schema.iter().enumerate() {
+        if let Some(params) = config.text_config() {
+            let mut builder = bf_text::SegmentBuilder::with_tokenizer(true, params.tokenizer);
+            for row in &rows {
+                if let Some(value) = row.get(name).filter(|v| !v.is_null()) {
+                    builder
+                        .add_document(&crate::text::tokens(value, &params))
+                        .map_err(index_error)?;
+                } else {
+                    builder.add_missing_document().map_err(index_error)?;
+                }
+            }
+            let bytes = builder.finish().map_err(index_error)?;
+            let metadata_len = 72;
+            files.insert(
+                format!("fts:{name}"),
+                put_file(
+                    store,
+                    format!("{prefix}/fts.{column}.bft"),
+                    bytes,
+                    metadata_len,
+                )
+                .await?,
+            );
+        }
+    }
     let live = put_value(
         store,
         format!("{prefix}/live.00000000000000000000.bfl"),
@@ -337,6 +363,7 @@ pub(crate) async fn build(
         wal_start: start,
         wal_end: end,
         row_count,
+        schema: schema.clone(),
         files,
         live,
         live_generation: 0,
@@ -376,22 +403,28 @@ pub(crate) async fn ids(store: &Storage, segment: &Segment) -> Result<Vec<Id>, A
     }
     Ok(index.ids)
 }
-pub(crate) async fn lookup(
+pub(crate) async fn lookup_many(
     store: &Storage,
     segment: &Segment,
-    wanted: &Id,
-) -> Result<Option<u32>, ApiError> {
+    wanted: &std::collections::BTreeSet<Id>,
+) -> Result<RoaringBitmap, ApiError> {
     let index: IdIndex = get_value(store, segment.files.get("ids").ok_or_else(corrupt)?).await?;
-    if index.bloom.is_empty() {
+    if index.bloom.is_empty() || index.ids.len() != segment.row_count as usize {
         return Err(corrupt());
     }
-    if hashes(wanted, index.bloom.len() * 8)
-        .iter()
-        .any(|b| index.bloom[b / 8] & (1 << (b % 8)) == 0)
-    {
-        return Ok(None);
+    let mut rows = RoaringBitmap::new();
+    for id in wanted {
+        if hashes(id, index.bloom.len() * 8)
+            .iter()
+            .any(|b| index.bloom[b / 8] & (1 << (b % 8)) == 0)
+        {
+            continue;
+        }
+        if let Ok(row) = index.ids.binary_search(id) {
+            rows.insert(row as u32);
+        }
     }
-    Ok(index.ids.binary_search(wanted).ok().map(|i| i as u32))
+    Ok(rows)
 }
 pub(crate) async fn documents(
     store: &Storage,
@@ -508,7 +541,43 @@ pub(crate) fn filter_rows<'a>(
                 Ok(out)
             }
             Filter::Not(f) => Ok(live - filter_rows(store, segment, f, schema, live).await?),
-            Filter::Compare { attribute, .. } => {
+            Filter::Compare {
+                attribute,
+                op,
+                value,
+                params,
+            } => {
+                if matches!(
+                    op,
+                    bf_types::FilterOp::ContainsAllTokens
+                        | bf_types::FilterOp::ContainsAnyToken
+                        | bf_types::FilterOp::ContainsTokenSequence
+                ) && seg_text_matches(segment, schema, attribute)
+                    && let Some(file) = segment.files.get(&format!("fts:{attribute}"))
+                {
+                    let cfg = schema[attribute].text_config().expect("validated FTS");
+                    let query = bf_text::Query::new(
+                        crate::text::tokens(value, &cfg),
+                        crate::text::prefix(params.as_ref()),
+                    );
+                    let reader = bf_text::SegmentReader::open(std::sync::Arc::new(ObjectReader {
+                        store: store.clone(),
+                        file: file.clone(),
+                    }))
+                    .await
+                    .map_err(index_error)?;
+                    let rows = match op {
+                        bf_types::FilterOp::ContainsAllTokens => {
+                            reader.contains_all_tokens(&query).await
+                        }
+                        bf_types::FilterOp::ContainsAnyToken => {
+                            reader.contains_any_token(&query).await
+                        }
+                        _ => reader.contains_token_sequence(&query).await,
+                    }
+                    .map_err(index_error)?;
+                    return Ok(rows & live);
+                }
                 let reader = ObjectReader {
                     store: store.clone(),
                     file: segment.files.get("filters").ok_or_else(corrupt)?.clone(),
@@ -565,4 +634,18 @@ impl bf_vector::RangeRead for ObjectReader {
     async fn read(&self, range: Range<u64>) -> io::Result<Bytes> {
         ObjectReader::read(self, range).await
     }
+}
+
+#[async_trait::async_trait]
+impl bf_text::RangeRead for ObjectReader {
+    fn len(&self) -> u64 {
+        self.file.size
+    }
+    async fn read(&self, range: Range<u64>) -> io::Result<Bytes> {
+        ObjectReader::read(self, range).await
+    }
+}
+pub(crate) fn seg_text_matches(segment: &Segment, schema: &Schema, attribute: &str) -> bool {
+    segment.schema.get(attribute).and_then(|s| s.text_config())
+        == schema.get(attribute).and_then(|s| s.text_config())
 }

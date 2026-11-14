@@ -20,6 +20,9 @@ pub(crate) async fn execute(
     let mut empty = state.clone();
     empty.docs.clear();
     query::execute(&empty, request)?;
+    let mut prepared = state.clone();
+    prepared.corpus = crate::text::global_stats(store, state).await?;
+    let state = &prepared;
     let mut candidates = state.clone();
     candidates.docs.clear();
     for q in request
@@ -51,7 +54,7 @@ async fn prepare(
         },
     ) = &q.rank_by
     else {
-        return snapshot::materialize(store, state).await;
+        return prepare_scalar(store, state, q).await;
     };
     if state.metric == DistanceMetric::CosineDistance && vector.iter().all(|x| *x == 0.0) {
         return snapshot::materialize(store, state).await;
@@ -170,4 +173,178 @@ pub(crate) fn recall(ann: &QueryResponse, exact: &QueryResponse) -> f64 {
     } else {
         ann.intersection(&exact).count() as f64 / exact.len() as f64
     }
+}
+
+fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) {
+    match rank {
+        RankBy::Bm25 { .. } => clauses.push(rank),
+        RankBy::Sum(xs) | RankBy::Max(xs) => {
+            for x in xs {
+                text_clauses(x, clauses);
+            }
+        }
+        RankBy::Product { expr, .. }
+        | RankBy::Saturate { expr, .. }
+        | RankBy::Decay { expr, .. }
+        | RankBy::Dist { expr, .. } => text_clauses(expr, clauses),
+        _ => {}
+    }
+}
+async fn prepare_scalar(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+) -> Result<NamespaceState, ApiError> {
+    let mut clauses = vec![];
+    if let Some(rank) = &q.rank_by {
+        text_clauses(rank, &mut clauses);
+    }
+    let plain_text = matches!(q.rank_by, Some(RankBy::Bm25 { .. }));
+    let k = q.total().unwrap_or(10000) + q.offset;
+    let all = !plain_text || q.limit.as_ref().and_then(Limit::per).is_some();
+    let mut out = state.clone();
+    out.docs.clear();
+    let columns: BTreeSet<_> = state
+        .schema
+        .iter()
+        .filter(|(name, cfg)| {
+            cfg.data_type
+                .as_ref()
+                .is_none_or(|t| t.dimensions().is_none())
+                || match &q.include_attributes {
+                    Some(IncludeAttributes::All(true)) => true,
+                    Some(IncludeAttributes::Names(names)) => names.contains(name),
+                    _ => q
+                        .exclude_attributes
+                        .as_ref()
+                        .is_some_and(|names| !names.contains(name)),
+                }
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for clause in &clauses {
+        out.scores.entry(rank_key(clause)).or_default();
+    }
+    for seg in &state.segments {
+        let allowed = snapshot::allowed(store, state, seg, q.filters.as_ref()).await?;
+        if allowed.is_empty() {
+            continue;
+        }
+        let mut selected = if all {
+            allowed.clone()
+        } else {
+            RoaringBitmap::new()
+        };
+        let ids = if clauses.is_empty() {
+            vec![]
+        } else {
+            segment::ids(store, seg).await?
+        };
+        for clause in &clauses {
+            let RankBy::Bm25 {
+                attribute,
+                query,
+                params,
+            } = clause
+            else {
+                unreachable!()
+            };
+            let cfg = state.schema[attribute]
+                .text_config()
+                .expect("validated FTS");
+            let query = bf_text::Query::new(
+                crate::text::tokens(query, &cfg),
+                crate::text::prefix(params.as_ref()),
+            );
+            let stats = state.corpus.get(attribute).cloned().unwrap_or_default();
+            let top = if all { allowed.len() as usize } else { k };
+            let hits = if segment::seg_text_matches(seg, &state.schema, attribute)
+                && let Some(file) = seg.files.get(&format!("fts:{attribute}"))
+            {
+                let reader =
+                    bf_text::SegmentReader::open(std::sync::Arc::new(segment::ObjectReader {
+                        store: store.clone(),
+                        file: file.clone(),
+                    }))
+                    .await
+                    .map_err(segment::index_error)?;
+                reader
+                    .search(&query, &stats, &cfg, top, Some(&allowed))
+                    .await
+                    .map_err(segment::index_error)?
+            } else {
+                let docs = segment::documents(store, seg, &allowed).await?;
+                let mut hits = vec![];
+                for row in &allowed {
+                    let value = docs[&ids[row as usize]]
+                        .get(attribute)
+                        .unwrap_or(&serde_json::Value::Null);
+                    let score = bf_text::score_document(
+                        &crate::text::tokens(value, &cfg),
+                        &query,
+                        &stats,
+                        &cfg,
+                    );
+                    if score > 0.0 {
+                        hits.push(bf_text::SearchHit { row, score });
+                    }
+                }
+                hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.row.cmp(&b.row)));
+                hits.truncate(top);
+                hits
+            };
+            let scores = out.scores.entry(rank_key(clause)).or_default();
+            for hit in hits {
+                selected.insert(hit.row);
+                scores.insert(ids[hit.row as usize].clone(), hit.score as f64);
+            }
+        }
+        out.docs
+            .extend(segment::projected_documents(store, seg, &selected, Some(&columns)).await?);
+    }
+    for (id, doc) in &state.docs {
+        if !q
+            .filters
+            .as_ref()
+            .map(|f| filter::matches(f, Some(doc), None, &state.schema))
+            .transpose()?
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let mut positive = false;
+        for clause in &clauses {
+            let RankBy::Bm25 {
+                attribute,
+                query,
+                params,
+            } = clause
+            else {
+                unreachable!()
+            };
+            let cfg = state.schema[attribute]
+                .text_config()
+                .expect("validated FTS");
+            let query = bf_text::Query::new(
+                crate::text::tokens(query, &cfg),
+                crate::text::prefix(params.as_ref()),
+            );
+            let stats = state.corpus.get(attribute).cloned().unwrap_or_default();
+            let score = bf_text::score_document(
+                &crate::text::tokens(doc.get(attribute).unwrap_or(&serde_json::Value::Null), &cfg),
+                &query,
+                &stats,
+                &cfg,
+            ) as f64;
+            out.scores
+                .entry(rank_key(clause))
+                .or_default()
+                .insert(id.clone(), score);
+            positive |= score > 0.0;
+        }
+        if all || positive {
+            out.docs.insert(id.clone(), doc.clone());
+        }
+    }
+    Ok(out)
 }

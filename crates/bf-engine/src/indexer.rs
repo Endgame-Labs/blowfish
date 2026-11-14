@@ -115,7 +115,11 @@ fn adjust(
     stats: &mut NamespaceStats,
     docs: &BTreeMap<bf_types::Id, bf_types::Document>,
     add: bool,
+    schema: &bf_types::Schema,
 ) {
+    for doc in docs.values() {
+        crate::text::adjust(stats, doc, schema, add);
+    }
     let rows = docs.len() as u64;
     let bytes: u64 = docs
         .values()
@@ -144,8 +148,15 @@ impl Engine {
         if !state.exists {
             return Ok(false);
         }
+        let rebuild = state.segments.iter().any(|seg| {
+            state
+                .schema
+                .keys()
+                .chain(seg.schema.keys())
+                .any(|name| !segment::seg_text_matches(seg, &state.schema, name))
+        });
         let compact = tier(&state, self.0.config.compaction_segments.max(2));
-        if state.seq == state.indexed_through && compact.is_empty() {
+        if state.seq == state.indexed_through && compact.is_empty() && !rebuild {
             return Ok(false);
         }
         let old = wal.latest_manifest().await.map_err(log_error)?;
@@ -158,6 +169,7 @@ impl Engine {
             .to_std()
             .unwrap_or_default();
         if !force
+            && !rebuild
             && compact.is_empty()
             && state.shadowed.len() < self.0.config.index_rows
             && state.tail_bytes < self.0.config.index_bytes
@@ -229,62 +241,90 @@ impl Engine {
             manifest.segments.clear();
             manifest.stats = NamespaceStats::default();
         }
-        let mut segments = vec![];
-        for mut seg in state.segments.clone() {
-            let live = segment::live(store, &seg).await?;
-            let keep = snapshot::allowed(store, &state, &seg, None).await?;
-            let deleted = &live - &keep;
-            if !deleted.is_empty() {
-                let removed = segment::documents(store, &seg, &deleted).await?;
-                adjust(&mut manifest.stats, &removed, false);
-                retire(&mut manifest, seg.live.key.clone());
-                segment::set_live(store, &mut seg, &keep).await?;
-            }
-            segments.push(seg);
-        }
-        if state.seq > state.indexed_through && !state.docs.is_empty() {
-            segments.push(
-                segment::build(
-                    store,
-                    ns,
-                    &state.schema,
-                    state.metric,
-                    &state.docs,
-                    state.indexed_through + 1,
-                    state.seq,
-                )
-                .await?,
-            );
-            adjust(&mut manifest.stats, &state.docs, true);
-        }
-        // Compaction only replaces selected disjoint live collections. New tail rows
-        // are already masked out of old segments, so the merged result has unique IDs.
-        if !compact.is_empty() {
-            let mut docs = BTreeMap::new();
-            let mut start = u64::MAX;
-            let mut end = 0;
-            let mut remaining = vec![];
-            for seg in segments {
-                if compact.contains(&seg.id) {
-                    let live = segment::live(store, &seg).await?;
-                    docs.extend(segment::documents(store, &seg, &live).await?);
-                    start = start.min(seg.wal_start);
-                    end = end.max(seg.wal_end);
-                    for file in seg.files.values().chain(std::iter::once(&seg.live)) {
-                        retire(&mut manifest, file.key.clone());
-                    }
-                } else {
-                    remaining.push(seg);
+        let segments = if rebuild {
+            let full = snapshot::materialize(store, &state).await?;
+            for seg in &state.segments {
+                for file in seg.files.values().chain(std::iter::once(&seg.live)) {
+                    retire(&mut manifest, file.key.clone());
                 }
             }
-            if !docs.is_empty() {
-                remaining.push(
-                    segment::build(store, ns, &state.schema, state.metric, &docs, start, end)
-                        .await?,
-                );
+            manifest.stats = NamespaceStats::default();
+            adjust(&mut manifest.stats, &full.docs, true, &state.schema);
+            if full.docs.is_empty() {
+                vec![]
+            } else {
+                vec![
+                    segment::build(
+                        store,
+                        ns,
+                        &state.schema,
+                        state.metric,
+                        &full.docs,
+                        1,
+                        state.seq,
+                    )
+                    .await?,
+                ]
             }
-            segments = remaining;
-        }
+        } else {
+            let mut segments = vec![];
+            for mut seg in state.segments.clone() {
+                let live = segment::live(store, &seg).await?;
+                let keep = snapshot::allowed(store, &state, &seg, None).await?;
+                let deleted = &live - &keep;
+                if !deleted.is_empty() {
+                    let removed = segment::documents(store, &seg, &deleted).await?;
+                    adjust(&mut manifest.stats, &removed, false, &state.schema);
+                    retire(&mut manifest, seg.live.key.clone());
+                    segment::set_live(store, &mut seg, &keep).await?;
+                }
+                segments.push(seg);
+            }
+            if state.seq > state.indexed_through && !state.docs.is_empty() {
+                segments.push(
+                    segment::build(
+                        store,
+                        ns,
+                        &state.schema,
+                        state.metric,
+                        &state.docs,
+                        state.indexed_through + 1,
+                        state.seq,
+                    )
+                    .await?,
+                );
+                adjust(&mut manifest.stats, &state.docs, true, &state.schema);
+            }
+            // Compaction only replaces selected disjoint live collections. New tail rows
+            // are already masked out of old segments, so the merged result has unique IDs.
+            if !compact.is_empty() {
+                let mut docs = BTreeMap::new();
+                let mut start = u64::MAX;
+                let mut end = 0;
+                let mut remaining = vec![];
+                for seg in segments {
+                    if compact.contains(&seg.id) {
+                        let live = segment::live(store, &seg).await?;
+                        docs.extend(segment::documents(store, &seg, &live).await?);
+                        start = start.min(seg.wal_start);
+                        end = end.max(seg.wal_end);
+                        for file in seg.files.values().chain(std::iter::once(&seg.live)) {
+                            retire(&mut manifest, file.key.clone());
+                        }
+                    } else {
+                        remaining.push(seg);
+                    }
+                }
+                if !docs.is_empty() {
+                    remaining.push(
+                        segment::build(store, ns, &state.schema, state.metric, &docs, start, end)
+                            .await?,
+                    );
+                }
+                segments = remaining;
+            }
+            segments
+        };
         manifest.segments = segments;
         manifest.schema = state.schema.clone();
         manifest.distance_metric = state.metric;
