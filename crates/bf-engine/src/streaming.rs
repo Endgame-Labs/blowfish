@@ -310,11 +310,11 @@ impl Scan<'_> {
 pub(crate) fn supports(q: &QueryRequest) -> bool {
     q.queries.is_none() && (q.aggregate_by.is_some() || matches!(q.rank_by, Some(RankBy::Order(_))))
 }
-pub(crate) async fn execute(
+async fn scan<'q>(
     store: &Storage,
     state: &NamespaceState,
-    q: &QueryRequest,
-) -> Result<QueryResponse, ApiError> {
+    q: &'q QueryRequest,
+) -> Result<Scan<'q>, ApiError> {
     let mut scan = Scan {
         q,
         winners: Winners::default(),
@@ -366,6 +366,24 @@ pub(crate) async fn execute(
             scan.row(id.clone(), doc.clone());
         }
     }
+    Ok(scan)
+}
+/// Scalar subqueries feeding RRF also retain only competitive rows.
+pub(crate) async fn order_candidates(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+) -> Result<NamespaceState, ApiError> {
+    let mut candidates = state.clone();
+    candidates.docs = scan(store, state, q).await?.winners.documents();
+    Ok(candidates)
+}
+pub(crate) async fn execute(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+) -> Result<QueryResponse, ApiError> {
+    let mut scan = scan(store, state, q).await?;
     if q.rank_by.is_some() {
         let mut candidates = state.clone();
         candidates.docs = scan.winners.documents();

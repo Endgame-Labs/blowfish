@@ -39,6 +39,7 @@ async fn streaming_blocks_groups_diversification_and_tail_match_reference() {
     }
     engine.write("stream", serde_json::from_value(json!({"deletes":[1,7,1000],"patch_rows":[{"id":5,"n":-10,"bucket":0}],"upsert_rows":[{"id":5000,"n":-20,"bucket":1,"value":-25,"tags":[]}]})).unwrap()).await.unwrap();
     for body in [
+        json!({"queries":[{"rank_by":["n","asc"],"top_k":20},{"rank_by":["id","desc"],"top_k":20}],"rerank_by":["RRF",{"rank_constant":1,"weights":[2,1]}],"limit":7}),
         json!({"rank_by":[["n","asc"],["id","desc"]],"top_k":17,"offset":9,"include_attributes":true}),
         json!({"rank_by":[["value","desc"],["id","asc"]],"limit":{"total":19,"per":{"attributes":["bucket"],"limit":2}},"offset":4,"include_attributes":true}),
         json!({"rank_by":["id","desc"],"top_k":20,"filters":["value","Lt",10]}),

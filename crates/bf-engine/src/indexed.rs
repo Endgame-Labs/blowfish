@@ -140,6 +140,9 @@ async fn prepare(
     config: &EngineConfig,
     force_exact: bool,
 ) -> Result<NamespaceState, ApiError> {
+    if matches!(q.rank_by, Some(RankBy::Order(_))) {
+        return crate::streaming::order_candidates(store, state, q).await;
+    }
     let Some(context) = crate::read_cache::context().filter(|_| state.segments.len() > 1) else {
         let mut out = prepare_one(store, state, q, config, force_exact).await?;
         trim_candidates(&mut out, q);
