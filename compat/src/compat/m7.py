@@ -58,3 +58,25 @@ def register(scenarios):
         return result
 
     scenarios['m7_sparse'] = (sparse, False)
+
+    def i8(ns):
+        import base64
+        import struct
+        encoded = base64.b64encode(struct.pack('<ff', 1.0, 2.0)).decode()
+        ns.write(distance_metric='euclidean_squared', schema={'v': {'type': '[2]i8', 'ann': True}}, upsert_rows=[{'id': 1, 'v': [-128, 127]}, {'id': 2, 'v': encoded}, {'id': 3, 'v': [3, 4]}])
+        result = [normalize(ns.query(rank_by=['v', 'ANN', [1, 2]], top_k=10, include_attributes=True))]
+        result.append(normalize(ns.query(rank_by=['v', 'kNN', [1, 2]], filters=['id', 'Gt', 0], top_k=10, include_attributes=True, vector_encoding='base64')))
+        for invalid in ([128, 0], [-129, 0], [0.5, 0]):
+            try:
+                ns.write(upsert_rows=[{'id': 4, 'v': invalid}])
+                raise AssertionError('invalid i8 write succeeded')
+            except turbopuffer.APIStatusError as exc:
+                result.append({'status': exc.status_code})
+            try:
+                ns.query(rank_by=['v', 'ANN', invalid], top_k=1)
+                raise AssertionError('invalid i8 query succeeded')
+            except turbopuffer.APIStatusError as exc:
+                result.append({'status': exc.status_code})
+        return result
+
+    scenarios['m7_i8'] = (i8, False)

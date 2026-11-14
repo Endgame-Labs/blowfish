@@ -93,3 +93,46 @@ async fn sparse_f16_dot_products_composition_and_indexed_tail() {
         assert!(bf_types::decode_sparse(&value).is_err());
     }
 }
+
+#[tokio::test]
+async fn i8_wire_storage_ann_base64_and_validation() {
+    let e = node().await;
+    write(&e,json!({"distance_metric":"euclidean_squared","schema":{"v":{"type":"[2]i8","ann":true}},"upsert_rows":[
+        {"id":1,"v":[-128,127]},{"id":2,"v":bf_types::encode_vector(&[1.0,2.0],false)},{"id":3,"v":[3,4]}]})).await;
+    let rank = json!(["v", "ANN", [1, 2]]);
+    let expected = rows(&e, rank.clone()).await;
+    assert_eq!(expected[0]["id"], 2);
+    assert_eq!(expected[0]["$dist"], 0.0);
+    e.index_namespace("vectors", true).await.unwrap();
+    assert_eq!(rows(&e, rank).await, expected);
+    let r=e.query("vectors",serde_json::from_value(json!({"rank_by":["v","kNN",[1,2]],"filters":["id","Gt",0],"top_k":10,"include_attributes":true,"vector_encoding":"base64"})).unwrap()).await.unwrap();
+    use base64::Engine as _;
+    assert_eq!(
+        base64::prelude::BASE64_STANDARD
+            .decode(r.result.rows.unwrap()[0]["v"].as_str().unwrap())
+            .unwrap(),
+        [1, 2]
+    );
+    for invalid in [json!([128, 0]), json!([-129, 0]), json!([0.5, 0])] {
+        assert_eq!(
+            e.write(
+                "vectors",
+                serde_json::from_value(json!({"upsert_rows":[{"id":4,"v":invalid}]})).unwrap()
+            )
+            .await
+            .unwrap_err()
+            .status,
+            400
+        );
+        assert_eq!(
+            e.query(
+                "vectors",
+                serde_json::from_value(json!({"rank_by":["v","ANN",invalid],"top_k":1})).unwrap()
+            )
+            .await
+            .unwrap_err()
+            .status,
+            400
+        );
+    }
+}

@@ -24,6 +24,8 @@ struct Column {
     blocks: Vec<Block>,
     /// Vector blocks use native f16/f32 little-endian elements, separate from attributes.
     vector: Option<(usize, bool)>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    vector_i8: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Directory {
@@ -161,6 +163,7 @@ pub(crate) async fn put_value<T: Serialize>(
             Column {
                 blocks: vec![b],
                 vector: None,
+                vector_i8: false,
             },
         )]),
     };
@@ -221,8 +224,10 @@ pub(crate) async fn build(
     for (name, config) in schema {
         let vector = match config.data_type {
             Some(AttributeType::Vector { dimensions, f16 }) => Some((dimensions, f16)),
+            Some(AttributeType::VectorI8 { dimensions }) => Some((dimensions, false)),
             _ => None,
         };
+        let vector_i8 = matches!(config.data_type, Some(AttributeType::VectorI8 { .. }));
         let mut blocks = vec![];
         for chunk in rows.chunks(BLOCK_ROWS) {
             let data = if let Some((dims, f16)) = vector {
@@ -236,7 +241,9 @@ pub(crate) async fn build(
                             return Err(corrupt());
                         }
                         for x in v {
-                            if f16 {
+                            if vector_i8 {
+                                data.push(x as i8 as u8);
+                            } else if f16 {
                                 data.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
                             } else {
                                 data.extend_from_slice(&x.to_le_bytes());
@@ -250,7 +257,14 @@ pub(crate) async fn build(
             };
             blocks.push(block(&mut body, &data));
         }
-        dir.columns.insert(name.clone(), Column { blocks, vector });
+        dir.columns.insert(
+            name.clone(),
+            Column {
+                blocks,
+                vector,
+                vector_i8,
+            },
+        );
     }
     let (bytes, meta) = finish(body, &dir)?;
     files.insert(
@@ -291,6 +305,7 @@ pub(crate) async fn build(
             Column {
                 blocks: vec![b],
                 vector: None,
+                vector_i8: false,
             },
         );
     }
@@ -300,7 +315,21 @@ pub(crate) async fn build(
         put_file(store, format!("{prefix}/filter.bfx"), bytes, meta).await?,
     );
     for (column, (name, config)) in schema.iter().enumerate() {
-        if let Some(AttributeType::Vector { dimensions, f16 }) = config.data_type {
+        let dense = match config.data_type {
+            Some(AttributeType::Vector { dimensions, f16 }) => Some((
+                dimensions,
+                if f16 {
+                    bf_vector::VectorType::F16
+                } else {
+                    bf_vector::VectorType::F32
+                },
+            )),
+            Some(AttributeType::VectorI8 { dimensions }) => {
+                Some((dimensions, bf_vector::VectorType::I8))
+            }
+            _ => None,
+        };
+        if let Some((dimensions, dtype)) = dense {
             let vectors = rows
                 .iter()
                 .enumerate()
@@ -309,11 +338,7 @@ pub(crate) async fn build(
                 .collect::<Result<Vec<_>, ApiError>>()?;
             let bytes = tokio::task::spawn_blocking(move || {
                 bf_vector::IndexBuilder::new(dimensions, vector_metric(metric))?
-                    .vector_type(if f16 {
-                        bf_vector::VectorType::F16
-                    } else {
-                        bf_vector::VectorType::F32
-                    })
+                    .vector_type(dtype)
                     .build(&vectors)
             })
             .await
@@ -493,9 +518,17 @@ pub(crate) async fn projected_documents(
                     }
                     let mut v = vec![];
                     for _ in 0..dims {
-                        let width = if f16 { 2 } else { 4 };
+                        let width = if col.vector_i8 {
+                            1
+                        } else if f16 {
+                            2
+                        } else {
+                            4
+                        };
                         let bytes = data.get(pos..pos + width).ok_or_else(corrupt)?;
-                        let x = if f16 {
+                        let x = if col.vector_i8 {
+                            bytes[0] as i8 as f32
+                        } else if f16 {
                             half::f16::from_le_bytes(bytes.try_into().unwrap()).to_f32()
                         } else {
                             f32::from_le_bytes(bytes.try_into().unwrap())
@@ -503,7 +536,11 @@ pub(crate) async fn projected_documents(
                         v.push(x);
                         pos += width;
                     }
-                    values.push(Some(serde_json::json!(v)));
+                    values.push(Some(if col.vector_i8 {
+                        serde_json::json!(v.iter().map(|x| *x as i8).collect::<Vec<_>>())
+                    } else {
+                        serde_json::json!(v)
+                    }));
                 }
                 if pos != data.len() {
                     return Err(corrupt());

@@ -475,3 +475,26 @@ async fn corrupt_codes_and_footer_version() {
     future_version[offset..offset + 4].copy_from_slice(&2u32.to_le_bytes());
     assert!(Index::open(future_version).await.is_err());
 }
+
+#[tokio::test]
+async fn signed_i8_storage_roundtrip_and_exact_scores() {
+    use bf_vector::{Bytes, Index, IndexBuilder, Metric, VectorType};
+    let data = vec![
+        (0, vec![-128.0, 127.0]),
+        (1, vec![1.0, 2.0]),
+        (2, vec![3.0, 4.0]),
+    ];
+    let builder = IndexBuilder::new(2, Metric::EuclideanSquared)
+        .unwrap()
+        .vector_type(VectorType::I8);
+    let bytes = builder.build(&data).unwrap();
+    let index = Index::open(Bytes::from(bytes)).await.unwrap();
+    assert_eq!(index.vector_type(), VectorType::I8);
+    assert_eq!(
+        index.exact_search(&[1.0, 2.0], 3, None).await.unwrap(),
+        vec![(1, 0.0), (2, 8.0), (0, 32266.0)]
+    );
+    for bad in [-129.0, 128.0, 0.5] {
+        assert!(builder.build(&[(0, vec![bad, 0.0])]).is_err());
+    }
+}

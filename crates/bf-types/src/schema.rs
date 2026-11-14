@@ -38,6 +38,10 @@ pub enum AttributeType {
         dimensions: usize,
         f16: bool,
     },
+    /// Dense vector stored as signed eight-bit integers.
+    VectorI8 {
+        dimensions: usize,
+    },
     /// Sparse string-keyed positive f16 weights.
     SparseVector,
 }
@@ -45,7 +49,7 @@ impl AttributeType {
     /// Dense-vector dimensions, if this is a vector.
     pub fn dimensions(&self) -> Option<usize> {
         match self {
-            Self::Vector { dimensions, .. } => Some(*dimensions),
+            Self::Vector { dimensions, .. } | Self::VectorI8 { dimensions } => Some(*dimensions),
             _ => None,
         }
     }
@@ -84,6 +88,7 @@ impl AttributeType {
 impl fmt::Display for AttributeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::VectorI8 { dimensions } => write!(f, "[{dimensions}]i8"),
             Self::SparseVector => f.write_str("{}f16"),
             Self::Scalar(t) => f.write_str(t.name()),
             Self::Array(t) => write!(f, "[]{}", t.name()),
@@ -120,13 +125,17 @@ impl FromStr for AttributeType {
         }
         if !array
             && let Some((dims, element)) = s.strip_prefix('[').and_then(|s| s.split_once(']'))
-            && matches!(element, "f32" | "f16")
+            && matches!(element, "f32" | "f16" | "i8")
             && let Ok(dimensions) = dims.parse::<usize>()
             && (1..=10752).contains(&dimensions)
         {
-            return Ok(Self::Vector {
-                dimensions,
-                f16: element == "f16",
+            return Ok(if element == "i8" {
+                Self::VectorI8 { dimensions }
+            } else {
+                Self::Vector {
+                    dimensions,
+                    f16: element == "f16",
+                }
             });
         }
         Err(ApiError::bad(format!(

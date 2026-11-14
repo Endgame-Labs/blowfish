@@ -370,6 +370,15 @@ fn validate_rank(state: &NamespaceState, rank: &RankBy, guarded: bool) -> Result
                 .as_ref()
                 .and_then(AttributeType::dimensions)
                 .ok_or_else(|| ApiError::bad("ANN requires a dense-vector attribute"))?;
+            if matches!(
+                attribute(state, name)?.data_type,
+                Some(AttributeType::VectorI8 { .. })
+            ) {
+                crate::write::normalize_value(
+                    &json!(vector),
+                    &AttributeType::VectorI8 { dimensions: dims },
+                )?;
+            }
             if vector.len() != dims {
                 return Err(ApiError::bad(format!(
                     "Invalid query dimensions! Query has dimensions={}, but index has dimensions={dims}",
@@ -645,11 +654,24 @@ fn project(
     };
     for name in attrs {
         if let Some(value) = doc.get(&name) {
-            let value = if encoding == VectorEncoding::Base64
-                && let Some(AttributeType::Vector { f16, .. }) =
-                    state.schema.get(&name).and_then(|s| s.data_type.as_ref())
-            {
-                json!(encode_vector(&decode_vector(value)?, *f16))
+            let value = if encoding == VectorEncoding::Base64 {
+                match state.schema.get(&name).and_then(|s| s.data_type.as_ref()) {
+                    Some(AttributeType::Vector { f16, .. }) => {
+                        json!(encode_vector(&decode_vector(value)?, *f16))
+                    }
+                    Some(AttributeType::VectorI8 { .. }) => {
+                        use base64::Engine as _;
+                        json!(
+                            base64::prelude::BASE64_STANDARD.encode(
+                                decode_vector(value)?
+                                    .iter()
+                                    .map(|x| *x as i8 as u8)
+                                    .collect::<Vec<_>>()
+                            )
+                        )
+                    }
+                    _ => value.clone(),
+                }
             } else {
                 value.clone()
             };

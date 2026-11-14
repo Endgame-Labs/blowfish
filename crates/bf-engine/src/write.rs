@@ -476,6 +476,21 @@ pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value,
             &serde_json::to_string(&decode_sparse(value)?).expect("sparse vector serializes"),
         )
         .expect("valid JSON")),
+        AttributeType::VectorI8 { dimensions } => {
+            let v = decode_vector(value)?;
+            if v.len() != *dimensions {
+                return Err(ApiError::bad(format!(
+                    "invalid vector dimensions: expected {dimensions}, got {}",
+                    v.len()
+                )));
+            }
+            if v.iter()
+                .any(|x| x.fract() != 0.0 || !(-128.0..=127.0).contains(x))
+            {
+                return Err(ApiError::bad("an invalid i8 value was passed"));
+            }
+            Ok(json!(v.iter().map(|x| *x as i8).collect::<Vec<_>>()))
+        }
         AttributeType::Vector { dimensions, f16 } => {
             let mut v = decode_vector(value)?;
             if v.len() != *dimensions {
