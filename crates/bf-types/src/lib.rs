@@ -168,9 +168,15 @@ pub fn datetime_millis(value: &str) -> Result<i64, ApiError> {
 pub fn decode_sparse(
     value: &serde_json::Value,
 ) -> Result<std::collections::BTreeMap<String, f32>, ApiError> {
-    value
+    let weights = value
         .as_object()
-        .ok_or_else(|| ApiError::bad("sparse vector must be an object"))?
+        .ok_or_else(|| ApiError::bad("sparse vector must be an object"))?;
+    if weights.len() > 4096 {
+        return Err(ApiError::bad(
+            "sparse vectors cannot exceed 4096 dimensions",
+        ));
+    }
+    weights
         .iter()
         .map(|(dim, value)| {
             let weight = value

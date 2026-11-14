@@ -239,6 +239,9 @@ impl AttributeSchema {
             .data_type
             .as_ref()
             .ok_or_else(|| ApiError::bad(format!("schema type is required for '{name}'")))?;
+        if t.dimensions().is_some_and(|n| !(1..=10752).contains(&n)) {
+            return Err(ApiError::bad("dense vectors require 1 to 10752 dimensions"));
+        }
         if name == "id" {
             if !matches!(
                 t,
