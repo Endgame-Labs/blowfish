@@ -75,7 +75,8 @@ pub(crate) fn reference_stats(state: &mut NamespaceState) {
         .text
         .iter()
         .map(|(name, s)| (name.clone(), corpus(s)))
-        .collect();
+        .collect::<BTreeMap<_, _>>()
+        .into();
 }
 /// Start at the checkpoint's live totals, subtract shadowed segment rows, and add the tail.
 pub(crate) async fn global_stats(
@@ -117,7 +118,7 @@ pub(crate) async fn global_stats(
             })
             .collect());
     }
-    let mut stats = state.stats.clone();
+    let mut stats = (*state.stats).clone();
     if !state.shadowed.is_empty() {
         for seg in &state.segments {
             let ids = segment::ids(store, seg).await?;

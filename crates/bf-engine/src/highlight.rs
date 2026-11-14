@@ -133,7 +133,7 @@ fn fragment_state(state: &NamespaceState, name: &str) -> Result<NamespaceState, 
     out.schema.insert(name.into(), cfg);
     out.docs.clear();
     out.scores.clear();
-    out.corpus.clear();
+    out.corpus = Default::default();
     Ok(out)
 }
 pub(crate) fn validate(state: &NamespaceState, q: &QueryRequest) -> Result<(), ApiError> {

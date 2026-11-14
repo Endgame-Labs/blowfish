@@ -183,7 +183,23 @@ async fn online_regex_and_glob_builds_return_retryable_conflicts() {
 
 #[tokio::test]
 async fn pattern_scores_use_trigram_indexes_and_fail_closed_on_missing_files() {
-    let e = node().await;
+    // A file-backed store, so a second node with cold caches can open the same data.
+    let dir = tempfile::tempdir().unwrap();
+    let file_node = || async {
+        Engine::with_config(
+            Storage::open(&StorageConfig {
+                url: format!("file://{}", dir.path().display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+            EngineConfig {
+                indexing: false,
+                ..Default::default()
+            },
+        )
+    };
+    let e = file_node().await;
     write(&e,json!({"schema":{"s":{"type":"string","fuzzy":true,"glob":true}},"upsert_rows":[{"id":1,"s":"turbopuffer"},{"id":2,"s":"other"}]})).await;
     let params = json!({"max_edit_distance":[{"min_query_chars":6,"distance":1}]});
     let rank = json!([
@@ -229,8 +245,11 @@ async fn pattern_scores_use_trigram_indexes_and_fail_closed_on_missing_files() {
         .find(|f| f.key.contains("trigram."))
         .unwrap();
     e.storage().delete(&file.key).await.unwrap();
+    // Segment bytes are immutable, so a warm node may keep serving them from cache.
+    // A cold node must fail closed rather than silently scanning without the index.
+    let cold = file_node().await;
     assert_eq!(
-        e.query("patterns", serde_json::from_value(q).unwrap())
+        cold.query("patterns", serde_json::from_value(q).unwrap())
             .await
             .unwrap_err()
             .status,

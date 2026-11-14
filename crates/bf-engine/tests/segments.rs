@@ -385,7 +385,17 @@ async fn gc_fences_orphan_builders_and_erases_deleted_namespace_segments() {
 
 #[tokio::test]
 async fn eventual_tail_cap_and_segment_checksum_fail_closed() {
-    let e = node().await;
+    use object_store::ObjectStoreExt;
+    let backend = std::sync::Arc::new(object_store::memory::InMemory::new());
+    let e = Engine::with_config(
+        Storage::from_backend(backend.clone(), Default::default(), false, false)
+            .await
+            .unwrap(),
+        EngineConfig {
+            indexing: false,
+            ..Default::default()
+        },
+    );
     write(&e, initial()).await;
     let bounded = Engine::with_config(
         e.storage().clone(),
@@ -438,9 +448,29 @@ async fn eventual_tail_cap_and_segment_checksum_fail_closed() {
         .unwrap()
         .unwrap();
     let file = &m.segments[0].files["docs"];
-    let mut bytes = e.storage().get(&file.key).await.unwrap().to_vec();
-    bytes[0] ^= 1;
-    e.storage().put(&file.key, bytes).await.unwrap();
+    let path = object_store::path::Path::from(file.key.as_str());
+    let mut bytes = backend
+        .get(&path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+    // Preserve the portable create header, and corrupt the first logical data byte.
+    bytes[24] ^= 1;
+    backend.put(&path, bytes.into()).await.unwrap();
+    // Immutable-object caches intentionally retain verified bytes. A cold reader
+    // must reject backend corruption instead of serving it into a newly filled cache.
+    let bounded = Engine::with_config(
+        Storage::from_backend(backend, Default::default(), true, false)
+            .await
+            .unwrap(),
+        EngineConfig {
+            indexing: false,
+            ..Default::default()
+        },
+    );
     let q: QueryRequest = serde_json::from_value(
         json!({"rank_by":["id","asc"],"top_k":100,"include_attributes":true}),
     )

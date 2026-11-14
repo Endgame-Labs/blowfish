@@ -96,7 +96,7 @@ pub(crate) async fn segment_scores(
             .entry(crate::indexed::rank_key(rank))
             .or_default();
         if let Some(file) = seg.files.get(&format!("sparse:{attribute}")) {
-            let index: Inverted = segment::get_value(store, file).await?;
+            let index: std::sync::Arc<Inverted> = segment::get_value(store, file).await?;
             let mut accum = BTreeMap::<u32, f32>::new();
             for (dim, q) in vector {
                 for (row, weight) in index.postings.get(dim).into_iter().flatten() {

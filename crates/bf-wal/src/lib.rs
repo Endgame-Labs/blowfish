@@ -38,10 +38,7 @@ impl WalEntry {
     }
     /// Serialize with a version header and bounded decompression on reads.
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        let json = serde_json::to_vec(self)?;
-        let mut out = vec![FORMAT_VERSION];
-        out.extend(zstd::stream::encode_all(json.as_slice(), 3)?);
-        Ok(out)
+        encode_payload(&serde_json::to_vec(self)?)
     }
     /// Read a supported WAL encoding; corrupt and future versions fail closed.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
@@ -59,9 +56,16 @@ impl WalEntry {
         Ok(serde_json::from_slice(&out)?)
     }
 }
-// WAL slot records are permanent CAS fences. Document-bearing payloads are separate
-// so a tombstone can physically erase them without making an old slot writable again.
-const SLOT_VERSION: u8 = 2;
+fn encode_payload(json: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = vec![FORMAT_VERSION];
+    out.extend(zstd::stream::encode_all(json, 3)?);
+    Ok(out)
+}
+// Slot occupancy and retry identities are permanent. Small payloads transition only
+// from inline to redacted; atomic replacement never makes an old slot writable.
+const SLOT_VERSION: u8 = 3;
+/// Maximum uncompressed entry size stored directly in a commit slot (64 KiB).
+pub const INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitRecord {
     write_id: Uuid,
@@ -71,6 +75,10 @@ struct CommitRecord {
     payload_seq: Option<u64>,
     committed_at: DateTime<Utc>,
     tombstone: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inline: Option<WalEntry>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    redacted: bool,
 }
 impl CommitRecord {
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -79,10 +87,16 @@ impl CommitRecord {
         Ok(bytes)
     }
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.first() != Some(&SLOT_VERSION) {
+        if !matches!(bytes.first(), Some(2) | Some(&SLOT_VERSION)) {
             return Err(Error::Format);
         }
-        Ok(serde_json::from_slice(&bytes[1..])?)
+        let record: Self = serde_json::from_slice(&bytes[1..])?;
+        if (record.inline.is_some() && (record.redacted || record.tombstone))
+            || (record.redacted && record.tombstone)
+        {
+            return Err(Error::Format);
+        }
+        Ok(record)
     }
 }
 /// A create-only manifest snapshot, extensible by later indexers.
@@ -209,7 +223,8 @@ impl Wal {
             .map(|seq| self.staged_payload_key(seq, record.write_id))
             .unwrap_or_else(|| self.payload_key(record.write_id))
     }
-    /// Attempt a slot. The payload is durable before the slot's conditional commit.
+    /// Attempt a slot. Small entries use one create-only PUT; larger payloads are
+    /// durable before the slot's conditional commit.
     /// Callers must catch up and revalidate after `Conflict`.
     pub async fn append(&self, seq: u64, entry: &WalEntry) -> Result<CreateResult, Error> {
         let started = std::time::Instant::now();
@@ -219,8 +234,14 @@ impl Wal {
     }
     async fn append_inner(&self, seq: u64, entry: &WalEntry) -> Result<CreateResult, Error> {
         let payload_key = self.staged_payload_key(seq, entry.write_id);
-        if !entry.tombstone {
-            let payload = entry.encode()?;
+        let json = if entry.tombstone {
+            vec![]
+        } else {
+            serde_json::to_vec(entry)?
+        };
+        let inline = !entry.tombstone && json.len() <= INLINE_PAYLOAD_BYTES;
+        if !entry.tombstone && !inline {
+            let payload = encode_payload(&json)?;
             let len = payload.len();
             let result = self
                 .store
@@ -235,6 +256,8 @@ impl Wal {
             payload_seq: Some(seq),
             committed_at: entry.committed_at,
             tombstone: entry.tombstone,
+            inline: inline.then(|| entry.clone()),
+            redacted: false,
         };
         let record = record.encode()?;
         let record_len = record.len();
@@ -251,7 +274,7 @@ impl Wal {
         if result == CreateResult::Created {
             metrics::histogram!("blowfish_wal_batch_requests").record(entry.batches.len() as f64);
         }
-        if result == CreateResult::Conflict && !entry.tombstone {
+        if result == CreateResult::Conflict && !entry.tombstone && !inline {
             // This UUID belongs only to this attempt; a losing slot cannot reference it.
             self.store.delete(&payload_key).await?;
         }
@@ -278,6 +301,18 @@ impl Wal {
                 batches: vec![],
                 tombstone: true,
             });
+        }
+        if record.redacted {
+            return Err(Error::Pruned);
+        }
+        if let Some(entry) = &record.inline {
+            if entry.write_id != record.write_id
+                || entry.tombstone
+                || entry.committed_at != record.committed_at
+            {
+                return Err(Error::Format);
+            }
+            return Ok(entry.clone());
         }
         let bytes = match self.store.get(&self.record_payload_key(record)).await {
             Ok(bytes) => bytes,
@@ -472,10 +507,22 @@ impl Wal {
     /// Reclaim committed payloads through a checkpoint while preserving every slot fence.
     pub async fn prune_payloads(&self, through: u64) -> Result<(), Error> {
         for seq in 1..=through {
-            if let Some(record) = self.record(seq).await?
+            if let Some(mut record) = self.record(seq).await?
                 && !record.tombstone
+                && !record.redacted
             {
-                self.store.delete(&self.record_payload_key(&record)).await?;
+                if record.inline.take().is_some() {
+                    record.redacted = true;
+                    if !self
+                        .store
+                        .redact_with_id(&self.key(seq), record.encode()?, record.write_id)
+                        .await?
+                    {
+                        return Err(Error::Fenced);
+                    }
+                } else {
+                    self.store.delete(&self.record_payload_key(&record)).await?;
+                }
             }
         }
         for object in self
@@ -498,6 +545,11 @@ impl Wal {
     }
     /// Read the most recent manifest if one exists.
     pub async fn latest_manifest(&self) -> Result<Option<(u64, Manifest)>, Error> {
+        self.manifest_after(0).await
+    }
+    /// Discover a newer immutable manifest, skipping payload reads and decoding when
+    /// the caller already holds the latest generation. Listing still observes remote publications.
+    pub async fn manifest_after(&self, known: u64) -> Result<Option<(u64, Manifest)>, Error> {
         let objects = self
             .store
             .list(&format!("ns/{}/manifest/", self.namespace))
@@ -512,6 +564,9 @@ impl Wal {
             .and_then(|s| s.strip_suffix(".json"))
             .and_then(|s| s.parse().ok())
             .ok_or(Error::Format)?;
+        if seq <= known {
+            return Ok(None);
+        }
         let bytes = self.store.get(&last.key).await?;
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         let manifest =

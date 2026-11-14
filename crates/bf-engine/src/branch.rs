@@ -46,7 +46,7 @@ fn commit_key(wal: &Wal, id: Uuid) -> String {
 }
 fn install(state: &mut NamespaceState, pin: &Pin) {
     state.segments = pin.segments.clone();
-    state.stats = pin.stats.clone();
+    state.stats = std::sync::Arc::new(pin.stats.clone());
 }
 pub(crate) fn install_source(state: &mut NamespaceState, source: &Source) {
     state.segments = source.state.segments.clone();
@@ -67,7 +67,7 @@ impl Engine {
                 source_namespace: source.into(),
                 created_at: Utc::now(),
                 segments: state.segments.clone(),
-                stats: state.stats.clone(),
+                stats: (*state.stats).clone(),
                 lineage: if is_branch {
                     Some(Lineage {
                         parent: source.into(),

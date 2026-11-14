@@ -1,5 +1,5 @@
 //! Immutable column blocks, ID dictionaries, filter bitmaps, and live generations.
-use crate::{filter, storage_error};
+use crate::{filter, read_cache, storage_error};
 use bf_storage::{CreateResult, Storage};
 use bf_types::{ApiError, AttributeType, Document, Filter, Id, Schema};
 use bf_wal::{Segment, SegmentFile};
@@ -7,7 +7,7 @@ use bytes::Bytes;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::{collections::BTreeMap, io, ops::Range};
+use std::{collections::BTreeMap, io, ops::Range, sync::Arc};
 
 const MAGIC: &[u8; 8] = b"BFSEG001";
 const FOOTER: usize = 32;
@@ -37,14 +37,83 @@ struct Directory {
 pub(crate) struct ObjectReader {
     pub store: Storage,
     pub file: SegmentFile,
+    prefetched: Option<(u64, Bytes)>,
 }
 impl ObjectReader {
+    pub fn new(store: &Storage, file: &SegmentFile) -> Self {
+        Self {
+            store: store.clone(),
+            file: file.clone(),
+            prefetched: None,
+        }
+    }
     pub async fn read(&self, range: Range<u64>) -> io::Result<Bytes> {
+        if let Some((start, bytes)) = &self.prefetched
+            && range.start >= *start
+            && range.end <= *start + bytes.len() as u64
+            && range.start <= range.end
+        {
+            return Ok(bytes.slice((range.start - start) as usize..(range.end - start) as usize));
+        }
         self.store
-            .get_range(&self.file.key, range)
+            .range_reader_with_length(&self.file.key, self.file.size, true)
+            .map_err(io::Error::other)?
+            .read_with_stats(range, &read_cache::stats())
             .await
             .map_err(io::Error::other)
     }
+    async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        self.store
+            .range_reader_with_length(&self.file.key, self.file.size, true)
+            .map_err(io::Error::other)?
+            .read_batch_with_stats(&ranges, &read_cache::stats())
+            .await
+            .map_err(io::Error::other)
+    }
+}
+
+pub(crate) async fn vector_index(
+    store: &Storage,
+    file: &SegmentFile,
+) -> Result<Arc<bf_vector::Index<ObjectReader>>, ApiError> {
+    if let Some(index) = read_cache::get(&file.key, file.metadata_len) {
+        return Ok(index);
+    }
+    let index =
+        bf_vector::Index::open_with_metadata_len(ObjectReader::new(store, file), file.metadata_len)
+            .await
+            .map_err(index_error)?;
+    // Covers decoded row directories, centroids, checksums, and allocator overhead.
+    Ok(read_cache::insert(
+        &file.key,
+        file.metadata_len.saturating_mul(16),
+        index,
+    ))
+}
+
+pub(crate) async fn text_index(
+    store: &Storage,
+    file: &SegmentFile,
+) -> Result<Arc<bf_text::SegmentReader>, ApiError> {
+    if let Some(index) = read_cache::get(&file.key, file.metadata_len) {
+        return Ok(index);
+    }
+    let mut reader = ObjectReader::new(store, file);
+    if file.metadata_len > file.size {
+        return Err(corrupt());
+    }
+    let start = file.size.saturating_sub(file.metadata_len.max(65536));
+    let bytes = reader.read(start..file.size).await.map_err(index_error)?;
+    reader.prefetched = Some((start, bytes));
+    let index = bf_text::SegmentReader::open(Arc::new(reader))
+        .await
+        .map_err(index_error)?;
+    // Include the retained metadata buffer and decoded posting directories.
+    Ok(read_cache::insert(
+        &file.key,
+        file.metadata_len.max(65536).saturating_mul(16),
+        index,
+    ))
 }
 
 fn corrupt() -> ApiError {
@@ -83,13 +152,29 @@ fn finish(mut body: Vec<u8>, directory: &Directory) -> Result<(Vec<u8>, u64), Ap
     body.extend_from_slice(&footer);
     Ok((body, meta))
 }
-async fn directory(reader: &ObjectReader) -> Result<Directory, ApiError> {
+async fn directory(reader: &ObjectReader) -> Result<Arc<Directory>, ApiError> {
+    if let Some(dir) = read_cache::get(&reader.file.key, reader.file.metadata_len) {
+        return Ok(dir);
+    }
+    let size = reader.file.size;
+    let start = size.saturating_sub(reader.file.metadata_len.max(65536));
+    let bytes = reader.read(start..size).await.map_err(index_error)?;
+    let dir = decode_directory(reader, &bytes, start)?;
+    Ok(read_cache::insert(
+        &reader.file.key,
+        reader.file.metadata_len.max(65536).saturating_mul(16),
+        dir,
+    ))
+}
+fn decode_directory(
+    reader: &ObjectReader,
+    bytes: &[u8],
+    start: u64,
+) -> Result<Directory, ApiError> {
     let size = reader.file.size;
     if size < FOOTER as u64 || reader.file.metadata_len > size {
         return Err(corrupt());
     }
-    let start = size.saturating_sub(reader.file.metadata_len.max(65536));
-    let bytes = reader.read(start..size).await.map_err(index_error)?;
     let footer = &bytes[bytes.len() - FOOTER..];
     if &footer[..8] != MAGIC
         || u32::from_le_bytes(footer[8..12].try_into().unwrap()) != 1
@@ -170,27 +255,40 @@ pub(crate) async fn put_value<T: Serialize>(
     let (bytes, meta) = finish(body, &dir)?;
     put_file(store, key, bytes, meta).await
 }
-pub(crate) async fn get_value<T: DeserializeOwned>(
+pub(crate) async fn get_value<T: DeserializeOwned + Send + Sync + 'static>(
     store: &Storage,
     file: &SegmentFile,
-) -> Result<T, ApiError> {
-    let reader = ObjectReader {
-        store: store.clone(),
-        file: file.clone(),
-    };
-    let dir = directory(&reader).await?;
+) -> Result<Arc<T>, ApiError> {
+    if let Some(value) = read_cache::get(&file.key, file.size) {
+        return Ok(value);
+    }
+    let mut reader = ObjectReader::new(store, file);
+    let bytes = reader.read(0..file.size).await.map_err(index_error)?;
+    let dir = decode_directory(&reader, &bytes, 0)?;
+    reader.prefetched = Some((0, bytes));
     let b = dir
         .columns
         .get("value")
         .and_then(|c| c.blocks.first())
         .ok_or_else(corrupt)?;
-    decode(&read_block(&reader, b).await?)
+    let value = decode(&read_block(&reader, b).await?)?;
+    Ok(read_cache::insert(
+        &file.key,
+        file.size.saturating_mul(16),
+        value,
+    ))
 }
 
 #[derive(Serialize, Deserialize)]
-struct IdIndex {
+pub(crate) struct IdIndex {
     ids: Vec<Id>,
     bloom: Vec<u8>,
+}
+impl std::ops::Deref for IdIndex {
+    type Target = Vec<Id>;
+    fn deref(&self) -> &Self::Target {
+        &self.ids
+    }
 }
 fn hashes(id: &Id, bits: usize) -> [usize; 3] {
     let data = serde_json::to_vec(id).expect("ID serializes");
@@ -412,11 +510,11 @@ pub(crate) async fn build(
     })
 }
 pub(crate) async fn live(store: &Storage, segment: &Segment) -> Result<RoaringBitmap, ApiError> {
-    let live: RoaringBitmap = get_value(store, &segment.live).await?;
+    let live: Arc<RoaringBitmap> = get_value(store, &segment.live).await?;
     if live.max().is_some_and(|row| row >= segment.row_count) {
         return Err(corrupt());
     }
-    Ok(live)
+    Ok((*live).clone())
 }
 pub(crate) async fn set_live(
     store: &Storage,
@@ -439,19 +537,40 @@ pub(crate) async fn set_live(
     .await?;
     Ok(())
 }
-pub(crate) async fn ids(store: &Storage, segment: &Segment) -> Result<Vec<Id>, ApiError> {
-    let index: IdIndex = get_value(store, segment.files.get("ids").ok_or_else(corrupt)?).await?;
-    if index.ids.len() != segment.row_count as usize || index.ids.windows(2).any(|w| w[0] >= w[1]) {
+pub(crate) async fn ids(store: &Storage, segment: &Segment) -> Result<Arc<IdIndex>, ApiError> {
+    let file = segment.files.get("ids").ok_or_else(corrupt)?;
+    let key = format!("validated:{}", file.key);
+    if let Some(index) = read_cache::get(&key, file.size) {
+        return Ok(index);
+    }
+    let mut reader = ObjectReader::new(store, file);
+    let bytes = reader.read(0..file.size).await.map_err(index_error)?;
+    let dir = decode_directory(&reader, &bytes, 0)?;
+    reader.prefetched = Some((0, bytes));
+    let b = dir
+        .columns
+        .get("value")
+        .and_then(|c| c.blocks.first())
+        .ok_or_else(corrupt)?;
+    let index: IdIndex = decode(&read_block(&reader, b).await?)?;
+    if index.ids.len() != segment.row_count as usize
+        || index.bloom.is_empty()
+        || index.ids.windows(2).any(|w| w[0] >= w[1])
+    {
         return Err(corrupt());
     }
-    Ok(index.ids)
+    Ok(read_cache::insert(
+        &key,
+        file.size.saturating_mul(16),
+        index,
+    ))
 }
 pub(crate) async fn lookup_many(
     store: &Storage,
     segment: &Segment,
     wanted: &std::collections::BTreeSet<Id>,
 ) -> Result<RoaringBitmap, ApiError> {
-    let index: IdIndex = get_value(store, segment.files.get("ids").ok_or_else(corrupt)?).await?;
+    let index = ids(store, segment).await?;
     if index.bloom.is_empty() || index.ids.len() != segment.row_count as usize {
         return Err(corrupt());
     }
@@ -485,17 +604,31 @@ pub(crate) async fn projected_documents(
     if rows.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let reader = ObjectReader {
-        store: store.clone(),
-        file: segment.files.get("docs").ok_or_else(corrupt)?.clone(),
-    };
+    if columns.is_some_and(|c| c.is_empty()) {
+        let ids = ids(store, segment).await?;
+        return rows
+            .iter()
+            .map(|row| {
+                let id = ids.get(row as usize).ok_or_else(corrupt)?.clone();
+                let doc = Document::from_iter([(
+                    "id".into(),
+                    serde_json::to_value(&id).map_err(index_error)?,
+                )]);
+                Ok((id, doc))
+            })
+            .collect();
+    }
+    let reader = ObjectReader::new(store, segment.files.get("docs").ok_or_else(corrupt)?);
     let dir = directory(&reader).await?;
     let mut docs: BTreeMap<u32, Document> = rows.iter().map(|row| (row, Document::new())).collect();
-    for (name, col) in dir.columns {
-        if name != "id" && columns.is_some_and(|c| !c.contains(&name)) {
+    let blocks: std::collections::BTreeSet<_> =
+        rows.iter().map(|row| row as usize / BLOCK_ROWS).collect();
+    for (name, col) in &dir.columns {
+        if name != "id" && columns.is_some_and(|c| !c.contains(name)) {
             continue;
         }
-        for (i, b) in col.blocks.iter().enumerate() {
+        for &i in &blocks {
+            let b = col.blocks.get(i).ok_or_else(corrupt)?;
             let first = (i * BLOCK_ROWS) as u32;
             let last = first
                 .saturating_add(BLOCK_ROWS as u32)
@@ -615,12 +748,7 @@ pub(crate) fn filter_rows<'a>(
                         crate::text::tokens(value, &cfg),
                         crate::text::prefix(params.as_ref()),
                     );
-                    let reader = bf_text::SegmentReader::open(std::sync::Arc::new(ObjectReader {
-                        store: store.clone(),
-                        file: file.clone(),
-                    }))
-                    .await
-                    .map_err(index_error)?;
+                    let reader = text_index(store, file).await?;
                     let rows = match op {
                         bf_types::FilterOp::ContainsAllTokens => {
                             reader.contains_all_tokens(&query).await
@@ -643,7 +771,8 @@ pub(crate) fn filter_rows<'a>(
                         | bf_types::FilterOp::NotIGlob
                 ) && let Some(file) = segment.files.get(&format!("trigram:{attribute}"))
                 {
-                    let index: crate::pattern::Trigrams = get_value(store, file).await?;
+                    let index: std::sync::Arc<crate::pattern::Trigrams> =
+                        get_value(store, file).await?;
                     let candidates = index.candidates(f, live)?;
                     let columns = std::collections::BTreeSet::from([attribute.clone()]);
                     let docs =
@@ -666,10 +795,8 @@ pub(crate) fn filter_rows<'a>(
                         },
                     );
                 }
-                let reader = ObjectReader {
-                    store: store.clone(),
-                    file: segment.files.get("filters").ok_or_else(corrupt)?.clone(),
-                };
+                let reader =
+                    ObjectReader::new(store, segment.files.get("filters").ok_or_else(corrupt)?);
                 let dir = directory(&reader).await?;
                 let Some(col) = dir.columns.get(attribute) else {
                     let columns = std::collections::BTreeSet::from([attribute.clone()]);
@@ -683,8 +810,14 @@ pub(crate) fn filter_rows<'a>(
                     }
                     return Ok(out);
                 };
-                let values: Vec<(Value, RoaringBitmap)> =
-                    decode(&read_block(&reader, &col.blocks[0]).await?)?;
+                let key = format!("{}:{attribute}", reader.file.key);
+                let values: Arc<Vec<(Value, RoaringBitmap)>> =
+                    if let Some(values) = read_cache::get(&key, col.blocks[0].length) {
+                        values
+                    } else {
+                        let value = decode(&read_block(&reader, &col.blocks[0]).await?)?;
+                        read_cache::insert(&key, col.blocks[0].length.saturating_mul(32), value)
+                    };
                 let mut out = RoaringBitmap::new();
                 // Sorted dictionary runs permit binary seeks for scalar ranges.
                 // Canonicalization preserves datetime, UUID, and exact integer ordering.
@@ -712,8 +845,8 @@ pub(crate) fn filter_rows<'a>(
                     }
                     return Ok(if *op == NotEq { live - out } else { out & live });
                 }
-                for (value, rows) in values {
-                    let doc = Document::from_iter([(attribute.clone(), value)]);
+                for (value, rows) in values.iter() {
+                    let doc = Document::from_iter([(attribute.clone(), value.clone())]);
                     if filter::matches(f, Some(&doc), None, schema)? {
                         out |= rows;
                     }
@@ -743,6 +876,9 @@ pub(crate) fn vector_metric(metric: bf_types::DistanceMetric) -> bf_vector::Metr
     }
 }
 impl bf_vector::RangeRead for ObjectReader {
+    async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        ObjectReader::read_batch(self, ranges).await
+    }
     fn len(&self) -> u64 {
         self.file.size
     }

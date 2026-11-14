@@ -57,8 +57,8 @@ async fn highlights_fragments_offsets_arrays_fuzzy_and_indexed_projection() {
     );
     assert_eq!(expected[5][1]["h"], json!([]));
     e.index_namespace("highlight", true).await.unwrap();
-    for (q, want) in queries.iter().zip(expected) {
-        assert_eq!(query(&e, q.clone()).await, want)
+    for (i, (q, want)) in queries.iter().zip(expected).enumerate() {
+        assert_eq!(query(&e, q.clone()).await, want, "indexed query {i}")
     }
     for options in [
         json!({"fragment_limit":0}),

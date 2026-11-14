@@ -54,7 +54,8 @@ protocol directly, reusing conditional-create retry identities rather than addin
 a second storage layer.
 
 Manifest slots contain tiny references to immutable payloads. GC retains WAL and
-manifest slot records permanently, preserving their CAS fences. Retirement grace
+manifest slots permanently, preserving their CAS fences. Small WAL entries inline
+their payload, which GC atomically redacts while retaining slot occupancy and retry identity. Retirement grace
 periods begin at publication, including for WAL checkpoints. GC inventories orphan
 segment files before claiming a newer epoch, fencing their paused builders before
 deleting them. Tombstone checkpoints retire deleted namespaces' segments. Empty
@@ -86,9 +87,11 @@ The temporary `text_fallback` module has been removed. bf-text's documented orac
 exceptions for historical Unicode versions, Greek stemming, and a stopword/subword
 edge case still apply.
 
-Order-by, aggregates, and general score expressions currently materialize eligible
-scalar rows for reference result assembly. Streaming scalar result merging and
-bounded by-filter materialization remain performance improvements.
+Scalar order-by scans one 256-row column block at a time and retains bounded top-k
+winners, including diversification. Aggregations retain accumulator states rather
+than documents; group scans retain only the smallest requested group keys and
+expand array products incrementally. General score expressions and by-filter
+writes still materialize eligible rows.
 The exhaustive diagnostic path deliberately materializes the full snapshot.
 
 ## Tuning and integration
@@ -109,11 +112,10 @@ expose these directly without changing the engine API.
 in the background and record `blowfish_ann_recall` through the metrics facade.
 Install a recorder in the binary to export it.
 
-`segment::ObjectReader` isolates range access for both index libraries. This
-worktree's storage interface supplies `Storage::get_range`; when merging the cache
-worker, connect this adapter to its cached range reader. Current range calls can
-include backend HEAD/header requests, and segment searches execute sequentially,
-so this implementation does not yet meet a three-round-trip cold-query budget.
+`segment::ObjectReader` adapts both index libraries to bf-storage's known-length
+range cache. Segment searches run concurrently on bounded blocking workers.
+Independent metadata reads start together, and ANN batches code and rerank ranges.
+See the M5 investigation below for cache budgets and the remaining cold BM25 limit.
 
 ## Validation
 
@@ -133,7 +135,7 @@ Fault injection fails each normal-path read, listing, create, and delete before 
 after its effect, including lost successful PUT responses. Every acknowledged
 write survives recovery exactly once through commit, indexing, compaction, and GC.
 
-The unchanged compatibility suite passes **96/96**, with one-row and one-millisecond
+The unchanged compatibility suite passes **111/111**, with one-row and one-millisecond
 index thresholds and persisted segment files verified. Official Python and
 TypeScript SDK write, ANN, BM25, and metadata smokes also pass.
 
@@ -185,3 +187,141 @@ Copies and branches share immutable segment files within the same bucket. Only t
 Segment pins are currently conservative: obsolete pins remain after compaction, a failed copy, or namespace deletion. This can retain storage indefinitely. Reclaiming them requires proving both that no committed namespace references the files and that no paused copier can still commit its pin. Until that protocol exists, GC favors retention over deleting a referenced segment.
 
 Late interaction accepts `[][N]f32` columns and nested query-vector arrays with `ANN` or `kNN`. It requires cosine distance and ranks by the sum, over query vectors, of the minimum distance to any document vector. Empty document-vector arrays are omitted from ranked results. Immutable segments support this representation, but late-interaction candidate search remains exhaustive. Vector arrays accept and return JSON arrays; base64 vector-array encoding is unsupported.
+
+## M5 performance investigation
+
+The benchmark accepts `--reuse <namespace>` to query an existing corpus, and
+`--recall-queries 0` to isolate query profiling from the exhaustive recall scan.
+`--consistency eventual` separates index execution from strong snapshot refresh.
+First-query measurements use a newly opened storage handle, so both engine and
+byte caches start empty; the operating system page cache remains uncontrolled.
+S3 runs take `BENCH_ENDPOINT`, `BENCH_PROFILE`, and `BENCH_REGION` from the
+benchmark environment. Keep private deployment settings out of this document.
+
+### WAL commit safety
+
+Entries whose uncompressed JSON is at most 64 KiB now commit with one conditional
+PUT, carrying the payload inside a version-three slot. Larger entries retain the
+two-PUT external-payload path. Readers accept legacy version-two slots.
+
+GC replaces an inline slot with an identical final redacted record, preserving
+its key, write identity, sequence, and timestamp. The overwrite is atomic, and
+never exposes an absent key: a stalled create-only writer therefore still loses.
+Concurrent collectors compute the same redacted bytes; neither can restore data.
+An ambiguous overwrite is resolved by reading back those bytes. A retry of the
+original create still recognizes its identity without restoring the payload.
+Redacted reads return `Pruned`, using the existing checkpoint/tombstone recovery
+path. WAL reads bypass immutable range caches. Tombstones contain no payload.
+
+This extends the immutable-record protocol to **permanent slot occupancy with a
+single monotonic redaction transition**. All nodes reading a prefix must be
+upgraded before version-three writes begin; old binaries fail closed on the new
+slot version. Tests cover concurrent collectors, losing writers, original-write
+retries, lost successful redaction responses, namespace recreation, legacy slots,
+large external payloads, and the engine's crash-injection matrix.
+
+Profiling the retained million-row corpus with Linux `perf record -F 499
+--call-graph dwarf,8192` found ID deserialization at 4.99% of sampled cycles,
+JSON sequence checks at 3.51%, integer parsing at 2.73%, byte-vector decoding at
+2.44%, and number parsing at 2.31%. RaBitQ estimation accounted for 4.27%, and
+query-table preparation for 3.55%. Repeated metadata decoding and per-range
+HEAD/header probing therefore preceded kernel tuning. Sampling perturbs timings;
+profiled latencies are not used as benchmark results.
+
+Immutable reads now use `Storage::range_reader_with_length` and batched cache
+reads. `StorageConfig.cache` controls byte-cache memory, disk, block size, and I/O
+concurrency. `EngineConfig.decoded_cache_bytes` separately bounds a node-local LRU
+of decoded directories, IDs/blooms, live masks, filter dictionaries, IVF metadata,
+and text readers. Its default is 512 MiB, with conservative serialized-size charges
+of 16 times metadata bytes (32 times filter dictionaries). Active queries can pin
+evicted entries until they finish. Zero disables decoded admission. Cache keys
+include immutable object generations; storage handles and decoded caches must not
+be shared across unrelated backends. Performance fields report per-query logical
+bytes, including decoded metadata hits, instead of guessing from namespace age.
+
+`query_concurrency` and `search_concurrency` each default to eight. Query drivers
+and segment scorers use bounded blocking tasks, keeping CPU work off Tokio reactor
+threads. Independent masks, IDs, and index metadata open together; ANN code reads
+and rerank vectors each use one coalesced batch. The counting-store regression
+requires exactly three dependent cold ANN read stages, zero HEADs, and zero backend
+reads for an identical warm query. That test uses 512 fetch permits to isolate
+read dependencies; the production default of 16 permits can introduce additional
+network waves inside a batch. It also tests a cold single-term BM25 query within
+three stages. General BM25 queries can still need additional posting-block stages:
+bf-text exposes demand-driven posting reads, not a public batch-prefetch plan.
+
+
+### M5 benchmark results
+
+Measured on the same retained **1M × 768** local corpus and five live segments as
+the M4 table above. Both runs use 64-times-k reranking, top ten, three warm-ups,
+50 measured queries, ten exact recall comparisons, and 64-KiB cache blocks.
+The engine's default remains 128 probes; `BF_ANN_NPROBE=32` (or `--nprobe 32` in
+the benchmark) meets the requested warm target on this synthetic corpus.
+
+| Local file store | M4, 128 probes | M5, 128 probes | M5, 32 probes |
+| --- | ---: | ---: | ---: |
+| ANN p50 / p99 | 238.25 / 275.95 ms | 46.96 / 60.14 ms | **23.42 / 33.14 ms** |
+| BM25 p50 / p99 | 113.22 / 157.63 ms | 8.62 / 14.19 ms | **8.16 / 16.33 ms** |
+| Recall@10 | 0.99 | 0.99 | **0.99** |
+| ANN execution-only p50 | not separated | 43 ms | 19 ms |
+| BM25 execution-only p50 | not separated | 5 ms | 4 ms |
+
+Independent cold engine and storage handles measured **102.55 ms ANN** and
+**68.24 ms BM25** at 32 probes, including namespace discovery. The OS page cache
+was retained. Cold BM25 now runs before the warm workload on a separate storage
+handle, so it does not inherit ANN's ID, live-mask, or byte-cache entries. A run
+concurrent with remote compaction measured 71.14 ms ANN p50; the final table was
+measured after that load finished. These are workload measurements on a shared
+worker, not isolated hardware guarantees. The default 128-probe ANN run still
+exceeds the 30-ms target; probe tuning supplies the documented speed/recall tradeoff.
+
+The **100k × 768 R2** run used four 25,000-row input batches, compacted to one live
+segment, 64 probes, 64-KiB cache blocks, three warm-ups, 20 measured queries, and
+five recall comparisons. Warm denotes the post-warm-up phase with varying vectors
+and terms, not a guarantee that every rerank/posting range is resident. All queries
+used strong consistency. Only a unique
+`dev/perf-bench/` prefix was used, and all its objects were deleted afterward.
+
+| R2 measurement | Result |
+| --- | ---: |
+| Cold ANN / BM25, independent caches | 1,671.31 / 859.99 ms |
+| Warm ANN p50 / p99 | 465.52 / 732.43 ms |
+| Warm BM25 p50 / p99 | 190.30 / 293.60 ms |
+| ANN / BM25 execution-only p50 | 344 / 65 ms |
+| Recall@10 | 1.00 |
+| Load wall time / indexing and compaction | 270.85 / 181.77 s |
+| Write throughput, excluding generation and indexing | 1,188 rows/s |
+| 25,000-row write batch p50 | 20,186.59 ms |
+
+An earlier R2 attempt returned a storage 503 during compaction after ingestion.
+It was cleaned up; a fresh run with error diagnostics enabled completed without
+reproducing the failure. Both attempts' prefixes were deleted. The successful
+cold results include strong refreshes and bounded I/O concurrency; they are not
+three bare network round trips. Achieving that wall-clock budget for arbitrary
+queries still needs bf-text posting-batch planning and sufficiently wide fetch
+concurrency. bf-vector's interleaved code/vector layout also limits coalescing
+across distant clusters.
+
+Small durable writes were measured separately with
+`cargo run --release -p bf-wal --example latency`, using the same environment
+variables plus `BENCH_URL` for a disposable prefix. Each measurement excludes
+three warm-ups and reports the median of 20 document-bearing commits.
+
+| R2 small-write durability measurement | Two-PUT baseline | Inline slot |
+| --- | ---: | ---: |
+| Single conditional-PUT control p50 | 509.80 ms | 173.76 ms |
+| WAL commit p50 | 1,016.84 ms | **183.73 ms** |
+| Commit / contemporaneous PUT control | 1.99× | **1.06×** |
+
+Conditions changed between runs, so the absolute improvement cannot all
+be attributed to the code. The control ratio and the slot/payload regression tests
+show the removed round trip. These are WAL durability latencies, excluding HTTP,
+validation, and indexing; large batches above the inline threshold still use two PUTs.
+
+
+The same small-write example on the local file store measured **0.061 ms WAL
+commit p50**, against **0.053 ms** for its single-PUT control (20 samples, after
+three warm-ups, with the OS cache retained). The million-row local corpus was
+reused for query comparison; its original ingestion-throughput figures above
+remain M4 measurements.
