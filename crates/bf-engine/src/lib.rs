@@ -93,6 +93,12 @@ impl Engine {
     pub fn storage(&self) -> &Storage {
         &self.0.store
     }
+    /// Namespaces with an in-memory handle on this node, sorted for operational inspection.
+    pub async fn cached_namespaces(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.0.namespaces.lock().await.keys().cloned().collect();
+        names.sort();
+        names
+    }
     async fn handle(&self, ns: &str) -> Result<Arc<Handle>, ApiError> {
         validate_namespace(ns)?;
         let mut handles = self.0.namespaces.lock().await;
