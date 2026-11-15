@@ -9,6 +9,7 @@ The Hub endpoint may be a keyless proxy. No credentials are read by this loader.
 """
 import argparse
 import base64
+import gc
 import json
 import signal
 import time
@@ -147,6 +148,9 @@ def main():
                             "title_initial": "string", "text_length": "int", "vector": f"[1024]{args.vector_type}"})
                     delay = 0.25
                     while True:
+                        # Transport exceptions and closed responses can form
+                        # cycles retaining a complete serialized request body.
+                        gc.collect()
                         while available() < 4 * (1 << 30):
                             pauses += 1
                             print(json.dumps({"event": "memory_pause", "available": available()}), flush=True)
@@ -160,6 +164,10 @@ def main():
                             continue
                         if response.status_code == 429:
                             retries += 1
+                            # HTTPX binds its stream back to the response, making
+                            # a cycle that also retains the large request body.
+                            response.close()
+                            del response
                             time.sleep(delay)
                             delay = min(10, delay * 1.5)
                             continue
@@ -183,6 +191,7 @@ def main():
                     # Release the previous request body and Arrow view before the
                     # next batch is decoded. HTTPX responses retain their requests.
                     del body, documents, response, matrix, batch, text, positions, ids
+                    gc.collect()
                     if rows == args.rows:
                         break
             finally:
