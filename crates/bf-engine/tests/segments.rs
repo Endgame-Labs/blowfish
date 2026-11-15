@@ -46,6 +46,90 @@ fn initial() -> Value {
     json!({"distance_metric":"cosine_distance","schema":{"text":{"type":"string","full_text_search":true},"small":"[2]f16"},
         "upsert_rows":(0..30).map(|id|json!({"id":id,"n":id%7,"text":if id%2==0 {"red fox"}else{"blue bird"},"vector":[id as f32+1.0,1.0],"small":[1.0,0.3333],"tags":["a","b"]})).collect::<Vec<_>>()})
 }
+
+#[tokio::test]
+async fn filtered_ann_skips_unused_columns_and_preserves_rrf_clause_projection() {
+    async fn uncached_node() -> Engine {
+        let mut config = StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        };
+        config.cache.memory_bytes = 0;
+        config.cache.disk_bytes = 0;
+        config.cache.block_size = 4096;
+        Engine::with_config(
+            Storage::open(&config).await.unwrap(),
+            EngineConfig {
+                indexing: false,
+                decoded_cache_bytes: 0,
+                ..Default::default()
+            },
+        )
+    }
+    let indexed = uncached_node().await;
+    let reference = uncached_node().await;
+    let mut seed = 17u64;
+    let rows: Vec<_> = (1..=64)
+        .map(|id| {
+            let padding: String = (0..65536)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (b'a' + ((seed >> 32) % 26) as u8) as char
+                })
+                .collect();
+            json!({"id":id,"n":id,"tag":if id%2==0 {"z"}else{"a"},
+                "vector":[id as f32+1.0,1.0],"padding":padding})
+        })
+        .collect();
+    let body = json!({"distance_metric":"cosine_distance",
+        "schema":{"padding":{"type":"string","filterable":false}},"upsert_rows":rows});
+    write(&indexed, body.clone()).await;
+    write(&reference, body).await;
+    assert!(indexed.index_namespace("test", true).await.unwrap());
+    for filter in [
+        json!(["tag", "Eq", "z"]),
+        json!(["And", [["tag", "Eq", "z"], ["Not", ["n", "Lt", 5]]]]),
+        json!(["id", "Gt", 4]),
+    ] {
+        let request = json!({"rank_by":["vector","ANN",[1.0,0.0]],
+            "top_k":16,"filters":filter});
+        let (response, diagnostic) = indexed
+            .query_with_diagnostics("test", serde_json::from_value(request.clone()).unwrap())
+            .await
+            .unwrap();
+        let mut actual = serde_json::to_value(response).unwrap();
+        actual.as_object_mut().unwrap().remove("performance");
+        assert_eq!(actual, query(&reference, request.clone()).await);
+        let skipped_bytes: u64 = diagnostic.backend.iter().map(|b| b.bytes).sum();
+        let mut projected = request;
+        projected["include_attributes"] = json!(["padding"]);
+        let (response, diagnostic) = indexed
+            .query_with_diagnostics("test", serde_json::from_value(projected).unwrap())
+            .await
+            .unwrap();
+        let projected_bytes: u64 = diagnostic.backend.iter().map(|b| b.bytes).sum();
+        assert!(
+            projected_bytes > skipped_bytes * 2,
+            "unused padding was read: unprojected={skipped_bytes}, projected={projected_bytes}"
+        );
+        let mut projected = serde_json::to_value(response).unwrap();
+        projected.as_object_mut().unwrap().remove("performance");
+        for row in projected["rows"].as_array_mut().unwrap() {
+            assert_eq!(row["padding"].as_str().unwrap().len(), 65536);
+            row.as_object_mut().unwrap().remove("padding");
+        }
+        assert_eq!(actual, projected);
+    }
+    let request = json!({"queries":[
+        {"rank_by":["vector","ANN",[1.0,0.0]],"top_k":16,"filters":["tag","Eq","z"],"include_attributes":["padding"]},
+        {"rank_by":["vector","ANN",[1.0,0.0]],"top_k":16,"filters":["id","Gt",4]}
+    ],"rerank_by":["RRF"],"limit":16});
+    assert_eq!(
+        query(&indexed, request.clone()).await,
+        query(&reference, request).await
+    );
+}
+
 #[tokio::test]
 async fn checkpoints_overlay_compaction_gc_and_cold_reopen_match_reference() {
     let indexed = node().await;
