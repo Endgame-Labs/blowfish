@@ -220,7 +220,7 @@ pub(crate) async fn put_file(
         metadata_len,
     };
     if store
-        .create(&file.key, bytes)
+        .create_unique(&file.key, bytes)
         .await
         .map_err(storage_error)?
         == CreateResult::Conflict
@@ -496,27 +496,35 @@ pub(crate) async fn build(
         }
     }
     crate::sparse::build(store, &prefix, schema, docs, &mut files).await?;
+    // Await each index and upload it as soon as it is ready, all of them at once.
+    let mut uploads = Vec::new();
     for (name, column, job) in ann_jobs {
-        let bytes = job.await.map_err(index_error)?.map_err(index_error)?;
-        let meta = bf_vector::metadata_len(&bytes).map_err(index_error)?;
-        files.insert(
-            format!("ann:{name}"),
-            put_file(store, format!("{prefix}/ann.{column}.bfv"), bytes, meta).await?,
-        );
+        let (store, prefix) = (store.clone(), prefix.clone());
+        uploads.push(Box::pin(async move {
+            let bytes = job.await.map_err(index_error)?.map_err(index_error)?;
+            let meta = bf_vector::metadata_len(&bytes).map_err(index_error)?;
+            let file = put_file(&store, format!("{prefix}/ann.{column}.bfv"), bytes, meta).await?;
+            Ok::<_, ApiError>((format!("ann:{name}"), file))
+        })
+            as std::pin::Pin<
+                Box<dyn Future<Output = Result<(String, SegmentFile), ApiError>> + Send>,
+            >);
     }
     for (name, column, job) in fts_jobs {
-        let (bytes, metadata_len) = job.await.map_err(index_error)??;
-        files.insert(
-            format!("fts:{name}"),
-            put_file(
-                store,
+        let (store, prefix) = (store.clone(), prefix.clone());
+        uploads.push(Box::pin(async move {
+            let (bytes, metadata_len) = job.await.map_err(index_error)??;
+            let file = put_file(
+                &store,
                 format!("{prefix}/fts.{column}.bft"),
                 bytes,
                 metadata_len,
             )
-            .await?,
-        );
+            .await?;
+            Ok::<_, ApiError>((format!("fts:{name}"), file))
+        }));
     }
+    files.extend(futures::future::try_join_all(uploads).await?);
     let live = put_value(
         store,
         format!("{prefix}/live.00000000000000000000.bfl"),
@@ -665,7 +673,7 @@ pub(crate) async fn projected_documents(
         // independent column blocks together. Serial block GETs make compaction
         // throughput depend on one object-store round trip per 256 documents.
         let indices: Vec<_> = blocks.iter().copied().collect();
-        for batch in indices.chunks(16) {
+        for batch in indices.chunks(64) {
             let descriptors = batch
                 .iter()
                 .map(|i| col.blocks.get(*i).ok_or_else(corrupt))

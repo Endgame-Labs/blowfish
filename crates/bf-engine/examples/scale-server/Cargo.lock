@@ -264,6 +264,7 @@ dependencies = [
  "globset",
  "half",
  "metrics",
+ "rayon",
  "regex",
  "regex-syntax",
  "roaring",

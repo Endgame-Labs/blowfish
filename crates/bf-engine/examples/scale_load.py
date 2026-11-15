@@ -13,6 +13,7 @@ import gc
 import json
 import signal
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -69,6 +70,35 @@ def update_truth(query, matrix, ids, best_scores, best_ids):
     return np.take_along_axis(joined_scores, keep, axis=1), np.take_along_axis(joined_ids, keep, axis=1)
 
 
+def send(client, args, body, counters):
+    """POST one batch, retrying backpressure and transport errors."""
+    delay = 0.25
+    while True:
+        # Transport exceptions and closed responses can form cycles retaining a complete
+        # serialized request body.
+        gc.collect()
+        while available() < 4 * (1 << 30):
+            counters["pauses"] += 1
+            print(json.dumps({"event": "memory_pause", "available": available()}), flush=True)
+            time.sleep(5)
+        try:
+            response = client.post(f"{args.base_url}/v2/namespaces/{args.namespace}", json=body)
+        except httpx.TransportError:
+            counters["transport"] += 1
+            time.sleep(delay)
+            delay = min(10, delay * 1.5)
+            continue
+        if response.status_code == 429:
+            counters["retries"] += 1
+            response.close()
+            del response
+            time.sleep(delay)
+            delay = min(10, delay * 1.5)
+            continue
+        response.raise_for_status()
+        return
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8300")
@@ -85,8 +115,10 @@ def main():
         parser.error("rows and batch must be positive")
     args.scratch.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
-    retries = pauses = rows = raw_bytes = 0
-    transport_retries = 0
+    rows = raw_bytes = 0
+    counters = {"retries": 0, "transport": 0, "pauses": 0}
+    inflight = []
+    pool = ThreadPoolExecutor(max_workers=2)
     best_scores = np.full((200, 10), -np.inf, dtype=np.float32)
     best_ids = np.full((200, 10), -1, dtype=np.int64)
     filtered = {name: (best_scores.copy(), best_ids.copy()) for name in ("selective", "broad")}
@@ -100,8 +132,7 @@ def main():
             state = {key: saved[key].item() for key in ("rows", "raw_bytes", "next_shard", "seconds", "retries_429", "memory_pauses", "retries_transport")}
             rows, raw_bytes, next_shard = state["rows"], state["raw_bytes"], state["next_shard"]
             start -= state["seconds"]
-            retries, pauses = state["retries_429"], state["memory_pauses"]
-            transport_retries = state["retries_transport"]
+            counters.update(retries=state["retries_429"], pauses=state["memory_pauses"], transport=state["retries_transport"])
             best_scores, best_ids, query = saved["scores"], saved["ids"], saved["query"]
             filtered = {name: (saved[f"{name}_scores"], saved[f"{name}_ids"]) for name in filtered}
         else:
@@ -146,33 +177,13 @@ def main():
                             "text": {"type": "string", "full_text_search": True, "filterable": False},
                             "title": {"type": "string", "filterable": False},
                             "title_initial": "string", "text_length": "int", "vector": f"[1024]{args.vector_type}"})
-                    delay = 0.25
-                    while True:
-                        # Transport exceptions and closed responses can form
-                        # cycles retaining a complete serialized request body.
-                        gc.collect()
-                        while available() < 4 * (1 << 30):
-                            pauses += 1
-                            print(json.dumps({"event": "memory_pause", "available": available()}), flush=True)
-                            time.sleep(5)
-                        try:
-                            response = client.post(f"{args.base_url}/v2/namespaces/{args.namespace}", json=body)
-                        except httpx.TransportError:
-                            transport_retries += 1
-                            time.sleep(delay)
-                            delay = min(10, delay * 1.5)
-                            continue
-                        if response.status_code == 429:
-                            retries += 1
-                            # HTTPX binds its stream back to the response, making
-                            # a cycle that also retains the large request body.
-                            response.close()
-                            del response
-                            time.sleep(delay)
-                            delay = min(10, delay * 1.5)
-                            continue
-                        response.raise_for_status()
-                        break
+                    # Overlap the (network-bound) write with the truth computation and the next
+                    # batch's preparation. The schema-carrying first write completes before any other.
+                    while len(inflight) >= 2:
+                        inflight.pop(0).result()
+                    inflight.append(pool.submit(send, client, args, body, counters))
+                    if rows == 0:
+                        inflight.pop(0).result()
                     best_scores, best_ids = update_truth(query, matrix, ids, best_scores, best_ids)
                     for name, selected in {
                         "selective": np.array([d["title_initial"] == "z" for d in documents]),
@@ -184,21 +195,23 @@ def main():
                     if rows % 10_000 < args.batch or rows == args.rows:
                         elapsed = time.monotonic() - start
                         result = dict(rows=rows, seconds=elapsed, docs_per_second=rows / elapsed,
-                                      retries_429=retries, retries_transport=transport_retries,
-                                      memory_pauses=pauses, raw_bytes=raw_bytes)
+                                      retries_429=counters["retries"], retries_transport=counters["transport"],
+                                      memory_pauses=counters["pauses"], raw_bytes=raw_bytes)
                         (args.scratch / "ingest.json").write_text(json.dumps(result, indent=2))
                         print(json.dumps(result), flush=True)
                     # Release the previous request body and Arrow view before the
                     # next batch is decoded. HTTPX responses retain their requests.
-                    del body, documents, response, matrix, batch, text, positions, ids
+                    del body, documents, matrix, batch, text, positions, ids
                     gc.collect()
                     if rows == args.rows:
                         break
             finally:
+                while inflight:
+                    inflight.pop(0).result()
                 target.unlink(missing_ok=True)
             state = dict(rows=rows, raw_bytes=raw_bytes, next_shard=shard+1,
-                         seconds=time.monotonic()-start, retries_429=retries,
-                         memory_pauses=pauses, retries_transport=transport_retries)
+                         seconds=time.monotonic()-start, retries_429=counters["retries"],
+                         memory_pauses=counters["pauses"], retries_transport=counters["transport"])
             pending = args.scratch / "truth-next.npz"
             np.savez(pending, ids=best_ids, scores=best_scores, query=query, **state,
                      **{f"{name}_{part}": value for name, pair in filtered.items()
