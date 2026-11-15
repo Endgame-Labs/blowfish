@@ -33,14 +33,16 @@ def download(client, endpoint, shard, target):
     if target.exists():
         return
     url = f"{endpoint}/datasets/{DATASET}/resolve/{REVISION}/en/{shard:04}.parquet"
+    pending = target.with_suffix(".partial")
     try:
         with client.stream("GET", url, follow_redirects=True) as response:
             response.raise_for_status()
-            with target.open("wb") as out:
+            with pending.open("wb") as out:
                 for block in response.iter_bytes(1 << 20):
                     out.write(block)
+        pending.replace(target)
     except BaseException:
-        target.unlink(missing_ok=True)
+        pending.unlink(missing_ok=True)
         raise
 
 
@@ -78,6 +80,8 @@ def main():
     parser.add_argument("--scratch", type=Path, required=True)
     parser.add_argument("--resume", action="store_true", help="Replay from the last completed shard; upserts are idempotent")
     args = parser.parse_args()
+    if args.rows <= 0 or args.batch <= 0:
+        parser.error("rows and batch must be positive")
     args.scratch.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     retries = pauses = rows = raw_bytes = 0
@@ -123,7 +127,9 @@ def main():
                     keep = min(len(ids), args.rows - rows)
                     ids, matrix = ids[:keep], matrix[:keep]
                     if not keep:
-                        break
+                        if rows == args.rows:
+                            break
+                        continue
                     if args.vector_type == "f16" and not np.array_equal(matrix, matrix.astype("f2").astype("f4")):
                         raise ValueError("source vectors are not losslessly representable as f16")
                     text = batch.select(["title", "text"]).to_pydict()
@@ -174,6 +180,9 @@ def main():
                                       memory_pauses=pauses, raw_bytes=raw_bytes)
                         (args.scratch / "ingest.json").write_text(json.dumps(result, indent=2))
                         print(json.dumps(result), flush=True)
+                    # Release the previous request body and Arrow view before the
+                    # next batch is decoded. HTTPX responses retain their requests.
+                    del body, documents, response, matrix, batch, text, positions, ids
                     if rows == args.rows:
                         break
             finally:
