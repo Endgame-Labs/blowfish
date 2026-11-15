@@ -89,6 +89,8 @@ struct TuningArgs {
     cache_block_size: Option<usize>,
     #[arg(long, env = "BLOWFISH_CACHE_MAX_COALESCE_BLOCKS")]
     cache_max_coalesce_blocks: Option<usize>,
+    #[arg(long, env = "BLOWFISH_CACHE_COALESCE_GAP_BLOCKS")]
+    cache_coalesce_gap_blocks: Option<usize>,
     #[arg(long, env = "BLOWFISH_CACHE_FETCH_CONCURRENCY")]
     cache_fetch_concurrency: Option<usize>,
     #[arg(long, env = "BLOWFISH_CACHE_PREFETCH_CONCURRENCY")]
@@ -290,6 +292,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(value) = tuning.cache_block_size {
         config.storage.cache.block_size = value;
+    }
+    if let Some(value) = tuning.cache_coalesce_gap_blocks {
+        config.storage.cache.coalesce_gap_blocks = value;
     }
     if let Some(value) = tuning.cache_max_coalesce_blocks {
         config.storage.cache.max_coalesce_blocks = value;

@@ -10,6 +10,7 @@ p.add_argument("--disk-gib", type=float, default=48)
 p.add_argument("--block", type=int, default=4000)
 p.add_argument("--coalesce", type=int, default=128)
 p.add_argument("--fetch", type=int, default=128)
+p.add_argument("--gap", type=int, default=0)
 p.add_argument("--read-only", action="store_true")
 a = p.parse_args()
 c = json.load(open(a.config))
@@ -18,6 +19,6 @@ json.dump({
     "region": c.get("region") or None, "profile": c.get("profile") or None,
     "read_only": a.read_only,
     "cache": {"memory_bytes": int(a.memory_gib * 2**30), "disk_bytes": int(a.disk_gib * 2**30),
-              "disk_dir": a.cache_dir, "block_size": a.block, "max_coalesce_blocks": a.coalesce,
+              "disk_dir": a.cache_dir, "block_size": a.block, "max_coalesce_blocks": a.coalesce, "coalesce_gap_blocks": a.gap,
               "fetch_concurrency": a.fetch},
 }, open(a.out, "w"))

@@ -40,6 +40,9 @@ pub struct CacheConfig {
     pub block_size: usize,
     /// Maximum blocks coalesced into one backend GET (default 8).
     pub max_coalesce_blocks: usize,
+    /// Missing blocks separated by at most this many unrequested blocks share one GET; the
+    /// gap bytes are fetched and discarded. Trades bytes for fewer requests (default 0).
+    pub coalesce_gap_blocks: usize,
     /// Maximum simultaneous cache-fill GETs across all readers (default 64).
     pub fetch_concurrency: usize,
     /// Maximum background warming tasks; excess hints are rejected (default 4).
@@ -72,6 +75,7 @@ impl Default for CacheConfig {
             namespace: None,
             block_size: 1 << 20,
             max_coalesce_blocks: 8,
+            coalesce_gap_blocks: 0,
             fetch_concurrency: 64,
             prefetch_concurrency: 4,
         }
@@ -444,9 +448,10 @@ impl RangeReader {
         let mut start = 0;
         while start < missing.len() {
             let mut end = start + 1;
+            let gap = cache.config.coalesce_gap_blocks as u64;
             while end < missing.len()
-                && end - start < cache.config.max_coalesce_blocks
-                && missing[end] == missing[end - 1] + 1
+                && (missing[end] - missing[start]) < cache.config.max_coalesce_blocks as u64
+                && missing[end] <= missing[end - 1] + 1 + gap
             {
                 end += 1;
             }
@@ -492,10 +497,10 @@ impl RangeReader {
             }
             .boxed()
             .shared();
-            for index in missing[start..end].iter().copied() {
+            for (position, index) in missing[start..end].iter().copied().enumerate() {
                 let fetch = group.clone();
                 let flight = Arc::new(Flight(
-                    async move { Ok(fetch.await?[(index - first) as usize].clone()) }
+                    async move { Ok(fetch.await?[position].clone()) }
                         .boxed()
                         .shared(),
                 ));
