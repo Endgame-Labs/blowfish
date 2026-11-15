@@ -21,7 +21,7 @@ async def main():
     base, namespace, concurrency = sys.argv[2], sys.argv[3], int(sys.argv[4])
     semaphore = asyncio.Semaphore(concurrency)
     limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
-    async with httpx.AsyncClient(timeout=300, limits=limits) as client:
+    async with httpx.AsyncClient(timeout=600, limits=limits) as client:
         url = f"{base}/v2/namespaces/{namespace}/query"
         if len(sys.argv) > 5 and sys.argv[5] == "warmup":
             for item in inputs:
