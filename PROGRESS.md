@@ -2,6 +2,13 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-15
+
+- **R2 10M-document scale test started, running alone.** It uses real text and embeddings on a
+  separate, memory-capped instance under the bucket's `scale/` prefix, and doesn't touch the live
+  service. Afterward, harden and then perf2 resume one at a time, with perf2's local benchmarks capped at
+  100k docs.
+
 ## 2026-11-14
 
 - **Always-on deployment documented and verified.** Added systemd and Caddy guidance covering
