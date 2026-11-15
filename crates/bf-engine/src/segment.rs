@@ -296,6 +296,37 @@ fn hashes(id: &Id, bits: usize) -> [usize; 3] {
     ]
 }
 /// Build documents and filter dictionaries in sorted global-ID order.
+/// Tokenize in parallel (bounded chunks keep memory flat), then feed the builder in row order.
+fn build_text(
+    values: Vec<Option<Value>>,
+    params: bf_text::FtsParams,
+) -> Result<(Vec<u8>, u64), ApiError> {
+    use rayon::prelude::*;
+    let mut builder = bf_text::SegmentBuilder::with_tokenizer(true, params.tokenizer);
+    for chunk in values.chunks(4096) {
+        let tokens: Vec<Option<Vec<bf_text::Token>>> = chunk
+            .par_iter()
+            .map(|value| value.as_ref().map(|v| crate::text::tokens(v, &params)))
+            .collect();
+        for tokens in tokens {
+            match tokens {
+                Some(tokens) => {
+                    builder.add_document(&tokens).map_err(index_error)?;
+                }
+                None => {
+                    builder.add_missing_document().map_err(index_error)?;
+                }
+            }
+        }
+    }
+    let bytes = builder.finish().map_err(index_error)?;
+    // bf-text v1 stores the document-length region offset at footer byte 32.
+    let footer = &bytes[bytes.len() - 72..];
+    let lengths_offset = u64::from_le_bytes(footer[32..40].try_into().expect("v1 footer"));
+    let metadata_len = bytes.len() as u64 - lengths_offset;
+    Ok((bytes, metadata_len))
+}
+
 pub(crate) async fn build(
     store: &Storage,
     ns: &str,
@@ -313,6 +344,51 @@ pub(crate) async fn build(
     let mut body = vec![];
     let mut dir = Directory::default();
     let rows: Vec<_> = docs.values().collect();
+    // Index builds are CPU-bound: start them on blocking workers now, so they overlap with
+    // document encoding and uploads below instead of running one after another.
+    let mut ann_jobs = Vec::new();
+    for (column, (name, config)) in schema.iter().enumerate() {
+        let dense = match config.data_type {
+            Some(AttributeType::Vector { dimensions, f16 }) => Some((
+                dimensions,
+                if f16 {
+                    bf_vector::VectorType::F16
+                } else {
+                    bf_vector::VectorType::F32
+                },
+            )),
+            Some(AttributeType::VectorI8 { dimensions }) => {
+                Some((dimensions, bf_vector::VectorType::I8))
+            }
+            _ => None,
+        };
+        if let Some((dimensions, dtype)) = dense {
+            let vectors = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| row.get(name).map(|v| (i as u32, v)))
+                .map(|(i, v)| Ok((i, bf_types::decode_vector(v)?)))
+                .collect::<Result<Vec<_>, ApiError>>()?;
+            let metric = vector_metric(metric);
+            let job = tokio::task::spawn_blocking(move || {
+                bf_vector::IndexBuilder::new(dimensions, metric)?
+                    .vector_type(dtype)
+                    .build(&vectors)
+            });
+            ann_jobs.push((name.clone(), column, job));
+        }
+    }
+    let mut fts_jobs = Vec::new();
+    for (column, (name, config)) in schema.iter().enumerate() {
+        if let Some(params) = config.text_config() {
+            let values: Vec<Option<Value>> = rows
+                .iter()
+                .map(|row| row.get(name).filter(|v| !v.is_null()).cloned())
+                .collect();
+            let job = tokio::task::spawn_blocking(move || build_text(values, params));
+            fts_jobs.push((name.clone(), column, job));
+        }
+    }
     for (name, config) in schema {
         let vector = match config.data_type {
             Some(AttributeType::Vector { dimensions, f16 }) => Some((dimensions, f16)),
@@ -407,43 +483,6 @@ pub(crate) async fn build(
         put_file(store, format!("{prefix}/filter.bfx"), bytes, meta).await?,
     );
     for (column, (name, config)) in schema.iter().enumerate() {
-        let dense = match config.data_type {
-            Some(AttributeType::Vector { dimensions, f16 }) => Some((
-                dimensions,
-                if f16 {
-                    bf_vector::VectorType::F16
-                } else {
-                    bf_vector::VectorType::F32
-                },
-            )),
-            Some(AttributeType::VectorI8 { dimensions }) => {
-                Some((dimensions, bf_vector::VectorType::I8))
-            }
-            _ => None,
-        };
-        if let Some((dimensions, dtype)) = dense {
-            let vectors = rows
-                .iter()
-                .enumerate()
-                .filter_map(|(i, row)| row.get(name).map(|v| (i as u32, v)))
-                .map(|(i, v)| Ok((i, bf_types::decode_vector(v)?)))
-                .collect::<Result<Vec<_>, ApiError>>()?;
-            let bytes = tokio::task::spawn_blocking(move || {
-                bf_vector::IndexBuilder::new(dimensions, vector_metric(metric))?
-                    .vector_type(dtype)
-                    .build(&vectors)
-            })
-            .await
-            .map_err(index_error)?
-            .map_err(index_error)?;
-            let meta = bf_vector::metadata_len(&bytes).map_err(index_error)?;
-            files.insert(
-                format!("ann:{name}"),
-                put_file(store, format!("{prefix}/ann.{column}.bfv"), bytes, meta).await?,
-            );
-        }
-    }
-    for (column, (name, config)) in schema.iter().enumerate() {
         if config.fuzzy == Some(true) || config.regex == Some(true) || config.glob == Some(true) {
             files.insert(
                 format!("trigram:{name}"),
@@ -457,34 +496,26 @@ pub(crate) async fn build(
         }
     }
     crate::sparse::build(store, &prefix, schema, docs, &mut files).await?;
-    for (column, (name, config)) in schema.iter().enumerate() {
-        if let Some(params) = config.text_config() {
-            let mut builder = bf_text::SegmentBuilder::with_tokenizer(true, params.tokenizer);
-            for row in &rows {
-                if let Some(value) = row.get(name).filter(|v| !v.is_null()) {
-                    builder
-                        .add_document(&crate::text::tokens(value, &params))
-                        .map_err(index_error)?;
-                } else {
-                    builder.add_missing_document().map_err(index_error)?;
-                }
-            }
-            let bytes = builder.finish().map_err(index_error)?;
-            // bf-text v1 stores the document-length region offset at footer byte 32.
-            let footer = &bytes[bytes.len() - 72..];
-            let lengths_offset = u64::from_le_bytes(footer[32..40].try_into().expect("v1 footer"));
-            let metadata_len = bytes.len() as u64 - lengths_offset;
-            files.insert(
-                format!("fts:{name}"),
-                put_file(
-                    store,
-                    format!("{prefix}/fts.{column}.bft"),
-                    bytes,
-                    metadata_len,
-                )
-                .await?,
-            );
-        }
+    for (name, column, job) in ann_jobs {
+        let bytes = job.await.map_err(index_error)?.map_err(index_error)?;
+        let meta = bf_vector::metadata_len(&bytes).map_err(index_error)?;
+        files.insert(
+            format!("ann:{name}"),
+            put_file(store, format!("{prefix}/ann.{column}.bfv"), bytes, meta).await?,
+        );
+    }
+    for (name, column, job) in fts_jobs {
+        let (bytes, metadata_len) = job.await.map_err(index_error)??;
+        files.insert(
+            format!("fts:{name}"),
+            put_file(
+                store,
+                format!("{prefix}/fts.{column}.bft"),
+                bytes,
+                metadata_len,
+            )
+            .await?,
+        );
     }
     let live = put_value(
         store,

@@ -40,6 +40,8 @@ pub struct EngineConfig {
     pub max_unindexed_bytes: u64,
     /// Eventual reads include at most this many logical WAL bytes.
     pub eventual_tail_bytes: u64,
+    /// Segments built concurrently when one flush or compaction yields several.
+    pub build_concurrency: usize,
     /// IVF leaf probes for ANN queries.
     pub ann_nprobe: usize,
     /// Exact rerank budget as a multiple of the requested k.
@@ -86,7 +88,8 @@ impl Default for EngineConfig {
             lease_duration: Duration::from_secs(30),
             max_unindexed_bytes: 2_000_000_000,
             eventual_tail_bytes: 128 * 1024 * 1024,
-            ann_nprobe: 128,
+            build_concurrency: 2,
+            ann_nprobe: 512,
             ann_rerank_factor: 64,
             recall_sample_rate: 0.01,
         }
@@ -113,6 +116,9 @@ impl EngineConfig {
         if let Some(v) = number("BF_INDEX_ROWS") {
             c.index_rows = v as usize;
         }
+        if let Some(v) = number("BF_INDEX_BYTES") {
+            c.index_bytes = v;
+        }
         if let Some(v) = number("BF_MAX_SEGMENT_ROWS") {
             c.max_segment_rows = v as usize;
         }
@@ -130,6 +136,9 @@ impl EngineConfig {
         }
         if let Some(v) = number("BF_ANN_NPROBE") {
             c.ann_nprobe = v as usize;
+        }
+        if let Some(v) = number("BF_BUILD_CONCURRENCY") {
+            c.build_concurrency = v as usize;
         }
         if let Some(v) = number("BF_ANN_RERANK") {
             c.ann_rerank_factor = v as usize;
@@ -641,7 +650,7 @@ async fn build_segments(
     end: u64,
     config: &EngineConfig,
 ) -> Result<Vec<bf_wal::Segment>, ApiError> {
-    let mut out = vec![];
+    let mut batches = vec![];
     let mut batch = BTreeMap::new();
     let mut bytes = 0u64;
     for (id, doc) in docs {
@@ -650,15 +659,29 @@ async fn build_segments(
             && (batch.len() >= config.max_segment_rows.max(1)
                 || bytes.saturating_add(size) > config.max_segment_bytes.max(1))
         {
-            out.push(segment::build(store, ns, schema, metric, &batch, start, end).await?);
-            batch.clear();
+            batches.push(std::mem::take(&mut batch));
             bytes = 0;
         }
         batch.insert(id.clone(), doc.clone());
         bytes = bytes.saturating_add(size);
     }
     if !batch.is_empty() {
-        out.push(segment::build(store, ns, schema, metric, &batch, start, end).await?);
+        batches.push(batch);
+    }
+    // Segments are independent: build a few at once, keeping their order.
+    let mut out = Vec::with_capacity(batches.len());
+    for group in batches.chunks(config.build_concurrency.max(1)) {
+        let mut builds = Vec::with_capacity(group.len());
+        for batch in group {
+            builds.push(segment::build(store, ns, schema, metric, batch, start, end));
+        }
+        let started = std::time::Instant::now();
+        let built = futures::future::try_join_all(builds).await?;
+        let rows: u32 = built.iter().map(|s| s.row_count).sum();
+        metrics::counter!("blowfish_segment_build_millis_total")
+            .increment((started.elapsed().as_secs_f64() * 1000.0) as u64);
+        metrics::counter!("blowfish_segment_build_rows_total").increment(rows as u64);
+        out.extend(built);
     }
     Ok(out)
 }
