@@ -18,6 +18,13 @@ instead of guessing.
 
 ## Rules
 
+- **No clutter on the machine.** Put every scratch file, log, benchmark data directory, and test output under
+  `.scratch/` at the repo root (git-ignored; a worktree uses its own `.scratch/`), never in `/tmp` or the home
+  directory. Give each run its own subdirectory, and **delete it when the run ends**, pass or fail (use a
+  `trap` or a finally block). Copy the numbers worth keeping into `PROGRESS.md` or a doc first. Benchmarks
+  that write to a bucket delete their prefix when done, too. Before you finish a task, check that `.scratch/`
+  holds nothing you made.
+
 - Never commit secrets or print their values. Private details go in a `*.local` file, never in tracked files.
 - Before every commit, check the diff for secrets, tokens, internal hostnames, and anything from a `*.local` file.
 - Use `uv` for anything Python.
