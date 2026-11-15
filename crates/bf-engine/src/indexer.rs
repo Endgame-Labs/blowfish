@@ -185,7 +185,8 @@ fn adjust(
 }
 impl Engine {
     /// Flush a namespace's current tail and compact one eligible tier.
-    /// `force` bypasses size, age, and advisory lease checks, but never epoch fencing.
+    /// `force` bypasses local freshness, size, age, and advisory lease checks,
+    /// but never epoch fencing.
     /// Returns false when there was no work or another indexer won the publication.
     pub async fn index_namespace(&self, ns: &str, force: bool) -> Result<bool, ApiError> {
         let context = crate::read_cache::ReadContext {
@@ -200,6 +201,17 @@ impl Engine {
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
         let state = {
             let mut state = handle.state.lock().await;
+            // Local commits and queued compaction are already known. Poll remote
+            // writers at the configured maximum tail age while idle, rather than
+            // holding this lock across two object-store calls on every tick.
+            if !force
+                && state.seq > 0
+                && state.seq == state.indexed_through
+                && state.refreshed.elapsed() < self.0.config.index_age
+                && tier(&state, &self.0.config).is_empty()
+            {
+                return Ok(false);
+            }
             catch_up(&wal, &mut state, &self.0.store).await?;
             state.clone()
         };

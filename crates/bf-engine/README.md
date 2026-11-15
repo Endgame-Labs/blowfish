@@ -376,3 +376,9 @@ checked against its own CRC before decoding.
 Keep runtime configurations, cache directories, downloaded shards, results, and
 logs under the repository's ignored `.scratch/` directory, and remove them when
 finished. The loader leaves the ingested namespace intact.
+
+An idle indexer at a known checkpoint polls remote writers at `index_age`, rather
+than every `index_interval`. Local writes and eligible compaction bypass this idle
+wait, and `index_namespace(..., true)` always refreshes the backend. Strong query
+checks also refresh the known WAL state, avoiding redundant idle indexer requests
+while the namespace is actively queried.
