@@ -4,6 +4,18 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-15
 
+- **10M-document R2 baseline merged (iteration 0).** 10M real Wikipedia passages with 1024-dim
+  embeddings loaded in 5 h 33 min (500 docs/s end to end), with 1,279 backpressure retries and no
+  OOMs. The retained namespace is 56.25 GB, or 5,625 bytes/doc, in 60 segments. ANN recall@10 is
+  0.997. Warm ANN p50 is 1.24 s and warm BM25 p50 is 4.45 s at concurrency 1. Cold single queries
+  take 45-50 s. Fixes merged with it: bounded segment builds and compaction, compact resident
+  vectors, shared BM25 corpus stats, batched column reads, quieter idle indexers, filtered ANN
+  skipping unused columns, and a tunable decoded-metadata cache. Raising that cache's budget
+  alone took warm BM25 from 4.1 s to 83 ms in a probe. Full numbers are in `docs/benchmarks.md`.
+  The query matrix was cut short when Codex ran out of credits. Checked with clippy, 156 tests,
+  and compat 121/121 in both modes (new `scripts/compat_both.sh`). Next: at least five
+  profile, fix, wipe, and reload iterations.
+
 - **R2 10M-document scale test started, running alone.** It uses real text and embeddings on a
   separate, memory-capped instance under the bucket's `scale/` prefix, and doesn't touch the live
   service. Afterward, harden and then perf2 resume one at a time, with perf2's local benchmarks capped at
