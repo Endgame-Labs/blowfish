@@ -284,6 +284,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "crc32fast",
  "futures",
  "metrics",
  "moka",

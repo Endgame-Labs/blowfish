@@ -485,6 +485,9 @@ impl RangeReader {
                     cache.insert(reader.block_key(index), value.clone()).await;
                     values.push(value);
                 }
+                // Apply pending evictions once per coalesced fetch, so memory stays within
+                // budget without paying for maintenance on every block.
+                cache.memory.run_pending_tasks();
                 Ok::<_, Arc<Error>>(Arc::new(values))
             }
             .boxed()
