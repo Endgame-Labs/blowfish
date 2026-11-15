@@ -698,9 +698,17 @@ async fn commit_worker(
         }
         let start = Instant::now();
         let mut current = state.lock().await;
+        // A state this node just committed or refreshed is current unless another writer
+        // has since appended. The conditional create of the next WAL slot detects exactly
+        // that (Conflict), and the retry then catches up, so the common single-writer
+        // bulk-load path skips a LIST round trip before every commit.
+        let mut trusted =
+            current.seq > 0 && current.refreshed.elapsed() < std::time::Duration::from_secs(2);
         let committed = loop {
             let stage = Instant::now();
-            if let Err(e) = catch_up(&wal, &mut current, &store).await {
+            if !std::mem::take(&mut trusted)
+                && let Err(e) = catch_up(&wal, &mut current, &store).await
+            {
                 break Err(e);
             }
             record_stage("catch_up", stage);
