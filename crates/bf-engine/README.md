@@ -346,3 +346,8 @@ one native-width vector copy, as required by the current segment format.
 Checkpoint BM25 corpus statistics are decoded once and shared by immutable query
 snapshots. Queries with an unindexed tail still compute deletion-adjusted totals;
 fully indexed queries reuse the checkpoint without cloning the vocabulary.
+
+Column materialization fetches at most 16 blocks per batch through the range cache.
+This bounds read buffers while allowing coalescing and parallel I/O during
+compaction, exact scans, and attribute projection. Each returned block is still
+checked against its own CRC before decoding.

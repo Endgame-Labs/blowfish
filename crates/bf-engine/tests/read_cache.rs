@@ -348,3 +348,39 @@ async fn independent_strong_queries_check_wal_concurrently() {
         "strong checks must not serialize under the namespace lock"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materializing_columns_fetches_bounded_block_batches_concurrently() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    writer.write("bulk", serde_json::from_value(json!({
+        "distance_metric":"cosine_distance",
+        "upsert_rows":(0..4096).map(|id|json!({"id":id,"vector":(0..64).map(|d| (id+d) as f32).collect::<Vec<_>>()})).collect::<Vec<_>>()
+    })).unwrap()).await.unwrap();
+    writer.index_namespace("bulk", true).await.unwrap();
+    let cold = Engine::with_config(store(backend.clone()).await, config());
+    backend.max_active.store(0, Ordering::SeqCst);
+    backend.delay.store(true, Ordering::SeqCst);
+    let result = cold
+        .query_exhaustive(
+            "bulk",
+            serde_json::from_value(json!({
+                "rank_by":["id","desc"],"top_k":3,"include_attributes":true
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.result.rows.as_ref().unwrap()[0]["id"], 4095);
+    assert_eq!(
+        result.result.rows.as_ref().unwrap()[0]["vector"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(backend.max_active.load(Ordering::SeqCst) > 1);
+}

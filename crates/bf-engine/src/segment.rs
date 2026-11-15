@@ -636,70 +636,87 @@ pub(crate) async fn projected_documents(
         if name != "id" && columns.is_some_and(|c| !c.contains(name)) {
             continue;
         }
-        for &i in &blocks {
-            let b = col.blocks.get(i).ok_or_else(corrupt)?;
-            let first = (i * BLOCK_ROWS) as u32;
-            let last = first
-                .saturating_add(BLOCK_ROWS as u32)
-                .min(segment.row_count);
-            if rows.range(first..last).next().is_none() {
-                continue;
-            }
-            let data = read_block(&reader, b).await?;
-            let values: Vec<Option<Value>> = if let Some((dims, f16)) = col.vector {
-                let mut pos = 0;
-                let mut values = vec![];
-                for _ in first..last {
-                    let present = *data.get(pos).ok_or_else(corrupt)?;
-                    pos += 1;
-                    if present == 0 {
-                        values.push(None);
-                        continue;
-                    }
-                    if present != 1 {
-                        return Err(corrupt());
-                    }
-                    let mut v = vec![];
-                    for _ in 0..dims {
-                        let width = if col.vector_i8 {
-                            1
-                        } else if f16 {
-                            2
-                        } else {
-                            4
-                        };
-                        let bytes = data.get(pos..pos + width).ok_or_else(corrupt)?;
-                        let x = if col.vector_i8 {
-                            bytes[0] as i8 as f32
-                        } else if f16 {
-                            half::f16::from_le_bytes(bytes.try_into().unwrap()).to_f32()
-                        } else {
-                            f32::from_le_bytes(bytes.try_into().unwrap())
-                        };
-                        v.push(x);
-                        pos += width;
-                    }
-                    values.push(Some(if col.vector_i8 {
-                        serde_json::json!(v.iter().map(|x| *x as i8).collect::<Vec<_>>())
-                    } else {
-                        Value::String(bf_types::encode_vector(&v, false))
-                    }));
-                }
-                if pos != data.len() {
+        // Bound prefetch memory while letting the range cache coalesce and fetch
+        // independent column blocks together. Serial block GETs make compaction
+        // throughput depend on one object-store round trip per 256 documents.
+        let indices: Vec<_> = blocks.iter().copied().collect();
+        for batch in indices.chunks(16) {
+            let descriptors = batch
+                .iter()
+                .map(|i| col.blocks.get(*i).ok_or_else(corrupt))
+                .collect::<Result<Vec<_>, _>>()?;
+            let data = reader
+                .read_batch(
+                    descriptors
+                        .iter()
+                        .map(|b| b.offset..b.offset + b.length)
+                        .collect(),
+                )
+                .await
+                .map_err(index_error)?;
+            for ((&i, b), data) in batch.iter().zip(descriptors).zip(data) {
+                if crc32fast::hash(&data) != b.crc {
                     return Err(corrupt());
                 }
-                values
-            } else {
-                decode(&data)?
-            };
-            if values.len() != (last - first) as usize {
-                return Err(corrupt());
-            }
-            for row in rows.range(first..last) {
-                if let Some(value) = &values[(row - first) as usize] {
-                    docs.get_mut(&row)
-                        .unwrap()
-                        .insert(name.clone(), value.clone());
+                let first = (i * BLOCK_ROWS) as u32;
+                let last = first
+                    .saturating_add(BLOCK_ROWS as u32)
+                    .min(segment.row_count);
+                let values: Vec<Option<Value>> = if let Some((dims, f16)) = col.vector {
+                    let mut pos = 0;
+                    let mut values = vec![];
+                    for _ in first..last {
+                        let present = *data.get(pos).ok_or_else(corrupt)?;
+                        pos += 1;
+                        if present == 0 {
+                            values.push(None);
+                            continue;
+                        }
+                        if present != 1 {
+                            return Err(corrupt());
+                        }
+                        let mut v = vec![];
+                        for _ in 0..dims {
+                            let width = if col.vector_i8 {
+                                1
+                            } else if f16 {
+                                2
+                            } else {
+                                4
+                            };
+                            let bytes = data.get(pos..pos + width).ok_or_else(corrupt)?;
+                            let x = if col.vector_i8 {
+                                bytes[0] as i8 as f32
+                            } else if f16 {
+                                half::f16::from_le_bytes(bytes.try_into().unwrap()).to_f32()
+                            } else {
+                                f32::from_le_bytes(bytes.try_into().unwrap())
+                            };
+                            v.push(x);
+                            pos += width;
+                        }
+                        values.push(Some(if col.vector_i8 {
+                            serde_json::json!(v.iter().map(|x| *x as i8).collect::<Vec<_>>())
+                        } else {
+                            Value::String(bf_types::encode_vector(&v, false))
+                        }));
+                    }
+                    if pos != data.len() {
+                        return Err(corrupt());
+                    }
+                    values
+                } else {
+                    decode(&data)?
+                };
+                if values.len() != (last - first) as usize {
+                    return Err(corrupt());
+                }
+                for row in rows.range(first..last) {
+                    if let Some(value) = &values[(row - first) as usize] {
+                        docs.get_mut(&row)
+                            .unwrap()
+                            .insert(name.clone(), value.clone());
+                    }
                 }
             }
         }
