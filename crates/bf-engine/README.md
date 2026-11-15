@@ -342,3 +342,7 @@ at validation. This avoids resident JSON number arrays and large decimal WAL
 payloads. Reads still return the requested JSON array or base64 encoding. Existing
 array-form WAL payloads remain readable. Document columns and ANN files each retain
 one native-width vector copy, as required by the current segment format.
+
+Checkpoint BM25 corpus statistics are decoded once and shared by immutable query
+snapshots. Queries with an unindexed tail still compute deletion-adjusted totals;
+fully indexed queries reuse the checkpoint without cloning the vocabulary.

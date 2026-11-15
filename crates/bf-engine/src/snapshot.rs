@@ -42,6 +42,7 @@ pub(crate) async fn catch_up(
                         segments: m.segments,
                         indexed_through: m.indexed_through,
                         manifest_seq: generation,
+                        corpus: crate::text::checkpoint_corpus(&m.stats),
                         stats: m.stats.into(),
                         ..Default::default()
                     }

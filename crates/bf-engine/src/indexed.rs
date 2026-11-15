@@ -60,7 +60,7 @@ pub(crate) async fn execute(
         }
     }
     if !clauses.is_empty() {
-        prepared.corpus = crate::text::global_stats(store, state).await?.into();
+        prepared.corpus = crate::text::global_stats(store, state).await?;
     }
     let state = &prepared;
     let mut candidates = state.clone();

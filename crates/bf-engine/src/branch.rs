@@ -47,10 +47,12 @@ fn commit_key(wal: &Wal, id: Uuid) -> String {
 fn install(state: &mut NamespaceState, pin: &Pin) {
     state.segments = pin.segments.clone();
     state.stats = std::sync::Arc::new(pin.stats.clone());
+    state.corpus = crate::text::checkpoint_corpus(&pin.stats);
 }
 pub(crate) fn install_source(state: &mut NamespaceState, source: &Source) {
     state.segments = source.state.segments.clone();
     state.stats = source.state.stats.clone();
+    state.corpus = source.state.corpus.clone();
 }
 impl Engine {
     pub(crate) async fn copy_source(
