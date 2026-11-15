@@ -13,6 +13,22 @@ pub(crate) fn rank_key(rank: &RankBy) -> String {
     rank.value().to_string()
 }
 
+fn filter_columns(filter: &Filter, columns: &mut BTreeSet<String>) {
+    match filter {
+        Filter::And(filters) | Filter::Or(filters) => {
+            for filter in filters {
+                filter_columns(filter, columns);
+            }
+        }
+        Filter::Not(filter) => filter_columns(filter, columns),
+        Filter::Compare { attribute, .. } => {
+            if attribute != "id" {
+                columns.insert(attribute.clone());
+            }
+        }
+    }
+}
+
 pub(crate) async fn execute(
     store: &Storage,
     state: &NamespaceState,
@@ -60,7 +76,7 @@ pub(crate) async fn execute(
         }
     }
     if !clauses.is_empty() {
-        prepared.corpus = crate::text::global_stats(store, state).await?.into();
+        prepared.corpus = crate::text::global_stats(store, state).await?;
     }
     let state = &prepared;
     let mut candidates = state.clone();
@@ -70,7 +86,17 @@ pub(crate) async fn execute(
         .as_deref()
         .unwrap_or(std::slice::from_ref(request))
     {
-        let part = prepare(store, state, q, config, force_exact).await?;
+        // RRF clauses can project different fields on overlapping candidates.
+        // Keep their common candidate hydration intact when merging the clauses.
+        let part = prepare(
+            store,
+            state,
+            q,
+            config,
+            force_exact,
+            request.queries.is_none(),
+        )
+        .await?;
         candidates.docs.extend(part.docs);
         for (rank, scores) in part.scores {
             candidates.scores.entry(rank).or_default().extend(scores);
@@ -139,6 +165,7 @@ async fn prepare(
     q: &QueryRequest,
     config: &EngineConfig,
     force_exact: bool,
+    narrow_columns: bool,
 ) -> Result<NamespaceState, ApiError> {
     if matches!(q.rank_by, Some(RankBy::MultiVector { .. })) {
         return snapshot::materialize(store, state).await;
@@ -147,7 +174,7 @@ async fn prepare(
         return crate::streaming::order_candidates(store, state, q).await;
     }
     let Some(context) = crate::read_cache::context().filter(|_| state.segments.len() > 1) else {
-        let mut out = prepare_one(store, state, q, config, force_exact).await?;
+        let mut out = prepare_one(store, state, q, config, force_exact, narrow_columns).await?;
         trim_candidates(&mut out, q);
         return Ok(out);
     };
@@ -176,7 +203,7 @@ async fn prepare(
                 state.segments.push(segment);
                 runtime.block_on(crate::read_cache::scope(
                     context,
-                    prepare_one(&store, &state, &q, &config, force_exact),
+                    prepare_one(&store, &state, &q, &config, force_exact, narrow_columns),
                 ))
             })
             .await
@@ -195,7 +222,7 @@ async fn prepare(
     }
     let mut tail = state.clone();
     tail.segments.clear();
-    let part = prepare_one(store, &tail, q, config, force_exact).await?;
+    let part = prepare_one(store, &tail, q, config, force_exact, narrow_columns).await?;
     out.docs.extend(part.docs);
     for (rank, scores) in part.scores {
         out.scores.entry(rank).or_default().extend(scores);
@@ -209,6 +236,7 @@ async fn prepare_one(
     q: &QueryRequest,
     config: &EngineConfig,
     force_exact: bool,
+    narrow_columns: bool,
 ) -> Result<NamespaceState, ApiError> {
     let Some(
         rank @ RankBy::Vector {
@@ -249,13 +277,22 @@ async fn prepare_one(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    if q.filters.is_none()
-        && q.include_attributes.is_none()
+    if q.include_attributes.is_none()
         && q.exclude_attributes.is_none()
         && q.compute_attributes.is_none()
         && q.limit.as_ref().and_then(Limit::per).is_none()
     {
-        columns.clear();
+        match &q.filters {
+            None => columns.clear(),
+            Some(filter) if narrow_columns && q.extra.is_empty() => {
+                // Scoring already supplied distances. Only the filter needs
+                // document values when the response projects no attributes.
+                let mut needed = BTreeSet::new();
+                filter_columns(filter, &mut needed);
+                columns.retain(|name| needed.contains(name));
+            }
+            _ => {}
+        }
     }
     for seg in &state.segments {
         let file = seg.files.get(&format!("ann:{attribute}"));

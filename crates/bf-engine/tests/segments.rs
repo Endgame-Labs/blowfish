@@ -46,6 +46,90 @@ fn initial() -> Value {
     json!({"distance_metric":"cosine_distance","schema":{"text":{"type":"string","full_text_search":true},"small":"[2]f16"},
         "upsert_rows":(0..30).map(|id|json!({"id":id,"n":id%7,"text":if id%2==0 {"red fox"}else{"blue bird"},"vector":[id as f32+1.0,1.0],"small":[1.0,0.3333],"tags":["a","b"]})).collect::<Vec<_>>()})
 }
+
+#[tokio::test]
+async fn filtered_ann_skips_unused_columns_and_preserves_rrf_clause_projection() {
+    async fn uncached_node() -> Engine {
+        let mut config = StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        };
+        config.cache.memory_bytes = 0;
+        config.cache.disk_bytes = 0;
+        config.cache.block_size = 4096;
+        Engine::with_config(
+            Storage::open(&config).await.unwrap(),
+            EngineConfig {
+                indexing: false,
+                decoded_cache_bytes: 0,
+                ..Default::default()
+            },
+        )
+    }
+    let indexed = uncached_node().await;
+    let reference = uncached_node().await;
+    let mut seed = 17u64;
+    let rows: Vec<_> = (1..=64)
+        .map(|id| {
+            let padding: String = (0..65536)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (b'a' + ((seed >> 32) % 26) as u8) as char
+                })
+                .collect();
+            json!({"id":id,"n":id,"tag":if id%2==0 {"z"}else{"a"},
+                "vector":[id as f32+1.0,1.0],"padding":padding})
+        })
+        .collect();
+    let body = json!({"distance_metric":"cosine_distance",
+        "schema":{"padding":{"type":"string","filterable":false}},"upsert_rows":rows});
+    write(&indexed, body.clone()).await;
+    write(&reference, body).await;
+    assert!(indexed.index_namespace("test", true).await.unwrap());
+    for filter in [
+        json!(["tag", "Eq", "z"]),
+        json!(["And", [["tag", "Eq", "z"], ["Not", ["n", "Lt", 5]]]]),
+        json!(["id", "Gt", 4]),
+    ] {
+        let request = json!({"rank_by":["vector","ANN",[1.0,0.0]],
+            "top_k":16,"filters":filter});
+        let (response, diagnostic) = indexed
+            .query_with_diagnostics("test", serde_json::from_value(request.clone()).unwrap())
+            .await
+            .unwrap();
+        let mut actual = serde_json::to_value(response).unwrap();
+        actual.as_object_mut().unwrap().remove("performance");
+        assert_eq!(actual, query(&reference, request.clone()).await);
+        let skipped_bytes: u64 = diagnostic.backend.iter().map(|b| b.bytes).sum();
+        let mut projected = request;
+        projected["include_attributes"] = json!(["padding"]);
+        let (response, diagnostic) = indexed
+            .query_with_diagnostics("test", serde_json::from_value(projected).unwrap())
+            .await
+            .unwrap();
+        let projected_bytes: u64 = diagnostic.backend.iter().map(|b| b.bytes).sum();
+        assert!(
+            projected_bytes > skipped_bytes * 2,
+            "unused padding was read: unprojected={skipped_bytes}, projected={projected_bytes}"
+        );
+        let mut projected = serde_json::to_value(response).unwrap();
+        projected.as_object_mut().unwrap().remove("performance");
+        for row in projected["rows"].as_array_mut().unwrap() {
+            assert_eq!(row["padding"].as_str().unwrap().len(), 65536);
+            row.as_object_mut().unwrap().remove("padding");
+        }
+        assert_eq!(actual, projected);
+    }
+    let request = json!({"queries":[
+        {"rank_by":["vector","ANN",[1.0,0.0]],"top_k":16,"filters":["tag","Eq","z"],"include_attributes":["padding"]},
+        {"rank_by":["vector","ANN",[1.0,0.0]],"top_k":16,"filters":["id","Gt",4]}
+    ],"rerank_by":["RRF"],"limit":16});
+    assert_eq!(
+        query(&indexed, request.clone()).await,
+        query(&reference, request).await
+    );
+}
+
 #[tokio::test]
 async fn checkpoints_overlay_compaction_gc_and_cold_reopen_match_reference() {
     let indexed = node().await;
@@ -558,4 +642,90 @@ async fn schema_drops_do_not_copy_surviving_vectors_into_the_wal() {
             .iter()
             .all(|row| row.get("tags").is_none())
     );
+}
+
+#[tokio::test]
+async fn segment_caps_split_flushes_and_bound_compaction_without_losing_updates() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let e = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            max_segment_rows: 7,
+            max_segment_bytes: 4096,
+            compaction_segments: 2,
+            retention: Duration::ZERO,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    write(&e, initial()).await;
+    e.index_namespace("test", true).await.unwrap();
+    for round in 0..4 {
+        write(&e, json!({"upsert_rows": [{"id":100+round,"text":"new fox","vector":[1.0,2.0],"small":[1.0,2.0]}],"patch_rows":[{"id":round,"n":100}]})).await;
+        e.index_namespace("test", true).await.unwrap();
+    }
+    for _ in 0..8 {
+        e.index_namespace("test", true).await.unwrap();
+    }
+    let (_, m) = Wal::new(store.clone(), "test")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(m.segments.len() > 1);
+    assert!(m.segments.iter().all(|s| s.row_count <= 7));
+    let q = json!({"rank_by":["id","asc"],"top_k":100,"include_attributes":true});
+    let before = query(&e, q.clone()).await;
+    assert_eq!(before["rows"].as_array().unwrap().len(), 34);
+    e.collect_garbage("test").await.unwrap();
+    let cold = Engine::with_config(
+        store,
+        EngineConfig {
+            indexing: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(query(&cold, q).await, before);
+}
+
+#[tokio::test]
+async fn byte_cap_splits_large_documents_and_compact_vectors_preserve_wire_encodings() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let e = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            max_segment_rows: 100,
+            max_segment_bytes: 600,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    write(&e, json!({"distance_metric":"cosine_distance","schema":{"small":"[2]f16"},"upsert_rows":
+        (0..12).map(|id|json!({"id":id,"text":"a".repeat(280),"vector":[0.25,1.0],"small":[0.3333,1.0]})).collect::<Vec<_>>()
+    })).await;
+    let wal = Wal::new(store, "test").unwrap();
+    let entries = wal.tail(0).await.unwrap();
+    assert!(entries[0].1.batches[0].upserts[0]["vector"].is_string());
+    let request = json!({"rank_by":["id","asc"],"top_k":12,"include_attributes":true});
+    let expected = query(&e, request.clone()).await;
+    assert!(expected["rows"][0]["vector"].is_array());
+    let encoded = query(&e, json!({"rank_by":["id","asc"],"top_k":12,"include_attributes":true,"vector_encoding":"base64"})).await;
+    assert!(encoded["rows"][0]["vector"].is_string());
+    e.index_namespace("test", true).await.unwrap();
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(manifest.segments.len(), 12);
+    assert_eq!(query(&e, request).await, expected);
 }

@@ -21,6 +21,7 @@ use std::{
 #[derive(Debug, Default)]
 struct Counting {
     inner: object_store::memory::InMemory,
+    calls: AtomicUsize,
     ranges: Mutex<Vec<Range<u64>>>,
     waves: AtomicUsize,
     heads: AtomicUsize,
@@ -54,6 +55,7 @@ impl ObjectStore for Counting {
         payload: PutPayload,
         opts: PutOptions,
     ) -> StoreResult<PutResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.put_opts(path, payload, opts).await
     }
     async fn put_multipart_opts(
@@ -64,6 +66,7 @@ impl ObjectStore for Counting {
         self.inner.put_multipart_opts(path, opts).await
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> StoreResult<GetResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         if opts.head
             && path.as_ref().contains("/wal/")
             && self.pause_head.swap(false, Ordering::SeqCst)
@@ -120,6 +123,7 @@ impl ObjectStore for Counting {
         self.inner.delete_stream(paths)
     }
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.list(prefix)
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> StoreResult<ListResult> {
@@ -346,5 +350,106 @@ async fn independent_strong_queries_check_wal_concurrently() {
     assert!(
         backend.wal_max_active.load(Ordering::SeqCst) >= 2,
         "strong checks must not serialize under the namespace lock"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materializing_columns_fetches_bounded_block_batches_concurrently() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    writer.write("bulk", serde_json::from_value(json!({
+        "distance_metric":"cosine_distance",
+        "upsert_rows":(0..4096).map(|id|json!({"id":id,"vector":(0..64).map(|d| (id+d) as f32).collect::<Vec<_>>()})).collect::<Vec<_>>()
+    })).unwrap()).await.unwrap();
+    writer.index_namespace("bulk", true).await.unwrap();
+    let cold = Engine::with_config(store(backend.clone()).await, config());
+    backend.max_active.store(0, Ordering::SeqCst);
+    backend.delay.store(true, Ordering::SeqCst);
+    let result = cold
+        .query_exhaustive(
+            "bulk",
+            serde_json::from_value(json!({
+                "rank_by":["id","desc"],"top_k":3,"include_attributes":true
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.result.rows.as_ref().unwrap()[0]["id"], 4095);
+    assert_eq!(
+        result.result.rows.as_ref().unwrap()[0]["vector"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(backend.max_active.load(Ordering::SeqCst) > 1);
+}
+
+#[tokio::test]
+async fn idle_indexing_skips_io_but_force_compaction_and_remote_polling_still_work() {
+    let backend = Arc::new(Counting::default());
+    let storage = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let tuning = EngineConfig {
+        indexing: false,
+        index_rows: 1,
+        index_age: Duration::from_secs(2),
+        compaction_segments: 2,
+        ..config()
+    };
+    let local = Engine::with_config(storage.clone(), tuning.clone());
+    let remote = Engine::with_config(storage.clone(), tuning);
+    local
+        .write(
+            "idle",
+            serde_json::from_value(json!({"upsert_rows":[{"id":1,"n":1}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    local.index_namespace("idle", true).await.unwrap();
+    let before = backend.calls.load(Ordering::SeqCst);
+    assert!(!local.index_namespace("idle", false).await.unwrap());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), before);
+    remote
+        .write(
+            "idle",
+            serde_json::from_value(json!({"upsert_rows":[{"id":2,"n":2}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    let before = backend.calls.load(Ordering::SeqCst);
+    assert!(!local.index_namespace("idle", false).await.unwrap());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), before);
+    assert!(local.index_namespace("idle", true).await.unwrap());
+    // Two fresh one-row segments still compact immediately, without waiting for age.
+    assert!(local.index_namespace("idle", false).await.unwrap());
+    let wal = bf_wal::Wal::new(storage, "idle").unwrap();
+    assert_eq!(
+        wal.latest_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .segments
+            .len(),
+        1
+    );
+    remote
+        .write(
+            "idle",
+            serde_json::from_value(json!({"upsert_rows":[{"id":3,"n":3}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert!(local.index_namespace("idle", false).await.unwrap());
+    assert_eq!(
+        wal.latest_manifest().await.unwrap().unwrap().1.stats.rows,
+        3
     );
 }

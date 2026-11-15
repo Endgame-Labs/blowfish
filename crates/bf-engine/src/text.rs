@@ -66,6 +66,17 @@ fn corpus(stats: &TextStats) -> CorpusStats {
         document_frequencies: stats.document_frequencies.clone(),
     }
 }
+/// Decode immutable checkpoint statistics once, rather than once per BM25 query.
+pub(crate) fn checkpoint_corpus(
+    stats: &NamespaceStats,
+) -> std::sync::Arc<BTreeMap<String, CorpusStats>> {
+    stats
+        .text
+        .iter()
+        .map(|(name, stats)| (name.clone(), corpus(stats)))
+        .collect::<BTreeMap<_, _>>()
+        .into()
+}
 pub(crate) fn reference_stats(state: &mut NamespaceState) {
     let mut stats = NamespaceStats::default();
     for doc in state.docs.values() {
@@ -82,7 +93,7 @@ pub(crate) fn reference_stats(state: &mut NamespaceState) {
 pub(crate) async fn global_stats(
     store: &Storage,
     state: &NamespaceState,
-) -> Result<BTreeMap<String, CorpusStats>, ApiError> {
+) -> Result<std::sync::Arc<BTreeMap<String, CorpusStats>>, ApiError> {
     let fields: BTreeSet<_> = state
         .schema
         .iter()
@@ -90,7 +101,7 @@ pub(crate) async fn global_stats(
         .map(|(n, _)| n.clone())
         .collect();
     if fields.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(Default::default());
     }
     if state.segments.iter().any(|seg| {
         fields
@@ -116,17 +127,17 @@ pub(crate) async fn global_stats(
                 let c = stats.text.get(&name).map(corpus).unwrap_or_default();
                 (name, c)
             })
-            .collect());
+            .collect::<BTreeMap<_, _>>()
+            .into());
+    }
+    if state.shadowed.is_empty() && state.docs.is_empty() {
+        return Ok(state.corpus.clone());
     }
     let mut stats = (*state.stats).clone();
     if !state.shadowed.is_empty() {
         for seg in &state.segments {
-            let ids = segment::ids(store, seg).await?;
             let live = segment::live(store, seg).await?;
-            let shadowed = live
-                .iter()
-                .filter(|row| state.shadowed.contains(&ids[*row as usize]))
-                .collect();
+            let shadowed = segment::lookup_many(store, seg, &state.shadowed).await? & live;
             for doc in segment::projected_documents(store, seg, &shadowed, Some(&fields))
                 .await?
                 .values()
@@ -144,5 +155,42 @@ pub(crate) async fn global_stats(
             let c = stats.text.get(&name).map(corpus).unwrap_or_default();
             (name, c)
         })
-        .collect())
+        .collect::<BTreeMap<_, _>>()
+        .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn immutable_corpus_statistics_are_shared_between_queries() {
+        let store = Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let schema: Schema = serde_json::from_value(serde_json::json!({
+            "text":{"type":"string","full_text_search":true}
+        }))
+        .unwrap();
+        let mut stats = NamespaceStats::default();
+        adjust(
+            &mut stats,
+            &serde_json::from_value(serde_json::json!({"text":"red fox"})).unwrap(),
+            &schema,
+            true,
+        );
+        let state = NamespaceState {
+            schema,
+            corpus: checkpoint_corpus(&stats),
+            stats: stats.into(),
+            ..Default::default()
+        };
+        let first = global_stats(&store, &state).await.unwrap();
+        let second = global_stats(&store, &state).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(first["text"].total_docs, 1);
+        assert_eq!(first["text"].document_frequencies["fox"], 1);
+    }
 }

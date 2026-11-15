@@ -42,6 +42,7 @@ pub(crate) async fn catch_up(
                         segments: m.segments,
                         indexed_through: m.indexed_through,
                         manifest_seq: generation,
+                        corpus: crate::text::checkpoint_corpus(&m.stats),
                         stats: m.stats.into(),
                         ..Default::default()
                     }
@@ -83,12 +84,7 @@ pub(crate) async fn allowed(
 ) -> Result<RoaringBitmap, ApiError> {
     let mut live = segment::live(store, seg).await?;
     if !state.shadowed.is_empty() {
-        let ids = segment::ids(store, seg).await?;
-        for row in live.clone() {
-            if state.shadowed.contains(&ids[row as usize]) {
-                live.remove(row);
-            }
-        }
+        live -= segment::lookup_many(store, seg, &state.shadowed).await?;
     }
     if let Some(f) = f {
         filter::validate(f, &state.schema, false)?;

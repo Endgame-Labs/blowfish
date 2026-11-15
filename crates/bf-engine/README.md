@@ -325,3 +325,60 @@ commit p50**, against **0.053 ms** for its single-PUT control (20 samples, after
 three warm-ups, with the OS cache retained). The million-row local corpus was
 reused for query comparison; its original ingestion-throughput figures above
 remain M4 measurements.
+
+## Bounded scale ingestion
+
+`EngineConfig::max_segment_rows` (200,000 by default) and `max_segment_bytes`
+(2 GiB by default) bound flush batches and tiered compaction inputs. The byte
+limit measures serialized source documents for a flush and persisted files for
+compaction; index overhead and one indivisible oversized document can exceed it.
+`Engine::new` also recognizes `BF_MAX_SEGMENT_ROWS` and `BF_MAX_SEGMENT_BYTES`.
+Schema rebuilds use the same bounded output batches. Existing oversized segments
+still require materializing their live documents to rebuild; limits prevent new
+unbounded compaction, rather than migrating old data automatically.
+
+Dense vectors use little-endian f32 base64 internally, including f16 values rounded
+at validation. This avoids resident JSON number arrays and large decimal WAL
+payloads. Reads still return the requested JSON array or base64 encoding. Existing
+array-form WAL payloads remain readable. Document columns and ANN files each retain
+one native-width vector copy, as required by the current segment format.
+
+Checkpoint BM25 corpus statistics are decoded once and shared by immutable query
+snapshots. Queries with an unindexed tail still compute deletion-adjusted totals;
+fully indexed queries reuse the checkpoint without cloning the vocabulary.
+
+Column materialization fetches at most 16 blocks per batch through the range cache.
+This bounds read buffers while allowing coalescing and parallel I/O during
+compaction, exact scans, and attribute projection. Each returned block is still
+checked against its own CRC before decoding.
+
+## Real-data scale tools
+
+- `examples/scale_load.py` streams pinned English Wikipedia Parquet shards, holds
+  out 200 vectors, maintains exact cosine top-10 for unfiltered and filtered
+  searches, retries 429s and transport failures, and checkpoints after each shard.
+  It deletes downloaded shards and pauses below 4 GiB of available memory.
+  Supply `--scratch`, `--hub-endpoint`, `--base-url`, `--namespace`, and `--rows`.
+  `--vector-type f16` rejects any source element that would lose precision.
+  `--resume` replays from the last atomic truth checkpoint using idempotent upserts.
+- `examples/scale_api.py` runs a JSON workload through bounded async HTTP clients:
+  `WORKLOAD.json BASE_URL NAMESPACE CONCURRENCY [warmup]`. Each workload entry has
+  `kind`, `query_id`, and a turbopuffer `request` object. JSON measurements go to
+  stdout, and aggregate throughput goes to stderr.
+- `examples/scale_query.rs` accepts `storage.json WORKLOAD.json NAMESPACE
+  CONCURRENCY [warmup]`, and emits engine latency, query-local backend operations,
+  transferred bytes, cache bytes, and results. Use it alongside HTTP timings to
+  attribute backend costs without changing the wire response.
+- `examples/test_scale_load.py` compares streaming ground truth with full exact
+  scans, including uneven and empty filtered batches. Run with `uv`, NumPy,
+  PyArrow, and HTTPX, using the versions pinned in the loader's script metadata.
+
+Keep runtime configurations, cache directories, downloaded shards, results, and
+logs under the repository's ignored `.scratch/` directory, and remove them when
+finished. The loader leaves the ingested namespace intact.
+
+An idle indexer at a known checkpoint polls remote writers at `index_age`, rather
+than every `index_interval`. Local writes and eligible compaction bypass this idle
+wait, and `index_namespace(..., true)` always refreshes the backend. Strong query
+checks also refresh the known WAL state, avoiding redundant idle indexer requests
+while the namespace is actively queried.

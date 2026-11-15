@@ -46,10 +46,12 @@ impl DecodedCache {
         if bytes > self.budget || self.budget == 0 {
             return;
         }
+        let mut retired = Vec::new();
         let mut entries = self.entries.lock().expect("decoded cache lock");
         let key = (TypeId::of::<T>(), key.into());
         if let Some(old) = entries.values.remove(&key) {
             entries.bytes -= old.bytes;
+            retired.push(old);
         }
         while entries.bytes > self.budget - bytes {
             let oldest = entries
@@ -60,11 +62,16 @@ impl DecodedCache {
                 .expect("nonempty over-budget cache");
             let old = entries.values.remove(&oldest).expect("LRU entry");
             entries.bytes -= old.bytes;
+            retired.push(old);
         }
         entries.clock += 1;
         let used = entries.clock;
         entries.bytes += bytes;
         entries.values.insert(key, Entry { value, bytes, used });
+        drop(entries);
+        // Large posting directories can own millions of allocations. Their
+        // destruction must not serialize unrelated cache lookups or insertions.
+        drop(retired);
     }
 }
 #[derive(Clone)]
@@ -121,5 +128,48 @@ mod tests {
         assert!(cache.get::<u64>("c").is_none());
         assert_eq!(*pinned, 1);
         assert_eq!(cache.entries.lock().unwrap().bytes, 8);
+    }
+
+    #[test]
+    fn retired_metadata_drops_do_not_block_cache_hits() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        struct SlowDrop {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.lock().unwrap().recv();
+            }
+        }
+
+        let cache = Arc::new(DecodedCache::new(1, 1));
+        let (entered, dropping) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        cache.insert(
+            "old",
+            1,
+            Arc::new(SlowDrop {
+                entered,
+                release: Mutex::new(resume),
+            }),
+        );
+        let writer = cache.clone();
+        let writer = thread::spawn(move || writer.insert("new", 1, Arc::new(9u64)));
+        dropping.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (done, result) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            done.send(cache.get::<u64>("new").map(|value| *value))
+                .unwrap();
+        });
+        let observed = result.recv_timeout(Duration::from_secs(5));
+        // Release the destructor before asserting, so a regression cannot leave
+        // either thread stuck while the test unwinds.
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert!(matches!(observed, Ok(Some(9))));
     }
 }

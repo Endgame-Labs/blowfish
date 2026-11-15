@@ -187,12 +187,20 @@ impl Engine {
             commits,
         });
         handles.insert(ns.into(), handle.clone());
-        tokio::spawn(commit_worker(
-            wal,
-            state,
-            receiver,
-            self.0.store.clone(),
-            self.0.config.clone(),
+        let context = read_cache::ReadContext {
+            cache: self.0.read_cache.clone(),
+            stats: Default::default(),
+            backend: Default::default(),
+        };
+        tokio::spawn(read_cache::scope(
+            context,
+            commit_worker(
+                wal,
+                state,
+                receiver,
+                self.0.store.clone(),
+                self.0.config.clone(),
+            ),
         ));
         Ok(handle)
     }
