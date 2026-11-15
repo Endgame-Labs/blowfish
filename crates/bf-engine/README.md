@@ -351,3 +351,28 @@ Column materialization fetches at most 16 blocks per batch through the range cac
 This bounds read buffers while allowing coalescing and parallel I/O during
 compaction, exact scans, and attribute projection. Each returned block is still
 checked against its own CRC before decoding.
+
+## Real-data scale tools
+
+- `examples/scale_load.py` streams pinned English Wikipedia Parquet shards, holds
+  out 200 vectors, maintains exact cosine top-10 for unfiltered and filtered
+  searches, retries 429s and transport failures, and checkpoints after each shard.
+  It deletes downloaded shards and pauses below 4 GiB of available memory.
+  Supply `--scratch`, `--hub-endpoint`, `--base-url`, `--namespace`, and `--rows`.
+  `--vector-type f16` rejects any source element that would lose precision.
+  `--resume` replays from the last atomic truth checkpoint using idempotent upserts.
+- `examples/scale_api.py` runs a JSON workload through bounded async HTTP clients:
+  `WORKLOAD.json BASE_URL NAMESPACE CONCURRENCY [warmup]`. Each workload entry has
+  `kind`, `query_id`, and a turbopuffer `request` object. JSON measurements go to
+  stdout, and aggregate throughput goes to stderr.
+- `examples/scale_query.rs` accepts `storage.json WORKLOAD.json NAMESPACE
+  CONCURRENCY [warmup]`, and emits engine latency, query-local backend operations,
+  transferred bytes, cache bytes, and results. Use it alongside HTTP timings to
+  attribute backend costs without changing the wire response.
+- `examples/test_scale_load.py` compares streaming ground truth with full exact
+  scans, including uneven and empty filtered batches. Run with `uv`, NumPy,
+  PyArrow, and HTTPX, using the versions pinned in the loader's script metadata.
+
+Keep runtime configurations, cache directories, downloaded shards, results, and
+logs under the repository's ignored `.scratch/` directory, and remove them when
+finished. The loader leaves the ingested namespace intact.
