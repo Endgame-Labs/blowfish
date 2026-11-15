@@ -21,6 +21,7 @@ const EXACT_BYTES: usize = 256 << 20;
 
 struct Seg {
     index: Arc<Index<segment::ObjectReader>>,
+    ids: Arc<segment::IdIndex>,
     allowed: Arc<RoaringBitmap>,
     counts: Vec<u32>,
     distances: Vec<f32>,
@@ -83,9 +84,10 @@ pub(crate) async fn search(
             let vector = vector.clone();
             let file = seg.files.get(&key).cloned().expect("checked above");
             async move {
-                let (allowed, index) = tokio::try_join!(
+                let (allowed, index, ids) = tokio::try_join!(
                     snapshot::allowed(&store, &base, &seg, filter.as_ref()),
                     segment::vector_index(&store, &file),
+                    segment::ids(&store, &seg),
                 )?;
                 if allowed.is_empty() {
                     return Ok::<_, ApiError>((i, None));
@@ -106,6 +108,7 @@ pub(crate) async fn search(
                     i,
                     Some(Seg {
                         index,
+                        ids,
                         allowed,
                         counts,
                         distances,
@@ -262,16 +265,13 @@ pub(crate) async fn search(
     winners.extend(reranked.into_iter().flatten());
 
     // Global top-k by (distance, id), then hydrate only the winners.
-    let mut id_indexes = BTreeMap::new();
-    for &(_, i, _) in &winners {
-        if let std::collections::btree_map::Entry::Vacant(e) = id_indexes.entry(i) {
-            e.insert(segment::ids(store, &state.segments[i]).await?);
-        }
-    }
     let mut ranked: Vec<(f32, Id, usize, u32)> = winners
         .into_iter()
         .map(|(d, i, row)| {
-            let id = id_indexes[&i]
+            let id = segs[i]
+                .as_ref()
+                .expect("winning segment is loaded")
+                .ids
                 .get(row as usize)
                 .cloned()
                 .ok_or_else(|| segment::index_error("row outside id index"))?;
