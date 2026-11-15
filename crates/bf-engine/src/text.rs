@@ -121,12 +121,8 @@ pub(crate) async fn global_stats(
     let mut stats = (*state.stats).clone();
     if !state.shadowed.is_empty() {
         for seg in &state.segments {
-            let ids = segment::ids(store, seg).await?;
             let live = segment::live(store, seg).await?;
-            let shadowed = live
-                .iter()
-                .filter(|row| state.shadowed.contains(&ids[*row as usize]))
-                .collect();
+            let shadowed = segment::lookup_many(store, seg, &state.shadowed).await? & live;
             for doc in segment::projected_documents(store, seg, &shadowed, Some(&fields))
                 .await?
                 .values()

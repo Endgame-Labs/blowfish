@@ -325,3 +325,20 @@ commit p50**, against **0.053 ms** for its single-PUT control (20 samples, after
 three warm-ups, with the OS cache retained). The million-row local corpus was
 reused for query comparison; its original ingestion-throughput figures above
 remain M4 measurements.
+
+## Bounded scale ingestion
+
+`EngineConfig::max_segment_rows` (250,000 by default) and `max_segment_bytes`
+(2 GiB by default) bound flush batches and tiered compaction inputs. The byte
+limit measures serialized source documents for a flush and persisted files for
+compaction; index overhead and one indivisible oversized document can exceed it.
+`Engine::new` also recognizes `BF_MAX_SEGMENT_ROWS` and `BF_MAX_SEGMENT_BYTES`.
+Schema rebuilds use the same bounded output batches. Existing oversized segments
+still require materializing their live documents to rebuild; limits prevent new
+unbounded compaction, rather than migrating old data automatically.
+
+Dense vectors use little-endian f32 base64 internally, including f16 values rounded
+at validation. This avoids resident JSON number arrays and large decimal WAL
+payloads. Reads still return the requested JSON array or base64 encoding. Existing
+array-form WAL payloads remain readable. Document columns and ANN files each retain
+one native-width vector copy, as required by the current segment format.

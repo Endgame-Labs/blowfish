@@ -27,6 +27,11 @@ pub struct EngineConfig {
     pub index_interval: Duration,
     /// Merge this many segments in one logarithmic size tier.
     pub compaction_segments: usize,
+    /// Maximum rows in a newly built segment (a single document is indivisible).
+    pub max_segment_rows: usize,
+    /// Maximum source-document bytes per flush segment, and persisted input bytes
+    /// per compaction. Index overhead can exceed this source budget.
+    pub max_segment_bytes: u64,
     /// A retired object remains readable for at least this long.
     pub retention: Duration,
     /// Advisory lease duration; correctness relies solely on manifest fencing.
@@ -54,6 +59,8 @@ impl Default for EngineConfig {
             index_age: Duration::from_secs(5),
             index_interval: Duration::from_millis(250),
             compaction_segments: 4,
+            max_segment_rows: 250_000,
+            max_segment_bytes: 2 << 30,
             retention: Duration::from_secs(3600),
             lease_duration: Duration::from_secs(30),
             max_unindexed_bytes: 2_000_000_000,
@@ -77,6 +84,12 @@ impl EngineConfig {
         };
         if let Some(v) = number("BF_INDEX_ROWS") {
             c.index_rows = v as usize;
+        }
+        if let Some(v) = number("BF_MAX_SEGMENT_ROWS") {
+            c.max_segment_rows = v as usize;
+        }
+        if let Some(v) = number("BF_MAX_SEGMENT_BYTES") {
+            c.max_segment_bytes = v;
         }
         if let Some(v) = number("BF_INDEX_AGE_MS") {
             c.index_age = Duration::from_millis(v);
@@ -175,6 +188,14 @@ impl Engine {
     /// `force` bypasses size, age, and advisory lease checks, but never epoch fencing.
     /// Returns false when there was no work or another indexer won the publication.
     pub async fn index_namespace(&self, ns: &str, force: bool) -> Result<bool, ApiError> {
+        let context = crate::read_cache::ReadContext {
+            cache: self.0.read_cache.clone(),
+            stats: Default::default(),
+            backend: Default::default(),
+        };
+        crate::read_cache::scope(context, self.index_namespace_inner(ns, force)).await
+    }
+    async fn index_namespace_inner(&self, ns: &str, force: bool) -> Result<bool, ApiError> {
         let handle = self.handle(ns).await?;
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
         let state = {
@@ -200,7 +221,7 @@ impl Engine {
                     })
                 })
         });
-        let compact = tier(&state, self.0.config.compaction_segments.max(2));
+        let compact = tier(&state, &self.0.config);
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild {
             return Ok(false);
         }
@@ -298,8 +319,8 @@ impl Engine {
                 }
                 adjust(&mut manifest.stats, &docs, true, &state.schema);
                 if !docs.is_empty() {
-                    rebuilt.push(
-                        segment::build(
+                    rebuilt.extend(
+                        build_segments(
                             store,
                             ns,
                             &state.schema,
@@ -307,6 +328,7 @@ impl Engine {
                             &docs,
                             seg.wal_start,
                             seg.wal_end,
+                            &self.0.config,
                         )
                         .await?,
                     );
@@ -317,8 +339,8 @@ impl Engine {
             }
             if !state.docs.is_empty() {
                 adjust(&mut manifest.stats, &state.docs, true, &state.schema);
-                rebuilt.push(
-                    segment::build(
+                rebuilt.extend(
+                    build_segments(
                         store,
                         ns,
                         &state.schema,
@@ -326,6 +348,7 @@ impl Engine {
                         &state.docs,
                         state.indexed_through + 1,
                         state.seq,
+                        &self.0.config,
                     )
                     .await?,
                 );
@@ -352,8 +375,8 @@ impl Engine {
                 segments.push(seg);
             }
             if state.seq > state.indexed_through && !state.docs.is_empty() {
-                segments.push(
-                    segment::build(
+                segments.extend(
+                    build_segments(
                         store,
                         ns,
                         &state.schema,
@@ -361,6 +384,7 @@ impl Engine {
                         &state.docs,
                         state.indexed_through + 1,
                         state.seq,
+                        &self.0.config,
                     )
                     .await?,
                 );
@@ -387,9 +411,18 @@ impl Engine {
                     }
                 }
                 if !docs.is_empty() {
-                    remaining.push(
-                        segment::build(store, ns, &state.schema, state.metric, &docs, start, end)
-                            .await?,
+                    remaining.extend(
+                        build_segments(
+                            store,
+                            ns,
+                            &state.schema,
+                            state.metric,
+                            &docs,
+                            start,
+                            end,
+                            &self.0.config,
+                        )
+                        .await?,
                     );
                 }
                 segments = remaining;
@@ -530,15 +563,59 @@ impl Engine {
         Ok(candidates.len())
     }
 }
-fn tier(state: &NamespaceState, count: usize) -> Vec<String> {
-    let mut tiers: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+fn tier(state: &NamespaceState, config: &EngineConfig) -> Vec<String> {
+    let count = config.compaction_segments.max(2);
+    let mut tiers: BTreeMap<u32, (Vec<String>, u64, u64)> = BTreeMap::new();
     for seg in &state.segments {
         let bucket = seg.row_count.max(1).ilog2();
         let group = tiers.entry(bucket).or_default();
-        group.push(seg.id.clone());
-        if group.len() == count {
-            return group.clone();
+        let bytes = seg.files.values().map(|file| file.size).sum::<u64>();
+        if group.1.saturating_add(seg.row_count as u64) > config.max_segment_rows.max(1) as u64
+            || group.2.saturating_add(bytes) > config.max_segment_bytes.max(1)
+        {
+            continue;
+        }
+        group.0.push(seg.id.clone());
+        group.1 += seg.row_count as u64;
+        group.2 += bytes;
+        if group.0.len() == count {
+            return group.0.clone();
         }
     }
     vec![]
+}
+
+// A segment build owns only one bounded document batch at a time. The WAL overlay
+// is separately bounded by ingest backpressure. One oversized document stays atomic.
+#[allow(clippy::too_many_arguments)]
+async fn build_segments(
+    store: &bf_storage::Storage,
+    ns: &str,
+    schema: &bf_types::Schema,
+    metric: bf_types::DistanceMetric,
+    docs: &BTreeMap<bf_types::Id, bf_types::Document>,
+    start: u64,
+    end: u64,
+    config: &EngineConfig,
+) -> Result<Vec<bf_wal::Segment>, ApiError> {
+    let mut out = vec![];
+    let mut batch = BTreeMap::new();
+    let mut bytes = 0u64;
+    for (id, doc) in docs {
+        let size = serde_json::to_vec(doc).map_err(segment::index_error)?.len() as u64;
+        if !batch.is_empty()
+            && (batch.len() >= config.max_segment_rows.max(1)
+                || bytes.saturating_add(size) > config.max_segment_bytes.max(1))
+        {
+            out.push(segment::build(store, ns, schema, metric, &batch, start, end).await?);
+            batch.clear();
+            bytes = 0;
+        }
+        batch.insert(id.clone(), doc.clone());
+        bytes = bytes.saturating_add(size);
+    }
+    if !batch.is_empty() {
+        out.push(segment::build(store, ns, schema, metric, &batch, start, end).await?);
+    }
+    Ok(out)
 }

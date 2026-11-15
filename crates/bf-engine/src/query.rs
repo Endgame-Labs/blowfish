@@ -773,7 +773,10 @@ fn project(
                     _ => value.clone(),
                 }
             } else {
-                value.clone()
+                match state.schema.get(&name).and_then(|s| s.data_type.as_ref()) {
+                    Some(AttributeType::Vector { .. }) => json!(decode_vector(value)?),
+                    _ => value.clone(),
+                }
             };
             row.insert(name, value);
         }

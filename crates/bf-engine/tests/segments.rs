@@ -559,3 +559,89 @@ async fn schema_drops_do_not_copy_surviving_vectors_into_the_wal() {
             .all(|row| row.get("tags").is_none())
     );
 }
+
+#[tokio::test]
+async fn segment_caps_split_flushes_and_bound_compaction_without_losing_updates() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let e = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            max_segment_rows: 7,
+            max_segment_bytes: 4096,
+            compaction_segments: 2,
+            retention: Duration::ZERO,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    write(&e, initial()).await;
+    e.index_namespace("test", true).await.unwrap();
+    for round in 0..4 {
+        write(&e, json!({"upsert_rows": [{"id":100+round,"text":"new fox","vector":[1.0,2.0],"small":[1.0,2.0]}],"patch_rows":[{"id":round,"n":100}]})).await;
+        e.index_namespace("test", true).await.unwrap();
+    }
+    for _ in 0..8 {
+        e.index_namespace("test", true).await.unwrap();
+    }
+    let (_, m) = Wal::new(store.clone(), "test")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(m.segments.len() > 1);
+    assert!(m.segments.iter().all(|s| s.row_count <= 7));
+    let q = json!({"rank_by":["id","asc"],"top_k":100,"include_attributes":true});
+    let before = query(&e, q.clone()).await;
+    assert_eq!(before["rows"].as_array().unwrap().len(), 34);
+    e.collect_garbage("test").await.unwrap();
+    let cold = Engine::with_config(
+        store,
+        EngineConfig {
+            indexing: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(query(&cold, q).await, before);
+}
+
+#[tokio::test]
+async fn byte_cap_splits_large_documents_and_compact_vectors_preserve_wire_encodings() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let e = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            max_segment_rows: 100,
+            max_segment_bytes: 600,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    write(&e, json!({"distance_metric":"cosine_distance","schema":{"small":"[2]f16"},"upsert_rows":
+        (0..12).map(|id|json!({"id":id,"text":"a".repeat(280),"vector":[0.25,1.0],"small":[0.3333,1.0]})).collect::<Vec<_>>()
+    })).await;
+    let wal = Wal::new(store, "test").unwrap();
+    let entries = wal.tail(0).await.unwrap();
+    assert!(entries[0].1.batches[0].upserts[0]["vector"].is_string());
+    let request = json!({"rank_by":["id","asc"],"top_k":12,"include_attributes":true});
+    let expected = query(&e, request.clone()).await;
+    assert!(expected["rows"][0]["vector"].is_array());
+    let encoded = query(&e, json!({"rank_by":["id","asc"],"top_k":12,"include_attributes":true,"vector_encoding":"base64"})).await;
+    assert!(encoded["rows"][0]["vector"].is_string());
+    e.index_namespace("test", true).await.unwrap();
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(manifest.segments.len(), 12);
+    assert_eq!(query(&e, request).await, expected);
+}

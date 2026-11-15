@@ -561,7 +561,16 @@ pub(crate) async fn ids(store: &Storage, segment: &Segment) -> Result<Arc<IdInde
     }
     Ok(read_cache::insert(
         &key,
-        file.size.saturating_mul(16),
+        (index.ids.capacity() * std::mem::size_of::<Id>()
+            + index.bloom.capacity()
+            + index
+                .ids
+                .iter()
+                .map(|id| match id {
+                    Id::String(value) => value.capacity(),
+                    _ => 0,
+                })
+                .sum::<usize>()) as u64,
         index,
     ))
 }
@@ -673,7 +682,7 @@ pub(crate) async fn projected_documents(
                     values.push(Some(if col.vector_i8 {
                         serde_json::json!(v.iter().map(|x| *x as i8).collect::<Vec<_>>())
                     } else {
-                        serde_json::json!(v)
+                        Value::String(bf_types::encode_vector(&v, false))
                     }));
                 }
                 if pos != data.len() {

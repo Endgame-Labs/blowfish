@@ -475,6 +475,11 @@ fn normalize_document(doc: &mut Document, schema: &Schema) -> Result<(), ApiErro
             value,
             cfg.data_type.as_ref().expect("normalized schema type"),
         )?;
+        // Keep dense vectors compact in the WAL and its resident overlay. Internal
+        // base64 always contains f32 values, including values rounded for f16 storage.
+        if matches!(cfg.data_type, Some(AttributeType::Vector { .. })) {
+            *value = Value::String(encode_vector(&decode_vector(value)?, false));
+        }
     }
     validate_document_size(doc, schema)
 }
