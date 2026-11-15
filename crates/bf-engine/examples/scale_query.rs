@@ -18,14 +18,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let requests: Vec<Value> = serde_json::from_slice(&std::fs::read(&args[2])?)?;
     let concurrency: usize = args[4].parse()?;
     let store = Storage::open(&config).await?;
-    let engine = Engine::with_config(
-        store,
-        EngineConfig {
-            indexing: false,
-            recall_sample_rate: 0.0,
-            ..Default::default()
-        },
-    );
+    let tuning = EngineConfig {
+        indexing: false,
+        recall_sample_rate: 0.0,
+        ..EngineConfig::from_env()
+    };
+    let engine = Engine::with_config(store, tuning.clone());
     if args.get(5).is_some_and(|s| s == "warmup") {
         for request in &requests {
             engine
@@ -66,7 +64,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     eprintln!(
         "{}",
         json!({"queries":count,"seconds":start.elapsed().as_secs_f64(),
-        "qps":count as f64/start.elapsed().as_secs_f64(),"concurrency":concurrency})
+        "qps":count as f64/start.elapsed().as_secs_f64(),"concurrency":concurrency,
+        "decoded_cache_bytes":tuning.decoded_cache_bytes,"ann_nprobe":tuning.ann_nprobe,
+        "ann_rerank_factor":tuning.ann_rerank_factor})
     );
     Ok(())
 }

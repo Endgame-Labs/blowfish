@@ -74,8 +74,15 @@ impl Default for EngineConfig {
 impl EngineConfig {
     /// Environment overrides let existing HTTP entrypoints exercise indexing unchanged.
     /// Invalid or zero threshold values retain defaults.
+    /// `BF_DECODED_CACHE_BYTES` accepts zero to disable decoded metadata admission.
     pub fn from_env() -> Self {
         let mut c = Self::default();
+        if let Some(bytes) = std::env::var("BF_DECODED_CACHE_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            c.decoded_cache_bytes = bytes;
+        }
         let number = |name: &str| {
             std::env::var(name)
                 .ok()
