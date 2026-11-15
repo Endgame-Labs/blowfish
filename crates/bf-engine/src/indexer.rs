@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, time::Duration};
 /// Node-local indexing and query tuning. No option changes the durable write ordering.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
-    /// Byte budget for decoded immutable segment metadata (conservative resident charges).
+    /// Byte budget for decoded immutable segment metadata (charged at resident size).
     /// Zero disables admission. In-flight queries can pin evicted entries until completion.
     pub decoded_cache_bytes: u64,
     /// Maximum concurrent segment scoring tasks across all queries on this engine.
@@ -47,10 +47,31 @@ pub struct EngineConfig {
     /// Fraction of ANN requests checked against exhaustive ground truth.
     pub recall_sample_rate: f64,
 }
+/// An eighth of the memory this process may use (host RAM or the cgroup limit), within
+/// 512 MiB to 4 GiB. Entries are charged at their resident size, so this bounds real memory.
+fn default_decoded_cache_bytes() -> u64 {
+    let host = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("MemTotal:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .map_or(4 << 30, |kb| kb.saturating_mul(1024));
+    let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(host);
+    (host.min(limit) / 8).clamp(512 << 20, 4 << 30)
+}
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            decoded_cache_bytes: 512 << 20,
+            decoded_cache_bytes: default_decoded_cache_bytes(),
             search_concurrency: 8,
             query_concurrency: 8,
             indexing: true,
@@ -109,6 +130,9 @@ impl EngineConfig {
         }
         if let Some(v) = number("BF_ANN_NPROBE") {
             c.ann_nprobe = v as usize;
+        }
+        if let Some(v) = number("BF_ANN_RERANK") {
+            c.ann_rerank_factor = v as usize;
         }
         c
     }

@@ -30,8 +30,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let _ = prometheus_handle();
     let storage = Storage::open(&config).await?;
-    // Match the normal binary's refresh interval, including its background LISTs.
-    let keys = KeyStore::from_storage(storage.clone(), None, Duration::from_secs(5)).await?;
+    // Authentication is disabled here, so the key set is refreshed rarely.
+    let keys = KeyStore::from_storage(storage.clone(), None, Duration::from_secs(300)).await?;
     let app = router(
         Engine::with_config(storage, tuning),
         keys,

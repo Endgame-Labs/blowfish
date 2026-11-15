@@ -83,12 +83,9 @@ pub(crate) async fn vector_index(
         bf_vector::Index::open_with_metadata_len(ObjectReader::new(store, file), file.metadata_len)
             .await
             .map_err(index_error)?;
-    // Covers decoded row directories, centroids, checksums, and allocator overhead.
-    Ok(read_cache::insert(
-        &file.key,
-        file.metadata_len.saturating_mul(16),
-        index,
-    ))
+    // Resident bytes of the decoded centroids, row sets, and checksums.
+    let resident = index.resident_bytes();
+    Ok(read_cache::insert(&file.key, resident, index))
 }
 
 pub(crate) async fn text_index(
@@ -108,12 +105,9 @@ pub(crate) async fn text_index(
     let index = bf_text::SegmentReader::open(Arc::new(reader))
         .await
         .map_err(index_error)?;
-    // Include the retained metadata buffer and decoded posting directories.
-    Ok(read_cache::insert(
-        &file.key,
-        file.metadata_len.max(65536).saturating_mul(16),
-        index,
-    ))
+    // The retained encoded buffer (the dictionary borrows it) plus the decoded directory.
+    let resident = file.metadata_len.max(65536) + index.resident_bytes();
+    Ok(read_cache::insert(&file.key, resident, index))
 }
 
 fn corrupt() -> ApiError {

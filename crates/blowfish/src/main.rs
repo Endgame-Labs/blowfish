@@ -305,12 +305,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = prometheus_handle();
     let storage = Storage::open(&config.storage).await?;
-    let keys = KeyStore::from_storage(
-        storage.clone(),
-        admin_key.as_deref(),
-        Duration::from_secs(5),
-    )
-    .await?;
+    // With authentication disabled no request consults the key set, so refresh it rarely
+    // instead of LISTing the bucket every few seconds.
+    let key_refresh = if admin_key.is_some() {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(300)
+    };
+    let keys = KeyStore::from_storage(storage.clone(), admin_key.as_deref(), key_refresh).await?;
     let listen = listen
         .or(config.listen)
         .unwrap_or_else(|| "0.0.0.0:8000".into());
