@@ -651,6 +651,10 @@ fn log_error(e: bf_wal::Error) -> ApiError {
         _ => ApiError::new(500, "stored WAL is corrupt or unsupported"),
     }
 }
+fn record_stage(stage: &'static str, since: Instant) {
+    metrics::histogram!("blowfish_commit_stage_seconds", "stage" => stage)
+        .record(since.elapsed().as_secs_f64());
+}
 async fn catch_up(wal: &Wal, state: &mut NamespaceState, store: &Storage) -> Result<(), ApiError> {
     snapshot::catch_up(wal, state, None, store).await
 }
@@ -695,9 +699,11 @@ async fn commit_worker(
         let start = Instant::now();
         let mut current = state.lock().await;
         let committed = loop {
+            let stage = Instant::now();
             if let Err(e) = catch_up(&wal, &mut current, &store).await {
                 break Err(e);
             }
+            record_stage("catch_up", stage);
             if deleting {
                 if !current.exists {
                     break Err(ApiError::not_found(
@@ -725,10 +731,13 @@ async fn commit_worker(
                     "unindexed WAL exceeds backpressure limit",
                 ));
             }
+            let stage = Instant::now();
             let mut working = match snapshot::for_writes(&store, &current, &pending).await {
                 Ok(s) => s,
                 Err(e) => break Err(e),
             };
+            record_stage("for_writes", stage);
+            let stage = Instant::now();
             let mut batches = vec![];
             let mut results = vec![];
             for p in &pending {
@@ -747,6 +756,7 @@ async fn commit_worker(
                     Err(e) => results.push(Err(e)),
                 }
             }
+            record_stage("prepare", stage);
             if batches.is_empty() {
                 break Ok(results);
             }
@@ -756,13 +766,18 @@ async fn commit_worker(
             {
                 break Err(e);
             }
-            match wal.append(current.seq + 1, &entry).await {
+            let stage = Instant::now();
+            let appended = wal.append(current.seq + 1, &entry).await;
+            record_stage("append", stage);
+            match appended {
                 Ok(CreateResult::Conflict) => continue,
                 Ok(_) => {
                     let seq = current.seq + 1;
+                    let stage = Instant::now();
                     if let Err(e) = branch::replay(&store, &wal, seq, &entry, &mut current).await {
                         break Err(e);
                     }
+                    record_stage("replay", stage);
                     current.refreshed = Instant::now();
                     break Ok(results);
                 }

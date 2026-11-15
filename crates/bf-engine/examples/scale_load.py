@@ -108,6 +108,7 @@ def main():
     parser.add_argument("--batch", type=int, default=2000)
     parser.add_argument("--vector-type", choices=("f32", "f16"), default="f32",
                         help="f16 requires every source value to be exactly representable; no silent quantization")
+    parser.add_argument("--inflight", type=int, default=2, help="concurrent writes; the server group-commits them")
     parser.add_argument("--scratch", type=Path, required=True)
     parser.add_argument("--resume", action="store_true", help="Replay from the last completed shard; upserts are idempotent")
     args = parser.parse_args()
@@ -118,7 +119,7 @@ def main():
     rows = raw_bytes = 0
     counters = {"retries": 0, "transport": 0, "pauses": 0}
     inflight = []
-    pool = ThreadPoolExecutor(max_workers=2)
+    pool = ThreadPoolExecutor(max_workers=args.inflight)
     best_scores = np.full((200, 10), -np.inf, dtype=np.float32)
     best_ids = np.full((200, 10), -1, dtype=np.int64)
     filtered = {name: (best_scores.copy(), best_ids.copy()) for name in ("selective", "broad")}
@@ -179,7 +180,7 @@ def main():
                             "title_initial": "string", "text_length": "int", "vector": f"[1024]{args.vector_type}"})
                     # Overlap the (network-bound) write with the truth computation and the next
                     # batch's preparation. The schema-carrying first write completes before any other.
-                    while len(inflight) >= 2:
+                    while len(inflight) >= args.inflight:
                         inflight.pop(0).result()
                     inflight.append(pool.submit(send, client, args, body, counters))
                     if rows == 0:

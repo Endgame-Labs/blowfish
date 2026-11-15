@@ -253,6 +253,43 @@ impl Engine {
                 return Ok(false);
             }
             catch_up(&wal, &mut state, &self.0.store).await?;
+            // Decide whether there is work before cloning: the tail can hold hundreds of MiB,
+            // and a clone under this lock stalls every concurrent write.
+            if !state.exists {
+                return Ok(false);
+            }
+            let will_rebuild = state.segments.iter().any(|seg| {
+                state
+                    .schema
+                    .keys()
+                    .chain(seg.schema.keys())
+                    .any(|name| !segment::seg_text_matches(seg, &state.schema, name))
+                    || seg.schema.iter().any(|(name, old)| {
+                        state.schema.get(name).is_none_or(|new| {
+                            old.filterable != new.filterable
+                                || old.fuzzy != new.fuzzy
+                                || old.regex != new.regex
+                                || old.glob != new.glob
+                        })
+                    })
+            });
+            let will_compact = tier(&state, &self.0.config);
+            if state.seq == state.indexed_through && will_compact.is_empty() && !will_rebuild {
+                return Ok(false);
+            }
+            let tail_age = Utc::now()
+                .signed_duration_since(state.tail_since.unwrap_or(state.updated_at))
+                .to_std()
+                .unwrap_or_default();
+            if !force
+                && !will_rebuild
+                && will_compact.is_empty()
+                && state.shadowed.len() < self.0.config.index_rows
+                && state.tail_bytes < self.0.config.index_bytes
+                && tail_age < self.0.config.index_age
+            {
+                return Ok(false);
+            }
             state.clone()
         };
         if !state.exists {
