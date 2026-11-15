@@ -59,7 +59,7 @@ impl Default for EngineConfig {
             index_age: Duration::from_secs(5),
             index_interval: Duration::from_millis(250),
             compaction_segments: 4,
-            max_segment_rows: 250_000,
+            max_segment_rows: 200_000,
             max_segment_bytes: 2 << 30,
             retention: Duration::from_secs(3600),
             lease_duration: Duration::from_secs(30),

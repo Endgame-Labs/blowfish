@@ -328,7 +328,7 @@ remain M4 measurements.
 
 ## Bounded scale ingestion
 
-`EngineConfig::max_segment_rows` (250,000 by default) and `max_segment_bytes`
+`EngineConfig::max_segment_rows` (200,000 by default) and `max_segment_bytes`
 (2 GiB by default) bound flush batches and tiered compaction inputs. The byte
 limit measures serialized source documents for a flush and persisted files for
 compaction; index overhead and one indivisible oversized document can exceed it.
