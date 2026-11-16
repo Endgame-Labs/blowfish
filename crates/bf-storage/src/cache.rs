@@ -47,6 +47,9 @@ pub struct CacheConfig {
     pub fetch_concurrency: usize,
     /// Maximum background warming tasks; excess hints are rejected (default 4).
     pub prefetch_concurrency: usize,
+    /// Extra-request budget for hedged ranged reads, as a fraction of primary requests
+    /// (0 disables hedging; default 0.1). `BF_HEDGE_BUDGET` overrides it.
+    pub hedge_budget: f64,
 }
 impl Default for CacheConfig {
     fn default() -> Self {
@@ -78,6 +81,7 @@ impl Default for CacheConfig {
             coalesce_gap_blocks: 0,
             fetch_concurrency: 512,
             prefetch_concurrency: 4,
+            hedge_budget: 0.1,
         }
     }
 }
@@ -198,6 +202,7 @@ pub(crate) struct RangeCache {
     planning: AsyncMutex<Planning>,
     fetches: Semaphore,
     prefetches: Arc<Semaphore>,
+    pub(crate) hedge: crate::hedge::Hedger,
     /// Disk writes started behind reads and not yet finished.
     spills: Arc<Spills>,
 }
@@ -250,6 +255,12 @@ impl RangeCache {
         Ok(Self {
             fetches: Semaphore::new(config.fetch_concurrency),
             prefetches: Arc::new(Semaphore::new(config.prefetch_concurrency)),
+            hedge: crate::hedge::Hedger::new(
+                std::env::var("BF_HEDGE_BUDGET")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(config.hedge_budget),
+            ),
             spills: Arc::default(),
             config,
             memory,
@@ -484,11 +495,10 @@ impl RangeReader {
                     .expect("cache semaphore stays open");
                 let from = first * size;
                 let to = (last * size).saturating_add(size).min(reader.len());
-                let bytes = reader
-                    .storage
-                    .0
-                    .backend
+                let bytes = cache
+                    .hedge
                     .get_range(
+                        &reader.storage.0.backend,
                         &reader.storage.path(&reader.key),
                         from + reader.layout.offset..to + reader.layout.offset,
                     )

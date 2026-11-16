@@ -2,6 +2,7 @@
 mod cache;
 mod diagnostics;
 mod disk;
+mod hedge;
 pub use diagnostics::{BackendMeasurement, BackendStats};
 mod observed;
 use bytes::Bytes;
@@ -80,7 +81,7 @@ pub enum StorageMode {
     SingleWriter,
 }
 /// Runtime storage options; credentials may come from environment or an AWS profile.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
     pub url: String,
@@ -91,6 +92,23 @@ pub struct StorageConfig {
     pub single_writer: bool,
     /// Budgets and concurrency limits for explicitly cached immutable reads.
     pub cache: CacheConfig,
+    /// Idle object-store connections to keep open (S3 only; 0 disables; default 256).
+    /// `BF_WARM_CONNECTIONS` overrides it.
+    pub warm_connections: usize,
+}
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            endpoint: None,
+            region: None,
+            profile: None,
+            read_only: false,
+            single_writer: false,
+            cache: CacheConfig::default(),
+            warm_connections: 256,
+        }
+    }
 }
 struct Inner {
     backend: Arc<dyn ObjectStore>,
@@ -137,7 +155,14 @@ impl Storage {
                 let bucket = url
                     .host_str()
                     .ok_or(Error::Config("S3 URL needs a bucket"))?;
-                let mut b = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+                // Parallel ranged reads each need a connection (HTTP/1), and a new TLS connection
+                // costs about 65 ms, so keep idle connections for ten minutes instead of 90 seconds.
+                let mut b = object_store::aws::AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .with_client_options(
+                        object_store::ClientOptions::new()
+                            .with_pool_idle_timeout(Duration::from_secs(600)),
+                    );
                 if let Some(endpoint) = &config.endpoint {
                     b = b
                         .with_endpoint(endpoint)
@@ -187,14 +212,42 @@ impl Storage {
         if cache.namespace.is_none() {
             cache.namespace = Some(namespace);
         }
-        Self::from_backend_with_cache(
+        let store = Self::from_backend_with_cache(
             backend,
             prefix,
             config.read_only,
             config.single_writer,
             cache,
         )
-        .await
+        .await?;
+        if url.scheme() == "s3" {
+            let warm = std::env::var("BF_WARM_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(config.warm_connections);
+            store.spawn_connection_warmer(warm);
+        }
+        Ok(store)
+    }
+    /// Keep about `count` idle connections open to the object store: a cold wave of N parallel
+    /// reads otherwise pays a TLS handshake per request (measured at about 65 ms each, and about
+    /// half the wall time of a 250-request wave). Refreshes before the pool's idle timeout.
+    fn spawn_connection_warmer(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let weak = Arc::downgrade(&self.0);
+        tokio::spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else { break };
+                let path = Path::from(format!("{}/.warm", inner.prefix));
+                let backend = inner.backend.clone();
+                drop(inner);
+                // HEAD of a missing key answers 404 on a connection that then returns to the pool.
+                futures::future::join_all((0..count).map(|_| backend.head(&path))).await;
+                tokio::time::sleep(Duration::from_secs(45)).await;
+            }
+        });
     }
     /// Wrap an object_store backend. Read-only instances do not run a mutating CAS probe.
     pub async fn from_backend(
