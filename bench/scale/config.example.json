@@ -4,5 +4,6 @@
   "region": "auto",
   "profile": "YOUR-AWS-PROFILE",
   "hub_endpoint": "https://huggingface.co",
-  "namespace": "wikipedia-10m"
+  "namespace": "wikipedia-10m",
+  "tpuf_namespace": "YOUR-ORACLE-NAMESPACE"
 }
