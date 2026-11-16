@@ -837,6 +837,12 @@ fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<Strin
         if group.1.saturating_add(seg.row_count as u64) > config.max_segment_rows.max(1) as u64
             || group.2.saturating_add(bytes) > config.max_segment_bytes.max(1)
         {
+            // The group cannot grow to `count` members without passing the caps: merge what it
+            // holds (two or more) rather than leave a tier of half-full segments forever, so a
+            // bulk load ends with a few evenly sized segments.
+            if group.0.len() >= 2 {
+                return group.0.clone();
+            }
             continue;
         }
         group.0.push(seg.id.clone());
@@ -898,4 +904,39 @@ async fn build_segments<D: std::borrow::Borrow<bf_types::Document> + Clone>(
         out.extend(built);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with(rows: &[u32]) -> NamespaceState {
+        let mut state = NamespaceState::default();
+        for (i, row_count) in rows.iter().enumerate() {
+            state.segments.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{i}"), "wal_start": 0, "wal_end": 0, "row_count": row_count,
+                    "files": {}, "live": {"key": "k", "size": 0, "metadata_len": 0},
+                    "live_generation": 0
+                }))
+                .unwrap(),
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn compaction_merges_pairs_that_cannot_grow_to_a_full_group() {
+        let config = EngineConfig::default();
+        // Four segments of 100K rows would pass the 200K row cap as a group of four, so the
+        // first two merge instead of staying as four half-full segments forever.
+        let state = state_with(&[100_000, 100_000, 100_000, 100_000]);
+        assert_eq!(tier(&state, &config, false), vec!["s0", "s1"]);
+        // A lone segment, or segments already at the cap, stay as they are.
+        assert!(tier(&state_with(&[100_000]), &config, false).is_empty());
+        assert!(tier(&state_with(&[190_000, 190_000]), &config, false).is_empty());
+        // Small segments still merge four at a time.
+        let small = state_with(&[1000, 1100, 1200, 1300, 1400]);
+        assert_eq!(tier(&small, &config, false).len(), 4);
+    }
 }
