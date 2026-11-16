@@ -4,6 +4,14 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Perf iteration 7 merged (1M).**
+  - **Ingest:** 740 → 1,199 docs/s over the whole load. The tail is no longer cloned or re-downloaded, bulk loads build large segments, and flush and compaction run concurrently. GET bytes during the load fell from 5.1 GB to 1.5 GB.
+  - **Tail writes:** an unindexed tail keeps the ANN directory path.
+  - **BM25:** large segments take hit IDs from the docs `id` column, so BM25 reads 38 MB per cold query, down from 49 MB.
+  - **Cold p50 at 1M** (best of two sessions): ANN 1,118 ms, BM25 1,212 ms, hybrid 1,525 ms, selective 1,699 ms. No cold-latency gain this round.
+  - **Recall:** ANN 0.949 against turbopuffer's 0.939; broad 0.978 against 0.977.
+  - **Open:** chunked FTS dictionaries and stats (28 MB + 5.9 MB read whole), selective filters (1,949 requests), cold ANN request count, vectors stored twice, and WAL upload bytes.
+
 - **Perf iteration 6 merged (1M).**
   - **Changes:**
     - The disk cache writes behind reads with a bounded queue. Awaiting block writes had cost 400-900 ms per cold wave.
