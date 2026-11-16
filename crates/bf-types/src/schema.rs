@@ -202,14 +202,116 @@ pub struct AttributeSchema {
     pub glob: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuzzy: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Native embedding settings. A JSON `null` deserializes to `Some(Value::Null)` so that a
+    /// schema update can remove the setting; `normalize` turns it into `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "keep_null"
+    )]
     pub embed: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sparse_knn: Option<Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub drop: bool,
 }
+fn keep_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+/// Vector element type of a generated embedding column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedDtype {
+    F32,
+    F16,
+}
+/// A parsed `embed` setting on a string attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedSpec {
+    /// Registry model name, for example `google/embeddinggemma-2`.
+    pub model: String,
+    /// Existing or generated vector attribute that receives the embedding.
+    pub attribute: Option<String>,
+    /// Output dimensions; the model's default when absent.
+    pub dims: Option<usize>,
+    pub dtype: EmbedDtype,
+}
+impl EmbedSpec {
+    /// Parse the wire form: a model name or `{model, attribute?, dims?, dtype?}`.
+    pub fn parse(value: &Value) -> Result<Self, ApiError> {
+        let bad = |m: &str| ApiError::bad(format!("invalid embed configuration: {m}"));
+        if let Some(model) = value.as_str() {
+            if model.is_empty() {
+                return Err(bad("model must not be empty"));
+            }
+            return Ok(Self {
+                model: model.into(),
+                attribute: None,
+                dims: None,
+                dtype: EmbedDtype::F32,
+            });
+        }
+        let o = value
+            .as_object()
+            .ok_or_else(|| bad("expected a model name or an object"))?;
+        if let Some(k) = o
+            .keys()
+            .find(|k| !matches!(k.as_str(), "model" | "attribute" | "dims" | "dtype"))
+        {
+            return Err(bad(&format!("unknown field '{k}'")));
+        }
+        let model = o
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| bad("model is required"))?;
+        let attribute = match o.get("attribute") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_str()
+                    .filter(|a| !a.is_empty())
+                    .ok_or_else(|| bad("attribute must be a string"))?
+                    .to_string(),
+            ),
+        };
+        let dims = match o.get("dims") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .filter(|n| (1..=10752).contains(n))
+                    .ok_or_else(|| bad("dims must be a positive integer"))?
+                    as usize,
+            ),
+        };
+        let dtype = match o.get("dtype").and_then(Value::as_str) {
+            None | Some("f32") => EmbedDtype::F32,
+            Some("f16") => EmbedDtype::F16,
+            Some(_) => return Err(bad("dtype must be f32 or f16")),
+        };
+        if o.get("dtype").is_some_and(|v| !v.is_string()) {
+            return Err(bad("dtype must be f32 or f16"));
+        }
+        Ok(Self {
+            model: model.into(),
+            attribute,
+            dims,
+            dtype,
+        })
+    }
+    /// The vector attribute this setting writes into, given the source attribute's name.
+    pub fn target(&self, source: &str) -> String {
+        self.attribute
+            .clone()
+            .unwrap_or_else(|| format!("embed_{source}"))
+    }
+}
 impl AttributeSchema {
+    /// The parsed embed setting, if one is stored.
+    pub fn embed_spec(&self) -> Option<EmbedSpec> {
+        self.embed
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .and_then(|v| EmbedSpec::parse(v).ok())
+    }
     /// New schema inferred from an attribute type.
     pub fn new(t: AttributeType) -> Self {
         Self {
@@ -355,10 +457,15 @@ impl AttributeSchema {
         if self.sparse_knn.is_some() && *t != AttributeType::SparseVector {
             return Err(ApiError::bad("sparse_knn requires a {}f16 attribute"));
         }
-        if self.embed.as_ref().is_some_and(|v| !v.is_null()) {
-            return Err(ApiError::bad(
-                "native Embed configuration is not supported by blowfish yet",
-            ));
+        match &self.embed {
+            Some(Value::Null) => self.embed = None,
+            Some(v) => {
+                EmbedSpec::parse(v)?;
+                if *t != AttributeType::Scalar(ScalarType::String) {
+                    return Err(ApiError::bad("embed requires a string attribute"));
+                }
+            }
+            None => {}
         }
         Ok(())
     }

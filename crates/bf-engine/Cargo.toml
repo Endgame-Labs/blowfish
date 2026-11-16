@@ -9,6 +9,7 @@ repository.workspace = true
 fst = "=0.4.7"
 futures = "=0.3.34"
 bf-text = { path = "../bf-text" }
+bf-models = { path = "../bf-models" }
 async-trait = "=0.1.92"
 bf-vector = { path = "../bf-vector" }
 metrics = "=0.24.6"
@@ -33,6 +34,8 @@ tracing = "0.1.44"
 uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
+axum = "0.8.9"
+bf-models = { path = "../bf-models" }
 async-trait = "=0.1.92"
 object_store = "=0.14.2"
 tempfile = "3.27.0"

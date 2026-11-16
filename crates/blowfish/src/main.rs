@@ -123,6 +123,8 @@ struct Config {
     admin_key: Option<String>,
     require_auth: bool,
     metrics_listen: Option<String>,
+    /// Embedding and reranking models, keyed by the model name clients use.
+    models: bf_models::ModelsConfig,
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -305,6 +307,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(value) = tuning.cache_prefetch_concurrency {
         config.storage.cache.prefetch_concurrency = value;
     }
+    if let Ok(json) = std::env::var("BLOWFISH_MODELS_JSON")
+        && !json.trim().is_empty()
+    {
+        bf_models::apply_env(&mut config.models, &json)?;
+    }
+    if !config.models.is_empty() {
+        let models = bf_models::Models::new(std::mem::take(&mut config.models))?;
+        let (embedding, rerank) = models.names();
+        tracing::info!(
+            ?embedding,
+            ?rerank,
+            "native embedding and reranking models configured"
+        );
+        engine_config.models = Some(models);
+    }
     if !(0.0..=1.0).contains(&engine_config.recall_sample_rate) {
         return Err("recall_sample_rate must be between 0 and 1".into());
     }
@@ -377,6 +394,20 @@ mod tests {
             toml::from_str(include_str!("../../../blowfish.example.toml")).unwrap();
         assert_eq!(config.engine.index_rows, Some(1000));
         assert_eq!(config.storage.cache.block_size, 1 << 20);
+    }
+
+    #[test]
+    fn example_models_parse_when_uncommented() {
+        let example = include_str!("../../../blowfish.example.toml");
+        let tail = &example[example.find("# [models.").unwrap()..];
+        let uncommented: String = tail
+            .lines()
+            .map(|l| l.strip_prefix("# ").or(l.strip_prefix('#')).unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config: Config = toml::from_str(&uncommented).unwrap();
+        assert_eq!(config.models.len(), 2);
+        assert!(config.models.contains_key("google/embeddinggemma-2"));
     }
 
     #[test]
