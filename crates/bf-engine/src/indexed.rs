@@ -523,20 +523,24 @@ async fn prepare_scalar(
             .await
             .map(|entries| entries.into_iter().collect::<BTreeMap<_, _>>())
         };
-        let (allowed, indexes, ids) = tokio::try_join!(
+        let (allowed, indexes) = tokio::try_join!(
             snapshot::allowed(store, state, seg, q.filters.as_ref()),
             open_text,
-            async {
-                if clauses.is_empty() {
-                    Ok(None)
-                } else {
-                    segment::ids(store, seg).await.map(Some)
-                }
-            },
         )?;
         if allowed.is_empty() {
             continue;
         }
+        // The ID index is read whole, so BM25 hits take their IDs from the (ranged) `id`
+        // column of the documents file instead, for the winning rows only. Segments whose
+        // text index cannot be used still score through documents and need the full index.
+        let ids = if clauses.iter().any(
+            |c| matches!(c, RankBy::Bm25 { attribute, .. } if !indexes.contains_key(attribute)),
+        ) {
+            Some(segment::ids(store, seg).await?)
+        } else {
+            None
+        };
+        let mut bm25_hits: Vec<(String, Vec<bf_text::SearchHit>)> = vec![];
         let mut selected = if all {
             allowed.clone()
         } else {
@@ -589,14 +593,10 @@ async fn prepare_scalar(
                 hits.truncate(top);
                 hits
             };
-            let scores = out.scores.entry(rank_key(clause)).or_default();
-            for hit in hits {
+            for hit in &hits {
                 selected.insert(hit.row);
-                scores.insert(
-                    ids.as_ref().expect("text IDs")[hit.row as usize].clone(),
-                    hit.score as f64,
-                );
             }
+            bm25_hits.push((rank_key(clause), hits));
         }
         if let Some(rows) =
             crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out)
@@ -605,9 +605,25 @@ async fn prepare_scalar(
             selected &= rows;
         }
         crate::sparse::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?;
-        out.docs.extend(crate::shared(
-            segment::projected_documents(store, seg, &selected, Some(&columns)).await?,
-        ));
+        let rows = segment::projected_rows(store, seg, &selected, Some(&columns)).await?;
+        let mut row_ids = BTreeMap::new();
+        let mut docs = BTreeMap::new();
+        for (row, doc) in rows {
+            let id: Id =
+                serde_json::from_value(doc.get("id").ok_or_else(segment::corrupt)?.clone())
+                    .map_err(segment::index_error)?;
+            row_ids.insert(row, id.clone());
+            docs.insert(id, doc);
+        }
+        for (key, hits) in bm25_hits {
+            let scores = out.scores.entry(key).or_default();
+            for hit in hits {
+                if let Some(id) = row_ids.get(&hit.row) {
+                    scores.insert(id.clone(), hit.score as f64);
+                }
+            }
+        }
+        out.docs.extend(crate::shared(docs));
     }
     for (id, doc) in &state.docs {
         if !q

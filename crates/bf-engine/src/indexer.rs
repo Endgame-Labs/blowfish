@@ -778,7 +778,16 @@ impl Engine {
         Ok(candidates.len())
     }
 }
+/// Under a bulk load, compaction waits for the writes to pause (up to this many segments):
+/// each flush then costs one build of its rows instead of competing with merges, and merging
+/// the backlog afterwards rewrites each row about once.
+const DEFER_COMPACTION_BELOW_SEGMENTS: usize = 64;
 fn tier(state: &NamespaceState, config: &EngineConfig) -> Vec<String> {
+    if state.shadowed.len() >= config.index_rows
+        && state.segments.len() < DEFER_COMPACTION_BELOW_SEGMENTS
+    {
+        return vec![];
+    }
     let count = config.compaction_segments.max(2);
     let mut tiers: BTreeMap<u32, (Vec<String>, u64, u64)> = BTreeMap::new();
     for seg in &state.segments {

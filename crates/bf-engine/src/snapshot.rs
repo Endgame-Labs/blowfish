@@ -128,12 +128,14 @@ impl OpenHint {
                         );
                     }
                 }
-                if (!self.ann.is_empty() && !by_dir) || !self.text.is_empty() {
+                if !self.ann.is_empty() && !by_dir {
                     tasks.push(
                         timed("ids", segment::ids(store, seg))
                             .map(|r| r.map(drop))
                             .boxed(),
                     );
+                }
+                if (!self.ann.is_empty() && !by_dir) || !self.text.is_empty() {
                     tasks.push(
                         segment::get_value::<RoaringBitmap>(store, &seg.live)
                             .map_ok(drop)

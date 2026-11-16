@@ -125,7 +125,7 @@ pub(crate) async fn text_index(
     Ok(read_cache::insert(&file.key, resident, index))
 }
 
-fn corrupt() -> ApiError {
+pub(crate) fn corrupt() -> ApiError {
     ApiError::new(500, "stored segment is corrupt or unsupported")
 }
 pub(crate) fn index_error(e: impl std::fmt::Display) -> ApiError {
