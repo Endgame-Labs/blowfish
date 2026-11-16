@@ -867,6 +867,125 @@ add about 55 B per document (5.5 MB at 100K). Parity: milestone 3 row below.
   row's vector (about 48 MB at 100K), so it is the wrong trade; a smaller pool or merged ranges are the levers.
 - BM25 block-max skipping is not done; BM25 cost still grows with posting-list length.
 
+## Iteration 6 (1M docs): filtered ANN through the directory, row-to-cluster maps, and a cold-read fix
+
+First round at 1M documents (the first 1M English Wikipedia passages, the same 200 held-out passages, 1024-dim f16;
+`scale/` wiped and loaded fresh; exact truth in `bench/scale/data/oracle-1m.npz`). Scale-down for cache pressure: block
+cache 1 GiB and decoded metadata 512 MiB (about a tenth of the 10M settings), nprobe 64, rerank cap 32 x k, strong
+consistency, cold means a fresh process with an empty disk cache (8 queries per type). R2 and VM latency moved by as much
+as 40 percent between sessions in this round (the same binary measured cold ANN p50 at 1,065 and 1,520 ms), so the table
+gives two full sessions of the final binary, and the baseline is iteration 5's code on the same dataset and cache sizes.
+
+### What grew from 100K to 1M (iteration 5 code, evidence)
+
+| Query | 100K cold p50, GETs, MB | 1M cold p50, GETs, MB | Cause |
+| --- | --- | --- | --- |
+| ANN | 1,044 ms, 138, 13 | 2,000 ms, 402, 24 | probes grow with sqrt(N): about 180 clusters, each its own request, plus the rerank ranges |
+| BM25 | 943 ms, 39, 7 | 2,371 ms, 113, 47 | per-segment whole ID indexes (10.7 MB) and length arrays (28 MB) are read whole |
+| Hybrid | 1,023 ms, 178, 20 | 2,404 ms, 518, 71 | the sum of both |
+| Selective ANN | 1,120 ms, 229, 8 | 3,800 ms, 719, 118 | the filtered path opened every segment (index header plus ID index) and, because selectivity inflated the probe count, scanned nearly every cluster's codes |
+
+Trace of one cold ANN query at 1M (`BF_TRACE_READS=1`): 433 backend reads, of which about 93 cluster blobs, about 300
+code and rerank ranges, and 38 document footers. Individual requests took 200 to 300 ms each instead of 45 to 90 ms,
+because hundreds were in flight together. The wave structure did not grow (manifest, then directory with the WAL probe,
+then scan, then rerank); the cost grew through request count and through the next item.
+
+**The largest cold cost was not the network.** The cache wrote every fetched 4 KB block to the disk tier with an awaited
+`spawn_blocking` call before returning the read. A cold 2 MB read finished its network transfer in about 150 ms and then
+spent 400 to 900 ms writing 500 block files, one at a time. In a cold BM25 trace the backend reads all finished by 650 ms
+and the next stage started at 1,450 ms. Disk writes now run behind the read (bounded: at most 16 queued batches, so a cold
+cache cannot buffer the whole transfer in memory), and tests call `Storage::flush_cache()` where they inspect the disk.
+Without that bound, a 200K namespace that fell back to the per-segment path grew the server to 15 GB under concurrent
+queries (see the open items).
+
+### What changed
+
+| Change | Evidence | Effect (1M, cold) |
+| --- | --- | --- |
+| Disk-tier writes run behind reads (bounded queue) | the trace above: network done at 650 ms, stage started at 1,450 ms | cold ANN 2,000 to about 1,100 ms; BM25 2,371 to about 1,250 ms, with no change in requests or bytes |
+| Filtered ANN uses the directory (`ann_dir::search` takes per-segment allowed-row bitmaps), reading no segment index and no ID index | selective was 719 requests and 118 MB; its warm-up opened every segment | filter bitmaps and the directory load in the snapshot wave; first version (estimated counts) 330 requests, 20 MB, 1,102 ms but recall 0.803 |
+| Fragments carry a row-to-cluster map (u16 per row, `BFFRG002`/`BFDIR003`): exact allowed rows per cluster, and each allowed row's vector location, without reading blobs | an estimate from row fractions gave selective recall 0.80 (needs about every matching row at 0.4 percent selectivity); exact counts keep 1.000 | selective cold p50 3,800 to about 1,450 ms, 719 to 330 requests (blob route) or 1,885 requests and 42 MB (exact route, below), recall 1.000 |
+| A filter whose allowed set is at most `exact_fetch_rows` (8,192) ranks exactly those rows' vectors (`PartialIndex::exact_at`); a larger set scans the nearest clusters' codes with exact per-cluster counts and does not widen the probe count | recall must reach turbopuffer's 0.998 at selectivity 0.4 percent (4,181 of 1M rows) | the exact route reads about 4,000 sparse 2 KB ranges merged to about 1,900 requests; see the open items |
+| `BF_IVF_CLUSTER_FACTOR` (default 1, so unchanged) makes leaf clusters N times larger | 200K experiment: factor 2 cut cold ANN requests 250 to 200 and MB 18 to 14, recall 0.950 to 0.944, cold p50 1,254 vs 1,161 ms (4 queries, noise) | left at 1: the recall cost is small but not free, and 1M recall is only 0.006 above turbopuffer |
+| Diagnostics: `ANN snapshot` and `DIRECTORY` stage lines (`BF_TRACE_STAGES=1`), warm-task timings | found the shadowed-tail fall-back below | none |
+
+Rejected after measuring: multipart upload for 12 MiB and larger WAL payloads (A/B at 120K docs, 16 writes in flight:
+1,223 docs/s without, 1,182 with; commit append 3.8 s vs 3.2 s per commit), so ingest is limited by the VM's upload
+bandwidth to R2 (about 10 to 12 MB/s), not by per-request latency. The change was reverted.
+
+### Results at 1M (strong consistency)
+
+Baseline is iteration 5's code on the same data; "session 2" is the final binary measured when R2 was quiet, "session 1"
+the same binary when it was not.
+
+| Query | Baseline cold p50 / p90 / p99 ms | Final cold p50 / p90 / p99 ms (session 2; session 1 p50) | Cold GETs/q | Cold MB/q | Warm c1 p50 / p90 / p99 ms | QPS c1 / c8 / c32 | Recall@10 |
+| --- | --- | --- | ---: | ---: | --- | --- | ---: |
+| ANN | 2,000 / 2,355 / 2,681 (406 GETs, 24 MB) | 1,065 / 1,257 / 1,268 (1,520) | 434 | 25 | 48 / 74 / 100 | 18.7 / 60.9 / 66.7 | 0.931 baseline, 0.944 final (32 queries); 0.942 over 200 |
+| BM25 | 2,371 / 2,712 / 2,897 (116 GETs, 47 MB) | 1,240 / 1,428 / 1,562 (1,790) | 122 | 49 | 52 / 86 / 152 | 16.5 / 109.6 / 155.0 | |
+| Hybrid | 2,404 / 2,983 / 3,444 (518 GETs, 71 MB) | 1,478 / 1,576 / 1,619 (2,702) | 553 | 74 | 53 / 84 / 202 | 15.4 / 51.3 / 52.6 | |
+| Selective ANN | 3,800 / 4,310 / 4,961 (722 GETs, 118 MB) | 1,623 / 2,053 / 2,081 (1,443) | 1,888 | 42 | 131 / 193 / 225 (session 1: 48 / 64 / 90) | 7.1 / 47.1 / 86.5 (session 1: 19.4 / 70.1 / 88.3) | 1.000 |
+
+Baseline warm: ANN 53 ms (QPS 17.5 / 70.3 / 69.7), BM25 51 ms (16.9 / 113 / 135), hybrid 65 ms (14.6 / 44.7 / 51.0), selective
+59 ms (15.7 / 28.6 / 29.3). Cold waves (sequential read stages, from the read trace): ANN 4 (manifest; directory with the
+WAL probe; blobs, codes, and document footers; rerank), BM25 4 (manifest; index headers, ID indexes, lengths, and text
+statistics; term records; postings), hybrid the larger of the two plus statistics, selective about 5 (manifest; directory;
+row-to-cluster maps; vectors; hydration). Cold ANN meets the target of under 500 requests but not 3 waves. Ingest of 1M:
+1,695 s (590 docs/s) with 2 writes in flight, against 1,351 s (740 docs/s) with 16, 0 backpressure 429s both times;
+indexing rewrote 2.09M rows (baseline) and 1.61M rows (final) of segments; the bucket held 12.4 GB after the load
+(12.4 KB per document, including retired files awaiting GC; the documents file holds the vector column as well as the
+index file's full vectors). The loader's write rate fell from about 1,980 docs/s at 80K rows to about 400 docs/s at 900K rows (WAL
+append of 24 MB per group commit at the VM's upload bandwidth, plus `prepare` and ID-index lookups growing with N).
+
+### Blowfish against turbopuffer, by scale
+
+turbopuffer numbers are from "turbopuffer alone at 1M and 10M" below (hot or warm: it cannot be forced cold). Blowfish
+warm is a local process, read-only, with the scaled-down caches described above, strong consistency (one R2 HEAD per
+query), measured at one request at a time; blowfish cold is a fresh process and an empty disk cache.
+
+| Scale | Query | blowfish cold p50 / p90 (ms) | blowfish warm p50 / p90 / p99 (ms) | turbopuffer client p50 / p90 / p99 (ms) | turbopuffer `server_total_ms` p50 | recall@10 blowfish / turbopuffer |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100K | ANN | 1,044 / 1,681 (iteration 5) | 53 / 72 / 114 | 73 / 81 / 123 | 15 | 0.984 / 0.963 |
+| 1M | ANN | 1,065 / 1,257 | 51 / 77 / 114 | 65 / 72 / 87 | 13 | 0.942 / 0.938 |
+| 1M | BM25 | 1,240 / 1,428 | 56 / 76 / 146 | 64 / 69 / 81 | 13 | |
+| 1M | Hybrid | 1,478 / 1,576 | 57 / 81 / 184 | 66 / 72 / 100 | 13 | |
+| 1M | Selective ANN | 1,623 / 2,053 | 51 / 76 / 141 | 66 / 71 / 106 | 13 | 1.000 / 0.998 |
+| 1M | Broad ANN | not measured cold | 62 / 75 / 120 | 66 / 70 / 99 | 13 | 0.973 / 0.977 |
+| 10M | (turbopuffer alone) ANN | | | 150 / 277 / 492 | 88 | 0.943 |
+
+Kyle's target for the climb is turbopuffer's published 10M cold numbers plus 40 percent: p50 at most about 1,224 ms and
+p90 about 1,700 ms. At 1M, cold ANN p50 is 1,065 ms (p90 1,257) when R2 is quiet and 1,520 ms in the noisy session; BM25
+is 1,240 / 1,428; hybrid and selective are above the p50 target (1,478 and 1,623).
+
+### Parity at 1M against `blowfish-oracle-wiki1m` (milestone 4, 200 queries per type)
+
+| Query | overlap@10 | top-1 agree | recall@10 blowfish / turbopuffer | blowfish client p50 / p90 / p99 (ms) | turbopuffer client p50 / p90 / p99 (ms) |
+| --- | ---: | ---: | --- | --- | --- |
+| ANN | 0.929 | 0.945 | 0.942 / 0.938 | 51 / 77 / 114 | 65 / 72 / 87 |
+| BM25 | 0.990 | 0.995 | | 56 / 76 / 146 | 64 / 69 / 81 |
+| Hybrid (RRF) | 0.969 | 0.910 | | 57 / 81 / 184 | 66 / 72 / 100 |
+| Selective ANN | 0.998 | 1.000 | 1.000 / 0.998 | 51 / 76 / 141 | 66 / 71 / 106 |
+| Broad ANN | 0.966 | 0.970 | 0.973 / 0.977 | 62 / 75 / 120 | 66 / 70 / 99 |
+
+Broad ANN is 0.004 below turbopuffer. Before this round's last change (code scans widen the probe count in proportion to
+how few rows the filter leaves, at most 3 times) it was 0.941; the change costs requests only on filtered queries that
+take the code route. An earlier measurement in the same session, with the caches at the same size but R2 busy, gave
+blowfish client p50 130 to 140 ms for every type, because 200 distinct queries do not fit the 1 GiB block cache at 1M
+documents. Both sides' numbers are one session.
+
+### Open items found in this round
+
+- **Any unindexed tail upsert disables the directory.** `NamespaceState::shadowed` marks every tail ID, whether or not it
+  replaces a segment row, and `ann::search` only takes the directory path when it is empty. A 200K namespace with 58K
+  unindexed docs answered ANN in 2 to 12 s and, at 8 concurrent queries, grew the server to 15 GB. Mitigation: only
+  shadow IDs that exist in a segment (a bloom check on each ID index), or search the directory with the tail's IDs
+  removed by lookup.
+- **BM25 bytes grow linearly with N**: ID indexes (10.7 MB at 1M) and length arrays (28 MB) are read whole per segment,
+  and corpus statistics 5.9 MB. At 10M that is about 500 MB per cold BM25 query.
+- **Selective filters read about 1,900 requests** at 0.4 percent selectivity (exact route over 4,181 rows). At 10M that is
+  about 20,000 requests. Per-cluster filter summaries, or a copy of the filtered set's vectors, would replace it.
+- **Ingest is bounded by upload bytes per document**: the WAL alone was 3.0 GB for 1M documents, and segment builds
+  covered 1.6M rows. Store vectors once and compact less often.
+
 ## turbopuffer reference (100K)
 
 The real turbopuffer holds the same 100K documents (the first 100K English Wikipedia passages, 1024-dim f16, the same
@@ -990,3 +1109,9 @@ turbopuffer). turbopuffer's numbers do not change between milestones except for 
 | 1: iteration 3 | `73d8110` | 87 / 116 / 155 ms, 0.965 | 90 / 129 / 201 ms, 0.982 | 100 / 133 / 299 ms, 0.972 | 98 / 136 / 216 ms, 0.998 | 100 / 131 / 234 ms, 0.991 |
 | 2: iteration 4 (ANN directory) | `f1a7db3`+ | 68 / 91 / 191 ms, 0.962 | 66 / 99 / 198 ms, 0.982 | 65 / 90 / 173 ms, 0.971 | 64 / 88 / 134 ms, 0.998 | 57 / 74 / 156 ms, 0.991 |
 | 3: iteration 5 (one-bit directory, fragments) | `af04e66`+ | 53 / 72 / 114 ms, 0.968 | 61 / 86 / 193 ms, 0.982 | 60 / 87 / 165 ms, 0.975 | 54 / 78 / 137 ms, 0.998 | 61 / 86 / 106 ms, 0.993 |
+
+### Milestone 4 at 1M (iteration 6)
+
+The milestone table above is at 100K. The 1M rows are the "Parity at 1M" table in the iteration 6 section: overlap@10
+ANN 0.929, BM25 0.990, hybrid 0.969, selective 0.998, broad 0.966; recall@10 ANN 0.942 (turbopuffer 0.938), selective
+1.000 (0.998), broad 0.973 (0.977).

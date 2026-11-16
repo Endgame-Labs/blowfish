@@ -144,3 +144,24 @@ resident for the int8 version. At 10M documents (about 22K leaves) that is about
   the codes would read every probed row's vector (about 48 MB at 100K), so it is not worth it; the remaining lever is a
   smaller rerank pool.
 - A segment's vectors are ordered by cluster, not by cluster proximity, so rerank ranges rarely merge.
+
+## Iteration 6: filters through the directory, and row-to-cluster maps
+
+Fragments (`BFFRG002`) and directories (`BFDIR003`) gained, per clustered segment, a **membership map**: one u16 (u32
+past 65,535 clusters) per row giving its leaf cluster, stored after the blobs in the fragment and read by a ranged GET
+(about 2 bytes per row, 250 KB for a 125K-row segment, cached decoded). Ordinals within a cluster follow ascending row
+order, so the map alone yields, for any allowed row, its cluster and the byte offset of its vector.
+
+A filtered ANN query now takes the same path as an unfiltered one:
+
+1. The snapshot wave loads the directory, each segment's allowed-row bitmap (live rows that pass the filter, from the
+   segment's existing filter file), and each segment's membership map. No segment index or ID index is opened.
+2. Exact allowed rows per cluster come from the map. If at most `exact_fetch_rows` (8,192) rows are allowed, their
+   vectors are fetched directly (`PartialIndex::exact_at`, merged ranges) and ranked exactly: no blobs, no codes.
+   Otherwise the nearest clusters (probe count up to `filtered_probe_cap` = 3 times the unfiltered count, until the
+   allowed candidates reach the rerank budget) are scanned by code with the allowed rows as the filter, then reranked.
+3. Winners are hydrated by segment row (`projected_rows`), so no ID index is read.
+
+Old fragments and directories (no map) make the directory unusable for the namespace until compaction rewrites them:
+queries use the per-segment path, as for segments without fragments. A directory in an unknown format is ignored, not an
+error. The unindexed-tail fall-back (any tail upsert disables the directory path) is unchanged and is the next fix.
