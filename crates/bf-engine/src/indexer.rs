@@ -294,7 +294,7 @@ impl Engine {
                 && state.seq > 0
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
-                && tier(&state, &self.0.config).is_empty()
+                && tier(&state, &self.0.config, force).is_empty()
             {
                 return Ok(false);
             }
@@ -319,7 +319,7 @@ impl Engine {
                         })
                     })
             });
-            let will_compact = tier(&state, &self.0.config);
+            let will_compact = tier(&state, &self.0.config, force);
             if state.seq == state.indexed_through && will_compact.is_empty() && !will_rebuild {
                 return Ok(false);
             }
@@ -361,7 +361,7 @@ impl Engine {
                     })
                 })
         });
-        let compact = tier(&state, &self.0.config);
+        let compact = tier(&state, &self.0.config, force);
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild {
             return Ok(false);
         }
@@ -635,17 +635,22 @@ impl Engine {
         }
         externalize_text_stats(store, ns, &mut manifest).await?;
         crate::ann::stage(t0, "idx text_stats");
-        match wal
+        let generation = match wal
             .publish_fenced(claim, manifest.indexer_epoch, &manifest)
             .await
         {
-            Ok(_) => {}
+            Ok(generation) => generation,
             Err(bf_wal::Error::Fenced) => return Ok(false),
             Err(e) => return Err(log_error(e)),
-        }
+        };
         crate::ann::stage(t0, "idx publish");
         let mut current = handle.state.lock().await;
-        catch_up(&wal, &mut current, &self.0.store).await?;
+        // This node wrote the manifest and holds the tail in memory, so adopt the checkpoint
+        // directly. Re-reading the tail from the object store would download every unindexed
+        // document again on every publication, with the state locked against writes.
+        if !current.fast_forward(&manifest, generation, state.seq) {
+            catch_up(&wal, &mut current, &self.0.store).await?;
+        }
         crate::ann::stage(t0, "idx done");
         Ok(true)
     }
@@ -782,8 +787,9 @@ impl Engine {
 /// each flush then costs one build of its rows instead of competing with merges, and merging
 /// the backlog afterwards rewrites each row about once.
 const DEFER_COMPACTION_BELOW_SEGMENTS: usize = 64;
-fn tier(state: &NamespaceState, config: &EngineConfig) -> Vec<String> {
-    if state.shadowed.len() >= config.index_rows
+fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<String> {
+    if !force
+        && state.shadowed.len() >= config.index_rows
         && state.segments.len() < DEFER_COMPACTION_BELOW_SEGMENTS
     {
         return vec![];

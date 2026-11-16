@@ -128,7 +128,11 @@ impl OpenHint {
                         );
                     }
                 }
-                if !self.ann.is_empty() && !by_dir {
+                let small_ids = seg
+                    .files
+                    .get("ids")
+                    .is_none_or(|f| f.size <= crate::indexed::RANGED_IDS_BYTES);
+                if (!self.ann.is_empty() && !by_dir) || (!self.text.is_empty() && small_ids) {
                     tasks.push(
                         timed("ids", segment::ids(store, seg))
                             .map(|r| r.map(drop))
@@ -142,7 +146,9 @@ impl OpenHint {
                             .boxed(),
                     );
                 }
-                if self.docs && !(by_dir && self.text.is_empty() && !self.ann.is_empty()) {
+                if (self.docs && !(by_dir && self.text.is_empty() && !self.ann.is_empty()))
+                    || (!self.text.is_empty() && !small_ids)
+                {
                     tasks.push(segment::warm_docs(store, seg).map(|()| Ok(())).boxed());
                 }
             }

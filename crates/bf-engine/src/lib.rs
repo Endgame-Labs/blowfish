@@ -31,6 +31,15 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+/// One unindexed WAL entry resident in a namespace's tail.
+#[derive(Clone)]
+pub(crate) struct TailEntry {
+    pub seq: u64,
+    pub bytes: u64,
+    pub at: DateTime<Utc>,
+    /// A copy or branch install: its effect is not captured by `docs` and `shadowed`.
+    pub copy: bool,
+}
 #[derive(Clone)]
 pub(crate) struct NamespaceState {
     pub seq: u64,
@@ -40,6 +49,10 @@ pub(crate) struct NamespaceState {
     /// Only the unindexed tail stays resident. Materialized views are query-local.
     pub docs: BTreeMap<Id, std::sync::Arc<Document>>,
     pub shadowed: BTreeSet<Id>,
+    /// The last tail entry that wrote or deleted each tail ID, so a publication can drop
+    /// exactly the IDs it indexed without re-reading the WAL.
+    pub marks: BTreeMap<Id, u64>,
+    pub entries: Vec<TailEntry>,
     pub segments: Vec<bf_wal::Segment>,
     pub indexed_through: u64,
     pub manifest_seq: u64,
@@ -67,6 +80,8 @@ impl Default for NamespaceState {
             metric: DistanceMetric::default(),
             docs: BTreeMap::new(),
             shadowed: BTreeSet::new(),
+            marks: BTreeMap::new(),
+            entries: vec![],
             segments: vec![],
             indexed_through: 0,
             manifest_seq: 0,
@@ -100,6 +115,8 @@ impl NamespaceState {
             metric: self.metric,
             docs: BTreeMap::new(),
             shadowed: self.shadowed.clone(),
+            marks: BTreeMap::new(),
+            entries: self.entries.clone(),
             segments: self.segments.clone(),
             indexed_through: self.indexed_through,
             manifest_seq: self.manifest_seq,
@@ -116,7 +133,7 @@ impl NamespaceState {
             checkpoint_refreshed: self.checkpoint_refreshed,
         }
     }
-    fn apply(&mut self, b: &WriteBatch) {
+    fn apply(&mut self, b: &WriteBatch, seq: u64) {
         self.exists = true;
         if self.schema.keys().any(|name| !b.schema.contains_key(name)) {
             for doc in self.docs.values_mut() {
@@ -130,10 +147,16 @@ impl NamespaceState {
         for id in &b.deletes {
             self.docs.remove(id);
             self.shadowed.insert(id.clone());
+            if seq > 0 {
+                self.marks.insert(id.clone(), seq);
+            }
         }
         for doc in &b.upserts {
             let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
             self.shadowed.insert(id.clone());
+            if seq > 0 {
+                self.marks.insert(id.clone(), seq);
+            }
             self.docs.insert(id, Arc::new(doc.clone()));
         }
     }
@@ -144,11 +167,65 @@ impl NamespaceState {
             self.manifest_seq = manifest_seq;
         }
         for batch in &entry.batches {
-            self.apply(batch);
+            self.apply(batch, seq);
         }
         self.tail_since.get_or_insert(entry.committed_at);
         self.seq = seq;
-        self.tail_bytes += serde_json::to_vec(entry).expect("WAL serializes").len() as u64;
+        let bytes = serde_json::to_vec(entry).expect("WAL serializes").len() as u64;
+        self.tail_bytes += bytes;
+        self.entries.push(TailEntry {
+            seq,
+            bytes,
+            at: entry.committed_at,
+            copy: false,
+        });
+    }
+    /// Advance this live state to a manifest this node just published, which indexed every
+    /// entry through `through`: adopt the manifest's checkpoint and drop the tail IDs whose
+    /// last write was indexed, without re-reading the WAL. Returns false (leaving the state
+    /// unchanged) when the tail cannot be trimmed from memory, so the caller must catch up.
+    pub(crate) fn fast_forward(
+        &mut self,
+        manifest: &bf_wal::Manifest,
+        generation: u64,
+        through: u64,
+    ) -> bool {
+        if manifest.deleted
+            || self.indexed_through >= through
+            || self.seq < through
+            || self.entries.iter().any(|e| e.copy)
+            || self
+                .entries
+                .first()
+                .is_some_and(|e| e.seq > self.indexed_through + 1)
+            || self.entries.iter().filter(|e| e.seq <= through).count() as u64
+                != through - self.indexed_through
+        {
+            return false;
+        }
+        let marks = std::mem::take(&mut self.marks);
+        self.docs
+            .retain(|id, _| marks.get(id).is_some_and(|m| *m > through));
+        self.shadowed
+            .retain(|id| marks.get(id).is_some_and(|m| *m > through));
+        self.marks = marks.into_iter().filter(|(_, m)| *m > through).collect();
+        self.entries.retain(|e| e.seq > through);
+        self.tail_bytes = self.entries.iter().map(|e| e.bytes).sum();
+        self.tail_since = self.entries.first().map(|e| e.at);
+        self.scores.clear();
+        self.segments = manifest.segments.clone();
+        self.indexed_through = through;
+        self.manifest_seq = generation;
+        self.corpus = if manifest.text_stats.is_some() {
+            Default::default()
+        } else {
+            text::checkpoint_corpus(&manifest.stats)
+        };
+        self.text_stats = manifest.text_stats.clone();
+        self.ann_dirs = manifest.ann_dirs.clone();
+        self.stats = manifest.stats.clone().into();
+        self.checkpoint_refreshed = Instant::now();
+        true
     }
 }
 /// Query-local diagnostics; backend durations sum overlapping requests.
@@ -820,7 +897,7 @@ async fn commit_worker(
                 };
                 match write::prepare(&working, req, copy.as_deref()) {
                     Ok((batch, result)) => {
-                        working.apply(&batch);
+                        working.apply(&batch, 0);
                         if let Some(source) = copy {
                             branch::install_source(&mut working, source);
                         }
@@ -875,5 +952,88 @@ async fn commit_worker(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+    use bf_wal::{Manifest, WalEntry, WriteBatch};
+    use serde_json::json;
+
+    fn entry(upserts: &[u64], deletes: &[u64]) -> WalEntry {
+        let schema: Schema =
+            serde_json::from_value(json!({"id":{"type":"uint"},"n":{"type":"int"}})).unwrap();
+        WalEntry::new(vec![WriteBatch {
+            upserts: upserts
+                .iter()
+                .map(|id| {
+                    serde_json::from_value(json!({"id":id,"n":*id as i64})).expect("document")
+                })
+                .collect(),
+            deletes: deletes.iter().map(|id| Id::Uint(*id)).collect(),
+            schema,
+            distance_metric: DistanceMetric::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }])
+    }
+
+    fn manifest(through: u64) -> Manifest {
+        Manifest {
+            format_version: 1,
+            schema: Schema::new(),
+            distance_metric: DistanceMetric::default(),
+            id_type: AttributeType::Scalar(ScalarType::Uint),
+            created_at: Utc::now(),
+            indexed_through: through,
+            indexer_epoch: 1,
+            deleted: false,
+            segments: vec![],
+            stats: Default::default(),
+            text_stats: None,
+            ann_dirs: Default::default(),
+            updated_at: None,
+            retired: vec![],
+            checkpoints: vec![],
+        }
+    }
+
+    /// Publishing a checkpoint drops exactly the tail IDs whose last write it indexed, and
+    /// keeps IDs written again afterwards, without re-reading any entry.
+    #[test]
+    fn fast_forward_drops_only_indexed_tail_ids() {
+        let mut state = NamespaceState::default();
+        let entries = [
+            entry(&[1, 2, 3], &[]),
+            entry(&[4], &[2]),
+            entry(&[3, 5], &[]),
+            entry(&[6], &[1]),
+        ];
+        for (i, e) in entries.iter().enumerate() {
+            state.replay(i as u64 + 1, e);
+        }
+        let last_two: u64 = state.entries[2..].iter().map(|e| e.bytes).sum();
+        // The indexer saw entries 1 and 2; entries 3 and 4 arrived while it built.
+        assert!(state.fast_forward(&manifest(2), 7, 2));
+        assert_eq!(state.indexed_through, 2);
+        assert_eq!(state.manifest_seq, 7);
+        assert_eq!(state.seq, 4);
+        let docs: Vec<_> = state.docs.keys().cloned().collect();
+        assert_eq!(docs, vec![Id::Uint(3), Id::Uint(5), Id::Uint(6)]);
+        let shadowed: Vec<_> = state.shadowed.iter().cloned().collect();
+        assert_eq!(
+            shadowed,
+            vec![Id::Uint(1), Id::Uint(3), Id::Uint(5), Id::Uint(6)]
+        );
+        assert_eq!(state.tail_bytes, last_two);
+        assert_eq!(state.entries.len(), 2);
+        // A second publication of an older checkpoint is refused.
+        assert!(!state.fast_forward(&manifest(1), 8, 1));
+        // Indexing everything leaves an empty tail.
+        assert!(state.fast_forward(&manifest(4), 9, 4));
+        assert!(state.docs.is_empty() && state.shadowed.is_empty() && state.entries.is_empty());
+        assert_eq!(state.tail_bytes, 0);
+        assert!(state.tail_since.is_none());
     }
 }
