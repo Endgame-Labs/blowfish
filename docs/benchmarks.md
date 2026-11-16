@@ -986,6 +986,111 @@ documents. Both sides' numbers are one session.
 - **Ingest is bounded by upload bytes per document**: the WAL alone was 3.0 GB for 1M documents, and segment builds
   covered 1.6M rows. Store vectors once and compact less often.
 
+## Iteration 7 (1M docs): ingest that no longer stalls, and an unindexed tail that keeps the directory
+
+Second round at 1M (same 1M passages, 200 held-out queries, `scale/` wiped and reloaded with the final binary; truth from
+the loader, parity against `blowfish-oracle-wiki1m` and `bench/scale/data/oracle-1m.npz`). Same cache sizes as iteration 6
+(1 GiB block cache, 512 MiB decoded metadata), nprobe 64, rerank cap 32 x k, strong consistency, cold means a fresh process
+with an empty disk cache (8 queries per type). Two full matrix sessions of the final binary are given, because R2 latency
+moved by up to 40 percent between sessions.
+
+### Where ingest time went (measured, then fixed)
+
+A local file-store load of 450K rows (so no network limit) with stage timers in the indexer
+(`BF_TRACE_STAGES=1` prints `idx ...` lines) and the commit-stage histograms showed the writers, not the builders, were
+the limit:
+
+| Stage (per cycle or commit, 300K to 450K rows) | Before | After |
+| --- | --- | --- |
+| Indexer `state.clone()` under the namespace lock (deep copy of every tail document) | 1.2 to 1.6 s | 0.05 s |
+| `prepare` per commit (clones the tail, then diffs every tail document against the batch) | 650 ms average | about 390 ms (the rest is normalizing 2,000-document batches) |
+| Final `catch_up` after publication (rebuild from the manifest, re-download the tail) with writes locked out | 1 to 5.5 s | 0 (adopts its own checkpoint in memory) |
+| Text statistics (`adjust`) after the build, serial | 0.6 to 1.7 s | overlapped with the builds |
+| Flush and compaction builds | serial | concurrent |
+| Local ingest, 450K rows | about 2,100 docs/s, falling | 3,650 docs/s |
+
+On R2 the remaining limit is bytes per document through one WAL stream. A flush cycle also downloaded the whole tail again
+after every publication, and garbage collection (every 60 s) replayed the whole WAL from scratch: 3.1 GB of GETs at 560K
+rows; 5.1 GB by the end of the 1M load, and 1.5 GB with the fixes.
+
+### What changed
+
+1. **Tail documents are shared** (`NamespaceState::docs` holds `Arc<Document>`), so cloning a state copies pointers.
+2. **Writes read only the rows they name**: `for_writes` builds the write's working state from the request's IDs (tail rows
+   by ID, segment rows by lookup) instead of cloning the whole tail, and `prepare` compares only touched rows.
+3. **Indexer cycle**: flush build, compaction build, and the tail's text statistics run concurrently; after publishing, the
+   node adopts its own checkpoint in memory (`NamespaceState::fast_forward`, tail IDs trimmed by their last-write sequence)
+   instead of replaying the WAL; a republished manifest with the same checkpoint (garbage collection, epoch claims) no longer
+   discards the resident tail; garbage collection starts from the resident state.
+4. **Bulk loads build big segments**: while writes are still arriving, the tail accumulates up to `bulk_flush_rows`
+   (100,000, `BF_BULK_FLUSH_ROWS`) or `bulk_flush_age` (60 s) before a segment is built, and compaction waits for writes
+   to pause (up to 64 segments). Ignored when `index_age` is under a second (forced-indexing tests).
+5. **WAL payloads of 8 MiB or more upload as concurrent 5 MiB parts** (the key is unique per attempt).
+6. **An unindexed tail keeps the ANN directory path.** Shadowed rows are dropped by ID from the winners (asking for
+   `k + max(2k, 20)` winners), with a fall back to the per-segment path only if shadowed rows leave fewer than k while the
+   pool was full. Filtered queries skip the per-segment shadow lookup (`snapshot::allowed_with`). Test:
+   `unindexed_tail_keeps_the_directory_path` (new rows, overwrites, and deletes of the query's own nearest neighbours; no
+   `.bfi` read; at most 4 waves).
+7. **BM25 hits for big segments take their IDs from the `id` column of the documents file** (winning rows only) instead of
+   reading the whole ID index, for ID indexes over 1 MiB. Smaller ones are still read whole, because the ranged read costs
+   one more sequential wave.
+
+### Ingest of 1M (batch 2,000, 16 writes in flight, loader in a 6 GiB scope, server in a 16 GiB scope)
+
+| | Iteration 6 | Iteration 7 |
+| --- | --- | --- |
+| Loader wall time, 1M rows | 1,351 s | 834 s |
+| docs/s over the whole load | 740 | 1,199 |
+| docs/s at about 160K rows, then over the last 100K rows | 1,980, then 400 | 1,480, then about 1,150 |
+| Fully indexed (including compaction) after the load starts | 1,351 s | 1,247 s |
+| 429s | 0 | 0 |
+| Server peak RSS | not captured (scope 11 GB with page cache) | about 3.1 GB |
+| Segment rows built per row ingested | 1.6 to 2.1 | about 1.0 at load end, then compaction |
+| WAL | 3.0 GB | 3.0 GB (3.0 KB per document) |
+| Live segment bytes | 12.4 KB per document in the bucket | 5.4 KB per document of live segments; 13.2 GB bucket before garbage collection |
+
+Intermediate runs on the way (same 1M load): 1,109 docs/s after items 1 to 3 alone (fully indexed 1,360 s), and 1,155
+docs/s after adding items 4 and 5. The load is now limited by upload bytes (the WAL commit is one serialized stream, and
+the indexer shares the link), not by the indexer. The 1,500 docs/s target is not met on this VM's link to R2.
+
+### Results at 1M (strong consistency; cold = fresh process, 8 queries)
+
+| | ANN | BM25 | Hybrid | Selective |
+| --- | --- | --- | --- | --- |
+| Iteration 6 cold p50 / p90 / p99 ms (session 2) | 1,065 / 1,257 / 1,268 | 1,240 / 1,428 / 1,562 | 1,478 / 1,576 / 1,619 | 1,623 / 2,053 / 2,081 |
+| Iteration 7 cold, session 1 | 1,410 / 1,722 / 1,922 | 1,854 / 2,962 / 3,275 | 1,525 / 1,631 / 1,757 | 1,768 / 2,944 / 4,687 |
+| Iteration 7 cold, session 2 | 1,118 / 1,233 / 1,250 | 1,212 / 1,274 / 1,347 | 1,652 / 2,779 / 2,945 | 1,699 / 3,039 / 3,533 |
+| Cold GETs / MB (before to after) | 434 / 25 to 375 / 23.5 | 122 / 49 to 126 / 38 | 553 / 74 to 493 / 61 | 1,888 / 42 to 1,949 / 43 |
+| Warm c1 p50 / p90 / p99 ms (session 2) | 59 / 77 / 126 | 61 / 77 / 154 | 52 / 79 / 146 | 60 / 96 / 187 |
+| QPS c1 / c8 / c32 (session 2) | 15.6 / 70.3 / 78.7 | 15.2 / 65.5 / 133.5 | 16.4 / 32.6 / 36.3 | 13.8 / 86.8 / 108.4 |
+| Recall@10 | 0.966 (200 queries) | | | 1.000 |
+
+The same session also re-measured iteration 6's namespace before it was wiped: cold ANN p50 1,168 ms (431 GETs, 25 MB) and BM25
+1,255 ms (119 GETs, 49 MB), within noise of session 2 of iteration 7. Cold p50 is therefore flat for ANN and BM25 in a quiet
+session (1,118 and 1,212 ms against a target of about 1,224 ms), and noisy session 1 (1,410 and 1,854 ms) shows the 40 percent
+spread. Hybrid and selective are above the target in both sessions. Waves were not re-measured (the wave tests pass unchanged), and requests fell about 14 percent
+for ANN because a 1M namespace now has 11 larger segments instead of 14 (compaction no longer runs during the load).
+
+### Parity at 1M against `blowfish-oracle-wiki1m` (200 queries per type)
+
+| | ANN | BM25 | Hybrid | Selective | Broad |
+| --- | --- | --- | --- | --- | --- |
+| Overlap@10 with turbopuffer | 0.924 | 0.990 | 0.965 | 0.999 | 0.966 |
+| Recall@10, blowfish vs turbopuffer | 0.949 vs 0.939 | | | 1.000 vs 0.999 | 0.978 vs 0.977 |
+| Warm client p50 ms, blowfish vs turbopuffer | 56 vs 68 | 57 vs 66 | 57 vs 67 | 60 vs 68 | 64 vs 67 |
+
+Blowfish's recall is at or above turbopuffer's at every size measured. Broad filter recall, which was 0.004 short at 1M in
+iteration 6, is now 0.001 above.
+
+### Not done (and why)
+
+- **Vectors are still stored twice per segment** (documents file and ANN file): 2.1 of the 5.9 KB per document. Reading them
+  back from the ANN file (hydration and compaction) was not started.
+- **BM25 bytes** are 38 MB per cold query, not under 10 MB: the per-segment text dictionaries (about 28 MB) and corpus
+  statistics (5.9 MB, a single FST) are still read whole, and they need a chunked format in `bf-text`.
+- **Selective filters** still need about 1,950 requests (exact route over 4,181 rows).
+- **Cold ANN** is still 4 waves and about 375 requests; `BF_IVF_CLUSTER_FACTOR` was not re-evaluated.
+
 ## turbopuffer reference (100K)
 
 The real turbopuffer holds the same 100K documents (the first 100K English Wikipedia passages, 1024-dim f16, the same
