@@ -502,134 +502,110 @@ async fn prepare_scalar(
     {
         columns.clear();
     }
-    for clause in clauses.iter() {
+    for clause in &clauses {
         out.scores.entry(rank_key(clause)).or_default();
     }
-    // Segments are searched concurrently: each needs several dependent reads (index open,
-    // postings, documents), and doing them one segment after another multiplies the waves.
-    let base = {
-        let mut base = out.clone();
-        base.docs.clear();
-        base.scores.clear();
-        base
-    };
-    let parts = futures::future::try_join_all(state.segments.iter().map(|seg| {
-        let (base, clauses, columns) = (&base, &clauses, &columns);
-        async move {
-            let mut part = base.clone();
-            let open_text = async {
-                futures::future::try_join_all(clauses.iter().filter_map(|clause| {
-                    let RankBy::Bm25 { attribute, .. } = clause else {
-                        return None;
-                    };
-                    if !segment::seg_text_matches(seg, &state.schema, attribute) {
-                        return None;
-                    }
-                    let file = seg.files.get(&format!("fts:{attribute}"))?;
-                    Some(async move {
-                        Ok::<_, ApiError>((
-                            attribute.clone(),
-                            segment::text_index(store, file).await?,
-                        ))
-                    })
-                }))
-                .await
-                .map(|entries| entries.into_iter().collect::<BTreeMap<_, _>>())
-            };
-            let (allowed, indexes, ids) = tokio::try_join!(
-                snapshot::allowed(store, state, seg, q.filters.as_ref()),
-                open_text,
-                async {
-                    if clauses.is_empty() {
-                        Ok(None)
-                    } else {
-                        segment::ids(store, seg).await.map(Some)
-                    }
-                },
-            )?;
-            if allowed.is_empty() {
-                return Ok::<Option<NamespaceState>, ApiError>(None);
-            }
-            let mut selected = if all {
-                allowed.clone()
-            } else {
-                RoaringBitmap::new()
-            };
-            for clause in clauses.iter() {
-                let RankBy::Bm25 {
-                    attribute,
-                    query,
-                    params,
-                } = clause
-                else {
-                    unreachable!()
+    for seg in &state.segments {
+        let open_text = async {
+            futures::future::try_join_all(clauses.iter().filter_map(|clause| {
+                let RankBy::Bm25 { attribute, .. } = clause else {
+                    return None;
                 };
-                let cfg = state.schema[attribute]
-                    .text_config()
-                    .expect("validated FTS");
-                let query = bf_text::Query::new(
-                    crate::text::tokens(query, &cfg),
-                    crate::text::prefix(params.as_ref()),
-                );
-                let fallback = bf_text::CorpusStats::default();
-                let stats = state.corpus.get(attribute).unwrap_or(&fallback);
-                let top = if all { allowed.len() as usize } else { k };
-                let hits = if let Some(reader) = indexes.get(attribute) {
-                    reader
-                        .search_prefetched(&query, stats, &cfg, top, Some(&allowed))
-                        .await
-                        .map_err(segment::index_error)?
-                } else {
-                    let columns = BTreeSet::from([attribute.clone()]);
-                    let docs =
-                        segment::projected_documents(store, seg, &allowed, Some(&columns)).await?;
-                    let mut hits = vec![];
-                    for row in &allowed {
-                        let value = docs[&ids.as_ref().expect("text IDs")[row as usize]]
-                            .get(attribute)
-                            .unwrap_or(&serde_json::Value::Null);
-                        let score = bf_text::score_document(
-                            &crate::text::tokens(value, &cfg),
-                            &query,
-                            stats,
-                            &cfg,
-                        );
-                        if score > 0.0 {
-                            hits.push(bf_text::SearchHit { row, score });
-                        }
-                    }
-                    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.row.cmp(&b.row)));
-                    hits.truncate(top);
-                    hits
-                };
-                let scores = part.scores.entry(rank_key(clause)).or_default();
-                for hit in hits {
-                    selected.insert(hit.row);
-                    scores.insert(
-                        ids.as_ref().expect("text IDs")[hit.row as usize].clone(),
-                        hit.score as f64,
-                    );
+                if !segment::seg_text_matches(seg, &state.schema, attribute) {
+                    return None;
                 }
-            }
-            if let Some(rows) =
-                crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut part)
-                    .await?
-            {
-                selected &= rows;
-            }
-            crate::sparse::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut part)
-                .await?;
-            part.docs
-                .extend(segment::projected_documents(store, seg, &selected, Some(columns)).await?);
-            Ok::<Option<NamespaceState>, ApiError>(Some(part))
+                let file = seg.files.get(&format!("fts:{attribute}"))?;
+                Some(async move {
+                    Ok::<_, ApiError>((attribute.clone(), segment::text_index(store, file).await?))
+                })
+            }))
+            .await
+            .map(|entries| entries.into_iter().collect::<BTreeMap<_, _>>())
+        };
+        let (allowed, indexes, ids) = tokio::try_join!(
+            snapshot::allowed(store, state, seg, q.filters.as_ref()),
+            open_text,
+            async {
+                if clauses.is_empty() {
+                    Ok(None)
+                } else {
+                    segment::ids(store, seg).await.map(Some)
+                }
+            },
+        )?;
+        if allowed.is_empty() {
+            continue;
         }
-    }))
-    .await?;
-    for part in parts.into_iter().flatten() {
-        for (key, scores) in part.scores {
-            out.scores.entry(key).or_default().extend(scores);
+        let mut selected = if all {
+            allowed.clone()
+        } else {
+            RoaringBitmap::new()
+        };
+        for clause in &clauses {
+            let RankBy::Bm25 {
+                attribute,
+                query,
+                params,
+            } = clause
+            else {
+                unreachable!()
+            };
+            let cfg = state.schema[attribute]
+                .text_config()
+                .expect("validated FTS");
+            let query = bf_text::Query::new(
+                crate::text::tokens(query, &cfg),
+                crate::text::prefix(params.as_ref()),
+            );
+            let fallback = bf_text::CorpusStats::default();
+            let stats = state.corpus.get(attribute).unwrap_or(&fallback);
+            let top = if all { allowed.len() as usize } else { k };
+            let hits = if let Some(reader) = indexes.get(attribute) {
+                reader
+                    .search_prefetched(&query, stats, &cfg, top, Some(&allowed))
+                    .await
+                    .map_err(segment::index_error)?
+            } else {
+                let columns = BTreeSet::from([attribute.clone()]);
+                let docs =
+                    segment::projected_documents(store, seg, &allowed, Some(&columns)).await?;
+                let mut hits = vec![];
+                for row in &allowed {
+                    let value = docs[&ids.as_ref().expect("text IDs")[row as usize]]
+                        .get(attribute)
+                        .unwrap_or(&serde_json::Value::Null);
+                    let score = bf_text::score_document(
+                        &crate::text::tokens(value, &cfg),
+                        &query,
+                        stats,
+                        &cfg,
+                    );
+                    if score > 0.0 {
+                        hits.push(bf_text::SearchHit { row, score });
+                    }
+                }
+                hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.row.cmp(&b.row)));
+                hits.truncate(top);
+                hits
+            };
+            let scores = out.scores.entry(rank_key(clause)).or_default();
+            for hit in hits {
+                selected.insert(hit.row);
+                scores.insert(
+                    ids.as_ref().expect("text IDs")[hit.row as usize].clone(),
+                    hit.score as f64,
+                );
+            }
         }
-        out.docs.extend(part.docs);
+        if let Some(rows) =
+            crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out)
+                .await?
+        {
+            selected &= rows;
+        }
+        crate::sparse::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?;
+        out.docs
+            .extend(segment::projected_documents(store, seg, &selected, Some(&columns)).await?);
     }
     for (id, doc) in &state.docs {
         if !q
