@@ -772,6 +772,58 @@ mode (`BF_INDEX_ROWS=1`, `BF_INDEX_AGE_MS=1`, and `BF_INDEX_INTERVAL_MS=50`), ag
 an isolated local file-store server built from commit `736162f`. No oracle or
 production namespaces were used for these checks.
 
+## Iteration 4 (100K docs): the namespace ANN directory
+
+Same dataset and 200 holdouts, `scale/` wiped and reloaded; block cache 256 MiB and decoded metadata 128 MiB (scaled
+down from the 10M settings so cache pressure resembles 10M); cold means a fresh process and an empty disk cache (8
+queries); strong consistency. Implements `docs/design/ann-directory.md`.
+
+### What changed
+
+| Change | Effect |
+| --- | --- |
+| The indexer writes one `ann-dir-*.bfd` object per publication (manifest field `ann_dirs`, additive): per leaf cluster, an int8-quantized rotated center for ranking, code and vector byte ranges, checksums, and a blob (exact center, row set, row checksums) read only for probed clusters. About 2.8 MB at 100K | cold ANN opens no segment index: the test over 20 segments sees zero reads of segment index metadata |
+| A directory is pinned in the decoded cache and loaded in the snapshot wave, next to the WAL tail | ranking needs no further wave |
+| Probed clusters: codes, blobs, and docs footers are read in one wave from directory byte ranges | one wave, requests grow with probes, not segments |
+| Error-bounded reranking: only candidates whose lower bound (estimate minus about 2 sigma) can beat the k-th best upper bound are reranked; `ann_rerank_factor` stays as a cap | rerank pool 301 (cap hit) to 93 per query; requests 216 to 129; recall unchanged (0.984) |
+| Vector range merge gap 16 KB to 64 KB | fewer rerank requests for a few more bytes |
+| Hydration reads the docs `id` column (no ID index); the best candidates' document blocks are prefetched during rerank, including exactly scanned flat segments | ids-only and attribute queries both finish in 3 waves in the test |
+| Ingest: no change in code, but the run loaded at 798 to 920 docs/s (iteration 3: 616 to 655), 0 backpressure 429s | |
+
+Directory use needs: no filter, no tail shadowing, and a directory that lists exactly the manifest's segments
+(otherwise the per-segment path runs). Filtered ANN still uses the per-segment path (phase 2: per-cluster filter
+summaries). `BF_ANN_DIRECTORY=0` forces the old path for A/B runs.
+
+### Results (strong, c1 unless noted; same session A/B for ANN)
+
+| Query | Cold p50 ms | Cold GETs/q | Cold MB/q | Warm p50 / p90 / p99 ms | QPS c1 / c8 / c32 | Recall@10 |
+| --- | ---: | ---: | ---: | --- | --- | ---: |
+| ANN, directory | 923 (881 in the A/B run) | 129 | 14 | 61 / 104 / 112 | 14.6 / 81 / 114 | 0.984 |
+| ANN, per-segment path, same session | 1,160 | 230 | 16 | 57 / 90 / 144 | 15.3 / 95 / 129 | 0.984 |
+| ANN, iteration 3 recorded | 1,937 | 240 | 16 | 100 / 101 / 221 | 10.0 / 46 / 56 | 0.988 |
+| BM25 | 725 (1,415) | 39 | 7 | 62 / 90 / 106 | 15.3 / 85 / 157 | |
+| Hybrid | 1,080 (2,167) | 168 (274) | 21 | 62 / 119 / 184 | 13.5 / 88 / 100 | |
+| Selective ANN | 1,172 (1,616) | 222 | 9 | 69 / 115 / 173 | 12.8 / 94 / 113 | 1.000 |
+
+R2 round trips were faster this session than in iteration 3 (warm p50 about 60 ms against 100 ms), so compare the
+same-session ANN rows: the directory is 24 percent faster cold than the per-segment path and halves cold requests.
+The target of 30 percent below iteration 3 is met against the recorded figure (52 percent) but only 24 percent
+in an A/B run, because this 100K namespace has only 8 segments, where the old open wave was cheap. The directory's win
+grows with the segment count.
+
+Waves, cold ANN (test `cold_ann_over_twenty_segments_uses_the_directory`, 20 segments, 10 ms per request): 3 for ids
+only and 3 with attributes, counting the snapshot wave with the directory, 33 to 40 requests, no segment index read.
+
+Parity against turbopuffer is recorded in the milestone table below. The per-segment path scored identically on this
+reloaded namespace (ANN overlap 0.962), so the small difference from earlier milestones is the reload, not the directory.
+
+### Remaining
+
+- Filtered ANN uses the per-segment path (222 requests, 8 MB).
+- The flat segment (about 2K rows) is read whole, 4 MB per cold query.
+- Rerank is still 80 sparse ranges per query; storing full vectors with the codes would turn them into one read per cluster.
+- Directory centers are int8, 1 KB per cluster: 30 MB at 10M. A 1-bit code would cut that to 130 B.
+
 ## turbopuffer reference (100K)
 
 The real turbopuffer holds the same 100K documents (the first 100K English Wikipedia passages, 1024-dim f16, the same
@@ -893,3 +945,4 @@ turbopuffer). turbopuffer's numbers do not change between milestones except for 
 | --- | --- | --- | --- | --- | --- | --- |
 | 0: iteration 2 main | `e12178f` | 76 / 120 / 179 ms, 0.963 | 73 / 110 / 191 ms, 0.982 | 78 / 117 / 261 ms, 0.973 | 74 / 123 / 232 ms, 0.998 | 74 / 110 / 166 ms, 0.992 |
 | 1: iteration 3 | `73d8110` | 87 / 116 / 155 ms, 0.965 | 90 / 129 / 201 ms, 0.982 | 100 / 133 / 299 ms, 0.972 | 98 / 136 / 216 ms, 0.998 | 100 / 131 / 234 ms, 0.991 |
+| 2: iteration 4 (ANN directory) | `f1a7db3`+ | 68 / 91 / 191 ms, 0.962 | 66 / 99 / 198 ms, 0.982 | 65 / 90 / 173 ms, 0.971 | 64 / 88 / 134 ms, 0.998 | 57 / 74 / 156 ms, 0.991 |

@@ -373,6 +373,7 @@ impl Engine {
             segments: vec![],
             stats: Default::default(),
             text_stats: None,
+            ann_dirs: Default::default(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
@@ -552,6 +553,28 @@ impl Engine {
         };
         manifest.deleted = false;
         manifest.segments = segments;
+        // Rebuild each vector attribute's ANN directory only when its segment list changed.
+        let attributes: std::collections::BTreeSet<String> = manifest
+            .segments
+            .iter()
+            .flat_map(|s| s.files.keys())
+            .filter(|k| k.starts_with("ann:"))
+            .cloned()
+            .collect();
+        let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
+        for key in attributes {
+            let built =
+                crate::ann_dir::build(store, ns, &manifest.segments, &key, previous_dirs.get(&key))
+                    .await?;
+            if let Some(file) = built {
+                manifest.ann_dirs.insert(key, file);
+            }
+        }
+        for old in previous_dirs.values() {
+            if !manifest.ann_dirs.values().any(|f| f.key == old.key) {
+                retire(&mut manifest, old.key.clone());
+            }
+        }
         manifest.schema = state.schema.clone();
         manifest.distance_metric = state.metric;
         manifest.id_type = state.schema["id"].data_type.clone().expect("id schema");
@@ -601,11 +624,15 @@ impl Engine {
             if let Some(file) = manifest.text_stats.take() {
                 retire(&mut manifest, file.key);
             }
+            for file in std::mem::take(&mut manifest.ann_dirs).into_values() {
+                retire(&mut manifest, file.key);
+            }
             manifest.deleted = true;
             manifest.indexed_through = checkpoint.seq;
         }
         let mut protected = std::collections::BTreeSet::new();
         protected.extend(manifest.text_stats.iter().map(|f| f.key.clone()));
+        protected.extend(manifest.ann_dirs.values().map(|f| f.key.clone()));
         for seg in &manifest.segments {
             protected.extend(
                 seg.files

@@ -121,6 +121,11 @@ pub struct Manifest {
     /// Separate object holding `stats.text` (a map of field to `TextStats`), when non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_stats: Option<SegmentFile>,
+    /// Namespace ANN directories, one per vector attribute (`ann:<attribute>` to object). A
+    /// directory is valid only while its segment list equals `segments`; readers fall back to
+    /// opening each segment otherwise.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub ann_dirs: std::collections::BTreeMap<String, SegmentFile>,
     /// Last indexed write timestamp; absent on legacy schema-only manifests.
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
@@ -697,6 +702,7 @@ mod manifest_codec_tests {
             segments: vec![],
             stats,
             text_stats: None,
+            ann_dirs: Default::default(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],

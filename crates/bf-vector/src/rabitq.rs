@@ -187,6 +187,9 @@ impl Rng {
     }
 }
 
+/// Multiples of the typical inner-product error that a candidate's distance bound covers.
+pub(crate) const ERROR_CONFIDENCE: f64 = 1.9;
+
 /// Bits used to quantize each coordinate of the rotated residual query.
 pub(crate) const QUERY_BITS: usize = 8;
 
@@ -281,7 +284,7 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, bool),
+        emit: &mut dyn FnMut(usize, f64, f64, bool),
     ) -> crate::Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -301,7 +304,7 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, bool),
+        emit: &mut dyn FnMut(usize, f64, f64, bool),
     ) -> crate::Result<()> {
         self.scan_impl(bytes, rows, compact, padded, emit)
     }
@@ -313,7 +316,7 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, bool),
+        emit: &mut dyn FnMut(usize, f64, f64, bool),
     ) -> crate::Result<()> {
         let code = padded.div_ceil(8);
         let head = if compact { 8 } else { 24 };
@@ -339,9 +342,15 @@ impl PlaneQuery {
             if !norm.is_finite() || norm < 0. || !alpha.is_finite() || alpha <= 0. || alpha > 1. {
                 return Err(crate::format::bad("invalid quantization factors"));
             }
+            // Statistical error bound of the distance estimate: the inner-product error of a
+            // one-bit code is about sqrt(1 - a^2) / (a * sqrt(D - 1)) per unit of norms.
+            let spread = ((1. - alpha * alpha).max(0.)).sqrt()
+                / (alpha * ((padded - 1).max(1) as f64).sqrt());
+            let bound = ERROR_CONFIDENCE * 2. * norm * self.norm2.sqrt() * spread;
             emit(
                 ordinal,
                 self.distance(norm, alpha, &row[head..], padded),
+                bound,
                 zero,
             );
         }

@@ -68,6 +68,26 @@ pub(crate) async fn search(
     if state.segments.iter().any(|s| !s.files.contains_key(&key)) {
         return Ok(None);
     }
+    // `BF_ANN_DIRECTORY=0` forces the per-segment path (A/B measurements only).
+    static DIRECTORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DIRECTORY.get_or_init(|| std::env::var("BF_ANN_DIRECTORY").is_ok_and(|v| v == "0")) {
+        // fall through
+    } else if q.filters.is_none()
+        && state.shadowed.is_empty()
+        && let Some(file) = state.ann_dirs.get(&key)
+    {
+        let (dir, lives) = tokio::try_join!(
+            crate::ann_dir::load(store, file),
+            crate::ann_dir::live_masks(store, state)
+        )?;
+        if crate::ann_dir::covers(&dir, &state.segments, attribute) {
+            return crate::ann_dir::search(
+                store, state, file, dir, lives, vector, config, k, columns, attribute,
+            )
+            .await
+            .map(Some);
+        }
+    }
     let vector: Arc<[f32]> = vector.into();
     let t0 = std::time::Instant::now();
     let mut base = state.clone();
@@ -327,7 +347,7 @@ pub(crate) async fn search(
 }
 
 /// `BF_TRACE_STAGES=1` prints elapsed time at each ANN stage (diagnostics only).
-fn stage(t0: std::time::Instant, name: &str) {
+pub(crate) fn stage(t0: std::time::Instant, name: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("BF_TRACE_STAGES").is_some()) {
         eprintln!("STAGE {name} {} ms", t0.elapsed().as_millis());

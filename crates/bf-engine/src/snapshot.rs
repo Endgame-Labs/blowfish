@@ -5,7 +5,10 @@ use bf_types::*;
 use bf_wal::{Pending, Wal};
 use futures::{FutureExt, TryFutureExt};
 use roaring::RoaringBitmap;
-use std::{collections::BTreeSet, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 /// What a query will open, so a cold snapshot can fetch it in parallel with the WAL tail.
 #[derive(Clone)]
@@ -63,12 +66,23 @@ impl OpenHint {
         store: &Storage,
         segments: &[bf_wal::Segment],
         text: Option<&bf_wal::SegmentFile>,
+        dirs: &BTreeMap<String, bf_wal::SegmentFile>,
     ) {
         let context = self.context.clone();
         crate::read_cache::scope(context, async {
             let mut tasks = vec![];
+            // A directory replaces opening every segment's ANN metadata, ids, and docs footer.
+            let by_dir = self
+                .ann
+                .iter()
+                .all(|a| dirs.contains_key(&format!("ann:{a}")));
+            for attribute in &self.ann {
+                if let Some(file) = dirs.get(&format!("ann:{attribute}")) {
+                    tasks.push(crate::ann_dir::load(store, file).map_ok(drop).boxed());
+                }
+            }
             for seg in segments {
-                for attribute in &self.ann {
+                for attribute in self.ann.iter().filter(|_| !by_dir) {
                     if let Some(file) = seg.files.get(&format!("ann:{attribute}")) {
                         tasks.push(segment::vector_index(store, file).map_ok(drop).boxed());
                     }
@@ -78,7 +92,7 @@ impl OpenHint {
                         tasks.push(segment::text_index(store, file).map_ok(drop).boxed());
                     }
                 }
-                if !self.ann.is_empty() || !self.text.is_empty() {
+                if (!self.ann.is_empty() && !by_dir) || !self.text.is_empty() {
                     tasks.push(segment::ids(store, seg).map_ok(drop).boxed());
                     tasks.push(
                         segment::get_value::<RoaringBitmap>(store, &seg.live)
@@ -86,7 +100,7 @@ impl OpenHint {
                             .boxed(),
                     );
                 }
-                if self.docs {
+                if self.docs && !(by_dir && self.text.is_empty() && !self.ann.is_empty()) {
                     tasks.push(segment::warm_docs(store, seg).map(|()| Ok(())).boxed());
                 }
             }
@@ -156,6 +170,7 @@ pub(crate) async fn catch_up_hinted(
                             crate::text::checkpoint_corpus(&m.stats)
                         },
                         text_stats: m.text_stats,
+                        ann_dirs: m.ann_dirs,
                         stats: m.stats.into(),
                         ..Default::default()
                     }
@@ -171,7 +186,8 @@ pub(crate) async fn catch_up_hinted(
         let tail = if let Some(hint) = hint.filter(|_| !state.segments.is_empty()) {
             // The checkpoint's files do not depend on the tail: open them meanwhile.
             let (segments, text) = (state.segments.clone(), state.text_stats.clone());
-            tokio::join!(tail, hint.warm(store, &segments, text.as_ref())).0
+            let dirs = state.ann_dirs.clone();
+            tokio::join!(tail, hint.warm(store, &segments, text.as_ref(), &dirs)).0
         } else {
             tail.await
         };
