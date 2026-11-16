@@ -2,7 +2,7 @@
 name = "compat"
 version = "0.1.0"
 authors = [
-    { name = "dorkitude", email = "157717+dorkitude@users.noreply.github.com" }
+    { name = "dorkitude" }
 ]
 requires-python = ">=3.12"
 dependencies = [

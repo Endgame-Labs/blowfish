@@ -205,13 +205,10 @@ storage peaks over the billing period, so load-day retention can affect that
 month's storage charge.
 
 https://developers.cloudflare.com/r2/pricing/
-https://hop.rip/ritt2
 
 https://developers.cloudflare.com/r2/platform/limits/
-https://hop.rip/32da7
 
 https://huggingface.co/datasets/CohereLabs/wikipedia-2023-11-embed-multilingual-v3
-https://hop.rip/a2ant
 
 ## Measurements
 
