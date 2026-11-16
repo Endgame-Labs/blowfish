@@ -72,17 +72,28 @@ pub(crate) async fn search(
     static DIRECTORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DIRECTORY.get_or_init(|| std::env::var("BF_ANN_DIRECTORY").is_ok_and(|v| v == "0")) {
         // fall through
-    } else if q.filters.is_none()
-        && state.shadowed.is_empty()
+    } else if state.shadowed.is_empty()
         && let Some(file) = state.ann_dirs.get(&key)
     {
+        // Filtered queries compute each segment's allowed rows (live rows that pass the filter)
+        // in the same wave as the directory; the directory then ranks clusters without
+        // opening any segment's index or ID index.
         let (dir, lives) = tokio::try_join!(
             crate::ann_dir::load(store, file),
-            crate::ann_dir::live_masks(store, state)
+            crate::ann_dir::live_masks(store, state, q.filters.as_ref())
         )?;
         if crate::ann_dir::covers(&dir, &state.segments, attribute) {
             return crate::ann_dir::search(
-                store, state, dir, lives, vector, config, k, columns, attribute,
+                store,
+                state,
+                dir,
+                lives,
+                vector,
+                config,
+                k,
+                columns,
+                attribute,
+                q.filters.is_some(),
             )
             .await
             .map(Some);

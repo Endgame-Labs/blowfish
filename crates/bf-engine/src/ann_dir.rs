@@ -163,12 +163,20 @@ async fn on_worker<T: Send + 'static>(
     .map_err(segment::index_error)?
 }
 
-/// Live-row masks for segments with deletions (generation above zero); others are all live.
+/// Row masks per segment: with a filter, the live rows that pass it (every segment gets one);
+/// without, the live rows of segments with deletions (generation above zero), and `None` (all
+/// rows are live) for the others. The caller has checked that no tail ID shadows a segment row.
 pub(crate) async fn live_masks(
     store: &Storage,
     state: &NamespaceState,
+    filter: Option<&Filter>,
 ) -> Result<Vec<Option<Arc<RoaringBitmap>>>, ApiError> {
     futures::future::try_join_all(state.segments.iter().map(|seg| async move {
+        if let Some(f) = filter {
+            return Ok(Some(Arc::new(
+                crate::snapshot::allowed(store, state, seg, Some(f)).await?,
+            )));
+        }
         if seg.live_generation == 0 {
             return Ok(None);
         }
@@ -197,6 +205,7 @@ pub(crate) async fn search(
     k: usize,
     columns: &BTreeSet<String>,
     attribute: &str,
+    filtered: bool,
 ) -> Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError> {
     let t0 = std::time::Instant::now();
     let key = format!("ann:{attribute}");
@@ -214,36 +223,30 @@ pub(crate) async fn search(
             .as_ref()
             .map_or(state.segments[i].row_count as usize, |l| l.len() as usize)
     };
-    // Rows in clusters of ANN (non-flat) segments, minus deleted rows.
-    let seg_rows: Vec<usize> = (0..dir.segments().len())
-        .map(|i| {
-            entries
-                .iter()
-                .filter(|e| e.segment == i)
-                .map(|e| e.rows as usize)
-                .sum::<usize>()
-        })
-        .collect();
+    // Rows in clusters of ANN (non-flat) segments, per segment and in all.
+    let mut seg_rows = vec![0usize; dir.segments().len()];
+    let mut seg_clusters = vec![0usize; dir.segments().len()];
+    for e in entries {
+        seg_rows[e.segment] += e.rows as usize;
+        seg_clusters[e.segment] += 1;
+    }
     let mut ann_rows = 0usize;
     let mut matching = 0usize;
     let mut clusters = 0usize;
+    // Expected allowed rows per cluster of each segment: the segment's allowed fraction.
+    let mut fraction = vec![1.0f64; dir.segments().len()];
     for (i, seg) in dir.segments().iter().enumerate() {
         if !seg.flat {
             ann_rows += seg_rows[i];
             matching += live_rows(i).min(seg_rows[i]);
-            clusters += entries.iter().filter(|e| e.segment == i).count();
+            clusters += seg_clusters[i];
+            fraction[i] = live_rows(i).min(seg_rows[i]) as f64 / seg_rows[i].max(1) as f64;
         }
     }
-    let flat_rows: usize = dir
-        .segments()
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.flat)
-        .map(|(i, _)| live_rows(i))
-        .sum();
     let target = k.saturating_mul(config.ann_rerank_factor).min(matching);
     let mut chosen: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     let mut exact_all = false;
+    let mut exact_chosen = false;
     if matching > 0 {
         let mut order: Vec<(f32, usize)> = entries
             .iter()
@@ -252,25 +255,36 @@ pub(crate) async fn search(
             .map(|(n, _)| (distances[n], n))
             .collect();
         let scale = (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0);
-        let probes = ((config.ann_nprobe as f64 * scale * ann_rows as f64 / matching.max(1) as f64)
-            .ceil() as usize)
-            .min(clusters);
+        // Unfiltered, deleted rows thin the probed clusters. A filter does not widen the probe
+        // count: it keeps probing until the expected allowed candidates reach `target`, which
+        // covers the same neighborhood of the filtered set as `nprobe` does of the whole.
+        let thin = if filtered {
+            1.0
+        } else {
+            ann_rows as f64 / matching.max(1) as f64
+        };
+        let probes = ((config.ann_nprobe as f64 * scale * thin).ceil() as usize).min(clusters);
         order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let (mut count, mut candidates) = (0usize, 0usize);
+        let (mut count, mut candidates) = (0usize, 0f64);
         let mut picked = Vec::new();
         for &(_, n) in &order {
             picked.push(n);
             count += 1;
-            candidates += entries[n].rows as usize;
-            if count >= probes && candidates >= target {
+            candidates += entries[n].rows as f64 * fraction[entries[n].segment];
+            if count >= probes && candidates >= target as f64 {
                 break;
             }
         }
         if matching <= k
-            || (matching <= EXACT_ROWS.max(count + target) && matching * width <= EXACT_BYTES)
+            || (!filtered
+                && matching <= EXACT_ROWS.max(count + target)
+                && matching * width <= EXACT_BYTES)
         {
             exact_all = true;
         } else {
+            // Few expected allowed rows in the probed clusters: fetch just those vectors
+            // (from the cluster blobs' row sets) instead of scanning quantized codes.
+            exact_chosen = filtered && candidates <= (2 * target) as f64;
             for n in picked {
                 chosen
                     .entry(entries[n].segment)
@@ -279,7 +293,6 @@ pub(crate) async fn search(
             }
         }
     }
-    let _ = flat_rows;
     // Flat segments, and every ANN segment when the namespace is small, are scanned exactly.
     let mut exact_segments = BTreeSet::new();
     for (i, seg) in dir.segments().iter().enumerate() {
@@ -293,6 +306,8 @@ pub(crate) async fn search(
                     .map(|e| e.cluster)
                     .collect(),
             );
+        } else if exact_chosen && chosen.contains_key(&i) {
+            exact_segments.insert(i);
         }
     }
     crate::ann::stage(t0, "plan");
@@ -303,6 +318,7 @@ pub(crate) async fn search(
     for (&i, cs) in &chosen {
         let (dir, vector) = (dir.clone(), vector.clone());
         let exact = exact_segments.contains(&i);
+        let flat = dir.segments()[i].flat;
         let cs = cs.clone();
         let file = state.segments[i]
             .files
@@ -329,7 +345,7 @@ pub(crate) async fn search(
             // An exactly scanned segment needs all of its vectors, and its row sets (from the
             // blobs) only say which. Read the vectors in parallel with the blobs, as
             // concurrent pieces, so the later exact scan is served from the cache.
-            let prefetch_ranges: Vec<_> = if exact {
+            let prefetch_ranges: Vec<_> = if exact && (flat || exact_all) {
                 seg_entries.iter().map(|e| e.vectors_range()).collect()
             } else {
                 Vec::new()

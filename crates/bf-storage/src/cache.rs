@@ -323,15 +323,6 @@ impl RangeCache {
         metrics::gauge!("blowfish_cache_bytes", "tier" => "memory").increment(value.len() as f64);
         self.memory.insert(key, value);
     }
-    async fn insert(&self, key: BlockKey, value: Bytes) {
-        self.insert_memory(key.clone(), value.clone());
-        if let Some(disk) = self.disk.clone() {
-            let name = self.disk_key(&key);
-            // A full or damaged cache never makes source-of-truth reads fail.
-            let _ = tokio::task::spawn_blocking(move || disk.lock().unwrap().insert(&name, &value))
-                .await;
-        }
-    }
 }
 impl Drop for RangeCache {
     fn drop(&mut self) {
@@ -482,13 +473,30 @@ impl RangeReader {
                     return Err(Arc::new(Error::Config("short object-store range response")));
                 }
                 let mut values = Vec::with_capacity(indices.len());
+                let mut spill = Vec::new();
                 for index in indices {
                     let begin = ((index - first) * size) as usize;
                     let end = bytes.len().min(begin + size as usize);
                     // Independent allocations keep a single cached block from pinning a whole GET.
                     let value = Bytes::copy_from_slice(&bytes[begin..end]);
-                    cache.insert(reader.block_key(index), value.clone()).await;
+                    let key = reader.block_key(index);
+                    if cache.disk.is_some() {
+                        spill.push((cache.disk_key(&key), value.clone()));
+                    }
+                    cache.insert_memory(key, value.clone());
                     values.push(value);
+                }
+                // The disk tier is written behind the read: a block-by-block write that the
+                // read awaited cost about a millisecond per 4 KB block, which made a cold 2 MB
+                // read take half a second after the network transfer had finished.
+                if let Some(disk) = cache.disk.clone() {
+                    tokio::task::spawn_blocking(move || {
+                        let mut disk = disk.lock().unwrap();
+                        for (name, value) in spill {
+                            // A full or damaged cache never makes source-of-truth reads fail.
+                            let _ = disk.insert(&name, &value);
+                        }
+                    });
                 }
                 // Apply pending evictions once per coalesced fetch, so memory stays within
                 // budget without paying for maintenance on every block.
