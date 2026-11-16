@@ -185,6 +185,26 @@ pub(crate) async fn catch_up(
 ) -> Result<(), ApiError> {
     catch_up_hinted(wal, state, cap, store, None).await
 }
+/// A manifest that republishes the checkpoint this state already holds (garbage collection and
+/// epoch claims do) changes nothing the state depends on, so it must not discard the resident
+/// tail: rebuilding would download every unindexed WAL payload again.
+fn same_checkpoint(state: &NamespaceState, m: &bf_wal::Manifest) -> bool {
+    state.exists
+        && !m.deleted
+        && m.indexed_through == state.indexed_through
+        && state.segments.len() == m.segments.len()
+        && state
+            .segments
+            .iter()
+            .zip(&m.segments)
+            .all(|(a, b)| a.id == b.id && a.live.key == b.live.key)
+        && state.text_stats.as_ref().map(|f| &f.key) == m.text_stats.as_ref().map(|f| &f.key)
+        && state.ann_dirs.len() == m.ann_dirs.len()
+        && state
+            .ann_dirs
+            .iter()
+            .all(|(k, f)| m.ann_dirs.get(k).is_some_and(|g| g.key == f.key))
+}
 pub(crate) async fn catch_up_hinted(
     wal: &Wal,
     state: &mut NamespaceState,
@@ -203,7 +223,10 @@ pub(crate) async fn catch_up_hinted(
             if m.format_version != 1 {
                 return Err(ApiError::new(500, "unsupported manifest format"));
             }
-            if m.indexed_through > 0 && generation > state.manifest_seq {
+            if m.indexed_through > 0
+                && generation > state.manifest_seq
+                && !same_checkpoint(state, &m)
+            {
                 *state = if m.deleted {
                     NamespaceState {
                         seq: m.indexed_through,

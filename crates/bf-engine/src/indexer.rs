@@ -681,7 +681,12 @@ impl Engine {
         let grace = chrono::Duration::from_std(self.0.config.retention)
             .unwrap_or(chrono::Duration::hours(1));
         let cutoff = Utc::now() - grace;
-        let mut checkpoint = NamespaceState::default();
+        // Start from the resident state when this node has one: a fresh replay would download
+        // every unindexed WAL payload again on each collection.
+        let mut checkpoint = match self.0.namespaces.lock().await.get(ns).cloned() {
+            Some(handle) => handle.state.lock().await.clone(),
+            None => NamespaceState::default(),
+        };
         catch_up(&wal, &mut checkpoint, &self.0.store).await?;
         if checkpoint.manifest_seq != sequence {
             return Ok(0);

@@ -36,6 +36,8 @@ struct Counting {
     resume_head: tokio::sync::Notify,
     wal_active: AtomicUsize,
     wal_max_active: AtomicUsize,
+    /// Downloads of WAL payload objects.
+    payload_reads: AtomicUsize,
 }
 impl fmt::Display for Counting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -68,6 +70,9 @@ impl ObjectStore for Counting {
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> StoreResult<GetResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if !opts.head && path.as_ref().contains("/wal-data/") {
+            self.payload_reads.fetch_add(1, Ordering::SeqCst);
+        }
         if opts.head
             && path.as_ref().contains("/wal/")
             && self.pause_head.swap(false, Ordering::SeqCst)
@@ -914,4 +919,50 @@ async fn bulk_writes_accumulate_into_one_large_segment() {
     // A forced index flushes even a small hot tail.
     write(2000, 5).await.unwrap();
     assert!(engine.index_namespace("bulk", true).await.unwrap());
+}
+
+/// Garbage collection republishes the manifest without advancing the checkpoint. A node that
+/// holds the unindexed tail in memory must keep it, not download the WAL payloads again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_republication_keeps_the_resident_tail() {
+    let backend = Arc::new(Counting::default());
+    let engine = Engine::with_config(
+        Storage::from_backend(backend.clone(), Path::default(), false, false)
+            .await
+            .unwrap(),
+        EngineConfig {
+            retention: std::time::Duration::from_millis(1),
+            ..config()
+        },
+    );
+    let write = |from: usize, rows: usize| {
+        let docs: Vec<_> = (from..from + rows)
+            .map(|id| json!({"id":id,"vector":[id as f32, 1.0],"pad":"x".repeat(200)}))
+            .collect();
+        engine.write(
+            "gc",
+            serde_json::from_value(json!({
+                "distance_metric":"euclidean_squared","upsert_rows":docs
+            }))
+            .unwrap(),
+        )
+    };
+    write(0, 1000).await.unwrap();
+    engine.index_namespace("gc", true).await.unwrap();
+    write(1000, 1000).await.unwrap();
+    engine.index_namespace("gc", true).await.unwrap();
+    // An unindexed tail, big enough to live in its own payload object.
+    write(2000, 1000).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    backend.payload_reads.store(0, Ordering::SeqCst);
+    let removed = engine.collect_garbage("gc").await.unwrap();
+    assert!(removed > 0, "garbage collection published nothing");
+    let request =
+        serde_json::from_value(json!({"rank_by":["vector","ANN",[2500.0, 1.0]],"top_k":3}))
+            .unwrap();
+    let result = engine.query("gc", request).await.unwrap();
+    assert_eq!(result.result.rows.as_ref().unwrap()[0]["id"], 2500);
+    write(3000, 10).await.unwrap();
+    let payload_reads = backend.payload_reads.load(Ordering::SeqCst);
+    assert_eq!(payload_reads, 0, "the tail was downloaded again");
 }
