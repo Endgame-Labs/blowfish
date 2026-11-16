@@ -1,0 +1,510 @@
+openapi: 3.1.0
+info:
+  title: blowfish admin API
+  version: 1.0.0
+  summary: Projects, project keys, and org superadmin keys.
+  description: |
+    A blowfish deployment is one org. The org holds projects, and each project has its own
+    namespaces and API keys. This API manages projects and keys. The namespace data routes are
+    the turbopuffer API and are described by turbopuffer's own documentation.
+
+    Every route needs `Authorization: Bearer <token>`. Errors use the turbopuffer envelope
+    `{"status":"error","error":"..."}`. A missing, invalid, expired, or revoked token is 401; a
+    key of the wrong kind is 403; a project that isn't the caller's own is 404, so project IDs
+    can't be probed.
+
+    A token is shown once, when the key is created. The break-glass `BLOWFISH_ADMIN_KEY` has
+    superadmin powers on every route.
+servers:
+  - url: https://blowfish.example.com
+    description: Your deployment
+security:
+  - bearer: []
+tags:
+  - name: whoami
+  - name: projects
+  - name: project keys
+  - name: org keys
+paths:
+  /_blowfish/v1/whoami:
+    get:
+      tags: [whoami]
+      operationId: whoami
+      summary: Describe the calling key
+      description: Any valid key. A superadmin has no project, because it picks one per request.
+      responses:
+        '200':
+          description: The caller
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WhoAmI' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /_blowfish/v1/projects:
+    get:
+      tags: [projects]
+      operationId: listProjects
+      summary: List projects
+      description: Superadmin only. The built-in `default` project is always first.
+      responses:
+        '200':
+          description: All projects
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [projects]
+                properties:
+                  projects:
+                    type: array
+                    items: { $ref: '#/components/schemas/Project' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [projects]
+      operationId: createProject
+      summary: Create a project
+      description: Superadmin only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProject' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /_blowfish/v1/projects/{project_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [projects]
+      operationId: getProject
+      summary: Get a project
+      description: Superadmin only.
+      responses:
+        '200':
+          description: The project
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [projects]
+      operationId: renameProject
+      summary: Rename a project
+      description: Superadmin only. The `default` project can't be renamed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: The updated project
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [projects]
+      operationId: deleteProject
+      summary: Delete a project
+      description: |
+        Superadmin only. Refuses with 409 while the project has namespaces, unless `force=true`,
+        which deletes them all. Revokes every key of the project. The `default` project can't
+        be deleted.
+      parameters:
+        - name: force
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /_blowfish/v1/projects/{project_id}/keys:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [project keys]
+      operationId: listProjectKeys
+      summary: List a project's keys
+      description: |
+        Superadmin, or that project's `admin` key. A project admin doesn't see `admin` keys. A
+        superadmin's listing of `default` also includes legacy keys.
+      responses:
+        '200':
+          description: Active keys
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: '#/components/schemas/KeyInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [project keys]
+      operationId: createProjectKey
+      summary: Create a project key
+      description: |
+        Superadmin, or that project's `admin` key. A project admin can create only `read_write`
+        and `read` keys. The token is returned once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectKey' }
+      responses:
+        '201': { $ref: '#/components/responses/KeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /_blowfish/v1/projects/{project_id}/keys/{key_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/KeyId'
+    get:
+      tags: [project keys]
+      operationId: getProjectKey
+      summary: Get a project key
+      description: A project admin can't see `admin` keys, so they are 404.
+      responses:
+        '200':
+          description: The key's metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [project keys]
+      operationId: revokeProjectKey
+      summary: Revoke a project key
+      description: |
+        Applies immediately on the node that handles it, and within about 5 seconds elsewhere. A
+        project admin can't revoke `admin` keys: they are 404.
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /_blowfish/v1/org/keys:
+    get:
+      tags: [org keys]
+      operationId: listOrgKeys
+      summary: List org superadmin keys
+      description: Superadmin only.
+      responses:
+        '200':
+          description: Active superadmin keys
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: '#/components/schemas/KeyInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [org keys]
+      operationId: createOrgKey
+      summary: Create an org superadmin key
+      description: Superadmin only. The token is returned once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrgKey' }
+      responses:
+        '201': { $ref: '#/components/responses/KeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /_blowfish/v1/org/keys/{key_id}:
+    parameters:
+      - $ref: '#/components/parameters/KeyId'
+    get:
+      tags: [org keys]
+      operationId: getOrgKey
+      summary: Get an org superadmin key
+      description: Superadmin only.
+      responses:
+        '200':
+          description: The key's metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [org keys]
+      operationId: revokeOrgKey
+      summary: Revoke an org superadmin key
+      description: Superadmin only. A key can revoke itself, so keep another one or the break-glass key.
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /_blowfish/v1/keys:
+    get:
+      deprecated: true
+      tags: [project keys]
+      operationId: listLegacyKeys
+      summary: List legacy keys (the default project)
+      description: Legacy role-and-prefix keys only. Use the project routes instead.
+      responses:
+        '200':
+          description: Active legacy keys
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: '#/components/schemas/KeyInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      deprecated: true
+      tags: [project keys]
+      operationId: createLegacyKey
+      summary: Create a legacy key (the default project)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, roles]
+              properties:
+                name: { type: string }
+                roles:
+                  type: array
+                  items:
+                    type: string
+                    enum: [admin, write, read, list, metrics, keys]
+                namespace_prefixes:
+                  type: [array, 'null']
+                  items: { type: string }
+                expires_at: { type: [string, 'null'], format: date-time }
+      responses:
+        '201': { $ref: '#/components/responses/KeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /_blowfish/v1/keys/{key_id}:
+    parameters:
+      - $ref: '#/components/parameters/KeyId'
+    get:
+      deprecated: true
+      tags: [project keys]
+      operationId: getLegacyKey
+      summary: Get a legacy key
+      responses:
+        '200':
+          description: The key's metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      deprecated: true
+      tags: [project keys]
+      operationId: revokeLegacyKey
+      summary: Revoke a legacy key
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: A blowfish key, `bf_<id>_<secret>`, or the break-glass admin key.
+  parameters:
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ProjectId' }
+    KeyId:
+      name: key_id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[0-9a-f]{32}$' }
+  schemas:
+    ProjectId:
+      type: string
+      pattern: '^[a-z0-9-]{1,40}$'
+      description: A slug. `default` is built in and maps to the storage root.
+    KeyKind:
+      type: string
+      enum: [superadmin, admin, read_write, read]
+    Project:
+      type: object
+      required: [id, name, created_at, created_by]
+      properties:
+        id: { $ref: '#/components/schemas/ProjectId' }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+    CreateProject:
+      type: object
+      required: [id, name]
+      properties:
+        id: { $ref: '#/components/schemas/ProjectId' }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        created_by:
+          type: string
+          description: Attribution label such as `webapp:alice@example.com`. Honored only from superadmin callers.
+    CreateProjectKey:
+      type: object
+      required: [name, kind]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        kind:
+          type: string
+          enum: [admin, read_write, read]
+          description: A project admin can create only `read_write` and `read`.
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+          description: Must be in the future, and no later than the creator's own expiry.
+        created_by:
+          type: string
+          description: Attribution label. Honored only from superadmin callers.
+    CreateOrgKey:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        expires_at: { type: [string, 'null'], format: date-time }
+        created_by: { type: string }
+    KeyInfo:
+      type: object
+      required: [id, name, created_at, created_by]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        name: { type: string }
+        kind:
+          $ref: '#/components/schemas/KeyKind'
+          description: Absent on legacy keys.
+        project:
+          type: string
+          description: Absent on superadmin and legacy keys.
+        roles:
+          type: array
+          items: { type: string }
+          description: Internal roles the kind maps to; informational.
+        namespace_prefixes:
+          type: [array, 'null']
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time }
+        created_by: { type: string }
+        last_used_at:
+          type: string
+          format: date-time
+          description: Seen by the node that answered; not a deployment-wide audit log.
+    CreatedKey:
+      type: object
+      required: [key, token]
+      properties:
+        key: { $ref: '#/components/schemas/KeyInfo' }
+        token:
+          type: string
+          description: The bearer token, `bf_<id>_<secret>`. Shown once.
+    WhoAmI:
+      type: object
+      required: [kind, project, key_id, name, expires_at]
+      properties:
+        kind:
+          type: string
+          enum: [superadmin, admin, read_write, read, legacy]
+        project:
+          type: [string, 'null']
+          description: Null for a superadmin. Legacy keys report `default`.
+        key_id:
+          type: string
+          description: '`super` for the break-glass key.'
+        name: { type: string }
+        expires_at: { type: [string, 'null'], format: date-time }
+    Error:
+      type: object
+      required: [status, error]
+      properties:
+        status: { type: string, const: error }
+        error: { type: string }
+  responses:
+    Ok:
+      description: Done
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              status: { type: string, const: OK }
+    KeyCreated:
+      description: Created. The token appears only in this response.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreatedKey' }
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing, invalid, expired, or revoked key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: This kind of key can't do that
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No such project or key, or it belongs to another project
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: The project exists, or still has namespaces
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
