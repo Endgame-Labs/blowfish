@@ -23,6 +23,13 @@ pub struct EngineConfig {
     pub index_bytes: u64,
     /// Flush small tails after this age.
     pub index_age: Duration,
+    /// While writes are still arriving, keep accumulating the tail up to this many distinct
+    /// rows (or `bulk_flush_age`) before building a segment, so a bulk load builds a few large
+    /// segments instead of many small ones that compaction would then rewrite. Ignored when
+    /// `index_age` is under a second.
+    pub bulk_flush_rows: usize,
+    /// Longest a tail keeps accumulating under `bulk_flush_rows`.
+    pub bulk_flush_age: Duration,
     /// Background poll interval.
     pub index_interval: Duration,
     /// Merge this many segments in one logarithmic size tier.
@@ -87,6 +94,8 @@ impl Default for EngineConfig {
             index_rows: 1000,
             index_bytes: 8 * 1024 * 1024,
             index_age: Duration::from_secs(5),
+            bulk_flush_rows: 100_000,
+            bulk_flush_age: Duration::from_secs(60),
             index_interval: Duration::from_millis(250),
             compaction_segments: 4,
             max_segment_rows: 200_000,
@@ -136,6 +145,12 @@ impl EngineConfig {
         }
         if let Some(v) = number("BF_INDEX_AGE_MS") {
             c.index_age = Duration::from_millis(v);
+        }
+        if let Some(v) = number("BF_BULK_FLUSH_ROWS") {
+            c.bulk_flush_rows = v as usize;
+        }
+        if let Some(v) = number("BF_BULK_FLUSH_AGE_MS") {
+            c.bulk_flush_age = Duration::from_millis(v);
         }
         if let Some(v) = number("BF_INDEX_INTERVAL_MS") {
             c.index_interval = Duration::from_millis(v);
@@ -330,9 +345,10 @@ impl Engine {
             if !force
                 && !will_rebuild
                 && will_compact.is_empty()
-                && state.shadowed.len() < self.0.config.index_rows
-                && state.tail_bytes < self.0.config.index_bytes
-                && tail_age < self.0.config.index_age
+                && ((state.shadowed.len() < self.0.config.index_rows
+                    && state.tail_bytes < self.0.config.index_bytes
+                    && tail_age < self.0.config.index_age)
+                    || bulk_wait(&state, &self.0.config, tail_age))
             {
                 return Ok(false);
             }
@@ -377,9 +393,10 @@ impl Engine {
         if !force
             && !rebuild
             && compact.is_empty()
-            && state.shadowed.len() < self.0.config.index_rows
-            && state.tail_bytes < self.0.config.index_bytes
-            && age < self.0.config.index_age
+            && ((state.shadowed.len() < self.0.config.index_rows
+                && state.tail_bytes < self.0.config.index_bytes
+                && age < self.0.config.index_age)
+                || bulk_wait(&state, &self.0.config, age))
         {
             return Ok(false);
         }
@@ -787,6 +804,18 @@ impl Engine {
 /// each flush then costs one build of its rows instead of competing with merges, and merging
 /// the backlog afterwards rewrites each row about once.
 const DEFER_COMPACTION_BELOW_SEGMENTS: usize = 64;
+/// True while a bulk load is still writing and its tail is under the bulk-flush limits: wait
+/// for more rows rather than building a small segment now.
+fn bulk_wait(state: &NamespaceState, config: &EngineConfig, tail_age: Duration) -> bool {
+    config.index_age >= Duration::from_secs(1)
+        && state.shadowed.len() < config.bulk_flush_rows
+        && tail_age < config.bulk_flush_age
+        && state.tail_bytes < config.max_unindexed_bytes / 4
+        && Utc::now()
+            .signed_duration_since(state.updated_at)
+            .to_std()
+            .is_ok_and(|since| since < Duration::from_secs(1))
+}
 fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<String> {
     if !force
         && state.shadowed.len() >= config.index_rows

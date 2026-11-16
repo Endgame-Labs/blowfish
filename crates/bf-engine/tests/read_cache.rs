@@ -852,3 +852,66 @@ async fn unindexed_tail_keeps_the_directory_path() {
     );
     assert!(backend.waves.load(Ordering::SeqCst) <= 4);
 }
+
+/// While writes keep arriving, a bulk load accumulates its tail into a large segment instead
+/// of flushing a small one every cycle; once the limit is reached (or the writes stop) it
+/// flushes, and a forced index always flushes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_writes_accumulate_into_one_large_segment() {
+    let backend = Arc::new(Counting::default());
+    let engine = Engine::with_config(
+        Storage::from_backend(backend.clone(), Path::default(), false, false)
+            .await
+            .unwrap(),
+        EngineConfig {
+            index_rows: 10,
+            bulk_flush_rows: 1000,
+            ..config()
+        },
+    );
+    let write = |from: usize, rows: usize| {
+        let docs: Vec<_> = (from..from + rows)
+            .map(|id| json!({"id":id,"vector":[id as f32, 1.0]}))
+            .collect();
+        engine.write(
+            "bulk",
+            serde_json::from_value(json!({
+                "distance_metric":"euclidean_squared","upsert_rows":docs
+            }))
+            .unwrap(),
+        )
+    };
+    write(0, 300).await.unwrap();
+    // Writes are still hot and the tail is under the limit: nothing is built.
+    assert!(!engine.index_namespace("bulk", false).await.unwrap());
+    write(300, 300).await.unwrap();
+    assert!(!engine.index_namespace("bulk", false).await.unwrap());
+    // Past the row limit the whole tail becomes one segment.
+    write(600, 500).await.unwrap();
+    assert!(engine.index_namespace("bulk", false).await.unwrap());
+    let fresh = Engine::with_config(store(backend.clone()).await, config());
+    let described = fresh
+        .query(
+            "bulk",
+            serde_json::from_value(json!({"rank_by":["vector","ANN",[5.0,1.0]],"top_k":3}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(described.result.rows.as_ref().unwrap().len(), 3);
+    let segments = backend
+        .inner
+        .list(None)
+        .filter(|o| {
+            futures::future::ready(
+                o.as_ref()
+                    .is_ok_and(|o| o.location.as_ref().ends_with("docs.bfc")),
+            )
+        })
+        .count()
+        .await;
+    assert_eq!(segments, 1);
+    // A forced index flushes even a small hot tail.
+    write(2000, 5).await.unwrap();
+    assert!(engine.index_namespace("bulk", true).await.unwrap());
+}

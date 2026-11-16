@@ -26,6 +26,9 @@ pub struct WalEntry {
     #[serde(default)]
     pub tombstone: bool,
 }
+/// Payloads of at least this size are uploaded as concurrent parts of `WAL_PART` bytes.
+const WAL_MULTIPART_MIN: usize = 8 << 20;
+const WAL_PART: usize = 5 << 20;
 impl WalEntry {
     /// A new group-commit entry with a stable identity for ambiguous retries.
     pub fn new(batches: Vec<WriteBatch>) -> Self {
@@ -252,10 +255,17 @@ impl Wal {
         if !entry.tombstone && !inline {
             let payload = encode_payload(&json)?;
             let len = payload.len();
-            let result = self
-                .store
-                .create_with_id(&payload_key, payload, entry.write_id)
-                .await?;
+            // The key carries this attempt's UUID, so no other writer can use it: a large
+            // payload goes up as concurrent parts (one PUT stream moves about 5 MB/s).
+            let result = if len >= WAL_MULTIPART_MIN && self.store.is_conditional() {
+                self.store
+                    .create_unique_sized(&payload_key, payload, WAL_MULTIPART_MIN, WAL_PART)
+                    .await?
+            } else {
+                self.store
+                    .create_with_id(&payload_key, payload, entry.write_id)
+                    .await?
+            };
             if result == CreateResult::Created {
                 metrics::counter!("blowfish_wal_bytes_written_total").increment(len as u64);
             }
