@@ -4,6 +4,15 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Native embedding and model reranking merged.**
+  - **Registry:** a `[models]` registry maps turbopuffer model names to providers: `local` (in-process llama.cpp GGUF, cargo feature `local-models` or `local-models-native`), `openai_embeddings`, and `rerank`.
+  - **turbopuffer surface:** `embed` in the schema, write-time embedding (256-row cap, embedded before conditions), `["Embed", ...]` in ANN and kNN, `rerank_by {model, attribute, query}` on single and multi-queries, and `embedding_tokens` and `embedding_ms`.
+  - **Real check on CPU** (EmbeddingGemma 2 and Qwen3-Reranker-0.6B):
+    - query embedding: median 35 ms;
+    - reranking: about 0.8 s per candidate, so use a GPU or a hosted rerank provider for real traffic;
+    - memory: about 1.6 GiB RSS with both models loaded.
+  - **Open:** patches don't re-embed; rerank runs candidates one at a time with no prefix reuse; and the 256-row cap applies even when vectors are supplied.
+
 - **Perf iteration 9 merged (1M): R2 tail latency.**
   - **Floor model:** one GET is 72 ms p50 and 309 ms p99. A wave of 256 parallel GETs takes about 290 ms on warm connections and about 1.05 s on fresh ones; a new TLS connection costs about 65 ms.
   - **Changes:**
