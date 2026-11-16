@@ -69,7 +69,7 @@ def ops():
 
 
 def rss_peak_gib():
-    pid = subprocess.run(["pgrep", "-f", "release/blowfish-scale-server"], capture_output=True, text=True).stdout.split()
+    pid = subprocess.run(["pgrep", "-f", "blowfish-scale-server"], capture_output=True, text=True).stdout.split()
     if not pid:
         return None
     for l in open(f"/proc/{pid[0]}/status"):

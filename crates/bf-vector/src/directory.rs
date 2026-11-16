@@ -16,6 +16,7 @@ use std::{ops::Range, sync::Arc};
 
 use bytes::Bytes;
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 
 use crate::{
     Metric, RaBitQ, RangeRead, Result, VectorType,
@@ -24,8 +25,8 @@ use crate::{
     index::{Index, StubCluster},
 };
 
-const DIR_MAGIC: &[u8; 8] = b"BFDIR002";
-const FRAG_MAGIC: &[u8; 8] = b"BFFRG001";
+const DIR_MAGIC: &[u8; 8] = b"BFDIR003";
+const FRAG_MAGIC: &[u8; 8] = b"BFFRG002";
 
 /// Vector-space parameters shared by every segment in a directory.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,6 +51,10 @@ pub struct DirSegment {
     pub flat: bool,
     /// Leaf cluster count in the segment.
     pub clusters: usize,
+    /// Rows in the segment's index.
+    pub rows: usize,
+    /// Byte range of the segment's row-to-cluster map inside its fragment, if it has one.
+    pub membership: Option<Range<u64>>,
 }
 
 /// One leaf cluster.
@@ -90,6 +95,10 @@ struct Section {
     entries: Vec<DirEntry>,
     /// One-bit codes, `padded / 8` bytes per entry.
     bits: Vec<u8>,
+    /// Rows in the segment's index.
+    rows: u32,
+    /// Row-to-cluster map inside the fragment (empty when the segment is flat).
+    membership: Range<u64>,
 }
 
 /// A parsed directory. Cheap to share: entries and center codes stay resident.
@@ -170,6 +179,9 @@ impl Section {
         put_shape(out, &self.shape);
         put_u32(out, self.clusters as u32);
         put_u32(out, self.entries.len() as u32);
+        put_u32(out, self.rows);
+        put_u64(out, self.membership.start);
+        put_u64(out, self.membership.end);
         for x in &self.centroid {
             out.extend(x.to_le_bytes());
         }
@@ -194,7 +206,9 @@ impl Section {
         let padded = shape.dims.next_power_of_two();
         let clusters = p.u32()? as usize;
         let n = p.u32()? as usize;
-        if n > clusters || n > p.remaining() {
+        let rows = p.u32()?;
+        let membership = p.u64()?..p.u64()?;
+        if n > clusters || n > p.remaining() || membership.start > membership.end {
             return Err(bad("invalid directory section"));
         }
         let centroid = p.vector(padded)?;
@@ -234,6 +248,8 @@ impl Section {
             centroid,
             entries,
             bits,
+            rows,
+            membership,
         })
     }
 }
@@ -273,7 +289,7 @@ impl Fragment {
         let mut entries = Vec::with_capacity(live.len());
         let mut blobs = Vec::new();
         let resident_len =
-            8 + 24 + 8 + padded * 4 + live.len() * (ENTRY_BYTES + bit_bytes(padded)) + 4;
+            8 + 24 + 8 + 20 + padded * 4 + live.len() * (ENTRY_BYTES + bit_bytes(padded)) + 4;
         for &cid in &live {
             let c = &m.clusters[cid];
             let r: Vec<f64> = c
@@ -311,12 +327,37 @@ impl Fragment {
             });
             blobs.extend(blob);
         }
+        // The row-to-cluster map: with it, a filtered query knows how many allowed rows each
+        // cluster holds, and where each one's vector is, without reading cluster blobs.
+        let mut member = Vec::new();
+        if !m.flat {
+            let wide = m.clusters.len() > u16::MAX as usize;
+            let mut map = vec![0u32; m.count as usize];
+            for (cid, c) in m.clusters.iter().enumerate() {
+                for row in &c.rows {
+                    *map.get_mut(row as usize)
+                        .ok_or_else(|| bad("row outside segment"))? = cid as u32;
+                }
+            }
+            for cid in map {
+                if wide {
+                    member.extend(cid.to_le_bytes());
+                } else {
+                    member.extend((cid as u16).to_le_bytes());
+                }
+            }
+            let crc = crc32fast::hash(&member);
+            put_u32(&mut member, crc);
+        }
+        let member_start = (resident_len + blobs.len()) as u64;
         let section = Section {
             shape,
             clusters: m.clusters.len(),
             centroid,
             entries,
             bits,
+            rows: m.count,
+            membership: member_start..member_start + member.len() as u64,
         };
         let mut out = FRAG_MAGIC.to_vec();
         section.put(&mut out);
@@ -324,6 +365,7 @@ impl Fragment {
         put_u32(&mut out, crc);
         debug_assert_eq!(out.len(), resident_len);
         out.extend(blobs);
+        out.extend(member);
         Ok((out, resident_len as u64))
     }
 
@@ -409,6 +451,8 @@ impl Directory {
                 fragment,
                 flat: section.shape.flat,
                 clusters: section.clusters,
+                rows: section.rows as usize,
+                membership: (!section.membership.is_empty()).then(|| section.membership.clone()),
             });
             entries.extend(section.entries.iter().cloned().map(|mut e| {
                 e.segment = s;
@@ -557,5 +601,83 @@ impl<R: RangeRead> PartialIndex<R> {
     /// Take the index.
     pub fn into_index(self) -> Index<R> {
         self.0
+    }
+}
+
+/// A segment's row-to-cluster map (decoded from the fragment's membership area).
+pub struct Membership {
+    cluster_of: Vec<u32>,
+}
+impl Membership {
+    /// Decode the membership bytes of a segment with `rows` rows and `clusters` clusters.
+    pub fn decode(bytes: &[u8], rows: usize, clusters: usize) -> Result<Self> {
+        let width = if clusters > u16::MAX as usize { 4 } else { 2 };
+        if bytes.len() != rows * width + 4 {
+            return Err(bad("invalid membership length"));
+        }
+        let (body, tail) = bytes.split_at(rows * width);
+        check_crc(body, u32::from_le_bytes(tail.try_into().unwrap()))?;
+        let cluster_of: Vec<u32> = if width == 2 {
+            body.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u32::from(u16::from_le_bytes(*c)))
+                .collect()
+        } else {
+            body.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
+                .collect()
+        };
+        if cluster_of.iter().any(|c| *c as usize >= clusters) {
+            return Err(bad("membership cluster outside segment"));
+        }
+        Ok(Self { cluster_of })
+    }
+    /// Approximate resident bytes.
+    pub fn resident_bytes(&self) -> u64 {
+        self.cluster_of.len() as u64 * 4
+    }
+    /// Rows of `allowed` in each of the segment's `clusters` clusters.
+    pub fn counts(&self, allowed: &RoaringBitmap, clusters: usize) -> Vec<u32> {
+        let mut counts = vec![0u32; clusters];
+        for row in allowed {
+            if let Some(c) = self.cluster_of.get(row as usize) {
+                counts[*c as usize] += 1;
+            }
+        }
+        counts
+    }
+    /// `(cluster, ordinal within the cluster, row)` of every row of `allowed` whose cluster
+    /// passes `keep`. A cluster's ordinals count its rows in ascending row order, the same
+    /// order its vectors are stored in.
+    pub fn locations(
+        &self,
+        allowed: &RoaringBitmap,
+        keep: impl Fn(u32) -> bool,
+    ) -> Vec<(u32, u32, u32)> {
+        let mut next = std::collections::HashMap::<u32, u32>::new();
+        let mut out = Vec::new();
+        for (row, &cluster) in self.cluster_of.iter().enumerate() {
+            let ordinal = next.entry(cluster).or_insert(0);
+            if allowed.contains(row as u32) && keep(cluster) {
+                out.push((cluster, *ordinal, row as u32));
+            }
+            *ordinal += 1;
+        }
+        out
+    }
+}
+impl<R: RangeRead> PartialIndex<R> {
+    /// Exact top-`k` `(row, distance)` over rows given by location (see
+    /// [`Membership::locations`]), reading only those vectors. Needs no installed clusters.
+    pub async fn exact_at(
+        &self,
+        query: &[f32],
+        k: usize,
+        locations: Vec<(u32, u32, u32)>,
+    ) -> Result<Vec<(u32, f32)>> {
+        self.0.exact_at(query, k, locations).await
     }
 }

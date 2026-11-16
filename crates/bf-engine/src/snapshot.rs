@@ -83,7 +83,19 @@ impl OpenHint {
                 .all(|a| dirs.contains_key(&format!("ann:{a}")));
             for attribute in &self.ann {
                 if let Some(file) = dirs.get(&format!("ann:{attribute}")) {
-                    tasks.push(crate::ann_dir::load(store, file).map_ok(drop).boxed());
+                    let filtered = !self.filters.is_empty();
+                    tasks.push(
+                        async move {
+                            let dir = crate::ann_dir::load(store, file).await?;
+                            if filtered {
+                                // Filtered queries also need each segment's row-to-cluster map.
+                                crate::ann_dir::memberships(store, segments, &dir, attribute)
+                                    .await?;
+                            }
+                            Ok(())
+                        }
+                        .boxed(),
+                    );
                 }
             }
             for seg in segments {

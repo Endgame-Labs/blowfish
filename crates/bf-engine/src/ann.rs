@@ -76,27 +76,37 @@ pub(crate) async fn search(
         && let Some(file) = state.ann_dirs.get(&key)
     {
         // Filtered queries compute each segment's allowed rows (live rows that pass the filter)
-        // in the same wave as the directory; the directory then ranks clusters without
-        // opening any segment's index or ID index.
-        let (dir, lives) = tokio::try_join!(
+        // alongside the directory, and read each segment's row-to-cluster map, so the
+        // directory ranks clusters by their allowed rows without opening any segment's index
+        // or ID index.
+        let (dir, lives) = tokio::join!(
             crate::ann_dir::load(store, file),
             crate::ann_dir::live_masks(store, state, q.filters.as_ref())
-        )?;
-        if crate::ann_dir::covers(&dir, &state.segments, attribute) {
-            return crate::ann_dir::search(
-                store,
-                state,
-                dir,
-                lives,
-                vector,
-                config,
-                k,
-                columns,
-                attribute,
-                q.filters.is_some(),
-            )
-            .await
-            .map(Some);
+        );
+        // A directory in an unknown (older) format is ignored: queries open each segment.
+        let lives = if dir.is_ok() { Some(lives?) } else { None };
+        if let (Ok(dir), Some(lives)) = (dir, lives)
+            && crate::ann_dir::covers(&dir, &state.segments, attribute)
+        {
+            let members = if q.filters.is_some() {
+                let members =
+                    crate::ann_dir::memberships(store, &state.segments, &dir, attribute).await?;
+                // A segment whose fragment predates the maps cannot take a filter.
+                dir.segments()
+                    .iter()
+                    .zip(&members)
+                    .all(|(s, m)| s.flat || m.is_some())
+                    .then_some(members)
+            } else {
+                None
+            };
+            if q.filters.is_none() || members.is_some() {
+                return crate::ann_dir::search(
+                    store, state, dir, lives, vector, config, k, columns, attribute, members,
+                )
+                .await
+                .map(Some);
+            }
         }
     }
     let vector: Arc<[f32]> = vector.into();

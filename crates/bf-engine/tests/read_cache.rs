@@ -699,7 +699,15 @@ async fn filtered_ann_uses_the_directory_without_opening_id_indexes() {
         let mut expected: Vec<_> = (0..4800).filter(|id| tag_ok(id % 50)).collect();
         expected.sort_by(|a, b| distance(*a).total_cmp(&distance(*b)));
         expected.truncate(10);
-        let engine = Engine::with_config(store(backend.clone()).await, config());
+        // The exact route fetches every allowed row; with a zero budget the second filter
+        // goes through code scans of the nearest clusters instead.
+        let engine = Engine::with_config(
+            store(backend.clone()).await,
+            EngineConfig {
+                exact_fetch_rows: if exact { 8192 } else { 0 },
+                ..config()
+            },
+        );
         backend.waves.store(0, Ordering::SeqCst);
         backend.paths.lock().unwrap().clear();
         backend.delay.store(true, Ordering::SeqCst);

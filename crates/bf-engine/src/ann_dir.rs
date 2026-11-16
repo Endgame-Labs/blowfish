@@ -4,8 +4,8 @@
 use crate::{EngineConfig, NamespaceState, read_cache, segment};
 use bf_storage::Storage;
 use bf_types::*;
-use bf_vector::{Candidate, Directory, Index, RoaringBitmap};
-use futures::{StreamExt, TryStreamExt};
+use bf_vector::{Candidate, Directory, Index, Membership, RoaringBitmap};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -117,7 +117,12 @@ pub(crate) async fn build(
             bf_vector::Fragment::decode(&bytes).map_err(segment::index_error)
         }
     }))
-    .await?;
+    .await;
+    // A fragment in an older format (without row-to-cluster maps) means no directory yet:
+    // queries open each segment until compaction rewrites it.
+    let Ok(reads) = reads else {
+        return Ok(None);
+    };
     for (seg, fragment) in segments.iter().zip(reads) {
         sources.push((
             seg.id.clone(),
@@ -185,6 +190,37 @@ pub(crate) async fn live_masks(
     .await
 }
 
+/// Load (and cache) the row-to-cluster map of every segment that has one. `None` for flat
+/// segments and for segments whose fragment predates the map.
+pub(crate) async fn memberships(
+    store: &Storage,
+    segments: &[bf_wal::Segment],
+    dir: &Directory,
+    attr: &str,
+) -> Result<Vec<Option<Arc<Membership>>>, ApiError> {
+    let frag_key = format!("annfrag:{attr}");
+    futures::future::try_join_all(dir.segments().iter().zip(segments).map(|(d, seg)| {
+        let frag_key = &frag_key;
+        async move {
+            let (Some(range), Some(file)) = (d.membership.clone(), seg.files.get(frag_key)) else {
+                return Ok(None);
+            };
+            let key = format!("member:{}", file.key);
+            if let Some(m) = read_cache::get(&key, range.end - range.start) {
+                return Ok(Some(m));
+            }
+            let bytes = Reader::new(store, file)
+                .read(range.clone())
+                .await
+                .map_err(segment::index_error)?;
+            let m = Membership::decode(&bytes, d.rows, d.clusters).map_err(segment::index_error)?;
+            let resident = m.resident_bytes();
+            Ok(Some(read_cache::insert(&key, resident, m)))
+        }
+    }))
+    .await
+}
+
 struct Probed {
     segment: usize,
     index: Arc<Index<Reader>>,
@@ -205,8 +241,10 @@ pub(crate) async fn search(
     k: usize,
     columns: &BTreeSet<String>,
     attribute: &str,
-    filtered: bool,
+    members: Option<Vec<Option<Arc<Membership>>>>,
 ) -> Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError> {
+    let filtered = members.is_some();
+    let members = members.unwrap_or_default();
     let t0 = std::time::Instant::now();
     let key = format!("ann:{attribute}");
     let vector: Arc<[f32]> = vector.into();
@@ -244,52 +282,81 @@ pub(crate) async fn search(
         }
     }
     let target = k.saturating_mul(config.ann_rerank_factor).min(matching);
-    let mut chosen: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    let mut exact_all = false;
-    let mut exact_chosen = false;
-    if matching > 0 {
-        let mut order: Vec<(f32, usize)> = entries
+    // Filtered: allowed rows in each cluster, exactly, from the row-to-cluster maps.
+    let counts: Vec<Vec<u32>> = if filtered {
+        dir.segments()
             .iter()
             .enumerate()
-            .filter(|(_, e)| !dir.segments()[e.segment].flat && e.rows > 0)
-            .map(|(n, _)| (distances[n], n))
-            .collect();
-        let scale = (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0);
-        // Unfiltered, deleted rows thin the probed clusters. A filter does not widen the probe
-        // count: it keeps probing until the expected allowed candidates reach `target`, which
-        // covers the same neighborhood of the filtered set as `nprobe` does of the whole.
-        let thin = if filtered {
-            1.0
-        } else {
-            ann_rows as f64 / matching.max(1) as f64
-        };
-        let probes = ((config.ann_nprobe as f64 * scale * thin).ceil() as usize).min(clusters);
-        order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let (mut count, mut candidates) = (0usize, 0f64);
-        let mut picked = Vec::new();
-        for &(_, n) in &order {
-            picked.push(n);
-            count += 1;
-            candidates += entries[n].rows as f64 * fraction[entries[n].segment];
-            if count >= probes && candidates >= target as f64 {
-                break;
-            }
+            .map(
+                |(i, seg)| match (members.get(i).and_then(Option::as_ref), &lives[i]) {
+                    (Some(m), Some(allowed)) if !seg.flat => m.counts(allowed, seg.clusters),
+                    _ => Vec::new(),
+                },
+            )
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let in_cluster = |n: usize| -> f64 {
+        let e = &entries[n];
+        match counts.get(e.segment).filter(|c| !c.is_empty()) {
+            Some(c) => f64::from(c[e.cluster]),
+            None => e.rows as f64 * fraction[e.segment],
         }
-        if matching <= k
-            || (!filtered
-                && matching <= EXACT_ROWS.max(count + target)
-                && matching * width <= EXACT_BYTES)
-        {
-            exact_all = true;
+    };
+    let mut chosen: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut exact_all = false;
+    // Segments whose few allowed rows are fetched and ranked exactly, without codes or blobs.
+    let mut exact_rows = BTreeSet::new();
+    if matching > 0 {
+        if filtered && matching <= config.exact_fetch_rows.max(target) {
+            for (i, seg) in dir.segments().iter().enumerate() {
+                if !seg.flat && live_rows(i) > 0 {
+                    exact_rows.insert(i);
+                }
+            }
         } else {
-            // Few expected allowed rows in the probed clusters: fetch just those vectors
-            // (from the cluster blobs' row sets) instead of scanning quantized codes.
-            exact_chosen = filtered && candidates <= (2 * target) as f64;
-            for n in picked {
-                chosen
-                    .entry(entries[n].segment)
-                    .or_default()
-                    .push(entries[n].cluster);
+            let mut order: Vec<(f32, usize)> = entries
+                .iter()
+                .enumerate()
+                .filter(|(n, e)| {
+                    !dir.segments()[e.segment].flat && e.rows > 0 && in_cluster(*n) > 0.0
+                })
+                .map(|(n, _)| (distances[n], n))
+                .collect();
+            let scale = (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0);
+            // Deleted rows thin the probed clusters, so probe more. A filter does not widen
+            // the probe count: probing continues until the allowed candidates reach `target`.
+            let thin = if filtered {
+                1.0
+            } else {
+                ann_rows as f64 / matching.max(1) as f64
+            };
+            let probes = ((config.ann_nprobe as f64 * scale * thin).ceil() as usize).min(clusters);
+            order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let (mut count, mut candidates) = (0usize, 0f64);
+            let mut picked = Vec::new();
+            for &(_, n) in &order {
+                picked.push(n);
+                count += 1;
+                candidates += in_cluster(n);
+                if count >= probes && candidates >= target as f64 {
+                    break;
+                }
+            }
+            if !filtered
+                && (matching <= k
+                    || (matching <= EXACT_ROWS.max(count + target)
+                        && matching * width <= EXACT_BYTES))
+            {
+                exact_all = true;
+            } else {
+                for n in picked {
+                    chosen
+                        .entry(entries[n].segment)
+                        .or_default()
+                        .push(entries[n].cluster);
+                }
             }
         }
     }
@@ -306,15 +373,58 @@ pub(crate) async fn search(
                     .map(|e| e.cluster)
                     .collect(),
             );
-        } else if exact_chosen && chosen.contains_key(&i) {
-            exact_segments.insert(i);
         }
     }
     crate::ann::stage(t0, "plan");
 
     // Wave 3: probed codes and cluster blobs for each chosen segment, in parallel. Docs
     // footers for the chosen segments are warmed in the same wave.
-    let mut tasks = Vec::new();
+    let mut tasks: Vec<futures::future::BoxFuture<'_, Result<(Probed, Found), ApiError>>> =
+        Vec::new();
+    for &i in &exact_rows {
+        let Some(member) = members.get(i).cloned().flatten() else {
+            return Err(segment::index_error("segment lost its membership map"));
+        };
+        let live = lives[i].clone().unwrap_or_default();
+        let file = state.segments[i]
+            .files
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| segment::index_error("segment lost its ANN index"))?;
+        let partial = dir
+            .partial_index(i, Reader::new(store, &file))
+            .map_err(segment::index_error)?;
+        let (vector, segment_meta, store) =
+            (vector.clone(), state.segments[i].clone(), store.clone());
+        tasks.push(
+            async move {
+                let locations = member.locations(&live, |_| true);
+                let (hits, ()) = tokio::try_join!(
+                    async {
+                        partial
+                            .exact_at(&vector, k, locations)
+                            .await
+                            .map_err(segment::index_error)
+                    },
+                    async {
+                        segment::warm_docs(&store, &segment_meta).await;
+                        Ok(())
+                    }
+                )?;
+                let probed = Probed {
+                    segment: i,
+                    index: Arc::new(partial.into_index()),
+                    clusters: Vec::new(),
+                    exact: true,
+                };
+                Ok((
+                    probed,
+                    (hits.into_iter().map(|(r, d)| (d, r)).collect(), Vec::new()),
+                ))
+            }
+            .boxed(),
+        );
+    }
     for (&i, cs) in &chosen {
         let (dir, vector) = (dir.clone(), vector.clone());
         let exact = exact_segments.contains(&i);
@@ -341,86 +451,90 @@ pub(crate) async fn search(
             .filter(|e| e.segment == i && cs.contains(&e.cluster))
             .cloned()
             .collect();
-        tasks.push(async move {
-            // An exactly scanned segment needs all of its vectors, and its row sets (from the
-            // blobs) only say which. Read the vectors in parallel with the blobs, as
-            // concurrent pieces, so the later exact scan is served from the cache.
-            let prefetch_ranges: Vec<_> = if exact && (flat || exact_all) {
-                seg_entries.iter().map(|e| e.vectors_range()).collect()
-            } else {
-                Vec::new()
-            };
-            let prefetch_reader = reader.clone();
-            let prefetch = async move {
-                let pieces = prefetch_ranges.into_iter().flat_map(|r| {
-                    let mut out = Vec::new();
-                    let mut start = r.start;
-                    while start < r.end {
-                        let end = (start + PREFETCH_PIECE).min(r.end);
-                        out.push(start..end);
-                        start = end;
-                    }
-                    out
-                });
-                // Best effort: a failure here only means the scan reads the range itself.
-                let _ = futures::future::join_all(pieces.map(|r| prefetch_reader.read(r))).await;
-                Ok::<(), ApiError>(())
-            };
-            let mut partial = dir.partial_index(i, reader).map_err(segment::index_error)?;
-            let ranges: Vec<_> = seg_entries.iter().map(|e| e.blob_range()).collect();
-            let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
-            let read_blobs = async {
-                bf_vector::read_merged(&dir_reader, ranges, BLOB_GAP, BLOB_MERGE_MAX)
-                    .await
-                    .map_err(segment::index_error)
-            };
-            let read_codes = async {
-                if exact {
-                    Ok(Vec::new())
+        tasks.push(
+            async move {
+                // An exactly scanned segment needs all of its vectors, and its row sets (from the
+                // blobs) only say which. Read the vectors in parallel with the blobs, as
+                // concurrent pieces, so the later exact scan is served from the cache.
+                let prefetch_ranges: Vec<_> = if exact && (flat || exact_all) {
+                    seg_entries.iter().map(|e| e.vectors_range()).collect()
                 } else {
-                    partial
-                        .index()
-                        .read_codes(&wanted)
+                    Vec::new()
+                };
+                let prefetch_reader = reader.clone();
+                let prefetch = async move {
+                    let pieces = prefetch_ranges.into_iter().flat_map(|r| {
+                        let mut out = Vec::new();
+                        let mut start = r.start;
+                        while start < r.end {
+                            let end = (start + PREFETCH_PIECE).min(r.end);
+                            out.push(start..end);
+                            start = end;
+                        }
+                        out
+                    });
+                    // Best effort: a failure here only means the scan reads the range itself.
+                    let _ =
+                        futures::future::join_all(pieces.map(|r| prefetch_reader.read(r))).await;
+                    Ok::<(), ApiError>(())
+                };
+                let mut partial = dir.partial_index(i, reader).map_err(segment::index_error)?;
+                let ranges: Vec<_> = seg_entries.iter().map(|e| e.blob_range()).collect();
+                let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
+                let read_blobs = async {
+                    bf_vector::read_merged(&dir_reader, ranges, BLOB_GAP, BLOB_MERGE_MAX)
                         .await
                         .map_err(segment::index_error)
-                }
-            };
-            let (blobs, codes, (), ()) =
-                tokio::try_join!(read_blobs, read_codes, prefetch, async {
-                    segment::warm_docs(&store, &segment_meta).await;
-                    Ok(())
-                })?;
-            for (cluster, blob) in wanted.iter().zip(&blobs) {
-                partial
-                    .install(*cluster, blob)
-                    .map_err(segment::index_error)?;
-            }
-            let index = Arc::new(partial.into_index());
-            let probed = Probed {
-                segment: i,
-                index: index.clone(),
-                clusters: wanted.clone(),
-                exact,
-            };
-            let found = on_worker(async move {
-                if exact {
-                    let hits = index
-                        .exact_search(&vector, k, live.as_deref())
-                        .await
+                };
+                let read_codes = async {
+                    if exact {
+                        Ok(Vec::new())
+                    } else {
+                        partial
+                            .index()
+                            .read_codes(&wanted)
+                            .await
+                            .map_err(segment::index_error)
+                    }
+                };
+                let (blobs, codes, (), ()) =
+                    tokio::try_join!(read_blobs, read_codes, prefetch, async {
+                        segment::warm_docs(&store, &segment_meta).await;
+                        Ok(())
+                    })?;
+                for (cluster, blob) in wanted.iter().zip(&blobs) {
+                    partial
+                        .install(*cluster, blob)
                         .map_err(segment::index_error)?;
-                    return Ok((
-                        hits.into_iter().map(|(r, d)| (d, r)).collect::<Vec<_>>(),
-                        Vec::new(),
-                    ));
                 }
-                let found = index
-                    .scan_blocks(&vector, &wanted, codes, live.as_deref())
-                    .map_err(segment::index_error)?;
-                Ok((Vec::new(), found))
-            })
-            .await?;
-            Ok::<_, ApiError>((probed, found))
-        });
+                let index = Arc::new(partial.into_index());
+                let probed = Probed {
+                    segment: i,
+                    index: index.clone(),
+                    clusters: wanted.clone(),
+                    exact,
+                };
+                let found = on_worker(async move {
+                    if exact {
+                        let hits = index
+                            .exact_search(&vector, k, live.as_deref())
+                            .await
+                            .map_err(segment::index_error)?;
+                        return Ok((
+                            hits.into_iter().map(|(r, d)| (d, r)).collect::<Vec<_>>(),
+                            Vec::new(),
+                        ));
+                    }
+                    let found = index
+                        .scan_blocks(&vector, &wanted, codes, live.as_deref())
+                        .map_err(segment::index_error)?;
+                    Ok((Vec::new(), found))
+                })
+                .await?;
+                Ok::<_, ApiError>((probed, found))
+            }
+            .boxed(),
+        );
     }
     let limit = config.search_concurrency.max(1) * 2;
     let results: Vec<(Probed, Found)> = futures::stream::iter(tasks)

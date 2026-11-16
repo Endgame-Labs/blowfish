@@ -46,6 +46,9 @@ pub struct EngineConfig {
     pub ann_nprobe: usize,
     /// Exact rerank budget as a multiple of the requested k.
     pub ann_rerank_factor: usize,
+    /// A filtered ANN query with at most this many allowed rows fetches and ranks exactly
+    /// those rows' vectors instead of scanning quantized codes.
+    pub exact_fetch_rows: usize,
     /// Fraction of ANN requests checked against exhaustive ground truth.
     pub recall_sample_rate: f64,
 }
@@ -91,6 +94,7 @@ impl Default for EngineConfig {
             build_concurrency: 2,
             ann_nprobe: 64,
             ann_rerank_factor: 32,
+            exact_fetch_rows: 8192,
             recall_sample_rate: 0.01,
         }
     }
@@ -145,6 +149,9 @@ impl EngineConfig {
         }
         if let Some(v) = number("BF_ANN_RERANK") {
             c.ann_rerank_factor = v as usize;
+        }
+        if let Some(v) = number("BF_EXACT_FETCH") {
+            c.exact_fetch_rows = v as usize;
         }
         c
     }
