@@ -627,6 +627,73 @@ Cold queries still read 400 MB to 1.2 GB (index metadata and probed codes) and a
 trips: 5,000 or more GETs per query. Warm ANN QPS does not scale with concurrency (3.0 at c1, 3.5 at c32)
 because one query already uses all cores for about 2 core-seconds of code scanning. See `WORKER_REPORT.md`.
 
+## Iteration 2 (100K docs)
+
+Scope change: from this round on, scale runs use **100,000 documents** (the first 100K English Wikipedia passages,
+1024-dim f16, the same 32 held-out queries), until speeds are down. The namespace holds 8 segment directories and
+about 1.18 GB in the bucket (including WAL objects not yet collected). Memory budgets are scaled down with the data:
+block cache 256 MiB (the 4.86M run used 8 GiB over 27.6 GB, about 30 percent; here 256 MiB over about 0.9 GB of
+segment data) and decoded-metadata cache 128 MiB (4 GiB at 4.86M, scaled by data size). Strong consistency, cold
+means a fresh process and an empty disk cache per query (8 queries), warm is the same 32 queries repeated.
+"Before" is the iteration 1 code (commit `bb8db09`) run on the same 100K namespace.
+
+### Diagnosis (measured, then fixed)
+
+1. **What the 419 MB per cold ANN query at 4.86M was** (read trace, `BF_TRACE_READS=1`): 323 MB from the 70 ANN
+   files (about 130 MB index metadata, mostly 4 KB centers and per-row checksums, plus about 186 MB of probed
+   codes in 4,000 requests), 56 MB of whole ID indexes, 32 MB of manifest (namespace-wide term document
+   frequencies, read in full by every cold query), 7 MB of rerank vectors, 3 MB of live masks. Probes covered 23
+   percent of all clusters because every segment is clustered independently and probes scale with the number of
+   clusters. In the old layout codes and vectors alternated per cluster, so probed codes could never coalesce.
+   The cold timeline was serial: manifest, then open (8 s at 4.86M), then codes (9 s), then rerank.
+2. **Warm ANN was not scan-bound.** A first 100K baseline looked broken (warm ANN 1.1 s, 15 GB of RSS under hybrid
+   load). The cause was a harness error: the loader stopped before the indexer drained, leaving a 30K-document
+   unindexed tail that every query cloned and scanned exhaustively. The loader now waits until the tail is empty.
+   With the tail drained, warm ANN is about 75 ms, of which about 70 ms is the strong-consistency HEAD of the next
+   WAL object; query execution itself is 23 ms. At 100K the warm floor is one R2 round trip.
+3. ANN recall at 100K, by sweep over 32 queries: nprobe 16, 32, 64, 128 gave 0.925, 0.966, 0.981, 0.997;
+   rerank factors 8, 16, 32 gave identical recall. The old defaults (512, 64) scanned every cluster.
+
+### What changed
+
+| Change | Effect |
+| --- | --- |
+| Index format flags (`bf-vector`): centers stored rotated, 8-byte code headers, all codes contiguous before all vectors. Old indexes still read (centers rotated at open) | smaller codes (144 to 136 B per row), probed clusters adjacent in the file |
+| Probed code blocks and candidate vectors are read with gap merging (64 KB for codes, 16 KB for vectors) | cold ANN 1,021 to 238 requests |
+| ANN scan: rotate the query once, quantize the residual to 8 bit planes, score with popcounts (was a 256-entry f64 table per 8 dimensions, rebuilt per cluster) | per-cluster setup and per-row scoring both cheaper; 4 to 8 ms per 60 clusters warm |
+| Defaults: nprobe 512 to 64, rerank factor 64 to 32 | cold bytes halved; recall 0.97 at 100K |
+| Manifest payloads over 64 KB are zstd-compressed (plain JSON still readable) | cold manifest download 2.4 MB at 100K, 32 MB at 4.86M, now compressed |
+| Fetch concurrency 64 to 512, wider segment open concurrency | request-latency-bound phases overlap more |
+| Diagnostics: `BF_TRACE_READS=1` (one line per backend read) and `BF_TRACE_STAGES=1` | used for the numbers above |
+
+### Inner loops
+
+| Loop | Change | Cold ANN req / MB / p50 | Warm ANN p50 |
+| --- | --- | --- | --- |
+| 0 | Iteration 1 code, drained namespace | 1,021 / 31.2 / 2,503 ms | 87 ms |
+| 1 | New binary on the old (v1) files: popcount scan, wide concurrency | 998 / 31.7 / 2,300 ms | 92 ms |
+| 2 | Fresh load in the new format, nprobe 64, rerank 16, merged reads | 170 / 15.7 / 2,079 ms | 74 ms |
+| 3 | Rerank 32, compressed manifest (final) | 238 / 16.1 / 1,839 ms | 81 ms |
+
+### Results at 100K (strong, c1 unless noted)
+
+| Query | Cold p50 / p90 / p99 ms | Cold R2 req/q | Cold MB/q | Warm p50 / p90 / p99 ms | QPS c1 / c8 / c32 | Recall@10 |
+| --- | --- | ---: | ---: | --- | --- | ---: |
+| ANN | 1,839 / 2,161 / 2,216 | 238 | 16.1 | 81 / 132 / 306 | 10.3 / 63.4 / 114.0 | 0.966 |
+| BM25 | 1,640 / 3,087 / 4,099 | 38 | 24.4 | 68 / 111 / 176 | 12.3 / 76.5 / 100.0 | |
+| Hybrid | 2,710 / 2,824 / 2,827 | 264 | 38.6 | 73 / 134 / 194 | 11.0 / 83.5 / 105.8 | |
+| Selective ANN | 2,458 / 3,018 / 3,699 | 234 | 7.9 | 72 / 114 / 130 | 12.3 / 61.2 / 109.9 | 1.000 |
+
+Before (iteration 1 code, same data): ANN cold 2,503 / 7,633 / 9,494 ms, 1,021 requests, 31.2 MB, warm c8 QPS 42.3,
+recall 1.000; BM25 cold 1,773 ms, 42 requests, 25.7 MB; hybrid cold 2,964 ms, 1,050 requests, 53.4 MB; selective
+cold 2,466 ms, 259 requests, 9.4 MB. Cold ANN reads 16.1 MB, which is about 1.4 percent of the 1.18 GB namespace
+(about 5 percent of the 335 MB ANN data). A cold ANN query opens 5 indexed segments plus a flat one and scans about
+120 of about 700 clusters. Sequential waves: manifest chain (list, slot, payload, WAL list; 3 to 4 serial round
+trips, about 0.65 s), open (index metadata, IDs, live masks, in parallel), codes, rerank vectors, then document
+hydration: 6 stages, over the 3-wave target. Ingest: 660 to 830 docs/s (the earlier baseline load ran 560),
+0 backpressure 429s. Targets met: cold ANN requests under 500, cold ANN p50 under 2 s, warm p50 under 100 ms.
+Not met: waves, cold BM25 and hybrid bytes, warm p50 below the HEAD round trip.
+
 ## Compatibility validation
 
 The 121-case compatibility suite passes in both normal mode and forced indexing

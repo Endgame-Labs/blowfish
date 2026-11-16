@@ -34,7 +34,7 @@ def stop():
 
 def start(cache):
     storage = OUT / "storage.json"
-    sh("python3", str(HERE / "mkconfig.py"), str(CONFIG), str(storage), str(cache), "--read-only")
+    sh("python3", str(HERE / "mkconfig.py"), str(CONFIG), str(storage), str(cache), "--memory-gib", os.environ.get("SCALE_MEMORY_GIB", "8"), "--read-only")
     log = open(OUT / "server.log", "a")
     proc = subprocess.Popen([str(HERE / "serve.sh"), str(storage)], stdout=log, stderr=subprocess.STDOUT)
     for _ in range(120):

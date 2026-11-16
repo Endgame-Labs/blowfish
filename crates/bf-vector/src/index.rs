@@ -7,7 +7,7 @@ use crate::{
     Error, Metric, RaBitQ, Result, VectorType,
     cluster::prepare,
     distance::{sort_truncate, validate},
-    format::{self, FOOTER_SIZE, Metadata, Parser, bad, check_crc},
+    format::{self, FOOTER_SIZE, Metadata, bad, check_crc},
     reader::RangeRead,
 };
 
@@ -42,6 +42,13 @@ pub struct Candidate {
     /// Position within the cluster.
     pub ordinal: u32,
 }
+
+/// Code blocks closer than this are read together (the gap bytes are fetched and dropped).
+const CODE_GAP: u64 = 64 << 10;
+const CODE_MERGE_MAX: u64 = 8 << 20;
+/// Candidate vectors closer than this are read together.
+const VECTOR_GAP: u64 = 16 << 10;
+const VECTOR_MERGE_MAX: u64 = 2 << 20;
 
 /// A parsed immutable index. Metadata and centroids stay resident; codes and
 /// vectors are fetched through the reader for each search (usually cache-backed).
@@ -80,14 +87,30 @@ impl<R: RangeRead> Index<R> {
         Self::from_metadata(reader, &bytes[1], crc, len)
     }
     fn from_metadata(reader: R, bytes: &[u8], crc: u32, len: u64) -> Result<Self> {
-        let metadata = format::decode_metadata(bytes, crc, len - FOOTER_SIZE)?;
+        let mut metadata = format::decode_metadata(bytes, crc, len - FOOTER_SIZE)?;
         let rq = RaBitQ::new(metadata.dims, metadata.seed)?;
+        if metadata.flags & format::FLAG_ROTATED == 0 {
+            // Older indexes store raw centers. Rotating once at open lets every search
+            // rotate the query once instead of once per probed cluster.
+            let rot =
+                |c: &Vec<f32>| -> Vec<f32> { rq.rotate(c).into_iter().map(|x| x as f32).collect() };
+            metadata.parents = metadata.parents.iter().map(rot).collect();
+            for c in &mut metadata.clusters {
+                c.center = rot(&c.center);
+            }
+            metadata.flags |= format::FLAG_ROTATED;
+        }
         Ok(Self {
             reader,
             metadata,
             rq,
         })
     }
+    /// The query, normalized as the metric requires, rotated into the index's transform space.
+    fn rotated_query(&self, query: &[f32]) -> Vec<f64> {
+        self.rq.rotate(&prepare(query, self.metric()))
+    }
+
     /// Vector dimension.
     pub fn dims(&self) -> usize {
         self.metadata.dims
@@ -157,7 +180,11 @@ impl<R: RangeRead> Index<R> {
             .saturating_mul(self.len())
             .div_ceil(matching)
             .min(self.cluster_count());
-        let q = prepare(query, self.metric());
+        let q: Vec<f32> = self
+            .rotated_query(query)
+            .into_iter()
+            .map(|x| x as f32)
+            .collect();
         let order = self.cluster_order(&q, probes);
         let mut chosen = Vec::new();
         let mut candidates = 0;
@@ -200,7 +227,11 @@ impl<R: RangeRead> Index<R> {
     /// vector space, which lets callers rank clusters across segments.
     pub fn center_distances(&self, query: &[f32]) -> Result<Vec<f32>> {
         validate(query, self.dims())?;
-        let q = prepare(query, self.metric());
+        let q: Vec<f32> = self
+            .rotated_query(query)
+            .into_iter()
+            .map(|x| x as f32)
+            .collect();
         Ok(self
             .metadata
             .clusters
@@ -211,7 +242,15 @@ impl<R: RangeRead> Index<R> {
 
     /// Stored bytes scanned per row when probing a cluster's quantized codes.
     pub fn code_row_bytes(&self) -> usize {
-        24 + self.rq.padded.div_ceil(8)
+        self.code_head() + self.rq.padded.div_ceil(8)
+    }
+
+    fn code_head(&self) -> usize {
+        if self.metadata.flags & format::FLAG_COMPACT != 0 {
+            8
+        } else {
+            24
+        }
     }
 
     /// Stored bytes per full-precision vector.
@@ -234,59 +273,104 @@ impl<R: RangeRead> Index<R> {
     ) -> Result<Vec<Candidate>> {
         validate(query, self.dims())?;
         let q = prepare(query, self.metric());
-        let ranges = clusters
-            .iter()
-            .map(|c| self.metadata.clusters[*c].codes.clone())
-            .collect();
-        let blocks = read_batch(&self.reader, ranges).await?;
         let q_zero = q.iter().all(|x| *x == 0.);
+        let q_rot = self.rq.rotate(&q);
+        let t_read = std::time::Instant::now();
+        let blocks = self.read_coalesced(clusters).await?;
+        let read_ms = t_read.elapsed().as_millis();
+        let t_cpu = std::time::Instant::now();
         let rows: usize = clusters
             .iter()
             .map(|c| self.metadata.clusters[*c].rows.len() as usize)
             .sum();
         let mut estimated = Vec::with_capacity(rows);
+        let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
         for (cid, bytes) in clusters.iter().copied().zip(blocks) {
             let c = &self.metadata.clusters[cid];
             check_crc(&bytes, c.codes_crc)?;
-            let rotated = self.rq.residual(&q, &c.center);
-            let prepared = crate::rabitq::PreparedQuery::new(&rotated);
-            let mut p = Parser::new(&bytes);
-            for (ordinal, row) in c.rows.iter().enumerate() {
-                let norm = p.f64()?;
-                let alpha = p.f64()?;
-                let zero = p.u64()?;
-                let bits = p.take(self.rq.padded.div_ceil(8))?;
-                if !norm.is_finite()
-                    || norm < 0.
-                    || !alpha.is_finite()
-                    || alpha <= 0.
-                    || alpha > 1.
-                    || zero > 1
-                {
-                    return Err(bad("invalid quantization factors"));
-                }
-                if filter.is_some_and(|f| !f.contains(row)) {
-                    continue;
-                }
-                let e = prepared.estimate(norm, alpha, bits, self.rq.padded);
-                let distance = if self.metric() == Metric::CosineDistance {
-                    if q_zero || zero == 1 {
-                        if q_zero && zero == 1 { 0. } else { 1. }
-                    } else {
-                        (e.distance * 0.5).clamp(0., 2.)
+            let plane = crate::rabitq::PlaneQuery::new(&q_rot, &c.center);
+            let mut rows = c.rows.iter();
+            plane.scan(
+                &bytes,
+                c.rows.len() as usize,
+                compact,
+                self.rq.padded,
+                &mut |ordinal, d, zero| {
+                    let row = rows.next().unwrap_or(u32::MAX);
+                    if filter.is_some_and(|f| !f.contains(row)) {
+                        return;
                     }
-                } else {
-                    e.distance.max(0.)
-                };
-                estimated.push(Candidate {
-                    row,
-                    distance: distance as f32,
-                    cluster: cid as u32,
-                    ordinal: ordinal as u32,
-                });
-            }
+                    let distance = if self.metric() == Metric::CosineDistance {
+                        if q_zero || zero {
+                            if q_zero && zero { 0. } else { 1. }
+                        } else {
+                            (d * 0.5).clamp(0., 2.)
+                        }
+                    } else {
+                        d.max(0.)
+                    };
+                    estimated.push(Candidate {
+                        row,
+                        distance: distance as f32,
+                        cluster: cid as u32,
+                        ordinal: ordinal as u32,
+                    });
+                },
+            )?;
+        }
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            eprintln!(
+                "SCAN clusters={} read={}ms cpu={}ms rows={}",
+                clusters.len(),
+                read_ms,
+                t_cpu.elapsed().as_millis(),
+                estimated.len()
+            );
         }
         Ok(estimated)
+    }
+
+    /// Read each cluster's code block, merging nearby ranges into one request.
+    async fn read_coalesced(&self, clusters: &[usize]) -> Result<Vec<Bytes>> {
+        let ranges: Vec<_> = clusters
+            .iter()
+            .map(|c| self.metadata.clusters[*c].codes.clone())
+            .collect();
+        self.read_merged(ranges, CODE_GAP, CODE_MERGE_MAX).await
+    }
+
+    /// Read `ranges` (in any order), merging ranges whose gap is at most `gap` bytes into one
+    /// read of at most `max` bytes. Returns one `Bytes` per input range, in input order.
+    async fn read_merged(&self, ranges: Vec<Range<u64>>, gap: u64, max: u64) -> Result<Vec<Bytes>> {
+        let mut order: Vec<usize> = (0..ranges.len()).collect();
+        order.sort_unstable_by_key(|i| ranges[*i].start);
+        let mut merged: Vec<Range<u64>> = Vec::new();
+        let mut members: Vec<Vec<usize>> = Vec::new();
+        for i in order {
+            let r = ranges[i].clone();
+            match merged.last_mut() {
+                Some(last)
+                    if r.start <= last.end + gap && r.end.max(last.end) - last.start <= max =>
+                {
+                    last.end = last.end.max(r.end);
+                    members.last_mut().unwrap().push(i);
+                }
+                _ => {
+                    merged.push(r);
+                    members.push(vec![i]);
+                }
+            }
+        }
+        let starts: Vec<u64> = merged.iter().map(|r| r.start).collect();
+        let bytes = read_batch(&self.reader, merged).await?;
+        let mut out = vec![Bytes::new(); ranges.len()];
+        for ((bytes, start), group) in bytes.into_iter().zip(starts).zip(members) {
+            for i in group {
+                let r = &ranges[i];
+                out[i] = bytes.slice((r.start - start) as usize..(r.end - start) as usize);
+            }
+        }
+        Ok(out)
     }
 
     /// Fetch full-precision vectors for `(cluster, ordinal)` locations and return the
@@ -441,7 +525,14 @@ impl<R: RangeRead> Index<R> {
                 offset + (*start * width) as u64..offset + (*end * width) as u64
             })
             .collect();
-        let blocks = read_batch(&self.reader, ranges).await?;
+        let t_read = std::time::Instant::now();
+        let nranges = ranges.len();
+        let rbytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+        let blocks = self
+            .read_merged(ranges, VECTOR_GAP, VECTOR_MERGE_MAX)
+            .await?;
+        let read_ms = t_read.elapsed().as_millis();
+        let t_cpu = std::time::Instant::now();
         let mut result = Vec::with_capacity(locations.len());
         let mut decoded = Vec::with_capacity(self.dims());
         for ((cid, start, end, whole), bytes) in plans.into_iter().zip(blocks) {
@@ -482,6 +573,16 @@ impl<R: RangeRead> Index<R> {
                     .ok_or_else(|| bad("invalid row ordinal"))?;
                 result.push((row, self.metric().distance_unchecked(query, &decoded)));
             }
+        }
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            eprintln!(
+                "RERANK locations={} ranges={} bytes={} read={}ms cpu={}ms",
+                locations.len(),
+                nranges,
+                rbytes,
+                read_ms,
+                t_cpu.elapsed().as_millis()
+            );
         }
         sort_truncate(&mut result, k);
         Ok(result)

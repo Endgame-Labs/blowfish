@@ -69,6 +69,7 @@ pub(crate) async fn search(
         return Ok(None);
     }
     let vector: Arc<[f32]> = vector.into();
+    let t0 = std::time::Instant::now();
     let mut base = state.clone();
     base.docs.clear();
     base.scores.clear();
@@ -116,11 +117,12 @@ pub(crate) async fn search(
                 ))
             }
         }))
-        .buffer_unordered(config.search_concurrency.max(1) * 2);
+        .buffer_unordered((config.search_concurrency.max(1) * 2).max(48));
     while let Some((i, seg)) = loaded.try_next().await? {
         segs[i] = seg;
     }
     drop(loaded);
+    stage(t0, "load segments");
 
     // Flat indexes are tiny and exact. Everything else joins the global probe plan.
     let mut winners: Vec<(f32, usize, u32)> = Vec::new(); // (exact distance, segment, row)
@@ -186,6 +188,7 @@ pub(crate) async fn search(
         }
     }
 
+    stage(t0, "plan");
     // Exact segments: every matching vector is reranked.
     let mut tasks = Vec::new();
     for (i, _) in exact {
@@ -221,6 +224,7 @@ pub(crate) async fn search(
         .try_collect()
         .await?;
     winners.extend(exact_hits.into_iter().flatten());
+    stage(t0, "exact");
     let mut pool: Vec<(usize, Candidate)> = futures::stream::iter(scans)
         .buffer_unordered(limit)
         .try_collect::<Vec<Vec<(usize, Candidate)>>>()
@@ -228,6 +232,7 @@ pub(crate) async fn search(
         .into_iter()
         .flatten()
         .collect();
+    stage(t0, "scan");
     if pool.len() > target {
         pool.select_nth_unstable_by(target, |a, b| {
             a.1.distance
@@ -263,6 +268,7 @@ pub(crate) async fn search(
         .try_collect()
         .await?;
     winners.extend(reranked.into_iter().flatten());
+    stage(t0, "rerank");
 
     // Global top-k by (distance, id), then hydrate only the winners.
     let mut ranked: Vec<(f32, Id, usize, u32)> = winners
@@ -292,5 +298,14 @@ pub(crate) async fn search(
             segment::projected_documents(store, &state.segments[i], &rows, Some(columns)).await?,
         );
     }
+    stage(t0, "hydrate");
     Ok(Some((scores, docs)))
+}
+
+/// `BF_TRACE_STAGES=1` prints elapsed time at each ANN stage (diagnostics only).
+fn stage(t0: std::time::Instant, name: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("BF_TRACE_STAGES").is_some()) {
+        eprintln!("STAGE {name} {} ms", t0.elapsed().as_millis());
+    }
 }

@@ -76,7 +76,7 @@ impl Default for CacheConfig {
             block_size: 1 << 20,
             max_coalesce_blocks: 8,
             coalesce_gap_blocks: 0,
-            fetch_concurrency: 64,
+            fetch_concurrency: 512,
             prefetch_concurrency: 4,
         }
     }

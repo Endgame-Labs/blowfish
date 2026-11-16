@@ -452,6 +452,14 @@ impl Engine {
                     .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
             ),
         };
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            eprintln!(
+                "QUERY snapshot={}ms exec={}ms total={}ms",
+                snapshot_elapsed.as_millis(),
+                execution_elapsed.as_millis(),
+                start.elapsed().as_millis()
+            );
+        }
         let diagnostics = QueryDiagnostics {
             snapshot_elapsed,
             execution_elapsed,
@@ -469,7 +477,11 @@ impl Engine {
         let start = Instant::now();
         let store = self.0.store.clone();
         let config = self.0.config.clone();
+        let t_clone = Instant::now();
         let state = state.clone();
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            eprintln!("CLONE {}ms", t_clone.elapsed().as_millis());
+        }
         let request = request.clone();
         let runtime = tokio::runtime::Handle::current();
         let permit = self

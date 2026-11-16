@@ -411,7 +411,7 @@ impl Wal {
         let identity = Uuid::new_v4();
         let payload = format!("ns/{}/manifest-data/{identity}.json", self.namespace);
         self.store
-            .create_with_id(&payload, serde_json::to_vec(manifest)?, identity)
+            .create_with_id(&payload, encode_manifest(manifest)?, identity)
             .await?;
         let slot = serde_json::to_vec(&serde_json::json!({"payload":payload}))?;
         let result = self
@@ -571,7 +571,7 @@ impl Wal {
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         let manifest =
             if let Some(payload) = value.get("payload").and_then(serde_json::Value::as_str) {
-                serde_json::from_slice(&self.store.get(payload).await?)?
+                decode_manifest(&self.store.get(payload).await?)?
             } else {
                 serde_json::from_value(value)?
             };
@@ -627,5 +627,75 @@ impl<T: Send + 'static, R: Send + 'static> GroupCommit<T, R> {
         result
             .await
             .map_err(|_| ApiError::new(503, "write coordinator unavailable"))
+    }
+}
+
+/// Manifests carry namespace-wide term statistics and can reach megabytes of JSON, which every
+/// cold query downloads. Large ones are zstd-compressed; plain JSON (always starting with `{`)
+/// stays readable, so older manifests and older readers' files keep working.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+const COMPRESS_ABOVE: usize = 64 << 10;
+
+fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, Error> {
+    let json = serde_json::to_vec(manifest)?;
+    if json.len() <= COMPRESS_ABOVE {
+        return Ok(json);
+    }
+    zstd::stream::encode_all(json.as_slice(), 3).map_err(|_| Error::Format)
+}
+
+fn decode_manifest(bytes: &[u8]) -> Result<Manifest, Error> {
+    if bytes.starts_with(&ZSTD_MAGIC) {
+        let json = zstd::stream::decode_all(bytes).map_err(|_| Error::Format)?;
+        return Ok(serde_json::from_slice(&json)?);
+    }
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+#[cfg(test)]
+mod manifest_codec_tests {
+    use super::*;
+
+    fn manifest_with_terms(terms: usize) -> Manifest {
+        let mut text = TextStats::default();
+        for i in 0..terms {
+            text.document_frequencies
+                .insert(format!("term{i:08}"), i as u64);
+        }
+        let mut stats = NamespaceStats::default();
+        stats.text.insert("body".into(), text);
+        Manifest {
+            format_version: 1,
+            schema: Default::default(),
+            distance_metric: DistanceMetric::CosineDistance,
+            id_type: AttributeType::Scalar(bf_types::ScalarType::Uint),
+            created_at: Utc::now(),
+            indexed_through: 7,
+            indexer_epoch: 1,
+            deleted: false,
+            segments: vec![],
+            stats,
+            updated_at: None,
+            retired: vec![],
+            checkpoints: vec![],
+        }
+    }
+
+    #[test]
+    fn large_manifests_are_compressed_and_round_trip() {
+        let big = manifest_with_terms(20_000);
+        let plain = serde_json::to_vec(&big).unwrap();
+        let packed = encode_manifest(&big).unwrap();
+        assert!(packed.len() * 2 < plain.len());
+        assert_eq!(decode_manifest(&packed).unwrap().indexed_through, 7);
+        // Small manifests and legacy plain JSON stay readable as is.
+        let small = encode_manifest(&manifest_with_terms(3)).unwrap();
+        assert_eq!(small[0], b'{');
+        assert_eq!(
+            decode_manifest(&plain).unwrap().stats.text["body"]
+                .document_frequencies
+                .len(),
+            20_000
+        );
     }
 }
