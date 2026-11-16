@@ -16,7 +16,10 @@ CONFIG = pathlib.Path(os.environ.get("SCALE_CONFIG", HERE / "config.local"))
 NS = json.loads(CONFIG.read_text()).get("namespace", "wikipedia-10m")
 URL = "http://127.0.0.1:8300"
 UNIT = "scale-server"
-truth = np.load(HERE / "data/truth.npz")
+# Ground truth is computed by the loader over exactly the rows it loaded; fall back to the
+# checked-in 10M truth when the loader scratch is absent.
+_loaded = SCRATCH / "load/truth.npz"
+truth = np.load(_loaded if _loaded.exists() else HERE / "data/truth.npz")
 TRUTH_KEY = {"ann": "ids", "selective": "selective_ids"}
 
 

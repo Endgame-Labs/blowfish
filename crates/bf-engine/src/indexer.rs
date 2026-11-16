@@ -134,6 +134,9 @@ impl EngineConfig {
         if let Some(v) = number("BF_MAX_UNINDEXED_BYTES") {
             c.max_unindexed_bytes = v;
         }
+        if let Some(v) = number("BF_RETENTION_SECS") {
+            c.retention = Duration::from_secs(v);
+        }
         if let Some(v) = number("BF_ANN_NPROBE") {
             c.ann_nprobe = v as usize;
         }
@@ -626,8 +629,17 @@ impl Engine {
         let shared = crate::branch::protected(&self.0.store).await?;
         candidates.retain(|key| !shared.contains(key));
         // The winner owns no reusable file names. Repeating deletes after a crash is safe.
-        for key in &candidates {
-            self.0.store.delete(key).await.map_err(storage_error)?;
+        // Deletes are independent round trips; run them concurrently so reclaiming
+        // thousands of retired objects does not stall indexing for minutes.
+        let keys: Vec<&String> = candidates.iter().collect();
+        for group in keys.chunks(32) {
+            let mut deletes = Vec::with_capacity(group.len());
+            for key in group {
+                deletes.push(self.0.store.delete(key));
+            }
+            futures::future::try_join_all(deletes)
+                .await
+                .map_err(storage_error)?;
         }
         if through > 0 {
             wal.prune_payloads(through).await.map_err(log_error)?;
