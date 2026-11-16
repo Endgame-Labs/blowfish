@@ -1220,3 +1220,86 @@ turbopuffer). turbopuffer's numbers do not change between milestones except for 
 The milestone table above is at 100K. The 1M rows are the "Parity at 1M" table in the iteration 6 section: overlap@10
 ANN 0.929, BM25 0.990, hybrid 0.969, selective 0.998, broad 0.966; recall@10 ANN 0.942 (turbopuffer 0.938), selective
 1.000 (0.998), broad 0.973 (0.977).
+
+## Iteration 8 (1M docs): BM25 bytes that no longer grow with the data
+
+Third round at 1M (same 1M passages, 200 held-out queries; `scale/` wiped and reloaded twice, the second time with the
+final text format; truth from the loader, parity against `blowfish-oracle-wiki1m` and `bench/scale/data/oracle-1m.npz`).
+Same settings as iteration 7 (1 GiB block cache, nprobe 64, rerank cap 32 x k, strong consistency, cold means a fresh process
+with an empty disk cache, 8 queries per type). R2 latency in this round was noisy (cold ANN, with the same 374 requests,
+ranged from 1,472 ms to 2,656 ms between two sessions an hour apart), so both final-layout sessions are given.
+
+### What changed
+
+1. **Chunked text dictionaries (`bf-text` segment version 3).** Each segment's FST dictionary is cut into chunks of 2,048
+   terms, each its own FST with a crc32, plus an index (first term, offset, length, crc) in the metadata tail. A query reads
+   only the chunks that hold its terms. Document lengths are bit-packed per 128-row block (about 1 byte per row, was 4).
+   Evidence before the change (one cold BM25 query, 15 segments, `BF_TRACE_READS`): 119 FTS reads of 5.9 MB (mostly the
+   whole-segment lengths and dictionaries), 2.3 MB of whole ID indexes, 1.1 MB of docs, 0.6 MB of live masks, 0.13 MB of
+   statistics.
+2. **Chunked corpus statistics (`BFSTAT02`).** FST chunks of 4,096 terms; the chunk index (first term, offset, length, crc
+   per chunk, 8.7 KB at 1M) rides in the manifest, so it is in the snapshot wave and a query reads only the chunks that hold
+   its terms. The legacy whole-object format still reads.
+3. **Snapshot-wave prefetch of query terms.** The open hint keeps each BM25 clause; the warm-up tokenizes it with the
+   manifest's schema, fetches the statistics chunks, and per segment opens the text index and runs the term lookups
+   (dictionary chunks and term records). Hybrid queries no longer wait for statistics before the ANN half.
+4. **ID indexes over 128 KiB** (was 1 MiB) are not read whole by BM25 queries: hits take IDs from the docs file's `id` column.
+5. **Compaction ends bulk loads in a few large segments.** A tier that cannot reach a full group of four under the 200K-row
+   cap now merges its pair, and when no tier is full the smallest sizeable segments (at least an eighth of the cap) merge
+   across tiers. The first reload ended with 15 segments of 40K to 100K rows (the old tier rule never merged them), which
+   cost 488 cold ANN requests and recall 0.934; after the new rule: 9 segments (2K, 20K, 22K, 112K, 144K, 166K, 166K, 172K, 196K).
+
+Tests: `chunked_dictionary_reads_only_the_query_terms_chunks` (bf-text; terms across chunk boundaries, prefixes spanning
+chunks, bytes read under a tenth of the object), `cold_bm25_reads_term_chunks_not_whole_dictionaries` (bf-engine; six
+segments of 9,000 terms each, bytes read about 2 percent of the FTS and statistics bytes and independent of how many
+segments hold other terms), `out_of_line_text_statistics_round_trip_and_restrict_to_query_terms` (three chunks), and
+`compaction_merges_pairs_that_cannot_grow_to_a_full_group`.
+
+### Cold queries at 1M
+
+| | Iteration 7 (session 2) | Iteration 8, session A | Iteration 8, session B |
+| --- | --- | --- | --- |
+| ANN p50 / p90 / p99 ms | 1,118 / 1,233 / 1,250 | 2,656 / 3,885 / 4,138 | 1,472 / 1,954 / 2,614 |
+| BM25 p50 / p90 / p99 ms | 1,212 / 1,274 / 1,347 | 1,666 / 2,613 / 3,469 | 1,329 / 1,599 / 1,764 |
+| Hybrid p50 / p90 / p99 ms | 1,652 / 2,779 / 2,945 | 1,605 / 1,776 / 1,835 | 1,736 / 2,047 / 2,158 |
+| Selective p50 / p90 / p99 ms | 1,699 / 3,039 / 3,533 | 2,474 / 3,098 / 3,287 | 2,070 / 2,691 / 3,246 |
+| GETs / MB: ANN | 375 / 23.5 | 374 / 22.6 | 374 / 22.6 |
+| GETs / MB: BM25 | 126 / 38 | 144 / 6.5 | 144 / 6.5 |
+| GETs / MB: hybrid | 493 / 61 | 507 / 27.9 | 507 / 27.9 |
+| GETs / MB: selective | 1,949 / 43 | 1,899 / 41.9 | 1,899 / 41.9 |
+| Waves (sweep of one traced cold query): ANN, BM25, hybrid, selective | 4, n/a, n/a, n/a | 4, 3, 5, 5 | |
+
+BM25 cold bytes fell 83 percent (38 MB to 6.5 MB, under the 10 MB target) and hybrid bytes 54 percent. Latency did not
+follow in the noisy sessions (the same-session iteration 7 baseline was not available: R2 moved by a factor of two between
+sessions); with requests flat and bytes down, the remaining cold time is round trips, not transfer.
+
+### Warm, recall, and parity
+
+| | Iteration 7 (session 2) | Iteration 8, session B |
+| --- | --- | --- |
+| Warm c1 p50 ms: ANN, BM25, hybrid, selective | 59, 61, 52, 60 | 113, 96, 71, 77 |
+| QPS c1 / c8 / c32: ANN | 15.6 / 70.3 / 78.7 | 8.6 / 48.0 / 54.5 |
+| QPS c1 / c8 / c32: BM25 | 15.2 / 65.5 / 133.5 | 10.7 / 53.4 / 74.1 |
+| Recall@10 vs loader truth: ANN, selective | 0.949, 1.000 | 0.944, 1.000 |
+| Recall@10 vs oracle truth: ANN (tpuf), selective (tpuf), broad (tpuf) | 0.949 (0.939), 1.000 (0.999), 0.978 (0.977) | 0.952 (0.938), 1.000 (0.998), 0.974 (0.977) |
+| Overlap with tpuf: ANN, BM25, hybrid, selective, broad | 0.924, 0.990, 0.965, 0.999, 0.966 | 0.935, 0.990, 0.971, 0.998, 0.963 |
+
+Warm latency was slower this round on the same code paths (the warm query makes one HEAD to R2, so it tracks the network);
+I did not isolate it from the session noise.
+
+### Ingest of 1M (batch 2,000, 16 writes in flight)
+
+| | Iteration 7 | Iteration 8 |
+| --- | --- | --- |
+| Loader wall time, docs/s | 834 s, 1,199 | 903 s, 1,107 (first load: 863 s, 1,158) |
+| 429s | 0 | 0 |
+| Server peak RSS | about 3.1 GB | 5.4 GB (first load, with 3.5 GB less spare cache: 9.6 GB; not investigated) |
+| Segments when the load ends (before compaction) | 21 | 15 |
+
+Ingest did not improve: it is bound by bytes per document through the WAL (item 4 of the brief, not started).
+
+### What is left
+
+See `WORKER_REPORT.md` of this round for the ranked list. In short: selective filters still read about 1,900 ranges in one
+wave (3 s); cold ANN is still 374 requests in 4 waves; per-segment lengths are still read whole at open; the indexer still
+rewrites the whole statistics object per publication; vectors are still stored twice.
