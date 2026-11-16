@@ -74,6 +74,10 @@ impl DirEntry {
     pub fn blob_range(&self) -> Range<u64> {
         self.blob.clone()
     }
+    /// Range of this cluster's full-precision vectors inside its segment's index object.
+    pub fn vectors_range(&self) -> Range<u64> {
+        self.vectors.clone()
+    }
 }
 
 /// One segment's clusters: what a fragment contributes to a directory.

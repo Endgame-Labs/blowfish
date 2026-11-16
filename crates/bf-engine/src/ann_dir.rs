@@ -15,6 +15,8 @@ use std::{
 /// Fetch merged ranges at most this far apart as one request.
 const BLOB_GAP: u64 = 64 << 10;
 const BLOB_MERGE_MAX: u64 = 8 << 20;
+/// Exact-scan vector prefetch is split into concurrent reads of this size.
+const PREFETCH_PIECE: u64 = 1 << 20;
 /// Above this many matching rows, fetching only the matching vectors stops being cheaper
 /// than scanning quantized codes.
 const EXACT_ROWS: usize = 2048;
@@ -324,6 +326,30 @@ pub(crate) async fn search(
             .cloned()
             .collect();
         tasks.push(async move {
+            // An exactly scanned segment needs all of its vectors, and its row sets (from the
+            // blobs) only say which. Read the vectors in parallel with the blobs, as
+            // concurrent pieces, so the later exact scan is served from the cache.
+            let prefetch_ranges: Vec<_> = if exact {
+                seg_entries.iter().map(|e| e.vectors_range()).collect()
+            } else {
+                Vec::new()
+            };
+            let prefetch_reader = reader.clone();
+            let prefetch = async move {
+                let pieces = prefetch_ranges.into_iter().flat_map(|r| {
+                    let mut out = Vec::new();
+                    let mut start = r.start;
+                    while start < r.end {
+                        let end = (start + PREFETCH_PIECE).min(r.end);
+                        out.push(start..end);
+                        start = end;
+                    }
+                    out
+                });
+                // Best effort: a failure here only means the scan reads the range itself.
+                let _ = futures::future::join_all(pieces.map(|r| prefetch_reader.read(r))).await;
+                Ok::<(), ApiError>(())
+            };
             let mut partial = dir.partial_index(i, reader).map_err(segment::index_error)?;
             let ranges: Vec<_> = seg_entries.iter().map(|e| e.blob_range()).collect();
             let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
@@ -343,10 +369,11 @@ pub(crate) async fn search(
                         .map_err(segment::index_error)
                 }
             };
-            let (blobs, codes, ()) = tokio::try_join!(read_blobs, read_codes, async {
-                segment::warm_docs(&store, &segment_meta).await;
-                Ok(())
-            })?;
+            let (blobs, codes, (), ()) =
+                tokio::try_join!(read_blobs, read_codes, prefetch, async {
+                    segment::warm_docs(&store, &segment_meta).await;
+                    Ok(())
+                })?;
             for (cluster, blob) in wanted.iter().zip(&blobs) {
                 partial
                     .install(*cluster, blob)
