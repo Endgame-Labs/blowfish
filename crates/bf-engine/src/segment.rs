@@ -62,7 +62,7 @@ impl ObjectReader {
             .await
             .map_err(io::Error::other)
     }
-    async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+    pub async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
         self.store
             .range_reader_with_length(&self.file.key, self.file.size, true)
             .map_err(io::Error::other)?
@@ -94,6 +94,15 @@ pub(crate) async fn read_whole(store: &Storage, file: &SegmentFile) -> Result<By
         .read(0..file.size)
         .await
         .map_err(index_error)
+}
+
+/// Independent byte ranges of an object, in one batch through the block cache.
+pub(crate) async fn read_ranges(
+    store: &Storage,
+    file: &SegmentFile,
+    ranges: Vec<Range<u64>>,
+) -> io::Result<Vec<Bytes>> {
+    ObjectReader::new(store, file).read_batch(ranges).await
 }
 
 /// Read and cache a docs file's column directory, so hydration needs only the data blocks.
@@ -230,6 +239,7 @@ pub(crate) async fn put_file(
     metadata_len: u64,
 ) -> Result<SegmentFile, ApiError> {
     let file = SegmentFile {
+        stats_index: None,
         key,
         size: bytes.len() as u64,
         metadata_len,

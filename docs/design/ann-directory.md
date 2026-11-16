@@ -185,3 +185,35 @@ that results stay exact with no `.bfi` read.
 The indexer also stopped invalidating the resident tail: a node that publishes a checkpoint adopts it in memory
 (`NamespaceState::fast_forward`, using each tail ID's last-write sequence), and a manifest that republishes the checkpoint
 the node already holds (garbage collection, epoch claims) leaves the tail alone.
+
+## Iteration 8: chunked text dictionaries and corpus statistics
+
+BM25 cold bytes were the last cost in the cold path that grew with the data: each text segment's FST dictionary (about
+2.5 MB per 100K rows) and the whole corpus-statistics FST (5.9 MB at 1M) were read whole by every cold query.
+
+**Text segments, version 3 (`BFTEXT01`, footer version 3).** Layout: postings, term records, dictionary chunks, packed
+lengths, chunk index, footer. The dictionary is cut into chunks of 2,048 consecutive terms; each chunk is its own small FST
+mapping a term to the same `(record offset << 28) | document frequency` handle as version 2. The chunk index (first term,
+offset, length, and crc32 per chunk, about 20 bytes per 2,048 terms plus the first term) sits next to the lengths in the
+metadata tail, so opening a segment is still one tail read. A query binary-searches the index and reads only the chunks that
+hold its terms, in one batch. Prefix queries read the chunks that overlap the prefix range, and Boolean `ContainsAllTokens`
+or fuzzy scans read every chunk (they scanned the whole FST before). Decoded chunks are memoized per reader (64 at most).
+Document lengths are bit-packed per 128-row block (`minimum | bits | packed offsets`), about 1 byte per row instead of 4.
+Versions 1 and 2 still read; older binaries reject version 3 cleanly ("unknown text segment format").
+
+**Corpus statistics (`BFSTAT02`).** The statistics object is a list of FST chunks (4,096 terms each, crc32 per chunk). Its
+chunk index (per field: documents, total length, and `(first term, offset, length, crc)` per chunk) is carried in the
+manifest next to the object reference (`SegmentFile::stats_index`, about 100 bytes per chunk), so it arrives with the
+snapshot and a query range-reads only the chunks that hold its terms. The legacy whole-object format still reads.
+
+**Snapshot-wave prefetch.** The open hint keeps each BM25 clause's query value. In the snapshot wave, the warm-up tokenizes
+it with the manifest's schema, fetches the statistics chunks, and, for each segment, opens the text index and then runs
+`prefetch_plan` (dictionary chunks, then term records). The query proper then finds all of it cached and only reads posting
+blocks and the winning rows' IDs. Hybrid queries no longer wait for statistics before starting the ANN half, because the
+statistics are already cached when `global_stats` runs.
+
+**ID indexes over 128 KiB** (was 1 MiB) are no longer read whole by BM25 queries; hits take their IDs from the `id` column
+of the documents file. A query over many segments already pays that final sequential wave.
+
+Not changed: the indexer still rewrites the whole statistics object on each publication (about 5 MB at 1M, written in
+parallel with the segment uploads). Per-segment lengths are still read whole at open (about 1 byte per row now).

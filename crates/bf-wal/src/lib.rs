@@ -145,6 +145,23 @@ pub struct SegmentFile {
     pub key: String,
     pub size: u64,
     pub metadata_len: u64,
+    /// For a chunked text statistics object: the per-field totals and the key range of each
+    /// chunk, so a query reads only the chunks that hold its terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_index: Option<TextStatsIndex>,
+}
+/// Chunk index of a text statistics object, carried in the manifest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TextStatsIndex {
+    pub fields: std::collections::BTreeMap<String, FieldStatsIndex>,
+}
+/// One field's totals and the chunks of its term frequencies, in term order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FieldStatsIndex {
+    pub documents: u64,
+    pub total_length: u64,
+    /// `(first term, offset, length, crc32)` per chunk.
+    pub chunks: Vec<(String, u64, u32, u32)>,
 }
 /// One immutable segment and its current live-row generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -245,16 +245,16 @@ async fn externalize_text_stats(
         return Ok(());
     }
     let text = std::mem::take(&mut manifest.stats.text);
-    let bytes = crate::text::encode_text_stats(&text)?;
-    manifest.text_stats = Some(
-        segment::put_file(
-            store,
-            format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
-            bytes,
-            0,
-        )
-        .await?,
-    );
+    let (bytes, index) = crate::text::encode_text_stats(&text)?;
+    let mut file = segment::put_file(
+        store,
+        format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
+        bytes,
+        0,
+    )
+    .await?;
+    file.stats_index = Some(index);
+    manifest.text_stats = Some(file);
     Ok(())
 }
 fn adjust<D: std::borrow::Borrow<bf_types::Document>>(
@@ -837,6 +837,12 @@ fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<Strin
         if group.1.saturating_add(seg.row_count as u64) > config.max_segment_rows.max(1) as u64
             || group.2.saturating_add(bytes) > config.max_segment_bytes.max(1)
         {
+            // The group cannot grow to `count` members without passing the caps: merge what it
+            // holds (two or more) rather than leave a tier of half-full segments forever, so a
+            // bulk load ends with a few evenly sized segments.
+            if group.0.len() >= 2 {
+                return group.0.clone();
+            }
             continue;
         }
         group.0.push(seg.id.clone());
@@ -846,7 +852,31 @@ fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<Strin
             return group.0.clone();
         }
     }
-    vec![]
+    // No tier is full. Merge the smallest sizeable segments (at least an eighth of the row cap,
+    // so trickles of small writes do not rewrite big segments) that fit under the caps together,
+    // whatever their tier: the odd-sized tail of a bulk load still ends up in a few large
+    // segments. Segments past half the cap never qualify, so this stops by itself.
+    let floor = (config.max_segment_rows.max(1) / 8) as u32;
+    let mut by_size: Vec<_> = state
+        .segments
+        .iter()
+        .filter(|seg| seg.row_count >= floor)
+        .collect();
+    by_size.sort_by_key(|seg| (seg.row_count, seg.id.clone()));
+    let (mut ids, mut rows, mut bytes) = (Vec::new(), 0u64, 0u64);
+    for seg in by_size {
+        let size = seg.files.values().map(|file| file.size).sum::<u64>();
+        if rows.saturating_add(seg.row_count as u64) > config.max_segment_rows.max(1) as u64
+            || bytes.saturating_add(size) > config.max_segment_bytes.max(1)
+            || ids.len() == count
+        {
+            break;
+        }
+        ids.push(seg.id.clone());
+        rows += seg.row_count as u64;
+        bytes += size;
+    }
+    if ids.len() >= 2 { ids } else { vec![] }
 }
 
 // A segment build owns only one bounded document batch at a time. The WAL overlay
@@ -898,4 +928,45 @@ async fn build_segments<D: std::borrow::Borrow<bf_types::Document> + Clone>(
         out.extend(built);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with(rows: &[u32]) -> NamespaceState {
+        let mut state = NamespaceState::default();
+        for (i, row_count) in rows.iter().enumerate() {
+            state.segments.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{i}"), "wal_start": 0, "wal_end": 0, "row_count": row_count,
+                    "files": {}, "live": {"key": "k", "size": 0, "metadata_len": 0},
+                    "live_generation": 0
+                }))
+                .unwrap(),
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn compaction_merges_pairs_that_cannot_grow_to_a_full_group() {
+        let config = EngineConfig::default();
+        // Four segments of 100K rows would pass the 200K row cap as a group of four, so the
+        // first two merge instead of staying as four half-full segments forever.
+        let state = state_with(&[100_000, 100_000, 100_000, 100_000]);
+        assert_eq!(tier(&state, &config, false), vec!["s0", "s1"]);
+        // A lone segment, or segments already at the cap, stay as they are.
+        assert!(tier(&state_with(&[100_000]), &config, false).is_empty());
+        assert!(tier(&state_with(&[190_000, 190_000]), &config, false).is_empty());
+        // Small segments still merge four at a time.
+        let small = state_with(&[1000, 1100, 1200, 1300, 1400]);
+        assert_eq!(tier(&small, &config, false).len(), 4);
+        // Odd sizes in different tiers merge while their total fits under the cap.
+        let odd = state_with(&[70_000, 90_000, 150_000]);
+        assert_eq!(tier(&odd, &config, false), vec!["s0", "s1"]);
+        // Small ones are left to their own tiers.
+        assert!(tier(&state_with(&[300, 50_000]), &config, false).is_empty());
+        assert!(tier(&state_with(&[110_000, 150_000]), &config, false).is_empty());
+    }
 }

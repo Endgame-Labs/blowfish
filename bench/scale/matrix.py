@@ -14,8 +14,8 @@ SCRATCH = pathlib.Path(os.environ.get("SCALE_SCRATCH", ROOT / ".scratch/scale"))
 OUT = SCRATCH / "out"; OUT.mkdir(parents=True, exist_ok=True)
 CONFIG = pathlib.Path(os.environ.get("SCALE_CONFIG", HERE / "config.local"))
 NS = json.loads(CONFIG.read_text()).get("namespace", "wikipedia-10m")
-URL = "http://127.0.0.1:8300"
-UNIT = "scale-server"
+URL = f"http://127.0.0.1:{os.environ.get('SCALE_PORT', '8300')}"
+UNIT = os.environ.get("SCALE_UNIT", "scale-server")
 # Ground truth is computed by the loader over exactly the rows it loaded; fall back to the
 # checked-in 10M truth when the loader scratch is absent.
 _loaded = SCRATCH / "load/truth.npz"
