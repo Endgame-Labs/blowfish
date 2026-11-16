@@ -81,7 +81,7 @@ Status as of 2026-11-16. Checked boxes are verified, not assumed.
 
 ## Flip
 
-- [ ] Final private-string grep of the tree and history, and the secret-scanner run.
+- [ ] Final private-string grep of the tree and history, and the secret-scanner run. Known hit: one integration hostname reached history in the perfiter9 merge (`bench/scale/parity.sh`, removed in 8af1e32).
 - [ ] Make `dorkitude/blowfish` public, and turn on security advisories and Dependabot.
 - [ ] Tag `v0.1.0`.
 - [ ] Clean up turbopuffer reference namespaces (`blowfish-oracle-wiki*`) and the R2
