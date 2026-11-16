@@ -8,15 +8,18 @@ The fixture suite tests representative behavior, not every combination or every 
 | Namespace writes, row/column upserts, patches, and deletes | Supported | Recorded write scenarios |
 | Conditional writes, filter mutations, and `$ref_new` | Supported | Recorded condition and filter scenarios |
 | Copy within a deployment | Supported | Recorded copy and async-copy scenarios |
-| Branch, cross-deployment copy, and customer encryption | Unsupported | Design §2.2 |
+| Namespace branching | Supported | Recorded branch scenario |
+| Cross-deployment copy and customer-managed encryption | Unsupported | Clear 400; Design §2.2 |
 | Scalar and array attributes, UUID, datetime, bytes, and dense float vectors | Supported | Type round-trip scenarios |
-| Sparse, integer, and multi-vector search | Unsupported | Design §2.3 |
+| Sparse vectors and int8 vectors | Supported | Recorded sparse and i8 scenarios |
+| Multi-vector (vector-array) ANN | Matches turbopuffer's gated response | turbopuffer gates it per organization; blowfish returns the same 400 |
 | ANN, exact vector search, BM25, and scoring expressions | Supported | ANN, BM25, and score scenarios |
 | Attribute ordering, filters, and token filters | Supported | Ordering and filter scenarios |
-| Regex and fuzzy filters | Unsupported | Design §2.4 |
+| Regex, glob, and fuzzy filters, and highlighting | Supported | Recorded regex, glob, fuzzy, and highlight scenarios |
 | Aggregation, grouping, result projection, and pagination | Supported | Aggregate, include, exclude, and export scenarios |
 | Multi-query | Supported | Recorded multi-query scenario |
-| Reranking and computed attributes | Partial | See unsupported forms in Design §2.4 |
+| Reranking and computed attributes | Partial | Model-based `rerank_by` (hosted reranker models) is unsupported, with a clear 400 |
+| Native embedding (`Embed` configuration and expressions) | Unsupported | Bring your own vectors; clear 400 |
 | Strong and eventual consistency | Supported | Recorded eventual scenario and engine tests |
 | Metadata, schema, namespace list/delete, warming, recall, and explain | Supported | Recorded endpoint scenarios |
 | Metadata pinning | Partial | Pinning is advisory |
