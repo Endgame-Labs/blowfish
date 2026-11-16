@@ -89,8 +89,8 @@ impl Default for EngineConfig {
             max_unindexed_bytes: 2_000_000_000,
             eventual_tail_bytes: 128 * 1024 * 1024,
             build_concurrency: 2,
-            ann_nprobe: 512,
-            ann_rerank_factor: 64,
+            ann_nprobe: 64,
+            ann_rerank_factor: 32,
             recall_sample_rate: 0.01,
         }
     }

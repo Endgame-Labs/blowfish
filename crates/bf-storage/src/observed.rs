@@ -65,6 +65,10 @@ impl ObjectStore for Observed {
             "get"
         };
         let head = opts.head;
+        let range_dbg = match &opts.range {
+            Some(object_store::GetRange::Bounded(r)) => Some((r.start, r.end)),
+            _ => None,
+        };
         let start = Instant::now();
         let result = async {
             let result = self.0.get_opts(path, opts).await?;
@@ -91,6 +95,20 @@ impl ObjectStore for Observed {
             ))
         }
         .await;
+        if op != "head" && trace_reads() {
+            let (a, b) = range_dbg.unwrap_or((0, 0));
+            eprintln!(
+                "TRACE_READ {} {} {} {} {} {}",
+                path,
+                a,
+                b,
+                result.as_ref().map_or(0, |(_, len)| *len),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis()),
+                start.elapsed().as_millis()
+            );
+        }
         record(
             op,
             start,
@@ -149,4 +167,10 @@ impl ObjectStore for Observed {
         record("copy", start, &result, 0);
         result
     }
+}
+
+/// `BF_TRACE_READS=1` prints one line per backend read (diagnostics only).
+fn trace_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BF_TRACE_READS").is_some())
 }
