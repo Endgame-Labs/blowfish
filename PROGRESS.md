@@ -4,6 +4,14 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Perf iteration 4 merged (100K): namespace ANN directory.**
+  - **Changes:** a persisted leaf directory per publication, referenced from the manifest. Cold unfiltered ANN opens no segment index: 3 waves in a 20-segment test. Reranking is error-bounded, and hydration reads the docs `id` column instead of the ID index.
+  - **Cold p50:** ANN 1,937 → about 900 ms (old path in the same session: 1,160 ms); BM25 1,415 → 725 ms; hybrid 2,167 → 1,080 ms; selective 1,616 → 1,172 ms.
+  - **Requests:** cold ANN GETs per query 240 → 129.
+  - **Ingest:** 616-655 → 798-920 docs/s, with 0 429s.
+  - **Recall and parity:** recall@10 0.984, parity ANN overlap 0.962. The old path scores the same on this reload.
+  - **Open:** filtered ANN still uses the per-segment path; directory centers are int8 (about 1 KB per leaf); directory rebuilds reopen segments; ID indexes are still read whole on upserts.
+
 - **turbopuffer reference at 1M and 10M loaded.** These are kept namespaces for later blowfish comparisons at the same sizes.
   - **Recall@10 for turbopuffer:** ANN 0.938 at 1M and 0.943 at 10M; selective 0.998 and 0.993; broad 0.977 and 0.971.
   - **Server p50:** about 12 ms at 1M, all hot. At 10M, 53-172 ms across query types, mostly warm, with tails of 300-900 ms.
