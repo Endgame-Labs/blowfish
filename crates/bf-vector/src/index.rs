@@ -584,6 +584,74 @@ impl<R: RangeRead> Index<R> {
         order
     }
 
+    /// Exact top-k over rows given as `(cluster, ordinal, row)`; only those vectors are read.
+    /// Row checksums are not available for a partial index, so vectors are not verified.
+    pub(crate) async fn exact_at(
+        &self,
+        query: &[f32],
+        k: usize,
+        mut locations: Vec<(u32, u32, u32)>,
+    ) -> Result<Vec<(u32, f32)>> {
+        validate(query, self.dims())?;
+        if k == 0 || locations.is_empty() {
+            return Ok(vec![]);
+        }
+        locations.sort_unstable();
+        let width = self.dims() * self.vector_type().width();
+        let mut ranges: Vec<Range<u64>> = Vec::with_capacity(locations.len());
+        for &(cid, ordinal, _) in &locations {
+            let c = self
+                .metadata
+                .clusters
+                .get(cid as usize)
+                .ok_or_else(|| bad("cluster outside segment"))?;
+            let at = c.vectors.start + u64::from(ordinal) * width as u64;
+            if at + width as u64 > c.vectors.end {
+                return Err(bad("vector ordinal outside cluster"));
+            }
+            match ranges.last_mut() {
+                Some(last) if last.end == at => last.end += width as u64,
+                _ => ranges.push(at..at + width as u64),
+            }
+        }
+        let blocks = self
+            .read_merged(ranges.clone(), VECTOR_GAP, VECTOR_MERGE_MAX)
+            .await?;
+        let mut result = Vec::with_capacity(locations.len());
+        let mut decoded = Vec::with_capacity(self.dims());
+        let mut next = locations.iter();
+        for (range, bytes) in ranges.iter().zip(blocks) {
+            for i in 0..(range.end - range.start) as usize / width {
+                let &(_, _, row) = next.next().ok_or_else(|| bad("location count mismatch"))?;
+                let vbytes = &bytes[i * width..(i + 1) * width];
+                decoded.clear();
+                match self.vector_type() {
+                    VectorType::I8 => decoded.extend(vbytes.iter().map(|x| *x as i8 as f32)),
+                    VectorType::F32 => decoded.extend(
+                        vbytes
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|x| f32::from_le_bytes(*x)),
+                    ),
+                    VectorType::F16 => decoded.extend(
+                        vbytes
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|x| half::f16::from_le_bytes(*x).to_f32()),
+                    ),
+                }
+                if decoded.iter().any(|x| !x.is_finite()) {
+                    return Err(bad("non-finite stored vector"));
+                }
+                result.push((row, self.metric().distance_unchecked(query, &decoded)));
+            }
+        }
+        sort_truncate(&mut result, k);
+        Ok(result)
+    }
+
     async fn rerank(
         &self,
         query: &[f32],

@@ -385,8 +385,20 @@ pub(crate) async fn build(
                 .map(|(i, v)| Ok((i, bf_types::decode_vector(v)?)))
                 .collect::<Result<Vec<_>, ApiError>>()?;
             let metric = vector_metric(metric);
+            // Leaf clusters default to sqrt(rows). `BF_IVF_CLUSTER_FACTOR` (a number above 1)
+            // makes them that many times larger, which cuts the requests a probe needs.
+            let factor: f64 = std::env::var("BF_IVF_CLUSTER_FACTOR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|f| *f >= 1.0)
+                .unwrap_or(1.0);
             let job = tokio::task::spawn_blocking(move || {
+                let params = bf_vector::BuildParams {
+                    clusters: Some(((vectors.len() as f64).sqrt() / factor).ceil() as usize),
+                    ..Default::default()
+                };
                 bf_vector::IndexBuilder::new(dimensions, metric)?
+                    .params(params)
                     .vector_type(dtype)
                     .build(&vectors)
             });

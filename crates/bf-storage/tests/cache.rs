@@ -298,6 +298,7 @@ async fn disk_reopens_evicts_and_isolates_backend_namespaces() {
         .range_reader_with_length("object", data.len() as u64, false)
         .unwrap();
     reader.read(0..192).await.unwrap(); // Three 104-byte files; only two fit.
+    store.flush_cache().await;
     assert!(
         Storage::from_backend_with_cache(
             backend.clone(),
@@ -369,6 +370,7 @@ async fn corrupt_disk_blocks_fall_back_to_source() {
         .range_reader_with_length("object", data.len() as u64, false)
         .unwrap();
     reader.read(0..64).await.unwrap();
+    store.flush_cache().await;
     let subdir = std::fs::read_dir(dir.path())
         .unwrap()
         .next()

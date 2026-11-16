@@ -17,6 +17,8 @@ pub(crate) struct OpenHint {
     ann: BTreeSet<String>,
     text: BTreeSet<String>,
     docs: bool,
+    /// Filters of ANN sub-queries: their per-segment bitmaps are opened in the snapshot wave.
+    filters: Vec<Filter>,
 }
 impl OpenHint {
     pub(crate) fn for_request(
@@ -28,6 +30,7 @@ impl OpenHint {
             ann: BTreeSet::new(),
             text: BTreeSet::new(),
             docs: false,
+            filters: Vec::new(),
         };
         for q in request
             .queries
@@ -41,6 +44,7 @@ impl OpenHint {
                     ..
                 }) => {
                     hint.ann.insert(attribute.clone());
+                    hint.filters.extend(q.filters.clone());
                 }
                 Some(rank) => {
                     let mut clauses = vec![];
@@ -67,6 +71,7 @@ impl OpenHint {
         segments: &[bf_wal::Segment],
         text: Option<&bf_wal::SegmentFile>,
         dirs: &BTreeMap<String, bf_wal::SegmentFile>,
+        schema: &Schema,
     ) {
         let context = self.context.clone();
         crate::read_cache::scope(context, async {
@@ -78,10 +83,37 @@ impl OpenHint {
                 .all(|a| dirs.contains_key(&format!("ann:{a}")));
             for attribute in &self.ann {
                 if let Some(file) = dirs.get(&format!("ann:{attribute}")) {
-                    tasks.push(crate::ann_dir::load(store, file).map_ok(drop).boxed());
+                    let filtered = !self.filters.is_empty();
+                    tasks.push(
+                        async move {
+                            let dir = crate::ann_dir::load(store, file).await?;
+                            if filtered {
+                                // Filtered queries also need each segment's row-to-cluster map.
+                                crate::ann_dir::memberships(store, segments, &dir, attribute)
+                                    .await?;
+                            }
+                            Ok(())
+                        }
+                        .boxed(),
+                    );
                 }
             }
             for seg in segments {
+                if by_dir {
+                    for f in &self.filters {
+                        // Populate the cache with the live mask and the filter's dictionary
+                        // blocks; the query recomputes the (cheap) bitmap from them.
+                        tasks.push(
+                            async move {
+                                let live = segment::live(store, seg).await?;
+                                segment::filter_rows(store, seg, f, schema, &live)
+                                    .await
+                                    .map(drop)
+                            }
+                            .boxed(),
+                        );
+                    }
+                }
                 for attribute in self.ann.iter().filter(|_| !by_dir) {
                     if let Some(file) = seg.files.get(&format!("ann:{attribute}")) {
                         tasks.push(segment::vector_index(store, file).map_ok(drop).boxed());
@@ -89,11 +121,19 @@ impl OpenHint {
                 }
                 for attribute in &self.text {
                     if let Some(file) = seg.files.get(&format!("fts:{attribute}")) {
-                        tasks.push(segment::text_index(store, file).map_ok(drop).boxed());
+                        tasks.push(
+                            timed("text_index", segment::text_index(store, file))
+                                .map_ok(drop)
+                                .boxed(),
+                        );
                     }
                 }
                 if (!self.ann.is_empty() && !by_dir) || !self.text.is_empty() {
-                    tasks.push(segment::ids(store, seg).map_ok(drop).boxed());
+                    tasks.push(
+                        timed("ids", segment::ids(store, seg))
+                            .map(|r| r.map(drop))
+                            .boxed(),
+                    );
                     tasks.push(
                         segment::get_value::<RoaringBitmap>(store, &seg.live)
                             .map_ok(drop)
@@ -108,7 +148,7 @@ impl OpenHint {
                 && let Some(file) = text
             {
                 tasks.push(
-                    crate::text::warm_corpus(store, file)
+                    timed("corpus", crate::text::warm_corpus(store, file))
                         .map(|()| Ok(()))
                         .boxed(),
                 );
@@ -117,6 +157,16 @@ impl OpenHint {
         })
         .await;
     }
+}
+
+/// `BF_TRACE_STAGES=1` prints how long each warm-up task took (diagnostics only).
+async fn timed<T>(label: &'static str, fut: impl std::future::Future<Output = T>) -> T {
+    let start = Instant::now();
+    let out = fut.await;
+    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+        eprintln!("WARM {label} {} ms", start.elapsed().as_millis());
+    }
+    out
 }
 
 pub(crate) async fn catch_up(
@@ -187,7 +237,12 @@ pub(crate) async fn catch_up_hinted(
             // The checkpoint's files do not depend on the tail: open them meanwhile.
             let (segments, text) = (state.segments.clone(), state.text_stats.clone());
             let dirs = state.ann_dirs.clone();
-            tokio::join!(tail, hint.warm(store, &segments, text.as_ref(), &dirs)).0
+            let schema = state.schema.clone();
+            tokio::join!(
+                tail,
+                hint.warm(store, &segments, text.as_ref(), &dirs, &schema)
+            )
+            .0
         } else {
             tail.await
         };

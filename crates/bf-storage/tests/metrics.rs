@@ -109,6 +109,7 @@ async fn facade_reports_bytes_hits_evictions_errors_and_lifetimes() {
         .unwrap();
     let stats = CacheStats::default();
     reader.read_with_stats(0..64, &stats).await.unwrap();
+    store.flush_cache().await;
     assert_eq!(stats.temperature(), "cold");
     assert_eq!(
         capture.number("blowfish_cache_bytes", &[("tier", "memory")]),
@@ -124,6 +125,7 @@ async fn facade_reports_bytes_hits_evictions_errors_and_lifetimes() {
         1.0
     );
     reader.read(64..256).await.unwrap();
+    store.flush_cache().await;
     assert!(capture.number("blowfish_cache_evictions_total", &[("tier", "memory")]) >= 3.0);
     assert_eq!(
         capture.number("blowfish_cache_evictions_total", &[("tier", "disk")]),

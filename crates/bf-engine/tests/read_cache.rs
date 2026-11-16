@@ -647,3 +647,101 @@ async fn directory_cost_and_publication_do_not_grow_with_segment_count() {
         assert!(*bfd <= 1, "batch {batch} read {bfd} directories");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_ann_uses_the_directory_without_opening_id_indexes() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    let vector = |id: usize| -> Vec<f32> {
+        (0..64)
+            .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+            .collect()
+    };
+    for batch in 0..12usize {
+        let docs: Vec<_> = (0..400)
+            .map(|n| {
+                let id = batch * 400 + n;
+                json!({"id":id,"vector":vector(id),"tag":(id % 50) as i64})
+            })
+            .collect();
+        writer
+            .write(
+                "filt",
+                serde_json::from_value(json!({
+                    "schema":{"tag":{"type":"int","filterable":true}},
+                    "distance_metric":"euclidean_squared","upsert_rows":docs
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.index_namespace("filt", true).await.unwrap();
+    }
+    let distance = |id: usize| -> f32 {
+        vector(id)
+            .iter()
+            .zip(vector(123))
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum()
+    };
+    // (filter, whether the filtered set is small enough to need an exact answer)
+    for (filter, tag_ok, exact) in [
+        (
+            json!(["tag", "Eq", 7]),
+            (|t: usize| t == 7) as fn(usize) -> bool,
+            true,
+        ),
+        (json!(["tag", "Lt", 25]), |t: usize| t < 25, false),
+    ] {
+        let mut expected: Vec<_> = (0..4800).filter(|id| tag_ok(id % 50)).collect();
+        expected.sort_by(|a, b| distance(*a).total_cmp(&distance(*b)));
+        expected.truncate(10);
+        // The exact route fetches every allowed row; with a zero budget the second filter
+        // goes through code scans of the nearest clusters instead.
+        let engine = Engine::with_config(
+            store(backend.clone()).await,
+            EngineConfig {
+                exact_fetch_rows: if exact { 8192 } else { 0 },
+                ..config()
+            },
+        );
+        backend.waves.store(0, Ordering::SeqCst);
+        backend.paths.lock().unwrap().clear();
+        backend.delay.store(true, Ordering::SeqCst);
+        let request = serde_json::from_value(json!({
+            "rank_by":["vector","ANN",vector(123)],"top_k":10,"filters":filter
+        }))
+        .unwrap();
+        let result = engine.query("filt", request).await.unwrap();
+        backend.delay.store(false, Ordering::SeqCst);
+        let got: Vec<usize> = result
+            .result
+            .rows
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_u64().unwrap() as usize)
+            .collect();
+        assert!(got.iter().all(|id| tag_ok(id % 50)), "{got:?}");
+        let hits = got.iter().filter(|id| expected.contains(id)).count();
+        assert!(
+            if exact { hits == 10 } else { hits >= 9 },
+            "{filter}: {hits} of 10, got {got:?} want {expected:?}"
+        );
+        let reads: Vec<String> = backend
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert!(
+            !reads.iter().any(|p| p.contains(".bfi")),
+            "filtered ANN read an ID index: {reads:?}"
+        );
+        assert!(backend.waves.load(Ordering::SeqCst) <= 5);
+    }
+}

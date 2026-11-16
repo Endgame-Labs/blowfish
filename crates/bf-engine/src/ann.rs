@@ -68,24 +68,65 @@ pub(crate) async fn search(
     if state.segments.iter().any(|s| !s.files.contains_key(&key)) {
         return Ok(None);
     }
+    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+        eprintln!(
+            "ANN snapshot: segments={} shadowed={} directories={:?} tail_docs={}",
+            state.segments.len(),
+            state.shadowed.len(),
+            state.ann_dirs.keys().collect::<Vec<_>>(),
+            state.docs.len()
+        );
+    }
     // `BF_ANN_DIRECTORY=0` forces the per-segment path (A/B measurements only).
     static DIRECTORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DIRECTORY.get_or_init(|| std::env::var("BF_ANN_DIRECTORY").is_ok_and(|v| v == "0")) {
         // fall through
-    } else if q.filters.is_none()
-        && state.shadowed.is_empty()
+    } else if state.shadowed.is_empty()
         && let Some(file) = state.ann_dirs.get(&key)
     {
-        let (dir, lives) = tokio::try_join!(
+        // Filtered queries compute each segment's allowed rows (live rows that pass the filter)
+        // alongside the directory, and read each segment's row-to-cluster map, so the
+        // directory ranks clusters by their allowed rows without opening any segment's index
+        // or ID index.
+        let (dir, lives) = tokio::join!(
             crate::ann_dir::load(store, file),
-            crate::ann_dir::live_masks(store, state)
-        )?;
-        if crate::ann_dir::covers(&dir, &state.segments, attribute) {
-            return crate::ann_dir::search(
-                store, state, dir, lives, vector, config, k, columns, attribute,
-            )
-            .await
-            .map(Some);
+            crate::ann_dir::live_masks(store, state, q.filters.as_ref())
+        );
+        // A directory in an unknown (older) format is ignored: queries open each segment.
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            match &dir {
+                Ok(d) => eprintln!(
+                    "DIRECTORY covers={} dir_segments={} state_segments={}",
+                    crate::ann_dir::covers(d, &state.segments, attribute),
+                    d.segments().len(),
+                    state.segments.len()
+                ),
+                Err(e) => eprintln!("DIRECTORY unusable: {e:?}"),
+            }
+        }
+        let lives = if dir.is_ok() { Some(lives?) } else { None };
+        if let (Ok(dir), Some(lives)) = (dir, lives)
+            && crate::ann_dir::covers(&dir, &state.segments, attribute)
+        {
+            let members = if q.filters.is_some() {
+                let members =
+                    crate::ann_dir::memberships(store, &state.segments, &dir, attribute).await?;
+                // A segment whose fragment predates the maps cannot take a filter.
+                dir.segments()
+                    .iter()
+                    .zip(&members)
+                    .all(|(s, m)| s.flat || m.is_some())
+                    .then_some(members)
+            } else {
+                None
+            };
+            if q.filters.is_none() || members.is_some() {
+                return crate::ann_dir::search(
+                    store, state, dir, lives, vector, config, k, columns, attribute, members,
+                )
+                .await
+                .map(Some);
+            }
         }
     }
     let vector: Arc<[f32]> = vector.into();

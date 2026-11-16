@@ -1,5 +1,7 @@
 //! One-bit directory centers rank clusters like exact centers do, and fragments round-trip.
-use bf_vector::{BuildParams, Bytes, Directory, Fragment, Index, IndexBuilder, Metric};
+use bf_vector::{
+    BuildParams, Bytes, Directory, Fragment, Index, IndexBuilder, Membership, Metric, RoaringBitmap,
+};
 
 fn rows(n: usize, dims: usize, salt: usize) -> Vec<(u32, Vec<f32>)> {
     (0..n)
@@ -72,4 +74,47 @@ async fn one_bit_centers_rank_clusters_and_fragments_round_trip() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn membership_gives_exact_cluster_counts_and_vector_locations() {
+    let dims = 64;
+    let builder = IndexBuilder::new(dims, Metric::EuclideanSquared)
+        .unwrap()
+        .params(BuildParams {
+            flat_threshold: 64,
+            ..BuildParams::default()
+        });
+    let data = rows(3000, dims, 5);
+    let blob = builder.build(&data).unwrap();
+    let (fragment, meta) = Fragment::build(&blob).unwrap();
+    let frag = Fragment::decode(&fragment[..meta as usize]).unwrap();
+    let bytes = Directory::build(&[("s".into(), "k".into(), "f".into(), frag)])
+        .unwrap()
+        .unwrap();
+    let dir = Directory::decode(&bytes).unwrap();
+    let seg = &dir.segments()[0];
+    let range = seg.membership.clone().expect("map for a clustered segment");
+    let membership = Membership::decode(
+        &fragment[range.start as usize..range.end as usize],
+        seg.rows,
+        seg.clusters,
+    )
+    .unwrap();
+    let index = Index::open(Bytes::from(blob.clone())).await.unwrap();
+    let allowed: RoaringBitmap = (0..3000u32).filter(|r| r % 7 == 3).collect();
+    let counts = membership.counts(&allowed, seg.clusters);
+    assert_eq!(counts.iter().map(|c| *c as u64).sum::<u64>(), allowed.len());
+    assert_eq!(counts, index.cluster_counts(Some(&allowed)));
+    // Exact ranking from locations equals the index's own exact search over the same rows.
+    let query = rows(1, dims, 11)[0].1.clone();
+    let expected = index
+        .exact_search(&query, 10, Some(&allowed))
+        .await
+        .unwrap();
+    let partial = dir.partial_index(0, Bytes::from(blob)).unwrap();
+    let locations = membership.locations(&allowed, |_| true);
+    assert_eq!(locations.len() as u64, allowed.len());
+    let got = partial.exact_at(&query, 10, locations).await.unwrap();
+    assert_eq!(got, expected);
 }

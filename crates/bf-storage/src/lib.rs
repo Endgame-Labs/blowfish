@@ -333,6 +333,10 @@ impl Storage {
             last_modified: m.last_modified,
         })
     }
+    /// Wait for disk-cache writes that were started behind reads (they never delay a read).
+    pub async fn flush_cache(&self) {
+        self.0.cache.flush().await;
+    }
     /// Replace an object. Only heartbeats and explicit mutable system objects should use this.
     pub async fn put(&self, key: &str, value: impl Into<Bytes>) -> Result<(), Error> {
         self.writable()?;

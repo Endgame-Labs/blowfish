@@ -198,6 +198,13 @@ pub(crate) struct RangeCache {
     planning: AsyncMutex<Planning>,
     fetches: Semaphore,
     prefetches: Arc<Semaphore>,
+    /// Disk writes started behind reads and not yet finished.
+    spills: Arc<Spills>,
+}
+#[derive(Default)]
+struct Spills {
+    pending: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
 }
 impl RangeCache {
     pub(crate) async fn open(config: CacheConfig) -> Result<Self, Error> {
@@ -243,6 +250,7 @@ impl RangeCache {
         Ok(Self {
             fetches: Semaphore::new(config.fetch_concurrency),
             prefetches: Arc::new(Semaphore::new(config.prefetch_concurrency)),
+            spills: Arc::default(),
             config,
             memory,
             disk,
@@ -315,6 +323,23 @@ impl RangeCache {
         }
         found
     }
+    /// Wait until every disk write started behind a read has finished.
+    pub(crate) async fn flush(&self) {
+        loop {
+            let idle = self.spills.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self
+                .spills
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return;
+            }
+            idle.await;
+        }
+    }
     fn insert_memory(&self, key: BlockKey, value: Bytes) {
         if value.len() as u64 > self.config.memory_bytes || self.config.memory_bytes == 0 {
             return;
@@ -322,15 +347,6 @@ impl RangeCache {
         // The planner and single-flight reservations guarantee one insertion per block.
         metrics::gauge!("blowfish_cache_bytes", "tier" => "memory").increment(value.len() as f64);
         self.memory.insert(key, value);
-    }
-    async fn insert(&self, key: BlockKey, value: Bytes) {
-        self.insert_memory(key.clone(), value.clone());
-        if let Some(disk) = self.disk.clone() {
-            let name = self.disk_key(&key);
-            // A full or damaged cache never makes source-of-truth reads fail.
-            let _ = tokio::task::spawn_blocking(move || disk.lock().unwrap().insert(&name, &value))
-                .await;
-        }
     }
 }
 impl Drop for RangeCache {
@@ -482,13 +498,50 @@ impl RangeReader {
                     return Err(Arc::new(Error::Config("short object-store range response")));
                 }
                 let mut values = Vec::with_capacity(indices.len());
+                // At most MAX_SPILLS disk writes wait at once: on a cold cache the disk is slower
+                // than the network, and an unbounded backlog would hold every fetched block in
+                // memory. A skipped write only means that block is fetched again later.
+                const MAX_SPILLS: usize = 16;
+                let spilling = cache.disk.is_some()
+                    && cache
+                        .spills
+                        .pending
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        < MAX_SPILLS;
+                let mut spill = Vec::new();
                 for index in indices {
                     let begin = ((index - first) * size) as usize;
                     let end = bytes.len().min(begin + size as usize);
                     // Independent allocations keep a single cached block from pinning a whole GET.
                     let value = Bytes::copy_from_slice(&bytes[begin..end]);
-                    cache.insert(reader.block_key(index), value.clone()).await;
+                    let key = reader.block_key(index);
+                    if spilling {
+                        spill.push((cache.disk_key(&key), value.clone()));
+                    }
+                    cache.insert_memory(key, value.clone());
                     values.push(value);
+                }
+                // The disk tier is written behind the read: a block-by-block write that the
+                // read awaited cost about a millisecond per 4 KB block, which made a cold 2 MB
+                // read take half a second after the network transfer had finished.
+                if let Some(disk) = cache.disk.clone().filter(|_| spilling) {
+                    let spills = cache.spills.clone();
+                    spills
+                        .pending
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::task::spawn_blocking(move || {
+                        {
+                            let mut disk = disk.lock().unwrap();
+                            for (name, value) in spill {
+                                // A full or damaged cache never makes source-of-truth reads fail.
+                                let _ = disk.insert(&name, &value);
+                            }
+                        }
+                        spills
+                            .pending
+                            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        spills.idle.notify_waiters();
+                    });
                 }
                 // Apply pending evictions once per coalesced fetch, so memory stays within
                 // budget without paying for maintenance on every block.
