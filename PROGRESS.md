@@ -2,6 +2,28 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-16
+
+- **Perf iteration 1 merged (measured on 4.86M docs on R2).**
+  - **Cross-segment ANN:** instead of running IVF in every segment, it ranks cluster centers across all
+    segments, scans only the globally nearest clusters, and reranks one merged pool. Default nprobe is now
+    512, chosen from a recall sweep at 10M.
+  - **Block cache:** lock-free and batched, with CRC blocks and exact-size reads.
+  - **Decoded-metadata cache:** charges resident size.
+  - **Auth:** rare key refresh when auth is disabled.
+  - **Ingest:** pipelined builds and multipart uploads, and a skipped catch-up LIST before commits.
+  - **Harness:** a reusable `bench/scale/`.
+  - **Warm results:**
+    - BM25 is 82 ms p50 (was 4.45 s).
+    - ANN is about 255-321 ms (was 1.24 s), with recall@10 0.98-0.99.
+  - **Cold results:**
+    - ANN is 27.7 s with 5,067 R2 requests and 419 MB per query (was 44.6 s and about 30,000 requests).
+    - Hybrid is 6,752 requests per query (was about 20,200).
+  - **Ingest:** about 600 docs/s.
+  - **Checks:** clippy, 158 tests, and compat 121/121 in both modes.
+  - **Next:** iteration 2 at 500K, with inner loops at 100K. Targets are cold bytes and requests per query,
+    warm ANN CPU, and WAL commit serialization.
+
 ## 2026-11-15
 
 - **10M-document R2 baseline merged (iteration 0).** 10M real Wikipedia passages with 1024-dim
