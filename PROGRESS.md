@@ -4,6 +4,11 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **turbopuffer reference at 1M and 10M loaded.** These are kept namespaces for later blowfish comparisons at the same sizes.
+  - **Recall@10 for turbopuffer:** ANN 0.938 at 1M and 0.943 at 10M; selective 0.998 and 0.993; broad 0.977 and 0.971.
+  - **Server p50:** about 12 ms at 1M, all hot. At 10M, 53-172 ms across query types, mostly warm, with tails of 300-900 ms.
+  - **BM25 IDF:** the constant +0.169 offset from 100K doesn't reappear at 1M or 10M. Only the rarest terms differ much, so it isn't a document-count factor.
+  - **Tooling:** `oracle_compare.py` gained `--tpuf-only`, `--data`, and `--cold-probe`. New: `make_oracle_truth.py` and `bm25_idf_tpuf_only.py`. Details are in `docs/benchmarks.md`.
 - **Perf iteration 3 merged (100K).**
   - **Changes:**
     - The manifest slot is inline (13 KB, down from 867 KB), and term statistics moved to an FST object.
