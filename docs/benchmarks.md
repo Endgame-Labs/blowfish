@@ -700,3 +700,67 @@ The 121-case compatibility suite passes in both normal mode and forced indexing
 mode (`BF_INDEX_ROWS=1`, `BF_INDEX_AGE_MS=1`, and `BF_INDEX_INTERVAL_MS=50`), against
 an isolated local file-store server built from commit `736162f`. No oracle or
 production namespaces were used for these checks.
+
+## turbopuffer reference (100K)
+
+The real turbopuffer holds the same 100K documents (the first 100K English Wikipedia passages, 1024-dim f16, the same
+200 held-out passages excluded) in one long-lived namespace, `blowfish-oracle-wiki100k`. It was loaded with
+`crates/bf-engine/examples/scale_load.py` pointed at turbopuffer, using the same schema as the blowfish load (the
+loader now sends the vector attribute as `{"type": "[1024]f16", "ann": true}`, which both services accept; the real
+service requires `ann`). The dataset never changes, so every speed milestone reuses it.
+
+Run `bench/scale/oracle_compare.py` (see its docstring) with `TPUF_URL` set to the turbopuffer base URL. It runs 200
+held-out queries per type (ANN, BM25, hybrid ANN plus BM25 with RRF, selective filtered ANN, and broad filtered ANN,
+all `top_k` 10, strong consistency) once against each side, alternating per query. Ground truth for recall is the exact
+cosine top-10 computed by the loader (checked in as `bench/scale/data/oracle-100k.npz`); BM25 and hybrid have no exact
+truth, so they only have parity numbers. Overlap divides by the larger result size, because a rare BM25 term can match
+fewer than 10 documents.
+
+Reading the numbers: turbopuffer requests go through a proxy and over the internet, so its client latency includes
+that path, while `server_total_ms` does not. turbopuffer cannot be forced cold, so the table records the cache
+temperature it reports. Blowfish was warmed with one unmeasured pass and is a local process (the 100K `scale/`
+namespace, read-only, 256 MiB block cache, 128 MiB decoded-metadata cache, default nprobe 64 and rerank 32), so its
+client latency has no network path to the client but includes the strong-consistency check against R2.
+
+### Milestone 0: current main (`e12178f`), 2026-11-16
+
+Parity, blowfish vs turbopuffer (200 queries per type):
+
+| Query | overlap@10 | min overlap | top-1 agree | same-rank@10 | mean rel score diff | recall@10 blowfish | recall@10 turbopuffer |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ANN | 0.963 | 0.7 | 0.970 | 0.848 | 0.0000 | 0.980 | 0.963 |
+| BM25 | 0.982 | 0.7 | 1.000 | 0.875 | 0.0167 | | |
+| Hybrid (RRF) | 0.973 | 0.6 | 0.955 | 0.823 | 0.0200 | | |
+| Selective ANN | 0.998 | 0.9 | 1.000 | 0.995 | 0.0000 | 1.000 | 0.998 |
+| Broad ANN | 0.992 | 0.8 | 1.000 | 0.963 | 0.0000 | 0.995 | 0.996 |
+
+Latency, ms p50 / p90 / p99, one request at a time:
+
+| Query | blowfish client | turbopuffer client | turbopuffer `server_total_ms` | turbopuffer cache temperature |
+| --- | --- | --- | --- | --- |
+| ANN | 76 / 120 / 179 | 73 / 81 / 123 | 15 / 21 / 41 | 200 hot |
+| BM25 | 73 / 110 / 191 | 70 / 89 / 115 | 14 / 32 / 59 | 200 hot |
+| Hybrid | 78 / 117 / 261 | 74 / 97 / 139 | 16 / 34 / 54 | 200 hot |
+| Selective ANN | 74 / 123 / 232 | 70 / 80 / 123 | 14 / 19 / 26 | 200 hot |
+| Broad ANN | 74 / 110 / 166 | 72 / 83 / 158 | 15 / 23 / 38 | 200 hot |
+
+Notes:
+
+- ANN set differences are approximation noise on both sides: both miss about 2 to 4 percent of the exact top-10, and
+  the ids they miss differ. Same-rank is low only because one missing id shifts every later position; $dist values
+  of shared ids are identical.
+- BM25 orders results the same way (top-1 agreement 1.000), but blowfish scores run about 1.5 to 2 percent below
+  turbopuffer for most queries. The likely cause is corpus statistics (average document length or IDF); the default
+  tokenizer settings match. The hybrid score diff is that gap passing through RRF plus rank shifts.
+- Blowfish's warm client p50 is within a few ms of turbopuffer's client p50, but its tail is longer (p99 166 to 261 ms
+  against 115 to 158 ms), and turbopuffer's own server time is only about 15 ms, so the floor for blowfish is the
+  network round trip to R2 for the strong-consistency check.
+
+### Per-milestone rows
+
+Add one row per milestone with the same 200 queries (blowfish client p50 / p90 / p99, then overlap@10 against
+turbopuffer). turbopuffer's numbers do not change between milestones except for its own variance.
+
+| Milestone | Commit | ANN | BM25 | Hybrid | Selective ANN | Broad ANN |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0: iteration 2 main | `e12178f` | 76 / 120 / 179 ms, 0.963 | 73 / 110 / 191 ms, 0.982 | 78 / 117 / 261 ms, 0.973 | 74 / 123 / 232 ms, 0.998 | 74 / 110 / 166 ms, 0.992 |
