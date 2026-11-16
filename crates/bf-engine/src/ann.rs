@@ -68,7 +68,11 @@ pub(crate) async fn search(
     if state.segments.iter().any(|s| !s.files.contains_key(&key)) {
         return Ok(None);
     }
-    if q.filters.is_none()
+    // `BF_ANN_DIRECTORY=0` forces the per-segment path (A/B measurements only).
+    static DIRECTORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DIRECTORY.get_or_init(|| std::env::var("BF_ANN_DIRECTORY").is_ok_and(|v| v == "0")) {
+        // fall through
+    } else if q.filters.is_none()
         && state.shadowed.is_empty()
         && let Some(file) = state.ann_dirs.get(&key)
     {

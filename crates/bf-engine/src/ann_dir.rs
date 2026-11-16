@@ -375,15 +375,7 @@ pub(crate) async fn search(
     let mut speculative: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
     if !pool.is_empty() {
         let mut best: Vec<&(usize, Candidate)> = pool.iter().collect();
-        // Document blocks hold 256 rows, so reading more of them is cheap unless a vector column
-        // is returned. The winners are almost always among the best estimates.
-        let heavy = columns.iter().any(|c| {
-            matches!(
-                state.schema.get(c).and_then(|s| s.data_type.as_ref()),
-                Some(AttributeType::Vector { .. } | AttributeType::VectorI8 { .. })
-            )
-        });
-        let keep = (k * if heavy { 3 } else { 8 }).min(best.len());
+        let keep = (k * 3).min(best.len());
         if best.len() > keep {
             best.select_nth_unstable_by(keep, |a, b| cmp(a, b));
         }

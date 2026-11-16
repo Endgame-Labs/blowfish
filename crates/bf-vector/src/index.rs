@@ -37,7 +37,7 @@ pub struct Candidate {
     pub row: u32,
     /// Estimated distance from the query.
     pub distance: f32,
-    /// Statistical bound on the estimate's error (about 3 sigma): the exact distance is
+    /// Statistical bound on the estimate's error (about 2 sigma): the exact distance is
     /// within `distance` plus or minus `error` almost always.
     pub error: f32,
     /// Leaf cluster holding the row.
@@ -50,7 +50,7 @@ pub struct Candidate {
 const CODE_GAP: u64 = 64 << 10;
 const CODE_MERGE_MAX: u64 = 8 << 20;
 /// Candidate vectors closer than this are read together.
-const VECTOR_GAP: u64 = 16 << 10;
+const VECTOR_GAP: u64 = 64 << 10;
 const VECTOR_MERGE_MAX: u64 = 2 << 20;
 
 pub(crate) struct StubCluster {

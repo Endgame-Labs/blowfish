@@ -188,7 +188,7 @@ impl Rng {
 }
 
 /// Multiples of the typical inner-product error that a candidate's distance bound covers.
-pub(crate) const ERROR_CONFIDENCE: f64 = 3.0;
+pub(crate) const ERROR_CONFIDENCE: f64 = 1.9;
 
 /// Bits used to quantize each coordinate of the rotated residual query.
 pub(crate) const QUERY_BITS: usize = 8;
