@@ -3,14 +3,16 @@
 #![warn(missing_docs)]
 
 mod cluster;
+mod directory;
 mod distance;
 mod format;
 mod index;
 mod reader;
 pub use bytes::Bytes;
 pub use cluster::{BuildParams, IndexBuilder, VectorType};
+pub use directory::{DirEntry, DirSegment, Directory, PartialIndex};
 pub use format::{FORMAT_VERSION, metadata_len};
-pub use index::{Candidate, Index, SearchParams};
+pub use index::{Candidate, Index, SearchParams, read_merged};
 pub use reader::RangeRead;
 mod rabitq;
 pub use rabitq::{DistanceEstimate, RaBitQ, RaBitQCode};

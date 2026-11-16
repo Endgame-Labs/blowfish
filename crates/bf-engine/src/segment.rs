@@ -675,6 +675,25 @@ pub(crate) async fn projected_documents(
             })
             .collect();
     }
+    let rows_docs = projected_rows(store, segment, rows, columns).await?;
+    rows_docs
+        .into_values()
+        .map(|doc| {
+            let id = serde_json::from_value(doc.get("id").ok_or_else(corrupt)?.clone())
+                .map_err(index_error)?;
+            Ok((id, doc))
+        })
+        .collect()
+}
+pub(crate) async fn projected_rows(
+    store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    columns: Option<&std::collections::BTreeSet<String>>,
+) -> Result<BTreeMap<u32, Document>, ApiError> {
+    if rows.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let reader = ObjectReader::new(store, segment.files.get("docs").ok_or_else(corrupt)?);
     let dir = directory(&reader).await?;
     let mut docs: BTreeMap<u32, Document> = rows.iter().map(|row| (row, Document::new())).collect();
@@ -779,13 +798,7 @@ pub(crate) async fn projected_documents(
             docs.get_mut(&row).unwrap().insert(name.clone(), value);
         }
     }
-    docs.into_values()
-        .map(|doc| {
-            let id = serde_json::from_value(doc.get("id").ok_or_else(corrupt)?.clone())
-                .map_err(index_error)?;
-            Ok((id, doc))
-        })
-        .collect()
+    Ok(docs)
 }
 /// Evaluate scalar, array, range, and boolean filters over sorted value dictionaries.
 pub(crate) fn filter_rows<'a>(

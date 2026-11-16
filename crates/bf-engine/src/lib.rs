@@ -1,5 +1,6 @@
 //! Immutable segment indexes with a WAL overlay and an exhaustive reference evaluator.
 mod ann;
+mod ann_dir;
 mod branch;
 mod filter;
 mod highlight;
@@ -48,6 +49,8 @@ pub(crate) struct NamespaceState {
     /// Object holding the checkpoint's per-term text statistics (loaded only for BM25 queries
     /// and by the indexer), when the manifest keeps them out of line.
     pub text_stats: Option<bf_wal::SegmentFile>,
+    /// Namespace ANN directories by `ann:<attribute>`, valid for exactly `segments`.
+    pub ann_dirs: BTreeMap<String, bf_wal::SegmentFile>,
     pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
     pub corpus: Arc<BTreeMap<String, bf_text::CorpusStats>>,
     pub created_at: DateTime<Utc>,
@@ -71,6 +74,7 @@ impl Default for NamespaceState {
             tail_since: None,
             stats: Default::default(),
             text_stats: None,
+            ann_dirs: BTreeMap::new(),
             scores: BTreeMap::new(),
             corpus: Arc::default(),
             created_at: Utc::now(),

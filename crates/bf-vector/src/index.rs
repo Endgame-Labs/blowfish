@@ -37,6 +37,9 @@ pub struct Candidate {
     pub row: u32,
     /// Estimated distance from the query.
     pub distance: f32,
+    /// Statistical bound on the estimate's error (about 3 sigma): the exact distance is
+    /// within `distance` plus or minus `error` almost always.
+    pub error: f32,
     /// Leaf cluster holding the row.
     pub cluster: u32,
     /// Position within the cluster.
@@ -50,12 +53,19 @@ const CODE_MERGE_MAX: u64 = 8 << 20;
 const VECTOR_GAP: u64 = 16 << 10;
 const VECTOR_MERGE_MAX: u64 = 2 << 20;
 
+pub(crate) struct StubCluster {
+    pub codes: Range<u64>,
+    pub vectors: Range<u64>,
+    pub codes_crc: u32,
+    pub vectors_crc: u32,
+}
+
 /// A parsed immutable index. Metadata and centroids stay resident; codes and
 /// vectors are fetched through the reader for each search (usually cache-backed).
 pub struct Index<R: RangeRead> {
     reader: R,
     metadata: Metadata,
-    rq: RaBitQ,
+    pub(crate) rq: RaBitQ,
 }
 impl<R: RangeRead> Index<R> {
     /// Open an index with two metadata reads: fixed footer, then directory.
@@ -105,6 +115,85 @@ impl<R: RangeRead> Index<R> {
             metadata,
             rq,
         })
+    }
+    /// A partial index over a namespace directory: only the code and vector ranges are known
+    /// until [`Self::install_cluster`] supplies each probed cluster's center and row set.
+    pub(crate) fn stub(
+        reader: R,
+        shape: &crate::directory::Shape,
+        stubs: Vec<StubCluster>,
+    ) -> Result<Self> {
+        let rq = RaBitQ::new(shape.dims, shape.seed)?;
+        let clusters = stubs
+            .into_iter()
+            .map(|s| format::Cluster {
+                center: Vec::new(),
+                parent: u32::MAX,
+                rows: RoaringBitmap::new(),
+                codes: s.codes,
+                vectors: s.vectors,
+                codes_crc: s.codes_crc,
+                vectors_crc: s.vectors_crc,
+                row_crcs: Vec::new(),
+            })
+            .collect();
+        let metadata = Metadata {
+            dims: shape.dims,
+            count: 0,
+            metric: shape.metric,
+            dtype: shape.dtype,
+            seed: shape.seed,
+            flat: shape.flat,
+            flags: format::FLAG_ROTATED | format::FLAG_COMPACT,
+            parents: Vec::new(),
+            clusters,
+        };
+        Ok(Self {
+            reader,
+            metadata,
+            rq,
+        })
+    }
+    /// Install a directory cluster blob (rotated center, row set, row checksums).
+    pub(crate) fn install_cluster(&mut self, cid: usize, blob: &[u8]) -> Result<()> {
+        let padded = self.rq.padded;
+        let mut p = format::Parser::new(blob);
+        let center = p.vector(padded)?;
+        let n = p.u32()? as usize;
+        let len = p.u32()? as usize;
+        let rows = RoaringBitmap::deserialize_from(std::io::Cursor::new(p.take(len)?))
+            .map_err(|_| bad("invalid membership bitmap"))?;
+        if rows.len() != n as u64 || n > p.remaining() / 4 {
+            return Err(bad("invalid cluster blob"));
+        }
+        let row_crcs = (0..n).map(|_| p.u32()).collect::<Result<Vec<_>>>()?;
+        let c = self
+            .metadata
+            .clusters
+            .get_mut(cid)
+            .ok_or_else(|| bad("cluster outside segment"))?;
+        c.center = center;
+        c.rows = rows;
+        c.row_crcs = row_crcs;
+        Ok(())
+    }
+    /// Cluster payload for the directory blob area.
+    pub(crate) fn cluster_blob(&self, cid: usize) -> Vec<u8> {
+        let c = &self.metadata.clusters[cid];
+        let mut out = Vec::new();
+        for x in &c.center {
+            out.extend(x.to_le_bytes());
+        }
+        out.extend((c.rows.len() as u32).to_le_bytes());
+        out.extend((c.rows.serialized_size() as u32).to_le_bytes());
+        c.rows.serialize_into(&mut out).expect("vec write");
+        for crc in &c.row_crcs {
+            out.extend(crc.to_le_bytes());
+        }
+        out
+    }
+    pub(crate) fn metadata(&self) -> &Metadata {
+        &self.metadata
     }
     /// The query, normalized as the metric requires, rotated into the index's transform space.
     fn rotated_query(&self, query: &[f32]) -> Vec<f64> {
@@ -272,12 +361,41 @@ impl<R: RangeRead> Index<R> {
         filter: Option<&RoaringBitmap>,
     ) -> Result<Vec<Candidate>> {
         validate(query, self.dims())?;
-        let q = prepare(query, self.metric());
-        let q_zero = q.iter().all(|x| *x == 0.);
-        let q_rot = self.rq.rotate(&q);
         let t_read = std::time::Instant::now();
         let blocks = self.read_coalesced(clusters).await?;
         let read_ms = t_read.elapsed().as_millis();
+        self.scan_blocks_timed(query, clusters, blocks, filter, read_ms)
+    }
+
+    /// Read the quantized-code blocks of `clusters` (merged into few requests), in input order.
+    pub async fn read_codes(&self, clusters: &[usize]) -> Result<Vec<Bytes>> {
+        self.read_coalesced(clusters).await
+    }
+
+    /// Score code blocks already fetched with [`Self::read_codes`]. Every scanned cluster's
+    /// center and row set must be present (always true for an opened index).
+    pub fn scan_blocks(
+        &self,
+        query: &[f32],
+        clusters: &[usize],
+        blocks: Vec<Bytes>,
+        filter: Option<&RoaringBitmap>,
+    ) -> Result<Vec<Candidate>> {
+        validate(query, self.dims())?;
+        self.scan_blocks_timed(query, clusters, blocks, filter, 0)
+    }
+
+    fn scan_blocks_timed(
+        &self,
+        query: &[f32],
+        clusters: &[usize],
+        blocks: Vec<Bytes>,
+        filter: Option<&RoaringBitmap>,
+        read_ms: u128,
+    ) -> Result<Vec<Candidate>> {
+        let q = prepare(query, self.metric());
+        let q_zero = q.iter().all(|x| *x == 0.);
+        let q_rot = self.rq.rotate(&q);
         let t_cpu = std::time::Instant::now();
         let rows: usize = clusters
             .iter()
@@ -295,23 +413,24 @@ impl<R: RangeRead> Index<R> {
                 c.rows.len() as usize,
                 compact,
                 self.rq.padded,
-                &mut |ordinal, d, zero| {
+                &mut |ordinal, d, bound, zero| {
                     let row = rows.next().unwrap_or(u32::MAX);
                     if filter.is_some_and(|f| !f.contains(row)) {
                         return;
                     }
-                    let distance = if self.metric() == Metric::CosineDistance {
+                    let (distance, error) = if self.metric() == Metric::CosineDistance {
                         if q_zero || zero {
-                            if q_zero && zero { 0. } else { 1. }
+                            (if q_zero && zero { 0. } else { 1. }, 0.)
                         } else {
-                            (d * 0.5).clamp(0., 2.)
+                            ((d * 0.5).clamp(0., 2.), bound * 0.5)
                         }
                     } else {
-                        d.max(0.)
+                        (d.max(0.), bound)
                     };
                     estimated.push(Candidate {
                         row,
                         distance: distance as f32,
+                        error: error as f32,
                         cluster: cid as u32,
                         ordinal: ordinal as u32,
                     });
@@ -342,35 +461,7 @@ impl<R: RangeRead> Index<R> {
     /// Read `ranges` (in any order), merging ranges whose gap is at most `gap` bytes into one
     /// read of at most `max` bytes. Returns one `Bytes` per input range, in input order.
     async fn read_merged(&self, ranges: Vec<Range<u64>>, gap: u64, max: u64) -> Result<Vec<Bytes>> {
-        let mut order: Vec<usize> = (0..ranges.len()).collect();
-        order.sort_unstable_by_key(|i| ranges[*i].start);
-        let mut merged: Vec<Range<u64>> = Vec::new();
-        let mut members: Vec<Vec<usize>> = Vec::new();
-        for i in order {
-            let r = ranges[i].clone();
-            match merged.last_mut() {
-                Some(last)
-                    if r.start <= last.end + gap && r.end.max(last.end) - last.start <= max =>
-                {
-                    last.end = last.end.max(r.end);
-                    members.last_mut().unwrap().push(i);
-                }
-                _ => {
-                    merged.push(r);
-                    members.push(vec![i]);
-                }
-            }
-        }
-        let starts: Vec<u64> = merged.iter().map(|r| r.start).collect();
-        let bytes = read_batch(&self.reader, merged).await?;
-        let mut out = vec![Bytes::new(); ranges.len()];
-        for ((bytes, start), group) in bytes.into_iter().zip(starts).zip(members) {
-            for i in group {
-                let r = &ranges[i];
-                out[i] = bytes.slice((r.start - start) as usize..(r.end - start) as usize);
-            }
-        }
-        Ok(out)
+        read_merged(&self.reader, ranges, gap, max).await
     }
 
     /// Fetch full-precision vectors for `(cluster, ordinal)` locations and return the
@@ -608,4 +699,41 @@ async fn read_batch<R: RangeRead>(reader: &R, ranges: Vec<Range<u64>>) -> Result
         return Err(bad("short or incomplete batch read"));
     }
     Ok(bytes)
+}
+
+/// Read `ranges` (in any order) from `reader`, merging ranges whose gap is at most `gap` bytes
+/// into one read of at most `max` bytes. Returns one `Bytes` per input range, in input order.
+pub async fn read_merged<R: RangeRead>(
+    reader: &R,
+    ranges: Vec<Range<u64>>,
+    gap: u64,
+    max: u64,
+) -> Result<Vec<Bytes>> {
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_unstable_by_key(|i| ranges[*i].start);
+    let mut merged: Vec<Range<u64>> = Vec::new();
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    for i in order {
+        let r = ranges[i].clone();
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end + gap && r.end.max(last.end) - last.start <= max => {
+                last.end = last.end.max(r.end);
+                members.last_mut().unwrap().push(i);
+            }
+            _ => {
+                merged.push(r);
+                members.push(vec![i]);
+            }
+        }
+    }
+    let starts: Vec<u64> = merged.iter().map(|r| r.start).collect();
+    let bytes = read_batch(reader, merged).await?;
+    let mut out = vec![Bytes::new(); ranges.len()];
+    for ((bytes, start), group) in bytes.into_iter().zip(starts).zip(members) {
+        for i in group {
+            let r = &ranges[i];
+            out[i] = bytes.slice((r.start - start) as usize..(r.end - start) as usize);
+        }
+    }
+    Ok(out)
 }

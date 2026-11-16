@@ -23,6 +23,7 @@ struct Counting {
     inner: object_store::memory::InMemory,
     calls: AtomicUsize,
     ranges: Mutex<Vec<Range<u64>>>,
+    paths: Mutex<Vec<(String, Option<Range<u64>>)>>,
     waves: AtomicUsize,
     heads: AtomicUsize,
     active: AtomicUsize,
@@ -89,6 +90,13 @@ impl ObjectStore for Counting {
         if opts.head {
             self.heads.fetch_add(1, Ordering::SeqCst);
         }
+        self.paths.lock().unwrap().push((
+            path.to_string(),
+            match &opts.range {
+                Some(object_store::GetRange::Bounded(r)) => Some(r.clone()),
+                _ => None,
+            },
+        ));
         if let Some(object_store::GetRange::Bounded(range)) = &opts.range {
             self.ranges.lock().unwrap().push(range.clone());
         }
@@ -97,6 +105,8 @@ impl ObjectStore for Counting {
         if active == 1 {
             self.waves.fetch_add(1, Ordering::SeqCst);
         }
+        self.paths.lock().unwrap().last_mut().unwrap().0 +=
+            &format!(" w{}", self.waves.load(Ordering::SeqCst));
         let _active = Active(&self.active);
         if self.delay.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -452,4 +462,110 @@ async fn idle_indexing_skips_io_but_force_compaction_and_remote_polling_still_wo
         wal.latest_manifest().await.unwrap().unwrap().1.stats.rows,
         3
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_ann_over_twenty_segments_uses_the_directory() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    let vector = |id: usize| -> Vec<f32> {
+        (0..128)
+            .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+            .collect()
+    };
+    for batch in 0..20 {
+        let docs: Vec<_> = (0..1200)
+            .map(|n| {
+                let id = batch * 1200 + n;
+                json!({"id":id,"vector":vector(id),"label":format!("doc{id}")})
+            })
+            .collect();
+        writer
+            .write(
+                "many",
+                serde_json::from_value(json!({
+                    "distance_metric":"euclidean_squared","upsert_rows":docs
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.index_namespace("many", true).await.unwrap();
+    }
+    let segments = backend
+        .inner
+        .list(None)
+        .filter(|o| {
+            futures::future::ready(
+                o.as_ref()
+                    .is_ok_and(|o| o.location.as_ref().ends_with(".bfv")),
+            )
+        })
+        .count()
+        .await;
+    assert!(segments >= 20, "expected 20 segments, found {segments}");
+    let query = |ids_only: bool| -> bf_types::QueryRequest {
+        let mut q = json!({"rank_by":["vector","ANN",vector(777)],"top_k":10});
+        if !ids_only {
+            q["include_attributes"] = json!(["label"]);
+        }
+        serde_json::from_value(q).unwrap()
+    };
+    for (ids_only, max_waves) in [(true, 3), (false, 4)] {
+        let engine = Engine::with_config(store(backend.clone()).await, config());
+        backend.waves.store(0, Ordering::SeqCst);
+        backend.ranges.lock().unwrap().clear();
+        backend.paths.lock().unwrap().clear();
+        backend.delay.store(true, Ordering::SeqCst);
+        let cold = engine.query("many", query(ids_only)).await.unwrap();
+        backend.delay.store(false, Ordering::SeqCst);
+        let rows = cold.result.rows.as_ref().unwrap();
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[0]["id"], 777);
+        let waves = backend.waves.load(Ordering::SeqCst);
+        let requests = backend.ranges.lock().unwrap().len();
+        let metadata_reads = backend
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, range)| {
+                path.ends_with(".bfv") && range.as_ref().is_none_or(|r| r.start == 0)
+            })
+            .count();
+        eprintln!(
+            "ids_only={ids_only} waves={waves} requests={requests} metadata={metadata_reads}"
+        );
+        if std::env::var_os("TRACE_PATHS").is_some() {
+            for (path, range) in backend.paths.lock().unwrap().iter() {
+                eprintln!("  {} {:?}", path.rsplit('/').next().unwrap(), range);
+            }
+        }
+        assert!(waves <= max_waves, "{waves} waves");
+        assert_eq!(metadata_reads, 0, "no segment index is opened");
+        assert!(requests < 100, "{requests} requests");
+        let exact = engine
+            .query_exhaustive(
+                "many",
+                serde_json::from_value(json!({"rank_by":["vector","ANN",vector(777)],"top_k":10}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let want: std::collections::BTreeSet<_> = exact
+            .result
+            .rows
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].clone().to_string())
+            .collect();
+        let got = rows
+            .iter()
+            .filter(|r| want.contains(&r["id"].to_string()))
+            .count();
+        assert!(got >= 9, "recall {got}/10");
+    }
 }
