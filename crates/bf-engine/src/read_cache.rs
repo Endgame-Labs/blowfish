@@ -23,22 +23,42 @@ struct Entries {
 /// Immutable keys include the object generation. In-flight users retain their own Arc.
 pub(crate) struct DecodedCache {
     budget: u64,
-    entries: Mutex<Entries>,
+    entries: Arc<Mutex<Entries>>,
+    /// Keys are relative to a storage view, so each view prefixes its own scope.
+    scope: String,
     pub workers: Arc<Semaphore>,
 }
 impl DecodedCache {
     pub fn new(budget: u64, workers: usize) -> Self {
         Self {
             budget,
-            entries: Mutex::new(Entries::default()),
+            entries: Arc::new(Mutex::new(Entries::default())),
+            scope: String::new(),
             workers: Arc::new(Semaphore::new(workers.max(1))),
         }
     }
+    /// A view sharing this cache's byte budget and workers, with keys kept separate.
+    pub fn scoped(&self, scope: &str) -> Self {
+        Self {
+            budget: self.budget,
+            entries: self.entries.clone(),
+            scope: scope.to_owned(),
+            workers: self.workers.clone(),
+        }
+    }
+    fn key(&self, key: &str) -> String {
+        if self.scope.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{}\0{key}", self.scope)
+        }
+    }
     fn get<T: Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
+        let key = self.key(key);
         let mut entries = self.entries.lock().expect("decoded cache lock");
         entries.clock += 1;
         let used = entries.clock;
-        let entry = entries.values.get_mut(&(TypeId::of::<T>(), key.into()))?;
+        let entry = entries.values.get_mut(&(TypeId::of::<T>(), key))?;
         entry.used = used;
         entry.value.clone().downcast().ok()
     }
@@ -47,8 +67,9 @@ impl DecodedCache {
             return;
         }
         let mut retired = Vec::new();
+        let key = self.key(key);
         let mut entries = self.entries.lock().expect("decoded cache lock");
-        let key = (TypeId::of::<T>(), key.into());
+        let key = (TypeId::of::<T>(), key);
         if let Some(old) = entries.values.remove(&key) {
             entries.bytes -= old.bytes;
             retired.push(old);

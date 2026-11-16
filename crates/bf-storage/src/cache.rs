@@ -620,20 +620,21 @@ impl Storage {
     /// Missing objects are never cached, so new WAL slots become visible immediately.
     pub async fn range_reader(&self, key: &str) -> Result<RangeReader, Error> {
         let cache = &self.0.cache;
+        let ckey = self.cache_key(key);
         let lock = {
             let mut locks = cache.layout_locks.lock().unwrap();
             locks.retain(|_, weak| weak.strong_count() > 0);
-            match locks.get(key).and_then(Weak::upgrade) {
+            match locks.get(&ckey).and_then(Weak::upgrade) {
                 Some(lock) => lock,
                 None => {
                     let lock = Arc::new(AsyncMutex::new(()));
-                    locks.insert(key.to_owned(), Arc::downgrade(&lock));
+                    locks.insert(ckey.clone(), Arc::downgrade(&lock));
                     lock
                 }
             }
         };
         let _guard = lock.lock().await;
-        let layout = if let Some(layout) = cache.layouts.get(key) {
+        let layout = if let Some(layout) = cache.layouts.get(&ckey) {
             layout
         } else {
             let path = self.path(key);
@@ -660,7 +661,7 @@ impl Storage {
                 len: meta.size - offset,
                 offset,
             };
-            cache.layouts.insert(key.to_owned(), layout);
+            cache.layouts.insert(ckey.clone(), layout);
             layout
         };
         Ok(RangeReader {

@@ -280,6 +280,21 @@ impl Engine {
         indexer::start(&engine);
         engine
     }
+    /// An engine over a sub-prefix of this one's storage, such as a project's namespaces. It
+    /// shares the storage backend, caches' byte budgets, and query concurrency with this
+    /// engine, but its namespaces are separate, with their own handles and background indexing.
+    pub fn scoped(&self, sub: &str) -> Self {
+        let engine = Self(Arc::new(Inner {
+            store: self.0.store.scoped(sub),
+            read_cache: Arc::new(self.0.read_cache.scoped(sub)),
+            queries: self.0.queries.clone(),
+            config: self.0.config.clone(),
+            owner: uuid::Uuid::new_v4(),
+            namespaces: Mutex::new(HashMap::new()),
+        }));
+        indexer::start(&engine);
+        engine
+    }
     /// Access the underlying store for operational inspection.
     pub fn storage(&self) -> &Storage {
         &self.0.store

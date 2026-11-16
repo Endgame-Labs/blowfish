@@ -139,3 +139,38 @@ async fn create_unique_uploads_large_objects_in_parts_and_reads_back() {
         CreateResult::Conflict
     );
 }
+
+#[tokio::test]
+async fn scoped_views_are_isolated_but_share_the_backend() {
+    let root = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let a = root.scoped("projects/a");
+    let b = root.scoped("projects/b");
+    a.create("ns/docs/x", "from a").await.unwrap();
+    b.create("ns/docs/x", "from b").await.unwrap();
+    assert_eq!(a.get("ns/docs/x").await.unwrap(), "from a");
+    assert_eq!(b.get("ns/docs/x").await.unwrap(), "from b");
+    // The shared range cache keys by full location, so same-named objects never collide.
+    for (store, want) in [(&a, "from a"), (&b, "from b")] {
+        assert_eq!(store.get_cached("ns/docs/x").await.unwrap(), want);
+        let reader = store.range_reader("ns/docs/x").await.unwrap();
+        assert_eq!(reader.read(0..6).await.unwrap(), want);
+    }
+    assert_eq!(a.list("ns/").await.unwrap().len(), 1);
+    assert_eq!(a.list("ns/").await.unwrap()[0].key, "ns/docs/x");
+    // The root sees the projects only by their full path.
+    assert!(root.list("ns/").await.unwrap().is_empty());
+    assert_eq!(root.get("projects/a/ns/docs/x").await.unwrap(), "from a");
+    assert_eq!(
+        root.scoped("projects")
+            .scoped("a")
+            .get("ns/docs/x")
+            .await
+            .unwrap(),
+        "from a"
+    );
+}

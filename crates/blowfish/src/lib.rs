@@ -1,4 +1,5 @@
 //! HTTP adapter for the exhaustive engine, with replaceable authorization.
+mod admin;
 mod legacy;
 mod operations;
 
@@ -20,7 +21,8 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    sync::OnceLock,
+    collections::HashMap,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 use tower_http::{
@@ -42,6 +44,56 @@ struct AppState {
     auth: KeyStore,
     options: ServerOptions,
     started: Instant,
+    projects: Arc<ProjectEngines>,
+}
+/// One engine per project, created on first use. `default` is the root engine itself.
+struct ProjectEngines {
+    root: Engine,
+    engines: std::sync::Mutex<HashMap<String, Engine>>,
+}
+impl ProjectEngines {
+    fn get(&self, project: &str) -> Engine {
+        if project == bf_auth::DEFAULT_PROJECT {
+            return self.root.clone();
+        }
+        self.engines
+            .lock()
+            .expect("project engine registry")
+            .entry(project.to_owned())
+            .or_insert_with(|| self.root.scoped(&format!("projects/{project}")))
+            .clone()
+    }
+    fn remove(&self, project: &str) {
+        self.engines
+            .lock()
+            .expect("project engine registry")
+            .remove(project);
+    }
+}
+/// Keep an engine running for every project, so its background indexing resumes after a
+/// restart without waiting for a first request, and drop engines of deleted projects.
+fn sync_project_engines(state: &AppState) {
+    let weak = Arc::downgrade(&state.projects);
+    let auth = state.auth.clone();
+    tokio::spawn(async move {
+        loop {
+            let Some(projects) = weak.upgrade() else {
+                break;
+            };
+            if let Ok(ids) = auth.project_ids().await {
+                for id in &ids {
+                    projects.get(id);
+                }
+                projects
+                    .engines
+                    .lock()
+                    .expect("project engine registry")
+                    .retain(|id, _| ids.contains(id));
+            }
+            drop(projects);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
 }
 /// Install one process-wide recorder shared by every crate using the metrics facade.
 pub fn prometheus_handle() -> PrometheusHandle {
@@ -84,17 +136,49 @@ fn router_with_body_limit(
 ) -> Router {
     prometheus_handle();
     let state = AppState {
-        engine,
         auth,
         options,
         started: Instant::now(),
+        projects: Arc::new(ProjectEngines {
+            root: engine.clone(),
+            engines: Default::default(),
+        }),
+        engine,
     };
+    sync_project_engines(&state);
     Router::new()
         .route("/", get(|| async { Json(json!({"status":"🐡"})) }))
         .route("/metrics", get(metrics_endpoint))
         .route("/_blowfish/v1/status", get(status))
         .route("/_blowfish/v1/keys", get(list_keys).post(create_key))
         .route("/_blowfish/v1/keys/{id}", get(get_key).delete(revoke_key))
+        .route("/_blowfish/v1/whoami", get(whoami))
+        .route(
+            "/_blowfish/v1/projects",
+            get(admin::list_projects).post(admin::create_project),
+        )
+        .route(
+            "/_blowfish/v1/projects/{id}",
+            get(admin::get_project)
+                .patch(admin::rename_project)
+                .delete(admin::delete_project),
+        )
+        .route(
+            "/_blowfish/v1/projects/{id}/keys",
+            get(admin::list_project_keys).post(admin::create_project_key),
+        )
+        .route(
+            "/_blowfish/v1/projects/{id}/keys/{key_id}",
+            get(admin::get_project_key).delete(admin::revoke_project_key),
+        )
+        .route(
+            "/_blowfish/v1/org/keys",
+            get(admin::list_org_keys).post(admin::create_org_key),
+        )
+        .route(
+            "/_blowfish/v1/org/keys/{key_id}",
+            get(admin::get_org_key).delete(admin::revoke_org_key),
+        )
         .route("/v1/namespaces", get(list))
         .route("/v2/namespaces/{ns}", post(write).delete(delete_namespace))
         .route("/v2/namespaces/{ns}/async", post(operations::start_copy))
@@ -166,6 +250,9 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
     Json(
         json!({"version":env!("CARGO_PKG_VERSION"), "storage_url":redacted_storage_url(&s.options.storage_url), "storage_mode":mode, "uptime_seconds":s.started.elapsed().as_secs_f64(), "namespaces_cached":s.engine.cached_namespaces().await}),
     )
+}
+async fn whoami(Extension(p): Extension<Principal>) -> Json<bf_auth::WhoAmI> {
+    Json(p.whoami())
 }
 async fn create_key(
     State(s): State<AppState>,
@@ -298,9 +385,36 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
     } else {
         None
     };
+    let namespaced = route.contains("{ns}") || route == "/v1/namespaces";
     let response = match principal {
         Err(e) => HttpError::from(e).into_response(),
         Ok(p) => {
+            // Resolve the project first, so another project's namespace is a 404 before any
+            // role check could distinguish "exists" from "doesn't".
+            let scoped = if namespaced {
+                let header = request
+                    .headers()
+                    .get("x-blowfish-project")
+                    .and_then(|v| v.to_str().ok());
+                match state.auth.effective_project(&p, header).await {
+                    Ok(project) => {
+                        let mut scoped = state.clone();
+                        scoped.engine = state.projects.get(&project);
+                        Some(scoped)
+                    }
+                    Err(e) => {
+                        return finish(
+                            HttpError::from(e).into_response(),
+                            route,
+                            method,
+                            key_name,
+                            started,
+                        );
+                    }
+                }
+            } else {
+                None
+            };
             let action = match route.as_str() {
                 "/metrics" => Some(Action::ReadMetrics),
                 "/_blowfish/v1/status" => Some(Action::ReadMetrics),
@@ -347,11 +461,23 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
                 Err(e) => HttpError::from(e).into_response(),
                 Ok(()) => {
                     request.extensions_mut().insert(p);
+                    if let Some(scoped) = scoped {
+                        request.extensions_mut().insert(scoped);
+                    }
                     next.run(request).await
                 }
             }
         }
     };
+    finish(response, route, method, key_name, started)
+}
+fn finish(
+    response: Response,
+    route: String,
+    method: String,
+    key_name: String,
+    started: Instant,
+) -> Response {
     let labels = [
         ("route", route),
         ("method", method),
@@ -380,7 +506,7 @@ async fn json_errors(request: Request, next: Next) -> Response {
     }
 }
 async fn write(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     Extension(p): Extension<Principal>,
     headers: HeaderMap,
@@ -410,7 +536,7 @@ async fn write(
     Ok(Json(response).into_response())
 }
 async fn query(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     input: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<QueryResponse>, HttpError> {
@@ -442,40 +568,40 @@ fn record_query(request: &QueryRequest) {
     metrics::counter!("blowfish_query_requests_total", "kind" => kind).increment(1);
 }
 async fn delete_namespace(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
     s.engine.delete_namespace(&ns).await?;
     Ok(Json(json!({"status":"OK"})))
 }
 async fn metadata(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
     Ok(Json(s.engine.metadata(&ns).await?))
 }
 async fn patch_metadata(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     input: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, HttpError> {
     Ok(Json(s.engine.patch_metadata(&ns, body(input)?).await?))
 }
 async fn schema(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
     Ok(Json(s.engine.schema(&ns).await?))
 }
 async fn update_schema(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     input: Result<Json<SchemaUpdate>, JsonRejection>,
 ) -> Result<Json<Value>, HttpError> {
     Ok(Json(s.engine.update_schema(&ns, body(input)?).await?))
 }
 async fn warm(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), HttpError> {
     s.engine.warm(&ns).await?;
@@ -485,7 +611,7 @@ async fn warm(
     ))
 }
 async fn recall(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     input: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, HttpError> {
@@ -496,7 +622,7 @@ async fn recall(
     Ok(Json(s.engine.recall(&ns, request).await?))
 }
 async fn explain(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     input: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<Value>, HttpError> {
@@ -514,7 +640,7 @@ fn default_page_size() -> usize {
     100
 }
 async fn list(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Extension(principal): Extension<Principal>,
     params: Result<Query<ListParams>, QueryRejection>,
 ) -> Result<Json<Value>, HttpError> {
