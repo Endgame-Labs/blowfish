@@ -1,0 +1,14 @@
+{{define "title"}}{{.Heading}}{{end}}
+{{define "content"}}
+<h1>{{.Heading}}</h1>
+<form class="card" method="post" action="{{.Base}}{{.Action}}">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<p>{{.Text}}</p>
+{{if .TypeToConfirm}}
+<label for="confirm">Type <code>{{.TypeToConfirm}}</code> to confirm</label>
+<input id="confirm" type="text" name="confirm" autocomplete="off" autocapitalize="none" required>
+{{end}}
+{{if .Force}}<div class="checkbox"><input id="force" type="checkbox" name="force" value="1"><label for="force">Also delete all of this project's namespaces, and their data</label></div>{{end}}
+<div class="actions"><button class="danger" type="submit">{{.Button}}</button><a class="btn ghost" href="{{.Base}}{{.Back}}">Cancel</a></div>
+</form>
+{{end}}

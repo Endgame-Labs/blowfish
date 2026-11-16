@@ -1,0 +1,16 @@
+{{define "keytable"}}
+<div class="card table">
+{{if .Keys}}<table>
+<thead><tr><th>Name</th><th>Kind</th><th>Created</th><th>Expires</th><th></th></tr></thead>
+<tbody>
+{{range .Keys}}<tr>
+<td><strong>{{.Name}}</strong><div class="mute small">by {{.CreatedBy}}{{if .LastUsedAt}} · used {{date .LastUsedAt}}{{end}}</div></td>
+<td><span class="badge {{.Kind}}">{{or .Kind "legacy"}}</span></td>
+<td class="mute small">{{date .CreatedAt}}</td>
+<td class="mute small">{{if .ExpiresAt}}{{date .ExpiresAt}}{{else}}never{{end}}</td>
+<td>{{if eq .ID $.OwnKey}}<span class="mute small">this webapp's key</span>{{else}}<a href="{{$.Base}}{{$.KeyPath}}/{{.ID}}/revoke">Revoke</a>{{end}}</td>
+</tr>{{end}}
+</tbody></table>
+{{else}}<p class="mute">No keys yet.</p>{{end}}
+</div>
+{{end}}

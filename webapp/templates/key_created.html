@@ -1,0 +1,18 @@
+{{define "title"}}Key created{{end}}
+{{define "content"}}
+<h1>Key created</h1>
+<div class="card">
+<p><strong>{{.Key.Name}}</strong> <span class="badge {{.Key.Kind}}">{{.Key.Kind}}</span></p>
+<div class="warn"><strong>Copy this token now.</strong> It is shown only once, and can't be recovered. If you lose it, revoke the key and make a new one.</div>
+<code class="token" id="token">{{.Token}}</code>
+<div class="actions"><button type="button" id="copy">Copy token</button><a class="btn ghost" href="{{.Base}}{{.Back}}">Done</a></div>
+</div>
+<script nonce="{{.Nonce}}">
+document.getElementById('copy').addEventListener('click',function(e){
+  var t=document.getElementById('token').textContent,b=e.target;
+  function ok(){b.textContent='Copied';}
+  if(navigator.clipboard){navigator.clipboard.writeText(t).then(ok,function(){sel();});}else{sel();}
+  function sel(){var r=document.createRange();r.selectNode(document.getElementById('token'));var s=getSelection();s.removeAllRanges();s.addRange(r);b.textContent='Selected: press copy';}
+});
+</script>
+{{end}}

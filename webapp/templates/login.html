@@ -1,0 +1,13 @@
+{{define "title"}}Sign in{{end}}
+{{define "content"}}
+<div class="card">
+<h1>Sign in</h1>
+<p class="mute">Enter your email and we'll send you a one-time sign-in link, good for 15 minutes.</p>
+<form method="post" action="{{.Base}}/login">
+<input type="hidden" name="form" value="{{.Form}}">
+<label for="email">Email</label>
+<input id="email" type="email" name="email" autocomplete="email" autofocus required>
+<div class="actions"><button type="submit">Email me a link</button></div>
+</form>
+</div>
+{{end}}

@@ -1,0 +1,31 @@
+{{define "title"}}{{.Project.Name}}{{end}}
+{{define "content"}}
+<p class="small"><a href="{{.Base}}/projects">← Projects</a></p>
+<h1>{{.Project.Name}} <span class="mute small"><code>{{.Project.ID}}</code></span></h1>
+<h2>Keys</h2>
+<p class="mute small"><strong>admin</strong> keys manage the project's other keys and namespaces. <strong>read_write</strong> keys write and query. <strong>read</strong> keys only query.</p>
+{{template "keytable" .}}
+<h2>New key</h2>
+<form class="card" method="post" action="{{.Base}}/projects/{{.Project.ID}}/keys">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<div class="row three">
+<div><label for="kname">Name</label><input id="kname" type="text" name="name" placeholder="production app" maxlength="200" required></div>
+<div><label for="kind">Kind</label><select id="kind" name="kind"><option value="read_write">read_write</option><option value="read">read</option><option value="admin">admin</option></select></div>
+<div><label for="expires">Expires</label><select id="expires" name="expires"><option value="">never</option><option value="30">in 30 days</option><option value="90">in 90 days</option><option value="365">in a year</option></select></div>
+</div>
+<div class="actions"><button type="submit">Create key</button></div>
+</form>
+{{if ne .Project.ID "default"}}
+<h2>Settings</h2>
+<form class="card" method="post" action="{{.Base}}/projects/{{.Project.ID}}/rename">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<label for="rname">Display name</label>
+<input id="rname" type="text" name="name" value="{{.Project.Name}}" maxlength="200" required>
+<div class="actions"><button class="ghost" type="submit">Rename</button></div>
+</form>
+<div class="card"><strong>Delete this project</strong>
+<p class="mute small">Revokes all of its keys, and optionally deletes its namespaces.</p>
+<a class="btn ghost danger" href="{{.Base}}/projects/{{.Project.ID}}/delete">Delete project…</a></div>
+{{end}}
+<p class="mute small">Created {{date .Project.CreatedAt}} by {{.Project.CreatedBy}}.</p>
+{{end}}
