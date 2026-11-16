@@ -223,7 +223,7 @@ cargo build --release -p blowfish --features local-models-native
 CFLAGS="-march=x86-64-v3" CXXFLAGS="-march=x86-64-v3" cargo build --release -p blowfish --features local-models
 ```
 
-Without AVX2 flags llama.cpp falls back to plain SSE2 and runs about five times slower. The container image
+Without AVX2 flags llama.cpp falls back to plain SSE2 and runs about four to five times slower (32 passages: 28 s baseline, 7 s with `x86-64-v3`, 5 s with the host-tuned build, on the host above). The container image
 is built with `local-models` and `x86-64-v3` flags (x86 only).
 
 CI builds, lints, and tests the feature in its own job. The default job never compiles it.
