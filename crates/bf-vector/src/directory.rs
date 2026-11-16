@@ -607,6 +607,8 @@ impl<R: RangeRead> PartialIndex<R> {
 /// A segment's row-to-cluster map (decoded from the fragment's membership area).
 pub struct Membership {
     cluster_of: Vec<u32>,
+    /// Position of each row among its cluster's rows, in ascending row order.
+    ordinal_of: Vec<u32>,
 }
 impl Membership {
     /// Decode the membership bytes of a segment with `rows` rows and `clusters` clusters.
@@ -633,11 +635,23 @@ impl Membership {
         if cluster_of.iter().any(|c| *c as usize >= clusters) {
             return Err(bad("membership cluster outside segment"));
         }
-        Ok(Self { cluster_of })
+        let mut next = vec![0u32; clusters];
+        let ordinal_of = cluster_of
+            .iter()
+            .map(|&c| {
+                let n = &mut next[c as usize];
+                *n += 1;
+                *n - 1
+            })
+            .collect();
+        Ok(Self {
+            cluster_of,
+            ordinal_of,
+        })
     }
     /// Approximate resident bytes.
     pub fn resident_bytes(&self) -> u64 {
-        self.cluster_of.len() as u64 * 4
+        self.cluster_of.len() as u64 * 8
     }
     /// Rows of `allowed` in each of the segment's `clusters` clusters.
     pub fn counts(&self, allowed: &RoaringBitmap, clusters: usize) -> Vec<u32> {
@@ -657,16 +671,13 @@ impl Membership {
         allowed: &RoaringBitmap,
         keep: impl Fn(u32) -> bool,
     ) -> Vec<(u32, u32, u32)> {
-        let mut next = std::collections::HashMap::<u32, u32>::new();
-        let mut out = Vec::new();
-        for (row, &cluster) in self.cluster_of.iter().enumerate() {
-            let ordinal = next.entry(cluster).or_insert(0);
-            if allowed.contains(row as u32) && keep(cluster) {
-                out.push((cluster, *ordinal, row as u32));
-            }
-            *ordinal += 1;
-        }
-        out
+        allowed
+            .iter()
+            .filter_map(|row| {
+                let cluster = *self.cluster_of.get(row as usize)?;
+                keep(cluster).then(|| (cluster, self.ordinal_of[row as usize], row))
+            })
+            .collect()
     }
 }
 impl<R: RangeRead> PartialIndex<R> {

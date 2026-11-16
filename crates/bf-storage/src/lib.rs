@@ -368,23 +368,11 @@ impl Storage {
         key: &str,
         value: impl Into<Bytes>,
     ) -> Result<CreateResult, Error> {
-        self.create_unique_with_id(key, value, Uuid::new_v4()).await
-    }
-    /// [`Self::create_unique`] with a caller-retained identity (see [`Self::create_with_id`]):
-    /// a retry of an upload that already completed overwrites it with identical bytes. Use it
-    /// only for keys no other writer can use, like a WAL payload staged under its own ID.
-    pub async fn create_unique_with_id(
-        &self,
-        key: &str,
-        value: impl Into<Bytes>,
-        write_id: Uuid,
-    ) -> Result<CreateResult, Error> {
-        // Parts must be at least 5 MiB (the object stores' minimum) except the last.
-        const MULTIPART_MIN: usize = 12 << 20;
-        const PART: usize = 6 << 20;
+        const MULTIPART_MIN: usize = 32 << 20;
+        const PART: usize = 16 << 20;
         let value = value.into();
         if value.len() < MULTIPART_MIN || self.0.mode != StorageMode::Conditional {
-            return self.create_with_id(key, value, write_id).await;
+            return self.create(key, value).await;
         }
         self.writable()?;
         let path = self.path(key);
@@ -392,7 +380,7 @@ impl Storage {
         let mut writer = object_store::WriteMultipart::new_with_chunk_size(upload, PART);
         let mut header = Vec::with_capacity(HEADER);
         header.extend_from_slice(MAGIC);
-        header.extend_from_slice(write_id.as_bytes());
+        header.extend_from_slice(Uuid::new_v4().as_bytes());
         writer.put(header.into());
         let mut offset = 0;
         let result = async {

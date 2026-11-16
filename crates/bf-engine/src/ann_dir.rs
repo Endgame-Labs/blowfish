@@ -120,8 +120,12 @@ pub(crate) async fn build(
     .await;
     // A fragment in an older format (without row-to-cluster maps) means no directory yet:
     // queries open each segment until compaction rewrites it.
-    let Ok(reads) = reads else {
-        return Ok(None);
+    let reads = match reads {
+        Ok(reads) => reads,
+        Err(e) => {
+            tracing::warn!(error=?e, "ANN directory not built: fragment unreadable");
+            return Ok(None);
+        }
     };
     for (seg, fragment) in segments.iter().zip(reads) {
         sources.push((
@@ -132,6 +136,7 @@ pub(crate) async fn build(
         ));
     }
     let Some(bytes) = Directory::build(&sources).map_err(segment::index_error)? else {
+        tracing::warn!("ANN directory not built: segments do not share one vector space");
         return Ok(None);
     };
     let len = bytes.len() as u64;

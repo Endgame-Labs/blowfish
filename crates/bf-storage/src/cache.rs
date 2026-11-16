@@ -498,6 +498,16 @@ impl RangeReader {
                     return Err(Arc::new(Error::Config("short object-store range response")));
                 }
                 let mut values = Vec::with_capacity(indices.len());
+                // At most MAX_SPILLS disk writes wait at once: on a cold cache the disk is slower
+                // than the network, and an unbounded backlog would hold every fetched block in
+                // memory. A skipped write only means that block is fetched again later.
+                const MAX_SPILLS: usize = 16;
+                let spilling = cache.disk.is_some()
+                    && cache
+                        .spills
+                        .pending
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        < MAX_SPILLS;
                 let mut spill = Vec::new();
                 for index in indices {
                     let begin = ((index - first) * size) as usize;
@@ -505,7 +515,7 @@ impl RangeReader {
                     // Independent allocations keep a single cached block from pinning a whole GET.
                     let value = Bytes::copy_from_slice(&bytes[begin..end]);
                     let key = reader.block_key(index);
-                    if cache.disk.is_some() {
+                    if spilling {
                         spill.push((cache.disk_key(&key), value.clone()));
                     }
                     cache.insert_memory(key, value.clone());
@@ -514,7 +524,7 @@ impl RangeReader {
                 // The disk tier is written behind the read: a block-by-block write that the
                 // read awaited cost about a millisecond per 4 KB block, which made a cold 2 MB
                 // read take half a second after the network transfer had finished.
-                if let Some(disk) = cache.disk.clone() {
+                if let Some(disk) = cache.disk.clone().filter(|_| spilling) {
                     let spills = cache.spills.clone();
                     spills
                         .pending
