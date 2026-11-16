@@ -101,3 +101,46 @@ change.
 - Recall@10 is at least 0.95, and turbopuffer parity overlap doesn't drop.
 - Old segments still load and query, and old binaries reading new manifests fail cleanly.
 - The full compat suite passes in both modes.
+
+## Iteration 5: fragments and one-bit centers
+
+### Fragments make publication incremental
+
+Each segment now writes a **fragment** (`ann.<column>.bff`, manifest file key `annfrag:<attribute>`) when its ANN
+index is built, and the directory is the concatenation of the fragments' resident parts. A fragment holds:
+
+- a resident part: the segment's mean center (`centroid`, f32), and per non-empty leaf cluster its row count, the code
+  and vector byte ranges and checksums inside the segment's `.bfv`, the byte range of its blob inside the fragment,
+  and the one-bit center code;
+- a blob area: per cluster the exact rotated center, the row set, and the row checksums, read only for probed clusters.
+
+Publishing a segment set reads only the fragments of segments the previous directory does not already list (one
+ranged read each), copies the other sections from the previous directory in memory, and writes one new object. Nothing
+opens an existing segment, so ingest cost per publication does not grow with the segment count (test
+`directory_cost_and_publication_do_not_grow_with_segment_count`: 60 publications, zero segment-index reads, at most
+two fragment reads and one directory read each). The directory (`BFDIR002`) holds no blobs: it is all resident
+metadata, read whole in the snapshot wave.
+
+Segments built before fragments existed have no `annfrag:` file, so the namespace has no directory and queries use
+the per-segment path, as before. Compaction rewrites such segments with fragments.
+
+### One-bit centers
+
+Each center is stored as a RaBitQ code of its offset from the segment's mean center: `padded / 8` sign bytes, the
+offset's norm, and the code's inner-product correction (`alpha`). The query side builds a per-segment byte lookup
+table (128 lookups per cluster at 1024 dims) and estimates `|q - c|^2 = |q - g|^2 + |c - g|^2 - 2 <q - g, c - g>`,
+dividing the one-bit inner product by `alpha`. Centering on the segment mean matters: raw centers of normalized
+embeddings share one large mean component, and their sign codes would all agree.
+
+Size: 196 bytes per leaf at 1024 dims (136 for the code and correction, 60 for the entry), against about 1.1 KB
+resident for the int8 version. At 10M documents (about 22K leaves) that is about 4.4 MB. Recall@10 at 100K was unchanged
+(0.984).
+
+### Still open
+
+- Filtered ANN does not use the directory (per-cluster filter summaries are not built): selective and broad filtered
+  queries open every segment's index and ID index.
+- Rerank is still sparse ranges, about 120 requests per query at 100K, in one wave. Interleaving full vectors with
+  the codes would read every probed row's vector (about 48 MB at 100K), so it is not worth it; the remaining lever is a
+  smaller rerank pool.
+- A segment's vectors are ordered by cluster, not by cluster proximity, so rerank ranges rarely merge.
