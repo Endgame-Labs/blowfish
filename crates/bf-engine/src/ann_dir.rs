@@ -15,6 +15,8 @@ use std::{
 /// Fetch merged ranges at most this far apart as one request.
 const BLOB_GAP: u64 = 64 << 10;
 const BLOB_MERGE_MAX: u64 = 8 << 20;
+/// Exact-scan vector prefetch is split into concurrent reads of this size.
+const PREFETCH_PIECE: u64 = 1 << 20;
 /// Above this many matching rows, fetching only the matching vectors stops being cheaper
 /// than scanning quantized codes.
 const EXACT_ROWS: usize = 2048;
@@ -25,7 +27,8 @@ type Reader = segment::ObjectReader;
 /// Exact hits `(distance, row)` and estimated candidates from one segment.
 type Found = (Vec<(f32, u32)>, Vec<Candidate>);
 
-/// Load (and pin in the decoded cache) a directory object: one ranged read of its metadata part.
+/// Load (and pin in the decoded cache) a directory object: one read of the whole object, which
+/// is all resident metadata.
 pub(crate) async fn load(
     store: &Storage,
     file: &bf_wal::SegmentFile,
@@ -48,16 +51,19 @@ pub(crate) async fn load(
 /// Whether `dir` lists exactly these segments' indexes for `attr`, in order.
 pub(crate) fn covers(dir: &Directory, segments: &[bf_wal::Segment], attr: &str) -> bool {
     let key = format!("ann:{attr}");
+    let frag = format!("annfrag:{attr}");
     dir.segments().len() == segments.len()
-        && dir
-            .segments()
-            .iter()
-            .zip(segments)
-            .all(|(d, s)| d.id == s.id && s.files.get(&key).is_some_and(|f| f.key == d.key))
+        && dir.segments().iter().zip(segments).all(|(d, s)| {
+            d.id == s.id
+                && s.files.get(&key).is_some_and(|f| f.key == d.key)
+                && s.files.get(&frag).is_some_and(|f| f.key == d.fragment)
+        })
 }
 
 /// Build (or keep) the directory for `key` (`ann:<attribute>`) over `segments`. Returns `None`
-/// when some segment lacks the index or the segments do not share one vector space.
+/// when some segment lacks the index or its fragment, or the segments do not share one vector
+/// space. Incremental: sections of segments already in `previous` are carried over, and only
+/// new segments' fragments (small, one ranged read each) are read.
 pub(crate) async fn build(
     store: &Storage,
     ns: &str,
@@ -65,34 +71,71 @@ pub(crate) async fn build(
     key: &str,
     previous: Option<&bf_wal::SegmentFile>,
 ) -> Result<Option<bf_wal::SegmentFile>, ApiError> {
-    if segments.is_empty() || segments.iter().any(|s| !s.files.contains_key(key)) {
+    let attr = key.trim_start_matches("ann:");
+    let frag_key = format!("annfrag:{attr}");
+    if segments.is_empty()
+        || segments
+            .iter()
+            .any(|s| !s.files.contains_key(key) || !s.files.contains_key(&frag_key))
+    {
         return Ok(None);
     }
-    let attr = key.trim_start_matches("ann:");
-    if let Some(old) = previous
-        && let Ok(dir) = load(store, old).await
-        && covers(&dir, segments, attr)
+    let old = match previous {
+        Some(old) => load(store, old).await.ok().map(|dir| (old, dir)),
+        None => None,
+    };
+    if let Some((old, dir)) = &old
+        && covers(dir, segments, attr)
     {
-        return Ok(Some(old.clone()));
+        return Ok(Some((*old).clone()));
     }
-    let mut indexes = Vec::with_capacity(segments.len());
-    for seg in segments {
-        indexes.push(segment::vector_index(store, &seg.files[key]).await?);
-    }
-    let sources: Vec<_> = segments
+    let carried: BTreeMap<&str, usize> = old
         .iter()
-        .zip(&indexes)
-        .map(|(s, i)| (s.id.clone(), s.files[key].key.clone(), &**i))
+        .flat_map(|(_, d)| {
+            d.segments()
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.fragment.as_str(), i))
+        })
         .collect();
-    let Some((bytes, meta)) = Directory::build(&sources).map_err(segment::index_error)? else {
+    let mut sources = Vec::with_capacity(segments.len());
+    let reads = futures::future::try_join_all(segments.iter().map(|seg| {
+        let carried = &carried;
+        let old = &old;
+        let frag_key = &frag_key;
+        async move {
+            let file = &seg.files[frag_key];
+            if let Some(&i) = carried.get(file.key.as_str())
+                && let Some((_, dir)) = old
+            {
+                return Ok::<_, ApiError>(dir.fragment_of(i));
+            }
+            let bytes = Reader::new(store, file)
+                .read(0..file.metadata_len)
+                .await
+                .map_err(segment::index_error)?;
+            bf_vector::Fragment::decode(&bytes).map_err(segment::index_error)
+        }
+    }))
+    .await?;
+    for (seg, fragment) in segments.iter().zip(reads) {
+        sources.push((
+            seg.id.clone(),
+            seg.files[key].key.clone(),
+            seg.files[&frag_key].key.clone(),
+            fragment,
+        ));
+    }
+    let Some(bytes) = Directory::build(&sources).map_err(segment::index_error)? else {
         return Ok(None);
     };
+    let len = bytes.len() as u64;
     Ok(Some(
         segment::put_file(
             store,
             format!("ns/{ns}/segments/ann-dir-{}.bfd", uuid::Uuid::new_v4()),
             bytes,
-            meta,
+            len,
         )
         .await?,
     ))
@@ -147,7 +190,6 @@ struct Probed {
 pub(crate) async fn search(
     store: &Storage,
     state: &NamespaceState,
-    dir_file: &bf_wal::SegmentFile,
     dir: Arc<Directory>,
     lives: Vec<Option<Arc<RoaringBitmap>>>,
     vector: &[f32],
@@ -257,7 +299,6 @@ pub(crate) async fn search(
 
     // Wave 3: probed codes and cluster blobs for each chosen segment, in parallel. Docs
     // footers for the chosen segments are warmed in the same wave.
-    let dir_reader = Reader::new(store, dir_file);
     let mut tasks = Vec::new();
     for (&i, cs) in &chosen {
         let (dir, vector) = (dir.clone(), vector.clone());
@@ -269,7 +310,12 @@ pub(crate) async fn search(
             .cloned()
             .ok_or_else(|| segment::index_error("segment lost its ANN index"))?;
         let reader = Reader::new(store, &file);
-        let dir_reader = dir_reader.clone();
+        let frag_file = state.segments[i]
+            .files
+            .get(&format!("annfrag:{attribute}"))
+            .cloned()
+            .ok_or_else(|| segment::index_error("segment lost its ANN fragment"))?;
+        let dir_reader = Reader::new(store, &frag_file);
         let live = lives[i].clone();
         let segment_meta = state.segments[i].clone();
         let store = store.clone();
@@ -280,6 +326,30 @@ pub(crate) async fn search(
             .cloned()
             .collect();
         tasks.push(async move {
+            // An exactly scanned segment needs all of its vectors, and its row sets (from the
+            // blobs) only say which. Read the vectors in parallel with the blobs, as
+            // concurrent pieces, so the later exact scan is served from the cache.
+            let prefetch_ranges: Vec<_> = if exact {
+                seg_entries.iter().map(|e| e.vectors_range()).collect()
+            } else {
+                Vec::new()
+            };
+            let prefetch_reader = reader.clone();
+            let prefetch = async move {
+                let pieces = prefetch_ranges.into_iter().flat_map(|r| {
+                    let mut out = Vec::new();
+                    let mut start = r.start;
+                    while start < r.end {
+                        let end = (start + PREFETCH_PIECE).min(r.end);
+                        out.push(start..end);
+                        start = end;
+                    }
+                    out
+                });
+                // Best effort: a failure here only means the scan reads the range itself.
+                let _ = futures::future::join_all(pieces.map(|r| prefetch_reader.read(r))).await;
+                Ok::<(), ApiError>(())
+            };
             let mut partial = dir.partial_index(i, reader).map_err(segment::index_error)?;
             let ranges: Vec<_> = seg_entries.iter().map(|e| e.blob_range()).collect();
             let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
@@ -299,10 +369,11 @@ pub(crate) async fn search(
                         .map_err(segment::index_error)
                 }
             };
-            let (blobs, codes, ()) = tokio::try_join!(read_blobs, read_codes, async {
-                segment::warm_docs(&store, &segment_meta).await;
-                Ok(())
-            })?;
+            let (blobs, codes, (), ()) =
+                tokio::try_join!(read_blobs, read_codes, prefetch, async {
+                    segment::warm_docs(&store, &segment_meta).await;
+                    Ok(())
+                })?;
             for (cluster, blob) in wanted.iter().zip(&blobs) {
                 partial
                     .install(*cluster, blob)

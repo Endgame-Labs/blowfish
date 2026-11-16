@@ -518,11 +518,26 @@ pub(crate) async fn build(
         uploads.push(Box::pin(async move {
             let bytes = job.await.map_err(index_error)?.map_err(index_error)?;
             let meta = bf_vector::metadata_len(&bytes).map_err(index_error)?;
-            let file = put_file(&store, format!("{prefix}/ann.{column}.bfv"), bytes, meta).await?;
-            Ok::<_, ApiError>((format!("ann:{name}"), file))
+            // The fragment lists this segment's clusters for the namespace ANN directory, so a
+            // later directory build never reopens the segment.
+            let (fragment, fragment_meta) =
+                bf_vector::Fragment::build(&bytes).map_err(index_error)?;
+            let (file, fragment) = tokio::try_join!(
+                put_file(&store, format!("{prefix}/ann.{column}.bfv"), bytes, meta),
+                put_file(
+                    &store,
+                    format!("{prefix}/ann.{column}.bff"),
+                    fragment,
+                    fragment_meta
+                ),
+            )?;
+            Ok::<_, ApiError>(vec![
+                (format!("ann:{name}"), file),
+                (format!("annfrag:{name}"), fragment),
+            ])
         })
             as std::pin::Pin<
-                Box<dyn Future<Output = Result<(String, SegmentFile), ApiError>> + Send>,
+                Box<dyn Future<Output = Result<Vec<(String, SegmentFile)>, ApiError>> + Send>,
             >);
     }
     for (name, column, job) in fts_jobs {
@@ -536,10 +551,15 @@ pub(crate) async fn build(
                 metadata_len,
             )
             .await?;
-            Ok::<_, ApiError>((format!("fts:{name}"), file))
+            Ok::<_, ApiError>(vec![(format!("fts:{name}"), file)])
         }));
     }
-    files.extend(futures::future::try_join_all(uploads).await?);
+    files.extend(
+        futures::future::try_join_all(uploads)
+            .await?
+            .into_iter()
+            .flatten(),
+    );
     let live = put_value(
         store,
         format!("{prefix}/live.00000000000000000000.bfl"),

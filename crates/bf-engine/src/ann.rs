@@ -82,7 +82,7 @@ pub(crate) async fn search(
         )?;
         if crate::ann_dir::covers(&dir, &state.segments, attribute) {
             return crate::ann_dir::search(
-                store, state, file, dir, lives, vector, config, k, columns, attribute,
+                store, state, dir, lives, vector, config, k, columns, attribute,
             )
             .await
             .map(Some);

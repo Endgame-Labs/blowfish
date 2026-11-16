@@ -824,6 +824,49 @@ reloaded namespace (ANN overlap 0.962), so the small difference from earlier mil
 - Rerank is still 80 sparse ranges per query; storing full vectors with the codes would turn them into one read per cluster.
 - Directory centers are int8, 1 KB per cluster: 30 MB at 10M. A 1-bit code would cut that to 130 B.
 
+## Iteration 5 (100K docs): one-bit directory centers and incremental publication
+
+Same dataset and 200 holdouts, `scale/` wiped and reloaded; block cache 256 MiB and decoded metadata 128 MiB (scaled
+down from the 10M settings so cache pressure resembles 10M); cold means a fresh process and an empty disk cache (8
+queries); strong consistency; nprobe 64, rerank cap 32 x k.
+
+### What changed
+
+| Change | Why (evidence) | Effect |
+| --- | --- | --- |
+| Directory centers are RaBitQ one-bit codes of the offset from the segment mean (196 B per leaf), not int8 (about 1.1 KB resident per leaf) | the int8 directory would be about 30 MB at 10M, pinned in memory and read whole on every cold start | final 100K directory 139 KB (about 700 leaves); projected 4.4 MB at 10M (about 22K leaves); recall@10 unchanged at 0.984 |
+| Each segment writes a fragment (`annfrag:` file) with its directory section and cluster blobs; a publication reads only new fragments and copies the other sections from the previous directory | iteration 4 reopened every segment's metadata on each publication, so ingest cost grew with segment count | test over 60 publications: zero segment-index reads, at most two fragment reads and one directory read per publication; the directory holds no blobs and is read whole |
+| Exactly scanned (flat) segments prefetch their vectors in parallel with the blobs, as concurrent 1 MiB reads | the 4 MB flat-segment read ran after the blob read, a second serial wave inside the scan stage (about 230 ms) | the flat read is a cache hit (3 ms) by the time the scan needs it |
+
+Scaling test (`directory_cost_and_publication_do_not_grow_with_segment_count`, 10 ms per request): at 6 segments cold
+ANN takes 3 waves and 14 requests; at 60 segments 3 waves and 64 requests (ten times the rows, so about 3x the
+probes). Waves do not grow with segments. The existing 20-segment test still sees 3 waves and zero segment-index reads.
+
+### Results (strong consistency)
+
+| Query | Cold p50 / p90 / p99 ms | Cold GETs/q | Cold MB/q | Warm c1 p50 / p90 / p99 ms | QPS c1 / c8 / c32 | Recall@10 |
+| --- | --- | ---: | ---: | --- | --- | ---: |
+| ANN | 1,044 / 1,681 / 2,142 | 138 | 13.4 | 59 / 88 / 114 | 15.1 / 101 / 124 | 0.984 |
+| BM25 | 943 / 1,429 / 1,663 | 39 | 7.0 | 58 / 92 / 160 | 15.2 / 110 / 158 | |
+| Hybrid | 1,023 / 1,141 / 1,161 | 178 | 20.5 | 60 / 71 / 119 | 16.3 / 83 / 107 | |
+| Selective ANN | 1,120 / 1,260 / 1,301 | 229 | 7.8 | 58 / 106 / 148 | 14.4 / 97 / 172 | 1.000 |
+
+Iteration 4 (recorded): ANN cold p50 923 (881 in its A/B run), 129 GETs, 14 MB, warm 61 ms, recall 0.984. Cold ANN
+over three runs of this iteration's code was 829, 1,044, and (an earlier build) 1,088 ms, so R2 round-trip variance
+between sessions is about as large as any difference here; the iteration's gain is structural (directory size,
+publication cost), not a 100K latency win. Cold ANN is 3 sequential waves on R2 as well (stage trace: snapshot with the
+directory about 200 ms, scan about 430 ms, rerank about 270 ms). Ingest: 100K in 122 s (816 docs/s), 0 backpressure
+429s, server peak RSS 2.9 GiB. Bucket after load: 1.2 GB including WAL objects and retired files awaiting GC; fragments
+add about 55 B per document (5.5 MB at 100K). Parity: milestone 3 row below.
+
+### Remaining
+
+- Filtered ANN (selective, broad) still opens every segment's index and ID index: 229 requests. Needs per-cluster
+  filter summaries.
+- Rerank is about 120 sparse ranges per query in one wave. Interleaving vectors with codes would read every probed
+  row's vector (about 48 MB at 100K), so it is the wrong trade; a smaller pool or merged ranges are the levers.
+- BM25 block-max skipping is not done; BM25 cost still grows with posting-list length.
+
 ## turbopuffer reference (100K)
 
 The real turbopuffer holds the same 100K documents (the first 100K English Wikipedia passages, 1024-dim f16, the same
@@ -946,3 +989,4 @@ turbopuffer). turbopuffer's numbers do not change between milestones except for 
 | 0: iteration 2 main | `e12178f` | 76 / 120 / 179 ms, 0.963 | 73 / 110 / 191 ms, 0.982 | 78 / 117 / 261 ms, 0.973 | 74 / 123 / 232 ms, 0.998 | 74 / 110 / 166 ms, 0.992 |
 | 1: iteration 3 | `73d8110` | 87 / 116 / 155 ms, 0.965 | 90 / 129 / 201 ms, 0.982 | 100 / 133 / 299 ms, 0.972 | 98 / 136 / 216 ms, 0.998 | 100 / 131 / 234 ms, 0.991 |
 | 2: iteration 4 (ANN directory) | `f1a7db3`+ | 68 / 91 / 191 ms, 0.962 | 66 / 99 / 198 ms, 0.982 | 65 / 90 / 173 ms, 0.971 | 64 / 88 / 134 ms, 0.998 | 57 / 74 / 156 ms, 0.991 |
+| 3: iteration 5 (one-bit directory, fragments) | `af04e66`+ | 53 / 72 / 114 ms, 0.968 | 61 / 86 / 193 ms, 0.982 | 60 / 87 / 165 ms, 0.975 | 54 / 78 / 137 ms, 0.998 | 61 / 86 / 106 ms, 0.993 |
