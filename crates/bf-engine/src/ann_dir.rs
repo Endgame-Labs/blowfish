@@ -491,9 +491,14 @@ pub(crate) async fn search(
                 let ranges: Vec<_> = seg_entries.iter().map(|e| e.blob_range()).collect();
                 let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
                 let read_blobs = async {
-                    bf_vector::read_merged(&dir_reader, ranges, BLOB_GAP, BLOB_MERGE_MAX)
-                        .await
-                        .map_err(segment::index_error)
+                    bf_vector::read_merged(
+                        &dir_reader,
+                        ranges,
+                        bf_vector::read_gap(BLOB_GAP),
+                        BLOB_MERGE_MAX,
+                    )
+                    .await
+                    .map_err(segment::index_error)
                 };
                 let read_codes = async {
                     if exact {

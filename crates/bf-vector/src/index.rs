@@ -46,6 +46,19 @@ pub struct Candidate {
     pub ordinal: u32,
 }
 
+/// Ranges closer than this many bytes are read together: the gap is fetched and dropped.
+/// `BF_READ_GAP_KB` overrides every merge gap below (experiments and tuning).
+pub fn read_gap(default: u64) -> u64 {
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("BF_READ_GAP_KB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|kb| kb << 10)
+        })
+        .unwrap_or(default)
+}
 /// Code blocks closer than this are read together (the gap bytes are fetched and dropped).
 const CODE_GAP: u64 = 64 << 10;
 const CODE_MERGE_MAX: u64 = 8 << 20;
@@ -464,7 +477,8 @@ impl<R: RangeRead> Index<R> {
             .iter()
             .map(|c| self.metadata.clusters[*c].codes.clone())
             .collect();
-        self.read_merged(ranges, CODE_GAP, CODE_MERGE_MAX).await
+        self.read_merged(ranges, read_gap(CODE_GAP), CODE_MERGE_MAX)
+            .await
     }
 
     /// Read `ranges` (in any order), merging ranges whose gap is at most `gap` bytes into one
@@ -615,7 +629,7 @@ impl<R: RangeRead> Index<R> {
             }
         }
         let blocks = self
-            .read_merged(ranges.clone(), VECTOR_GAP, VECTOR_MERGE_MAX)
+            .read_merged(ranges.clone(), read_gap(VECTOR_GAP), VECTOR_MERGE_MAX)
             .await?;
         let mut result = Vec::with_capacity(locations.len());
         let mut decoded = Vec::with_capacity(self.dims());
@@ -697,7 +711,7 @@ impl<R: RangeRead> Index<R> {
         let nranges = ranges.len();
         let rbytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         let blocks = self
-            .read_merged(ranges, VECTOR_GAP, VECTOR_MERGE_MAX)
+            .read_merged(ranges, read_gap(VECTOR_GAP), VECTOR_MERGE_MAX)
             .await?;
         let read_ms = t_read.elapsed().as_millis();
         let t_cpu = std::time::Instant::now();

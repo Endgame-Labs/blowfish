@@ -23,7 +23,25 @@ pub(crate) struct OpenHint {
     /// Filters of ANN sub-queries: their per-segment bitmaps are opened in the snapshot wave.
     filters: Vec<Filter>,
 }
+/// Which part of the warm-up to run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    All,
+    /// Everything except text segments, statistics, and the files they need.
+    WithoutText,
+    OnlyText,
+}
 impl OpenHint {
+    /// A hybrid query's ANN half needs only the directory, so it must not wait for the BM25
+    /// term lookups (they finish a few hundred milliseconds later on a cold namespace).
+    fn splits_text(&self, dirs: &BTreeMap<String, bf_wal::SegmentFile>) -> bool {
+        !self.ann.is_empty()
+            && !self.text.is_empty()
+            && self
+                .ann
+                .iter()
+                .all(|a| dirs.contains_key(&format!("ann:{a}")))
+    }
     pub(crate) fn for_request(
         request: &QueryRequest,
         context: crate::read_cache::ReadContext,
@@ -81,12 +99,14 @@ impl OpenHint {
     /// Open (and cache) segment metadata. Failures are ignored: the query reports them.
     async fn warm(
         &self,
+        part: Part,
         store: &Storage,
         segments: &[bf_wal::Segment],
         text: Option<&bf_wal::SegmentFile>,
         dirs: &BTreeMap<String, bf_wal::SegmentFile>,
         schema: &Schema,
     ) {
+        let (with_text, with_rest) = (part != Part::WithoutText, part != Part::OnlyText);
         let context = self.context.clone();
         crate::read_cache::scope(context, async {
             let mut queries: BTreeMap<&str, Vec<bf_text::Query>> = BTreeMap::new();
@@ -111,7 +131,7 @@ impl OpenHint {
                 .ann
                 .iter()
                 .all(|a| dirs.contains_key(&format!("ann:{a}")));
-            for attribute in &self.ann {
+            for attribute in self.ann.iter().filter(|_| with_rest) {
                 if let Some(file) = dirs.get(&format!("ann:{attribute}")) {
                     let filtered = !self.filters.is_empty();
                     tasks.push(
@@ -129,7 +149,7 @@ impl OpenHint {
                 }
             }
             for seg in segments {
-                if by_dir {
+                if by_dir && with_rest {
                     for f in &self.filters {
                         // Populate the cache with the live mask and the filter's dictionary
                         // blocks; the query recomputes the (cheap) bitmap from them.
@@ -144,12 +164,12 @@ impl OpenHint {
                         );
                     }
                 }
-                for attribute in self.ann.iter().filter(|_| !by_dir) {
+                for attribute in self.ann.iter().filter(|_| !by_dir && with_rest) {
                     if let Some(file) = seg.files.get(&format!("ann:{attribute}")) {
                         tasks.push(segment::vector_index(store, file).map_ok(drop).boxed());
                     }
                 }
-                for attribute in &self.text {
+                for attribute in self.text.iter().filter(|_| with_text) {
                     if let Some(file) = seg.files.get(&format!("fts:{attribute}")) {
                         tasks.push(
                             timed("text_index", async move {
@@ -171,27 +191,34 @@ impl OpenHint {
                     .files
                     .get("ids")
                     .is_none_or(|f| f.size <= crate::indexed::RANGED_IDS_BYTES);
-                if (!self.ann.is_empty() && !by_dir) || (!self.text.is_empty() && small_ids) {
+                if (with_rest && !self.ann.is_empty() && !by_dir)
+                    || (with_text && !self.text.is_empty() && small_ids)
+                {
                     tasks.push(
                         timed("ids", segment::ids(store, seg))
                             .map(|r| r.map(drop))
                             .boxed(),
                     );
                 }
-                if (!self.ann.is_empty() && !by_dir) || !self.text.is_empty() {
+                if (with_rest && !self.ann.is_empty() && !by_dir)
+                    || (with_text && !self.text.is_empty())
+                {
                     tasks.push(
                         segment::get_value::<RoaringBitmap>(store, &seg.live)
                             .map_ok(drop)
                             .boxed(),
                     );
                 }
-                if (self.docs && !(by_dir && self.text.is_empty() && !self.ann.is_empty()))
-                    || (!self.text.is_empty() && !small_ids)
+                if (with_rest
+                    && self.docs
+                    && !(by_dir && self.text.is_empty() && !self.ann.is_empty()))
+                    || (with_text && !self.text.is_empty() && !small_ids)
                 {
                     tasks.push(segment::warm_docs(store, seg).map(|()| Ok(())).boxed());
                 }
             }
-            if !self.text.is_empty()
+            if with_text
+                && !self.text.is_empty()
                 && let Some(file) = text
             {
                 tasks.push(
@@ -308,9 +335,37 @@ pub(crate) async fn catch_up_hinted(
             let (segments, text) = (state.segments.clone(), state.text_stats.clone());
             let dirs = state.ann_dirs.clone();
             let schema = state.schema.clone();
+            if hint.splits_text(&dirs) {
+                // The text half keeps warming behind the query: its reads are single-flighted
+                // with the query's own, so nothing is fetched twice.
+                let (hint, store, segments, text, dirs, schema) = (
+                    hint.clone(),
+                    store.clone(),
+                    segments.clone(),
+                    text.clone(),
+                    dirs.clone(),
+                    schema.clone(),
+                );
+                tokio::spawn(async move {
+                    hint.warm(
+                        Part::OnlyText,
+                        &store,
+                        &segments,
+                        text.as_ref(),
+                        &dirs,
+                        &schema,
+                    )
+                    .await
+                });
+            }
+            let part = if hint.splits_text(&dirs) {
+                Part::WithoutText
+            } else {
+                Part::All
+            };
             tokio::join!(
                 tail,
-                hint.warm(store, &segments, text.as_ref(), &dirs, &schema)
+                hint.warm(part, store, &segments, text.as_ref(), &dirs, &schema)
             )
             .0
         } else {

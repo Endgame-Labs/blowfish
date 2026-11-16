@@ -1303,3 +1303,121 @@ Ingest did not improve: it is bound by bytes per document through the WAL (item 
 See `WORKER_REPORT.md` of this round for the ranked list. In short: selective filters still read about 1,900 ranges in one
 wave (3 s); cold ANN is still 374 requests in 4 waves; per-segment lengths are still read whole at open; the indexer still
 rewrites the whole statistics object per publication; vectors are still stored twice.
+
+## Iteration 9 (1M docs): paying R2's tail latency, not its median
+
+Goal (from the brief): cold p50 within 40 percent of turbopuffer's published 10M numbers (p50 874 ms, p90 1,214 ms), so
+p50 at most about 1,224 ms and p90 at most about 1,700 ms. The namespace is iteration 8's 1M load (9 segments), reused
+unchanged: nothing in this round changes a format.
+
+### The R2 floor, measured from this VM (`crates/bf-storage/examples/r2_floor.rs`)
+
+The tool uses the same `object_store` client blowfish uses (HTTP/1.1, one connection per concurrent request) against one
+317 MB object. One R2 request from this VM, warm connection, sequential:
+
+| Size | p50 ms | p90 | p99 |
+| ---: | ---: | ---: | ---: |
+| 4 KB | 72 | 110 | 309 |
+| 64 KB | 72 | 98 | 210 |
+| 1 MB | 96 | 190 | 242 |
+| 4 MB | 130 | 325 | 651 |
+
+A wave of N parallel ranged GETs (wall time of the slowest, median of 5 waves; warm pool unless noted):
+
+| N | 4 KB objects | 64 KB | 256 KB | Fresh connections, 4 KB | Fresh, 64 KB |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 77 | 129 | 92 | 142 | 167 |
+| 8 | 149 | 151 | 179 | 349 | 223 |
+| 32 | 174 | 210 | 194 | 317 | 246 |
+| 128 | 355 | 369 | 401 | 484 | 388 |
+| 256 | 291 | 374 | 720 | 1,052 | 520 |
+| 1,024 | 553 | 983 | 17,925 | 1,311 | 2,161 |
+
+What the floor says:
+
+- A single request is about 70 to 80 ms whatever its size up to 64 KB. A wave of N is the slowest of N draws, so the wave
+  time is the tail of the latency distribution: about 150 ms at N=8, 175 to 290 at 32, 300 to 700 at 256, and 550 ms to
+  over 2 s at 1,024. The coordinator's diagnosis (we pay the tail) holds.
+- **Connections matter as much as the tail.** The client speaks HTTP/1.1, so a wave of N needs N connections, and a new TLS
+  connection costs about 65 ms. A cold process pays that for every request of its first big wave: a 256-request wave takes
+  about 1.05 s on fresh connections and 0.3 to 0.4 s on warm ones. `object_store` keeps idle connections for 90 s by default,
+  so any idle server goes cold again. HTTP/2 (`with_allow_http2`) did not beat a warm HTTP/1.1 pool (256 x 4 KB: 537 ms
+  against 291 ms) and was not adopted.
+- **Bytes cost real time too: the VM-to-R2 path tops out around 60 to 180 MB/s.** Waves of 1 MB objects take 3 s at N=128
+  (128 MB) and 9.5 s at N=256, and 4 MB x 128 takes 8.6 s. Merging ranges across a wide gap is therefore not free. The
+  A/B below (cold ANN, `BF_READ_GAP_KB`) shows it: gap 64 KB (current) 1,013 ms p50 with 356 requests and 22 MB, gap 256 KB
+  1,118 ms with 229 requests and 40 MB, gap 1 MB 1,481 ms with 153 requests and 90 MB. A marginal request costs about
+  1 ms in a warm wave and a marginal MB about 10 ms, so the break-even gap is near 100 KB, which is about where it is.
+
+### What changed
+
+1. **Warm connection pool** (`StorageConfig::warm_connections`, default 256 for S3, `BF_WARM_CONNECTIONS`): at startup and
+   every 45 s, 256 parallel HEADs of a missing key keep that many idle connections open, and the pool's idle timeout is
+   10 minutes. A long-running server keeps connections after any big wave anyway; this makes a restart or an idle period
+   not cost a TLS handshake per request. Cost: about 5.7 HEADs per second, about 15M a month, which is about 5 dollars of R2
+   class B operations. The A/B runs wait 1.5 to 4 s after start for the pool to fill, as a warmed server would have.
+2. **Hedged ranged reads** (`bf-storage/src/hedge.rs`, `BF_HEDGE_BUDGET`, default 0.1): a block-cache fetch of at most
+   1 MiB that has not answered by the p90 of the last 512 fetches (at least 60 ms; 250 ms before 24 samples) gets one duplicate
+   request, and the first answer wins. A token bucket earns 0.1 token per fetch (capacity 64), so extra requests stay at
+   or under 10 percent. Metric: `blowfish_object_store_hedges_total`. Tests: a stalled first attempt is beaten, the budget
+   caps hedges, and large or disabled reads are never hedged.
+3. **Hybrid queries start their ANN half without waiting for BM25 term warm-up** (`snapshot.rs`): the snapshot wave used to
+   join the dictionary-chunk and term-record prefetch for every segment before the query began, so the ANN probes of a
+   hybrid query started about 400 ms after the directory had arrived. The text half of the warm-up now continues in the
+   background (its reads are single-flighted with the query's own), and the snapshot waits only for the directory work.
+   Cold hybrid went from 4 waves (5 in some traces) to 2.3.
+4. Harness: `bench/scale/ab.py` (same-session A/B: alternates arms query by query, each on a fresh server process with an empty
+   disk cache, rotating the order), `waves.py` (waves from `BF_TRACE_READS`), `parity.sh` (recall and parity against the
+   oracle), and `r2_floor.rs`. `BF_READ_GAP_KB` overrides every merge gap for experiments.
+
+### Cold queries at 1M, same-session A/B (fresh process and empty disk cache per query, alternating arms)
+
+Base is iteration 8's binary; final has all three changes. n is the number of queries per arm. R2 was about 20 percent slower in
+this session than in the exploratory runs, so compare rows within a table, not across tables.
+
+| Query (n) | Base p50 / p90 / p99 ms | Final p50 / p90 / p99 ms | Requests | MB | Waves base, final |
+| --- | --- | --- | ---: | ---: | --- |
+| ANN (24) | 1,392 / 1,950 / 2,146 | 1,278 / 1,593 / 2,503 | 339 | 22.0 | 4.1, 4.1 |
+| BM25 (24) | 1,069 / 1,816 / 3,020 | 869 / 1,594 / 1,994 | 310 | 9.2 | 3.4, 3.2 |
+| Hybrid (24) | 1,635 / 2,714 / 3,298 | 1,188 / 1,752 / 2,138 | 635 | 29.8 | 4.0, 2.3 |
+| Selective (16) | 1,958 / 2,642 / 2,949 | 1,973 / 2,600 / 2,731; with 1,024 warm connections 1,429 / 1,940 / 2,390 | 1,904 | 41.9 | 4.1, 4.1 |
+
+Earlier smaller A/B blocks in the same afternoon (n=12 to 16) gave the same ordering with faster R2: ANN 1,162 to 1,013 ms
+(base to warm pool plus hedging; the pool alone 1,107 and hedging alone was the part that cut p90 from 2,045 to 1,240),
+BM25 1,089 to 1,010, hybrid 1,845 to 1,584 before the hybrid change and 1,684 to 1,177 after it.
+
+Where the time goes in a cold ANN query (one traced query, fresh process, warm pool): manifest 60 to 100 ms, then WAL probes
+and the directory 120 to 170 ms, then the probe wave (about 250 requests: 150 code ranges, 90 cluster blobs, 9 docs
+footers; 20 MB) 400 ms, then the rerank wave (80 to 190 requests, 1 to 3 MB) 200 to 280 ms. Without the warm pool the probe
+wave took 795 ms.
+
+### Selective filters: what did not work
+
+Selective is one wave of 1,900 requests (4,000 matching rows, each a separate 2 KB vector). Fetching only the allowed rows of
+the nearest clusters, to cut requests, loses recall faster than it saves time, because clusters hold about 300 rows and
+the winners are spread across many of them: covering 50 percent of the allowed rows (1,025 requests) gave recall@10 0.990
+and 25 percent (663 requests) gave 0.964, against 1.000 for all of them (turbopuffer 0.998 here). Latency at 50 percent was
+1,754 ms against 2,147 ms (n=12). Not adopted: the recall bar is 0.993. Widening merge gaps does not help (same byte cost
+as for ANN). A larger warm pool does: 1,024 connections took p50 from 2,677 (128) to 2,404 (512) to 2,010 ms (1,024) in one block,
+and 1,973 to 1,429 ms in the final block.
+
+### Recall and parity at 1M (200 queries per type, against `blowfish-oracle-wiki1m`)
+
+| | Overlap with turbopuffer | Recall@10 blowfish | Recall@10 turbopuffer |
+| --- | ---: | ---: | ---: |
+| ANN | 0.935 | 0.952 | 0.938 |
+| BM25 | 0.990 | | |
+| Hybrid | 0.971 | | |
+| Selective | 0.998 | 1.000 | 0.998 |
+| Broad | 0.963 | 0.974 | 0.977 |
+
+Identical to iteration 8: nothing in this round changes what is read or ranked.
+
+### Verdict against the goal
+
+Met at 1M in this session: BM25 p50 869 ms and p90 1,594 ms, hybrid p50 1,188 ms and p90 1,752 ms (p90 just over 1,700).
+Close: ANN p50 1,278 ms (goal 1,224) and p90 1,593 ms. Not met: selective (p50 1,973 ms, 1,429 ms with a 1,024-connection
+pool). The request count per wave did not fall (ANN 339 requests): the floor measurements say bytes cost more than requests
+past a gap of about 100 KB, so the way to fewer requests is a layout in which the cluster blob and the codes of a probe
+are one range, and nearby clusters are stored near each other, which needs a reload. That is the first item for the next round.
+Warm latency and QPS were not re-measured this round.
