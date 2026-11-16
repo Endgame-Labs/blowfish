@@ -40,14 +40,9 @@ async fn one_bit_centers_rank_clusters_and_fragments_round_trip() {
     let dir = Directory::decode(&bytes).unwrap();
     assert_eq!(dir.segments().len(), 3);
     // Carrying a section over into a new directory keeps it byte-identical.
-    let again = Directory::build(&[(
-        "s0".into(),
-        "k0".into(),
-        "f0".into(),
-        dir.fragment_of(0),
-    )])
-    .unwrap()
-    .unwrap();
+    let again = Directory::build(&[("s0".into(), "k0".into(), "f0".into(), dir.fragment_of(0))])
+        .unwrap()
+        .unwrap();
     assert_eq!(Directory::decode(&again).unwrap().entries().len(), {
         dir.entries().iter().filter(|e| e.segment == 0).count()
     });
