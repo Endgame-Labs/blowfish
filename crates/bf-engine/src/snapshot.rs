@@ -16,6 +16,9 @@ pub(crate) struct OpenHint {
     context: crate::read_cache::ReadContext,
     ann: BTreeSet<String>,
     text: BTreeSet<String>,
+    /// BM25 clauses `(attribute, query value, last_as_prefix)`: their terms are looked up (the
+    /// dictionary chunks, term records, and corpus statistics chunks) in the snapshot wave.
+    bm25: Vec<(String, serde_json::Value, bool)>,
     docs: bool,
     /// Filters of ANN sub-queries: their per-segment bitmaps are opened in the snapshot wave.
     filters: Vec<Filter>,
@@ -29,6 +32,7 @@ impl OpenHint {
             context,
             ann: BTreeSet::new(),
             text: BTreeSet::new(),
+            bm25: Vec::new(),
             docs: false,
             filters: Vec::new(),
         };
@@ -50,8 +54,18 @@ impl OpenHint {
                     let mut clauses = vec![];
                     crate::indexed::text_clauses(rank, &mut clauses);
                     for clause in clauses {
-                        if let RankBy::Bm25 { attribute, .. } = clause {
+                        if let RankBy::Bm25 {
+                            attribute,
+                            query,
+                            params,
+                        } = clause
+                        {
                             hint.text.insert(attribute.clone());
+                            hint.bm25.push((
+                                attribute.clone(),
+                                query.clone(),
+                                crate::text::prefix(params.as_ref()),
+                            ));
                         }
                     }
                 }
@@ -75,6 +89,22 @@ impl OpenHint {
     ) {
         let context = self.context.clone();
         crate::read_cache::scope(context, async {
+            let mut queries: BTreeMap<&str, Vec<bf_text::Query>> = BTreeMap::new();
+            let mut terms = crate::text::QueryTerms::new();
+            for (attribute, value, prefix) in &self.bm25 {
+                if let Some(cfg) = schema.get(attribute).and_then(|s| s.text_config()) {
+                    let tokens = crate::text::tokens(value, &cfg);
+                    terms
+                        .entry(attribute.clone())
+                        .or_default()
+                        .extend(tokens.iter().map(|t| t.text.clone()));
+                    queries
+                        .entry(attribute)
+                        .or_default()
+                        .push(bf_text::Query::new(tokens, *prefix));
+                }
+            }
+            let queries = &queries;
             let mut tasks = vec![];
             // A directory replaces opening every segment's ANN metadata, ids, and docs footer.
             let by_dir = self
@@ -122,9 +152,18 @@ impl OpenHint {
                 for attribute in &self.text {
                     if let Some(file) = seg.files.get(&format!("fts:{attribute}")) {
                         tasks.push(
-                            timed("text_index", segment::text_index(store, file))
-                                .map_ok(drop)
-                                .boxed(),
+                            timed("text_index", async move {
+                                let reader = segment::text_index(store, file).await?;
+                                // The query's dictionary chunks and term records.
+                                for q in queries.get(attribute.as_str()).into_iter().flatten() {
+                                    reader
+                                        .prefetch_plan(q, None)
+                                        .await
+                                        .map_err(segment::index_error)?;
+                                }
+                                Ok(())
+                            })
+                            .boxed(),
                         );
                     }
                 }
@@ -156,7 +195,7 @@ impl OpenHint {
                 && let Some(file) = text
             {
                 tasks.push(
-                    timed("corpus", crate::text::warm_corpus(store, file))
+                    timed("corpus", crate::text::warm_corpus(store, file, &terms))
                         .map(|()| Ok(()))
                         .boxed(),
                 );

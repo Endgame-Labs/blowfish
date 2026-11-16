@@ -966,3 +966,67 @@ async fn manifest_republication_keeps_the_resident_tail() {
     let payload_reads = backend.payload_reads.load(Ordering::SeqCst);
     assert_eq!(payload_reads, 0, "the tail was downloaded again");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_bm25_reads_term_chunks_not_whole_dictionaries() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    let segments = 6;
+    for s in 0..segments {
+        // Every document carries six terms that occur nowhere else, so each segment's
+        // dictionary has about 9,000 terms (several chunks).
+        let docs: Vec<_> = (0..1500)
+            .map(|i| {
+                let n = s * 1500 + i;
+                let unique: Vec<_> = (0..6).map(|t| format!("u{n}x{t}")).collect();
+                json!({"id":n,"text":format!("common {}", unique.join(" "))})
+            })
+            .collect();
+        writer
+            .write(
+                "chunks",
+                serde_json::from_value(json!({
+                    "schema":{"text":{"type":"string","full_text_search":true}},
+                    "upsert_rows":docs
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.index_namespace("chunks", true).await.unwrap();
+    }
+    let engine = Engine::with_config(store(backend.clone()).await, config());
+    engine.schema("chunks").await.unwrap();
+    backend.paths.lock().unwrap().clear();
+    let request =
+        serde_json::from_value(json!({"rank_by":["text","BM25","u7x3"],"top_k":10})).unwrap();
+    let cold = engine.query("chunks", request).await.unwrap();
+    assert_eq!(cold.result.rows.as_ref().unwrap().len(), 1);
+    // Bytes requested from FTS and statistics objects, against the whole of those objects.
+    let reads: u64 = backend
+        .paths
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.contains(".bft") || p.contains("text-stats"))
+        .map(|(_, r)| r.as_ref().map_or(0, |r| r.end - r.start))
+        .sum();
+    let total: u64 = {
+        let mut sum = 0;
+        let mut list = backend.inner.list(None);
+        while let Some(meta) = list.next().await {
+            let meta = meta.unwrap();
+            if meta.location.as_ref().contains(".bft")
+                || meta.location.as_ref().contains("text-stats")
+            {
+                sum += meta.size;
+            }
+        }
+        sum
+    };
+    eprintln!("cold BM25 read {reads} of {total} FTS and statistics bytes");
+    assert!(reads * 20 < total, "read {reads} of {total}");
+}

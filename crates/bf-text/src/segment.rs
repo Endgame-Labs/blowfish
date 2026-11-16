@@ -21,6 +21,15 @@ const VERSION: u32 = 1;
 /// term to `(record offset << DF_BITS) | document frequency`, and every term's block directory is
 /// a separately checksummed record that is read only when a query needs the term.
 const VERSION_LAZY: u32 = 2;
+/// Chunked dictionary: postings, term records, dictionary chunks, lengths, chunk index. Each
+/// chunk is a small FST over `CHUNK_TERMS` consecutive terms with its own checksum, and the
+/// index (first term, offset, length, checksum per chunk) sits next to the lengths in the
+/// metadata tail, so a query reads only the chunks that hold its terms.
+const VERSION_CHUNKED: u32 = 3;
+/// Terms per dictionary chunk (version 3).
+const CHUNK_TERMS: usize = 2048;
+/// Decoded dictionary chunks kept per reader before the memo is reset.
+const MEMO_CHUNKS: usize = 64;
 const DF_BITS: u32 = 28;
 const DF_MASK: u64 = (1 << DF_BITS) - 1;
 const RECORD_HEADER: usize = 8;
@@ -246,7 +255,8 @@ impl SegmentBuilder {
     pub fn finish(self) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut records = Vec::new();
-        let mut dictionary = fst::MapBuilder::memory();
+        let mut chunk_terms: Vec<(&str, u64)> = Vec::new();
+        let mut chunk_data: Vec<(String, Vec<u8>)> = Vec::new();
         let packer = BitPacker4x::new();
         for (term, postings) in self.postings.iter() {
             let mut blocks = Vec::new();
@@ -312,29 +322,40 @@ impl SegmentBuilder {
             }
             let crc = crc32fast::hash(&records[start..]);
             put32(&mut records, crc);
-            dictionary
-                .insert(term, (record_offset << DF_BITS) | df)
-                .map_err(|e| invalid(&e.to_string()))?;
+            chunk_terms.push((term, (record_offset << DF_BITS) | df));
+            if chunk_terms.len() == CHUNK_TERMS {
+                chunk_data.push(build_chunk(&chunk_terms)?);
+                chunk_terms.clear();
+            }
+        }
+        if !chunk_terms.is_empty() {
+            chunk_data.push(build_chunk(&chunk_terms)?);
         }
         let metadata_offset = bytes.len() as u64;
         bytes.extend_from_slice(&records);
         drop(records);
+        let mut index = Vec::new();
+        put32(&mut index, chunk_data.len() as u32);
+        for (first, blob) in &chunk_data {
+            put32(&mut index, first.len() as u32);
+            index.extend_from_slice(first.as_bytes());
+            put64(&mut index, bytes.len() as u64);
+            put32(&mut index, blob.len() as u32);
+            put32(&mut index, crc32fast::hash(blob));
+            bytes.extend_from_slice(blob);
+        }
         let lengths_offset = bytes.len() as u64;
         for length in &self.lengths {
             put32(&mut bytes, *length);
         }
         let dictionary_offset = bytes.len() as u64;
-        bytes.extend_from_slice(
-            &dictionary
-                .into_inner()
-                .map_err(|e| invalid(&e.to_string()))?,
-        );
+        bytes.extend_from_slice(&index);
         let lengths_crc =
             crc32fast::hash(&bytes[lengths_offset as usize..dictionary_offset as usize]);
         let dictionary_crc = crc32fast::hash(&bytes[dictionary_offset as usize..]);
         let mut footer = Vec::with_capacity(FOOTER);
         footer.extend_from_slice(MAGIC);
-        put32(&mut footer, VERSION_LAZY);
+        put32(&mut footer, VERSION_CHUNKED);
         put32(&mut footer, u32::from(self.positions));
         put32(&mut footer, self.lengths.len() as u32);
         put32(&mut footer, self.tokenizer as u32);
@@ -353,6 +374,17 @@ impl SegmentBuilder {
         bytes.extend(footer);
         Ok(bytes)
     }
+}
+
+fn build_chunk(terms: &[(&str, u64)]) -> io::Result<(String, Vec<u8>)> {
+    let mut builder = fst::MapBuilder::memory();
+    for (term, handle) in terms {
+        builder
+            .insert(term, *handle)
+            .map_err(|e| invalid(&e.to_string()))?;
+    }
+    let blob = builder.into_inner().map_err(|e| invalid(&e.to_string()))?;
+    Ok((terms[0].0.to_owned(), blob))
 }
 
 /// One positive BM25 result. Scores descend, with the smaller row ID winning ties.
@@ -400,13 +432,29 @@ enum Terms {
     },
 }
 
+struct ChunkEntry {
+    first: Vec<u8>,
+    offset: u64,
+    len: u32,
+    crc: u32,
+}
+/// The term dictionary: one FST read whole (versions 1 and 2), or an index of small FST chunks
+/// read on demand (version 3).
+enum Dictionary {
+    Whole(fst::Map<Bytes>),
+    Chunked {
+        entries: Vec<ChunkEntry>,
+        memo: std::sync::Mutex<std::collections::HashMap<usize, fst::Map<Bytes>>>,
+    },
+}
+
 /// An immutable segment. Opening reads the last 64 KiB, then any missing index
 /// metadata in one additional read (version 2: just the lengths and dictionary, about
 /// 20 bytes per distinct term, with each term's block directory read when a query needs it).
 /// Posting payloads and phrase positions stay lazy.
 pub struct SegmentReader {
     source: Arc<dyn RangeRead>,
-    dictionary: fst::Map<Bytes>,
+    dictionary: Dictionary,
     terms: Terms,
     lengths: Vec<u32>,
     total_tokens: u64,
@@ -461,10 +509,11 @@ impl SegmentReader {
             return Err(invalid("unknown text segment format"));
         }
         let version = c.u32()?;
-        if version != VERSION && version != VERSION_LAZY {
+        if version != VERSION && version != VERSION_LAZY && version != VERSION_CHUNKED {
             return Err(invalid("unknown text segment format"));
         }
-        let lazy = version == VERSION_LAZY;
+        let chunked = version == VERSION_CHUNKED;
+        let lazy = version == VERSION_LAZY || chunked;
         let flags = c.u32()?;
         if flags > 1 {
             return Err(invalid("unknown text segment flags"));
@@ -536,12 +585,32 @@ impl SegmentReader {
         if lengths.iter().map(|&n| n as u64).sum::<u64>() != total_tokens {
             return Err(invalid("invalid document length sum"));
         }
+        if chunked {
+            let entries = parse_chunk_index(&index[dict_start..], metadata_offset, lengths_offset)?;
+            return Ok(Self {
+                source,
+                dictionary: Dictionary::Chunked {
+                    entries,
+                    memo: Default::default(),
+                },
+                terms: Terms::Lazy {
+                    start: metadata_offset,
+                    end: lengths_offset,
+                    memo: Default::default(),
+                },
+                lengths,
+                total_tokens,
+                positions: flags != 0,
+                tokenizer,
+                postings_end: metadata_offset,
+            });
+        }
         let dictionary =
             fst::Map::new(index.slice(dict_start..)).map_err(|e| invalid(&e.to_string()))?;
         if lazy {
             return Ok(Self {
                 source,
-                dictionary,
+                dictionary: Dictionary::Whole(dictionary),
                 terms: Terms::Lazy {
                     start: metadata_offset,
                     end: lengths_offset,
@@ -598,7 +667,7 @@ impl SegmentReader {
         }
         Ok(Self {
             source,
-            dictionary,
+            dictionary: Dictionary::Whole(dictionary),
             terms: Terms::Eager(terms),
             lengths,
             total_tokens,
@@ -721,7 +790,14 @@ impl SegmentReader {
             // Memoized records are bounded by `MEMO_TERMS`; count a typical small term each.
             Terms::Lazy { .. } => MEMO_TERMS * 128,
         };
-        (terms + self.lengths.capacity() * 4) as u64
+        let dictionary = match &self.dictionary {
+            Dictionary::Whole(_) => 0,
+            // The chunk index, plus the bounded memo of decoded chunks (about 16 KiB each).
+            Dictionary::Chunked { entries, .. } => {
+                entries.iter().map(|e| e.first.len() + 48).sum::<usize>() + MEMO_CHUNKS * 16384
+            }
+        };
+        (terms + dictionary + self.lengths.capacity() * 4) as u64
     }
     /// Number of segment rows, including empty or missing fields.
     pub fn num_docs(&self) -> u32 {
@@ -732,8 +808,9 @@ impl SegmentReader {
     pub fn doc_lengths(&self) -> &[u32] {
         &self.lengths
     }
-    /// Per-segment statistics for the engine's namespace-wide aggregation.
-    pub fn stats(&self) -> CorpusStats {
+    /// Per-segment statistics for the engine's namespace-wide aggregation. Reads the whole
+    /// dictionary (every chunk, for version 3 segments).
+    pub async fn stats(&self) -> io::Result<CorpusStats> {
         let present = self.lengths.iter().filter(|&&n| n > 0).count() as u64;
         let mut stats = CorpusStats {
             total_docs: present,
@@ -744,30 +821,141 @@ impl SegmentReader {
             },
             ..CorpusStats::default()
         };
-        let mut stream = self.dictionary.stream();
-        while let Some((term, id)) = stream.next() {
+        for (term, id) in self.all_terms().await? {
             stats.document_frequencies.insert(
-                String::from_utf8(term.to_vec()).unwrap(),
+                String::from_utf8(term).map_err(|e| invalid(&e.to_string()))?,
                 self.handle_df(id) as u64,
             );
         }
-        stats
+        Ok(stats)
     }
-    fn term(&self, text: &str) -> Option<u64> {
-        self.dictionary.get(text)
-    }
-    fn prefix_terms(&self, prefix: &str) -> Vec<u64> {
-        let automaton = fst::automaton::Str::new(prefix);
-        use fst::Automaton;
-        let mut stream = self
-            .dictionary
-            .search(automaton.starts_with())
-            .into_stream();
-        let mut terms = Vec::new();
-        while let Some((_, id)) = stream.next() {
-            terms.push(id);
+    /// Decoded chunks, fetched in one batch for those the memo lacks.
+    async fn chunks(&self, wanted: &[usize]) -> io::Result<Vec<fst::Map<Bytes>>> {
+        let Dictionary::Chunked { entries, memo } = &self.dictionary else {
+            return Ok(Vec::new());
+        };
+        let mut have: BTreeMap<usize, fst::Map<Bytes>> = BTreeMap::new();
+        let mut missing = Vec::new();
+        {
+            let memo = memo.lock().unwrap();
+            for &c in wanted {
+                match memo.get(&c) {
+                    Some(map) => {
+                        have.insert(c, map.clone());
+                    }
+                    None => missing.push(c),
+                }
+            }
         }
-        terms
+        missing.sort_unstable();
+        missing.dedup();
+        if !missing.is_empty() {
+            let ranges = missing
+                .iter()
+                .map(|&c| entries[c].offset..entries[c].offset + entries[c].len as u64)
+                .collect::<Vec<_>>();
+            let values = self.source.read_batch(ranges).await?;
+            if values.len() != missing.len() {
+                return Err(invalid("invalid dictionary batch"));
+            }
+            let mut decoded = Vec::new();
+            for (&c, bytes) in missing.iter().zip(values) {
+                if bytes.len() != entries[c].len as usize {
+                    return Err(invalid("short dictionary chunk"));
+                }
+                verify(&bytes, entries[c].crc)?;
+                decoded.push((
+                    c,
+                    fst::Map::new(bytes).map_err(|e| invalid(&e.to_string()))?,
+                ));
+            }
+            let mut memo = memo.lock().unwrap();
+            if memo.len() + decoded.len() > MEMO_CHUNKS {
+                memo.clear();
+            }
+            for (c, map) in decoded {
+                memo.insert(c, map.clone());
+                have.insert(c, map);
+            }
+        }
+        Ok(wanted.iter().map(|c| have[c].clone()).collect())
+    }
+    /// Dictionary handles of exact terms, reading only the chunks that hold them.
+    async fn lookup(&self, texts: &[&str]) -> io::Result<Vec<Option<u64>>> {
+        match &self.dictionary {
+            Dictionary::Whole(map) => Ok(texts.iter().map(|t| map.get(t)).collect()),
+            Dictionary::Chunked { entries, .. } => {
+                let at: Vec<Option<usize>> = texts
+                    .iter()
+                    .map(|t| {
+                        entries
+                            .partition_point(|e| e.first.as_slice() <= t.as_bytes())
+                            .checked_sub(1)
+                    })
+                    .collect();
+                let wanted: Vec<usize> = at.iter().flatten().copied().collect();
+                let maps = self.chunks(&wanted).await?;
+                let by_chunk: BTreeMap<usize, &fst::Map<Bytes>> =
+                    wanted.iter().copied().zip(maps.iter()).collect();
+                Ok(texts
+                    .iter()
+                    .zip(at)
+                    .map(|(t, c)| c.and_then(|c| by_chunk[&c].get(t)))
+                    .collect())
+            }
+        }
+    }
+    async fn term(&self, text: &str) -> io::Result<Option<u64>> {
+        Ok(self.lookup(&[text]).await?[0])
+    }
+    async fn prefix_terms(&self, prefix: &str) -> io::Result<Vec<u64>> {
+        use fst::Automaton;
+        let scan = |map: &fst::Map<Bytes>, out: &mut Vec<u64>| {
+            let mut stream = map
+                .search(fst::automaton::Str::new(prefix).starts_with())
+                .into_stream();
+            while let Some((_, id)) = stream.next() {
+                out.push(id);
+            }
+        };
+        let mut terms = Vec::new();
+        match &self.dictionary {
+            Dictionary::Whole(map) => scan(map, &mut terms),
+            Dictionary::Chunked { entries, .. } => {
+                let first = entries
+                    .partition_point(|e| e.first.as_slice() <= prefix.as_bytes())
+                    .saturating_sub(1);
+                let mut wanted = vec![first];
+                wanted.extend(
+                    (first + 1..entries.len())
+                        .take_while(|&c| entries[c].first.starts_with(prefix.as_bytes())),
+                );
+                for map in self.chunks(&wanted).await? {
+                    scan(&map, &mut terms);
+                }
+            }
+        }
+        Ok(terms)
+    }
+    /// Every term and handle (a scan: fetches every chunk of a version 3 dictionary).
+    async fn all_terms(&self) -> io::Result<Vec<(Vec<u8>, u64)>> {
+        let mut out = Vec::new();
+        let mut collect = |map: &fst::Map<Bytes>| {
+            let mut stream = map.stream();
+            while let Some((term, id)) = stream.next() {
+                out.push((term.to_vec(), id));
+            }
+        };
+        match &self.dictionary {
+            Dictionary::Whole(map) => collect(map),
+            Dictionary::Chunked { entries, .. } => {
+                let all: Vec<usize> = (0..entries.len()).collect();
+                for map in self.chunks(&all).await? {
+                    collect(&map);
+                }
+            }
+        }
+        Ok(out)
     }
     async fn postings(&self, b: &BlockMeta) -> io::Result<Vec<(u32, u32)>> {
         let bytes = read_exact(&*self.source, b.offset..b.offset + b.size as u64).await?;
@@ -822,19 +1010,18 @@ impl SegmentReader {
         query: &Query,
         allowed: Option<&RoaringBitmap>,
     ) -> io::Result<Vec<Range<u64>>> {
-        let ids = self.query_handles(query);
+        let ids = self.query_handles(query).await?;
         let metas = self.load(ids.iter().copied()).await?;
         Ok(Self::plan_ranges(&ids, &metas, allowed))
     }
-    fn query_handles(&self, query: &Query) -> std::collections::BTreeSet<u64> {
-        let mut ids = std::collections::BTreeSet::new();
-        for term in query.exact_terms().keys() {
-            ids.extend(self.term(term));
-        }
+    async fn query_handles(&self, query: &Query) -> io::Result<std::collections::BTreeSet<u64>> {
+        let terms: Vec<&str> = query.exact_terms().keys().copied().collect();
+        let mut ids: std::collections::BTreeSet<u64> =
+            self.lookup(&terms).await?.into_iter().flatten().collect();
         if let Some(prefix) = query.prefix() {
-            ids.extend(self.prefix_terms(prefix));
+            ids.extend(self.prefix_terms(prefix).await?);
         }
-        ids
+        Ok(ids)
     }
     fn plan_ranges(
         ids: &std::collections::BTreeSet<u64>,
@@ -908,8 +1095,10 @@ impl SegmentReader {
         }
         let exact = query.exact_terms();
         let mut selections: BTreeMap<u64, (u32, bool, u64)> = BTreeMap::new();
-        for (term, qf) in &exact {
-            if let Some(id) = self.term(term) {
+        let exact_terms: Vec<&str> = exact.keys().copied().collect();
+        let found = self.lookup(&exact_terms).await?;
+        for ((term, qf), id) in exact.iter().zip(found) {
+            if let Some(id) = id {
                 selections.insert(
                     id,
                     (
@@ -921,7 +1110,7 @@ impl SegmentReader {
             }
         }
         if let Some(prefix) = query.prefix() {
-            for id in self.prefix_terms(prefix) {
+            for id in self.prefix_terms(prefix).await? {
                 selections.entry(id).or_insert((0, false, 0)).1 = true;
             }
         }
@@ -1057,19 +1246,18 @@ impl SegmentReader {
         let postings = try_join_all(blocks.iter().map(|b| self.postings(b))).await?;
         Ok(postings.into_iter().flatten().map(|(row, _)| row).collect())
     }
-    fn boolean_terms(&self, text: &str, prefix: bool) -> Vec<u64> {
+    async fn boolean_terms(&self, text: &str, prefix: bool) -> io::Result<Vec<u64>> {
         if !matches!(self.tokenizer, Tokenizer::WordV3 | Tokenizer::WordV4) {
-            return if prefix {
-                self.prefix_terms(text)
+            return Ok(if prefix {
+                self.prefix_terms(text).await?
             } else {
-                self.term(text).into_iter().collect()
-            };
+                self.term(text).await?.into_iter().collect()
+            });
         }
-        let mut stream = self.dictionary.stream();
         let mut ids = Vec::new();
-        while let Some((term, id)) = stream.next() {
+        for (term, id) in self.all_terms().await? {
             if crate::analysis::boolean_term_matches(
-                std::str::from_utf8(term).unwrap(),
+                std::str::from_utf8(&term).unwrap(),
                 text,
                 prefix,
                 self.tokenizer,
@@ -1077,7 +1265,7 @@ impl SegmentReader {
                 ids.push(id);
             }
         }
-        ids
+        Ok(ids)
     }
     /// Rows containing every query token. Empty queries match every row, including
     /// null fields. Boolean UAX #29 matching also recognizes punctuation-delimited
@@ -1087,7 +1275,7 @@ impl SegmentReader {
         for (i, token) in query.tokens.iter().enumerate() {
             let prefix = query.last_as_prefix && i + 1 == query.tokens.len();
             result &= self
-                .bitmap(&self.boolean_terms(&token.text, prefix))
+                .bitmap(&self.boolean_terms(&token.text, prefix).await?)
                 .await?;
             if result.is_empty() {
                 break;
@@ -1099,10 +1287,13 @@ impl SegmentReader {
     pub async fn contains_any_token(&self, query: &Query) -> io::Result<RoaringBitmap> {
         let mut ids = Vec::new();
         for (i, token) in query.tokens.iter().enumerate() {
-            ids.extend(self.boolean_terms(
-                &token.text,
-                query.last_as_prefix && i + 1 == query.tokens.len(),
-            ));
+            ids.extend(
+                self.boolean_terms(
+                    &token.text,
+                    query.last_as_prefix && i + 1 == query.tokens.len(),
+                )
+                .await?,
+            );
         }
         ids.sort_unstable();
         ids.dedup();
@@ -1123,7 +1314,7 @@ impl SegmentReader {
         }
         let mut candidates: RoaringBitmap = (0..self.num_docs()).collect();
         for token in &query.tokens {
-            let Some(id) = self.term(&token.text) else {
+            let Some(id) = self.term(&token.text).await? else {
                 return Ok(RoaringBitmap::new());
             };
             candidates &= self.bitmap(&[id]).await?;
@@ -1133,7 +1324,7 @@ impl SegmentReader {
         }
         let mut terms: BTreeMap<String, BTreeMap<u32, Vec<(u32, u32)>>> = BTreeMap::new();
         for term in query.exact_terms().keys() {
-            let id = self.term(term).unwrap();
+            let id = self.term(term).await?.unwrap();
             let meta = self.load([id]).await?.remove(&id).unwrap();
             let mut docs = BTreeMap::new();
             let blocks: Vec<_> = meta
@@ -1193,6 +1384,38 @@ impl SegmentReader {
             })
             .collect())
     }
+}
+
+fn parse_chunk_index(data: &[u8], low: u64, high: u64) -> io::Result<Vec<ChunkEntry>> {
+    let mut c = Cursor::new(data);
+    let count = c.u32()? as usize;
+    if count > data.len() / 20 {
+        return Err(invalid("invalid dictionary chunk count"));
+    }
+    let mut entries: Vec<ChunkEntry> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let first_len = c.u32()? as usize;
+        let first = c.take(first_len)?.to_vec();
+        let offset = c.u64()?;
+        let len = c.u32()?;
+        let crc = c.u32()?;
+        if offset < low
+            || offset.checked_add(len as u64).is_none_or(|end| end > high)
+            || entries.last().is_some_and(|p| p.first >= first)
+        {
+            return Err(invalid("invalid dictionary chunk"));
+        }
+        entries.push(ChunkEntry {
+            first,
+            offset,
+            len,
+            crc,
+        });
+    }
+    if c.at != data.len() {
+        return Err(invalid("trailing dictionary index"));
+    }
+    Ok(entries)
 }
 
 async fn read_exact(source: &dyn RangeRead, range: Range<u64>) -> io::Result<Bytes> {

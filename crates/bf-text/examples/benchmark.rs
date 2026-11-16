@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let size = bytes.len();
     let build_time = start.elapsed();
     let reader = block_on(SegmentReader::open(Arc::new(MemoryRangeRead::from(bytes))))?;
-    let stats = reader.stats();
+    let stats = block_on(reader.stats())?;
     let params = FtsParams::default();
     let mut latencies = Vec::with_capacity(iterations);
     let mut reads = 0;

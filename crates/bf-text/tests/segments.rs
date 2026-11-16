@@ -59,7 +59,10 @@ fn empty_and_single_row_roundtrip() {
         vec![tokenize("fox fox", &FtsParams::default())],
     ] {
         let reader = open(build(&docs, true, Tokenizer::WordV4));
-        assert_eq!(reader.stats(), CorpusStats::from_documents(&docs));
+        assert_eq!(
+            block_on(reader.stats()).unwrap(),
+            CorpusStats::from_documents(&docs)
+        );
         assert_eq!(reader.num_docs(), docs.len() as u32);
         let empty = Query::default();
         assert_eq!(
@@ -78,9 +81,15 @@ fn empty_and_single_row_roundtrip() {
             docs.len() as u64
         );
         assert!(
-            block_on(reader.search(&empty, &reader.stats(), &FtsParams::default(), 10, None))
-                .unwrap()
-                .is_empty()
+            block_on(reader.search(
+                &empty,
+                &block_on(reader.stats()).unwrap(),
+                &FtsParams::default(),
+                10,
+                None
+            ))
+            .unwrap()
+            .is_empty()
         );
     }
 }
@@ -223,9 +232,10 @@ fn small_open_one_read_and_positions_are_lazy() {
     };
     let reader = block_on(SegmentReader::open(Arc::new(source))).unwrap();
     assert_eq!(reads.lock().unwrap().len(), 1);
+    let stats = block_on(reader.stats()).unwrap();
     reads.lock().unwrap().clear();
     let q = Query::new(tokenize("fox", &p), false);
-    block_on(reader.search(&q, &reader.stats(), &p, 10, None)).unwrap();
+    block_on(reader.search(&q, &stats, &p, 10, None)).unwrap();
     // The term's block directory (version 2 loads it on demand), then its one posting block.
     assert_eq!(reads.lock().unwrap().len(), 2);
     // One-bit docs plus two-bit frequency in a 128-value block, plus two header bytes.
@@ -253,7 +263,7 @@ fn block_max_prunes_and_allowed_rows_and_ties_stay_correct() {
         .collect();
     let reader = open(build(&docs, false, p.tokenizer));
     let q = Query::new(tokenize("fox", &p), false);
-    let stats = reader.stats();
+    let stats = block_on(reader.stats()).unwrap();
     let (hits, metrics) = block_on(reader.search_with_metrics(&q, &stats, &p, 5, None)).unwrap();
     assert_hits(&hits, &expected(&docs, &q, &stats, &p, 5, None));
     assert!(metrics.windows_pruned > 0, "{metrics:?}");
@@ -282,7 +292,7 @@ fn corrupt_sections_and_short_reads_return_errors() {
     corrupt[0] ^= 1;
     let reader = open(corrupt);
     let q = Query::new(tokenize("dog fox", &p), false);
-    assert!(block_on(reader.search(&q, &reader.stats(), &p, 10, None)).is_err());
+    assert!(block_on(reader.search(&q, &block_on(reader.stats()).unwrap(), &p, 10, None)).is_err());
     for len in 0..72 {
         assert!(
             block_on(SegmentReader::open(Arc::new(MemoryRangeRead::from(
@@ -308,7 +318,7 @@ proptest! {
         let allowed:RoaringBitmap=(0..docs.len() as u32).filter(|i|i%mask==0).collect();
         let reader=open(build(&docs,true,params.tokenizer));
         // Add an external collection to ensure pruning never assumes local statistics.
-        let mut stats=reader.stats();stats.merge(&CorpusStats::from_documents(&[vec![Token::new("term1",0),Token::new("external",1)]]));
+        let mut stats=block_on(reader.stats()).unwrap();stats.merge(&CorpusStats::from_documents(&[vec![Token::new("term1",0),Token::new("external",1)]]));
         for allowed in [None,Some(&allowed)] {
             let actual=block_on(reader.search(&query,&stats,&params,k,allowed)).unwrap();
             assert_hits(&actual,&expected(&docs,&query,&stats,&params,k,allowed));
@@ -332,10 +342,11 @@ fn missing_and_empty_fields_have_distinct_corpus_statistics() {
     let reader = open(builder.finish().unwrap());
     assert_eq!(reader.num_docs(), 3);
     assert_eq!(reader.doc_lengths(), &[2, 1, 0]);
-    assert_eq!(reader.stats().total_docs, 2);
-    assert_eq!(reader.stats().average_doc_length, 1.5);
+    assert_eq!(block_on(reader.stats()).unwrap().total_docs, 2);
+    assert_eq!(block_on(reader.stats()).unwrap().average_doc_length, 1.5);
     let q = Query::new(tokenize("fox", &p), false);
-    let hits = block_on(reader.search(&q, &reader.stats(), &p, 10, None)).unwrap();
+    let hits =
+        block_on(reader.search(&q, &block_on(reader.stats()).unwrap(), &p, 10, None)).unwrap();
     let stats = CorpusStats::from_documents(&[tokenize("fox fox", &p), vec![]]);
     assert!(
         (hits[0].score - score_document(&tokenize("fox fox", &p), &q, &stats, &p)).abs() < 1e-6
@@ -377,7 +388,7 @@ fn prefetched_postings_match_demand_search_with_prefixes_repetition_and_filters(
         })
         .collect();
     let reader = open(build(&docs, true, params.tokenizer));
-    let stats = reader.stats();
+    let stats = block_on(reader.stats()).unwrap();
     for (text, prefix) in [
         ("common term1 term1", false),
         ("term1 pre", true),
@@ -409,4 +420,51 @@ fn prefetched_postings_match_demand_search_with_prefixes_repetition_and_filters(
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn chunked_dictionary_reads_only_the_query_terms_chunks() {
+    let p = FtsParams::default();
+    // 12,000 distinct terms span six dictionary chunks.
+    let docs: Vec<_> = (0..4000)
+        .map(|i| {
+            tokenize(
+                &format!("w{:05} w{:05} w{:05}", i * 3, i * 3 + 1, i * 3 + 2),
+                &p,
+            )
+        })
+        .collect();
+    let bytes = build(&docs, false, p.tokenizer);
+    let total = bytes.len() as u64;
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let reader = block_on(SegmentReader::open(Arc::new(Recording {
+        bytes: bytes.into(),
+        reads: reads.clone(),
+    })))
+    .unwrap();
+    reads.lock().unwrap().clear();
+    let stats = CorpusStats {
+        total_docs: 4000,
+        average_doc_length: 3.0,
+        document_frequencies: (0..12000).map(|i| (format!("w{i:05}"), 1)).collect(),
+    };
+    let q = Query::new(tokenize("w09000", &p), false);
+    let hits = block_on(reader.search(&q, &stats, &p, 10, None)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].row, 3000);
+    // Only the term's dictionary chunk, its record, and its posting block.
+    let bytes_read: u64 = reads.lock().unwrap().iter().map(|r| r.end - r.start).sum();
+    assert!(bytes_read < total / 10, "{bytes_read} of {total}");
+    // Every term resolves across chunk boundaries, and prefixes span chunks.
+    for i in [0u32, 2047, 2048, 2049, 6000, 11999] {
+        let q = Query::new(tokenize(&format!("w{i:05}"), &p), false);
+        let hits = block_on(reader.search(&q, &stats, &p, 10, None)).unwrap();
+        assert_eq!(hits.len(), 1, "term {i}");
+        assert_eq!(hits[0].row, i / 3);
+    }
+    let prefix = Query::new(tokenize("w0", &p), true);
+    let hits = block_on(reader.search(&prefix, &stats, &p, 20000, None)).unwrap();
+    assert_eq!(hits.len(), 3334);
+    let stats = block_on(reader.stats()).unwrap();
+    assert_eq!(stats.document_frequencies.len(), 12000);
 }

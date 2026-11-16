@@ -79,40 +79,50 @@ pub(crate) fn checkpoint_corpus(
 }
 type TextMap = BTreeMap<String, TextStats>;
 const STATS_MAGIC: &[u8; 8] = b"BFSTAT01";
+const CHUNKED_MAGIC: &[u8; 8] = b"BFSTAT02";
+/// Terms per statistics chunk.
+const STATS_CHUNK_TERMS: usize = 4096;
 /// Out-of-line checkpoint text statistics: per field, the document count and total length plus
-/// an FST from term to document frequency. Queries look up only their own terms, directly in the
+/// FSTs from term to document frequency. Queries look up only their own terms, directly in the
 /// downloaded bytes, so there is nothing to decode or clone.
 pub(crate) struct TextIndex {
-    fields: BTreeMap<String, (u64, u64, fst::Map<bytes::Bytes>)>,
+    fields: BTreeMap<String, (u64, u64, Vec<fst::Map<bytes::Bytes>>)>,
     bytes: u64,
 }
-/// Serialize per-term statistics (`MAGIC | header length | JSON header | FSTs | crc32`).
-pub(crate) fn encode_text_stats(text: &TextMap) -> Result<Vec<u8>, ApiError> {
-    let mut header = serde_json::Map::new();
-    let mut blobs = Vec::new();
+/// Serialize per-term statistics in chunks (`MAGIC | chunk | chunk | ...`, each chunk an FST of
+/// up to `STATS_CHUNK_TERMS` terms with its own checksum). The chunk index goes in the manifest,
+/// next to the object's reference, so a query can range-read the chunks it needs.
+pub(crate) fn encode_text_stats(
+    text: &TextMap,
+) -> Result<(Vec<u8>, bf_wal::TextStatsIndex), ApiError> {
+    let mut out = CHUNKED_MAGIC.to_vec();
+    let mut index = bf_wal::TextStatsIndex::default();
     for (name, stats) in text {
-        let mut builder = fst::MapBuilder::memory();
-        for (term, df) in &stats.document_frequencies {
-            builder.insert(term, *df).map_err(segment::index_error)?;
+        let mut field = bf_wal::FieldStatsIndex {
+            documents: stats.documents,
+            total_length: stats.total_length,
+            chunks: Vec::new(),
+        };
+        let terms: Vec<_> = stats.document_frequencies.iter().collect();
+        for chunk in terms.chunks(STATS_CHUNK_TERMS) {
+            let mut builder = fst::MapBuilder::memory();
+            for (term, df) in chunk {
+                builder.insert(term, **df).map_err(segment::index_error)?;
+            }
+            let blob = builder.into_inner().map_err(segment::index_error)?;
+            field.chunks.push((
+                chunk[0].0.clone(),
+                out.len() as u64,
+                blob.len() as u32,
+                crc32fast::hash(&blob),
+            ));
+            out.extend(blob);
         }
-        let blob = builder.into_inner().map_err(segment::index_error)?;
-        header.insert(
-            name.clone(),
-            serde_json::json!([stats.documents, stats.total_length, blob.len()]),
-        );
-        blobs.push(blob);
+        index.fields.insert(name.clone(), field);
     }
-    let header = serde_json::to_vec(&header).map_err(segment::index_error)?;
-    let mut out = STATS_MAGIC.to_vec();
-    out.extend((header.len() as u32).to_le_bytes());
-    out.extend(header);
-    for blob in blobs {
-        out.extend(blob);
-    }
-    let crc = crc32fast::hash(&out);
-    out.extend(crc.to_le_bytes());
-    Ok(out)
+    Ok((out, index))
 }
+/// The legacy whole-object format (`MAGIC | header length | JSON header | FSTs | crc32`).
 fn decode_text_stats(bytes: bytes::Bytes) -> Result<TextIndex, ApiError> {
     let bad = || ApiError::new(500, "stored statistics are corrupt or unsupported");
     if bytes.len() < 16 || &bytes[..8] != STATS_MAGIC {
@@ -136,7 +146,7 @@ fn decode_text_stats(bytes: bytes::Bytes) -> Result<TextIndex, ApiError> {
             (
                 documents,
                 total_length,
-                fst::Map::new(blob).map_err(|_| bad())?,
+                vec![fst::Map::new(blob).map_err(|_| bad())?],
             ),
         );
     }
@@ -145,7 +155,39 @@ fn decode_text_stats(bytes: bytes::Bytes) -> Result<TextIndex, ApiError> {
         bytes: bytes.len() as u64,
     })
 }
-/// Per-term text statistics of the checkpoint (one GET, cached while the checkpoint is current).
+/// Decode every chunk of a chunked object that was read whole.
+fn decode_chunked(
+    bytes: &bytes::Bytes,
+    index: &bf_wal::TextStatsIndex,
+) -> Result<TextIndex, ApiError> {
+    let bad = || ApiError::new(500, "stored statistics are corrupt or unsupported");
+    if bytes.len() < 8 || &bytes[..8] != CHUNKED_MAGIC {
+        return Err(bad());
+    }
+    let mut fields = BTreeMap::new();
+    for (name, field) in &index.fields {
+        let mut maps = Vec::with_capacity(field.chunks.len());
+        for (_, offset, len, crc) in &field.chunks {
+            let blob = bytes
+                .get(*offset as usize..(*offset as usize + *len as usize))
+                .ok_or_else(bad)?;
+            if crc32fast::hash(blob) != *crc {
+                return Err(bad());
+            }
+            maps.push(
+                fst::Map::new(bytes.slice(*offset as usize..*offset as usize + *len as usize))
+                    .map_err(|_| bad())?,
+            );
+        }
+        fields.insert(name.clone(), (field.documents, field.total_length, maps));
+    }
+    Ok(TextIndex {
+        fields,
+        bytes: bytes.len() as u64,
+    })
+}
+/// The whole statistics object (the legacy format, and the indexer or slow paths with a shadowed
+/// or unindexed tail), cached while the checkpoint is current.
 async fn load_index(
     store: &Storage,
     file: &bf_wal::SegmentFile,
@@ -155,7 +197,10 @@ async fn load_index(
         return Ok(index);
     }
     let bytes = segment::read_whole(store, file).await?;
-    let index = decode_text_stats(bytes)?;
+    let index = match &file.stats_index {
+        Some(chunks) => decode_chunked(&bytes, chunks)?,
+        None => decode_text_stats(bytes)?,
+    };
     let resident = index.bytes;
     Ok(crate::read_cache::insert(&key, resident, index))
 }
@@ -163,18 +208,20 @@ async fn load_index(
 async fn load_text(store: &Storage, file: &bf_wal::SegmentFile) -> Result<TextMap, ApiError> {
     let index = load_index(store, file).await?;
     let mut out = TextMap::new();
-    for (name, (documents, total_length, map)) in &index.fields {
+    for (name, (documents, total_length, maps)) in &index.fields {
         let mut stats = TextStats {
             documents: *documents,
             total_length: *total_length,
             ..Default::default()
         };
-        let mut stream = fst::IntoStreamer::into_stream(map);
-        while let Some((term, df)) = fst::Streamer::next(&mut stream) {
-            stats.document_frequencies.insert(
-                String::from_utf8(term.to_vec()).map_err(segment::index_error)?,
-                df,
-            );
+        for map in maps {
+            let mut stream = fst::IntoStreamer::into_stream(map);
+            while let Some((term, df)) = fst::Streamer::next(&mut stream) {
+                stats.document_frequencies.insert(
+                    String::from_utf8(term.to_vec()).map_err(segment::index_error)?,
+                    df,
+                );
+            }
         }
         out.insert(name.clone(), stats);
     }
@@ -193,7 +240,8 @@ pub(crate) async fn full_stats(
 }
 /// Query terms per text field, so corpus statistics carry only the frequencies a query uses.
 pub(crate) type QueryTerms = BTreeMap<String, BTreeSet<String>>;
-/// The checkpoint's corpus statistics per text field, restricted to the query's terms.
+/// The checkpoint's corpus statistics per text field, restricted to the query's terms. A chunked
+/// object reads only the chunks that hold the terms (ranged, in one batch).
 async fn checkpoint_corpus_of(
     store: &Storage,
     state: &NamespaceState,
@@ -202,33 +250,98 @@ async fn checkpoint_corpus_of(
     let Some(file) = &state.text_stats else {
         return Ok(state.corpus.clone());
     };
-    let index = load_index(store, file).await?;
-    Ok(index
+    corpus_for(store, file, terms).await
+}
+async fn corpus_for(
+    store: &Storage,
+    file: &bf_wal::SegmentFile,
+    terms: &QueryTerms,
+) -> Result<std::sync::Arc<BTreeMap<String, CorpusStats>>, ApiError> {
+    let averaged = |documents: u64, total_length: u64| CorpusStats {
+        total_docs: documents,
+        average_doc_length: if documents == 0 {
+            0.0
+        } else {
+            total_length as f64 / documents as f64
+        },
+        ..Default::default()
+    };
+    let Some(index) = &file.stats_index else {
+        let index = load_index(store, file).await?;
+        return Ok(index
+            .fields
+            .iter()
+            .map(|(name, (documents, total_length, maps))| {
+                let mut stats = averaged(*documents, *total_length);
+                for term in terms.get(name).into_iter().flatten() {
+                    if let Some(df) = maps.iter().find_map(|m| m.get(term)) {
+                        stats.document_frequencies.insert(term.clone(), df);
+                    }
+                }
+                (name.clone(), stats)
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into());
+    };
+    // Which chunk holds each query term.
+    let mut wanted: BTreeMap<(&str, usize), Vec<&String>> = BTreeMap::new();
+    for (name, field) in &index.fields {
+        for term in terms.get(name).into_iter().flatten() {
+            let at = field
+                .chunks
+                .partition_point(|c| c.0.as_str() <= term.as_str());
+            if let Some(chunk) = at.checked_sub(1) {
+                wanted.entry((name, chunk)).or_default().push(term);
+            }
+        }
+    }
+    let keys: Vec<_> = wanted.keys().copied().collect();
+    let ranges = keys
+        .iter()
+        .map(|(name, c)| {
+            let (_, offset, len, _) = &index.fields[*name].chunks[*c];
+            *offset..*offset + *len as u64
+        })
+        .collect::<Vec<_>>();
+    let blobs = if ranges.is_empty() {
+        Vec::new()
+    } else {
+        segment::read_ranges(store, file, ranges)
+            .await
+            .map_err(segment::index_error)?
+    };
+    let mut out: BTreeMap<String, CorpusStats> = index
         .fields
         .iter()
-        .map(|(name, (documents, total_length, map))| {
-            let mut stats = CorpusStats {
-                total_docs: *documents,
-                average_doc_length: if *documents == 0 {
-                    0.0
-                } else {
-                    *total_length as f64 / *documents as f64
-                },
-                ..Default::default()
-            };
-            for term in terms.get(name).into_iter().flatten() {
-                if let Some(df) = map.get(term) {
-                    stats.document_frequencies.insert(term.clone(), df);
-                }
+        .map(|(name, f)| (name.clone(), averaged(f.documents, f.total_length)))
+        .collect();
+    for ((name, c), blob) in keys.iter().zip(blobs) {
+        let (_, _, len, crc) = &index.fields[*name].chunks[*c];
+        if blob.len() != *len as usize || crc32fast::hash(&blob) != *crc {
+            return Err(ApiError::new(
+                500,
+                "stored statistics are corrupt or unsupported",
+            ));
+        }
+        let map = fst::Map::new(blob).map_err(segment::index_error)?;
+        let stats = out.get_mut(*name).expect("field present");
+        for term in &wanted[&(*name, *c)] {
+            if let Some(df) = map.get(term) {
+                stats.document_frequencies.insert((*term).clone(), df);
             }
-            (name.clone(), stats)
-        })
-        .collect::<BTreeMap<_, _>>()
-        .into())
+        }
+    }
+    Ok(out.into())
 }
-/// Fetch and cache the checkpoint's text statistics ahead of a BM25 query.
-pub(crate) async fn warm_corpus(store: &Storage, file: &bf_wal::SegmentFile) {
-    let _ = load_index(store, file).await;
+/// Fetch and cache the checkpoint's text statistics ahead of a BM25 query: the chunks holding
+/// the query's terms for a chunked object (the manifest's chunk index says which), the whole
+/// object for the legacy format.
+pub(crate) async fn warm_corpus(store: &Storage, file: &bf_wal::SegmentFile, terms: &QueryTerms) {
+    if file.stats_index.is_some() {
+        let _ = corpus_for(store, file, terms).await;
+    } else {
+        let _ = load_index(store, file).await;
+    }
 }
 /// Load out-of-line text statistics into `state`, for callers (the indexer and branch pins)
 /// that carry or rewrite the complete statistics.
@@ -376,18 +489,17 @@ mod tests {
             total_length: 9,
             ..Default::default()
         };
-        for (term, df) in [("fox", 2), ("quick", 1), ("zebra", 3)] {
-            field.document_frequencies.insert(term.into(), df);
+        // 10,000 terms span three chunks.
+        for i in 0..10_000u64 {
+            field.document_frequencies.insert(format!("t{i:05}"), i + 1);
         }
         text.insert("text".into(), field);
-        let file = segment::put_file(
-            &store,
-            "ns/t/segments/text-stats-x.bfs".into(),
-            encode_text_stats(&text).unwrap(),
-            0,
-        )
-        .await
-        .unwrap();
+        let (bytes, index) = encode_text_stats(&text).unwrap();
+        assert_eq!(index.fields["text"].chunks.len(), 3);
+        let mut file = segment::put_file(&store, "ns/t/segments/text-stats-x.bfs".into(), bytes, 0)
+            .await
+            .unwrap();
+        file.stats_index = Some(index);
         let state = NamespaceState {
             text_stats: Some(file.clone()),
             ..Default::default()
@@ -396,12 +508,20 @@ mod tests {
             full_stats(&store, &state).await.unwrap().text["text"].document_frequencies,
             text["text"].document_frequencies
         );
-        let terms =
-            QueryTerms::from([("text".into(), BTreeSet::from(["fox".into(), "nope".into()]))]);
+        let terms = QueryTerms::from([(
+            "text".into(),
+            BTreeSet::from([
+                "t00007".into(),
+                "t05000".into(),
+                "t09999".into(),
+                "nope".into(),
+            ]),
+        )]);
         let corpus = checkpoint_corpus_of(&store, &state, &terms).await.unwrap();
         assert_eq!(corpus["text"].total_docs, 3);
         assert_eq!(corpus["text"].average_doc_length, 3.0);
-        assert_eq!(corpus["text"].document_frequencies.len(), 1);
-        assert_eq!(corpus["text"].document_frequencies["fox"], 2);
+        assert_eq!(corpus["text"].document_frequencies.len(), 3);
+        assert_eq!(corpus["text"].document_frequencies["t05000"], 5001);
+        assert_eq!(corpus["text"].document_frequencies["t09999"], 10_000);
     }
 }

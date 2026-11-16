@@ -245,16 +245,16 @@ async fn externalize_text_stats(
         return Ok(());
     }
     let text = std::mem::take(&mut manifest.stats.text);
-    let bytes = crate::text::encode_text_stats(&text)?;
-    manifest.text_stats = Some(
-        segment::put_file(
-            store,
-            format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
-            bytes,
-            0,
-        )
-        .await?,
-    );
+    let (bytes, index) = crate::text::encode_text_stats(&text)?;
+    let mut file = segment::put_file(
+        store,
+        format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
+        bytes,
+        0,
+    )
+    .await?;
+    file.stats_index = Some(index);
+    manifest.text_stats = Some(file);
     Ok(())
 }
 fn adjust<D: std::borrow::Borrow<bf_types::Document>>(
