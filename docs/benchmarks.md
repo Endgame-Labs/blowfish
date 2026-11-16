@@ -827,6 +827,63 @@ Notes:
   against 115 to 158 ms), and turbopuffer's own server time is only about 15 ms, so the floor for blowfish is the
   network round trip to R2 for the strong-consistency check.
 
+### turbopuffer alone at 1M and 10M, 2026-11-16
+
+Namespaces `blowfish-oracle-wiki1m` and `blowfish-oracle-wiki10m` hold the first 1M and 10M passages (the same 200
+held-out passages excluded; same schema, 1024-dim f16). Loaded with `scale_load.py` (batch 2000, 4 writes in flight,
+f16, no 429s): 1M in 780 s (1,282 docs/s), 10M in 6,467 s (1,546 docs/s, 45.0 GB raw). Measured with
+`oracle_compare.py --tpuf-only --data bench/scale/data/oracle-<size>.npz` (built by `make_oracle_truth.py` from the
+loader's exact truth), 200 queries per type, one pass, one request at a time, no blowfish side.
+
+| Scale | Query | recall@10 |
+| --- | --- | ---: |
+| 100K | ANN | 0.963 |
+| 100K | Selective ANN | 0.998 |
+| 100K | Broad ANN | 0.996 |
+| 1M | ANN | 0.938 |
+| 1M | Selective ANN | 0.998 |
+| 1M | Broad ANN | 0.977 |
+| 10M | ANN | 0.943 |
+| 10M | Selective ANN | 0.993 |
+| 10M | Broad ANN | 0.971 |
+
+Latency, ms p50 / p90 / p99 (100K rows are from Milestone 0 above):
+
+| Scale | Query | turbopuffer client | turbopuffer `server_total_ms` | cache temperature |
+| --- | --- | --- | --- | --- |
+| 100K | ANN | 73 / 81 / 123 | 15 / 21 / 41 | 200 hot |
+| 100K | BM25 | 70 / 89 / 115 | 14 / 32 / 59 | 200 hot |
+| 100K | Hybrid | 74 / 97 / 139 | 16 / 34 / 54 | 200 hot |
+| 100K | Selective ANN | 70 / 80 / 123 | 14 / 19 / 26 | 200 hot |
+| 100K | Broad ANN | 72 / 83 / 158 | 15 / 23 / 38 | 200 hot |
+| 1M | ANN | 68 / 77 / 104 | 12 / 16 / 25 | 200 hot |
+| 1M | BM25 | 67 / 78 / 96 | 12 / 17 / 30 | 200 hot |
+| 1M | Hybrid | 69 / 89 / 101 | 12 / 16 / 24 | 200 hot |
+| 1M | Selective ANN | 69 / 102 / 152 | 12 / 23 / 83 | 200 hot |
+| 1M | Broad ANN | 68 / 93 / 101 | 12 / 15 / 19 | 200 hot |
+| 10M | ANN | 150 / 277 / 492 | 88 / 203 / 390 | 182 warm, 17 hot, 1 cold |
+| 10M | BM25 | 125 / 231 / 368 | 65 / 176 / 303 | 109 hot, 87 warm, 4 cold |
+| 10M | Hybrid | 108 / 214 / 349 | 53 / 159 / 271 | 114 hot, 84 warm, 2 cold |
+| 10M | Selective ANN | 238 / 444 / 1027 | 172 / 361 / 923 | 148 warm, 51 hot, 1 cold |
+| 10M | Broad ANN | 169 / 352 / 539 | 110 / 289 / 435 | 165 warm, 35 hot |
+
+Cold-ish samples: one query per type right after each load finished, before any measured pass (client ms /
+`server_total_ms` / temperature).
+
+| Scale | ANN | BM25 | Hybrid | Selective ANN | Broad ANN |
+| --- | --- | --- | --- | --- | --- |
+| 1M | 129 / 11 / hot | 67 / 13 / hot | 83 / 8 / hot | 99 / 32 / hot | 101 / 21 / hot |
+| 10M | 518 / 405 / warm | 321 / 267 / warm | 311 / 207 / hot | 551 / 448 / warm | 753 / 650 / warm |
+
+Reading: at 1M turbopuffer is flat with 100K (server about 12 ms, always hot, so client latency is the network path).
+At 10M the first pass is not hot: ANN is mostly warm and the server time p50 rises to 52 to 172 ms with p99 up to
+923 ms (selective ANN is the slowest), so the tail grows 5 to 10 times. ANN recall@10 stays near 0.94 (0.963, 0.938,
+0.943); filtered recall holds. `bench/scale/bm25_idf_tpuf_only.py` estimates the BM25 idf offset from turbopuffer
+alone (approximate, about +/-0.05 per term): the constant +0.169 plateau seen at 100K does not appear at 1M or 10M.
+Median offsets over 40 title terms are +0.035 at 1M and +0.049 at 10M, against about +0.13 at 100K with the same
+method, and the large offsets (+0.33 at 1M) belong to the rarest terms (document frequency 2 to 7). So the 100K
+offset is not a fixed "18.5 percent more documents" factor that scales with N.
+
 ### Per-milestone rows
 
 Add one row per milestone with the same 200 queries (blowfish client p50 / p90 / p99, then overlap@10 against

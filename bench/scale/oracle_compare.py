@@ -111,10 +111,14 @@ def main():
     ap.add_argument("--queries", type=int, default=200)
     ap.add_argument("--kinds", default=",".join(KINDS))
     ap.add_argument("--no-bf-warmup", action="store_true")
+    ap.add_argument("--data", type=Path, default=DATA, help="oracle npz (see make_oracle_truth.py for other sizes)")
+    ap.add_argument("--tpuf-only", action="store_true", help="skip blowfish; measure turbopuffer recall and latency alone")
+    ap.add_argument("--cold-probe", action="store_true",
+                    help="send one query per kind to turbopuffer, print its reported cache temperature, and exit")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
 
-    d = np.load(DATA)
+    d = np.load(a.data)
     n = min(a.queries, len(d["title"]))
     vecs = [d["vector"][i].astype("f4").tolist() for i in range(n)]
     titles = [str(t) for t in d["title"][:n]]
@@ -128,16 +132,25 @@ def main():
     bf_url = f"{a.blowfish}/v2/namespaces/{a.bf_ns}/query"
     tp_url = f"{a.tpuf_url}/v2/namespaces/{a.tpuf_ns}/query"
 
+    if a.cold_probe:
+        for kind in a.kinds.split(","):
+            rt, mt = call(tp, tp_url, build(kind, vecs[0], titles[0]))
+            perf = rt.get("performance", {})
+            print(json.dumps({"kind": kind, "client_ms": round(mt, 1), "server_total_ms": perf.get("server_total_ms"),
+                              "cache_temperature": perf.get("cache_temperature"),
+                              "approx_namespace_size": perf.get("approx_namespace_size")}), flush=True)
+        return
+
     result = {}
     for kind in a.kinds.split(","):
         bodies = [build(kind, vecs[i], titles[i]) for i in range(n)]
-        if not a.no_bf_warmup:
+        if not a.no_bf_warmup and not a.tpuf_only:
             for b in bodies:
                 call(bf, bf_url, b)
         bf_ms, tp_ms, srv_ms, exec_ms, temps = [], [], [], [], {}
         par, rec_bf, rec_tp = [], [], []
         for i, b in enumerate(bodies):
-            rb, mb = call(bf, bf_url, b)
+            rb, mb = ({}, 0.0) if a.tpuf_only else call(bf, bf_url, b)
             rt, mt = call(tp, tp_url, b)
             bf_ms.append(mb)
             tp_ms.append(mt)
@@ -148,9 +161,11 @@ def main():
                 exec_ms.append(perf["query_execution_ms"])
             t = perf.get("cache_temperature", "unknown")
             temps[t] = temps.get(t, 0) + 1
-            par.append(compare(rows_of(rb), rows_of(rt)))
+            if not a.tpuf_only:
+                par.append(compare(rows_of(rb), rows_of(rt)))
             if kind in TRUTH:
-                rec_bf.append(recall(rows_of(rb), d[TRUTH[kind]][i]))
+                if not a.tpuf_only:
+                    rec_bf.append(recall(rows_of(rb), d[TRUTH[kind]][i]))
                 rec_tp.append(recall(rows_of(rt), d[TRUTH[kind]][i]))
 
         def mean(key):
@@ -162,7 +177,7 @@ def main():
             "overlap@10": mean("overlap"), "top1_agree": mean("top1"), "pos_match@10": mean("pos_match"),
             "mean_abs_score_diff": mean("abs_diff"), "mean_rel_score_diff": mean("rel_diff"),
             "max_rel_score_diff": mean("max_rel_diff"),
-            "min_overlap": min(p["overlap"] for p in par),
+            "min_overlap": min((p["overlap"] for p in par), default=None),
             "recall_blowfish": float(np.mean(rec_bf)) if rec_bf else None,
             "recall_tpuf": float(np.mean(rec_tp)) if rec_tp else None,
             "blowfish_client_ms": lat(bf_ms), "tpuf_client_ms": lat(tp_ms),
@@ -180,6 +195,14 @@ def main():
     def l(x):
         return f"{x['p50']:.0f} / {x['p90']:.0f} / {x['p99']:.0f}"
 
+    if a.tpuf_only:
+        print("\nturbopuffer alone, %d queries per type (ms p50 / p90 / p99):\n" % n)
+        print("| Query | recall@10 | tpuf client | tpuf server_total_ms | tpuf cache temperature |")
+        print("| --- | ---: | --- | --- | --- |")
+        for k, r in result.items():
+            t = ", ".join(f"{v} {c}" for c, v in sorted(r["tpuf_cache_temperature"].items()))
+            print(f"| {k} | {f(r['recall_tpuf'])} | {l(r['tpuf_client_ms'])} | {l(r['tpuf_server_total_ms'])} | {t} |")
+        return
     print("\nNote: turbopuffer requests go through a proxy and over the internet, so its client latency includes that"
           " path; server_total_ms does not. turbopuffer cannot be forced cold, so its cache temperature is recorded.\n")
     print(f"Parity, blowfish vs turbopuffer, {n} queries per type, top_k 10 (score diffs are over shared ids):\n")
