@@ -569,3 +569,81 @@ async fn cold_ann_over_twenty_segments_uses_the_directory() {
         assert!(got >= 9, "recall {got}/10");
     }
 }
+
+/// Cold ANN waves and requests, and the reads a publication needs, do not grow with the number
+/// of segments (a 1M-equivalent namespace has dozens of them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_cost_and_publication_do_not_grow_with_segment_count() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    let vector = |id: usize| -> Vec<f32> {
+        (0..64)
+            .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+            .collect()
+    };
+    let query = || -> bf_types::QueryRequest {
+        serde_json::from_value(json!({"rank_by":["vector","ANN",vector(77)],"top_k":10})).unwrap()
+    };
+    let mut cold = Vec::new();
+    let mut publish_reads = Vec::new();
+    for batch in 0..60usize {
+        let docs: Vec<_> = (0..400)
+            .map(|n| {
+                let id = batch * 400 + n;
+                json!({"id":id,"vector":vector(id)})
+            })
+            .collect();
+        writer
+            .write(
+                "grow",
+                serde_json::from_value(json!({
+                    "distance_metric":"euclidean_squared","upsert_rows":docs
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        backend.paths.lock().unwrap().clear();
+        writer.index_namespace("grow", true).await.unwrap();
+        let reads: Vec<String> = backend
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.rsplit('/').next().unwrap().to_string())
+            .collect();
+        let count = |ext: &str| reads.iter().filter(|p| p.contains(ext)).count();
+        // Publishing opens no existing segment's index, and reads only new fragments.
+        publish_reads.push((batch, count(".bfv"), count(".bff"), count(".bfd")));
+        if batch + 1 == 6 || batch + 1 == 60 {
+            let engine = Engine::with_config(store(backend.clone()).await, config());
+            backend.waves.store(0, Ordering::SeqCst);
+            backend.ranges.lock().unwrap().clear();
+            backend.delay.store(true, Ordering::SeqCst);
+            let result = engine.query("grow", query()).await.unwrap();
+            backend.delay.store(false, Ordering::SeqCst);
+            assert_eq!(result.result.rows.as_ref().unwrap()[0]["id"], 77);
+            cold.push((
+                batch + 1,
+                backend.waves.load(Ordering::SeqCst),
+                backend.ranges.lock().unwrap().len(),
+            ));
+        }
+    }
+    eprintln!("cold (segments, waves, requests): {cold:?}");
+    eprintln!("publication reads (batch, bfv, bff, bfd): {publish_reads:?}");
+    assert!(cold.iter().all(|c| c.1 <= 3), "waves {cold:?}");
+    // Requests follow the number of probed clusters, not the segment count: ten times the
+    // segments (and rows) stays well under ten times the requests.
+    assert!(cold[1].2 <= cold[0].2 * 6, "requests grew: {cold:?}");
+    assert!(cold[1].2 < 100, "requests {cold:?}");
+    for (batch, bfv, bff, bfd) in &publish_reads {
+        assert_eq!(*bfv, 0, "batch {batch} reopened a segment index");
+        // The new segment's fragment, plus the compacted segment's when compaction ran.
+        assert!(*bff <= 2, "batch {batch} read {bff} fragments");
+        assert!(*bfd <= 1, "batch {batch} read {bfd} directories");
+    }
+}

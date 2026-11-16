@@ -116,6 +116,15 @@ impl<R: RangeRead> Index<R> {
             rq,
         })
     }
+    /// Parse only the metadata of a complete in-memory index blob (no payload reads are possible).
+    pub(crate) fn metadata_only(blob: &[u8], reader: R) -> Result<Self> {
+        let len = blob.len() as u64;
+        if len < FOOTER_SIZE {
+            return Err(bad("missing footer"));
+        }
+        let (meta_len, crc) = format::decode_footer(&blob[(len - FOOTER_SIZE) as usize..], len)?;
+        Self::from_metadata(reader, &blob[..meta_len as usize], crc, len)
+    }
     /// A partial index over a namespace directory: only the code and vector ranges are known
     /// until [`Self::install_cluster`] supplies each probed cluster's center and row set.
     pub(crate) fn stub(
