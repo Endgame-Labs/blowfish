@@ -530,6 +530,103 @@ immediate local-write processing, explicit fences, and eligible compaction.
 The rehearsal prefix was deleted and verified empty before starting the fresh
 10M load.
 
+## Iteration 1 (about 5M docs)
+
+Scope change: the run stopped the load at **4,859,800 documents** (real English Wikipedia passages, 1024-dim
+f16 embeddings, 70 segments, fully indexed and garbage-collected) instead of 10M, so later iterations can
+scale up in steps (500K, 2.5M, then 10M). Iteration 0 numbers below are at 10M with 60 segments, so the
+comparison favors iteration 0 on data size, not iteration 1. Harness: `bench/scale/` (no private settings
+in tracked files). Server defaults throughout: nprobe 512, rerank factor 64, decoded cache default (4 GiB
+on this 32 GiB host), 8 GiB block cache with 4,000-byte blocks.
+
+### What changed, and the evidence
+
+1. **Cross-segment ANN** (`bf-engine/src/ann.rs`). The old path ran IVF per segment: 128 probes and a
+   64x rerank in each of 60 segments. One cold query made about 30,000 ranged GETs (122,341 GETs and 2.27 GB
+   for four queries) and rerank-fetched about 38,000 vectors. Now every segment's cluster centers are ranked
+   together, only the globally nearest clusters are scanned, and one merged candidate pool is reranked and
+   hydrated. Cold ANN dropped to about 5,060 GETs and 419 MB per query. Probes scale as
+   `nprobe * clusters / sqrt(rows)` (equal to the old behavior for one segment); default nprobe became 512,
+   chosen from a sweep at 10M: 128 gave recall 0.928, 256 gave 0.969, 384 gave 0.981, 512 gave 0.994, and the
+   rerank factor made no difference between 64 and 256. Selective filters use exact reads when that is cheaper.
+2. **Storage cache** (`bf-storage`). Planning no longer holds the async lock across disk reads, disk
+   lookups run in parallel batches outside the disk index lock, blocks verify with CRC-32 instead of SHA-256,
+   reads use exact-size buffers (no 2x retained capacity), per-block path allocations and per-block metric
+   updates are gone, and eviction maintenance runs once per fetch. Warm ANN at 10M went from 1,239 ms to
+   about 255 ms at the same recall, of which about 3x came from these changes.
+3. **Decoded-metadata accounting.** Entries are charged at resident size instead of 16x encoded size, and the
+   default budget is one eighth of memory (512 MiB to 4 GiB). Warm BM25 p50 went from 4,454 ms to 82 ms
+   without raising any flag.
+4. **Ingest.** Findings with evidence: write commits are serialized under the state lock and dominated by the
+   9 MB WAL PUT (append about 1.4 s per commit, of about 2.3 s total); an idle indexer tick deep-cloned the
+   whole unindexed tail under the same lock; the pre-commit catch-up LIST cost about 0.6 s per commit; GC
+   deleted retired objects one at a time, stalling indexing for minutes once the retention window passed
+   (2,500 deletes); and compaction runs in the same call as the flush, so a long compaction backs up the tail
+   (the loader hit 800 backpressure 429s over the run). Fixes: decide before cloning, skip the catch-up when
+   the state is fresh (the conditional create still detects other writers), concurrent GC deletes, text
+   tokenization in parallel, ANN and text builds overlapped on blocking workers, concurrent index uploads,
+   multipart uploads for files of 32 MiB and up, concurrent segment builds, and a pipelined loader
+   (`--inflight`). The loader's own bandwidth was about 1,400 docs/s against a local store.
+5. Smaller: the key store refreshes every 300 s when auth is disabled (it LISTed every 5 s), optional
+   `coalesce_gap_blocks`, new env knobs `BF_INDEX_BYTES`, `BF_ANN_RERANK`, `BF_BUILD_CONCURRENCY`,
+   `BF_RETENTION_SECS`, and commit-stage and segment-build metrics.
+
+### Ingest and storage
+
+| Measurement | Iteration 0 (10M) | Iteration 1 (4.86M) |
+| --- | ---: | ---: |
+| End-to-end rate | 500 docs/s | about 600 docs/s average (about 900 docs/s peak; 360 to 650 while compacting) |
+| Backpressure 429s | 1,279 | 799 |
+| R2 bytes per doc after GC | 5,653 (1M rehearsal) | 5,689 (27.65 GB over 70 segments) |
+| Server peak scope memory | 10.6 GiB RSS | 13.9 GiB scope with a 4 GiB decoded cache and 1 GiB unindexed limit, 7 to 8 GiB with 1 GiB and 384 MiB |
+
+Ingest was still bound by serial commits and compaction, not by CPU (the VM was 85 to 98 percent idle): see
+the ranked bottlenecks in `WORKER_REPORT.md`. The run was resumed several times to hot-swap fixes, so the
+averages include restarts. Post-GC inventory: docs 11.95 GB, ANN 10.79 GB, full text 4.45 GB, filters
+0.33 GB, ids 0.06 GB.
+
+### Query matrix (strong consistency, 32 held-out queries, `top_k` 10)
+
+Cold means a fresh process and an empty disk cache for each of 8 queries at concurrency 1. Requests and
+bytes are R2 operations per query from process metrics. Warm queries make one HEAD and no other request.
+
+| Query | Cold p50 / p90 / p99 ms | Cold R2 requests/q | Cold MB/q | Warm c1 p50 / p90 / p99 ms | Warm QPS c1 / c8 / c32 | Recall@10 |
+| --- | --- | ---: | ---: | --- | --- | ---: |
+| ANN | 27,690 / 30,719 / 33,393 | 5,067 | 419 | 321 / 384 / 390 | 3.00 / 3.73 / 3.49 | 0.984 |
+| BM25 | 46,485 / 50,236 / 52,851 | 1,902 | 857 | 82 / 129 / 237 | 10.65 / 18.90 / 17.93 | |
+| Hybrid | 70,570 / 74,992 / 77,012 | 6,752 | 1,185 | 371 / 483 / 579 | 2.67 / 3.14 / 3.17 | |
+| Selective ANN | 41,255 / 46,195 / 46,653 | 7,305 | 600 | 391 / 478 / 493 | 2.53 / 3.03 / 2.82 | 0.994 |
+
+Recall is against the loader's exact truth for the loaded rows (computed at the last shard checkpoint, so it
+misses about 1 percent of rows loaded after it; treat as a lower bound). Peak RSS: ANN 2.3 GiB, BM25
+3.7 GiB, hybrid 5.3 GiB, selective 1.6 GiB.
+
+Sequential read waves per cold query: ANN has three ranged-read stages (index metadata, ids, and live masks
+together; probed-cluster codes; candidate vectors), asserted by `cold_ann_has_three_read_stages_...` in
+`bf-engine/tests/read_cache.rs`. BM25 and hybrid have the same shape (directory, posting blocks, documents)
+by construction; they were not independently counted at scale.
+
+### Before and after
+
+| Metric | Iteration 0 (10M, 60 segments) | Iteration 1 (4.86M, 70 segments) |
+| --- | ---: | ---: |
+| Cold ANN p50 | 44,644 ms | 27,690 ms |
+| Cold ANN R2 requests/query | about 30,000 | 5,067 |
+| Cold hybrid R2 requests/query (c32) | about 20,200 | 6,752 |
+| Warm ANN p50 (c1) | 1,239 ms | 321 ms |
+| Warm BM25 p50 (c1) | 4,454 ms | 82 ms |
+| Warm BM25 QPS (c1) | 0.22 | 10.65 |
+| ANN recall@10 | 0.997 | 0.984 (0.994 at 10M-tuned nprobe 512 on the selective set) |
+
+Not comparable one-to-one (half the data), but the cold request counts fall far faster than data size, and the
+warm BM25 fix is a pure accounting change.
+
+### Remaining bottlenecks
+
+Cold queries still read 400 MB to 1.2 GB (index metadata and probed codes) and are latency-bound by round
+trips: 5,000 or more GETs per query. Warm ANN QPS does not scale with concurrency (3.0 at c1, 3.5 at c32)
+because one query already uses all cores for about 2 core-seconds of code scanning. See `WORKER_REPORT.md`.
+
 ## Compatibility validation
 
 The 121-case compatibility suite passes in both normal mode and forced indexing

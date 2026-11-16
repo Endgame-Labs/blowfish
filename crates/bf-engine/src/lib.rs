@@ -1,4 +1,5 @@
 //! Immutable segment indexes with a WAL overlay and an exhaustive reference evaluator.
+mod ann;
 mod branch;
 mod filter;
 mod highlight;
@@ -650,6 +651,10 @@ fn log_error(e: bf_wal::Error) -> ApiError {
         _ => ApiError::new(500, "stored WAL is corrupt or unsupported"),
     }
 }
+fn record_stage(stage: &'static str, since: Instant) {
+    metrics::histogram!("blowfish_commit_stage_seconds", "stage" => stage)
+        .record(since.elapsed().as_secs_f64());
+}
 async fn catch_up(wal: &Wal, state: &mut NamespaceState, store: &Storage) -> Result<(), ApiError> {
     snapshot::catch_up(wal, state, None, store).await
 }
@@ -693,10 +698,20 @@ async fn commit_worker(
         }
         let start = Instant::now();
         let mut current = state.lock().await;
+        // A state this node just committed or refreshed is current unless another writer
+        // has since appended. The conditional create of the next WAL slot detects exactly
+        // that (Conflict), and the retry then catches up, so the common single-writer
+        // bulk-load path skips a LIST round trip before every commit.
+        let mut trusted =
+            current.seq > 0 && current.refreshed.elapsed() < std::time::Duration::from_secs(2);
         let committed = loop {
-            if let Err(e) = catch_up(&wal, &mut current, &store).await {
+            let stage = Instant::now();
+            if !std::mem::take(&mut trusted)
+                && let Err(e) = catch_up(&wal, &mut current, &store).await
+            {
                 break Err(e);
             }
+            record_stage("catch_up", stage);
             if deleting {
                 if !current.exists {
                     break Err(ApiError::not_found(
@@ -724,10 +739,13 @@ async fn commit_worker(
                     "unindexed WAL exceeds backpressure limit",
                 ));
             }
+            let stage = Instant::now();
             let mut working = match snapshot::for_writes(&store, &current, &pending).await {
                 Ok(s) => s,
                 Err(e) => break Err(e),
             };
+            record_stage("for_writes", stage);
+            let stage = Instant::now();
             let mut batches = vec![];
             let mut results = vec![];
             for p in &pending {
@@ -746,6 +764,7 @@ async fn commit_worker(
                     Err(e) => results.push(Err(e)),
                 }
             }
+            record_stage("prepare", stage);
             if batches.is_empty() {
                 break Ok(results);
             }
@@ -755,13 +774,18 @@ async fn commit_worker(
             {
                 break Err(e);
             }
-            match wal.append(current.seq + 1, &entry).await {
+            let stage = Instant::now();
+            let appended = wal.append(current.seq + 1, &entry).await;
+            record_stage("append", stage);
+            match appended {
                 Ok(CreateResult::Conflict) => continue,
                 Ok(_) => {
                     let seq = current.seq + 1;
+                    let stage = Instant::now();
                     if let Err(e) = branch::replay(&store, &wal, seq, &entry, &mut current).await {
                         break Err(e);
                     }
+                    record_stage("replay", stage);
                     current.refreshed = Instant::now();
                     break Ok(results);
                 }

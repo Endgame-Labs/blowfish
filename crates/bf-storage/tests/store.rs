@@ -99,3 +99,43 @@ async fn s3_contract() {
     exercise(store.clone()).await;
     assert!(store.list("").await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn create_unique_uploads_large_objects_in_parts_and_reads_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Storage::open(&StorageConfig {
+        url: format!("file://{}", dir.path().display()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    // Above the multipart threshold, and not a multiple of the part size.
+    let value: Vec<u8> = (0..(40usize << 20) + 12_345)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    assert_eq!(
+        store
+            .create_unique("big/object", value.clone())
+            .await
+            .unwrap(),
+        CreateResult::Created
+    );
+    let reader = store.range_reader("big/object").await.unwrap();
+    assert_eq!(reader.len(), value.len() as u64);
+    let tail = reader
+        .read(value.len() as u64 - 5000..value.len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(&tail[..], &value[value.len() - 5000..]);
+    let middle = reader.read((17 << 20) - 10..(17 << 20) + 10).await.unwrap();
+    assert_eq!(&middle[..], &value[(17 << 20) - 10..(17 << 20) + 10]);
+    // Small values keep conditional-create semantics.
+    assert_eq!(
+        store.create_unique("small", "a").await.unwrap(),
+        CreateResult::Created
+    );
+    assert_eq!(
+        store.create_unique("small", "b").await.unwrap(),
+        CreateResult::Conflict
+    );
+}

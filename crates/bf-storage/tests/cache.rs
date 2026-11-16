@@ -597,3 +597,29 @@ async fn unavailable_disk_writes_do_not_fail_source_reads() {
         .unwrap();
     assert_eq!(reader.read(0..128).await.unwrap(), data.slice(0..128));
 }
+
+#[tokio::test]
+async fn gap_coalescing_merges_nearby_blocks_into_one_get() {
+    let (store, backend, data) = setup(CacheConfig {
+        block_size: 64,
+        max_coalesce_blocks: 16,
+        coalesce_gap_blocks: 2,
+        ..config()
+    })
+    .await;
+    let reader = store
+        .range_reader_with_length("object", data.len() as u64, false)
+        .unwrap();
+    // Blocks 0, 2, and 5 are separated by gaps of 1 and 2 blocks: one GET covers them.
+    let got = reader
+        .read_batch(&[0..10, 130..140, 330..340])
+        .await
+        .unwrap();
+    assert_eq!(got[0], data.slice(0..10));
+    assert_eq!(got[1], data.slice(130..140));
+    assert_eq!(got[2], data.slice(330..340));
+    assert_eq!(ranges(&backend).len(), 1);
+    // Block 9 is more than two blocks away from block 5: a second GET.
+    reader.read(600..610).await.unwrap();
+    assert_eq!(ranges(&backend).len(), 2);
+}

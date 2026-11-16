@@ -1,7 +1,7 @@
 //! Immutable object range caching and per-query accounting.
 use crate::{
     Error, HEADER, MAGIC, Storage,
-    disk::{Disk, digest},
+    disk::{Disk, digest, read_block},
 };
 use bytes::{Bytes, BytesMut};
 use futures::{
@@ -40,6 +40,9 @@ pub struct CacheConfig {
     pub block_size: usize,
     /// Maximum blocks coalesced into one backend GET (default 8).
     pub max_coalesce_blocks: usize,
+    /// Missing blocks separated by at most this many unrequested blocks share one GET; the
+    /// gap bytes are fetched and discarded. Trades bytes for fewer requests (default 0).
+    pub coalesce_gap_blocks: usize,
     /// Maximum simultaneous cache-fill GETs across all readers (default 64).
     pub fetch_concurrency: usize,
     /// Maximum background warming tasks; excess hints are rejected (default 4).
@@ -72,6 +75,7 @@ impl Default for CacheConfig {
             namespace: None,
             block_size: 1 << 20,
             max_coalesce_blocks: 8,
+            coalesce_gap_blocks: 0,
             fetch_concurrency: 64,
             prefetch_concurrency: 4,
         }
@@ -119,6 +123,12 @@ impl CacheStats {
         self.record(Tier::Memory, bytes);
     }
     fn record(&self, tier: Tier, bytes: u64) {
+        self.record_many(tier, bytes, 1);
+    }
+    fn record_many(&self, tier: Tier, bytes: u64, blocks: u64) {
+        if blocks == 0 {
+            return;
+        }
         let counter = match tier {
             Tier::Memory => &self.memory,
             Tier::Disk => &self.disk,
@@ -127,12 +137,12 @@ impl CacheStats {
         counter.fetch_add(bytes, Ordering::Relaxed);
         match tier {
             Tier::Memory => {
-                metrics::counter!("blowfish_cache_hits_total", "tier" => "memory").increment(1)
+                metrics::counter!("blowfish_cache_hits_total", "tier" => "memory").increment(blocks)
             }
             Tier::Disk => {
-                metrics::counter!("blowfish_cache_hits_total", "tier" => "disk").increment(1)
+                metrics::counter!("blowfish_cache_hits_total", "tier" => "disk").increment(blocks)
             }
-            Tier::Miss => metrics::counter!("blowfish_cache_misses_total").increment(1),
+            Tier::Miss => metrics::counter!("blowfish_cache_misses_total").increment(blocks),
         }
     }
 }
@@ -162,7 +172,7 @@ enum Tier {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BlockKey {
-    path: String,
+    path: Arc<str>,
     index: u64,
     offset: u64,
     len: u64,
@@ -252,17 +262,58 @@ impl RangeCache {
             key.path
         ))
     }
-    async fn lookup(&self, key: &BlockKey, expected: usize) -> Option<(Bytes, Tier)> {
-        if let Some(bytes) = self.memory.get(key) {
-            return Some((bytes, Tier::Memory));
+    /// Look up blocks in memory, then on disk, with no cache-wide lock held. Disk reads are
+    /// split across blocking workers and run outside the disk index lock.
+    async fn lookup_many(&self, wanted: &[(BlockKey, usize)]) -> Vec<Option<(Bytes, Tier)>> {
+        let mut found: Vec<Option<(Bytes, Tier)>> = wanted
+            .iter()
+            .map(|(key, _)| self.memory.get(key).map(|b| (b, Tier::Memory)))
+            .collect();
+        let Some(disk) = self.disk.clone() else {
+            return found;
+        };
+        let missing: Vec<usize> = (0..found.len()).filter(|i| found[*i].is_none()).collect();
+        if missing.is_empty() {
+            return found;
         }
-        let disk = self.disk.clone()?;
-        let name = self.disk_key(key);
-        let bytes = tokio::task::spawn_blocking(move || disk.lock().unwrap().get(&name, expected))
-            .await
-            .ok()??;
-        self.insert_memory(key.clone(), bytes.clone());
-        Some((bytes, Tier::Disk))
+        let jobs: Vec<_> = missing
+            .iter()
+            .map(|&i| (i, self.disk_key(&wanted[i].0), wanted[i].1))
+            .collect();
+        let chunk = jobs.len().div_ceil(8).max(64);
+        let mut tasks = Vec::new();
+        for part in jobs.chunks(chunk) {
+            let part = part.to_vec();
+            let disk = disk.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                let paths: Vec<_> = {
+                    let disk = disk.lock().unwrap();
+                    part.iter().map(|(_, name, _)| disk.locate(name)).collect()
+                };
+                let mut out = Vec::with_capacity(part.len());
+                let mut verdicts = Vec::new();
+                for ((i, name, expected), path) in part.into_iter().zip(paths) {
+                    let Some(path) = path else { continue };
+                    let bytes = read_block(&path, expected);
+                    verdicts.push((name, bytes.is_some()));
+                    if let Some(bytes) = bytes {
+                        out.push((i, bytes));
+                    }
+                }
+                let mut disk = disk.lock().unwrap();
+                for (name, ok) in verdicts {
+                    disk.finish_read(&name, ok);
+                }
+                out
+            }));
+        }
+        for task in tasks {
+            for (i, bytes) in task.await.unwrap_or_default() {
+                self.insert_memory(wanted[i].0.clone(), bytes.clone());
+                found[i] = Some((bytes, Tier::Disk));
+            }
+        }
+        found
     }
     fn insert_memory(&self, key: BlockKey, value: Bytes) {
         if value.len() as u64 > self.config.memory_bytes || self.config.memory_bytes == 0 {
@@ -271,7 +322,6 @@ impl RangeCache {
         // The planner and single-flight reservations guarantee one insertion per block.
         metrics::gauge!("blowfish_cache_bytes", "tier" => "memory").increment(value.len() as f64);
         self.memory.insert(key, value);
-        self.memory.run_pending_tasks();
     }
     async fn insert(&self, key: BlockKey, value: Bytes) {
         self.insert_memory(key.clone(), value.clone());
@@ -295,6 +345,7 @@ impl Drop for RangeCache {
 pub struct RangeReader {
     storage: Storage,
     key: String,
+    path: Arc<str>,
     layout: Layout,
 }
 impl RangeReader {
@@ -345,34 +396,62 @@ impl RangeReader {
                         - range.start.max(index * size);
             }
         }
-        // Serialize planning, not network I/O. This closes cache-lookup/reservation races,
-        // including when memory admission is disabled and only disk is available.
+        // Cache lookups (memory, then disk) run without the planning lock.
+        let wanted: Vec<_> = requested
+            .keys()
+            .map(|&index| {
+                let expected = (self.len() - index * size).min(size) as usize;
+                (self.block_key(index), expected)
+            })
+            .collect();
+        let looked_up = cache.lookup_many(&wanted).await;
+        let mut blocks = BTreeMap::<u64, Bytes>::new();
+        let mut unresolved = Vec::new();
+        let (mut memory, mut disk, mut memory_blocks, mut disk_blocks) = (0, 0, 0, 0);
+        for ((index, weight), found) in requested.iter().zip(looked_up) {
+            match found {
+                Some((bytes, Tier::Memory)) => {
+                    memory += weight;
+                    memory_blocks += 1;
+                    blocks.insert(*index, bytes);
+                }
+                Some((bytes, _)) => {
+                    disk += weight;
+                    disk_blocks += 1;
+                    blocks.insert(*index, bytes);
+                }
+                None => unresolved.push((*index, *weight)),
+            }
+        }
+        stats.record_many(Tier::Memory, memory, memory_blocks);
+        stats.record_many(Tier::Disk, disk, disk_blocks);
+        // Serialize only the reservation of missing blocks, not network or disk I/O. The
+        // re-check under the lock closes races with fetches that finished since the lookup.
         let mut planning = cache.planning.lock().await;
         planning.flights.retain(|_, weak| weak.strong_count() > 0);
-        let mut blocks = BTreeMap::<u64, Bytes>::new();
         let mut pending = Vec::<(u64, Arc<Flight>)>::new();
         let mut missing = Vec::new();
-        for (index, weight) in requested {
+        for (index, weight) in unresolved {
             let key = self.block_key(index);
-            let expected = (self.len() - index * size).min(size) as usize;
-            if let Some((bytes, tier)) = cache.lookup(&key, expected).await {
-                stats.record(tier, weight);
+            if let Some(bytes) = cache.memory.get(&key) {
+                stats.record(Tier::Memory, weight);
                 blocks.insert(index, bytes);
+                continue;
+            }
+            stats.record(Tier::Miss, weight);
+            if let Some(flight) = planning.flights.get(&key).and_then(Weak::upgrade) {
+                pending.push((index, flight));
             } else {
-                stats.record(Tier::Miss, weight);
-                if let Some(flight) = planning.flights.get(&key).and_then(Weak::upgrade) {
-                    pending.push((index, flight));
-                } else {
-                    missing.push(index);
-                }
+                missing.push(index);
             }
         }
         let mut start = 0;
         while start < missing.len() {
             let mut end = start + 1;
+            let gap = cache.config.coalesce_gap_blocks as u64;
             while end < missing.len()
-                && end - start < cache.config.max_coalesce_blocks
-                && missing[end] == missing[end - 1] + 1
+                && (missing[end] - missing[start]) < cache.config.max_coalesce_blocks as u64
+                && missing[end] <= missing[end - 1] + 1 + gap
             {
                 end += 1;
             }
@@ -411,14 +490,17 @@ impl RangeReader {
                     cache.insert(reader.block_key(index), value.clone()).await;
                     values.push(value);
                 }
+                // Apply pending evictions once per coalesced fetch, so memory stays within
+                // budget without paying for maintenance on every block.
+                cache.memory.run_pending_tasks();
                 Ok::<_, Arc<Error>>(Arc::new(values))
             }
             .boxed()
             .shared();
-            for index in missing[start..end].iter().copied() {
+            for (position, index) in missing[start..end].iter().copied().enumerate() {
                 let fetch = group.clone();
                 let flight = Arc::new(Flight(
-                    async move { Ok(fetch.await?[(index - first) as usize].clone()) }
+                    async move { Ok(fetch.await?[position].clone()) }
                         .boxed()
                         .shared(),
                 ));
@@ -473,7 +555,7 @@ impl RangeReader {
     }
     fn block_key(&self, index: u64) -> BlockKey {
         BlockKey {
-            path: self.storage.path(&self.key).to_string(),
+            path: self.path.clone(),
             index,
             offset: self.layout.offset,
             len: self.layout.len,
@@ -531,6 +613,7 @@ impl Storage {
         Ok(RangeReader {
             storage: self.clone(),
             key: key.to_owned(),
+            path: self.path(key).to_string().into(),
             layout,
         })
     }
@@ -548,6 +631,7 @@ impl Storage {
         Ok(RangeReader {
             storage: self.clone(),
             key: key.to_owned(),
+            path: self.path(key).to_string().into(),
             layout: Layout { len, offset },
         })
     }

@@ -30,6 +30,19 @@ impl Default for SearchParams {
     }
 }
 
+/// One row's quantized distance estimate, with the location needed to rerank it.
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate {
+    /// Segment-local row ID.
+    pub row: u32,
+    /// Estimated distance from the query.
+    pub distance: f32,
+    /// Leaf cluster holding the row.
+    pub cluster: u32,
+    /// Position within the cluster.
+    pub ordinal: u32,
+}
+
 /// A parsed immutable index. Metadata and centroids stay resident; codes and
 /// vectors are fetched through the reader for each search (usually cache-backed).
 pub struct Index<R: RangeRead> {
@@ -158,14 +171,81 @@ impl<R: RangeRead> Index<R> {
                 break;
             }
         }
-        let ranges = chosen
+        let mut estimated = self.scan_clusters(query, &chosen, filter).await?;
+        let cmp = |a: &Candidate, b: &Candidate| {
+            a.distance.total_cmp(&b.distance).then(a.row.cmp(&b.row))
+        };
+        if estimated.len() > target {
+            estimated.select_nth_unstable_by(target, cmp);
+            estimated.truncate(target);
+        }
+        let locations = estimated
+            .into_iter()
+            .map(|c| (c.cluster as usize, c.ordinal as usize))
+            .collect();
+        self.rerank(query, k, locations).await
+    }
+
+    /// Number of rows per leaf cluster that pass `filter` (all rows when `None`).
+    pub fn cluster_counts(&self, filter: Option<&RoaringBitmap>) -> Vec<u32> {
+        self.metadata
+            .clusters
+            .iter()
+            .map(|c| filter.map_or(c.rows.len(), |f| c.rows.intersection_len(f)) as u32)
+            .collect()
+    }
+
+    /// Squared Euclidean distance from the query, normalized as the metric requires,
+    /// to every leaf center. Distances are comparable across indexes built over one
+    /// vector space, which lets callers rank clusters across segments.
+    pub fn center_distances(&self, query: &[f32]) -> Result<Vec<f32>> {
+        validate(query, self.dims())?;
+        let q = prepare(query, self.metric());
+        Ok(self
+            .metadata
+            .clusters
+            .iter()
+            .map(|c| Metric::EuclideanSquared.distance_unchecked(&q, &c.center))
+            .collect())
+    }
+
+    /// Stored bytes scanned per row when probing a cluster's quantized codes.
+    pub fn code_row_bytes(&self) -> usize {
+        24 + self.rq.padded.div_ceil(8)
+    }
+
+    /// Stored bytes per full-precision vector.
+    pub fn vector_row_bytes(&self) -> usize {
+        self.dims() * self.vector_type().width()
+    }
+
+    /// Rows stored in one leaf cluster.
+    pub fn cluster_rows(&self, cluster: usize) -> usize {
+        self.metadata.clusters[cluster].rows.len() as usize
+    }
+
+    /// Estimate distances for every row (passing `filter`) in the given leaf clusters,
+    /// from their quantized codes. Cluster code ranges are fetched in one batch.
+    pub async fn scan_clusters(
+        &self,
+        query: &[f32],
+        clusters: &[usize],
+        filter: Option<&RoaringBitmap>,
+    ) -> Result<Vec<Candidate>> {
+        validate(query, self.dims())?;
+        let q = prepare(query, self.metric());
+        let ranges = clusters
             .iter()
             .map(|c| self.metadata.clusters[*c].codes.clone())
             .collect();
         let blocks = read_batch(&self.reader, ranges).await?;
         let q_zero = q.iter().all(|x| *x == 0.);
-        let mut estimated = Vec::with_capacity(candidates);
-        for (cid, bytes) in chosen.into_iter().zip(blocks) {
+        let rows: usize = clusters
+            .iter()
+            .map(|c| self.metadata.clusters[*c].rows.len() as usize)
+            .sum();
+        let mut estimated = Vec::with_capacity(rows);
+        for (cid, bytes) in clusters.iter().copied().zip(blocks) {
             let c = &self.metadata.clusters[cid];
             check_crc(&bytes, c.codes_crc)?;
             let rotated = self.rq.residual(&q, &c.center);
@@ -198,18 +278,58 @@ impl<R: RangeRead> Index<R> {
                 } else {
                     e.distance.max(0.)
                 };
-                estimated.push((row, distance as f32, cid, ordinal));
+                estimated.push(Candidate {
+                    row,
+                    distance: distance as f32,
+                    cluster: cid as u32,
+                    ordinal: ordinal as u32,
+                });
             }
         }
-        let cmp = |a: &(u32, f32, usize, usize), b: &(u32, f32, usize, usize)| {
-            a.1.total_cmp(&b.1).then(a.0.cmp(&b.0))
-        };
-        if estimated.len() > target {
-            estimated.select_nth_unstable_by(target, cmp);
-            estimated.truncate(target);
-        }
-        let locations = estimated.into_iter().map(|(_, _, c, i)| (c, i)).collect();
+        Ok(estimated)
+    }
+
+    /// Fetch full-precision vectors for `(cluster, ordinal)` locations and return the
+    /// exact top-k, sorted by distance then row ID.
+    pub async fn rerank_candidates(
+        &self,
+        query: &[f32],
+        k: usize,
+        locations: Vec<(u32, u32)>,
+    ) -> Result<Vec<(u32, f32)>> {
+        validate(query, self.dims())?;
+        let locations = locations
+            .into_iter()
+            .map(|(c, i)| (c as usize, i as usize))
+            .collect();
         self.rerank(query, k, locations).await
+    }
+
+    /// Every `(cluster, ordinal)` location whose row passes `filter`.
+    pub fn locations(&self, filter: Option<&RoaringBitmap>) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for (cid, c) in self.metadata.clusters.iter().enumerate() {
+            match filter {
+                Some(f) => {
+                    for row in (&c.rows & f).iter() {
+                        out.push((cid as u32, c.rows.rank(row) as u32 - 1));
+                    }
+                }
+                None => out.extend((0..c.rows.len() as u32).map(|i| (cid as u32, i))),
+            }
+        }
+        out
+    }
+
+    /// Approximate resident bytes of the decoded metadata (centers, row sets, checksums).
+    pub fn resident_bytes(&self) -> u64 {
+        let m = &self.metadata;
+        let mut total = (m.parents.len() * (m.dims * 4 + 48)) as u64;
+        for c in &m.clusters {
+            total += (c.center.len() * 4 + c.row_crcs.capacity() * 4 + 160) as u64
+                + c.rows.serialized_size() as u64;
+        }
+        total + (self.rq.padded * 8 * 4) as u64
     }
 
     /// Exact top-k over stored vectors, using bitmap membership to fetch only

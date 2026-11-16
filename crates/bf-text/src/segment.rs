@@ -523,6 +523,19 @@ impl SegmentReader {
             tokenizer,
         })
     }
+    /// Approximate heap bytes owned by the decoded directory (term table, block metadata,
+    /// and document lengths). The encoded buffer that the dictionary borrows is not counted.
+    pub fn resident_bytes(&self) -> u64 {
+        const MALLOC_OVERHEAD: usize = 16;
+        let blocks: usize = self
+            .terms
+            .iter()
+            .map(|t| t.blocks.capacity() * std::mem::size_of::<BlockMeta>() + MALLOC_OVERHEAD)
+            .sum();
+        (self.terms.capacity() * std::mem::size_of::<TermMeta>()
+            + blocks
+            + self.lengths.capacity() * 4) as u64
+    }
     /// Number of segment rows, including empty or missing fields.
     pub fn num_docs(&self) -> u32 {
         self.lengths.len() as u32

@@ -173,6 +173,34 @@ async fn prepare(
     if matches!(q.rank_by, Some(RankBy::Order(_))) {
         return crate::streaming::order_candidates(store, state, q).await;
     }
+    if let Some(
+        rank @ RankBy::Vector {
+            attribute,
+            vector,
+            exact,
+            ..
+        },
+    ) = &q.rank_by
+        && !*exact
+        && !force_exact
+        && q.limit.as_ref().and_then(Limit::per).is_none()
+        && !state.segments.is_empty()
+        && !(state.metric == DistanceMetric::CosineDistance && vector.iter().all(|x| *x == 0.0))
+    {
+        let k = q.total().unwrap_or(10) + q.offset;
+        let columns = projection_columns(state, q, narrow_columns);
+        if let Some((scores, docs)) =
+            crate::ann::search(store, state, q, attribute, vector, config, k, &columns).await?
+        {
+            let mut tail = state.clone();
+            tail.segments.clear();
+            let mut out = prepare_one(store, &tail, q, config, force_exact, narrow_columns).await?;
+            out.docs.extend(docs);
+            out.scores.entry(rank_key(rank)).or_default().extend(scores);
+            trim_candidates(&mut out, q);
+            return Ok(out);
+        }
+    }
     let Some(context) = crate::read_cache::context().filter(|_| state.segments.len() > 1) else {
         let mut out = prepare_one(store, state, q, config, force_exact, narrow_columns).await?;
         trim_candidates(&mut out, q);
@@ -230,35 +258,12 @@ async fn prepare(
     trim_candidates(&mut out, q);
     Ok(out)
 }
-async fn prepare_one(
-    store: &Storage,
+fn projection_columns(
     state: &NamespaceState,
     q: &QueryRequest,
-    config: &EngineConfig,
-    force_exact: bool,
     narrow_columns: bool,
-) -> Result<NamespaceState, ApiError> {
-    let Some(
-        rank @ RankBy::Vector {
-            attribute,
-            vector,
-            exact,
-            ..
-        },
-    ) = &q.rank_by
-    else {
-        return prepare_scalar(store, state, q).await;
-    };
-    if state.metric == DistanceMetric::CosineDistance && vector.iter().all(|x| *x == 0.0) {
-        return snapshot::materialize(store, state).await;
-    }
-    // Diversification can need arbitrarily deep candidates from each segment.
-    let all = q.limit.as_ref().and_then(Limit::per).is_some();
-    let k = q.total().unwrap_or(10) + q.offset;
-    let mut out = state.clone();
-    out.docs.clear();
-    let mut scores = BTreeMap::new();
-    let mut columns: BTreeSet<_> = state
+) -> BTreeSet<String> {
+    let mut columns: BTreeSet<String> = state
         .schema
         .iter()
         .filter(|(name, cfg)| {
@@ -294,6 +299,37 @@ async fn prepare_one(
             _ => {}
         }
     }
+    columns
+}
+async fn prepare_one(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+    config: &EngineConfig,
+    force_exact: bool,
+    narrow_columns: bool,
+) -> Result<NamespaceState, ApiError> {
+    let Some(
+        rank @ RankBy::Vector {
+            attribute,
+            vector,
+            exact,
+            ..
+        },
+    ) = &q.rank_by
+    else {
+        return prepare_scalar(store, state, q).await;
+    };
+    if state.metric == DistanceMetric::CosineDistance && vector.iter().all(|x| *x == 0.0) {
+        return snapshot::materialize(store, state).await;
+    }
+    // Diversification can need arbitrarily deep candidates from each segment.
+    let all = q.limit.as_ref().and_then(Limit::per).is_some();
+    let k = q.total().unwrap_or(10) + q.offset;
+    let mut out = state.clone();
+    out.docs.clear();
+    let mut scores = BTreeMap::new();
+    let columns = projection_columns(state, q, narrow_columns);
     for seg in &state.segments {
         let file = seg.files.get(&format!("ann:{attribute}"));
         let (allowed, index, ids) = tokio::try_join!(

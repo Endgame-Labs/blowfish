@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, time::Duration};
 /// Node-local indexing and query tuning. No option changes the durable write ordering.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
-    /// Byte budget for decoded immutable segment metadata (conservative resident charges).
+    /// Byte budget for decoded immutable segment metadata (charged at resident size).
     /// Zero disables admission. In-flight queries can pin evicted entries until completion.
     pub decoded_cache_bytes: u64,
     /// Maximum concurrent segment scoring tasks across all queries on this engine.
@@ -40,6 +40,8 @@ pub struct EngineConfig {
     pub max_unindexed_bytes: u64,
     /// Eventual reads include at most this many logical WAL bytes.
     pub eventual_tail_bytes: u64,
+    /// Segments built concurrently when one flush or compaction yields several.
+    pub build_concurrency: usize,
     /// IVF leaf probes for ANN queries.
     pub ann_nprobe: usize,
     /// Exact rerank budget as a multiple of the requested k.
@@ -47,10 +49,31 @@ pub struct EngineConfig {
     /// Fraction of ANN requests checked against exhaustive ground truth.
     pub recall_sample_rate: f64,
 }
+/// An eighth of the memory this process may use (host RAM or the cgroup limit), within
+/// 512 MiB to 4 GiB. Entries are charged at their resident size, so this bounds real memory.
+fn default_decoded_cache_bytes() -> u64 {
+    let host = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("MemTotal:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .map_or(4 << 30, |kb| kb.saturating_mul(1024));
+    let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(host);
+    (host.min(limit) / 8).clamp(512 << 20, 4 << 30)
+}
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            decoded_cache_bytes: 512 << 20,
+            decoded_cache_bytes: default_decoded_cache_bytes(),
             search_concurrency: 8,
             query_concurrency: 8,
             indexing: true,
@@ -65,7 +88,8 @@ impl Default for EngineConfig {
             lease_duration: Duration::from_secs(30),
             max_unindexed_bytes: 2_000_000_000,
             eventual_tail_bytes: 128 * 1024 * 1024,
-            ann_nprobe: 128,
+            build_concurrency: 2,
+            ann_nprobe: 512,
             ann_rerank_factor: 64,
             recall_sample_rate: 0.01,
         }
@@ -92,6 +116,9 @@ impl EngineConfig {
         if let Some(v) = number("BF_INDEX_ROWS") {
             c.index_rows = v as usize;
         }
+        if let Some(v) = number("BF_INDEX_BYTES") {
+            c.index_bytes = v;
+        }
         if let Some(v) = number("BF_MAX_SEGMENT_ROWS") {
             c.max_segment_rows = v as usize;
         }
@@ -107,8 +134,17 @@ impl EngineConfig {
         if let Some(v) = number("BF_MAX_UNINDEXED_BYTES") {
             c.max_unindexed_bytes = v;
         }
+        if let Some(v) = number("BF_RETENTION_SECS") {
+            c.retention = Duration::from_secs(v);
+        }
         if let Some(v) = number("BF_ANN_NPROBE") {
             c.ann_nprobe = v as usize;
+        }
+        if let Some(v) = number("BF_BUILD_CONCURRENCY") {
+            c.build_concurrency = v as usize;
+        }
+        if let Some(v) = number("BF_ANN_RERANK") {
+            c.ann_rerank_factor = v as usize;
         }
         c
     }
@@ -220,6 +256,43 @@ impl Engine {
                 return Ok(false);
             }
             catch_up(&wal, &mut state, &self.0.store).await?;
+            // Decide whether there is work before cloning: the tail can hold hundreds of MiB,
+            // and a clone under this lock stalls every concurrent write.
+            if !state.exists {
+                return Ok(false);
+            }
+            let will_rebuild = state.segments.iter().any(|seg| {
+                state
+                    .schema
+                    .keys()
+                    .chain(seg.schema.keys())
+                    .any(|name| !segment::seg_text_matches(seg, &state.schema, name))
+                    || seg.schema.iter().any(|(name, old)| {
+                        state.schema.get(name).is_none_or(|new| {
+                            old.filterable != new.filterable
+                                || old.fuzzy != new.fuzzy
+                                || old.regex != new.regex
+                                || old.glob != new.glob
+                        })
+                    })
+            });
+            let will_compact = tier(&state, &self.0.config);
+            if state.seq == state.indexed_through && will_compact.is_empty() && !will_rebuild {
+                return Ok(false);
+            }
+            let tail_age = Utc::now()
+                .signed_duration_since(state.tail_since.unwrap_or(state.updated_at))
+                .to_std()
+                .unwrap_or_default();
+            if !force
+                && !will_rebuild
+                && will_compact.is_empty()
+                && state.shadowed.len() < self.0.config.index_rows
+                && state.tail_bytes < self.0.config.index_bytes
+                && tail_age < self.0.config.index_age
+            {
+                return Ok(false);
+            }
             state.clone()
         };
         if !state.exists {
@@ -556,8 +629,17 @@ impl Engine {
         let shared = crate::branch::protected(&self.0.store).await?;
         candidates.retain(|key| !shared.contains(key));
         // The winner owns no reusable file names. Repeating deletes after a crash is safe.
-        for key in &candidates {
-            self.0.store.delete(key).await.map_err(storage_error)?;
+        // Deletes are independent round trips; run them concurrently so reclaiming
+        // thousands of retired objects does not stall indexing for minutes.
+        let keys: Vec<&String> = candidates.iter().collect();
+        for group in keys.chunks(32) {
+            let mut deletes = Vec::with_capacity(group.len());
+            for key in group {
+                deletes.push(self.0.store.delete(key));
+            }
+            futures::future::try_join_all(deletes)
+                .await
+                .map_err(storage_error)?;
         }
         if through > 0 {
             wal.prune_payloads(through).await.map_err(log_error)?;
@@ -617,7 +699,7 @@ async fn build_segments(
     end: u64,
     config: &EngineConfig,
 ) -> Result<Vec<bf_wal::Segment>, ApiError> {
-    let mut out = vec![];
+    let mut batches = vec![];
     let mut batch = BTreeMap::new();
     let mut bytes = 0u64;
     for (id, doc) in docs {
@@ -626,15 +708,29 @@ async fn build_segments(
             && (batch.len() >= config.max_segment_rows.max(1)
                 || bytes.saturating_add(size) > config.max_segment_bytes.max(1))
         {
-            out.push(segment::build(store, ns, schema, metric, &batch, start, end).await?);
-            batch.clear();
+            batches.push(std::mem::take(&mut batch));
             bytes = 0;
         }
         batch.insert(id.clone(), doc.clone());
         bytes = bytes.saturating_add(size);
     }
     if !batch.is_empty() {
-        out.push(segment::build(store, ns, schema, metric, &batch, start, end).await?);
+        batches.push(batch);
+    }
+    // Segments are independent: build a few at once, keeping their order.
+    let mut out = Vec::with_capacity(batches.len());
+    for group in batches.chunks(config.build_concurrency.max(1)) {
+        let mut builds = Vec::with_capacity(group.len());
+        for batch in group {
+            builds.push(segment::build(store, ns, schema, metric, batch, start, end));
+        }
+        let started = std::time::Instant::now();
+        let built = futures::future::try_join_all(builds).await?;
+        let rows: u32 = built.iter().map(|s| s.row_count).sum();
+        metrics::counter!("blowfish_segment_build_millis_total")
+            .increment((started.elapsed().as_secs_f64() * 1000.0) as u64);
+        metrics::counter!("blowfish_segment_build_rows_total").increment(rows as u64);
+        out.extend(built);
     }
     Ok(out)
 }

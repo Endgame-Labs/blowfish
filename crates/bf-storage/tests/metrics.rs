@@ -116,7 +116,7 @@ async fn facade_reports_bytes_hits_evictions_errors_and_lifetimes() {
     );
     assert_eq!(
         capture.number("blowfish_cache_bytes", &[("tier", "disk")]),
-        104.0
+        80.0
     );
     reader.read(0..64).await.unwrap();
     assert_eq!(
@@ -132,7 +132,7 @@ async fn facade_reports_bytes_hits_evictions_errors_and_lifetimes() {
     assert!(capture.number("blowfish_cache_bytes", &[("tier", "memory")]) <= 64.0);
     assert_eq!(
         capture.number("blowfish_cache_bytes", &[("tier", "disk")]),
-        208.0
+        160.0
     );
     assert_eq!(
         capture.number(
@@ -178,7 +178,7 @@ async fn facade_reports_bytes_hits_evictions_errors_and_lifetimes() {
             .unwrap();
     assert_eq!(
         capture.number("blowfish_cache_bytes", &[("tier", "disk")]),
-        208.0
+        160.0
     );
     let reader = store
         .range_reader_with_length("object", 256, false)

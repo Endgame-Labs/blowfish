@@ -354,6 +354,52 @@ impl Storage {
     pub async fn create(&self, key: &str, value: impl Into<Bytes>) -> Result<CreateResult, Error> {
         self.create_with_id(key, value, Uuid::new_v4()).await
     }
+    /// Upload an immutable object under a key no other writer can use (for example a segment
+    /// file under a fresh UUID prefix). Large values go up as concurrent multipart parts,
+    /// which is several times faster than one PUT stream. Multipart uploads cannot be
+    /// conditional, so unlike [`Self::create`] this overwrites: callers must guarantee key
+    /// uniqueness. Small values and single-writer stores use [`Self::create`].
+    pub async fn create_unique(
+        &self,
+        key: &str,
+        value: impl Into<Bytes>,
+    ) -> Result<CreateResult, Error> {
+        const MULTIPART_MIN: usize = 32 << 20;
+        const PART: usize = 16 << 20;
+        let value = value.into();
+        if value.len() < MULTIPART_MIN || self.0.mode != StorageMode::Conditional {
+            return self.create(key, value).await;
+        }
+        self.writable()?;
+        let path = self.path(key);
+        let upload = self.0.backend.put_multipart(&path).await?;
+        let mut writer = object_store::WriteMultipart::new_with_chunk_size(upload, PART);
+        let mut header = Vec::with_capacity(HEADER);
+        header.extend_from_slice(MAGIC);
+        header.extend_from_slice(Uuid::new_v4().as_bytes());
+        writer.put(header.into());
+        let mut offset = 0;
+        let result = async {
+            while offset < value.len() {
+                writer.wait_for_capacity(8).await?;
+                let end = (offset + PART).min(value.len());
+                writer.put(value.slice(offset..end));
+                offset = end;
+            }
+            Ok::<_, object_store::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                writer.finish().await?;
+                Ok(CreateResult::Created)
+            }
+            Err(e) => {
+                let _ = writer.abort().await;
+                Err(e.into())
+            }
+        }
+    }
     /// Create with a caller-retained identity. A retry of an already committed put succeeds.
     pub async fn create_with_id(
         &self,

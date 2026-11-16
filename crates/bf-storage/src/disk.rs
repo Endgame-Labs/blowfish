@@ -8,14 +8,34 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const HEADER: usize = 40;
-const MAGIC: &[u8; 8] = b"BFCACHE1";
+/// Magic (8 bytes) followed by a CRC-32 of the payload and four reserved bytes.
+const HEADER: usize = 16;
+const MAGIC: &[u8; 8] = b"BFCACHE2";
 
 pub(crate) fn digest(input: impl AsRef<[u8]>) -> String {
-    Sha256::digest(input.as_ref())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in Sha256::digest(input.as_ref()) {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 15) as usize] as char);
+    }
+    out
+}
+
+/// Read and verify one cache file. Runs without any lock held. The buffer is allocated
+/// at its exact size, so the returned `Bytes` retains no spare capacity.
+pub(crate) fn read_block(path: &Path, expected: usize) -> Option<Bytes> {
+    let mut file = File::open(path).ok()?;
+    let mut bytes = vec![0u8; HEADER + expected];
+    file.read_exact(&mut bytes).ok()?;
+    // A longer file is corrupt: it cannot be a block of the expected size.
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra).ok()? != 0 {
+        return None;
+    }
+    let crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    (&bytes[..8] == MAGIC && crc32fast::hash(&bytes[HEADER..]) == crc)
+        .then(|| Bytes::from(bytes).slice(HEADER..))
 }
 
 pub(crate) struct Disk {
@@ -108,34 +128,23 @@ impl Disk {
         Ok(())
     }
 
-    pub(crate) fn get(&mut self, name: &str, expected: usize) -> Option<Bytes> {
-        let &(size, clock) = self.entries.get(name)?;
-        let result = (|| {
-            let file = File::open(self.dir.join(name))?;
-            let mut bytes = Vec::new();
-            // Corrupt files cannot force an allocation larger than one expected block.
-            file.take((HEADER + expected + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            Ok::<_, io::Error>(bytes)
-        })();
-        let value = result.ok().filter(|v| {
-            v.len() == HEADER + expected
-                && &v[..8] == MAGIC
-                && Sha256::digest(&v[HEADER..])[..] == v[8..HEADER]
-        });
-        match value {
-            Some(value) => {
+    /// Path of a tracked block, without touching the file.
+    pub(crate) fn locate(&self, name: &str) -> Option<PathBuf> {
+        self.entries.contains_key(name).then(|| self.dir.join(name))
+    }
+
+    /// Record a successful read (LRU touch) or drop a block that failed verification.
+    pub(crate) fn finish_read(&mut self, name: &str, ok: bool) {
+        if ok {
+            if let Some(&(size, clock)) = self.entries.get(name) {
                 self.order.remove(&(clock, name.to_owned()));
                 self.clock += 1;
                 self.order.insert((self.clock, name.to_owned()));
                 self.entries.insert(name.to_owned(), (size, self.clock));
-                Some(Bytes::from(value).slice(HEADER..))
             }
-            None => {
-                let _ = self.remove(name);
-                self.publish_bytes();
-                None
-            }
+        } else {
+            let _ = self.remove(name);
+            self.publish_bytes();
         }
     }
 
@@ -150,7 +159,8 @@ impl Disk {
             self.evict(size)?;
             let mut file = File::create(&tmp)?;
             file.write_all(MAGIC)?;
-            file.write_all(&Sha256::digest(value))?;
+            file.write_all(&crc32fast::hash(value).to_le_bytes())?;
+            file.write_all(&[0u8; 4])?;
             file.write_all(value)?;
             file.flush()?;
             fs::rename(&tmp, self.dir.join(name))?;
