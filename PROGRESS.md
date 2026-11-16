@@ -4,6 +4,14 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **turbopuffer reference (100K) added.**
+  - **Namespace:** the same 100K docs, loaded once into a kept turbopuffer namespace.
+  - **Comparison:** `bench/scale/oracle_compare.py` compares parity, recall, and latency at each milestone.
+  - **First result against main:**
+    - overlap@10 is 0.963 (ANN), 0.982 (BM25), 0.973 (hybrid), 0.998 (selective), and 0.992 (broad).
+    - Recall@10 for blowfish vs turbopuffer is 0.980 vs 0.963 (ANN), 1.000 vs 0.998 (selective), and 0.995 vs 0.996 (broad).
+    - Warm client p50 is about 75 ms on both sides, but turbopuffer's server time is about 15 ms, while about 70 ms of blowfish's is the R2 consistency HEAD.
+    - BM25 scores run 1.5-2% below turbopuffer's, with identical top-1. Corpus statistics are suspected; to be fixed.
 - **Perf iteration 2 merged (100K docs on R2, with inner loops).**
   - **IVF format:** rotated centers, compact codes stored contiguously, a popcount scan, and merged reads.
   - **Manifests:** large ones are zstd-compressed.
