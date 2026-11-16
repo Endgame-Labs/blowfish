@@ -76,27 +76,47 @@ pub(crate) async fn execute(
         }
     }
     if !clauses.is_empty() {
-        prepared.corpus = crate::text::global_stats(store, state).await?;
+        let mut terms = crate::text::QueryTerms::new();
+        for clause in &clauses {
+            if let RankBy::Bm25 {
+                attribute, query, ..
+            } = clause
+                && let Some(cfg) = state.schema.get(attribute).and_then(|s| s.text_config())
+            {
+                terms
+                    .entry(attribute.clone())
+                    .or_default()
+                    .extend(crate::text::tokens(query, &cfg).into_iter().map(|t| t.text));
+            }
+        }
+        prepared.corpus = crate::text::global_stats(store, state, &terms).await?;
     }
     let state = &prepared;
     let mut candidates = state.clone();
     candidates.docs.clear();
-    for q in request
-        .queries
-        .as_deref()
-        .unwrap_or(std::slice::from_ref(request))
-    {
-        // RRF clauses can project different fields on overlapping candidates.
-        // Keep their common candidate hydration intact when merging the clauses.
-        let part = prepare(
-            store,
-            state,
-            q,
-            config,
-            force_exact,
-            request.queries.is_none(),
-        )
-        .await?;
+    // Subqueries (for example the ANN and BM25 halves of a hybrid query) read independent
+    // files, so they run concurrently. Results merge in request order.
+    let parts = futures::future::try_join_all(
+        request
+            .queries
+            .as_deref()
+            .unwrap_or(std::slice::from_ref(request))
+            .iter()
+            .map(|q| {
+                prepare(
+                    store,
+                    state,
+                    q,
+                    config,
+                    force_exact,
+                    request.queries.is_none(),
+                )
+            }),
+    )
+    .await?;
+    // RRF clauses can project different fields on overlapping candidates.
+    // Keep their common candidate hydration intact when merging the clauses.
+    for part in parts {
         candidates.docs.extend(part.docs);
         for (rank, scores) in part.scores {
             candidates.scores.entry(rank).or_default().extend(scores);
@@ -425,7 +445,7 @@ pub(crate) fn recall(ann: &QueryResponse, exact: &QueryResponse) -> f64 {
     }
 }
 
-fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) {
+pub(crate) fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) {
     match rank {
         RankBy::Bm25 { .. } => clauses.push(rank),
         RankBy::Sum(xs) | RankBy::Max(xs) => {

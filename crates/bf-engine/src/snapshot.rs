@@ -3,14 +3,122 @@ use crate::{NamespaceState, Operation, filter, log_error, segment};
 use bf_storage::Storage;
 use bf_types::*;
 use bf_wal::{Pending, Wal};
+use futures::{FutureExt, TryFutureExt};
 use roaring::RoaringBitmap;
 use std::{collections::BTreeSet, time::Instant};
+
+/// What a query will open, so a cold snapshot can fetch it in parallel with the WAL tail.
+#[derive(Clone)]
+pub(crate) struct OpenHint {
+    context: crate::read_cache::ReadContext,
+    ann: BTreeSet<String>,
+    text: BTreeSet<String>,
+    docs: bool,
+}
+impl OpenHint {
+    pub(crate) fn for_request(
+        request: &QueryRequest,
+        context: crate::read_cache::ReadContext,
+    ) -> Self {
+        let mut hint = Self {
+            context,
+            ann: BTreeSet::new(),
+            text: BTreeSet::new(),
+            docs: false,
+        };
+        for q in request
+            .queries
+            .as_deref()
+            .unwrap_or(std::slice::from_ref(request))
+        {
+            match &q.rank_by {
+                Some(RankBy::Vector {
+                    attribute,
+                    exact: false,
+                    ..
+                }) => {
+                    hint.ann.insert(attribute.clone());
+                }
+                Some(rank) => {
+                    let mut clauses = vec![];
+                    crate::indexed::text_clauses(rank, &mut clauses);
+                    for clause in clauses {
+                        if let RankBy::Bm25 { attribute, .. } = clause {
+                            hint.text.insert(attribute.clone());
+                        }
+                    }
+                }
+                None => {}
+            }
+            hint.docs |= q.include_attributes.is_some()
+                || q.exclude_attributes.is_some()
+                || q.compute_attributes.is_some()
+                || q.filters.is_some();
+        }
+        hint
+    }
+    /// Open (and cache) segment metadata. Failures are ignored: the query reports them.
+    async fn warm(
+        &self,
+        store: &Storage,
+        segments: &[bf_wal::Segment],
+        text: Option<&bf_wal::SegmentFile>,
+    ) {
+        let context = self.context.clone();
+        crate::read_cache::scope(context, async {
+            let mut tasks = vec![];
+            for seg in segments {
+                for attribute in &self.ann {
+                    if let Some(file) = seg.files.get(&format!("ann:{attribute}")) {
+                        tasks.push(segment::vector_index(store, file).map_ok(drop).boxed());
+                    }
+                }
+                for attribute in &self.text {
+                    if let Some(file) = seg.files.get(&format!("fts:{attribute}")) {
+                        tasks.push(segment::text_index(store, file).map_ok(drop).boxed());
+                    }
+                }
+                if !self.ann.is_empty() || !self.text.is_empty() {
+                    tasks.push(segment::ids(store, seg).map_ok(drop).boxed());
+                    tasks.push(
+                        segment::get_value::<RoaringBitmap>(store, &seg.live)
+                            .map_ok(drop)
+                            .boxed(),
+                    );
+                }
+                if self.docs {
+                    tasks.push(segment::warm_docs(store, seg).map(|()| Ok(())).boxed());
+                }
+            }
+            if !self.text.is_empty()
+                && let Some(file) = text
+            {
+                tasks.push(
+                    crate::text::warm_corpus(store, file)
+                        .map(|()| Ok(()))
+                        .boxed(),
+                );
+            }
+            futures::future::join_all(tasks).await;
+        })
+        .await;
+    }
+}
 
 pub(crate) async fn catch_up(
     wal: &Wal,
     state: &mut NamespaceState,
     cap: Option<u64>,
     store: &Storage,
+) -> Result<(), ApiError> {
+    catch_up_hinted(wal, state, cap, store, None).await
+}
+pub(crate) async fn catch_up_hinted(
+    wal: &Wal,
+    state: &mut NamespaceState,
+    cap: Option<u64>,
+    store: &Storage,
+    hint: Option<&OpenHint>,
 ) -> Result<(), ApiError> {
     // Always refresh the manifest before reading a potentially reclaimed tail.
     // A concurrent GC can still race this read; one fresh checkpoint retry resolves it.
@@ -42,7 +150,12 @@ pub(crate) async fn catch_up(
                         segments: m.segments,
                         indexed_through: m.indexed_through,
                         manifest_seq: generation,
-                        corpus: crate::text::checkpoint_corpus(&m.stats),
+                        corpus: if m.text_stats.is_some() {
+                            Default::default()
+                        } else {
+                            crate::text::checkpoint_corpus(&m.stats)
+                        },
+                        text_stats: m.text_stats,
                         stats: m.stats.into(),
                         ..Default::default()
                     }
@@ -51,13 +164,18 @@ pub(crate) async fn catch_up(
             state.manifest_seq = generation;
         }
         state.checkpoint_refreshed = Instant::now();
-        match wal
-            .tail_bounded(
-                state.seq,
-                cap.unwrap_or(u64::MAX).saturating_sub(state.tail_bytes),
-            )
-            .await
-        {
+        let tail = wal.tail_bounded(
+            state.seq,
+            cap.unwrap_or(u64::MAX).saturating_sub(state.tail_bytes),
+        );
+        let tail = if let Some(hint) = hint.filter(|_| !state.segments.is_empty()) {
+            // The checkpoint's files do not depend on the tail: open them meanwhile.
+            let (segments, text) = (state.segments.clone(), state.text_stats.clone());
+            tokio::join!(tail, hint.warm(store, &segments, text.as_ref())).0
+        } else {
+            tail.await
+        };
+        match tail {
             Ok(entries) => {
                 for (seq, entry) in entries {
                     let size = serde_json::to_vec(&entry).expect("WAL serializes").len() as u64;
