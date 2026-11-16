@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Projects, keys, and the admin console merged and deployed.**
+  - **Model:** org superadmin keys; projects with isolated namespaces under `projects/<id>/`, with `default` mapping to the root; and project `admin`, `read_write`, and `read` keys.
+  - **API:** `whoami`, the admin API, and `docs/api/admin.openapi.yaml`.
+  - **Webapp:** the Go app in `webapp/` with magic-link sign-in through the exe.dev email gateway.
+  - **Deployment:** live serves the console at `/console/` through Caddy, run by the `blowfish-webapp` systemd unit. It uses a minted superadmin key named "console".
+  - **Checks:** the turbopuffer SDK smoke test passed after the upgrade.
+
 - **Live instance upgraded** to main (f5b08a9), from abb3cfd. The previous binary is kept for rollback, and the `live/` prefix was backed up first. The turbopuffer SDK smoke test passed for upsert, ANN, BM25, and filtered queries. Unauthenticated requests still get 401.
 - **New docs:**
   - `docs/design/projects-and-keys.md`: org, projects, project keys, the admin API, and the Go admin webapp with magic-link login.
