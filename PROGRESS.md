@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Perf iteration 5 merged (100K): scale-ready ANN directory.**
+  - **Changes:**
+    - Directory centers are 1-bit codes: 196 B per leaf, down from about 1.1 KB. The 100K directory is 139 KB; projected at 10M it's about 4.4 MB.
+    - Segments write fragments, so publication never reopens existing segments. A 60-segment test shows cold ANN stays at 3 waves.
+    - Flat-segment vectors are prefetched in parallel.
+  - **Cold p50 / p90:** ANN 1,044 / 1,681 ms, within run-to-run noise of iteration 4 (829-1,088 ms); BM25 943 / 1,429 ms; hybrid 1,023 / 1,141 ms; selective 1,120 / 1,260 ms.
+  - **Warm p50:** about 59 ms, of which the strong-consistency HEAD is about 55 ms.
+  - **QPS at concurrency 32:** 107-172.
+  - **Recall and parity:** ANN recall 0.984. Parity overlap: ANN 0.968, BM25 0.982.
+  - **Open:** filtered ANN through the directory, sparse rerank ranges, and BM25 block-max.
+
 - **Perf iteration 4 merged (100K): namespace ANN directory.**
   - **Changes:** a persisted leaf directory per publication, referenced from the manifest. Cold unfiltered ANN opens no segment index: 3 waves in a 20-segment test. Reranking is error-bounded, and hydration reads the docs `id` column instead of the ID index.
   - **Cold p50:** ANN 1,937 → about 900 ms (old path in the same session: 1,160 ms); BM25 1,415 → 725 ms; hybrid 2,167 → 1,080 ms; selective 1,616 → 1,172 ms.
