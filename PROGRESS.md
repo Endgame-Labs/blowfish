@@ -4,6 +4,24 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Perf iteration 3 merged (100K).**
+  - **Changes:**
+    - The manifest slot is inline (13 KB, down from 867 KB), and term statistics moved to an FST object.
+    - Text segments are now v2, with lazy per-term records.
+    - Snapshot, tail probe, and hydration are overlapped, and hybrid subqueries run concurrently.
+  - **Cold results:**
+    - BM25 is 1.42 s and 7 MB (was 1.64 s and 24 MB).
+    - Hybrid is 2.17 s and 22 MB (was 2.71 s and 39 MB).
+    - Selective is 1.62 s (was 2.46 s).
+    - ANN is flat, at about 1.9 s.
+    - R2 latency was about 25 ms higher during the run, and quiet single traces show ANN about 1.1 s and BM25 about 0.9 s.
+  - **Waves:** still 5-6.
+  - **Recall@10:** ANN 0.988.
+  - **Eventual-consistency warm:** ANN 35 ms and BM25 9 ms, against about 100 ms strong.
+  - **turbopuffer parity:** unchanged.
+  - **BM25 scores:** for about 40% of terms, turbopuffer's IDF is a constant +0.169 higher, with identical ordering. Its namespace reports 100,000 rows, so the cause is still open.
+  - **Compatibility:** older binaries can't read the new text segments and manifests.
+  - **Checks:** clippy, 161 tests, and compat 121/121 in both modes.
 - **turbopuffer reference (100K) added.**
   - **Namespace:** the same 100K docs, loaded once into a kept turbopuffer namespace.
   - **Comparison:** `bench/scale/oracle_compare.py` compares parity, recall, and latency at each milestone.
