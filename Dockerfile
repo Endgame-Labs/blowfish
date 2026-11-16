@@ -1,12 +1,13 @@
 # syntax=docker/dockerfile:1
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates cmake clang libclang-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --locked --release -p blowfish && cp target/release/blowfish /blowfish
+    if [ "$(uname -m)" = x86_64 ]; then export CFLAGS="-march=x86-64-v3" CXXFLAGS="-march=x86-64-v3"; fi && \
+    cargo build --locked --release -p blowfish --features local-models && cp target/release/blowfish /blowfish
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
@@ -14,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && mkdir /data && chown blowfish:blowfish /data
 COPY --from=builder /blowfish /usr/local/bin/blowfish
 USER 10001:10001
-ENV BLOWFISH_STORAGE_URL=file:///data BLOWFISH_LISTEN=0.0.0.0:8000
+ENV BLOWFISH_STORAGE_URL=file:///data BLOWFISH_LISTEN=0.0.0.0:8000 BLOWFISH_MODELS_CACHE_DIR=/data/models
 EXPOSE 8000
 VOLUME ["/data"]
 # Authenticated deployments should supply the super key through this environment variable.
