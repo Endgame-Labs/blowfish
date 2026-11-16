@@ -31,6 +31,86 @@ pub enum Role {
     Keys,
 }
 
+/// What a key is for. Keys with no kind are legacy role-and-prefix keys, which act in the
+/// `default` project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyKind {
+    /// Org superadmin: every project and every key.
+    Superadmin,
+    /// Project admin: all namespace operations, and `read_write` and `read` keys of its project.
+    Admin,
+    /// Project writer: writes, schema updates, and queries.
+    ReadWrite,
+    /// Project reader: queries and metadata.
+    Read,
+}
+impl KeyKind {
+    /// The wire name, such as `read_write`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Superadmin => "superadmin",
+            Self::Admin => "admin",
+            Self::ReadWrite => "read_write",
+            Self::Read => "read",
+        }
+    }
+    fn roles(self) -> Vec<Role> {
+        match self {
+            Self::Superadmin => vec![],
+            Self::Admin => vec![Role::Admin],
+            Self::ReadWrite => vec![Role::Write],
+            Self::Read => vec![Role::Read],
+        }
+    }
+}
+/// The built-in project that maps to the storage root, where pre-project data lives.
+pub const DEFAULT_PROJECT: &str = "default";
+/// A project: its own namespaces and its own keys.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub created_by: String,
+}
+/// Body for `POST /_blowfish/v1/projects`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateProjectRequest {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+/// Body for `PATCH /_blowfish/v1/projects/{id}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateProjectRequest {
+    pub name: String,
+}
+/// Body for creating a project key or an org superadmin key. Org keys ignore `kind`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateKindKeyRequest {
+    pub name: String,
+    #[serde(default)]
+    pub kind: Option<KeyKind>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Attribution label, such as `webapp:alice`. Honored only from superadmin callers.
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+/// Response to `GET /_blowfish/v1/whoami`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WhoAmI {
+    /// `superadmin`, `admin`, `read_write`, `read`, or `legacy`.
+    pub kind: String,
+    /// The key's project, or `null` for a superadmin (who selects one per request).
+    pub project: Option<String>,
+    pub key_id: String,
+    pub name: String,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 /// An operation enforced by the HTTP server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -87,6 +167,12 @@ pub struct KeyInfo {
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_by: String,
+    /// `None` for legacy keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<KeyKind>,
+    /// The project a project key belongs to; `None` for legacy and superadmin keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// Most recent use observed by this process, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<DateTime<Utc>>,
@@ -129,6 +215,8 @@ pub struct Principal {
     namespace_prefixes: Option<Vec<String>>,
     expires_at: Option<DateTime<Utc>>,
     super_key: bool,
+    kind: Option<KeyKind>,
+    project: Option<String>,
 }
 impl Principal {
     /// Display name used in HTTP metrics.
@@ -144,6 +232,37 @@ impl Principal {
             namespace_prefixes: None,
             expires_at: None,
             super_key: true,
+            kind: Some(KeyKind::Superadmin),
+            project: None,
+        }
+    }
+    /// Whether this is an org superadmin (including the break-glass key).
+    pub fn is_superadmin(&self) -> bool {
+        self.super_key
+    }
+    /// The key's kind; `None` for legacy keys.
+    pub fn kind(&self) -> Option<KeyKind> {
+        self.kind
+    }
+    /// The project this key belongs to; `None` for superadmin and legacy keys.
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+    /// Describe this identity for `whoami`.
+    pub fn whoami(&self) -> WhoAmI {
+        WhoAmI {
+            kind: self.kind.map_or("legacy", KeyKind::as_str).into(),
+            project: match self.kind {
+                Some(KeyKind::Superadmin) => None,
+                _ => Some(
+                    self.project
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_PROJECT.into()),
+                ),
+            },
+            key_id: self.id.clone(),
+            name: self.name.clone(),
+            expires_at: self.expires_at,
         }
     }
     /// Stable identifier, or `super` for the configured super key.
@@ -175,6 +294,10 @@ pub enum AuthError {
     InvalidRequest(&'static str),
     #[error("key not found")]
     NotFound,
+    #[error("project not found")]
+    ProjectNotFound,
+    #[error("project already exists")]
+    Conflict,
     #[error("key authorization data is temporarily unavailable")]
     Unavailable,
     #[error("key storage error")]
@@ -191,7 +314,8 @@ impl AuthError {
             Self::Unauthorized => 401,
             Self::Forbidden => 403,
             Self::InvalidRequest(_) => 400,
-            Self::NotFound => 404,
+            Self::NotFound | Self::ProjectNotFound => 404,
+            Self::Conflict => 409,
             Self::Unavailable => 503,
             Self::SharedStorage(bf_storage::Error::ReadOnly) => 403,
             Self::Storage(_) | Self::Data(_) | Self::SharedStorage(_) => 500,
@@ -215,6 +339,7 @@ pub struct ErrorResponse {
 #[derive(Default)]
 struct Cache {
     keys: HashMap<String, StoredKey>,
+    projects: HashMap<String, Project>,
     revoked: HashSet<String>,
     negative: HashMap<String, Instant>,
     last_used: HashMap<String, DateTime<Utc>>,
@@ -255,6 +380,27 @@ impl Backend {
             Self::Shared(store) => Ok(store.get(path.as_ref()).await?),
         }
     }
+    async fn put(&self, path: &Path, bytes: Vec<u8>) -> Result<(), AuthError> {
+        match self {
+            Self::Object(store) => {
+                store
+                    .put(path, bytes.into())
+                    .await
+                    .map_err(AuthError::Storage)?;
+                Ok(())
+            }
+            Self::Shared(store) => Ok(store.put(path.as_ref(), bytes).await?),
+        }
+    }
+    async fn delete(&self, path: &Path) -> Result<(), AuthError> {
+        match self {
+            Self::Object(store) => match store.delete(path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(e) => Err(AuthError::Storage(e)),
+            },
+            Self::Shared(store) => Ok(store.delete(path.as_ref()).await?),
+        }
+    }
     async fn create(&self, path: &Path, bytes: Vec<u8>) -> Result<(), AuthError> {
         match self {
             Self::Object(store) => match store
@@ -285,6 +431,7 @@ impl Backend {
 struct Inner {
     store: Backend,
     base: String,
+    projects_base: String,
     super_hash: Option<[u8; 32]>,
     interval: Duration,
     cache: RwLock<Cache>,
@@ -325,14 +472,18 @@ impl KeyStore {
             ));
         }
         let prefix = prefix.trim_matches('/');
-        let base = if prefix.is_empty() {
-            "_system/keys".to_string()
+        let (base, projects_base) = if prefix.is_empty() {
+            ("_system/keys".to_string(), "_system/projects".to_string())
         } else {
-            format!("{prefix}/_system/keys")
+            (
+                format!("{prefix}/_system/keys"),
+                format!("{prefix}/_system/projects"),
+            )
         };
         let inner = Arc::new(Inner {
             store,
             base,
+            projects_base,
             super_hash: super_key.filter(|s| !s.is_empty()).map(hash),
             interval,
             cache: RwLock::new(Cache::default()),
@@ -373,8 +524,28 @@ impl KeyStore {
                 keys.insert(id.to_owned(), key);
             }
         }
+        let mut projects = HashMap::new();
+        for obj in self
+            .inner
+            .store
+            .list(&Path::from(self.inner.projects_base.clone()))
+            .await?
+        {
+            let Some(id) = obj.filename().and_then(|f| f.strip_suffix(".json")) else {
+                continue;
+            };
+            if !valid_project_id(id) {
+                continue;
+            }
+            let bytes = self.inner.store.get(&obj).await?;
+            let project: Project = serde_json::from_slice(&bytes).map_err(AuthError::Data)?;
+            if project.id == id {
+                projects.insert(id.to_owned(), project);
+            }
+        }
         let mut cache = self.inner.cache.write().await;
         cache.keys = keys;
+        cache.projects = projects;
         cache.revoked = revoked;
         cache.negative.clear();
         cache.refreshed_at = Some(Instant::now());
@@ -392,6 +563,8 @@ impl KeyStore {
                 namespace_prefixes: None,
                 expires_at: None,
                 super_key: true,
+                kind: Some(KeyKind::Superadmin),
+                project: None,
             });
         }
         let (id, secret) = parse_token(bearer).ok_or(AuthError::Unauthorized)?;
@@ -428,13 +601,21 @@ impl KeyStore {
         {
             return Err(AuthError::Unauthorized);
         }
+        if let Some(project) = &key.info.project
+            && project != DEFAULT_PROJECT
+            && !cache.projects.contains_key(project)
+        {
+            return Err(AuthError::Unauthorized);
+        }
         let principal = Principal {
             id: id.to_owned(),
             name: key.info.name.clone(),
             roles: key.info.roles.clone(),
             namespace_prefixes: key.info.namespace_prefixes.clone(),
             expires_at: key.info.expires_at,
-            super_key: false,
+            super_key: key.info.kind == Some(KeyKind::Superadmin),
+            kind: key.info.kind,
+            project: key.info.project.clone(),
         };
         cache.last_used.insert(id.to_owned(), Utc::now());
         Ok(principal)
@@ -517,6 +698,8 @@ impl KeyStore {
             created_at: Utc::now(),
             expires_at: spec.expires_at,
             created_by: creator.id.clone(),
+            kind: None,
+            project: None,
             last_used_at: None,
         };
         let key = StoredKey {
@@ -556,7 +739,11 @@ impl KeyStore {
         let mut result: Vec<_> = cache
             .keys
             .values()
-            .filter(|k| !cache.revoked.contains(&k.info.id) && Self::can_manage(principal, &k.info))
+            .filter(|k| {
+                k.info.kind.is_none()
+                    && !cache.revoked.contains(&k.info.id)
+                    && Self::can_manage(principal, &k.info)
+            })
             .map(|k| {
                 let mut info = k.info.clone();
                 info.last_used_at = cache.last_used.get(&info.id).copied();
@@ -584,10 +771,9 @@ impl KeyStore {
         {
             let cache = self.inner.cache.read().await;
             if cache.revoked.contains(id)
-                || cache
-                    .keys
-                    .get(id)
-                    .is_none_or(|key| !Self::can_manage(principal, &key.info))
+                || cache.keys.get(id).is_none_or(|key| {
+                    key.info.kind.is_some() || !Self::can_manage(principal, &key.info)
+                })
             {
                 return Err(AuthError::NotFound);
             }
@@ -599,6 +785,451 @@ impl KeyStore {
         self.inner.cache.write().await.revoked.insert(id.to_owned());
         Ok(())
     }
+}
+/// Projects, project keys, and org superadmin keys.
+impl KeyStore {
+    fn project_path(&self, id: &str) -> Path {
+        Path::from(format!("{}/{id}.json", self.inner.projects_base))
+    }
+    fn require_superadmin(principal: &Principal) -> Result<(), AuthError> {
+        if principal.expires_at.is_some_and(|t| t <= Utc::now()) {
+            return Err(AuthError::Unauthorized);
+        }
+        if principal.super_key {
+            Ok(())
+        } else {
+            Err(AuthError::Forbidden)
+        }
+    }
+    /// Which project a request acts on. A superadmin picks one with the `X-Blowfish-Project`
+    /// header (default: `default`); every other key is pinned to its own project, and a header
+    /// naming another project is a 404, so it can't be used to probe for projects.
+    pub async fn effective_project(
+        &self,
+        principal: &Principal,
+        header: Option<&str>,
+    ) -> Result<String, AuthError> {
+        if principal.super_key {
+            let project = header.unwrap_or(DEFAULT_PROJECT);
+            if project != DEFAULT_PROJECT
+                && !self.inner.cache.read().await.projects.contains_key(project)
+            {
+                return Err(AuthError::ProjectNotFound);
+            }
+            return Ok(project.to_owned());
+        }
+        let own = principal.project.as_deref().unwrap_or(DEFAULT_PROJECT);
+        match header {
+            Some(h) if h != own => Err(AuthError::ProjectNotFound),
+            _ => Ok(own.to_owned()),
+        }
+    }
+    /// IDs of every project, `default` included. Not an authorization check.
+    pub async fn project_ids(&self) -> Result<Vec<String>, AuthError> {
+        let cache = self.inner.cache.read().await;
+        let mut ids: Vec<_> = cache.projects.keys().cloned().collect();
+        ids.push(DEFAULT_PROJECT.into());
+        Ok(ids)
+    }
+    /// The built-in `default` project, which has no stored record.
+    fn default_project() -> Project {
+        Project {
+            id: DEFAULT_PROJECT.into(),
+            name: "Default".into(),
+            created_at: DateTime::UNIX_EPOCH,
+            created_by: "system".into(),
+        }
+    }
+    /// All projects, with `default` first. Superadmin only.
+    pub async fn list_projects(&self, principal: &Principal) -> Result<Vec<Project>, AuthError> {
+        Self::require_superadmin(principal)?;
+        let cache = self.inner.cache.read().await;
+        let mut rest: Vec<_> = cache.projects.values().cloned().collect();
+        rest.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut all = vec![Self::default_project()];
+        all.extend(rest);
+        Ok(all)
+    }
+    /// One project. Superadmin only.
+    pub async fn get_project(&self, principal: &Principal, id: &str) -> Result<Project, AuthError> {
+        Self::require_superadmin(principal)?;
+        if id == DEFAULT_PROJECT {
+            return Ok(Self::default_project());
+        }
+        self.inner
+            .cache
+            .read()
+            .await
+            .projects
+            .get(id)
+            .cloned()
+            .ok_or(AuthError::ProjectNotFound)
+    }
+    /// Create a project. Superadmin only.
+    pub async fn create_project(
+        &self,
+        principal: &Principal,
+        spec: CreateProjectRequest,
+    ) -> Result<Project, AuthError> {
+        Self::require_superadmin(principal)?;
+        if !valid_project_id(&spec.id) {
+            return Err(AuthError::InvalidRequest(
+                "project id must be 1 to 40 characters of a-z, 0-9, and -",
+            ));
+        }
+        validate_name(&spec.name)?;
+        let _guard = self.inner.mutation.lock().await;
+        if spec.id == DEFAULT_PROJECT
+            || self
+                .inner
+                .cache
+                .read()
+                .await
+                .projects
+                .contains_key(&spec.id)
+        {
+            return Err(AuthError::Conflict);
+        }
+        let project = Project {
+            id: spec.id,
+            name: spec.name.trim().to_owned(),
+            created_at: Utc::now(),
+            created_by: attribution(principal, spec.created_by),
+        };
+        let bytes = serde_json::to_vec(&project).map_err(AuthError::Data)?;
+        // Creation must not overwrite a concurrent creation on another node.
+        let path = self.project_path(&project.id);
+        if self.inner.store.get(&path).await.is_ok() {
+            return Err(AuthError::Conflict);
+        }
+        self.inner.store.create(&path, bytes).await?;
+        self.inner
+            .cache
+            .write()
+            .await
+            .projects
+            .insert(project.id.clone(), project.clone());
+        Ok(project)
+    }
+    /// Rename a project. Superadmin only; `default` is built in and can't be renamed.
+    pub async fn rename_project(
+        &self,
+        principal: &Principal,
+        id: &str,
+        name: &str,
+    ) -> Result<Project, AuthError> {
+        Self::require_superadmin(principal)?;
+        validate_name(name)?;
+        let _guard = self.inner.mutation.lock().await;
+        let mut project = {
+            let cache = self.inner.cache.read().await;
+            if id == DEFAULT_PROJECT {
+                return Err(AuthError::InvalidRequest(
+                    "the default project is built in and can't be renamed",
+                ));
+            }
+            cache
+                .projects
+                .get(id)
+                .cloned()
+                .ok_or(AuthError::ProjectNotFound)?
+        };
+        project.name = name.trim().to_owned();
+        let bytes = serde_json::to_vec(&project).map_err(AuthError::Data)?;
+        self.inner.store.put(&self.project_path(id), bytes).await?;
+        self.inner
+            .cache
+            .write()
+            .await
+            .projects
+            .insert(id.to_owned(), project.clone());
+        Ok(project)
+    }
+    /// Remove a project's record and revoke all of its keys. The caller removes its namespaces
+    /// first. Superadmin only; `default` can't be deleted.
+    pub async fn delete_project(&self, principal: &Principal, id: &str) -> Result<(), AuthError> {
+        Self::require_superadmin(principal)?;
+        if id == DEFAULT_PROJECT {
+            return Err(AuthError::InvalidRequest(
+                "the default project is built in and can't be deleted",
+            ));
+        }
+        let _guard = self.inner.mutation.lock().await;
+        let key_ids: Vec<String> = {
+            let cache = self.inner.cache.read().await;
+            if !cache.projects.contains_key(id) {
+                return Err(AuthError::ProjectNotFound);
+            }
+            cache
+                .keys
+                .values()
+                .filter(|k| {
+                    k.info.project.as_deref() == Some(id) && !cache.revoked.contains(&k.info.id)
+                })
+                .map(|k| k.info.id.clone())
+                .collect()
+        };
+        for key in &key_ids {
+            self.inner
+                .store
+                .create(&self.path(key, "revoked"), Vec::new())
+                .await?;
+        }
+        self.inner.store.delete(&self.project_path(id)).await?;
+        let mut cache = self.inner.cache.write().await;
+        cache.projects.remove(id);
+        cache.revoked.extend(key_ids);
+        Ok(())
+    }
+    /// Whether a project exists (`default` always does).
+    pub async fn project_exists(&self, id: &str) -> bool {
+        id == DEFAULT_PROJECT || self.inner.cache.read().await.projects.contains_key(id)
+    }
+    /// Check that `principal` may manage keys of `project`, returning whether it is a superadmin.
+    /// Other projects' admins get a 404, so project IDs can't be probed.
+    async fn project_key_scope(
+        &self,
+        principal: &Principal,
+        project: &str,
+    ) -> Result<bool, AuthError> {
+        if principal.expires_at.is_some_and(|t| t <= Utc::now()) {
+            return Err(AuthError::Unauthorized);
+        }
+        if principal.super_key {
+            if !self.project_exists(project).await {
+                return Err(AuthError::ProjectNotFound);
+            }
+            return Ok(true);
+        }
+        match (principal.kind, principal.project.as_deref()) {
+            (Some(_), Some(own)) if own != project => Err(AuthError::ProjectNotFound),
+            (Some(KeyKind::Admin), Some(_)) => Ok(false),
+            _ => Err(AuthError::Forbidden),
+        }
+    }
+    fn visible_to_project_admin(info: &KeyInfo) -> bool {
+        matches!(info.kind, Some(KeyKind::ReadWrite | KeyKind::Read))
+    }
+    async fn insert_key(
+        &self,
+        name: &str,
+        kind: KeyKind,
+        project: Option<String>,
+        expires_at: Option<DateTime<Utc>>,
+        created_by: String,
+    ) -> Result<(KeyInfo, String), AuthError> {
+        validate_name(name)?;
+        let _guard = self.inner.mutation.lock().await;
+        let id = random_hex(16);
+        let secret = random_hex(32);
+        let info = KeyInfo {
+            id: id.clone(),
+            name: name.trim().to_owned(),
+            roles: kind.roles(),
+            namespace_prefixes: None,
+            created_at: Utc::now(),
+            expires_at,
+            created_by,
+            kind: Some(kind),
+            project,
+            last_used_at: None,
+        };
+        let key = StoredKey {
+            info: info.clone(),
+            secret_hash: hash(&secret),
+        };
+        let bytes = serde_json::to_vec(&key).map_err(AuthError::Data)?;
+        self.inner
+            .store
+            .create(&self.path(&id, "json"), bytes)
+            .await?;
+        let mut cache = self.inner.cache.write().await;
+        cache.negative.remove(&id);
+        cache.keys.insert(id.clone(), key);
+        Ok((info, format!("bf_{id}_{secret}")))
+    }
+    /// Create a key in a project. A superadmin can create any kind but `superadmin`; a
+    /// project admin can create only `read_write` and `read` keys, in its own project.
+    pub async fn create_project_key(
+        &self,
+        principal: &Principal,
+        project: &str,
+        spec: CreateKindKeyRequest,
+    ) -> Result<(KeyInfo, String), AuthError> {
+        let superadmin = self.project_key_scope(principal, project).await?;
+        let kind = spec
+            .kind
+            .ok_or(AuthError::InvalidRequest("kind is required"))?;
+        match kind {
+            KeyKind::Superadmin => {
+                return Err(AuthError::InvalidRequest(
+                    "superadmin keys belong to the org: use org/keys",
+                ));
+            }
+            KeyKind::Admin if !superadmin => return Err(AuthError::Forbidden),
+            _ => {}
+        }
+        check_expiry(principal, spec.expires_at)?;
+        let label = if superadmin { spec.created_by } else { None };
+        self.insert_key(
+            &spec.name,
+            kind,
+            Some(project.to_owned()),
+            spec.expires_at,
+            attribution(principal, label),
+        )
+        .await
+    }
+    /// List a project's active keys. Project admins don't see `admin` keys.
+    pub async fn list_project_keys(
+        &self,
+        principal: &Principal,
+        project: &str,
+    ) -> Result<Vec<KeyInfo>, AuthError> {
+        let superadmin = self.project_key_scope(principal, project).await?;
+        let cache = self.inner.cache.read().await;
+        let mut keys: Vec<_> = cache
+            .keys
+            .values()
+            .filter(|k| !cache.revoked.contains(&k.info.id))
+            .filter(|k| in_project(&k.info, project, superadmin))
+            .filter(|k| superadmin || Self::visible_to_project_admin(&k.info))
+            .map(|k| {
+                let mut info = k.info.clone();
+                info.last_used_at = cache.last_used.get(&info.id).copied();
+                info
+            })
+            .collect();
+        keys.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(keys)
+    }
+    /// One active key of a project.
+    pub async fn get_project_key(
+        &self,
+        principal: &Principal,
+        project: &str,
+        id: &str,
+    ) -> Result<KeyInfo, AuthError> {
+        self.list_project_keys(principal, project)
+            .await?
+            .into_iter()
+            .find(|k| k.id == id)
+            .ok_or(AuthError::NotFound)
+    }
+    /// Revoke a key of a project.
+    pub async fn revoke_project_key(
+        &self,
+        principal: &Principal,
+        project: &str,
+        id: &str,
+    ) -> Result<(), AuthError> {
+        self.get_project_key(principal, project, id).await?;
+        self.revoke_checked(id).await
+    }
+    async fn revoke_checked(&self, id: &str) -> Result<(), AuthError> {
+        let _guard = self.inner.mutation.lock().await;
+        if self.inner.cache.read().await.revoked.contains(id) {
+            return Err(AuthError::NotFound);
+        }
+        self.inner
+            .store
+            .create(&self.path(id, "revoked"), Vec::new())
+            .await?;
+        self.inner.cache.write().await.revoked.insert(id.to_owned());
+        Ok(())
+    }
+    /// Create an org superadmin key. Superadmin only.
+    pub async fn create_org_key(
+        &self,
+        principal: &Principal,
+        spec: CreateKindKeyRequest,
+    ) -> Result<(KeyInfo, String), AuthError> {
+        Self::require_superadmin(principal)?;
+        check_expiry(principal, spec.expires_at)?;
+        self.insert_key(
+            &spec.name,
+            KeyKind::Superadmin,
+            None,
+            spec.expires_at,
+            attribution(principal, spec.created_by),
+        )
+        .await
+    }
+    /// List active org superadmin keys. Superadmin only.
+    pub async fn list_org_keys(&self, principal: &Principal) -> Result<Vec<KeyInfo>, AuthError> {
+        Self::require_superadmin(principal)?;
+        let cache = self.inner.cache.read().await;
+        let mut keys: Vec<_> = cache
+            .keys
+            .values()
+            .filter(|k| {
+                k.info.kind == Some(KeyKind::Superadmin) && !cache.revoked.contains(&k.info.id)
+            })
+            .map(|k| {
+                let mut info = k.info.clone();
+                info.last_used_at = cache.last_used.get(&info.id).copied();
+                info
+            })
+            .collect();
+        keys.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(keys)
+    }
+    /// One active org superadmin key. Superadmin only.
+    pub async fn get_org_key(&self, principal: &Principal, id: &str) -> Result<KeyInfo, AuthError> {
+        self.list_org_keys(principal)
+            .await?
+            .into_iter()
+            .find(|k| k.id == id)
+            .ok_or(AuthError::NotFound)
+    }
+    /// Revoke an org superadmin key. Superadmin only.
+    pub async fn revoke_org_key(&self, principal: &Principal, id: &str) -> Result<(), AuthError> {
+        self.get_org_key(principal, id).await?;
+        self.revoke_checked(id).await
+    }
+}
+fn in_project(info: &KeyInfo, project: &str, include_legacy: bool) -> bool {
+    match (&info.kind, &info.project) {
+        (Some(KeyKind::Superadmin), _) => false,
+        (Some(_), Some(p)) => p == project,
+        // Legacy keys act in `default`, and only a superadmin manages them here.
+        (None, _) => include_legacy && project == DEFAULT_PROJECT,
+        (Some(_), None) => false,
+    }
+}
+fn attribution(creator: &Principal, label: Option<String>) -> String {
+    match label {
+        Some(label) if creator.super_key && !label.trim().is_empty() => {
+            label.chars().take(200).collect()
+        }
+        _ => creator.id.clone(),
+    }
+}
+fn check_expiry(creator: &Principal, expires_at: Option<DateTime<Utc>>) -> Result<(), AuthError> {
+    if expires_at.is_some_and(|t| t <= Utc::now()) {
+        return Err(AuthError::InvalidRequest("expiry must be in the future"));
+    }
+    if let Some(parent) = creator.expires_at
+        && expires_at.is_none_or(|child| child > parent)
+    {
+        return Err(AuthError::Forbidden);
+    }
+    Ok(())
+}
+fn validate_name(name: &str) -> Result<(), AuthError> {
+    if name.trim().is_empty() || name.len() > 200 {
+        return Err(AuthError::InvalidRequest(
+            "name is required and at most 200 bytes",
+        ));
+    }
+    Ok(())
+}
+/// Project IDs are slugs: 1 to 40 characters of `a-z`, `0-9`, and `-`.
+pub fn valid_project_id(id: &str) -> bool {
+    (1..=40).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 async fn refresh_loop(inner: Weak<Inner>, interval: Duration) {
     loop {

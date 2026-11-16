@@ -12,6 +12,28 @@ services:
       - "127.0.0.1:${BLOWFISH_PORT:-8000}:8000"
     volumes:
       - blowfish-data:/data
+  # The admin console (see webapp/README.md). Start blowfish first, mint a superadmin key with
+  # BLOWFISH_ADMIN_KEY, then: docker compose --profile console up -d webapp
+  webapp:
+    build: ./webapp
+    image: blowfish-webapp:local
+    profiles: [console]
+    restart: unless-stopped
+    environment:
+      BLOWFISH_WEBAPP_API_URL: http://blowfish:8000
+      BLOWFISH_WEBAPP_API_KEY: ${BLOWFISH_WEBAPP_API_KEY:?a superadmin key}
+      BLOWFISH_WEBAPP_ADMINS: ${BLOWFISH_WEBAPP_ADMINS:?comma-separated admin emails}
+      BLOWFISH_WEBAPP_SESSION_SECRET: ${BLOWFISH_WEBAPP_SESSION_SECRET:?at least 32 characters}
+      BLOWFISH_WEBAPP_BASE_URL: ${BLOWFISH_WEBAPP_BASE_URL:-http://127.0.0.1:8090}
+      BLOWFISH_WEBAPP_MAILER: ${BLOWFISH_WEBAPP_MAILER:-log}
+      BLOWFISH_WEBAPP_SMTP_ADDR: ${BLOWFISH_WEBAPP_SMTP_ADDR:-}
+      BLOWFISH_WEBAPP_SMTP_USER: ${BLOWFISH_WEBAPP_SMTP_USER:-}
+      BLOWFISH_WEBAPP_SMTP_PASS: ${BLOWFISH_WEBAPP_SMTP_PASS:-}
+      BLOWFISH_WEBAPP_SMTP_FROM: ${BLOWFISH_WEBAPP_SMTP_FROM:-}
+    ports:
+      - "127.0.0.1:${BLOWFISH_WEBAPP_PORT:-8090}:8090"
+    depends_on:
+      - blowfish
   seaweedfs:
     image: chrislusf/seaweedfs:4.53
     profiles: [s3, multinode]

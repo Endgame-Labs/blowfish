@@ -1,0 +1,11 @@
+{{define "title"}}Confirm sign-in{{end}}
+{{define "content"}}
+<div class="card cta">
+<h1>Welcome back</h1>
+<p class="mute">Confirm to finish signing in on this device.</p>
+<form method="post" action="{{.Base}}/login/verify">
+<input type="hidden" name="token" value="{{.Token}}">
+<button type="submit">Sign in</button>
+</form>
+</div>
+{{end}}

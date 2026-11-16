@@ -45,6 +45,27 @@ and revocation: inaccessible IDs return 404. Roles are checked literally for del
 prefixes, not directories, patterns, or regexes. An absent prefix list means all namespaces;
 an empty list means none.
 
+## Projects and isolation
+
+The deployment is one org with projects (see [auth.md](auth.md)). Project keys (`admin`, `read_write`, and
+`read`) are bound to one project, and org superadmin keys span all of them. Each project's namespaces live
+under their own storage prefix (`projects/<id>/`), with their own engine, so isolation does not depend on
+name filtering. The built-in `default` project is the storage root.
+
+- The project is resolved before any role check. A project key naming another project, through the
+  `X-Blowfish-Project` header, gets 404, so project and namespace names can't be probed. Superadmin keys use
+  the header to choose a project, and naming a project that does not exist is also 404.
+- A project `admin` can create `read_write` and `read` keys in its own project, and can't see, mint, or
+  revoke `admin` or superadmin keys. Superadmin keys can only be created and revoked by superadmins.
+- Project, org-key, and key routes check authority in the key store, not by role. Legacy keys, including
+  those with the `keys` role, get 403 on them.
+- Deleting a project revokes its keys, and a key whose project is gone fails authentication.
+- Org superadmin keys are as powerful as the break-glass `BLOWFISH_ADMIN_KEY`: keep them in a secret store,
+  prefer expiry for any that automation holds, and revoke those you no longer use.
+- The admin webapp holds one superadmin key and authenticates humans with emailed single-use links; see
+  [`webapp/README.md`](../webapp/README.md). It is a separate process, and the blowfish API remains the
+  only enforcement point.
+
 ## Route authorization matrix
 
 Every entry below also permits the configured super key. `R` means any of `read`, `write`,
@@ -57,7 +78,11 @@ routes use the same permission as GET.
 | GET `/` | Any authenticated key | Status marker only; this is the health route |
 | GET `/metrics` | `ReadMetrics` / `metrics` | Deployment-wide operational data |
 | GET `/_blowfish/v1/status` | `ReadMetrics` or `ManageKeys` / `metrics` or `keys` | Deployment-wide operational data |
-| POST `/_blowfish/v1/keys` | `ManageKeys` / `keys` | Delegation containment, including expiry |
+| GET `/_blowfish/v1/whoami` | Any authenticated key | Reports the caller's own kind, project, and expiry |
+| `/_blowfish/v1/projects` and `/projects/{id}` | Superadmin only | Others get 403 |
+| `/_blowfish/v1/projects/{id}/keys[/{key_id}]` | Superadmin, or that project's `admin` | Other projects' keys get 404; a project admin sees only `read_write` and `read` keys |
+| `/_blowfish/v1/org/keys[/{key_id}]` | Superadmin only | Others get 403 |
+| POST `/_blowfish/v1/keys` (deprecated) | `ManageKeys` / `keys` | Delegation containment, including expiry |
 | GET `/_blowfish/v1/keys` | `ManageKeys` / `keys` | Only manageable keys are returned |
 | GET `/_blowfish/v1/keys/{id}` | `ManageKeys` / `keys` | Only manageable keys are visible |
 | DELETE `/_blowfish/v1/keys/{id}` | `ManageKeys` / `keys` | Only manageable keys may be revoked |

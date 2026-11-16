@@ -104,7 +104,7 @@ struct Inner {
 }
 /// Cloneable store handle. Creates carry a portable body header with a retry identity.
 #[derive(Clone)]
-pub struct Storage(Arc<Inner>);
+pub struct Storage(Arc<Inner>, Arc<str>);
 /// Object metadata; size includes the portable conditional-create header, if present.
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
@@ -237,16 +237,19 @@ impl Storage {
         } else {
             StorageMode::SingleWriter
         };
-        let store = Self(Arc::new(Inner {
-            backend,
-            cache,
-            prefix,
-            mode,
-            read_only,
-            healthy: AtomicBool::new(true),
-            writer: Uuid::new_v4(),
-            serial: Mutex::new(()),
-        }));
+        let store = Self(
+            Arc::new(Inner {
+                backend,
+                cache,
+                prefix,
+                mode,
+                read_only,
+                healthy: AtomicBool::new(true),
+                writer: Uuid::new_v4(),
+                serial: Mutex::new(()),
+            }),
+            Arc::from(""),
+        );
         if mode == StorageMode::SingleWriter && !read_only {
             store.acquire_heartbeat().await?;
             let weak = Arc::downgrade(&store.0);
@@ -254,7 +257,7 @@ impl Storage {
                 loop {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     let Some(inner) = weak.upgrade() else { break };
-                    let store = Storage(inner);
+                    let store = Storage(inner, Arc::from(""));
                     if store.refresh_heartbeat().await.is_err() {
                         store.0.healthy.store(false, Ordering::Release);
                         break;
@@ -273,7 +276,31 @@ impl Storage {
         self.0.read_only
     }
     fn path(&self, key: &str) -> Path {
-        Path::from(format!("{}/{key}", self.0.prefix))
+        if self.1.is_empty() {
+            Path::from(format!("{}/{key}", self.0.prefix))
+        } else {
+            Path::from(format!("{}/{}/{key}", self.0.prefix, self.1))
+        }
+    }
+    /// Identity of a key within the shared range cache: unique across scoped views.
+    fn cache_key(&self, key: &str) -> String {
+        if self.1.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{}/{key}", self.1)
+        }
+    }
+    /// A view of this store rooted at a sub-prefix, such as `projects/acme`. It shares the
+    /// backend, caches, write mode, and health with the original, and sees only keys beneath
+    /// the sub-prefix. System state such as the writer heartbeat stays with the root store.
+    pub fn scoped(&self, sub: &str) -> Self {
+        let sub = sub.trim_matches('/');
+        let joined = if self.1.is_empty() {
+            sub.to_owned()
+        } else {
+            format!("{}/{sub}", self.1)
+        };
+        Self(self.0.clone(), Arc::from(joined))
     }
     fn writable(&self) -> Result<(), Error> {
         if self.0.read_only || !self.0.healthy.load(Ordering::Acquire) {
@@ -534,7 +561,14 @@ impl Storage {
     }
     /// List objects under a relative prefix, sorted by key.
     pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, Error> {
-        let base = self.0.prefix.as_ref();
+        let base = if self.1.is_empty() {
+            self.0.prefix.to_string()
+        } else if self.0.prefix.as_ref().is_empty() {
+            self.1.to_string()
+        } else {
+            format!("{}/{}", self.0.prefix, self.1)
+        };
+        let base = base.as_str();
         let mut objects = self
             .0
             .backend

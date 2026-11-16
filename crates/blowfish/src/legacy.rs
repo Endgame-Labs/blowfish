@@ -120,7 +120,7 @@ fn translate_write(value: Value) -> Result<WriteRequest, HttpError> {
     deserialize(Value::Object(input))
 }
 pub(super) async fn write(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     Extension(p): Extension<Principal>,
     input: Result<Json<Value>, JsonRejection>,
@@ -210,7 +210,7 @@ fn nested_rows(rows: Vec<Document>, vectors: bool, attributes: bool) -> Vec<Valu
         .collect()
 }
 pub(super) async fn query(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     input: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, HttpError> {
@@ -232,7 +232,7 @@ fn export_page_size() -> usize {
     1000
 }
 pub(super) async fn export(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     params: Result<Query<ExportParams>, QueryRejection>,
 ) -> Result<Json<Value>, HttpError> {
@@ -296,7 +296,7 @@ pub(super) async fn export(
     ))
 }
 pub(super) async fn head(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
 ) -> Result<Response, HttpError> {
     let metadata = s.engine.metadata(&ns).await?;
@@ -335,7 +335,7 @@ pub(super) async fn head(
     Ok(response)
 }
 pub(super) async fn delete(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
     s.engine.delete_namespace(&ns).await?;

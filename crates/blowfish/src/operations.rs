@@ -105,7 +105,7 @@ pub(super) async fn start(
     Ok(response)
 }
 pub(super) async fn start_copy(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     Extension(p): Extension<Principal>,
     input: Result<Json<WriteRequest>, JsonRejection>,
@@ -115,7 +115,7 @@ pub(super) async fn start_copy(
     start(s, ns, request, false).await
 }
 pub(super) async fn poll(
-    State(s): State<AppState>,
+    Extension(s): Extension<AppState>,
     Path((ns, token)): Path<(String, String)>,
 ) -> Result<Json<Value>, HttpError> {
     validate_namespace(&ns)?;

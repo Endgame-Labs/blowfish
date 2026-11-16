@@ -44,6 +44,12 @@ are errors. Nested storage settings currently follow `bf-storage`'s parser.
 | `storage.cache.fetch_concurrency` | `--cache-fetch-concurrency` | `BLOWFISH_CACHE_FETCH_CONCURRENCY` | 16 |
 | `storage.cache.prefetch_concurrency` | `--cache-prefetch-concurrency` | `BLOWFISH_CACHE_PREFETCH_CONCURRENCY` | 4 |
 
+`BLOWFISH_ADMIN_KEY` is the deployment's **break-glass** key, with org superadmin powers and never stored in
+the bucket. Mint an org superadmin key with it (see [auth.md](auth.md)), and use that key, not this one, for
+programs and the admin webapp. Projects need no configuration: they are created through the admin API, and
+their namespaces live under `<storage-prefix>/projects/<id>/`. The admin webapp has its own environment
+variables, listed in [`webapp/README.md`](../webapp/README.md).
+
 `--config PATH` selects the file. The legacy top-level `storage_url` aliases `storage.url`; do not
 set both. `RUST_LOG` controls tracing, defaulting to `blowfish=info,bf_engine=info`.
 

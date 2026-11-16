@@ -1,0 +1,26 @@
+{{define "title"}}Projects{{end}}
+{{define "content"}}
+<h1>Projects</h1>
+<div class="card table">
+<table>
+<thead><tr><th>Project</th><th>ID</th><th>Created</th></tr></thead>
+<tbody>
+{{range .Projects}}<tr>
+<td><a href="{{$.Base}}/projects/{{.ID}}"><strong>{{.Name}}</strong></a></td>
+<td><code>{{.ID}}</code></td>
+<td class="mute small">{{if eq .ID "default"}}built in{{else}}{{date .CreatedAt}}{{end}}</td>
+</tr>{{end}}
+</tbody>
+</table>
+</div>
+<h2>New project</h2>
+<form class="card" method="post" action="{{.Base}}/projects">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<div class="row two">
+<div><label for="name">Name</label><input id="name" type="text" name="name" placeholder="Acme search" maxlength="200" required></div>
+<div><label for="id">ID</label><input id="id" type="text" name="id" placeholder="acme" pattern="[a-z0-9\-]{1,40}" title="lowercase letters, digits, and dashes" maxlength="40" autocapitalize="none" required></div>
+</div>
+<p class="mute small">The ID is the project's slug, set once. Namespaces in a project are separate from every other project's.</p>
+<div class="actions"><button type="submit">Create project</button></div>
+</form>
+{{end}}
