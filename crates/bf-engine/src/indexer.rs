@@ -62,6 +62,8 @@ pub struct EngineConfig {
     pub filtered_probe_cap: usize,
     /// Fraction of ANN requests checked against exhaustive ground truth.
     pub recall_sample_rate: f64,
+    /// Embedding and reranking models. Without them, `Embed` and model `rerank_by` return a 400.
+    pub models: Option<std::sync::Arc<bf_models::Models>>,
 }
 /// An eighth of the memory this process may use (host RAM or the cgroup limit), within
 /// 512 MiB to 4 GiB. Entries are charged at their resident size, so this bounds real memory.
@@ -110,6 +112,7 @@ impl Default for EngineConfig {
             exact_fetch_rows: 8192,
             filtered_probe_cap: 3,
             recall_sample_rate: 0.01,
+            models: None,
         }
     }
 }

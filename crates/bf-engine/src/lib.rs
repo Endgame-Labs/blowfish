@@ -15,6 +15,7 @@ mod sparse;
 mod streaming;
 pub use indexer::EngineConfig;
 mod metadata;
+mod models;
 mod query;
 mod text;
 mod write;
@@ -432,11 +433,16 @@ impl Engine {
         Ok((state.clone(), warm))
     }
     /// Atomically validate, group, and durably commit all operations in one request.
-    pub async fn write(&self, ns: &str, request: WriteRequest) -> Result<WriteResponse, ApiError> {
+    pub async fn write(
+        &self,
+        ns: &str,
+        mut request: WriteRequest,
+    ) -> Result<WriteResponse, ApiError> {
         if self.0.store.is_read_only() {
             return Err(ApiError::new(403, "server is read-only"));
         }
         self.check_writable(ns).await?;
+        let embedded = self.embed_for_write(ns, &mut request).await?;
         let handle = self.handle(ns).await?;
         let copy = if let Some(source) = request
             .copy_from_namespace
@@ -484,6 +490,11 @@ impl Engine {
         if inherited_read_only {
             self.patch_metadata(ns, json!({"read_only":true})).await?;
         }
+        let mut response = response;
+        if let Some((tokens, ms)) = embedded {
+            response.performance.embedding_tokens = Some(tokens);
+            response.performance.embedding_ms = Some(ms);
+        }
         Ok(response)
     }
     /// Search a consistent segment-and-tail snapshot, including multi-query RRF.
@@ -495,6 +506,16 @@ impl Engine {
     /// Search with query-local backend counts, transferred bytes, and stage timings.
     /// Diagnostics are separate from the turbopuffer wire response.
     pub async fn query_with_diagnostics(
+        &self,
+        ns: &str,
+        request: QueryRequest,
+    ) -> Result<(QueryResponse, QueryDiagnostics), ApiError> {
+        match self.0.config.models.clone() {
+            Some(models) => self.query_with_models(models, ns, request).await,
+            None => self.query_inner(ns, request).await,
+        }
+    }
+    async fn query_inner(
         &self,
         ns: &str,
         request: QueryRequest,
@@ -597,6 +618,9 @@ impl Engine {
                     .updated_at
                     .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
             ),
+            embedding_tokens: None,
+            embedding_ms: None,
+            rerank_ms: None,
         };
         if std::env::var_os("BF_TRACE_STAGES").is_some() {
             eprintln!(

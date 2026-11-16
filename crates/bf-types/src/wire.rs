@@ -181,6 +181,15 @@ pub struct QueryPerformance {
     pub approx_namespace_size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_included_write_at: Option<String>,
+    /// Tokens sent to an embedding provider for this query (native embedding only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_tokens: Option<u64>,
+    /// Time spent in embedding calls (native embedding only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_ms: Option<u64>,
+    /// Time spent in the model reranking call (blowfish extension).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_ms: Option<u64>,
 }
 /// Result payload shared by single and multi-query responses.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -213,6 +222,12 @@ pub struct WriteBilling {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WritePerformance {
     pub server_total_ms: u64,
+    /// Tokens sent to an embedding provider for this write (native embedding only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_tokens: Option<u64>,
+    /// Time spent in embedding calls (native embedding only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_ms: Option<u64>,
 }
 /// Atomic write result; operation counters are omitted when zero, matching the oracle.
 #[derive(Debug, Clone, Serialize, Deserialize)]

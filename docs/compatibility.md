@@ -18,8 +18,8 @@ The fixture suite tests representative behavior, not every combination or every 
 | Regex, glob, and fuzzy filters, and highlighting | Supported | Recorded regex, glob, fuzzy, and highlight scenarios |
 | Aggregation, grouping, result projection, and pagination | Supported | Aggregate, include, exclude, and export scenarios |
 | Multi-query | Supported | Recorded multi-query scenario |
-| Reranking and computed attributes | Partial | Model-based `rerank_by` (hosted reranker models) is unsupported, with a clear 400 |
-| Native embedding (`Embed` configuration and expressions) | Unsupported | Bring your own vectors; clear 400 |
+| Reranking and computed attributes | Supported with configured models | RRF always works. Model `rerank_by` works for models the operator maps in `[models]` (see [models.md](models.md)); unconfigured models get a clear 400 |
+| Native embedding (`embed` schema setting and `Embed` expressions) | Supported with configured models | Works for models the operator maps in `[models]`, in-process or through an HTTP provider (see [models.md](models.md)). Without a `[models]` entry, a clear 400. Differences: the model list is the operator's, the generated vector column is named `embed_<attribute>` (our reading of the docs), and patches do not re-embed |
 | Strong and eventual consistency | Supported | Recorded eventual scenario and engine tests |
 | Metadata, schema, namespace list/delete, warming, recall, and explain | Supported | Recorded endpoint scenarios |
 | Metadata pinning | Partial | Pinning is advisory |

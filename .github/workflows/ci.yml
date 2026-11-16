@@ -14,6 +14,18 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+  local-models:
+    # In-process GGUF inference needs cmake, a C++ toolchain, and libclang (all on ubuntu-latest).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+      - run: cargo clippy -p bf-models -p blowfish --features bf-models/local-models,blowfish/local-models --all-targets -- -D warnings
+      - run: cargo test -p bf-models --features local-models
   compat:
     runs-on: ubuntu-latest
     strategy:

@@ -111,6 +111,15 @@ pub(crate) fn prepare(
                 if cfg.data_type.is_some() && cfg.data_type != old.data_type {
                     return Err(ApiError::bad(format!("cannot change type of '{name}'")));
                 }
+                if let (Some(Value::Object(_) | Value::String(_)), Some(new)) =
+                    (&old.embed, &cfg.embed)
+                    && !new.is_null()
+                    && EmbedSpec::parse(new)? != EmbedSpec::parse(old.embed.as_ref().expect("set"))?
+                {
+                    return Err(ApiError::bad(
+                        "embed cannot be modified; remove it (null) and add the new setting",
+                    ));
+                }
                 let mut merged = old.clone();
                 macro_rules! merge{($($field:ident),*)=>{$(if cfg.$field.is_some(){merged.$field=cfg.$field.take();})*};}
                 merge!(
@@ -220,9 +229,16 @@ pub(crate) fn prepare(
         return Err(ApiError::bad("namespace exceeds eight vector columns"));
     }
     if current.exists {
+        // Native embedding may add the vector column it writes into.
+        let embed_targets: BTreeSet<String> = state
+            .schema
+            .iter()
+            .filter_map(|(n, a)| a.embed_spec().map(|s| s.target(n)))
+            .collect();
         for (name, cfg) in &state.schema {
             if cfg.data_type.as_ref().is_some_and(AttributeType::is_vector)
                 && !current.schema.contains_key(name)
+                && !embed_targets.contains(name)
             {
                 return Err(ApiError::bad(
                     "vector columns must be declared at namespace creation",
@@ -661,7 +677,10 @@ pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value,
         }),
     }
 }
-fn columns_to_rows(columns: &Document, schema: &Schema) -> Result<Vec<Document>, ApiError> {
+pub(crate) fn columns_to_rows(
+    columns: &Document,
+    schema: &Schema,
+) -> Result<Vec<Document>, ApiError> {
     let ids = columns
         .get("id")
         .and_then(Value::as_array)

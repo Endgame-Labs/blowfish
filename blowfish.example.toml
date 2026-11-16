@@ -48,3 +48,24 @@ block_size = 1048576
 max_coalesce_blocks = 8
 fetch_concurrency = 16
 prefetch_concurrency = 4
+
+# Native embedding and model reranking. See docs/models.md. Uncomment to enable the in-process
+# models (needs a build with `--features local-models`; the files download on first use).
+#
+# [models."google/embeddinggemma-2"]
+# provider = "local"
+# task = "embedding"
+# hf_repo = "ggml-org/embeddinggemma-2-GGUF"
+# hf_file = "embeddinggemma-2-Q8_0.gguf"
+# dims = 768
+# allowed_dims = [128, 256, 512]
+# max_input_tokens = 2048
+# query_prefix = "task: search result | query: "
+# document_prefix = "title: none | text: "
+#
+# [models."qwen/qwen3-reranker-0.6b"]
+# provider = "local"
+# task = "rerank"
+# hf_repo = "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF"
+# hf_file = "qwen3-reranker-0.6b-q8_0.gguf"
+# max_input_tokens = 2048

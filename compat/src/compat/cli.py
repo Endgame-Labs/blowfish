@@ -265,6 +265,7 @@ def main():
         if cmd in ("check", "diff-live"):
             p.add_argument("--base-url", required=True)
             p.add_argument("--api-key")
+            p.add_argument("--models", action="store_true", help="run only the native embedding and reranking scenarios (needs COMPAT_MODELS_EMBED and COMPAT_MODELS_RERANK)")
         if cmd != "cleanup": p.add_argument("-k", default="*", help="scenario name substring or glob")
     args = parser.parse_args()
     oracle_url = os.getenv("COMPAT_ORACLE_BASE_URL")
@@ -274,6 +275,11 @@ def main():
         cleanup(client(oracle_url, None)); return
     target = client(args.base_url, args.api_key) if args.command in ("check", "diff-live") else None
     oracle = client(oracle_url, None) if args.command in ("record", "diff-live") else None
+    if args.command == "check" and (getattr(args, "models", False) or os.getenv("COMPAT_MODELS_EMBED")):
+        from compat.models import run as run_models
+        _, bad = run_models(target)
+        if getattr(args, "models", False) or bad:
+            sys.exit(1 if bad else 0)
     pattern = args.k if any(c in args.k for c in "*?[") else "*" + args.k + "*"
     selected = [n for n in SCENARIOS if fnmatch.fnmatch(n, pattern)]
     if not selected:

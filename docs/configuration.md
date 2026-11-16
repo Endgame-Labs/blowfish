@@ -44,6 +44,15 @@ are errors. Nested storage settings currently follow `bf-storage`'s parser.
 | `storage.cache.fetch_concurrency` | `--cache-fetch-concurrency` | `BLOWFISH_CACHE_FETCH_CONCURRENCY` | 16 |
 | `storage.cache.prefetch_concurrency` | `--cache-prefetch-concurrency` | `BLOWFISH_CACHE_PREFETCH_CONCURRENCY` | 4 |
 
+### Models (native embedding and reranking)
+
+`[models."<name>"]` tables map the model names clients use (for example `google/embeddinggemma-2`, or
+turbopuffer's own names) to a provider. `BLOWFISH_MODELS_JSON` holds a JSON object of the same shape and is
+merged over the file. With no entries, `Embed` and model `rerank_by` return a 400. Every field is documented in
+[models.md](models.md). `provider = "local"` runs a GGUF model in-process and needs a build with
+`--features local-models`. Related environment variables: `BLOWFISH_MODELS_CACHE_DIR` (default
+`~/.cache/blowfish/models`), `HF_ENDPOINT` (default `https://huggingface.co`), and `HF_TOKEN` for gated files.
+
 `BLOWFISH_ADMIN_KEY` is the deployment's **break-glass** key, with org superadmin powers and never stored in
 the bucket. Mint an org superadmin key with it (see [auth.md](auth.md)), and use that key, not this one, for
 programs and the admin webapp. Projects need no configuration: they are created through the admin API, and
