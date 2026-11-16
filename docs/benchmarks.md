@@ -694,6 +694,77 @@ hydration: 6 stages, over the 3-wave target. Ingest: 660 to 830 docs/s (the earl
 0 backpressure 429s. Targets met: cold ANN requests under 500, cold ANN p50 under 2 s, warm p50 under 100 ms.
 Not met: waves, cold BM25 and hybrid bytes, warm p50 below the HEAD round trip.
 
+## Iteration 3 (100K docs)
+
+Same 100K namespace, strong consistency, memory budgets scaled with the data (256 MiB block cache, 128 MiB decoded
+metadata), cold means a fresh process and an empty disk cache (8 queries), as in iteration 2. The R2 round trip was
+about 25 ms slower during the final matrix than during iteration 2 (warm p50 100 ms against 75 to 81 ms, which is
+the strong-consistency HEAD), and a cold query has five to six dependent round trips, so the final cold numbers
+understate the code gain: single cold runs taken earlier in the day on the same data gave ANN 1.1 to 1.3 s, BM25
+0.9 s, hybrid 1.5 to 1.9 s, and selective 1.2 s.
+
+### What changed, and the evidence
+
+Cold ANN timeline before (read trace): manifest list, slot, payload (867 KB, 290 ms), WAL probe, then open, then the
+flat segment's exact search (370 ms, serialized before the cluster scan), scan, rerank, hydrate.
+
+| Change | Effect |
+| --- | --- |
+| Manifest slot holds the manifest itself (JSON, or zstd above 64 KB); old slots with a payload pointer still read | one fewer dependent GET |
+| Namespace-wide term statistics leave the manifest: an out-of-line object (an FST from term to document frequency per field, plus counts). BM25 queries look up only their own terms in the downloaded bytes; the manifest is 13 KB instead of 867 KB | manifest read 290 ms to 90 ms; no term-map decode or clone per query; non-text queries never read it |
+| WAL tail probing in doubling windows, not one slot at a time | a tail of n entries costs about log2(n) round trips |
+| A strong snapshot that adopts a newer manifest opens the query's segment files (vector index, text index, IDs, live masks, docs directory, term statistics) while it reads the WAL tail | the open wave overlaps the tail probe |
+| Text segment format v2: postings, then per-term block directories, then lengths and the term dictionary. The dictionary maps a term to its directory record, and a query reads only its terms' records (v1 segments still read) | cold BM25 24.4 MB to 7.5 MB, the 7 MB to 17 MB of eager decode per segment is gone |
+| Flat-segment exact search runs concurrently with the clustered scan (was serialized) | about 370 ms off cold ANN |
+| Hybrid subqueries run concurrently (were sequential) | cold hybrid 2.7 s to 2.2 s (1.5 s on a quiet link) |
+| Document hydration reads columns and segments concurrently; ANN prefetches the best candidates' documents during rerank; the docs directory is opened in the open wave when the query projects attributes or filters | selective cold 2.9 s to 1.2 s in a single-run trace (hydration was 1.7 s of serial 80 ms reads) |
+
+### Inner loops (single cold query traces, request count / MB / ms)
+
+| Loop | Change | ANN | BM25 | Hybrid | Selective |
+| --- | --- | --- | --- | --- | --- |
+| 0 | Iteration 2 main (v1 files) | 238 / 16.1 / 2,225 | 38 / 24.4 / 1,406 | 264 / 38.6 / 2,710 | 234 / 7.9 / 2,458 |
+| 1 | Exact and scan overlap, concurrent hybrid, open overlapped with the WAL tail (old files) | 251 / 16.3 / 1,669 | 48 / 24.3 / 1,576 | | |
+| 2 | Lazy text format v2, inline manifest, statistics object as JSON (fresh load) | 238 / 15.9 / 1,751 | 69 / 8.2 / 1,420 | 292 / 23.0 / 1,477 | 240 / 7.2 / 3,005 |
+| 3 | Statistics as an FST, concurrent hydration, namespace drained | 275 / 16.5 / 1,084 | 43 / 7.5 / 890 | 301 / 22.8 / 1,514 | 233 / 7.9 / 1,214 |
+
+(Loops 2 and the first selective figure ran on an undrained WAL tail; the drained namespace is loop 3.)
+
+### Results at 100K, final matrix (strong, c1 unless noted)
+
+| Query | Cold p50 ms | Cold GETs/q | Cold MB/q | Warm p50 / p90 / p99 ms | QPS c1 / c8 / c32 | Recall@10 |
+| --- | ---: | ---: | ---: | --- | --- | ---: |
+| ANN | 1,937 (was 1,839) | 240 (238) | 16 (16.1) | 100 / 101 / 221 | 10.0 / 46.2 / 56.1 | 0.988 (0.966) |
+| BM25 | 1,415 (1,640) | 46 (38) | 7 (24.4) | 100 / 164 / 299 | 8.7 / 47.2 / 93.8 | |
+| Hybrid | 2,167 (2,710) | 274 (264) | 22 (38.6) | 100 / 126 / 177 | 10.2 / 52.9 / 51.7 | |
+| Selective ANN | 1,616 (2,458) | 239 (234) | 8 (7.9) | 99 / 105 / 221 | 9.8 / 52.0 / 107.0 | 1.000 |
+
+Ingest 100K docs at 616 to 655 docs/s with 0 backpressure 429s; peak server RSS 2.6 GB. Warm QPS at c8 is lower than in
+iteration 2 (63 to 83) for the same reason as the warm p50: R2 round trip time during this run.
+
+Sequential waves for a cold ANN query that returns ids only: list, slot, (WAL tail with segment open), (flat exact
+with cluster scan), rerank, which is five; with attributes there is a sixth (hydration), partly served from the
+speculative prefetch. The target of three needs either a pointer that skips the listing or a persisted open-hint,
+neither of which exists yet.
+
+Eventual consistency, warm (32 queries, c1, repeated): ANN 35 ms per query (28.7 QPS) against about 100 ms strong; BM25
+9 ms (114 QPS). The strong figure is the HEAD of the next WAL object, so the eventual figure is the execution floor.
+
+### BM25 score parity
+
+Scores run 1 to 3 percent below turbopuffer's for the same ranking. `bench/scale/bm25_idf_probe.py` isolates it. For a
+single-term query the score is idf times a tf-part, and the ratio of the two systems' scores is constant across
+documents with different term frequencies and lengths, so average document length, k1, and b agree. What differs is
+the idf, by a near-constant additive offset: for 40 percent of terms turbopuffer's idf is exactly +0.169 above ours
+(rare terms, df 1 to 15, and common terms alike), which is ln((N'+1)/(N+1)) for an N' about 18.5 percent above the
+100,000 documents the namespace holds. The rest of the terms sit below that offset or above it (a few at +0.2 to +0.3),
+which is consistent with turbopuffer counting a different set of documents for those terms (the 200 held-out passages
+are not enough). The recorded 3-document compat scenarios match to 1e-5, so the formula is the same; the difference
+appears only at scale. This looks like an artifact of the reference namespace (statistics counting documents that
+were superseded or not yet compacted), not a blowfish bug, and the ordering is the same (top-1 agreement 1.000), so no
+scoring change was made. Confirming it needs a freshly loaded reference namespace, which this round was not
+permitted to create.
+
 ## Compatibility validation
 
 The 121-case compatibility suite passes in both normal mode and forced indexing
@@ -764,3 +835,4 @@ turbopuffer). turbopuffer's numbers do not change between milestones except for 
 | Milestone | Commit | ANN | BM25 | Hybrid | Selective ANN | Broad ANN |
 | --- | --- | --- | --- | --- | --- | --- |
 | 0: iteration 2 main | `e12178f` | 76 / 120 / 179 ms, 0.963 | 73 / 110 / 191 ms, 0.982 | 78 / 117 / 261 ms, 0.973 | 74 / 123 / 232 ms, 0.998 | 74 / 110 / 166 ms, 0.992 |
+| 1: iteration 3 | `73d8110` | 87 / 116 / 155 ms, 0.965 | 90 / 129 / 201 ms, 0.982 | 100 / 133 / 299 ms, 0.972 | 98 / 136 / 216 ms, 0.998 | 100 / 131 / 234 ms, 0.991 |
