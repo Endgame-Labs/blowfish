@@ -4,6 +4,16 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Perf iteration 2 merged (100K docs on R2, with inner loops).**
+  - **IVF format:** rotated centers, compact codes stored contiguously, a popcount scan, and merged reads.
+  - **Manifests:** large ones are zstd-compressed.
+  - **ANN defaults:** nprobe 64 and rerank 32. Recall@10 is 0.966 at 100K; re-sweep at larger scale.
+  - **Cold ANN:** 1,021 to 238 R2 requests, 31 to 16 MB, and 2.5 to 1.84 s p50.
+  - **Warm p50:** about 75 ms, of which about 70 ms is the strong-consistency HEAD.
+  - **Ingest:** 660-830 docs/s with zero 429s.
+  - **Compatibility:** new index files need this binary; older binaries can't read them, but this one reads old files.
+  - **Checks:** clippy, 160 tests, and compat 121/121 in both modes.
+  - **Next:** cold read waves (about 6), lazy BM25 term dictionaries, term stats out of the manifest, and chunked ID indexes.
 - **Perf iteration 1 merged (measured on 4.86M docs on R2).**
   - **Cross-segment ANN:** instead of running IVF in every segment, it ranks cluster centers across all
     segments, scans only the globally nearest clusters, and reranks one merged pool. Default nprobe is now
