@@ -198,6 +198,13 @@ pub(crate) struct RangeCache {
     planning: AsyncMutex<Planning>,
     fetches: Semaphore,
     prefetches: Arc<Semaphore>,
+    /// Disk writes started behind reads and not yet finished.
+    spills: Arc<Spills>,
+}
+#[derive(Default)]
+struct Spills {
+    pending: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
 }
 impl RangeCache {
     pub(crate) async fn open(config: CacheConfig) -> Result<Self, Error> {
@@ -243,6 +250,7 @@ impl RangeCache {
         Ok(Self {
             fetches: Semaphore::new(config.fetch_concurrency),
             prefetches: Arc::new(Semaphore::new(config.prefetch_concurrency)),
+            spills: Arc::default(),
             config,
             memory,
             disk,
@@ -314,6 +322,23 @@ impl RangeCache {
             }
         }
         found
+    }
+    /// Wait until every disk write started behind a read has finished.
+    pub(crate) async fn flush(&self) {
+        loop {
+            let idle = self.spills.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self
+                .spills
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return;
+            }
+            idle.await;
+        }
     }
     fn insert_memory(&self, key: BlockKey, value: Bytes) {
         if value.len() as u64 > self.config.memory_bytes || self.config.memory_bytes == 0 {
@@ -490,12 +515,22 @@ impl RangeReader {
                 // read awaited cost about a millisecond per 4 KB block, which made a cold 2 MB
                 // read take half a second after the network transfer had finished.
                 if let Some(disk) = cache.disk.clone() {
+                    let spills = cache.spills.clone();
+                    spills
+                        .pending
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     tokio::task::spawn_blocking(move || {
-                        let mut disk = disk.lock().unwrap();
-                        for (name, value) in spill {
-                            // A full or damaged cache never makes source-of-truth reads fail.
-                            let _ = disk.insert(&name, &value);
+                        {
+                            let mut disk = disk.lock().unwrap();
+                            for (name, value) in spill {
+                                // A full or damaged cache never makes source-of-truth reads fail.
+                                let _ = disk.insert(&name, &value);
+                            }
                         }
+                        spills
+                            .pending
+                            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        spills.idle.notify_waiters();
                     });
                 }
                 // Apply pending evictions once per coalesced fetch, so memory stays within

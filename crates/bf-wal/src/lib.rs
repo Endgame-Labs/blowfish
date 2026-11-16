@@ -254,7 +254,7 @@ impl Wal {
             let len = payload.len();
             let result = self
                 .store
-                .create_with_id(&payload_key, payload, entry.write_id)
+                .create_unique_with_id(&payload_key, payload, entry.write_id)
                 .await?;
             if result == CreateResult::Created {
                 metrics::counter!("blowfish_wal_bytes_written_total").increment(len as u64);
