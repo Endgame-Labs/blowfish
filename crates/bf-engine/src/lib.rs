@@ -45,6 +45,9 @@ pub(crate) struct NamespaceState {
     pub tail_bytes: u64,
     pub tail_since: Option<DateTime<Utc>>,
     pub stats: Arc<bf_wal::NamespaceStats>,
+    /// Object holding the checkpoint's per-term text statistics (loaded only for BM25 queries
+    /// and by the indexer), when the manifest keeps them out of line.
+    pub text_stats: Option<bf_wal::SegmentFile>,
     pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
     pub corpus: Arc<BTreeMap<String, bf_text::CorpusStats>>,
     pub created_at: DateTime<Utc>,
@@ -67,6 +70,7 @@ impl Default for NamespaceState {
             tail_bytes: 0,
             tail_since: None,
             stats: Default::default(),
+            text_stats: None,
             scores: BTreeMap::new(),
             corpus: Arc::default(),
             created_at: Utc::now(),
@@ -210,6 +214,16 @@ impl Engine {
         ns: &str,
         consistency: &Consistency,
     ) -> Result<(NamespaceState, bool), ApiError> {
+        self.snapshot_hinted(ns, consistency, None).await
+    }
+    /// A snapshot that, when it has to read a newer checkpoint, opens the files the query
+    /// will need while the WAL tail is being read.
+    async fn snapshot_hinted(
+        &self,
+        ns: &str,
+        consistency: &Consistency,
+        hint: Option<snapshot::OpenHint>,
+    ) -> Result<(NamespaceState, bool), ApiError> {
         let handle = self.handle(ns).await?;
         let mut state = handle.state.lock().await;
         let warm = state.seq > 0;
@@ -263,11 +277,12 @@ impl Engine {
             false
         };
         if (refresh || over_cap) && !unchanged {
-            snapshot::catch_up(
+            snapshot::catch_up_hinted(
                 &Wal::new(self.0.store.clone(), ns).map_err(log_error)?,
                 &mut state,
                 cap,
                 &self.0.store,
+                hint.as_ref(),
             )
             .await?;
         }
@@ -375,9 +390,13 @@ impl Engine {
         } else {
             None
         };
+        let hint = snapshot::OpenHint::for_request(&request, context.clone());
         let snapshot = async {
             let result = backend
-                .scope("snapshot", self.snapshot(ns, &request.consistency))
+                .scope(
+                    "snapshot",
+                    self.snapshot_hinted(ns, &request.consistency, Some(hint)),
+                )
                 .await;
             (result, start.elapsed())
         };

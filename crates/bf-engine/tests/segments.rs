@@ -373,8 +373,13 @@ async fn text_statistics_empty_missing_prefix_positions_and_schema_rebuild() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(m.stats.text["text"].documents, 2);
-    assert_eq!(m.stats.text["text"].total_length, 5);
+    // Per-term statistics live in their own object; the manifest only references it.
+    assert!(m.stats.text.is_empty());
+    let file = m.text_stats.expect("text statistics object");
+    assert_eq!(
+        e.storage().get(&file.key).await.unwrap().len() as u64,
+        file.size
+    );
     write(
         &e,
         json!({"schema":{"text":{"full_text_search":{"tokenizer":"pre_tokenized_array"}}}}),

@@ -114,9 +114,13 @@ pub struct Manifest {
     pub deleted: bool,
     #[serde(default)]
     pub segments: Vec<Segment>,
-    /// Namespace totals as of `indexed_through`.
+    /// Namespace totals as of `indexed_through`. Per-term text statistics live in
+    /// `text_stats` when present, so queries that do not rank by text never download them.
     #[serde(default)]
     pub stats: NamespaceStats,
+    /// Separate object holding `stats.text` (a map of field to `TextStats`), when non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_stats: Option<SegmentFile>,
     /// Last indexed write timestamp; absent on legacy schema-only manifests.
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
@@ -348,9 +352,23 @@ impl Wal {
         loop {
             let mut records = vec![];
             let mut seq = after + 1;
-            while let Some(record) = self.record(seq).await? {
-                records.push((seq, record));
-                seq += 1;
+            // Probe growing windows of consecutive slots concurrently: a cold reader with
+            // a tail of n entries needs about log2(n) round trips instead of n + 1.
+            let mut window = 2u64;
+            'scan: loop {
+                let found =
+                    futures::future::try_join_all((seq..seq + window).map(|s| self.record(s)))
+                        .await?;
+                for record in found {
+                    match record {
+                        Some(record) => {
+                            records.push((seq, record));
+                            seq += 1;
+                        }
+                        None => break 'scan,
+                    }
+                }
+                window = (window * 2).min(32);
             }
             let start = records.iter().rposition(|(_, r)| r.tombstone).unwrap_or(0);
             let mut entries = vec![];
@@ -408,24 +426,17 @@ impl Wal {
         seq: u64,
         manifest: &Manifest,
     ) -> Result<CreateResult, Error> {
+        // The slot holds the whole manifest (compressed when large), so a cold reader needs
+        // one GET after the listing. Older slots point at a separate payload object.
         let identity = Uuid::new_v4();
-        let payload = format!("ns/{}/manifest-data/{identity}.json", self.namespace);
         self.store
-            .create_with_id(&payload, encode_manifest(manifest)?, identity)
-            .await?;
-        let slot = serde_json::to_vec(&serde_json::json!({"payload":payload}))?;
-        let result = self
-            .store
             .create_with_id(
                 &format!("ns/{}/manifest/{seq:020}.json", self.namespace),
-                slot,
+                encode_manifest(manifest)?,
                 identity,
             )
-            .await?;
-        if result == CreateResult::Conflict {
-            self.store.delete(&payload).await?;
-        }
-        Ok(result)
+            .await
+            .map_err(Into::into)
     }
     /// Publish against exactly one predecessor. No retry may reuse stale indexer work.
     ///
@@ -460,10 +471,9 @@ impl Wal {
                     self.namespace
                 ))
                 .await?;
-            let slot: serde_json::Value = serde_json::from_slice(&bytes)?;
-            if let Some(payload) = slot.get("payload").and_then(serde_json::Value::as_str) {
+            if let Some(payload) = slot_payload_key(&bytes) {
                 manifest.retired.push(RetiredObject {
-                    key: payload.to_owned(),
+                    key: payload,
                     retired_at: Utc::now(),
                 });
             }
@@ -568,13 +578,11 @@ impl Wal {
             return Ok(None);
         }
         let bytes = self.store.get(&last.key).await?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-        let manifest =
-            if let Some(payload) = value.get("payload").and_then(serde_json::Value::as_str) {
-                decode_manifest(&self.store.get(payload).await?)?
-            } else {
-                serde_json::from_value(value)?
-            };
+        let manifest = if let Some(payload) = slot_payload_key(&bytes) {
+            decode_manifest(&self.store.get(&payload).await?)?
+        } else {
+            decode_manifest(&bytes)?
+        };
         Ok(Some((seq, manifest)))
     }
     /// Erase document-bearing payloads through a committed tombstone.
@@ -644,6 +652,19 @@ fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, Error> {
     zstd::stream::encode_all(json.as_slice(), 3).map_err(|_| Error::Format)
 }
 
+/// The payload object a manifest slot points at, for slots written before manifests were
+/// stored inline. Inline slots (JSON or zstd) have none.
+pub fn slot_payload_key(slot: &[u8]) -> Option<String> {
+    if slot.starts_with(&ZSTD_MAGIC) {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(slot)
+        .ok()?
+        .get("payload")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 fn decode_manifest(bytes: &[u8]) -> Result<Manifest, Error> {
     if bytes.starts_with(&ZSTD_MAGIC) {
         let json = zstd::stream::decode_all(bytes).map_err(|_| Error::Format)?;
@@ -675,6 +696,7 @@ mod manifest_codec_tests {
             deleted: false,
             segments: vec![],
             stats,
+            text_stats: None,
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],

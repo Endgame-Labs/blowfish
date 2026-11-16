@@ -204,6 +204,29 @@ fn retire(manifest: &mut Manifest, key: String) {
         });
     }
 }
+/// Move per-term text statistics out of the manifest into their own object, so only BM25 queries
+/// (and the indexer) read them.
+async fn externalize_text_stats(
+    store: &bf_storage::Storage,
+    ns: &str,
+    manifest: &mut Manifest,
+) -> Result<(), ApiError> {
+    if manifest.stats.text.is_empty() {
+        return Ok(());
+    }
+    let text = std::mem::take(&mut manifest.stats.text);
+    let bytes = crate::text::encode_text_stats(&text)?;
+    manifest.text_stats = Some(
+        segment::put_file(
+            store,
+            format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
+            bytes,
+            0,
+        )
+        .await?,
+    );
+    Ok(())
+}
 fn adjust(
     stats: &mut NamespaceStats,
     docs: &BTreeMap<bf_types::Id, bf_types::Document>,
@@ -298,6 +321,9 @@ impl Engine {
         if !state.exists {
             return Ok(false);
         }
+        // The indexer rewrites complete statistics, so it needs the out-of-line text part.
+        let mut state = state;
+        crate::text::hydrate(&self.0.store, &mut state).await?;
         let rebuild = state.segments.iter().any(|seg| {
             state
                 .schema
@@ -346,6 +372,7 @@ impl Engine {
             deleted: false,
             segments: vec![],
             stats: Default::default(),
+            text_stats: None,
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
@@ -390,6 +417,8 @@ impl Engine {
         }
         let store = &self.0.store;
         manifest.stats = (*state.stats).clone();
+        // The previous text statistics object is replaced by this publication.
+        let previous_text = manifest.text_stats.take();
         // A tombstone followed by recreation discards every old segment and its statistics.
         if state.segments.is_empty() && !manifest.segments.is_empty() {
             for seg in manifest.segments.clone() {
@@ -529,6 +558,10 @@ impl Engine {
         manifest.created_at = state.created_at;
         manifest.updated_at = Some(state.updated_at);
         manifest.indexed_through = state.seq;
+        if let Some(previous) = previous_text {
+            retire(&mut manifest, previous.key);
+        }
+        externalize_text_stats(store, ns, &mut manifest).await?;
         match wal
             .publish_fenced(claim, manifest.indexer_epoch, &manifest)
             .await
@@ -565,10 +598,14 @@ impl Engine {
             }
             manifest.segments.clear();
             manifest.stats = NamespaceStats::default();
+            if let Some(file) = manifest.text_stats.take() {
+                retire(&mut manifest, file.key);
+            }
             manifest.deleted = true;
             manifest.indexed_through = checkpoint.seq;
         }
         let mut protected = std::collections::BTreeSet::new();
+        protected.extend(manifest.text_stats.iter().map(|f| f.key.clone()));
         for seg in &manifest.segments {
             protected.extend(
                 seg.files
@@ -588,10 +625,8 @@ impl Engine {
             .get(&format!("ns/{ns}/manifest/{sequence:020}.json"))
             .await
             .map_err(storage_error)?;
-        let slot: serde_json::Value =
-            serde_json::from_slice(&slot).map_err(segment::index_error)?;
-        if let Some(key) = slot.get("payload").and_then(serde_json::Value::as_str) {
-            protected.insert(key.to_owned());
+        if let Some(key) = bf_wal::slot_payload_key(&slot) {
+            protected.insert(key);
         }
         // Take the candidate inventory BEFORE claiming a newer epoch. This fences
         // paused builders of these files, without sweeping a newer builder's files.

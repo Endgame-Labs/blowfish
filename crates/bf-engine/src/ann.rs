@@ -239,6 +239,24 @@ pub(crate) async fn search(
         });
         pool.truncate(target);
     }
+    // Documents are fetched after the winners are known, which would add a round trip. Start
+    // reading the best candidates' documents now: the winners are almost always among them,
+    // and the later hydration is then served from the cache.
+    let mut speculative: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
+    if !columns.is_empty() {
+        let mut best: Vec<&(usize, Candidate)> = pool.iter().collect();
+        let keep = (k * 2).min(best.len());
+        if keep > 0 && best.len() > keep {
+            best.select_nth_unstable_by(keep, |a, b| {
+                a.1.distance
+                    .total_cmp(&b.1.distance)
+                    .then(a.1.row.cmp(&b.1.row))
+            });
+        }
+        for (i, c) in best.into_iter().take(keep) {
+            speculative.entry(*i).or_default().insert(c.row);
+        }
+    }
     let mut by_segment: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
     for (i, c) in pool {
         by_segment
@@ -261,10 +279,16 @@ pub(crate) async fn search(
                 .collect::<Vec<_>>())
         }));
     }
-    let reranked: Vec<Vec<(f32, usize, u32)>> = futures::stream::iter(reranks)
-        .buffer_unordered(limit)
-        .try_collect()
-        .await?;
+    let prefetch = futures::future::join_all(speculative.iter().map(|(&i, rows)| async move {
+        let _ = segment::projected_documents(store, &state.segments[i], rows, Some(columns)).await;
+    }));
+    let (reranked, _) = tokio::join!(
+        futures::stream::iter(reranks)
+            .buffer_unordered(limit)
+            .try_collect::<Vec<Vec<(f32, usize, u32)>>>(),
+        prefetch
+    );
+    let reranked = reranked?;
     winners.extend(reranked.into_iter().flatten());
     stage(t0, "rerank");
 
@@ -291,10 +315,12 @@ pub(crate) async fn search(
         rows_by_segment.entry(i).or_default().insert(row);
     }
     let mut docs = BTreeMap::new();
-    for (i, rows) in rows_by_segment {
-        docs.extend(
-            segment::projected_documents(store, &state.segments[i], &rows, Some(columns)).await?,
-        );
+    for part in futures::future::try_join_all(rows_by_segment.iter().map(|(&i, rows)| {
+        segment::projected_documents(store, &state.segments[i], rows, Some(columns))
+    }))
+    .await?
+    {
+        docs.extend(part);
     }
     stage(t0, "hydrate");
     Ok(Some((scores, docs)))

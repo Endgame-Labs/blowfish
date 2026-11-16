@@ -76,7 +76,20 @@ pub(crate) async fn execute(
         }
     }
     if !clauses.is_empty() {
-        prepared.corpus = crate::text::global_stats(store, state).await?;
+        let mut terms = crate::text::QueryTerms::new();
+        for clause in &clauses {
+            if let RankBy::Bm25 {
+                attribute, query, ..
+            } = clause
+                && let Some(cfg) = state.schema.get(attribute).and_then(|s| s.text_config())
+            {
+                terms
+                    .entry(attribute.clone())
+                    .or_default()
+                    .extend(crate::text::tokens(query, &cfg).into_iter().map(|t| t.text));
+            }
+        }
+        prepared.corpus = crate::text::global_stats(store, state, &terms).await?;
     }
     let state = &prepared;
     let mut candidates = state.clone();
@@ -432,7 +445,7 @@ pub(crate) fn recall(ann: &QueryResponse, exact: &QueryResponse) -> f64 {
     }
 }
 
-fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) {
+pub(crate) fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) {
     match rank {
         RankBy::Bm25 { .. } => clauses.push(rank),
         RankBy::Sum(xs) | RankBy::Max(xs) => {

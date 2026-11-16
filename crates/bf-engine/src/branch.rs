@@ -63,7 +63,10 @@ impl Engine {
     ) -> Result<Source, ApiError> {
         let wal = Wal::new(self.0.store.clone(), source).map_err(log_error)?;
         for _ in 0..16 {
-            let state = self.snapshot(source, &Consistency::Strong).await?.0;
+            let mut state = self.snapshot(source, &Consistency::Strong).await?.0;
+            // Pins carry complete statistics: the destination keeps no reference into the
+            // source's out-of-line text object.
+            crate::text::hydrate(&self.0.store, &mut state).await?;
             let pin = Pin {
                 format_version: 1,
                 source_namespace: source.into(),
