@@ -81,9 +81,7 @@ pub(crate) async fn search(
     static DIRECTORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DIRECTORY.get_or_init(|| std::env::var("BF_ANN_DIRECTORY").is_ok_and(|v| v == "0")) {
         // fall through
-    } else if state.shadowed.is_empty()
-        && let Some(file) = state.ann_dirs.get(&key)
-    {
+    } else if let Some(file) = state.ann_dirs.get(&key) {
         // Filtered queries compute each segment's allowed rows (live rows that pass the filter)
         // alongside the directory, and read each segment's row-to-cluster map, so the
         // directory ranks clusters by their allowed rows without opening any segment's index
@@ -121,11 +119,39 @@ pub(crate) async fn search(
                 None
             };
             if q.filters.is_none() || members.is_some() {
-                return crate::ann_dir::search(
-                    store, state, dir, lives, vector, config, k, columns, attribute, members,
+                // Unindexed upserts and deletes shadow rows of the segments by ID. Rather than
+                // opening every ID index to find the shadowed rows, ask for a few extra
+                // winners and drop the shadowed ones afterwards. If the shadowed rows eat into
+                // the results so that fewer than k remain while the pool was full, use the
+                // per-segment path instead.
+                let slack = if state.shadowed.is_empty() {
+                    0
+                } else {
+                    (2 * k).max(20)
+                };
+                let (mut scores, mut docs) = crate::ann_dir::search(
+                    store,
+                    state,
+                    dir,
+                    lives,
+                    vector,
+                    config,
+                    k + slack,
+                    columns,
+                    attribute,
+                    members,
                 )
-                .await
-                .map(Some);
+                .await?;
+                if slack > 0 {
+                    let pooled = scores.len();
+                    scores.retain(|id, _| !state.shadowed.contains(id));
+                    docs.retain(|id, _| !state.shadowed.contains(id));
+                    if scores.len() >= k || pooled < k + slack {
+                        return Ok(Some((scores, docs)));
+                    }
+                } else {
+                    return Ok(Some((scores, docs)));
+                }
             }
         }
     }

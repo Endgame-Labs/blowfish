@@ -358,7 +358,7 @@ async fn scan<'q>(
             .transpose()?
             .unwrap_or(true)
         {
-            scan.row(id.clone(), doc.clone())?;
+            scan.row(id.clone(), (**doc).clone())?;
         }
     }
     Ok(scan)
@@ -370,7 +370,7 @@ pub(crate) async fn order_candidates(
     q: &QueryRequest,
 ) -> Result<NamespaceState, ApiError> {
     let mut candidates = state.clone();
-    candidates.docs = scan(store, state, q).await?.winners.documents();
+    candidates.docs = crate::shared(scan(store, state, q).await?.winners.documents());
     Ok(candidates)
 }
 pub(crate) async fn execute(
@@ -381,7 +381,7 @@ pub(crate) async fn execute(
     let mut scan = scan(store, state, q).await?;
     if q.rank_by.is_some() {
         let mut candidates = state.clone();
-        candidates.docs = scan.winners.documents();
+        candidates.docs = crate::shared(scan.winners.documents());
         return query::execute(&candidates, q);
     }
     let aggregates = q.aggregate_by.as_ref().expect("aggregate scan");

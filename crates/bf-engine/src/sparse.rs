@@ -24,11 +24,11 @@ pub(crate) fn dot(value: Option<&Value>, query: &BTreeMap<String, f32>) -> f32 {
         })
         .sum()
 }
-pub(crate) async fn build(
+pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
     store: &Storage,
     prefix: &str,
     schema: &Schema,
-    docs: &BTreeMap<Id, Document>,
+    docs: &BTreeMap<Id, D>,
     files: &mut BTreeMap<String, SegmentFile>,
 ) -> Result<(), ApiError> {
     for (column, (name, cfg)) in schema.iter().enumerate() {
@@ -37,7 +37,7 @@ pub(crate) async fn build(
         }
         let mut index = Inverted::default();
         for (row, doc) in docs.values().enumerate() {
-            if let Some(value) = doc.get(name) {
+            if let Some(value) = doc.borrow().get(name) {
                 for (dim, weight) in decode_sparse(value)? {
                     index
                         .postings
@@ -118,9 +118,9 @@ pub(crate) async fn segment_scores(
     Ok(())
 }
 
-pub(crate) fn tail_scores(
+pub(crate) fn tail_scores<D: std::borrow::Borrow<Document>>(
     rank: Option<&RankBy>,
-    docs: &BTreeMap<Id, Document>,
+    docs: &BTreeMap<Id, D>,
     out: &mut NamespaceState,
 ) {
     let mut terms = vec![];
@@ -139,7 +139,7 @@ pub(crate) fn tail_scores(
             .entry(crate::indexed::rank_key(rank))
             .or_default();
         for (id, doc) in docs {
-            scores.insert(id.clone(), dot(doc.get(attribute), vector) as f64);
+            scores.insert(id.clone(), dot(doc.borrow().get(attribute), vector) as f64);
         }
     }
 }

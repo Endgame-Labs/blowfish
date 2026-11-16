@@ -268,7 +268,7 @@ fn single(
         }
         return Ok(SingleQueryResult {
             aggregations: Some(aggregate(
-                &docs.into_iter().map(|(_, d)| d).collect::<Vec<_>>(),
+                &docs.iter().map(|(_, d)| &***d).collect::<Vec<_>>(),
                 aggregates,
             )?),
             ..Default::default()
@@ -996,7 +996,8 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
             samples.extend(
                 crate::segment::documents(engine.storage(), seg, &rows)
                     .await?
-                    .into_values(),
+                    .into_values()
+                    .map(std::sync::Arc::new),
             );
         }
         for doc in samples

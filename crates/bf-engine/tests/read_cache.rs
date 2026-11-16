@@ -745,3 +745,110 @@ async fn filtered_ann_uses_the_directory_without_opening_id_indexes() {
         assert!(backend.waves.load(Ordering::SeqCst) <= 5);
     }
 }
+
+/// An unindexed tail (new rows, overwrites of segment rows, and deletes) keeps the directory
+/// path: no ID index is opened, shadowed rows are dropped by ID, and answers stay exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unindexed_tail_keeps_the_directory_path() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    let vector = |id: usize| -> Vec<f32> {
+        (0..64)
+            .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+            .collect()
+    };
+    for batch in 0..12usize {
+        let docs: Vec<_> = (0..400)
+            .map(|n| {
+                let id = batch * 400 + n;
+                json!({"id":id,"vector":vector(id)})
+            })
+            .collect();
+        writer
+            .write(
+                "tail",
+                serde_json::from_value(json!({
+                    "distance_metric":"euclidean_squared","upsert_rows":docs
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.index_namespace("tail", true).await.unwrap();
+    }
+    // The query's own nearest neighbours are deleted or overwritten in the tail, so shadowed
+    // rows really do rank in the segments' top results.
+    let target = vector(123);
+    let distance =
+        |v: &[f32]| -> f32 { v.iter().zip(&target).map(|(a, b)| (a - b) * (a - b)).sum() };
+    let mut logical: std::collections::BTreeMap<usize, Vec<f32>> =
+        (0..4800).map(|id| (id, vector(id))).collect();
+    let mut by_distance: Vec<usize> = logical.keys().copied().collect();
+    by_distance.sort_by(|a, b| distance(&logical[a]).total_cmp(&distance(&logical[b])));
+    let doomed: Vec<usize> = by_distance[..3].to_vec();
+    let moved: Vec<usize> = by_distance[3..6].to_vec();
+    let mut tail_docs = Vec::new();
+    for id in &moved {
+        // Moved far away from the query.
+        let far: Vec<f32> = vector(*id).iter().map(|x| x + 50.0).collect();
+        logical.insert(*id, far.clone());
+        tail_docs.push(json!({"id":id,"vector":far}));
+    }
+    for id in 5000..5050usize {
+        logical.insert(id, vector(id));
+        tail_docs.push(json!({"id":id,"vector":vector(id)}));
+    }
+    for id in &doomed {
+        logical.remove(id);
+    }
+    writer
+        .write(
+            "tail",
+            serde_json::from_value(json!({"upsert_rows":tail_docs,"deletes":doomed})).unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut expected: Vec<usize> = logical.keys().copied().collect();
+    expected.sort_by(|a, b| distance(&logical[a]).total_cmp(&distance(&logical[b])));
+    expected.truncate(10);
+    let engine = Engine::with_config(store(backend.clone()).await, config());
+    backend.waves.store(0, Ordering::SeqCst);
+    backend.paths.lock().unwrap().clear();
+    backend.delay.store(true, Ordering::SeqCst);
+    let request = serde_json::from_value(json!({
+        "rank_by":["vector","ANN",target],"top_k":10
+    }))
+    .unwrap();
+    let result = engine.query("tail", request).await.unwrap();
+    backend.delay.store(false, Ordering::SeqCst);
+    let got: Vec<usize> = result
+        .result
+        .rows
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_u64().unwrap() as usize)
+        .collect();
+    assert!(
+        !got.iter()
+            .any(|id| doomed.contains(id) || moved.contains(id)),
+        "shadowed rows leaked: {got:?}"
+    );
+    let hits = got.iter().filter(|id| expected.contains(id)).count();
+    assert!(hits >= 9, "{hits} of 10: got {got:?} want {expected:?}");
+    let reads: Vec<String> = backend
+        .paths
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect();
+    assert!(
+        !reads.iter().any(|p| p.contains(".bfi")),
+        "an unindexed tail opened an ID index: {reads:?}"
+    );
+    assert!(backend.waves.load(Ordering::SeqCst) <= 4);
+}

@@ -271,8 +271,19 @@ pub(crate) async fn allowed(
     seg: &bf_wal::Segment,
     f: Option<&Filter>,
 ) -> Result<RoaringBitmap, ApiError> {
+    allowed_with(store, state, seg, f, true).await
+}
+/// `allowed`, optionally leaving tail-shadowed rows in (the directory ANN path drops them by
+/// ID from its winners instead of opening the segment's ID index).
+pub(crate) async fn allowed_with(
+    store: &Storage,
+    state: &NamespaceState,
+    seg: &bf_wal::Segment,
+    f: Option<&Filter>,
+    unshadow: bool,
+) -> Result<RoaringBitmap, ApiError> {
     let mut live = segment::live(store, seg).await?;
-    if !state.shadowed.is_empty() {
+    if unshadow && !state.shadowed.is_empty() {
         live -= segment::lookup_many(store, seg, &state.shadowed).await?;
     }
     if let Some(f) = f {
@@ -289,11 +300,11 @@ pub(crate) async fn materialize(
     for seg in &state.segments {
         let live = allowed(store, state, seg, None).await?;
         full.docs
-            .extend(segment::documents(store, seg, &live).await?);
+            .extend(crate::shared(segment::documents(store, seg, &live).await?));
     }
     // Schema drops apply immediately even while older segment columns remain on disk.
     for doc in full.docs.values_mut() {
-        doc.retain(|name, _| state.schema.contains_key(name));
+        std::sync::Arc::make_mut(doc).retain(|name, _| state.schema.contains_key(name));
     }
     Ok(full)
 }
@@ -347,16 +358,22 @@ pub(crate) async fn for_writes(
             })
             .collect();
     }
-    let mut full = state.clone();
+    // A write reads only the rows it names: tail rows by ID here, segment rows below.
+    let mut full = state.without_docs();
+    for id in &wanted {
+        if let Some(doc) = state.docs.get(id) {
+            full.docs.insert(id.clone(), doc.clone());
+        }
+    }
     for seg in &state.segments {
         let live = segment::live(store, seg).await?;
         let wanted = wanted.difference(&state.shadowed).cloned().collect();
         let rows = segment::lookup_many(store, seg, &wanted).await? & live;
         full.docs
-            .extend(segment::documents(store, seg, &rows).await?);
+            .extend(crate::shared(segment::documents(store, seg, &rows).await?));
     }
     for doc in full.docs.values_mut() {
-        doc.retain(|name, _| state.schema.contains_key(name));
+        std::sync::Arc::make_mut(doc).retain(|name, _| state.schema.contains_key(name));
     }
     Ok(full)
 }
@@ -384,7 +401,7 @@ pub(crate) async fn statistics(
     stats.logical_bytes += state
         .docs
         .values()
-        .map(|d| serde_json::to_vec(d).expect("document serializes").len() as u64)
+        .map(|d| serde_json::to_vec(&**d).expect("document serializes").len() as u64)
         .sum::<u64>();
     Ok(stats)
 }

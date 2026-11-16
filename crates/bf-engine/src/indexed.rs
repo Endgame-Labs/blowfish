@@ -215,7 +215,7 @@ async fn prepare(
             let mut tail = state.clone();
             tail.segments.clear();
             let mut out = prepare_one(store, &tail, q, config, force_exact, narrow_columns).await?;
-            out.docs.extend(docs);
+            out.docs.extend(crate::shared(docs));
             out.scores.entry(rank_key(rank)).or_default().extend(scores);
             trim_candidates(&mut out, q);
             return Ok(out);
@@ -375,7 +375,7 @@ async fn prepare_one(
                         id.clone(),
                         query::distance(&decode_vector(v)?, vector, state.metric),
                     );
-                    out.docs.insert(id, doc);
+                    out.docs.insert(id, std::sync::Arc::new(doc));
                 }
             }
             continue;
@@ -401,8 +401,9 @@ async fn prepare_one(
         for (row, score) in hits {
             scores.insert(ids[row as usize].clone(), score as f64);
         }
-        out.docs
-            .extend(segment::projected_documents(store, seg, &rows, Some(&columns)).await?);
+        out.docs.extend(crate::shared(
+            segment::projected_documents(store, seg, &rows, Some(&columns)).await?,
+        ));
     }
     for (id, doc) in &state.docs {
         if q.filters
@@ -604,8 +605,9 @@ async fn prepare_scalar(
             selected &= rows;
         }
         crate::sparse::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?;
-        out.docs
-            .extend(segment::projected_documents(store, seg, &selected, Some(&columns)).await?);
+        out.docs.extend(crate::shared(
+            segment::projected_documents(store, seg, &selected, Some(&columns)).await?,
+        ));
     }
     for (id, doc) in &state.docs {
         if !q

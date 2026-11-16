@@ -38,7 +38,7 @@ pub(crate) struct NamespaceState {
     pub schema: Schema,
     pub metric: DistanceMetric,
     /// Only the unindexed tail stays resident. Materialized views are query-local.
-    pub docs: BTreeMap<Id, Document>,
+    pub docs: BTreeMap<Id, std::sync::Arc<Document>>,
     pub shadowed: BTreeSet<Id>,
     pub segments: Vec<bf_wal::Segment>,
     pub indexed_through: u64,
@@ -84,12 +84,43 @@ impl Default for NamespaceState {
         }
     }
 }
+/// Shared documents: cloning a namespace state must not deep-copy its tail.
+pub(crate) fn shared(docs: BTreeMap<Id, Document>) -> BTreeMap<Id, Arc<Document>> {
+    docs.into_iter()
+        .map(|(id, doc)| (id, Arc::new(doc)))
+        .collect()
+}
 impl NamespaceState {
+    /// Everything but the tail documents, which writes pick out by ID.
+    pub(crate) fn without_docs(&self) -> Self {
+        Self {
+            seq: self.seq,
+            exists: self.exists,
+            schema: self.schema.clone(),
+            metric: self.metric,
+            docs: BTreeMap::new(),
+            shadowed: self.shadowed.clone(),
+            segments: self.segments.clone(),
+            indexed_through: self.indexed_through,
+            manifest_seq: self.manifest_seq,
+            tail_bytes: self.tail_bytes,
+            tail_since: self.tail_since,
+            stats: self.stats.clone(),
+            text_stats: self.text_stats.clone(),
+            ann_dirs: self.ann_dirs.clone(),
+            scores: BTreeMap::new(),
+            corpus: self.corpus.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            refreshed: self.refreshed,
+            checkpoint_refreshed: self.checkpoint_refreshed,
+        }
+    }
     fn apply(&mut self, b: &WriteBatch) {
         self.exists = true;
         if self.schema.keys().any(|name| !b.schema.contains_key(name)) {
             for doc in self.docs.values_mut() {
-                doc.retain(|name, _| b.schema.contains_key(name));
+                Arc::make_mut(doc).retain(|name, _| b.schema.contains_key(name));
             }
         }
         self.schema = b.schema.clone();
@@ -103,7 +134,7 @@ impl NamespaceState {
         for doc in &b.upserts {
             let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
             self.shadowed.insert(id.clone());
-            self.docs.insert(id, doc.clone());
+            self.docs.insert(id, Arc::new(doc.clone()));
         }
     }
     fn replay(&mut self, seq: u64, entry: &WalEntry) {
