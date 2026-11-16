@@ -226,9 +226,10 @@ fn small_open_one_read_and_positions_are_lazy() {
     reads.lock().unwrap().clear();
     let q = Query::new(tokenize("fox", &p), false);
     block_on(reader.search(&q, &reader.stats(), &p, 10, None)).unwrap();
-    assert_eq!(reads.lock().unwrap().len(), 1);
+    // The term's block directory (version 2 loads it on demand), then its one posting block.
+    assert_eq!(reads.lock().unwrap().len(), 2);
     // One-bit docs plus two-bit frequency in a 128-value block, plus two header bytes.
-    let range = reads.lock().unwrap()[0].clone();
+    let range = reads.lock().unwrap()[1].clone();
     assert!(range.end - range.start <= 514);
     reads.lock().unwrap().clear();
     block_on(reader.contains_token_sequence(&q)).unwrap();
@@ -386,7 +387,7 @@ fn prefetched_postings_match_demand_search_with_prefixes_repetition_and_filters(
         let query = Query::new(tokenize(text, &params), prefix);
         let allowed: RoaringBitmap = (130..170).chain(1024..1200).collect();
         for filter in [None, Some(&allowed)] {
-            let plan = reader.prefetch_plan(&query, filter);
+            let plan = block_on(reader.prefetch_plan(&query, filter)).unwrap();
             assert!(
                 plan.windows(2)
                     .all(|ranges| ranges[0].end <= ranges[1].start)
@@ -404,8 +405,8 @@ fn prefetched_postings_match_demand_search_with_prefixes_repetition_and_filters(
     }
     let query = Query::new(tokenize("common", &params), false);
     assert!(
-        reader
-            .prefetch_plan(&query, Some(&RoaringBitmap::new()))
+        block_on(reader.prefetch_plan(&query, Some(&RoaringBitmap::new())))
+            .unwrap()
             .is_empty()
     );
 }

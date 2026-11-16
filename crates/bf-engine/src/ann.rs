@@ -219,19 +219,17 @@ pub(crate) async fn search(
         }));
     }
     let limit = config.search_concurrency.max(1) * 2;
-    let exact_hits: Vec<Vec<(f32, usize, u32)>> = futures::stream::iter(tasks)
-        .buffer_unordered(limit)
-        .try_collect()
-        .await?;
+    // Flat segments and clustered scans are independent: overlap their reads.
+    let (exact_hits, scanned) = tokio::try_join!(
+        futures::stream::iter(tasks)
+            .buffer_unordered(limit)
+            .try_collect::<Vec<Vec<(f32, usize, u32)>>>(),
+        futures::stream::iter(scans)
+            .buffer_unordered(limit)
+            .try_collect::<Vec<Vec<(usize, Candidate)>>>(),
+    )?;
     winners.extend(exact_hits.into_iter().flatten());
-    stage(t0, "exact");
-    let mut pool: Vec<(usize, Candidate)> = futures::stream::iter(scans)
-        .buffer_unordered(limit)
-        .try_collect::<Vec<Vec<(usize, Candidate)>>>()
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+    let mut pool: Vec<(usize, Candidate)> = scanned.into_iter().flatten().collect();
     stage(t0, "scan");
     if pool.len() > target {
         pool.select_nth_unstable_by(target, |a, b| {
