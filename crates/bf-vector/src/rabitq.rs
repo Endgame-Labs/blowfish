@@ -111,6 +111,20 @@ impl RaBitQ {
         for i in 0..self.dims {
             result[i] = v[i] as f64 - c[i] as f64;
         }
+        self.transform(result)
+    }
+
+    /// Rotate a vector (zero-padded to the transform width). The transform is linear and
+    /// orthogonal, so `rotate(v) - rotate(c) == residual(v, c)` and distances are preserved.
+    pub(crate) fn rotate(&self, v: &[f32]) -> Vec<f64> {
+        let mut result = vec![0.; self.padded];
+        for i in 0..self.dims {
+            result[i] = v[i] as f64;
+        }
+        self.transform(result)
+    }
+
+    fn transform(&self, mut result: Vec<f64>) -> Vec<f64> {
         for signs in &self.signs {
             for (x, sign) in result.iter_mut().zip(signs) {
                 *x *= sign;
@@ -173,11 +187,175 @@ impl Rng {
     }
 }
 
+/// Bits used to quantize each coordinate of the rotated residual query.
+pub(crate) const QUERY_BITS: usize = 8;
+
+/// A residual query quantized to `QUERY_BITS` bit planes, so that a one-bit code's inner
+/// product costs a few popcounts per 64 dimensions instead of a table lookup per byte.
+pub(crate) struct PlaneQuery {
+    /// `planes[j * words + w]` holds bit `j` of the quantized coordinates `64w..64w+64`.
+    planes: Vec<u64>,
+    words: usize,
+    delta: f64,
+    vmin: f64,
+    sum: f64,
+    /// Squared norm of the rotated residual query.
+    pub(crate) norm2: f64,
+}
+impl PlaneQuery {
+    /// `q` and `c` are rotated, padded to the same length.
+    pub(crate) fn new(q: &[f64], c: &[f32]) -> Self {
+        let words = q.len().div_ceil(64);
+        let mut vmin = f64::INFINITY;
+        let mut vmax = f64::NEG_INFINITY;
+        let mut norm2 = 0.;
+        let mut sum = 0.;
+        let r: Vec<f64> = q.iter().zip(c).map(|(q, c)| *q - *c as f64).collect();
+        for x in &r {
+            vmin = vmin.min(*x);
+            vmax = vmax.max(*x);
+            norm2 += x * x;
+            sum += x;
+        }
+        let levels = ((1usize << QUERY_BITS) - 1) as f64;
+        let delta = if vmax > vmin {
+            (vmax - vmin) / levels
+        } else {
+            0.
+        };
+        let mut planes = vec![0u64; QUERY_BITS * words];
+        if delta > 0. {
+            for (i, x) in r.iter().enumerate() {
+                let v = ((x - vmin) / delta).round().clamp(0., levels) as u64;
+                for j in 0..QUERY_BITS {
+                    planes[j * words + i / 64] |= ((v >> j) & 1) << (i % 64);
+                }
+            }
+        }
+        Self {
+            planes,
+            words,
+            delta,
+            vmin,
+            sum,
+            norm2,
+        }
+    }
+
+    /// Inner product of the residual query with the code's +-1 vector, divided by sqrt(padded).
+    #[inline(always)]
+    fn signed_dot(&self, bits: &[u8], padded: usize) -> f64 {
+        let mut weighted = 0u64;
+        let mut ones = 0u64;
+        let full = bits.len() / 8;
+        for w in 0..self.words {
+            let word = if w < full {
+                u64::from_le_bytes(bits[w * 8..w * 8 + 8].try_into().unwrap())
+            } else {
+                let mut buf = [0u8; 8];
+                let rest = &bits[(w * 8).min(bits.len())..];
+                buf[..rest.len()].copy_from_slice(rest);
+                u64::from_le_bytes(buf)
+            };
+            ones += word.count_ones() as u64;
+            for j in 0..QUERY_BITS {
+                weighted += ((word & self.planes[j * self.words + w]).count_ones() as u64) << j;
+            }
+        }
+        (2. * (self.delta * weighted as f64 + self.vmin * ones as f64) - self.sum)
+            / (padded as f64).sqrt()
+    }
+
+    /// Estimated squared distance (plain, without the error bound).
+    #[inline(always)]
+    pub(crate) fn distance(&self, norm: f64, alpha: f64, bits: &[u8], padded: usize) -> f64 {
+        let dot = self.signed_dot(bits, padded);
+        norm * norm + self.norm2 - 2. * norm * dot / alpha
+    }
+
+    /// Score `rows` consecutive codes of `stride` bytes each (header of `head` bytes).
+    /// Calls `emit(ordinal, distance, zero_flag)`.
+    pub(crate) fn scan(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        compact: bool,
+        padded: usize,
+        emit: &mut dyn FnMut(usize, f64, bool),
+    ) -> crate::Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("popcnt") {
+                // SAFETY: the CPU feature was detected at runtime.
+                return unsafe { self.scan_popcnt(bytes, rows, compact, padded, emit) };
+            }
+        }
+        self.scan_impl(bytes, rows, compact, padded, emit)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt")]
+    unsafe fn scan_popcnt(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        compact: bool,
+        padded: usize,
+        emit: &mut dyn FnMut(usize, f64, bool),
+    ) -> crate::Result<()> {
+        self.scan_impl(bytes, rows, compact, padded, emit)
+    }
+
+    #[inline(always)]
+    fn scan_impl(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        compact: bool,
+        padded: usize,
+        emit: &mut dyn FnMut(usize, f64, bool),
+    ) -> crate::Result<()> {
+        let code = padded.div_ceil(8);
+        let head = if compact { 8 } else { 24 };
+        let stride = head + code;
+        if bytes.len() != rows * stride {
+            return Err(crate::format::bad("code block length mismatch"));
+        }
+        for (ordinal, row) in bytes.chunks_exact(stride).enumerate() {
+            let (norm, alpha, zero) = if compact {
+                let norm = f32::from_le_bytes(row[0..4].try_into().unwrap()) as f64;
+                // A negative alpha marks an all-zero input vector.
+                let alpha = f32::from_le_bytes(row[4..8].try_into().unwrap()) as f64;
+                (norm, alpha.abs(), alpha < 0.)
+            } else {
+                let norm = f64::from_le_bytes(row[0..8].try_into().unwrap());
+                let alpha = f64::from_le_bytes(row[8..16].try_into().unwrap());
+                let zero = u64::from_le_bytes(row[16..24].try_into().unwrap());
+                if zero > 1 {
+                    return Err(crate::format::bad("invalid quantization factors"));
+                }
+                (norm, alpha, zero == 1)
+            };
+            if !norm.is_finite() || norm < 0. || !alpha.is_finite() || alpha <= 0. || alpha > 1. {
+                return Err(crate::format::bad("invalid quantization factors"));
+            }
+            emit(
+                ordinal,
+                self.distance(norm, alpha, &row[head..], padded),
+                zero,
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Query-local lookup tables; eight signs are accumulated per byte.
+#[cfg(test)]
 pub(crate) struct PreparedQuery {
     tables: Vec<[f64; 256]>,
     norm2: f64,
 }
+#[cfg(test)]
 impl PreparedQuery {
     pub(crate) fn new(q: &[f64]) -> Self {
         let tables = q
@@ -252,6 +430,28 @@ mod tests {
             prop_assert!((e.distance-truth).abs() <= e.error_bound);
         }
     }
+    #[test]
+    fn plane_estimate_tracks_reference() {
+        let dims = 1024;
+        let mut rng = Rng(7);
+        let mut sample = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| (rng.next() % 2000) as f32 / 1000. - 1.)
+                .collect()
+        };
+        let (v, q, c) = (sample(dims), sample(dims), sample(dims));
+        let rq = RaBitQ::new(dims, 3).unwrap();
+        let code = rq.encode(&v, &c).unwrap();
+        let reference = rq.estimate(&code, &q, &c).unwrap().distance;
+        let c_rot: Vec<f32> = rq.rotate(&c).into_iter().map(|x| x as f32).collect();
+        let plane = PlaneQuery::new(&rq.rotate(&q), &c_rot);
+        let fast = plane.distance(code.norm, code.alpha, &code.bits, rq.padded);
+        assert!(
+            (fast - reference).abs() < 2e-2 * reference.abs(),
+            "{fast} vs {reference}"
+        );
+    }
+
     #[test]
     fn zero_residual_and_padding() {
         let rq = RaBitQ::new(3, 0).unwrap();

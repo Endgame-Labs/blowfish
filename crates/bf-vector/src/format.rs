@@ -12,6 +12,10 @@ pub(crate) const FOOTER_SIZE: u64 = 64;
 const MAGIC: &[u8; 8] = b"BFVFOOT1";
 /// Current `.bfv` file format version.
 pub const FORMAT_VERSION: u32 = 1;
+/// Metadata flag: centers and parents are stored rotated and zero-padded to the transform width.
+pub(crate) const FLAG_ROTATED: u32 = 1;
+/// Metadata flag: eight-byte code headers (f32 norm and alpha) and all codes stored before all vectors.
+pub(crate) const FLAG_COMPACT: u32 = 2;
 
 pub(crate) struct Cluster {
     pub center: Vec<f32>,
@@ -31,6 +35,7 @@ pub(crate) struct Metadata {
     pub dtype: VectorType,
     pub seed: u64,
     pub flat: bool,
+    pub flags: u32,
     pub parents: Vec<Vec<f32>>,
     pub clusters: Vec<Cluster>,
 }
@@ -78,15 +83,16 @@ pub(crate) fn build_blob(
                 row_crcs.push(crc32fast::hash(&vectors[start..]));
                 if !flat {
                     let code = rq.encode_unchecked(&training[i], &centers[c]);
-                    codes.extend(code.norm.to_le_bytes());
-                    codes.extend(code.alpha.to_le_bytes());
-                    codes.extend(u64::from(training[i].iter().all(|x| *x == 0.)).to_le_bytes());
+                    let zero = training[i].iter().all(|x| *x == 0.);
+                    let alpha = (code.alpha as f32).clamp(1e-6, 1.);
+                    codes.extend((code.norm as f32).to_le_bytes());
+                    codes.extend((if zero { -alpha } else { alpha }).to_le_bytes());
                     codes.extend(code.bits);
                 }
             }
             Block {
                 cluster: Cluster {
-                    center: centers[c].clone(),
+                    center: rotated_center(&rq, &centers[c]),
                     parent: parent_ids[c],
                     rows,
                     codes: 0..codes.len() as u64,
@@ -111,23 +117,30 @@ pub(crate) fn build_blob(
         dtype: b.dtype,
         seed: b.params.seed,
         flat,
-        parents,
+        flags: FLAG_ROTATED | FLAG_COMPACT,
+        parents: parents.iter().map(|p| rotated_center(&rq, p)).collect(),
         clusters,
     };
     let meta_len = encode_metadata(&metadata)?.len() as u64;
+    // All codes first (probed clusters sit close together, so reads coalesce), then all vectors.
     let mut offset = meta_len;
     for cluster in &mut metadata.clusters {
         let codes_len = cluster.codes.end;
-        let vectors_len = cluster.vectors.end;
         cluster.codes = offset..offset + codes_len;
         offset += codes_len;
+    }
+    for cluster in &mut metadata.clusters {
+        let vectors_len = cluster.vectors.end;
         cluster.vectors = offset..offset + vectors_len;
         offset += vectors_len;
     }
     let mut blob = encode_metadata(&metadata)?;
     let meta_crc = crc32fast::hash(&blob);
-    for (codes, vectors) in payloads {
+    let (all_codes, all_vectors): (Vec<_>, Vec<_>) = payloads.into_iter().unzip();
+    for codes in all_codes {
         blob.extend(codes);
+    }
+    for vectors in all_vectors {
         blob.extend(vectors);
     }
     let mut footer = vec![0u8; FOOTER_SIZE as usize];
@@ -140,6 +153,10 @@ pub(crate) fn build_blob(
     footer[60..].copy_from_slice(&checksum.to_le_bytes());
     blob.extend(footer);
     Ok(blob)
+}
+
+fn rotated_center(rq: &RaBitQ, c: &[f32]) -> Vec<f32> {
+    rq.rotate(c).into_iter().map(|x| x as f32).collect()
 }
 
 fn encode_metadata(m: &Metadata) -> Result<Vec<u8>> {
@@ -166,7 +183,7 @@ fn encode_metadata(m: &Metadata) -> Result<Vec<u8>> {
     put_u32(&mut out, u32::from(m.flat));
     put_u32(&mut out, m.clusters.len() as u32);
     put_u32(&mut out, m.parents.len() as u32);
-    put_u32(&mut out, 0);
+    put_u32(&mut out, m.flags);
     for p in &m.parents {
         for x in p {
             out.extend(x.to_le_bytes());
@@ -269,30 +286,39 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
     };
     let nclusters = p.u32()? as usize;
     let nparents = p.u32()? as usize;
+    let flags = p.u32()?;
     if nclusters == 0
         || nclusters > 65_536
         || nparents > nclusters
         || (flat && (nclusters != 1 || nparents != 0))
-        || p.u32()? != 0
+        || flags & !(FLAG_ROTATED | FLAG_COMPACT) != 0
     {
         return Err(bad("invalid centroid directory"));
     }
+    let compact = flags & FLAG_COMPACT != 0;
+    let center_dims = if flags & FLAG_ROTATED != 0 {
+        dims.next_power_of_two()
+    } else {
+        dims
+    };
     // Check minimum size before allocating based on untrusted counts.
     let min_size = nclusters
-        .checked_mul(dims * 4 + 52)
-        .and_then(|x| x.checked_add(nparents * dims * 4))
+        .checked_mul(center_dims * 4 + 52)
+        .and_then(|x| x.checked_add(nparents * center_dims * 4))
         .ok_or_else(|| bad("metadata size overflow"))?;
     if min_size > p.remaining() {
         return Err(bad("truncated centroid directory"));
     }
     let parents = (0..nparents)
-        .map(|_| p.vector(dims))
+        .map(|_| p.vector(center_dims))
         .collect::<Result<Vec<_>>>()?;
     let mut clusters = Vec::with_capacity(nclusters);
     let mut all_rows = RoaringBitmap::new();
-    let mut offset = bytes.len() as u64;
+    let meta_end = bytes.len() as u64;
+    let mut total = 0u64;
+    let mut offset = meta_end;
     for _ in 0..nclusters {
-        let center = p.vector(dims)?;
+        let center = p.vector(center_dims)?;
         let parent = p.u32()?;
         if (nparents == 0 && parent != u32::MAX) || (nparents > 0 && parent as usize >= nparents) {
             return Err(bad("invalid parent centroid"));
@@ -320,18 +346,21 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
         let code_len = if flat {
             0
         } else {
-            n as u64 * (24 + dims.next_power_of_two().div_ceil(8)) as u64
+            n as u64
+                * ((if compact { 8 } else { 24 }) + dims.next_power_of_two().div_ceil(8)) as u64
         };
         let vector_len = n as u64 * dims as u64 * dtype.width() as u64;
-        if codes.start != offset
-            || codes.end.checked_sub(codes.start) != Some(code_len)
-            || vectors.start != codes.end
+        let in_payload = |r: &Range<u64>| r.start >= meta_end && r.end <= payload_end;
+        if codes.end.checked_sub(codes.start) != Some(code_len)
             || vectors.end.checked_sub(vectors.start) != Some(vector_len)
-            || vectors.end > payload_end
+            || !in_payload(&codes)
+            || !in_payload(&vectors)
+            || (!compact && (codes.start != offset || vectors.start != codes.end))
         {
             return Err(bad("invalid cluster ranges"));
         }
         offset = vectors.end;
+        total += code_len + vector_len;
         clusters.push(Cluster {
             center,
             parent,
@@ -343,7 +372,11 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
             row_crcs,
         });
     }
-    if p.remaining() != 0 || offset != payload_end || all_rows.len() != count as u64 {
+    if p.remaining() != 0
+        || (!compact && offset != payload_end)
+        || meta_end + total != payload_end
+        || all_rows.len() != count as u64
+    {
         return Err(bad("inconsistent index lengths or row count"));
     }
     Ok(Metadata {
@@ -353,6 +386,7 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
         dtype,
         seed,
         flat,
+        flags,
         parents,
         clusters,
     })
@@ -388,9 +422,6 @@ impl<'a> Parser<'a> {
     }
     pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    pub fn f64(&mut self) -> Result<f64> {
-        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     pub fn vector(&mut self, dims: usize) -> Result<Vec<f32>> {
         let bytes = self.take(dims * 4)?;
