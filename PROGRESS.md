@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Perf iteration 8 merged (1M).**
+  - **Changes:**
+    - FTS dictionaries are chunked (2,048 terms) and corpus statistics are chunked, with the chunk index in the manifest.
+    - BM25 term prefetch runs in the snapshot wave, and the ANN half of hybrid no longer waits for statistics.
+    - Document lengths are bit-packed.
+    - Compaction produces evener segments: 9 instead of 15.
+  - **Bytes per cold query:** BM25 38 → 6.5 MB, hybrid 61 → 28 MB. Requests are flat: ANN 374, selective 1,899.
+  - **Latency:** no measurable change. R2 varied about 2× between sessions; cold ANN ranged from 1,472 to 2,656 ms on the same layout.
+  - **Recall:** ANN 0.952 and selective 1.000.
+  - **Open:** selective request count, cold ANN probe requests, warm p50 (71-113 ms, unexplained), and peak RSS (5.4-9.6 GB).
+
 - **Perf iteration 7 merged (1M).**
   - **Ingest:** 740 → 1,199 docs/s over the whole load. The tail is no longer cloned or re-downloaded, bulk loads build large segments, and flush and compaction run concurrently. GET bytes during the load fell from 5.1 GB to 1.5 GB.
   - **Tail writes:** an unindexed tail keeps the ANN directory path.
