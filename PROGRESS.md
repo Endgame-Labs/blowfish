@@ -4,6 +4,30 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Perf iteration 6 merged (1M).**
+  - **Changes:**
+    - The disk cache writes behind reads with a bounded queue. Awaiting block writes had cost 400-900 ms per cold wave.
+    - Filtered ANN goes through the directory.
+    - Row-to-cluster maps in fragments make small filters exact and fetch their vectors directly.
+  - **Cold p50 / p90 at 1M** (quiet session; R2 noise swung results up to 40%):
+
+    | Query | Before | After |
+    |---|---|---|
+    | ANN | 2,000 / 2,355 ms | 1,065 / 1,257 ms |
+    | BM25 | 2,371 / 2,712 ms | 1,240 / 1,428 ms |
+    | Hybrid | 2,404 / 2,983 ms | 1,478 / 1,576 ms |
+    | Selective | 3,800 / 4,310 ms | 1,623 / 2,053 ms |
+
+  - **Warm p50:** about 48-53 ms.
+  - **Recall:** ANN 0.942 against turbopuffer's 0.938 at 1M; selective 1.000; broad 0.973 against 0.977.
+  - **Parity overlap:** ANN 0.929, BM25 0.990.
+  - **Ingest:** 740 docs/s, falling as N grows.
+  - **Open for 10M:**
+    - Unindexed tail upserts disable the directory path.
+    - BM25 reads 49 MB per cold query (ID indexes, lengths, and statistics), which grows linearly.
+    - Selective filters need about 1,900 requests.
+    - Ingest is bound by bytes uploaded per doc.
+
 - **Perf iteration 5 merged (100K): scale-ready ANN directory.**
   - **Changes:**
     - Directory centers are 1-bit codes: 196 B per leaf, down from about 1.1 KB. The 100K directory is 139 KB; projected at 10M it's about 4.4 MB.
