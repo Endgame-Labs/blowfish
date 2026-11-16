@@ -125,7 +125,7 @@ pub(crate) async fn text_index(
     Ok(read_cache::insert(&file.key, resident, index))
 }
 
-fn corrupt() -> ApiError {
+pub(crate) fn corrupt() -> ApiError {
     ApiError::new(500, "stored segment is corrupt or unsupported")
 }
 pub(crate) fn index_error(e: impl std::fmt::Display) -> ApiError {
@@ -342,12 +342,12 @@ fn build_text(
     Ok((bytes, metadata_len))
 }
 
-pub(crate) async fn build(
+pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
     store: &Storage,
     ns: &str,
     schema: &Schema,
     metric: bf_types::DistanceMetric,
-    docs: &BTreeMap<Id, Document>,
+    docs: &BTreeMap<Id, D>,
     start: u64,
     end: u64,
 ) -> Result<Segment, ApiError> {
@@ -358,7 +358,7 @@ pub(crate) async fn build(
     let mut files = BTreeMap::new();
     let mut body = vec![];
     let mut dir = Directory::default();
-    let rows: Vec<_> = docs.values().collect();
+    let rows: Vec<&Document> = docs.values().map(|d| d.borrow()).collect();
     // Index builds are CPU-bound: start them on blocking workers now, so they overlap with
     // document encoding and uploads below instead of running one after another.
     let mut ann_jobs = Vec::new();

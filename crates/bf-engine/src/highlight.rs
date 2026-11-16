@@ -276,7 +276,9 @@ fn highlights(
             fragment_doc.insert("$fragment".into(), json!(fragment));
             let id = Id::Uint(fragments.docs.len() as u64);
             fragment_doc.insert("id".into(), id.value());
-            fragments.docs.insert(id, fragment_doc.clone());
+            fragments
+                .docs
+                .insert(id, std::sync::Arc::new(fragment_doc.clone()));
             candidates.push((element, range, spans, fragment_doc));
         }
     }

@@ -176,6 +176,11 @@ pub(crate) async fn replay(
         install(state, &pin);
     }
     state.replay(seq, entry);
+    if entry.write_id.get_version_num() == 8
+        && let Some(last) = state.entries.last_mut()
+    {
+        last.copy = true;
+    }
     Ok(())
 }
 /// Pins conservatively outlive both branches and in-flight copies. Keeping an

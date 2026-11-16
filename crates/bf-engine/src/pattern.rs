@@ -17,10 +17,12 @@ fn grams(text: &str) -> Vec<String> {
         .collect()
 }
 impl Trigrams {
-    pub fn build(docs: &BTreeMap<Id, Document>, name: &str) -> Self {
+    pub fn build<D: std::borrow::Borrow<Document>>(docs: &BTreeMap<Id, D>, name: &str) -> Self {
         let mut out = Self::default();
         for (row, doc) in docs.values().enumerate() {
-            let Some(value) = doc.get(name) else { continue };
+            let Some(value) = doc.borrow().get(name) else {
+                continue;
+            };
             let strings: Vec<_> = if let Some(s) = value.as_str() {
                 vec![s]
             } else {
@@ -272,9 +274,9 @@ pub(crate) async fn segment_scores(
     }
     Ok(direct)
 }
-pub(crate) fn tail_scores(
+pub(crate) fn tail_scores<D: std::borrow::Borrow<Document>>(
     rank: Option<&bf_types::RankBy>,
-    docs: &BTreeMap<Id, Document>,
+    docs: &BTreeMap<Id, D>,
     out: &mut crate::NamespaceState,
 ) -> Result<(), ApiError> {
     let mut clauses = vec![];
@@ -294,7 +296,7 @@ pub(crate) fn tail_scores(
                 id.clone(),
                 f64::from(u8::from(crate::filter::matches(
                     f,
-                    Some(doc),
+                    Some(doc.borrow()),
                     None,
                     &out.schema,
                 )?)),

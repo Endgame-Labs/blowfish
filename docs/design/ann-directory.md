@@ -165,3 +165,23 @@ A filtered ANN query now takes the same path as an unfiltered one:
 Old fragments and directories (no map) make the directory unusable for the namespace until compaction rewrites them:
 queries use the per-segment path, as for segments without fragments. A directory in an unknown format is ignored, not an
 error. The unindexed-tail fall-back (any tail upsert disables the directory path) is unchanged and is the next fix.
+
+## Iteration 7: the unindexed tail and the directory
+
+An unindexed tail no longer disables the directory path. `NamespaceState::shadowed` still records every tail ID, but the
+directory search does not need it to exclude segment rows up front:
+
+1. The directory search asks for `k + max(2k, 20)` winners when `shadowed` is not empty.
+2. Winners whose ID is in `shadowed` (an overwrite or delete in the tail) are dropped by ID. IDs that are new in the tail
+   (the bulk-load case) never appear in a segment, so nothing is dropped and the extra winners are trimmed.
+3. If the drops leave fewer than k winners while the pool was full, the query falls back to the per-segment path (rare:
+   it needs most of the nearest rows to be overwritten).
+
+Filtered queries compute their per-segment allowed bitmaps without the shadow lookup (`snapshot::allowed_with(.., false)`),
+which would have opened every segment's ID index, and drop shadowed winners the same way. The test
+`unindexed_tail_keeps_the_directory_path` deletes and moves the query's own three nearest neighbours in the tail and checks
+that results stay exact with no `.bfi` read.
+
+The indexer also stopped invalidating the resident tail: a node that publishes a checkpoint adopts it in memory
+(`NamespaceState::fast_forward`, using each tail ID's last-write sequence), and a manifest that republishes the checkpoint
+the node already holds (garbage collection, epoch claims) leaves the tail alone.

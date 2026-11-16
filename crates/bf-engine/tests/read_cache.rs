@@ -36,6 +36,8 @@ struct Counting {
     resume_head: tokio::sync::Notify,
     wal_active: AtomicUsize,
     wal_max_active: AtomicUsize,
+    /// Downloads of WAL payload objects.
+    payload_reads: AtomicUsize,
 }
 impl fmt::Display for Counting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -68,6 +70,9 @@ impl ObjectStore for Counting {
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> StoreResult<GetResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if !opts.head && path.as_ref().contains("/wal-data/") {
+            self.payload_reads.fetch_add(1, Ordering::SeqCst);
+        }
         if opts.head
             && path.as_ref().contains("/wal/")
             && self.pause_head.swap(false, Ordering::SeqCst)
@@ -744,4 +749,220 @@ async fn filtered_ann_uses_the_directory_without_opening_id_indexes() {
         );
         assert!(backend.waves.load(Ordering::SeqCst) <= 5);
     }
+}
+
+/// An unindexed tail (new rows, overwrites of segment rows, and deletes) keeps the directory
+/// path: no ID index is opened, shadowed rows are dropped by ID, and answers stay exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unindexed_tail_keeps_the_directory_path() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    let vector = |id: usize| -> Vec<f32> {
+        (0..64)
+            .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+            .collect()
+    };
+    for batch in 0..12usize {
+        let docs: Vec<_> = (0..400)
+            .map(|n| {
+                let id = batch * 400 + n;
+                json!({"id":id,"vector":vector(id)})
+            })
+            .collect();
+        writer
+            .write(
+                "tail",
+                serde_json::from_value(json!({
+                    "distance_metric":"euclidean_squared","upsert_rows":docs
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.index_namespace("tail", true).await.unwrap();
+    }
+    // The query's own nearest neighbours are deleted or overwritten in the tail, so shadowed
+    // rows really do rank in the segments' top results.
+    let target = vector(123);
+    let distance =
+        |v: &[f32]| -> f32 { v.iter().zip(&target).map(|(a, b)| (a - b) * (a - b)).sum() };
+    let mut logical: std::collections::BTreeMap<usize, Vec<f32>> =
+        (0..4800).map(|id| (id, vector(id))).collect();
+    let mut by_distance: Vec<usize> = logical.keys().copied().collect();
+    by_distance.sort_by(|a, b| distance(&logical[a]).total_cmp(&distance(&logical[b])));
+    let doomed: Vec<usize> = by_distance[..3].to_vec();
+    let moved: Vec<usize> = by_distance[3..6].to_vec();
+    let mut tail_docs = Vec::new();
+    for id in &moved {
+        // Moved far away from the query.
+        let far: Vec<f32> = vector(*id).iter().map(|x| x + 50.0).collect();
+        logical.insert(*id, far.clone());
+        tail_docs.push(json!({"id":id,"vector":far}));
+    }
+    for id in 5000..5050usize {
+        logical.insert(id, vector(id));
+        tail_docs.push(json!({"id":id,"vector":vector(id)}));
+    }
+    for id in &doomed {
+        logical.remove(id);
+    }
+    writer
+        .write(
+            "tail",
+            serde_json::from_value(json!({"upsert_rows":tail_docs,"deletes":doomed})).unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut expected: Vec<usize> = logical.keys().copied().collect();
+    expected.sort_by(|a, b| distance(&logical[a]).total_cmp(&distance(&logical[b])));
+    expected.truncate(10);
+    let engine = Engine::with_config(store(backend.clone()).await, config());
+    backend.waves.store(0, Ordering::SeqCst);
+    backend.paths.lock().unwrap().clear();
+    backend.delay.store(true, Ordering::SeqCst);
+    let request = serde_json::from_value(json!({
+        "rank_by":["vector","ANN",target],"top_k":10
+    }))
+    .unwrap();
+    let result = engine.query("tail", request).await.unwrap();
+    backend.delay.store(false, Ordering::SeqCst);
+    let got: Vec<usize> = result
+        .result
+        .rows
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_u64().unwrap() as usize)
+        .collect();
+    assert!(
+        !got.iter()
+            .any(|id| doomed.contains(id) || moved.contains(id)),
+        "shadowed rows leaked: {got:?}"
+    );
+    let hits = got.iter().filter(|id| expected.contains(id)).count();
+    assert!(hits >= 9, "{hits} of 10: got {got:?} want {expected:?}");
+    let reads: Vec<String> = backend
+        .paths
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect();
+    assert!(
+        !reads.iter().any(|p| p.contains(".bfi")),
+        "an unindexed tail opened an ID index: {reads:?}"
+    );
+    assert!(backend.waves.load(Ordering::SeqCst) <= 4);
+}
+
+/// While writes keep arriving, a bulk load accumulates its tail into a large segment instead
+/// of flushing a small one every cycle; once the limit is reached (or the writes stop) it
+/// flushes, and a forced index always flushes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_writes_accumulate_into_one_large_segment() {
+    let backend = Arc::new(Counting::default());
+    let engine = Engine::with_config(
+        Storage::from_backend(backend.clone(), Path::default(), false, false)
+            .await
+            .unwrap(),
+        EngineConfig {
+            index_rows: 10,
+            bulk_flush_rows: 1000,
+            ..config()
+        },
+    );
+    let write = |from: usize, rows: usize| {
+        let docs: Vec<_> = (from..from + rows)
+            .map(|id| json!({"id":id,"vector":[id as f32, 1.0]}))
+            .collect();
+        engine.write(
+            "bulk",
+            serde_json::from_value(json!({
+                "distance_metric":"euclidean_squared","upsert_rows":docs
+            }))
+            .unwrap(),
+        )
+    };
+    write(0, 300).await.unwrap();
+    // Writes are still hot and the tail is under the limit: nothing is built.
+    assert!(!engine.index_namespace("bulk", false).await.unwrap());
+    write(300, 300).await.unwrap();
+    assert!(!engine.index_namespace("bulk", false).await.unwrap());
+    // Past the row limit the whole tail becomes one segment.
+    write(600, 500).await.unwrap();
+    assert!(engine.index_namespace("bulk", false).await.unwrap());
+    let fresh = Engine::with_config(store(backend.clone()).await, config());
+    let described = fresh
+        .query(
+            "bulk",
+            serde_json::from_value(json!({"rank_by":["vector","ANN",[5.0,1.0]],"top_k":3}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(described.result.rows.as_ref().unwrap().len(), 3);
+    let segments = backend
+        .inner
+        .list(None)
+        .filter(|o| {
+            futures::future::ready(
+                o.as_ref()
+                    .is_ok_and(|o| o.location.as_ref().ends_with("docs.bfc")),
+            )
+        })
+        .count()
+        .await;
+    assert_eq!(segments, 1);
+    // A forced index flushes even a small hot tail.
+    write(2000, 5).await.unwrap();
+    assert!(engine.index_namespace("bulk", true).await.unwrap());
+}
+
+/// Garbage collection republishes the manifest without advancing the checkpoint. A node that
+/// holds the unindexed tail in memory must keep it, not download the WAL payloads again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_republication_keeps_the_resident_tail() {
+    let backend = Arc::new(Counting::default());
+    let engine = Engine::with_config(
+        Storage::from_backend(backend.clone(), Path::default(), false, false)
+            .await
+            .unwrap(),
+        EngineConfig {
+            retention: std::time::Duration::from_millis(1),
+            ..config()
+        },
+    );
+    let write = |from: usize, rows: usize| {
+        let docs: Vec<_> = (from..from + rows)
+            .map(|id| json!({"id":id,"vector":[id as f32, 1.0],"pad":"x".repeat(200)}))
+            .collect();
+        engine.write(
+            "gc",
+            serde_json::from_value(json!({
+                "distance_metric":"euclidean_squared","upsert_rows":docs
+            }))
+            .unwrap(),
+        )
+    };
+    write(0, 1000).await.unwrap();
+    engine.index_namespace("gc", true).await.unwrap();
+    write(1000, 1000).await.unwrap();
+    engine.index_namespace("gc", true).await.unwrap();
+    // An unindexed tail, big enough to live in its own payload object.
+    write(2000, 1000).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    backend.payload_reads.store(0, Ordering::SeqCst);
+    let removed = engine.collect_garbage("gc").await.unwrap();
+    assert!(removed > 0, "garbage collection published nothing");
+    let request =
+        serde_json::from_value(json!({"rank_by":["vector","ANN",[2500.0, 1.0]],"top_k":3}))
+            .unwrap();
+    let result = engine.query("gc", request).await.unwrap();
+    assert_eq!(result.result.rows.as_ref().unwrap()[0]["id"], 2500);
+    write(3000, 10).await.unwrap();
+    let payload_reads = backend.payload_reads.load(Ordering::SeqCst);
+    assert_eq!(payload_reads, 0, "the tail was downloaded again");
 }

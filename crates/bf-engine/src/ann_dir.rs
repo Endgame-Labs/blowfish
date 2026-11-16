@@ -184,7 +184,7 @@ pub(crate) async fn live_masks(
     futures::future::try_join_all(state.segments.iter().map(|seg| async move {
         if let Some(f) = filter {
             return Ok(Some(Arc::new(
-                crate::snapshot::allowed(store, state, seg, Some(f)).await?,
+                crate::snapshot::allowed_with(store, state, seg, Some(f), false).await?,
             )));
         }
         if seg.live_generation == 0 {

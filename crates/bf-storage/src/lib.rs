@@ -368,16 +368,32 @@ impl Storage {
         key: &str,
         value: impl Into<Bytes>,
     ) -> Result<CreateResult, Error> {
-        const MULTIPART_MIN: usize = 32 << 20;
-        const PART: usize = 16 << 20;
+        self.create_unique_sized(key, value, 32 << 20, 16 << 20)
+            .await
+    }
+    /// Whether the store supports conditional creates, and so multipart uploads here.
+    pub fn is_conditional(&self) -> bool {
+        self.0.mode == StorageMode::Conditional
+    }
+    /// [`Self::create_unique`] with explicit thresholds: values of at least `multipart_min`
+    /// bytes go up in parts of `part` bytes (object stores need at least 5 MiB per part).
+    pub async fn create_unique_sized(
+        &self,
+        key: &str,
+        value: impl Into<Bytes>,
+        multipart_min: usize,
+        part: usize,
+    ) -> Result<CreateResult, Error> {
+        const MIN_PART: usize = 5 << 20;
+        let (min, part) = (multipart_min, part.max(MIN_PART));
         let value = value.into();
-        if value.len() < MULTIPART_MIN || self.0.mode != StorageMode::Conditional {
+        if value.len() < min || self.0.mode != StorageMode::Conditional {
             return self.create(key, value).await;
         }
         self.writable()?;
         let path = self.path(key);
         let upload = self.0.backend.put_multipart(&path).await?;
-        let mut writer = object_store::WriteMultipart::new_with_chunk_size(upload, PART);
+        let mut writer = object_store::WriteMultipart::new_with_chunk_size(upload, part);
         let mut header = Vec::with_capacity(HEADER);
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(Uuid::new_v4().as_bytes());
@@ -386,7 +402,7 @@ impl Storage {
         let result = async {
             while offset < value.len() {
                 writer.wait_for_capacity(8).await?;
-                let end = (offset + PART).min(value.len());
+                let end = (offset + part).min(value.len());
                 writer.put(value.slice(offset..end));
                 offset = end;
             }

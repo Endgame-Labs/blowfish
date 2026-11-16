@@ -128,19 +128,27 @@ impl OpenHint {
                         );
                     }
                 }
-                if (!self.ann.is_empty() && !by_dir) || !self.text.is_empty() {
+                let small_ids = seg
+                    .files
+                    .get("ids")
+                    .is_none_or(|f| f.size <= crate::indexed::RANGED_IDS_BYTES);
+                if (!self.ann.is_empty() && !by_dir) || (!self.text.is_empty() && small_ids) {
                     tasks.push(
                         timed("ids", segment::ids(store, seg))
                             .map(|r| r.map(drop))
                             .boxed(),
                     );
+                }
+                if (!self.ann.is_empty() && !by_dir) || !self.text.is_empty() {
                     tasks.push(
                         segment::get_value::<RoaringBitmap>(store, &seg.live)
                             .map_ok(drop)
                             .boxed(),
                     );
                 }
-                if self.docs && !(by_dir && self.text.is_empty() && !self.ann.is_empty()) {
+                if (self.docs && !(by_dir && self.text.is_empty() && !self.ann.is_empty()))
+                    || (!self.text.is_empty() && !small_ids)
+                {
                     tasks.push(segment::warm_docs(store, seg).map(|()| Ok(())).boxed());
                 }
             }
@@ -177,6 +185,26 @@ pub(crate) async fn catch_up(
 ) -> Result<(), ApiError> {
     catch_up_hinted(wal, state, cap, store, None).await
 }
+/// A manifest that republishes the checkpoint this state already holds (garbage collection and
+/// epoch claims do) changes nothing the state depends on, so it must not discard the resident
+/// tail: rebuilding would download every unindexed WAL payload again.
+fn same_checkpoint(state: &NamespaceState, m: &bf_wal::Manifest) -> bool {
+    state.exists
+        && !m.deleted
+        && m.indexed_through == state.indexed_through
+        && state.segments.len() == m.segments.len()
+        && state
+            .segments
+            .iter()
+            .zip(&m.segments)
+            .all(|(a, b)| a.id == b.id && a.live.key == b.live.key)
+        && state.text_stats.as_ref().map(|f| &f.key) == m.text_stats.as_ref().map(|f| &f.key)
+        && state.ann_dirs.len() == m.ann_dirs.len()
+        && state
+            .ann_dirs
+            .iter()
+            .all(|(k, f)| m.ann_dirs.get(k).is_some_and(|g| g.key == f.key))
+}
 pub(crate) async fn catch_up_hinted(
     wal: &Wal,
     state: &mut NamespaceState,
@@ -195,7 +223,10 @@ pub(crate) async fn catch_up_hinted(
             if m.format_version != 1 {
                 return Err(ApiError::new(500, "unsupported manifest format"));
             }
-            if m.indexed_through > 0 && generation > state.manifest_seq {
+            if m.indexed_through > 0
+                && generation > state.manifest_seq
+                && !same_checkpoint(state, &m)
+            {
                 *state = if m.deleted {
                     NamespaceState {
                         seq: m.indexed_through,
@@ -271,8 +302,19 @@ pub(crate) async fn allowed(
     seg: &bf_wal::Segment,
     f: Option<&Filter>,
 ) -> Result<RoaringBitmap, ApiError> {
+    allowed_with(store, state, seg, f, true).await
+}
+/// `allowed`, optionally leaving tail-shadowed rows in (the directory ANN path drops them by
+/// ID from its winners instead of opening the segment's ID index).
+pub(crate) async fn allowed_with(
+    store: &Storage,
+    state: &NamespaceState,
+    seg: &bf_wal::Segment,
+    f: Option<&Filter>,
+    unshadow: bool,
+) -> Result<RoaringBitmap, ApiError> {
     let mut live = segment::live(store, seg).await?;
-    if !state.shadowed.is_empty() {
+    if unshadow && !state.shadowed.is_empty() {
         live -= segment::lookup_many(store, seg, &state.shadowed).await?;
     }
     if let Some(f) = f {
@@ -289,11 +331,11 @@ pub(crate) async fn materialize(
     for seg in &state.segments {
         let live = allowed(store, state, seg, None).await?;
         full.docs
-            .extend(segment::documents(store, seg, &live).await?);
+            .extend(crate::shared(segment::documents(store, seg, &live).await?));
     }
     // Schema drops apply immediately even while older segment columns remain on disk.
     for doc in full.docs.values_mut() {
-        doc.retain(|name, _| state.schema.contains_key(name));
+        std::sync::Arc::make_mut(doc).retain(|name, _| state.schema.contains_key(name));
     }
     Ok(full)
 }
@@ -347,16 +389,22 @@ pub(crate) async fn for_writes(
             })
             .collect();
     }
-    let mut full = state.clone();
+    // A write reads only the rows it names: tail rows by ID here, segment rows below.
+    let mut full = state.without_docs();
+    for id in &wanted {
+        if let Some(doc) = state.docs.get(id) {
+            full.docs.insert(id.clone(), doc.clone());
+        }
+    }
     for seg in &state.segments {
         let live = segment::live(store, seg).await?;
         let wanted = wanted.difference(&state.shadowed).cloned().collect();
         let rows = segment::lookup_many(store, seg, &wanted).await? & live;
         full.docs
-            .extend(segment::documents(store, seg, &rows).await?);
+            .extend(crate::shared(segment::documents(store, seg, &rows).await?));
     }
     for doc in full.docs.values_mut() {
-        doc.retain(|name, _| state.schema.contains_key(name));
+        std::sync::Arc::make_mut(doc).retain(|name, _| state.schema.contains_key(name));
     }
     Ok(full)
 }
@@ -384,7 +432,7 @@ pub(crate) async fn statistics(
     stats.logical_bytes += state
         .docs
         .values()
-        .map(|d| serde_json::to_vec(d).expect("document serializes").len() as u64)
+        .map(|d| serde_json::to_vec(&**d).expect("document serializes").len() as u64)
         .sum::<u64>();
     Ok(stats)
 }

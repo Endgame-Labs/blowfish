@@ -46,7 +46,7 @@ pub(crate) fn prepare(
         }
         let now = Utc::now();
         let batch = WriteBatch {
-            upserts: source.docs.values().cloned().collect(),
+            upserts: source.docs.values().map(|d| (**d).clone()).collect(),
             deletes: source.shadowed.iter().cloned().collect(),
             schema: source.schema.clone(),
             distance_metric: source.metric,
@@ -103,7 +103,7 @@ pub(crate) fn prepare(
                 }
                 state.schema.remove(name);
                 for doc in state.docs.values_mut() {
-                    doc.remove(name);
+                    std::sync::Arc::make_mut(doc).remove(name);
                 }
                 continue;
             }
@@ -303,7 +303,7 @@ pub(crate) fn prepare(
         }
         remaining |= ids.len() > 50_000;
         for id in ids.into_iter().take(50_000) {
-            let doc = state.docs.get_mut(&id).expect("matched row");
+            let doc = std::sync::Arc::make_mut(state.docs.get_mut(&id).expect("matched row"));
             apply_patch(doc, &patch);
             patched.push(id);
         }
@@ -315,7 +315,7 @@ pub(crate) fn prepare(
             _ => true,
         };
         if allowed {
-            state.docs.insert(id.clone(), row);
+            state.docs.insert(id.clone(), std::sync::Arc::new(row));
             upserted.push(id);
         }
     }
@@ -328,7 +328,10 @@ pub(crate) fn prepare(
                 true
             };
             if allowed {
-                apply_patch(state.docs.get_mut(&id).expect("existing row"), &patch);
+                apply_patch(
+                    std::sync::Arc::make_mut(state.docs.get_mut(&id).expect("existing row")),
+                    &patch,
+                );
                 patched.push(id);
             }
         }
@@ -384,7 +387,7 @@ pub(crate) fn prepare(
                         .ne(doc.iter())
                 })
             })
-            .map(|(_, doc)| doc.clone())
+            .map(|(_, doc)| (**doc).clone())
             .collect(),
         deletes: current
             .docs
