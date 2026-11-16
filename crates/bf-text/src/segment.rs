@@ -21,7 +21,7 @@ const VERSION: u32 = 1;
 /// term to `(record offset << DF_BITS) | document frequency`, and every term's block directory is
 /// a separately checksummed record that is read only when a query needs the term.
 const VERSION_LAZY: u32 = 2;
-/// Chunked dictionary: postings, term records, dictionary chunks, lengths, chunk index. Each
+/// Chunked dictionary and packed lengths: postings, term records, dictionary chunks, lengths, chunk index. Each
 /// chunk is a small FST over `CHUNK_TERMS` consecutive terms with its own checksum, and the
 /// index (first term, offset, length, checksum per chunk) sits next to the lengths in the
 /// metadata tail, so a query reads only the chunks that hold its terms.
@@ -345,9 +345,7 @@ impl SegmentBuilder {
             bytes.extend_from_slice(blob);
         }
         let lengths_offset = bytes.len() as u64;
-        for length in &self.lengths {
-            put32(&mut bytes, *length);
-        }
+        encode_lengths(&self.lengths, &mut bytes);
         let dictionary_offset = bytes.len() as u64;
         bytes.extend_from_slice(&index);
         let lengths_crc =
@@ -374,6 +372,56 @@ impl SegmentBuilder {
         bytes.extend(footer);
         Ok(bytes)
     }
+}
+
+/// Document lengths, packed per 128-row block as `minimum (u32) | bits (u8) | packed offsets`.
+/// Typical passages need about one byte per row, against four unpacked.
+fn encode_lengths(lengths: &[u32], out: &mut Vec<u8>) {
+    let packer = BitPacker4x::new();
+    for block in lengths.chunks(BLOCK) {
+        let min = *block.iter().min().unwrap();
+        let mut offsets = [min; BLOCK];
+        offsets[..block.len()].copy_from_slice(block);
+        for v in &mut offsets {
+            *v -= min;
+        }
+        let bits = packer.num_bits(&offsets);
+        put32(out, min);
+        out.push(bits);
+        let start = out.len();
+        out.resize(start + 16 * bits as usize, 0);
+        packer.compress(&offsets, &mut out[start..], bits);
+    }
+}
+fn decode_lengths(data: &[u8], docs: usize) -> io::Result<Vec<u32>> {
+    let packer = BitPacker4x::new();
+    let mut out = Vec::with_capacity(docs.div_ceil(BLOCK) * BLOCK);
+    let mut at = 0;
+    while out.len() < docs {
+        let min = u32::from_le_bytes(checked_slice(data, at..at + 4)?.try_into().unwrap());
+        let bits = *data
+            .get(at + 4)
+            .ok_or_else(|| invalid("truncated lengths"))?;
+        let size = 16 * bits as usize;
+        if bits > 32 {
+            return Err(invalid("invalid length block"));
+        }
+        let packed = checked_slice(data, at + 5..at + 5 + size)?;
+        let mut offsets = [0u32; BLOCK];
+        packer.decompress(packed, &mut offsets, bits);
+        for v in offsets {
+            out.push(
+                min.checked_add(v)
+                    .ok_or_else(|| invalid("invalid document length"))?,
+            );
+        }
+        at += 5 + size;
+    }
+    if at != data.len() {
+        return Err(invalid("trailing document lengths"));
+    }
+    out.truncate(docs);
+    Ok(out)
 }
 
 fn build_chunk(terms: &[(&str, u64)]) -> io::Result<(String, Vec<u8>)> {
@@ -545,7 +593,7 @@ impl SegmentReader {
             metadata_offset <= lengths_offset
                 && lengths_offset <= dictionary_offset
                 && dictionary_offset < footer_start
-                && dictionary_offset - lengths_offset == docs as u64 * 4
+                && (chunked || dictionary_offset - lengths_offset == docs as u64 * 4)
         } else {
             lengths_offset <= metadata_offset
                 && metadata_offset <= dictionary_offset
@@ -576,12 +624,16 @@ impl SegmentReader {
             verify(&index[lengths_end..dict_start], metadata_crc)?;
         }
         verify(&index[dict_start..], dictionary_crc)?;
-        let lengths: Vec<u32> = index[..lengths_end]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|n| u32::from_le_bytes(*n))
-            .collect();
+        let lengths: Vec<u32> = if chunked {
+            decode_lengths(&index[..lengths_end], docs as usize)?
+        } else {
+            index[..lengths_end]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|n| u32::from_le_bytes(*n))
+                .collect()
+        };
         if lengths.iter().map(|&n| n as u64).sum::<u64>() != total_tokens {
             return Err(invalid("invalid document length sum"));
         }

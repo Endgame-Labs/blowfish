@@ -447,7 +447,7 @@ pub(crate) fn recall(ann: &QueryResponse, exact: &QueryResponse) -> f64 {
 }
 
 /// ID indexes above this size are not read whole by BM25 queries.
-pub(crate) const RANGED_IDS_BYTES: u64 = 1 << 20;
+pub(crate) const RANGED_IDS_BYTES: u64 = 128 << 10;
 pub(crate) fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) {
     match rank {
         RankBy::Bm25 { .. } => clauses.push(rank),
