@@ -852,7 +852,31 @@ fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<Strin
             return group.0.clone();
         }
     }
-    vec![]
+    // No tier is full. Merge the smallest sizeable segments (at least an eighth of the row cap,
+    // so trickles of small writes do not rewrite big segments) that fit under the caps together,
+    // whatever their tier: the odd-sized tail of a bulk load still ends up in a few large
+    // segments. Segments past half the cap never qualify, so this stops by itself.
+    let floor = (config.max_segment_rows.max(1) / 8) as u32;
+    let mut by_size: Vec<_> = state
+        .segments
+        .iter()
+        .filter(|seg| seg.row_count >= floor)
+        .collect();
+    by_size.sort_by_key(|seg| (seg.row_count, seg.id.clone()));
+    let (mut ids, mut rows, mut bytes) = (Vec::new(), 0u64, 0u64);
+    for seg in by_size {
+        let size = seg.files.values().map(|file| file.size).sum::<u64>();
+        if rows.saturating_add(seg.row_count as u64) > config.max_segment_rows.max(1) as u64
+            || bytes.saturating_add(size) > config.max_segment_bytes.max(1)
+            || ids.len() == count
+        {
+            break;
+        }
+        ids.push(seg.id.clone());
+        rows += seg.row_count as u64;
+        bytes += size;
+    }
+    if ids.len() >= 2 { ids } else { vec![] }
 }
 
 // A segment build owns only one bounded document batch at a time. The WAL overlay
@@ -938,5 +962,11 @@ mod tests {
         // Small segments still merge four at a time.
         let small = state_with(&[1000, 1100, 1200, 1300, 1400]);
         assert_eq!(tier(&small, &config, false).len(), 4);
+        // Odd sizes in different tiers merge while their total fits under the cap.
+        let odd = state_with(&[70_000, 90_000, 150_000]);
+        assert_eq!(tier(&odd, &config, false), vec!["s0", "s1"]);
+        // Small ones are left to their own tiers.
+        assert!(tier(&state_with(&[300, 50_000]), &config, false).is_empty());
+        assert!(tier(&state_with(&[110_000, 150_000]), &config, false).is_empty());
     }
 }
