@@ -177,7 +177,7 @@ def main():
                         body.update(distance_metric="cosine_distance", schema={
                             "text": {"type": "string", "full_text_search": True, "filterable": False},
                             "title": {"type": "string", "filterable": False},
-                            "title_initial": "string", "text_length": "int", "vector": f"[1024]{args.vector_type}"})
+                            "title_initial": "string", "text_length": "int", "vector": {"type": f"[1024]{args.vector_type}", "ann": True}})  # real turbopuffer requires ann:true
                     # Overlap the (network-bound) write with the truth computation and the next
                     # batch's preparation. The schema-carrying first write completes before any other.
                     while len(inflight) >= args.inflight:
