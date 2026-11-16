@@ -1293,8 +1293,8 @@ I did not isolate it from the session noise.
 | --- | --- | --- |
 | Loader wall time, docs/s | 834 s, 1,199 | 903 s, 1,107 (first load: 863 s, 1,158) |
 | 429s | 0 | 0 |
-| Server peak RSS | about 3.1 GB | 5.4 GB (first load, with 3.5 GB less spare cache: 9.6 GB; not investigated) |
-| Segments when the load ends (before compaction) | 21 | 15 |
+| Server peak RSS | about 3.1 GB | 5.4 GB (the first load of this round peaked at 9.6 GB; not investigated) |
+| Segments when the load ends, before compaction | not recorded | 15 |
 
 Ingest did not improve: it is bound by bytes per document through the WAL (item 4 of the brief, not started).
 
