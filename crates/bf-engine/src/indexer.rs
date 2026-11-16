@@ -49,6 +49,10 @@ pub struct EngineConfig {
     /// A filtered ANN query with at most this many allowed rows fetches and ranks exactly
     /// those rows' vectors instead of scanning quantized codes.
     pub exact_fetch_rows: usize,
+    /// A filtered ANN query that scans codes probes up to this many times as many clusters as
+    /// an unfiltered one, in proportion to how few rows the filter leaves (recall on filtered
+    /// sets needs a deeper probe than the allowed fraction alone suggests).
+    pub filtered_probe_cap: usize,
     /// Fraction of ANN requests checked against exhaustive ground truth.
     pub recall_sample_rate: f64,
 }
@@ -95,6 +99,7 @@ impl Default for EngineConfig {
             ann_nprobe: 64,
             ann_rerank_factor: 32,
             exact_fetch_rows: 8192,
+            filtered_probe_cap: 3,
             recall_sample_rate: 0.01,
         }
     }
@@ -152,6 +157,9 @@ impl EngineConfig {
         }
         if let Some(v) = number("BF_EXACT_FETCH") {
             c.exact_fetch_rows = v as usize;
+        }
+        if let Some(v) = number("BF_FILTER_PROBE_CAP") {
+            c.filtered_probe_cap = v as usize;
         }
         c
     }

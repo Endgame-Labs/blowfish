@@ -330,12 +330,16 @@ pub(crate) async fn search(
                 .map(|(n, _)| (distances[n], n))
                 .collect();
             let scale = (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0);
-            // Deleted rows thin the probed clusters, so probe more. A filter does not widen
-            // the probe count: probing continues until the allowed candidates reach `target`.
-            let thin = if filtered {
-                1.0
-            } else {
-                ann_rows as f64 / matching.max(1) as f64
+            // Deleted rows and filtered-out rows thin the probed clusters, so probe more (a
+            // filter at most `filtered_probe_cap` times) and keep probing until the allowed
+            // candidates reach `target`.
+            let thin = {
+                let thin = ann_rows as f64 / matching.max(1) as f64;
+                if filtered {
+                    thin.min(config.filtered_probe_cap.max(1) as f64)
+                } else {
+                    thin
+                }
             };
             let probes = ((config.ann_nprobe as f64 * scale * thin).ceil() as usize).min(clusters);
             order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));

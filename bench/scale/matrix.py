@@ -69,12 +69,22 @@ def ops():
 
 
 def rss_peak_gib():
-    pid = subprocess.run(["pgrep", "-f", "blowfish-scale-server"], capture_output=True, text=True).stdout.split()
-    if not pid:
-        return None
-    for l in open(f"/proc/{pid[0]}/status"):
-        if l.startswith("VmHWM"):
-            return int(l.split()[1]) / 2**20
+    """Peak resident set of the running server process (VmHWM), from its systemd scope."""
+    pids = subprocess.run(["systemctl", "--user", "show", f"{UNIT}.scope", "-p", "MainPID", "--value"],
+                          capture_output=True, text=True).stdout.split()
+    # The scope's main PID is the server itself when started through systemd-run --scope.
+    candidates = [p for p in pids if p.isdigit() and p != "0"]
+    if not candidates:
+        cg = subprocess.run(["pgrep", "-f", "blowfish-scale-server"], capture_output=True, text=True).stdout.split()
+        candidates = cg[-1:]
+    for pid in candidates:
+        try:
+            for line in open(f"/proc/{pid}/status"):
+                if line.startswith("VmHWM"):
+                    return int(line.split()[1]) / 2**20
+        except OSError:
+            continue
+    return None
 
 
 def recall(kind, rows):
