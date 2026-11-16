@@ -4,6 +4,25 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-16
 
+- **Perf iteration 9 merged (1M): R2 tail latency.**
+  - **Floor model:** one GET is 72 ms p50 and 309 ms p99. A wave of 256 parallel GETs takes about 290 ms on warm connections and about 1.05 s on fresh ones; a new TLS connection costs about 65 ms.
+  - **Changes:**
+    - A warm connection pool (`BF_WARM_CONNECTIONS`, default 256).
+    - Hedged ranged reads, capped at 10% extra requests.
+    - The ANN half of hybrid no longer waits for BM25 term warm-up.
+    - An interleaved A/B harness (`bench/scale/ab.py`).
+  - **Same-session cold p50 / p90 at 1M:**
+
+    | Query | Before | After |
+    |---|---|---|
+    | ANN | 1,392 / 1,950 ms | 1,278 / 1,593 ms |
+    | BM25 | 1,069 / 1,816 ms | 869 / 1,594 ms |
+    | hybrid | 1,635 / 2,714 ms | 1,188 / 1,752 ms |
+    | selective | 1,958 / 2,642 ms | 1,973 / 2,600 ms |
+
+  - **Recall and parity:** unchanged.
+  - **Open:** selective needs a new structure (1,900 requests); the cold ANN layout should put blobs next to codes; the manifest and directory are read in sequence; and the warm pool is fixed and always on, costing about $5 a month in R2 HEADs even when idle.
+
 - **Projects, keys, and the admin console merged and deployed.**
   - **Model:** org superadmin keys; projects with isolated namespaces under `projects/<id>/`, with `default` mapping to the root; and project `admin`, `read_write`, and `read` keys.
   - **API:** `whoami`, the admin API, and `docs/api/admin.openapi.yaml`.

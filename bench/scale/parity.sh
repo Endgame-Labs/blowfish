@@ -9,6 +9,6 @@ python3 "$BENCH_DIR/mkconfig.py" "$CONFIG" "$W/storage.json" "$W/cache" --memory
 RAYON_NUM_THREADS=6 MALLOC_ARENA_MAX=2 "$BIN" "$W/storage.json" "127.0.0.1:$PORT" > "$W/server.log" 2>&1 &
 PID=$!; trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$W"' EXIT
 until curl -s -o /dev/null "http://127.0.0.1:$PORT/"; do sleep 0.5; done
-TPUF_URL="${TPUF_URL:-https://turbopuffer.example.internal}" uv run "$BENCH_DIR/oracle_compare.py" \
+: "${TPUF_URL:?set TPUF_URL to your turbopuffer endpoint}"; TPUF_URL="$TPUF_URL" uv run "$BENCH_DIR/oracle_compare.py" \
   --blowfish "http://127.0.0.1:$PORT" --bf-ns "$(cfg namespace)" --tpuf-ns "$(cfg tpuf_namespace)" \
   --data "$BENCH_DIR/data/oracle-1m.npz" --kinds "$KINDS" --out "$OUTJSON"
