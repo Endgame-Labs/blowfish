@@ -973,6 +973,7 @@ impl SegmentReader {
         let mut terms = Vec::new();
         match &self.dictionary {
             Dictionary::Whole(map) => scan(map, &mut terms),
+            Dictionary::Chunked { entries, .. } if entries.is_empty() => {}
             Dictionary::Chunked { entries, .. } => {
                 let first = entries
                     .partition_point(|e| e.first.as_slice() <= prefix.as_bytes())
