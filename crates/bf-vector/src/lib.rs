@@ -9,7 +9,7 @@ mod format;
 mod index;
 mod reader;
 pub use bytes::Bytes;
-pub use cluster::{BuildParams, IndexBuilder, VectorType};
+pub use cluster::{BuildParams, IndexBuilder, VectorType, kmeans, nearest_center, prepare_vector};
 pub use directory::{DirEntry, DirSegment, Directory, Fragment, Membership, PartialIndex};
 pub use format::{FORMAT_VERSION, metadata_len};
 pub use index::{Candidate, Index, SearchParams, read_gap, read_merged};

@@ -431,6 +431,12 @@ Newest first. Each entry says what works now and how it was checked.
   upgrade path, built-in role-based API keys and metrics, and single-writer mode for stores without
   conditional writes. The Cargo workspace skeleton and crate boundaries are in place.
 
+## Perf iteration 12 (10M): namespace-wide recluster
+
+`Engine::recluster` repartitions every row into 32 spatial slabs (about 200-row leaves) beside the segments (`Manifest::ann_slabs`);
+unfiltered ANN answers from them while they cover the live segments. 10M cold, fresh process: p50 2,916 to 1,082 ms and p90 4,358 to
+1,592 ms at recall 0.945 (goal met), 880 to 383 requests, 116 to 47 MB. Details and the offline curves in `docs/benchmarks.md`.
+
 ## Milestones
 
 | # | Milestone | Status |

@@ -80,6 +80,16 @@ pub(crate) async fn search(
     // `BF_ANN_DIRECTORY=0` forces the per-segment path (A/B measurements only).
     static DIRECTORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*DIRECTORY.get_or_init(|| std::env::var("BF_ANN_DIRECTORY").is_ok_and(|v| v == "0")) {
+        // A namespace-wide recluster (slabs) answers unfiltered queries while it covers exactly
+        // the live segments; otherwise (new segments since it was built) fall through.
+        if q.filters.is_none()
+            && slabs_enabled()
+            && let Some(set) = state.ann_slabs.get(attribute)
+            && let Some(found) =
+                from_slabs(store, state, attribute, vector, config, k, columns, set).await?
+        {
+            return Ok(Some(found));
+        }
         // Unfiltered queries prefer the block layout (one read per probed cluster); filtered ones
         // need the plain fragments' row-to-cluster maps.
         if q.filters.is_none()
@@ -451,6 +461,7 @@ async fn from_directory(
                 attribute,
                 members,
                 layout,
+                None,
             )
             .await?;
             if slack > 0 {
@@ -474,4 +485,115 @@ pub(crate) fn stage(t0: std::time::Instant, name: &str) {
     if *ON.get_or_init(|| std::env::var_os("BF_TRACE_STAGES").is_some()) {
         eprintln!("STAGE {name} {} ms", t0.elapsed().as_millis());
     }
+}
+
+/// `BF_ANN_SLABS=0` ignores a recluster's slabs (A/B measurements only).
+pub(crate) fn slabs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("BF_ANN_SLABS").is_ok_and(|v| v == "0"))
+}
+
+/// Whether the slab set covers exactly the live segments, in order.
+pub(crate) fn slabs_cover(segments: &[bf_wal::Segment], set: &bf_wal::SlabSet) -> bool {
+    segments.len() == set.covered.len()
+        && segments
+            .iter()
+            .zip(&set.covered)
+            .all(|(s, c)| s.id == c.segment && s.row_count == c.rows)
+}
+
+/// Unfiltered ANN from a recluster's slabs: the same directory search, over slabs as pseudo
+/// segments, with winners mapped back to their segments for hydration.
+#[allow(clippy::too_many_arguments)]
+async fn from_slabs(
+    store: &Storage,
+    state: &NamespaceState,
+    attribute: &str,
+    vector: &[f32],
+    config: &EngineConfig,
+    k: usize,
+    columns: &BTreeSet<String>,
+    set: &bf_wal::SlabSet,
+) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+    if !slabs_cover(&state.segments, set) {
+        return Ok(None);
+    }
+    let Ok(dir) = crate::ann_dir::load(store, &set.dir, None).await else {
+        return Ok(None);
+    };
+    let mut view = state.without_docs();
+    view.segments = set.slabs.clone();
+    if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
+        return Ok(None);
+    }
+    // Rows deleted since the slabs were built: a mask over global row numbers.
+    let changed: Vec<usize> = (0..state.segments.len())
+        .filter(|i| state.segments[*i].live_generation != set.covered[*i].live_generation)
+        .collect();
+    let mask = if changed.is_empty() {
+        None
+    } else {
+        let mut mask = RoaringBitmap::new();
+        let loaded = futures::future::try_join_all(
+            changed
+                .iter()
+                .map(|i| segment::live(store, &state.segments[*i])),
+        )
+        .await?;
+        for (n, i) in changed.iter().enumerate() {
+            let c = &set.covered[*i];
+            mask.insert_range(c.base..c.base + c.rows);
+            let mut live = RoaringBitmap::new();
+            for r in &loaded[n] {
+                live.insert(c.base + r);
+            }
+            mask -= RoaringBitmap::from_iter(c.base..c.base + c.rows);
+            mask |= live;
+        }
+        // Unchanged segments stay fully live.
+        for (i, c) in set.covered.iter().enumerate() {
+            if !changed.contains(&i) {
+                mask.insert_range(c.base..c.base + c.rows);
+            }
+        }
+        Some(Arc::new(mask))
+    };
+    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+        eprintln!(
+            "SLABS slabs={} masked={}",
+            view.segments.len(),
+            mask.is_some()
+        );
+    }
+    let lives = vec![mask; view.segments.len()];
+    let slack = if state.shadowed.is_empty() {
+        0
+    } else {
+        (2 * k).max(20)
+    };
+    let (mut scores, mut docs) = crate::ann_dir::search(
+        store,
+        &view,
+        dir,
+        lives,
+        vector,
+        config,
+        k + slack,
+        columns,
+        attribute,
+        None,
+        Layout::Slabs,
+        Some((state, &set.covered)),
+    )
+    .await?;
+    if slack > 0 {
+        let pooled = scores.len();
+        scores.retain(|id, _| !state.shadowed.contains(id));
+        docs.retain(|id, _| !state.shadowed.contains(id));
+        if scores.len() >= k || pooled < k + slack {
+            return Ok(Some((scores, docs)));
+        }
+        return Ok(None);
+    }
+    Ok(Some((scores, docs)))
 }

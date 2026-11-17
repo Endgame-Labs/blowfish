@@ -369,6 +369,40 @@ impl<R: RangeRead> Index<R> {
         self.dims() * self.vector_type().width()
     }
 
+    /// Every row of one leaf cluster (ascending) and its raw full-precision vectors
+    /// (`vector_row_bytes` each, in row order), read in one ranged read. Used by reclustering.
+    pub async fn read_cluster_rows(&self, cluster: usize) -> Result<(Vec<u32>, Bytes)> {
+        let c = &self.metadata.clusters[cluster];
+        let rows: Vec<u32> = c.rows.iter().collect();
+        if rows.is_empty() {
+            return Ok((rows, Bytes::new()));
+        }
+        let bytes = read_one(&self.reader, c.vectors.clone()).await?;
+        if bytes.len() != rows.len() * self.vector_row_bytes() {
+            return Err(bad("cluster vector length disagrees with its rows"));
+        }
+        Ok((rows, bytes))
+    }
+
+    /// Decode one stored vector (`vector_row_bytes` raw bytes) to `f32`.
+    pub fn decode_stored(&self, raw: &[u8]) -> Vec<f32> {
+        match self.vector_type() {
+            VectorType::F32 => raw
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect(),
+            VectorType::I8 => raw.iter().map(|b| *b as i8 as f32).collect(),
+            VectorType::F16 => raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::f16::from_le_bytes(*b).to_f32())
+                .collect(),
+        }
+    }
+
     /// Rows stored in one leaf cluster.
     pub fn cluster_rows(&self, cluster: usize) -> usize {
         self.metadata.clusters[cluster].rows.len() as usize
