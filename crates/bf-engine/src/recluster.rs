@@ -255,7 +255,8 @@ impl Engine {
                     state ^= state << 17;
                     state
                 };
-                let sample_n = 100_000.min(present.len());
+                // A coarse partition needs a few hundred points per cell, not the whole corpus.
+                let sample_n = (cells_n * 600).clamp(8_000, 50_000).min(present.len());
                 let picks: Vec<u32> = (0..sample_n)
                     .map(|_| present[next() as usize % present.len()])
                     .collect();
@@ -307,17 +308,15 @@ impl Engine {
             let k = (rows.len() / opts.cluster_rows.max(1)).max(1);
             clusters += k;
             let spill = spill.clone();
-            let first2 = first.clone();
             let rows_n = rows.len() as u32;
             let blob = tokio::task::spawn_blocking(
                 move || -> Result<(Vec<u8>, Vec<u8>, u64), ApiError> {
-                    let mut buf = vec![0u8; width];
-                    let mut vectors: Vec<(u32, Vec<f32>)> = Vec::with_capacity(rows.len());
-                    for g in &rows {
+                    // Rows stay packed at the stored precision (about 2 KB each at 1,024 dims in f16).
+                    let mut data = vec![0u8; rows.len() * width];
+                    for (g, chunk) in rows.iter().zip(data.chunks_exact_mut(width)) {
                         spill
-                            .read_exact_at(&mut buf, u64::from(*g) * width as u64)
+                            .read_exact_at(chunk, u64::from(*g) * width as u64)
                             .map_err(segment::index_error)?;
-                        vectors.push((*g, first2.decode_stored(&buf)));
                     }
                     let params = bf_vector::BuildParams {
                         clusters: Some(k),
@@ -327,7 +326,7 @@ impl Engine {
                         .map_err(segment::index_error)?
                         .params(params)
                         .vector_type(dtype)
-                        .build_owned(vectors)
+                        .build_packed(rows, data)
                         .map_err(segment::index_error)?;
                     let (frag, frag_meta) =
                         bf_vector::Fragment::build_blocks(&blob).map_err(segment::index_error)?;
@@ -439,7 +438,7 @@ async fn segment_index(
 ) -> Result<Arc<bf_vector::Index<segment::ObjectReader>>, ApiError> {
     let file = &seg.files[key];
     bf_vector::Index::open_with_metadata_len(
-        segment::ObjectReader::new(store, file),
+        segment::ObjectReader::new(store, file).bypass_cache(),
         file.metadata_len,
     )
     .await

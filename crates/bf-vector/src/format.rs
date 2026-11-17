@@ -5,7 +5,7 @@ use roaring::RoaringBitmap;
 
 use crate::{
     Error, Metric, RaBitQ, Result,
-    cluster::{IndexBuilder, VectorType},
+    cluster::{IndexBuilder, Packed, VectorType},
 };
 
 pub(crate) const FOOTER_SIZE: u64 = 64;
@@ -43,14 +43,12 @@ pub(crate) struct Metadata {
 struct Block {
     cluster: Cluster,
     codes: Vec<u8>,
-    vectors: Vec<u8>,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_blob(
     b: &IndexBuilder,
-    stored: &[(u32, Vec<f32>)],
-    training: &[Vec<f32>],
+    rows: &Packed,
     centers: Vec<Vec<f32>>,
     parents: Vec<Vec<f32>>,
     parent_ids: Vec<u32>,
@@ -58,32 +56,32 @@ pub(crate) fn build_blob(
     flat: bool,
 ) -> Result<Vec<u8>> {
     let rq = RaBitQ::new(b.dims, b.params.seed)?;
-    let mut groups = vec![Vec::new(); centers.len()];
+    let mut groups: Vec<Vec<u32>> = vec![Vec::new(); centers.len()];
     for (i, c) in assignments.into_iter().enumerate() {
-        groups[c].push(i);
+        groups[c].push(i as u32);
     }
+    // Only the quantized codes are materialized per cluster. The full-precision bytes are the
+    // packed input rows verbatim, so they are checksummed here and copied once into the blob.
     let blocks: Vec<Block> = groups
-        .into_par_iter()
+        .par_iter()
         .enumerate()
         .map(|(c, group)| {
             let mut codes = Vec::new();
-            let mut vectors = Vec::new();
             let mut row_crcs = Vec::with_capacity(group.len());
-            let mut rows = RoaringBitmap::new();
-            for i in group {
-                rows.insert(stored[i].0);
-                let start = vectors.len();
-                for x in &stored[i].1 {
-                    match b.dtype {
-                        VectorType::F32 => vectors.extend(x.to_le_bytes()),
-                        VectorType::I8 => vectors.push(*x as i8 as u8),
-                        VectorType::F16 => vectors.extend(half::f16::from_f32(*x).to_le_bytes()),
-                    }
-                }
-                row_crcs.push(crc32fast::hash(&vectors[start..]));
+            let mut vectors_crc = crc32fast::Hasher::new();
+            let mut vectors_len = 0u64;
+            let mut ids = RoaringBitmap::new();
+            for &i in group {
+                let i = i as usize;
+                ids.insert(rows.row_id(i));
+                let raw = rows.raw(i);
+                row_crcs.push(crc32fast::hash(raw));
+                vectors_crc.update(raw);
+                vectors_len += raw.len() as u64;
                 if !flat {
-                    let code = rq.encode_unchecked(&training[i], &centers[c]);
-                    let zero = training[i].iter().all(|x| *x == 0.);
+                    let training = rows.prepared(i);
+                    let code = rq.encode_unchecked(&training, &centers[c]);
+                    let zero = training.iter().all(|x| *x == 0.);
                     let alpha = (code.alpha as f32).clamp(1e-6, 1.);
                     codes.extend((code.norm as f32).to_le_bytes());
                     codes.extend((if zero { -alpha } else { alpha }).to_le_bytes());
@@ -94,25 +92,22 @@ pub(crate) fn build_blob(
                 cluster: Cluster {
                     center: rotated_center(&rq, &centers[c]),
                     parent: parent_ids[c],
-                    rows,
+                    rows: ids,
                     codes: 0..codes.len() as u64,
-                    vectors: 0..vectors.len() as u64,
+                    vectors: 0..vectors_len,
                     codes_crc: crc32fast::hash(&codes),
-                    vectors_crc: crc32fast::hash(&vectors),
+                    vectors_crc: vectors_crc.finalize(),
                     row_crcs,
                 },
                 codes,
-                vectors,
             }
         })
         .collect();
-    let (clusters, payloads): (Vec<_>, Vec<_>) = blocks
-        .into_iter()
-        .map(|b| (b.cluster, (b.codes, b.vectors)))
-        .unzip();
+    let (clusters, all_codes): (Vec<_>, Vec<_>) =
+        blocks.into_iter().map(|b| (b.cluster, b.codes)).unzip();
     let mut metadata = Metadata {
         dims: b.dims,
-        count: stored.len() as u32,
+        count: rows.len() as u32,
         metric: b.metric,
         dtype: b.dtype,
         seed: b.params.seed,
@@ -134,14 +129,16 @@ pub(crate) fn build_blob(
         cluster.vectors = offset..offset + vectors_len;
         offset += vectors_len;
     }
-    let mut blob = encode_metadata(&metadata)?;
+    let mut blob = Vec::with_capacity(offset as usize + FOOTER_SIZE as usize);
+    blob.extend(encode_metadata(&metadata)?);
     let meta_crc = crc32fast::hash(&blob);
-    let (all_codes, all_vectors): (Vec<_>, Vec<_>) = payloads.into_iter().unzip();
     for codes in all_codes {
         blob.extend(codes);
     }
-    for vectors in all_vectors {
-        blob.extend(vectors);
+    for group in &groups {
+        for &i in group {
+            blob.extend_from_slice(rows.raw(i as usize));
+        }
     }
     let mut footer = vec![0u8; FOOTER_SIZE as usize];
     footer[..8].copy_from_slice(MAGIC);

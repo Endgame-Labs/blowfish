@@ -292,7 +292,11 @@ impl RangeCache {
     }
     /// Look up blocks in memory, then on disk, with no cache-wide lock held. Disk reads are
     /// split across blocking workers and run outside the disk index lock.
-    async fn lookup_many(&self, wanted: &[(BlockKey, usize)]) -> Vec<Option<(Bytes, Tier)>> {
+    async fn lookup_many(
+        &self,
+        wanted: &[(BlockKey, usize)],
+        admit: bool,
+    ) -> Vec<Option<(Bytes, Tier)>> {
         let mut found: Vec<Option<(Bytes, Tier)>> = wanted
             .iter()
             .map(|(key, _)| self.memory.get(key).map(|b| (b, Tier::Memory)))
@@ -337,7 +341,9 @@ impl RangeCache {
         }
         for task in tasks {
             for (i, bytes) in task.await.unwrap_or_default() {
-                self.insert_memory(wanted[i].0.clone(), bytes.clone());
+                if admit {
+                    self.insert_memory(wanted[i].0.clone(), bytes.clone());
+                }
                 found[i] = Some((bytes, Tier::Disk));
             }
         }
@@ -383,8 +389,16 @@ pub struct RangeReader {
     key: String,
     path: Arc<str>,
     layout: Layout,
+    /// Whether blocks this reader fetches (or promotes from disk) enter the memory and disk caches.
+    admit: bool,
 }
 impl RangeReader {
+    /// A reader that still uses cached blocks but admits none of its own: for one-pass scans
+    /// (compaction, recluster) that would otherwise evict the working set of queries.
+    pub fn bypass_cache(mut self) -> Self {
+        self.admit = false;
+        self
+    }
     /// Logical object length, excluding the retry header.
     pub fn len(&self) -> u64 {
         self.layout.len
@@ -440,7 +454,7 @@ impl RangeReader {
                 (self.block_key(index), expected)
             })
             .collect();
-        let looked_up = cache.lookup_many(&wanted).await;
+        let looked_up = cache.lookup_many(&wanted, self.admit).await;
         let mut blocks = BTreeMap::<u64, Bytes>::new();
         let mut unresolved = Vec::new();
         let (mut memory, mut disk, mut memory_blocks, mut disk_blocks) = (0, 0, 0, 0);
@@ -493,6 +507,7 @@ impl RangeReader {
             }
             let indices = missing[start..end].to_vec();
             let reader = self.clone();
+            let admit = self.admit;
             let first = indices[0];
             let last = *indices.last().unwrap();
             let group = async move {
@@ -521,7 +536,8 @@ impl RangeReader {
                 // than the network, and an unbounded backlog would hold every fetched block in
                 // memory. A skipped write only means that block is fetched again later.
                 const MAX_SPILLS: usize = 16;
-                let spilling = cache.disk.is_some()
+                let spilling = admit
+                    && cache.disk.is_some()
                     && cache
                         .spills
                         .pending
@@ -537,7 +553,9 @@ impl RangeReader {
                     if spilling {
                         spill.push((cache.disk_key(&key), value.clone()));
                     }
-                    cache.insert_memory(key, value.clone());
+                    if admit {
+                        cache.insert_memory(key, value.clone());
+                    }
                     values.push(value);
                 }
                 // The disk tier is written behind the read: a block-by-block write that the
@@ -688,6 +706,7 @@ impl Storage {
             key: key.to_owned(),
             path: self.path(key).to_string().into(),
             layout,
+            admit: true,
         })
     }
     /// Open an immutable object without HEAD or header probing. The caller supplies the
@@ -706,6 +725,7 @@ impl Storage {
             key: key.to_owned(),
             path: self.path(key).to_string().into(),
             layout: Layout { len, offset },
+            admit: true,
         })
     }
     /// Cached whole-object read for immutable objects, sharing the range cache and single-flight.

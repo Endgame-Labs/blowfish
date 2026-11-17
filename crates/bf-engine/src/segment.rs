@@ -38,6 +38,8 @@ pub(crate) struct ObjectReader {
     pub store: Storage,
     pub file: SegmentFile,
     prefetched: Option<(u64, Bytes)>,
+    /// One-pass scans (compaction, recluster) read through the caches without filling them.
+    bypass: bool,
 }
 impl ObjectReader {
     pub fn new(store: &Storage, file: &SegmentFile) -> Self {
@@ -45,7 +47,24 @@ impl ObjectReader {
             store: store.clone(),
             file: file.clone(),
             prefetched: None,
+            bypass: false,
         }
+    }
+    /// Read through the block caches without admitting what this reader fetches.
+    pub fn bypass_cache(mut self) -> Self {
+        self.bypass = true;
+        self
+    }
+    fn range_reader(&self) -> io::Result<bf_storage::RangeReader> {
+        let reader = self
+            .store
+            .range_reader_with_length(&self.file.key, self.file.size, true)
+            .map_err(io::Error::other)?;
+        Ok(if self.bypass {
+            reader.bypass_cache()
+        } else {
+            reader
+        })
     }
     pub async fn read(&self, range: Range<u64>) -> io::Result<Bytes> {
         if let Some((start, bytes)) = &self.prefetched
@@ -55,17 +74,13 @@ impl ObjectReader {
         {
             return Ok(bytes.slice((range.start - start) as usize..(range.end - start) as usize));
         }
-        self.store
-            .range_reader_with_length(&self.file.key, self.file.size, true)
-            .map_err(io::Error::other)?
+        self.range_reader()?
             .read_with_stats(range, &read_cache::stats())
             .await
             .map_err(io::Error::other)
     }
     pub async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
-        self.store
-            .range_reader_with_length(&self.file.key, self.file.size, true)
-            .map_err(io::Error::other)?
+        self.range_reader()?
             .read_batch_with_stats(&ranges, &read_cache::stats())
             .await
             .map_err(io::Error::other)
@@ -91,6 +106,18 @@ pub(crate) async fn vector_index(
 /// The whole object, read through the block cache.
 pub(crate) async fn read_whole(store: &Storage, file: &SegmentFile) -> Result<Bytes, ApiError> {
     ObjectReader::new(store, file)
+        .read(0..file.size)
+        .await
+        .map_err(index_error)
+}
+
+/// A whole object read once through the block caches without filling them.
+pub(crate) async fn read_whole_uncached(
+    store: &Storage,
+    file: &SegmentFile,
+) -> Result<Bytes, ApiError> {
+    ObjectReader::new(store, file)
+        .bypass_cache()
         .read(0..file.size)
         .await
         .map_err(index_error)
@@ -426,12 +453,64 @@ fn build_text(
     Ok((bytes, metadata_len, header))
 }
 
-pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
+/// One vector attribute's values at the stored precision, for the rows that have one: row
+/// positions (ascending, within the segment being built) and their packed little-endian bytes.
+pub(crate) struct PackedColumn {
+    pub dims: usize,
+    pub dtype: bf_vector::VectorType,
+    pub rows: Vec<u32>,
+    pub data: Vec<u8>,
+}
+impl PackedColumn {
+    pub fn new(dims: usize, dtype: bf_vector::VectorType) -> Self {
+        Self {
+            dims,
+            dtype,
+            rows: Vec::new(),
+            data: Vec::new(),
+        }
+    }
+    /// Append a vector for row `row` (rows must be pushed in ascending order).
+    pub fn push(&mut self, row: u32, v: &[f32]) -> Result<(), ApiError> {
+        self.dtype
+            .pack(v, self.dims, &mut self.data)
+            .map_err(index_error)?;
+        self.rows.push(row);
+        Ok(())
+    }
+}
+/// The dimensions and stored precision of a dense vector attribute (None for any other type).
+pub(crate) fn dense_type(
+    config: &bf_types::AttributeSchema,
+) -> Option<(usize, bf_vector::VectorType)> {
+    match config.data_type {
+        Some(AttributeType::Vector { dimensions, f16 }) => Some((
+            dimensions,
+            if f16 {
+                bf_vector::VectorType::F16
+            } else {
+                bf_vector::VectorType::F32
+            },
+        )),
+        Some(AttributeType::VectorI8 { dimensions }) => {
+            Some((dimensions, bf_vector::VectorType::I8))
+        }
+        _ => None,
+    }
+}
+
+/// Build a segment from `docs` (ID order). A vector attribute in `vectors` is taken from there
+/// (and `docs` need not carry it); any other is packed from the documents. Vectors stay at their
+/// stored precision from here on: the ANN build, which runs on a blocking worker, owns the packed
+/// bytes (4 KB per row less than a decoded f32 copy), and the column blocks copy them verbatim.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
     store: &Storage,
     ns: &str,
     schema: &Schema,
     metric: bf_types::DistanceMetric,
     docs: &BTreeMap<Id, D>,
+    mut vectors: BTreeMap<String, PackedColumn>,
     start: u64,
     end: u64,
 ) -> Result<Segment, ApiError> {
@@ -443,51 +522,75 @@ pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
     let mut body = vec![];
     let mut dir = Directory::default();
     let rows: Vec<&Document> = docs.values().map(|d| d.borrow()).collect();
-    // Index builds are CPU-bound: start them on blocking workers now, so they overlap with
-    // document encoding and uploads below instead of running one after another.
+    for (name, config) in schema {
+        if let Some((dims, dtype)) = dense_type(config)
+            && !vectors.contains_key(name)
+        {
+            let mut column = PackedColumn::new(dims, dtype);
+            for (i, row) in rows.iter().enumerate() {
+                if let Some(v) = row.get(name).filter(|v| !v.is_null()) {
+                    column.push(i as u32, &bf_types::decode_vector(v)?)?;
+                }
+            }
+            vectors.insert(name.clone(), column);
+        }
+    }
+    // Index builds are CPU-bound: start them on blocking workers as soon as a column's blocks
+    // are written, so they overlap with document encoding and uploads below.
     let mut ann_jobs = Vec::new();
     for (column, (name, config)) in schema.iter().enumerate() {
-        let dense = match config.data_type {
-            Some(AttributeType::Vector { dimensions, f16 }) => Some((
-                dimensions,
-                if f16 {
-                    bf_vector::VectorType::F16
-                } else {
-                    bf_vector::VectorType::F32
-                },
-            )),
-            Some(AttributeType::VectorI8 { dimensions }) => {
-                Some((dimensions, bf_vector::VectorType::I8))
-            }
-            _ => None,
+        let Some((dimensions, dtype)) = dense_type(config) else {
+            continue;
         };
-        if let Some((dimensions, dtype)) = dense {
-            let vectors = rows
-                .iter()
-                .enumerate()
-                .filter_map(|(i, row)| row.get(name).map(|v| (i as u32, v)))
-                .map(|(i, v)| Ok((i, bf_types::decode_vector(v)?)))
-                .collect::<Result<Vec<_>, ApiError>>()?;
-            let metric = vector_metric(metric);
-            // Leaf clusters default to sqrt(rows). `BF_IVF_CLUSTER_FACTOR` (a number above 1)
-            // makes them that many times larger, which cuts the requests a probe needs.
-            let factor: f64 = std::env::var("BF_IVF_CLUSTER_FACTOR")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|f| *f >= 1.0)
-                .unwrap_or(1.0);
-            let job = tokio::task::spawn_blocking(move || {
-                let params = bf_vector::BuildParams {
-                    clusters: Some(((vectors.len() as f64).sqrt() / factor).ceil() as usize),
-                    ..Default::default()
-                };
-                bf_vector::IndexBuilder::new(dimensions, metric)?
-                    .params(params)
-                    .vector_type(dtype)
-                    .build_owned(vectors)
-            });
-            ann_jobs.push((name.clone(), column, job));
+        let packed = vectors.remove(name).ok_or_else(corrupt)?;
+        if packed.dims != dimensions || packed.dtype != dtype {
+            return Err(corrupt());
         }
+        let width = dimensions * dtype.width();
+        let mut blocks = vec![];
+        let mut next = 0usize;
+        for first in (0..row_count).step_by(BLOCK_ROWS) {
+            let last = first.saturating_add(BLOCK_ROWS as u32).min(row_count);
+            let mut data = Vec::with_capacity((last - first) as usize * (1 + width));
+            for r in first..last {
+                if packed.rows.get(next) == Some(&r) {
+                    data.push(1);
+                    data.extend_from_slice(&packed.data[next * width..(next + 1) * width]);
+                    next += 1;
+                } else {
+                    data.push(0);
+                }
+            }
+            blocks.push(block(&mut body, &data));
+        }
+        let vector_i8 = matches!(config.data_type, Some(AttributeType::VectorI8 { .. }));
+        dir.columns.insert(
+            name.clone(),
+            Column {
+                blocks,
+                vector: Some((dimensions, dtype == bf_vector::VectorType::F16)),
+                vector_i8,
+            },
+        );
+        let metric = vector_metric(metric);
+        // Leaf clusters default to sqrt(rows). `BF_IVF_CLUSTER_FACTOR` (a number above 1)
+        // makes them that many times larger, which cuts the requests a probe needs.
+        let factor: f64 = std::env::var("BF_IVF_CLUSTER_FACTOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|f| *f >= 1.0)
+            .unwrap_or(1.0);
+        let job = tokio::task::spawn_blocking(move || {
+            let params = bf_vector::BuildParams {
+                clusters: Some(((packed.rows.len() as f64).sqrt() / factor).ceil() as usize),
+                ..Default::default()
+            };
+            bf_vector::IndexBuilder::new(dimensions, metric)?
+                .params(params)
+                .vector_type(dtype)
+                .build_packed(packed.rows, packed.data)
+        });
+        ann_jobs.push((name.clone(), column, job));
     }
     let mut fts_jobs = Vec::new();
     for (column, (name, config)) in schema.iter().enumerate() {
@@ -501,47 +604,20 @@ pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
         }
     }
     for (name, config) in schema {
-        let vector = match config.data_type {
-            Some(AttributeType::Vector { dimensions, f16 }) => Some((dimensions, f16)),
-            Some(AttributeType::VectorI8 { dimensions }) => Some((dimensions, false)),
-            _ => None,
-        };
-        let vector_i8 = matches!(config.data_type, Some(AttributeType::VectorI8 { .. }));
+        if dense_type(config).is_some() {
+            continue;
+        }
         let mut blocks = vec![];
         for chunk in rows.chunks(BLOCK_ROWS) {
-            let data = if let Some((dims, f16)) = vector {
-                let mut data = Vec::new();
-                for row in chunk {
-                    let v = row.get(name).filter(|v| !v.is_null());
-                    data.push(u8::from(v.is_some()));
-                    if let Some(v) = v {
-                        let v = bf_types::decode_vector(v)?;
-                        if v.len() != dims {
-                            return Err(corrupt());
-                        }
-                        for x in v {
-                            if vector_i8 {
-                                data.push(x as i8 as u8);
-                            } else if f16 {
-                                data.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
-                            } else {
-                                data.extend_from_slice(&x.to_le_bytes());
-                            }
-                        }
-                    }
-                }
-                data
-            } else {
-                encode(&chunk.iter().map(|d| d.get(name)).collect::<Vec<_>>())?
-            };
+            let data = encode(&chunk.iter().map(|d| d.get(name)).collect::<Vec<_>>())?;
             blocks.push(block(&mut body, &data));
         }
         dir.columns.insert(
             name.clone(),
             Column {
                 blocks,
-                vector,
-                vector_i8,
+                vector: None,
+                vector_i8: false,
             },
         );
     }
@@ -818,10 +894,23 @@ pub(crate) async fn projected_rows(
     rows: &RoaringBitmap,
     columns: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<BTreeMap<u32, Document>, ApiError> {
+    projected_rows_with(store, segment, rows, columns, false).await
+}
+/// [`projected_rows`], optionally reading through the block caches without filling them.
+pub(crate) async fn projected_rows_with(
+    store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    columns: Option<&std::collections::BTreeSet<String>>,
+    bypass: bool,
+) -> Result<BTreeMap<u32, Document>, ApiError> {
     if rows.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let reader = ObjectReader::new(store, segment.files.get("docs").ok_or_else(corrupt)?);
+    let mut reader = ObjectReader::new(store, segment.files.get("docs").ok_or_else(corrupt)?);
+    if bypass {
+        reader = reader.bypass_cache();
+    }
     let dir = directory(&reader).await?;
     let mut docs: BTreeMap<u32, Document> = rows.iter().map(|row| (row, Document::new())).collect();
     let blocks: std::collections::BTreeSet<_> =
@@ -926,6 +1015,158 @@ pub(crate) async fn projected_rows(
         }
     }
     Ok(docs)
+}
+/// A segment's rows for compaction: documents without the `strip` columns (vector attributes,
+/// read separately) keyed by ID, plus each stripped column's present values as packed bytes
+/// (the ID of each present row, in row order, and their stored-precision bytes). Reads bypass the
+/// block caches. A vector costs its stored width here (2 KB at 1,024 dimensions in f16) rather
+/// than a 5.5 KB base64 string plus JSON value overhead.
+pub(crate) type SegmentVectors = BTreeMap<String, PackedPart>;
+/// The IDs of a segment's present vectors, in row order, and their packed bytes.
+pub(crate) type PackedPart = (Vec<Id>, Vec<u8>);
+pub(crate) async fn compaction_rows(
+    store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    strip: &std::collections::BTreeSet<String>,
+) -> Result<(BTreeMap<Id, Document>, SegmentVectors), ApiError> {
+    if rows.is_empty() {
+        return Ok((BTreeMap::new(), BTreeMap::new()));
+    }
+    let columns: std::collections::BTreeSet<String> = segment
+        .schema
+        .keys()
+        .filter(|name| !strip.contains(*name))
+        .cloned()
+        .collect();
+    let docs = projected_rows_with(store, segment, rows, Some(&columns), true).await?;
+    let docs: BTreeMap<Id, Document> = docs
+        .into_values()
+        .map(|doc| {
+            let id = serde_json::from_value(doc.get("id").ok_or_else(corrupt)?.clone())
+                .map_err(index_error)?;
+            Ok((id, doc))
+        })
+        .collect::<Result<_, ApiError>>()?;
+    let mut vectors = SegmentVectors::new();
+    let ids = ids(store, segment).await?;
+    for name in strip {
+        if !segment.schema.contains_key(name) {
+            continue;
+        }
+        let (present, data) = read_packed(store, segment, rows, name).await?;
+        let ids: Vec<Id> = present
+            .iter()
+            .map(|row| ids.get(*row as usize).cloned().ok_or_else(corrupt))
+            .collect::<Result<_, _>>()?;
+        vectors.insert(name.clone(), (ids, data));
+    }
+    Ok((docs, vectors))
+}
+/// The stored-precision bytes of one vector column for the requested rows: which of them have a
+/// vector (ascending), and those vectors back to back. Reads block by block, bypassing the caches.
+pub(crate) async fn read_packed(
+    store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    attribute: &str,
+) -> Result<(Vec<u32>, Vec<u8>), ApiError> {
+    let reader =
+        ObjectReader::new(store, segment.files.get("docs").ok_or_else(corrupt)?).bypass_cache();
+    let dir = directory(&reader).await?;
+    let col = dir.columns.get(attribute).ok_or_else(corrupt)?;
+    let (dims, f16) = col.vector.ok_or_else(corrupt)?;
+    let width = dims
+        * if col.vector_i8 {
+            1
+        } else if f16 {
+            2
+        } else {
+            4
+        };
+    let blocks: std::collections::BTreeSet<_> =
+        rows.iter().map(|row| row as usize / BLOCK_ROWS).collect();
+    let indices: Vec<_> = blocks.into_iter().collect();
+    let (mut present, mut out) = (Vec::new(), Vec::new());
+    for batch in indices.chunks(16) {
+        let descriptors = batch
+            .iter()
+            .map(|i| col.blocks.get(*i).ok_or_else(corrupt))
+            .collect::<Result<Vec<_>, _>>()?;
+        let data = reader
+            .read_batch(
+                descriptors
+                    .iter()
+                    .map(|b| b.offset..b.offset + b.length)
+                    .collect(),
+            )
+            .await
+            .map_err(index_error)?;
+        for ((&i, b), data) in batch.iter().zip(descriptors).zip(data) {
+            if crc32fast::hash(&data) != b.crc {
+                return Err(corrupt());
+            }
+            let first = (i * BLOCK_ROWS) as u32;
+            let last = first
+                .saturating_add(BLOCK_ROWS as u32)
+                .min(segment.row_count);
+            let mut pos = 0;
+            for row in first..last {
+                let flag = *data.get(pos).ok_or_else(corrupt)?;
+                pos += 1;
+                match flag {
+                    0 => {}
+                    1 => {
+                        let bytes = data.get(pos..pos + width).ok_or_else(corrupt)?;
+                        if rows.contains(row) {
+                            present.push(row);
+                            out.extend_from_slice(bytes);
+                        }
+                        pos += width;
+                    }
+                    _ => return Err(corrupt()),
+                }
+            }
+            if pos != data.len() {
+                return Err(corrupt());
+            }
+        }
+    }
+    Ok((present, out))
+}
+/// Join the per-segment packed vectors of a compaction into one column per attribute in the
+/// order of `docs` (the merged documents, by ID).
+pub(crate) fn merge_packed<D>(
+    schema: &Schema,
+    docs: &BTreeMap<Id, D>,
+    parts: BTreeMap<String, Vec<PackedPart>>,
+) -> Result<BTreeMap<String, PackedColumn>, ApiError> {
+    let mut out = BTreeMap::new();
+    for (name, parts) in parts {
+        let (dims, dtype) = schema.get(&name).and_then(dense_type).ok_or_else(corrupt)?;
+        let width = dims * dtype.width();
+        let mut at: BTreeMap<&Id, (usize, usize)> = BTreeMap::new();
+        for (p, (ids, data)) in parts.iter().enumerate() {
+            if data.len() != ids.len() * width {
+                return Err(corrupt());
+            }
+            for (k, id) in ids.iter().enumerate() {
+                at.insert(id, (p, k));
+            }
+        }
+        let mut column = PackedColumn::new(dims, dtype);
+        column.data.reserve(at.len() * width);
+        for (row, id) in docs.keys().enumerate() {
+            if let Some(&(p, k)) = at.get(id) {
+                column.rows.push(row as u32);
+                column
+                    .data
+                    .extend_from_slice(&parts[p].1[k * width..(k + 1) * width]);
+            }
+        }
+        out.insert(name, column);
+    }
+    Ok(out)
 }
 /// Evaluate scalar, array, range, and boolean filters over sorted value dictionaries.
 pub(crate) fn filter_rows<'a>(

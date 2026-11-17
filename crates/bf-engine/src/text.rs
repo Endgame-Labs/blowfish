@@ -122,6 +122,131 @@ pub(crate) fn encode_text_stats(
     }
     Ok((out, index))
 }
+/// Rewrite the out-of-line statistics object after a publication, without ever holding the term
+/// map in memory: stream the previous object's FST chunks in term order, apply the batch's
+/// term-frequency changes (`added` minus `removed`, both small and sorted), and write new chunks as
+/// they fill. Memory is the previous object's bytes, the new object's bytes, and the two deltas,
+/// whatever the vocabulary size. Returns the new object and its chunk index.
+pub(crate) fn merge_text_stats(
+    old: &[u8],
+    index: &bf_wal::TextStatsIndex,
+    added: &TextMap,
+    removed: &TextMap,
+) -> Result<(Vec<u8>, bf_wal::TextStatsIndex), ApiError> {
+    let bad = || ApiError::new(500, "stored statistics are corrupt or unsupported");
+    if old.len() < 8 || &old[..8] != CHUNKED_MAGIC {
+        return Err(bad());
+    }
+    let mut out = CHUNKED_MAGIC.to_vec();
+    out.reserve(old.len() + old.len() / 8);
+    let mut merged = bf_wal::TextStatsIndex::default();
+    let names: BTreeSet<&String> = index
+        .fields
+        .keys()
+        .chain(added.keys())
+        .chain(removed.keys())
+        .collect();
+    let empty = TextStats::default();
+    let no_chunks = bf_wal::FieldStatsIndex::default();
+    for name in names {
+        let was = index.fields.get(name).unwrap_or(&no_chunks);
+        let (add, rem) = (
+            added.get(name).unwrap_or(&empty),
+            removed.get(name).unwrap_or(&empty),
+        );
+        let mut field = bf_wal::FieldStatsIndex {
+            documents: (was.documents + add.documents).saturating_sub(rem.documents),
+            total_length: (was.total_length + add.total_length).saturating_sub(rem.total_length),
+            chunks: Vec::new(),
+        };
+        // Signed changes per term, in term order.
+        let mut delta: BTreeMap<&str, i64> = BTreeMap::new();
+        for (term, df) in &add.document_frequencies {
+            *delta.entry(term).or_default() += *df as i64;
+        }
+        for (term, df) in &rem.document_frequencies {
+            *delta.entry(term).or_default() -= *df as i64;
+        }
+        let mut delta = delta.into_iter().filter(|(_, v)| *v != 0).peekable();
+        let mut pending: Vec<(Vec<u8>, u64)> = Vec::with_capacity(STATS_CHUNK_TERMS);
+        let flush = |pending: &mut Vec<(Vec<u8>, u64)>,
+                     out: &mut Vec<u8>,
+                     field: &mut bf_wal::FieldStatsIndex|
+         -> Result<(), ApiError> {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let mut builder = fst::MapBuilder::memory();
+            for (term, df) in pending.iter() {
+                builder.insert(term, *df).map_err(segment::index_error)?;
+            }
+            let blob = builder.into_inner().map_err(segment::index_error)?;
+            field.chunks.push((
+                String::from_utf8(pending[0].0.clone()).map_err(segment::index_error)?,
+                out.len() as u64,
+                blob.len() as u32,
+                crc32fast::hash(&blob),
+            ));
+            out.extend(blob);
+            pending.clear();
+            Ok(())
+        };
+        let emit = |term: &[u8],
+                    df: u64,
+                    pending: &mut Vec<(Vec<u8>, u64)>,
+                    out: &mut Vec<u8>,
+                    field: &mut bf_wal::FieldStatsIndex|
+         -> Result<(), ApiError> {
+            if df == 0 {
+                return Ok(());
+            }
+            pending.push((term.to_vec(), df));
+            if pending.len() == STATS_CHUNK_TERMS {
+                flush(pending, out, field)?;
+            }
+            Ok(())
+        };
+        for (_, offset, len, crc) in &was.chunks {
+            let blob = old
+                .get(*offset as usize..*offset as usize + *len as usize)
+                .ok_or_else(bad)?;
+            if crc32fast::hash(blob) != *crc {
+                return Err(bad());
+            }
+            let map = fst::Map::new(blob).map_err(|_| bad())?;
+            let mut stream = fst::IntoStreamer::into_stream(&map);
+            while let Some((term, df)) = fst::Streamer::next(&mut stream) {
+                // New terms that sort before this one.
+                while let Some((u, v)) = delta.next_if(|(u, _)| u.as_bytes() < term) {
+                    emit(
+                        u.as_bytes(),
+                        v.max(0) as u64,
+                        &mut pending,
+                        &mut out,
+                        &mut field,
+                    )?;
+                }
+                let change = delta
+                    .next_if(|(u, _)| u.as_bytes() == term)
+                    .map_or(0, |(_, v)| v);
+                let df = (df as i64 + change).max(0) as u64;
+                emit(term, df, &mut pending, &mut out, &mut field)?;
+            }
+        }
+        for (u, v) in delta {
+            emit(
+                u.as_bytes(),
+                v.max(0) as u64,
+                &mut pending,
+                &mut out,
+                &mut field,
+            )?;
+        }
+        flush(&mut pending, &mut out, &mut field)?;
+        merged.fields.insert(name.clone(), field);
+    }
+    Ok((out, merged))
+}
 /// The legacy whole-object format (`MAGIC | header length | JSON header | FSTs | crc32`).
 fn decode_text_stats(bytes: bytes::Bytes) -> Result<TextIndex, ApiError> {
     let bad = || ApiError::new(500, "stored statistics are corrupt or unsupported");
@@ -523,5 +648,76 @@ mod tests {
         assert_eq!(corpus["text"].document_frequencies.len(), 3);
         assert_eq!(corpus["text"].document_frequencies["t05000"], 5001);
         assert_eq!(corpus["text"].document_frequencies["t09999"], 10_000);
+    }
+    #[test]
+    fn streamed_statistics_merge_equals_the_in_memory_update() {
+        let mut base = TextMap::new();
+        let mut field = TextStats {
+            documents: 100,
+            total_length: 900,
+            ..Default::default()
+        };
+        for i in 0..10_000u64 {
+            field
+                .document_frequencies
+                .insert(format!("t{:05}", i * 2), (i % 7) + 1);
+        }
+        base.insert("text".into(), field);
+        base.insert("title".into(), TextStats::default());
+        let (bytes, index) = encode_text_stats(&base).unwrap();
+        let mut added = TextMap::new();
+        let mut removed = TextMap::new();
+        let mut add = TextStats {
+            documents: 5,
+            total_length: 40,
+            ..Default::default()
+        };
+        let mut rem = TextStats {
+            documents: 2,
+            total_length: 10,
+            ..Default::default()
+        };
+        // New terms before, inside, and after the old range; bumps; and removals that hit zero.
+        for t in [
+            "a", "t00001", "t00003", "t05001", "t19999", "zzz", "t00000", "t00004",
+        ] {
+            *add.document_frequencies.entry(t.to_string()).or_default() += 1;
+        }
+        for t in ["t00002", "t00004", "t00006", "t19998", "unknown"] {
+            *rem.document_frequencies.entry(t.to_string()).or_default() += 9;
+        }
+        added.insert("text".into(), add.clone());
+        removed.insert("text".into(), rem.clone());
+        // A field that appears only in the batch.
+        added.insert("body".into(), add.clone());
+        let mut expected = base.clone();
+        for (name, a) in &added {
+            let f = expected.entry(name.clone()).or_default();
+            f.documents += a.documents;
+            f.total_length += a.total_length;
+            for (t, d) in &a.document_frequencies {
+                *f.document_frequencies.entry(t.clone()).or_default() += d;
+            }
+        }
+        for (name, r) in &removed {
+            let f = expected.get_mut(name).unwrap();
+            f.documents -= r.documents;
+            f.total_length -= r.total_length;
+            for (t, d) in &r.document_frequencies {
+                if let Some(c) = f.document_frequencies.get_mut(t) {
+                    *c = c.saturating_sub(*d);
+                    if *c == 0 {
+                        f.document_frequencies.remove(t);
+                    }
+                }
+            }
+        }
+        let (merged, merged_index) = merge_text_stats(&bytes, &index, &added, &removed).unwrap();
+        let (want, want_index) = encode_text_stats(&expected).unwrap();
+        assert_eq!(merged, want);
+        assert_eq!(
+            serde_json::to_string(&merged_index).unwrap(),
+            serde_json::to_string(&want_index).unwrap()
+        );
     }
 }
