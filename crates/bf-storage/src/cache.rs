@@ -212,6 +212,15 @@ struct Spills {
     idle: tokio::sync::Notify,
 }
 impl RangeCache {
+    /// Empty the memory and disk tiers and the object-length cache (bench cold-cache runs).
+    pub(crate) fn drop_all(&self) {
+        self.memory.invalidate_all();
+        self.memory.run_pending_tasks();
+        self.layouts.invalidate_all();
+        if let Some(disk) = &self.disk {
+            disk.lock().expect("disk cache lock").clear();
+        }
+    }
     pub(crate) async fn open(config: CacheConfig) -> Result<Self, Error> {
         if config.block_size == 0
             || config.block_size > u32::MAX as usize

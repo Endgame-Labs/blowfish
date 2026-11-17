@@ -236,7 +236,15 @@ pub(crate) fn start(engine: &Engine) {
         }
     });
 }
-fn retire(manifest: &mut Manifest, key: String) {
+pub(crate) fn retire_slabs(manifest: &mut Manifest, set: &bf_wal::SlabSet) {
+    for seg in &set.slabs {
+        for file in seg.files.values() {
+            retire(manifest, file.key.clone());
+        }
+    }
+    retire(manifest, set.dir.key.clone());
+}
+pub(crate) fn retire(manifest: &mut Manifest, key: String) {
     if !manifest.retired.iter().any(|r| r.key == key) {
         manifest.retired.push(RetiredObject {
             key,
@@ -432,6 +440,7 @@ impl Engine {
             stats: Default::default(),
             text_stats: None,
             ann_dirs: Default::default(),
+            ann_slabs: Default::default(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
@@ -637,6 +646,26 @@ impl Engine {
         };
         manifest.deleted = false;
         manifest.segments = segments;
+        // A recluster's slabs hold rows of the segments they cover: once a covered segment is
+        // gone (compaction, deletion of the namespace), they can never answer again.
+        let stale: Vec<String> = manifest
+            .ann_slabs
+            .iter()
+            .filter(|(_, set)| {
+                !set.covered.iter().all(|c| {
+                    manifest
+                        .segments
+                        .iter()
+                        .any(|s| s.id == c.segment && s.row_count == c.rows)
+                })
+            })
+            .map(|(a, _)| a.clone())
+            .collect();
+        for attr in stale {
+            if let Some(set) = manifest.ann_slabs.remove(&attr) {
+                retire_slabs(&mut manifest, &set);
+            }
+        }
         // Segments built before block fragments existed get theirs now (a one-time upgrade).
         for seg in &mut manifest.segments {
             segment::backfill_blocks(store, ns, seg).await?;
@@ -740,6 +769,9 @@ impl Engine {
             for file in std::mem::take(&mut manifest.ann_dirs).into_values() {
                 retire(&mut manifest, file.key);
             }
+            for set in std::mem::take(&mut manifest.ann_slabs).into_values() {
+                retire_slabs(&mut manifest, &set);
+            }
             manifest.deleted = true;
             manifest.indexed_through = checkpoint.seq;
         }
@@ -752,6 +784,15 @@ impl Engine {
                 .keys()
                 .map(|k| crate::ann_dir::hint_key(ns, k.trim_start_matches("ann:"))),
         );
+        for (attr, set) in &manifest.ann_slabs {
+            protected.insert(set.dir.key.clone());
+            protected.insert(crate::ann_dir::hint_key(ns, &format!("ann3:{attr}")));
+            protected.extend(
+                set.slabs
+                    .iter()
+                    .flat_map(|s| s.files.values().map(|f| f.key.clone())),
+            );
+        }
         for seg in &manifest.segments {
             protected.extend(
                 seg.files
@@ -779,6 +820,7 @@ impl Engine {
         let mut candidates = std::collections::BTreeSet::new();
         for prefix in [
             format!("ns/{ns}/segments/"),
+            format!("ns/{ns}/slabs/"),
             format!("ns/{ns}/manifest-data/"),
             format!("ns/{ns}/indexer/"),
         ] {

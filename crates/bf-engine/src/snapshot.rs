@@ -130,6 +130,7 @@ impl OpenHint {
         segments: &[bf_wal::Segment],
         text: Option<&bf_wal::SegmentFile>,
         dirs: &BTreeMap<String, bf_wal::SegmentFile>,
+        slabs: &BTreeMap<String, bf_wal::SlabSet>,
         prefetched: &BTreeMap<String, crate::ann_dir::Prefetched>,
         schema: &Schema,
     ) {
@@ -160,6 +161,39 @@ impl OpenHint {
                 .all(|a| dirs.contains_key(&format!("ann:{a}")));
             for attribute in self.ann.iter().filter(|_| with_rest) {
                 // A lone unfiltered ANN query reads the block-layout directory when there is one.
+                // A recluster's slabs, when they cover exactly these segments, take the scan.
+                let slab = self
+                    .scan
+                    .as_ref()
+                    .filter(|(a, _, _)| a == attribute)
+                    .filter(|_| crate::ann::slabs_enabled())
+                    .and_then(|_| slabs.get(attribute))
+                    .filter(|set| crate::ann::slabs_cover(segments, set));
+                if let Some(set) = slab
+                    && let Some((_, vector, k)) = self.scan.as_ref()
+                {
+                    let config = &self.config;
+                    let name = crate::ann_dir::Layout::Slabs.dir_key(attribute);
+                    tasks.push(
+                        async move {
+                            let dir = crate::ann_dir::load(store, &set.dir, prefetched.get(&name))
+                                .await?;
+                            crate::ann_dir::prefetch_scan(
+                                store,
+                                &set.slabs,
+                                &dir,
+                                attribute,
+                                crate::ann_dir::Layout::Slabs,
+                                vector,
+                                *k,
+                                config,
+                            )
+                            .await
+                        }
+                        .boxed(),
+                    );
+                    continue;
+                }
                 let blocks = self
                     .scan
                     .as_ref()
@@ -322,6 +356,11 @@ fn same_checkpoint(state: &NamespaceState, m: &bf_wal::Manifest) -> bool {
             .ann_dirs
             .iter()
             .all(|(k, f)| m.ann_dirs.get(k).is_some_and(|g| g.key == f.key))
+        && state.ann_slabs.len() == m.ann_slabs.len()
+        && state
+            .ann_slabs
+            .iter()
+            .all(|(k, f)| m.ann_slabs.get(k).is_some_and(|g| g.dir.key == f.dir.key))
 }
 pub(crate) async fn catch_up_hinted(
     wal: &Wal,
@@ -341,18 +380,28 @@ pub(crate) async fn catch_up_hinted(
                 let reads = hint.ann.iter().map(|a| async move {
                     // A lone unfiltered ANN query wants the block-layout directory: try its hint
                     // first, and the plain one when the namespace has none.
+                    let mut got = Vec::new();
                     if hint.scan.is_some() && crate::ann_dir::blocks_enabled() {
+                        // The recluster's slab directory and the block directory are fetched
+                        // together: which one answers is decided once the manifest is read.
+                        let slab = crate::ann_dir::Layout::Slabs.dir_key(a);
                         let name = crate::ann_dir::Layout::Blocks.dir_key(a);
-                        let name = name.trim_start_matches("ann:").to_string();
-                        if let Some(p) =
-                            crate::ann_dir::prefetch(store, wal.namespace(), &name).await
-                        {
-                            return Some((name, p));
+                        let (slab_hint, block_hint) = tokio::join!(
+                            crate::ann_dir::prefetch(store, wal.namespace(), &slab),
+                            crate::ann_dir::prefetch(store, wal.namespace(), &name)
+                        );
+                        got.extend(slab_hint.map(|p| (slab, p)));
+                        if let Some(p) = block_hint {
+                            got.push((name, p));
+                            return got;
                         }
                     }
-                    crate::ann_dir::prefetch(store, wal.namespace(), a)
-                        .await
-                        .map(|p| (a.clone(), p))
+                    got.extend(
+                        crate::ann_dir::prefetch(store, wal.namespace(), a)
+                            .await
+                            .map(|p| (a.clone(), p)),
+                    );
+                    got
                 });
                 found.extend(futures::future::join_all(reads).await.into_iter().flatten());
             }
@@ -391,6 +440,7 @@ pub(crate) async fn catch_up_hinted(
                         },
                         text_stats: m.text_stats,
                         ann_dirs: m.ann_dirs,
+                        ann_slabs: m.ann_slabs,
                         stats: m.stats.into(),
                         ..Default::default()
                     }
@@ -407,16 +457,18 @@ pub(crate) async fn catch_up_hinted(
             // The checkpoint's files do not depend on the tail: open them meanwhile.
             let (segments, text) = (state.segments.clone(), state.text_stats.clone());
             let dirs = state.ann_dirs.clone();
+            let slabs = state.ann_slabs.clone();
             let schema = state.schema.clone();
             if hint.splits_text(&dirs) {
                 // The text half keeps warming behind the query: its reads are single-flighted
                 // with the query's own, so nothing is fetched twice.
-                let (hint, store, segments, text, dirs, schema) = (
+                let (hint, store, segments, text, dirs, slabs, schema) = (
                     hint.clone(),
                     store.clone(),
                     segments.clone(),
                     text.clone(),
                     dirs.clone(),
+                    slabs.clone(),
                     schema.clone(),
                 );
                 let none = BTreeMap::new();
@@ -427,6 +479,7 @@ pub(crate) async fn catch_up_hinted(
                         &segments,
                         text.as_ref(),
                         &dirs,
+                        &slabs,
                         &none,
                         &schema,
                     )
@@ -446,6 +499,7 @@ pub(crate) async fn catch_up_hinted(
                     &segments,
                     text.as_ref(),
                     &dirs,
+                    &slabs,
                     &prefetched,
                     &schema
                 )

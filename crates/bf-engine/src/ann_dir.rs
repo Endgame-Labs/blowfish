@@ -138,6 +138,8 @@ pub(crate) async fn load(
 pub(crate) enum Layout {
     Plain,
     Blocks,
+    /// Block fragments of a namespace-wide recluster's slabs (`SlabSet`).
+    Slabs,
 }
 impl Layout {
     /// Key of the directory in the manifest.
@@ -145,13 +147,14 @@ impl Layout {
         match self {
             Self::Plain => format!("ann:{attr}"),
             Self::Blocks => format!("ann2:{attr}"),
+            Self::Slabs => format!("ann3:{attr}"),
         }
     }
     /// Key of a segment's fragment in its file map.
     pub(crate) fn frag_key(self, attr: &str) -> String {
         match self {
             Self::Plain => format!("annfrag:{attr}"),
-            Self::Blocks => format!("annfrag2:{attr}"),
+            Self::Blocks | Self::Slabs => format!("annfrag2:{attr}"),
         }
     }
 }
@@ -268,7 +271,11 @@ pub(crate) async fn build(
         store,
         format!(
             "ns/{ns}/segments/ann-dir{}-{}.bfd",
-            if layout == Layout::Blocks { "2" } else { "" },
+            match layout {
+                Layout::Plain => "",
+                Layout::Blocks => "2",
+                Layout::Slabs => "3",
+            },
             uuid::Uuid::new_v4()
         ),
         bytes.clone(),
@@ -646,7 +653,20 @@ pub(crate) async fn search(
     attribute: &str,
     members: Option<Vec<Option<Arc<Membership>>>>,
     layout: Layout,
+    real: Option<(&NamespaceState, &[bf_wal::SlabCover])>,
 ) -> Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError> {
+    // With slabs, `state` lists the slabs and `real` the segments that hold the documents: a
+    // slab row is a global row number, mapped back by the covered segments' bases.
+    let docs_state = real.map_or(state, |r| r.0);
+    let to_real = |i: usize, row: u32| -> (usize, u32) {
+        match real {
+            None => (i, row),
+            Some((_, covers)) => {
+                let p = covers.partition_point(|c| c.base <= row).saturating_sub(1);
+                (p, row - covers[p].base)
+            }
+        }
+    };
     let filtered = members.is_some();
     let members = members.unwrap_or_default();
     let t0 = std::time::Instant::now();
@@ -961,13 +981,15 @@ pub(crate) async fn search(
             best.select_nth_unstable_by(keep, |a, b| cmp(a, b));
         }
         for (i, c) in best.into_iter().take(keep) {
-            speculative.entry(*i).or_default().insert(c.row);
+            let (i, row) = to_real(*i, c.row);
+            speculative.entry(i).or_default().insert(row);
         }
     }
     // Exactly scanned segments already know their best rows.
     winners.sort_by(|a, b| a.0.total_cmp(&b.0));
     for (_, i, row) in winners.iter().take(k * 2) {
-        speculative.entry(*i).or_default().insert(*row);
+        let (i, row) = to_real(*i, *row);
+        speculative.entry(i).or_default().insert(row);
     }
     let mut by_segment: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
     for (i, c) in pool {
@@ -990,7 +1012,7 @@ pub(crate) async fn search(
     });
     let rerank_limit = reranks.len().max(limit);
     let prefetch = futures::future::join_all(speculative.iter().map(|(&i, rows)| async move {
-        let _ = segment::projected_rows(store, &state.segments[i], rows, Some(columns)).await;
+        let _ = segment::projected_rows(store, &docs_state.segments[i], rows, Some(columns)).await;
     }));
     let (reranked, _) = tokio::join!(
         futures::stream::iter(reranks)
@@ -1012,6 +1034,13 @@ pub(crate) async fn search(
         }
     }
     winners.truncate(keep);
+    let winners: Vec<(f32, usize, u32)> = winners
+        .into_iter()
+        .map(|(d, i, row)| {
+            let (i, row) = to_real(i, row);
+            (d, i, row)
+        })
+        .collect();
     let mut rows_by_segment: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
     for (_, i, row) in &winners {
         rows_by_segment.entry(*i).or_default().insert(*row);
@@ -1021,7 +1050,8 @@ pub(crate) async fn search(
         futures::future::try_join_all(rows_by_segment.iter().map(|(&i, rows)| async move {
             Ok::<_, ApiError>((
                 i,
-                segment::projected_rows(store, &state.segments[i], rows, Some(columns)).await?,
+                segment::projected_rows(store, &docs_state.segments[i], rows, Some(columns))
+                    .await?,
             ))
         }))
         .await?

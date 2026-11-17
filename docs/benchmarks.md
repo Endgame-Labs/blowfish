@@ -1763,3 +1763,85 @@ recall is 0.9465 and the cold p50 is about 3.3 s. Against the iteration 10 numbe
   seconds. Opening the pool at 1,024 (the cap it already grows to) fixed some of the tail in one session and none in another.
 - 1M and 100K were not loaded in R2 for this round. The cold-read unit tests (`crates/bf-engine/tests/read_cache.rs`: waves and
   requests for 20 and 60 segments) pass with unchanged limits.
+
+## Iteration 12 (10M docs): a namespace-wide recluster, scanning a fifth of the rows
+
+Same 10M, 1,024-dimension namespace (70 segments), same 200 queries and truth. Goal unchanged: cold p50 at most 1,224 ms or p90 at
+most 1,700 ms, with ANN recall@10 at least 0.943. **Met on both latency rules at 0.945 recall** (full 200 queries, warm).
+
+### Offline: recall against rows scanned (1M, exact truth, exact centers, 200 queries)
+
+The first 1M passages, truth recomputed by brute force. "Rows to 0.943" is the mean rows scanned when the nearest clusters are probed
+until recall@10 first reaches 0.943.
+
+| Layout | Rows to 0.943 | Notes |
+| --- | ---: | --- |
+| (a) per-segment clusters (7 segments, sqrt(n) each), global ranking of all centers | 56K | the current layout. (b), a global ranking with no per-segment scaling, is the same curve: the planner already ranks all centers together, and the scaling only sets the probe count |
+| (c) one global k-means, about 1,000 rows per cluster | 55K | |
+| (c) global, about 300 rows | 39K | |
+| (c) global, about 100 rows | 16K | |
+| (d) global 100 rows, each row in its top 2 clusters | 17K | counting duplicated rows. Gain 1.0 to 1.13 times (300 rows: 35K): killed, under 1.3 times |
+| (e) 20 spatial slabs, about 100 rows per cluster | 23K | slabs are a hard coarse partition |
+| (e) 20 slabs, about 200 rows | 29K | the shipped layout |
+| (e) 8 slabs, about 100 rows | 23K | |
+
+Merged byte runs per query at 0.943 (blocks in tree order, a 136-byte code per row, gap 0, 256 KB, 1 MB; at 1M rows, so the gaps cover
+more of the layout than at 10M): 20 slabs of 100 rows need 194 probes (123, 30, and 15 runs); 200 rows, 131 probes (80, 25, and 13
+runs); 374 rows, 119 probes (67, 28, and 15 runs; 48K rows); the 7 per-segment layout needs 131 probes (98, 52, and 28 runs).
+The 300K-row kill rule for 100-row leaves is not close (16K to 23K at 1M).
+
+Why a global layout wins more at 10M than at 1M: the per-segment layout needs clusters from every segment that holds a neighbor, so
+its probes grow with the segment count (1,500 clusters, 583K rows at 160 probes). A slab layout's probes grow with the neighborhood.
+
+### What was built
+
+- `Engine::recluster` (`recluster.rs`, `examples/recluster.rs`): copies every live row's vector once into a local spill file indexed by
+  global row number (segment base plus segment-local row), trains 32 coarse cells on a 100K sample (8 Lloyd iterations), assigns every
+  row, then builds each cell as a slab with the ordinary index builder (about 200 rows per leaf), its block fragment, and a block
+  directory over the slabs. A slab's row IDs are global row numbers, so a winner maps back to its segment and row by a 70-entry base
+  table, with no lookup object. Documents, attributes, and the per-segment indexes and directories stay where they are.
+- `Manifest::ann_slabs` (`SlabSet`): slabs, covered segments (with bases and live generations), and the directory. Older binaries ignore
+  the field and answer from the segments as before. GC protects the slab files and retires them when a covered segment is gone.
+- Queries: an unfiltered ANN query answers from the slabs while they cover exactly the live segments (same planner, scan, bound-pruned
+  rerank, and hydrate code, with winners mapped back). A delete after the build is a mask over global rows. A tail upsert or delete
+  works as before (shadowed IDs). The snapshot wave fetches the slab directory's hint beside the manifest and prefetches the scan.
+  Filtered queries, and any namespace that gained a segment since the build, use the per-segment path (`BF_ANN_SLABS=0` forces it).
+- The 10M namespace was reclustered additively: 32 slabs, 49,986 leaves, a 9.9 MB directory, 2,004 s (copy 273 s, partition 37 s,
+  slab builds the rest), peak resident 16.9 GB (above the 12 GB target: the largest slab, 465K rows, builds in f32 with a second copy
+  for training; a lower `max_slab_rows` cuts it). The temporary spill file is 20 GB and is deleted at the end.
+- A bench-only `POST /_bench/drop_caches` in the scale server (loopback, no auth, not in the public router) empties the block, disk,
+  and decoded caches and the resident namespace state: the cache-cold, process-warm measurement.
+
+### Recall, warm, full 200 queries
+
+| `BF_ANN_NPROBE` (slab leaves probed, x15.8) | 8 (126) | 16 (253) | 24 (380) | 32 (506) | 40 (632) | 48 (759) | 64 (1,011) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| recall@10 | 0.8365 | 0.882 | 0.9135 | 0.930 | 0.9415 | 0.953 | 0.9615 |
+
+Rows scanned at 0.943 (about 42 probes, 660 leaves) are about 130K, against 583K for the per-segment layout at 160 probes.
+
+### Cold, same-session A/B, 30 queries per arm (`bench/scale/ab.py`, fresh process, empty caches)
+
+| Arm | p50 ms | p90 | p99 | Requests | MB | Waves | Recall@10 (these 30; full 200) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| per-segment, 160 probes (before) | 2,916 | 4,358 | 23,116 | 880 | 116.5 | 3.5 | 0.950 (0.9465) |
+| per-segment, 64 probes | 1,342 | 1,720 | 2,782 | 463 | 62.9 | 3.4 | 0.870 (0.8855) |
+| **slabs, 42 probes (after)** | **1,082** | **1,592** | 2,283 | 383 | 47.1 | 3.2 | 0.927 (about 0.945) |
+
+Cache-cold, process-warm (one running server, `drop_caches` before each query; 30 queries; its own session, so only compare within the
+row pair): slabs at 42 probes 954 ms p50 and 1,262 ms p90 (440 requests, 47.1 MB); per-segment at 160 probes 4,306 and 7,001 ms
+(1,000 requests, 116.5 MB). Both numbers are reported beside each other; the fresh-process number is the conservative one.
+
+Recall on these 30 queries is below the full-set recall for the slab arm (0.927 against about 0.945): 42 probes is the full-set
+interpolation between 0.9415 (40) and 0.953 (48), and 30 queries are a noisy sample.
+
+### What is left
+
+- Two-level directory: a cold query reads the 9.9 MB slab directory plus the manifest (about 5 MB of it is the per-segment directory
+  hint, still fetched). The slab directory could be a top level in the manifest and per-slab sections.
+- The final wave's two dependent document hops (about 340 to 450 ms) are untouched. Putting each leaf's documents' bytes beside its
+  block (research hypothesis 2) would make rerank and hydrate one wave.
+- New segments flushed after a recluster make the slabs stale (any uncovered live segment): queries fall back to the per-segment path
+  until the next recluster. Serving covered slabs plus the new segments in one query, and an indexer-triggered recluster, are not built.
+- The builder's peak memory (16.9 GB) and a slab split that ignores locality for cells above `max_slab_rows`.
+- Filtered ANN does not use the slabs.
