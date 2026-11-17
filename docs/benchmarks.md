@@ -1418,3 +1418,115 @@ pool). The request count per wave did not fall (ANN 339 requests): the floor mea
 past a gap of about 100 KB, so the way to fewer requests is a layout in which the cluster blob and the codes of a probe
 are one range, and nearby clusters are stored near each other, which needs a reload. That is the first item for the next round.
 Warm latency and QPS were not re-measured this round.
+
+## Iteration 10 (10M docs): pipelined WAL ingest, and what 10M costs
+
+Goal unchanged: cold p50 at most about 1,224 ms or p90 at most about 1,700 ms (turbopuffer's published 10M cold numbers are
+p50 874 ms and p90 1,214 ms), recall at least turbopuffer's measured 10M recall. This round loaded the full 10M real passages
+(same dataset, 200 held-out queries, truth `bench/scale/data/oracle-10m.npz`) after wiping `scale/`.
+
+### What changed
+
+1. **WAL pipeline** (`bf-wal` `Wal::stage` and `Wal::commit`, `commit_worker` in `bf-engine`, `BF_WAL_PIPELINE`, default 8).
+   The coordinator measured the old ingest at 14 MB/s of upload with the server at 0.6 cores: each group's payload was a single PUT,
+   and the next group could not start until the previous slot committed. Now up to 8 groups upload their payloads at once, each as its
+   own object under a unique key, and the small slot records commit strictly in order. A writer is acknowledged only after its own
+   slot commits. Writes are evaluated against the groups still in flight (`snapshot::for_writes` takes an overlay of their IDs and
+   schema), so conditions, `$ref_new`, patches, and deletes see them. A failed slot fails every later in-flight group: after a lost
+   race the writers are queued again after a resync, after a storage error they get the error, and the abandoned payloads are
+   deleted (orphans from a crash are reclaimed by the existing `prune_payloads`). Deletes, copies, and filter writes drain the
+   pipeline first. Tests (`crates/bf-engine/tests/wal_pipeline.rs`): ordering with reversed upload completion, conditional writes
+   across in-flight groups, a failed slot, two racing writers, and orphan reclaim.
+2. **Adaptive connection warmer** (`bf-storage`): the warm pool follows 1.25 times the largest wave of parallel reads seen in the last
+   10 minutes (starts at 256, cap 1,024, floor 16 after an idle window, `BF_WARM_CONNECTIONS` fixes it, `BF_WARM_FLOOR`).
+3. **ANN directory hint**: each publication also writes the directory to a fixed key, and a cold open reads it in parallel with
+   the manifest (verified against the manifest's directory key). A unit test shows one wave fewer. At 10M it did not show in the
+   A/B (waves 4.6 against 4.1 is within the spread), because the wave count there is dominated by the probe and rerank waves.
+
+### Ingest
+
+`scale/inner/` (200K docs, same loader, 16 writes in flight, same R2): old binary 175 s (1,152 docs/s, server 0.64 cores, peak RSS
+2.5 GB); pipelined binary 98 s (2,040 docs/s over the run, which includes the startup and drain, server 0.75 cores, 3.1 GB). A
+500K run on the new binary held about 1,860 docs/s from 100K to 470K rows while another job was compiling on the same VM.
+**The target of 3,000 docs/s was not met, and the next limiter is the VM-to-R2 upload path**: a plain parallel PUT test (12 MB
+objects) reaches 4.8 MB/s with one stream and tops out at 13.9 MB/s aggregate with 4, 8, or 16 streams. Each document uploads about
+3 KB of WAL plus 5.6 KB of live segments (more with rewrites), so the ceiling is about 1.7K docs/s. The commit worker is about
+20 percent busy (prepare 0.2 s, slot commit 0.27 s, replay 0.04 s per group of two requests).
+
+Full 10M load (batch 2,000, 16 in flight, loader in a 6 GiB scope, server in a 16 GiB scope): rows 0 to 1M at 1,710 docs/s, 1 to 2M at
+1,380, 2 to 5M at 1,250, 5 to 7M at 1,160; 7.83M rows at 6,446 s (1,215 docs/s over that stretch) with 1,717 429s. Then the
+**server's memory became the limiter**: RSS reached the 14 GB scope mark and stalled (a throttled process at `MemoryHigh` makes
+no progress), and finishing took six server restarts and about 18,000 seconds of pauses, so the whole-run wall time of 24,780 s
+(403 docs/s) says nothing about throughput. Peak RSS 16.1 GB. Final: 10,000,000 documents in 70 segments (the last 2M rows
+were loaded with `BF_MAX_SEGMENT_ROWS=100000` to avoid the large merges below), 3,039 429s, 5,635 live bytes per document
+(ANN 2.2 KB, documents 2.5 KB, text 0.9 KB); the bucket held 69.5 GB before garbage collection (WAL 6.7 GB not yet reclaimed).
+
+### Memory grows with the namespace (top bottleneck)
+
+Server RSS at 0.5M, 1M, 1.5M, 2.5M, 3.5M, 5M, 7M rows: 4.0, 5.9, 7.0, 7.9, 9.4, 8.8, 11.2 GB, a sawtooth with a floor rising about 1.3 GB per
+million rows, and spikes to 13 to 15 GB when a compaction reads its source segments (every compaction of two to four 100K-row
+segments went to 13 to 15 GB). A restarted server at 9.6M rows reached 15 GB within a minute of its first compaction. At the
+7.09M mark `smaps` showed 11.4 GB anonymous: 4.7 GB in the main heap and 6.4 GB in other anonymous mappings (thread arenas and large
+allocations), 20 MB file-backed. Known contributors: the 1 GiB block cache (full), the decoded-metadata cache (budget 4.2 GiB,
+charged at resident size), the unindexed tail held as documents (base64 f32 vectors, about 8 KB per row, up to the 2 GB
+backpressure limit), and compaction and flush working sets. There is no heap profiler on this VM, so the split is inferred from
+budgets and mapping sizes, not measured: the next iteration should run a heap profile (dhat or jemalloc) at 2M rows first.
+
+### Cold queries at 10M, same-session A/B (fresh process and empty disk cache per query, alternating arms)
+
+Base is this round's starting binary, new has the three changes. Both read the same 10M namespace (70 segments).
+
+| Query (n) | Base p50 / p90 / p99 ms | New p50 / p90 / p99 ms | Requests | MB | Waves (base, new) |
+| --- | --- | --- | ---: | ---: | --- |
+| ANN (12) | 2,947 / 4,043 / 4,404 | 2,999 / 4,379 / 4,612 | 1,115 | 68.9 | 4.1, 4.6 |
+| BM25 (8) | 4,991 / 7,607 / 8,424 | 4,384 / 5,816 / 6,448 | 1,196 | 61.5 | 3.8, 3.4 |
+| Hybrid (8) | 3,877 / 4,799 / 5,604 | 4,158 / 4,769 / 5,647 | 2,241 | 119.9 | 2.4, 2.9 |
+| Selective (8) | 7,285 / 8,532 / 10,658 | 6,564 / 8,707 / 10,725 | 2,603 | 268.0 | 4.0, 4.2 |
+
+There is no measurable difference between the arms: the changes in this round do not touch the cold read path at 10M. What grew
+from 1M (iteration 9: ANN 339 requests and 22 MB, BM25 310 and 9.2 MB, hybrid 635 and 29.8 MB, selective 1,904 and 41.9 MB) is
+the number of probed clusters and the number of segments: ANN 3.3 times the requests and 3.1 times the bytes, BM25 3.9 and 6.7
+times, hybrid 3.5 and 4.0 times, and selective 1.4 times the requests but 6.4 times the bytes (the filtered path now scans codes
+rather than fetching exact rows, because 42K rows match, which is over the exact-fetch limit). Cold latency is about 2.3 to 4.5
+times the 1M figures and 2.4 to 7.5 times the goal.
+
+### Hot (warm) latency, recall, and parity at 10M (`oracle_compare.py`, 200 queries per type, one request at a time, after one warm-up pass)
+
+| | ANN | BM25 | Hybrid | Selective |
+| --- | ---: | ---: | ---: | ---: |
+| blowfish hot client p50 / p90 / p99 ms | 104 / 147 / 204 | 128 / 266 / 483 | 153 / 265 / 377 | 201 / 232 / 316 |
+| turbopuffer client p50 / p90 / p99 ms (measured, this session) | 123 / 279 / 442 | 70 / 192 / 389 | 67 / 74 / 121 | 117 / 134 / 188 |
+| turbopuffer `server_total_ms` p50 / p90 | 43 / 223 | 15 / 137 | 13 / 18 | 24 / 27 |
+| turbopuffer published cold p50 / p90 ms | 874 / 1,214 | | | |
+| blowfish cold p50 / p90 ms (A/B above) | 2,999 / 4,379 | 4,384 / 5,816 | 4,158 / 4,769 | 6,564 / 8,707 |
+| Overlap@10 with turbopuffer | 0.887 | 0.985 | 0.935 | 0.962 |
+| Recall@10 blowfish (default nprobe 64) | 0.886 | | | 0.968 |
+| Recall@10 turbopuffer | 0.943 | | | 0.993 |
+| Recall@10 blowfish with `BF_ANN_NPROBE=160` (turbopuffer 0.943 and 0.993) | 0.947 | | | 0.992 |
+| Hot client p50 / p90 ms with nprobe 160 | 164 / 197 | | | 446 / 518 |
+
+Recall at 10M is below turbopuffer's with the default 64 probes (ANN 0.886 against 0.943, selective 0.968 against 0.993), which
+the earlier sizes did not show (0.952 at 1M). 160 probes restores it (0.947 and 0.992) at a hot-latency cost; its cold cost was not
+measured and will be larger than the table above. turbopuffer's published numbers are cold p50 874 ms and p90 1,214 ms; it cannot
+be forced cold, so its measured column is hot or warm (ANN 98 hot and 102 warm of 200).
+
+### Verdict
+
+Not met: no query type is near the goal at 10M (cold p50 3.0 to 6.6 s against 1.22 s). Ingest improved 1.7 to 1.8 times but is now
+bound by the upload path and, past about 5M rows, by server memory.
+
+### Ranked bottlenecks for the next iteration
+
+1. **Memory that grows with rows and compaction working sets** (above): blocks the load at about 7M rows on a 14 GB scope. Profile
+   the heap, stream compaction (read, merge, and build per cluster without holding every source row), and cap the tail's in-memory
+   form.
+2. **Cold requests and bytes scale with the data**: ANN 1,115 requests and 69 MB, BM25 1,196 and 61 MB, selective 2,603 and 268 MB.
+   Needs the layout change from iteration 9's report (vectors next to codes, clusters ordered by proximity, so a probe set is a few
+   ranges), a smaller probe set that keeps recall (the 160-probe recall fix makes it worse), and fewer, larger segments
+   (70 segments against about 9 at 1M).
+3. **Selective filters at 10M** scan codes over about 3 times the probed clusters (268 MB per query): a per-cluster allowed-row index
+   would cut that.
+4. **Upload bandwidth**: 14 MB/s aggregate to R2 from this VM caps ingest at about 1.7K docs/s at 8.6 KB uploaded per document;
+   fewer bytes per document (vectors are stored twice per segment) is the only lever.
+5. Not done this round: the selective-filter structure, the cold layout change, the manifest and directory overlap beyond the hint,
+   and the 160-probe cold cost.
