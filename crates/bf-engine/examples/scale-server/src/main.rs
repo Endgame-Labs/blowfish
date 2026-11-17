@@ -9,6 +9,7 @@ use std::{error::Error, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    blowfish::start_alloc_monitor();
     let mut args = std::env::args().skip(1);
     let path = args
         .next()

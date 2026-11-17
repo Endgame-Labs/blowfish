@@ -3,6 +3,7 @@ mod admin;
 mod legacy;
 mod operations;
 
+use bf_alloc as _; // installs jemalloc as the global allocator
 use axum::{
     Extension, Json, Router,
     extract::{
@@ -114,11 +115,16 @@ pub fn prometheus_handle() -> PrometheusHandle {
         })
         .clone()
 }
+/// Start the allocator monitor configured by `BF_MEM_LOG_SECS` and `BF_HEAP_DUMP_DIR` (see `bf-alloc`).
+pub fn start_alloc_monitor() {
+    bf_alloc::start_monitor();
+}
 /// Unauthenticated metrics listener; bind it only to a trusted monitoring network.
 pub fn metrics_router() -> Router {
     Router::new().route("/metrics", get(metrics_endpoint))
 }
 async fn metrics_endpoint() -> impl IntoResponse {
+    bf_alloc::publish_gauges();
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         prometheus_handle().render(),

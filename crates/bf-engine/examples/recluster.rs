@@ -1,11 +1,13 @@
 //! Build a namespace-wide ANN layout (see `recluster.rs`) for an ingested namespace.
 //! Usage: recluster storage.json namespace attribute scratch_dir [cells] [cluster_rows] [max_slab_rows]
+use bf_alloc as _;
 use bf_engine::{Engine, EngineConfig, ReclusterOptions};
 use bf_storage::{Storage, StorageConfig};
 use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    bf_alloc::start_monitor();
     let a: Vec<_> = std::env::args().collect();
     if a.len() < 5 {
         return Err("expected storage.json namespace attribute scratch_dir [cells] [cluster_rows] [max_slab_rows]".into());

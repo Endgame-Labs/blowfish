@@ -7,6 +7,9 @@ publish = false
 # Keep benchmark-only HTTP dependencies out of the engine's dependency graph.
 [workspace]
 
+[features]
+heap-profile = ["blowfish/heap-profile"]
+
 [dependencies]
 axum = "=0.8.9"
 bf-auth = { path = "../../../bf-auth" }

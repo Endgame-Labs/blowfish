@@ -1,0 +1,19 @@
+[package]
+name = "bf-alloc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The process allocator (jemalloc with background purging) and its memory statistics"
+
+[dependencies]
+metrics = "=0.24.6"
+
+[features]
+# Compile jemalloc with its heap profiler. Activate it at run time with
+# `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_final:true,prof_prefix:/path/heap`.
+heap-profile = ["tikv-jemallocator/profiling"]
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads", "stats"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats"] }

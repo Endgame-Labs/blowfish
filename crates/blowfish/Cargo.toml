@@ -9,6 +9,7 @@ repository.workspace = true
 http-body-util = "0.1.3"
 base64 = "=0.22.1"
 uuid = { version = "=1.29.2", features = ["v4"] }
+bf-alloc = { path = "../bf-alloc" }
 bf-auth = { path = "../bf-auth" }
 chrono = { version = "0.4.45", features = ["serde"] }
 metrics = "=0.24.6"
@@ -32,6 +33,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [features]
+# jemalloc heap profiler (see bf-alloc).
+heap-profile = ["bf-alloc/heap-profile"]
 # Run GGUF embedding and reranking models in-process (llama.cpp). Needs cmake and clang to build.
 local-models = ["bf-models/local-models"]
 local-models-native = ["bf-models/local-models-native"]
