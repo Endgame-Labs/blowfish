@@ -164,6 +164,18 @@ pub struct SlabCover {
     #[serde(default)]
     pub live_generation: u64,
 }
+/// Record `blowfish_wal_commit_duration_seconds` for one slot attempt, from the start of staging
+/// to the end of the slot's conditional commit. Pipelined writers that call `stage` and `commit`
+/// separately must call this themselves.
+pub fn record_commit(result: &Result<CreateResult, Error>, started: std::time::Instant) {
+    let outcome = match result {
+        Ok(CreateResult::Conflict) => "conflict",
+        Ok(_) => "success",
+        Err(_) => "error",
+    };
+    metrics::histogram!("blowfish_wal_commit_duration_seconds", "outcome" => outcome)
+        .record(started.elapsed().as_secs_f64());
+}
 /// Immutable file reference. Lengths exclude the storage retry-identity header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentFile {
@@ -303,7 +315,7 @@ impl Wal {
     pub async fn append(&self, seq: u64, entry: &WalEntry) -> Result<CreateResult, Error> {
         let started = std::time::Instant::now();
         let result = self.append_inner(seq, entry).await;
-        metrics::histogram!("blowfish_wal_commit_duration_seconds", "outcome" => match &result { Ok(CreateResult::Conflict) => "conflict", Ok(_) => "success", Err(_) => "error" }).record(started.elapsed().as_secs_f64());
+        record_commit(&result, started);
         result
     }
     async fn append_inner(&self, seq: u64, entry: &WalEntry) -> Result<CreateResult, Error> {

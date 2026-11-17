@@ -1055,7 +1055,9 @@ async fn commit_front(
                 Some(ApiError::new(503, "WAL position changed"))
             } else {
                 let stage = Instant::now();
-                match wal.commit(front.seq, &front.entry, &staged).await {
+                let committed = wal.commit(front.seq, &front.entry, &staged).await;
+                bf_wal::record_commit(&committed, front.start);
+                match committed {
                     Ok(CreateResult::Conflict) => {
                         retry = true;
                         Some(ApiError::new(503, "WAL slot lost"))
