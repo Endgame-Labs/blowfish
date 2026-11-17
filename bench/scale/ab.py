@@ -14,7 +14,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 SCRATCH = pathlib.Path(os.environ.get("SCALE_SCRATCH", ROOT / ".scratch/scale"))
 CONFIG = pathlib.Path(os.environ.get("SCALE_CONFIG", HERE / "config.local"))
-NS = json.loads(CONFIG.read_text())["namespace"]  # overridden by --namespace
+NS = json.loads(CONFIG.read_text())["namespace"]  # overridden by --namespace; per-arm AB_NS and AB_CONFIG env override both
 PORT = int(os.environ.get("SCALE_PORT", "8391"))
 URL = f"http://127.0.0.1:{PORT}"
 WORK = SCRATCH / "ab"
@@ -32,12 +32,20 @@ def metrics():
     return out
 
 
+CUR_NS = NS
+
+
 def start_server(arm, append_log=False):
     name, (binary, env) = arm
+    env = dict(env)
+    config = env.pop("AB_CONFIG", str(CONFIG))  # an arm may read another bucket prefix (a different layout)
+    ns = env.pop("AB_NS", NS)
     shutil.rmtree(WORK, ignore_errors=True); (WORK / "cache").mkdir(parents=True)
-    subprocess.run(["python3", str(HERE / "mkconfig.py"), str(CONFIG), str(WORK / "storage.json"), str(WORK / "cache"),
+    subprocess.run(["python3", str(HERE / "mkconfig.py"), config, str(WORK / "storage.json"), str(WORK / "cache"),
                     "--memory-gib", os.environ.get("AB_MEM_GIB", "8"), "--read-only"], check=True)
     e = dict(os.environ, RAYON_NUM_THREADS=os.environ.get("RAYON_NUM_THREADS", "6"), MALLOC_ARENA_MAX="2", BF_TRACE_READS="1", **env)
+    global CUR_NS
+    CUR_NS = ns
     log = open(WORK / "server.log", "a" if append_log else "w")
     proc = subprocess.Popen([binary, str(WORK / "storage.json"), f"127.0.0.1:{PORT}"], stdout=log, stderr=subprocess.STDOUT, env=e)
     for _ in range(200):
@@ -52,7 +60,7 @@ def start_server(arm, append_log=False):
 def query_once(query):
     before = metrics()
     (WORK / "q.json").write_text(json.dumps([query]))
-    res = subprocess.run(["uv", "run", str(ROOT / "crates/bf-engine/examples/scale_api.py"), str(WORK / "q.json"), URL, NS, "1"],
+    res = subprocess.run(["uv", "run", str(ROOT / "crates/bf-engine/examples/scale_api.py"), str(WORK / "q.json"), URL, CUR_NS, "1"],
                          capture_output=True, text=True, check=True)
     row = json.loads(res.stdout.splitlines()[0])
     after = metrics()

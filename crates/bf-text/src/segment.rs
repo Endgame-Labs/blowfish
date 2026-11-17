@@ -26,6 +26,14 @@ const VERSION_LAZY: u32 = 2;
 /// index (first term, offset, length, checksum per chunk) sits next to the lengths in the
 /// metadata tail, so a query reads only the chunks that hold its terms.
 const VERSION_CHUNKED: u32 = 3;
+/// Version 3 with each term's record stored immediately before its posting blocks, and the phrase
+/// positions in one region after all postings. `metadata_offset` is where that positions region begins,
+/// so records live in `[0, metadata_offset)` and a record's handle offset is absolute.
+const VERSION_COLOCATED: u32 = 4;
+/// Terms of at most this many blocks are read together with their record (version 4).
+const SMALL_BLOCKS: usize = 4;
+/// Upper bound of one compressed posting block.
+const MAX_BLOCK_BYTES: usize = 1026;
 /// Terms per dictionary chunk (version 3).
 const CHUNK_TERMS: usize = 2048;
 /// Decoded dictionary chunks kept per reader before the memo is reset.
@@ -37,6 +45,8 @@ const BLOCK_META: usize = 52;
 /// Decoded term records kept per reader before the memo is reset.
 const MEMO_TERMS: usize = 16384;
 const TAIL: u64 = 64 * 1024;
+/// Windows whose posting blocks a prefetching search reads in its first batch.
+const FIRST_WINDOWS: usize = 24;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message)
@@ -253,11 +263,12 @@ impl SegmentBuilder {
     /// Produce immutable version-2 bytes (version-1 segments remain readable). No other
     /// crate's serialization is embedded.
     pub fn finish(self) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        let mut records = Vec::new();
-        let mut chunk_terms: Vec<(&str, u64)> = Vec::new();
-        let mut chunk_data: Vec<(String, Vec<u8>)> = Vec::new();
         let packer = BitPacker4x::new();
+        // Phase 1: compress every term's blocks. `post` holds the blocks of all terms in order and
+        // `pos` the phrase positions; block offsets are relative until phase 2 places them.
+        let mut post: Vec<u8> = Vec::new();
+        let mut pos: Vec<u8> = Vec::new();
+        let mut terms: Vec<(&str, Vec<BlockMeta>)> = Vec::with_capacity(self.postings.len());
         for (term, postings) in self.postings.iter() {
             let mut blocks = Vec::new();
             for entries in postings.chunks(BLOCK) {
@@ -277,19 +288,19 @@ impl SegmentBuilder {
                 let n = packer.compress(&deltas, &mut compressed[2..], doc_bits);
                 let m = packer.compress(&frequencies, &mut compressed[2 + n..], tf_bits);
                 compressed.truncate(2 + n + m);
-                let offset = bytes.len() as u64;
-                bytes.extend_from_slice(&compressed);
-                let mut positions = Vec::new();
+                let offset = post.len() as u64;
+                post.extend_from_slice(&compressed);
+                let positions_offset = pos.len() as u64;
                 if self.positions {
                     for entry in entries {
                         for &(element, position) in &entry.positions {
-                            put32(&mut positions, element);
-                            put32(&mut positions, position);
+                            put32(&mut pos, element);
+                            put32(&mut pos, position);
                         }
                     }
                 }
-                let positions_offset = bytes.len() as u64;
-                bytes.extend_from_slice(&positions);
+                let positions_size = pos.len() as u64 - positions_offset;
+                let positions_crc = crc32fast::hash(&pos[positions_offset as usize..]);
                 blocks.push(BlockMeta {
                     first: entries[0].row,
                     last: entries.last().unwrap().row,
@@ -304,24 +315,48 @@ impl SegmentBuilder {
                     size: compressed.len() as u32,
                     crc: crc32fast::hash(&compressed),
                     positions: positions_offset,
-                    positions_size: u32::try_from(positions.len())
+                    positions_size: u32::try_from(positions_size)
                         .map_err(|_| input("positions block too large"))?,
-                    positions_crc: crc32fast::hash(&positions),
+                    positions_crc,
                 });
             }
-            let df = postings.len() as u64;
-            let record_offset = records.len() as u64;
+            terms.push((term, blocks));
+        }
+        // Phase 2: each term's record sits immediately before its blocks, so one read returns a
+        // short term's record and postings together. Phrase positions follow all postings.
+        let record_size = |blocks: usize| RECORD_HEADER + BLOCK_META * blocks + 4;
+        let postings_len = post.len() as u64
+            + terms
+                .iter()
+                .map(|(_, b)| record_size(b.len()) as u64)
+                .sum::<u64>();
+        let mut bytes = Vec::with_capacity(postings_len as usize + pos.len());
+        let mut chunk_terms: Vec<(&str, u64)> = Vec::new();
+        let mut chunk_data: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut cursor = 0usize;
+        for (term, mut blocks) in terms {
+            let record_offset = bytes.len() as u64;
+            let df: u64 = blocks.iter().map(|b| b.count as u64).sum();
             if df > DF_MASK || record_offset >> (64 - DF_BITS) != 0 {
                 return Err(input("text segment too large"));
             }
-            let start = records.len();
-            put32(&mut records, df as u32);
-            put32(&mut records, blocks.len() as u32);
-            for block in &blocks {
-                block.encode(&mut records);
+            let blocks_start = record_offset + record_size(blocks.len()) as u64;
+            let first = blocks[0].offset;
+            let mut record = Vec::with_capacity(record_size(blocks.len()));
+            put32(&mut record, df as u32);
+            put32(&mut record, blocks.len() as u32);
+            for block in &mut blocks {
+                block.offset = blocks_start + (block.offset - first);
+                block.positions += postings_len;
+                block.encode(&mut record);
             }
-            let crc = crc32fast::hash(&records[start..]);
-            put32(&mut records, crc);
+            let crc = crc32fast::hash(&record);
+            put32(&mut record, crc);
+            bytes.extend_from_slice(&record);
+            let last = blocks.last().unwrap();
+            let length = (last.offset + last.size as u64 - blocks_start) as usize;
+            bytes.extend_from_slice(&post[cursor..cursor + length]);
+            cursor += length;
             chunk_terms.push((term, (record_offset << DF_BITS) | df));
             if chunk_terms.len() == CHUNK_TERMS {
                 chunk_data.push(build_chunk(&chunk_terms)?);
@@ -331,9 +366,11 @@ impl SegmentBuilder {
         if !chunk_terms.is_empty() {
             chunk_data.push(build_chunk(&chunk_terms)?);
         }
+        drop(post);
+        debug_assert_eq!(bytes.len() as u64, postings_len);
         let metadata_offset = bytes.len() as u64;
-        bytes.extend_from_slice(&records);
-        drop(records);
+        bytes.extend_from_slice(&pos);
+        drop(pos);
         let mut index = Vec::new();
         put32(&mut index, chunk_data.len() as u32);
         for (first, blob) in &chunk_data {
@@ -353,7 +390,7 @@ impl SegmentBuilder {
         let dictionary_crc = crc32fast::hash(&bytes[dictionary_offset as usize..]);
         let mut footer = Vec::with_capacity(FOOTER);
         footer.extend_from_slice(MAGIC);
-        put32(&mut footer, VERSION_CHUNKED);
+        put32(&mut footer, VERSION_COLOCATED);
         put32(&mut footer, u32::from(self.positions));
         put32(&mut footer, self.lengths.len() as u32);
         put32(&mut footer, self.tokenizer as u32);
@@ -496,6 +533,41 @@ enum Dictionary {
     },
 }
 
+/// What a reader needs to start without reading the object: its footer and the dictionary's chunk
+/// index `(first term, offset, length, crc32)`. The engine keeps it in the manifest (version 4 segments).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextHeader {
+    /// The 72-byte footer.
+    pub footer: Vec<u8>,
+    /// Dictionary chunks in term order.
+    pub chunks: Vec<(Vec<u8>, u64, u32, u32)>,
+}
+/// The header of a finished version 4 segment (`None` for older versions).
+pub fn text_header(bytes: &[u8]) -> io::Result<Option<TextHeader>> {
+    if bytes.len() < FOOTER {
+        return Err(invalid("text segment has no footer"));
+    }
+    let footer = &bytes[bytes.len() - FOOTER..];
+    let mut c = Cursor::new(footer);
+    if c.take(8)? != MAGIC {
+        return Err(invalid("unknown text segment format"));
+    }
+    if c.u32()? != VERSION_COLOCATED {
+        return Ok(None);
+    }
+    let mut c = Cursor::new(&footer[32..]);
+    let (lengths_offset, metadata_offset, dictionary_offset) = (c.u64()?, c.u64()?, c.u64()?);
+    let index = checked_slice(bytes, dictionary_offset as usize..bytes.len() - FOOTER)?;
+    let entries = parse_chunk_index(index, metadata_offset, lengths_offset)?;
+    Ok(Some(TextHeader {
+        footer: footer.to_vec(),
+        chunks: entries
+            .into_iter()
+            .map(|e| (e.first, e.offset, e.len, e.crc))
+            .collect(),
+    }))
+}
+
 /// An immutable segment. Opening reads the last 64 KiB, then any missing index
 /// metadata in one additional read (version 2: just the lengths and dictionary, about
 /// 20 bytes per distinct term, with each term's block directory read when a query needs it).
@@ -504,12 +576,18 @@ pub struct SegmentReader {
     source: Arc<dyn RangeRead>,
     dictionary: Dictionary,
     terms: Terms,
-    lengths: Vec<u32>,
+    /// Per-row lengths: set at open, or read on demand (`ensure_lengths`) for a reader opened from a header.
+    lengths: std::sync::OnceLock<Vec<u32>>,
+    docs: u32,
+    /// Where the packed lengths are, for a reader opened from a header: offset, end, and checksum.
+    lazy_lengths: Option<(u64, u64, u32)>,
     total_tokens: u64,
     positions: bool,
     tokenizer: Tokenizer,
     /// End of the posting and position payloads.
     postings_end: u64,
+    /// Version 4: each term's record is followed by its blocks (`SMALL_BLOCKS` and fewer are read with it).
+    colocated: bool,
 }
 
 fn check_block(
@@ -557,10 +635,15 @@ impl SegmentReader {
             return Err(invalid("unknown text segment format"));
         }
         let version = c.u32()?;
-        if version != VERSION && version != VERSION_LAZY && version != VERSION_CHUNKED {
+        if version != VERSION
+            && version != VERSION_LAZY
+            && version != VERSION_CHUNKED
+            && version != VERSION_COLOCATED
+        {
             return Err(invalid("unknown text segment format"));
         }
-        let chunked = version == VERSION_CHUNKED;
+        let colocated = version == VERSION_COLOCATED;
+        let chunked = version == VERSION_CHUNKED || colocated;
         let lazy = version == VERSION_LAZY || chunked;
         let flags = c.u32()?;
         if flags > 1 {
@@ -646,15 +729,26 @@ impl SegmentReader {
                     memo: Default::default(),
                 },
                 terms: Terms::Lazy {
-                    start: metadata_offset,
-                    end: lengths_offset,
+                    start: if colocated { 0 } else { metadata_offset },
+                    end: if colocated {
+                        metadata_offset
+                    } else {
+                        lengths_offset
+                    },
                     memo: Default::default(),
                 },
-                lengths,
+                lengths: lengths_cell(lengths),
+                docs,
+                lazy_lengths: None,
                 total_tokens,
                 positions: flags != 0,
                 tokenizer,
-                postings_end: metadata_offset,
+                postings_end: if colocated {
+                    lengths_offset
+                } else {
+                    metadata_offset
+                },
+                colocated,
             });
         }
         let dictionary =
@@ -668,11 +762,14 @@ impl SegmentReader {
                     end: lengths_offset,
                     memo: Default::default(),
                 },
-                lengths,
+                lengths: lengths_cell(lengths),
+                docs,
+                lazy_lengths: None,
                 total_tokens,
                 positions: flags != 0,
                 tokenizer,
                 postings_end: metadata_offset,
+                colocated: false,
             });
         }
         let mut c = Cursor::new(&index[lengths_end..dict_start]);
@@ -721,11 +818,14 @@ impl SegmentReader {
             source,
             dictionary: Dictionary::Whole(dictionary),
             terms: Terms::Eager(terms),
-            lengths,
+            lengths: lengths_cell(lengths),
+            docs,
+            lazy_lengths: None,
             total_tokens,
             positions: flags != 0,
             tokenizer,
             postings_end: lengths_offset,
+            colocated: false,
         })
     }
     /// Document frequency recorded in a dictionary handle.
@@ -777,7 +877,15 @@ impl SegmentReader {
                     if df == 0 || begin + size as u64 > *end {
                         return Err(invalid("invalid term record"));
                     }
-                    ranges.push(begin..begin + size as u64);
+                    // A short term's blocks follow its record: read them in the same request, so
+                    // the block cache holds the postings by the time a query asks for them.
+                    let blocks = df.div_ceil(BLOCK);
+                    let extra = if self.colocated && blocks <= SMALL_BLOCKS {
+                        blocks * MAX_BLOCK_BYTES
+                    } else {
+                        0
+                    };
+                    ranges.push(begin..(begin + (size + extra) as u64).min(*end));
                 }
                 let values = self.source.read_batch(ranges.clone()).await?;
                 if values.len() != ranges.len() {
@@ -788,10 +896,13 @@ impl SegmentReader {
                     if bytes.len() as u64 != range.end - range.start {
                         return Err(invalid("short term record"));
                     }
-                    let body = &bytes[..bytes.len() - 4];
+                    let size =
+                        RECORD_HEADER + BLOCK_META * ((h & DF_MASK) as usize).div_ceil(BLOCK) + 4;
+                    let bytes = &bytes[..size];
+                    let body = &bytes[..size - 4];
                     verify(
                         body,
-                        u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap()),
+                        u32::from_le_bytes(bytes[size - 4..].try_into().unwrap()),
                     )?;
                     let mut c = Cursor::new(body);
                     let df = c.u32()?;
@@ -849,21 +960,113 @@ impl SegmentReader {
                 entries.iter().map(|e| e.first.len() + 48).sum::<usize>() + MEMO_CHUNKS * 16384
             }
         };
-        (terms + dictionary + self.lengths.capacity() * 4) as u64
+        (terms + dictionary + self.lens().len() * 4) as u64
+    }
+    /// The decoded lengths. Callers that read postings or score call `ensure_lengths` first.
+    fn lens(&self) -> &[u32] {
+        self.lengths.get().map_or(&[], Vec::as_slice)
+    }
+    /// Read the per-row lengths of a reader opened from a header (a no-op after the first call).
+    pub async fn ensure_lengths(&self) -> io::Result<()> {
+        if self.lengths.get().is_some() {
+            return Ok(());
+        }
+        let Some((offset, end, crc)) = self.lazy_lengths else {
+            return Err(invalid("missing document lengths"));
+        };
+        let bytes = read_exact(&*self.source, offset..end).await?;
+        verify(&bytes, crc)?;
+        let lengths = decode_lengths(&bytes, self.docs as usize)?;
+        let sum: u64 = lengths.iter().map(|&n| n as u64).sum();
+        if sum != self.total_tokens {
+            return Err(invalid("invalid document length sum"));
+        }
+        let _ = self.lengths.set(lengths);
+        Ok(())
+    }
+    /// Open from a header kept elsewhere (the manifest), without reading the object: the footer
+    /// and the dictionary's chunk index. Document lengths load on first use. Only version 4
+    /// segments have headers.
+    pub fn open_with_header(source: Arc<dyn RangeRead>, header: &TextHeader) -> io::Result<Self> {
+        let len = source.len();
+        if header.footer.len() != FOOTER || len < FOOTER as u64 {
+            return Err(invalid("invalid text header"));
+        }
+        let raw = &header.footer[..];
+        let mut c = Cursor::new(raw);
+        if c.take(8)? != MAGIC || c.u32()? != VERSION_COLOCATED {
+            return Err(invalid("unknown text segment format"));
+        }
+        let flags = c.u32()?;
+        let docs = c.u32()?;
+        let tokenizer = tokenizer_of(c.u32()?)?;
+        let total_tokens = c.u64()?;
+        let lengths_offset = c.u64()?;
+        let metadata_offset = c.u64()?;
+        let dictionary_offset = c.u64()?;
+        let lengths_crc = c.u32()?;
+        let _metadata_crc = c.u32()?;
+        let _dictionary_crc = c.u32()?;
+        verify(&raw[..FOOTER - 4], c.u32()?)?;
+        if flags > 1
+            || !(metadata_offset <= lengths_offset
+                && lengths_offset <= dictionary_offset
+                && dictionary_offset < len - FOOTER as u64)
+        {
+            return Err(invalid("invalid text segment offsets"));
+        }
+        let mut entries: Vec<ChunkEntry> = Vec::with_capacity(header.chunks.len());
+        for (first, offset, length, crc) in &header.chunks {
+            if *offset < metadata_offset
+                || offset
+                    .checked_add(*length as u64)
+                    .is_none_or(|end| end > lengths_offset)
+                || entries.last().is_some_and(|p| p.first >= *first)
+            {
+                return Err(invalid("invalid dictionary chunk"));
+            }
+            entries.push(ChunkEntry {
+                first: first.clone(),
+                offset: *offset,
+                len: *length,
+                crc: *crc,
+            });
+        }
+        Ok(Self {
+            source,
+            dictionary: Dictionary::Chunked {
+                entries,
+                memo: Default::default(),
+            },
+            terms: Terms::Lazy {
+                start: 0,
+                end: metadata_offset,
+                memo: Default::default(),
+            },
+            lengths: std::sync::OnceLock::new(),
+            docs,
+            lazy_lengths: Some((lengths_offset, dictionary_offset, lengths_crc)),
+            total_tokens,
+            positions: flags != 0,
+            tokenizer,
+            postings_end: lengths_offset,
+            colocated: true,
+        })
     }
     /// Number of segment rows, including empty or missing fields.
     pub fn num_docs(&self) -> u32 {
-        self.lengths.len() as u32
+        self.docs
     }
     /// Per-row normalization lengths. Present fields have a minimum of one;
     /// missing fields have length zero.
     pub fn doc_lengths(&self) -> &[u32] {
-        &self.lengths
+        self.lens()
     }
     /// Per-segment statistics for the engine's namespace-wide aggregation. Reads the whole
     /// dictionary (every chunk, for version 3 segments).
     pub async fn stats(&self) -> io::Result<CorpusStats> {
-        let present = self.lengths.iter().filter(|&&n| n > 0).count() as u64;
+        self.ensure_lengths().await?;
+        let present = self.lens().iter().filter(|&&n| n > 0).count() as u64;
         let mut stats = CorpusStats {
             total_docs: present,
             average_doc_length: if present == 0 {
@@ -1011,6 +1214,7 @@ impl SegmentReader {
         Ok(out)
     }
     async fn postings(&self, b: &BlockMeta) -> io::Result<Vec<(u32, u32)>> {
+        self.ensure_lengths().await?;
         let bytes = read_exact(&*self.source, b.offset..b.offset + b.size as u64).await?;
         self.decode_postings(b, &bytes)
     }
@@ -1043,8 +1247,8 @@ impl SegmentReader {
                 .checked_add(deltas[i])
                 .ok_or_else(|| invalid("posting row overflow"))?;
             if row > b.last
-                || tfs[i] > self.lengths[row as usize]
-                || self.lengths[row as usize] < b.min_length
+                || tfs[i] > self.lens()[row as usize]
+                || self.lens()[row as usize] < b.min_length
             {
                 return Err(invalid("posting row out of bounds"));
             }
@@ -1063,7 +1267,7 @@ impl SegmentReader {
         query: &Query,
         allowed: Option<&RoaringBitmap>,
     ) -> io::Result<Vec<Range<u64>>> {
-        let ids = self.query_handles(query).await?;
+        let (_, ids) = futures::try_join!(self.ensure_lengths(), self.query_handles(query))?;
         let metas = self.load(ids.iter().copied()).await?;
         Ok(Self::plan_ranges(&ids, &metas, allowed))
     }
@@ -1142,6 +1346,7 @@ impl SegmentReader {
         prefetch: bool,
     ) -> io::Result<(Vec<SearchHit>, SearchMetrics)> {
         params.validate().map_err(|e| input(&e))?;
+        self.ensure_lengths().await?;
         let mut metrics = SearchMetrics::default();
         if k == 0 || query.tokens.is_empty() {
             return Ok((Vec::new(), metrics));
@@ -1173,12 +1378,75 @@ impl SegmentReader {
         let windows = (self.num_docs() as usize).div_ceil(BLOCK);
         let mut bounds = vec![0.0f64; windows];
         let mut prefix_windows = vec![false; windows];
-        for (&id, &(qf, prefix, df)) in &selections {
-            for b in &metas[&id].blocks {
-                let bound = b.upper_bound(qf, df, stats, params) as f64;
-                for w in b.first as usize / BLOCK..=b.last as usize / BLOCK {
-                    bounds[w] += bound;
-                    prefix_windows[w] |= prefix;
+        let mut heap: BinaryHeap<Reverse<SearchHit>> = BinaryHeap::new();
+        let mut cache: BTreeMap<(u64, usize), Vec<(u32, u32)>> = BTreeMap::new();
+        let margin = 1.0 + 8.0 * f64::from(f32::EPSILON);
+        if prefetch {
+            // Short exact terms are read whole (their record and blocks usually arrived together
+            // while the dictionary was consulted), so their windows are known exactly: a window's
+            // bound for such a term is the best score any of its postings gives, and a window with
+            // no posting gets nothing. Long terms keep per-block bounds, at most one per window.
+            let mut small = Vec::new();
+            for (&id, &(_, prefix, _)) in &selections {
+                if !prefix && metas[&id].blocks.len() <= SMALL_BLOCKS {
+                    small.push(id);
+                }
+            }
+            let mut ranges: Vec<_> = small
+                .iter()
+                .flat_map(|id| &metas[id].blocks)
+                .map(|b| b.offset..b.offset + b.size as u64)
+                .collect();
+            ranges.sort_unstable_by_key(|r| r.start);
+            if !ranges.is_empty() {
+                let values = self.source.read_batch(ranges.clone()).await?;
+                if values.len() != ranges.len() {
+                    return Err(invalid("invalid posting batch length"));
+                }
+                let values: BTreeMap<_, _> = ranges
+                    .into_iter()
+                    .zip(values)
+                    .map(|(r, v)| (r.start, v))
+                    .collect();
+                for &id in &small {
+                    for (block, b) in metas[&id].blocks.iter().enumerate() {
+                        cache.insert((id, block), self.decode_postings(b, &values[&b.offset])?);
+                        metrics.blocks_read += 1;
+                    }
+                }
+            }
+            for (&id, &(qf, prefix, df)) in &selections {
+                let mut best = vec![0.0f64; windows];
+                if small.contains(&id) {
+                    for block in 0..metas[&id].blocks.len() {
+                        for &(row, tf) in &cache[&(id, block)] {
+                            let score =
+                                term_score(tf, self.lens()[row as usize], qf, df, stats, params);
+                            let w = row as usize / BLOCK;
+                            best[w] = best[w].max(score as f64);
+                        }
+                    }
+                } else {
+                    for b in &metas[&id].blocks {
+                        let bound = b.upper_bound(qf, df, stats, params) as f64;
+                        for w in b.first as usize / BLOCK..=b.last as usize / BLOCK {
+                            best[w] = best[w].max(bound);
+                            prefix_windows[w] |= prefix;
+                        }
+                    }
+                }
+                for (w, v) in best.into_iter().enumerate() {
+                    bounds[w] += v * margin;
+                }
+            }
+        } else {
+            for (&id, &(qf, prefix, df)) in &selections {
+                for b in &metas[&id].blocks {
+                    let bound = b.upper_bound(qf, df, stats, params) as f64;
+                    for w in b.first as usize / BLOCK..=b.last as usize / BLOCK {
+                        bounds[w] += bound;
+                        prefix_windows[w] |= prefix;
+                    }
                 }
             }
         }
@@ -1189,103 +1457,172 @@ impl SegmentReader {
             .filter(|(_, b)| *b > 0.0)
             .collect();
         order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        let mut heap: BinaryHeap<Reverse<SearchHit>> = BinaryHeap::new();
-        let mut cache: BTreeMap<(u64, usize), Vec<(u32, u32)>> = BTreeMap::new();
-        if prefetch {
-            let ids: std::collections::BTreeSet<u64> = selections.keys().copied().collect();
-            let ranges = Self::plan_ranges(&ids, &metas, allowed);
-            let values = self.source.read_batch(ranges.clone()).await?;
-            if values.len() != ranges.len() {
-                return Err(invalid("invalid posting batch length"));
-            }
-            let values: BTreeMap<_, _> = ranges
-                .into_iter()
-                .zip(values)
-                .map(|(r, v)| (r.start, v))
-                .collect();
-            for &id in selections.keys() {
-                for (block, b) in metas[&id].blocks.iter().enumerate() {
-                    if let Some(bytes) = values.get(&b.offset) {
-                        cache.insert((id, block), self.decode_postings(b, bytes)?);
-                        metrics.blocks_read += 1;
-                    }
+        // In prefetch mode, posting blocks arrive in at most a few parallel batches, chosen by
+        // window bound: the most promising windows first, which fills the heap and sets a threshold;
+        // then every window whose bound can still reach the threshold. Exactness is unchanged: a
+        // window is skipped only when its bound is below the heap's k-th score.
+        let mut next = 0;
+        let mut batch_size = if prefetch { FIRST_WINDOWS } else { usize::MAX };
+        while next < order.len() {
+            let mut batch = Vec::new();
+            while next < order.len() && batch.len() < batch_size {
+                let (window, bound) = order[next];
+                next += 1;
+                if heap.len() == k && bound < heap.peek().unwrap().0.score as f64 {
+                    metrics.windows_pruned += 1;
+                    continue;
                 }
-            }
-        }
-        for (window, bound) in order {
-            if heap.len() == k && bound < heap.peek().unwrap().0.score as f64 {
-                metrics.windows_pruned += 1;
-                continue;
-            }
-            let start = (window * BLOCK) as u32;
-            let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
-            if allowed.is_some_and(|rows| rows.range(start..end).next().is_none()) {
-                continue;
-            }
-            let mut needed = Vec::new();
-            for &id in selections.keys() {
-                let blocks = &metas[&id].blocks;
-                let first = blocks.partition_point(|b| b.last < start);
-                for (block, b) in blocks
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .take_while(|(_, b)| b.first < end)
-                {
-                    if !cache.contains_key(&(id, block))
-                        && allowed.is_none_or(|rows| rows.range(b.first..=b.last).next().is_some())
-                    {
-                        needed.push((id, block, b));
-                    }
+                let start = (window * BLOCK) as u32;
+                let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
+                if allowed.is_some_and(|rows| rows.range(start..end).next().is_none()) {
+                    continue;
                 }
+                batch.push((window, bound));
             }
-            let results = try_join_all(needed.iter().map(|(_, _, b)| self.postings(b))).await?;
-            for ((id, block, _), postings) in needed.into_iter().zip(results) {
-                metrics.blocks_read += 1;
-                cache.insert((id, block), postings);
+            if batch.is_empty() {
+                break;
             }
-            let mut scores = [0.0f32; BLOCK];
-            let mut prefix_matches = [false; BLOCK];
-            for (&id, &(qf, prefix, df)) in &selections {
-                let blocks = &metas[&id].blocks;
-                let first = blocks.partition_point(|b| b.last < start);
-                for (block, _) in blocks
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .take_while(|(_, b)| b.first < end)
-                {
-                    let Some(postings) = cache.get(&(id, block)) else {
-                        continue;
-                    };
-                    for &(row, tf) in postings {
-                        if row >= start
-                            && row < end
-                            && allowed.is_none_or(|rows| rows.contains(row))
+            if std::env::var_os("BF_TRACE_STAGES").is_some() {
+                eprintln!(
+                    "FTS batch windows={} of {} first_bound={:.2} last_bound={:.2} heap_min={:?}",
+                    batch.len(),
+                    order.len(),
+                    batch[0].1,
+                    batch.last().unwrap().1,
+                    heap.peek().map(|h| h.0.score)
+                );
+            }
+            batch_size = usize::MAX;
+            if prefetch {
+                let mut wanted = std::collections::BTreeSet::new();
+                for &(window, _) in &batch {
+                    let start = (window * BLOCK) as u32;
+                    let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
+                    for &id in selections.keys() {
+                        let blocks = &metas[&id].blocks;
+                        let first = blocks.partition_point(|b| b.last < start);
+                        for (block, b) in blocks
+                            .iter()
+                            .enumerate()
+                            .skip(first)
+                            .take_while(|(_, b)| b.first < end)
                         {
-                            let i = (row - start) as usize;
-                            scores[i] +=
-                                term_score(tf, self.lengths[row as usize], qf, df, stats, params);
-                            prefix_matches[i] |= prefix;
+                            if !cache.contains_key(&(id, block))
+                                && allowed.is_none_or(|rows| {
+                                    rows.range(b.first..=b.last).next().is_some()
+                                })
+                            {
+                                wanted.insert((id, block));
+                            }
                         }
                     }
                 }
+                let wanted: Vec<_> = wanted.into_iter().collect();
+                let mut ranges: Vec<_> = wanted
+                    .iter()
+                    .map(|&(id, block)| {
+                        let b = &metas[&id].blocks[block];
+                        b.offset..b.offset + b.size as u64
+                    })
+                    .collect();
+                ranges.sort_unstable_by_key(|r| r.start);
+                let values = self.source.read_batch(ranges.clone()).await?;
+                if values.len() != ranges.len() {
+                    return Err(invalid("invalid posting batch length"));
+                }
+                let values: BTreeMap<_, _> = ranges
+                    .into_iter()
+                    .zip(values)
+                    .map(|(r, v)| (r.start, v))
+                    .collect();
+                for (id, block) in wanted {
+                    let b = &metas[&id].blocks[block];
+                    cache.insert((id, block), self.decode_postings(b, &values[&b.offset])?);
+                    metrics.blocks_read += 1;
+                }
             }
-            for row in start..end {
-                if allowed.is_some_and(|rows| !rows.contains(row)) {
+            for (window, bound) in batch {
+                if heap.len() == k && bound < heap.peek().unwrap().0.score as f64 {
+                    metrics.windows_pruned += 1;
                     continue;
                 }
-                let i = (row - start) as usize;
-                let score = scores[i] + f32::from(prefix_matches[i]);
-                if score <= 0.0 {
+                let start = (window * BLOCK) as u32;
+                let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
+                if allowed.is_some_and(|rows| rows.range(start..end).next().is_none()) {
                     continue;
                 }
-                metrics.rows_scored += 1;
-                let hit = SearchHit { row, score };
-                if heap.len() < k {
-                    heap.push(Reverse(hit));
-                } else if hit > heap.peek().unwrap().0 {
-                    *heap.peek_mut().unwrap() = Reverse(hit);
+                let mut needed = Vec::new();
+                for &id in selections.keys() {
+                    let blocks = &metas[&id].blocks;
+                    let first = blocks.partition_point(|b| b.last < start);
+                    for (block, b) in blocks
+                        .iter()
+                        .enumerate()
+                        .skip(first)
+                        .take_while(|(_, b)| b.first < end)
+                    {
+                        if !cache.contains_key(&(id, block))
+                            && allowed
+                                .is_none_or(|rows| rows.range(b.first..=b.last).next().is_some())
+                        {
+                            needed.push((id, block, b));
+                        }
+                    }
+                }
+                let results = try_join_all(needed.iter().map(|(_, _, b)| self.postings(b))).await?;
+                for ((id, block, _), postings) in needed.into_iter().zip(results) {
+                    metrics.blocks_read += 1;
+                    cache.insert((id, block), postings);
+                }
+                let mut scores = [0.0f32; BLOCK];
+                let mut prefix_matches = [false; BLOCK];
+                for (&id, &(qf, prefix, df)) in &selections {
+                    let blocks = &metas[&id].blocks;
+                    let first = blocks.partition_point(|b| b.last < start);
+                    for (block, _) in blocks
+                        .iter()
+                        .enumerate()
+                        .skip(first)
+                        .take_while(|(_, b)| b.first < end)
+                    {
+                        let Some(postings) = cache.get(&(id, block)) else {
+                            continue;
+                        };
+                        for &(row, tf) in postings {
+                            if row >= start
+                                && row < end
+                                && allowed.is_none_or(|rows| rows.contains(row))
+                            {
+                                let i = (row - start) as usize;
+                                scores[i] += term_score(
+                                    tf,
+                                    self.lens()[row as usize],
+                                    qf,
+                                    df,
+                                    stats,
+                                    params,
+                                );
+                                prefix_matches[i] |= prefix;
+                            }
+                        }
+                    }
+                }
+                for row in start..end {
+                    if allowed.is_some_and(|rows| !rows.contains(row)) {
+                        continue;
+                    }
+                    let i = (row - start) as usize;
+                    let score = scores[i] + f32::from(prefix_matches[i]);
+                    if score <= 0.0 {
+                        continue;
+                    }
+                    metrics.rows_scored += 1;
+                    let hit = SearchHit { row, score };
+                    if heap.len() < k {
+                        heap.push(Reverse(hit));
+                    } else if hit > heap.peek().unwrap().0 {
+                        *heap.peek_mut().unwrap() = Reverse(hit);
+                    }
                 }
             }
         }
@@ -1469,6 +1806,28 @@ fn parse_chunk_index(data: &[u8], low: u64, high: u64) -> io::Result<Vec<ChunkEn
         return Err(invalid("trailing dictionary index"));
     }
     Ok(entries)
+}
+
+fn tokenizer_of(code: u32) -> io::Result<Tokenizer> {
+    Ok(match code {
+        0 => Tokenizer::WordV4,
+        1 => Tokenizer::WordV3,
+        2 => Tokenizer::WordV2,
+        3 => Tokenizer::WordV1,
+        4 => Tokenizer::WordV0,
+        5 => Tokenizer::Whitespace,
+        6 => Tokenizer::Smartcn,
+        7 => Tokenizer::Kuromoji,
+        8 => Tokenizer::Nori,
+        9 => Tokenizer::PreTokenizedArray,
+        _ => return Err(invalid("unknown field tokenizer")),
+    })
+}
+
+fn lengths_cell(lengths: Vec<u32>) -> std::sync::OnceLock<Vec<u32>> {
+    let cell = std::sync::OnceLock::new();
+    let _ = cell.set(lengths);
+    cell
 }
 
 async fn read_exact(source: &dyn RangeRead, range: Range<u64>) -> io::Result<Bytes> {
