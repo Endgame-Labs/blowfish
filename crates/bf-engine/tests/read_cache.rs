@@ -308,8 +308,14 @@ async fn cold_open_reads_the_directory_hint_alongside_the_manifest() {
         .into_iter()
         .filter(|o| o.key.contains("ann-dir-latest"))
         .collect();
-    assert_eq!(hints.len(), 1, "one hint per vector attribute");
-    writable.delete(&hints[0].key).await.unwrap();
+    assert_eq!(
+        hints.len(),
+        2,
+        "one hint per vector attribute and directory layout"
+    );
+    for hint in &hints {
+        writable.delete(&hint.key).await.unwrap();
+    }
     let (without_hint, rows_without) = cold_waves(backend.clone()).await;
     assert_eq!(rows, rows_without);
     assert!(
@@ -707,7 +713,8 @@ async fn directory_cost_and_publication_do_not_grow_with_segment_count() {
         assert_eq!(*bfv, 0, "batch {batch} reopened a segment index");
         // The new segment's fragment, plus the compacted segment's when compaction ran.
         assert!(*bff <= 2, "batch {batch} read {bff} fragments");
-        assert!(*bfd <= 1, "batch {batch} read {bfd} directories");
+        // One previous directory per layout (plain and block fragments).
+        assert!(*bfd <= 2, "batch {batch} read {bfd} directories");
     }
 }
 

@@ -105,6 +105,38 @@ pub(crate) async fn read_ranges(
     ObjectReader::new(store, file).read_batch(ranges).await
 }
 
+/// Give a segment built before block fragments existed its `annfrag2:` files, from the segment's
+/// own index objects (one whole read each). Returns whether it added any.
+pub(crate) async fn backfill_blocks(
+    store: &Storage,
+    ns: &str,
+    segment: &mut Segment,
+) -> Result<bool, ApiError> {
+    let names: Vec<String> = segment
+        .files
+        .keys()
+        .filter_map(|k| k.strip_prefix("ann:").map(str::to_string))
+        .filter(|n| {
+            segment.files.contains_key(&format!("annfrag:{n}"))
+                && !segment.files.contains_key(&format!("annfrag2:{n}"))
+        })
+        .collect();
+    for name in &names {
+        let file = &segment.files[&format!("ann:{name}")];
+        let blob = read_whole(store, file).await?;
+        let (blocks, meta) = bf_vector::Fragment::build_blocks(&blob).map_err(index_error)?;
+        drop(blob);
+        let key = format!(
+            "ns/{ns}/segments/{}/ann2.{}.bfb",
+            segment.id,
+            uuid::Uuid::new_v4()
+        );
+        let put = put_file(store, key, blocks, meta).await?;
+        segment.files.insert(format!("annfrag2:{name}"), put);
+    }
+    Ok(!names.is_empty())
+}
+
 /// Read and cache a docs file's column directory, so hydration needs only the data blocks.
 pub(crate) async fn warm_docs(store: &Storage, segment: &Segment) {
     if let Some(file) = segment.files.get("docs") {
@@ -541,10 +573,13 @@ pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
             let bytes = job.await.map_err(index_error)?.map_err(index_error)?;
             let meta = bf_vector::metadata_len(&bytes).map_err(index_error)?;
             // The fragment lists this segment's clusters for the namespace ANN directory, so a
-            // later directory build never reopens the segment.
+            // later directory build never reopens the segment. The block fragment holds the same
+            // clusters with their codes beside the blobs.
             let (fragment, fragment_meta) =
                 bf_vector::Fragment::build(&bytes).map_err(index_error)?;
-            let (file, fragment) = tokio::try_join!(
+            let (blocks, blocks_meta) =
+                bf_vector::Fragment::build_blocks(&bytes).map_err(index_error)?;
+            let (file, fragment, blocks) = tokio::try_join!(
                 put_file(&store, format!("{prefix}/ann.{column}.bfv"), bytes, meta),
                 put_file(
                     &store,
@@ -552,10 +587,17 @@ pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
                     fragment,
                     fragment_meta
                 ),
+                put_file(
+                    &store,
+                    format!("{prefix}/ann.{column}.bfb"),
+                    blocks,
+                    blocks_meta
+                ),
             )?;
             Ok::<_, ApiError>(vec![
                 (format!("ann:{name}"), file),
                 (format!("annfrag:{name}"), fragment),
+                (format!("annfrag2:{name}"), blocks),
             ])
         })
             as std::pin::Pin<

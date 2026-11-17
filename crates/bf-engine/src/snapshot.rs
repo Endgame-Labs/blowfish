@@ -22,6 +22,10 @@ pub(crate) struct OpenHint {
     docs: bool,
     /// Filters of ANN sub-queries: their per-segment bitmaps are opened in the snapshot wave.
     filters: Vec<Filter>,
+    /// A lone unfiltered ANN query `(attribute, vector, k)`: its scan reads start in the snapshot
+    /// wave too, overlapping the WAL tail read.
+    scan: Option<(String, std::sync::Arc<[f32]>, usize)>,
+    config: crate::EngineConfig,
 }
 /// Which part of the warm-up to run.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,8 +49,12 @@ impl OpenHint {
     pub(crate) fn for_request(
         request: &QueryRequest,
         context: crate::read_cache::ReadContext,
+        config: &crate::EngineConfig,
+        prefetch_scan: bool,
     ) -> Self {
         let mut hint = Self {
+            config: config.clone(),
+            scan: None,
             context,
             ann: BTreeSet::new(),
             text: BTreeSet::new(),
@@ -94,6 +102,23 @@ impl OpenHint {
                 || q.compute_attributes.is_some()
                 || q.filters.is_some();
         }
+        if prefetch_scan
+            && request.queries.is_none()
+            && let Some(RankBy::Vector {
+                attribute,
+                exact: false,
+                vector,
+                ..
+            }) = &request.rank_by
+            && request.filters.is_none()
+            && request.limit.as_ref().and_then(Limit::per).is_none()
+        {
+            hint.scan = Some((
+                attribute.clone(),
+                vector.as_slice().into(),
+                request.total().unwrap_or(10) + request.offset,
+            ));
+        }
         hint
     }
     /// Open (and cache) segment metadata. Failures are ignored: the query reports them.
@@ -134,16 +159,40 @@ impl OpenHint {
                 .iter()
                 .all(|a| dirs.contains_key(&format!("ann:{a}")));
             for attribute in self.ann.iter().filter(|_| with_rest) {
-                if let Some(file) = dirs.get(&format!("ann:{attribute}")) {
+                // A lone unfiltered ANN query reads the block-layout directory when there is one.
+                let blocks = self
+                    .scan
+                    .as_ref()
+                    .filter(|(a, _, _)| a == attribute)
+                    .filter(|_| crate::ann_dir::blocks_enabled())
+                    .and_then(|_| dirs.get(&crate::ann_dir::Layout::Blocks.dir_key(attribute)));
+                let chosen = match blocks {
+                    Some(file) => Some((
+                        file,
+                        crate::ann_dir::Layout::Blocks,
+                        crate::ann_dir::Layout::Blocks.dir_key(attribute),
+                    )),
+                    None => dirs
+                        .get(&format!("ann:{attribute}"))
+                        .map(|f| (f, crate::ann_dir::Layout::Plain, attribute.clone())),
+                };
+                if let Some((file, layout, hint_name)) = chosen {
                     let filtered = !self.filters.is_empty();
+                    let scan = self.scan.as_ref().filter(|(a, _, _)| a == attribute);
+                    let config = &self.config;
                     tasks.push(
                         async move {
-                            let dir = crate::ann_dir::load(store, file, prefetched.get(attribute))
+                            let dir = crate::ann_dir::load(store, file, prefetched.get(&hint_name))
                                 .await?;
                             if filtered {
                                 // Filtered queries also need each segment's row-to-cluster map.
                                 crate::ann_dir::memberships(store, segments, &dir, attribute)
                                     .await?;
+                            } else if let Some((_, vector, k)) = scan {
+                                crate::ann_dir::prefetch_scan(
+                                    store, segments, &dir, attribute, layout, vector, *k, config,
+                                )
+                                .await?;
                             }
                             Ok(())
                         }
@@ -290,6 +339,17 @@ pub(crate) async fn catch_up_hinted(
             let mut found = BTreeMap::new();
             if let Some(hint) = hint.filter(|_| state.ann_dirs.is_empty()) {
                 let reads = hint.ann.iter().map(|a| async move {
+                    // A lone unfiltered ANN query wants the block-layout directory: try its hint
+                    // first, and the plain one when the namespace has none.
+                    if hint.scan.is_some() && crate::ann_dir::blocks_enabled() {
+                        let name = crate::ann_dir::Layout::Blocks.dir_key(a);
+                        let name = name.trim_start_matches("ann:").to_string();
+                        if let Some(p) =
+                            crate::ann_dir::prefetch(store, wal.namespace(), &name).await
+                        {
+                            return Some((name, p));
+                        }
+                    }
                     crate::ann_dir::prefetch(store, wal.namespace(), a)
                         .await
                         .map(|p| (a.clone(), p))

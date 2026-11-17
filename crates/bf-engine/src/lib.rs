@@ -566,7 +566,14 @@ impl Engine {
         } else {
             None
         };
-        let hint = snapshot::OpenHint::for_request(&request, context.clone());
+        let hint = snapshot::OpenHint::for_request(
+            &request,
+            context.clone(),
+            &self.0.config,
+            // With a resident checkpoint the query searches speculatively, concurrently with the
+            // snapshot: prefetching its scan as well would read the same ranges twice.
+            cached.is_none(),
+        );
         let snapshot = async {
             let result = backend
                 .scope(
