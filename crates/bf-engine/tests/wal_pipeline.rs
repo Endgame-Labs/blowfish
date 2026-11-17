@@ -149,8 +149,11 @@ async fn slots(store: &Storage, ns: &str) -> usize {
 async fn concurrent_groups_upload_together_and_commit_in_order() {
     let backend = Arc::new(Slow::default());
     let (engine, store) = engine(&backend).await;
-    let tasks: Vec<_> = (0..24u64)
-        .map(|i| {
+    let mut tasks = vec![];
+    for i in 0..24u64 {
+        // Staggered, so later writes form new groups while earlier payloads are still uploading.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tasks.push({
             let engine = engine.clone();
             tokio::spawn(async move {
                 engine
@@ -160,8 +163,8 @@ async fn concurrent_groups_upload_together_and_commit_in_order() {
                     )
                     .await
             })
-        })
-        .collect();
+        });
+    }
     for t in tasks {
         t.await.unwrap().unwrap();
     }
@@ -242,10 +245,12 @@ async fn a_failed_slot_fails_every_later_group_and_leaves_no_visible_or_orphaned
         )
         .await
         .unwrap();
-    // The commit of slot 4 fails once, while slots 3 to 7 are in flight.
-    backend.fail_slot.store(4, Ordering::SeqCst);
-    let tasks: Vec<_> = (0..12u64)
-        .map(|i| {
+    // The commit of the first slot of the burst fails once, while later groups are in flight.
+    backend.fail_slot.store(2, Ordering::SeqCst);
+    let mut tasks = vec![];
+    for i in 0..12u64 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tasks.push({
             let engine = engine.clone();
             tokio::spawn(async move {
                 let r = engine
@@ -256,8 +261,8 @@ async fn a_failed_slot_fails_every_later_group_and_leaves_no_visible_or_orphaned
                     .await;
                 (i, r.is_ok())
             })
-        })
-        .collect();
+        });
+    }
     let mut acked = BTreeSet::from([1000u64]);
     let mut failed = 0;
     for t in tasks {
