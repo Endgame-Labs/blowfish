@@ -2,9 +2,21 @@
 
 This page summarizes blowfish's measured query and upsert latency against turbopuffer's published numbers, along with the network round-trip profile, 1M multi-workload breakdown, recall and result-set parity, ingest throughput, known engineering gaps, and reproduction commands.
 
-For the complete chronological engineering log across iterations 0 through 10 and the full apples-to-apples run notes, see [`../benchmarks.md`](../benchmarks.md).
+For the complete chronological engineering log across iterations 0 through 12 and the full apples-to-apples run notes, see [`../benchmarks.md`](../benchmarks.md).
 
-## Against turbopuffer's published numbers
+## Latest: namespace-wide ANN layout (version 0.1.12)
+
+Iteration 12 added `recluster`: a compaction that regroups every vector in the namespace into 32 slabs of about 200-row clusters, instead of clustering each segment on its own. On the 10M namespace (1,024-dim, over the internet to R2, 30 queries per arm, cold = fresh process and empty caches):
+
+| Layout | Cold p50 / p90 | Requests | MB per query | Recall@10 (200 queries) |
+| --- | ---: | ---: | ---: | ---: |
+| Per-segment, 160 probes | 2,916 / 4,358 ms | 880 | 116.5 | 0.9465 |
+| Namespace-wide slabs, about 42 probes | 1,082 / 1,592 ms | 383 | 47.1 | 0.9415 at 40 probes, 0.953 at 48 |
+| Same, server already running, caches dropped per query | 954 / 1,262 ms | 440 | 47.1 | same |
+
+turbopuffer publishes 874 / 1,214 ms for cold vector queries at 10M. A re-timing at exactly 40, 48, and 64 probes, and in-region measurements on AWS, are in progress and will replace this table. The sections below predate iteration 12.
+
+## Against turbopuffer's published numbers (iteration 10 layout)
 
 Client-side `p50 / p90` latency in milliseconds (with strong consistency on every query), compared against turbopuffer's [published benchmarks](https://turbopuffer.com/docs/performance):
 
