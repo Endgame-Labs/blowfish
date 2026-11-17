@@ -461,6 +461,7 @@ pub(crate) async fn for_writes(
     store: &Storage,
     state: &NamespaceState,
     pending: &[Pending<Operation, Result<WriteResponse, ApiError>>],
+    overlay: &[std::sync::Arc<bf_wal::WalEntry>],
 ) -> Result<NamespaceState, ApiError> {
     let mut wanted = BTreeSet::new();
     for p in pending {
@@ -519,6 +520,13 @@ pub(crate) async fn for_writes(
         let rows = segment::lookup_many(store, seg, &wanted).await? & live;
         full.docs
             .extend(crate::shared(segment::documents(store, seg, &rows).await?));
+    }
+    // Groups that are staged but not yet committed come first in the log: a write must see their
+    // effect on the rows it names (and their schema), without applying every in-flight document.
+    for entry in overlay {
+        for batch in &entry.batches {
+            full.apply_filtered(batch, &wanted);
+        }
     }
     for doc in full.docs.values_mut() {
         std::sync::Arc::make_mut(doc).retain(|name, _| state.schema.contains_key(name));

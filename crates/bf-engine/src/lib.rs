@@ -26,7 +26,7 @@ use bf_wal::{GroupCommit, Pending, Wal, WalEntry, WriteBatch};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Instant,
 };
@@ -159,6 +159,34 @@ impl NamespaceState {
                 self.marks.insert(id.clone(), seq);
             }
             self.docs.insert(id, Arc::new(doc.clone()));
+        }
+    }
+    /// Apply a not-yet-committed batch for write evaluation: its schema and metric, and only the
+    /// deletes and upserts that name an ID in `wanted`.
+    pub(crate) fn apply_filtered(
+        &mut self,
+        b: &WriteBatch,
+        wanted: &std::collections::BTreeSet<Id>,
+    ) {
+        self.exists = true;
+        if self.schema.keys().any(|name| !b.schema.contains_key(name)) {
+            for doc in self.docs.values_mut() {
+                Arc::make_mut(doc).retain(|name, _| b.schema.contains_key(name));
+            }
+        }
+        self.schema = b.schema.clone();
+        self.metric = b.distance_metric;
+        self.created_at = b.created_at;
+        self.updated_at = b.updated_at;
+        for id in b.deletes.iter().filter(|id| wanted.contains(id)) {
+            self.docs.remove(id);
+        }
+        for doc in &b.upserts {
+            if let Ok(id) = serde_json::from_value::<Id>(doc["id"].clone())
+                && wanted.contains(&id)
+            {
+                self.docs.insert(id, Arc::new(doc.clone()));
+            }
         }
     }
     fn replay(&mut self, seq: u64, entry: &WalEntry) {
@@ -840,155 +868,420 @@ fn record_stage(stage: &'static str, since: Instant) {
 async fn catch_up(wal: &Wal, state: &mut NamespaceState, store: &Storage) -> Result<(), ApiError> {
     snapshot::catch_up(wal, state, None, store).await
 }
+/// The original one-group-at-a-time commit: validate, append, and replay under the state lock.
+/// Deletes, copies, and filter writes use it, after the pipeline has drained.
+async fn commit_sync(
+    wal: &Wal,
+    state: &Mutex<NamespaceState>,
+    store: &Storage,
+    config: &EngineConfig,
+    deleting: bool,
+    pending: &[Op],
+) -> Result<Vec<Result<WriteResponse, ApiError>>, ApiError> {
+    let mut current = state.lock().await;
+    // A state this node just committed or refreshed is current unless another writer
+    // has since appended. The conditional create of the next WAL slot detects exactly
+    // that (Conflict), and the retry then catches up, so the common single-writer
+    // bulk-load path skips a LIST round trip before every commit.
+    let mut trusted =
+        current.seq > 0 && current.refreshed.elapsed() < std::time::Duration::from_secs(2);
+    let committed = loop {
+        let stage = Instant::now();
+        if !std::mem::take(&mut trusted)
+            && let Err(e) = catch_up(wal, &mut current, store).await
+        {
+            break Err(e);
+        }
+        record_stage("catch_up", stage);
+        if deleting {
+            if !current.exists {
+                break Err(ApiError::not_found(
+                    wal.key(0).split('/').nth(1).unwrap_or("unknown"),
+                ));
+            }
+            let mut entry = WalEntry::new(vec![]);
+            entry.tombstone = true;
+            match wal.append(current.seq + 1, &entry).await {
+                Ok(CreateResult::Conflict) => continue,
+                Ok(_) => {
+                    let seq = current.seq + 1;
+                    current.replay(seq, &entry);
+                    if let Err(e) = wal.cleanup_deleted(seq).await {
+                        tracing::warn!(error=?e,"namespace cleanup deferred");
+                    }
+                    break Ok(vec![Ok(WriteResponse::default())]);
+                }
+                Err(e) => break Err(log_error(e)),
+            }
+        }
+        if current.tail_bytes >= config.max_unindexed_bytes {
+            break Err(ApiError::new(
+                429,
+                "unindexed WAL exceeds backpressure limit",
+            ));
+        }
+        let stage = Instant::now();
+        let mut working = match snapshot::for_writes(store, &current, pending, &[]).await {
+            Ok(s) => s,
+            Err(e) => break Err(e),
+        };
+        record_stage("for_writes", stage);
+        let stage = Instant::now();
+        let mut batches = vec![];
+        let mut results = vec![];
+        for p in pending {
+            let Operation::Write(req, copy) = &p.request else {
+                unreachable!()
+            };
+            match write::prepare(&working, req, copy.as_deref()) {
+                Ok((batch, result)) => {
+                    working.apply(&batch, 0);
+                    if let Some(source) = copy {
+                        branch::install_source(&mut working, source);
+                    }
+                    batches.push(batch);
+                    results.push(Ok(result));
+                }
+                Err(e) => results.push(Err(e)),
+            }
+        }
+        record_stage("prepare", stage);
+        if batches.is_empty() {
+            break Ok(results);
+        }
+        let mut entry = WalEntry::new(batches);
+        if let Operation::Write(_, Some(source)) = &pending[0].request
+            && let Err(e) = branch::stage(store, wal, &mut entry, source).await
+        {
+            break Err(e);
+        }
+        let stage = Instant::now();
+        let appended = wal.append(current.seq + 1, &entry).await;
+        record_stage("append", stage);
+        match appended {
+            Ok(CreateResult::Conflict) => continue,
+            Ok(_) => {
+                let seq = current.seq + 1;
+                let stage = Instant::now();
+                if let Err(e) = branch::replay(store, wal, seq, &entry, &mut current).await {
+                    break Err(e);
+                }
+                record_stage("replay", stage);
+                current.refreshed = Instant::now();
+                break Ok(results);
+            }
+            Err(e) => break Err(log_error(e)),
+        }
+    };
+    drop(current);
+    committed
+}
+type Op = Pending<Operation, Result<WriteResponse, ApiError>>;
+type WriteResult = Result<WriteResponse, ApiError>;
+
+/// A group whose payload is uploading (or uploaded) and whose slot is not yet committed.
+struct Flight {
+    seq: u64,
+    entry: Arc<WalEntry>,
+    upload: tokio::task::JoinHandle<Result<bf_wal::Staged, bf_wal::Error>>,
+    pending: Vec<Op>,
+    results: Vec<WriteResult>,
+    start: Instant,
+}
+
+/// Operations that cannot be evaluated against in-flight groups: deletes, copies, and writes
+/// that scan the whole namespace.
+fn is_barrier(op: &Operation) -> bool {
+    match op {
+        Operation::Delete | Operation::Write(_, Some(_)) => true,
+        Operation::Write(req, None) => {
+            req.delete_by_filter.is_some() || req.patch_by_filter.is_some()
+        }
+    }
+}
+
+/// Commit the oldest flight's slot (its upload has finished with `staged`) and reply to its
+/// writers. A failure fails every later flight too (their payloads were staged for slots that
+/// will not be used): after a lost race their writers are queued again in `backlog` after a
+/// resync, and after a storage error they get the error. No writer is acknowledged before its
+/// own slot commits, and slots commit strictly in order.
+async fn commit_front(
+    wal: &Wal,
+    state: &Mutex<NamespaceState>,
+    store: &Storage,
+    flights: &mut VecDeque<Flight>,
+    staged: Result<Result<bf_wal::Staged, bf_wal::Error>, tokio::task::JoinError>,
+    backlog: &mut VecDeque<Op>,
+) {
+    let Some(front) = flights.pop_front() else {
+        return;
+    };
+    let staged = match staged {
+        Ok(Ok(staged)) => Ok(staged),
+        Ok(Err(e)) => Err(log_error(e)),
+        Err(e) => Err(segment::index_error(e)),
+    };
+    let mut retry = false;
+    let failure = match staged {
+        Err(e) => Some(e),
+        Ok(staged) => {
+            let mut current = state.lock().await;
+            if current.seq + 1 != front.seq {
+                // The state moved (a catch-up replayed someone else's slot): resync and redo.
+                retry = true;
+                let _ = wal.discard(front.seq, &front.entry, &staged).await;
+                Some(ApiError::new(503, "WAL position changed"))
+            } else {
+                let stage = Instant::now();
+                match wal.commit(front.seq, &front.entry, &staged).await {
+                    Ok(CreateResult::Conflict) => {
+                        retry = true;
+                        Some(ApiError::new(503, "WAL slot lost"))
+                    }
+                    Ok(_) => {
+                        record_stage("append", stage);
+                        let stage = Instant::now();
+                        match branch::replay(store, wal, front.seq, &front.entry, &mut current)
+                            .await
+                        {
+                            Ok(()) => {
+                                record_stage("replay", stage);
+                                current.refreshed = Instant::now();
+                                drop(current);
+                                for (p, result) in front.pending.into_iter().zip(front.results) {
+                                    let result = result.map(|mut r| {
+                                        r.performance.server_total_ms =
+                                            front.start.elapsed().as_millis() as u64;
+                                        r
+                                    });
+                                    let _ = p.reply.send(result);
+                                }
+                                return;
+                            }
+                            Err(e) => {
+                                // Committed but not applied locally: resync from the log.
+                                current.refreshed = Instant::now()
+                                    .checked_sub(std::time::Duration::from_secs(60))
+                                    .unwrap_or(current.refreshed);
+                                Some(e)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = wal.discard(front.seq, &front.entry, &staged).await;
+                        Some(log_error(e))
+                    }
+                }
+            }
+        }
+    };
+    let error = failure.expect("every path that did not return failed");
+    {
+        // Force a catch-up before the next group is evaluated.
+        let mut current = state.lock().await;
+        current.refreshed = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap_or(current.refreshed);
+    }
+    let mut failed = vec![front];
+    failed.extend(flights.drain(..));
+    // Later flights never reached their slots: stop their uploads and remove their payloads.
+    for (i, f) in failed.iter_mut().enumerate() {
+        if i > 0 {
+            f.upload.abort();
+            let (wal, seq, entry) = (wal.clone(), f.seq, f.entry.clone());
+            tokio::spawn(async move {
+                let staged = bf_wal::Staged::maybe_uploaded();
+                let _ = wal.discard(seq, &entry, &staged).await;
+            });
+        }
+    }
+    if retry {
+        for f in failed.into_iter().rev() {
+            for p in f.pending.into_iter().rev() {
+                backlog.push_front(p);
+            }
+        }
+    } else {
+        for f in failed {
+            for p in f.pending {
+                let _ = p.reply.send(Err(error.clone()));
+            }
+        }
+    }
+}
+
+/// Commit every flight, oldest first.
+async fn drain(
+    wal: &Wal,
+    state: &Mutex<NamespaceState>,
+    store: &Storage,
+    flights: &mut VecDeque<Flight>,
+    backlog: &mut VecDeque<Op>,
+) {
+    while let Some(front) = flights.front_mut() {
+        let staged = (&mut front.upload).await;
+        commit_front(wal, state, store, flights, staged, backlog).await;
+    }
+}
+
 async fn commit_worker(
     wal: Wal,
     state: Arc<Mutex<NamespaceState>>,
-    mut receiver: tokio::sync::mpsc::Receiver<Pending<Operation, Result<WriteResponse, ApiError>>>,
+    mut receiver: tokio::sync::mpsc::Receiver<Op>,
     store: Storage,
     config: EngineConfig,
 ) {
-    let mut carry = None;
+    let depth = config.wal_pipeline.max(1);
+    let mut backlog: VecDeque<Op> = VecDeque::new();
+    let mut flights: VecDeque<Flight> = VecDeque::new();
     loop {
-        let first = if let Some(p) = carry.take() {
+        let first = if let Some(p) = backlog.pop_front() {
             p
-        } else {
+        } else if flights.is_empty() {
             let Some(p) = receiver.recv().await else {
                 break;
             };
             p
-        };
-        let deleting = matches!(first.request, Operation::Delete);
-        let barrier = deleting || matches!(first.request, Operation::Write(_, Some(_)));
-        let mut pending = vec![first];
-        if !barrier {
-            tokio::task::yield_now().await;
-            while pending.len() < 128 {
-                match receiver.try_recv() {
-                    Ok(p)
-                        if matches!(
-                            p.request,
-                            Operation::Delete | Operation::Write(_, Some(_))
-                        ) =>
-                    {
-                        carry = Some(p);
+        } else {
+            // Commit the oldest slot as soon as its upload lands; otherwise take new work.
+            let full = flights.len() >= depth;
+            let front = flights.front_mut().expect("non-empty");
+            let event = tokio::select! {
+                biased;
+                staged = &mut front.upload => Err(staged),
+                p = receiver.recv(), if !full => Ok(p),
+            };
+            match event {
+                Err(staged) => {
+                    commit_front(&wal, &state, &store, &mut flights, staged, &mut backlog).await;
+                    continue;
+                }
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    drain(&wal, &state, &store, &mut flights, &mut backlog).await;
+                    if backlog.is_empty() {
                         break;
                     }
-                    Ok(p) => pending.push(p),
-                    Err(_) => break,
+                    continue;
                 }
-            }
-        }
-        let start = Instant::now();
-        let mut current = state.lock().await;
-        // A state this node just committed or refreshed is current unless another writer
-        // has since appended. The conditional create of the next WAL slot detects exactly
-        // that (Conflict), and the retry then catches up, so the common single-writer
-        // bulk-load path skips a LIST round trip before every commit.
-        let mut trusted =
-            current.seq > 0 && current.refreshed.elapsed() < std::time::Duration::from_secs(2);
-        let committed = loop {
-            let stage = Instant::now();
-            if !std::mem::take(&mut trusted)
-                && let Err(e) = catch_up(&wal, &mut current, &store).await
-            {
-                break Err(e);
-            }
-            record_stage("catch_up", stage);
-            if deleting {
-                if !current.exists {
-                    break Err(ApiError::not_found(
-                        wal.key(0).split('/').nth(1).unwrap_or("unknown"),
-                    ));
-                }
-                let mut entry = WalEntry::new(vec![]);
-                entry.tombstone = true;
-                match wal.append(current.seq + 1, &entry).await {
-                    Ok(CreateResult::Conflict) => continue,
-                    Ok(_) => {
-                        let seq = current.seq + 1;
-                        current.replay(seq, &entry);
-                        if let Err(e) = wal.cleanup_deleted(seq).await {
-                            tracing::warn!(error=?e,"namespace cleanup deferred");
-                        }
-                        break Ok(vec![Ok(WriteResponse::default())]);
-                    }
-                    Err(e) => break Err(log_error(e)),
-                }
-            }
-            if current.tail_bytes >= config.max_unindexed_bytes {
-                break Err(ApiError::new(
-                    429,
-                    "unindexed WAL exceeds backpressure limit",
-                ));
-            }
-            let stage = Instant::now();
-            let mut working = match snapshot::for_writes(&store, &current, &pending).await {
-                Ok(s) => s,
-                Err(e) => break Err(e),
-            };
-            record_stage("for_writes", stage);
-            let stage = Instant::now();
-            let mut batches = vec![];
-            let mut results = vec![];
-            for p in &pending {
-                let Operation::Write(req, copy) = &p.request else {
-                    unreachable!()
-                };
-                match write::prepare(&working, req, copy.as_deref()) {
-                    Ok((batch, result)) => {
-                        working.apply(&batch, 0);
-                        if let Some(source) = copy {
-                            branch::install_source(&mut working, source);
-                        }
-                        batches.push(batch);
-                        results.push(Ok(result));
-                    }
-                    Err(e) => results.push(Err(e)),
-                }
-            }
-            record_stage("prepare", stage);
-            if batches.is_empty() {
-                break Ok(results);
-            }
-            let mut entry = WalEntry::new(batches);
-            if let Operation::Write(_, Some(source)) = &pending[0].request
-                && let Err(e) = branch::stage(&store, &wal, &mut entry, source).await
-            {
-                break Err(e);
-            }
-            let stage = Instant::now();
-            let appended = wal.append(current.seq + 1, &entry).await;
-            record_stage("append", stage);
-            match appended {
-                Ok(CreateResult::Conflict) => continue,
-                Ok(_) => {
-                    let seq = current.seq + 1;
-                    let stage = Instant::now();
-                    if let Err(e) = branch::replay(&store, &wal, seq, &entry, &mut current).await {
-                        break Err(e);
-                    }
-                    record_stage("replay", stage);
-                    current.refreshed = Instant::now();
-                    break Ok(results);
-                }
-                Err(e) => break Err(log_error(e)),
             }
         };
-        drop(current);
-        match committed {
-            Ok(results) => {
-                for (p, result) in pending.into_iter().zip(results) {
-                    let result = result.map(|mut r| {
-                        r.performance.server_total_ms = start.elapsed().as_millis() as u64;
-                        r
-                    });
-                    let _ = p.reply.send(result);
-                }
+        let start = Instant::now();
+        if is_barrier(&first.request) {
+            drain(&wal, &state, &store, &mut flights, &mut backlog).await;
+            if !backlog.is_empty() {
+                backlog.push_back(first);
+                continue;
             }
+            let deleting = matches!(first.request, Operation::Delete);
+            let pending = vec![first];
+            let committed = commit_sync(&wal, &state, &store, &config, deleting, &pending).await;
+            reply_all(pending, committed, start);
+            continue;
+        }
+        let mut pending = vec![first];
+        tokio::task::yield_now().await;
+        while pending.len() < 128 {
+            let next = match backlog.pop_front() {
+                Some(p) => p,
+                None => match receiver.try_recv() {
+                    Ok(p) => p,
+                    Err(_) => break,
+                },
+            };
+            if is_barrier(&next.request) {
+                backlog.push_front(next);
+                break;
+            }
+            pending.push(next);
+        }
+        let mut current = state.lock().await;
+        if flights.is_empty() {
+            // A state this node just committed or refreshed is current unless another writer
+            // has since appended. The conditional create of the next WAL slot detects exactly
+            // that (Conflict), and the retry then catches up, so the common single-writer
+            // bulk-load path skips a LIST round trip before every commit.
+            let trusted =
+                current.seq > 0 && current.refreshed.elapsed() < std::time::Duration::from_secs(2);
+            let stage = Instant::now();
+            if !trusted && let Err(e) = catch_up(&wal, &mut current, &store).await {
+                drop(current);
+                reply_all(pending, Err(e), start);
+                continue;
+            }
+            record_stage("catch_up", stage);
+        }
+        if current.tail_bytes >= config.max_unindexed_bytes {
+            drop(current);
+            let e = ApiError::new(429, "unindexed WAL exceeds backpressure limit");
+            reply_all(pending, Err(e), start);
+            continue;
+        }
+        let overlay: Vec<Arc<WalEntry>> = flights.iter().map(|f| f.entry.clone()).collect();
+        let stage = Instant::now();
+        let mut working = match snapshot::for_writes(&store, &current, &pending, &overlay).await {
+            Ok(s) => s,
             Err(e) => {
-                for p in pending {
-                    let _ = p.reply.send(Err(e.clone()));
+                drop(current);
+                reply_all(pending, Err(e), start);
+                continue;
+            }
+        };
+        record_stage("for_writes", stage);
+        let stage = Instant::now();
+        let mut batches = vec![];
+        let mut results = vec![];
+        for p in &pending {
+            let Operation::Write(req, None) = &p.request else {
+                unreachable!("barriers never reach the pipeline")
+            };
+            match write::prepare(&working, req, None) {
+                Ok((batch, result)) => {
+                    working.apply(&batch, 0);
+                    batches.push(batch);
+                    results.push(Ok(result));
                 }
+                Err(e) => results.push(Err(e)),
+            }
+        }
+        record_stage("prepare", stage);
+        let seq = current.seq + flights.len() as u64 + 1;
+        drop(current);
+        if batches.is_empty() {
+            reply_all(pending, Ok(results), start);
+            continue;
+        }
+        let entry = Arc::new(WalEntry::new(batches));
+        let upload = {
+            let (wal, entry) = (wal.clone(), entry.clone());
+            tokio::spawn(async move { wal.stage(seq, &entry).await })
+        };
+        flights.push_back(Flight {
+            seq,
+            entry,
+            upload,
+            pending,
+            results,
+            start,
+        });
+    }
+}
+
+fn reply_all(pending: Vec<Op>, committed: Result<Vec<WriteResult>, ApiError>, start: Instant) {
+    match committed {
+        Ok(results) => {
+            for (p, result) in pending.into_iter().zip(results) {
+                let result = result.map(|mut r| {
+                    r.performance.server_total_ms = start.elapsed().as_millis() as u64;
+                    r
+                });
+                let _ = p.reply.send(result);
+            }
+        }
+        Err(e) => {
+            for p in pending {
+                let _ = p.reply.send(Err(e.clone()));
             }
         }
     }
