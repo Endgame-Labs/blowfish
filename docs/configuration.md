@@ -30,7 +30,7 @@ are errors. Nested storage settings currently follow `bf-storage`'s parser.
 | `engine.compaction_segments` | `--compaction-segments` | `BLOWFISH_COMPACTION_SEGMENTS` | 4 |
 | `engine.retention_ms` | `--retention-ms` | `BLOWFISH_RETENTION_MS` | 3600000 |
 | `engine.lease_duration_ms` | `--lease-duration-ms` | `BLOWFISH_LEASE_DURATION_MS` | 30000 |
-| `engine.max_unindexed_bytes` | `--max-unindexed-bytes` | `BLOWFISH_MAX_UNINDEXED_BYTES` | memory limit / 16, within 128 MiB to 2000000000 |
+| `engine.max_unindexed_bytes` | `--max-unindexed-bytes` | `BLOWFISH_MAX_UNINDEXED_BYTES` | memory limit / 8, within 128 MiB to 2000000000 |
 | `engine.eventual_tail_bytes` | `--eventual-tail-bytes` | `BLOWFISH_EVENTUAL_TAIL_BYTES` | 134217728 |
 | `engine.ann_nprobe` | `--ann-nprobe` | `BLOWFISH_ANN_NPROBE` | 64 |
 | `engine.ann_rerank_factor` | `--ann-rerank-factor` | `BLOWFISH_ANN_RERANK_FACTOR` | 32 |
@@ -95,7 +95,9 @@ memory limit (host RAM, or the cgroup limit when lower), and each has an overrid
 
 | What | Default | Override |
 | --- | --- | --- |
-| Unindexed WAL tail (write backpressure) | limit / 16, 128 MiB to 2 GB | `BF_MAX_UNINDEXED_BYTES` |
+| Unindexed WAL tail (write backpressure) | limit / 8, 128 MiB to 2 GB | `BF_MAX_UNINDEXED_BYTES` |
+| Tail bytes at which a bulk load flushes | three quarters of the unindexed limit | `BF_BULK_FLUSH_BYTES` |
+| Segments a bulk load accumulates before compaction runs while writes arrive | 1,024 | `BF_DEFER_COMPACTION_SEGMENTS` |
 | Rows in a built or compacted segment | limit / 80,000, 25,000 to 200,000 | `BF_MAX_SEGMENT_ROWS` |
 | Rows accumulated before a bulk flush | the smaller of 100,000 and the segment cap | `BF_BULK_FLUSH_ROWS` |
 | Segment builds at once | 1 below 8 GiB, otherwise 2 | `BF_BUILD_CONCURRENCY` |

@@ -253,6 +253,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or(config.engine.max_unindexed_bytes)
     {
         engine_config.max_unindexed_bytes = value;
+        // A bulk flush follows the limit (three quarters of it) unless set on its own.
+        if std::env::var_os("BF_BULK_FLUSH_BYTES").is_none() {
+            engine_config.bulk_flush_bytes = value / 4 * 3;
+        }
     }
     if let Some(value) = tuning
         .eventual_tail_bytes
