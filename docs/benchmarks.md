@@ -2065,3 +2065,65 @@ Ranked next steps:
    the bytes in the busiest wave), and run-compress the live-row bitmaps (118 KB each, about 1 MB per query, for a few hundred bytes).
 3. One namespace-wide text dictionary, so requests do not scale with segment count (186 reads over 9 segments).
 4. Hydrate only the global winners (the per-segment top 10 is hydrated, up to 50 rows for 10 results).
+
+## Iteration 14 (memory): where 10M's memory goes, and the first fixes
+
+Goal: load and recluster 10M documents (1,024-dimension f16) on a c7gd.large (2 vCPU, 4 GB, no swap) with RSS under about 3.5 GB. Before this
+round a 10M load reached 13 to 16 GB and `recluster` 16.9 GB. Status: **target not met, not validated at 10M on c7gd.large** (the weekly
+quota ran out first). Measured on a c7gd.2xlarge in-region (us-west-2), jemalloc heap profiles (`--features heap-profile`,
+`_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19`, dumps every 10 to 20 s, read with `jeprof`) on a 1M-row load and one 1M-row recluster.
+
+### Heap profile (live bytes at the allocation site, at the peak dump)
+
+| Phase | Peak live heap | Top sites |
+| --- | ---: | --- |
+| Steady ingest (WAL commit into the tail), 100K-row flush cycle | 2.1 to 2.5 GB | `commit_front` / `branch::replay` tail documents 660 to 720 MB (a 5.5 KB base64 vector plus text per row); segment build 400 to 820 MB (`decode_vector` f32 copies 340 MB, `cluster::prepare` 340 MB, `build_text` 180 MB) |
+| Segment build, 100K rows | about 1.7 KB x 4 per row | the build holds the input f32 vectors, a second rounded f32 copy (`stored`), a third normalized copy (`training`), the blocks, and then the whole blob again |
+| Compaction, two 100K-row segments (200K rows) | 5.7 to 6.3 GB (32 KB per row) | `segment::documents` re-materializes every document 2.1 GB (vectors as base64 strings); `build` 0.8 GB (`decode_vector` 700 MB, `prepare` 684 MB); `build_text` 240 MB; text statistics `hydrate` / `full_stats` 240 MB (grows with the namespace) |
+| Idle after the load | 3.2 GB | the in-memory block cache, filled by the compaction reads (`read_batch_with_stats`, 2.7 GB with a 4 GiB budget) |
+| Recluster, 1M rows in 3 slabs (largest 527K) | 10.3 GB (8.4 GB without the profiler) | the copy pass fills the block cache 2.1 GB; slab build `vectors` 2.1 GB, `stored` 2.1 GB, `training` 2.1 GB, blocks 1.1 GB, blob 1.1 GB (about 16 KB per slab row) |
+
+RSS split: with jemalloc and 1 s decay, RSS was within 1 to 6 percent of the live heap (resident 2,566 vs allocated 2,413 MB at a spike), so
+**fragmentation and retention are small once the allocator purges**: the memory is live data. At the 1M compaction peak: 2.1 GB materialized
+documents, about 1.5 GB build copies, 0.25 GB text statistics, and the block cache whatever its budget allows (1 GiB on a 4 GB box).
+The 1M ingest floor with the starting code and jemalloc was 2.8 GB peak (earlier glibc runs: 5.9 GB at 1M).
+
+### What changed
+
+1. **jemalloc** (`bf-alloc`) with background purge threads, 4 arenas, and 1 s dirty and muzzy decay. Statistics are in `/metrics`
+   (`blowfish_alloc_bytes{kind}`) and `BF_MEM_LOG_SECS`; the heap profiler is the `heap-profile` feature.
+2. **Size by memory**: segment rows (limit / 80,000, 25K to 200K), bulk flush rows, build concurrency (1 below 8 GiB), unindexed tail bytes (limit / 16, so
+   256 MiB on 4 GB), and recluster `max_slab_rows` (limit / 40,000) follow the host or cgroup memory limit (read from the process's own cgroup).
+3. **Builder takes ownership** (`IndexBuilder::build_owned`): one fewer f32 copy of the input (4 KB per row) in segment builds and recluster slabs.
+
+### Measured after (c7gd.2xlarge host, process in a 4 GiB cgroup with swap off, 1 GiB block cache, 2 rayon threads)
+
+| Test | Before | After |
+| --- | ---: | ---: |
+| 1M ingest, peak RSS (cap 4 GiB) | 2.8 GB (8 GB box, no cap) | 3.4 GB, 7,084 docs/s, no OOM (3 retries on 429) |
+| 1M recluster, peak RSS | 8.4 GB (10.3 GB profiled), 58 s | **2.5 GB** with 15 slabs of at most 100K rows (largest cell 137K split in two), 196 s on 2 threads |
+| 3M ingest in a 4 GiB cgroup | not run | **OOM-killed at 1.56M rows** (4.05 GB RSS at 4,110 docs/s, 350 retries): floor grew 1.0 to 1.9 GB between 0.5M and 1.5M rows, with compaction spikes of +2 GB |
+
+Recluster memory no longer depends on the row count (builder about 1.3 GB per 100K-row slab, the block cache, and about 10 bytes per row of
+assignment arrays), so a 10M recluster should fit; that was not run. Ingest does not fit yet: the namespace-size term is
+the text statistics and the compaction working set (below).
+
+### BM25 cold at 1M MS MARCO (round 13 code, c7gd.2xlarge in-region, 50 queries, `ab.py`)
+
+| Arm | p50 / p90 / p99 ms | Reads | MB | Waves | overlap@10 vs exact BM25 (1,000 queries) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| turbopuffer published | 316 / 381 / 559 | | | | |
+| fresh process | 380 / 526 / 659 | 194 | 4.4 | 3.4 | 1.0000 |
+| cache-cold (`--cachecold`) | 301 / 369 / 429 | 194 | 4.4 | 3.5 | 1.0000 |
+
+Target (p50 at most 395 or p90 at most 476): met on p50 in both arms and on p90 for cache-cold; fresh-process p90 is 526.
+
+### What is left
+
+- **Compaction working set**: stream compaction (read, merge, and write a segment's documents block by block instead of `segment::documents` for the whole merge),
+  and keep vectors f16 or off-heap during compaction. 32 KB per row now.
+- **Text statistics and the tail**: the corpus statistics that the indexer hydrates grow with the namespace (240 MB at 1M, so about 2.4 GB at 10M); and the
+  tail holds base64 f32 documents (7 KB per row).
+- **Builder**: `training` (normalized f32 copy) and `stored` are still full f32; build from f16 and normalize on the fly (target 6 KB per row).
+- **Block cache pollution**: compaction and recluster reads should bypass the memory block cache.
+- **Validation**: 10M load and recluster on a c7gd.large, cold ANN at 48 probes, and recall@10 were not run.

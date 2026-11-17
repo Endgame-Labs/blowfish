@@ -114,6 +114,40 @@ impl IndexBuilder {
             validate(&v, self.dims)?;
             stored.push((*row, v));
         }
+        self.build_stored(stored)
+    }
+    /// Like [`IndexBuilder::build`], but consumes the rows and rounds them in place, so a large
+    /// build holds one full-precision copy of the input instead of two.
+    pub fn build_owned(&self, mut rows: Vec<(u32, Vec<f32>)>) -> Result<Vec<u8>> {
+        if rows.len() > u32::MAX as usize
+            || self.params.iterations == 0
+            || self.params.samples_per_cluster == 0
+            || self.params.clusters == Some(0)
+        {
+            return Err(Error::InvalidInput(
+                "invalid build parameters or too many rows".into(),
+            ));
+        }
+        for (_, v) in &mut rows {
+            validate(v, self.dims)?;
+            match self.dtype {
+                VectorType::F32 => {}
+                VectorType::I8 => {
+                    if v.iter().any(|x| x.fract() != 0.0 || !(-128.0..=127.0).contains(x)) {
+                        return Err(Error::InvalidInput("an invalid i8 value was passed".into()));
+                    }
+                }
+                VectorType::F16 => {
+                    for x in v.iter_mut() {
+                        *x = half::f16::from_f32(*x).to_f32();
+                    }
+                }
+            }
+            validate(v, self.dims)?;
+        }
+        self.build_stored(rows)
+    }
+    fn build_stored(&self, mut stored: Vec<(u32, Vec<f32>)>) -> Result<Vec<u8>> {
         stored.sort_unstable_by_key(|x| x.0);
         if stored.windows(2).any(|w| w[0].0 == w[1].0) {
             return Err(Error::InvalidInput("duplicate row ID".into()));
@@ -125,15 +159,15 @@ impl IndexBuilder {
         let k = self
             .params
             .clusters
-            .unwrap_or_else(|| (rows.len() as f64).sqrt().ceil() as usize)
-            .min(rows.len());
-        let flat = rows.len() < self.params.flat_threshold || k <= 1;
+            .unwrap_or_else(|| (stored.len() as f64).sqrt().ceil() as usize)
+            .min(stored.len());
+        let flat = stored.len() < self.params.flat_threshold || k <= 1;
         let (centers, parents, parent_ids, assignments) = if flat {
             (
                 vec![vec![0.; self.dims]],
                 vec![],
                 vec![u32::MAX],
-                vec![0; rows.len()],
+                vec![0; stored.len()],
             )
         } else {
             self.cluster(&training, k)?

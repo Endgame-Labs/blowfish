@@ -34,6 +34,7 @@ tracing = "0.1.44"
 uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
+bf-alloc = { path = "../bf-alloc" }
 axum = "0.8.9"
 bf-models = { path = "../bf-models" }
 async-trait = "=0.1.92"

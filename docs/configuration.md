@@ -30,7 +30,7 @@ are errors. Nested storage settings currently follow `bf-storage`'s parser.
 | `engine.compaction_segments` | `--compaction-segments` | `BLOWFISH_COMPACTION_SEGMENTS` | 4 |
 | `engine.retention_ms` | `--retention-ms` | `BLOWFISH_RETENTION_MS` | 3600000 |
 | `engine.lease_duration_ms` | `--lease-duration-ms` | `BLOWFISH_LEASE_DURATION_MS` | 30000 |
-| `engine.max_unindexed_bytes` | `--max-unindexed-bytes` | `BLOWFISH_MAX_UNINDEXED_BYTES` | 2000000000 |
+| `engine.max_unindexed_bytes` | `--max-unindexed-bytes` | `BLOWFISH_MAX_UNINDEXED_BYTES` | memory limit / 16, within 128 MiB to 2000000000 |
 | `engine.eventual_tail_bytes` | `--eventual-tail-bytes` | `BLOWFISH_EVENTUAL_TAIL_BYTES` | 134217728 |
 | `engine.ann_nprobe` | `--ann-nprobe` | `BLOWFISH_ANN_NPROBE` | 64 |
 | `engine.ann_rerank_factor` | `--ann-rerank-factor` | `BLOWFISH_ANN_RERANK_FACTOR` | 32 |
@@ -87,3 +87,23 @@ Durations ending in `_ms` are milliseconds. The legacy `BF_INDEX_ROWS`, `BF_INDE
 `BF_INDEX_INTERVAL_MS`, `BF_MAX_UNINDEXED_BYTES`, and `BF_ANN_NPROBE` variables remain aliases.
 Flags and `BLOWFISH_*` variables take precedence over aliases, which take precedence over TOML.
 Set `--indexing false` to disable background indexing. Recall sampling must be between 0 and 1.
+
+### Memory sizing
+
+blowfish links jemalloc, with background purging, as its allocator. Where memory matters, these defaults follow the
+memory limit (host RAM, or the cgroup limit when lower), and each has an override:
+
+| What | Default | Override |
+| --- | --- | --- |
+| Unindexed WAL tail (write backpressure) | limit / 16, 128 MiB to 2 GB | `BF_MAX_UNINDEXED_BYTES` |
+| Rows in a built or compacted segment | limit / 80,000, 25,000 to 200,000 | `BF_MAX_SEGMENT_ROWS` |
+| Rows accumulated before a bulk flush | the smaller of 100,000 and the segment cap | `BF_BULK_FLUSH_ROWS` |
+| Segment builds at once | 1 below 8 GiB, otherwise 2 | `BF_BUILD_CONCURRENCY` |
+| Decoded metadata cache | limit / 8, 512 MiB to 4 GiB | `BF_DECODED_CACHE_BYTES` |
+| Block cache in memory | limit / 4, up to 8 GiB | `storage.cache.memory_bytes` |
+
+The row caps assume 1,024-dimension vectors (a compaction needs about 30 KB per row while it runs). `recluster` sizes
+`max_slab_rows` the same way (40 KB per row, 100,000 on a 4 GB machine). Diagnostics:
+`BF_MEM_LOG_SECS=N` prints allocator and RSS statistics every N seconds, `/metrics` exposes
+`blowfish_alloc_bytes{kind}` (allocated, active, resident, retained), and a build with `--features heap-profile` writes jemalloc
+heap profiles when run with `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19` and `BF_HEAP_DUMP_DIR=DIR`.

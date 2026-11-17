@@ -68,9 +68,8 @@ pub struct EngineConfig {
     /// Embedding and reranking models. Without them, `Embed` and model `rerank_by` return a 400.
     pub models: Option<std::sync::Arc<bf_models::Models>>,
 }
-/// An eighth of the memory this process may use (host RAM or the cgroup limit), within
-/// 512 MiB to 4 GiB. Entries are charged at their resident size, so this bounds real memory.
-fn default_decoded_cache_bytes() -> u64 {
+/// Memory this process may use: host RAM or the cgroup limit, whichever is smaller (4 GiB if unknown).
+fn memory_limit_bytes() -> u64 {
     let host = std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| {
@@ -83,11 +82,30 @@ fn default_decoded_cache_bytes() -> u64 {
             })
         })
         .map_or(4 << 30, |kb| kb.saturating_mul(1024));
-    let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+    // The process's own cgroup (a systemd scope or a container) first, then the root file.
+    let own = std::fs::read_to_string("/proc/self/cgroup")
         .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("0::").map(str::to_string)))
+        .and_then(|path| {
+            std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.max", path.trim_end()))
+                .ok()
+        });
+    let limit = own
+        .or_else(|| std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(host);
-    (host.min(limit) / 8).clamp(512 << 20, 4 << 30)
+    host.min(limit)
+}
+/// An eighth of the memory this process may use, within 512 MiB to 4 GiB. Entries are charged at
+/// their resident size, so this bounds real memory.
+fn default_decoded_cache_bytes() -> u64 {
+    (memory_limit_bytes() / 8).clamp(512 << 20, 4 << 30)
+}
+/// Rows in one built or compacted segment that a machine of this size can hold in memory. A
+/// compaction of 1,024-dimension vectors needs about 30 KB per row while it runs (measured with the
+/// jemalloc heap profiler), so the cap is memory / 80,000 rows within 25,000 to 200,000.
+fn default_max_segment_rows() -> usize {
+    ((memory_limit_bytes() / 80_000) as usize).clamp(25_000, 200_000)
 }
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -99,18 +117,20 @@ impl Default for EngineConfig {
             index_rows: 1000,
             index_bytes: 8 * 1024 * 1024,
             index_age: Duration::from_secs(5),
-            bulk_flush_rows: 100_000,
+            bulk_flush_rows: default_max_segment_rows().min(100_000),
             bulk_flush_age: Duration::from_secs(60),
             index_interval: Duration::from_millis(250),
             compaction_segments: 4,
-            max_segment_rows: 200_000,
+            max_segment_rows: default_max_segment_rows(),
             max_segment_bytes: 2 << 30,
             retention: Duration::from_secs(3600),
             lease_duration: Duration::from_secs(30),
-            max_unindexed_bytes: 2_000_000_000,
+            // Backpressure by bytes: a sixteenth of memory (256 MiB on 4 GB), within 128 MiB to 2 GB.
+            max_unindexed_bytes: (memory_limit_bytes() / 16).clamp(128 << 20, 2_000_000_000),
             wal_pipeline: 8,
             eventual_tail_bytes: 128 * 1024 * 1024,
-            build_concurrency: 2,
+            // Two builds at once only where memory allows (each holds a whole segment).
+            build_concurrency: if memory_limit_bytes() < (8 << 30) { 1 } else { 2 },
             ann_nprobe: 64,
             ann_rerank_factor: 32,
             exact_fetch_rows: 8192,

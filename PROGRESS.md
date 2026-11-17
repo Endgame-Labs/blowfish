@@ -457,3 +457,7 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
 - New: text segment version 4 (records beside postings), manifest text headers, `manifest-latest` copy, window-pruned posting reads, segments
   processed concurrently. Older segments and namespaces keep working. Details and next steps: `docs/benchmarks.md`, "Iteration 13".
 - New namespace under `scale/bm25/` (`msmarco-1m`, 1M MS MARCO passages, 9 segments).
+- Iteration 14 (memory), partial: jemalloc (`bf-alloc`) with stats and an optional heap profiler; segment rows, build concurrency, unindexed tail, and
+  recluster slab size follow the memory limit; `IndexBuilder::build_owned`. 1M recluster peak RSS 8.4 GB to 2.5 GB; 1M ingest fits 4 GiB (3.4 GB), 3M ingest still
+  OOMs at 1.5M rows (compaction working set and text statistics). 10M on c7gd.large not validated. Cold BM25 at 1M in-region: 380 / 526 ms fresh, 301 / 369 cache-cold,
+  overlap 1.0. Details: `docs/benchmarks.md`, "Iteration 14 (memory)".

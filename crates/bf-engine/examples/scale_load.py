@@ -77,7 +77,7 @@ def send(client, args, body, counters):
         # Transport exceptions and closed responses can form cycles retaining a complete
         # serialized request body.
         gc.collect()
-        while available() < 4 * (1 << 30):
+        while available() < args.min_available_gib * (1 << 30):
             counters["pauses"] += 1
             print(json.dumps({"event": "memory_pause", "available": available()}), flush=True)
             time.sleep(5)
@@ -109,6 +109,8 @@ def main():
     parser.add_argument("--vector-type", choices=("f32", "f16"), default="f32",
                         help="f16 requires every source value to be exactly representable; no silent quantization")
     parser.add_argument("--inflight", type=int, default=2, help="concurrent writes; the server group-commits them")
+    parser.add_argument("--min-available-gib", type=float, default=4.0,
+                        help="pause while MemAvailable is below this (lower it on small machines)")
     parser.add_argument("--scratch", type=Path, required=True)
     parser.add_argument("--resume", action="store_true", help="Replay from the last completed shard; upserts are idempotent")
     args = parser.parse_args()
