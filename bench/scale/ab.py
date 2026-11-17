@@ -79,10 +79,17 @@ class CacheCold:
         urllib.request.urlopen(urllib.request.Request(URL + "/__drop_caches", method="POST"), timeout=600).read()
         query_once(warm_query)  # one throwaway query
 
+    def cpu_ms(self):
+        f = open(f"/proc/{self.proc.pid}/stat").read().rsplit(")", 1)[1].split()
+        return (int(f[11]) + int(f[12])) * 1000 / os.sysconf("SC_CLK_TCK")
+
     def run(self, query, qid):
         urllib.request.urlopen(urllib.request.Request(URL + "/__drop_caches", method="POST"), timeout=600).read()
         open(WORK / "server.log", "r+").truncate(0)
-        return query_once(query)
+        c0 = self.cpu_ms()
+        out = query_once(query)
+        out[0]["cpu_ms"] = self.cpu_ms() - c0
+        return out
 
     def close(self):
         self.proc.terminate(); self.proc.wait()
@@ -105,7 +112,7 @@ def main():
         binary, _, envs = rest.partition(":")
         arms.append((name, (binary, dict(kv.split("=", 1) for kv in envs.split(",") if kv))))
     inputs = json.loads(pathlib.Path(a.workload or HERE / f"data/{a.kind}-strong.json").read_text())
-    res = {n: {"ms": [], "reads": [], "mb": [], "waves": [], "hedges": [], "recall": []} for n, _ in arms}
+    res = {n: {"ms": [], "reads": [], "mb": [], "waves": [], "hedges": [], "recall": [], "cpu": []} for n, _ in arms}
     cc = {}
     if a.cachecold:
         if len(arms) != 1:
@@ -118,18 +125,19 @@ def main():
                 row, d, (reads, mb, waves) = cc[arm[0]].run(inputs[qi], qi) if cc else run_one(arm, inputs[qi], qi)
                 r = res[arm[0]]
                 r["ms"].append(row["ms"]); r["reads"].append(reads); r["mb"].append(mb); r["waves"].append(waves)
+                r["cpu"].append(row.get("cpu_ms", 0))
                 r["hedges"].append(d.get("hedges_issued", 0))
                 if inputs[qi].get("truth"):
                     got = {int(x["id"]) for x in row["response"].get("rows", [])}
                     r["recall"].append(len(got & set(inputs[qi]["truth"])) / 10)
-                print(json.dumps({"q": qi, "arm": arm[0], "ms": round(row["ms"]), "recall": r["recall"][-1] if r["recall"] else None, "reads": reads, "mb": mb, "waves": waves}), flush=True)
-    print(f"\n| arm ({a.kind}, n={len(res[arms[0][0]]['ms'])}) | p50 ms | p90 | p99 | mean | reads | MB | waves | hedges | recall |")
-    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+                print(json.dumps({"q": qi, "arm": arm[0], "ms": round(row["ms"]), "recall": r["recall"][-1] if r["recall"] else None, "reads": reads, "mb": mb, "waves": waves, "cpu_ms": round(row.get("cpu_ms", 0))}), flush=True)
+    print(f"\n| arm ({a.kind}, n={len(res[arms[0][0]]['ms'])}) | p50 ms | p90 | p99 | mean | reads | MB | waves | hedges | recall | cpu ms |")
+    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for n, r in res.items():
         ms = r["ms"]
         rec = f"{np.mean(r['recall']):.3f}" if r["recall"] else ""
         print(f"| {n} | {np.percentile(ms, 50):.0f} | {np.percentile(ms, 90):.0f} | {np.percentile(ms, 99):.0f} | {np.mean(ms):.0f} | "
-              f"{np.mean(r['reads']):.0f} | {np.mean(r['mb']):.1f} | {np.mean(r['waves']):.1f} | {np.mean(r['hedges']):.1f} | {rec} |")
+              f"{np.mean(r['reads']):.0f} | {np.mean(r['mb']):.1f} | {np.mean(r['waves']):.1f} | {np.mean(r['hedges']):.1f} | {rec} | {np.mean(r['cpu']):.0f} |")
     for c in cc.values():
         c.close()
     pathlib.Path(SCRATCH / "out").mkdir(parents=True, exist_ok=True)
