@@ -1530,3 +1530,122 @@ bound by the upload path and, past about 5M rows, by server memory.
    fewer bytes per document (vectors are stored twice per segment) is the only lever.
 5. Not done this round: the selective-filter structure, the cold layout change, the manifest and directory overlap beyond the hint,
    and the 160-probe cold cost.
+
+## Against turbopuffer's published numbers
+
+Measured 2026-11-17 on the benchmark VM (8 vCPU, 32 GB, Los Angeles, a Latitude.sh host; nothing else heavy running), against a
+Cloudflare R2 bucket whose location hint is WNAM. The binary is `main` at the end of perf iteration 10. Published numbers are
+turbopuffer's, from https://turbopuffer.com/docs/performance, checked 2026-11-16. Ratios are blowfish over turbopuffer. All
+latencies are client-side, in ms, with strong consistency in every request.
+
+- **Cold** is a fresh blowfish process with an empty memory and disk cache, one query, repeated 100 times (`bench/scale/ab.py`, in
+  its fresh-process mode, with a 1.5 s settle for the connection warmer).
+- **Warm** is two unmeasured passes over the query set (one for BM25), then 1,000 queries at concurrency 1 on a keep-alive
+  connection (`bench/scale/warm.py`).
+- The **network-adjusted estimate** is an estimate, shown next to the measurement and never instead of it. It is the measured
+  number minus waves times (our request RTT minus 15 ms), where 15 ms is an assumed in-region RTT, our request RTT is the 4 KB
+  GET p50 below, and waves is the mean number of sequential rounds of parallel reads in a cold query (from `BF_TRACE_READS`).
+  A warm strong query is one wave: a check of the WAL tail. It ignores bandwidth, so it understates the cold ANN rows.
+
+### The network, and where this VM is
+
+| Measurement (this VM to the R2 S3 endpoint, 200 samples) | p50 | p90 |
+| --- | ---: | ---: |
+| TCP connect | 6.2 ms | 8.5 ms |
+| TLS handshake | 26.4 ms | 35.0 ms |
+| GET of 4 KB (warm connection) | 83.5 ms | 129.8 ms |
+| PUT of 200 B to 500 KB, one object (30 samples per size) | 260 to 304 ms | 346 to 499 ms |
+
+The VM is in Los Angeles (IP geolocation and the Cloudflare edge it reaches is LAX); the bucket reports `WNAM`. Connect time is
+small, so the edge is near. The 83 ms is R2's own time to first byte for a small object, which is far above an in-region object
+store, and a PUT costs about three times a GET. This is the difference we cannot remove from this VM. A same-region test needs a
+VM in the bucket's region (or an object store there that we do not run on R2), and would need a new bucket and VM, so it was not
+done. turbopuffer measures in-region next to its storage.
+
+### Vector query: 10M docs, strong consistency
+
+blowfish is the existing 10M, 1024-dimension Wikipedia namespace (70 segments, f16 vectors, about 5.6 KB per document). turbopuffer's
+published run is 768 dimensions, so our vectors are 33 percent larger: this is a conservative upper bound. Recall@10 is against exact
+cosine truth for 200 held-out queries (`bench/scale/data/oracle-10m.npz`). turbopuffer measured 0.943 on the same queries.
+The 160-probe row is the apples-to-apples one, because it matches turbopuffer's accuracy.
+
+| Cold (n=100) | p50 | p90 | p99 | Recall@10 | Requests, MB | Waves |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| turbopuffer published | 874 | 1,214 | 1,686 | | | |
+| blowfish, 160 probes | 5,175 | 6,528 | 8,456 | 0.952 | 2,093, 137 | 4.5 |
+| ratio, 160 probes | 5.9x | 5.4x | 5.0x | | | |
+| blowfish, 64 probes (default) | 2,790 | 3,862 | 5,353 | 0.886 | 1,103, 67 | 4.4 |
+| ratio, 64 probes | 3.2x | 3.2x | 3.2x | | | |
+| network-adjusted estimate, 160 probes | 4,870 | 6,222 | | | | |
+| network-adjusted estimate, 64 probes | 2,491 | 3,563 | | | | |
+
+| Warm (n=1,000, c=1) | p50 | p90 | p99 | Recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| turbopuffer published | 14 | 17 | 27 | |
+| blowfish, 160 probes | 136 | 168 | 280 | 0.9465 |
+| ratio, 160 probes | 9.7x | 9.9x | 10.4x | |
+| blowfish, 64 probes (default) | 88 | 128 | 199 | 0.8855 |
+| ratio, 64 probes | 6.3x | 7.5x | 7.4x | |
+| network-adjusted estimate, 160 probes (one wave) | 68 | 100 | | |
+| network-adjusted estimate, 64 probes (one wave) | 20 | 60 | | |
+
+Neither cold row is within 10 percent of the perf goal (cold p50 1,224 ms or p90 1,700 ms). The adjustment barely moves the cold
+rows: 4 to 5 waves of 68 ms is only 300 ms, and the cold query moves 67 to 137 MB and 1,100 to 2,100 requests over 70 segments, so
+it is bound by bytes, request count, and compaction, not RTT. The 160-probe cold cost is about 1.9 times the 64-probe cost,
+in line with its 2x bytes and requests.
+
+### BM25 full-text: 1M docs, strong consistency
+
+MS MARCO passages (the first 1,000,000 of `Tevatron/msmarco-passage-corpus`, text only, loaded with `bench/scale/msmarco_load.py`),
+one `text` attribute with full-text search and default tokenizer settings, no vectors. The corpus is 335 MB of text (335 bytes
+per passage on average; turbopuffer's is about 300 MB), and `approx_logical_bytes` reports 358 MB. Queries are 1,000 MS MARCO dev
+queries (seeded sample; many of their relevant passages lie outside the first 1M, which does not change the latency work). Top 10.
+
+| BM25 | p50 | p90 | p99 | Requests, MB | Waves |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| turbopuffer published, cold | 316 | 381 | 559 | | |
+| blowfish, cold (n=100) | 1,570 | 1,885 | 2,268 | 198, 17.6 | 3.3 |
+| ratio, cold | 5.0x | 4.9x | 4.1x | | |
+| network-adjusted estimate, cold | 1,346 | 1,661 | | | |
+| turbopuffer published, warm | 13 | 18 | 29 | | |
+| blowfish, warm (n=1,000, c=1) | 77 | 108 | 178 | | |
+| ratio, warm | 5.9x | 6.0x | 6.1x | | |
+| network-adjusted estimate, warm (one wave) | 9 | 40 | | | |
+
+### Upsert: about 512 KB batches
+
+Each batch is 68 rows (about 506 KB of JSON): 30 to 70 pseudo-random words of text, a category, and a 768-dimension f32 vector as a JSON
+array. 300 sequential writes (`bench/scale/upsert_bench.py`) into a fresh namespace, with the indexer running normally, each
+acknowledged once its WAL slot is committed in R2. No 429s. The namespace and its objects were removed afterward.
+
+| Upsert (client latency until acknowledged) | p50 | p90 | p99 |
+| --- | ---: | ---: | ---: |
+| turbopuffer published | 165 | 248 | 850 |
+| blowfish, run 2 (300 writes) | 792 | 1,531 | 2,713 |
+| ratio | 4.8x | 6.2x | 3.2x |
+| blowfish, run 1 (300 writes, a slower R2 hour) | 2,114 | 2,563 | 3,250 |
+| network-adjusted estimate, run 2, GET RTT (2 PUT waves) | 656 | | |
+| network-adjusted estimate, run 2, PUT RTT of 270 ms | 282 | | |
+
+A write is two sequential PUTs: the payload, then the conditional slot record. The brief's formula, with the 83 ms GET RTT, leaves
+656 ms. The PUT RTT is the better per-request figure for this benchmark, because the PUT p50 here is 260 to 304 ms whatever the
+size, and the estimate then leaves 282 ms. Run 1 and run 2 differ by 2.7x on the same code: R2 write latency moves a lot
+between sessions, so treat the upsert numbers as a range (792 to 2,114 ms p50), not a point. A 60-write run on the same binary had p50 810.
+
+### Differences that remain
+
+1. **Network:** we cross the Internet to R2 (83 ms for a 4 KB GET, 270 ms for a PUT), while turbopuffer measures in-region. Not removable
+   from this VM. The adjusted estimates above assume 15 ms in-region.
+2. **Vector dimension:** 1024 against 768 (33 percent more bytes). The 768-dimension reload was skipped, on instruction.
+3. **Layout:** the 10M namespace has 70 segments, because its last 2M rows were loaded with `BF_MAX_SEGMENT_ROWS=100000` and never
+   compacted. A compacted namespace would read fewer, larger objects.
+4. **Warm consistency check:** every strong query pays one R2 round trip to check the WAL tail, which dominates our warm numbers
+   (77 to 136 ms against about 14 ms). turbopuffer does not have to cross a network for it.
+5. **Corpus:** MS MARCO at 335 bytes per passage, not the 300 MB turbopuffer used; the queries are MS MARCO dev queries. The upsert rows
+   are synthetic.
+6. **Recall:** at the 64-probe default we are below turbopuffer (0.886 against 0.943). The apples-to-apples row is 160 probes (0.947 warm,
+   0.952 cold; the two differ only in which queries were drawn and the cold run's 100 against 1,000).
+7. **Sampling:** 100 cold queries each (the cold ANN arms alternated in one session, which is the only way to compare R2 at different times),
+   1,000 warm queries (the 200-query ANN set repeats five times). R2 latency varies by 2x or more between sessions, as the two upsert runs show.
+8. **Cache and process:** cold means an empty 8 GiB memory cache and an empty disk cache, but a settled warm connection pool; the server
+   is one process on the VM, and no other heavy job ran during any measurement.

@@ -14,7 +14,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 SCRATCH = pathlib.Path(os.environ.get("SCALE_SCRATCH", ROOT / ".scratch/scale"))
 CONFIG = pathlib.Path(os.environ.get("SCALE_CONFIG", HERE / "config.local"))
-NS = json.loads(CONFIG.read_text())["namespace"]
+NS = json.loads(CONFIG.read_text())["namespace"]  # overridden by --namespace
 PORT = int(os.environ.get("SCALE_PORT", "8391"))
 URL = f"http://127.0.0.1:{PORT}"
 WORK = SCRATCH / "ab"
@@ -64,15 +64,19 @@ def run_one(arm, query, qid):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kind", default="ann"); ap.add_argument("--queries", type=int, default=32)
-    ap.add_argument("--rounds", type=int, default=1); ap.add_argument("--arm", action="append", required=True)
+    ap.add_argument("--rounds", type=int, default=1)
+    ap.add_argument("--workload", help="workload JSON (default data/KIND-strong.json); items with a \"truth\" list give recall@10")
+    ap.add_argument("--namespace", help="namespace to query (default: config.local)")
+    ap.add_argument("--arm", action="append", required=True)
     a = ap.parse_args()
+    global NS
+    NS = a.namespace or NS
     arms = []
     for spec in a.arm:
         name, rest = spec.split("=", 1)
         binary, _, envs = rest.partition(":")
         arms.append((name, (binary, dict(kv.split("=", 1) for kv in envs.split(",") if kv))))
-    inputs = json.loads((HERE / f"data/{a.kind}-strong.json").read_text())
-    truth = None  # recall comes from oracle_compare.py (the workloads here are latency samples)
+    inputs = json.loads(pathlib.Path(a.workload or HERE / f"data/{a.kind}-strong.json").read_text())
     res = {n: {"ms": [], "reads": [], "mb": [], "waves": [], "hedges": [], "recall": []} for n, _ in arms}
     for rnd in range(a.rounds):
         for qi in range(min(a.queries, len(inputs))):
@@ -82,10 +86,10 @@ def main():
                 r = res[arm[0]]
                 r["ms"].append(row["ms"]); r["reads"].append(reads); r["mb"].append(mb); r["waves"].append(waves)
                 r["hedges"].append(d.get("hedges_issued", 0))
-                if truth is not None:
+                if inputs[qi].get("truth"):
                     got = {int(x["id"]) for x in row["response"].get("rows", [])}
-                    r["recall"].append(len(got & set(truth[TRUTH[a.kind]][inputs[qi]["query_id"]].tolist())) / 10)
-                print(json.dumps({"q": qi, "arm": arm[0], "ms": round(row["ms"]), "reads": reads, "mb": mb, "waves": waves}), flush=True)
+                    r["recall"].append(len(got & set(inputs[qi]["truth"])) / 10)
+                print(json.dumps({"q": qi, "arm": arm[0], "ms": round(row["ms"]), "recall": r["recall"][-1] if r["recall"] else None, "reads": reads, "mb": mb, "waves": waves}), flush=True)
     print(f"\n| arm ({a.kind}, n={len(res[arms[0][0]]['ms'])}) | p50 ms | p90 | p99 | mean | reads | MB | waves | hedges | recall |")
     print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for n, r in res.items():

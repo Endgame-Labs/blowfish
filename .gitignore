@@ -5,3 +5,4 @@ __pycache__/
 node_modules/
 *.local/
 /.scratch/
+bench/scale/data/ann-apples.json
