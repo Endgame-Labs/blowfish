@@ -1881,3 +1881,104 @@ Here the drop-caches p50 is not lower than the fresh-process p50 at the same set
 minutes apart, and the gap is inside session-to-session R2 variation. Treat the two as the same cold cost.
 
 Warm for reference (same servers, 200 queries, concurrency 1): p50 76, 78, and 101 ms at 40, 48, and 64 probes.
+
+## In-region on AWS (v0.1.12)
+
+Setup: AWS `c7gd` instances in `us-west-2` reading a same-region S3 bucket, running `main` at `1901a41` (round 12, which is the
+`v0.1.12` code). All rows were measured on `c7gd.2xlarge` (8 vCPU, 16 GB) unless the instance-size table says otherwise. The 10M
+English Wikipedia namespace (1,024-dim `f16` vectors, 70 segments, and 32 spatial slabs from `recluster`) was copied from R2 to S3
+unchanged; BM25 uses 1M MS MARCO passages. Every query uses strong consistency. Upserts were not measured in-region.
+
+"Fresh" starts a new read-only process with an empty cache for each query (50 queries per arm, rotated in the same session).
+"Cache-cold" runs against a warm process with caches dropped before each query (`POST /_bench/drop_caches`). `Recall@10` is
+measured over all 200 held-out queries from a warm 1,000-query run.
+
+### Network floor (instance to S3)
+
+| Measurement | p50 | p90 |
+| --- | ---: | ---: |
+| TCP connect | 1.6 ms | 2.2 ms |
+| TLS handshake | 26.9 ms | 27.7 ms |
+| 4 KB `GET` | 24.5 ms | 30.5 ms |
+| 1 MB `GET` | 30.2 ms | 36.1 ms |
+
+### 10M vector (`c7gd.2xlarge`)
+
+Cold `p50 / p90` in milliseconds (blowfish vectors are 1,024-dim `f16`; turbopuffer's published benchmark uses 768-dim):
+
+| Arm | Fresh (ms) | Gap vs. published | Cache-cold (ms) | Gap vs. published | Recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| turbopuffer published | 874 / 1,214 | | | | 0.943 |
+| Slabs, 40 probes | 642 / 806 | -27% / -34% | 558 / 699 | -36% / -42% | 0.9415 |
+| Slabs, 48 probes | 662 / 991 | -24% / -18% | 574 / 652 | -34% / -46% | 0.953 |
+| Slabs, 64 probes | 773 / 969 | -12% / -20% | 630 / 746 | -28% / -39% | 0.9615 |
+| Per-segment, 160 probes (slabs off) | 1,079 / 1,336 | +23% / +10% | 924 / 1,071 | +6% / -12% | 0.9465 |
+
+Tail latency and object-store I/O per cold query:
+
+| Arm | p99 fresh (ms) | p99 cache-cold (ms) | Requests | MB | Waves |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Slabs, 40 probes | 1,078 | 1,038 | 357 | 45.6 | 3.4 |
+| Slabs, 48 probes | 1,454 | 816 | 404 | 50.7 | 3.5 |
+| Slabs, 64 probes | 1,080 | 872 | 495 | 60.7 | 3.6 |
+| Per-segment, 160 probes (slabs off) | 1,543 | 2,371 | 844 | 115.2 | 3.2 |
+
+Warm, 1,000 queries at concurrency 1 (`p50 / p90 / p99`, ms; turbopuffer published warm is `14 / 17 ms` `p50 / p90`):
+
+| Arm | Warm p50 / p90 / p99 (ms) |
+| --- | ---: |
+| Slabs, 40 probes | 67.5 / 80.9 / 96.0 |
+| Slabs, 48 probes | 70.7 / 84.1 / 99.0 |
+| Slabs, 64 probes | 84.0 / 101.9 / 117.8 |
+| Per-segment, 160 probes (slabs off) | 96.9 / 106.2 / 112.3 |
+
+### BM25, 1M MS MARCO passages (`c7gd.2xlarge`)
+
+| Mode | turbopuffer published (p50 / p90) | blowfish in-region (p50 / p90) | Gap vs. published |
+| --- | ---: | ---: | ---: |
+| Cold, fresh process | 316 / 381 ms | 453 / 569 ms | +43% / +49% |
+| Cold, cache-cold (`drop_caches`) | | 420 / 512 ms | +33% / +34% |
+| Warm (round 11 code) | 13 / 18 ms | 17.1 / 34.5 ms | |
+
+- Each cold BM25 query makes 156 requests and reads 17.1 MB.
+- Against the published cold numbers, no gap remains on vector; on BM25, about 4 sequential waves at 25–30 ms per round trip, plus
+  CPU, dominate the remaining gap. Wave count, rather than bytes, sets the floor because only 17.1 MB moves.
+
+### Per-stage breakdown: one cache-cold 10M vector query (slabs, 48 probes)
+
+The query took 477 ms in-process (`308 ms` snapshot total and `169 ms` execution total) and 660 ms of CPU summed across threads:
+
+| Stage | Requests | Bytes | Time |
+| --- | ---: | ---: | ---: |
+| Wave 0: two ANN directory hints | | 15.3 MB | 100 ms |
+| Wave 1: WAL tail | 2 | | 23 ms |
+| Wave 2: fragments (scan prefetch) | 361 | 36.8 MB | 181 ms |
+| Wave 3: rerank vectors plus two dependent document hops | 67 | | 123 ms |
+| Scan CPU | | | 34 ms |
+| Rerank and hydrate in-process | | | 162 ms |
+
+About 70% of query wall time is waiting on S3, and the 15.3 MB directory-hint read in wave 0 is the clearest single target. For
+comparison, one cache-cold per-segment query at 160 probes took 899 ms wall time and 1,690 ms of CPU; its fragment wave alone moved
+113 MB across 705 requests and took 550 ms.
+
+### Instance sizes
+
+`p50 / p90` in milliseconds (except warm `p50` and swap pages out):
+
+| Size | Slab 40 fresh | Slab 48 cache-cold | Slab 64 fresh | BM25 cold fresh | Warm p50 (40) | Swap pages out |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `c7gd.2xlarge` (8 vCPU, 16 GB) | 642 / 806 | 574 / 652 | 773 / 969 | 453 / 569 | 67.5 | 0 |
+| `c7gd.xlarge` (4 vCPU, 8 GB) | 566 / 730 | 650 / 845 | 673 / 976 | 501 / 682 | 71.3 | 0 |
+| `c7gd.large` (2 vCPU, 4 GB) | 728 / 961 | 661 / 781 | 857 / 1,152 | 509 / 720 | 114 | 8 |
+
+Verdict:
+- `c7gd.xlarge` is the smallest size that holds the `c7gd.2xlarge` cold numbers; differences are within session noise.
+- `c7gd.large` works (1 GiB block cache, 256 MB decoded cache, and an NVMe swap file that was barely touched) and still beats
+  turbopuffer's published cold vector `p50` and `p90` at 40 and 48 probes, though it is 15–20% slower on fresh `p50` and 1.7x
+  slower warm because it has 2 vCPUs.
+
+### S3 copy incident
+
+A writable loader server indexes, compacts, and garbage-collects every namespace under its prefix. Loading MS MARCO under the same
+prefix forked the S3 copy of the 10M namespace. The namespace was restored from R2 and verified key by key, and
+`bench/scale/msmarco_load.py` now warns about this.

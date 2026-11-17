@@ -281,40 +281,45 @@ Writes are group-committed to a write-ahead log in object storage using create-o
 
 ## Benchmarks
 
-Client-side `p50 / p90` latency in milliseconds (strong consistency on queries), compared against turbopuffer's [published numbers](https://turbopuffer.com/docs/performance):
+Client-side `p50 / p90` latency in milliseconds (strong consistency on queries), compared against turbopuffer's [published numbers](https://turbopuffer.com/docs/performance).
 
-| Benchmark | turbopuffer published | blowfish measured |
+### In-region (AWS S3)
+
+Measured on `c7gd.2xlarge` in `us-west-2` reading a same-region S3 bucket (`v0.1.12`, fresh server process and empty caches per cold query):
+
+| Benchmark | turbopuffer published | blowfish in-region |
 | --- | --- | --- |
-| Vector, 10M docs, cold | 874 / 1,214 ms | 1,111 / 1,311 ms |
-| Vector, 10M docs, warm | 14 / 17 ms | 136 / 168 ms (per-segment layout) |
-| BM25, 1M docs, cold | 316 / 381 ms | 1,570 / 1,885 ms |
-| BM25, 1M docs, warm | 13 / 18 ms | 77 / 108 ms |
+| Vector, 10M, cold (48 probes, recall@10 0.953 vs turbopuffer's 0.943) | 874 / 1,214 ms | 662 / 991 ms |
+| Vector, 10M, warm (48 probes) | 14 / 17 ms | 70.7 / 84.1 ms |
+| BM25, 1M, cold | 316 / 381 ms | 453 / 569 ms |
+| BM25, 1M, warm | 13 / 18 ms | 17.1 / 34.5 ms |
+
+In-region, blowfish's cold vector search at 10M is faster than turbopuffer's published p50 and p90 at higher recall. Cold BM25 is about 43% / 49% slower and is being worked on. Warm vector is still about 5x slower.
+
+- **Network floor:** a 4 KB `GET` to S3 is 24.5 ms p50.
+- **Cache-cold variant:** with the process warm and caches dropped before each query (turbopuffer's definition of cold), vector is **574 / 652 ms** and BM25 is **420 / 512 ms**.
+- **Instance size:** `c7gd.xlarge` (4 vCPU, 8 GB) holds these numbers.
+- **Vectors and layout:** vectors are 1,024-dim `f16` (while turbopuffer's benchmark uses 768-dim), served from the namespace-wide ANN layout built by `recluster` (32 slabs, about 200 rows per cluster; unfiltered ANN only, writes after `recluster` fall back to the per-segment path until the next manual `recluster`, and the 10M build peaked at about 17 GB RSS).
+- **BM25:** 1M MS MARCO passages (335 MB of text); the warm BM25 row was measured on round 11 code.
+- **Upserts:** not measured in-region; see the over-the-internet table below.
+
+### Over the internet (Cloudflare R2)
+
+Measured from an 8-vCPU VM in Los Angeles reaching Cloudflare R2 over the public internet (fresh server process and empty caches per cold query):
+
+| Benchmark | turbopuffer published | blowfish over the internet (R2) |
+| --- | --- | --- |
+| Vector, 10M, cold (48 probes, recall@10 0.953 vs turbopuffer's 0.943) | 874 / 1,214 ms | 1,111 / 1,311 ms |
+| Vector, 10M, warm (160 probes, per-segment layout) | 14 / 17 ms | 136 / 168 ms |
+| BM25, 1M, cold | 316 / 381 ms | 1,570 / 1,885 ms |
+| BM25, 1M, warm | 13 / 18 ms | 77 / 108 ms |
 | Upsert, 512 KB batch | 165 / 248 ms | 792 / 1,531 ms |
 
-Cold vector search at 10M is within about 27% of turbopuffer's published p50 and 8% of its p90. Cold BM25, warm queries, and upserts are still about 5 to 10x slower. Warm latency over the internet is mostly one round trip to the bucket.
+- **Network floor:** a warm 4 KB `GET` to R2 was about 50 ms p50 in the cold-vector session, and about 84 ms p50 (`PUT` about 260 to 300 ms p50) in the earlier session covering BM25, warm queries, and upserts. Warm latency over the internet is mostly one strong-consistency round trip to the bucket.
+- **Cold vector cost:** a cold 48-probe query makes about 400 requests and reads about 51 MB (down from about 880 requests, 117 MB, and 2,916 / 4,358 ms on the per-segment layout at 160 probes).
+- **Upsert variance:** each batch is 68 rows (about 506 KB) over 300 sequential writes; a second identical R2 session measured **2,114 / 2,563 ms**, so treat R2 upsert p50 as roughly **792 to 2,114 ms**.
 
-Vector notes:
-
-- **Data:** 1,024-dim `f16` vectors (turbopuffer's benchmark uses 768-dim). They're served from the namespace-wide ANN layout built by `recluster`: 32 slabs, about 200 rows per cluster.
-- **Settings and recall:** 48 probes (`BF_ANN_NPROBE=48`), recall@10 0.953 over 200 queries with exact ground truth. turbopuffer, measured on the same data and queries, gets 0.943.
-- **Method:** cold is a fresh server process with empty caches for every query. 50 queries; p99 1,584 ms. The warm vector row (136 / 168 ms) was measured on the previous per-segment layout at 160 probes.
-- **What the gap is:** about 1.27x at p50 and 1.08x at p90. The measurement is over the internet to R2 from Los Angeles (4 KB `GET` p50 about 50 ms in that session); turbopuffer measures in-region. In-region AWS measurements are in progress.
-- **Cost per query:** a cold query makes about 400 requests and reads about 51 MB. The previous per-segment layout made about 880 requests and read 117 MB, taking 2,916 / 4,358 ms.
-- **Limits of the layout today:**
-  - it covers unfiltered ANN only;
-  - writes made after the last `recluster` fall back to the per-segment path until the next one;
-  - `recluster` is a manual step;
-  - the build peaked at about 17 GB RSS at 10M.
-
-BM25, upsert, and warm notes:
-
-- **BM25 setup:** the BM25 corpus is 1M MS MARCO passages, 335 MB of text.
-- **Upsert setup:** each upsert batch is 68 rows, about 506 KB, measured over 300 sequential writes. A second identical run gave p50 **2,114 ms** (2,114 / 2,563 ms), so treat upsert p50 as roughly **0.8 to 2.1 s**.
-- **Network (BM25, warm, and upsert runs):** measured from the same VM in Los Angeles reaching R2 over the internet in an earlier session (TCP connect about 6 ms; a 4 KB `GET` was about 84 ms p50, and a `PUT` was about 260 to 300 ms p50).
-  - Warm queries are mostly one strong-consistency round trip to the bucket. Adjusted, warm vector is about **68 / 100 ms** and warm BM25 is about **9 / 40 ms**.
-  - These network-adjusted figures are estimates only, and never replace the measured numbers above.
-
-Methodology, network RTT table, 1M breakdown, parity numbers, known gaps, and reproduction scripts: [`docs/benchmarks/README.md`](docs/benchmarks/README.md).
+Methodology, probe sweeps, network RTT tables, 1M breakdown, parity numbers, known gaps, and reproduction scripts: [`docs/benchmarks/README.md`](docs/benchmarks/README.md).
 
 ## Documentation
 
