@@ -221,6 +221,22 @@ pub enum Error {
     #[error(transparent)]
     Api(#[from] ApiError),
 }
+/// A payload made durable by `Wal::stage`, awaiting its slot's commit.
+#[derive(Debug, Clone, Copy)]
+pub struct Staged {
+    inline: bool,
+    uploaded: bool,
+}
+impl Staged {
+    /// A payload that may or may not have been uploaded (an abandoned upload task): `discard`
+    /// then attempts the delete regardless.
+    pub fn maybe_uploaded() -> Self {
+        Self {
+            inline: false,
+            uploaded: true,
+        }
+    }
+}
 /// WAL operations scoped to one validated namespace.
 #[derive(Clone)]
 pub struct Wal {
@@ -228,6 +244,10 @@ pub struct Wal {
     namespace: String,
 }
 impl Wal {
+    /// The namespace this log belongs to.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
     /// Open a namespace log without creating it.
     pub fn new(store: Storage, namespace: &str) -> Result<Self, Error> {
         validate_namespace(namespace)?;
@@ -262,6 +282,14 @@ impl Wal {
         result
     }
     async fn append_inner(&self, seq: u64, entry: &WalEntry) -> Result<CreateResult, Error> {
+        let staged = self.stage(seq, entry).await?;
+        self.commit(seq, entry, &staged).await
+    }
+    /// First half of an append: make the entry's payload durable under a key unique to this
+    /// attempt (nothing references it yet, so readers cannot see it). Small entries stay inline
+    /// in the slot and upload nothing. Staging several slots concurrently and committing them in
+    /// order with `commit` keeps many uploads in flight at once.
+    pub async fn stage(&self, seq: u64, entry: &WalEntry) -> Result<Staged, Error> {
         let payload_key = self.staged_payload_key(seq, entry.write_id);
         let json = if entry.tombstone {
             vec![]
@@ -269,6 +297,7 @@ impl Wal {
             serde_json::to_vec(entry)?
         };
         let inline = !entry.tombstone && json.len() <= INLINE_PAYLOAD_BYTES;
+        let mut uploaded = false;
         if !entry.tombstone && !inline {
             let payload = encode_payload(&json)?;
             let len = payload.len();
@@ -286,7 +315,29 @@ impl Wal {
             if result == CreateResult::Created {
                 metrics::counter!("blowfish_wal_bytes_written_total").increment(len as u64);
             }
+            uploaded = true;
         }
+        Ok(Staged { inline, uploaded })
+    }
+    /// Delete a staged payload that will never be committed (a failed or abandoned pipeline slot).
+    pub async fn discard(&self, seq: u64, entry: &WalEntry, staged: &Staged) -> Result<(), Error> {
+        if staged.uploaded {
+            self.store
+                .delete(&self.staged_payload_key(seq, entry.write_id))
+                .await?;
+        }
+        Ok(())
+    }
+    /// Second half of an append: the create-only conditional PUT of the slot record. `Conflict`
+    /// means another writer holds the slot; the staged payload is deleted and the caller must
+    /// catch up and revalidate.
+    pub async fn commit(
+        &self,
+        seq: u64,
+        entry: &WalEntry,
+        staged: &Staged,
+    ) -> Result<CreateResult, Error> {
+        let inline = staged.inline;
         let record = CommitRecord {
             write_id: entry.write_id,
             payload_seq: Some(seq),
@@ -310,9 +361,9 @@ impl Wal {
         if result == CreateResult::Created {
             metrics::histogram!("blowfish_wal_batch_requests").record(entry.batches.len() as f64);
         }
-        if result == CreateResult::Conflict && !entry.tombstone && !inline {
+        if result == CreateResult::Conflict {
             // This UUID belongs only to this attempt; a losing slot cannot reference it.
-            self.store.delete(&payload_key).await?;
+            self.discard(seq, entry, staged).await?;
         }
         Ok(result)
     }

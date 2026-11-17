@@ -97,6 +97,7 @@ impl OpenHint {
         hint
     }
     /// Open (and cache) segment metadata. Failures are ignored: the query reports them.
+    #[allow(clippy::too_many_arguments)]
     async fn warm(
         &self,
         part: Part,
@@ -104,6 +105,7 @@ impl OpenHint {
         segments: &[bf_wal::Segment],
         text: Option<&bf_wal::SegmentFile>,
         dirs: &BTreeMap<String, bf_wal::SegmentFile>,
+        prefetched: &BTreeMap<String, crate::ann_dir::Prefetched>,
         schema: &Schema,
     ) {
         let (with_text, with_rest) = (part != Part::WithoutText, part != Part::OnlyText);
@@ -136,7 +138,8 @@ impl OpenHint {
                     let filtered = !self.filters.is_empty();
                     tasks.push(
                         async move {
-                            let dir = crate::ann_dir::load(store, file).await?;
+                            let dir = crate::ann_dir::load(store, file, prefetched.get(attribute))
+                                .await?;
                             if filtered {
                                 // Filtered queries also need each segment's row-to-cluster map.
                                 crate::ann_dir::memberships(store, segments, &dir, attribute)
@@ -281,11 +284,21 @@ pub(crate) async fn catch_up_hinted(
     // Always refresh the manifest before reading a potentially reclaimed tail.
     // A concurrent GC can still race this read; one fresh checkpoint retry resolves it.
     for attempt in 0..3 {
-        if let Some((generation, m)) = wal
-            .manifest_after(state.manifest_seq)
-            .await
-            .map_err(log_error)?
-        {
+        // A cold open reads the newest ANN directory's hint copy while it reads the manifest; the
+        // directory's key inside it is checked against the manifest before use.
+        let (manifest, prefetched) = tokio::join!(wal.manifest_after(state.manifest_seq), async {
+            let mut found = BTreeMap::new();
+            if let Some(hint) = hint.filter(|_| state.ann_dirs.is_empty()) {
+                let reads = hint.ann.iter().map(|a| async move {
+                    crate::ann_dir::prefetch(store, wal.namespace(), a)
+                        .await
+                        .map(|p| (a.clone(), p))
+                });
+                found.extend(futures::future::join_all(reads).await.into_iter().flatten());
+            }
+            found
+        });
+        if let Some((generation, m)) = manifest.map_err(log_error)? {
             if m.format_version != 1 {
                 return Err(ApiError::new(500, "unsupported manifest format"));
             }
@@ -346,6 +359,7 @@ pub(crate) async fn catch_up_hinted(
                     dirs.clone(),
                     schema.clone(),
                 );
+                let none = BTreeMap::new();
                 tokio::spawn(async move {
                     hint.warm(
                         Part::OnlyText,
@@ -353,6 +367,7 @@ pub(crate) async fn catch_up_hinted(
                         &segments,
                         text.as_ref(),
                         &dirs,
+                        &none,
                         &schema,
                     )
                     .await
@@ -365,7 +380,15 @@ pub(crate) async fn catch_up_hinted(
             };
             tokio::join!(
                 tail,
-                hint.warm(part, store, &segments, text.as_ref(), &dirs, &schema)
+                hint.warm(
+                    part,
+                    store,
+                    &segments,
+                    text.as_ref(),
+                    &dirs,
+                    &prefetched,
+                    &schema
+                )
             )
             .0
         } else {
@@ -438,6 +461,7 @@ pub(crate) async fn for_writes(
     store: &Storage,
     state: &NamespaceState,
     pending: &[Pending<Operation, Result<WriteResponse, ApiError>>],
+    overlay: &[std::sync::Arc<bf_wal::WalEntry>],
 ) -> Result<NamespaceState, ApiError> {
     let mut wanted = BTreeSet::new();
     for p in pending {
@@ -496,6 +520,13 @@ pub(crate) async fn for_writes(
         let rows = segment::lookup_many(store, seg, &wanted).await? & live;
         full.docs
             .extend(crate::shared(segment::documents(store, seg, &rows).await?));
+    }
+    // Groups that are staged but not yet committed come first in the log: a write must see their
+    // effect on the rows it names (and their schema), without applying every in-flight document.
+    for entry in overlay {
+        for batch in &entry.batches {
+            full.apply_filtered(batch, &wanted);
+        }
     }
     for doc in full.docs.values_mut() {
         std::sync::Arc::make_mut(doc).retain(|name, _| state.schema.contains_key(name));

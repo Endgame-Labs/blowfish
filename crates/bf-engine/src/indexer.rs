@@ -45,6 +45,9 @@ pub struct EngineConfig {
     pub lease_duration: Duration,
     /// Reject writes once unindexed logical WAL bytes reach this limit.
     pub max_unindexed_bytes: u64,
+    /// WAL groups whose payloads upload concurrently before their slots commit in order
+    /// (1 disables pipelining). `BF_WAL_PIPELINE`.
+    pub wal_pipeline: usize,
     /// Eventual reads include at most this many logical WAL bytes.
     pub eventual_tail_bytes: u64,
     /// Segments built concurrently when one flush or compaction yields several.
@@ -105,6 +108,7 @@ impl Default for EngineConfig {
             retention: Duration::from_secs(3600),
             lease_duration: Duration::from_secs(30),
             max_unindexed_bytes: 2_000_000_000,
+            wal_pipeline: 8,
             eventual_tail_bytes: 128 * 1024 * 1024,
             build_concurrency: 2,
             ann_nprobe: 64,
@@ -160,6 +164,9 @@ impl EngineConfig {
         }
         if let Some(v) = number("BF_MAX_UNINDEXED_BYTES") {
             c.max_unindexed_bytes = v;
+        }
+        if let Some(v) = number("BF_WAL_PIPELINE") {
+            c.wal_pipeline = (v as usize).max(1);
         }
         if let Some(v) = number("BF_RETENTION_SECS") {
             c.retention = Duration::from_secs(v);
@@ -715,6 +722,12 @@ impl Engine {
         let mut protected = std::collections::BTreeSet::new();
         protected.extend(manifest.text_stats.iter().map(|f| f.key.clone()));
         protected.extend(manifest.ann_dirs.values().map(|f| f.key.clone()));
+        protected.extend(
+            manifest
+                .ann_dirs
+                .keys()
+                .map(|k| crate::ann_dir::hint_key(ns, k.trim_start_matches("ann:"))),
+        );
         for seg in &manifest.segments {
             protected.extend(
                 seg.files

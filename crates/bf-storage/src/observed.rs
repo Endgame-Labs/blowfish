@@ -8,10 +8,43 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
-use std::{fmt, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
+
+/// In-flight object reads and the highest count seen in the current window. The connection warmer
+/// sizes its pool from the peak: a wave of N parallel reads needs N connections.
+#[derive(Debug, Default)]
+pub(crate) struct Activity {
+    inflight: AtomicUsize,
+    peak: AtomicUsize,
+}
+impl Activity {
+    /// Highest number of concurrent reads since the last call.
+    pub(crate) fn take_peak(&self) -> usize {
+        self.peak
+            .swap(self.inflight.load(Ordering::Relaxed), Ordering::Relaxed)
+    }
+    fn enter(self: &Arc<Self>) -> ReadGuard {
+        let now = self.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+        ReadGuard(self.clone())
+    }
+}
+struct ReadGuard(Arc<Activity>);
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug)]
-pub(crate) struct Observed(pub(crate) Arc<dyn ObjectStore>);
+pub(crate) struct Observed(pub(crate) Arc<dyn ObjectStore>, pub(crate) Arc<Activity>);
 impl fmt::Display for Observed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("observed object store")
@@ -70,6 +103,7 @@ impl ObjectStore for Observed {
             _ => None,
         };
         let start = Instant::now();
+        let _guard = (!head).then(|| self.1.enter());
         let result = async {
             let result = self.0.get_opts(path, opts).await?;
             if head {

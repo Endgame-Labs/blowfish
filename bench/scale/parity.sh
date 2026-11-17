@@ -11,4 +11,4 @@ PID=$!; trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$W"' EXIT
 until curl -s -o /dev/null "http://127.0.0.1:$PORT/"; do sleep 0.5; done
 : "${TPUF_URL:?set TPUF_URL to your turbopuffer endpoint}"; TPUF_URL="$TPUF_URL" uv run "$BENCH_DIR/oracle_compare.py" \
   --blowfish "http://127.0.0.1:$PORT" --bf-ns "$(cfg namespace)" --tpuf-ns "$(cfg tpuf_namespace)" \
-  --data "$BENCH_DIR/data/oracle-1m.npz" --kinds "$KINDS" --out "$OUTJSON"
+  --data "$BENCH_DIR/data/${ORACLE_DATA:-oracle-1m.npz}" --kinds "$KINDS" --out "$OUTJSON"
