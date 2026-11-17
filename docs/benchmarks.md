@@ -1649,3 +1649,117 @@ between sessions, so treat the upsert numbers as a range (792 to 2,114 ms p50), 
    1,000 warm queries (the 200-query ANN set repeats five times). R2 latency varies by 2x or more between sessions, as the two upsert runs show.
 8. **Cache and process:** cold means an empty 8 GiB memory cache and an empty disk cache, but a settled warm connection pool; the server
    is one process on the VM, and no other heavy job ran during any measurement.
+
+## Iteration 11 (10M docs): block fragments, fewer requests per cold query
+
+Goal unchanged: cold vector search p50 at most about 1,224 ms or p90 at most about 1,700 ms, with recall at least turbopuffer's
+(ANN 0.943, selective 0.993). Same 10M, 1,024-dimension namespace (70 segments, f16 vectors), same 200 held-out queries and truth
+(`bench/scale/data/oracle-10m.npz`); nothing was reloaded. Cold means a fresh process and an empty disk and memory cache per query,
+arms alternating query by query (`bench/scale/ab.py`).
+
+### Diagnosis: where one cold ANN query goes (query 3, before this round, `BF_TRACE_READS`)
+
+| Stage (wave) | 64 probes: requests, MB | 160 probes: requests, MB |
+| --- | ---: | ---: |
+| Directory hint (5.35 MB) and manifest | 2, 5.4 | 2, 5.4 |
+| WAL tail | 2, 0 | 2, 0 |
+| Scan wave, codes from the segments' index objects (`.bfv`) | 502, 48.5 | 1,178, 107.9 |
+| Scan wave, cluster blobs from the fragments (`.bff`: exact center, row set, row checksums) | 424, 8.7 | 768, 27.3 |
+| Scan wave, documents' footers of every probed segment (`.bfc`, 70 segments) | 70, 10.5 | 70, 10.5 |
+| Rerank vectors (about 105 candidates after the error bound; 2 KB each) | 48, 0.1 | 35, 0.1 |
+| Documents of the top candidates (speculative, then the winners) | 21, 0.7 | 21, 0.4 |
+| Total | 1,069, 75.1 | 2,076, 153.1 |
+
+Why the count scales with probes times segments: the probe count is `nprobe` times `clusters / sqrt(rows)` (8.4 here, from 26.5K
+leaf clusters in 70 segments), so 64 probes mean about 540 probed clusters (245K rows, 2.45 percent) and 160 mean about 1,350
+(583K rows, 5.8 percent). Each probed cluster cost two reads, a blob from the fragment and its codes from the index object, and
+clusters sit in arbitrary order inside a segment, so only about 1 in 20 of them merged with a neighbor. The rerank is not the
+problem (about 105 candidates survive the error bound at both probe counts, so it stays about 50 small reads). The wave of
+requests is. Its time is set by two things: the number of connections it needs beyond the 256 the warmer opens (each extra one
+pays a TLS handshake, and a connection that has only carried HEADs starts TCP slow start on its first large range), and the
+slowest request. `BF_WARM_CONNECTIONS=1024` alone took the old binary from 2,329 to 1,746 ms p50 at 64 probes (10 queries), which
+is how much of the old wave was connection setup.
+
+Things measured and not adopted (warm server, 200 queries unless noted):
+
+- Widening the error bound (`BF_ANN_BOUND`, a temporary knob) from 1 to 2 and 3 times grew the rerank pool from 108 to 273 and 308
+  and left recall at 0.8855 in all three. The error-bounded pruning is lossless, and the recall loss at 64 probes is routing (clusters
+  not probed), not quantization.
+- Exact (f32) cluster centers instead of the directory's one-bit centers (`BF_ANN_DIRECTORY=0`) give 0.897 against 0.8855 at 64
+  probes: routing noise is worth about 1 point.
+- Rows scanned per query: 129K at 32 probes (recall 0.8155), 245K at 64 (0.8855), 583K at 160 (0.9465).
+- A cluster-distance ratio cutoff instead of a fixed probe count (clamped to a third to three times the count): recall fell to 0.77
+  to 0.78. In 1,024 dimensions the distances to the nearest clusters are too close together to tell them apart by ratio.
+- Shorter codes (the first 128, 256, or 512 of the 1,024 sign bits, on a real 200K-row segment, 60 queries): the relative error of
+  the estimate grows about 3 times at 256 bits (standard deviation 0.143 of `|o| |q|` against 0.047 at 1,024), and keeping 9.9 of the
+  true top 10 needs a rerank pool of about 1,300 candidates per 66K rows (against about 46 at 1,024 bits). The extra rerank reads
+  cost more than the 4 times smaller scan saves.
+- Coarser clusters (fewer, bigger blocks per request), top-10 coverage at 2.5 percent of rows scanned, one 200K-row segment: 0.86 at
+  448 clusters, 0.83 at 224, 0.77 at 133. Recall falls faster than the request count.
+- Hedge budget 0.1 against 0.3, merge gap 0, 16, and 64 KB: no difference outside the noise (12 queries each).
+
+### What changed
+
+1. **Block fragments** (`annfrag2:<attribute>`, directory `ann2:<attribute>`; format in `docs/design/ann-directory.md`). A cluster's
+   block is its blob followed by its codes, so a probe is one ranged read, and blocks are ordered along a nearest-neighbor tour
+   of the segment's cluster centers so probed neighbors merge: on a real segment, 8 probed clusters make 4.4 ranges against 7.8
+   in cluster-ID order, with no gap bytes. The plain fragments and directory stay, so older binaries and filtered queries are
+   unchanged. New segments get both fragments; older ones get the block fragment from the next indexing pass.
+2. **Scan prefetch.** A lone unfiltered ANN query starts the scan's reads (and the flat segments' exact reads) in the snapshot wave,
+   as soon as the directory hint is loaded and in parallel with the WAL tail read, instead of after it. Skipped when a resident
+   checkpoint lets the query search speculatively.
+3. **No documents' footers in the scan wave** (70 requests, 10.5 MB at 70 segments), except when 8 or fewer segments are probed. With
+   dozens of segments, warming the footers of the nearest 32 clusters' segments was slower in an A/B (1,386 against 1,294 ms p50
+   at 64 probes, 14 queries).
+4. **Reranks off the CPU workers.** They are a few small reads, and holding one of the 8 worker permits through each read's latency
+   queued the segments (the rerank wave fell from about 600 to about 450 ms).
+5. **The scan wave starts every segment at once** (it used to run 48 at a time, a second batch of segments at 70).
+
+The 10M namespace was upgraded in place, once, by a writable server with compaction disabled (`BF_MAX_SEGMENT_ROWS=1`): 70 block
+fragments (1.53 GB, about 22 MB per segment) and the `ann2` directory, in 540 s, peak resident 7.5 GB, with the plain objects
+untouched. The old binary was measured against the upgraded manifest in every A/B below and answers as before.
+
+### Cold queries at 10M, same-session A/B (30 queries per arm, 200-query truth, `top_k` 10)
+
+| Arm | p50 ms | p90 | p99 | mean | Requests | MB | Waves | Recall@10 (these 30) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 probes, before | 2,421 | 3,291 | 3,507 | 2,561 | 1,112 | 67.6 | 4.6 | 0.870 |
+| 64 probes, after | 1,502 | 1,834 | 2,947 | 1,559 | 462 | 52.9 | 3.5 | 0.870 |
+| 160 probes, before | 5,422 | 6,318 | 10,909 | 5,182 | 2,104 | 137.9 | 4.5 | 0.950 |
+| 160 probes, after | 3,280 | 8,293 | 20,352 | 4,907 | 879 | 106.5 | 3.9 | 0.950 |
+| 160 probes, after, `BF_WARM_CONNECTIONS=1024` | 3,718 | 5,887 | 7,498 | 4,003 | 879 | 106.5 | 4.5 | 0.950 |
+| 160 probes, after, repeat in a second session | 3,256 | 5,077 | 6,576 | 3,467 | 879 | 106.5 | 3.7 | 0.950 |
+
+Recall on the full 200 queries (warm server, which is the same code path): 0.8855 at 64 probes and 0.9465 at 160, unchanged (the
+scan reads the same clusters). The selective (filtered) path is untouched: it still uses the plain directory, and its recall was not
+re-measured. The 160-probe tail is R2's: 4 of the 60 "after" queries took 7.8 to 22.8 seconds with the same request counts (the
+"before" arm had 2 of 30 above 9.7 seconds), and a smaller 1 MiB cap on merged reads (hedgeable) did not change it. The
+first-session 160-probe medians (3,280 against 5,422 ms) and the 64-probe medians (1,502 against 2,421 ms) are the comparison;
+the 160-probe p90 and p99 move with R2's stalls from session to session.
+
+One cold query (query 3) after the change, from the trace: 64 probes make 461 requests and 60.2 MB (366 block reads, 47 MB; 52
+vector reads; 39 documents' footers and rows), 4 waves, 1,693 ms; 160 probes make 780 requests and 122.3 MB (698 block reads, 109
+MB), 4 waves.
+
+### Verdict
+
+Neither stop rule is met. At 64 probes the cold p50 is 1,502 ms (goal 1,224), but recall is 0.8855 (turbopuffer 0.943). At 160 probes
+recall is 0.9465 and the cold p50 is about 3.3 s. Against the iteration 10 numbers, p50 fell 38 percent at 64 probes (2,421 to
+1,502 ms) and 40 percent at 160 (5,422 to 3,280 ms), requests fell 58 and 58 percent, and bytes fell 22 and 23 percent.
+
+### What is left
+
+- **Bytes.** 160 probes scan 583K rows at 136 bytes each (codes: 128 bytes of sign bits and 8 of corrections), about 80 MB of the
+  106 MB, and recall is routing-limited, so shorter codes (above) and a wider error bound do not help. What would: better routing
+  (a probe plan that spends fewer rows for the same recall, such as spilling each row into two clusters, or a second ranking from the
+  exact centers that the block reads already carry), or a cross-segment layout that merges clusters of different segments that
+  are near each other, so a probe is one read whatever the segment count.
+- **The final wave** (vector reads, then documents' footer and rows): about 340 to 450 ms, two dependent hops on the documents. An
+  `id`-only query could read the id column's footer range instead of the 66 to 80 KB footer.
+- **The pre-scan wave**: the directory hint (5.35 MB, about 150 to 290 ms) and the manifest LIST and GET (about 190 ms) run side by
+  side, and the scan cannot start before the manifest names the segments. A smaller directory (the entry table is 1.8 MB of ranges and
+  checksums that could be derived) would shave tens of milliseconds.
+- **Connections and stalls.** A wave of 800 requests opens about 550 connections beyond the warmed 256, and R2 stalls a few of them for
+  seconds. Opening the pool at 1,024 (the cap it already grows to) fixed some of the tail in one session and none in another.
+- 1M and 100K were not loaded in R2 for this round. The cold-read unit tests (`crates/bf-engine/tests/read_cache.rs`: waves and
+  requests for 20 and 60 segments) pass with unchanged limits.
