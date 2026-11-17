@@ -1533,7 +1533,7 @@ bound by the upload path and, past about 5M rows, by server memory.
 
 ## Against turbopuffer's published numbers
 
-Measured 2026-11-17 on the benchmark VM (8 vCPU, 32 GB, Los Angeles, a Latitude.sh host; nothing else heavy running), against a
+Measured 2026-11-17 on the benchmark VM (8 vCPU, 32 GB, in Los Angeles; nothing else heavy running), against a
 Cloudflare R2 bucket whose location hint is WNAM. The binary is `main` at the end of perf iteration 10. Published numbers are
 turbopuffer's, from https://turbopuffer.com/docs/performance, checked 2026-11-16. Ratios are blowfish over turbopuffer. All
 latencies are client-side, in ms, with strong consistency in every request.
