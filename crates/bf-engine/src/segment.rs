@@ -155,6 +155,14 @@ pub(crate) async fn text_index(
     if file.metadata_len > file.size {
         return Err(corrupt());
     }
+    if let Some(header) = &file.text_header {
+        // The manifest carries the footer and dictionary index: no read until a query needs data.
+        let header = text_header_of(header)?;
+        let index = bf_text::SegmentReader::open_with_header(Arc::new(reader), &header)
+            .map_err(index_error)?;
+        let resident = index.resident_bytes() + 16384;
+        return Ok(read_cache::insert(&file.key, resident, index));
+    }
     let start = file.size.saturating_sub(file.metadata_len.max(65536));
     let bytes = reader.read(start..file.size).await.map_err(index_error)?;
     reader.prefetched = Some((start, bytes));
@@ -164,6 +172,24 @@ pub(crate) async fn text_index(
     // The retained encoded buffer (the dictionary borrows it) plus the decoded directory.
     let resident = file.metadata_len.max(65536) + index.resident_bytes();
     Ok(read_cache::insert(&file.key, resident, index))
+}
+
+fn text_header_of(header: &bf_wal::TextHeaderRef) -> Result<bf_text::TextHeader, ApiError> {
+    if !header.footer.len().is_multiple_of(2) || !header.footer.is_ascii() {
+        return Err(corrupt());
+    }
+    Ok(bf_text::TextHeader {
+        footer: (0..header.footer.len() / 2)
+            .map(|i| {
+                u8::from_str_radix(&header.footer[2 * i..2 * i + 2], 16).map_err(|_| corrupt())
+            })
+            .collect::<Result<_, _>>()?,
+        chunks: header
+            .chunks
+            .iter()
+            .map(|(first, o, l, c)| (first.clone().into_bytes(), *o, *l, *c))
+            .collect(),
+    })
 }
 
 pub(crate) fn corrupt() -> ApiError {
@@ -272,6 +298,7 @@ pub(crate) async fn put_file(
 ) -> Result<SegmentFile, ApiError> {
     let file = SegmentFile {
         stats_index: None,
+        text_header: None,
         key,
         size: bytes.len() as u64,
         metadata_len,
@@ -357,7 +384,7 @@ fn hashes(id: &Id, bits: usize) -> [usize; 3] {
 fn build_text(
     values: Vec<Option<Value>>,
     params: bf_text::FtsParams,
-) -> Result<(Vec<u8>, u64), ApiError> {
+) -> Result<(Vec<u8>, u64, Option<bf_wal::TextHeaderRef>), ApiError> {
     use rayon::prelude::*;
     let mut builder = bf_text::SegmentBuilder::with_tokenizer(true, params.tokenizer);
     for chunk in values.chunks(4096) {
@@ -381,7 +408,22 @@ fn build_text(
     let footer = &bytes[bytes.len() - 72..];
     let lengths_offset = u64::from_le_bytes(footer[32..40].try_into().expect("v1 footer"));
     let metadata_len = bytes.len() as u64 - lengths_offset;
-    Ok((bytes, metadata_len))
+    let header = bf_text::text_header(&bytes)
+        .map_err(index_error)?
+        .map(|h| {
+            Ok::<_, ApiError>(bf_wal::TextHeaderRef {
+                footer: h.footer.iter().map(|b| format!("{b:02x}")).collect(),
+                chunks: h
+                    .chunks
+                    .into_iter()
+                    .map(|(first, o, l, c)| {
+                        Ok((String::from_utf8(first).map_err(index_error)?, o, l, c))
+                    })
+                    .collect::<Result<_, ApiError>>()?,
+            })
+        })
+        .transpose()?;
+    Ok((bytes, metadata_len, header))
 }
 
 pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
@@ -607,14 +649,15 @@ pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
     for (name, column, job) in fts_jobs {
         let (store, prefix) = (store.clone(), prefix.clone());
         uploads.push(Box::pin(async move {
-            let (bytes, metadata_len) = job.await.map_err(index_error)??;
-            let file = put_file(
+            let (bytes, metadata_len, header) = job.await.map_err(index_error)??;
+            let mut file = put_file(
                 &store,
                 format!("{prefix}/fts.{column}.bft"),
                 bytes,
                 metadata_len,
             )
             .await?;
+            file.text_header = header;
             Ok::<_, ApiError>(vec![(format!("fts:{name}"), file)])
         }));
     }

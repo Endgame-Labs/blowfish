@@ -186,6 +186,18 @@ pub struct SegmentFile {
     /// chunk, so a query reads only the chunks that hold its terms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats_index: Option<TextStatsIndex>,
+    /// For a version 4 full-text segment: its footer (hex) and dictionary chunk index, so a query
+    /// starts without reading the object's tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_header: Option<TextHeaderRef>,
+}
+/// A full-text segment's footer and dictionary chunk index, carried in the manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextHeaderRef {
+    /// The 72-byte footer, hex encoded.
+    pub footer: String,
+    /// `(first term, offset, length, crc32)` per dictionary chunk, in term order.
+    pub chunks: Vec<(String, u64, u32, u32)>,
 }
 /// Chunk index of a text statistics object, carried in the manifest.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -549,14 +561,26 @@ impl Wal {
         // The slot holds the whole manifest (compressed when large), so a cold reader needs
         // one GET after the listing. Older slots point at a separate payload object.
         let identity = Uuid::new_v4();
-        self.store
+        let encoded = encode_manifest(manifest)?;
+        let result = self
+            .store
             .create_with_id(
                 &format!("ns/{}/manifest/{seq:020}.json", self.namespace),
-                encode_manifest(manifest)?,
+                encoded.clone(),
                 identity,
             )
-            .await
-            .map_err(Into::into)
+            .await?;
+        if result == CreateResult::Created {
+            // A copy at a fixed key, so a cold reader fetches the manifest in the same round trip
+            // as the listing that confirms it is the newest. Best effort: readers verify it.
+            let mut pointer = seq.to_be_bytes().to_vec();
+            pointer.extend_from_slice(&encoded);
+            let _ = self.store.put(&self.latest_key(), pointer).await;
+        }
+        Ok(result)
+    }
+    fn latest_key(&self) -> String {
+        format!("ns/{}/manifest-latest", self.namespace)
     }
     /// Publish against exactly one predecessor. No retry may reuse stale indexer work.
     ///
@@ -680,14 +704,21 @@ impl Wal {
     /// Discover a newer immutable manifest, skipping payload reads and decoding when
     /// the caller already holds the latest generation. Listing still observes remote publications.
     pub async fn manifest_after(&self, known: u64) -> Result<Option<(u64, Manifest)>, Error> {
-        let objects = self
-            .store
-            .list(&format!("ns/{}/manifest/", self.namespace))
-            .await?;
+        // A cold reader asks for the fixed-key copy while it lists; when the copy is the newest
+        // manifest, that is one round trip instead of two. A copy that lags the listing is ignored.
+        let prefix = format!("ns/{}/manifest/", self.namespace);
+        let (listed, copy) = futures::join!(self.store.list(&prefix), async {
+            if known == 0 {
+                self.store.get(&self.latest_key()).await.ok()
+            } else {
+                None
+            }
+        });
+        let objects = listed?;
         let Some(last) = objects.last() else {
             return Ok(None);
         };
-        let seq = last
+        let seq: u64 = last
             .key
             .rsplit('/')
             .next()
@@ -696,6 +727,14 @@ impl Wal {
             .ok_or(Error::Format)?;
         if seq <= known {
             return Ok(None);
+        }
+        if let Some(copy) = copy
+            && copy.len() > 8
+            && copy[..8] == seq.to_be_bytes()
+            && slot_payload_key(&copy[8..]).is_none()
+            && let Ok(manifest) = decode_manifest(&copy[8..])
+        {
+            return Ok(Some((seq, manifest)));
         }
         let bytes = self.store.get(&last.key).await?;
         let manifest = if let Some(payload) = slot_payload_key(&bytes) {

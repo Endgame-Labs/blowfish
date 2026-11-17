@@ -448,3 +448,12 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
 | M5 | Cache and performance | ✅ done locally; R2 warm-path tuning next |
 | M6 | Multi-node, auth, metrics, and packaging | in progress |
 | M7 | The "later" list | ✅ done (hosted Embed and model rerank intentionally unsupported) |
+
+## Perf iteration 13: cold BM25 at 1M (branch `wt/perfiter13`)
+
+- Cold BM25 over R2 from this VM went from 839 / 1,080 / 1,425 ms (p50 / p90 / p99, fresh process) to 673 / 923 / 1,167 in a same-session A/B,
+  with 14.7 MB per query down to 4.3 MB and overlap@10 against exhaustive BM25 at 1.0000 over 1,000 queries. Goal (p50 395 or p90 476) not met from
+  this VM; the chain is five hops instead of seven, so in-region it projects to about 260 to 330 ms.
+- New: text segment version 4 (records beside postings), manifest text headers, `manifest-latest` copy, window-pruned posting reads, segments
+  processed concurrently. Older segments and namespaces keep working. Details and next steps: `docs/benchmarks.md`, "Iteration 13".
+- New namespace under `scale/bm25/` (`msmarco-1m`, 1M MS MARCO passages, 9 segments).

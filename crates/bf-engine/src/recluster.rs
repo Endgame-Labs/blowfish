@@ -382,6 +382,7 @@ impl Engine {
                         size: 0,
                         metadata_len: 0,
                         stats_index: None,
+                        text_header: None,
                     },
                     live_generation: 0,
                 });

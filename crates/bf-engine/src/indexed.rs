@@ -463,6 +463,157 @@ pub(crate) fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) 
         _ => {}
     }
 }
+/// One segment's contribution to a scalar or BM25 query: scores and hydrated documents, in a
+/// state of their own so segments run concurrently.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_segment(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+    seg: &bf_wal::Segment,
+    clauses: &[&RankBy],
+    all: bool,
+    k: usize,
+    columns: &BTreeSet<String>,
+    mut out: NamespaceState,
+) -> Result<NamespaceState, ApiError> {
+    let open_text = async {
+        futures::future::try_join_all(clauses.iter().filter_map(|clause| {
+            let RankBy::Bm25 { attribute, .. } = clause else {
+                return None;
+            };
+            if !segment::seg_text_matches(seg, &state.schema, attribute) {
+                return None;
+            }
+            let file = seg.files.get(&format!("fts:{attribute}"))?;
+            Some(async move {
+                Ok::<_, ApiError>((attribute.clone(), segment::text_index(store, file).await?))
+            })
+        }))
+        .await
+        .map(|entries| entries.into_iter().collect::<BTreeMap<_, _>>())
+    };
+    // The ID index is read whole. For a big one, BM25 hits take their IDs from the
+    // (ranged) `id` column of the documents file instead, for the winning rows only (one
+    // more sequential read, but bytes that no longer grow with the segment). Segments
+    // whose text index cannot be used still score through documents and need the index.
+    let big_ids = seg
+        .files
+        .get("ids")
+        .is_some_and(|f| f.size > RANGED_IDS_BYTES);
+    let (allowed, indexes, whole_ids) = tokio::try_join!(
+        snapshot::allowed(store, state, seg, q.filters.as_ref()),
+        open_text,
+        async {
+            if clauses.is_empty() || big_ids {
+                Ok(None)
+            } else {
+                segment::ids(store, seg).await.map(Some)
+            }
+        },
+    )?;
+    if allowed.is_empty() {
+        return Ok(out);
+    }
+    let ids = if whole_ids.is_none()
+        && clauses.iter().any(
+            |c| matches!(c, RankBy::Bm25 { attribute, .. } if !indexes.contains_key(attribute)),
+        ) {
+        Some(segment::ids(store, seg).await?)
+    } else {
+        whole_ids
+    };
+    let mut bm25_hits: Vec<(String, Vec<bf_text::SearchHit>)> = vec![];
+    let mut selected = if all {
+        allowed.clone()
+    } else {
+        RoaringBitmap::new()
+    };
+    for &clause in clauses {
+        let RankBy::Bm25 {
+            attribute,
+            query,
+            params,
+        } = clause
+        else {
+            unreachable!()
+        };
+        let cfg = state.schema[attribute]
+            .text_config()
+            .expect("validated FTS");
+        let query = bf_text::Query::new(
+            crate::text::tokens(query, &cfg),
+            crate::text::prefix(params.as_ref()),
+        );
+        let fallback = bf_text::CorpusStats::default();
+        let stats = state.corpus.get(attribute).unwrap_or(&fallback);
+        let top = if all { allowed.len() as usize } else { k };
+        let hits = if let Some(reader) = indexes.get(attribute) {
+            reader
+                .search_prefetched(&query, stats, &cfg, top, Some(&allowed))
+                .await
+                .map_err(segment::index_error)?
+        } else {
+            let columns = BTreeSet::from([attribute.clone()]);
+            let docs = segment::projected_documents(store, seg, &allowed, Some(&columns)).await?;
+            let mut hits = vec![];
+            for row in &allowed {
+                let value = docs[&ids.as_ref().expect("text IDs")[row as usize]]
+                    .get(attribute)
+                    .unwrap_or(&serde_json::Value::Null);
+                let score =
+                    bf_text::score_document(&crate::text::tokens(value, &cfg), &query, stats, &cfg);
+                if score > 0.0 {
+                    hits.push(bf_text::SearchHit { row, score });
+                }
+            }
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.row.cmp(&b.row)));
+            hits.truncate(top);
+            hits
+        };
+        for hit in &hits {
+            selected.insert(hit.row);
+        }
+        bm25_hits.push((rank_key(clause), hits));
+    }
+    if let Some(rows) =
+        crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?
+    {
+        selected &= rows;
+    }
+    crate::sparse::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?;
+    if let Some(ids) = &ids {
+        for (key, hits) in bm25_hits {
+            let scores = out.scores.entry(key).or_default();
+            for hit in hits {
+                scores.insert(ids[hit.row as usize].clone(), hit.score as f64);
+            }
+        }
+        out.docs.extend(crate::shared(
+            segment::projected_documents(store, seg, &selected, Some(columns)).await?,
+        ));
+        return Ok(out);
+    }
+    let rows = segment::projected_rows(store, seg, &selected, Some(columns)).await?;
+    let mut row_ids = BTreeMap::new();
+    let mut docs = BTreeMap::new();
+    for (row, doc) in rows {
+        let id: Id = serde_json::from_value(doc.get("id").ok_or_else(segment::corrupt)?.clone())
+            .map_err(segment::index_error)?;
+        row_ids.insert(row, id.clone());
+        docs.insert(id, doc);
+    }
+    for (key, hits) in bm25_hits {
+        let scores = out.scores.entry(key).or_default();
+        for hit in hits {
+            if let Some(id) = row_ids.get(&hit.row) {
+                scores.insert(id.clone(), hit.score as f64);
+            }
+        }
+    }
+    out.docs.extend(crate::shared(docs));
+    Ok(out)
+}
 async fn prepare_scalar(
     store: &Storage,
     state: &NamespaceState,
@@ -508,149 +659,25 @@ async fn prepare_scalar(
     for clause in &clauses {
         out.scores.entry(rank_key(clause)).or_default();
     }
-    for seg in &state.segments {
-        let open_text = async {
-            futures::future::try_join_all(clauses.iter().filter_map(|clause| {
-                let RankBy::Bm25 { attribute, .. } = clause else {
-                    return None;
-                };
-                if !segment::seg_text_matches(seg, &state.schema, attribute) {
-                    return None;
-                }
-                let file = seg.files.get(&format!("fts:{attribute}"))?;
-                Some(async move {
-                    Ok::<_, ApiError>((attribute.clone(), segment::text_index(store, file).await?))
-                })
-            }))
-            .await
-            .map(|entries| entries.into_iter().collect::<BTreeMap<_, _>>())
-        };
-        // The ID index is read whole. For a big one, BM25 hits take their IDs from the
-        // (ranged) `id` column of the documents file instead, for the winning rows only (one
-        // more sequential read, but bytes that no longer grow with the segment). Segments
-        // whose text index cannot be used still score through documents and need the index.
-        let big_ids = seg
-            .files
-            .get("ids")
-            .is_some_and(|f| f.size > RANGED_IDS_BYTES);
-        let (allowed, indexes, whole_ids) = tokio::try_join!(
-            snapshot::allowed(store, state, seg, q.filters.as_ref()),
-            open_text,
-            async {
-                if clauses.is_empty() || big_ids {
-                    Ok(None)
-                } else {
-                    segment::ids(store, seg).await.map(Some)
-                }
-            },
-        )?;
-        if allowed.is_empty() {
-            continue;
+    let parts = futures::future::try_join_all(state.segments.iter().map(|seg| {
+        prepare_segment(
+            store,
+            state,
+            q,
+            seg,
+            &clauses,
+            all,
+            k,
+            &columns,
+            out.clone(),
+        )
+    }))
+    .await?;
+    for part in parts {
+        out.docs.extend(part.docs);
+        for (rank, scores) in part.scores {
+            out.scores.entry(rank).or_default().extend(scores);
         }
-        let ids = if whole_ids.is_none()
-            && clauses.iter().any(
-                |c| matches!(c, RankBy::Bm25 { attribute, .. } if !indexes.contains_key(attribute)),
-            ) {
-            Some(segment::ids(store, seg).await?)
-        } else {
-            whole_ids
-        };
-        let mut bm25_hits: Vec<(String, Vec<bf_text::SearchHit>)> = vec![];
-        let mut selected = if all {
-            allowed.clone()
-        } else {
-            RoaringBitmap::new()
-        };
-        for clause in &clauses {
-            let RankBy::Bm25 {
-                attribute,
-                query,
-                params,
-            } = clause
-            else {
-                unreachable!()
-            };
-            let cfg = state.schema[attribute]
-                .text_config()
-                .expect("validated FTS");
-            let query = bf_text::Query::new(
-                crate::text::tokens(query, &cfg),
-                crate::text::prefix(params.as_ref()),
-            );
-            let fallback = bf_text::CorpusStats::default();
-            let stats = state.corpus.get(attribute).unwrap_or(&fallback);
-            let top = if all { allowed.len() as usize } else { k };
-            let hits = if let Some(reader) = indexes.get(attribute) {
-                reader
-                    .search_prefetched(&query, stats, &cfg, top, Some(&allowed))
-                    .await
-                    .map_err(segment::index_error)?
-            } else {
-                let columns = BTreeSet::from([attribute.clone()]);
-                let docs =
-                    segment::projected_documents(store, seg, &allowed, Some(&columns)).await?;
-                let mut hits = vec![];
-                for row in &allowed {
-                    let value = docs[&ids.as_ref().expect("text IDs")[row as usize]]
-                        .get(attribute)
-                        .unwrap_or(&serde_json::Value::Null);
-                    let score = bf_text::score_document(
-                        &crate::text::tokens(value, &cfg),
-                        &query,
-                        stats,
-                        &cfg,
-                    );
-                    if score > 0.0 {
-                        hits.push(bf_text::SearchHit { row, score });
-                    }
-                }
-                hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.row.cmp(&b.row)));
-                hits.truncate(top);
-                hits
-            };
-            for hit in &hits {
-                selected.insert(hit.row);
-            }
-            bm25_hits.push((rank_key(clause), hits));
-        }
-        if let Some(rows) =
-            crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out)
-                .await?
-        {
-            selected &= rows;
-        }
-        crate::sparse::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?;
-        if let Some(ids) = &ids {
-            for (key, hits) in bm25_hits {
-                let scores = out.scores.entry(key).or_default();
-                for hit in hits {
-                    scores.insert(ids[hit.row as usize].clone(), hit.score as f64);
-                }
-            }
-            out.docs.extend(crate::shared(
-                segment::projected_documents(store, seg, &selected, Some(&columns)).await?,
-            ));
-            continue;
-        }
-        let rows = segment::projected_rows(store, seg, &selected, Some(&columns)).await?;
-        let mut row_ids = BTreeMap::new();
-        let mut docs = BTreeMap::new();
-        for (row, doc) in rows {
-            let id: Id =
-                serde_json::from_value(doc.get("id").ok_or_else(segment::corrupt)?.clone())
-                    .map_err(segment::index_error)?;
-            row_ids.insert(row, id.clone());
-            docs.insert(id, doc);
-        }
-        for (key, hits) in bm25_hits {
-            let scores = out.scores.entry(key).or_default();
-            for hit in hits {
-                if let Some(id) = row_ids.get(&hit.row) {
-                    scores.insert(id.clone(), hit.score as f64);
-                }
-            }
-        }
-        out.docs.extend(crate::shared(docs));
     }
     for (id, doc) in &state.docs {
         if !q

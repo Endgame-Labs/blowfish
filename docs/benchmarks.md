@@ -1982,3 +1982,86 @@ Verdict:
 A writable loader server indexes, compacts, and garbage-collects every namespace under its prefix. Loading MS MARCO under the same
 prefix forked the S3 copy of the 10M namespace. The namespace was restored from R2 and verified key by key, and
 `bench/scale/msmarco_load.py` now warns about this.
+## Iteration 13 (BM25, 1M)
+
+Goal: cold BM25 on 1M MS MARCO passages within 25 percent of turbopuffer's published cold numbers (p50 316 ms, p90 381 ms), so
+p50 at most 395 ms or p90 at most 476 ms, with the same result quality. Namespace: the first 1,000,000 passages, 9 text segments,
+under the R2 prefix `scale/bm25/` (`msmarco_load.py`, loaded by a server that sees only that prefix). Queries: the 1,000 dev
+queries of the apples run. BM25 settings are the schema defaults (word_v4, no stemming, no stopword removal, k1 1.2, b 0.75, k3 8).
+Truth: `bf-text/examples/exact_bm25.rs` scores every document for every query with the engine's formula (namespace-wide
+statistics), and `bench/scale/bm25_overlap.py` compares top 10 (ties at the 10th score count as matches).
+
+### Where the milliseconds went (one fresh-process cold query, before; `bench/scale/cold_trace.py`, `timeline.py`)
+
+Query "is my 401k an ira", 5 segments, a fast-R2 hour (a 4 KB GET is 50 to 60 ms), 123 reads, 14.9 MB, 812 ms in the server:
+
+| Step (sequential hop) | ms |
+| --- | ---: |
+| LIST of `manifest/` (not in the read trace; it precedes the first read) | about 50 |
+| GET manifest | 52 |
+| Open each segment's text index (192 KB tail read: lengths and dictionary index) | 80 |
+| Dictionary chunks (and the corpus-statistics chunks, WAL tail, live masks, docs footers in the same wave) | 60 to 130 |
+| Term records (block directories) | 90 |
+| Posting blocks of every term (25 reads, 11.5 MB, so "is", "my", and "an" are read whole) | 185, then 43 of decode and scoring |
+| Hydration of the top 10, one segment after another (31 reads in a stagger of about 50 ms per segment) | 130 |
+
+That is seven dependent round trips, and the network, not CPU, is most of it: CPU between waves was 10 to 45 ms in total. The
+1,570 ms of the earlier table is the same chain at 150 to 250 ms per hop (R2 tails; the same query measured 2,076 ms right after
+an idle hour, 830 ms minutes later). Fresh process and cache-cold with a warm process differ by under 10 percent once the process
+has been up a few seconds; the 1.5 s settle for the connection warmer is enough. Compaction to one text segment was tried (cap
+1.2M rows gave 4 segments of 700K rows at most) and did not help: p50 700 against 635 ms for 9 segments (n=40), because the
+lengths and dictionary reads grow with the segment.
+
+### What changed
+
+1. **Window-pruned posting reads (`bf-text`).** A prefetching search used to read every block of every query term. Now short exact
+   terms (at most 4 blocks) are read whole and give exact per-window bounds, long terms give one block bound per window, and blocks
+   are fetched in two parallel batches: the 24 highest-bound 128-row windows first, then every window whose bound can still reach
+   the heap's k-th score. A window is skipped only when its bound is below that score, so results are unchanged.
+   Bytes per cold query fell from 14.7 to 4.3 MB.
+2. **Segment format version 4: records next to their postings.** Each term's record (block directory) is stored immediately before
+   its blocks, and phrase positions moved to one region after all postings. One read returns a short term's record and postings, so
+   the dictionary-to-record-to-postings chain lost a hop for rare terms, and a long term's blocks are contiguous.
+3. **Text headers in the manifest.** A version 4 segment's footer and dictionary chunk index ride in its manifest entry
+   (`SegmentFile.text_header`), so a cold query reads the dictionary chunks with no open read first; the document lengths load in
+   parallel with the dictionary. Version 1 to 3 segments still open and query as before.
+4. **Manifest copy at a fixed key.** The indexer writes `ns/<ns>/manifest-latest` (the sequence and the manifest bytes) after each
+   publication. A cold reader fetches it while it lists `manifest/`, and uses it only when it is the newest listed generation, so the
+   LIST and the GET share one round trip, and a stale or missing copy falls back to the old path.
+5. **Segments run concurrently.** `prepare_scalar` handled segments one after another, hydration included (a stagger of about 50 ms per
+   segment). Each segment now builds its own scores and documents, and the parts merge.
+
+### Results (R2, fresh process and empty disk cache per query, arms alternating; this VM to R2)
+
+| Cold BM25 at 1M | p50 / p90 / p99 ms | Reads | MB | Waves | overlap@10 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| turbopuffer published | 316 / 381 / 559 | | | | |
+| before (iteration 12 binary), fresh process, n=60 | 839 / 1,080 / 1,425 | 146 | 14.7 | 3.7 | 1.000 |
+| after, fresh process, same session, n=60 | 673 / 923 / 1,167 | 186 | 4.3 | 3.1 | 1.000 |
+| after, fresh process, a second session, n=40 | 635 / 716 / 1,850 | 188 | 4.3 | 3.3 | 1.000 |
+| before, cache-cold with a warm process, n=100 | 825 / 1,204 / 1,331 | | | | 1.000 |
+| after, cache-cold with a warm process, same session, n=100 | 634 / 977 / 1,112 | | | | 1.000 |
+
+Overlap@10 against the exhaustive truth over all 1,000 queries (warm server, the new binary): 1.0000, every query exact. The
+requests rose (more, smaller reads across 9 segments) and the waves are counted by `waves.py` (a wave starts when no earlier read is
+still running; the true dependent chain is longer than that count).
+
+The best single cold query after the change (one traced fresh process, "al baik food houston", 9 segments): manifest copy 0 to 50 ms;
+dictionary chunks, lengths, WAL probes, live masks, and statistics chunks 58 to 180 ms; term records with the short postings
+149 to 262 ms; the long terms' pruned blocks 266 to 394 ms; hydration of the winners 309 to 474 ms (overlapping, per segment). The
+server reported 474 ms.
+
+### Verdict and what is left
+
+Not met from this VM: 635 to 673 ms p50 over the internet against 395 ms, and R2's per-hop tail (50 to 120 ms for the slowest
+of about 60 parallel requests) is most of the remaining time. The chain is now manifest copy, dictionary, records plus short
+postings, long-term blocks, hydration: five hops, from seven. Projected in-region (about 25 ms per hop, 150 ms of
+non-overlapped CPU and transfer): 260 to 330 ms, which would meet the goal; the coordinator's in-region run is the confirmation.
+Ranked next steps:
+
+1. Fold the record read into the dictionary read for short terms (inline records in small dictionary chunks, or a hot-term table in the
+   manifest-adjacent object): one hop fewer.
+2. Store each posting block's document lengths with the block, so no lengths read is needed (192 KB per 200K rows, about 40 percent of
+   the bytes in the busiest wave), and run-compress the live-row bitmaps (118 KB each, about 1 MB per query, for a few hundred bytes).
+3. One namespace-wide text dictionary, so requests do not scale with segment count (186 reads over 9 segments).
+4. Hydrate only the global winners (the per-segment top 10 is hydrated, up to 50 rows for 10 results).
