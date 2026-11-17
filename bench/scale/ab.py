@@ -36,7 +36,7 @@ def start_server(arm, append_log=False):
     name, (binary, env) = arm
     shutil.rmtree(WORK, ignore_errors=True); (WORK / "cache").mkdir(parents=True)
     subprocess.run(["python3", str(HERE / "mkconfig.py"), str(CONFIG), str(WORK / "storage.json"), str(WORK / "cache"),
-                    "--memory-gib", "8", "--read-only"], check=True)
+                    "--memory-gib", os.environ.get("AB_MEM_GIB", "8"), "--read-only"], check=True)
     e = dict(os.environ, RAYON_NUM_THREADS=os.environ.get("RAYON_NUM_THREADS", "6"), MALLOC_ARENA_MAX="2", BF_TRACE_READS="1", **env)
     log = open(WORK / "server.log", "a" if append_log else "w")
     proc = subprocess.Popen([binary, str(WORK / "storage.json"), f"127.0.0.1:{PORT}"], stdout=log, stderr=subprocess.STDOUT, env=e)
