@@ -72,11 +72,11 @@ def run_one(arm, query, qid):
 
 
 class CacheCold:
-    """One long-lived server per arm. Before each query, POST /__drop_caches (memory, disk, decoded metadata,
+    """One long-lived server per arm. Before each query, POST /_bench/drop_caches (memory, disk, decoded metadata,
     and namespace handles) and truncate the read trace. Connections stay warm: turbopuffer's definition of cold."""
     def __init__(self, arm, warm_query):
         self.arm = arm; self.proc = start_server(arm, append_log=True)
-        urllib.request.urlopen(urllib.request.Request(URL + "/__drop_caches", method="POST"), timeout=600).read()
+        urllib.request.urlopen(urllib.request.Request(URL + "/_bench/drop_caches", method="POST"), timeout=600).read()
         query_once(warm_query)  # one throwaway query
 
     def cpu_ms(self):
@@ -84,7 +84,7 @@ class CacheCold:
         return (int(f[11]) + int(f[12])) * 1000 / os.sysconf("SC_CLK_TCK")
 
     def run(self, query, qid):
-        urllib.request.urlopen(urllib.request.Request(URL + "/__drop_caches", method="POST"), timeout=600).read()
+        urllib.request.urlopen(urllib.request.Request(URL + "/_bench/drop_caches", method="POST"), timeout=600).read()
         open(WORK / "server.log", "r+").truncate(0)
         c0 = self.cpu_ms()
         out = query_once(query)
