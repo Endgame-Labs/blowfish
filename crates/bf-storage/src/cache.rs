@@ -270,6 +270,15 @@ impl RangeCache {
             planning: AsyncMutex::new(Planning::default()),
         })
     }
+    /// Drop every cached block, object layout, and disk block. In-flight reads are unaffected.
+    pub(crate) fn clear(&self) {
+        self.memory.invalidate_all();
+        self.memory.run_pending_tasks();
+        self.layouts.invalidate_all();
+        if let Some(disk) = &self.disk {
+            disk.lock().unwrap().clear();
+        }
+    }
     fn disk_key(&self, key: &BlockKey) -> String {
         digest(format!(
             "{}:{}:{}:{}:{}:{}",

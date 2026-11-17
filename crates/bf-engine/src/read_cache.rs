@@ -46,6 +46,14 @@ impl DecodedCache {
             workers: self.workers.clone(),
         }
     }
+    /// Drop every decoded entry (all scopes share the map).
+    pub fn clear(&self) {
+        let mut entries = self.entries.lock().expect("decoded cache lock");
+        let retired = std::mem::take(&mut entries.values);
+        entries.bytes = 0;
+        drop(entries);
+        drop(retired);
+    }
     fn key(&self, key: &str) -> String {
         if self.scope.is_empty() {
             key.to_owned()

@@ -32,13 +32,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let storage = Storage::open(&config).await?;
     // Authentication is disabled here, so the key set is refreshed rarely.
     let keys = KeyStore::from_storage(storage.clone(), None, Duration::from_secs(300)).await?;
+    let engine = Engine::with_config(storage, tuning);
+    let dropper = engine.clone();
     let app = router(
-        Engine::with_config(storage, tuning),
+        engine,
         keys,
         ServerOptions {
             auth_enabled: false,
             storage_url: config.url,
         },
+    );
+    // Benchmark-only (loopback, auth disabled): empty every cache and namespace handle.
+    let app = app.route(
+        "/__drop_caches",
+        axum::routing::post(move || {
+            let engine = dropper.clone();
+            async move {
+                engine.clear_caches().await;
+                "ok"
+            }
+        }),
     );
     axum::serve(tokio::net::TcpListener::bind(address).await?, app).await?;
     Ok(())

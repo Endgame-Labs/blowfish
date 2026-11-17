@@ -128,6 +128,15 @@ impl Disk {
         Ok(())
     }
 
+    /// Remove every cached block (benchmarks use this to measure cache-cold reads).
+    pub(crate) fn clear(&mut self) {
+        let names: Vec<String> = self.entries.keys().cloned().collect();
+        for name in names {
+            let _ = self.remove(&name);
+        }
+        self.publish_bytes();
+    }
+
     /// Path of a tracked block, without touching the file.
     pub(crate) fn locate(&self, name: &str) -> Option<PathBuf> {
         self.entries.contains_key(name).then(|| self.dir.join(name))
