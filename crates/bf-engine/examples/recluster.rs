@@ -44,7 +44,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 fn default_slab_rows() -> usize {
     let kb = std::fs::read_to_string("/proc/meminfo")
         .ok()
-        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("MemTotal:")?.split_whitespace().next()?.parse::<u64>().ok()))
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("MemTotal:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
         .unwrap_or(4 << 20);
     ((kb * 1024 / 40_000) as usize).clamp(50_000, 700_000)
 }

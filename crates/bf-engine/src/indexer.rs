@@ -85,10 +85,12 @@ fn memory_limit_bytes() -> u64 {
     // The process's own cgroup (a systemd scope or a container) first, then the root file.
     let own = std::fs::read_to_string("/proc/self/cgroup")
         .ok()
-        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("0::").map(str::to_string)))
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("0::").map(str::to_string))
+        })
         .and_then(|path| {
-            std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.max", path.trim_end()))
-                .ok()
+            std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.max", path.trim_end())).ok()
         });
     let limit = own
         .or_else(|| std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok())
@@ -130,7 +132,11 @@ impl Default for EngineConfig {
             wal_pipeline: 8,
             eventual_tail_bytes: 128 * 1024 * 1024,
             // Two builds at once only where memory allows (each holds a whole segment).
-            build_concurrency: if memory_limit_bytes() < (8 << 30) { 1 } else { 2 },
+            build_concurrency: if memory_limit_bytes() < (8 << 30) {
+                1
+            } else {
+                2
+            },
             ann_nprobe: 64,
             ann_rerank_factor: 32,
             exact_fetch_rows: 8192,

@@ -3,7 +3,6 @@ mod admin;
 mod legacy;
 mod operations;
 
-use bf_alloc as _; // installs jemalloc as the global allocator
 use axum::{
     Extension, Json, Router,
     extract::{
@@ -15,6 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use bf_alloc as _; // installs jemalloc as the global allocator
 use bf_auth::{Action, AuthError, KeyStore, Principal};
 use bf_engine::Engine;
 use bf_types::*;

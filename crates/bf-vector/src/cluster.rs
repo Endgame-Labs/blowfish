@@ -133,7 +133,9 @@ impl IndexBuilder {
             match self.dtype {
                 VectorType::F32 => {}
                 VectorType::I8 => {
-                    if v.iter().any(|x| x.fract() != 0.0 || !(-128.0..=127.0).contains(x)) {
+                    if v.iter()
+                        .any(|x| x.fract() != 0.0 || !(-128.0..=127.0).contains(x))
+                    {
                         return Err(Error::InvalidInput("an invalid i8 value was passed".into()));
                     }
                 }
