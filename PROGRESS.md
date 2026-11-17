@@ -461,3 +461,7 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
   recluster slab size follow the memory limit; `IndexBuilder::build_owned`. 1M recluster peak RSS 8.4 GB to 2.5 GB; 1M ingest fits 4 GiB (3.4 GB), 3M ingest still
   OOMs at 1.5M rows (compaction working set and text statistics). 10M on c7gd.large not validated. Cold BM25 at 1M in-region: 380 / 526 ms fresh, 301 / 369 cache-cold,
   overlap 1.0. Details: `docs/benchmarks.md`, "Iteration 14 (memory)".
+- Iteration 15 (memory): 10M loads and reclusters on a c7gd.large with swap off, no OOM: ingest peak 2.26 GB (VmHWM), recluster 1.76 GB (target 3.5 GB). Packed f16 index
+  builder (`build_packed`), vectors packed through compaction, streamed text statistics merge, scans bypass the block cache, flat BM25 postings, smaller recluster sample.
+  Cold ANN at 48 probes, 10M on the large: 769 / 973 ms fresh, 623 / 740 cache-cold, recall 0.9545. Ingest took 11,568 s (864 docs/s average, decaying with size).
+  Details: `docs/benchmarks.md`, "Iteration 15 (memory)".

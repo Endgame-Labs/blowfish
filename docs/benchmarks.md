@@ -2127,3 +2127,63 @@ Target (p50 at most 395 or p90 at most 476): met on p50 in both arms and on p90 
 - **Builder**: `training` (normalized f32 copy) and `stored` are still full f32; build from f16 and normalize on the fly (target 6 KB per row).
 - **Block cache pollution**: compaction and recluster reads should bypass the memory block cache.
 - **Validation**: 10M load and recluster on a c7gd.large, cold ANN at 48 probes, and recall@10 were not run.
+
+## Iteration 15 (memory): 10M load and recluster on a c7gd.large
+
+Target: ingest 10M documents (1,024-dim f16 Wikipedia) and run `recluster` on a c7gd.large (2 vCPU, 3.8 GiB usable, swap off) with no OOM and
+peak RSS of at most 3.5 GB. **Met**: ingest, index builds, and compaction peaked at 2.26 GB (10-second samples of VmHWM; 2.09 GB in the 5-second
+allocator log), and recluster at 1.76 GB. The Python loader ran on the same machine (about 0.5 GB), and MemAvailable never fell under 0.97 GB. Block
+cache 0.5 GiB while loading (1 GiB for the query runs), decoded cache at its default of 512 MiB, server in a 3.5 GiB cgroup.
+
+### What changed
+
+1. **Packed builder.** `IndexBuilder::build_packed` takes rows at the stored precision (f16 bytes) and normalizes on the fly for training, assignment, and
+   quantization; the vector bytes in the blob are the packed input copied once. Peak is the packed input plus the output blob (about 4.3 KB per row at
+   1,024 dims in f16) instead of four f32 copies; the blob is byte-identical to the old builder's (checked with hashes on three configurations).
+2. **Compaction keeps vectors packed.** A compaction reads each source segment block by block, takes the vector column as packed bytes straight from the
+   column blocks, and reads the other columns without the vector; no base64 string is ever materialized (documents were about 10 KB per row).
+3. **Text statistics merged by streaming.** The indexer no longer hydrates the per-term map (3 to 4 copies, 240 MB per 1M rows). It streams the previous
+   chunked FST object, applies the batch's sorted term deltas, and writes new chunks (`text::merge_text_stats`, tested to be byte-equal to a full
+   rewrite); a publication that changes no text statistics keeps the object.
+4. **Scans bypass the block cache.** `RangeReader::bypass_cache` reads through the caches without admitting blocks; compaction, text statistics reads,
+   and recluster reads use it.
+5. **Flat BM25 postings in the segment builder** (`bf-text`): a posting is 8 bytes plus its positions instead of about 48 bytes and a heap allocation
+   (the old layout was about 17 KB per Wikipedia row and dominated a compaction). The segment bytes are identical (hash-checked).
+6. **Recluster.** The coarse-partition sample is `cells * 600` rows (19,200 at 32 cells) instead of 100,000 f32 rows, slabs are built from the spill file
+   as packed bytes, and `max_slab_rows` is memory / 12,000 (330,000 on this machine).
+
+### 10M on c7gd.large (swap off)
+
+| Phase | Peak RSS | Time |
+| --- | ---: | ---: |
+| Ingest, index builds, and compaction (whole load; the 2,000-second windows peak between 1.90 and 2.09 GB) | 2.09 GB (2.26 GB VmHWM) | 11,568 s, 864 docs/s average |
+| Index drain after the last write | 1.87 GB | |
+| Idle after the load (caches) | 1.33 GB | |
+| Recluster, vector copy (10M rows) | 0.59 GB | 272 s |
+| Recluster, assignment | 0.57 GB | 133 s |
+| Recluster, slab builds (45 slabs, largest cell 449,930 rows split in two) | 1.76 GB | 4,287 s |
+
+Ingest rate fell from about 3,200 docs/s at 0.5M rows to about 1,500 at 3M and 300 near 9M: every publication rewrites the text statistics object and
+checks every segment's ID index, and the indexer wrote 19.0M segment rows for 10M ingested (1.9 times). On the same instance and loader, the previous
+code ingested 1M rows at 3,392 and 1,900 docs/s in two runs and this code at 2,290 and 3,800 (round-to-round noise from the host and downloads is
+larger than the difference); build time per row was 185 and 174 microseconds. The previous code cannot load this namespace in this memory at all.
+
+### Cold ANN at 48 probes, 10M, c7gd.large (50 queries; recall over all 200 oracle queries)
+
+The new namespace's exact top 10 (the loader's own truth) matches `oracle-10m.npz` as a set for all 200 queries (198 equal in order, 2 tie
+swaps), so the same ground truth applies. 1 GiB block cache, 256 MiB decoded cache, 2 rayon threads.
+
+| Arm | p50 / p90 / p99 ms | Requests, MB, waves | Recall@10 |
+| --- | --- | --- | ---: |
+| c7gd.2xlarge, slabs (iteration 11 report) | 662 / 991 (fresh) | 404, 50.7, 3.5 | 0.953 |
+| c7gd.large, fresh process | 769 / 973 / 1,384 | 436, 53.5, 3.2 | 0.9545 (200 queries; 0.952 on the 50 timed) |
+| c7gd.large, cache-cold (`--cachecold`) | 623 / 740 / 935 | 436, 53.5, 3.2 | 0.952 |
+| c7gd.large, warm, 1,000 queries | 81.8 / 96.0 / 121.9 | | 0.9545 |
+
+### Not done and what is left
+
+- The per-row cost of a compaction is still about 12 KB (non-vector documents, BM25 build state, packed vectors, and the blob); text, filter, and
+  trigram builds still hold a segment's non-vector documents rather than streaming them.
+- The unindexed tail still holds base64 f32 documents (bounded by bytes, not compacted).
+- Ingest throughput decays with namespace size (above): a separate bloom object per segment (so a write batch need not load every segment's ID
+  index) and a larger bulk flush would cut that.
