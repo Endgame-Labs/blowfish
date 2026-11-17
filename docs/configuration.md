@@ -102,8 +102,10 @@ memory limit (host RAM, or the cgroup limit when lower), and each has an overrid
 | Decoded metadata cache | limit / 8, 512 MiB to 4 GiB | `BF_DECODED_CACHE_BYTES` |
 | Block cache in memory | limit / 4, up to 8 GiB | `storage.cache.memory_bytes` |
 
-The row caps assume 1,024-dimension vectors (a compaction needs about 30 KB per row while it runs). `recluster` sizes
-`max_slab_rows` the same way (40 KB per row, 100,000 on a 4 GB machine). Diagnostics:
+The row caps assume 1,024-dimension vectors. Builds and compactions keep vectors packed at their stored precision (2 KB per f16 row)
+and normalize on the fly, compaction and `recluster` reads bypass the in-memory block cache, and the text statistics object is
+merged by streaming, so none of these terms grows with the namespace. `recluster` sizes `max_slab_rows` at 12 KB per row
+(about 350,000 on a 4 GB machine). Diagnostics:
 `BF_MEM_LOG_SECS=N` prints allocator and RSS statistics every N seconds, `/metrics` exposes
 `blowfish_alloc_bytes{kind}` (allocated, active, resident, retained), and a build with `--features heap-profile` writes jemalloc
 heap profiles when run with `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19` and `BF_HEAP_DUMP_DIR=DIR`.

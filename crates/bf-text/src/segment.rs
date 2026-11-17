@@ -198,10 +198,22 @@ struct TermMeta {
     df: u32,
     blocks: Vec<BlockMeta>,
 }
-#[derive(Debug)]
-struct Posting {
-    row: u32,
+/// One term's postings, stored flat: a posting is one `rows` entry and one `ends` entry (the
+/// running count of positions through that posting), with every position in `positions`. A
+/// `Vec<Posting>` with a position vector per posting cost about 48 bytes plus a heap allocation
+/// per posting; this costs 8.
+#[derive(Debug, Default)]
+struct TermPostings {
+    rows: Vec<u32>,
+    ends: Vec<u32>,
     positions: Vec<(u32, u32)>,
+}
+impl TermPostings {
+    /// The positions of the `i`th posting.
+    fn of(&self, i: usize) -> &[(u32, u32)] {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        &self.positions[start..self.ends[i] as usize]
+    }
 }
 
 /// Incremental segment writer. Rows are assigned consecutive zero-based ordinals;
@@ -209,7 +221,7 @@ struct Posting {
 #[derive(Default)]
 pub struct SegmentBuilder {
     lengths: Vec<u32>,
-    postings: BTreeMap<String, Vec<Posting>>,
+    postings: BTreeMap<String, TermPostings>,
     positions: bool,
     tokenizer: Tokenizer,
 }
@@ -245,10 +257,14 @@ impl SegmentBuilder {
         self.lengths.push(length);
         for (term, mut positions) in terms {
             positions.sort_unstable();
-            self.postings
-                .entry(term.into())
-                .or_default()
-                .push(Posting { row, positions });
+            let entry = match self.postings.get_mut(term) {
+                Some(entry) => entry,
+                None => self.postings.entry(term.into()).or_default(),
+            };
+            entry.positions.extend_from_slice(&positions);
+            u32::try_from(entry.positions.len()).map_err(|_| input("too many positions"))?;
+            entry.rows.push(row);
+            entry.ends.push(entry.positions.len() as u32);
         }
         Ok(row)
     }
@@ -271,14 +287,16 @@ impl SegmentBuilder {
         let mut terms: Vec<(&str, Vec<BlockMeta>)> = Vec::with_capacity(self.postings.len());
         for (term, postings) in self.postings.iter() {
             let mut blocks = Vec::new();
-            for entries in postings.chunks(BLOCK) {
+            for first in (0..postings.rows.len()).step_by(BLOCK) {
+                let last = (first + BLOCK).min(postings.rows.len());
+                let rows = &postings.rows[first..last];
                 let mut deltas = [0; BLOCK];
                 let mut frequencies = [0; BLOCK];
-                let mut previous = entries[0].row;
-                for (i, posting) in entries.iter().enumerate() {
-                    deltas[i] = posting.row - previous;
-                    previous = posting.row;
-                    frequencies[i] = posting.positions.len() as u32;
+                let mut previous = rows[0];
+                for (i, row) in rows.iter().enumerate() {
+                    deltas[i] = row - previous;
+                    previous = *row;
+                    frequencies[i] = postings.of(first + i).len() as u32;
                 }
                 let doc_bits = packer.num_bits(&deltas);
                 let tf_bits = packer.num_bits(&frequencies);
@@ -292,8 +310,8 @@ impl SegmentBuilder {
                 post.extend_from_slice(&compressed);
                 let positions_offset = pos.len() as u64;
                 if self.positions {
-                    for entry in entries {
-                        for &(element, position) in &entry.positions {
+                    for i in first..last {
+                        for &(element, position) in postings.of(i) {
                             put32(&mut pos, element);
                             put32(&mut pos, position);
                         }
@@ -302,13 +320,13 @@ impl SegmentBuilder {
                 let positions_size = pos.len() as u64 - positions_offset;
                 let positions_crc = crc32fast::hash(&pos[positions_offset as usize..]);
                 blocks.push(BlockMeta {
-                    first: entries[0].row,
-                    last: entries.last().unwrap().row,
-                    count: entries.len() as u32,
+                    first: rows[0],
+                    last: *rows.last().unwrap(),
+                    count: rows.len() as u32,
                     max_tf: *frequencies.iter().max().unwrap(),
-                    min_length: entries
+                    min_length: rows
                         .iter()
-                        .map(|e| self.lengths[e.row as usize])
+                        .map(|row| self.lengths[*row as usize])
                         .min()
                         .unwrap(),
                     offset,

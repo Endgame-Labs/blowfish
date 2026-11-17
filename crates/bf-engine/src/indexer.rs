@@ -409,10 +409,7 @@ impl Engine {
             return Ok(false);
         }
         crate::ann::stage(t0, "idx lock+clone");
-        // The indexer rewrites complete statistics, so it needs the out-of-line text part.
         let mut state = state;
-        crate::text::hydrate(&self.0.store, &mut state).await?;
-        crate::ann::stage(t0, "idx hydrate");
         let rebuild = state.segments.iter().any(|seg| {
             state
                 .schema
@@ -428,6 +425,18 @@ impl Engine {
                     })
                 })
         });
+        // A chunked statistics object is updated by streaming it (see `text::merge_text_stats`),
+        // so the per-term map never enters memory. A rebuild, which recomputes every statistic,
+        // and the legacy whole-object format load it completely.
+        let mut external = state
+            .text_stats
+            .as_ref()
+            .is_some_and(|f| f.stats_index.is_some())
+            && !rebuild;
+        if !external {
+            crate::text::hydrate(&self.0.store, &mut state).await?;
+        }
+        crate::ann::stage(t0, "idx hydrate");
         let compact = tier(&state, &self.0.config, force);
         let upgrade = needs_blocks(&state);
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
@@ -514,6 +523,9 @@ impl Engine {
         manifest.stats = (*state.stats).clone();
         // The previous text statistics object is replaced by this publication.
         let previous_text = manifest.text_stats.take();
+        // With `external` statistics, changes accumulate here and merge into the object at the end.
+        let (mut added_stats, mut removed_stats) =
+            (NamespaceStats::default(), NamespaceStats::default());
         // A tombstone followed by recreation discards every old segment and its statistics.
         if state.segments.is_empty() && !manifest.segments.is_empty() {
             for seg in manifest.segments.clone() {
@@ -523,6 +535,7 @@ impl Engine {
             }
             manifest.segments.clear();
             manifest.stats = NamespaceStats::default();
+            external = false;
         }
         let segments = if rebuild {
             let mut rebuilt = vec![];
@@ -542,6 +555,7 @@ impl Engine {
                             &state.schema,
                             state.metric,
                             &docs,
+                            BTreeMap::new(),
                             seg.wal_start,
                             seg.wal_end,
                             &self.0.config,
@@ -562,6 +576,7 @@ impl Engine {
                         &state.schema,
                         state.metric,
                         &state.docs,
+                        BTreeMap::new(),
                         state.indexed_through + 1,
                         state.seq,
                         &self.0.config,
@@ -579,7 +594,11 @@ impl Engine {
                 let deleted = &live - &keep;
                 if !deleted.is_empty() {
                     let removed = segment::documents(store, &seg, &deleted).await?;
-                    adjust(&mut manifest.stats, &removed, false, &state.schema);
+                    if external {
+                        adjust(&mut removed_stats, &removed, true, &state.schema);
+                    } else {
+                        adjust(&mut manifest.stats, &removed, false, &state.schema);
+                    }
                     retire(&mut manifest, seg.live.key.clone());
                     if keep.is_empty() {
                         for file in seg.files.values() {
@@ -594,7 +613,16 @@ impl Engine {
             crate::ann::stage(t0, "idx live");
             // Compaction only replaces selected disjoint live collections. New tail rows
             // are already masked out of old segments, so the merged result has unique IDs.
-            let mut compact_docs = BTreeMap::new();
+            let mut compact_docs: BTreeMap<bf_types::Id, std::sync::Arc<bf_types::Document>> =
+                BTreeMap::new();
+            // Vector attributes travel as packed stored-precision bytes, not documents.
+            let strip: std::collections::BTreeSet<String> = state
+                .schema
+                .iter()
+                .filter(|(_, c)| segment::dense_type(c).is_some() && c.filterable != Some(true))
+                .map(|(name, _)| name.clone())
+                .collect();
+            let mut compact_vectors: BTreeMap<String, Vec<segment::PackedPart>> = BTreeMap::new();
             let mut start = u64::MAX;
             let mut end = 0;
             if !compact.is_empty() {
@@ -602,7 +630,12 @@ impl Engine {
                 for seg in segments {
                     if compact.contains(&seg.id) {
                         let live = segment::live(store, &seg).await?;
-                        compact_docs.extend(segment::documents(store, &seg, &live).await?);
+                        let (docs, vectors) =
+                            segment::compaction_rows(store, &seg, &live, &strip).await?;
+                        compact_docs.extend(crate::shared(docs));
+                        for (name, part) in vectors {
+                            compact_vectors.entry(name).or_default().push(part);
+                        }
                         start = start.min(seg.wal_start);
                         end = end.max(seg.wal_end);
                         for file in seg.files.values().chain(std::iter::once(&seg.live)) {
@@ -621,7 +654,11 @@ impl Engine {
             let stats_job = flushing.then(|| {
                 let docs = state.docs.clone();
                 let schema = state.schema.clone();
-                let mut stats = std::mem::take(&mut manifest.stats);
+                let mut stats = if external {
+                    NamespaceStats::default()
+                } else {
+                    std::mem::take(&mut manifest.stats)
+                };
                 tokio::task::spawn_blocking(move || {
                     adjust(&mut stats, &docs, true, &schema);
                     stats
@@ -635,6 +672,7 @@ impl Engine {
                         &state.schema,
                         state.metric,
                         &state.docs,
+                        BTreeMap::new(),
                         state.indexed_through + 1,
                         state.seq,
                         &self.0.config,
@@ -644,6 +682,8 @@ impl Engine {
                     Ok(vec![])
                 }
             };
+            let compact_packed =
+                segment::merge_packed(&state.schema, &compact_docs, compact_vectors)?;
             let compacted = async {
                 if compact_docs.is_empty() {
                     Ok(vec![])
@@ -654,6 +694,7 @@ impl Engine {
                         &state.schema,
                         state.metric,
                         &compact_docs,
+                        compact_packed,
                         start,
                         end,
                         &self.0.config,
@@ -664,7 +705,12 @@ impl Engine {
             let (flushed, compacted) = futures::future::try_join(flush, compacted).await?;
             crate::ann::stage(t0, "idx builds");
             if let Some(job) = stats_job {
-                manifest.stats = job.await.map_err(segment::index_error)?;
+                let stats = job.await.map_err(segment::index_error)?;
+                if external {
+                    added_stats = stats;
+                } else {
+                    manifest.stats = stats;
+                }
             }
             segments.extend(flushed);
             segments.extend(compacted);
@@ -736,10 +782,58 @@ impl Engine {
         manifest.created_at = state.created_at;
         manifest.updated_at = Some(state.updated_at);
         manifest.indexed_through = state.seq;
-        if let Some(previous) = previous_text {
+        if external && added_stats.text.is_empty() && removed_stats.text.is_empty() {
+            // Nothing changed in the text statistics (a compaction, say): keep the object.
+            manifest.stats.rows = manifest
+                .stats
+                .rows
+                .saturating_add(added_stats.rows)
+                .saturating_sub(removed_stats.rows);
+            manifest.stats.logical_bytes = manifest
+                .stats
+                .logical_bytes
+                .saturating_add(added_stats.logical_bytes)
+                .saturating_sub(removed_stats.logical_bytes);
+            manifest.text_stats = previous_text.clone();
+        } else if external {
+            let previous = previous_text.as_ref().expect("external statistics object");
+            manifest.stats.rows = manifest
+                .stats
+                .rows
+                .saturating_add(added_stats.rows)
+                .saturating_sub(removed_stats.rows);
+            manifest.stats.logical_bytes = manifest
+                .stats
+                .logical_bytes
+                .saturating_add(added_stats.logical_bytes)
+                .saturating_sub(removed_stats.logical_bytes);
+            let old = segment::read_whole_uncached(store, previous).await?;
+            let index = previous.stats_index.clone().expect("chunked statistics");
+            let (bytes, index) = tokio::task::spawn_blocking(move || {
+                crate::text::merge_text_stats(&old, &index, &added_stats.text, &removed_stats.text)
+            })
+            .await
+            .map_err(segment::index_error)??;
+            let mut file = segment::put_file(
+                store,
+                format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
+                bytes,
+                0,
+            )
+            .await?;
+            file.stats_index = Some(index);
+            manifest.text_stats = Some(file);
+        } else {
+            externalize_text_stats(store, ns, &mut manifest).await?;
+        }
+        if let Some(previous) = previous_text
+            && manifest
+                .text_stats
+                .as_ref()
+                .is_none_or(|f| f.key != previous.key)
+        {
             retire(&mut manifest, previous.key);
         }
-        externalize_text_stats(store, ns, &mut manifest).await?;
         crate::ann::stage(t0, "idx text_stats");
         let generation = match wal
             .publish_fenced(claim, manifest.indexer_epoch, &manifest)
@@ -1008,6 +1102,7 @@ async fn build_segments<D: std::borrow::Borrow<bf_types::Document> + Clone>(
     schema: &bf_types::Schema,
     metric: bf_types::DistanceMetric,
     docs: &BTreeMap<bf_types::Id, D>,
+    mut vectors: BTreeMap<String, segment::PackedColumn>,
     start: u64,
     end: u64,
     config: &EngineConfig,
@@ -1032,12 +1127,45 @@ async fn build_segments<D: std::borrow::Borrow<bf_types::Document> + Clone>(
     if !batch.is_empty() {
         batches.push(batch);
     }
+    // Hand each batch its share of the packed vectors (they cover `docs` in order).
+    let mut batch_vectors: Vec<BTreeMap<String, segment::PackedColumn>> =
+        (0..batches.len()).map(|_| BTreeMap::new()).collect();
+    for (name, column) in &mut vectors {
+        let width = column.dims * column.dtype.width();
+        let mut base = 0u32;
+        for (b, batch) in batches.iter().enumerate() {
+            let rows = batch.len() as u32;
+            let n = column.rows.partition_point(|r| *r < base + rows);
+            let rest_rows = column.rows.split_off(n);
+            let rest_data = column.data.split_off(n * width);
+            let rows_here = std::mem::replace(&mut column.rows, rest_rows)
+                .into_iter()
+                .map(|r| r - base)
+                .collect();
+            let data_here = std::mem::replace(&mut column.data, rest_data);
+            batch_vectors[b].insert(
+                name.clone(),
+                segment::PackedColumn {
+                    dims: column.dims,
+                    dtype: column.dtype,
+                    rows: rows_here,
+                    data: data_here,
+                },
+            );
+            base += rows;
+        }
+    }
+    drop(vectors);
     // Segments are independent: build a few at once, keeping their order.
     let mut out = Vec::with_capacity(batches.len());
+    let mut batch_vectors = batch_vectors.into_iter();
     for group in batches.chunks(config.build_concurrency.max(1)) {
         let mut builds = Vec::with_capacity(group.len());
         for batch in group {
-            builds.push(segment::build(store, ns, schema, metric, batch, start, end));
+            let vectors = batch_vectors.next().unwrap_or_default();
+            builds.push(segment::build_with(
+                store, ns, schema, metric, batch, vectors, start, end,
+            ));
         }
         let started = std::time::Instant::now();
         let built = futures::future::try_join_all(builds).await?;

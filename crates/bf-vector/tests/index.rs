@@ -498,3 +498,34 @@ async fn signed_i8_storage_roundtrip_and_exact_scores() {
         assert!(builder.build(&[(0, vec![bad, 0.0])]).is_err());
     }
 }
+
+/// Packed rows (the stored precision, in any ID order) build the same blob as the f32 entry point.
+#[test]
+fn packed_build_matches_the_f32_build() {
+    for (dtype, metric) in [
+        (VectorType::F16, Metric::CosineDistance),
+        (VectorType::F32, Metric::EuclideanSquared),
+    ] {
+        let mut data = clustered(3000, 16);
+        data.reverse();
+        let builder = IndexBuilder::new(16, metric)
+            .unwrap()
+            .vector_type(dtype)
+            .params(BuildParams {
+                clusters: Some(30),
+                ..Default::default()
+            });
+        let expected = builder.build(&data).unwrap();
+        let (mut ids, mut bytes) = (Vec::new(), Vec::new());
+        for (id, v) in &data {
+            ids.push(*id);
+            dtype.pack(v, 16, &mut bytes).unwrap();
+        }
+        assert_eq!(bytes.len(), ids.len() * builder.row_bytes());
+        assert_eq!(builder.build_packed(ids, bytes).unwrap(), expected);
+    }
+    let mut out = Vec::new();
+    assert!(VectorType::F16.pack(&[f32::MAX; 4], 4, &mut out).is_err());
+    assert!(VectorType::I8.pack(&[0.5; 4], 4, &mut out).is_err());
+    assert!(VectorType::F32.pack(&[1.0; 3], 4, &mut out).is_err());
+}
