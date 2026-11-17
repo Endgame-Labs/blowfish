@@ -395,6 +395,119 @@ impl std::ops::Deref for IdIndex {
         &self.ids
     }
 }
+/// A segment's ID filter: its smallest and largest ID plus a Bloom filter with a false-positive rate
+/// low enough (about 1e-5) that a write batch of thousands of IDs rarely has to open any segment's
+/// full ID list. It is a small object of its own (3 bytes per row, against about 35 for `ids.bfi`),
+/// so a write or publication checks every segment without loading a single ID list.
+///
+/// Layout: `BFIF0001`, the Bloom's probe count (u8), the length of the JSON `[min, max]` (u32 LE),
+/// that JSON, then the bit array.
+pub(crate) struct IdFilter {
+    min: Id,
+    max: Id,
+    probes: u8,
+    bits: Vec<u8>,
+}
+const ID_FILTER_MAGIC: &[u8; 8] = b"BFIF0001";
+/// 24 bits per ID with 16 probes: a false-positive rate of about 1e-5.
+const ID_FILTER_BITS_PER_ID: usize = 24;
+const ID_FILTER_PROBES: u8 = 16;
+/// Two independent 64-bit hashes of an ID (FNV-1a with a splitmix finalizer, then a second round).
+pub(crate) fn id_hash(id: &Id) -> (u64, u64) {
+    fn mix(mut z: u64) -> u64 {
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+    let h = match id {
+        Id::Uint(n) => mix(*n ^ 0x9e3779b97f4a7c15),
+        Id::String(s) => mix(s.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x100000001b3)
+        }) ^ 0x517cc1b727220a95),
+    };
+    (h, mix(h ^ 0xd6e8feb86659fd93) | 1)
+}
+impl IdFilter {
+    /// `ids` must be sorted and non-empty.
+    pub(crate) fn build(ids: &[Id]) -> Self {
+        let nbits = (ids.len() * ID_FILTER_BITS_PER_ID).max(64);
+        let mut bits = vec![0u8; nbits.div_ceil(8)];
+        let modulus = bits.len() as u64 * 8;
+        for id in ids {
+            let (h1, h2) = id_hash(id);
+            for i in 0..ID_FILTER_PROBES as u64 {
+                let bit = h1.wrapping_add(i.wrapping_mul(h2)) % modulus;
+                bits[(bit / 8) as usize] |= 1 << (bit % 8);
+            }
+        }
+        Self {
+            min: ids.first().cloned().unwrap_or(Id::Uint(0)),
+            max: ids.last().cloned().unwrap_or(Id::Uint(0)),
+            probes: ID_FILTER_PROBES,
+            bits,
+        }
+    }
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let range = serde_json::to_vec(&(&self.min, &self.max)).expect("IDs serialize");
+        let mut out = Vec::with_capacity(13 + range.len() + self.bits.len());
+        out.extend_from_slice(ID_FILTER_MAGIC);
+        out.push(self.probes);
+        out.extend_from_slice(&(range.len() as u32).to_le_bytes());
+        out.extend_from_slice(&range);
+        out.extend_from_slice(&self.bits);
+        out
+    }
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 13 || &bytes[..8] != ID_FILTER_MAGIC {
+            return None;
+        }
+        let probes = bytes[8];
+        let len = u32::from_le_bytes(bytes[9..13].try_into().ok()?) as usize;
+        let (min, max): (Id, Id) = serde_json::from_slice(bytes.get(13..13 + len)?).ok()?;
+        let bits = bytes.get(13 + len..)?.to_vec();
+        (probes > 0 && !bits.is_empty()).then_some(Self {
+            min,
+            max,
+            probes,
+            bits,
+        })
+    }
+    fn resident_bytes(&self) -> u64 {
+        (self.bits.capacity() + 128) as u64
+    }
+    /// The wanted IDs this segment might hold: those inside its ID range that pass the Bloom filter.
+    fn candidates(&self, wanted: &std::collections::BTreeSet<Id>) -> Vec<Id> {
+        let modulus = self.bits.len() as u64 * 8;
+        wanted
+            .range(&self.min..=&self.max)
+            .filter(|id| {
+                let (h1, h2) = id_hash(id);
+                (0..self.probes as u64).all(|i| {
+                    let bit = h1.wrapping_add(i.wrapping_mul(h2)) % modulus;
+                    self.bits[(bit / 8) as usize] & (1 << (bit % 8)) != 0
+                })
+            })
+            .cloned()
+            .collect()
+    }
+}
+/// The segment's ID filter, or `None` for a segment built before filters existed.
+async fn id_filter(store: &Storage, segment: &Segment) -> Result<Option<Arc<IdFilter>>, ApiError> {
+    let Some(file) = segment.files.get("idfilter") else {
+        return Ok(None);
+    };
+    let key = format!("idfilter:{}", file.key);
+    if let Some(filter) = read_cache::get(&key, file.size) {
+        return Ok(Some(filter));
+    }
+    let bytes = ObjectReader::new(store, file)
+        .read(0..file.size)
+        .await
+        .map_err(index_error)?;
+    let filter = IdFilter::from_bytes(&bytes).ok_or_else(corrupt)?;
+    let size = filter.resident_bytes();
+    Ok(Some(read_cache::insert(&key, size, filter)))
+}
 fn hashes(id: &Id, bits: usize) -> [usize; 3] {
     let data = serde_json::to_vec(id).expect("ID serializes");
     let h = data.iter().fold(0xcbf29ce484222325u64, |h, b| {
@@ -633,6 +746,17 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
             bloom[bit / 8] |= 1 << (bit % 8);
         }
     }
+    let filter = IdFilter::build(&ids);
+    files.insert(
+        "idfilter".into(),
+        put_file(
+            store,
+            format!("{prefix}/idfilter.bff"),
+            filter.to_bytes(),
+            0,
+        )
+        .await?,
+    );
     files.insert(
         "ids".into(),
         put_value(store, format!("{prefix}/ids.bfi"), &IdIndex { ids, bloom }).await?,
@@ -830,6 +954,22 @@ pub(crate) async fn lookup_many(
     segment: &Segment,
     wanted: &std::collections::BTreeSet<Id>,
 ) -> Result<RoaringBitmap, ApiError> {
+    if wanted.is_empty() {
+        return Ok(RoaringBitmap::new());
+    }
+    // The small filter first: most segments hold none of the wanted IDs, and then their (large)
+    // ID lists are never read.
+    let narrowed;
+    let wanted = match id_filter(store, segment).await? {
+        Some(filter) => {
+            narrowed = filter.candidates(wanted).into_iter().collect();
+            if std::collections::BTreeSet::is_empty(&narrowed) {
+                return Ok(RoaringBitmap::new());
+            }
+            &narrowed
+        }
+        None => wanted,
+    };
     let index = ids(store, segment).await?;
     if index.bloom.is_empty() || index.ids.len() != segment.row_count as usize {
         return Err(corrupt());
@@ -1367,4 +1507,46 @@ impl bf_text::RangeRead for ObjectReader {
 pub(crate) fn seg_text_matches(segment: &Segment, schema: &Schema, attribute: &str) -> bool {
     segment.schema.get(attribute).and_then(|s| s.text_config())
         == schema.get(attribute).and_then(|s| s.text_config())
+}
+
+#[cfg(test)]
+mod id_filter_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn filter_round_trips_and_has_a_tiny_false_positive_rate() {
+        let ids: Vec<Id> = (0..50_000u64).map(|n| Id::Uint(n * 3 + 1_000)).collect();
+        let filter = IdFilter::build(&ids);
+        let again = IdFilter::from_bytes(&filter.to_bytes()).expect("decodes");
+        assert_eq!((&again.min, &again.max), (&ids[0], ids.last().unwrap()));
+        let present: BTreeSet<Id> = ids.iter().step_by(7).cloned().collect();
+        assert_eq!(
+            again.candidates(&present).len(),
+            present.len(),
+            "no false negatives"
+        );
+        // IDs outside the range never reach the Bloom filter; inside it, almost none pass.
+        let outside: BTreeSet<Id> = (0..1_000u64).map(Id::Uint).collect();
+        assert!(again.candidates(&outside).is_empty());
+        let absent: BTreeSet<Id> = (0..200_000u64).map(|n| Id::Uint(n * 3 + 1_001)).collect();
+        let false_positives = again.candidates(&absent).len();
+        assert!(
+            false_positives < 20,
+            "{false_positives} false positives in 200,000"
+        );
+        assert!(IdFilter::from_bytes(b"BFIF0001").is_none());
+    }
+
+    #[test]
+    fn string_ids_and_corrupt_bytes() {
+        let mut ids: Vec<Id> = (0..1_000)
+            .map(|n| Id::String(format!("doc-{n:05}")))
+            .collect();
+        ids.sort();
+        let filter = IdFilter::from_bytes(&IdFilter::build(&ids).to_bytes()).unwrap();
+        let wanted: BTreeSet<Id> = ids.iter().cloned().collect();
+        assert_eq!(filter.candidates(&wanted).len(), 1_000);
+        assert!(IdFilter::from_bytes(&[0u8; 40]).is_none());
+    }
 }
