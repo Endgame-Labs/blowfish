@@ -7,7 +7,8 @@
 Usage: uv run msmarco_load.py --base-url http://127.0.0.1:8300 --namespace NS --rows 1000000 [--hub-endpoint URL]
 The corpus (Tevatron/msmarco-passage-corpus, corpus.jsonl.gz) is streamed and gunzipped on the fly; nothing is
 kept on disk, and the download stops after N rows. Document id is the passage's docid. Writes retry on 429 and
-transport errors; the schema rides on the first write. No credentials are read (the Hub endpoint may be a proxy).
+transport errors; the schema rides on the first write. Warning: a writable server indexes, compacts, and collects garbage in EVERY
+namespace under its storage prefix, so point it at a prefix that holds only the namespace being loaded. No credentials are read (the Hub endpoint may be a proxy).
 """
 import argparse, json, time, zlib
 from concurrent.futures import ThreadPoolExecutor
