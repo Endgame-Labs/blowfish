@@ -444,11 +444,6 @@ impl Storage {
             last_modified: m.last_modified,
         })
     }
-    /// Empty the range cache (memory and disk). Meant for benchmarks that need cache-cold reads.
-    pub async fn clear_cache(&self) {
-        self.0.cache.flush().await;
-        self.0.cache.clear();
-    }
     /// Wait for disk-cache writes that were started behind reads (they never delay a read).
     pub async fn flush_cache(&self) {
         self.0.cache.flush().await;
