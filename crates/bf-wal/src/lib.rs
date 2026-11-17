@@ -228,6 +228,10 @@ pub struct Wal {
     namespace: String,
 }
 impl Wal {
+    /// The namespace this log belongs to.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
     /// Open a namespace log without creating it.
     pub fn new(store: Storage, namespace: &str) -> Result<Self, Error> {
         validate_namespace(namespace)?;

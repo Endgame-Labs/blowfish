@@ -261,6 +261,64 @@ async fn cold_ann_has_three_read_stages_no_heads_and_warm_queries_hit_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_open_reads_the_directory_hint_alongside_the_manifest() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable.clone(), config());
+    let docs: Vec<_> = (0..3000)
+        .map(|id| {
+            let vector: Vec<_> = (0..64)
+                .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+                .collect();
+            json!({"id":id,"vector":vector})
+        })
+        .collect();
+    writer
+        .write(
+            "hinted",
+            serde_json::from_value(json!({"distance_metric":"cosine_distance","upsert_rows":docs}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    writer.index_namespace("hinted", true).await.unwrap();
+    let cold_waves = |backend: Arc<Counting>| async move {
+        let engine = Engine::with_config(store(backend.clone()).await, config());
+        backend.waves.store(0, Ordering::SeqCst);
+        backend.delay.store(true, Ordering::SeqCst);
+        let request =
+            serde_json::from_value(json!({"rank_by":["vector","ANN",docs_vector()],"top_k":10}))
+                .unwrap();
+        let rows = engine.query("hinted", request).await.unwrap().result.rows;
+        backend.delay.store(false, Ordering::SeqCst);
+        (backend.waves.load(Ordering::SeqCst), rows)
+    };
+    fn docs_vector() -> Vec<f32> {
+        (0..64)
+            .map(|d| ((d * 104729) as f64).sin() as f32)
+            .collect()
+    }
+    let (with_hint, rows) = cold_waves(backend.clone()).await;
+    let hints: Vec<_> = writable
+        .list("ns/hinted/segments/")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.key.contains("ann-dir-latest"))
+        .collect();
+    assert_eq!(hints.len(), 1, "one hint per vector attribute");
+    writable.delete(&hints[0].key).await.unwrap();
+    let (without_hint, rows_without) = cold_waves(backend.clone()).await;
+    assert_eq!(rows, rows_without);
+    assert!(
+        with_hint < without_hint,
+        "the hint saves a wave: {with_hint} against {without_hint}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_wal_write_discards_speculative_results() {
     let backend = Arc::new(Counting::default());
     let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)

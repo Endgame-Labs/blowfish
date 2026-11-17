@@ -715,6 +715,12 @@ impl Engine {
         let mut protected = std::collections::BTreeSet::new();
         protected.extend(manifest.text_stats.iter().map(|f| f.key.clone()));
         protected.extend(manifest.ann_dirs.values().map(|f| f.key.clone()));
+        protected.extend(
+            manifest
+                .ann_dirs
+                .keys()
+                .map(|k| crate::ann_dir::hint_key(ns, k.trim_start_matches("ann:"))),
+        );
         for seg in &manifest.segments {
             protected.extend(
                 seg.files

@@ -32,9 +32,18 @@ type Found = (Vec<(f32, u32)>, Vec<Candidate>);
 pub(crate) async fn load(
     store: &Storage,
     file: &bf_wal::SegmentFile,
+    prefetched: Option<&Prefetched>,
 ) -> Result<Arc<Directory>, ApiError> {
     if let Some(dir) = read_cache::get(&file.key, file.metadata_len) {
         return Ok(dir);
+    }
+    if let Some((key, bytes)) = prefetched
+        && *key == file.key
+        && bytes.len() as u64 >= file.metadata_len
+        && let Ok(dir) = Directory::decode(&bytes[..file.metadata_len as usize])
+    {
+        let resident = dir.resident_bytes();
+        return Ok(read_cache::insert(&file.key, resident, dir));
     }
     if file.metadata_len > file.size {
         return Err(segment::index_error("directory metadata exceeds object"));
@@ -81,7 +90,7 @@ pub(crate) async fn build(
         return Ok(None);
     }
     let old = match previous {
-        Some(old) => load(store, old).await.ok().map(|dir| (old, dir)),
+        Some(old) => load(store, old, None).await.ok().map(|dir| (old, dir)),
         None => None,
     };
     if let Some((old, dir)) = &old
@@ -140,15 +149,42 @@ pub(crate) async fn build(
         return Ok(None);
     };
     let len = bytes.len() as u64;
-    Ok(Some(
-        segment::put_file(
-            store,
-            format!("ns/{ns}/segments/ann-dir-{}.bfd", uuid::Uuid::new_v4()),
-            bytes,
-            len,
-        )
-        .await?,
-    ))
+    let file = segment::put_file(
+        store,
+        format!("ns/{ns}/segments/ann-dir-{}.bfd", uuid::Uuid::new_v4()),
+        bytes.clone(),
+        len,
+    )
+    .await?;
+    // A copy at a fixed key lets a cold reader fetch the directory while it reads the manifest.
+    // Best effort: readers verify the embedded key against the manifest, so a stale or missing
+    // hint only costs the extra wave.
+    let mut hint = Vec::with_capacity(bytes.len() + file.key.len() + 4);
+    hint.extend_from_slice(&(file.key.len() as u32).to_le_bytes());
+    hint.extend_from_slice(file.key.as_bytes());
+    hint.extend_from_slice(&bytes);
+    if let Err(e) = store.put(&hint_key(ns, attr), hint).await {
+        tracing::warn!(error=?e, "ANN directory hint not written");
+    }
+    Ok(Some(file))
+}
+
+/// Fixed key of the newest directory's copy for one vector attribute (protected from GC while the
+/// manifest lists a directory for it).
+pub(crate) fn hint_key(ns: &str, attr: &str) -> String {
+    let hex: String = attr.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("ns/{ns}/segments/ann-dir-latest-{hex}.bin")
+}
+
+/// A directory fetched before the manifest said which one is current: its object key and bytes.
+pub(crate) type Prefetched = (String, bytes::Bytes);
+
+/// Read the hint copy for `attr` (one GET, issued in parallel with the manifest read).
+pub(crate) async fn prefetch(store: &Storage, ns: &str, attr: &str) -> Option<Prefetched> {
+    let bytes = store.get(&hint_key(ns, attr)).await.ok()?;
+    let klen = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    let key = String::from_utf8(bytes.get(4..4 + klen)?.to_vec()).ok()?;
+    Some((key, bytes.slice(4 + klen..)))
 }
 
 async fn on_worker<T: Send + 'static>(

@@ -87,7 +87,7 @@ pub(crate) async fn search(
         // directory ranks clusters by their allowed rows without opening any segment's index
         // or ID index.
         let (dir, lives) = tokio::join!(
-            crate::ann_dir::load(store, file),
+            crate::ann_dir::load(store, file, None),
             crate::ann_dir::live_masks(store, state, q.filters.as_ref())
         );
         // A directory in an unknown (older) format is ignored: queries open each segment.
