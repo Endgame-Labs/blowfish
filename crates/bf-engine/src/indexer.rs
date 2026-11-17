@@ -562,6 +562,7 @@ impl Engine {
             manifest.stats = NamespaceStats::default();
             external = false;
         }
+        let mut merged_text: Option<bf_wal::SegmentFile> = None;
         let segments = if rebuild {
             let mut rebuilt = vec![];
             manifest.stats = NamespaceStats::default();
@@ -727,16 +728,56 @@ impl Engine {
                     .await
                 }
             };
-            let (flushed, compacted) = futures::future::try_join(flush, compacted).await?;
+            // The statistics merge needs only the tail's statistics and the previous object, not
+            // the built segments, so it runs beside the builds (it is mostly object-store
+            // transfer, and the builds leave cores idle while they wait on uploads).
+            let removed_text = removed_stats.text.clone();
+            let previous_for_merge = previous_text.clone();
+            let text_merge = async {
+                let tail_stats = match stats_job {
+                    Some(job) => Some(job.await.map_err(segment::index_error)?),
+                    None => None,
+                };
+                if !external {
+                    return Ok::<_, ApiError>((tail_stats, None));
+                }
+                let empty = NamespaceStats::default();
+                let added_text = &tail_stats.as_ref().unwrap_or(&empty).text;
+                if added_text.is_empty() && removed_text.is_empty() {
+                    return Ok((tail_stats, None));
+                }
+                let previous = previous_for_merge
+                    .as_ref()
+                    .expect("external statistics object");
+                let old = segment::read_whole_uncached(store, previous).await?;
+                let index = previous.stats_index.clone().expect("chunked statistics");
+                let (added_text, removed_text) = (added_text.clone(), removed_text.clone());
+                let (bytes, index) = tokio::task::spawn_blocking(move || {
+                    crate::text::merge_text_stats(&old, &index, &added_text, &removed_text)
+                })
+                .await
+                .map_err(segment::index_error)??;
+                let mut file = segment::put_file(
+                    store,
+                    format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
+                    bytes,
+                    0,
+                )
+                .await?;
+                file.stats_index = Some(index);
+                Ok((tail_stats, Some(file)))
+            };
+            let (flushed, compacted, (tail_stats, merged)) =
+                futures::future::try_join3(flush, compacted, text_merge).await?;
             crate::ann::stage(t0, "idx builds");
-            if let Some(job) = stats_job {
-                let stats = job.await.map_err(segment::index_error)?;
+            if let Some(stats) = tail_stats {
                 if external {
                     added_stats = stats;
                 } else {
                     manifest.stats = stats;
                 }
             }
+            merged_text = merged;
             segments.extend(flushed);
             segments.extend(compacted);
             segments
@@ -776,22 +817,25 @@ impl Engine {
             .collect();
         let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
         for attr in attributes {
-            for layout in [
+            // The two layouts are independent objects: write them at the same time.
+            let layouts = [
                 crate::ann_dir::Layout::Plain,
                 crate::ann_dir::Layout::Blocks,
-            ] {
-                let key = layout.dir_key(&attr);
-                let built = crate::ann_dir::build(
+            ];
+            let built = futures::future::try_join_all(layouts.iter().map(|layout| {
+                crate::ann_dir::build(
                     store,
                     ns,
                     &manifest.segments,
                     &attr,
-                    layout,
-                    previous_dirs.get(&key),
+                    *layout,
+                    previous_dirs.get(&layout.dir_key(&attr)),
                 )
-                .await?;
-                if let Some(file) = built {
-                    manifest.ann_dirs.insert(key, file);
+            }))
+            .await?;
+            for (layout, file) in layouts.iter().zip(built) {
+                if let Some(file) = file {
+                    manifest.ann_dirs.insert(layout.dir_key(&attr), file);
                 }
             }
         }
@@ -821,7 +865,6 @@ impl Engine {
                 .saturating_sub(removed_stats.logical_bytes);
             manifest.text_stats = previous_text.clone();
         } else if external {
-            let previous = previous_text.as_ref().expect("external statistics object");
             manifest.stats.rows = manifest
                 .stats
                 .rows
@@ -832,22 +875,7 @@ impl Engine {
                 .logical_bytes
                 .saturating_add(added_stats.logical_bytes)
                 .saturating_sub(removed_stats.logical_bytes);
-            let old = segment::read_whole_uncached(store, previous).await?;
-            let index = previous.stats_index.clone().expect("chunked statistics");
-            let (bytes, index) = tokio::task::spawn_blocking(move || {
-                crate::text::merge_text_stats(&old, &index, &added_stats.text, &removed_stats.text)
-            })
-            .await
-            .map_err(segment::index_error)??;
-            let mut file = segment::put_file(
-                store,
-                format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
-                bytes,
-                0,
-            )
-            .await?;
-            file.stats_index = Some(index);
-            manifest.text_stats = Some(file);
+            manifest.text_stats = Some(merged_text.take().expect("merged statistics object"));
         } else {
             externalize_text_stats(store, ns, &mut manifest).await?;
         }

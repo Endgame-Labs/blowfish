@@ -4,6 +4,7 @@ use bf_storage::Storage;
 use bf_text::{CorpusStats, FtsParams, Token};
 use bf_types::{ApiError, Document, Schema};
 use bf_wal::{NamespaceStats, TextStats};
+use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -122,6 +123,58 @@ pub(crate) fn encode_text_stats(
     }
     Ok((out, index))
 }
+/// A run of sorted `(term, document frequency)` pairs.
+type Block = Vec<(Vec<u8>, u64)>;
+/// Chunks decoded and re-encoded together by one merge step.
+const MERGE_WINDOW_CHUNKS: usize = 32;
+/// Encode the complete chunks of `pending` (all of it when `last`), in parallel, appending them to
+/// `out` in term order and recording them in `field`.
+fn write_full_chunks(
+    pending: &mut Vec<(Vec<u8>, u64)>,
+    out: &mut Vec<u8>,
+    field: &mut bf_wal::FieldStatsIndex,
+    last: bool,
+) -> Result<(), ApiError> {
+    let take = if last {
+        pending.len()
+    } else {
+        pending.len() / STATS_CHUNK_TERMS * STATS_CHUNK_TERMS
+    };
+    if take == 0 {
+        return Ok(());
+    }
+    let blocks: Vec<(Block, String)> = {
+        let drained: Vec<(Vec<u8>, u64)> = pending.drain(..take).collect();
+        let mut blocks = Vec::new();
+        let mut it = drained.into_iter().peekable();
+        while it.peek().is_some() {
+            let block: Vec<_> = it.by_ref().take(STATS_CHUNK_TERMS).collect();
+            let first = String::from_utf8(block[0].0.clone()).map_err(segment::index_error)?;
+            blocks.push((block, first));
+        }
+        blocks
+    };
+    let built: Vec<Vec<u8>> = blocks
+        .par_iter()
+        .map(|(block, _)| {
+            let mut builder = fst::MapBuilder::memory();
+            for (term, df) in block {
+                builder.insert(term, *df).map_err(segment::index_error)?;
+            }
+            builder.into_inner().map_err(segment::index_error)
+        })
+        .collect::<Result<_, ApiError>>()?;
+    for ((_, first), blob) in blocks.into_iter().zip(built) {
+        field.chunks.push((
+            first,
+            out.len() as u64,
+            blob.len() as u32,
+            crc32fast::hash(&blob),
+        ));
+        out.extend(blob);
+    }
+    Ok(())
+}
 /// Rewrite the out-of-line statistics object after a publication, without ever holding the term
 /// map in memory: stream the previous object's FST chunks in term order, apply the batch's
 /// term-frequency changes (`added` minus `removed`, both small and sorted), and write new chunks as
@@ -168,81 +221,52 @@ pub(crate) fn merge_text_stats(
             *delta.entry(term).or_default() -= *df as i64;
         }
         let mut delta = delta.into_iter().filter(|(_, v)| *v != 0).peekable();
-        let mut pending: Vec<(Vec<u8>, u64)> = Vec::with_capacity(STATS_CHUNK_TERMS);
-        let flush = |pending: &mut Vec<(Vec<u8>, u64)>,
-                     out: &mut Vec<u8>,
-                     field: &mut bf_wal::FieldStatsIndex|
-         -> Result<(), ApiError> {
-            if pending.is_empty() {
-                return Ok(());
-            }
-            let mut builder = fst::MapBuilder::memory();
-            for (term, df) in pending.iter() {
-                builder.insert(term, *df).map_err(segment::index_error)?;
-            }
-            let blob = builder.into_inner().map_err(segment::index_error)?;
-            field.chunks.push((
-                String::from_utf8(pending[0].0.clone()).map_err(segment::index_error)?,
-                out.len() as u64,
-                blob.len() as u32,
-                crc32fast::hash(&blob),
-            ));
-            out.extend(blob);
-            pending.clear();
-            Ok(())
-        };
-        let emit = |term: &[u8],
-                    df: u64,
-                    pending: &mut Vec<(Vec<u8>, u64)>,
-                    out: &mut Vec<u8>,
-                    field: &mut bf_wal::FieldStatsIndex|
-         -> Result<(), ApiError> {
-            if df == 0 {
-                return Ok(());
-            }
-            pending.push((term.to_vec(), df));
-            if pending.len() == STATS_CHUNK_TERMS {
-                flush(pending, out, field)?;
-            }
-            Ok(())
-        };
-        for (_, offset, len, crc) in &was.chunks {
-            let blob = old
-                .get(*offset as usize..*offset as usize + *len as usize)
-                .ok_or_else(bad)?;
-            if crc32fast::hash(blob) != *crc {
-                return Err(bad());
-            }
-            let map = fst::Map::new(blob).map_err(|_| bad())?;
-            let mut stream = fst::IntoStreamer::into_stream(&map);
-            while let Some((term, df)) = fst::Streamer::next(&mut stream) {
+        let mut pending: Vec<(Vec<u8>, u64)> = Vec::new();
+        // Old chunks are decoded and new chunks encoded in parallel, a window of chunks at a
+        // time (the work is FST decoding and building, which is most of a merge's CPU); the
+        // merge of the sorted streams stays sequential and cheap. Memory is one window.
+        for window in was.chunks.chunks(MERGE_WINDOW_CHUNKS) {
+            let decoded: Vec<Vec<(Vec<u8>, u64)>> = window
+                .par_iter()
+                .map(|(_, offset, len, crc)| {
+                    let blob = old
+                        .get(*offset as usize..*offset as usize + *len as usize)
+                        .ok_or_else(bad)?;
+                    if crc32fast::hash(blob) != *crc {
+                        return Err(bad());
+                    }
+                    let map = fst::Map::new(blob).map_err(|_| bad())?;
+                    let mut terms = Vec::with_capacity(STATS_CHUNK_TERMS);
+                    let mut stream = fst::IntoStreamer::into_stream(&map);
+                    while let Some((term, df)) = fst::Streamer::next(&mut stream) {
+                        terms.push((term.to_vec(), df));
+                    }
+                    Ok(terms)
+                })
+                .collect::<Result<_, ApiError>>()?;
+            for (term, df) in decoded.into_iter().flatten() {
                 // New terms that sort before this one.
-                while let Some((u, v)) = delta.next_if(|(u, _)| u.as_bytes() < term) {
-                    emit(
-                        u.as_bytes(),
-                        v.max(0) as u64,
-                        &mut pending,
-                        &mut out,
-                        &mut field,
-                    )?;
+                while let Some((u, v)) = delta.next_if(|(u, _)| u.as_bytes() < term.as_slice()) {
+                    if v > 0 {
+                        pending.push((u.as_bytes().to_vec(), v as u64));
+                    }
                 }
                 let change = delta
-                    .next_if(|(u, _)| u.as_bytes() == term)
+                    .next_if(|(u, _)| u.as_bytes() == term.as_slice())
                     .map_or(0, |(_, v)| v);
                 let df = (df as i64 + change).max(0) as u64;
-                emit(term, df, &mut pending, &mut out, &mut field)?;
+                if df > 0 {
+                    pending.push((term, df));
+                }
             }
+            write_full_chunks(&mut pending, &mut out, &mut field, false)?;
         }
         for (u, v) in delta {
-            emit(
-                u.as_bytes(),
-                v.max(0) as u64,
-                &mut pending,
-                &mut out,
-                &mut field,
-            )?;
+            if v > 0 {
+                pending.push((u.as_bytes().to_vec(), v as u64));
+            }
         }
-        flush(&mut pending, &mut out, &mut field)?;
+        write_full_chunks(&mut pending, &mut out, &mut field, true)?;
         merged.fields.insert(name.clone(), field);
     }
     Ok((out, merged))
@@ -651,13 +675,19 @@ mod tests {
     }
     #[test]
     fn streamed_statistics_merge_equals_the_in_memory_update() {
+        // 3 chunks, then enough chunks (about 73) to span several merge windows.
+        for terms in [10_000u64, 300_000] {
+            streamed_merge_of(terms);
+        }
+    }
+    fn streamed_merge_of(terms: u64) {
         let mut base = TextMap::new();
         let mut field = TextStats {
             documents: 100,
             total_length: 900,
             ..Default::default()
         };
-        for i in 0..10_000u64 {
+        for i in 0..terms {
             field
                 .document_frequencies
                 .insert(format!("t{:05}", i * 2), (i % 7) + 1);
@@ -679,7 +709,7 @@ mod tests {
         };
         // New terms before, inside, and after the old range; bumps; and removals that hit zero.
         for t in [
-            "a", "t00001", "t00003", "t05001", "t19999", "zzz", "t00000", "t00004",
+            "a", "t00001", "t00003", "t05001", "t19999", "t99999", "zzz", "t00000", "t00004",
         ] {
             *add.document_frequencies.entry(t.to_string()).or_default() += 1;
         }
