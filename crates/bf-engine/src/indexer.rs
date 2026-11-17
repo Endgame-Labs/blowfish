@@ -320,6 +320,7 @@ impl Engine {
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
                 && tier(&state, &self.0.config, force).is_empty()
+                && !needs_blocks(&state)
             {
                 return Ok(false);
             }
@@ -345,7 +346,12 @@ impl Engine {
                     })
             });
             let will_compact = tier(&state, &self.0.config, force);
-            if state.seq == state.indexed_through && will_compact.is_empty() && !will_rebuild {
+            let upgrade = needs_blocks(&state);
+            if state.seq == state.indexed_through
+                && will_compact.is_empty()
+                && !will_rebuild
+                && !upgrade
+            {
                 return Ok(false);
             }
             let tail_age = Utc::now()
@@ -354,6 +360,7 @@ impl Engine {
                 .unwrap_or_default();
             if !force
                 && !will_rebuild
+                && !upgrade
                 && will_compact.is_empty()
                 && ((state.shadowed.len() < self.0.config.index_rows
                     && state.tail_bytes < self.0.config.index_bytes
@@ -388,7 +395,8 @@ impl Engine {
                 })
         });
         let compact = tier(&state, &self.0.config, force);
-        if state.seq == state.indexed_through && compact.is_empty() && !rebuild {
+        let upgrade = needs_blocks(&state);
+        if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
         }
         let old = wal.latest_manifest().await.map_err(log_error)?;
@@ -402,6 +410,7 @@ impl Engine {
             .unwrap_or_default();
         if !force
             && !rebuild
+            && !upgrade
             && compact.is_empty()
             && ((state.shadowed.len() < self.0.config.index_rows
                 && state.tail_bytes < self.0.config.index_bytes
@@ -628,21 +637,36 @@ impl Engine {
         };
         manifest.deleted = false;
         manifest.segments = segments;
-        // Rebuild each vector attribute's ANN directory only when its segment list changed.
+        // Segments built before block fragments existed get theirs now (a one-time upgrade).
+        for seg in &mut manifest.segments {
+            segment::backfill_blocks(store, ns, seg).await?;
+        }
+        // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest
             .segments
             .iter()
             .flat_map(|s| s.files.keys())
-            .filter(|k| k.starts_with("ann:"))
-            .cloned()
+            .filter_map(|k| k.strip_prefix("ann:").map(str::to_string))
             .collect();
         let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
-        for key in attributes {
-            let built =
-                crate::ann_dir::build(store, ns, &manifest.segments, &key, previous_dirs.get(&key))
-                    .await?;
-            if let Some(file) = built {
-                manifest.ann_dirs.insert(key, file);
+        for attr in attributes {
+            for layout in [
+                crate::ann_dir::Layout::Plain,
+                crate::ann_dir::Layout::Blocks,
+            ] {
+                let key = layout.dir_key(&attr);
+                let built = crate::ann_dir::build(
+                    store,
+                    ns,
+                    &manifest.segments,
+                    &attr,
+                    layout,
+                    previous_dirs.get(&key),
+                )
+                .await?;
+                if let Some(file) = built {
+                    manifest.ann_dirs.insert(key, file);
+                }
             }
         }
         for old in previous_dirs.values() {
@@ -837,6 +861,18 @@ fn bulk_wait(state: &NamespaceState, config: &EngineConfig, tail_age: Duration) 
             .to_std()
             .is_ok_and(|since| since < Duration::from_secs(1))
 }
+/// Whether some segment has a vector index but no block fragment yet (built before they existed).
+fn needs_blocks(state: &NamespaceState) -> bool {
+    state.segments.iter().any(|seg| {
+        seg.files.keys().any(|k| {
+            k.strip_prefix("ann:").is_some_and(|n| {
+                seg.files.contains_key(&format!("annfrag:{n}"))
+                    && !seg.files.contains_key(&format!("annfrag2:{n}"))
+            })
+        })
+    })
+}
+
 fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<String> {
     if !force
         && state.shadowed.len() >= config.index_rows

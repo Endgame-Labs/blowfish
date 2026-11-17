@@ -217,3 +217,30 @@ of the documents file. A query over many segments already pays that final sequen
 
 Not changed: the indexer still rewrites the whole statistics object on each publication (about 5 MB at 1M, written in
 parallel with the segment uploads). Per-segment lengths are still read whole at open (about 1 byte per row now).
+
+## Iteration 11: block fragments (one read per probed cluster, in locality order)
+
+At 10M rows in 70 segments, a cold unfiltered ANN query probed about 540 clusters (64 probes) and made two reads for each:
+the cluster's blob from the fragment and its quantized codes from the segment's index object, so one query made about 1,100
+requests, and the requests (not the rerank, which is about 70 small reads) set the cold latency.
+
+A **block fragment** (`annfrag2:<attribute>`, magic `BFFRG003`) holds, for every non-empty cluster, the blob and then the
+cluster's codes, so a probe is one ranged read. The blocks are ordered along a greedy nearest-neighbor tour of the cluster
+centers, so the clusters a query probes in one segment tend to sit side by side and merge into fewer reads (measured on a real
+200K-row segment: 8 probed clusters make 4.4 ranges, against 7.8 in cluster-ID order). A block fragment has no row-to-cluster map.
+
+A second directory (`ann2:<attribute>` in `ann_dirs`, magic `BFDIR004`, its own hint copy) lists the block fragments. Unfiltered
+queries use it, and filtered ones keep using the plain directory and its maps. Both sets of objects sit side by side:
+
+- Readers that predate block fragments ignore the new manifest keys and keep using `ann:<attribute>`.
+- A segment built before block fragments gets its `annfrag2:` file from the next indexing pass, which publishes even when there is
+  nothing to flush (one whole read of the segment's index object each, a one-time cost; 70 segments of 440 MB took 540 s).
+- `BF_ANN_BLOCKS=0` makes queries ignore the block layout (A/B only).
+
+The scan prefetch: the snapshot wave starts the scan's reads (and the exact reads of flat segments) as soon as the directory is
+loaded, in parallel with the WAL tail read, for a lone unfiltered ANN query. The query's own scan then finds them in the block
+cache. A tail that shadows rows only wastes those bytes.
+
+Two smaller changes: the scan wave no longer warms every probed segment's documents footer (70 requests and 10 MB; the few
+segments with likely winners read it in the speculative document read), and the reranks run on the async runtime instead of
+on the CPU workers (they are small reads, and holding one of eight worker permits through each read's latency queued them).

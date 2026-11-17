@@ -118,3 +118,76 @@ async fn membership_gives_exact_cluster_counts_and_vector_locations() {
     let got = partial.exact_at(&query, 10, locations).await.unwrap();
     assert_eq!(got, expected);
 }
+
+#[tokio::test]
+async fn block_fragments_hold_blob_and_codes_together_and_scan_like_the_index() {
+    let dims = 64;
+    let builder = IndexBuilder::new(dims, Metric::CosineDistance)
+        .unwrap()
+        .params(BuildParams {
+            flat_threshold: 64,
+            ..BuildParams::default()
+        });
+    let blob = builder.build(&rows(4000, dims, 9)).unwrap();
+    let index = Index::open(Bytes::from(blob.clone())).await.unwrap();
+    let (fragment, meta) = Fragment::build_blocks(&blob).unwrap();
+    assert!(meta < fragment.len() as u64);
+    let frag = Fragment::decode(&fragment[..meta as usize]).unwrap();
+    let bytes = Directory::build(&[("s".into(), "k".into(), "f".into(), frag)])
+        .unwrap()
+        .unwrap();
+    let dir = Directory::decode(&bytes).unwrap();
+    let seg = &dir.segments()[0];
+    assert!(seg.codes_in_fragment);
+    assert!(seg.membership.is_none());
+    // Each block is the blob followed by the codes, so one range covers both.
+    for e in dir.entries() {
+        assert_eq!(e.blob_range().end, e.codes_range().start);
+    }
+    // A plain fragment and a block fragment cannot share a directory.
+    let (plain, plain_meta) = Fragment::build(&blob).unwrap();
+    let mixed = Directory::build(&[
+        (
+            "a".into(),
+            "k".into(),
+            "f".into(),
+            Fragment::decode(&fragment[..meta as usize]).unwrap(),
+        ),
+        (
+            "b".into(),
+            "k".into(),
+            "f".into(),
+            Fragment::decode(&plain[..plain_meta as usize]).unwrap(),
+        ),
+    ])
+    .unwrap();
+    assert!(mixed.is_none());
+    // Probing clusters through the fragment gives the index's own estimates.
+    let query: Vec<f32> = rows(1, dims, 5)[0].1.clone();
+    let wanted: Vec<usize> = dir.entries().iter().take(6).map(|e| e.cluster).collect();
+    let mut partial = dir.partial_index(0, Bytes::from(blob)).unwrap();
+    let mut codes = Vec::new();
+    for e in dir.entries().iter().take(6) {
+        let b = e.blob_range();
+        partial
+            .install(
+                e.cluster,
+                &Bytes::copy_from_slice(&fragment[b.start as usize..b.end as usize]),
+            )
+            .unwrap();
+        let c = e.codes_range();
+        codes.push(Bytes::copy_from_slice(
+            &fragment[c.start as usize..c.end as usize],
+        ));
+    }
+    let got = partial
+        .index()
+        .scan_blocks(&query, &wanted, codes, None)
+        .unwrap();
+    let expected = index.scan_clusters(&query, &wanted, None).await.unwrap();
+    assert_eq!(got.len(), expected.len());
+    for (a, b) in got.iter().zip(&expected) {
+        assert_eq!((a.row, a.cluster, a.ordinal), (b.row, b.cluster, b.ordinal));
+        assert_eq!(a.distance, b.distance);
+    }
+}

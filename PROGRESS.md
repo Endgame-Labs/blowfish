@@ -4,6 +4,12 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-17
 
+- **Perf iteration 11 (10M): block fragments, fewer requests per cold ANN query.**
+  - **Diagnosis:** a cold ANN query made 1,069 requests and read 75 MB at 64 probes (2,076 and 153 MB at 160). The scan wave is almost all of it: each probed cluster cost two reads (blob from the fragment, codes from the index object), and 64 probes are about 540 clusters over 70 segments. The rerank is about 50 small reads.
+  - **Changes:** block fragments (`annfrag2:`, directory `ann2:`, one read per probed cluster, blocks in nearest-neighbor tour order); the scan's reads start during the WAL tail read; no documents' footers in the scan wave; reranks off the CPU workers; every segment starts at once. Old binaries and filtered queries keep using the plain objects. The 10M namespace was upgraded in place (additive).
+  - **10M cold, same-session A/B, 30 queries:** 64 probes p50 / p90 2,421 / 3,291 to 1,502 / 1,834 ms (1,112 to 462 requests, 67.6 to 52.9 MB); 160 probes p50 5,422 to 3,280 ms (2,104 to 879 requests, 137.9 to 106.5 MB), with a heavy R2 tail on the p90. Recall is unchanged (0.8855 at 64, 0.9465 at 160). The stop rule is still not met.
+  - **Checked:** fmt, clippy, `cargo test`, compat 121/121 in both modes, and a test that upgrades a namespace without block fragments.
+
 - **Perf iteration 10 merged (10M): ingest and the first full 10M run.**
   - **Pipelined WAL:** up to `BF_WAL_PIPELINE` (8) groups upload at once, and slots still commit in order. On 200K docs, ingest went from 1,152 to 2,040 docs/s. The remaining limit is the VM's upload bandwidth to R2, about 14 MB/s.
   - **Other changes:** an adaptive warm pool (floor `BF_WARM_FLOOR`), and a cold open now fetches the ANN directory in parallel with the manifest.

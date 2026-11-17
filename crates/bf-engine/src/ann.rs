@@ -2,7 +2,7 @@
 //! nearest clusters, and rerank one merged candidate pool. Probing each segment separately
 //! scans and reranks once per segment, so cost grew with the segment count instead of the
 //! corpus size.
-use crate::{EngineConfig, NamespaceState, read_cache, segment, snapshot};
+use crate::{EngineConfig, NamespaceState, ann_dir::Layout, read_cache, segment, snapshot};
 use bf_storage::Storage;
 use bf_types::*;
 use bf_vector::{Candidate, Index, RoaringBitmap};
@@ -79,80 +79,44 @@ pub(crate) async fn search(
     }
     // `BF_ANN_DIRECTORY=0` forces the per-segment path (A/B measurements only).
     static DIRECTORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DIRECTORY.get_or_init(|| std::env::var("BF_ANN_DIRECTORY").is_ok_and(|v| v == "0")) {
-        // fall through
-    } else if let Some(file) = state.ann_dirs.get(&key) {
-        // Filtered queries compute each segment's allowed rows (live rows that pass the filter)
-        // alongside the directory, and read each segment's row-to-cluster map, so the
-        // directory ranks clusters by their allowed rows without opening any segment's index
-        // or ID index.
-        let (dir, lives) = tokio::join!(
-            crate::ann_dir::load(store, file, None),
-            crate::ann_dir::live_masks(store, state, q.filters.as_ref())
-        );
-        // A directory in an unknown (older) format is ignored: queries open each segment.
-        if std::env::var_os("BF_TRACE_STAGES").is_some() {
-            match &dir {
-                Ok(d) => eprintln!(
-                    "DIRECTORY covers={} dir_segments={} state_segments={}",
-                    crate::ann_dir::covers(d, &state.segments, attribute),
-                    d.segments().len(),
-                    state.segments.len()
-                ),
-                Err(e) => eprintln!("DIRECTORY unusable: {e:?}"),
-            }
-        }
-        let lives = if dir.is_ok() { Some(lives?) } else { None };
-        if let (Ok(dir), Some(lives)) = (dir, lives)
-            && crate::ann_dir::covers(&dir, &state.segments, attribute)
+    if !*DIRECTORY.get_or_init(|| std::env::var("BF_ANN_DIRECTORY").is_ok_and(|v| v == "0")) {
+        // Unfiltered queries prefer the block layout (one read per probed cluster); filtered ones
+        // need the plain fragments' row-to-cluster maps.
+        if q.filters.is_none()
+            && crate::ann_dir::blocks_enabled()
+            && let Some(file) = state.ann_dirs.get(&Layout::Blocks.dir_key(attribute))
+            && let Some(found) = from_directory(
+                store,
+                state,
+                q,
+                attribute,
+                vector,
+                config,
+                k,
+                columns,
+                file,
+                Layout::Blocks,
+            )
+            .await?
         {
-            let members = if q.filters.is_some() {
-                let members =
-                    crate::ann_dir::memberships(store, &state.segments, &dir, attribute).await?;
-                // A segment whose fragment predates the maps cannot take a filter.
-                dir.segments()
-                    .iter()
-                    .zip(&members)
-                    .all(|(s, m)| s.flat || m.is_some())
-                    .then_some(members)
-            } else {
-                None
-            };
-            if q.filters.is_none() || members.is_some() {
-                // Unindexed upserts and deletes shadow rows of the segments by ID. Rather than
-                // opening every ID index to find the shadowed rows, ask for a few extra
-                // winners and drop the shadowed ones afterwards. If the shadowed rows eat into
-                // the results so that fewer than k remain while the pool was full, use the
-                // per-segment path instead.
-                let slack = if state.shadowed.is_empty() {
-                    0
-                } else {
-                    (2 * k).max(20)
-                };
-                let (mut scores, mut docs) = crate::ann_dir::search(
-                    store,
-                    state,
-                    dir,
-                    lives,
-                    vector,
-                    config,
-                    k + slack,
-                    columns,
-                    attribute,
-                    members,
-                )
-                .await?;
-                if slack > 0 {
-                    let pooled = scores.len();
-                    scores.retain(|id, _| !state.shadowed.contains(id));
-                    docs.retain(|id, _| !state.shadowed.contains(id));
-                    if scores.len() >= k || pooled < k + slack {
-                        return Ok(Some((scores, docs)));
-                    }
-                } else {
-                    return Ok(Some((scores, docs)));
-                }
-            }
+            return Ok(Some(found));
+        }
+        if let Some(file) = state.ann_dirs.get(&key)
+            && let Some(found) = from_directory(
+                store,
+                state,
+                q,
+                attribute,
+                vector,
+                config,
+                k,
+                columns,
+                file,
+                Layout::Plain,
+            )
+            .await?
+        {
+            return Ok(Some(found));
         }
     }
     let vector: Arc<[f32]> = vector.into();
@@ -411,6 +375,97 @@ pub(crate) async fn search(
     }
     stage(t0, "hydrate");
     Ok(Some((scores, docs)))
+}
+
+/// Answer an ANN query from one namespace directory, or `None` when it cannot (stale or
+/// unusable directory, or shadowed rows eat into the results), so the caller falls back.
+#[allow(clippy::too_many_arguments)]
+async fn from_directory(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+    attribute: &str,
+    vector: &[f32],
+    config: &EngineConfig,
+    k: usize,
+    columns: &BTreeSet<String>,
+    file: &bf_wal::SegmentFile,
+    layout: Layout,
+) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+    // Filtered queries compute each segment's allowed rows (live rows that pass the filter)
+    // alongside the directory, and read each segment's row-to-cluster map, so the
+    // directory ranks clusters by their allowed rows without opening any segment's index
+    // or ID index.
+    let (dir, lives) = tokio::join!(
+        crate::ann_dir::load(store, file, None),
+        crate::ann_dir::live_masks(store, state, q.filters.as_ref())
+    );
+    // A directory in an unknown (older) format is ignored: queries open each segment.
+    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+        match &dir {
+            Ok(d) => eprintln!(
+                "DIRECTORY covers={} dir_segments={} state_segments={}",
+                crate::ann_dir::covers(d, &state.segments, attribute, layout),
+                d.segments().len(),
+                state.segments.len()
+            ),
+            Err(e) => eprintln!("DIRECTORY unusable: {e:?}"),
+        }
+    }
+    let lives = if dir.is_ok() { Some(lives?) } else { None };
+    if let (Ok(dir), Some(lives)) = (dir, lives)
+        && crate::ann_dir::covers(&dir, &state.segments, attribute, layout)
+    {
+        let members = if q.filters.is_some() {
+            let members =
+                crate::ann_dir::memberships(store, &state.segments, &dir, attribute).await?;
+            // A segment whose fragment predates the maps cannot take a filter.
+            dir.segments()
+                .iter()
+                .zip(&members)
+                .all(|(s, m)| s.flat || m.is_some())
+                .then_some(members)
+        } else {
+            None
+        };
+        if q.filters.is_none() || members.is_some() {
+            // Unindexed upserts and deletes shadow rows of the segments by ID. Rather than
+            // opening every ID index to find the shadowed rows, ask for a few extra
+            // winners and drop the shadowed ones afterwards. If the shadowed rows eat into
+            // the results so that fewer than k remain while the pool was full, use the
+            // per-segment path instead.
+            let slack = if state.shadowed.is_empty() {
+                0
+            } else {
+                (2 * k).max(20)
+            };
+            let (mut scores, mut docs) = crate::ann_dir::search(
+                store,
+                state,
+                dir,
+                lives,
+                vector,
+                config,
+                k + slack,
+                columns,
+                attribute,
+                members,
+                layout,
+            )
+            .await?;
+            if slack > 0 {
+                let pooled = scores.len();
+                scores.retain(|id, _| !state.shadowed.contains(id));
+                docs.retain(|id, _| !state.shadowed.contains(id));
+                if scores.len() >= k || pooled < k + slack {
+                    return Ok(Some((scores, docs)));
+                }
+            } else {
+                return Ok(Some((scores, docs)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// `BF_TRACE_STAGES=1` prints elapsed time at each ANN stage (diagnostics only).
