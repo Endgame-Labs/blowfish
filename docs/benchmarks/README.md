@@ -6,15 +6,22 @@ For the complete chronological engineering log across iterations 0 through 12 an
 
 ## Latest: namespace-wide ANN layout (version 0.1.12)
 
-Iteration 12 added `recluster`: a compaction that regroups every vector in the namespace into 32 slabs of about 200-row clusters, instead of clustering each segment on its own. On the 10M namespace (1,024-dim, over the internet to R2, 30 queries per arm, cold = fresh process and empty caches):
+Iteration 12 added `recluster`: a manual compaction step that regroups every vector in a namespace into 32 spatial slabs of about 200-row clusters, instead of clustering each segment on its own.
 
-| Layout | Cold p50 / p90 | Requests | MB per query | Recall@10 (200 queries) |
+Cold 10M vector search (1,024-dim `f16`, strong consistency, fresh server process with empty memory and disk caches for every query, over the internet from Los Angeles to R2; 50 queries per slab arm rotated query by query in one session where a warm 4 KB `GET` was 50.0 ms p50 and 64.8 ms p90):
+
+| Layout and setting | Cold p50 / p90 / p99 (ms) | Requests | MB per query | Recall@10 (200 queries) |
 | --- | ---: | ---: | ---: | ---: |
-| Per-segment, 160 probes | 2,916 / 4,358 ms | 880 | 116.5 | 0.9465 |
-| Namespace-wide slabs, about 42 probes | 1,082 / 1,592 ms | 383 | 47.1 | 0.9415 at 40 probes, 0.953 at 48 |
-| Same, server already running, caches dropped per query | 954 / 1,262 ms | 440 | 47.1 | same |
+| Per-segment baseline, 160 probes (`n = 30`, prior session) | 2,916 / 4,358 / 23,116 | 880 | 116.5 | 0.9465 |
+| Namespace-wide slabs, 40 probes (`BF_ANN_NPROBE=40`) | 1,075 / 1,345 / 3,043 | 357 | 45.6 | 0.9415 |
+| Namespace-wide slabs, 48 probes (`BF_ANN_NPROBE=48`) | 1,111 / 1,311 / 1,584 | 404 | 50.7 | 0.953 |
+| Namespace-wide slabs, 64 probes (`BF_ANN_NPROBE=64`) | 1,326 / 1,757 / 2,228 | 495 | 60.7 | 0.9615 |
 
-turbopuffer publishes 874 / 1,214 ms for cold vector queries at 10M. A re-timing at exactly 40, 48, and 64 probes, and in-region measurements on AWS, are in progress and will replace this table. The sections below predate iteration 12.
+- **Against turbopuffer:** turbopuffer publishes **874 / 1,214 ms** (p50 / p90) for cold 10M vector queries (768-dim, in-region) and measures **0.943** recall@10 on the same 10M dataset and 200 queries. At 48 probes (`0.953` recall@10), blowfish measures **1,111 / 1,311 ms** (about 1.27x at p50 and 1.08x at p90). In-region AWS measurements are in progress.
+- **Tail note and warm reference:** with `n = 50`, p99 is the second-slowest query, so individual object-store stalls move p99 (such as 3,043 ms at 40 probes, and 23,116 ms at `n = 30` on the per-segment baseline). Warm concurrency-1 p50 on the same slab servers over all 200 queries is **76, 78, and 101 ms** at 40, 48, and 64 probes.
+- **Limits of the layout today:** it covers unfiltered ANN only; writes made after the last `recluster` fall back to the per-segment path until the next one; `recluster` is a manual step; and building the 10M layout peaked at 16.9 GB RSS (about 17 GB).
+
+The sections below predate iteration 12.
 
 ## Against turbopuffer's published numbers (iteration 10 layout)
 

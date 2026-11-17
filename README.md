@@ -285,24 +285,32 @@ Client-side `p50 / p90` latency in milliseconds (strong consistency on queries),
 
 | Benchmark | turbopuffer published | blowfish measured |
 | --- | --- | --- |
-| Vector, 10M docs, cold | 874 / 1,214 ms | 1,082 / 1,592 ms |
-| Vector, 10M docs, cold, server already running | 874 / 1,214 ms | 954 / 1,262 ms |
-| Vector, 10M docs, warm | 14 / 17 ms | 136 / 168 ms |
+| Vector, 10M docs, cold | 874 / 1,214 ms | 1,111 / 1,311 ms |
+| Vector, 10M docs, warm | 14 / 17 ms | 136 / 168 ms (per-segment layout) |
 | BM25, 1M docs, cold | 316 / 381 ms | 1,570 / 1,885 ms |
 | BM25, 1M docs, warm | 13 / 18 ms | 77 / 108 ms |
 | Upsert, 512 KB batch | 165 / 248 ms | 792 / 1,531 ms |
 
-Cold vector search at 10M is within about 25 percent of turbopuffer's published p50 (within about 10 percent when the server is already running, which is how turbopuffer defines cold), measured over the internet rather than in-region. Cold BM25, warm queries, and upserts are still 5–10x slower; warm latency here is mostly one round trip to the bucket.
+Cold vector search at 10M is within about 27% of turbopuffer's published p50 and 8% of its p90. Cold BM25, warm queries, and upserts are still about 5 to 10x slower. Warm latency over the internet is mostly one round trip to the bucket.
 
-Setup and caveats:
+Vector notes:
 
-- **Vector setup:** 1,024-dim `f16` vectors (turbopuffer's benchmark uses 768-dim), served from the namespace-wide ANN layout built by `recluster` (32 slabs, about 200 rows per cluster), at about 42 probes. Recall@10 over 200 queries is 0.9415 at 40 probes and 0.953 at 48, against turbopuffer's measured 0.943 on the same data. A re-timing at 40, 48, and 64 probes is in progress and will replace these numbers.
-  - "Cold" is a fresh server process with empty caches for every query. "Server already running" keeps the process and its connections but drops all caches before each query.
-  - The warm vector row was measured on the previous per-segment layout at 160 probes.
+- **Data:** 1,024-dim `f16` vectors (turbopuffer's benchmark uses 768-dim). They're served from the namespace-wide ANN layout built by `recluster`: 32 slabs, about 200 rows per cluster.
+- **Settings and recall:** 48 probes (`BF_ANN_NPROBE=48`), recall@10 0.953 over 200 queries with exact ground truth. turbopuffer, measured on the same data and queries, gets 0.943.
+- **Method:** cold is a fresh server process with empty caches for every query. 50 queries; p99 1,584 ms. The warm vector row (136 / 168 ms) was measured on the previous per-segment layout at 160 probes.
+- **What the gap is:** about 1.27x at p50 and 1.08x at p90. The measurement is over the internet to R2 from Los Angeles (4 KB `GET` p50 about 50 ms in that session); turbopuffer measures in-region. In-region AWS measurements are in progress.
+- **Cost per query:** a cold query makes about 400 requests and reads about 51 MB. The previous per-segment layout made about 880 requests and read 117 MB, taking 2,916 / 4,358 ms.
+- **Limits of the layout today:**
+  - it covers unfiltered ANN only;
+  - writes made after the last `recluster` fall back to the per-segment path until the next one;
+  - `recluster` is a manual step;
+  - the build peaked at about 17 GB RSS at 10M.
+
+BM25, upsert, and warm notes:
+
 - **BM25 setup:** the BM25 corpus is 1M MS MARCO passages, 335 MB of text.
-- **Upsert setup:** each upsert batch is 68 rows, about 506 KB, measured over 300 sequential writes. A second identical run gave `p50` **2,114 ms** (`2,114 / 2,563 ms`), so treat upsert `p50` as roughly **0.8 to 2.1 s**.
-- **Network:** blowfish was measured from a VM in Los Angeles reaching an R2 bucket over the internet (TCP connect about 6 ms; a 4 KB `GET` is about 84 ms `p50`, and a `PUT` is about 260 to 300 ms `p50`). turbopuffer measures in-region.
-  - A cold vector query on the new layout makes about 380 requests and reads about 47 MB, down from about 880 requests and 117 MB on the per-segment layout. In-region measurements on AWS are in progress.
+- **Upsert setup:** each upsert batch is 68 rows, about 506 KB, measured over 300 sequential writes. A second identical run gave p50 **2,114 ms** (2,114 / 2,563 ms), so treat upsert p50 as roughly **0.8 to 2.1 s**.
+- **Network (BM25, warm, and upsert runs):** measured from the same VM in Los Angeles reaching R2 over the internet in an earlier session (TCP connect about 6 ms; a 4 KB `GET` was about 84 ms p50, and a `PUT` was about 260 to 300 ms p50).
   - Warm queries are mostly one strong-consistency round trip to the bucket. Adjusted, warm vector is about **68 / 100 ms** and warm BM25 is about **9 / 40 ms**.
   - These network-adjusted figures are estimates only, and never replace the measured numbers above.
 
@@ -324,7 +332,7 @@ Methodology, network RTT table, 1M breakdown, parity numbers, known gaps, and re
   - [`docs/security.md`](docs/security.md) — Threat model, route authorization matrix, input bounds, and durability guarantees
 - **Benchmarks, architecture, and research**
   - [`docs/benchmarks/README.md`](docs/benchmarks/README.md) — Benchmark summary, methodology, parity tables, known gaps, and reproduction guide
-  - [`docs/benchmarks.md`](docs/benchmarks.md) — Detailed engineering log across scale iterations 0–10
+  - [`docs/benchmarks.md`](docs/benchmarks.md) — Detailed engineering log across scale iterations 0–12
   - [`DESIGN.md`](DESIGN.md) — Overall architecture, object layout, WAL group commit, indexing, and query execution
   - [`docs/design/ann-directory.md`](docs/design/ann-directory.md) — Namespace-wide ANN cluster directory design
   - [`docs/design/projects-and-keys.md`](docs/design/projects-and-keys.md) — Multi-project isolation and key model design
