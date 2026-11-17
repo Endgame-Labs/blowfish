@@ -2,6 +2,22 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-17
+
+- **Perf iteration 10 merged (10M): ingest and the first full 10M run.**
+  - **Pipelined WAL:** up to `BF_WAL_PIPELINE` (8) groups upload at once, and slots still commit in order. On 200K docs, ingest went from 1,152 to 2,040 docs/s. The remaining limit is the VM's upload bandwidth to R2, about 14 MB/s.
+  - **Other changes:** an adaptive warm pool (floor `BF_WARM_FLOOR`), and a cold open now fetches the ANN directory in parallel with the manifest.
+  - **10M cold, p50 / p90:**
+    - ANN: 3,000 / 4,380 ms;
+    - BM25: 4,380 / 5,820 ms;
+    - hybrid: 4,160 / 4,770 ms;
+    - selective: 6,560 / 8,710 ms.
+
+    A cold query makes 1,100 to 2,600 requests and reads 61 to 268 MB. The target is ANN p50 ≤ 1,224 ms, so this is not there yet.
+  - **Recall at 10M:** ANN is 0.886 at 64 probes and 0.947 at 160, against turbopuffer's 0.943. Selective is 0.968 at 64 probes and 0.992 at 160.
+  - **Memory:** RSS reaches 13 to 16 GB past 7M rows and spikes during compaction. A heap profile comes next.
+  - **Fix:** prefix search on an empty chunked text dictionary no longer panics. A proptest found it.
+
 ## 2026-11-16
 
 - **Native embedding and model reranking merged.**
