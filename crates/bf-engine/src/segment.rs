@@ -414,7 +414,7 @@ fn build_text(
 ) -> Result<(Vec<u8>, u64, Option<bf_wal::TextHeaderRef>), ApiError> {
     use rayon::prelude::*;
     let mut builder = bf_text::SegmentBuilder::with_tokenizer(true, params.tokenizer);
-    for chunk in values.chunks(4096) {
+    for chunk in values.chunks(1024) {
         let tokens: Vec<Option<Vec<bf_text::Token>>> = chunk
             .par_iter()
             .map(|value| value.as_ref().map(|v| crate::text::tokens(v, &params)))

@@ -30,7 +30,7 @@ pub struct ReclusterOptions {
     pub cells: usize,
     /// Target rows per leaf cluster inside a slab.
     pub cluster_rows: usize,
-    /// Most rows in one slab (bounds the builder's memory: about 9 KB per row at 1,024 dims).
+    /// Most rows in one slab (bounds the builder's memory: about 6.6 KB per row at 1,024 dims in f16).
     pub max_slab_rows: usize,
     /// Directory for the spill file (deleted when the job ends).
     pub scratch: std::path::PathBuf,
