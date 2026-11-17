@@ -42,13 +42,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             storage_url: config.url,
         },
     );
-    // Benchmark-only (loopback, auth disabled): empty every cache and namespace handle.
+    // Bench-only (loopback, auth disabled): empty every cache on a warm process.
     let app = app.route(
-        "/__drop_caches",
+        "/_bench/drop_caches",
         axum::routing::post(move || {
             let engine = dropper.clone();
             async move {
-                engine.clear_caches().await;
+                engine.drop_caches().await;
                 "ok"
             }
         }),

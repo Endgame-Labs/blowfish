@@ -14,9 +14,11 @@ mod snapshot;
 mod sparse;
 mod streaming;
 pub use indexer::EngineConfig;
+pub use recluster::{ReclusterOptions, ReclusterReport};
 mod metadata;
 mod models;
 mod query;
+mod recluster;
 mod text;
 mod write;
 
@@ -65,6 +67,8 @@ pub(crate) struct NamespaceState {
     pub text_stats: Option<bf_wal::SegmentFile>,
     /// Namespace ANN directories by `ann:<attribute>`, valid for exactly `segments`.
     pub ann_dirs: BTreeMap<String, bf_wal::SegmentFile>,
+    /// Namespace-wide ANN layouts by attribute (valid while their covered segments are live).
+    pub ann_slabs: BTreeMap<String, bf_wal::SlabSet>,
     pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
     pub corpus: Arc<BTreeMap<String, bf_text::CorpusStats>>,
     pub created_at: DateTime<Utc>,
@@ -91,6 +95,7 @@ impl Default for NamespaceState {
             stats: Default::default(),
             text_stats: None,
             ann_dirs: BTreeMap::new(),
+            ann_slabs: BTreeMap::new(),
             scores: BTreeMap::new(),
             corpus: Arc::default(),
             created_at: Utc::now(),
@@ -126,6 +131,7 @@ impl NamespaceState {
             stats: self.stats.clone(),
             text_stats: self.text_stats.clone(),
             ann_dirs: self.ann_dirs.clone(),
+            ann_slabs: self.ann_slabs.clone(),
             scores: BTreeMap::new(),
             corpus: self.corpus.clone(),
             created_at: self.created_at,
@@ -252,6 +258,7 @@ impl NamespaceState {
         };
         self.text_stats = manifest.text_stats.clone();
         self.ann_dirs = manifest.ann_dirs.clone();
+        self.ann_slabs = manifest.ann_slabs.clone();
         self.stats = manifest.stats.clone().into();
         self.checkpoint_refreshed = Instant::now();
         true
@@ -309,6 +316,14 @@ impl Engine {
         indexer::start(&engine);
         engine
     }
+    /// Drop every cache the engine and its store hold, including resident namespace state, so
+    /// the next query is cache-cold on a warm process. For benchmarks only.
+    pub async fn drop_caches(&self) {
+        self.0.read_cache.clear();
+        self.0.store.drop_caches();
+        self.0.namespaces.lock().await.clear();
+    }
+
     /// An engine over a sub-prefix of this one's storage, such as a project's namespaces. It
     /// shares the storage backend, caches' byte budgets, and query concurrency with this
     /// engine, but its namespaces are separate, with their own handles and background indexing.
@@ -1048,7 +1063,9 @@ async fn commit_front(
                 Some(ApiError::new(503, "WAL position changed"))
             } else {
                 let stage = Instant::now();
-                match wal.commit(front.seq, &front.entry, &staged).await {
+                let committed = wal.commit(front.seq, &front.entry, &staged).await;
+                bf_wal::record_commit(&committed, front.start);
+                match committed {
                     Ok(CreateResult::Conflict) => {
                         retry = true;
                         Some(ApiError::new(503, "WAL slot lost"))
@@ -1340,6 +1357,7 @@ mod tail_tests {
             stats: Default::default(),
             text_stats: None,
             ann_dirs: Default::default(),
+            ann_slabs: Default::default(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],

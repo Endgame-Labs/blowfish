@@ -137,6 +137,11 @@ struct Heartbeat {
     updated_at: DateTime<Utc>,
 }
 impl Storage {
+    /// Empty this store's block caches. For benchmarks that need a cache-cold, process-warm
+    /// state; no public route calls it.
+    pub fn drop_caches(&self) {
+        self.0.cache.drop_all();
+    }
     /// Open a local or S3-compatible URL, probe create semantics, and acquire a fallback heartbeat.
     pub async fn open(config: &StorageConfig) -> Result<Self, Error> {
         let url = url::Url::parse(&config.url).map_err(|_| Error::Config("invalid storage URL"))?;

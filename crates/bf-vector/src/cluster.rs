@@ -280,3 +280,19 @@ fn train(data: &[&[f32]], k: usize, iterations: usize, rng: &mut Rng) -> Vec<Vec
     }
     centers
 }
+
+/// Lloyd k-means on `data` (rows already prepared for the metric), for coarse partitions such as
+/// the slab cells of a recluster. Deterministic for a seed.
+pub fn kmeans(data: &[&[f32]], k: usize, iterations: usize, seed: u64) -> Vec<Vec<f32>> {
+    train(data, k.min(data.len()), iterations, &mut Rng(seed))
+}
+
+/// Index of the center nearest to `v` (squared Euclidean distance).
+pub fn nearest_center(v: &[f32], centers: &[Vec<f32>]) -> usize {
+    nearest(v, centers)
+}
+
+/// Unit-normalize `v` for cosine metrics; a copy for Euclidean ones.
+pub fn prepare_vector(v: &[f32], metric: Metric) -> Vec<f32> {
+    prepare(v, metric)
+}

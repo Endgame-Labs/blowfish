@@ -128,7 +128,7 @@ impl Disk {
         Ok(())
     }
 
-    /// Remove every cached block (benchmarks use this to measure cache-cold reads).
+    /// Delete every cached block (bench cold-cache runs).
     pub(crate) fn clear(&mut self) {
         let names: Vec<String> = self.entries.keys().cloned().collect();
         for name in names {
