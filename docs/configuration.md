@@ -32,8 +32,8 @@ are errors. Nested storage settings currently follow `bf-storage`'s parser.
 | `engine.lease_duration_ms` | `--lease-duration-ms` | `BLOWFISH_LEASE_DURATION_MS` | 30000 |
 | `engine.max_unindexed_bytes` | `--max-unindexed-bytes` | `BLOWFISH_MAX_UNINDEXED_BYTES` | 2000000000 |
 | `engine.eventual_tail_bytes` | `--eventual-tail-bytes` | `BLOWFISH_EVENTUAL_TAIL_BYTES` | 134217728 |
-| `engine.ann_nprobe` | `--ann-nprobe` | `BLOWFISH_ANN_NPROBE` | 128 |
-| `engine.ann_rerank_factor` | `--ann-rerank-factor` | `BLOWFISH_ANN_RERANK_FACTOR` | 64 |
+| `engine.ann_nprobe` | `--ann-nprobe` | `BLOWFISH_ANN_NPROBE` | 64 |
+| `engine.ann_rerank_factor` | `--ann-rerank-factor` | `BLOWFISH_ANN_RERANK_FACTOR` | 32 |
 | `engine.recall_sample_rate` | `--recall-sample-rate` | `BLOWFISH_RECALL_SAMPLE_RATE` | 0.01 |
 | `storage.cache.memory_bytes` | `--cache-memory-bytes` | `BLOWFISH_CACHE_MEMORY_BYTES` | host/container limit / 4, capped at 8 GiB |
 | `storage.cache.disk_bytes` | `--cache-disk-bytes` | `BLOWFISH_CACHE_DISK_BYTES` | 68719476736 |
