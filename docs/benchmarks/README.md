@@ -2,9 +2,78 @@
 
 This page summarizes blowfish's measured query and upsert latency against turbopuffer's published numbers, along with the network round-trip profile, 1M multi-workload breakdown, recall and result-set parity, ingest throughput, known engineering gaps, and reproduction commands.
 
-For the complete chronological engineering log across iterations 0 through 12 and the full apples-to-apples run notes, see [`../benchmarks.md`](../benchmarks.md).
+For the complete chronological engineering log across iterations 0 through 12, the apples-to-apples R2 runs, and the AWS in-region runs, see [`../benchmarks.md`](../benchmarks.md).
 
-## Latest: namespace-wide ANN layout (version 0.1.12)
+## In-region on AWS S3 (version 0.1.12)
+
+Measured on `c7gd.2xlarge` (8 vCPU, 16 GB) in `us-west-2` reading a same-region S3 bucket (`v0.1.12`, `main` at `1901a41`), with the 10M English Wikipedia namespace copied unchanged from R2 (1,024-dim `f16` vectors, 70 segments, and 32 spatial slabs built by `recluster`) and the 1M MS MARCO passage corpus (335 MB of text). Client-side `p50 / p90` latency in milliseconds with strong consistency on queries (fresh read-only server process and empty memory and disk caches per cold query), compared against turbopuffer's [published benchmarks](https://turbopuffer.com/docs/performance):
+
+| Benchmark | turbopuffer published | blowfish in-region |
+| --- | --- | --- |
+| Vector, 10M, cold (48 probes, recall@10 0.953 vs turbopuffer's 0.943) | 874 / 1,214 ms | 662 / 991 ms |
+| Vector, 10M, warm (48 probes) | 14 / 17 ms | 70.7 / 84.1 ms |
+| BM25, 1M, cold | 316 / 381 ms | 453 / 569 ms |
+| BM25, 1M, warm | 13 / 18 ms | 17.1 / 34.5 ms |
+
+In-region, blowfish's cold vector search at 10M is faster than turbopuffer's published p50 and p90 at higher recall. Cold BM25 is about 43% / 49% slower and is being worked on. Warm vector is still about 5x slower. Upserts were not measured in-region; see the over-the-internet R2 section below.
+
+### 10M vector: probe sweep and layout comparison
+
+Cold `p50 / p90` in milliseconds on `c7gd.2xlarge` across the 32-slab `recluster` layout (`BF_ANN_NPROBE` = 40, 48, and 64) and the 70-segment per-segment baseline (`BF_ANN_SLABS=0`, 160 probes):
+
+| Arm | Fresh p50 / p90 (ms) | Gap vs. published | Cache-cold p50 / p90 (ms) | Gap vs. published | Recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| turbopuffer published (768-dim) | 874 / 1,214 | | | | 0.943 |
+| Slabs, 40 probes | 642 / 806 | -27% / -34% | 558 / 699 | -36% / -42% | 0.9415 |
+| Slabs, 48 probes | 662 / 991 | -24% / -18% | 574 / 652 | -34% / -46% | 0.953 |
+| Slabs, 64 probes | 773 / 969 | -12% / -20% | 630 / 746 | -28% / -39% | 0.9615 |
+| Per-segment, 160 probes (slabs off) | 1,079 / 1,336 | +23% / +10% | 924 / 1,071 | +6% / -12% | 0.9465 |
+
+Tail latency, object-store I/O per cold query, and warm latency (`1,000` queries at concurrency 1):
+
+| Arm | Fresh p99 (ms) | Cache-cold p99 (ms) | Requests | MB | Waves | Warm p50 / p90 / p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Slabs, 40 probes | 1,078 | 1,038 | 357 | 45.6 | 3.4 | 67.5 / 80.9 / 96.0 |
+| Slabs, 48 probes | 1,454 | 816 | 404 | 50.7 | 3.5 | 70.7 / 84.1 / 99.0 |
+| Slabs, 64 probes | 1,080 | 872 | 495 | 60.7 | 3.6 | 84.0 / 101.9 / 117.8 |
+| Per-segment, 160 probes (slabs off) | 1,543 | 2,371 | 844 | 115.2 | 3.2 | 96.9 / 106.2 / 112.3 |
+
+- **Vectors and sampling:** vectors are 1,024-dim `f16` (while turbopuffer's published benchmark uses 768-dim). "Fresh" starts a new server process with an empty cache per query (50 queries per arm, rotated in the same session). "Cache-cold" runs against a warm server process with caches dropped before each query via `POST /_bench/drop_caches` (turbopuffer's definition of cold). `Recall@10` is measured over all 200 held-out queries from a warm 1,000-query run.
+- **Per-stage breakdown (one cache-cold 48-probe slab query):** 477 ms in-process (`308 ms` snapshot total and `169 ms` execution total) and 660 ms of CPU summed across threads. Wave 0 reads the two ANN directory hints (`15.3 MB`, `100 ms`), wave 1 reads the WAL tail (`2` requests, `23 ms`), wave 2 prefetches scan fragments (`361` requests, `36.8 MB`, `181 ms`), and wave 3 reads rerank vectors plus two dependent document hops (`67` requests, `123 ms`), with `34 ms` of scan CPU and `162 ms` of in-process rerank and hydration. About 70% of wall time is waiting on S3, making the 15.3 MB directory-hint wave 0 the clearest single target. By comparison, one cache-cold per-segment query at 160 probes took `899 ms` wall time and `1,690 ms` of CPU, moving `113 MB` in `705` requests (`550 ms`) in its fragment wave alone.
+- **Limits of the `recluster` layout today:** it covers unfiltered ANN only; writes made after the last `recluster` fall back to the per-segment path until the next one; `recluster` is a manual step; and building the 10M layout peaked at 16.9 GB RSS (about 17 GB).
+
+### 1M BM25 (MS MARCO)
+
+| Mode | turbopuffer published (p50 / p90) | blowfish in-region (p50 / p90) | Gap vs. published |
+| --- | ---: | ---: | ---: |
+| Cold, fresh process | 316 / 381 ms | 453 / 569 ms | +43% / +49% |
+| Cold, cache-cold (`POST /_bench/drop_caches`) | | 420 / 512 ms | +33% / +34% |
+| Warm (round 11 code) | 13 / 18 ms | 17.1 / 34.5 ms | |
+
+- **Cold I/O and bottleneck:** each cold BM25 query makes `156` requests and reads `17.1 MB`. About 4 sequential waves at 25–30 ms per round trip, plus CPU, dominate the remaining cold gap; wave count, rather than bytes, sets the floor because only 17.1 MB moves.
+
+### Network floor and instance sizing (`us-west-2`)
+
+Instance-to-S3 round-trip floor in `us-west-2`:
+
+| Measurement | p50 | p90 |
+| --- | ---: | ---: |
+| TCP connect | 1.6 ms | 2.2 ms |
+| TLS handshake | 26.9 ms | 27.7 ms |
+| 4 KB `GET` | 24.5 ms | 30.5 ms |
+| 1 MB `GET` | 30.2 ms | 36.1 ms |
+
+Latency across `c7gd` instance sizes (`p50 / p90` in ms, except warm `p50` and swap pages out):
+
+| Instance size | Slab 40 fresh | Slab 48 cache-cold | Slab 64 fresh | BM25 cold fresh | Warm p50 (40) | Swap pages out |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `c7gd.2xlarge` (8 vCPU, 16 GB) | 642 / 806 | 574 / 652 | 773 / 969 | 453 / 569 | 67.5 | 0 |
+| `c7gd.xlarge` (4 vCPU, 8 GB) | 566 / 730 | 650 / 845 | 673 / 976 | 501 / 682 | 71.3 | 0 |
+| `c7gd.large` (2 vCPU, 4 GB) | 728 / 961 | 661 / 781 | 857 / 1,152 | 509 / 720 | 114 | 8 |
+
+- **Sizing verdict:** `c7gd.xlarge` is the smallest instance size whose cold numbers stay within noise of `c7gd.2xlarge`. `c7gd.large` works (1 GiB block cache, 256 MB decoded cache, and an NVMe swap file that was barely touched) and still beats turbopuffer's published cold vector `p50` and `p90` at 40 and 48 probes, though it is 15–20% slower on fresh `p50` and 1.7x slower warm because it has 2 vCPUs.
+
+## Over the internet to Cloudflare R2 (version 0.1.12)
 
 Iteration 12 added `recluster`: a manual compaction step that regroups every vector in a namespace into 32 spatial slabs of about 200-row clusters, instead of clustering each segment on its own.
 
@@ -17,17 +86,16 @@ Cold 10M vector search (1,024-dim `f16`, strong consistency, fresh server proces
 | Namespace-wide slabs, 48 probes (`BF_ANN_NPROBE=48`) | 1,111 / 1,311 / 1,584 | 404 | 50.7 | 0.953 |
 | Namespace-wide slabs, 64 probes (`BF_ANN_NPROBE=64`) | 1,326 / 1,757 / 2,228 | 495 | 60.7 | 0.9615 |
 
-- **Against turbopuffer:** turbopuffer publishes **874 / 1,214 ms** (p50 / p90) for cold 10M vector queries (768-dim, in-region) and measures **0.943** recall@10 on the same 10M dataset and 200 queries. At 48 probes (`0.953` recall@10), blowfish measures **1,111 / 1,311 ms** (about 1.27x at p50 and 1.08x at p90). In-region AWS measurements are in progress.
+- **Against turbopuffer over the internet:** turbopuffer publishes **874 / 1,214 ms** (p50 / p90) for cold 10M vector queries (768-dim, in-region) and measures **0.943** recall@10 on the same 10M dataset and 200 queries. At 48 probes (`0.953` recall@10), blowfish over the internet to R2 measures **1,111 / 1,311 ms** (about 1.27x at p50 and 1.08x at p90).
 - **Tail note and warm reference:** with `n = 50`, p99 is the second-slowest query, so individual object-store stalls move p99 (such as 3,043 ms at 40 probes, and 23,116 ms at `n = 30` on the per-segment baseline). Warm concurrency-1 p50 on the same slab servers over all 200 queries is **76, 78, and 101 ms** at 40, 48, and 64 probes.
-- **Limits of the layout today:** it covers unfiltered ANN only; writes made after the last `recluster` fall back to the per-segment path until the next one; `recluster` is a manual step; and building the 10M layout peaked at 16.9 GB RSS (about 17 GB).
 
-The sections below predate iteration 12.
+The R2 sections below predate iteration 12 (except where noted) and retain the BM25, upsert, network, 1M multi-workload, and parity measurements.
 
-## Against turbopuffer's published numbers (iteration 10 layout)
+## Over the internet to Cloudflare R2 (iteration 10 layout)
 
-Client-side `p50 / p90` latency in milliseconds (with strong consistency on every query), compared against turbopuffer's [published benchmarks](https://turbopuffer.com/docs/performance):
+Client-side `p50 / p90` latency in milliseconds over the internet to R2 (with strong consistency on every query), compared against turbopuffer's [published benchmarks](https://turbopuffer.com/docs/performance):
 
-| Benchmark | turbopuffer published (p50 / p90) | blowfish measured (p50 / p90) | Ratio (p50 / p90) |
+| Benchmark | turbopuffer published (p50 / p90) | blowfish measured on R2 (p50 / p90) | Ratio (p50 / p90) |
 | --- | ---: | ---: | ---: |
 | Vector, 10M docs, cold (`BF_ANN_NPROBE=160`) | 874 / 1,214 ms | 5,175 / 6,528 ms | 5.9x / 5.4x |
 | Vector, 10M docs, warm (`BF_ANN_NPROBE=160`) | 14 / 17 ms | 136 / 168 ms | 9.7x / 9.9x |
@@ -35,7 +103,7 @@ Client-side `p50 / p90` latency in milliseconds (with strong consistency on ever
 | BM25, 1M docs, warm | 13 / 18 ms | 77 / 108 ms | 5.9x / 6.0x |
 | Upsert, 512 KB batch | 165 / 248 ms | 792 / 1,531 ms | 4.8x / 6.2x |
 
-Today blowfish is about 5–6x slower than turbopuffer on cold queries and 6–10x slower on warm queries, at matching recall. Most of the cold gap is engineering work in progress: fewer requests and fewer bytes per cold query.
+On the iteration 10 per-segment layout over the internet to R2, blowfish was about 5–6x slower than turbopuffer on cold queries and 6–10x slower on warm queries, at matching recall.
 
 ### Vector search: 10M documents, strong consistency
 
@@ -78,7 +146,7 @@ Today blowfish is about 5–6x slower than turbopuffer on cold queries and 6–1
 - **Setup and session variance:** each batch contains 68 synthetic rows (about 506 KB of JSON: 30–70 pseudo-random words of text, a category string, and a 768-dim `f32` vector as a JSON array), sent as 300 sequential writes into a fresh namespace with the background indexer running and acknowledged once durable in object storage (zero `429` retries). Two identical 300-write runs differed by 2.7x (`792 ms` vs. `2,114 ms` `p50`) due to bucket write-latency variance across hours, so treat upsert `p50` as roughly **0.8 to 2.1 s**.
 - **Write path and network-adjusted estimate:** each sequential write executes two `PUT`s (the WAL payload, then the conditional slot record). As a `p50` estimate only on run 2, replacing two ~270 ms `PUT` round trips with 15 ms in-region `PUT`s leaves ~282 ms (~656 ms if adjusted using the 83.5 ms `GET` RTT).
 
-## Network and environment
+## Network and environment (R2 runs)
 
 - **Compute host:** an 8-vCPU x86-64 VM (AMD EPYC 9354P, Zen 4) in Los Angeles with 32 GiB RAM and local NVMe, running no other heavy workloads during measurements. The benchmark server runs inside a `systemd` scope with `MemoryHigh=14G`, `MemoryMax=16G`, 6 Rayon worker threads, and an 8 GiB memory block cache (`4,000`-byte blocks).
 - **Object-storage path:** blowfish reaches an R2 bucket (location hint `WNAM`) over the public internet, whereas turbopuffer measures in-region next to object storage. Direct measurements from this VM (`bench/scale/r2_rtt.py` and single-object `PUT` probes) show:
@@ -120,7 +188,8 @@ Every query requests `top_k = 10` (or `limit = 10` for `multi_query`) with **str
 
 ### Cold vs. warm definitions
 
-- **Cold (`bench/scale/ab.py`):** each measured cold query runs at concurrency 1 against a **freshly started, read-only server process** with an **empty 8 GiB memory cache and a newly created, empty local disk cache**. After startup, the harness waits 1.5 s for the HTTP connection warmer to establish idle TLS connections to the bucket (matching an already-running node serving a cold namespace), then times one query. Every manifest, cluster directory, posting-list chunk, quantized code block, and candidate document is fetched over the network from object storage.
+- **Cold, fresh process (`bench/scale/ab.py`):** each measured cold query runs at concurrency 1 against a **freshly started, read-only server process** with an **empty 8 GiB memory cache and a newly created, empty local disk cache**. After startup, the harness waits 1.5 s for the HTTP connection warmer to establish idle TLS connections to the bucket (matching an already-running node serving a cold namespace), then times one query. Every manifest, cluster directory, posting-list chunk, quantized code block, and candidate document is fetched over the network from object storage.
+- **Cache-cold, process-warm (`bench/scale/ab.py --cachecold`):** one long-lived read-only server process keeps its S3/R2 connections warm while `POST /_bench/drop_caches` empties memory, disk, decoded-metadata, and namespace-handle caches before every measured query (turbopuffer's definition of cold).
 - **Warm (`bench/scale/warm.py`):** a read-only server process completes unmeasured warm-up passes over the query set (two passes for 10M vector, one pass for 1M BM25), then runs 1,000 measured queries sequentially at concurrency 1 over a keep-alive HTTP connection. Active index metadata and data blocks reside in local memory and NVMe caches, while strong consistency still issues one bucket round trip per query to check the WAL tail.
 
 ## 1M Wikipedia query breakdown
@@ -243,7 +312,7 @@ The scale and apples-to-apples harness lives in [`bench/scale/`](../../bench/sca
    uv run bench/scale/upsert_bench.py http://127.0.0.1:8300 upsert-bench --writes 300 --target-kb 512 --delete
    ```
 
-   Stop the writable server before running read-only query benchmarks (`systemctl --user stop scale-server.scope`).
+   Stop the writable server before running read-only query benchmarks (`systemctl --user stop scale-server.scope`). Because a writable server indexes, compacts, and collects garbage in every namespace under its storage prefix, point writable loader servers at an isolated prefix holding only the namespace being loaded when preserving an existing benchmark namespace.
 
 5. **Measure cold latency (`ab.py`) and warm latency (`warm.py`):**
 
