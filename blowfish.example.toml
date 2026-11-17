@@ -32,6 +32,7 @@ index_interval_ms = 250
 compaction_segments = 4
 retention_ms = 3600000
 lease_duration_ms = 30000
+# Default: a sixteenth of the memory limit (host RAM or cgroup), within 128 MiB to 2 GB.
 max_unindexed_bytes = 2000000000
 eventual_tail_bytes = 134217728
 ann_nprobe = 64

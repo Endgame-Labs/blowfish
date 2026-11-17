@@ -327,9 +327,8 @@ impl Engine {
                         .map_err(segment::index_error)?
                         .params(params)
                         .vector_type(dtype)
-                        .build(&vectors)
+                        .build_owned(vectors)
                         .map_err(segment::index_error)?;
-                    drop(vectors);
                     let (frag, frag_meta) =
                         bf_vector::Fragment::build_blocks(&blob).map_err(segment::index_error)?;
                     Ok((blob, frag, frag_meta))

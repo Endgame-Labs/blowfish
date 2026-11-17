@@ -484,7 +484,7 @@ pub(crate) async fn build<D: std::borrow::Borrow<Document>>(
                 bf_vector::IndexBuilder::new(dimensions, metric)?
                     .params(params)
                     .vector_type(dtype)
-                    .build(&vectors)
+                    .build_owned(vectors)
             });
             ann_jobs.push((name.clone(), column, job));
         }
