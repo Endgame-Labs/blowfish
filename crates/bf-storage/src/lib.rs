@@ -119,6 +119,7 @@ struct Inner {
     healthy: AtomicBool,
     writer: Uuid,
     serial: Mutex<()>,
+    activity: Arc<observed::Activity>,
 }
 /// Cloneable store handle. Creates carry a portable body header with a retry identity.
 #[derive(Clone)]
@@ -221,31 +222,54 @@ impl Storage {
         )
         .await?;
         if url.scheme() == "s3" {
-            let warm = std::env::var("BF_WARM_CONNECTIONS")
+            let fixed = std::env::var("BF_WARM_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let floor = std::env::var("BF_WARM_FLOOR")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(config.warm_connections);
-            store.spawn_connection_warmer(warm);
+                .unwrap_or(16);
+            store.spawn_connection_warmer(PoolSizer::new(
+                fixed,
+                config.warm_connections,
+                floor,
+                1024,
+                Duration::from_secs(600),
+            ));
         }
         Ok(store)
     }
-    /// Keep about `count` idle connections open to the object store: a cold wave of N parallel
-    /// reads otherwise pays a TLS handshake per request (measured at about 65 ms each, and about
-    /// half the wall time of a 250-request wave). Refreshes before the pool's idle timeout.
-    fn spawn_connection_warmer(&self, count: usize) {
-        if count == 0 {
+    /// Keep idle connections open to the object store: a cold wave of N parallel reads otherwise
+    /// pays a TLS handshake per request (measured at about 65 ms each, and about half the wall
+    /// time of a 250-request wave). The pool follows the largest recent wave (see `PoolSizer`),
+    /// grows within seconds of a bigger wave, and decays to a small floor after an idle period, so
+    /// an idle server does not pay for hundreds of keepalive HEADs. Refreshes before the pool's
+    /// idle timeout.
+    fn spawn_connection_warmer(&self, mut sizer: PoolSizer) {
+        if sizer.fixed == Some(0) {
             return;
         }
         let weak = Arc::downgrade(&self.0);
         tokio::spawn(async move {
+            let mut warmed = 0usize;
+            let mut last_refresh: Option<std::time::Instant> = None;
             loop {
                 let Some(inner) = weak.upgrade() else { break };
                 let path = Path::from(format!("{}/.warm", inner.prefix));
                 let backend = inner.backend.clone();
+                let peak = inner.activity.take_peak();
                 drop(inner);
-                // HEAD of a missing key answers 404 on a connection that then returns to the pool.
-                futures::future::join_all((0..count).map(|_| backend.head(&path))).await;
-                tokio::time::sleep(Duration::from_secs(45)).await;
+                let now = std::time::Instant::now();
+                let target = sizer.observe(peak, now);
+                let due =
+                    last_refresh.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(45));
+                if target > 0 && (due || target > warmed) {
+                    // HEAD of a missing key answers 404 on a connection that then returns to the pool.
+                    futures::future::join_all((0..target).map(|_| backend.head(&path))).await;
+                    warmed = target;
+                    last_refresh = Some(std::time::Instant::now());
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
     }
@@ -279,7 +303,8 @@ impl Storage {
                 .expect("cache identity serializes");
         }
         let cache = cache::RangeCache::open(cache).await?;
-        let backend: Arc<dyn ObjectStore> = Arc::new(observed::Observed(backend));
+        let activity = Arc::new(observed::Activity::default());
+        let backend: Arc<dyn ObjectStore> = Arc::new(observed::Observed(backend, activity.clone()));
         let conditional = if read_only {
             true
         } else {
@@ -300,6 +325,7 @@ impl Storage {
                 healthy: AtomicBool::new(true),
                 writer: Uuid::new_v4(),
                 serial: Mutex::new(()),
+                activity,
             }),
             Arc::from(""),
         );
@@ -766,4 +792,72 @@ fn profile_credentials(profile: &str) -> Result<(String, String, Option<String>)
         secret.ok_or(Error::Config("AWS profile secret missing"))?,
         token,
     ))
+}
+
+/// Chooses how many idle connections to keep: 1.25 times the largest wave of parallel reads seen in
+/// the last `window`, between `floor` and `ceiling`. It starts from `initial` so the first query
+/// after startup finds a warm pool, and falls to `floor` once the window passes without a wave that
+/// big. `fixed` (from `BF_WARM_CONNECTIONS`) overrides all of it.
+#[derive(Debug)]
+pub(crate) struct PoolSizer {
+    fixed: Option<usize>,
+    floor: usize,
+    ceiling: usize,
+    window: Duration,
+    demand: usize,
+    demand_at: std::time::Instant,
+}
+impl PoolSizer {
+    pub(crate) fn new(
+        fixed: Option<usize>,
+        initial: usize,
+        floor: usize,
+        ceiling: usize,
+        window: Duration,
+    ) -> Self {
+        Self {
+            fixed,
+            floor,
+            ceiling,
+            window,
+            demand: initial.min(ceiling),
+            demand_at: std::time::Instant::now(),
+        }
+    }
+    /// Record the peak concurrency of the last tick and return the pool size to hold.
+    pub(crate) fn observe(&mut self, peak: usize, now: std::time::Instant) -> usize {
+        if let Some(n) = self.fixed {
+            return n;
+        }
+        let scaled = peak + peak / 4;
+        if scaled >= self.demand || now.duration_since(self.demand_at) > self.window {
+            self.demand = scaled;
+            self.demand_at = now;
+        }
+        self.demand.clamp(self.floor, self.ceiling)
+    }
+}
+#[cfg(test)]
+mod pool_sizer_tests {
+    use super::*;
+    #[test]
+    fn follows_the_largest_wave_and_decays_when_idle() {
+        let t0 = std::time::Instant::now();
+        let mut s = PoolSizer::new(None, 256, 16, 1024, Duration::from_secs(600));
+        assert_eq!(s.observe(0, t0), 256, "starts warm");
+        assert_eq!(s.observe(900, t0), 1024, "grows to the wave, capped");
+        assert_eq!(
+            s.observe(10, t0 + Duration::from_secs(300)),
+            1024,
+            "keeps it inside the window"
+        );
+        assert_eq!(
+            s.observe(10, t0 + Duration::from_secs(700)),
+            16,
+            "decays to the floor"
+        );
+        assert_eq!(s.observe(200, t0 + Duration::from_secs(710)), 250);
+        let mut f = PoolSizer::new(Some(64), 256, 16, 1024, Duration::from_secs(1));
+        assert_eq!(f.observe(900, t0), 64, "override wins");
+    }
 }
