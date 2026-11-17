@@ -281,23 +281,30 @@ Writes are group-committed to a write-ahead log in object storage using create-o
 
 ## Benchmarks
 
-Comparison against turbopuffer's [published cold latency](https://turbopuffer.com/docs/performance):
+Client-side `p50 / p90` latency in milliseconds (strong consistency on queries), compared against turbopuffer's [published numbers](https://turbopuffer.com/docs/performance):
 
-| Workload | turbopuffer published | blowfish measured |
+| Benchmark | turbopuffer published | blowfish measured |
 | --- | --- | --- |
-| Vector search, cold, p50 / p90 | 874 / 1,214 ms (10M docs, 768-dim, in-region) | 10M: 3,000 / 4,380 ms (1024-dim); 1M: 1,278 / 1,593 ms |
-| BM25, 1M docs, cold, p50 / p90 | 316 / 381 ms | 869 / 1,594 ms |
+| Vector, 10M docs, cold | 874 / 1,214 ms | 5,175 / 6,528 ms |
+| Vector, 10M docs, warm | 14 / 17 ms | 136 / 168 ms |
+| BM25, 1M docs, cold | 316 / 381 ms | 1,570 / 1,885 ms |
+| BM25, 1M docs, warm | 13 / 18 ms | 77 / 108 ms |
+| Upsert, 512 KB batch | 165 / 248 ms | 792 / 1,531 ms |
 
-blowfish is slower than turbopuffer on cold queries today. At 10M documents, cold vector search is about 3.4x slower at p50: a cold query issues about 1,100 object-store requests and reads about 69 MB, which is the primary engineering gap.
+Today blowfish is about 5–6x slower than turbopuffer on cold queries and 6–10x slower on warm queries, at matching recall. Most of the cold gap is engineering work in progress: fewer requests and fewer bytes per cold query.
 
-Context and caveats on the blowfish numbers:
+Setup and caveats:
 
-- **Network and hardware:** measured from an 8-vCPU VM reaching Cloudflare R2 over the public internet at about 72 ms per request (p99 309 ms), whereas turbopuffer measures in-region next to object storage.
-- **Consistency and cache state:** every query uses strong consistency, and every cold query runs on a fresh server process with an empty disk cache.
-- **Warm latency:** warm queries from this VM take about 50–60 ms, most of which is the strong-consistency check against R2 (one `HEAD` request, about 55 ms from this host).
-- **Recall:** on the same 1M English Wikipedia dataset against exact ground truth, recall@10 is **0.952** for blowfish and **0.938** for turbopuffer. At 10M with default settings (`nprobe = 64`), blowfish recall@10 is **0.886** against turbopuffer's measured **0.943** on the same data; raising probes to 160 (`BF_ANN_NPROBE=160`) brings recall@10 to **0.947**. A stricter, like-for-like in-region comparison is being measured.
+- **Vector setup:** blowfish's vector rows use 1,024-dim `f16` vectors (turbopuffer's benchmark uses 768-dim), at 160 probes (`BF_ANN_NPROBE=160`). That setting gives recall@10 of **0.952** cold and **0.947** warm, against turbopuffer's measured **0.943** on the same data.
+  - At the default 64 probes, cold is **2,790 / 3,862 ms** and warm is **88 / 128 ms**, but recall@10 drops to **0.886**.
+- **BM25 setup:** the BM25 corpus is 1M MS MARCO passages, 335 MB of text.
+- **Upsert setup:** each upsert batch is 68 rows, about 506 KB, measured over 300 sequential writes. A second identical run gave `p50` **2,114 ms** (`2,114 / 2,563 ms`), so treat upsert `p50` as roughly **0.8 to 2.1 s**.
+- **Network:** blowfish was measured from a VM in Los Angeles reaching an R2 bucket over the internet (TCP connect about 6 ms; a 4 KB `GET` is about 84 ms `p50`, and a `PUT` is about 260 to 300 ms `p50`). turbopuffer measures in-region.
+  - A network-adjusted estimate (assuming 15 ms in-region round trips) barely changes cold: for example, vector cold would be about **4,870 / 6,222 ms**, because a cold query makes 1,100 to 2,100 requests and reads 67 to 137 MB. It is bound by bytes and request count, not round-trip time.
+  - Warm queries are mostly one strong-consistency round trip to the bucket. Adjusted, warm vector is about **68 / 100 ms** and warm BM25 is about **9 / 40 ms**.
+  - These network-adjusted figures are estimates only, and never replace the measured numbers above.
 
-Methodology, full 1M and 10M tables, parity numbers, and reproduction scripts: [`docs/benchmarks/README.md`](docs/benchmarks/README.md).
+Methodology, network RTT table, 1M breakdown, parity numbers, known gaps, and reproduction scripts: [`docs/benchmarks/README.md`](docs/benchmarks/README.md).
 
 ## Documentation
 
