@@ -1845,3 +1845,39 @@ interpolation between 0.9415 (40) and 0.953 (48), and 30 queries are a noisy sam
   until the next recluster. Serving covered slabs plus the new segments in one query, and an indexer-triggered recluster, are not built.
 - The builder's peak memory (16.9 GB) and a slab split that ignores locality for cells above `max_slab_rows`.
 - Filtered ANN does not use the slabs.
+
+### Iteration 12: publication run
+
+Date 2026-11-17, commit 1901a41 (main), no engine changes. Same 10M, 1,024-dimension namespace (70 segments, 32 slabs from round 12),
+read-only, on the 8 vCPU benchmark VM against Cloudflare R2. Queries are the first 50 of the 200 held-out queries in `ann-apples.json`
+(exact top-10 truth). Cold arms use `bench/scale/ab.py` in one session: a fresh server process and an empty memory and disk cache for
+every query, arms rotated query by query, 1.5 s for the connection warmer. One binary, only `BF_ANN_NPROBE` differs.
+
+Network floor for the session (`r2_rtt.py`, 200 samples, warm connection): 4 KB ranged GET p50 50.0 ms, p90 64.8 ms; TCP connect
+p50 6.2 ms; TLS handshake p50 24.5 ms.
+
+#### Cold, fresh process, 50 queries per arm
+
+| `BF_ANN_NPROBE` | p50 ms | p90 ms | p99 ms | Requests | MB | Recall@10 (these 50) | Recall@10 (all 200, warm) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 40 | 1,075 | 1,345 | 3,043 | 357 | 45.6 | 0.934 | 0.9415 |
+| 48 | 1,111 | 1,311 | 1,584 | 404 | 50.7 | 0.944 | 0.953 |
+| 64 | 1,326 | 1,757 | 2,228 | 495 | 60.7 | 0.950 | 0.9615 |
+
+The all-200 recall comes from a warm server per setting (`warm.py`, one pass over the 200 queries after one warm-up pass); it matches
+the round 12 table at all three settings. With n = 50, p99 is the second-slowest query, so it is noisy: the 3,043 ms at 40 probes is
+one or two slow object-store responses, not a property of the setting.
+
+#### Cache-cold, process-warm, 48 probes
+
+One running server (the resident namespace state stays only until `POST /_bench/drop_caches`, which empties the block, disk, and
+decoded caches and that state before every query), 50 queries, in its own session.
+
+| p50 ms | p90 ms | p99 ms | Recall@10 (these 50) |
+| ---: | ---: | ---: | ---: |
+| 1,176 | 1,677 | 3,584 | 0.944 |
+
+Here the drop-caches p50 is not lower than the fresh-process p50 at the same setting (1,111 ms): the two runs are different sessions
+minutes apart, and the gap is inside session-to-session R2 variation. Treat the two as the same cold cost.
+
+Warm for reference (same servers, 200 queries, concurrency 1): p50 76, 78, and 101 ms at 40, 48, and 64 probes.
