@@ -34,8 +34,8 @@ retention_ms = 3600000
 lease_duration_ms = 30000
 max_unindexed_bytes = 2000000000
 eventual_tail_bytes = 134217728
-ann_nprobe = 128
-ann_rerank_factor = 64
+ann_nprobe = 64
+ann_rerank_factor = 32
 recall_sample_rate = 0.01
 
 [storage.cache]

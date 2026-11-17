@@ -47,6 +47,7 @@ Rust workspace, one crate per concern (`crates/`):
 | `bf-text` | Tokenizers, BM25, and the posting-list index format. No dependency on other bf crates |
 | `bf-vector` | Distance kernels, IVF with RaBitQ, and its on-disk format. No dependency on other bf crates |
 | `bf-auth` | API keys, roles, and the key store |
+| `bf-models` | The model registry and providers for native embedding and reranking: in-process llama.cpp, OpenAI-compatible embeddings, and rerank endpoints |
 | `blowfish` | The binary: HTTP server (axum), admin API, metrics, CLI, and config |
 
 `compat/` is the Python compatibility suite (run with `uv`), which drives the official turbopuffer SDK
