@@ -468,3 +468,47 @@ fn chunked_dictionary_reads_only_the_query_terms_chunks() {
     let stats = block_on(reader.stats()).unwrap();
     assert_eq!(stats.document_frequencies.len(), 12000);
 }
+
+/// Version 4 segments open from a header kept elsewhere (no object read), load lengths on demand, and
+/// the pruned prefetching search matches the exhaustive reference on a corpus with hot and rare terms.
+#[test]
+fn header_opened_reader_searches_like_the_full_reader() {
+    let params = FtsParams::default();
+    let mut docs = Vec::new();
+    for i in 0..6000u32 {
+        let mut text = format!("the common word{} filler{}", i % 7, i % 1301);
+        if i % 3 == 0 {
+            text.push_str(" often often");
+        }
+        if i % 997 == 0 {
+            text.push_str(" rare alpha");
+        }
+        if i % 2003 == 5 {
+            text.push_str(" rare beta beta");
+        }
+        docs.push(tokenize(&text, &params));
+    }
+    let bytes = build(&docs, true, Tokenizer::WordV4);
+    let header = bf_text::text_header(&bytes)
+        .unwrap()
+        .expect("version 4 header");
+    let source = Arc::new(MemoryRangeRead::from(bytes.clone()));
+    let hinted = SegmentReader::open_with_header(source, &header).unwrap();
+    let full = open(bytes);
+    let stats = CorpusStats::from_documents(&docs);
+    for text in [
+        "rare alpha",
+        "the rare beta",
+        "common often rare",
+        "the common word3",
+        "filler5 often alpha",
+        "missing",
+    ] {
+        let query = Query::new(tokenize(text, &params), false);
+        let want = expected(&docs, &query, &stats, &params, 10, None);
+        let a = block_on(hinted.search_prefetched(&query, &stats, &params, 10, None)).unwrap();
+        let b = block_on(full.search_prefetched(&query, &stats, &params, 10, None)).unwrap();
+        assert_hits(&a, &want);
+        assert_hits(&b, &want);
+    }
+}

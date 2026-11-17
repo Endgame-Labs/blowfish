@@ -14,7 +14,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 SCRATCH = pathlib.Path(os.environ.get("SCALE_SCRATCH", ROOT / ".scratch/scale"))
 CONFIG = pathlib.Path(os.environ.get("SCALE_CONFIG", HERE / "config.local"))
-NS = json.loads(CONFIG.read_text())["namespace"]  # overridden by --namespace
+NS = json.loads(CONFIG.read_text())["namespace"]  # overridden by --namespace; per-arm AB_NS and AB_CONFIG env override both
 PORT = int(os.environ.get("SCALE_PORT", "8391"))
 URL = f"http://127.0.0.1:{PORT}"
 WORK = SCRATCH / "ab"
@@ -34,8 +34,11 @@ def metrics():
 
 def run_one(arm, query, qid):
     name, (binary, env) = arm
+    env = dict(env)
+    config = env.pop("AB_CONFIG", str(CONFIG))  # an arm may read another bucket prefix (a different layout)
+    ns = env.pop("AB_NS", NS)
     shutil.rmtree(WORK, ignore_errors=True); (WORK / "cache").mkdir(parents=True)
-    subprocess.run(["python3", str(HERE / "mkconfig.py"), str(CONFIG), str(WORK / "storage.json"), str(WORK / "cache"),
+    subprocess.run(["python3", str(HERE / "mkconfig.py"), config, str(WORK / "storage.json"), str(WORK / "cache"),
                     "--memory-gib", "8", "--read-only"], check=True)
     e = dict(os.environ, RAYON_NUM_THREADS="6", MALLOC_ARENA_MAX="2", BF_TRACE_READS="1", **env)
     log = open(WORK / "server.log", "w")
@@ -49,7 +52,7 @@ def run_one(arm, query, qid):
         time.sleep(float(os.environ.get("AB_SETTLE", "1.5")))  # let the connection warmer finish
         before = metrics()
         (WORK / "q.json").write_text(json.dumps([query]))
-        res = subprocess.run(["uv", "run", str(ROOT / "crates/bf-engine/examples/scale_api.py"), str(WORK / "q.json"), URL, NS, "1"],
+        res = subprocess.run(["uv", "run", str(ROOT / "crates/bf-engine/examples/scale_api.py"), str(WORK / "q.json"), URL, ns, "1"],
                              capture_output=True, text=True, check=True)
         row = json.loads(res.stdout.splitlines()[0])
         after = metrics()
