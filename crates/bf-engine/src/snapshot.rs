@@ -97,6 +97,7 @@ impl OpenHint {
         hint
     }
     /// Open (and cache) segment metadata. Failures are ignored: the query reports them.
+    #[allow(clippy::too_many_arguments)]
     async fn warm(
         &self,
         part: Part,
