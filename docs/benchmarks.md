@@ -2187,3 +2187,141 @@ swaps), so the same ground truth applies. 1 GiB block cache, 256 MiB decoded cac
 - The unindexed tail still holds base64 f32 documents (bounded by bytes, not compacted).
 - Ingest throughput decays with namespace size (above): a separate bloom object per segment (so a write batch need not load every segment's ID
   index) and a larger bulk flush would cut that.
+
+## Iteration 16 (ingest): throughput that stays flat as the namespace grows
+
+Round 15 made 10M fit in 4 GB, but ingest slowed as the namespace grew (about 3,200 docs/s at 0.5M rows, 300 near 9M on a c7gd.large). This round
+finds out why and makes it flat. Target, on a c7gd.xlarge (4 vCPU, 8 GB, swap off, server in a 3.5 GiB cgroup, the Python loader on the same
+machine): ingest docs/s at 9M to 10M rows within 25% of the rate at 1M, and peak RSS under 3.5 GB. **Met**: 4,540 docs/s over 9M to 10M against 4,187 to
+4,683 at 0.5M to 1M (an average of 4,501 over the 10M, against 2,126 before), and a 2.51 GB peak (VmHWM) on the xlarge. The 10M load takes 2,222 s
+instead of 4,704 s, and the namespace is fully indexed 7 s after the last write.
+
+### Where ingest time went (profile first)
+
+`BF_TRACE_STAGES=1` prints the time of each stage of an indexing cycle, and `perf record --call-graph dwarf` on the server (loader on the same box)
+gives the CPU view. Before: the loader is not the bottleneck (the loader meets a 429 about once per batch (4,575 retries over 5,000 batches), so the server is the
+limit; the Python loader averages about a third of a core, though it reaches two cores while it checks truth for a batch). The server's time per cycle:
+
+| Rows | rows/cycle | builds + compaction read | directories | text stats | claim, publish, other | s/cycle |
+|---|---:|---:|---:|---:|---:|---:|
+| 1.0M | 23,256 | 2.6 | 0.34 | 0.33 | 0.41 | 3.6 |
+| 3.0M | 21,277 | 7.3 | 0.58 | 0.95 | 0.64 | 9.5 |
+| 5.0M | 20,000 | 5.4 | 0.69 | 1.26 | 0.74 | 8.1 |
+| 7.0M | 20,833 | 5.4 | 0.82 | 1.60 | 0.81 | 8.6 |
+| 9.0M | 21,277 | 5.3 | 1.12 | 1.87 | 1.04 | 9.3 |
+| 10.0M | 26,316 | 4.7 | 1.20 | 1.96 | 1.08 | 8.9 |
+
+- **Compaction rewrites.** Up to 64 segments (about 1.3M rows) the load only flushes; after that every cycle also merges, so rows are built 1.9 times and
+  the rate halves, from about 4,900 to about 2,300 docs/s between 1M and 2M rows. This is the biggest term and does not depend on the namespace's size after that.
+- **Text statistics** (the whole object is read and rewritten on every flush): 0.33 s per cycle at 1M, 1.96 s at 10M. perf at 9.6M shows
+  `merge_text_stats` at 13.6% of CPU.
+- **ANN directories** (both layouts, plus their hints, are written on every publication): 0.34 s to 1.2 s. **Claim, publish, and the live-bitmap pass**: 0.4 s to 1.1 s.
+- **ID checks.** Every write batch and every publication asks every segment whether it holds the IDs. A segment's Bloom filter (10 bits per ID) passes 1.7%
+  of absent IDs, so a 2,000-row batch always passed in every segment and the segment's whole ID list (35 bytes per ID decoded, 350 MB at 10M against a 512 MiB cache) was
+  read and parsed. At 10M on the xlarge this sets in at 9M: the rate falls from about 2,050 to 1,300 and then 920 docs/s over the last 1M (`lookup_many`
+  is 1.2% of CPU at 9.6M and the cache churns); on the 2-vCPU large it is the collapse to 300 docs/s.
+- **CPU.** `nk_sqeuclidean_f32_sve` (k-means training and assignment in segment builds) is 37% of cycles at 0.65M, 45% at 2.2M and 5.3M, and 27% at 9.6M;
+  zstd (text segment blocks) is 8 to 11%, BM25 `add_document` 3%, RaBitQ encode and transform 4%.
+  WAL commit and S3 waits do not show: the S3 client (`aws_lc` SHA-256) is 1.4%.
+
+### What changed
+
+1. **Per-segment ID filter** (`idfilter.bff`, new file in each segment). The segment's smallest and largest ID plus a Bloom filter at 24 bits per ID with 16 probes
+   (false-positive rate about 1e-5, 3 bytes per row; the ID list `ids.bfi` is 35). `lookup_many` first takes only the wanted IDs inside the segment's range
+   (a range query on the sorted set, so a bulk load's sequential IDs never touch an old segment), tests them against the filter, and opens `ids.bfi` only
+   if one passes. Segments built earlier have no filter and take the old path (tested by deleting the filters from a manifest; a 10M namespace loaded by the
+   previous binary accepted patches and deletes under the new one). Layout: `BFIF0001`, probe count, a JSON `[min, max]`, then the bits.
+2. **Bulk loads flush big and compact later.** The unindexed limit is now memory / 8 (448 MiB in a 3.5 GiB cgroup; it was /16) and a bulk load flushes at three quarters of it
+   (`BF_BULK_FLUSH_BYTES`), so a flush builds a segment of about `max_segment_rows` (43,750 on this machine). While writes arrive, compaction waits until a namespace holds 1,024
+   segments (`BF_DEFER_COMPACTION_SEGMENTS`, was 64). Each row is built once during the load (the rewrite factor goes from 1.9 to 1.0); the merges run when writes pause,
+   and segments already at the cap do not merge at all.
+3. **The text statistics merge runs beside the builds**, not after them. It needs only the tail's statistics and the previous object, so it is one more future in
+   the `try_join` with the flush and compaction builds; it decodes and encodes its chunks in parallel (`rayon`, 32 chunks at a time; the output is byte-identical
+   to the sequential merge, checked on a 300,000-term object).
+4. **The two ANN directory layouts are written at the same time.**
+
+### Ingest at 10M, c7gd.xlarge (3.5 GiB cgroup, loader on the same machine)
+
+Docs/s over each 0.5M rows, same loader, same instance type, one run each:
+
+| Rows | Before, xlarge docs/s | s | After, xlarge docs/s | s | After, c7gd.large docs/s | s |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.5M | 4,959 | 101 | 4,683 | 107 | 3,281 | 153 |
+| 1.0M | 4,718 | 207 | 4,187 | 227 | 3,090 | 315 |
+| 1.5M | 2,989 | 374 | 4,431 | 339 | 3,093 | 476 |
+| 2.0M | 2,077 | 615 | 4,530 | 450 | 2,966 | 645 |
+| 2.5M | 1,974 | 868 | 4,512 | 561 | 3,113 | 806 |
+| 3.0M | 2,434 | 1,074 | 4,517 | 671 | 3,038 | 970 |
+| 3.5M | 2,507 | 1,273 | 4,427 | 784 | 2,920 | 1,141 |
+| 4.0M | 2,416 | 1,480 | 4,358 | 899 | 3,017 | 1,307 |
+| 4.5M | 2,256 | 1,702 | 4,583 | 1,008 | 2,996 | 1,474 |
+| 5.0M | 2,472 | 1,904 | 4,310 | 1,124 | 2,841 | 1,650 |
+| 5.5M | 2,236 | 2,128 | 4,497 | 1,235 | 2,966 | 1,819 |
+| 6.0M | 2,077 | 2,368 | 4,326 | 1,351 | 2,847 | 1,994 |
+| 6.5M | 2,188 | 2,597 | 4,658 | 1,458 | 2,851 | 2,170 |
+| 7.0M | 2,412 | 2,804 | 4,472 | 1,570 | 2,855 | 2,345 |
+| 7.5M | 2,032 | 3,050 | 4,730 | 1,676 | 2,842 | 2,521 |
+| 8.0M | 2,048 | 3,294 | 4,538 | 1,786 | 2,717 | 2,705 |
+| 8.5M | 2,038 | 3,540 | 4,783 | 1,890 | 2,708 | 2,889 |
+| 9.0M | 2,077 | 3,781 | 4,639 | 1,998 | 2,814 | 3,067 |
+| 9.5M | 1,306 | 4,163 | 4,315 | 2,114 | 2,796 | 3,246 |
+| 10.0M | 921 | 4,704 | 4,639 | 2,222 | 2,744 | 3,427 |
+| total | 2,126 avg | 4,704 | 4,501 avg | 2,222 | 2,918 avg | 3,427 |
+
+The rate over a window moves by about 5% between runs on this instance (a first run of the same binary measured 5,165 at 1M, and a build running at
+low priority on the same machine in that run cost 15% from 7M on, so its curve is not used). Per cycle, after:
+
+| Rows | Before: rows/cycle | builds + compaction read | directories | text stats | claim, publish, other | s/cycle | After: rows/cycle | builds | directories | text stats | claim, publish, other | s/cycle |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1.0M | 23,256 | 2.6 | 0.34 | 0.33 | 0.41 | 3.6 | 37,037 | 4.5 | 0.16 | 0.00 | 0.67 | 5.4 |
+| 2.0M | 18,868 | 5.5 | 0.53 | 0.70 | 0.63 | 7.4 | 31,250 | 4.5 | 0.27 | 0.00 | 0.53 | 5.3 |
+| 3.0M | 21,277 | 7.3 | 0.58 | 0.95 | 0.64 | 9.5 | 29,412 | 4.5 | 0.26 | 0.00 | 0.69 | 5.4 |
+| 5.0M | 20,000 | 5.4 | 0.69 | 1.26 | 0.74 | 8.1 | 34,483 | 5.0 | 0.46 | 0.00 | 0.62 | 6.1 |
+| 7.0M | 20,833 | 5.4 | 0.82 | 1.60 | 0.81 | 8.6 | 35,714 | 5.3 | 0.51 | 0.00 | 0.58 | 6.4 |
+| 9.0M | 21,277 | 5.3 | 1.12 | 1.87 | 1.04 | 9.3 | 40,000 | 6.0 | 0.64 | 0.00 | 0.63 | 7.3 |
+| 10.0M | 26,316 | 4.7 | 1.20 | 1.96 | 1.08 | 8.9 | 38,462 | 5.9 | 0.68 | 0.00 | 0.79 | 7.4 |
+
+On the c7gd.large (2 vCPU, 3.8 GiB, server in a 3.5 GiB cgroup, loader on the same machine, 2 rayon threads) the same binary loads 10M in 3,427 s
+(2,918 docs/s on average) where round 15 took 11,568 s (864): 3,281 docs/s over the first 0.5M and 2,744 over the last, against about 3,200 falling to 300 before.
+Peak server RSS is 2.27 GB in the 5-second allocator log (VmHWM 2.31 GB), and the machine's MemAvailable never fell under 1.09 GB.
+On the xlarge the peak is 2.38 GB in the log (VmHWM 2.51 GB), reached about ten minutes in and flat after that: the larger tail (448 MiB instead of 224 MiB) costs about 0.25 GB over round 15,
+and the ID lists no longer fill the decoded cache.
+
+### Validation on the new namespace (xlarge)
+
+- `scripts/compat_both.sh`: 121/121 in both modes (run on the x86 development VM). `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test -p bf-engine` pass.
+  New tests: the filter's format (round trip, false-positive rate, string IDs, corrupt bytes), a 300,000-term statistics merge equal to a full rewrite, and
+  an engine test that replaces, patches, and deletes rows spread over ten segments and then repeats it with the filters stripped from the manifest.
+- The exact top 10 the loader computed for this namespace matches `oracle-10m.npz` as a set for all 200 queries (198 equal in order), so the same ground truth applies.
+- `recluster` (32 cells, `max_slab_rows` 330,000 as on the large): 47 slabs (largest cell 493,055 rows), 49,976 clusters, 10.0 MB directory, 2,967 s on 4 vCPU (copy 135 s,
+  assignment 65 s, slabs 2,767 s; round 15 took 4,692 s on 2 vCPU), peak RSS 1.2 GB.
+- Cold ANN at 48 probes, 10M (1 GiB block cache, 256 MiB decoded cache; recall@10 over the 200 oracle queries):
+
+| Arm | p50 / p90 / p99 ms | Requests, MB, waves | Recall@10 |
+| --- | --- | --- | ---: |
+| c7gd.large, fresh process (round 15) | 769 / 973 / 1,384 | 436, 53.5, 3.2 | 0.9545 |
+| c7gd.large, cache-cold (round 15) | 623 / 740 / 935 | 436, 53.5, 3.2 | 0.9545 |
+| c7gd.xlarge, fresh process, 2 rayon threads (50 queries) | 751 / 966 / 1,079 | 443, 53.9, 3.4 | 0.934 on these 50 |
+| c7gd.xlarge, fresh process, 4 rayon threads (50 queries) | 745 / 1,181 / 1,469 | 443, 53.9, 3.4 | 0.934 on these 50 |
+| c7gd.xlarge, cache-cold, 4 rayon threads (200 queries) | 600 / 751 / 929 | 445, 53.7, 3.3 | 0.956 |
+
+Latency and recall have not regressed (the first 50 queries score 0.934 against 0.956 over all 200 in every arm).
+
+### Projection for a 100M load
+
+Measured per-cycle costs that grow with the namespace (after, xlarge): directories 0.16 s at 1M to 0.68 s at 10M (about 0.06 s per million rows), claim and publish 0.8 to 1.1 s
+(about 0.015 s per million). The text statistics merge is hidden behind the builds at 10M; it is a serial 1.96 s there before this round, and grows with the vocabulary.
+- **If the rate stays flat** at 4,500 docs/s, 100M takes about 22,000 s (6.2 hours) on this instance, about 9.5 hours at the large's 2,900.
+- **With the growth above continuing** (directories about 6 s, claim and publish about 2 s, and a statistics merge of several seconds per cycle on a 40,000-row flush,
+  which then no longer hides behind a 6 s build), a cycle is 14 to 20 s, the rate 2,000 to 2,800 docs/s, and the load 10 to 14 hours.
+- A bigger machine helps twice: segments and flushes scale with memory (`max_segment_rows` is memory / 80,000, so 200,000 rows on 16 GB), which divides the per-cycle terms by five, and
+  the builds get more cores.
+- At 100M the segment count is about 2,300, so the deferral limit of 1,024 would start merging at 45M rows on this machine; raise it with `BF_DEFER_COMPACTION_SEGMENTS`.
+
+### Not done and what is left
+
+- The text statistics object, both ANN directories, and the manifest are still rewritten in full on every publication, so those terms stay linear in the namespace. Next: a log-structured
+  statistics object (small additive deltas, folded geometrically), an incremental directory, and manifest delta records.
+- Compaction is deferred, not cheaper: merging two IVF segments still re-trains k-means (37 to 45% of build CPU). A merge that keeps the source clusters, or reuses their centroids, would make the merges after a load cheap.
+- Builds are CPU-bound (k-means, zstd on text blocks) and the loader's truth computation takes cores from the server on a small machine; a lean loader (no truth) would raise the numbers here.
+- The unindexed tail still holds base64 f32 documents (7 KB per row), which sets the flush size on a small machine; holding it packed would double the flush.
