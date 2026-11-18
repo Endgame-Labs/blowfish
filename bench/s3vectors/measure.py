@@ -37,7 +37,7 @@ def q(c, vec):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=("recall", "warm", "cold"))
+    p.add_argument("mode", choices=("recall", "warm", "warm_novel", "cold"))
     p.add_argument("--oracle", default="oracle-10m.npz")
     p.add_argument("--n", type=int, default=1000)
     p.add_argument("--rounds", type=int, default=20)
@@ -59,7 +59,16 @@ def main():
         lat = []
         for i in range(a.n):
             lat.append(q(c, vecs[i % len(vecs)])[1])
-        print(json.dumps(dict(mode="warm", latency_ms=summary(lat))))
+        passes = {f"pass{k + 1}": summary(lat[k * 200:(k + 1) * 200]) for k in range(a.n // 200)}
+        print(json.dumps(dict(mode="warm", latency_ms=summary(lat), per_pass_of_200=passes)))
+    elif a.mode == "warm_novel":
+        # every query is an oracle vector plus small noise, so no two requests are byte-identical
+        rng = np.random.default_rng(7)
+        lat = []
+        for i in range(a.n):
+            v = vecs[i % len(vecs)] + rng.normal(0, 1e-3, 1024).astype(np.float32)
+            lat.append(q(c, v / np.linalg.norm(v))[1])
+        print(json.dumps(dict(mode="warm_novel", latency_ms=summary(lat))))
     else:
         first, follow = [], []
         for r in range(a.rounds):
