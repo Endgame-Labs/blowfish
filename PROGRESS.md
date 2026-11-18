@@ -465,3 +465,9 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
   builder (`build_packed`), vectors packed through compaction, streamed text statistics merge, scans bypass the block cache, flat BM25 postings, smaller recluster sample.
   Cold ANN at 48 probes, 10M on the large: 769 / 973 ms fresh, 623 / 740 cache-cold, recall 0.9545. Ingest took 11,568 s (864 docs/s average, decaying with size).
   Details: `docs/benchmarks.md`, "Iteration 15 (memory)".
+- Iteration 16 (ingest): ingest stays flat as the namespace grows. 10M on a c7gd.xlarge loads in 2,222 s (4,501 docs/s average, 4,540 over the last 1M against 4,187 to 4,683
+  at 1M) instead of 4,704 s (2,126 average, 921 over the last 1M); on the c7gd.large 3,427 s instead of 11,568 s, peak RSS 2.3 GB. Per-segment ID filter (`idfilter.bff`: range plus a
+  24-bit Bloom, so existence checks no longer read ID lists), bulk loads flush at three quarters of a larger unindexed limit (memory / 8) and defer compaction to 1,024 segments (each
+  row built once), the text statistics merge runs in parallel beside the builds, and the ANN directory layouts are written together. Recluster (2,967 s, 1.2 GB) and cold ANN
+  (600 / 751 ms cache-cold, recall 0.956) are unchanged. Projection: about 6 hours for 100M if flat, 10 to 14 hours with the remaining linear terms (statistics object, directories,
+  manifest). Details: `docs/benchmarks.md`, "Iteration 16 (ingest)".

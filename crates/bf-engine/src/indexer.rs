@@ -30,6 +30,13 @@ pub struct EngineConfig {
     pub bulk_flush_rows: usize,
     /// Longest a tail keeps accumulating under `bulk_flush_rows`.
     pub bulk_flush_age: Duration,
+    /// Logical tail bytes at which a bulk load stops accumulating and flushes (`BF_BULK_FLUSH_BYTES`).
+    /// Under `max_unindexed_bytes`, so writes keep arriving while the flush builds.
+    pub bulk_flush_bytes: u64,
+    /// While writes are arriving, compaction waits until a namespace holds this many segments
+    /// (`BF_DEFER_COMPACTION_SEGMENTS`). Each row is then built once during a load instead of about
+    /// twice, and the merges run when the writes pause.
+    pub defer_compaction_segments: usize,
     /// Background poll interval.
     pub index_interval: Duration,
     /// Merge this many segments in one logarithmic size tier.
@@ -109,6 +116,16 @@ fn default_decoded_cache_bytes() -> u64 {
 fn default_max_segment_rows() -> usize {
     ((memory_limit_bytes() / 80_000) as usize).clamp(25_000, 200_000)
 }
+/// Backpressure by bytes: an eighth of memory (448 MiB on a 3.5 GiB limit), within 128 MiB to 2 GB. A
+/// bulk flush then builds segments as large as `max_segment_rows` allows instead of a trickle of
+/// small ones.
+fn default_max_unindexed_bytes() -> u64 {
+    (memory_limit_bytes() / 8).clamp(128 << 20, 2_000_000_000)
+}
+/// A bulk load flushes at three quarters of the unindexed limit.
+fn bulk_flush_bytes_for(max_unindexed: u64) -> u64 {
+    max_unindexed / 4 * 3
+}
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -121,14 +138,15 @@ impl Default for EngineConfig {
             index_age: Duration::from_secs(5),
             bulk_flush_rows: default_max_segment_rows().min(100_000),
             bulk_flush_age: Duration::from_secs(60),
+            bulk_flush_bytes: bulk_flush_bytes_for(default_max_unindexed_bytes()),
+            defer_compaction_segments: 1024,
             index_interval: Duration::from_millis(250),
             compaction_segments: 4,
             max_segment_rows: default_max_segment_rows(),
             max_segment_bytes: 2 << 30,
             retention: Duration::from_secs(3600),
             lease_duration: Duration::from_secs(30),
-            // Backpressure by bytes: a sixteenth of memory (256 MiB on 4 GB), within 128 MiB to 2 GB.
-            max_unindexed_bytes: (memory_limit_bytes() / 16).clamp(128 << 20, 2_000_000_000),
+            max_unindexed_bytes: default_max_unindexed_bytes(),
             wal_pipeline: 8,
             eventual_tail_bytes: 128 * 1024 * 1024,
             // Two builds at once only where memory allows (each holds a whole segment).
@@ -190,6 +208,13 @@ impl EngineConfig {
         }
         if let Some(v) = number("BF_MAX_UNINDEXED_BYTES") {
             c.max_unindexed_bytes = v;
+            c.bulk_flush_bytes = bulk_flush_bytes_for(v);
+        }
+        if let Some(v) = number("BF_BULK_FLUSH_BYTES") {
+            c.bulk_flush_bytes = v;
+        }
+        if let Some(v) = number("BF_DEFER_COMPACTION_SEGMENTS") {
+            c.defer_compaction_segments = v as usize;
         }
         if let Some(v) = number("BF_WAL_PIPELINE") {
             c.wal_pipeline = (v as usize).max(1);
@@ -537,6 +562,7 @@ impl Engine {
             manifest.stats = NamespaceStats::default();
             external = false;
         }
+        let mut merged_text: Option<bf_wal::SegmentFile> = None;
         let segments = if rebuild {
             let mut rebuilt = vec![];
             manifest.stats = NamespaceStats::default();
@@ -702,16 +728,56 @@ impl Engine {
                     .await
                 }
             };
-            let (flushed, compacted) = futures::future::try_join(flush, compacted).await?;
+            // The statistics merge needs only the tail's statistics and the previous object, not
+            // the built segments, so it runs beside the builds (it is mostly object-store
+            // transfer, and the builds leave cores idle while they wait on uploads).
+            let removed_text = removed_stats.text.clone();
+            let previous_for_merge = previous_text.clone();
+            let text_merge = async {
+                let tail_stats = match stats_job {
+                    Some(job) => Some(job.await.map_err(segment::index_error)?),
+                    None => None,
+                };
+                if !external {
+                    return Ok::<_, ApiError>((tail_stats, None));
+                }
+                let empty = NamespaceStats::default();
+                let added_text = &tail_stats.as_ref().unwrap_or(&empty).text;
+                if added_text.is_empty() && removed_text.is_empty() {
+                    return Ok((tail_stats, None));
+                }
+                let previous = previous_for_merge
+                    .as_ref()
+                    .expect("external statistics object");
+                let old = segment::read_whole_uncached(store, previous).await?;
+                let index = previous.stats_index.clone().expect("chunked statistics");
+                let (added_text, removed_text) = (added_text.clone(), removed_text.clone());
+                let (bytes, index) = tokio::task::spawn_blocking(move || {
+                    crate::text::merge_text_stats(&old, &index, &added_text, &removed_text)
+                })
+                .await
+                .map_err(segment::index_error)??;
+                let mut file = segment::put_file(
+                    store,
+                    format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
+                    bytes,
+                    0,
+                )
+                .await?;
+                file.stats_index = Some(index);
+                Ok((tail_stats, Some(file)))
+            };
+            let (flushed, compacted, (tail_stats, merged)) =
+                futures::future::try_join3(flush, compacted, text_merge).await?;
             crate::ann::stage(t0, "idx builds");
-            if let Some(job) = stats_job {
-                let stats = job.await.map_err(segment::index_error)?;
+            if let Some(stats) = tail_stats {
                 if external {
                     added_stats = stats;
                 } else {
                     manifest.stats = stats;
                 }
             }
+            merged_text = merged;
             segments.extend(flushed);
             segments.extend(compacted);
             segments
@@ -751,22 +817,25 @@ impl Engine {
             .collect();
         let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
         for attr in attributes {
-            for layout in [
+            // The two layouts are independent objects: write them at the same time.
+            let layouts = [
                 crate::ann_dir::Layout::Plain,
                 crate::ann_dir::Layout::Blocks,
-            ] {
-                let key = layout.dir_key(&attr);
-                let built = crate::ann_dir::build(
+            ];
+            let built = futures::future::try_join_all(layouts.iter().map(|layout| {
+                crate::ann_dir::build(
                     store,
                     ns,
                     &manifest.segments,
                     &attr,
-                    layout,
-                    previous_dirs.get(&key),
+                    *layout,
+                    previous_dirs.get(&layout.dir_key(&attr)),
                 )
-                .await?;
-                if let Some(file) = built {
-                    manifest.ann_dirs.insert(key, file);
+            }))
+            .await?;
+            for (layout, file) in layouts.iter().zip(built) {
+                if let Some(file) = file {
+                    manifest.ann_dirs.insert(layout.dir_key(&attr), file);
                 }
             }
         }
@@ -796,7 +865,6 @@ impl Engine {
                 .saturating_sub(removed_stats.logical_bytes);
             manifest.text_stats = previous_text.clone();
         } else if external {
-            let previous = previous_text.as_ref().expect("external statistics object");
             manifest.stats.rows = manifest
                 .stats
                 .rows
@@ -807,22 +875,7 @@ impl Engine {
                 .logical_bytes
                 .saturating_add(added_stats.logical_bytes)
                 .saturating_sub(removed_stats.logical_bytes);
-            let old = segment::read_whole_uncached(store, previous).await?;
-            let index = previous.stats_index.clone().expect("chunked statistics");
-            let (bytes, index) = tokio::task::spawn_blocking(move || {
-                crate::text::merge_text_stats(&old, &index, &added_stats.text, &removed_stats.text)
-            })
-            .await
-            .map_err(segment::index_error)??;
-            let mut file = segment::put_file(
-                store,
-                format!("ns/{ns}/segments/text-stats-{}.bfs", uuid::Uuid::new_v4()),
-                bytes,
-                0,
-            )
-            .await?;
-            file.stats_index = Some(index);
-            manifest.text_stats = Some(file);
+            manifest.text_stats = Some(merged_text.take().expect("merged statistics object"));
         } else {
             externalize_text_stats(store, ns, &mut manifest).await?;
         }
@@ -1007,17 +1060,13 @@ impl Engine {
         Ok(candidates.len())
     }
 }
-/// Under a bulk load, compaction waits for the writes to pause (up to this many segments):
-/// each flush then costs one build of its rows instead of competing with merges, and merging
-/// the backlog afterwards rewrites each row about once.
-const DEFER_COMPACTION_BELOW_SEGMENTS: usize = 64;
 /// True while a bulk load is still writing and its tail is under the bulk-flush limits: wait
 /// for more rows rather than building a small segment now.
 fn bulk_wait(state: &NamespaceState, config: &EngineConfig, tail_age: Duration) -> bool {
     config.index_age >= Duration::from_secs(1)
         && state.shadowed.len() < config.bulk_flush_rows
         && tail_age < config.bulk_flush_age
-        && state.tail_bytes < config.max_unindexed_bytes / 4
+        && state.tail_bytes < config.bulk_flush_bytes.min(config.max_unindexed_bytes)
         && Utc::now()
             .signed_duration_since(state.updated_at)
             .to_std()
@@ -1038,7 +1087,7 @@ fn needs_blocks(state: &NamespaceState) -> bool {
 fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<String> {
     if !force
         && state.shadowed.len() >= config.index_rows
-        && state.segments.len() < DEFER_COMPACTION_BELOW_SEGMENTS
+        && state.segments.len() < config.defer_compaction_segments
     {
         return vec![];
     }

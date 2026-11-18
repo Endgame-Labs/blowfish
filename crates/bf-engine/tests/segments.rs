@@ -734,3 +734,109 @@ async fn byte_cap_splits_large_documents_and_compact_vectors_preserve_wire_encod
     assert_eq!(manifest.segments.len(), 12);
     assert_eq!(query(&e, request).await, expected);
 }
+
+/// Upserts, patches, and deletes of IDs that live in older segments must find them through each
+/// segment's ID filter (range plus Bloom), and a segment without a filter (one built before
+/// filters existed) must still answer from its ID list.
+#[tokio::test]
+async fn id_filters_find_existing_rows_across_many_segments_and_legacy_segments() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let e = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            defer_compaction_segments: 1_000,
+            compaction_segments: 1_000,
+            retention: Duration::ZERO,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    write(&e, json!({"distance_metric":"cosine_distance","schema":{"text":{"type":"string","full_text_search":true}},
+        "upsert_rows":[{"id":"seed","text":"seed","vector":[1.0,1.0]}]}))
+    .await;
+    e.index_namespace("test", true).await.unwrap();
+    // Ten segments of ten rows each, with string IDs spread across the key space.
+    for batch in 0..10 {
+        let rows: Vec<_> = (0..10)
+            .map(|i| json!({"id":format!("doc-{i}-{batch}"),"text":"fox","vector":[i as f32+1.0,batch as f32+1.0]}))
+            .collect();
+        write(&e, json!({"upsert_rows": rows})).await;
+        e.index_namespace("test", true).await.unwrap();
+    }
+    let (_, m) = Wal::new(store.clone(), "test")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(m.segments.len() >= 10);
+    assert!(m.segments.iter().all(|s| s.files.contains_key("idfilter")));
+    // Replace rows in several different segments, delete some, patch some, then index.
+    write(
+        &e,
+        json!({"upsert_rows":[
+        {"id":"doc-3-2","text":"replaced","vector":[9.0,9.0]},
+        {"id":"doc-7-8","text":"replaced","vector":[9.0,9.0]},
+        {"id":"brand-new","text":"new","vector":[1.0,2.0]}],
+        "patch_rows":[{"id":"doc-0-0","text":"patched"}],
+        "deletes":["doc-5-5","doc-9-9","never-existed"]}),
+    )
+    .await;
+    e.index_namespace("test", true).await.unwrap();
+    let q = json!({"rank_by":["id","asc"],"top_k":200,"include_attributes":["text"]});
+    let rows = query(&e, q.clone()).await["rows"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        rows.len(),
+        1 + 100 + 1 - 2,
+        "no duplicates, two deletes, one insert"
+    );
+    let text_of = |id: &str| {
+        rows.iter()
+            .find(|r| r["id"] == id)
+            .map(|r| r["text"].clone())
+    };
+    assert_eq!(text_of("doc-3-2"), Some(json!("replaced")));
+    assert_eq!(text_of("doc-7-8"), Some(json!("replaced")));
+    assert_eq!(text_of("doc-0-0"), Some(json!("patched")));
+    assert_eq!(text_of("doc-5-5"), None);
+    assert_eq!(text_of("brand-new"), Some(json!("new")));
+    // Strip every filter from the manifest, as in a namespace written by an earlier version.
+    let wal = Wal::new(store.clone(), "test").unwrap();
+    let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    for seg in &mut manifest.segments {
+        seg.files.remove("idfilter");
+    }
+    let epoch = manifest.indexer_epoch;
+    manifest.indexer_epoch += 1;
+    wal.publish_fenced(seq, epoch, &manifest).await.unwrap();
+    let legacy = Engine::with_config(
+        store,
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    write(&legacy, json!({"upsert_rows":[{"id":"doc-1-1","text":"legacy replaced","vector":[2.0,2.0]}],"deletes":["doc-2-2"]})).await;
+    let after = query(&legacy, q).await["rows"].as_array().unwrap().clone();
+    assert_eq!(
+        after.len(),
+        rows.len() - 1,
+        "one delete through a legacy segment"
+    );
+    let legacy_text = after
+        .iter()
+        .find(|r| r["id"] == "doc-1-1")
+        .map(|r| r["text"].clone());
+    assert_eq!(legacy_text, Some(json!("legacy replaced")));
+    assert!(after.iter().all(|r| r["id"] != "doc-2-2"));
+}
