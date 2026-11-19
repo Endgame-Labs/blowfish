@@ -345,3 +345,111 @@ async fn json_routes_require_json_content_type() {
         }
     }
 }
+
+#[tokio::test]
+async fn backpressure_429_carries_retry_headers() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let keys = KeyStore::from_storage(store.clone(), None, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let engine = Engine::with_config(
+        store,
+        bf_engine::EngineConfig {
+            max_unindexed_bytes: 1,
+            index_age: Duration::from_secs(3600),
+            bulk_flush_age: Duration::from_secs(3600),
+            ..Default::default()
+        },
+    );
+    let app = router(engine, keys, ServerOptions::default());
+    let write = |id: u64| {
+        Request::builder()
+            .method("POST")
+            .uri("/v2/namespaces/bp")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"upsert_rows":[{"id":id,"text":"x"}]}).to_string(),
+            ))
+            .unwrap()
+    };
+    let first = app.clone().oneshot(write(1)).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = app.clone().oneshot(write(2)).await.unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let h = second.headers();
+    let ms: u64 = h["retry-after-ms"].to_str().unwrap().parse().unwrap();
+    assert!((500..=30_000).contains(&ms), "retry-after-ms {ms}");
+    let secs: u64 = h["retry-after"].to_str().unwrap().parse().unwrap();
+    assert_eq!(secs, ms.div_ceil(1000).max(1));
+    assert_eq!(h["x-should-retry"], "true");
+}
+
+#[test]
+fn retry_headers_by_status() {
+    use axum::response::IntoResponse;
+    use bf_types::ApiError;
+    let headers = |e: ApiError| blowfish::HttpError(e).into_response().headers().clone();
+    let h = headers(ApiError::new(503, "object storage is unavailable"));
+    assert_eq!(h["retry-after"], "1");
+    assert_eq!(h["retry-after-ms"], "1000");
+    assert_eq!(h["x-should-retry"], "true");
+    let h = headers(ApiError::new(429, "slow down").with_retry_after_ms(2500));
+    assert_eq!(h["retry-after"], "3");
+    assert_eq!(h["retry-after-ms"], "2500");
+    let h = headers(ApiError::new(409, "index is still being built"));
+    assert_eq!(h["x-should-retry"], "true");
+    assert!(h.get("retry-after").is_none());
+    let h = headers(ApiError::new(408, "timeout"));
+    assert_eq!(h["x-should-retry"], "true");
+    let h = headers(ApiError::new(500, "corrupt"));
+    assert_eq!(h["x-should-retry"], "false");
+    let h = headers(ApiError::new(503, "gone").with_should_retry(false));
+    assert_eq!(h["x-should-retry"], "false");
+    let h = headers(ApiError::bad("nope"));
+    assert!(h.get("x-should-retry").is_none() && h.get("retry-after").is_none());
+}
+
+#[tokio::test]
+async fn response_compression_follows_accept_encoding() {
+    let app = app(None).await;
+    let rows: Vec<Value> = (0..200)
+        .map(|i| json!({"id":i,"text":"some repeated text"}))
+        .collect();
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v2/namespaces/enc",
+        json!({"upsert_rows":rows}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for (accept, encoded) in [("identity", false), ("gzip", true)] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/namespaces/enc/query")
+                    .header("content-type", "application/json")
+                    .header("accept-encoding", accept)
+                    .body(Body::from(
+                        json!({"rank_by":["id","asc"],"top_k":200,"include_attributes":true})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().contains_key("content-encoding"),
+            encoded,
+            "{accept}"
+        );
+    }
+}

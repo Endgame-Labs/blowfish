@@ -2,6 +2,7 @@
 mod ann;
 mod ann_dir;
 mod branch;
+mod drain;
 mod filter;
 mod highlight;
 mod indexed;
@@ -970,10 +971,10 @@ async fn commit_sync(
             }
         }
         if current.tail_bytes >= config.max_unindexed_bytes {
-            break Err(ApiError::new(
-                429,
-                "unindexed WAL exceeds backpressure limit",
-            ));
+            break Err(
+                ApiError::new(429, "unindexed WAL exceeds backpressure limit")
+                    .with_retry_after_ms(drain::retry_after_ms(current.tail_bytes)),
+            );
         }
         let stage = Instant::now();
         let mut working = match snapshot::for_writes(store, &current, pending, &[]).await {
@@ -1270,8 +1271,9 @@ async fn commit_worker(
             record_stage("catch_up", stage);
         }
         if current.tail_bytes >= config.max_unindexed_bytes {
+            let e = ApiError::new(429, "unindexed WAL exceeds backpressure limit")
+                .with_retry_after_ms(drain::retry_after_ms(current.tail_bytes));
             drop(current);
-            let e = ApiError::new(429, "unindexed WAL exceeds backpressure limit");
             reply_all(pending, Err(e), start);
             continue;
         }

@@ -294,6 +294,8 @@ async fn revoke_key(
     s.auth.revoke_key(&p, &id).await?;
     Ok(Json(json!({"status":"OK"})))
 }
+/// Retry delay sent on a 429 or 503 that carries no estimate of its own.
+const DEFAULT_RETRY_AFTER_MS: u64 = 1000;
 /// HTTP representation of the shared error, without coupling bf-types to axum.
 pub struct HttpError(pub ApiError);
 impl From<ApiError> for HttpError {
@@ -306,10 +308,24 @@ impl IntoResponse for HttpError {
         let status =
             StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut response = (status, Json(self.0.body())).into_response();
-        if self.0.status == 500 {
-            response
-                .headers_mut()
-                .insert("x-should-retry", HeaderValue::from_static("false"));
+        let headers = response.headers_mut();
+        // The official SDKs read `retry-after-ms`, then `Retry-After` (seconds), and retry 408,
+        // 409, 429, and 5xx unless `x-should-retry` says otherwise.
+        if matches!(self.0.status, 429 | 503) {
+            let ms = self.0.retry_after_ms.unwrap_or(DEFAULT_RETRY_AFTER_MS);
+            headers.insert("retry-after", HeaderValue::from(ms.div_ceil(1000).max(1)));
+            headers.insert("retry-after-ms", HeaderValue::from(ms));
+        }
+        let retry = self.0.should_retry.or(match self.0.status {
+            408 | 409 | 429 | 502 | 503 | 504 => Some(true),
+            500 => Some(false),
+            _ => None,
+        });
+        if let Some(retry) = retry {
+            headers.insert(
+                "x-should-retry",
+                HeaderValue::from_static(if retry { "true" } else { "false" }),
+            );
         }
         response
     }

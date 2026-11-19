@@ -44,6 +44,11 @@ pub struct ApiError {
     pub status: u16,
     /// Public error message (never credentials or backend URLs).
     pub message: String,
+    /// How long the client should wait before retrying, in milliseconds. The HTTP layer sends it
+    /// as `Retry-After` and `retry-after-ms` on 429 and 503 (with a default when unset).
+    pub retry_after_ms: Option<u64>,
+    /// Explicit `x-should-retry` verdict; when unset, the HTTP layer chooses by status.
+    pub should_retry: Option<bool>,
 }
 impl ApiError {
     /// Construct an error with an explicit HTTP status.
@@ -51,7 +56,19 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            retry_after_ms: None,
+            should_retry: None,
         }
+    }
+    /// Suggest a retry delay in milliseconds (sent as `Retry-After` and `retry-after-ms`).
+    pub fn with_retry_after_ms(mut self, ms: u64) -> Self {
+        self.retry_after_ms = Some(ms);
+        self
+    }
+    /// Mark the error transient (`true`) or permanent (`false`) for the SDKs' retry logic.
+    pub fn with_should_retry(mut self, retry: bool) -> Self {
+        self.should_retry = Some(retry);
+        self
     }
     /// Semantic validation failure.
     pub fn bad(message: impl Into<String>) -> Self {
