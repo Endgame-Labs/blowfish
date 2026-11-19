@@ -142,6 +142,10 @@ pub struct Manifest {
     /// Publication-time grace periods for reclaiming checkpointed WAL payloads.
     #[serde(default)]
     pub checkpoints: Vec<(u64, DateTime<Utc>)>,
+    /// Every WAL payload up to this sequence has been reclaimed, so the next pass starts after it
+    /// instead of re-reading the whole log. Absent in older manifests (zero: start from the top).
+    #[serde(default)]
+    pub pruned_through: u64,
 }
 /// A namespace-wide ANN layout: the rows of `covered` segments, repartitioned by position in
 /// vector space into slabs, each a pseudo segment with its own index and block fragment. A
@@ -660,40 +664,61 @@ impl Wal {
     }
     /// Reclaim committed payloads through a checkpoint while preserving every slot fence.
     pub async fn prune_payloads(&self, through: u64) -> Result<(), Error> {
-        for seq in 1..=through {
-            if let Some(mut record) = self.record(seq).await?
-                && !record.tombstone
-                && !record.redacted
-            {
-                if record.inline.take().is_some() {
-                    record.redacted = true;
-                    if !self
-                        .store
-                        .redact_with_id(&self.key(seq), record.encode()?, record.write_id)
-                        .await?
-                    {
-                        return Err(Error::Fenced);
+        self.prune_payloads_from(0, through).await
+    }
+    /// Like `prune_payloads`, for sequences in `(after, through]` only (the caller knows everything
+    /// up to `after` is already reclaimed). Slots are processed concurrently: a serial pass over a
+    /// long log would stall indexing for minutes.
+    pub async fn prune_payloads_from(&self, after: u64, through: u64) -> Result<(), Error> {
+        use futures::StreamExt;
+        let mut work = futures::stream::iter(after.saturating_add(1)..=through)
+            .map(|seq| async move {
+                if let Some(mut record) = self.record(seq).await?
+                    && !record.tombstone
+                    && !record.redacted
+                {
+                    if record.inline.take().is_some() {
+                        record.redacted = true;
+                        if !self
+                            .store
+                            .redact_with_id(&self.key(seq), record.encode()?, record.write_id)
+                            .await?
+                        {
+                            return Err(Error::Fenced);
+                        }
+                    } else {
+                        self.store.delete(&self.record_payload_key(&record)).await?;
                     }
-                } else {
-                    self.store.delete(&self.record_payload_key(&record)).await?;
                 }
-            }
+                Ok(())
+            })
+            .buffer_unordered(32);
+        while let Some(done) = work.next().await {
+            done?;
         }
-        for object in self
+        drop(work);
+        let orphans: Vec<String> = self
             .store
             .list(&format!("ns/{}/wal-data/", self.namespace))
             .await?
-        {
-            let attempt = object
-                .key
-                .rsplit('/')
-                .next()
-                .and_then(|name| name.split_once('-'))
-                .filter(|(seq, _)| seq.len() == 20)
-                .and_then(|(seq, _)| seq.parse::<u64>().ok());
-            if attempt.is_some_and(|seq| seq <= through) {
-                self.store.delete(&object.key).await?;
-            }
+            .into_iter()
+            .filter(|object| {
+                object
+                    .key
+                    .rsplit('/')
+                    .next()
+                    .and_then(|name| name.split_once('-'))
+                    .filter(|(seq, _)| seq.len() == 20)
+                    .and_then(|(seq, _)| seq.parse::<u64>().ok())
+                    .is_some_and(|seq| seq <= through)
+            })
+            .map(|object| object.key)
+            .collect();
+        let mut deletes = futures::stream::iter(orphans)
+            .map(|key| async move { self.store.delete(&key).await })
+            .buffer_unordered(32);
+        while let Some(done) = deletes.next().await {
+            done?;
         }
         Ok(())
     }
@@ -861,6 +886,7 @@ mod manifest_codec_tests {
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
+            pruned_through: 0,
         }
     }
 

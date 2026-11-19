@@ -51,6 +51,7 @@ async fn versioned_slots_conflicts_tail_and_manifest() {
         updated_at: None,
         retired: vec![],
         checkpoints: vec![],
+        pruned_through: 0,
     };
     a.publish_manifest(1, &manifest).await.unwrap();
     assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 1);
@@ -117,6 +118,7 @@ async fn epoch_claims_fence_stalled_indexers_and_checkpoint_regression() {
         updated_at: None,
         retired: vec![],
         checkpoints: vec![],
+        pruned_through: 0,
     };
     assert_eq!(wal.publish_fenced(0, 0, &manifest).await.unwrap(), 1);
     let stale = manifest.clone();
@@ -261,4 +263,34 @@ async fn large_external_and_legacy_v2_payloads_remain_readable_and_erasable() {
     assert!(matches!(wal.read(2).await, Err(Error::Pruned)));
     assert!(store.list("ns/formats/wal-data/").await.unwrap().is_empty());
     assert_eq!(store.list("ns/formats/wal/").await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn prune_from_skips_already_pruned_sequences_and_prunes_many_concurrently() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let wal = Wal::new(store.clone(), "range").unwrap();
+    for seq in 1..=100u64 {
+        let entry = document_entry(format!("doc-{seq}"));
+        assert_eq!(
+            wal.append(seq, &entry).await.unwrap(),
+            CreateResult::Created
+        );
+    }
+    wal.prune_payloads_from(0, 60).await.unwrap();
+    for seq in 1..=60 {
+        assert!(matches!(wal.read(seq).await, Err(Error::Pruned)), "{seq}");
+    }
+    assert!(wal.read(61).await.unwrap().is_some());
+    // A later pass over (60, 90] leaves the earlier range alone and prunes the new one.
+    wal.prune_payloads_from(60, 90).await.unwrap();
+    assert!(matches!(wal.read(90).await, Err(Error::Pruned)));
+    assert!(wal.read(91).await.unwrap().is_some());
+    // The whole-range form is the same as starting at zero.
+    wal.prune_payloads(100).await.unwrap();
+    assert!(matches!(wal.read(100).await, Err(Error::Pruned)));
 }
