@@ -48,3 +48,36 @@ try {
     await target.deleteAll().catch(error => { if (error.status !== 404) throw error; });
   }
 }
+
+// Backpressure: a server with a tiny unindexed limit answers the second write 429 until its
+// indexer publishes. The official SDK must retry after the advertised delay and then succeed.
+const bpURL = process.env.COMPAT_BACKPRESSURE_URL;
+if (bpURL) {
+  const events = [];
+  const recording = async (url, init) => {
+    const sent = Date.now();
+    const response = await fetch(url, init);
+    events.push({ sent, status: response.status, ms: response.headers.get('retry-after-ms'), at: Date.now() });
+    return response;
+  };
+  const bp = new Turbuffer({ baseURL: bpURL, apiKey: process.env.COMPAT_API_KEY || 'dummy', maxRetries: 6, fetch: recording });
+  const bpNs = bp.namespace(`blowfish-oracle-ts-retry-${randomUUID()}`);
+  try {
+    await bpNs.write({ upsert_rows: [{ id: 1, text: 'x' }] });
+    const result = await bpNs.write({ upsert_rows: [{ id: 2, text: 'x' }] });
+    assert.equal(result.rows_affected, 1);
+    const statuses = events.map(e => e.status);
+    assert.equal(statuses[1], 429, `statuses ${statuses}`);
+    assert.equal(statuses[statuses.length - 1], 200);
+    events.forEach((e, i) => {
+      if (e.status !== 429) return;
+      const ms = Number(e.ms);
+      const waited = events[i + 1].sent - e.at;
+      assert.ok(ms >= 500 && ms <= 30000, `retry-after-ms ${ms}`);
+      assert.ok(waited >= 0.85 * ms && waited <= ms + 1500, `waited ${waited} ms, header said ${ms} ms`);
+    });
+    console.log('PASS TypeScript retries a 429 after the advertised retry-after-ms');
+  } finally {
+    await bpNs.deleteAll().catch(error => { if (error.status !== 404) throw error; });
+  }
+}
