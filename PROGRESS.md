@@ -481,3 +481,9 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
   row built once), the text statistics merge runs in parallel beside the builds, and the ANN directory layouts are written together. Recluster (2,967 s, 1.2 GB) and cold ANN
   (600 / 751 ms cache-cold, recall 0.956) are unchanged. Projection: about 6 hours for 100M if flat, 10 to 14 hours with the remaining linear terms (statistics object, directories,
   manifest). Details: `docs/benchmarks.md`, "Iteration 16 (ingest)".
+- Iteration 17 (100M): cold and warm ANN at 100M, in-region on a c7gd.2xlarge. Cache-cold p50 / p90 at 64 probes (recall@10 0.954) went from 2,677 / 2,953 ms to 1,164 / 1,348,
+  fresh process from 3,366 / 4,111 to 1,228 / 1,411, warm from 378 / 425 to 168 / 201 (48 probes: 949 / 1,131 cache-cold, 1,047 / 1,223 fresh, 123.5 / 142.9 warm at recall 0.941).
+  Bytes per cold query fell from 327 MB to 163 MB. New: a paged slab directory (a 4 MB header with one one-bit code per cell, then one page per cell of about 24 clusters; `repage` adds it to
+  an existing recluster in 39 s), hints that drop the layouts not in use, a manifest read that lists only what follows the fixed-key copy, directory pages and scan reads that start from the
+  hint before the manifest arrives, scans that run while a cold query's reads arrive, and namespace-state clones that share the segment list. Cold targets met (1,200 and 1,500 ms); warm
+  at 64 probes misses its 150 ms target. 10M does not regress (cache-cold 561 / 683 against 665 / 911, warm 43.2 / 55.8 against 47.4 / 59.0). Details: `docs/benchmarks.md`, "Iteration 17 (100M)".

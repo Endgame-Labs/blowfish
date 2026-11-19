@@ -2428,3 +2428,131 @@ What this says: cold and warm both grow 4 to 5x for 10x the data, much better th
 - The scan wave reads 3x the bytes and makes 3.3x the requests: 48 probes over 160 slabs touch more slabs and larger clusters (the recluster cells are no finer than at 10M).
 - Warm queries cost 4.7x because a probe scans larger slabs, and recall is a little lower than at 10M for the same probe count (0.941 against 0.953 at 48), so 64 probes
   (0.9555) is the like-for-like setting. Turbopuffer publishes no 100M number to compare with.
+
+## Iteration 17 (100M): cold and warm ANN
+
+Goal: at 100M, in-region on a c7gd.2xlarge, recall@10 of at least 0.95 with a cache-cold p50 of 1,200 ms or less, a fresh-process p50 of 1,500 ms or
+less, and a warm p50 of 150 ms or less, with no regression at 10M. Same machine, namespace (`wikipedia-100m`, 160 slabs, 499,920 clusters), workload,
+and measurement code as the 100M section above. "main" is the code at the start of the iteration, run in the same session as this branch.
+
+### Where the time went (main, one cache-cold query at 64 probes, 3,049 ms)
+
+- wave 0, both ANN directory hints (slab and block layouts): 2 requests, 185.7 MB, 1,281 ms;
+- the manifest listing: 2,760 manifest objects need three sequential list pages (about 260 ms) before anything else is known;
+- wave 2, the scan: 1,402 requests, 131.3 MB, 682 ms;
+- wave 4, rerank vectors and documents: 127 requests, 3.3 MB, 427 ms;
+- between waves, about 100 ms of CPU (the scan ran only after the last read landed) and, on a warm query, about 10 ms for each of six clones of a
+  namespace state that holds 1,787 segment records.
+
+Small ranged reads of objects that are not hot cost 100 to 125 ms at p50 in this bucket (boto3 from the same instance, random 8 KB ranges over many
+objects; a single hot object answered in 43 ms), so every serial wave costs about 100 ms plus its tail, whatever its size. The fixes below remove bytes
+and waves; the S3 latency itself is not ours to change.
+
+### What changed
+
+- **Paged slab directory.** `recluster` (and the new `repage` example, for namespaces reclustered before) writes a paged copy of the slab directory beside
+  the flat one. A resident header (4.0 MB at 100M: the segment table with each slab's object sizes, one one-bit code per cell, and a page table) is
+  followed by one page per cell of about 24 neighboring clusters (21,000 pages, 104 MB in all). Cells come from a two-level k-means over the clusters'
+  approximate centers, ordered along a nearest-neighbor tour, so the pages a query reads sit together and merge into about 100 requests. A query ranks the
+  cells from the header, reads the pages of the nearest ones until they hold 16 times the clusters it will probe (about 13 MB for 48 probes, 18 MB for 64),
+  and ranks only those. At a multiple of 8 recall fell by 0.5 point; at 16 it equals the flat directory's at 48 probes and is 0.9540 against 0.9555 at 64
+  (table below). `repage` took 39 s for 100M, with no slab rebuilt.
+- **Only the layout in use.** A cold query used to download both the slab and the block layout's hint (186 MB). It now asks for the paged, slab, and block
+  hints together, in that order of preference, and drops the slower ones once an earlier one answers.
+- **Manifest.** A cold open reads the fixed-key manifest copy, then lists only the manifests after it (one request), instead of listing all 2,760. The
+  object-store wrapper did not forward `list_with_offset`, so the first version of this still listed everything; fixed and tested.
+- **Speculation from the hint.** The hint header lists every slab object with its size, so the directory pages and the scan reads start while the
+  manifest is still in flight. The manifest later confirms the layout (a stale one only costs the bytes).
+- **Scan while the reads arrive.** The prefetch scans each slab's clusters as its reads complete and hands the candidates to the query, so the last read
+  is followed by the rerank directly (the scan memo is exact: a scan is a pure function of the immutable index object, the query, and the probed clusters;
+  it is skipped whenever a row mask applies).
+- **Cheaper namespace state.** A state clone shares the checkpoint's segment list and slab sets (`Arc`, copy on write): the six clones per query no longer
+  copy 1,787 segment records each. The probe plan partitions off the nearest few thousand entries instead of sorting all of them, and per-segment entry
+  slices replace a filter over all entries.
+- **Warm queries skip the scan prefetch** when the directory pages are already resident.
+
+New knobs (environment only, in `docs/configuration.md`): `BF_ANN_PAGED`, `BF_ANN_PAGE_MARGIN`, `BF_ANN_PAGE_KAPPA`, `BF_ANN_PAGE_ENTRIES`,
+`BF_ANN_PAGED_MIN_ENTRIES`, `BF_ANN_SCAN_MEMO`, and `BF_ANN_SPECULATE`.
+
+### Results: c7gd.2xlarge, same region as the bucket, 100M
+
+`ab.py`, 50 queries per cold arm (fresh process: 50 for 48 probes; 30 for main at 64 probes); warm is 1,000 queries at concurrency 1; recall@10 for the cold
+rows is over those 50 queries, for the warm rows over all 200 oracle queries. 8 GiB block cache, default decoded cache, 6 rayon threads.
+
+| Arm | p50 / p90 ms | p99 ms | Requests, MB, waves | Recall@10 |
+|---|---|---:|---|---:|
+| 48 probes, main, cache-cold | 2,478 / 2,863 | 3,433 | 1,186, 294.0, 4.1 | 0.950 |
+| 48 probes, this branch, cache-cold | 949 / 1,131 | 1,253 | 1,295, 126.0, 4.5 | 0.950 |
+| 48 probes, main, fresh process | 2,914 / 3,606 | 4,220 | 1,186, 294.0, 4.2 | 0.950 |
+| 48 probes, this branch, fresh process | 1,047 / 1,223 | 1,520 | 1,295, 126.0, 4.3 | 0.950 |
+| 48 probes, main, warm | 323.1 / 366.3 | 398.3 | | 0.9410 |
+| 48 probes, this branch, warm | 123.5 / 142.9 | 159.9 | | 0.9410 |
+| 64 probes, main, cache-cold | 2,677 / 2,953 | 4,096 | 1,510, 326.8, 4.2 | 0.958 |
+| 64 probes, this branch, cache-cold | 1,164 / 1,348 | 1,614 | 1,637, 163.0, 4.5 | 0.958 |
+| 64 probes, main, fresh process | 3,366 / 4,111 | 5,557 | 1,512, 326.5, 4.2 | 0.957 |
+| 64 probes, this branch, fresh process | 1,228 / 1,411 | 1,813 | 1,637, 163.0, 4.4 | 0.958 |
+| 64 probes, main, warm | 378.2 / 425.4 | 476.7 | | 0.9555 |
+| 64 probes, this branch, warm | 168.3 / 201.1 | 249.0 | | 0.9540 |
+
+Against the target, at the setting that reaches recall 0.95 (64 probes): cache-cold p50 1,164 ms (target 1,200, met), fresh-process p50 1,228 ms (target
+1,500, met), warm p50 168 ms (target 150, **not met**). At 48 probes recall is 0.941 and warm is 123.5 ms. Cold p99 sits well above p50 because every wave
+waits for its slowest request out of about a thousand.
+
+### Per-stage timeline, one cache-cold query at 64 probes (traced runs, so a little slower than the table)
+
+| Wave | main | This branch |
+|---|---|---|
+| Hints and manifest | 2 requests, 185.7 MB, 1,281 ms, then the WAL tail 91 ms | 1 request, 4.0 MB, 96 ms |
+| Directory pages | (inside the hints) | 121 requests, 17.9 MB, 178 ms (starts at 96 ms, overlaps the manifest) |
+| Scan | 1,402 requests, 131.3 MB, 682 ms (starts at 1,419 ms) | 1,404 requests, 131.6 MB, 699 ms (starts at 299 ms) |
+| Gap before the rerank | about 350 ms (scan CPU, ranking 500,000 entries, state clones) | 35 ms |
+| Rerank vectors and documents | 127 requests, 3.3 MB, 427 ms | 127 requests, 3.3 MB, 308 ms |
+| Total | 3,049 ms | 1,380 ms |
+
+What is left is the scan (130 MB in about 650 ms: 1,400 requests of about 90 KB, bound by the slowest of them) and the last wave (a hundred small reads of
+different objects, bound by S3's 100 ms tail). Neither shrinks without fewer bytes per query or fewer waves.
+
+### Recall against the page margin (64 probes, 200 oracle queries, warm runs)
+
+| Page margin | Entries read (about) | Recall@10 | Warm p50 ms |
+|---|---:|---:|---:|
+| 12 | 38,000 | 0.9505 | 157 |
+| 16 (default) | 51,000 | 0.9540 | 168 |
+| 24 | 77,000 | 0.9550 | 189 |
+| flat directory (main) | 500,000 | 0.9555 | 378 |
+
+(The 16 and 24 rows come from 400-query runs and the default row from the 1,000-query run; the margin 12 warm p50 is from the 1,000-query run before
+the probe plan was optimized.) At 48 probes a margin of 12 and of 16 both give 0.9410, the flat directory's recall.
+
+### Tried, no gain
+
+Hedge budget 0.4 (cache-cold p50 1,297 ms against 1,383 on the same build, within the noise of S3), merge gaps of 64, 128, 256, and 512 KB
+(fewer requests, more bytes: 1,275 ms at 128 KB, then worse, and no better combined with hedging), and jemalloc's dirty-page decay at 30 s, which cuts about
+14 ms from a warm query (the kernel spends 10 to 15 percent of a warm query faulting in freshly allocated read buffers) but holds freed memory longer than the
+memory targets allow, so it is not the default (`_RJEM_MALLOC_CONF=background_thread:true,narenas:4,dirty_decay_ms:30000,muzzy_decay_ms:30000`). Measured over
+1,000 warm queries at 64 probes: 155.7 / 180.0 ms with the 30 s decay, and 148.2 / 169.7 ms with the decay and `RAYON_NUM_THREADS=8` instead of 6 (recall
+0.954 in both), which meets the 150 ms warm target for a node that only serves queries.
+
+### No regression at 10M (in-region, c7gd.2xlarge, `scale/ns/wikipedia-10m`, read-only, 48 probes, same session, 50 cold queries)
+
+The 10M namespace's directory (49,976 clusters) is below the paging threshold, so it takes the old path plus the manifest, hint, and state-clone changes.
+
+| Arm | p50 / p90 ms | p99 ms | Requests, MB, waves | Recall@10 |
+|---|---|---:|---|---:|
+| main, cache-cold | 665 / 911 | 1,151 | 405, 50.7, 3.3 | 0.944 |
+| this branch, cache-cold | 561 / 683 | 795 | 406, 50.2, 3.3 | 0.944 |
+| main, fresh process | 703 / 938 | 1,063 | 405, 50.7, 3.7 | 0.944 |
+| this branch, fresh process | 691 / 914 | 1,111 | 406, 50.1, 3.6 | 0.944 |
+| main, warm | 47.4 / 59.0 | 73.1 | | 0.953 |
+| this branch, warm | 43.2 / 55.8 | 71.7 | | 0.953 |
+
+### Not done and what is left
+
+- **Warm at 64 probes is 168 ms against the 150 ms target.** Roughly 10 to 15 percent of a warm query's CPU is kernel time from allocating and freeing about
+  130 MB of read buffers, and about 13 percent is the scan itself (`PlaneQuery::scan`). A longer jemalloc decay plus 8 rayon threads closes it
+  (148.2 ms, above). Making that the default for `--read-only` servers, or reusing read buffers, is the follow-up.
+- **Finer slabs** (a recluster with 100-row clusters, so each probe reads less and recall per probe rises) were not built: the cold targets were met
+  without it, and it needs another 3 to 4 hour recluster at 100M. It remains the way to lower the scan bytes, which are now most of a cold query.
+- **Manifest at 100M** is 3.4 MB of JSON read whole by every cold query (about 50 ms); splitting it is the next cold-start cut.
+- The 100M recluster in `big/` was not redone; it carries the paged copy added by `repage`.
+

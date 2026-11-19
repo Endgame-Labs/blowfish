@@ -127,6 +127,8 @@ variables; the defaults suit 1,024-dimension vectors.
 | How strongly a cell's spread pulls it up the ranking (see `PagedDirectory::select_cells`) | 0.5 | `BF_ANN_PAGE_KAPPA` |
 | Entries per cell when `recluster` (or `repage`) builds the paged copy | 24 | `BF_ANN_PAGE_ENTRIES` |
 | Smallest directory (in clusters) that gets a paged copy | 100,000 | `BF_ANN_PAGED_MIN_ENTRIES` |
+| Scan each slab's clusters while a cold query's other reads are still arriving (set to `0` for A/B runs) | on | `BF_ANN_SCAN_MEMO` |
+| Start a cold query's directory pages and scan reads from the hint, before the manifest arrives (set to `0` for A/B runs) | on | `BF_ANN_SPECULATE` |
 
 `cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged copy to a namespace
 that was reclustered before paging existed, without rebuilding any slab.
