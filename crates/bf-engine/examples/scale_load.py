@@ -9,6 +9,7 @@ The Hub endpoint may be a keyless proxy. No credentials are read by this loader.
 """
 import argparse
 import base64
+import contextlib
 import gc
 import json
 import signal
@@ -22,6 +23,21 @@ import pyarrow.parquet as pq
 
 DATASET = "CohereLabs/wikipedia-2023-11-embed-multilingual-v3"
 REVISION = "ade45fb52bd549f5e8c065636fe4160a43c2af36"
+# Shard order. English first (415 shards, about 41M rows), then these languages in this fixed order
+# (shard counts at REVISION). A "unit" is one (language, shard); its index in this list is the resume
+# checkpoint, and English unit i is shard i, so checkpoints from English-only runs stay valid.
+LANGUAGES = (("en", 415), ("de", 208), ("fr", 179), ("es", 130), ("ru", 138), ("ja", 67))
+# Document ids: language index * 10^9 + shard * 100,000 + row in shard. English (index 0) ids are the
+# original shard * 100,000 + row, so the first 10M rows and oracle-10m.npz are unchanged. A shard holds
+# at most 100,000 rows (checked), so ids are unique and stable.
+LANGUAGE_ID_STRIDE = 1_000_000_000
+SHARD_ROWS = 100_000
+UNITS = [(index, language, shard) for index, (language, count) in enumerate(LANGUAGES) for shard in range(count)]
+
+
+def unit_path(scratch, unit):
+    index, language, shard = unit
+    return scratch / (f"{shard:04}.parquet" if index == 0 else f"{language}-{shard:04}.parquet")
 
 
 def available():
@@ -31,10 +47,11 @@ def available():
     raise RuntimeError("MemAvailable is required for the scale run")
 
 
-def download(client, endpoint, shard, target):
+def download(client, endpoint, unit, target):
     if target.exists():
         return
-    url = f"{endpoint}/datasets/{DATASET}/resolve/{REVISION}/en/{shard:04}.parquet"
+    _, language, shard = unit
+    url = f"{endpoint}/datasets/{DATASET}/resolve/{REVISION}/{language}/{shard:04}.parquet"
     pending = target.with_suffix(".partial")
     try:
         with client.stream("GET", url, follow_redirects=True) as response:
@@ -140,7 +157,7 @@ def main():
             filtered = {name: (saved[f"{name}_scores"], saved[f"{name}_ids"]) for name in filtered}
         else:
             first = args.scratch / "0000.parquet"
-            download(client, args.hub_endpoint, 0, first)
+            download(client, args.hub_endpoint, UNITS[0], first)
             held = pq.read_table(first).take(np.array(sorted(held_ids)))
             held_vectors = vectors(held.to_batches()[0])
             query = held_vectors / np.maximum(np.linalg.norm(held_vectors, axis=1, keepdims=True), 1e-30)
@@ -148,15 +165,28 @@ def main():
                        for i, v, row in zip(sorted(held_ids), held_vectors, held.select(["title"]).to_pylist())]
             (args.scratch / "queries.json").write_text(json.dumps(queries))
             del held, held_vectors
-        for shard in range(next_shard, (args.rows + 200 + 99_999) // 100_000):
-            target = args.scratch / f"{shard:04}.parquet"
-            download(client, args.hub_endpoint, shard, target)
+        prefetch = None  # (target, future) for the next unit, downloaded while this one loads
+        fetcher = ThreadPoolExecutor(max_workers=1)
+        for unit_index in range(next_shard, len(UNITS)):
+            if rows >= args.rows:
+                break
+            unit = UNITS[unit_index]
+            lang_index, _, shard = unit
+            id_base = lang_index * LANGUAGE_ID_STRIDE + shard * SHARD_ROWS
+            target = unit_path(args.scratch, unit)
+            if prefetch and prefetch[0] == target:
+                prefetch[1].result()
+            else:
+                download(client, args.hub_endpoint, unit, target)
+            prefetch = None
             try:
                 offset = 0
                 for batch in pq.ParquetFile(target).iter_batches(batch_size=args.batch):
                     matrix = vectors(batch)
-                    ids = np.arange(shard * 100_000 + offset, shard * 100_000 + offset + len(batch), dtype=np.int64)
+                    ids = np.arange(id_base + offset, id_base + offset + len(batch), dtype=np.int64)
                     offset += len(batch)
+                    if offset > SHARD_ROWS:
+                        raise ValueError(f"shard {unit} has more than {SHARD_ROWS} rows; ids would collide")
                     mask = np.array([int(i) not in held_ids for i in ids])
                     ids, matrix = ids[mask], matrix[mask]
                     keep = min(len(ids), args.rows - rows)
@@ -180,6 +210,10 @@ def main():
                             "text": {"type": "string", "full_text_search": True, "filterable": False},
                             "title": {"type": "string", "filterable": False},
                             "title_initial": "string", "text_length": "int", "vector": {"type": f"[1024]{args.vector_type}", "ann": True}})  # real turbopuffer requires ann:true
+                    if prefetch is None and rows + keep < args.rows and unit_index + 1 < len(UNITS):
+                        following = UNITS[unit_index + 1]
+                        following_path = unit_path(args.scratch, following)
+                        prefetch = (following_path, fetcher.submit(download, client, args.hub_endpoint, following, following_path))
                     # Overlap the (network-bound) write with the truth computation and the next
                     # batch's preparation. The schema-carrying first write completes before any other.
                     while len(inflight) >= args.inflight:
@@ -212,7 +246,7 @@ def main():
                 while inflight:
                     inflight.pop(0).result()
                 target.unlink(missing_ok=True)
-            state = dict(rows=rows, raw_bytes=raw_bytes, next_shard=shard+1,
+            state = dict(rows=rows, raw_bytes=raw_bytes, next_shard=unit_index + 1,
                          seconds=time.monotonic()-start, retries_429=counters["retries"],
                          memory_pauses=counters["pauses"], retries_transport=counters["transport"])
             pending = args.scratch / "truth-next.npz"
@@ -223,6 +257,11 @@ def main():
             (args.scratch / "checkpoint.json").write_text(json.dumps(state))
             if rows == args.rows:
                 break
+    if prefetch:
+        with contextlib.suppress(Exception):
+            prefetch[1].result()
+        prefetch[0].unlink(missing_ok=True)
+    fetcher.shutdown()
     print(json.dumps({"event": "complete", "rows": rows}), flush=True)
 
 

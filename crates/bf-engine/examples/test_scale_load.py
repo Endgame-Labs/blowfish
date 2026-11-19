@@ -47,6 +47,20 @@ class StreamingTruth(unittest.TestCase):
         np.testing.assert_array_equal(ids, np.arange(15, 5, -1).reshape(1, 10))
 
 
+class ShardOrder(unittest.TestCase):
+    def test_english_units_keep_the_original_ids_and_order(self):
+        self.assertEqual([u[1] for u in scale_load.UNITS[:415]], ["en"] * 415)
+        self.assertEqual([u[2] for u in scale_load.UNITS[:415]], list(range(415)))
+        self.assertEqual(scale_load.UNITS[415], (1, "de", 0))
+
+    def test_ids_never_collide_across_languages(self):
+        bases = {i * scale_load.LANGUAGE_ID_STRIDE + s * scale_load.SHARD_ROWS for i, _, s in scale_load.UNITS}
+        self.assertEqual(len(bases), len(scale_load.UNITS))
+        last = max(i * scale_load.LANGUAGE_ID_STRIDE + s * scale_load.SHARD_ROWS for i, _, s in scale_load.UNITS)
+        self.assertLess(max(s for _, _, s in scale_load.UNITS) * scale_load.SHARD_ROWS, scale_load.LANGUAGE_ID_STRIDE)
+        self.assertLess(last + scale_load.SHARD_ROWS, 2**62)
+
+
 class RequestLifetime(unittest.TestCase):
     def test_retry_cycles_release_requests_without_automatic_gc(self):
         vector = [1.0] + [0.0] * 1023
