@@ -105,7 +105,7 @@ def send(client, args, body, counters):
             time.sleep(delay)
             delay = min(10, delay * 1.5)
             continue
-        if response.status_code == 429:
+        if response.status_code == 429 or response.status_code >= 500:
             counters["retries"] += 1
             response.close()
             del response
