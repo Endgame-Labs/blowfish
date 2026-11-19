@@ -736,14 +736,46 @@ impl Wal {
         // A cold reader asks for the fixed-key copy while it lists; when the copy is the newest
         // manifest, that is one round trip instead of two. A copy that lags the listing is ignored.
         let prefix = format!("ns/{}/manifest/", self.namespace);
-        let (listed, copy) = futures::join!(self.store.list(&prefix), async {
+        // A namespace with thousands of publications lists over several sequential pages. With
+        // the copy in hand, only the manifests after it need listing (usually none, one page): take
+        // whichever of the two ways of finding the newest sequence finishes first.
+        use futures::FutureExt as _;
+        let copy_read = async {
             if known == 0 {
                 self.store.get(&self.latest_key()).await.ok()
             } else {
                 None
             }
-        });
-        let objects = listed?;
+        }
+        .shared();
+        let tail = {
+            let (copy_read, prefix) = (copy_read.clone(), &prefix);
+            async move {
+                let copy = copy_read.await?;
+                let seq = u64::from_be_bytes(copy.get(..8)?.try_into().ok()?);
+                let after = format!("{prefix}{seq:020}.json");
+                let newer = self.store.list_after(prefix, &after).await.ok()?;
+                Some((seq, after, newer))
+            }
+        };
+        let full = self.store.list(&prefix);
+        let tail = tail.boxed();
+        let (objects, copy) = match futures::future::select(full.boxed(), tail).await {
+            futures::future::Either::Left((listed, _)) => (listed?, copy_read.await),
+            futures::future::Either::Right((Some((_, after, newer)), _)) => {
+                let objects = if newer.is_empty() {
+                    vec![bf_storage::ObjectInfo {
+                        key: after,
+                        size: 0,
+                        last_modified: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
+                    }]
+                } else {
+                    newer
+                };
+                (objects, copy_read.await)
+            }
+            futures::future::Either::Right((None, full)) => (full.await?, copy_read.await),
+        };
         let Some(last) = objects.last() else {
             return Ok(None);
         };

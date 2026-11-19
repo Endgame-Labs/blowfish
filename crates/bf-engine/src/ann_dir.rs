@@ -1244,5 +1244,24 @@ pub(crate) async fn slab_directory(
         let paged = paged.clone();
         on_worker(async move { Ok(paged.assemble(&pages)) }).await?
     };
+    if std::env::var_os("BF_ANN_PAGED_DEBUG").is_some() {
+        // Diagnostics: how many of the clusters a flat directory would probe the pages hold.
+        let full = load(store, &set.dir, None).await?;
+        let d = full.center_distances(vector).map_err(segment::index_error)?;
+        let mut order: Vec<usize> = (0..d.len()).collect();
+        order.sort_unstable_by(|a, b| d[*a].total_cmp(&d[*b]));
+        let probes = probe_count(config, rows as usize, clusters as usize, 1.0);
+        let have: std::collections::HashSet<(usize, usize)> =
+            view.entries().iter().map(|e| (e.segment, e.cluster)).collect();
+        let found = order[..probes]
+            .iter()
+            .filter(|n| have.contains(&(full.entries()[**n].segment, full.entries()[**n].cluster)))
+            .count();
+        eprintln!(
+            "COVERAGE probes={probes} found={found} cells={} entries={}",
+            cells.len(),
+            view.entries().len()
+        );
+    }
     Ok(Arc::new(view))
 }
