@@ -10,9 +10,12 @@ The Hub endpoint may be a keyless proxy. No credentials are read by this loader.
 import argparse
 import base64
 import contextlib
+import email.utils
 import gc
 import json
+import random
 import signal
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -87,8 +90,82 @@ def update_truth(query, matrix, ids, best_scores, best_ids):
     return np.take_along_axis(joined_scores, keep, axis=1), np.take_along_axis(joined_ids, keep, axis=1)
 
 
-def send(client, args, body, counters):
-    """POST one batch, retrying backpressure and transport errors."""
+class Limiter:
+    """One backpressure limiter shared by every in-flight thread.
+
+    A 429 or 503 pauses all threads until the server's `retry-after-ms` / `Retry-After` (or a
+    full-jitter backoff when it sends none) has passed, then spaces out new requests. The spacing
+    shrinks on every success, so the load ramps back up gradually instead of all at once.
+    """
+    BASE, CAP = 0.25, 30.0
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pause_until = 0.0   # monotonic time before which no request starts
+        self.next_start = 0.0    # earliest start of the next request (the spacing)
+        self.spacing = 0.0       # seconds between request starts; 0 when unthrottled
+        self.failures = 0        # consecutive backpressure responses, for the backoff exponent
+        self.counts = {429: 0, 503: 0}
+        self.hints = []          # first few (status, retry-after-ms, retry-after) values seen
+
+    def wait_turn(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                ready = max(self.pause_until, self.next_start)
+                if now >= ready:
+                    self.next_start = now + self.spacing
+                    return
+            time.sleep(min(ready - now, 1.0))
+
+    def success(self):
+        with self.lock:
+            self.failures = 0
+            self.spacing = 0.0 if self.spacing < 0.01 else self.spacing * 0.7
+
+    def backpressure(self, response):
+        """Record a 429 or 503, slow every thread, and return the seconds to wait."""
+        status = response.status_code
+        ms, secs = response.headers.get("retry-after-ms"), response.headers.get("retry-after")
+        hint = parse_retry_after(ms, secs)
+        with self.lock:
+            self.counts[status] += 1
+            if len(self.hints) < 5:
+                self.hints.append({"status": status, "retry_after_ms": ms, "retry_after": secs})
+            now = time.monotonic()
+            # Threads that were already in flight when the pause began all see the same overload:
+            # only the first response of an episode counts toward the backoff and the slowdown.
+            new_episode = now >= self.pause_until
+            if new_episode:
+                self.failures += 1
+                self.spacing = min(self.CAP, max(self.spacing * 2, self.BASE))
+            if hint is None:
+                # Full jitter: uniform over the whole exponential window.
+                wait = random.uniform(0, min(self.CAP, self.BASE * 2 ** self.failures))
+            else:
+                # Honor the server's delay; a little jitter keeps threads from retrying in lockstep.
+                wait = hint + random.uniform(0, 0.25 * hint)
+            self.pause_until = max(self.pause_until, now + wait)
+            return wait
+
+
+def parse_retry_after(ms, secs):
+    """`retry-after-ms` first, then `Retry-After` as seconds or an HTTP date; None when unusable."""
+    with contextlib.suppress(TypeError, ValueError):
+        if ms is not None and float(ms) >= 0:
+            return float(ms) / 1000
+    if secs is not None:
+        with contextlib.suppress(ValueError):
+            if float(secs) >= 0:
+                return float(secs)
+        with contextlib.suppress(TypeError, ValueError):
+            when = email.utils.parsedate_to_datetime(secs)
+            return max(0.0, when.timestamp() - time.time())
+    return None
+
+
+def send(client, args, body, counters, limiter):
+    """POST one batch, retrying backpressure (429 and 503) and transport errors."""
     delay = 0.25
     while True:
         # Transport exceptions and closed responses can form cycles retaining a complete
@@ -98,21 +175,26 @@ def send(client, args, body, counters):
             counters["pauses"] += 1
             print(json.dumps({"event": "memory_pause", "available": available()}), flush=True)
             time.sleep(5)
+        limiter.wait_turn()
         try:
             response = client.post(f"{args.base_url}/v2/namespaces/{args.namespace}", json=body)
         except httpx.TransportError:
             counters["transport"] += 1
-            time.sleep(delay)
+            # Full jitter, so threads do not retry in step.
+            time.sleep(random.uniform(0, delay))
             delay = min(10, delay * 1.5)
             continue
-        if response.status_code == 429:
-            counters["retries"] += 1
+        if response.status_code in (429, 503):
+            status = response.status_code
+            counters["retries"] += status == 429
+            wait = limiter.backpressure(response)
             response.close()
             del response
-            time.sleep(delay)
-            delay = min(10, delay * 1.5)
+            if wait and limiter.failures == 1:  # log the first of each burst, not every retry
+                print(json.dumps({"event": "backpressure", "status": status, "wait_seconds": round(wait, 2)}), flush=True)
             continue
         response.raise_for_status()
+        limiter.success()
         return
 
 
@@ -137,6 +219,7 @@ def main():
     start = time.monotonic()
     rows = raw_bytes = 0
     counters = {"retries": 0, "transport": 0, "pauses": 0}
+    limiter = Limiter()
     inflight = []
     pool = ThreadPoolExecutor(max_workers=args.inflight)
     best_scores = np.full((200, 10), -np.inf, dtype=np.float32)
@@ -152,6 +235,7 @@ def main():
             state = {key: saved[key].item() for key in ("rows", "raw_bytes", "next_shard", "seconds", "retries_429", "memory_pauses", "retries_transport")}
             rows, raw_bytes, next_shard = state["rows"], state["raw_bytes"], state["next_shard"]
             start -= state["seconds"]
+            limiter.counts[503] = int(saved["retries_503"]) if "retries_503" in saved else 0
             counters.update(retries=state["retries_429"], pauses=state["memory_pauses"], transport=state["retries_transport"])
             best_scores, best_ids, query = saved["scores"], saved["ids"], saved["query"]
             filtered = {name: (saved[f"{name}_scores"], saved[f"{name}_ids"]) for name in filtered}
@@ -218,7 +302,7 @@ def main():
                     # batch's preparation. The schema-carrying first write completes before any other.
                     while len(inflight) >= args.inflight:
                         inflight.pop(0).result()
-                    inflight.append(pool.submit(send, client, args, body, counters))
+                    inflight.append(pool.submit(send, client, args, body, counters, limiter))
                     if rows == 0:
                         inflight.pop(0).result()
                     best_scores, best_ids = update_truth(query, matrix, ids, best_scores, best_ids)
@@ -232,7 +316,8 @@ def main():
                     if rows % 10_000 < args.batch or rows == args.rows:
                         elapsed = time.monotonic() - start
                         result = dict(rows=rows, seconds=elapsed, docs_per_second=rows / elapsed,
-                                      retries_429=counters["retries"], retries_transport=counters["transport"],
+                                      retries_429=counters["retries"], retries_503=limiter.counts[503],
+                                      retry_after_samples=limiter.hints, retries_transport=counters["transport"],
                                       memory_pauses=counters["pauses"], raw_bytes=raw_bytes)
                         (args.scratch / "ingest.json").write_text(json.dumps(result, indent=2))
                         print(json.dumps(result), flush=True)
@@ -248,6 +333,7 @@ def main():
                 target.unlink(missing_ok=True)
             state = dict(rows=rows, raw_bytes=raw_bytes, next_shard=unit_index + 1,
                          seconds=time.monotonic()-start, retries_429=counters["retries"],
+                         retries_503=limiter.counts[503],
                          memory_pauses=counters["pauses"], retries_transport=counters["transport"])
             pending = args.scratch / "truth-next.npz"
             np.savez(pending, ids=best_ids, scores=best_scores, query=query, **state,

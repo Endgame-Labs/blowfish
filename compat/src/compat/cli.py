@@ -280,6 +280,11 @@ def main():
         _, bad = run_models(target)
         if getattr(args, "models", False) or bad:
             sys.exit(1 if bad else 0)
+    if args.command == "check" and os.getenv("COMPAT_BACKPRESSURE_URL"):
+        from compat.sdk_retry import run as run_retry
+        _, bad = run_retry(os.environ["COMPAT_BACKPRESSURE_URL"], args.api_key)
+        if bad:
+            sys.exit(1)
     pattern = args.k if any(c in args.k for c in "*?[") else "*" + args.k + "*"
     selected = [n for n in SCENARIOS if fnmatch.fnmatch(n, pattern)]
     if not selected:

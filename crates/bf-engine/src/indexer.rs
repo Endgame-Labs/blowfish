@@ -901,6 +901,7 @@ impl Engine {
             Err(e) => return Err(log_error(e)),
         };
         crate::ann::stage(t0, "idx publish");
+        crate::drain::record(state.tail_bytes, t0.elapsed());
         let mut current = handle.state.lock().await;
         // This node wrote the manifest and holds the tail in memory, so adopt the checkpoint
         // directly. Re-reading the tail from the object store would download every unindexed

@@ -42,10 +42,21 @@ log entry in the same commit.
   429 and 503 responses carry `Retry-After` (and `retry-after-ms`), and `x-should-retry` is set where the SDKs read it.
   Every wire behavior the SDKs rely on (`docs/research/turbopuffer-sdks.md`) is either implemented or listed here as
   Open.
+- Backpressure (2026-11-20): every 429 and 503 carries `Retry-After` (whole seconds, at least 1) and `retry-after-ms`.
+  For the unindexed-WAL limit the delay is the backlog divided by the indexer's recent throughput, clamped to 0.5 to
+  30 s. `x-should-retry` is `true` on 408, 409, 429, 502, 503, and 504, and `false` on 500. The full audit is in
+  `docs/research/sdk-compat-audit.md`.
 - The compatibility suite (`compat/`) drives the official SDK against blowfish and diffs against recorded turbopuffer
   responses. It must pass in both modes (`scripts/compat_both.sh`) before every merge.
 - Checks against the real turbopuffer use a paid account: only tiny namespaces prefixed `blowfish-oracle-`, deleted
   when the comparison is done.
+
+**Open** (SDK compatibility, from `docs/research/sdk-compat-audit.md`).
+
+- `Server-Timing` response header, which the legacy Python SDK (0.1.x and 0.4.x) can parse for cache and timing figures.
+- Only the Python and TypeScript SDKs are exercised by tests. Go, Java, Ruby, Rust, and C# share the generated retry,
+  error, and header code, which was read but not run.
+- A base URL with a path prefix needs a proxy that strips the prefix.
 
 ## 3. Code and workflow
 
