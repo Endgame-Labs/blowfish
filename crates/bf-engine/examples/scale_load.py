@@ -113,6 +113,12 @@ def send(client, args, body, counters):
             delay = min(10, delay * 1.5)
             continue
         response.raise_for_status()
+        # turbopuffer reports billing on writes; blowfish does not. Sum what is there.
+        with contextlib.suppress(ValueError):
+            billing = response.json().get("billing") or {}
+            for name, value in billing.items():
+                if isinstance(value, (int, float)):
+                    counters["billing"][name] = counters["billing"].get(name, 0) + value
         return
 
 
@@ -128,6 +134,8 @@ def main():
     parser.add_argument("--inflight", type=int, default=2, help="concurrent writes; the server group-commits them")
     parser.add_argument("--min-available-gib", type=float, default=4.0,
                         help="pause while MemAvailable is below this (lower it on small machines)")
+    parser.add_argument("--stop-after-units", type=int, default=None,
+                        help="stop cleanly after this many (language, shard) units are loaded in total (resumable)")
     parser.add_argument("--scratch", type=Path, required=True)
     parser.add_argument("--resume", action="store_true", help="Replay from the last completed shard; upserts are idempotent")
     args = parser.parse_args()
@@ -136,7 +144,7 @@ def main():
     args.scratch.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     rows = raw_bytes = 0
-    counters = {"retries": 0, "transport": 0, "pauses": 0}
+    counters = {"retries": 0, "transport": 0, "pauses": 0, "billing": {}}
     inflight = []
     pool = ThreadPoolExecutor(max_workers=args.inflight)
     best_scores = np.full((200, 10), -np.inf, dtype=np.float32)
@@ -154,6 +162,8 @@ def main():
             start -= state["seconds"]
             counters.update(retries=state["retries_429"], pauses=state["memory_pauses"], transport=state["retries_transport"])
             best_scores, best_ids, query = saved["scores"], saved["ids"], saved["query"]
+            if "billing" in saved.files:
+                counters["billing"] = json.loads(str(saved["billing"]))
             filtered = {name: (saved[f"{name}_scores"], saved[f"{name}_ids"]) for name in filtered}
         else:
             first = args.scratch / "0000.parquet"
@@ -233,7 +243,7 @@ def main():
                         elapsed = time.monotonic() - start
                         result = dict(rows=rows, seconds=elapsed, docs_per_second=rows / elapsed,
                                       retries_429=counters["retries"], retries_transport=counters["transport"],
-                                      memory_pauses=counters["pauses"], raw_bytes=raw_bytes)
+                                      memory_pauses=counters["pauses"], raw_bytes=raw_bytes, billing=counters["billing"])
                         (args.scratch / "ingest.json").write_text(json.dumps(result, indent=2))
                         print(json.dumps(result), flush=True)
                     # Release the previous request body and Arrow view before the
@@ -250,12 +260,15 @@ def main():
                          seconds=time.monotonic()-start, retries_429=counters["retries"],
                          memory_pauses=counters["pauses"], retries_transport=counters["transport"])
             pending = args.scratch / "truth-next.npz"
-            np.savez(pending, ids=best_ids, scores=best_scores, query=query, **state,
+            np.savez(pending, ids=best_ids, scores=best_scores, query=query, billing=json.dumps(counters["billing"]), **state,
                      **{f"{name}_{part}": value for name, pair in filtered.items()
                         for part, value in zip(("scores", "ids"), pair)})
             pending.replace(checkpoint)
             (args.scratch / "checkpoint.json").write_text(json.dumps(state))
             if rows == args.rows:
+                break
+            if args.stop_after_units is not None and unit_index + 1 >= args.stop_after_units:
+                print(json.dumps({"event": "stopped", "rows": rows, "billing": counters["billing"]}), flush=True)
                 break
     if prefetch:
         with contextlib.suppress(Exception):
