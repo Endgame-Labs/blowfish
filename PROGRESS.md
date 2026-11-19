@@ -74,7 +74,7 @@ Newest first. Each entry says what works now and how it was checked.
 - **Live instance upgraded** to main (f5b08a9), from abb3cfd. The previous binary is kept for rollback, and the `live/` prefix was backed up first. The turbopuffer SDK smoke test passed for upsert, ANN, BM25, and filtered queries. Unauthenticated requests still get 401.
 - **New docs:**
   - `docs/design/projects-and-keys.md`: org, projects, project keys, the admin API, and the Go admin webapp with magic-link login.
-  - `docs/open-source-checklist.md`.
+  - `docs/open-source-checklist.md` (removed 2026-11-20).
 
 - **Perf iteration 8 merged (1M).**
   - **Changes:**

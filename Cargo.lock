@@ -230,7 +230,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bf-alloc"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "metrics",
  "tikv-jemalloc-ctl",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "bf-auth"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "bf-storage",
  "bytes",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "bf-engine"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "axum",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "bf-models"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "axum",
  "bf-types",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "bf-storage"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "async-trait",
  "bytes",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "bf-text"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "alyze",
  "async-trait",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "bf-types"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "base64 0.22.1",
  "bf-text",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "bf-vector"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "bf-wal"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "bf-storage",
  "bf-types",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "blowfish"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "axum",
  "base64 0.22.1",
