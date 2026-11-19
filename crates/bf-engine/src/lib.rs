@@ -43,6 +43,39 @@ pub(crate) struct TailEntry {
     /// A copy or branch install: its effect is not captured by `docs` and `shadowed`.
     pub copy: bool,
 }
+/// A checkpoint's segments, shared: cloning a namespace state (a query does it several times)
+/// must not copy thousands of segment records. Mutation copies on write.
+#[derive(Clone, Default)]
+pub(crate) struct Segments(Arc<Vec<bf_wal::Segment>>);
+impl std::ops::Deref for Segments {
+    type Target = Vec<bf_wal::Segment>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Segments {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+impl Segments {
+    /// Drop every segment without copying the shared list.
+    pub(crate) fn clear(&mut self) {
+        self.0 = Arc::default();
+    }
+}
+impl<'a> IntoIterator for &'a Segments {
+    type Item = &'a bf_wal::Segment;
+    type IntoIter = std::slice::Iter<'a, bf_wal::Segment>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+impl From<Vec<bf_wal::Segment>> for Segments {
+    fn from(v: Vec<bf_wal::Segment>) -> Self {
+        Self(Arc::new(v))
+    }
+}
 #[derive(Clone)]
 pub(crate) struct NamespaceState {
     pub seq: u64,
@@ -56,7 +89,7 @@ pub(crate) struct NamespaceState {
     /// exactly the IDs it indexed without re-reading the WAL.
     pub marks: BTreeMap<Id, u64>,
     pub entries: Vec<TailEntry>,
-    pub segments: Vec<bf_wal::Segment>,
+    pub segments: Segments,
     pub indexed_through: u64,
     pub manifest_seq: u64,
     pub tail_bytes: u64,
@@ -68,7 +101,7 @@ pub(crate) struct NamespaceState {
     /// Namespace ANN directories by `ann:<attribute>`, valid for exactly `segments`.
     pub ann_dirs: BTreeMap<String, bf_wal::SegmentFile>,
     /// Namespace-wide ANN layouts by attribute (valid while their covered segments are live).
-    pub ann_slabs: BTreeMap<String, bf_wal::SlabSet>,
+    pub ann_slabs: Arc<BTreeMap<String, bf_wal::SlabSet>>,
     pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
     pub corpus: Arc<BTreeMap<String, bf_text::CorpusStats>>,
     pub created_at: DateTime<Utc>,
@@ -87,7 +120,7 @@ impl Default for NamespaceState {
             shadowed: BTreeSet::new(),
             marks: BTreeMap::new(),
             entries: vec![],
-            segments: vec![],
+            segments: Segments::default(),
             indexed_through: 0,
             manifest_seq: 0,
             tail_bytes: 0,
@@ -95,7 +128,7 @@ impl Default for NamespaceState {
             stats: Default::default(),
             text_stats: None,
             ann_dirs: BTreeMap::new(),
-            ann_slabs: BTreeMap::new(),
+            ann_slabs: Arc::default(),
             scores: BTreeMap::new(),
             corpus: Arc::default(),
             created_at: Utc::now(),
@@ -248,7 +281,7 @@ impl NamespaceState {
         self.tail_bytes = self.entries.iter().map(|e| e.bytes).sum();
         self.tail_since = self.entries.first().map(|e| e.at);
         self.scores.clear();
-        self.segments = manifest.segments.clone();
+        self.segments = manifest.segments.clone().into();
         self.indexed_through = through;
         self.manifest_seq = generation;
         self.corpus = if manifest.text_stats.is_some() {
@@ -258,7 +291,7 @@ impl NamespaceState {
         };
         self.text_stats = manifest.text_stats.clone();
         self.ann_dirs = manifest.ann_dirs.clone();
-        self.ann_slabs = manifest.ann_slabs.clone();
+        self.ann_slabs = manifest.ann_slabs.clone().into();
         self.stats = manifest.stats.clone().into();
         self.checkpoint_refreshed = Instant::now();
         true

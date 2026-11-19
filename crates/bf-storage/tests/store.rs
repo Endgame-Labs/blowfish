@@ -30,7 +30,13 @@ async fn exercise(store: Storage) {
     let after = store.list_after("data", "data/object").await.unwrap();
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].key, "data/plain");
-    assert!(store.list_after("data", "data/plain").await.unwrap().is_empty());
+    assert!(
+        store
+            .list_after("data", "data/plain")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     store.delete(key).await.unwrap();
     store.delete("data/plain").await.unwrap();
     assert!(store.list("data").await.unwrap().is_empty());

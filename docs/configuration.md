@@ -111,3 +111,22 @@ merged by streaming, so none of these terms grows with the namespace. `recluster
 `BF_MEM_LOG_SECS=N` prints allocator and RSS statistics every N seconds, `/metrics` exposes
 `blowfish_alloc_bytes{kind}` (allocated, active, resident, retained), and a build with `--features heap-profile` writes jemalloc
 heap profiles when run with `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19` and `BF_HEAP_DUMP_DIR=DIR`.
+
+### Paged ANN directory (large reclustered namespaces)
+
+`recluster` writes the slab directory twice: whole (for older readers) and, once it lists at least 100,000 clusters, as a
+paged copy. A cold query reads the paged copy's small header (segment table, one one-bit code per cell, a page table) and
+then only the pages of the cells nearest the query, instead of the whole directory (about 100 MB at 100M rows). Queries
+rank only the clusters in those pages, so warm queries also skip ranking every cluster. All of these are environment
+variables; the defaults suit 1,024-dimension vectors.
+
+| What | Default | Variable |
+| --- | --- | --- |
+| Read paged directories (set to `0` to read the whole slab directory, for A/B runs) | on | `BF_ANN_PAGED` |
+| Cells' entries a query reads, as a multiple of the clusters it will probe (higher: more recall, more bytes) | 12 | `BF_ANN_PAGE_MARGIN` |
+| How strongly a cell's spread pulls it up the ranking (see `PagedDirectory::select_cells`) | 0.5 | `BF_ANN_PAGE_KAPPA` |
+| Entries per cell when `recluster` (or `repage`) builds the paged copy | 24 | `BF_ANN_PAGE_ENTRIES` |
+| Smallest directory (in clusters) that gets a paged copy | 100,000 | `BF_ANN_PAGED_MIN_ENTRIES` |
+
+`cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged copy to a namespace
+that was reclustered before paging existed, without rebuilding any slab.

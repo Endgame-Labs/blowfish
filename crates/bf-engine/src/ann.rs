@@ -526,7 +526,7 @@ async fn from_slabs(
         return Ok(None);
     };
     let mut view = state.without_docs();
-    view.segments = set.slabs.clone();
+    view.segments = set.slabs.clone().into();
     if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
         return Ok(None);
     }

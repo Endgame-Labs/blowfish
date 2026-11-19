@@ -475,7 +475,7 @@ pub(crate) async fn catch_up_hinted(
                         metric: m.distance_metric,
                         created_at: m.created_at,
                         updated_at: m.updated_at.unwrap_or(m.created_at),
-                        segments: m.segments,
+                        segments: m.segments.into(),
                         indexed_through: m.indexed_through,
                         manifest_seq: generation,
                         corpus: if m.text_stats.is_some() {
@@ -485,7 +485,7 @@ pub(crate) async fn catch_up_hinted(
                         },
                         text_stats: m.text_stats,
                         ann_dirs: m.ann_dirs,
-                        ann_slabs: m.ann_slabs,
+                        ann_slabs: m.ann_slabs.into(),
                         stats: m.stats.into(),
                         ..Default::default()
                     }

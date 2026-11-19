@@ -618,7 +618,7 @@ impl Engine {
         } else {
             let mut segments = vec![];
             crate::ann::stage(t0, "idx pre-live");
-            for mut seg in state.segments.clone() {
+            for mut seg in state.segments.to_vec() {
                 let live = segment::live(store, &seg).await?;
                 let keep = snapshot::allowed(store, &state, &seg, None).await?;
                 let deleted = &live - &keep;
