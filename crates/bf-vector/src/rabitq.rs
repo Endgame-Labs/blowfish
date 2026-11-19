@@ -235,7 +235,7 @@ impl PlaneQuery {
                 let x = *q - *c as f64;
                 *slot = ((x - vmin) / delta).round().clamp(0., levels) as u8;
             }
-            for (w, block) in levels_q.chunks_exact(64).enumerate() {
+            for (w, block) in levels_q.as_chunks::<64>().0.iter().enumerate() {
                 let mut acc = [0u64; QUERY_BITS];
                 for (k, &v) in block.iter().enumerate() {
                     for (j, a) in acc.iter_mut().enumerate() {
