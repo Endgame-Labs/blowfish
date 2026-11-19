@@ -487,3 +487,14 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
   an existing recluster in 39 s), hints that drop the layouts not in use, a manifest read that lists only what follows the fixed-key copy, directory pages and scan reads that start from the
   hint before the manifest arrives, scans that run while a cold query's reads arrive, and namespace-state clones that share the segment list. Cold targets met (1,200 and 1,500 ms); warm
   at 64 probes misses its 150 ms target. 10M does not regress (cache-cold 561 / 683 against 665 / 911, warm 43.2 / 55.8 against 47.4 / 59.0). Details: `docs/benchmarks.md`, "Iteration 17 (100M)".
+
+## SDK compatibility: retry and backpressure headers (branch `wt/sdkcompat`)
+
+- Every 429 and 503 now carries `Retry-After` (whole seconds, at least 1) and `retry-after-ms`; `x-should-retry` is `true` on 408, 409, 429, 502, 503, and 504 and `false` on 500.
+  For the unindexed-WAL limit the delay is the backlog divided by the indexer's smoothed throughput, clamped to 0.5 to 30 s (1 s before the first publish).
+  `ApiError` gained `retry_after_ms` and `should_retry` (builders `with_retry_after_ms`, `with_should_retry`); `HttpError` renders the headers.
+- Tests: Rust (`backpressure_429_carries_retry_headers`, `retry_headers_by_status`, `drain` unit test); `compat/src/compat/sdk_retry.py` (4 scenarios, the official Python SDK sync and async
+  retrying a 429 and waiting the advertised time) and a TypeScript smoke section, both against a second server with a 1-byte limit that `scripts/compat_both.sh` starts in each mode.
+- Audit of every behavior the SDKs rely on: `docs/research/sdk-compat-audit.md`; open items in `SPEC.md` section 2.
+- `scale_load.py`: one limiter shared by all in-flight threads, honors `retry-after-ms` / `Retry-After` (also on 503), full-jitter backoff, gradual ramp-up, and reports 429 / 503 counts and
+  sample header values in its progress line. The checkpoint format is unchanged (one optional `retries_503` field).
