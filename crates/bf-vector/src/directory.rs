@@ -64,6 +64,10 @@ pub struct DirSegment {
     /// Whether each cluster's quantized codes sit in the fragment, right after the cluster's
     /// blob, instead of in the segment's index object (see [`Fragment::build_blocks`]).
     pub codes_in_fragment: bool,
+    /// `(size, metadata length)` of the segment's index object and of its fragment, when the
+    /// directory records them (a paged directory does, so a reader can open the objects without
+    /// the manifest).
+    pub files: Option<[(u64, u64); 2]>,
 }
 
 /// One leaf cluster.
@@ -625,6 +629,7 @@ impl Directory {
                 rows: section.rows as usize,
                 membership: (!section.membership.is_empty()).then(|| section.membership.clone()),
                 codes_in_fragment: section.codes_in_fragment,
+                files: None,
             });
             entries.extend(section.entries.iter().cloned().map(|mut e| {
                 e.segment = s;

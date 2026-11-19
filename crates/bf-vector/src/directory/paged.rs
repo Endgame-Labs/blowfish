@@ -29,7 +29,7 @@ use super::{
 };
 use crate::cluster;
 
-const PAGED_MAGIC: &[u8; 8] = b"BFDIR006";
+const PAGED_MAGIC: &[u8; 8] = b"BFDIR007";
 /// Bytes of one page entry: the segment index, then the flat entry's fields.
 const PAGE_ENTRY_BYTES: usize = 4 + ENTRY_BYTES;
 /// Entries per top-level group the cells are carved from.
@@ -127,7 +127,17 @@ impl Directory {
     /// Rearrange this directory's entries into cells of about `per_cell` neighboring clusters, and
     /// write them as a paged object. Returns the object bytes and the header's length.
     /// Deterministic for a seed.
-    pub fn build_paged(&self, per_cell: usize, seed: u64) -> Result<(Vec<u8>, u64)> {
+    ///
+    /// `files` gives each segment's `(size, metadata length)` for its index object and its fragment.
+    pub fn build_paged(
+        &self,
+        per_cell: usize,
+        seed: u64,
+        files: &[[(u64, u64); 2]],
+    ) -> Result<(Vec<u8>, u64)> {
+        if files.len() != self.sections.len() {
+            return Err(bad("file sizes do not match the directory's segments"));
+        }
         let padded = self.shape.dims.next_power_of_two();
         let per_cell = per_cell.max(1);
         // (section, entry within section) of every entry, in directory order.
@@ -287,7 +297,11 @@ impl Directory {
         let mut header = PAGED_MAGIC.to_vec();
         put_shape(&mut header, &self.shape);
         put_u32(&mut header, self.sections.len() as u32);
-        for (seg, sec) in self.segments.iter().zip(&self.sections) {
+        for ((seg, sec), sizes) in self.segments.iter().zip(&self.sections).zip(files) {
+            for (size, meta) in sizes {
+                put_u64(&mut header, *size);
+                put_u64(&mut header, *meta);
+            }
             put_str(&mut header, &seg.id);
             put_str(&mut header, &seg.key);
             put_str(&mut header, &seg.fragment);
@@ -386,6 +400,7 @@ impl PagedDirectory {
         let mut segments = Vec::with_capacity(nsegs);
         let mut heads = Vec::with_capacity(nsegs);
         for _ in 0..nsegs {
+            let sizes = [(p.u64()?, p.u64()?), (p.u64()?, p.u64()?)];
             let id = text(&mut p)?;
             let key = text(&mut p)?;
             let fragment = text(&mut p)?;
@@ -409,6 +424,7 @@ impl PagedDirectory {
                 rows: rows as usize,
                 membership: (!membership.is_empty()).then(|| membership.clone()),
                 codes_in_fragment,
+                files: Some(sizes),
             });
             heads.push(Head {
                 shape: Shape { flat, ..shape },
@@ -496,6 +512,16 @@ impl PagedDirectory {
             self.heads.iter().map(|h| h.entry_rows).sum(),
             self.heads.iter().map(|h| h.entry_count).sum(),
         )
+    }
+    /// Size of the whole object, from the header's page table.
+    pub fn object_len(&self) -> u64 {
+        self.metadata_len
+            + self
+                .cells
+                .iter()
+                .map(|c| c.offset + u64::from(c.len))
+                .max()
+                .unwrap_or(0)
     }
     /// Number of cells (pages).
     pub fn cell_count(&self) -> usize {

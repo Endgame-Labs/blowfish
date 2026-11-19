@@ -210,10 +210,12 @@ async fn paged_directory_round_trips_and_selects_the_nearest_cells() {
     }
     let dir = Directory::decode(&Directory::build(&sources).unwrap().unwrap()).unwrap();
     let total = dir.entries().len();
-    let (object, header_len) = dir.build_paged(25, 7).unwrap();
+    let (object, header_len) = dir.build_paged(25, 7, &[[(1, 1); 2]; 3]).unwrap();
     assert!(bf_vector::PagedDirectory::is_paged(&object));
     let paged = bf_vector::PagedDirectory::decode(&object[..header_len as usize]).unwrap();
     assert_eq!(paged.segments().len(), 3);
+    assert_eq!(paged.segments()[2].files, Some([(1, 1); 2]));
+    assert_eq!(paged.object_len(), object.len() as u64);
     assert_eq!(paged.totals().1 as usize, total);
     let page = |c: usize| {
         let r = paged.page_range(c);

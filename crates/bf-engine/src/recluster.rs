@@ -405,7 +405,7 @@ impl Engine {
         // A directory this large is read in pieces: write the paged copy, and the hint a cold
         // query reads beside the manifest (the paged header, or else the whole directory).
         let paged_dir = ann_dir::load(store, &dir, None).await?;
-        let pages = ann_dir::build_paged(store, &ns, attr, paged_dir.clone()).await?;
+        let pages = ann_dir::build_paged(store, &ns, attr, paged_dir.clone(), &slabs).await?;
         if pages.is_none() {
             let bytes = segment::ObjectReader::new(store, &dir)
                 .bypass_cache()
@@ -467,7 +467,7 @@ impl Engine {
                 .get(attr)
                 .ok_or_else(|| ApiError::new(400, "namespace has no slabs"))?;
             let dir = ann_dir::load(store, &set.dir, None).await?;
-            let Some(pages) = ann_dir::build_paged(store, ns, attr, dir).await? else {
+            let Some(pages) = ann_dir::build_paged(store, ns, attr, dir, &set.slabs).await? else {
                 return Ok(None);
             };
             let size = pages.size;

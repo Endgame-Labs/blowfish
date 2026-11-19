@@ -437,6 +437,22 @@ pub(crate) async fn catch_up_hinted(
                             .zip(reader_names)
                             .find_map(|(r, name)| r.flatten().map(|p| (name, p)));
                         if let Some((name, p)) = first {
+                            // A paged slab directory's header says what the scan will read:
+                            // start those reads now, while the manifest is still in flight.
+                            if let Some((attribute, vector, k)) =
+                                hint.scan.as_ref().filter(|(s, _, _)| s == a)
+                            {
+                                let (store, context, config) =
+                                    (store.clone(), hint.context.clone(), hint.config.clone());
+                                let (attribute, vector, k, p) =
+                                    (attribute.clone(), vector.clone(), *k, p.clone());
+                                tokio::spawn(crate::read_cache::scope(context, async move {
+                                    crate::ann_dir::speculate_slab_scan(
+                                        &store, p, &attribute, &vector, k, &config,
+                                    )
+                                    .await
+                                }));
+                            }
                             got.push((name, p));
                             return got;
                         }

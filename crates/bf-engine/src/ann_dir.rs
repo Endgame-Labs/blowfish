@@ -445,7 +445,11 @@ pub(crate) async fn prefetch_scan(
     }
     let key = format!("ann:{attribute}");
     let frag_key = layout.frag_key(attribute);
+    let memoize = layout == Layout::Slabs && scan_memo_enabled();
+    let vector_key: Arc<[f32]> = vector.clone();
     let reads = chosen.into_iter().map(|(i, cs)| {
+        let vector = vector.clone();
+        let vector_key = vector_key.clone();
         let (key, frag_key) = (&key, &frag_key);
         async move {
             let (Some(file), Some(frag)) =
@@ -462,14 +466,41 @@ pub(crate) async fn prefetch_scan(
                 return;
             };
             let frag_reader = Reader::new(store, frag);
-            let _ = read_clusters(
+            let Ok((blobs, codes)) = read_clusters(
                 &seg_entries,
                 dir.segments()[i].codes_in_fragment,
                 false,
                 &frag_reader,
                 &partial,
             )
+            .await
+            else {
+                return;
+            };
+            // Scan now, while other segments' reads are still in flight: the query then needs
+            // only the rerank. Only for a lone segment list without deletions, where the query
+            // scans with no row mask too.
+            if !memoize {
+                return;
+            }
+            let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
+            let mut partial = partial;
+            for (cluster, blob) in wanted.iter().zip(&blobs) {
+                if partial.install(*cluster, blob).is_err() {
+                    return;
+                }
+            }
+            let index = Arc::new(partial.into_index());
+            let (scanner, vector, wanted2) = (index.clone(), vector.clone(), wanted.clone());
+            let found = on_worker(async move {
+                scanner
+                    .scan_blocks(&vector, &wanted2, codes, None)
+                    .map_err(segment::index_error)
+            })
             .await;
+            if let Ok(found) = found {
+                scan_memo_put(scan_key(&file.key, &vector_key, &wanted), (index, found));
+            }
         }
     });
     // Flat segments are scanned exactly in the same wave: their blobs and all their vectors.
@@ -871,6 +902,8 @@ pub(crate) async fn search(
             .cloned()
             .ok_or_else(|| segment::index_error("segment lost its ANN index"))?;
         let reader = Reader::new(store, &file);
+        let object_key = file.key.clone();
+        let memo_hit = layout == Layout::Slabs && scan_memo_enabled() && !exact;
         let frag_file = state.segments[i]
             .files
             .get(&layout.frag_key(attribute))
@@ -889,6 +922,22 @@ pub(crate) async fn search(
             .collect();
         tasks.push(
             async move {
+                // The prefetch may have scanned this segment's clusters already (see
+                // `scan_memo_put`): that is exact only without a row mask.
+                if memo_hit && live.is_none() {
+                    let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
+                    if let Some((index, found)) =
+                        scan_memo_take(&scan_key(&object_key, &vector, &wanted))
+                    {
+                        let probed = Probed {
+                            segment: i,
+                            index,
+                            clusters: wanted,
+                            exact: false,
+                        };
+                        return Ok((probed, (Vec::new(), found)));
+                    }
+                }
                 // An exactly scanned segment needs all of its vectors, and its row sets (from the
                 // blobs) only say which. Read the vectors in parallel with the blobs, as
                 // concurrent pieces, so the later exact scan is served from the cache.
@@ -1147,16 +1196,26 @@ pub(crate) async fn build_paged(
     ns: &str,
     attr: &str,
     dir: Arc<Directory>,
+    slabs: &[bf_wal::Segment],
 ) -> Result<Option<bf_wal::SegmentFile>, ApiError> {
     let entries = dir.entries().len();
     if entries < env_number("BF_ANN_PAGED_MIN_ENTRIES", 100_000usize) {
         return Ok(None);
     }
     let per_cell = env_number("BF_ANN_PAGE_ENTRIES", 24usize).max(1);
-    let (bytes, header_len) = tokio::task::spawn_blocking(move || dir.build_paged(per_cell, 7))
-        .await
-        .map_err(segment::index_error)?
-        .map_err(segment::index_error)?;
+    let (key, frag_key) = (format!("ann:{attr}"), Layout::Slabs.frag_key(attr));
+    let files: Vec<[(u64, u64); 2]> = slabs
+        .iter()
+        .map(|s| {
+            let size = |k: &str| s.files.get(k).map_or((0, 0), |f| (f.size, f.metadata_len));
+            [size(&key), size(&frag_key)]
+        })
+        .collect();
+    let (bytes, header_len) =
+        tokio::task::spawn_blocking(move || dir.build_paged(per_cell, 7, &files))
+            .await
+            .map_err(segment::index_error)?
+            .map_err(segment::index_error)?;
     let file = segment::put_file(
         store,
         format!("ns/{ns}/segments/ann-dir3p-{}.bfd", uuid::Uuid::new_v4()),
@@ -1219,9 +1278,24 @@ pub(crate) async fn slab_directory(
         return Ok((load(store, &set.dir, prefetched).await?, cached));
     };
     let t0 = std::time::Instant::now();
-    let mut warm = read_cache::get::<PagedDirectory>(&file.key, file.metadata_len).is_some();
+    let warm = read_cache::get::<PagedDirectory>(&file.key, file.metadata_len).is_some();
     let paged = load_paged(store, file, prefetched).await?;
     crate::ann::stage(t0, "directory header");
+    paged_view(store, file, &paged, vector, config, warm).await
+}
+
+/// The ordinary directory over the cells of `paged` nearest `vector`: their pages, read (merged)
+/// or taken from the decoded cache. `warm` says the header was already resident; the result's
+/// flag says the pages were too.
+async fn paged_view(
+    store: &Storage,
+    file: &bf_wal::SegmentFile,
+    paged: &Arc<PagedDirectory>,
+    vector: &[f32],
+    config: &EngineConfig,
+    mut warm: bool,
+) -> Result<(Arc<Directory>, bool), ApiError> {
+    let t0 = std::time::Instant::now();
     let (rows, clusters) = paged.totals();
     let want = (probe_count(config, rows as usize, clusters as usize, 1.0) as f64 * page_margin())
         .ceil() as usize;
@@ -1269,29 +1343,133 @@ pub(crate) async fn slab_directory(
         let paged = paged.clone();
         on_worker(async move { Ok(paged.assemble(&pages)) }).await?
     };
-    if std::env::var_os("BF_ANN_PAGED_DEBUG").is_some() {
-        // Diagnostics: how many of the clusters a flat directory would probe the pages hold.
-        let full = load(store, &set.dir, None).await?;
-        let d = full
-            .center_distances(vector)
-            .map_err(segment::index_error)?;
-        let mut order: Vec<usize> = (0..d.len()).collect();
-        order.sort_unstable_by(|a, b| d[*a].total_cmp(&d[*b]));
-        let probes = probe_count(config, rows as usize, clusters as usize, 1.0);
-        let have: std::collections::HashSet<(usize, usize)> = view
-            .entries()
-            .iter()
-            .map(|e| (e.segment, e.cluster))
-            .collect();
-        let found = order[..probes]
-            .iter()
-            .filter(|n| have.contains(&(full.entries()[**n].segment, full.entries()[**n].cluster)))
-            .count();
-        eprintln!(
-            "COVERAGE probes={probes} found={found} cells={} entries={}",
-            cells.len(),
-            view.entries().len()
-        );
-    }
     Ok((Arc::new(view), warm))
+}
+
+/// Scan results computed while a cold query's reads were still arriving, so the query's own scan
+/// finds them instead of reading the cached bytes again and scanning after the last read lands.
+/// A scan is a pure function of the (immutable) index object, the query, and the probed clusters,
+/// so a hit is exact; entries are taken once and expire.
+type Scanned = (Arc<Index<Reader>>, Vec<Candidate>);
+type ScanKey = (String, u64);
+static SCAN_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<ScanKey, (std::time::Instant, Scanned)>>,
+> = std::sync::OnceLock::new();
+
+fn scan_key(object: &str, vector: &[f32], clusters: &[usize]) -> ScanKey {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    vector.iter().for_each(|x| x.to_bits().hash(&mut h));
+    clusters.hash(&mut h);
+    (object.to_string(), h.finish())
+}
+
+fn scan_memo_put(key: ScanKey, value: Scanned) {
+    let memo = SCAN_MEMO.get_or_init(Default::default);
+    let mut memo = memo.lock().expect("scan memo lock");
+    let now = std::time::Instant::now();
+    memo.retain(|_, (at, _)| now.duration_since(*at) < std::time::Duration::from_secs(30));
+    if memo.len() < 4096 {
+        memo.insert(key, (now, value));
+    }
+}
+
+fn scan_memo_take(key: &ScanKey) -> Option<Scanned> {
+    let memo = SCAN_MEMO.get()?;
+    memo.lock()
+        .expect("scan memo lock")
+        .remove(key)
+        .map(|(_, v)| v)
+}
+
+/// `BF_ANN_SCAN_MEMO=0` leaves the scan to the query (A/B measurements only).
+fn scan_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("BF_ANN_SCAN_MEMO").is_ok_and(|v| v == "0"))
+}
+
+/// Start a cold unfiltered ANN query's directory pages and scan reads from the hint alone, before
+/// the manifest has been read: a paged directory's header lists every slab (key, sizes, and
+/// fragment), so nothing else is needed to know what to read. The reads land in the caches, and
+/// the query's own reads join them while in flight. Advisory: a manifest that disagrees (the slabs
+/// were replaced) only costs the bytes.
+pub(crate) async fn speculate_slab_scan(
+    store: &Storage,
+    hint: Prefetched,
+    attribute: &str,
+    vector: &[f32],
+    k: usize,
+    config: &EngineConfig,
+) {
+    let (key, bytes) = hint;
+    if !PagedDirectory::is_paged(&bytes) || !paged_enabled() || !scan_speculation_enabled() {
+        return;
+    }
+    let Ok(decoded) = PagedDirectory::decode(&bytes) else {
+        return;
+    };
+    let file = bf_wal::SegmentFile {
+        key,
+        size: decoded.object_len(),
+        metadata_len: bytes.len() as u64,
+        stats_index: None,
+        text_header: None,
+    };
+    let resident = decoded.resident_bytes();
+    let paged = read_cache::get::<PagedDirectory>(&file.key, file.metadata_len)
+        .unwrap_or_else(|| read_cache::insert(&file.key, resident, decoded));
+    let Ok((dir, _)) = paged_view(store, &file, &paged, vector, config, false).await else {
+        return;
+    };
+    let (ann, frag) = (
+        format!("ann:{attribute}"),
+        Layout::Slabs.frag_key(attribute),
+    );
+    let slabs: Option<Vec<bf_wal::Segment>> = paged
+        .segments()
+        .iter()
+        .map(|s| {
+            let [(isize, imeta), (fsize, fmeta)] = s.files?;
+            let object = |key: &str, size, metadata_len| bf_wal::SegmentFile {
+                key: key.to_string(),
+                size,
+                metadata_len,
+                stats_index: None,
+                text_header: None,
+            };
+            Some(bf_wal::Segment {
+                id: s.id.clone(),
+                wal_start: 0,
+                wal_end: 0,
+                row_count: s.rows as u32,
+                schema: Default::default(),
+                files: [
+                    (ann.clone(), object(&s.key, isize, imeta)),
+                    (frag.clone(), object(&s.fragment, fsize, fmeta)),
+                ]
+                .into(),
+                live: object("", 0, 0),
+                live_generation: 0,
+            })
+        })
+        .collect();
+    if let Some(slabs) = slabs {
+        let _ = prefetch_scan(
+            store,
+            &slabs,
+            &dir,
+            attribute,
+            Layout::Slabs,
+            vector,
+            k,
+            config,
+        )
+        .await;
+    }
+}
+
+/// `BF_ANN_SPECULATE=0` waits for the manifest before reading the scan (A/B measurements only).
+fn scan_speculation_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("BF_ANN_SPECULATE").is_ok_and(|v| v == "0"))
 }
