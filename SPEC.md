@@ -101,7 +101,9 @@ log entry in the same commit.
 
 **Decided.**
 
-- Benchmark against turbopuffer's **published** numbers only (2026-11-16).
+- Benchmark against turbopuffer's **published** numbers (2026-11-16), and also against turbopuffer measured by us on the
+  same data and queries, labelled as ours (2026-11-19). turbopuffer can't be forced cold: record its reported
+  `cache_temperature` and the idle time before each sample.
 - **Vector, 10M:** within 30% of turbopuffer's published cold p50 or p90, at recall at least theirs, on the smallest
   instance that holds the numbers (2026-11-17; the earlier rule was 40%).
 - **BM25, 1M:** within 25% of turbopuffer's published cold p50 or p90, with overlap@10 against exact BM25 at least as
@@ -158,7 +160,9 @@ S3 until the run is cleaned up.
 
 - Data: the first 10M English rows as today, then rows in other languages from the same embedding model, with exact
   top-10 truth computed on the instance.
-- No turbopuffer comparison at 100M: they don't publish one.
+- turbopuffer publishes nothing at 100M, so we measure it ourselves: the same 100M rows loaded into turbopuffer
+  (Kyle approved about $220 to $430 on 2026-11-19, with a cost check after the first 1M rows).
+- The 100M blowfish namespace stays in the bucket after round 17 until Kyle says to delete it (2026-11-19).
 
 ## Decision log
 
@@ -180,3 +184,5 @@ S3 until the run is cleaned up.
 12. 2026-11-17: Add an Amazon S3 Vectors head-to-head; run it at 10M first and report back before 100M.
 13. 2026-11-19: `SPEC.md` started; kept current with every decision.
 14. 2026-11-19: 100M run approved.
+15. 2026-11-19: Measure turbopuffer ourselves, cold and warm, including the same 100M rows. Keep the 100M blowfish
+    namespace in the bucket after round 17.
