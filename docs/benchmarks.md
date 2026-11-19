@@ -1,4 +1,16 @@
-# R2 scale benchmark 🐡
+# Scale benchmark log
+
+## Current numbers
+
+Chronological lab notebook (iterations 0 through 18, plus 100M runs). For the concise summary and reproduction guide, see [`benchmarks/README.md`](benchmarks/README.md).
+
+Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, strong consistency, 1,024-dim `f16` Cohere Wikipedia embeddings; current `main`, beyond `v0.1.12`):
+
+- **10M vector (48 probes, recall@10 `0.953–0.956`):** `533 / 656 ms` cache-cold (`533–600 / 650–750 ms` across runs), `680 / 907 ms` fresh process (`680–690 / 907–966 ms` across runs), and `36.6 / 50.8 ms` warm ([Iteration 18](#iteration-18-100m-warm-ann-under-150-ms-and-a-small-cold-manifest-read)). turbopuffer published (768-dim): `874 / 1,214 ms` cold, `14 / 17 ms` warm.
+- **100M vector (64 probes, recall@10 `0.954`; 48 probes `0.941–0.950`):** `1,201 / 1,391 ms` cache-cold (`1,164–1,201 / 1,348–1,391 ms`), `1,243 / 1,370 ms` fresh process (`1,228–1,243 / 1,370–1,411 ms`), and `99.7 / 162.8 ms` warm (`72.6 / 90.4 ms` warm at 48 probes); about `160 MB` read per cold query; load `5.7 h` at `4,891 docs/s`, `recluster` `1.7 h` into 160 slabs ([100M load and recluster](#100m-wikipedia-embeddings-in-region-and-over-the-internet), [Iteration 17](#iteration-17-100m-cold-and-warm-ann), and [Iteration 18](#iteration-18-100m-warm-ann-under-150-ms-and-a-small-cold-manifest-read)). turbopuffer publishes no 100M number.
+- **1M BM25 (MS MARCO, `overlap@10` `1.000` vs. exact BM25):** `380 / 526 ms` fresh process and `301 / 369 ms` cache-cold ([Iteration 13](#iteration-13-bm25-1m) and [Iteration 14 in-region check](#bm25-cold-at-1m-ms-marco-round-13-code-c7gd2xlarge-in-region-50-queries-abpy)). turbopuffer published: `316 / 381 ms` cold, `13 / 18 ms` warm.
+- **Memory and ingest:** a 4 GB `c7gd.large` (swap off) holds a 10M load plus `recluster` at `2.3–2.9 GB` peak RSS (`769 / 973 ms` fresh, `623 / 740 ms` cache-cold; [Iteration 15](#iteration-15-memory-10m-load-and-recluster-on-a-c7gdlarge) and [Iteration 18 memory check](#memory-check-10m-load-and-recluster-4-gib-cgroup-swap-off-2-cpus)). Ingest holds flat at about `4,500 docs/s` to 10M on `c7gd.xlarge` ([Iteration 16](#iteration-16-ingest-throughput-that-stays-flat-as-the-namespace-grows)).
+- **Our own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; 100M load in progress); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
 
 ## Scope and status
 
@@ -1982,6 +1994,7 @@ Verdict:
 A writable loader server indexes, compacts, and garbage-collects every namespace under its prefix. Loading MS MARCO under the same
 prefix forked the S3 copy of the 10M namespace. The namespace was restored from R2 and verified key by key, and
 `bench/scale/msmarco_load.py` now warns about this.
+
 ## Iteration 13 (BM25, 1M)
 
 Goal: cold BM25 on 1M MS MARCO passages within 25 percent of turbopuffer's published cold numbers (p50 316 ms, p90 381 ms), so
@@ -2175,7 +2188,7 @@ swaps), so the same ground truth applies. 1 GiB block cache, 256 MiB decoded cac
 
 | Arm | p50 / p90 / p99 ms | Requests, MB, waves | Recall@10 |
 | --- | --- | --- | ---: |
-| c7gd.2xlarge, slabs (iteration 11 report) | 662 / 991 (fresh) | 404, 50.7, 3.5 | 0.953 |
+| c7gd.2xlarge, slabs (v0.1.12 / iteration 12 report) | 662 / 991 (fresh) | 404, 50.7, 3.5 | 0.953 |
 | c7gd.large, fresh process | 769 / 973 / 1,384 | 436, 53.5, 3.2 | 0.9545 (200 queries; 0.952 on the 50 timed) |
 | c7gd.large, cache-cold (`--cachecold`) | 623 / 740 / 935 | 436, 53.5, 3.2 | 0.952 |
 | c7gd.large, warm, 1,000 queries | 81.8 / 96.0 / 121.9 | | 0.9545 |
@@ -2389,9 +2402,9 @@ default decoded cache, 6 rayon threads (the same setup as the 10M in-region tabl
 | 64 probes, cache-cold | 2,687 / 2,936 | 4,632 | 1,510, 326.8, 4.2 | 0.958 |
 | 64 probes, warm | 387 / 434 | 480 | | 0.9555 (200 queries) |
 
-### Query: over the internet (this VM, outside AWS), 100M, 48 probes
+### Query: over the internet (this VM, outside AWS), 100M, 48 probes (pre-Iteration-17 code, not remeasured)
 
-A read-only server on a 32 GB x86 VM against the same prefix. Network floor to the bucket from here: TCP connect 33.9 / 38.4 ms (p50 / p90), TLS
+Measured before Iterations 17 and 18 (without the paged slab directory, compact manifest copy, or parallel slab scans), and not remeasured since. A read-only server on a 32 GB x86 VM against the same prefix. Network floor to the bucket from here: TCP connect 33.9 / 38.4 ms (p50 / p90), TLS
 handshake 55.8 / 60.6, 4 KB GET 56.7 / 71.3, 1 MB GET 65.9 / 76.1 (in-region: 1.6, 26.9, 24.5, 30.2).
 
 | Arm | p50 / p90 ms | p99 ms | Requests, MB, waves | Recall@10 |
@@ -2433,8 +2446,7 @@ What this says: cold and warm both grow 4 to 5x for 10x the data, much better th
 
 Target at 100M (in-region on a c7gd.2xlarge): recall@10 of at least 0.95, cache-cold p50 of 1,200 ms or less, fresh-process p50 of 1,500 ms or less,
 and warm p50 of 150 ms or less. Performance at 10M must not regress. These runs use the same machine, namespace (`wikipedia-100m`, 160 slabs, 499,920
-clusters), workload, and measurement code as the 100M section above. "main" is the code at the start of the iteration, measured in the same session as
-this branch.
+clusters), workload, and measurement code as the 100M section above. In the tables below, `"main"` is pre-iteration-17 code and `"this branch"` is iteration 17 (now merged), measured in the same session.
 
 ### Where the time went (main, one cache-cold query at 64 probes, 3,049 ms)
 
@@ -2456,10 +2468,10 @@ changes below cut bytes and waves; we cannot change S3 latency itself.
   cell, and a page table. One page per cell follows, each holding about 24 neighboring clusters (21,000 pages, 104 MB total). Cells come from two-level
   k-means over the approximate cluster centers and are ordered along a nearest-neighbor tour, so the pages a query needs sit together and merge into about
   100 requests. A query ranks the cells from the header, fetches the nearest pages until they hold 16 times the clusters it will probe (about 13 MB for 48
-  probes, 18 MB for 64), and ranks only those clusters. At a multiple of 8, recall fell by 0.5 point; at 16, it matches the flat directory at 48 probes and
+  probes, 18 MB for 64), and ranks only those clusters. At a multiple of 8, recall fell by 0.5 percentage points (0.005); at 16, it matches the flat directory at 48 probes and
   reaches 0.9540 against 0.9555 at 64 (table below). `repage` took 39 s at 100M without rebuilding any slabs.
 - **Only the layout in use.** Cold queries previously downloaded both the slab and block layout hints (186 MB). They now request the paged, slab, and
-  block hints together in that order of preference and drop the slower ones once an earlier one answers.
+  block hints together in that order of preference and drop the lower-priority requests once a higher-priority hint answers.
 - **Manifest.** A cold open reads the fixed-key manifest copy and then lists only manifests after it (one request) instead of listing all 2,760. The
   object-store wrapper previously did not forward `list_with_offset`, so the first version still listed everything; that is now fixed and tested.
 - **Speculation from the hint.** Because the hint header lists every slab object and its size, directory-page and scan reads start while the manifest is
@@ -2523,8 +2535,7 @@ hundred small reads across different objects, limited by S3's 100 ms tail). Neit
 | 24 | 77,000 | 0.9550 | 189 |
 | flat directory (main) | 500,000 | 0.9555 | 378 |
 
-The 16 and 24 rows come from 400-query runs, and the default row comes from the 1,000-query run; the margin 12 warm p50 comes from the 1,000-query run
-before the probe plan was optimized. At 48 probes, margins of 12 and 16 both give 0.9410, matching the flat directory's recall.
+The margin 12 and 24 recall rows come from 400-query runs, and the margin 16 (default) row comes from the 1,000-query run; the margin 12 warm p50 comes from an earlier 1,000-query run before the probe plan was optimized. At 48 probes, margins of 12 and 16 both give 0.9410, matching the flat directory's recall.
 
 ### Tried, no gain
 
@@ -2557,19 +2568,19 @@ The 10M namespace's directory (49,976 clusters) is below the paging threshold, s
 - **Finer slabs.** A recluster with 100-row clusters (so each probe reads less and recall per probe rises) was not built, because the cold targets were
   met without it and 100M requires another 3 to 4 hour recluster. It remains the way to cut scan bytes, which now make up most of a cold query.
 - **Manifest at 100M.** Every cold query reads the full 3.4 MB JSON manifest (about 50 ms). Splitting it is the next cold-start reduction.
-- **Existing 100M data.** The 100M recluster in `big/` was not redone; it carries the paged copy added by `repage`.
+- **Existing 100M data.** The 100M namespace was not reclustered again; it carries the paged copy added by `repage`.
 
 
 ## Iteration 18 (100M): warm ANN under 150 ms, and a small cold manifest read
 
 Target: at 100M, 64 probes, default settings, warm p50 of 150 ms or less (it was 160 to 168 ms) without breaking the 10M memory target, and a small cold
 manifest read that older namespaces and older binaries still work with. Same machine (c7gd.2xlarge, in the bucket's region), namespace
-(`wikipedia-100m`), workload, and `ab.py` as iteration 17. "main" is the code at the start of the iteration, measured in the same session.
+(`wikipedia-100m`), workload, and `ab.py` as iteration 17. In the tables below, `"main"` is iteration 17 code and `"branch"` is iteration 18 (now merged), measured in the same session.
 
 ### Where the warm time went
 
 Warm queries cost 322 ms of CPU each but only 157 ms of wall time, so about two of the eight cores were busy. A per-task trace of one query (`BF_TRACE_STAGES`
-now also prints a `TASK` line per slab) showed why. The scan stage launched 160 per-slab tasks from one polled future (`buffer_unordered`). On a warm query
+now also prints a `TASK` line per slab) showed why. The scan stage launched one per-slab task per probed slab (about 70 of the 160 slabs at 64 probes) from one polled future (`buffer_unordered`). On a warm query
 every read is a block-cache hit that finishes without yielding, so each task's copies, checksums, and decodes ran one after another on a single thread
 (task start times spread from 38 ms to 94 ms after the query began), and only the final scan reached other threads.
 
@@ -2598,7 +2609,7 @@ every read is a block-cache hit that finishes without yielding, so each task's c
   reads that copy; a text query, a writer, and the indexer read the full manifest slot (a state that holds the compact copy replaces it before it
   builds anything, so a publish never drops a header, and a test checks that). Manifest slots are unchanged, so older binaries read these namespaces
   as before (a segment without a header reads its own footer). Older namespaces keep their full copy until the next publication; `examples/readercopy.rs`
-  rewrites it (it took one PUT on `big/`).
+  rewrites it (it took one PUT on the 100M namespace).
 
 ### Warm, 100M (1,000 queries, concurrency 1; recall over the 200 oracle queries)
 
@@ -2633,7 +2644,7 @@ With the full manifest copy (the namespace as iteration 17 left it; the branch h
 | 48 probes, main, cache-cold | 1,080 / 1,227 | 1,429 | 126.0 | 4.4 | 0.950 |
 | 48 probes, branch, cache-cold | 1,069 / 1,243 | 1,673 | 126.0 | 4.5 | 0.950 |
 
-With the compact reader copy (`big/` rewritten; "full manifest" is the branch with `BF_READER_COPY=0`, which reads the 3.4 MB slot):
+With the compact reader copy (the 100M namespace rewritten; "full manifest" is the branch with `BF_READER_COPY=0`, which probes `manifest-latest` and then reads the 3.4 MB full slot):
 
 | Arm | p50 / p90 ms | p99 ms | MB | Waves | Recall |
 |---|---|---:|---:|---:|---:|
@@ -2646,7 +2657,7 @@ With the compact reader copy (`big/` rewritten; "full manifest" is the branch wi
 | 48 probes, compact copy, cache-cold | 1,128 / 1,341 | 1,584 | 122.9 | 4.7 | 0.950 |
 | 48 probes, full manifest, cache-cold | 1,075 / 1,347 | 1,629 | 126.3 | 4.1 | 0.950 |
 
-Reading it: the manifest read is 375 KB instead of 3.4 MB (3.4 MB fewer per query) and the compact copy's p90 is 140 ms lower at 64 probes fresh, but
+Reading it: the manifest read is 375 KB instead of 3.4 MB (about 3.0 MB smaller; total query bytes dropped by 3.4 MB because `BF_READER_COPY=0` still probes the 375 KB `manifest-latest` copy before fetching the 3.4 MB full slot) and the compact copy's p90 is 140 ms lower at 64 probes fresh, but
 the p50 does not move beyond the run-to-run spread (S3 first-byte latency, not the transfer, dominates a manifest that small). The cold targets are
 not regressed. This session's cold numbers are 40 to 100 ms above iteration 17's (1,164 and 1,228 ms) for the same code, which is S3 variance between
 sessions; only the same-session pairs are comparable.
@@ -2687,6 +2698,24 @@ RSS is sampled every 5 s from `/proc`; the cgroup figure includes page cache, wh
 | Recluster peak RSS / VmHWM | 1,538 / 2,357 MB | not run |
 | OOM kills | 0 | 0 |
 
-Both are under the 3.5 GB target and equal within noise, so the adaptive decay costs no memory: at the peak jemalloc's resident bytes were within 4 percent of
+Both are under the 3.5 GB target and equal within noise, so the adaptive decay costs no memory: at the peak jemalloc's resident bytes were within 6 percent of
 its live bytes (2,980 against 2,811 MB). The ingest peak here (3.0 GB) is higher than the 2.3 GB measured on a c7gd.large in iteration 16, for both binaries; I did not find
 out why (the cgroup setup, the loader's pace, and the host are different). The recluster peak is below the ingest peak.
+
+## turbopuffer cold samples, measured by us (10M and 1M)
+
+turbopuffer can't be forced cold, so `bench/scale/tpuf_cold.py` waits between queries and records the
+`cache_temperature` and `server_total_ms` turbopuffer reports (server-side, so the network to its region is excluded).
+Namespaces `blowfish-oracle-wiki10m` and `blowfish-oracle-wiki1m` (the same 1,024-dim Wikipedia rows and oracle queries
+as blowfish's 10M and 1M runs), 2026-11-19.
+
+| Sample | 10M `server_total_ms` | 1M `server_total_ms` |
+| --- | ---: | ---: |
+| First query after about 2 days idle (one sample each) | 2,051 | 1,374 |
+| Queries after 5 minutes idle, all reported `cold` (22 each), p50 / p90 | 670 / 1,120 | 380 / 699 |
+| A different query right after each of those, also reported `cold`, p50 / p90 | 748 / 849 (first 18) | 363 / 507 (first 18) |
+| The same namespace once its data is cached (reported `hot`) | 13 to 24 | 14 to 30 |
+
+Every query that touched data turbopuffer hadn't cached was reported `cold`, even right after other queries, so its
+"cold" label is per query, not per namespace. Its published 10M cold p50 (874 ms) matches the 5-minute-idle samples; the
+2-day-idle sample is about 2.3 times that.

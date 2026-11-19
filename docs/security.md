@@ -1,4 +1,4 @@
-# Security 🐡
+# Security
 
 blowfish is intended for development, CI, and modest self-hosted deployments. Authentication
 and namespace isolation are security boundaries; query execution is not a hard tenant resource
@@ -12,7 +12,7 @@ Untrusted clients can send malformed requests, use compromised or restricted API
 other namespaces, and attempt resource exhaustion. Namespace permissions must hold across
 all API versions, copying, branching, operation polling, and key delegation.
 
-The operator, configured super key, process environment, local filesystem owner, and object
+The operator, break-glass `BLOWFISH_ADMIN_KEY`, org superadmin keys, process environment, local filesystem owner, and object
 storage backend are trusted. Someone who can modify the bucket can replace key records or
 stored data; checksums detect corruption, but are not signatures. Read access to the bucket
 reveals document data and key hashes. API keys are random bearer credentials; use TLS and
@@ -68,7 +68,7 @@ name filtering. The built-in `default` project is the storage root.
 
 ## Route authorization matrix
 
-Every entry below also permits the configured super key. `R` means any of `read`, `write`,
+Every entry below also permits org superadmin keys and the break-glass `BLOWFISH_ADMIN_KEY`. `R` means any of `read`, `write`,
 or `admin`; `W` means `write` or `admin`; `A` means `admin`. Namespace-scoped actions check
 the percent-decoded namespace that the handler receives. Implicit HEAD requests on GET
 routes use the same permission as GET.
@@ -136,6 +136,10 @@ use directories that untrusted local users cannot modify or replace with symlink
 These limits apply before committing a write or producing a successful query response.
 Errors use `{"status":"error","error":"..."}`. Semantic limits return 400, body-size
 limits return 413, malformed request shapes return 422, and WAL backpressure returns 429.
+`429` and `503` responses include `Retry-After` (seconds) and `retry-after-ms` headers
+(for WAL backpressure, computed from the indexer's smoothed drain rate and clamped to
+0.5–30 s; 1 s before the first publish or for other 429/503 responses); `x-should-retry`
+is sent as `true` on `408`, `409`, `429`, `502`, `503`, and `504`, and `false` on `500`.
 Malformed JSON syntax currently returns 400. Engine/storage failures use generic client
 messages; detailed backend errors belong in protected server logs.
 
@@ -156,7 +160,7 @@ messages; detailed backend errors belong in protected server logs.
 | Full-text and text-filter query | 8,192 bytes |
 | Highlight result fragments | 1–1,024 |
 | Eventual staleness | 1–3,600 seconds when specified |
-| Unindexed WAL | Default 2,000,000,000-byte write backpressure; configurable |
+| Unindexed WAL | Default memory limit / 8 (128 MiB to 2,000,000,000 bytes) write backpressure; configurable |
 | Eventual unindexed scan | Default 128 MiB; configurable |
 
 Logical sizes count UTF-8 strings, decoded byte values, scalar widths, vector element widths,

@@ -1,35 +1,59 @@
 # Benchmarks
 
-This page summarizes blowfish's measured query and upsert latency against turbopuffer's published numbers, along with the network round-trip profile, 1M multi-workload breakdown, recall and result-set parity, ingest throughput, known engineering gaps, and reproduction commands.
+This page summarizes blowfish's measured query and ingest performance against turbopuffer's published numbers, along with 100M in-region results, our own measurements of turbopuffer and Amazon S3 Vectors, the network round-trip profile, 1M multi-workload breakdown, recall and result-set parity, known engineering gaps, and reproduction commands.
 
-For the complete chronological engineering log across iterations 0 through 12, the apples-to-apples R2 runs, and the AWS in-region runs, see [`../benchmarks.md`](../benchmarks.md).
+For the complete chronological engineering log across iterations 0 through 18, the 100M runs, the apples-to-apples R2 runs, and the AWS in-region runs, see [`../benchmarks.md`](../benchmarks.md).
 
-## In-region on AWS S3 (version 0.1.12)
+## In-region on AWS S3 (current `main`, beyond `v0.1.12`)
 
-Measured on `c7gd.2xlarge` (8 vCPU, 16 GB) in `us-west-2` reading a same-region S3 bucket (`v0.1.12`, `main` at `1901a41`), with the 10M English Wikipedia namespace copied unchanged from R2 (1,024-dim `f16` vectors, 70 segments, and 32 spatial slabs built by `recluster`) and the 1M MS MARCO passage corpus (335 MB of text). Client-side `p50 / p90` latency in milliseconds with strong consistency on queries (fresh read-only server process and empty memory and disk caches per cold query), compared against turbopuffer's [published benchmarks](https://turbopuffer.com/docs/performance):
+Measured on `c7gd.2xlarge` (8 vCPU, 16 GB) in `us-west-2` reading a same-region S3 bucket on current `main` (which adds memory-sized defaults, flat ingest, paged slab directories, compact manifest reader copies, parallel slab scans, and BM25 posting pruning on top of `v0.1.12`). Vector benchmarks use 1,024-dim `f16` Cohere Wikipedia embeddings in the namespace-wide `recluster` slab layout; BM25 uses 1M MS MARCO passages (335 MB of text). Client-side `p50 / p90` latency in milliseconds with strong consistency on queries, compared against turbopuffer's [published benchmarks](https://turbopuffer.com/docs/performance):
 
 | Benchmark | turbopuffer published | blowfish in-region |
 | --- | --- | --- |
-| Vector, 10M, cold (48 probes, recall@10 0.953 vs turbopuffer's 0.943) | 874 / 1,214 ms | 662 / 991 ms |
-| Vector, 10M, warm (48 probes) | 14 / 17 ms | 70.7 / 84.1 ms |
-| BM25, 1M, cold | 316 / 381 ms | 453 / 569 ms |
+| Vector, 10M, cold (48 probes, recall@10 0.953 vs. turbopuffer's 0.943) | 874 / 1,214 ms | 680 / 907 ms fresh (533 / 656 ms cache-cold) |
+| Vector, 10M, warm (48 probes) | 14 / 17 ms | 36.6 / 50.8 ms |
+| BM25, 1M, cold (`overlap@10` 1.000 vs. exact BM25) | 316 / 381 ms | 380 / 526 ms fresh (301 / 369 ms cache-cold) |
 | BM25, 1M, warm | 13 / 18 ms | 17.1 / 34.5 ms |
 
-In-region, blowfish's cold vector search at 10M is faster than turbopuffer's published p50 and p90 at higher recall. Cold BM25 is about 43% / 49% slower and is being worked on. Warm vector is still about 5x slower. Upserts were not measured in-region; see the over-the-internet R2 section below.
+- **10M vector across runs:** on `c7gd.2xlarge` at 48 probes (recall@10 `0.953–0.956`), cache-cold runs range from `533–600 / 650–750 ms` (latest run `533 / 656 ms`), fresh-process runs range from `680–690 / 907–966 ms` (latest run `680 / 907 ms`), and warm latency dropped from `70.7 / 84.1 ms` (`v0.1.12`) to `36.6 / 50.8 ms` after spawning per-slab scan tasks in parallel.
+- **1M BM25:** cold cache-cold latency (`301 / 369 ms`) now matches turbopuffer's published `316 / 381 ms`, while fresh-process latency is `380 / 526 ms` (down from `453 / 569 ms` in `v0.1.12`). Warm BM25 (`17.1 / 34.5 ms`) was measured earlier on `c7gd.2xlarge` and has not been remeasured since.
+- **Single-batch upserts:** not measured in-region; see the over-the-internet R2 section below for 512 KB batch latency, and [Ingest and storage footprint](#ingest-and-storage-footprint) for in-region bulk ingest throughput (`~4,500 docs/s` at 10M on `c7gd.xlarge` and `4,891 docs/s` at 100M on `c7gd.2xlarge`).
 
-### 10M vector: probe sweep and layout comparison
+### 100M vector in-region (`c7gd.2xlarge`)
 
-Cold `p50 / p90` in milliseconds on `c7gd.2xlarge` across the 32-slab `recluster` layout (`BF_ANN_NPROBE` = 40, 48, and 64) and the 70-segment per-segment baseline (`BF_ANN_SLABS=0`, 160 probes):
+100M rows of 1,024-dim `f16` Cohere Wikipedia embeddings across five languages (English, German, French, Spanish, and Russian), 160 spatial slabs, a paged slab directory (written by `recluster` or `examples/repage.rs`), and a compact manifest reader copy (375 KB instead of 3.4 MB, written on publish or by `examples/readercopy.rs`). Strong consistency, `c7gd.2xlarge` in the same region as S3; turbopuffer publishes no 100M number:
+
+| Setting | Cache-cold p50 / p90 (ms) | Fresh process p50 / p90 (ms) | Warm p50 / p90 (ms) | Recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| 64 probes (latest run) | 1,201 / 1,391 | 1,243 / 1,370 | 99.7 / 162.8 | 0.954 |
+| 48 probes (latest run) | 1,128 / 1,341 | 1,058 / 1,253 | 72.6 / 90.4 | 0.941–0.950 |
+
+- **Range across recent 100M runs (64 probes):** cache-cold `1,164–1,201 / 1,348–1,391 ms`; fresh process `1,228–1,243 / 1,370–1,411 ms`.
+- **Cold I/O, load, and recluster:** each cold 64-probe query reads about `160 MB` (down from `326.8 MB` before the paged slab directory). Loading 100M rows took **5.7 h** (`20,445 s`, **4,891 docs/s** average); `recluster` took **1.7 h** (`6,248 s`, 160 slabs, 499,920 clusters).
+- **Over the internet (pre-paged-directory code, not remeasured):** measured before the paged slab directory and parallel slab scans from an 8-vCPU VM outside AWS at 48 probes (`294 MB` per cold query), fresh process was `6,399 / 8,929 ms` and warm was `448 / 513 ms`.
+
+### Our own measurements of hosted services (10M)
+
+We also loaded the same 10M 1,024-dim `f16` Wikipedia dataset into live turbopuffer and Amazon S3 Vectors indexes to measure recall and idle-gap latency (`bench/scale/tpuf_cold.py` and `bench/s3vectors/measure.py`). Because caches cannot be forced cold externally on either hosted service, their idle-gap latencies are not directly comparable to blowfish's fresh-process or cache-cold measurements:
+
+| Service (10M, 1,024-dim `f16`) | Idle / "cold" p50 / p90 (ms) | Warm p50 / p90 (ms) | Recall@10 | Caveat |
+| --- | ---: | ---: | ---: | --- |
+| turbopuffer (server-reported) | ~670 / 1,120 (5 min idle) | 88 / 203 (first-pass warm) | 0.943 | Caches cannot be dropped; one deep-cold sample after 2 days idle measured 2,051 ms (100M load in progress) |
+| Amazon S3 Vectors (client-side, in-region) | 178 / 276 (30 min idle) | 60 / 278 | 0.894 | Caches cannot be dropped; lower recall@10 than blowfish (0.953–0.956) and turbopuffer (0.943) |
+
+### 10M vector: probe sweep and layout comparison (`v0.1.12` baseline)
+
+Cold `p50 / p90` in milliseconds on `c7gd.2xlarge` across the 32-slab `recluster` layout (`BF_ANN_NPROBE` = 40, 48, and 64) and the 70-segment per-segment baseline (`BF_ANN_SLABS=0`, 160 probes), from the `v0.1.12` in-region sweep (warm slab latency has since dropped to `36.6 / 50.8 ms` at 48 probes and cache-cold to `533 / 656 ms`):
 
 | Arm | Fresh p50 / p90 (ms) | Gap vs. published | Cache-cold p50 / p90 (ms) | Gap vs. published | Recall@10 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| turbopuffer published (768-dim) | 874 / 1,214 | | | | 0.943 |
+| turbopuffer published (768-dim) | 874 / 1,214 | — | — | — | 0.943 |
 | Slabs, 40 probes | 642 / 806 | -27% / -34% | 558 / 699 | -36% / -42% | 0.9415 |
 | Slabs, 48 probes | 662 / 991 | -24% / -18% | 574 / 652 | -34% / -46% | 0.953 |
 | Slabs, 64 probes | 773 / 969 | -12% / -20% | 630 / 746 | -28% / -39% | 0.9615 |
 | Per-segment, 160 probes (slabs off) | 1,079 / 1,336 | +23% / +10% | 924 / 1,071 | +6% / -12% | 0.9465 |
 
-Tail latency, object-store I/O per cold query, and warm latency (`1,000` queries at concurrency 1):
+Tail latency, object-store I/O per cold query, and warm latency (`1,000` queries at concurrency 1, `v0.1.12` baseline):
 
 | Arm | Fresh p99 (ms) | Cache-cold p99 (ms) | Requests | MB | Waves | Warm p50 / p90 / p99 (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -39,18 +63,20 @@ Tail latency, object-store I/O per cold query, and warm latency (`1,000` queries
 | Per-segment, 160 probes (slabs off) | 1,543 | 2,371 | 844 | 115.2 | 3.2 | 96.9 / 106.2 / 112.3 |
 
 - **Vectors and sampling:** vectors are 1,024-dim `f16` (while turbopuffer's published benchmark uses 768-dim). "Fresh" starts a new server process with an empty cache per query (50 queries per arm, rotated in the same session). "Cache-cold" runs against a warm server process with caches dropped before each query via `POST /_bench/drop_caches` (turbopuffer's definition of cold). `Recall@10` is measured over all 200 held-out queries from a warm 1,000-query run.
-- **Per-stage breakdown (one cache-cold 48-probe slab query):** 477 ms in-process (`308 ms` snapshot total and `169 ms` execution total) and 660 ms of CPU summed across threads. Wave 0 reads the two ANN directory hints (`15.3 MB`, `100 ms`), wave 1 reads the WAL tail (`2` requests, `23 ms`), wave 2 prefetches scan fragments (`361` requests, `36.8 MB`, `181 ms`), and wave 3 reads rerank vectors plus two dependent document hops (`67` requests, `123 ms`), with `34 ms` of scan CPU and `162 ms` of in-process rerank and hydration. About 70% of wall time is waiting on S3, making the 15.3 MB directory-hint wave 0 the clearest single target. By comparison, one cache-cold per-segment query at 160 probes took `899 ms` wall time and `1,690 ms` of CPU, moving `113 MB` in `705` requests (`550 ms`) in its fragment wave alone.
-- **Limits of the `recluster` layout today:** it covers unfiltered ANN only; writes made after the last `recluster` fall back to the per-segment path until the next one; `recluster` is a manual step; and building the 10M layout peaked at 16.9 GB RSS (about 17 GB).
+- **Per-stage breakdown (one cache-cold 48-probe slab query, `v0.1.12`):** 477 ms in-process (`308 ms` snapshot total and `169 ms` execution total) and 660 ms of CPU summed across threads. Wave 0 read the two ANN directory hints (`15.3 MB`, `100 ms`), wave 1 read the WAL tail (`2` requests, `23 ms`), wave 2 prefetched scan fragments (`361` requests, `36.8 MB`, `181 ms`), and wave 3 read rerank vectors plus two dependent document hops (`67` requests, `123 ms`), with `34 ms` of scan CPU and `162 ms` of in-process rerank and hydration. Current `main` drops lower-priority directory hints once the active layout answers and spawns per-slab scan tasks in parallel.
+- **Limits of the `recluster` layout today:** it covers unfiltered ANN only; writes made after the last `recluster` fall back to the per-segment path until the next one; and `recluster` is a manual step. Building the 10M layout previously peaked at 16.9 GB RSS in `v0.1.12`, but with packed `f16` builds and memory-sized defaults it now peaks at **1.76–2.36 GB RSS** and fits on a 4 GB `c7gd.large` with swap off.
 
 ### 1M BM25 (MS MARCO)
 
-| Mode | turbopuffer published (p50 / p90) | blowfish in-region (p50 / p90) | Gap vs. published |
-| --- | ---: | ---: | ---: |
-| Cold, fresh process | 316 / 381 ms | 453 / 569 ms | +43% / +49% |
-| Cold, cache-cold (`POST /_bench/drop_caches`) | | 420 / 512 ms | +33% / +34% |
-| Warm (round 11 code) | 13 / 18 ms | 17.1 / 34.5 ms | |
+Measured on `c7gd.2xlarge` in `us-west-2` with window-pruned posting reads, segment format v4, manifest text headers, and fixed-key `manifest-latest`:
 
-- **Cold I/O and bottleneck:** each cold BM25 query makes `156` requests and reads `17.1 MB`. About 4 sequential waves at 25–30 ms per round trip, plus CPU, dominate the remaining cold gap; wave count, rather than bytes, sets the floor because only 17.1 MB moves.
+| Mode | turbopuffer published (p50 / p90) | blowfish in-region (p50 / p90) | `overlap@10` vs. exact BM25 |
+| --- | ---: | ---: | ---: |
+| Cold, fresh process | 316 / 381 ms | 380 / 526 ms | 1.000 |
+| Cold, cache-cold (`POST /_bench/drop_caches`) | 316 / 381 ms | 301 / 369 ms | 1.000 |
+| Warm (earlier measurement) | 13 / 18 ms | 17.1 / 34.5 ms | 1.000 |
+
+- **Cold I/O:** each cold BM25 query makes `194` requests and reads `4.4 MB` (down from `17.1 MB` in `v0.1.12`), across about `3.4–3.5` waves.
 
 ### Network floor and instance sizing (`us-west-2`)
 
@@ -63,15 +89,19 @@ Instance-to-S3 round-trip floor in `us-west-2`:
 | 4 KB `GET` | 24.5 ms | 30.5 ms |
 | 1 MB `GET` | 30.2 ms | 36.1 ms |
 
-Latency across `c7gd` instance sizes (`p50 / p90` in ms, except warm `p50` and swap pages out):
+Smallest-instance 10M results (memory-sized defaults, jemalloc, packed `f16` builds, **swap off**):
+
+- **`c7gd.large` (2 vCPU, 4 GB, swap off):** holds a full 10M ingest plus `recluster` at **2.3–2.9 GB** peak RSS (2.26–2.31 GB on a bare `c7gd.large`; 2.93–3.02 GB in a 4 GiB cgroup check). On `c7gd.large` at 48 probes (recall@10 `0.9545`), 10M vector search measures **769 / 973 ms** fresh, **623 / 740 ms** cache-cold, and **81.8 / 96.0 ms** warm.
+- **`c7gd.xlarge` (4 vCPU, 8 GB):** holds flat **~4,500 docs/s** (`4,501 docs/s` average) across a full 10M ingest at **2.51 GB** peak RSS (`VmHWM`), with 48-probe cache-cold 10M vector search at **600 / 751 ms** (recall@10 `0.956`).
+- **`c7gd.2xlarge` (8 vCPU, 16 GB):** ingests 100M rows at **4,891 docs/s** (5.7 h) and serves 10M vector at **680 / 907 ms** fresh, **533 / 656 ms** cache-cold, and **36.6 / 50.8 ms** warm.
+
+Historical `v0.1.12` cross-size comparison (`p50 / p90` in ms, except warm `p50` and swap pages out):
 
 | Instance size | Slab 40 fresh | Slab 48 cache-cold | Slab 64 fresh | BM25 cold fresh | Warm p50 (40) | Swap pages out |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `c7gd.2xlarge` (8 vCPU, 16 GB) | 642 / 806 | 574 / 652 | 773 / 969 | 453 / 569 | 67.5 | 0 |
 | `c7gd.xlarge` (4 vCPU, 8 GB) | 566 / 730 | 650 / 845 | 673 / 976 | 501 / 682 | 71.3 | 0 |
 | `c7gd.large` (2 vCPU, 4 GB) | 728 / 961 | 661 / 781 | 857 / 1,152 | 509 / 720 | 114 | 8 |
-
-- **Sizing verdict:** `c7gd.xlarge` is the smallest instance size whose cold numbers stay within noise of `c7gd.2xlarge`. `c7gd.large` works (1 GiB block cache, 256 MB decoded cache, and an NVMe swap file that was barely touched) and still beats turbopuffer's published cold vector `p50` and `p90` at 40 and 48 probes, though it is 15–20% slower on fresh `p50` and 1.7x slower warm because it has 2 vCPUs.
 
 ## Over the internet to Cloudflare R2 (version 0.1.12)
 
@@ -251,21 +281,29 @@ At 10M documents, the default `nprobe = 64` drops below turbopuffer's recall (`0
 
 ## Ingest and storage footprint
 
-- **Ingest rate:** about **2,000 docs/s** on pipelined WAL code (`BF_WAL_PIPELINE=8`, 2,000 rows per batch, 16 concurrent writes in flight: 2,040 docs/s measured end-to-end on 200K docs, ~1,860 docs/s sustained on 500K, and ~1,710 docs/s over the first 1M rows of the 10M load). Throughput on this VM is capped by its **~14 MB/s** aggregate upload link to the bucket: each document uploads ~3.0 KB of compressed WAL payload plus ~5.6 KB of segment files, while the server's commit worker is ~20% utilized.
-- **10M memory behavior:** during the full 10M Wikipedia load inside a 16 GiB `systemd` scope (`MemoryHigh=14G`), resident memory rose by roughly 1.3 GB per million rows and spiked to 14–16 GB during multi-segment compactions past ~7M rows, requiring server restarts and capping segment size (`BF_MAX_SEGMENT_ROWS=100000`) for the final 2M rows (leaving 70 segments).
-- **Retained storage size:** after compaction and garbage collection, the 10M Wikipedia namespace occupies **~5.6 KB per document** (~56.3 GB across 10M rows: ~2.5 KB/doc in columnar `.bfc` document files, ~2.2 KB/doc in `.bfv` ANN index files, and ~0.9 KB/doc across `.bft` full-text, `.bfx` filter, and `.bfi` ID indexes).
+- **In-region ingest rate (AWS S3, current `main`):** with per-segment ID filters, bulk-load compaction deferral, memory-sized defaults, jemalloc, and packed `f16` segment builds:
+  - **10M on `c7gd.xlarge` (4 vCPU, 8 GB, server in a 3.5 GiB cgroup):** flat at about **4,500 docs/s** (`4,501 docs/s` average, `2,222 s` total, `4,540 docs/s` over 9M–10M), peak RSS `2.51 GB` (`VmHWM`).
+  - **10M on `c7gd.large` (2 vCPU, 4 GB, swap off):** **2,918 docs/s** average (`3,427 s` total), peak RSS **2.3–2.9 GB** across runs (including a 4 GiB cgroup check with swap off), with `recluster` peaking at `1.76–2.36 GB`.
+  - **100M on `c7gd.2xlarge` (8 vCPU, 16 GB):** **4,891 docs/s** average (`20,445 s`, **5.7 h** total), peak RSS `6.8 GB` (`7.1 GB` `VmHWM`), followed by a `1.7 h` (`6,248 s`) `recluster` into 160 slabs (`6.0 GB` peak RSS).
+- **Over-the-internet R2 ingest (historical, iteration 10):** about **2,000 docs/s** (`BF_WAL_PIPELINE=8`, 2,000 rows per batch, 16 concurrent writes in flight: `2,040 docs/s` on 200K docs, `~1,860 docs/s` on 500K, and `~1,710 docs/s` over the first 1M of 10M), capped by the VM's `~14 MB/s` aggregate upload link to R2.
+- **Retained storage size:** after compaction and garbage collection, the 10M Wikipedia namespace occupies **~5.6 KB per document** (`~56.3 GB` across 10M rows: `~2.5 KB/doc` in columnar `.bfc` document files, `~2.2 KB/doc` in `.bfv` ANN index files, and `~0.9 KB/doc` across `.bft` full-text, `.bfx` filter, and `.bfi` ID indexes).
 
 ## Known gaps
 
 - **Selective filters issue ~1,900 object-store requests per cold query at 1M** (fetching ~4,181 individual 2 KB vectors on the exact-fetch path when matching rows <= 8,192), and scan **~268 MB across ~2,600 requests at 10M** (where ~42,000 matching rows exceed the exact-fetch cap and fall back to widened RaBitQ code scans without a per-cluster allowed-row index).
-- **The cold vector layout is not contiguous yet:** cluster metadata blobs, RaBitQ 1-bit codes, and full-precision rerank vectors live in separate regions across clusters that are not ordered by spatial proximity, leaving cold ANN at ~339 requests / 22 MB at 1M, ~1,103 requests / 67 MB at 10M with 64 probes, and ~2,093 requests / 137 MB at 10M with 160 probes.
+- **`recluster` is manual and covers unfiltered ANN only:** writes flushed into new segments after a `recluster` fall back to the per-segment layout until the next manual `recluster`, and filtered ANN does not use slabs. On the per-segment layout (before `recluster`), default `nprobe = 64` under-probes at 10M (`0.886` recall@10; `BF_ANN_NPROBE=160` restores `0.947–0.952`).
 - **Vectors are stored twice per segment:** once in the columnar document store (`.bfc`) for attribute projection and compaction, and once in the ANN index file (`.bfv`) for full-precision reranking, nearly doubling segment upload bytes and bucket footprint.
-- **Ingest and compaction memory growth above ~5M rows:** compaction currently materializes bounded segment inputs in memory rather than streaming cluster-by-cluster, causing 13–15 GB RSS spikes near 7–10M rows on a 16 GiB budget.
-- **Default probe scaling at 10M:** default `nprobe = 64` under-probes at 10M (`0.886` recall@10); raising `BF_ANN_NPROBE=160` recovers `0.947–0.952` recall@10 at roughly twice the cold bytes and requests (`5,175 / 6,528 ms` cold vs. `2,790 / 3,862 ms`).
+- **Full rewrites per publication at very large scale:** the text statistics object, ANN directories, and manifest are still rewritten in full on each publication, which adds linear per-cycle work past tens of millions of rows.
 
 ## How to reproduce
 
-The scale and apples-to-apples harness lives in [`bench/scale/`](../../bench/scale/). Private bucket endpoints, profiles, and namespace names stay in `bench/scale/config.local`, which is git-ignored; all build outputs, caches, downloaded shards, and logs stay under `.scratch/scale/` (`SCALE_SCRATCH`).
+The scale and apples-to-apples harness lives in [`bench/scale/`](../../bench/scale/), the 100M workload scripts live in [`bench/scale/big/`](../../bench/scale/big/), and the Amazon S3 Vectors comparison scripts live in [`bench/s3vectors/`](../../bench/s3vectors/). Private bucket endpoints, profiles, and namespace names stay in `bench/scale/config.local`, which is git-ignored; all build outputs, caches, downloaded shards, and logs stay under `.scratch/scale/` (`SCALE_SCRATCH`).
+
+For large reclustered namespaces, three helper examples live in `crates/bf-engine/examples/`:
+
+- `cargo run --release -p bf-engine --example recluster -- storage.json NAMESPACE ATTRIBUTE SCRATCH_DIR` builds the namespace-wide spatial slab layout (and writes a paged slab directory automatically at 100,000+ clusters).
+- `cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged slab directory to a previously reclustered namespace without rebuilding slabs.
+- `cargo run --release -p bf-engine --example readercopy -- storage.json NAMESPACE` rewrites `manifest-latest` in compact form (omitting text headers) for a namespace published before compact copies existed.
 
 1. **Create `bench/scale/config.local` from [`bench/scale/config.example.json`](../../bench/scale/config.example.json) and build the benchmark server:**
 

@@ -1,4 +1,4 @@
-# Get swimming 🐡
+# Quickstart
 
 blowfish is for development, CI, and modest self-hosted workloads. For production at scale, we
 recommend turbopuffer itself. The official SDKs use the same API, so upgrading means changing the
@@ -42,7 +42,7 @@ cargo run -p blowfish -- serve --storage-url file:///tmp/blowfish --listen 127.0
 
 For S3, use `--storage-url s3://your-bucket/your-prefix` with the backend endpoint, region, and AWS
 credentials described in [configuration](configuration.md). For a config file, copy
-`blowfish.example.toml`, and pass `--config blowfish.toml`.
+[`blowfish.example.toml`](../blowfish.example.toml) and pass `--config blowfish.toml`.
 
 ## Official Python SDK
 
@@ -67,7 +67,7 @@ PY
 ```
 
 The SDK requires a nonempty API key even when server auth is disabled. When auth is enabled, set
-`TURBOPUFFER_API_KEY` to your server key instead.
+`TURBOPUFFER_API_KEY` to a project API key (`bf_...`; see [auth](auth.md)).
 
 ## Official TypeScript SDK
 
@@ -96,5 +96,6 @@ console.log(await ns.query({
 }));
 ```
 
-See [operations](operations.md), [metrics](metrics.md), and the
-[API compatibility research](research/turbopuffer-api.md) for deployment and contract details.
+See [configuration](configuration.md), [compatibility](compatibility.md), [models](models.md),
+[operations](operations.md), [metrics](metrics.md), and [benchmarks](benchmarks/README.md) for
+configuration, deployment, and performance details.

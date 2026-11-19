@@ -1,13 +1,15 @@
-# Prometheus metrics 🐡
+# Prometheus metrics
 
-The main HTTP listener serves `GET /metrics`. When auth is enabled, use the super key or a key with
-`metrics`. `--metrics-listen 127.0.0.1:9100` serves a second `/metrics` without authentication. Bind
-that listener only to localhost or a trusted monitoring network. Both expose the same recorder.
+The main HTTP listener serves `GET /metrics`. When auth is enabled, use an org superadmin key,
+the break-glass `BLOWFISH_ADMIN_KEY`, or a legacy key with the `metrics` role. `--metrics-listen 127.0.0.1:9100`
+serves a second `/metrics` without authentication. Bind that listener only to localhost or a trusted
+monitoring network. Both expose the same recorder.
 
 All crates emit through the `metrics` facade. The binary installs `metrics-exporter-prometheus`
-once, so storage, cache, and WAL instrumentation share the same endpoint. Names follow
-`blowfish_<area>_<name>`. Use base units: seconds, bytes, and counts. Counters end in `_total`;
-histograms describe their measured quantity. Do not label by namespace, object key, token, or raw URL.
+once, so allocator, storage, cache, WAL, and engine instrumentation share the same endpoint. Names follow
+`blowfish_<area>_<name>`. Base units are seconds, bytes, and counts (with `blowfish_segment_build_millis_total`
+in milliseconds). Counters end in `_total`; histograms describe their measured quantity. Do not label
+by namespace, object key, token, or raw URL.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -21,24 +23,27 @@ histograms describe their measured quantity. Do not label by namespace, object k
 | `blowfish_wal_batch_requests` | Histogram | None | Atomic requests grouped into each newly committed WAL slot; tombstones have zero |
 | `blowfish_wal_cas_conflicts_total` | Counter | None | WAL slots won by another writer |
 | `blowfish_wal_bytes_written_total` | Counter | None | Encoded payload and slot bytes newly created; includes losing payloads, excludes retry hits, storage framing, and transport overhead |
-
+| `blowfish_commit_stage_seconds` | Histogram | `stage` | Duration of write commit stages: `catch_up`, `for_writes`, `prepare`, `append`, or `replay` |
+| `blowfish_segment_build_millis_total` | Counter | None | Cumulative wall time in milliseconds spent building segments |
+| `blowfish_segment_build_rows_total` | Counter | None | Total rows built into immutable segments |
 | `blowfish_ann_recall` | Histogram | None | Sampled overlap between ANN and exhaustive results |
-| `blowfish_cache_hits_total` | Counter | `tier` | Cache block hits by memory or disk tier |
+| `blowfish_alloc_bytes` | Gauge | `kind` | jemalloc memory accounting refreshed on each `/metrics` scrape: `allocated`, `active`, `resident`, or `retained` |
+| `blowfish_cache_hits_total` | Counter | `tier` | Cache block hits by `memory` or `disk` tier |
 | `blowfish_cache_misses_total` | Counter | None | Cache block misses |
-| `blowfish_cache_evictions_total` | Counter | `tier` | Evicted cache blocks |
-| `blowfish_cache_bytes` | Gauge | `tier` | Accounted cache bytes |
+| `blowfish_cache_evictions_total` | Counter | `tier` | Evicted cache blocks by `memory` or `disk` tier |
+| `blowfish_cache_bytes` | Gauge | `tier` | Accounted cache bytes by `memory` or `disk` tier |
 | `blowfish_object_store_requests_total` | Counter | `op`, `status` | Backend operations by outcome |
 | `blowfish_object_store_request_seconds` | Histogram | `op` | Backend operation duration |
 | `blowfish_object_store_bytes_total` | Counter | `op` | Bytes transferred by backend operations |
+| `blowfish_object_store_hedges_total` | Counter | `outcome` | Duplicate hedged ranged GETs (`outcome="issued"`) sent for tail latency |
 
 `route` is the Axum route template, such as `/v2/namespaces/{ns}/query`; unknown routes use
 `unmatched`. `key_name` is the configured key's display name, `super`, `development`, or
 `unauthenticated`. Key names are visible to metrics readers, so avoid confidential names, and limit
-key churn to control cardinality. Metrics appear after first use, and reset on process restart.
+key churn to control cardinality. Metrics appear after first use and reset on process restart.
 Histograms export the usual `_bucket`, `_sum`, and `_count` series. The in-flight gauge includes the
-scrape itself when scraping the main listener. Counters describe this node, not deployment totals.
-
-Cache and object-store metrics describe this node’s activity.
+scrape itself when scraping the main listener. All counters, gauges, and histograms describe this
+node's activity, not deployment totals.
 
 Example scrape configuration (replace the placeholder through your secret provisioning):
 

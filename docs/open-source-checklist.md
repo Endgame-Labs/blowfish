@@ -1,6 +1,6 @@
 # Open-source readiness checklist
 
-Status as of 2026-11-16. Checked boxes are verified, not assumed.
+> **Historical note (2026-11-16):** This pre-release planning checklist predates the initial public releases (current release `v0.1.12`). Many unchecked items below (README, `CONTRIBUTING.md`, `SECURITY.md`, org/projects/webapp, CI checks, and replacing temporary links in `docs/benchmarks.md`) have since shipped.
 
 ## Legal and naming
 
@@ -84,6 +84,4 @@ Status as of 2026-11-16. Checked boxes are verified, not assumed.
 - [ ] Final private-string grep of the tree and history, and the secret-scanner run. Known hit: one integration hostname reached history in the perfiter9 merge (`bench/scale/parity.sh`, removed in 8af1e32).
 - [ ] Make `dorkitude/blowfish` public, and turn on security advisories and Dependabot.
 - [ ] Tag `v0.1.0`.
-- [ ] Clean up turbopuffer reference namespaces (`blowfish-oracle-wiki*`) and the R2
-  `scale/` and `live-backup-*` prefixes when they're no longer needed. These aren't public, but they
-  still cost money.
+- [ ] Clean up any temporary turbopuffer reference namespaces (`blowfish-oracle-*`) and benchmark bucket prefixes when they are no longer needed. These are not public, but they still cost money.

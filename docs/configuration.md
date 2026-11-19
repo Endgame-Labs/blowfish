@@ -1,4 +1,4 @@
-# Configuration 🐡
+# Configuration
 
 Run `blowfish serve --config blowfish.toml`. The complete annotated template is
 [`blowfish.example.toml`](../blowfish.example.toml). No config file is loaded implicitly. Set a storage
@@ -21,28 +21,30 @@ are errors. Nested storage settings currently follow `bf-storage`'s parser.
 | `storage.profile` | `--storage-profile` | `BLOWFISH_STORAGE_PROFILE` | AWS provider chain |
 | `storage.read_only` | `--read-only` | `BLOWFISH_READ_ONLY` | `false` |
 | `storage.single_writer` | `--single-writer` | `BLOWFISH_SINGLE_WRITER` | `false` |
-
-| `engine.indexing` | `--indexing` | `BLOWFISH_INDEXING` | true |
-| `engine.index_rows` | `--index-rows` | `BLOWFISH_INDEX_ROWS` | 1000 |
-| `engine.index_bytes` | `--index-bytes` | `BLOWFISH_INDEX_BYTES` | 8388608 |
-| `engine.index_age_ms` | `--index-age-ms` | `BLOWFISH_INDEX_AGE_MS` | 5000 |
-| `engine.index_interval_ms` | `--index-interval-ms` | `BLOWFISH_INDEX_INTERVAL_MS` | 250 |
-| `engine.compaction_segments` | `--compaction-segments` | `BLOWFISH_COMPACTION_SEGMENTS` | 4 |
-| `engine.retention_ms` | `--retention-ms` | `BLOWFISH_RETENTION_MS` | 3600000 |
-| `engine.lease_duration_ms` | `--lease-duration-ms` | `BLOWFISH_LEASE_DURATION_MS` | 30000 |
-| `engine.max_unindexed_bytes` | `--max-unindexed-bytes` | `BLOWFISH_MAX_UNINDEXED_BYTES` | memory limit / 8, within 128 MiB to 2000000000 |
-| `engine.eventual_tail_bytes` | `--eventual-tail-bytes` | `BLOWFISH_EVENTUAL_TAIL_BYTES` | 134217728 |
-| `engine.ann_nprobe` | `--ann-nprobe` | `BLOWFISH_ANN_NPROBE` | 64 |
-| `engine.ann_rerank_factor` | `--ann-rerank-factor` | `BLOWFISH_ANN_RERANK_FACTOR` | 32 |
-| `engine.recall_sample_rate` | `--recall-sample-rate` | `BLOWFISH_RECALL_SAMPLE_RATE` | 0.01 |
-| `storage.cache.memory_bytes` | `--cache-memory-bytes` | `BLOWFISH_CACHE_MEMORY_BYTES` | host/container limit / 4, capped at 8 GiB |
-| `storage.cache.disk_bytes` | `--cache-disk-bytes` | `BLOWFISH_CACHE_DISK_BYTES` | 68719476736 |
+| `storage.warm_connections` | — | `BF_WARM_CONNECTIONS` | `256` (S3 only; `0` disables) |
+| `engine.indexing` | `--indexing` | `BLOWFISH_INDEXING` | `true` |
+| `engine.index_rows` | `--index-rows` | `BLOWFISH_INDEX_ROWS` | `1000` |
+| `engine.index_bytes` | `--index-bytes` | `BLOWFISH_INDEX_BYTES` | `8388608` |
+| `engine.index_age_ms` | `--index-age-ms` | `BLOWFISH_INDEX_AGE_MS` | `5000` |
+| `engine.index_interval_ms` | `--index-interval-ms` | `BLOWFISH_INDEX_INTERVAL_MS` | `250` |
+| `engine.compaction_segments` | `--compaction-segments` | `BLOWFISH_COMPACTION_SEGMENTS` | `4` |
+| `engine.retention_ms` | `--retention-ms` | `BLOWFISH_RETENTION_MS` | `3600000` |
+| `engine.lease_duration_ms` | `--lease-duration-ms` | `BLOWFISH_LEASE_DURATION_MS` | `30000` |
+| `engine.max_unindexed_bytes` | `--max-unindexed-bytes` | `BLOWFISH_MAX_UNINDEXED_BYTES` | Memory limit / 8, within 128 MiB to 2,000,000,000 |
+| `engine.eventual_tail_bytes` | `--eventual-tail-bytes` | `BLOWFISH_EVENTUAL_TAIL_BYTES` | `134217728` |
+| `engine.ann_nprobe` | `--ann-nprobe` | `BLOWFISH_ANN_NPROBE` | `64` |
+| `engine.ann_rerank_factor` | `--ann-rerank-factor` | `BLOWFISH_ANN_RERANK_FACTOR` | `32` |
+| `engine.recall_sample_rate` | `--recall-sample-rate` | `BLOWFISH_RECALL_SAMPLE_RATE` | `0.01` |
+| `storage.cache.memory_bytes` | `--cache-memory-bytes` | `BLOWFISH_CACHE_MEMORY_BYTES` | Host/container limit / 4, capped at 8 GiB |
+| `storage.cache.disk_bytes` | `--cache-disk-bytes` | `BLOWFISH_CACHE_DISK_BYTES` | `68719476736` |
 | `storage.cache.disk_dir` | `--cache-disk-dir` | `BLOWFISH_CACHE_DISK_DIR` | Disabled |
-| `storage.cache.namespace` | `--cache-namespace` | `BLOWFISH_CACHE_NAMESPACE` | automatic |
-| `storage.cache.block_size` | `--cache-block-size` | `BLOWFISH_CACHE_BLOCK_SIZE` | 1048576 |
-| `storage.cache.max_coalesce_blocks` | `--cache-max-coalesce-blocks` | `BLOWFISH_CACHE_MAX_COALESCE_BLOCKS` | 8 |
-| `storage.cache.fetch_concurrency` | `--cache-fetch-concurrency` | `BLOWFISH_CACHE_FETCH_CONCURRENCY` | 16 |
-| `storage.cache.prefetch_concurrency` | `--cache-prefetch-concurrency` | `BLOWFISH_CACHE_PREFETCH_CONCURRENCY` | 4 |
+| `storage.cache.namespace` | `--cache-namespace` | `BLOWFISH_CACHE_NAMESPACE` | Automatic |
+| `storage.cache.block_size` | `--cache-block-size` | `BLOWFISH_CACHE_BLOCK_SIZE` | `1048576` |
+| `storage.cache.max_coalesce_blocks` | `--cache-max-coalesce-blocks` | `BLOWFISH_CACHE_MAX_COALESCE_BLOCKS` | `8` |
+| `storage.cache.coalesce_gap_blocks` | `--cache-coalesce-gap-blocks` | `BLOWFISH_CACHE_COALESCE_GAP_BLOCKS` | `0` |
+| `storage.cache.fetch_concurrency` | `--cache-fetch-concurrency` | `BLOWFISH_CACHE_FETCH_CONCURRENCY` | `512` |
+| `storage.cache.prefetch_concurrency` | `--cache-prefetch-concurrency` | `BLOWFISH_CACHE_PREFETCH_CONCURRENCY` | `4` |
+| `storage.cache.hedge_budget` | — | `BF_HEDGE_BUDGET` | `0.1` (`0` disables hedged ranged reads) |
 
 ### Models (native embedding and reranking)
 
@@ -51,7 +53,8 @@ turbopuffer's own names) to a provider. `BLOWFISH_MODELS_JSON` holds a JSON obje
 merged over the file. With no entries, `Embed` and model `rerank_by` return a 400. Every field is documented in
 [models.md](models.md). `provider = "local"` runs a GGUF model in-process and needs a build with
 `--features local-models`. Related environment variables: `BLOWFISH_MODELS_CACHE_DIR` (default
-`~/.cache/blowfish/models`), `HF_ENDPOINT` (default `https://huggingface.co`), and `HF_TOKEN` for gated files.
+`~/.cache/blowfish/models`), `HF_ENDPOINT` (default `https://huggingface.co`), `HF_TOKEN` for gated files, and
+`BLOWFISH_LLAMA_LOGS` (when set, enables verbose `llama.cpp` stderr logging).
 
 `BLOWFISH_ADMIN_KEY` is the deployment's **break-glass** key, with org superadmin powers and never stored in
 the bucket. Mint an org superadmin key with it (see [auth.md](auth.md)), and use that key, not this one, for
@@ -84,33 +87,37 @@ The `keys` CLI has separate client settings: `--url` / `BLOWFISH_URL` (default
 [authentication](auth.md). SIGINT or SIGTERM initiates graceful HTTP shutdown.
 
 Durations ending in `_ms` are milliseconds. The legacy `BF_INDEX_ROWS`, `BF_INDEX_AGE_MS`,
-`BF_INDEX_INTERVAL_MS`, `BF_MAX_UNINDEXED_BYTES`, and `BF_ANN_NPROBE` variables remain aliases.
+`BF_INDEX_INTERVAL_MS`, `BF_MAX_UNINDEXED_BYTES`, and `BF_ANN_NPROBE` variables remain aliases in `blowfish serve`.
 Flags and `BLOWFISH_*` variables take precedence over aliases, which take precedence over TOML.
 Set `--indexing false` to disable background indexing. Recall sampling must be between 0 and 1.
 
 ### Memory sizing
 
 blowfish links jemalloc, with background purging, as its allocator. Where memory matters, these defaults follow the
-memory limit (host RAM, or the cgroup limit when lower), and each has an override:
+memory limit (host RAM, or the cgroup limit when lower):
 
 | What | Default | Override |
 | --- | --- | --- |
-| Unindexed WAL tail (write backpressure) | limit / 8, 128 MiB to 2 GB | `BF_MAX_UNINDEXED_BYTES` |
-| Tail bytes at which a bulk load flushes | three quarters of the unindexed limit | `BF_BULK_FLUSH_BYTES` |
+| Unindexed WAL tail (write backpressure) | limit / 8, 128 MiB to 2 GB | `engine.max_unindexed_bytes`, `--max-unindexed-bytes`, `BLOWFISH_MAX_UNINDEXED_BYTES`, `BF_MAX_UNINDEXED_BYTES` |
+| Block cache in memory | limit / 4, up to 8 GiB | `storage.cache.memory_bytes`, `--cache-memory-bytes`, `BLOWFISH_CACHE_MEMORY_BYTES` |
+| Tail bytes at which a bulk load flushes | three quarters of `max_unindexed_bytes` | `BF_BULK_FLUSH_BYTES` |
 | Segments a bulk load accumulates before compaction runs while writes arrive | 1,024 | `BF_DEFER_COMPACTION_SEGMENTS` |
 | Rows in a built or compacted segment | limit / 80,000, 25,000 to 200,000 | `BF_MAX_SEGMENT_ROWS` |
 | Rows accumulated before a bulk flush | the smaller of 100,000 and the segment cap | `BF_BULK_FLUSH_ROWS` |
 | Segment builds at once | 1 below 8 GiB, otherwise 2 | `BF_BUILD_CONCURRENCY` |
 | Decoded metadata cache | limit / 8, 512 MiB to 4 GiB | `BF_DECODED_CACHE_BYTES` |
-| Block cache in memory | limit / 4, up to 8 GiB | `storage.cache.memory_bytes` |
+
+`blowfish serve` reads every `BF_*` engine variable above, plus `BF_INDEX_BYTES`, `BF_MAX_SEGMENT_BYTES`, `BF_BULK_FLUSH_AGE_MS`, `BF_WAL_PIPELINE`, `BF_RETENTION_SECS`, `BF_ANN_RERANK`, `BF_EXACT_FETCH`, and `BF_FILTER_PROBE_CAP`. CLI flags and TOML keys take precedence over them. `BF_BULK_FLUSH_BYTES` follows `max_unindexed_bytes` (three quarters of it) unless set explicitly.
+
+Note on cgroup detection: `bf-engine` reads the process's own cgroup (`/proc/self/cgroup` -> `/sys/fs/cgroup<path>/memory.max`) before falling back to `/sys/fs/cgroup/memory.max`, whereas `storage.cache.memory_bytes` reads `/sys/fs/cgroup/memory.max` only. Under a nested systemd scope, set `storage.cache.memory_bytes` explicitly if you want it sized to the scope limit rather than host RAM.
 
 The row caps assume 1,024-dimension vectors. Builds and compactions keep vectors packed at their stored precision (2 KB per f16 row)
 and normalize on the fly, compaction and `recluster` reads bypass the in-memory block cache, and the text statistics object is
-merged by streaming, so none of these terms grows with the namespace. `recluster` sizes `max_slab_rows` at 12 KB per row
+merged by streaming, so none of these terms grows with the namespace. `examples/recluster.rs` sizes `max_slab_rows` from `/proc/meminfo` at 12 KB per row, clamped to 50,000–700,000
 (about 350,000 on a 4 GB machine). Diagnostics:
 `BF_MEM_LOG_SECS=N` prints allocator and RSS statistics every N seconds, `/metrics` exposes
-`blowfish_alloc_bytes{kind}` (allocated, active, resident, retained), and a build with `--features heap-profile` writes jemalloc
-heap profiles when run with `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19` and `BF_HEAP_DUMP_DIR=DIR`.
+`blowfish_alloc_bytes{kind}` (allocated, active, resident, and retained), and a build with `--features heap-profile` writes jemalloc
+heap profiles when run with `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19` and `BF_HEAP_DUMP_DIR=DIR` (interval `BF_HEAP_DUMP_SECS`, default 30).
 
 ### Allocator decay: short while writing, long while only querying
 
@@ -136,7 +143,7 @@ A manifest of a large namespace is mostly per-segment text headers (the dictiona
 segment: about 6.6 of 9.8 MB of JSON at 100M rows). Only BM25 and full-text filters read them, and a segment without
 one reads its own footer instead. When a publication's manifest is larger than 256 KB and the text headers are over
 half of it, blowfish writes the fixed-key reader copy (`manifest-latest`) without them. A cold ANN query reads that
-copy (370 KB instead of 3.4 MB at 100M rows). A query that ranks by text, and every writer and indexer, read the full manifest
+copy (375 KB instead of 3.4 MB at 100M rows). A query that ranks by text, and every writer and indexer, read the full manifest
 slot instead (one more round trip for a cold text query), and a server holding the compact copy replaces it before
 it publishes anything. The manifest slots are unchanged, so older binaries read these namespaces as before (their cold
 text queries read the footers). Namespaces published before this existed keep their full copy until their next
@@ -151,7 +158,7 @@ publication, or until you run
 ### Paged ANN directory (large reclustered namespaces)
 
 `recluster` writes the slab directory twice: whole (for older readers) and, once it lists at least 100,000 clusters, as a
-paged copy. A cold query reads the paged copy's small header (segment table, one one-bit code per cell, a page table) and
+paged copy. A cold query reads the paged copy's small header (segment table, one one-bit code per cell, and a page table) and
 then only the pages of the cells nearest the query, instead of the whole directory (about 100 MB at 100M rows). Queries
 rank only the clusters in those pages, so warm queries also skip ranking every cluster. All of these are environment
 variables; the defaults suit 1,024-dimension vectors.
@@ -168,3 +175,20 @@ variables; the defaults suit 1,024-dimension vectors.
 
 `cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged copy to a namespace
 that was reclustered before paging existed, without rebuilding any slab.
+
+### Connection warming, hedging, and diagnostics
+
+These environment-only switches are read directly by the storage and engine crates (including under `blowfish serve`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BF_WARM_CONNECTIONS` | adaptive (starts at `storage.warm_connections`, `256`) | Fix the S3 warm connection pool size (`0` disables connection warming) |
+| `BF_WARM_FLOOR` | `16` | Minimum idle S3 connections kept warm after an idle window |
+| `BF_HEDGE_BUDGET` | `storage.cache.hedge_budget` (`0.1`) | Extra-request fraction for hedged ranged GETs up to 1 MiB (`0` disables) |
+| `BF_ANN_DIRECTORY` | on | Set to `0` to force the per-segment ANN path (A/B runs) |
+| `BF_ANN_SLABS` | on | Set to `0` to ignore `recluster` slabs (A/B runs) |
+| `BF_ANN_BLOCKS` | on | Set to `0` to ignore block fragments (A/B runs) |
+| `BF_IVF_CLUSTER_FACTOR` | `1.0` | Multiplier on leaf cluster size during IVF builds |
+| `BF_READ_GAP_KB` | layout default | Override read range-merge gap in KiB |
+| `BF_TRACE_READS` | off | Print each backend read and its timing to stderr |
+| `BF_TRACE_STAGES` | off | Print per-stage query and indexer timings to stderr |

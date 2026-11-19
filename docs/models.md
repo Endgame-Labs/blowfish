@@ -1,4 +1,4 @@
-# Native embedding and reranking 🐡🧠
+# Native embedding and reranking
 
 blowfish can embed text for you and rerank results with a model, the way turbopuffer does, without
 tying you to one vendor. Models are **mapped by the operator** in a `[models]` table: a model name
@@ -9,9 +9,9 @@ Three provider types exist:
 
 | `provider` | Runs | Use it for |
 | --- | --- | --- |
-| `local` | A GGUF model **inside the blowfish process** (llama.cpp), on CPU | The default: nothing else to run or pay for |
-| `openai_embeddings` | Any OpenAI-compatible `POST {base_url}/v1/embeddings` | GPU servers and hosted APIs: llama.cpp `llama-server`, vLLM, TEI, Ollama, Fireworks, OpenRouter, OpenAI |
-| `rerank` | A Cohere/Jina-style `POST {base_url}/v1/rerank` | GPU servers and hosted APIs: vLLM, TEI, Jina, Cohere, Voyage, llama.cpp `--reranking` |
+| `local` | A GGUF model **inside the blowfish process** (llama.cpp), on CPU | Self-contained: no external service to run or pay for (requires `--features local-models`) |
+| `openai_embeddings` | Any OpenAI-compatible `POST {base_url}/v1/embeddings` | GPU servers and hosted APIs: llama.cpp `llama-server`, vLLM, TEI, Ollama, Fireworks, OpenRouter, and OpenAI |
+| `rerank` | A Cohere/Jina-style `POST {base_url}/v1/rerank` | GPU servers and hosted APIs: vLLM, TEI, Jina, Cohere, Voyage, and llama.cpp `--reranking` |
 
 With no `[models]` entries, `embed` and model `rerank_by` return a clear `400`, and everything else is
 unchanged.
@@ -80,9 +80,9 @@ Inference runs on **its own dedicated threads**, separate from the HTTP, query, 
 burst of embedding or reranking cannot starve them. The cost is those threads' CPU: size `threads` with the
 rest of the host in mind.
 
-### Measured on this host
+### Measured latency (8-vCPU AMD EPYC Zen 4 VM)
 
-Measured on the 8 vCPU AMD EPYC (Zen 4) VM that runs blowfish, **while another benchmark job was using
+Measured on an 8-vCPU AMD EPYC (Zen 4) VM, **while another benchmark job was using
 about half the CPU**, with the defaults above (4 threads), Q8_0 weights, and a build tuned for the host CPU
 (`local-models-native`). Corpus: 1,000 English Wikipedia passages (326 characters, about 80 tokens each, from
 the benchmark dataset), indexed through the real HTTP API with the turbopuffer Python SDK.
@@ -103,7 +103,7 @@ MB. (Weights are memory-mapped, so some of that is shared page cache.)
 Sanity: querying with a passage's title returned a passage with that title in the top 5 for 25 of 25 sampled
 titles. The reranker gave a river passage 0.98 and an unrelated one 0.00005 in a direct check.
 
-What this means in practice: **query embedding is fast on CPU, bulk embedding is slow-ish (about 6 passages
+What this means in practice: **query embedding is fast on CPU, bulk embedding is slow (about 6 passages
 a second), and CPU reranking is expensive.** Keep rerank candidates to 10 to 20, or point `rerank` at a GPU
 or hosted provider. For a large backfill, run a GPU `openai_embeddings` provider for the load and keep the
 local model for queries (the model name and dims must match).
@@ -224,7 +224,8 @@ CFLAGS="-march=x86-64-v3" CXXFLAGS="-march=x86-64-v3" cargo build --release -p b
 ```
 
 Without AVX2 flags llama.cpp falls back to plain SSE2 and runs about four to five times slower (32 passages: 28 s baseline, 7 s with `x86-64-v3`, 5 s with the host-tuned build, on the host above). The container image
-is built with `local-models` and `x86-64-v3` flags (x86 only).
+is built with `--features local-models` on all architectures, and applies `-march=x86-64-v3` flags on x86-64.
+Set `BLOWFISH_LLAMA_LOGS=1` to enable verbose `llama.cpp` stderr logging.
 
 CI builds, lints, and tests the feature in its own job. The default job never compiles it.
 

@@ -17,7 +17,7 @@ cargo build -p blowfish
 cargo build --release -p blowfish
 ```
 
-Build with in-process GGUF model support (`docs/models.md`):
+Build with in-process GGUF model support ([`docs/models.md`](docs/models.md)):
 
 ```bash
 # Portable x86-64 binary with AVX2 kernels:
@@ -51,7 +51,7 @@ cargo clippy -p bf-models -p blowfish --features bf-models/local-models,blowfish
 cargo test -p bf-models --features local-models
 ```
 
-Run the Python compatibility suite against a local release build in both normal mode and forced-indexing mode (121 recorded scenarios using the official `turbopuffer` Python SDK; requires `uv`):
+Run the compatibility suite against a local release build in both normal mode and forced-indexing mode (121 recorded scenarios using the official `turbopuffer` Python SDK, plus Python and TypeScript SDK retry scenarios against a low-limit backpressure server; requires `uv`):
 
 ```bash
 scripts/compat_both.sh
@@ -82,6 +82,7 @@ The Rust workspace has one crate per concern under `crates/`:
 | `bf-text` | Tokenizers, BM25, and the posting-list index format. No dependency on other `bf` crates |
 | `bf-vector` | Distance kernels, IVF with RaBitQ, and its on-disk format. No dependency on other `bf` crates |
 | `bf-models` | The `[models]` registry, HTTP embedding and rerank provider clients, and optional in-process `llama.cpp` GGUF inference (`local-models`) |
+| `bf-alloc` | Global jemalloc allocator, adaptive busy/idle page decay, `blowfish_alloc_bytes` gauges, and optional `heap-profile` dumps |
 | `bf-auth` | API keys, projects, roles, and the key store |
 | `blowfish` | The binary: HTTP server (`axum`), admin API, metrics, CLI, and config |
 
@@ -89,8 +90,8 @@ Other top-level directories:
 
 - `compat/` — Python compatibility suite (`uv`) and TypeScript SDK smoke test (`compat/smoke-ts/`), diffing blowfish responses against recorded turbopuffer fixtures.
 - `webapp/` — Optional Go admin web console (standard library only, magic-link sign-in).
-- `bench/scale/` — Scale and parity benchmark harness (`docs/benchmarks/README.md`).
-- `docs/` — User, operator, design, and API research documentation (`DESIGN.md` at the root holds the system architecture).
+- `bench/scale/` — Scale and parity benchmark harness ([`docs/benchmarks/README.md`](docs/benchmarks/README.md)).
+- `docs/` — User, operator, design, and API research documentation ([`DESIGN.md`](DESIGN.md) at the root holds the system architecture).
 
 Keep crate boundaries clean: `bf-text` and `bf-vector` must not depend on other `bf-*` crates.
 
@@ -98,7 +99,7 @@ Keep crate boundaries clean: `bf-text` and `bf-vector` must not depend on other 
 
 Wire compatibility with the turbopuffer API and official SDKs is blowfish's primary contract:
 
-- Any change to request parsing, query semantics, ranking, filtering, schema validation, status codes, or response shapes must include a compatibility scenario in `compat/` (in addition to crate-level unit or integration tests).
+- Any change to request parsing, query semantics, ranking, filtering, schema validation, status codes, retry headers (`Retry-After`, `retry-after-ms`, and `x-should-retry`; see [`docs/research/sdk-compat-audit.md`](docs/research/sdk-compat-audit.md)), or response shapes must include a compatibility scenario in `compat/` (in addition to crate-level unit or integration tests).
 - Features that blowfish intentionally does not implement (such as cross-deployment copy or customer-managed encryption keys) must return a clear `400` error using the `{"status":"error","error":"..."}` envelope rather than silently ignoring fields.
 
 ## Commit, hygiene, and style guidelines

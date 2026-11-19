@@ -244,3 +244,10 @@ cache. A tail that shadows rows only wastes those bytes.
 Two smaller changes: the scan wave no longer warms every probed segment's documents footer (70 requests and 10 MB; the few
 segments with likely winners read it in the speculative document read), and the reranks run on the async runtime instead of
 on the CPU workers (they are small reads, and holding one of eight worker permits through each read's latency queued them).
+
+## Iterations 12 and 17 (shipped): namespace-wide slabs and paged slab directory
+
+The two-level directory sketched as "phase 3" above has since shipped in two steps:
+
+- **Iteration 12 (`Engine::recluster`, `crates/bf-engine/examples/recluster.rs`):** builds a namespace-wide spatial slab layout (`Manifest::ann_slabs`, about 200 rows per leaf cluster) so unfiltered cold ANN queries probe far fewer clusters than the per-segment layout. Writes flushed after `recluster` fall back to the per-segment path until the next manual `recluster`.
+- **Iteration 17 (paged slab directory, `crates/bf-engine/examples/repage.rs`):** once a slab directory reaches `BF_ANN_PAGED_MIN_ENTRIES` (default 100,000 clusters), `recluster` (or `repage` for older reclustered namespaces) writes a paged copy beside the flat directory. Cold queries fetch only the small resident header (segment table, one-bit cell codes, and page table; 4.0 MB at 100M rows) and the nearest cell pages instead of the entire ~100 MB directory, and start page and scan reads speculatively while the manifest is in flight. See [`docs/configuration.md`](../configuration.md) and [`docs/benchmarks.md`](../benchmarks.md) (Iterations 12 and 17).
