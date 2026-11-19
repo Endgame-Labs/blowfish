@@ -33,7 +33,8 @@ instead of guessing.
 
 ## Layout and conventions
 
-The design is `DESIGN.md`; the build log is `PROGRESS.md` (update it with every commit that changes
+Decisions and their status live in `SPEC.md`: read it before changing direction, and when Kyle decides something,
+update it and its decision log in the same commit. The design is `DESIGN.md`; the build log is `PROGRESS.md` (update it with every commit that changes
 what works). Research notes and the upstream API contract are in `docs/research/`.
 
 Rust workspace, one crate per concern (`crates/`):
