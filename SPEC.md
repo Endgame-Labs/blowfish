@@ -108,11 +108,19 @@ log entry in the same commit.
   probes, and starts the scan reads from the header before the manifest arrives. The flat directory stays for older
   readers. Queries read about 16 times the clusters they probe, which keeps recall equal to the flat directory's.
   Existing reclustered namespaces get a paged copy with `examples/repage.rs`, without rebuilding slabs.
+- **Warm path and allocator** (iteration 18): each slab's scan task runs on its own runtime task, so a warm 100M query uses
+  every core (warm p50 160 to 100 ms at 64 probes). jemalloc's page decay is adaptive: 1 s while writes, builds, compaction,
+  or `recluster` run and for 15 s after, 30 s while only queries run (`bf-alloc`, `BF_BUSY_DECAY_MS`, `BF_IDLE_DECAY_MS`,
+  `BF_DECAY_LINGER_MS`).
+- **Compact manifest copy** (iteration 18): the fixed-key `manifest-latest` copy omits the per-segment text headers (the
+  bulk of a large manifest) and is flagged `root`. Cold ANN queries read it (375 KB against 3.4 MB at 100M); text queries,
+  writers, and the indexer read the full manifest slot, which is unchanged, so older binaries and older namespaces work as
+  before. `examples/readercopy.rs` rewrites the copy of an existing namespace.
 
 **Open.**
 
 - Automatic recluster, slabs that cover new segments, and filtered ANN on slabs.
-- The manifest (3.4 MB at 100M, JSON) is read whole by every cold query; a split manifest could shrink it.
+- A split manifest (a small root plus lazily read segment lists) would shrink the cold ANN read further than the compact copy's 375 KB; text-header reads on a namespace with a compact copy cost one more round trip.
 - BM25: fold term records into dictionary reads, store document lengths in blocks, and a namespace-wide text
   dictionary.
 - The text statistics object, ANN directories, and manifest are still rewritten whole on each publish. Fine at 10M;
@@ -210,4 +218,5 @@ S3 until the run is cleaned up.
 15. 2026-11-19: Measure turbopuffer ourselves, cold and warm, including the same 100M rows. Keep the 100M blowfish
     namespace in the bucket after round 17.
 16. 2026-11-19: turbopuffer 100M load approved at about $900 (it bills f16 vectors as f32).
-17. 2026-11-20: Full compatibility with the official SDKs, including retry and backpressure headers.
+17. 2026-11-19: Iteration 18 built (status Proposed): slab scan tasks on the runtime, adaptive allocator decay, compact manifest reader copy.
+18. 2026-11-20: Full compatibility with the official SDKs, including retry and backpressure headers.

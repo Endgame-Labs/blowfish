@@ -2559,3 +2559,134 @@ The 10M namespace's directory (49,976 clusters) is below the paging threshold, s
 - **Manifest at 100M.** Every cold query reads the full 3.4 MB JSON manifest (about 50 ms). Splitting it is the next cold-start reduction.
 - **Existing 100M data.** The 100M recluster in `big/` was not redone; it carries the paged copy added by `repage`.
 
+
+## Iteration 18 (100M): warm ANN under 150 ms, and a small cold manifest read
+
+Target: at 100M, 64 probes, default settings, warm p50 of 150 ms or less (it was 160 to 168 ms) without breaking the 10M memory target, and a small cold
+manifest read that older namespaces and older binaries still work with. Same machine (c7gd.2xlarge, in the bucket's region), namespace
+(`wikipedia-100m`), workload, and `ab.py` as iteration 17. "main" is the code at the start of the iteration, measured in the same session.
+
+### Where the warm time went
+
+Warm queries cost 322 ms of CPU each but only 157 ms of wall time, so about two of the eight cores were busy. A per-task trace of one query (`BF_TRACE_STAGES`
+now also prints a `TASK` line per slab) showed why. The scan stage launched 160 per-slab tasks from one polled future (`buffer_unordered`). On a warm query
+every read is a block-cache hit that finishes without yielding, so each task's copies, checksums, and decodes ran one after another on a single thread
+(task start times spread from 38 ms to 94 ms after the query began), and only the final scan reached other threads.
+
+| Stage (median, warm, 64 probes) | main | branch |
+|---|---:|---:|
+| Directory pages, rank, and plan | 4 ms | 4 ms |
+| Scan (read, decode, and score 790,000 rows in 70 slab tasks) | 109 ms | 42 ms |
+| Rerank | 21 ms | 23 ms |
+| Whole query (trace on) | 154 ms | 89 ms |
+
+### What changed
+
+- **Slab scan tasks run on the runtime.** Each task is spawned (inside the query's read context, and cancelled together on the first error), so the
+  per-slab reads and decodes use every core. Results are unchanged (same recall).
+- **Adaptive allocator decay.** jemalloc's page decay is 1 s while a write, a segment build or compaction, or a `recluster` is in flight and for 15 s after,
+  and 30 s while only queries run (`BF_BUSY_DECAY_MS`, `BF_IDLE_DECAY_MS`, `BF_DECAY_LINGER_MS`). The 1 s setting that keeps ingest inside a 4 GB machine is
+  therefore unchanged during loads. On its own it did not move the warm p50 in this session (table below): the earlier 13 ms gain did not reproduce once
+  the scan was the bottleneck, so it stays as a memory-neutral default rather than a speedup.
+- **Rayon pool.** The default pool is already one thread per available CPU (rayon honors cgroup quotas). The benchmark scripts had been forcing 6; they no
+  longer do. Eight threads against six made no difference here either.
+- **Cheaper `PlaneQuery` construction.** The residual is quantized to bytes in one pass and transposed into bit planes 64 values at a time, with no
+  intermediate vector. This showed as 8 percent of CPU in the profile (the scan itself is 26 percent).
+- **Compact manifest copy for cold ANN queries.** At 100M the manifest is 9.8 MB of JSON (3.4 MB compressed), and 6.6 MB of that is the per-segment text
+  headers (the dictionary chunk index of each full-text segment), which only BM25 and full-text filters read. The fixed-key copy (`manifest-latest`) is now
+  written without them (`root: true`) when the manifest is larger than 256 KB and the compact form is under half the size: 375 KB at 100M. A cold ANN query
+  reads that copy; a text query, a writer, and the indexer read the full manifest slot (a state that holds the compact copy replaces it before it
+  builds anything, so a publish never drops a header, and a test checks that). Manifest slots are unchanged, so older binaries read these namespaces
+  as before (a segment without a header reads its own footer). Older namespaces keep their full copy until the next publication; `examples/readercopy.rs`
+  rewrites it (it took one PUT on `big/`).
+
+### Warm, 100M (1,000 queries, concurrency 1; recall over the 200 oracle queries)
+
+| Arm | p50 / p90 ms | p99 ms | Recall@10 |
+|---|---|---:|---:|
+| 64 probes, main | 163.0 / 195.3 | 254.4 | 0.9540 |
+| 64 probes, branch | **99.7 / 162.8** | 243.5 | 0.9540 |
+| 48 probes, main | 119.6 / 138.0 | 156.5 | 0.9410 |
+| 48 probes, branch | **72.6 / 90.4** | 119.4 | 0.9410 |
+
+Before the scan change, with the allocator and thread settings alone (64 probes, a different part of the same session):
+
+| Arm | p50 / p90 ms |
+|---|---|
+| main, 6 rayon threads | 158.7 / 190.1 |
+| main, default threads | 162.0 / 193.6 |
+| branch (adaptive decay), default threads | 161.4 / 193.0 |
+| branch (adaptive decay), 6 threads | 163.0 / 197.4 |
+
+### Cold, 100M (50 queries per arm; "fresh" is a new process per query, "cache-cold" drops caches on a warm process)
+
+With the full manifest copy (the namespace as iteration 17 left it; the branch has the scan change only):
+
+| Arm | p50 / p90 ms | p99 ms | MB | Waves | Recall |
+|---|---|---:|---:|---:|---:|
+| 64 probes, main, fresh | 1,345 / 1,529 | 1,674 | 163.0 | 4.0 | 0.958 |
+| 64 probes, branch, fresh | 1,352 / 1,652 | 2,097 | 163.0 | 4.2 | 0.958 |
+| 64 probes, main, cache-cold | 1,250 / 1,430 | 1,619 | 163.0 | 4.3 | 0.958 |
+| 64 probes, branch, cache-cold | 1,260 / 1,392 | 1,591 | 163.0 | 4.5 | 0.958 |
+| 48 probes, main, fresh | 1,085 / 1,319 | 1,466 | 126.0 | 4.1 | 0.950 |
+| 48 probes, branch, fresh | 1,036 / 1,364 | 1,695 | 126.0 | 4.1 | 0.950 |
+| 48 probes, main, cache-cold | 1,080 / 1,227 | 1,429 | 126.0 | 4.4 | 0.950 |
+| 48 probes, branch, cache-cold | 1,069 / 1,243 | 1,673 | 126.0 | 4.5 | 0.950 |
+
+With the compact reader copy (`big/` rewritten; "full manifest" is the branch with `BF_READER_COPY=0`, which reads the 3.4 MB slot):
+
+| Arm | p50 / p90 ms | p99 ms | MB | Waves | Recall |
+|---|---|---:|---:|---:|---:|
+| 64 probes, compact copy, fresh | 1,243 / 1,370 | 1,540 | 159.9 | 4.5 | 0.958 |
+| 64 probes, full manifest, fresh | 1,230 / 1,513 | 3,767 | 163.3 | 3.9 | 0.958 |
+| 64 probes, compact copy, cache-cold | 1,201 / 1,391 | 1,500 | 159.9 | 4.3 | 0.958 |
+| 64 probes, full manifest, cache-cold | 1,219 / 1,511 | 1,601 | 163.3 | 4.4 | 0.958 |
+| 48 probes, compact copy, fresh | 1,058 / 1,253 | 1,972 | 122.9 | 4.3 | 0.950 |
+| 48 probes, full manifest, fresh | 1,059 / 1,337 | 5,902 | 126.3 | 3.9 | 0.950 |
+| 48 probes, compact copy, cache-cold | 1,128 / 1,341 | 1,584 | 122.9 | 4.7 | 0.950 |
+| 48 probes, full manifest, cache-cold | 1,075 / 1,347 | 1,629 | 126.3 | 4.1 | 0.950 |
+
+Reading it: the manifest read is 375 KB instead of 3.4 MB (3.4 MB fewer per query) and the compact copy's p90 is 140 ms lower at 64 probes fresh, but
+the p50 does not move beyond the run-to-run spread (S3 first-byte latency, not the transfer, dominates a manifest that small). The cold targets are
+not regressed. This session's cold numbers are 40 to 100 ms above iteration 17's (1,164 and 1,228 ms) for the same code, which is S3 variance between
+sessions; only the same-session pairs are comparable.
+
+### 10M no-regression check (`scale/ns/wikipedia-10m`, read-only, 48 probes, which has no compact copy)
+
+| Arm | p50 / p90 ms | p99 ms | MB | Recall@10 |
+|---|---|---:|---:|---:|
+| main, fresh | 703 / 890 | 1,322 | 49.6 | 0.944 |
+| branch, fresh | 680 / 907 | 1,173 | 50.2 | 0.944 |
+| main, cache-cold | 539 / 686 | 828 | 50.4 | 0.944 |
+| branch, cache-cold | 533 / 656 | 755 | 50.3 | 0.944 |
+| main, warm | 42.2 / 54.7 | 70.9 | | 0.953 |
+| branch, warm | 36.6 / 50.8 | 70.5 | | 0.953 |
+
+### Known gaps
+
+- The `ab.py` fresh-process runs sometimes failed before printing a table (a client timeout or a reset connection): 5 of 10 runs of 50 queries, at
+  both 100M and 10M, and each succeeded on retry. Twenty-five fresh-process queries run directly against the branch all succeeded with the server alive, so
+  I did not reproduce a server fault and did not find the cause (the harness restarts a server on the same port between arms). The cache-cold and warm runs
+  never failed.
+- A cold text query on a namespace with a compact copy reads the manifest slot after the listing, one round trip more than before (not measured; the BM25
+  namespaces here are small and have no compact copy).
+- Writes are not measured against the adaptive decay beyond the memory check below.
+
+### Memory check (10M load and recluster, 4 GiB cgroup, swap off, 2 CPUs)
+
+The server ran in a systemd cgroup with `MemoryMax=4G`, `MemorySwapMax=0`, and two CPUs (`AllowedCPUs=0-1`) on the c7gd.2xlarge, with the loader in a
+separate 2 GiB cgroup on two other CPUs. Defaults throughout (memory sizing follows the cgroup limit), fresh namespace under `mem/` (deleted afterward).
+RSS is sampled every 5 s from `/proc`; the cgroup figure includes page cache, which the kernel reclaims, so it sits at the limit without anything being killed.
+
+| Phase | Branch | main (same setup) |
+|---|---|---|
+| Ingest 10M rows (f16, 1,024 dimensions), seconds | 2,839 (3,522 docs/s) | 2,804 (3,566 docs/s) |
+| Ingest peak RSS / VmHWM | 2,931 / 3,016 MB | 2,961 / 3,035 MB |
+| Indexing to idle after the last write | 270 s | 270 s |
+| Recluster (32 slabs, 49,985 clusters), seconds | 2,972 | not run |
+| Recluster peak RSS / VmHWM | 1,538 / 2,357 MB | not run |
+| OOM kills | 0 | 0 |
+
+Both are under the 3.5 GB target and equal within noise, so the adaptive decay costs no memory: at the peak jemalloc's resident bytes were within 4 percent of
+its live bytes (2,980 against 2,811 MB). The ingest peak here (3.0 GB) is higher than the 2.3 GB measured on a c7gd.large in iteration 16, for both binaries; I did not find
+out why (the cgroup setup, the loader's pace, and the host are different). The recluster peak is below the ingest peak.

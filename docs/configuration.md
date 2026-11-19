@@ -112,6 +112,42 @@ merged by streaming, so none of these terms grows with the namespace. `recluster
 `blowfish_alloc_bytes{kind}` (allocated, active, resident, retained), and a build with `--features heap-profile` writes jemalloc
 heap profiles when run with `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19` and `BF_HEAP_DUMP_DIR=DIR`.
 
+### Allocator decay: short while writing, long while only querying
+
+jemalloc returns freed pages to the OS after a decay time. A short decay keeps RSS flat while an ingest or a build
+churns through gigabytes; a long one avoids a page fault for each fresh 4 KB of the 100 MB or so that every ANN query
+reads. blowfish switches between the two by itself: it uses the short decay while a write, a segment build or
+compaction, or a `recluster` is in flight and for a while after, and the long one otherwise (a query-only or idle server).
+A process starts with the short decay and settles to the long one after the linger time. Setting a decay in
+`_RJEM_MALLOC_CONF` turns the switching off.
+
+| What | Default | Variable |
+| --- | --- | --- |
+| Dirty and muzzy page decay while writes or builds run | 1,000 ms | `BF_BUSY_DECAY_MS` |
+| Decay while only queries run | 30,000 ms | `BF_IDLE_DECAY_MS` |
+| How long the short decay stays after the last write or build ends | 15,000 ms | `BF_DECAY_LINGER_MS` |
+
+The rayon pool is sized by the machine (rayon's default, the CPUs the process may use, which honors a cgroup quota).
+Set `RAYON_NUM_THREADS` to override it.
+
+### Compact manifest copy for cold queries
+
+A manifest of a large namespace is mostly per-segment text headers (the dictionary chunk index of each full-text
+segment: about 6.6 of 9.8 MB of JSON at 100M rows). Only BM25 and full-text filters read them, and a segment without
+one reads its own footer instead. When a publication's manifest is larger than 256 KB and the text headers are over
+half of it, blowfish writes the fixed-key reader copy (`manifest-latest`) without them. A cold ANN query reads that
+copy (370 KB instead of 3.4 MB at 100M rows). A query that ranks by text, and every writer and indexer, read the full manifest
+slot instead (one more round trip for a cold text query), and a server holding the compact copy replaces it before
+it publishes anything. The manifest slots are unchanged, so older binaries read these namespaces as before (their cold
+text queries read the footers). Namespaces published before this existed keep their full copy until their next
+publication, or until you run
+`cargo run --release -p bf-engine --example readercopy -- storage.json NAMESPACE`.
+
+| What | Default | Variable |
+| --- | --- | --- |
+| Smallest manifest (encoded bytes) that gets a compact copy | 262,144 | `BF_READER_COPY_MIN_BYTES` |
+| Read the compact copy for ANN queries (set to `0` to read the full manifest, for A/B runs) | on | `BF_READER_COPY` |
+
 ### Paged ANN directory (large reclustered namespaces)
 
 `recluster` writes the slab directory twice: whole (for older readers) and, once it lists at least 100,000 clusters, as a

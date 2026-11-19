@@ -344,6 +344,29 @@ pub(crate) async fn prefetch(store: &Storage, ns: &str, attr: &str) -> Option<Pr
     Some((key, bytes.slice(4 + klen..)))
 }
 
+/// Run `tasks` concurrently, each on its own runtime task (in this query's read context), and
+/// collect their results in completion order. The first error cancels the rest.
+async fn run_parallel<T: Send + 'static>(
+    tasks: Vec<futures::future::BoxFuture<'static, Result<T, ApiError>>>,
+) -> Result<Vec<T>, ApiError> {
+    let context = read_cache::context();
+    let mut set = tokio::task::JoinSet::new();
+    for task in tasks {
+        let context = context.clone();
+        set.spawn(async move {
+            match context {
+                Some(context) => read_cache::scope(context, task).await,
+                None => task.await,
+            }
+        });
+    }
+    let mut out = Vec::with_capacity(set.len());
+    while let Some(joined) = set.join_next().await {
+        out.push(joined.map_err(segment::index_error)??);
+    }
+    Ok(out)
+}
+
 async fn on_worker<T: Send + 'static>(
     fut: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -864,7 +887,7 @@ pub(crate) async fn search(
 
     // Wave 3: probed codes and cluster blobs for each chosen segment, in parallel. Docs
     // footers for the chosen segments are warmed in the same wave.
-    let mut tasks: Vec<futures::future::BoxFuture<'_, Result<(Probed, Found), ApiError>>> =
+    let mut tasks: Vec<futures::future::BoxFuture<'static, Result<(Probed, Found), ApiError>>> =
         Vec::new();
     for &i in &exact_rows {
         let Some(member) = members.get(i).cloned().flatten() else {
@@ -940,8 +963,10 @@ pub(crate) async fn search(
             .filter(|e| wanted_set.contains(&e.cluster))
             .cloned()
             .collect();
+        let trace_t0 = t0;
         tasks.push(
             async move {
+                let task_start = trace_t0.elapsed().as_millis();
                 // The prefetch may have scanned this segment's clusters already (see
                 // `scan_memo_put`): that is exact only without a row mask.
                 if memo_hit && live.is_none() {
@@ -992,6 +1017,7 @@ pub(crate) async fn search(
                     }
                 )?;
                 let (blobs, codes) = read;
+                let read_done = trace_t0.elapsed().as_millis();
                 for (cluster, blob) in wanted.iter().zip(&blobs) {
                     partial
                         .install(*cluster, blob)
@@ -1004,6 +1030,7 @@ pub(crate) async fn search(
                     clusters: wanted.clone(),
                     exact,
                 };
+                let install_done = trace_t0.elapsed().as_millis();
                 let found = on_worker(async move {
                     if exact {
                         let hits = index
@@ -1021,18 +1048,25 @@ pub(crate) async fn search(
                     Ok((Vec::new(), found))
                 })
                 .await?;
+                if std::env::var_os("BF_TRACE_STAGES").is_some() {
+                    eprintln!(
+                        "TASK seg={i} clusters={} start={task_start} read={read_done} install={install_done} scan={}",
+                        probed.clusters.len(),
+                        trace_t0.elapsed().as_millis()
+                    );
+                }
                 Ok::<_, ApiError>((probed, found))
             }
             .boxed(),
         );
     }
-    let limit = config.search_concurrency.max(1) * 2;
     // Every segment's reads start at once: a second batch of segments would add a whole wave.
-    let tasks_len = tasks.len();
-    let results: Vec<(Probed, Found)> = futures::stream::iter(tasks)
-        .buffer_unordered(limit.max(tasks_len))
-        .try_collect()
-        .await?;
+    // Each runs as its own task: on a warm query the reads are cache hits that finish without
+    // yielding, so tasks polled from this one would run their copies and decodes one after the
+    // other on a single thread.
+    crate::ann::stage(t0, "tasks built");
+    let limit = config.search_concurrency.max(1) * 2;
+    let results: Vec<(Probed, Found)> = run_parallel(tasks).await?;
     crate::ann::stage(t0, "scan");
     let mut winners: Vec<(f32, usize, u32)> = Vec::new(); // (exact distance, segment, row)
     let mut pool: Vec<(usize, Candidate)> = Vec::new();

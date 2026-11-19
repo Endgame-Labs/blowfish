@@ -56,6 +56,7 @@ impl Engine {
         ns: &str,
         opts: &ReclusterOptions,
     ) -> Result<ReclusterReport, ApiError> {
+        let _busy = bf_alloc::busy();
         let context = crate::read_cache::ReadContext {
             cache: self.0.read_cache.clone(),
             stats: Default::default(),

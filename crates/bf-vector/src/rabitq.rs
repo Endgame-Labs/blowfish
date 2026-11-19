@@ -213,10 +213,10 @@ impl PlaneQuery {
         let mut vmax = f64::NEG_INFINITY;
         let mut norm2 = 0.;
         let mut sum = 0.;
-        let r: Vec<f64> = q.iter().zip(c).map(|(q, c)| *q - *c as f64).collect();
-        for x in &r {
-            vmin = vmin.min(*x);
-            vmax = vmax.max(*x);
+        for (q, c) in q.iter().zip(c) {
+            let x = *q - *c as f64;
+            vmin = vmin.min(x);
+            vmax = vmax.max(x);
             norm2 += x * x;
             sum += x;
         }
@@ -228,10 +228,22 @@ impl PlaneQuery {
         };
         let mut planes = vec![0u64; QUERY_BITS * words];
         if delta > 0. {
-            for (i, x) in r.iter().enumerate() {
-                let v = ((x - vmin) / delta).round().clamp(0., levels) as u64;
-                for j in 0..QUERY_BITS {
-                    planes[j * words + i / 64] |= ((v >> j) & 1) << (i % 64);
+            // Quantize into bytes first (a loop the compiler vectorizes), then transpose each
+            // 64-value block into one word per bit plane in registers.
+            let mut levels_q = vec![0u8; words * 64];
+            for ((slot, q), c) in levels_q.iter_mut().zip(q).zip(c) {
+                let x = *q - *c as f64;
+                *slot = ((x - vmin) / delta).round().clamp(0., levels) as u8;
+            }
+            for (w, block) in levels_q.as_chunks::<64>().0.iter().enumerate() {
+                let mut acc = [0u64; QUERY_BITS];
+                for (k, &v) in block.iter().enumerate() {
+                    for (j, a) in acc.iter_mut().enumerate() {
+                        *a |= (((v >> j) & 1) as u64) << k;
+                    }
+                }
+                for (j, a) in acc.into_iter().enumerate() {
+                    planes[j * words + w] = a;
                 }
             }
         }
