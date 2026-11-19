@@ -1369,7 +1369,10 @@ fn scan_memo_put(key: ScanKey, value: Scanned) {
     let mut memo = memo.lock().expect("scan memo lock");
     let now = std::time::Instant::now();
     memo.retain(|_, (at, _)| now.duration_since(*at) < std::time::Duration::from_secs(30));
-    if memo.len() < 4096 {
+    // Entries are consumed by the query that made them. Bound what an unconsumed one can hold
+    // (about 24 bytes a candidate) when many cold queries overlap.
+    let held: usize = memo.values().map(|(_, (_, found))| found.len()).sum();
+    if memo.len() < 4096 && (held + value.1.len()) * 24 < (128 << 20) {
         memo.insert(key, (now, value));
     }
 }
