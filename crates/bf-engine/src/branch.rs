@@ -45,7 +45,7 @@ fn commit_key(wal: &Wal, id: Uuid) -> String {
     format!("ns/{namespace}/branch-commits/{id}.json")
 }
 fn install(state: &mut NamespaceState, pin: &Pin) {
-    state.segments = pin.segments.clone();
+    state.segments = pin.segments.clone().into();
     state.stats = std::sync::Arc::new(pin.stats.clone());
     state.corpus = crate::text::checkpoint_corpus(&pin.stats);
 }
@@ -71,7 +71,7 @@ impl Engine {
                 format_version: 1,
                 source_namespace: source.into(),
                 created_at: Utc::now(),
-                segments: state.segments.clone(),
+                segments: state.segments.to_vec(),
                 stats: (*state.stats).clone(),
                 lineage: if is_branch {
                     Some(Lineage {

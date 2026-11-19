@@ -176,8 +176,19 @@ impl OpenHint {
                     let name = crate::ann_dir::Layout::Slabs.dir_key(attribute);
                     tasks.push(
                         async move {
-                            let dir = crate::ann_dir::load(store, &set.dir, prefetched.get(&name))
-                                .await?;
+                            let (dir, warm) = crate::ann_dir::slab_directory(
+                                store,
+                                set,
+                                prefetched.get(&name),
+                                vector,
+                                config,
+                            )
+                            .await?;
+                            // Everything this query touches is already in memory: the scan's
+                            // reads would only copy cached bytes, and the query itself reads them.
+                            if warm {
+                                return Ok(());
+                            }
                             crate::ann_dir::prefetch_scan(
                                 store,
                                 &set.slabs,
@@ -382,16 +393,66 @@ pub(crate) async fn catch_up_hinted(
                     // first, and the plain one when the namespace has none.
                     let mut got = Vec::new();
                     if hint.scan.is_some() && crate::ann_dir::blocks_enabled() {
-                        // The recluster's slab directory and the block directory are fetched
-                        // together: which one answers is decided once the manifest is read.
-                        let slab = crate::ann_dir::Layout::Slabs.dir_key(a);
-                        let name = crate::ann_dir::Layout::Blocks.dir_key(a);
-                        let (slab_hint, block_hint) = tokio::join!(
-                            crate::ann_dir::prefetch(store, wal.namespace(), &slab),
-                            crate::ann_dir::prefetch(store, wal.namespace(), &name)
-                        );
-                        got.extend(slab_hint.map(|p| (slab, p)));
-                        if let Some(p) = block_hint {
+                        // The recluster's paged slab directory, its flat slab directory, and
+                        // the block directory are fetched together: which one answers is decided
+                        // once the manifest is read. They are tried in that order, and the
+                        // slower ones are dropped as soon as an earlier one is found, so a big
+                        // flat directory is not downloaded in full for nothing.
+                        let names = [
+                            crate::ann_dir::paged_hint_name(a),
+                            crate::ann_dir::Layout::Slabs.dir_key(a),
+                            crate::ann_dir::Layout::Blocks.dir_key(a),
+                        ];
+                        let mut pending: Vec<futures::future::BoxFuture<'_, _>> = names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| {
+                                async move {
+                                    (i, crate::ann_dir::prefetch(store, wal.namespace(), n).await)
+                                }
+                                .boxed()
+                            })
+                            .collect();
+                        let mut results: [Option<Option<crate::ann_dir::Prefetched>>; 3] =
+                            Default::default();
+                        'priority: for want in 0..3 {
+                            while results[want].is_none() {
+                                let ((i, r), _, rest) = futures::future::select_all(pending).await;
+                                pending = rest;
+                                results[i] = Some(r);
+                            }
+                            if results[want].as_ref().is_some_and(Option::is_some) {
+                                break 'priority;
+                            }
+                        }
+                        drop(pending);
+                        // Readers look a hint up by the directory's own name.
+                        let reader_names = [
+                            crate::ann_dir::Layout::Slabs.dir_key(a),
+                            crate::ann_dir::Layout::Slabs.dir_key(a),
+                            crate::ann_dir::Layout::Blocks.dir_key(a),
+                        ];
+                        let first = results
+                            .into_iter()
+                            .zip(reader_names)
+                            .find_map(|(r, name)| r.flatten().map(|p| (name, p)));
+                        if let Some((name, p)) = first {
+                            // A paged slab directory's header says what the scan will read:
+                            // start those reads now, while the manifest is still in flight.
+                            if let Some((attribute, vector, k)) =
+                                hint.scan.as_ref().filter(|(s, _, _)| s == a)
+                            {
+                                let (store, context, config) =
+                                    (store.clone(), hint.context.clone(), hint.config.clone());
+                                let (attribute, vector, k, p) =
+                                    (attribute.clone(), vector.clone(), *k, p.clone());
+                                tokio::spawn(crate::read_cache::scope(context, async move {
+                                    crate::ann_dir::speculate_slab_scan(
+                                        &store, p, &attribute, &vector, k, &config,
+                                    )
+                                    .await
+                                }));
+                            }
                             got.push((name, p));
                             return got;
                         }
@@ -430,7 +491,7 @@ pub(crate) async fn catch_up_hinted(
                         metric: m.distance_metric,
                         created_at: m.created_at,
                         updated_at: m.updated_at.unwrap_or(m.created_at),
-                        segments: m.segments,
+                        segments: m.segments.into(),
                         indexed_through: m.indexed_through,
                         manifest_seq: generation,
                         corpus: if m.text_stats.is_some() {
@@ -440,7 +501,7 @@ pub(crate) async fn catch_up_hinted(
                         },
                         text_stats: m.text_stats,
                         ann_dirs: m.ann_dirs,
-                        ann_slabs: m.ann_slabs,
+                        ann_slabs: m.ann_slabs.into(),
                         stats: m.stats.into(),
                         ..Default::default()
                     }

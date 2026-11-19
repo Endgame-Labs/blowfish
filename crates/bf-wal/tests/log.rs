@@ -56,9 +56,21 @@ async fn versioned_slots_conflicts_tail_and_manifest() {
     a.publish_manifest(1, &manifest).await.unwrap();
     assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 1);
     assert!(b.manifest_after(1).await.unwrap().is_none());
+    let store = Storage::open(&cfg).await.unwrap();
+    let copy_of_one = store.get("ns/shared/manifest-latest").await.unwrap();
     a.publish_manifest(2, &manifest).await.unwrap();
     assert_eq!(b.manifest_after(1).await.unwrap().unwrap().0, 2);
     assert!(b.manifest_after(2).await.unwrap().is_none());
+    // A cold read finds the newest manifest from the fixed-key copy plus the listing after it, and
+    // a copy that lags the listing (a publish whose copy write was lost) is not believed.
+    assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 2);
+    store
+        .put("ns/shared/manifest-latest", copy_of_one)
+        .await
+        .unwrap();
+    assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 2);
+    a.publish_manifest(3, &manifest).await.unwrap();
+    assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 3);
 }
 
 #[tokio::test]

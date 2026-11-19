@@ -402,6 +402,19 @@ impl Engine {
         let dir = ann_dir::build(store, &ns, &slabs, attr, ann_dir::Layout::Slabs, None)
             .await?
             .ok_or_else(|| ApiError::new(500, "slab directory not built"))?;
+        // A directory this large is read in pieces: write the paged copy, and the hint a cold
+        // query reads beside the manifest (the paged header, or else the whole directory).
+        let paged_dir = ann_dir::load(store, &dir, None).await?;
+        let pages = ann_dir::build_paged(store, &ns, attr, paged_dir.clone(), &slabs).await?;
+        if pages.is_none() {
+            let bytes = segment::ObjectReader::new(store, &dir)
+                .bypass_cache()
+                .read(0..dir.size)
+                .await
+                .map_err(segment::index_error)?;
+            ann_dir::write_hint(store, &ns, ann_dir::Layout::Slabs, attr, &dir.key, &bytes).await;
+        }
+        drop(paged_dir);
         let report = ReclusterReport {
             rows: present.len() as u64,
             slabs: slabs.len(),
@@ -418,6 +431,7 @@ impl Engine {
                 covered,
                 slabs,
                 dir,
+                pages,
             },
         );
         wal.publish_fenced(claim, manifest.indexer_epoch, manifest)
@@ -427,6 +441,47 @@ impl Engine {
             seconds: t0.elapsed().as_secs_f64(),
             ..report
         })
+    }
+}
+
+impl Engine {
+    /// Write a paged copy of the namespace's slab directory beside the flat one (no slab is
+    /// rebuilt) and publish it. Returns the pages object's size, or `None` when the directory is
+    /// too small to page. Stops another indexer from publishing meanwhile, like [`Engine::recluster`].
+    pub async fn page_slab_directory(&self, ns: &str, attr: &str) -> Result<Option<u64>, ApiError> {
+        let context = crate::read_cache::ReadContext {
+            cache: self.0.read_cache.clone(),
+            stats: Default::default(),
+            backend: Default::default(),
+        };
+        crate::read_cache::scope(context, async {
+            let store = &self.0.store;
+            let wal = Wal::new(store.clone(), ns).map_err(log_error)?;
+            let (sequence, mut manifest) = wal
+                .latest_manifest()
+                .await
+                .map_err(log_error)?
+                .ok_or_else(|| ApiError::new(404, "namespace has no checkpoint"))?;
+            let set = manifest
+                .ann_slabs
+                .get(attr)
+                .ok_or_else(|| ApiError::new(400, "namespace has no slabs"))?;
+            let dir = ann_dir::load(store, &set.dir, None).await?;
+            let Some(pages) = ann_dir::build_paged(store, ns, attr, dir, &set.slabs).await? else {
+                return Ok(None);
+            };
+            let size = pages.size;
+            let old = manifest.ann_slabs.get_mut(attr).expect("checked above");
+            if let Some(previous) = old.pages.replace(pages) {
+                crate::indexer::retire(&mut manifest, previous.key);
+            }
+            let epoch = manifest.indexer_epoch;
+            wal.publish_fenced(sequence, epoch, &manifest)
+                .await
+                .map_err(log_error)?;
+            Ok(Some(size))
+        })
+        .await
     }
 }
 

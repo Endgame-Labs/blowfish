@@ -14,6 +14,9 @@
 //! ranks clusters; scanning uses the exact center from the blob.
 use std::{ops::Range, sync::Arc};
 
+mod paged;
+pub use paged::{Page, PagedDirectory};
+
 use bytes::Bytes;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
@@ -61,6 +64,10 @@ pub struct DirSegment {
     /// Whether each cluster's quantized codes sit in the fragment, right after the cluster's
     /// blob, instead of in the segment's index object (see [`Fragment::build_blocks`]).
     pub codes_in_fragment: bool,
+    /// `(size, metadata length)` of the segment's index object and of its fragment, when the
+    /// directory records them (a paged directory does, so a reader can open the objects without
+    /// the manifest).
+    pub files: Option<[(u64, u64); 2]>,
 }
 
 /// One leaf cluster.
@@ -123,6 +130,9 @@ pub struct Directory {
     rq: RaBitQ,
     /// Bytes of the resident metadata part (the whole object).
     pub metadata_len: u64,
+    /// Per segment `(rows, clusters)` of the whole namespace, when `entries` lists only part of it
+    /// (see [`PagedDirectory::assemble`]).
+    totals: Option<Vec<(usize, usize)>>,
 }
 
 /// A parsed segment fragment, ready to be placed in a directory.
@@ -504,6 +514,44 @@ impl Fragment {
     }
 }
 
+/// Estimated squared distance from the (rotated) query `q` to each entry of `s`, from the
+/// section's one-bit codes.
+fn section_distances(s: &Section, q: &[f64]) -> Vec<f32> {
+    let padded = q.len();
+    let root = (padded as f64).sqrt() as f32;
+    let qr: Vec<f32> = q
+        .iter()
+        .zip(&s.centroid)
+        .map(|(x, g)| *x as f32 - g)
+        .collect();
+    let q2: f32 = qr.iter().map(|x| x * x).sum();
+    // lut[j * 256 + v] = sum of qr over the bits set in v, for byte j.
+    let width = bit_bytes(padded);
+    let mut lut = vec![0f32; width * 256];
+    for j in 0..width {
+        let t = &mut lut[j * 256..(j + 1) * 256];
+        for v in 1..256usize {
+            let bit = v.trailing_zeros() as usize;
+            t[v] = t[v & (v - 1)] + qr.get(j * 8 + bit).copied().unwrap_or(0.);
+        }
+    }
+    let total: f32 = qr.iter().sum();
+    s.entries
+        .iter()
+        .enumerate()
+        .map(|(n, e)| {
+            let code = &s.bits[n * width..(n + 1) * width];
+            let set: f32 = code
+                .iter()
+                .enumerate()
+                .map(|(j, b)| lut[j * 256 + *b as usize])
+                .sum();
+            let dot = (2. * set - total) / root;
+            q2 + e.norm * e.norm - 2. * e.norm * dot / e.alpha
+        })
+        .collect()
+}
+
 impl Directory {
     /// Build a directory object over `(segment id, index key, fragment key, fragment)` for each
     /// segment. Segments carried over from a previous directory pass the same `Fragment`
@@ -581,6 +629,7 @@ impl Directory {
                 rows: section.rows as usize,
                 membership: (!section.membership.is_empty()).then(|| section.membership.clone()),
                 codes_in_fragment: section.codes_in_fragment,
+                files: None,
             });
             entries.extend(section.entries.iter().cloned().map(|mut e| {
                 e.segment = s;
@@ -605,12 +654,31 @@ impl Directory {
             entries,
             rq: RaBitQ::new(shape.dims, shape.seed)?,
             metadata_len: bytes.len() as u64,
+            totals: None,
         })
+    }
+
+    /// Per segment, the rows and the non-empty clusters of the whole namespace. For a directory
+    /// assembled from pages this is more than `entries()` lists.
+    pub fn segment_totals(&self) -> Vec<(usize, usize)> {
+        if let Some(t) = &self.totals {
+            return t.clone();
+        }
+        let mut t = vec![(0usize, 0usize); self.segments.len()];
+        for e in &self.entries {
+            t[e.segment].0 += e.rows as usize;
+            t[e.segment].1 += 1;
+        }
+        t
     }
 
     /// Segments in the order entries refer to them.
     pub fn segments(&self) -> &[DirSegment] {
         &self.segments
+    }
+    /// The entries of one segment, in `entries()` order.
+    pub fn segment_entries(&self, segment: usize) -> &[DirEntry] {
+        &self.sections[segment].entries
     }
     /// Every non-empty leaf cluster.
     pub fn entries(&self) -> &[DirEntry] {
@@ -641,44 +709,10 @@ impl Directory {
     pub fn center_distances(&self, query: &[f32]) -> Result<Vec<f32>> {
         crate::distance::validate(query, self.shape.dims)?;
         let q = self.rq.rotate(&prepare(query, self.shape.metric));
-        let padded = q.len();
-        let root = (padded as f64).sqrt() as f32;
         let per_segment: Vec<Vec<f32>> = self
             .sections
             .par_iter()
-            .map(|s| {
-                let qr: Vec<f32> = q
-                    .iter()
-                    .zip(&s.centroid)
-                    .map(|(x, g)| *x as f32 - g)
-                    .collect();
-                let q2: f32 = qr.iter().map(|x| x * x).sum();
-                // lut[j * 256 + v] = sum of qr over the bits set in v, for byte j.
-                let width = bit_bytes(padded);
-                let mut lut = vec![0f32; width * 256];
-                for j in 0..width {
-                    let t = &mut lut[j * 256..(j + 1) * 256];
-                    for v in 1..256usize {
-                        let bit = v.trailing_zeros() as usize;
-                        t[v] = t[v & (v - 1)] + qr.get(j * 8 + bit).copied().unwrap_or(0.);
-                    }
-                }
-                let total: f32 = qr.iter().sum();
-                s.entries
-                    .iter()
-                    .enumerate()
-                    .map(|(n, e)| {
-                        let code = &s.bits[n * width..(n + 1) * width];
-                        let set: f32 = code
-                            .iter()
-                            .enumerate()
-                            .map(|(j, b)| lut[j * 256 + *b as usize])
-                            .sum();
-                        let dot = (2. * set - total) / root;
-                        q2 + e.norm * e.norm - 2. * e.norm * dot / e.alpha
-                    })
-                    .collect()
-            })
+            .map(|s| section_distances(s, &q))
             .collect();
         Ok(per_segment.into_iter().flatten().collect())
     }

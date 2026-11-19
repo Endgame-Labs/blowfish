@@ -87,11 +87,17 @@ log entry in the same commit.
 
 - Recluster runs by hand (`examples/recluster.rs`). New segments written after a recluster are not covered by slabs
   until the next one.
+- **Paged slab directory** (iteration 17): once a recluster's directory lists 100,000 or more clusters it also writes a
+  paged copy (a small resident header with one one-bit code per cell of about 24 neighboring clusters, then one page per
+  cell). A cold query reads the header (in the manifest's wave, from a hint object) and only the pages of the cells it
+  probes, and starts the scan reads from the header before the manifest arrives. The flat directory stays for older
+  readers. Queries read about 16 times the clusters they probe, which keeps recall equal to the flat directory's.
+  Existing reclustered namespaces get a paged copy with `examples/repage.rs`, without rebuilding slabs.
 
 **Open.**
 
 - Automatic recluster, slabs that cover new segments, and filtered ANN on slabs.
-- A two-level ANN directory, so a cold query's first read is smaller.
+- The manifest (3.4 MB at 100M, JSON) is read whole by every cold query; a split manifest could shrink it.
 - BM25: fold term records into dictionary reads, store document lengths in blocks, and a namespace-wide text
   dictionary.
 - The text statistics object, ANN directories, and manifest are still rewritten whole on each publish. Fine at 10M;

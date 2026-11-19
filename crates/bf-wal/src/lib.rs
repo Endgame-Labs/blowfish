@@ -156,6 +156,10 @@ pub struct SlabSet {
     pub slabs: Vec<Segment>,
     /// The block-layout directory over `slabs`.
     pub dir: SegmentFile,
+    /// The same directory as a paged object (a resident coarse header, then entry pages): a query
+    /// reads the header and only the pages of the cells it probes, never the whole of `dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<SegmentFile>,
 }
 /// One covered segment's span of global row numbers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -731,15 +735,54 @@ impl Wal {
     pub async fn manifest_after(&self, known: u64) -> Result<Option<(u64, Manifest)>, Error> {
         // A cold reader asks for the fixed-key copy while it lists; when the copy is the newest
         // manifest, that is one round trip instead of two. A copy that lags the listing is ignored.
+        let t0 = std::time::Instant::now();
         let prefix = format!("ns/{}/manifest/", self.namespace);
-        let (listed, copy) = futures::join!(self.store.list(&prefix), async {
+        // A namespace with thousands of publications lists over several sequential pages. With
+        // the copy in hand, only the manifests after it need listing (usually none, one page): take
+        // whichever of the two ways of finding the newest sequence finishes first.
+        use futures::FutureExt as _;
+        let copy_read = async {
             if known == 0 {
                 self.store.get(&self.latest_key()).await.ok()
             } else {
                 None
             }
-        });
-        let objects = listed?;
+        }
+        .shared();
+        let tail = {
+            let (copy_read, prefix) = (copy_read.clone(), &prefix);
+            async move {
+                let copy = copy_read.await?;
+                let seq = u64::from_be_bytes(copy.get(..8)?.try_into().ok()?);
+                let after = format!("{prefix}{seq:020}.json");
+                let newer = self.store.list_after(prefix, &after).await.ok()?;
+                Some((seq, after, newer))
+            }
+        };
+        let full = self.store.list(&prefix);
+        let tail = tail.boxed();
+        let (objects, copy) = match futures::future::select(full.boxed(), tail).await {
+            futures::future::Either::Left((listed, _)) => (listed?, copy_read.await),
+            futures::future::Either::Right((Some((_, after, newer)), _)) => {
+                let objects = if newer.is_empty() {
+                    vec![bf_storage::ObjectInfo {
+                        key: after,
+                        size: 0,
+                        last_modified: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
+                    }]
+                } else {
+                    newer
+                };
+                (objects, copy_read.await)
+            }
+            futures::future::Either::Right((None, full)) => (full.await?, copy_read.await),
+        };
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            eprintln!(
+                "MANIFEST found newest after {} ms",
+                t0.elapsed().as_millis()
+            );
+        }
         let Some(last) = objects.last() else {
             return Ok(None);
         };
@@ -759,6 +802,9 @@ impl Wal {
             && slot_payload_key(&copy[8..]).is_none()
             && let Ok(manifest) = decode_manifest(&copy[8..])
         {
+            if std::env::var_os("BF_TRACE_STAGES").is_some() {
+                eprintln!("MANIFEST decoded after {} ms", t0.elapsed().as_millis());
+            }
             return Ok(Some((seq, manifest)));
         }
         let bytes = self.store.get(&last.key).await?;

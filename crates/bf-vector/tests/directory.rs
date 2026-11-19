@@ -191,3 +191,79 @@ async fn block_fragments_hold_blob_and_codes_together_and_scan_like_the_index() 
         assert_eq!(a.distance, b.distance);
     }
 }
+
+#[tokio::test]
+async fn paged_directory_round_trips_and_selects_the_nearest_cells() {
+    let dims = 64;
+    let builder = IndexBuilder::new(dims, Metric::EuclideanSquared)
+        .unwrap()
+        .params(BuildParams {
+            flat_threshold: 64,
+            ..BuildParams::default()
+        });
+    let mut sources = Vec::new();
+    for s in 0..3 {
+        let blob = builder.build(&rows(2000, dims, s)).unwrap();
+        let (fragment, meta) = Fragment::build_blocks(&blob).unwrap();
+        let frag = Fragment::decode(&fragment[..meta as usize]).unwrap();
+        sources.push((format!("s{s}"), format!("k{s}"), format!("f{s}"), frag));
+    }
+    let dir = Directory::decode(&Directory::build(&sources).unwrap().unwrap()).unwrap();
+    let total = dir.entries().len();
+    let (object, header_len) = dir.build_paged(25, 7, &[[(1, 1); 2]; 3]).unwrap();
+    assert!(bf_vector::PagedDirectory::is_paged(&object));
+    let paged = bf_vector::PagedDirectory::decode(&object[..header_len as usize]).unwrap();
+    assert_eq!(paged.segments().len(), 3);
+    assert_eq!(paged.segments()[2].files, Some([(1, 1); 2]));
+    assert_eq!(paged.object_len(), object.len() as u64);
+    assert_eq!(paged.totals().1 as usize, total);
+    let page = |c: usize| {
+        let r = paged.page_range(c);
+        std::sync::Arc::new(
+            paged
+                .decode_page(&object[r.start as usize..r.end as usize])
+                .unwrap(),
+        )
+    };
+    // Every cell together reproduce the flat directory: same entries, same estimated distances.
+    let query: Vec<f32> = rows(1, dims, 4)[0].1.clone();
+    let all = paged.select_cells(&query, usize::MAX, 0.5).unwrap();
+    assert_eq!(all.len(), paged.cell_count());
+    let pages: Vec<_> = all.iter().map(|&c| page(c)).collect();
+    let whole = paged.assemble(&pages);
+    assert_eq!(whole.entries().len(), total);
+    assert_eq!(whole.segment_totals(), dir.segment_totals());
+    let key = |e: &bf_vector::DirEntry| (e.segment, e.cluster);
+    let mut want: Vec<_> = dir
+        .entries()
+        .iter()
+        .zip(dir.center_distances(&query).unwrap())
+        .map(|(e, d)| (key(e), d))
+        .collect();
+    let mut got: Vec<_> = whole
+        .entries()
+        .iter()
+        .zip(whole.center_distances(&query).unwrap())
+        .map(|(e, d)| (key(e), d))
+        .collect();
+    want.sort_by_key(|x| x.0);
+    got.sort_by_key(|x| x.0);
+    assert_eq!(want, got);
+    // A small request reads a few cells, and the nearest cluster is among their entries.
+    let few = paged.select_cells(&query, 1, 0.5).unwrap();
+    assert_eq!(few.len(), 1);
+    let nearest = want
+        .iter()
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|x| x.0)
+        .unwrap();
+    let wide = paged.select_cells(&query, total / 2, 0.5).unwrap();
+    let partial = paged.assemble(&wide.iter().map(|&c| page(c)).collect::<Vec<_>>());
+    assert!(partial.entries().len() < total);
+    assert!(partial.entries().iter().any(|e| key(e) == nearest));
+    assert_eq!(partial.segment_totals(), dir.segment_totals());
+    // Corruption is detected.
+    let mut bad = object[..header_len as usize].to_vec();
+    bad[20] ^= 1;
+    assert!(bf_vector::PagedDirectory::decode(&bad).is_err());
+}

@@ -645,6 +645,14 @@ impl Storage {
     }
     /// List objects under a relative prefix, sorted by key.
     pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, Error> {
+        self.list_from(prefix, None).await
+    }
+    /// List objects under a relative prefix whose keys sort after `after` (a relative key), sorted
+    /// by key. On S3 this is one request however many keys sort before `after`.
+    pub async fn list_after(&self, prefix: &str, after: &str) -> Result<Vec<ObjectInfo>, Error> {
+        self.list_from(prefix, Some(after)).await
+    }
+    async fn list_from(&self, prefix: &str, after: Option<&str>) -> Result<Vec<ObjectInfo>, Error> {
         let base = if self.1.is_empty() {
             self.0.prefix.to_string()
         } else if self.0.prefix.as_ref().is_empty() {
@@ -653,10 +661,15 @@ impl Storage {
             format!("{}/{}", self.0.prefix, self.1)
         };
         let base = base.as_str();
-        let mut objects = self
-            .0
-            .backend
-            .list(Some(&self.path(prefix)))
+        let path = self.path(prefix);
+        let stream = match after {
+            Some(after) => self
+                .0
+                .backend
+                .list_with_offset(Some(&path), &self.path(after)),
+            None => self.0.backend.list(Some(&path)),
+        };
+        let mut objects = stream
             .try_collect::<Vec<_>>()
             .await?
             .into_iter()
