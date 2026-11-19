@@ -161,7 +161,9 @@ S3 until the run is cleaned up.
 - Data: the first 10M English rows as today, then rows in other languages from the same embedding model, with exact
   top-10 truth computed on the instance.
 - turbopuffer publishes nothing at 100M, so we measure it ourselves: the same 100M rows loaded into turbopuffer
-  (Kyle approved about $220 to $430 on 2026-11-19, with a cost check after the first 1M rows).
+  (Kyle approved on 2026-11-19; the 1M-row check showed turbopuffer bills f16 vectors at f32 size, about $900 in
+  writes for 100M, and Kyle approved that too). turbopuffer can't be guaranteed cold, so its samples are labelled by
+  its reported `cache_temperature` and idle time.
 - The 100M blowfish namespace stays in the bucket after round 17 until Kyle says to delete it (2026-11-19).
 
 ## Decision log
@@ -186,3 +188,4 @@ S3 until the run is cleaned up.
 14. 2026-11-19: 100M run approved.
 15. 2026-11-19: Measure turbopuffer ourselves, cold and warm, including the same 100M rows. Keep the 100M blowfish
     namespace in the bucket after round 17.
+16. 2026-11-19: turbopuffer 100M load approved at about $900 (it bills f16 vectors as f32).
