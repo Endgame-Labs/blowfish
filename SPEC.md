@@ -38,6 +38,10 @@ log entry in the same commit.
   semantics, status codes, and error shape.
 - BM25 scores only need to be close to turbopuffer's; rankings should match on ordinary corpora.
 - ANN matches turbopuffer on recall, not on row order.
+- **Full compatibility with the official SDKs** (Kyle, 2026-11-20), including their retry and backpressure behavior:
+  429 and 503 responses carry `Retry-After` (and `retry-after-ms`), and `x-should-retry` is set where the SDKs read it.
+  Every wire behavior the SDKs rely on (`docs/research/turbopuffer-sdks.md`) is either implemented or listed here as
+  Open.
 - The compatibility suite (`compat/`) drives the official SDK against blowfish and diffs against recorded turbopuffer
   responses. It must pass in both modes (`scripts/compat_both.sh`) before every merge.
 - Checks against the real turbopuffer use a paid account: only tiny namespaces prefixed `blowfish-oracle-`, deleted
@@ -195,3 +199,4 @@ S3 until the run is cleaned up.
 15. 2026-11-19: Measure turbopuffer ourselves, cold and warm, including the same 100M rows. Keep the 100M blowfish
     namespace in the bucket after round 17.
 16. 2026-11-19: turbopuffer 100M load approved at about $900 (it bills f16 vectors as f32).
+17. 2026-11-20: Full compatibility with the official SDKs, including retry and backpressure headers.
