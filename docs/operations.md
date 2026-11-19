@@ -1,4 +1,4 @@
-# Operating blowfish 🐡
+# Operating blowfish
 
 Object storage is the source of truth. Local process state is disposable; protect the bucket and its
 credentials. Use blowfish for development, testing, and modest deployments. For production at scale,
@@ -62,11 +62,20 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 WantedBy=multi-user.target
 ```
 
-Set `storage.cache.disk_dir` under `/var/lib/blowfish`, and configure explicit memory and disk
-cache budgets. A 1 GiB memory cache and a 32 GiB disk cache are a modest starting point on a
-shared 32 GiB host. The process limit covers more than the byte cache: decoded indexes, document
-state, requests, and background work also consume memory. Tune WAL backpressure and concurrency
-for the workload; hitting `MemoryMax` can kill the process.
+Set `storage.cache.disk_dir` under `/var/lib/blowfish`. blowfish links jemalloc and sizes its
+memory-sensitive defaults from host RAM or cgroup `memory.max` (see [configuration](configuration.md)):
+unindexed WAL backpressure (`limit / 8`, 128 MiB to 2 GB), decoded metadata cache (`limit / 8`,
+512 MiB to 4 GiB), memory block cache (`limit / 4`, up to 8 GiB), segment row cap, and build
+concurrency. jemalloc switches adaptively between a 1 s page decay during writes, segment builds,
+compactions, and `recluster` and a 30 s decay while only queries run. On a 4 GB `c7gd.large`
+with swap off, a 10M-row load plus `recluster` peaks at 2.3–2.9 GB RSS. Because `storage.cache.memory_bytes`
+reads `/sys/fs/cgroup/memory.max` rather than nested systemd scope limits, set explicit memory and
+disk cache budgets under systemd (for example, a 1 GiB memory cache and a 32 GiB disk cache on a
+shared host). The process limit covers more than the byte cache: decoded indexes, document state,
+requests, and background work also consume memory. Tune WAL backpressure and concurrency for the
+workload; hitting `MemoryMax` can kill the process. On `429` backpressure and `503` transient
+storage errors, blowfish emits `Retry-After`, `retry-after-ms`, and `x-should-retry` headers so
+official SDKs back off automatically.
 
 When an upstream proxy terminates HTTPS, Caddy can listen on an internal HTTP port:
 
@@ -114,7 +123,7 @@ concurrent startup is not guaranteed safe. Do not run multiple writers on such a
 Start replicas with `--read-only`. They do not run a mutating probe or acquire a heartbeat, and they
 reject storage mutations, including key creation/revocation. They can serve strong queries against
 new writes in the shared prefix. Read-only status reports `read_only`, irrespective of the writer's
-coordination mode. Provision the same super key on every node when enforcing auth.
+coordination mode. Provision the same break-glass `BLOWFISH_ADMIN_KEY` on every node when enforcing auth.
 
 A WAL slot is a permanent CAS fence, while document-bearing payloads can be reclaimed on namespace
 deletion. Do not manually delete fences, renumber WAL objects, or apply lifecycle expiry to live
@@ -123,7 +132,7 @@ with working conditional writes uses the same logical format as a single-writer 
 
 ## Health, status, and metrics
 
-`GET /` returns `{"status":"🐡"}`. It is a process-level healthcheck, not a live bucket probe, and
+`GET /` returns `200 OK` with a JSON `{"status": ...}` body. It is a process-level healthcheck, not a live bucket probe, and
 requires bearer auth when auth is enabled. `GET /_blowfish/v1/status` reports version, redacted storage
 URL, `multi_writer` / `single_writer` / `read_only`, uptime, and names of namespaces with cached engine
 handles on this node. Cached handles can include deleted or previously missing namespaces; this is
@@ -131,21 +140,54 @@ not the deployment's list of live namespaces. Status does not yet report a node 
 lag. Use `GET /v1/namespaces` for the live, scope-filtered namespace list.
 
 See [metrics](metrics.md) for metric names, labels, and scrape configuration. Main-port `/metrics`
-requires the super key or `metrics`. The optional `--metrics-listen` endpoint is unauthenticated.
+requires an org superadmin key, the break-glass `BLOWFISH_ADMIN_KEY`, or a legacy key with the
+`metrics` role. The optional `--metrics-listen` endpoint is unauthenticated.
 Use a trusted interface or network policy for it. Metrics are per-node and reset on restart.
-Monitor error rates, WAL conflicts, latency, scanned rows, and backend availability. A storage outage
-can delay key revocations reaching other nodes; see [auth](auth.md).
+Monitor error rates, WAL conflicts, latency, scanned rows, allocator memory (`blowfish_alloc_bytes`),
+hedged reads (`blowfish_object_store_hedges_total`), and backend availability. A storage outage
+delays key revocations across nodes for up to two refresh intervals before generated keys fail
+closed with `503`; see [auth](auth.md) and [security](security.md).
 
-The packaged container runs as UID/GID 10001. Its healthcheck reads the super key from
+The packaged container runs as UID/GID 10001. Its healthcheck reads the break-glass key from
 `BLOWFISH_ADMIN_KEY`, and expects internal port 8000. The Compose S3 profile is a real local
 SeaweedFS setup with demo credentials, not a hardened public object-storage service. Keep its ports
 private, and replace demo credentials before adapting it for shared use. SIGINT and SIGTERM allow
 in-flight main-port HTTP requests to finish before shutdown.
 
+## Large namespaces: recluster, paged directory, and compact manifest copy
+
+For namespaces with millions of vectors, three maintenance helpers in `crates/bf-engine/examples/`
+reduce cold ANN latency without rewriting documents:
+
+- **Namespace-wide spatial slabs (`examples/recluster.rs`):** groups all live vectors in a namespace
+  into spatial slabs (about 200 rows per cluster) so unfiltered cold ANN queries probe far fewer
+  rows and clusters. At 100,000+ clusters, `recluster` automatically writes a paged copy of the slab
+  directory beside the flat directory. Note: slabs serve unfiltered ANN only, and new segments
+  flushed after `recluster` cause queries to fall back to the per-segment path until the next
+  manual `recluster`.
+  ```bash
+  cargo run --release -p bf-engine --example recluster -- storage.json NAMESPACE ATTRIBUTE SCRATCH_DIR
+  ```
+- **Paged slab directory for older reclustered namespaces (`examples/repage.rs`):** adds a paged slab
+  directory copy to a namespace that was reclustered before paging existed, without rebuilding slabs.
+  ```bash
+  cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE
+  ```
+- **Compact manifest copy for older large namespaces (`examples/readercopy.rs`):** rewrites the
+  fixed-key `manifest-latest` object without per-segment text headers (375 KB instead of 3.4 MB at
+  100M rows) for namespaces published before compact copies existed. Safe to run alongside live
+  servers; full manifest slots remain unchanged.
+  ```bash
+  cargo run --release -p bf-engine --example readercopy -- storage.json NAMESPACE
+  ```
+
+See [configuration](configuration.md) for the environment variables controlling paging and compact
+manifest copies.
+
 ## Backups and recovery
 
-Back up the **entire deployment prefix**, including `_system/keys`, revocation markers, namespace
-manifests, segments, WAL slots, and WAL payloads. Keep the configured super key in your secret backup
+Back up the **entire deployment prefix**, including `_system/keys`, `_system/projects`, revocation markers, namespace
+manifests, segments, WAL slots, and WAL payloads. Keep the configured break-glass `BLOWFISH_ADMIN_KEY` in your secret backup
 separately; it is never stored in the bucket. Enable provider versioning or snapshot retention where
 available. Treat backups as sensitive because they contain documents and key hashes.
 
@@ -156,7 +198,7 @@ Provider snapshots with documented atomicity can offer another path. No backup c
 snapshot protocol is provided by the binary yet.
 
 Restore into an empty prefix, copy every object preserving its relative key, configure the backend
-and super key, and start a read-only node first. Check status, enumerate namespaces, and run a few
+and break-glass key, and start a read-only node first. Check status, enumerate namespaces, and run a few
 known queries before starting a writer. Do not restore revoked key records without their revocation
 markers. Test your restore process periodically; successful object copies alone are not enough.
 
@@ -180,7 +222,7 @@ single-writer mode, and a second writer is refused. A separate local-store test 
 read-only instance opens while the writer is active and rejects mutations. These tests do not prove
 that the best-effort heartbeat fences simultaneously starting writers.
 
-On 2026-11-14, `scripts/multinode.sh` passed all 111 recorded compatibility scenarios through
-Caddy and three nodes sharing SeaweedFS. Its restart run verified all 67 acknowledged writes and
+On 2026-11-14, `scripts/multinode.sh` passed all 111 recorded compatibility scenarios (the suite has
+since grown to 121 recorded scenarios plus SDK retry checks) through Caddy and three nodes sharing SeaweedFS. Its restart run verified all 67 acknowledged writes and
 one winning conditional update; 23 interrupted writes were unacknowledged. This is a small local
 smoke and stress run, not a durability or availability guarantee.

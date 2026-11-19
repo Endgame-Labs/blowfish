@@ -1,5 +1,7 @@
 # Org, projects, and API keys, plus the admin webapp
 
+> **Status: Implemented.** For user and operator reference, see [`docs/auth.md`](../auth.md), [`docs/api/admin.openapi.yaml`](../api/admin.openapi.yaml), and [`webapp/README.md`](../../webapp/README.md).
+
 ## Goal
 
 A blowfish deployment is one **org**. The org holds **projects**, and each project has its own
@@ -97,7 +99,7 @@ above, using a superadmin key from its environment (`BLOWFISH_WEBAPP_API_KEY`).
 - The session secret is `BLOWFISH_WEBAPP_SESSION_SECRET`.
 
 **Mailers**, chosen with `BLOWFISH_WEBAPP_MAILER`:
-- `exedev`: `POST http://169.254.169.254/gateway/email/send` with `{to, subject, body}`, plain text;
+- `exedev`: posts `{to, subject, body}` (plain text) to the exe.dev VM email gateway URL (`BLOWFISH_WEBAPP_EXEDEV_EMAIL_URL`);
 - `smtp`, for other self-hosters;
 - `log`, for development, which prints the link.
 

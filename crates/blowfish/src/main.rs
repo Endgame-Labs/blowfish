@@ -187,7 +187,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "AUTHENTICATION IS DISABLED: all API, admin, and metrics routes are publicly accessible; development mode only"
         );
     }
-    let mut engine_config = EngineConfig::default();
+    // Environment overrides first, so every `BF_*` engine knob works under `blowfish serve`; CLI flags and TOML keys
+    // applied below take precedence over them.
+    let mut engine_config = EngineConfig::from_env();
     if let Some(value) = tuning.indexing.or(config.engine.indexing) {
         engine_config.indexing = value;
     }

@@ -1,7 +1,7 @@
-# Authentication, projects, and API keys 🐡
+# Authentication, projects, and API keys
 
 A blowfish deployment is one **org**. The org holds **projects**. Each project has its own namespaces and
-its own API keys, and a request can only ever see its own project. Humans manage all of this in the admin
+its own API keys, and a request can only ever see its own project. Operators manage projects and keys in the admin
 webapp (see [`webapp/`](../webapp/README.md)), and programs do the same through the admin API, which is
 described in full by [`api/admin.openapi.yaml`](api/admin.openapi.yaml).
 
@@ -111,7 +111,7 @@ All routes are under `/_blowfish/v1/`, and all bodies are JSON. The OpenAPI 3.1 
 | `GET`, `DELETE projects/{id}/keys/{key_id}` | Superadmin, or that project's `admin` | A project admin can't see or revoke `admin` keys |
 | `GET`, `POST org/keys` | Superadmin | Body `{name, expires_at?}` |
 | `GET`, `DELETE org/keys/{key_id}` | Superadmin | |
-| `GET status` | Superadmin, or a legacy `metrics` or `keys` key | Version, redacted storage URL, mode, and uptime |
+| `GET status` | Superadmin, or a legacy `metrics` or `keys` key | Version, redacted storage URL, mode, uptime, and locally cached namespace handles |
 
 What a caller gets, by key kind:
 
@@ -199,6 +199,8 @@ blowfish keys revoke KEY_ID
 Keys live under `<storage-prefix>/_system/keys/<id>.json` (hashes only), with revocations as
 `<id>.revoked`. Projects live under `<storage-prefix>/_system/projects/<id>.json`. Nodes refresh both every
 five seconds; changes apply immediately on the node handling them, and normally within five seconds
-elsewhere. A failed refresh keeps the last loaded set, so a storage outage can delay revocation. A key whose
+elsewhere. A single failed refresh keeps the last loaded set, so a brief storage outage can delay
+revocation; after two refresh intervals (about 10 seconds) without a successful refresh, generated
+keys fail closed with `503` while the break-glass `BLOWFISH_ADMIN_KEY` continues to work for recovery. A key whose
 project was deleted stops authenticating. Read-only replicas can authenticate and inspect, but can't create
 or revoke. Rotate the break-glass key through configuration, and restart nodes to apply the change.

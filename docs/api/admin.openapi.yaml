@@ -22,10 +22,28 @@ security:
   - bearer: []
 tags:
   - name: whoami
+  - name: status
   - name: projects
   - name: project keys
   - name: org keys
 paths:
+  /_blowfish/v1/status:
+    get:
+      tags: [status]
+      operationId: getStatus
+      summary: Describe the running node's status
+      description: |
+        Superadmin, break-glass key, or a legacy key with the `metrics` or `keys` role.
+        `namespaces_cached` lists namespaces with cached engine handles on this node, not the
+        deployment's list of live namespaces.
+      responses:
+        '200':
+          description: Node operational status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Status' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /_blowfish/v1/whoami:
     get:
       tags: [whoami]
@@ -448,6 +466,22 @@ components:
         token:
           type: string
           description: The bearer token, `bf_<id>_<secret>`. Shown once.
+    Status:
+      type: object
+      required: [version, storage_url, storage_mode, uptime_seconds, namespaces_cached]
+      properties:
+        version: { type: string }
+        storage_url:
+          type: string
+          description: Configured storage URL with credentials, query strings, and fragments removed.
+        storage_mode:
+          type: string
+          enum: [multi_writer, single_writer, read_only]
+        uptime_seconds: { type: number }
+        namespaces_cached:
+          type: array
+          items: { type: string }
+          description: Namespaces with cached engine handles on this node (may include deleted or missing namespaces).
     WhoAmI:
       type: object
       required: [kind, project, key_id, name, expires_at]
