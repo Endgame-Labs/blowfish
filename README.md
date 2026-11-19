@@ -305,7 +305,7 @@ In-region, blowfish's cold vector search at 10M is faster than turbopuffer's pub
 - **Network floor:** a 4 KB `GET` to S3 is 24.5 ms p50.
 - **Cache-cold variant:** with the process warm and caches dropped before each query (turbopuffer's definition of cold), vector is **574 / 652 ms** and BM25 is **420 / 512 ms**.
 - **Instance size:** `c7gd.xlarge` (4 vCPU, 8 GB) holds these numbers.
-- **100M:** on the same `c7gd.2xlarge`, 100M rows (1,024-dim `f16`, 160 slabs) at 64 probes and recall@10 0.954 take **1,164 / 1,348 ms** cache-cold, **1,228 / 1,411 ms** with a fresh process, and **168 / 201 ms** warm. A cold query reads about 163 MB. turbopuffer publishes no 100M number.
+- **100M:** on the same `c7gd.2xlarge`, 100M rows (1,024-dim `f16`, 160 slabs) at 64 probes and recall@10 0.954 take **1,201 / 1,391 ms** cache-cold, **1,243 / 1,370 ms** with a fresh process, and **99.7 / 162.8 ms** warm. A cold query reads about 160 MB. turbopuffer publishes no 100M number.
 - **Vectors and layout:** vectors are 1,024-dim `f16` (while turbopuffer's benchmark uses 768-dim), served from the namespace-wide ANN layout built by `recluster` (32 slabs, about 200 rows per cluster; unfiltered ANN only, writes after `recluster` fall back to the per-segment path until the next manual `recluster`; a 10M load and `recluster` peak at about 2.3 GB RSS, so they fit a 4 GB `c7gd.large`).
 - **BM25:** 1M MS MARCO passages (335 MB of text); the warm BM25 row was measured on round 11 code.
 - **Upserts:** not measured in-region; see the over-the-internet table below.

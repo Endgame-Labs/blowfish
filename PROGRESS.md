@@ -487,3 +487,9 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
   an existing recluster in 39 s), hints that drop the layouts not in use, a manifest read that lists only what follows the fixed-key copy, directory pages and scan reads that start from the
   hint before the manifest arrives, scans that run while a cold query's reads arrive, and namespace-state clones that share the segment list. Cold targets met (1,200 and 1,500 ms); warm
   at 64 probes misses its 150 ms target. 10M does not regress (cache-cold 561 / 683 against 665 / 911, warm 43.2 / 55.8 against 47.4 / 59.0). Details: `docs/benchmarks.md`, "Iteration 17 (100M)".
+- Iteration 18 (100M warm and manifest): warm p50 / p90 at 100M and 64 probes (recall@10 0.954) went from 163.0 / 195.3 ms to 99.7 / 162.8 (48 probes: 119.6 / 138.0 to 72.6 / 90.4). Warm
+  queries used about two of eight cores: the scan stage's per-slab tasks were polled from one future, and cache-hit reads never yield, so their copies and decodes ran on one thread. Each task now
+  runs on the runtime. Also: adaptive jemalloc decay (1 s while writing or building and for 15 s after, 30 s while only querying; no measurable warm gain alone), a cheaper `PlaneQuery`
+  construction, and a compact `manifest-latest` copy without per-segment text headers (375 KB instead of 3.4 MB at 100M; written on publish, `examples/readercopy.rs` for older namespaces; older binaries
+  read it unchanged). Cold 100M did not move beyond noise (1,201 / 1,391 cache-cold, 1,243 / 1,370 fresh at 64 probes); 10M does not regress (533 / 656 cache-cold, 680 / 907 fresh, 36.6 / 50.8 warm).
+  Details: `docs/benchmarks.md`, "Iteration 18 (100M)".
