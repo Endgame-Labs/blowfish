@@ -33,9 +33,21 @@ mod imp {
                 b"arenas.dirty_decay_ms\0",
                 b"arenas.muzzy_decay_ms\0",
             ] {
-                let _ = tikv_jemalloc_ctl::raw::write(name, ms);
+                if let Err(e) = tikv_jemalloc_ctl::raw::write(name, ms) {
+                    eprintln!(
+                        "bf-alloc: setting {} failed: {e}",
+                        String::from_utf8_lossy(name)
+                    );
+                }
             }
         }
+    }
+
+    /// The dirty decay of arena 0 (for tests).
+    #[cfg(test)]
+    pub fn arena0_dirty_decay_ms() -> Option<isize> {
+        // SAFETY: the name takes a `ssize_t`.
+        unsafe { tikv_jemalloc_ctl::raw::read::<isize>(b"arena.0.dirty_decay_ms\0").ok() }
     }
 
     pub fn stats() -> Option<super::Stats> {
@@ -240,5 +252,17 @@ pub fn start_monitor() {
                 }
             }
         });
+    }
+}
+
+#[cfg(all(test, not(target_env = "msvc")))]
+mod tests {
+    #[test]
+    fn decay_switches_for_existing_arenas() {
+        let _x = vec![1u8; 1 << 20]; // make sure arena 0 exists
+        super::imp::set_decay_ms(30_000);
+        assert_eq!(super::imp::arena0_dirty_decay_ms(), Some(30_000));
+        super::imp::set_decay_ms(1_000);
+        assert_eq!(super::imp::arena0_dirty_decay_ms(), Some(1_000));
     }
 }
