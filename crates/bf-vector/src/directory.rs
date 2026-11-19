@@ -14,6 +14,9 @@
 //! ranks clusters; scanning uses the exact center from the blob.
 use std::{ops::Range, sync::Arc};
 
+mod paged;
+pub use paged::{Page, PagedDirectory};
+
 use bytes::Bytes;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
@@ -123,6 +126,9 @@ pub struct Directory {
     rq: RaBitQ,
     /// Bytes of the resident metadata part (the whole object).
     pub metadata_len: u64,
+    /// Per segment `(rows, clusters)` of the whole namespace, when `entries` lists only part of it
+    /// (see [`PagedDirectory::assemble`]).
+    totals: Option<Vec<(usize, usize)>>,
 }
 
 /// A parsed segment fragment, ready to be placed in a directory.
@@ -605,7 +611,22 @@ impl Directory {
             entries,
             rq: RaBitQ::new(shape.dims, shape.seed)?,
             metadata_len: bytes.len() as u64,
+            totals: None,
         })
+    }
+
+    /// Per segment, the rows and the non-empty clusters of the whole namespace. For a directory
+    /// assembled from pages this is more than `entries()` lists.
+    pub fn segment_totals(&self) -> Vec<(usize, usize)> {
+        if let Some(t) = &self.totals {
+            return t.clone();
+        }
+        let mut t = vec![(0usize, 0usize); self.segments.len()];
+        for e in &self.entries {
+            t[e.segment].0 += e.rows as usize;
+            t[e.segment].1 += 1;
+        }
+        t
     }
 
     /// Segments in the order entries refer to them.

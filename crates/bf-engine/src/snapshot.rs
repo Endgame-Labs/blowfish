@@ -176,8 +176,14 @@ impl OpenHint {
                     let name = crate::ann_dir::Layout::Slabs.dir_key(attribute);
                     tasks.push(
                         async move {
-                            let dir = crate::ann_dir::load(store, &set.dir, prefetched.get(&name))
-                                .await?;
+                            let dir = crate::ann_dir::slab_directory(
+                                store,
+                                set,
+                                prefetched.get(&name),
+                                vector,
+                                config,
+                            )
+                            .await?;
                             crate::ann_dir::prefetch_scan(
                                 store,
                                 &set.slabs,
@@ -386,13 +392,30 @@ pub(crate) async fn catch_up_hinted(
                         // together: which one answers is decided once the manifest is read.
                         let slab = crate::ann_dir::Layout::Slabs.dir_key(a);
                         let name = crate::ann_dir::Layout::Blocks.dir_key(a);
-                        let (slab_hint, block_hint) = tokio::join!(
-                            crate::ann_dir::prefetch(store, wal.namespace(), &slab),
-                            crate::ann_dir::prefetch(store, wal.namespace(), &name)
-                        );
-                        got.extend(slab_hint.map(|p| (slab, p)));
+                        // The slab directory's hint answers when it exists, so the block
+                        // directory's (as large as the slab one) is dropped as soon as it
+                        // arrives instead of finishing a download nothing will use.
+                        let mut slab_read =
+                            Box::pin(crate::ann_dir::prefetch(store, wal.namespace(), &slab));
+                        let mut block_read =
+                            Box::pin(crate::ann_dir::prefetch(store, wal.namespace(), &name));
+                        let mut block_done = None;
+                        let slab_hint = loop {
+                            tokio::select! {
+                                r = &mut slab_read => break r,
+                                r = &mut block_read, if block_done.is_none() => block_done = Some(r),
+                            }
+                        };
+                        let block_hint = if slab_hint.is_some() {
+                            None
+                        } else if let Some(r) = block_done {
+                            r
+                        } else {
+                            block_read.await
+                        };
+                        got.extend(slab_hint.map(|p| (slab.clone(), p)));
                         if let Some(p) = block_hint {
-                            got.push((name, p));
+                            got.push((name.clone(), p));
                             return got;
                         }
                     }

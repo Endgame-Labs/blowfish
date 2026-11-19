@@ -85,8 +85,10 @@ pub(crate) async fn search(
         if q.filters.is_none()
             && slabs_enabled()
             && let Some(set) = state.ann_slabs.get(attribute)
-            && let Some(found) =
-                from_slabs(store, state, attribute, vector, config, k, columns, set).await?
+            && let Some(found) = from_slabs(
+                store, state, attribute, vector, config, k, columns, set, None,
+            )
+            .await?
         {
             return Ok(Some(found));
         }
@@ -514,11 +516,13 @@ async fn from_slabs(
     k: usize,
     columns: &BTreeSet<String>,
     set: &bf_wal::SlabSet,
+    prefetched: Option<&crate::ann_dir::Prefetched>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     if !slabs_cover(&state.segments, set) {
         return Ok(None);
     }
-    let Ok(dir) = crate::ann_dir::load(store, &set.dir, None).await else {
+    let Ok(dir) = crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
+    else {
         return Ok(None);
     };
     let mut view = state.without_docs();

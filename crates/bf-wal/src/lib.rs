@@ -156,6 +156,10 @@ pub struct SlabSet {
     pub slabs: Vec<Segment>,
     /// The block-layout directory over `slabs`.
     pub dir: SegmentFile,
+    /// The same directory as a paged object (a resident coarse header, then entry pages): a query
+    /// reads the header and only the pages of the cells it probes, never the whole of `dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<SegmentFile>,
 }
 /// One covered segment's span of global row numbers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
