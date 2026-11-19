@@ -225,7 +225,7 @@ async fn paged_directory_round_trips_and_selects_the_nearest_cells() {
     };
     // Every cell together reproduce the flat directory: same entries, same estimated distances.
     let query: Vec<f32> = rows(1, dims, 4)[0].1.clone();
-    let all = paged.select_cells(&query, usize::MAX).unwrap();
+    let all = paged.select_cells(&query, usize::MAX, 0.5).unwrap();
     assert_eq!(all.len(), paged.cell_count());
     let pages: Vec<_> = all.iter().map(|&c| page(c)).collect();
     let whole = paged.assemble(&pages);
@@ -248,14 +248,14 @@ async fn paged_directory_round_trips_and_selects_the_nearest_cells() {
     got.sort_by_key(|x| x.0);
     assert_eq!(want, got);
     // A small request reads a few cells, and the nearest cluster is among their entries.
-    let few = paged.select_cells(&query, 1).unwrap();
+    let few = paged.select_cells(&query, 1, 0.5).unwrap();
     assert_eq!(few.len(), 1);
     let nearest = want
         .iter()
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|x| x.0)
         .unwrap();
-    let wide = paged.select_cells(&query, total / 2).unwrap();
+    let wide = paged.select_cells(&query, total / 2, 0.5).unwrap();
     let partial = paged.assemble(&wide.iter().map(|&c| page(c)).collect::<Vec<_>>());
     assert!(partial.entries().len() < total);
     assert!(partial.entries().iter().any(|e| key(e) == nearest));

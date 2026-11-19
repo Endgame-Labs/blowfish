@@ -1129,6 +1129,12 @@ fn page_margin() -> f64 {
     *V.get_or_init(|| env_number("BF_ANN_PAGE_MARGIN", 4.0f64).max(1.0))
 }
 
+/// How much a cell's spread pulls its rank toward the query (see `PagedDirectory::select_cells`).
+fn page_kappa() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_number("BF_ANN_PAGE_KAPPA", 0.5f32))
+}
+
 /// Pages this close together are read as one request, and one request reads at most this much.
 const PAGE_GAP: u64 = 64 << 10;
 const PAGE_MERGE_MAX: u64 = 4 << 20;
@@ -1217,11 +1223,12 @@ pub(crate) async fn slab_directory(
     let (rows, clusters) = paged.totals();
     let want = (probe_count(config, rows as usize, clusters as usize, 1.0) as f64 * page_margin())
         .ceil() as usize;
+    let kappa = page_kappa();
     let cells = {
         let (paged, vector) = (paged.clone(), vector.to_vec());
         on_worker(async move {
             paged
-                .select_cells(&vector, want)
+                .select_cells(&vector, want, kappa)
                 .map_err(segment::index_error)
         })
         .await?

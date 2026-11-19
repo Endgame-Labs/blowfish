@@ -55,6 +55,8 @@ struct Cell {
     offset: u64,
     len: u32,
     count: u32,
+    /// Root mean square distance of the cell's entries' centers from the cell's center.
+    radius: f32,
 }
 
 /// The header of a paged directory: everything resident, no entries.
@@ -232,6 +234,20 @@ impl Directory {
         let root = (padded as f64).sqrt();
         let mut coarse_bits = Vec::with_capacity(cells.len() * width);
         let mut coarse_entries = Vec::with_capacity(cells.len());
+        let radii: Vec<f32> = cells
+            .par_iter()
+            .map(|(c, m)| {
+                let mut buf = Vec::new();
+                let total: f32 = m
+                    .iter()
+                    .map(|&(s, n)| {
+                        approx_center(&self.sections[s], n, &mut buf);
+                        sq(&buf, c)
+                    })
+                    .sum();
+                (total / m.len().max(1) as f32).sqrt()
+            })
+            .collect();
         for (c, m) in &cells {
             let r: Vec<f64> = c
                 .iter()
@@ -295,9 +311,11 @@ impl Directory {
             header.extend(x.to_le_bytes());
         }
         let mut offset = 0u64;
-        for ((norm, alpha, count), page) in coarse_entries.iter().zip(&pages) {
+        for (((norm, alpha, count), page), radius) in coarse_entries.iter().zip(&pages).zip(&radii)
+        {
             header.extend(norm.to_le_bytes());
             header.extend(alpha.to_le_bytes());
+            header.extend(radius.to_le_bytes());
             put_u32(&mut header, *count);
             put_u64(&mut header, offset);
             put_u32(&mut header, page.len() as u32);
@@ -413,13 +431,19 @@ impl PagedDirectory {
         for _ in 0..ncells {
             let norm = f32::from_le_bytes(p.take(4)?.try_into().unwrap());
             let alpha = f32::from_le_bytes(p.take(4)?.try_into().unwrap());
+            let radius = f32::from_le_bytes(p.take(4)?.try_into().unwrap());
             let count = p.u32()?;
             let offset = p.u64()?;
             let len = p.u32()?;
-            if !norm.is_finite() || !(alpha > 0. && alpha <= 1.) {
+            if !norm.is_finite() || !radius.is_finite() || !(alpha > 0. && alpha <= 1.) {
                 return Err(bad("invalid paged directory cell"));
             }
-            cells.push(Cell { offset, len, count });
+            cells.push(Cell {
+                offset,
+                len,
+                count,
+                radius,
+            });
             entries.push(DirEntry {
                 segment: 0,
                 cluster: 0,
@@ -499,13 +523,19 @@ impl PagedDirectory {
         start..start + u64::from(c.len)
     }
 
-    /// The cells to read for `query`: the nearest by estimated center distance until together they
+    /// The cells to read for `query`: the nearest by estimated distance (see `kappa`) until together they
     /// list at least `want` entries (all cells when the directory is smaller). Sorted by cell, so
     /// that neighboring pages can be read together.
-    pub fn select_cells(&self, query: &[f32], want: usize) -> Result<Vec<usize>> {
+    pub fn select_cells(&self, query: &[f32], want: usize, kappa: f32) -> Result<Vec<usize>> {
         crate::distance::validate(query, self.shape.dims)?;
         let q = self.rq.rotate(&prepare(query, self.shape.metric));
-        let d = section_distances(&self.coarse, &q);
+        // A cell's nearest entry is nearer than its center by about its spread: rank by the
+        // distance a typical nearest entry would have, d^2 + r^2 - kappa * d * r.
+        let d: Vec<f32> = section_distances(&self.coarse, &q)
+            .into_iter()
+            .zip(&self.cells)
+            .map(|(d2, c)| d2 + c.radius * c.radius - kappa * d2.max(0.).sqrt() * c.radius)
+            .collect();
         let mut order: Vec<usize> = (0..d.len()).collect();
         order.sort_unstable_by(|a, b| d[*a].total_cmp(&d[*b]).then(a.cmp(b)));
         let (mut got, mut picked) = (0usize, Vec::new());
