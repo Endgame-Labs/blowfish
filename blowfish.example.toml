@@ -39,7 +39,7 @@ ann_nprobe = 64
 ann_rerank_factor = 32
 recall_sample_rate = 0.01
 # Large reclustered namespaces read their ANN directory in pieces. These are environment-only
-# variables (see docs/configuration.md): BF_ANN_PAGED (0 turns it off), BF_ANN_PAGE_MARGIN (12),
+# variables (see docs/configuration.md): BF_ANN_PAGED (0 turns it off), BF_ANN_PAGE_MARGIN (16),
 # BF_ANN_PAGE_KAPPA (0.5), BF_ANN_PAGE_ENTRIES (24), and BF_ANN_PAGED_MIN_ENTRIES (100000).
 
 [storage.cache]

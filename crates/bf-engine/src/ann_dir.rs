@@ -457,10 +457,11 @@ pub(crate) async fn prefetch_scan(
             else {
                 return;
             };
+            let wanted_set: std::collections::HashSet<usize> = cs.iter().copied().collect();
             let seg_entries: Vec<_> = dir
-                .entries()
+                .segment_entries(i)
                 .iter()
-                .filter(|e| e.segment == i && cs.contains(&e.cluster))
+                .filter(|e| wanted_set.contains(&e.cluster))
                 .collect();
             let Ok(partial) = dir.partial_index(i, Reader::new(store, file)) else {
                 return;
@@ -517,7 +518,7 @@ pub(crate) async fn prefetch_scan(
                 else {
                     return;
                 };
-                let seg_entries: Vec<_> = dir.entries().iter().filter(|e| e.segment == i).collect();
+                let seg_entries: Vec<_> = dir.segment_entries(i).iter().collect();
                 let Ok(partial) = dir.partial_index(i, Reader::new(store, file)) else {
                     return;
                 };
@@ -675,10 +676,28 @@ fn pick_clusters(
         }
     };
     let probes = probe_count(config, ann_rows, clusters, thin);
-    order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let cmp = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+    // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
+    // only in the unlikely case the walk runs past them.
+    let mut sorted = if order.len() > probes.saturating_mul(8).max(256) {
+        let head = probes * 2 + 64;
+        order.select_nth_unstable_by(head, cmp);
+        order[..head].sort_unstable_by(cmp);
+        head
+    } else {
+        order.sort_unstable_by(cmp);
+        order.len()
+    };
     let (mut count, mut candidates) = (0usize, 0f64);
     let mut picked = Vec::new();
-    for &(_, n) in &order {
+    let mut at = 0;
+    while at < order.len() {
+        if at == sorted {
+            order[sorted..].sort_unstable_by(cmp);
+            sorted = order.len();
+        }
+        let n = order[at].1;
+        at += 1;
         picked.push(n);
         count += 1;
         candidates += in_cluster(n);
@@ -914,10 +933,11 @@ pub(crate) async fn search(
         let (segment_docs, docs_store) = (state.segments[i].clone(), store.clone());
         let dir_reader = Reader::new(store, &frag_file);
         let live = lives[i].clone();
+        let wanted_set: std::collections::HashSet<usize> = cs.iter().copied().collect();
         let seg_entries: Vec<_> = dir
-            .entries()
+            .segment_entries(i)
             .iter()
-            .filter(|e| e.segment == i && cs.contains(&e.cluster))
+            .filter(|e| wanted_set.contains(&e.cluster))
             .cloned()
             .collect();
         tasks.push(
@@ -1175,7 +1195,7 @@ fn env_number<T: std::str::FromStr + Copy>(name: &str, default: T) -> T {
 /// A paged query reads cells until they hold this many times the clusters it will probe.
 fn page_margin() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_number("BF_ANN_PAGE_MARGIN", 12.0f64).max(1.0))
+    *V.get_or_init(|| env_number("BF_ANN_PAGE_MARGIN", 16.0f64).max(1.0))
 }
 
 /// How much a cell's spread pulls its rank toward the query (see `PagedDirectory::select_cells`).

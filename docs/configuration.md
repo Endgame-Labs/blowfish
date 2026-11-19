@@ -123,7 +123,7 @@ variables; the defaults suit 1,024-dimension vectors.
 | What | Default | Variable |
 | --- | --- | --- |
 | Read paged directories (set to `0` to read the whole slab directory, for A/B runs) | on | `BF_ANN_PAGED` |
-| Cells' entries a query reads, as a multiple of the clusters it will probe (higher: more recall, more bytes) | 12 | `BF_ANN_PAGE_MARGIN` |
+| Cells' entries a query reads, as a multiple of the clusters it will probe (higher: more recall, more bytes) | 16 | `BF_ANN_PAGE_MARGIN` |
 | How strongly a cell's spread pulls it up the ranking (see `PagedDirectory::select_cells`) | 0.5 | `BF_ANN_PAGE_KAPPA` |
 | Entries per cell when `recluster` (or `repage`) builds the paged copy | 24 | `BF_ANN_PAGE_ENTRIES` |
 | Smallest directory (in clusters) that gets a paged copy | 100,000 | `BF_ANN_PAGED_MIN_ENTRIES` |

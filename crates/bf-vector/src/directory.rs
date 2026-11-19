@@ -676,6 +676,10 @@ impl Directory {
     pub fn segments(&self) -> &[DirSegment] {
         &self.segments
     }
+    /// The entries of one segment, in `entries()` order.
+    pub fn segment_entries(&self, segment: usize) -> &[DirEntry] {
+        &self.sections[segment].entries
+    }
     /// Every non-empty leaf cluster.
     pub fn entries(&self) -> &[DirEntry] {
         &self.entries

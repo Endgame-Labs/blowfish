@@ -91,7 +91,7 @@ log entry in the same commit.
   paged copy (a small resident header with one one-bit code per cell of about 24 neighboring clusters, then one page per
   cell). A cold query reads the header (in the manifest's wave, from a hint object) and only the pages of the cells it
   probes, and starts the scan reads from the header before the manifest arrives. The flat directory stays for older
-  readers. Queries read about 12 times the clusters they probe, which keeps recall equal to the flat directory's.
+  readers. Queries read about 16 times the clusters they probe, which keeps recall equal to the flat directory's.
   Existing reclustered namespaces get a paged copy with `examples/repage.rs`, without rebuilding slabs.
 
 **Open.**
