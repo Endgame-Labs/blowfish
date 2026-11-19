@@ -1126,11 +1126,15 @@ fn env_number<T: std::str::FromStr + Copy>(name: &str, default: T) -> T {
 /// A paged query reads cells until they hold this many times the clusters it will probe.
 fn page_margin() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_number("BF_ANN_PAGE_MARGIN", 6.0f64).max(1.0))
+    *V.get_or_init(|| env_number("BF_ANN_PAGE_MARGIN", 4.0f64).max(1.0))
 }
 
+/// Pages this close together are read as one request, and one request reads at most this much.
+const PAGE_GAP: u64 = 64 << 10;
+const PAGE_MERGE_MAX: u64 = 4 << 20;
+
 /// Build a paged copy of a slab directory when it lists at least `BF_ANN_PAGED_MIN_ENTRIES`
-/// clusters (default 100,000), with about `BF_ANN_PAGE_ENTRIES` entries per page (default 400).
+/// clusters (default 100,000), with about `BF_ANN_PAGE_ENTRIES` entries per page (default 24).
 /// Writes the object and the hint (the header). Returns `None` for a small directory.
 pub(crate) async fn build_paged(
     store: &Storage,
@@ -1142,8 +1146,8 @@ pub(crate) async fn build_paged(
     if entries < env_number("BF_ANN_PAGED_MIN_ENTRIES", 100_000usize) {
         return Ok(None);
     }
-    let cells = entries.div_ceil(env_number("BF_ANN_PAGE_ENTRIES", 400usize).max(1));
-    let (bytes, header_len) = tokio::task::spawn_blocking(move || dir.build_paged(cells, 7))
+    let per_cell = env_number("BF_ANN_PAGE_ENTRIES", 24usize).max(1);
+    let (bytes, header_len) = tokio::task::spawn_blocking(move || dir.build_paged(per_cell, 7))
         .await
         .map_err(segment::index_error)?
         .map_err(segment::index_error)?;
@@ -1223,22 +1227,33 @@ pub(crate) async fn slab_directory(
         .await?
     };
     let reader = Reader::new(store, file);
-    let pages: Vec<Arc<Page>> = futures::future::try_join_all(cells.iter().map(|&cell| {
-        let (paged, reader) = (paged.clone(), reader.clone());
-        async move {
+    let page_key = |cell: usize| format!("{}#{cell}", file.key);
+    let mut pages: Vec<Option<Arc<Page>>> = cells
+        .iter()
+        .map(|&cell| {
             let range = paged.page_range(cell);
-            let key = format!("{}#{cell}", file.key);
-            let len = range.end - range.start;
-            if let Some(page) = read_cache::get::<Page>(&key, len) {
-                return Ok(page);
-            }
-            let bytes = reader.read(range).await.map_err(segment::index_error)?;
-            let page = paged.decode_page(&bytes).map_err(segment::index_error)?;
-            let resident = page.resident_bytes();
-            Ok::<_, ApiError>(read_cache::insert(&key, resident, page))
-        }
-    }))
-    .await?;
+            read_cache::get::<Page>(&page_key(cell), range.end - range.start)
+        })
+        .collect();
+    // Pages of neighboring cells sit next to each other: read them as few merged ranges.
+    let missing: Vec<usize> = (0..cells.len()).filter(|i| pages[*i].is_none()).collect();
+    let bytes = bf_vector::read_merged(
+        &reader,
+        missing
+            .iter()
+            .map(|&i| paged.page_range(cells[i]))
+            .collect(),
+        bf_vector::read_gap(PAGE_GAP),
+        PAGE_MERGE_MAX,
+    )
+    .await
+    .map_err(segment::index_error)?;
+    for (&i, bytes) in missing.iter().zip(bytes) {
+        let page = paged.decode_page(&bytes).map_err(segment::index_error)?;
+        let resident = page.resident_bytes();
+        pages[i] = Some(read_cache::insert(&page_key(cells[i]), resident, page));
+    }
+    let pages: Vec<Arc<Page>> = pages.into_iter().flatten().collect();
     crate::ann::stage(t0, "directory pages");
     let view = {
         let paged = paged.clone();
@@ -1247,12 +1262,17 @@ pub(crate) async fn slab_directory(
     if std::env::var_os("BF_ANN_PAGED_DEBUG").is_some() {
         // Diagnostics: how many of the clusters a flat directory would probe the pages hold.
         let full = load(store, &set.dir, None).await?;
-        let d = full.center_distances(vector).map_err(segment::index_error)?;
+        let d = full
+            .center_distances(vector)
+            .map_err(segment::index_error)?;
         let mut order: Vec<usize> = (0..d.len()).collect();
         order.sort_unstable_by(|a, b| d[*a].total_cmp(&d[*b]));
         let probes = probe_count(config, rows as usize, clusters as usize, 1.0);
-        let have: std::collections::HashSet<(usize, usize)> =
-            view.entries().iter().map(|e| (e.segment, e.cluster)).collect();
+        let have: std::collections::HashSet<(usize, usize)> = view
+            .entries()
+            .iter()
+            .map(|e| (e.segment, e.cluster))
+            .collect();
         let found = order[..probes]
             .iter()
             .filter(|n| have.contains(&(full.entries()[**n].segment, full.entries()[**n].cluster)))

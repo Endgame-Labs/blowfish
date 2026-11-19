@@ -510,6 +510,44 @@ impl Fragment {
     }
 }
 
+/// Estimated squared distance from the (rotated) query `q` to each entry of `s`, from the
+/// section's one-bit codes.
+fn section_distances(s: &Section, q: &[f64]) -> Vec<f32> {
+    let padded = q.len();
+    let root = (padded as f64).sqrt() as f32;
+    let qr: Vec<f32> = q
+        .iter()
+        .zip(&s.centroid)
+        .map(|(x, g)| *x as f32 - g)
+        .collect();
+    let q2: f32 = qr.iter().map(|x| x * x).sum();
+    // lut[j * 256 + v] = sum of qr over the bits set in v, for byte j.
+    let width = bit_bytes(padded);
+    let mut lut = vec![0f32; width * 256];
+    for j in 0..width {
+        let t = &mut lut[j * 256..(j + 1) * 256];
+        for v in 1..256usize {
+            let bit = v.trailing_zeros() as usize;
+            t[v] = t[v & (v - 1)] + qr.get(j * 8 + bit).copied().unwrap_or(0.);
+        }
+    }
+    let total: f32 = qr.iter().sum();
+    s.entries
+        .iter()
+        .enumerate()
+        .map(|(n, e)| {
+            let code = &s.bits[n * width..(n + 1) * width];
+            let set: f32 = code
+                .iter()
+                .enumerate()
+                .map(|(j, b)| lut[j * 256 + *b as usize])
+                .sum();
+            let dot = (2. * set - total) / root;
+            q2 + e.norm * e.norm - 2. * e.norm * dot / e.alpha
+        })
+        .collect()
+}
+
 impl Directory {
     /// Build a directory object over `(segment id, index key, fragment key, fragment)` for each
     /// segment. Segments carried over from a previous directory pass the same `Fragment`
@@ -662,44 +700,10 @@ impl Directory {
     pub fn center_distances(&self, query: &[f32]) -> Result<Vec<f32>> {
         crate::distance::validate(query, self.shape.dims)?;
         let q = self.rq.rotate(&prepare(query, self.shape.metric));
-        let padded = q.len();
-        let root = (padded as f64).sqrt() as f32;
         let per_segment: Vec<Vec<f32>> = self
             .sections
             .par_iter()
-            .map(|s| {
-                let qr: Vec<f32> = q
-                    .iter()
-                    .zip(&s.centroid)
-                    .map(|(x, g)| *x as f32 - g)
-                    .collect();
-                let q2: f32 = qr.iter().map(|x| x * x).sum();
-                // lut[j * 256 + v] = sum of qr over the bits set in v, for byte j.
-                let width = bit_bytes(padded);
-                let mut lut = vec![0f32; width * 256];
-                for j in 0..width {
-                    let t = &mut lut[j * 256..(j + 1) * 256];
-                    for v in 1..256usize {
-                        let bit = v.trailing_zeros() as usize;
-                        t[v] = t[v & (v - 1)] + qr.get(j * 8 + bit).copied().unwrap_or(0.);
-                    }
-                }
-                let total: f32 = qr.iter().sum();
-                s.entries
-                    .iter()
-                    .enumerate()
-                    .map(|(n, e)| {
-                        let code = &s.bits[n * width..(n + 1) * width];
-                        let set: f32 = code
-                            .iter()
-                            .enumerate()
-                            .map(|(j, b)| lut[j * 256 + *b as usize])
-                            .sum();
-                        let dot = (2. * set - total) / root;
-                        q2 + e.norm * e.norm - 2. * e.norm * dot / e.alpha
-                    })
-                    .collect()
-            })
+            .map(|s| section_distances(s, &q))
             .collect();
         Ok(per_segment.into_iter().flatten().collect())
     }

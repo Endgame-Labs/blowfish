@@ -3,31 +3,37 @@
 //!
 //! A flat [`Directory`] lists every leaf cluster, so its size grows with the namespace: at 100M rows
 //! it is about 100 MB, and a cold query reads all of it to rank clusters (and pays the same in CPU
-//! when warm). Here the entries are grouped by position in vector space (k-means over the clusters'
-//! centers, a few hundred entries per cell), and one object holds:
+//! when warm). Here the entries are grouped into small **cells** of a couple of dozen neighboring
+//! clusters, and one object holds:
 //!
 //! - a resident **header**: the segment table, each segment's centroid (needed to decode its one-bit
-//!   codes), the coarse cell centers (f16), and a table of each cell's page range; then
+//!   codes), one one-bit code per cell (the cell's mean center, coded like a cluster's center, so a
+//!   cell costs about as much as one entry), and a table of each cell's page range; then
 //! - one **page** per cell: the cell's entries (the same fields a flat directory keeps) and their
 //!   one-bit center codes.
 //!
-//! A query ranks the cells by distance to their centers, reads the pages of the nearest cells until
-//! they hold several times as many clusters as it will probe, and [`PagedDirectory::assemble`]s those
-//! pages into an ordinary [`Directory`] holding only those entries, which the existing ranking and
-//! scan code consume unchanged.
+//! Cells are found by a two-level k-means over the clusters' approximate centers and laid out in
+//! tour order, so the cells a query probes are close together in the object and their reads merge.
+//! A query ranks the cells from the header, reads the pages of the nearest cells until they hold
+//! several times as many clusters as it will probe, and [`PagedDirectory::assemble`]s those pages
+//! into an ordinary [`Directory`] holding only those entries, which the existing ranking and scan
+//! code consume unchanged.
 use std::{ops::Range, sync::Arc};
 
 use rayon::prelude::*;
 
 use super::{
     DirEntry, DirSegment, Directory, ENTRY_BYTES, Parser, RaBitQ, Result, Section, Shape, bad,
-    bit_bytes, check_crc, get_shape, prepare, put_shape, put_str, put_u32, put_u64, text,
+    bit_bytes, check_crc, get_shape, prepare, put_shape, put_str, put_u32, put_u64,
+    section_distances, text,
 };
 use crate::cluster;
 
-const PAGED_MAGIC: &[u8; 8] = b"BFDIR005";
+const PAGED_MAGIC: &[u8; 8] = b"BFDIR006";
 /// Bytes of one page entry: the segment index, then the flat entry's fields.
 const PAGE_ENTRY_BYTES: usize = 4 + ENTRY_BYTES;
+/// Entries per top-level group the cells are carved from.
+const GROUP_ENTRIES: usize = 1000;
 
 /// Per-segment data a query needs to decode that segment's entries.
 #[derive(Debug)]
@@ -57,7 +63,8 @@ pub struct PagedDirectory {
     segments: Vec<DirSegment>,
     heads: Vec<Head>,
     padded: usize,
-    coarse: Vec<f32>,
+    /// The cells' centers as a section of one-bit codes (its entries carry only norm and alpha).
+    coarse: Section,
     cells: Vec<Cell>,
     rq: RaBitQ,
     /// Bytes of the header (the entries' pages start right after).
@@ -91,11 +98,36 @@ fn approx_center(section: &Section, n: usize, out: &mut Vec<f32>) {
     }));
 }
 
+fn sq(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+/// Greedy nearest-neighbor order of `points`, starting at the first.
+fn tour_order(points: &[Vec<f32>]) -> Vec<usize> {
+    let mut left: Vec<usize> = (1..points.len()).collect();
+    let mut order = vec![0usize];
+    while !left.is_empty() {
+        let last = &points[*order.last().expect("tour is not empty")];
+        let (at, _) = left
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (i, sq(&points[c], last)))
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+            .expect("left is not empty");
+        order.push(left.swap_remove(at));
+    }
+    order
+}
+
+type Members = Vec<(usize, usize)>;
+
 impl Directory {
-    /// Rearrange this directory's entries into about `cells` pages by position in vector space.
-    /// Returns the object bytes and the header's length. Deterministic for a seed.
-    pub fn build_paged(&self, cells: usize, seed: u64) -> Result<(Vec<u8>, u64)> {
+    /// Rearrange this directory's entries into cells of about `per_cell` neighboring clusters, and
+    /// write them as a paged object. Returns the object bytes and the header's length.
+    /// Deterministic for a seed.
+    pub fn build_paged(&self, per_cell: usize, seed: u64) -> Result<(Vec<u8>, u64)> {
         let padded = self.shape.dims.next_power_of_two();
+        let per_cell = per_cell.max(1);
         // (section, entry within section) of every entry, in directory order.
         let flat: Vec<(usize, usize)> = self
             .sections
@@ -106,8 +138,9 @@ impl Directory {
         if flat.is_empty() {
             return Err(bad("directory has no entries"));
         }
-        let cells = cells.clamp(1, flat.len());
-        let sample_n = (cells * 100).clamp(20_000, 200_000).min(flat.len());
+        // Level one: groups of about GROUP_ENTRIES neighboring entries.
+        let groups_n = (flat.len() / GROUP_ENTRIES).max(1);
+        let sample_n = (groups_n * 100).clamp(20_000, 100_000).min(flat.len());
         let step = flat.len() as f64 / sample_n as f64;
         let sample: Vec<Vec<f32>> = (0..sample_n)
             .into_par_iter()
@@ -119,43 +152,117 @@ impl Directory {
             })
             .collect();
         let refs: Vec<&[f32]> = sample.iter().map(Vec::as_slice).collect();
-        let centers = cluster::kmeans(&refs, cells, 10, seed);
+        let top = cluster::kmeans(&refs, groups_n, 8, seed);
         drop(refs);
         drop(sample);
         let assigned: Vec<u32> = flat
             .par_iter()
             .map_init(Vec::new, |buf, &(s, n)| {
                 approx_center(&self.sections[s], n, buf);
-                cluster::nearest(buf, &centers) as u32
+                cluster::nearest(buf, &top) as u32
             })
             .collect();
-        let mut members: Vec<Vec<(usize, usize)>> = vec![Vec::new(); centers.len()];
-        for (&(s, n), &c) in flat.iter().zip(&assigned) {
-            members[c as usize].push((s, n));
+        let mut groups: Vec<Members> = vec![Vec::new(); top.len()];
+        for (&m, &g) in flat.iter().zip(&assigned) {
+            groups[g as usize].push(m);
         }
-        // Drop empty cells, and order each page by (segment, cluster).
-        let mut kept: Vec<(usize, Vec<(usize, usize)>)> = members
-            .into_iter()
-            .enumerate()
-            .filter(|(_, m)| !m.is_empty())
+        let kept: Vec<usize> = (0..groups.len())
+            .filter(|g| !groups[*g].is_empty())
             .collect();
-        for (_, m) in &mut kept {
+        let group_order: Vec<usize> = {
+            let centers: Vec<Vec<f32>> = kept.iter().map(|g| top[*g].clone()).collect();
+            tour_order(&centers).into_iter().map(|i| kept[i]).collect()
+        };
+        // Level two: cells inside each group, ordered along a tour.
+        let per_group: Vec<Vec<(Vec<f32>, Members)>> = group_order
+            .par_iter()
+            .map(|&g| {
+                let members = &groups[g];
+                let points: Vec<Vec<f32>> = members
+                    .iter()
+                    .map(|&(s, n)| {
+                        let mut v = Vec::new();
+                        approx_center(&self.sections[s], n, &mut v);
+                        v
+                    })
+                    .collect();
+                let k = members.len().div_ceil(per_cell);
+                let centers = if k <= 1 {
+                    vec![mean(&points, padded)]
+                } else {
+                    let refs: Vec<&[f32]> = points.iter().map(Vec::as_slice).collect();
+                    cluster::kmeans(&refs, k, 6, seed ^ g as u64)
+                };
+                let mut cells: Vec<Members> = vec![Vec::new(); centers.len()];
+                let mut cell_points: Vec<Vec<Vec<f32>>> = vec![Vec::new(); centers.len()];
+                for (m, p) in members.iter().zip(points) {
+                    let c = cluster::nearest(&p, &centers);
+                    cells[c].push(*m);
+                    cell_points[c].push(p);
+                }
+                let mut out: Vec<(Vec<f32>, Members)> = cells
+                    .into_iter()
+                    .zip(cell_points)
+                    .filter(|(m, _)| !m.is_empty())
+                    .map(|(m, p)| (mean(&p, padded), m))
+                    .collect();
+                let order = tour_order(&out.iter().map(|c| c.0.clone()).collect::<Vec<_>>());
+                let mut slots: Vec<Option<(Vec<f32>, Members)>> = out.drain(..).map(Some).collect();
+                order
+                    .into_iter()
+                    .map(|i| slots[i].take().expect("tour visits each cell once"))
+                    .collect()
+            })
+            .collect();
+        let mut cells: Vec<(Vec<f32>, Members)> = per_group.into_iter().flatten().collect();
+        for (_, m) in &mut cells {
             m.sort_unstable_by_key(|&(s, n)| (s, self.sections[s].entries[n].cluster));
         }
+        // The cells' centers, coded relative to their mean like a segment's clusters.
+        let mut centroid = vec![0f32; padded];
+        for (c, _) in &cells {
+            for (g, x) in centroid.iter_mut().zip(c) {
+                *g += *x;
+            }
+        }
+        for g in &mut centroid {
+            *g /= cells.len() as f32;
+        }
         let width = bit_bytes(padded);
-        let mut pages: Vec<Vec<u8>> = Vec::with_capacity(kept.len());
-        for (_, m) in &kept {
+        let root = (padded as f64).sqrt();
+        let mut coarse_bits = Vec::with_capacity(cells.len() * width);
+        let mut coarse_entries = Vec::with_capacity(cells.len());
+        for (c, m) in &cells {
+            let r: Vec<f64> = c
+                .iter()
+                .zip(&centroid)
+                .map(|(x, g)| f64::from(*x - *g))
+                .collect();
+            let norm = r.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let mut code = vec![0u8; width];
+            for (i, x) in r.iter().enumerate() {
+                if *x >= 0. {
+                    code[i / 8] |= 1 << (i % 8);
+                }
+            }
+            coarse_bits.extend(code);
+            let alpha = if norm == 0. {
+                1.
+            } else {
+                r.iter().map(|x| x.abs()).sum::<f64>() / (norm * root)
+            };
+            coarse_entries.push((norm as f32, alpha.clamp(1e-6, 1.) as f32, m.len() as u32));
+        }
+        let mut pages: Vec<Vec<u8>> = Vec::with_capacity(cells.len());
+        for (_, m) in &cells {
             let mut page = Vec::with_capacity(4 + m.len() * (PAGE_ENTRY_BYTES + width) + 4);
             put_u32(&mut page, m.len() as u32);
             for &(s, n) in m {
-                let sec = &self.sections[s];
-                let e = &sec.entries[n];
                 put_u32(&mut page, s as u32);
-                put_entry(&mut page, e);
+                put_entry(&mut page, &self.sections[s].entries[n]);
             }
             for &(s, n) in m {
-                let sec = &self.sections[s];
-                page.extend_from_slice(&sec.bits[n * width..(n + 1) * width]);
+                page.extend_from_slice(&self.sections[s].bits[n * width..(n + 1) * width]);
             }
             let crc = crc32fast::hash(&page);
             put_u32(&mut page, crc);
@@ -183,21 +290,20 @@ impl Directory {
                 header.extend(x.to_le_bytes());
             }
         }
-        put_u32(&mut header, kept.len() as u32);
-        for (c, _) in &kept {
-            for x in &centers[*c] {
-                header.extend(half::f16::from_f32(*x).to_le_bytes());
-            }
+        put_u32(&mut header, cells.len() as u32);
+        for x in &centroid {
+            header.extend(x.to_le_bytes());
         }
         let mut offset = 0u64;
-        for page in &pages {
+        for ((norm, alpha, count), page) in coarse_entries.iter().zip(&pages) {
+            header.extend(norm.to_le_bytes());
+            header.extend(alpha.to_le_bytes());
+            put_u32(&mut header, *count);
             put_u64(&mut header, offset);
             put_u32(&mut header, page.len() as u32);
             offset += page.len() as u64;
         }
-        for (_, m) in &kept {
-            put_u32(&mut header, m.len() as u32);
-        }
+        header.extend(&coarse_bits);
         let crc = crc32fast::hash(&header);
         put_u32(&mut header, crc);
         let header_len = header.len() as u64;
@@ -207,6 +313,19 @@ impl Directory {
         }
         Ok((out, header_len))
     }
+}
+
+fn mean(points: &[Vec<f32>], padded: usize) -> Vec<f32> {
+    let mut m = vec![0f32; padded];
+    for p in points {
+        for (a, b) in m.iter_mut().zip(p) {
+            *a += *b;
+        }
+    }
+    for a in &mut m {
+        *a /= points.len().max(1) as f32;
+    }
+    m
 }
 
 fn put_entry(out: &mut Vec<u8>, e: &DirEntry) {
@@ -288,29 +407,46 @@ impl PagedDirectory {
         if ncells == 0 || ncells > p.remaining() {
             return Err(bad("invalid paged directory cells"));
         }
-        let raw = p.take(ncells * padded * 2)?;
-        let coarse: Vec<f32> = raw
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|b| half::f16::from_le_bytes(*b).to_f32())
-            .collect();
+        let centroid = p.vector(padded)?;
         let mut cells = Vec::with_capacity(ncells);
+        let mut entries = Vec::with_capacity(ncells);
         for _ in 0..ncells {
+            let norm = f32::from_le_bytes(p.take(4)?.try_into().unwrap());
+            let alpha = f32::from_le_bytes(p.take(4)?.try_into().unwrap());
+            let count = p.u32()?;
             let offset = p.u64()?;
             let len = p.u32()?;
-            cells.push(Cell {
-                offset,
-                len,
-                count: 0,
+            if !norm.is_finite() || !(alpha > 0. && alpha <= 1.) {
+                return Err(bad("invalid paged directory cell"));
+            }
+            cells.push(Cell { offset, len, count });
+            entries.push(DirEntry {
+                segment: 0,
+                cluster: 0,
+                rows: count,
+                codes: 0..0,
+                vectors: 0..0,
+                codes_crc: 0,
+                vectors_crc: 0,
+                blob: 0..0,
+                norm,
+                alpha,
             });
         }
-        for c in &mut cells {
-            c.count = p.u32()?;
-        }
+        let bits = p.take(ncells * bit_bytes(padded))?.to_vec();
         if p.remaining() != 0 {
             return Err(bad("inconsistent paged directory length"));
         }
+        let coarse = Section {
+            shape,
+            clusters: ncells,
+            centroid,
+            entries,
+            bits,
+            rows: 0,
+            membership: 0..0,
+            codes_in_fragment: false,
+        };
         Ok(Self {
             shape: Shape {
                 flat: false,
@@ -347,7 +483,8 @@ impl PagedDirectory {
     }
     /// Approximate resident bytes.
     pub fn resident_bytes(&self) -> u64 {
-        (self.coarse.len() * 4
+        (self.coarse.bits.len()
+            + self.coarse.entries.len() * std::mem::size_of::<DirEntry>()
             + self
                 .heads
                 .iter()
@@ -362,39 +499,24 @@ impl PagedDirectory {
         start..start + u64::from(c.len)
     }
 
-    /// The cells to read for `query`: the nearest by center until together they list at least
-    /// `want` entries (all cells when the directory is smaller).
+    /// The cells to read for `query`: the nearest by estimated center distance until together they
+    /// list at least `want` entries (all cells when the directory is smaller). Sorted by cell, so
+    /// that neighboring pages can be read together.
     pub fn select_cells(&self, query: &[f32], want: usize) -> Result<Vec<usize>> {
         crate::distance::validate(query, self.shape.dims)?;
-        let q: Vec<f32> = self
-            .rq
-            .rotate(&prepare(query, self.shape.metric))
-            .into_iter()
-            .map(|x| x as f32)
-            .collect();
-        let mut order: Vec<(f32, usize)> = self
-            .coarse
-            .par_chunks_exact(self.padded)
-            .enumerate()
-            .map(|(i, c)| {
-                (
-                    c.iter()
-                        .zip(&q)
-                        .map(|(a, b)| (a - b) * (a - b))
-                        .sum::<f32>(),
-                    i,
-                )
-            })
-            .collect();
-        order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let q = self.rq.rotate(&prepare(query, self.shape.metric));
+        let d = section_distances(&self.coarse, &q);
+        let mut order: Vec<usize> = (0..d.len()).collect();
+        order.sort_unstable_by(|a, b| d[*a].total_cmp(&d[*b]).then(a.cmp(b)));
         let (mut got, mut picked) = (0usize, Vec::new());
-        for (_, i) in order {
+        for i in order {
             picked.push(i);
             got += self.cells[i].count as usize;
             if got >= want {
                 break;
             }
         }
+        picked.sort_unstable();
         Ok(picked)
     }
 
