@@ -26,6 +26,11 @@ async fn exercise(store: Storage) {
         .await
         .unwrap();
     assert_eq!(store.get_range("data/plain", 0..3).await.unwrap(), "raw");
+    // Listing after a key returns only the keys that sort after it.
+    let after = store.list_after("data", "data/object").await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].key, "data/plain");
+    assert!(store.list_after("data", "data/plain").await.unwrap().is_empty());
     store.delete(key).await.unwrap();
     store.delete("data/plain").await.unwrap();
     assert!(store.list("data").await.unwrap().is_empty());

@@ -735,6 +735,7 @@ impl Wal {
     pub async fn manifest_after(&self, known: u64) -> Result<Option<(u64, Manifest)>, Error> {
         // A cold reader asks for the fixed-key copy while it lists; when the copy is the newest
         // manifest, that is one round trip instead of two. A copy that lags the listing is ignored.
+        let t0 = std::time::Instant::now();
         let prefix = format!("ns/{}/manifest/", self.namespace);
         // A namespace with thousands of publications lists over several sequential pages. With
         // the copy in hand, only the manifests after it need listing (usually none, one page): take
@@ -776,6 +777,12 @@ impl Wal {
             }
             futures::future::Either::Right((None, full)) => (full.await?, copy_read.await),
         };
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            eprintln!(
+                "MANIFEST found newest after {} ms",
+                t0.elapsed().as_millis()
+            );
+        }
         let Some(last) = objects.last() else {
             return Ok(None);
         };
@@ -795,6 +802,9 @@ impl Wal {
             && slot_payload_key(&copy[8..]).is_none()
             && let Ok(manifest) = decode_manifest(&copy[8..])
         {
+            if std::env::var_os("BF_TRACE_STAGES").is_some() {
+                eprintln!("MANIFEST decoded after {} ms", t0.elapsed().as_millis());
+            }
             return Ok(Some((seq, manifest)));
         }
         let bytes = self.store.get(&last.key).await?;

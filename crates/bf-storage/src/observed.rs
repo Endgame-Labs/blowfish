@@ -166,27 +166,16 @@ impl ObjectStore for Observed {
             .boxed()
     }
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        let start = Instant::now();
-        let source = self.0.list(prefix);
-        stream::unfold((source, false), move |(mut source, done)| async move {
-            if done {
-                return None;
-            }
-            match source.next().await {
-                Some(item) => {
-                    let failed = item.is_err();
-                    if failed {
-                        record("list", start, &item, 0);
-                    }
-                    Some((item, (source, failed)))
-                }
-                None => {
-                    record("list", start, &Ok::<_, object_store::Error>(()), 0);
-                    None
-                }
-            }
-        })
-        .boxed()
+        Self::observed_list(self.0.list(prefix))
+    }
+    // Forward the offset, so a backend with start-after lists only the keys after it instead of
+    // the default's full listing filtered here.
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        Self::observed_list(self.0.list_with_offset(prefix, offset))
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
@@ -207,4 +196,31 @@ impl ObjectStore for Observed {
 fn trace_reads() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BF_TRACE_READS").is_some())
+}
+
+impl Observed {
+    fn observed_list(
+        source: BoxStream<'static, Result<ObjectMeta>>,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        let start = Instant::now();
+        stream::unfold((source, false), move |(mut source, done)| async move {
+            if done {
+                return None;
+            }
+            match source.next().await {
+                Some(item) => {
+                    let failed = item.is_err();
+                    if failed {
+                        record("list", start, &item, 0);
+                    }
+                    Some((item, (source, failed)))
+                }
+                None => {
+                    record("list", start, &Ok::<_, object_store::Error>(()), 0);
+                    None
+                }
+            }
+        })
+        .boxed()
+    }
 }
