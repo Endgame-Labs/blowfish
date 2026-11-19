@@ -300,17 +300,28 @@ pub(crate) async fn write_hint(
     object_key: &str,
     bytes: &[u8],
 ) {
+    write_hint_named(
+        store,
+        ns,
+        layout.dir_key(attr).trim_start_matches("ann:"),
+        object_key,
+        bytes,
+    )
+    .await;
+}
+
+/// Name (for [`hint_key`]) of the hint holding a paged slab directory's header. It is separate
+/// from the flat slab directory's hint, which readers without paging still use.
+pub(crate) fn paged_hint_name(attr: &str) -> String {
+    format!("ann3p:{attr}")
+}
+
+async fn write_hint_named(store: &Storage, ns: &str, name: &str, object_key: &str, bytes: &[u8]) {
     let mut hint = Vec::with_capacity(bytes.len() + object_key.len() + 4);
     hint.extend_from_slice(&(object_key.len() as u32).to_le_bytes());
     hint.extend_from_slice(object_key.as_bytes());
     hint.extend_from_slice(bytes);
-    if let Err(e) = store
-        .put(
-            &hint_key(ns, layout.dir_key(attr).trim_start_matches("ann:")),
-            hint,
-        )
-        .await
-    {
+    if let Err(e) = store.put(&hint_key(ns, name), hint).await {
         tracing::warn!(error=?e, "ANN directory hint not written");
     }
 }
@@ -1143,11 +1154,10 @@ pub(crate) async fn build_paged(
         header_len,
     )
     .await?;
-    write_hint(
+    write_hint_named(
         store,
         ns,
-        Layout::Slabs,
-        attr,
+        &paged_hint_name(attr),
         &file.key,
         &bytes[..header_len as usize],
     )

@@ -388,34 +388,51 @@ pub(crate) async fn catch_up_hinted(
                     // first, and the plain one when the namespace has none.
                     let mut got = Vec::new();
                     if hint.scan.is_some() && crate::ann_dir::blocks_enabled() {
-                        // The recluster's slab directory and the block directory are fetched
-                        // together: which one answers is decided once the manifest is read.
-                        let slab = crate::ann_dir::Layout::Slabs.dir_key(a);
-                        let name = crate::ann_dir::Layout::Blocks.dir_key(a);
-                        // The slab directory's hint answers when it exists, so the block
-                        // directory's (as large as the slab one) is dropped as soon as it
-                        // arrives instead of finishing a download nothing will use.
-                        let mut slab_read =
-                            Box::pin(crate::ann_dir::prefetch(store, wal.namespace(), &slab));
-                        let mut block_read =
-                            Box::pin(crate::ann_dir::prefetch(store, wal.namespace(), &name));
-                        let mut block_done = None;
-                        let slab_hint = loop {
-                            tokio::select! {
-                                r = &mut slab_read => break r,
-                                r = &mut block_read, if block_done.is_none() => block_done = Some(r),
+                        // The recluster's paged slab directory, its flat slab directory, and
+                        // the block directory are fetched together: which one answers is decided
+                        // once the manifest is read. They are tried in that order, and the
+                        // slower ones are dropped as soon as an earlier one is found, so a big
+                        // flat directory is not downloaded in full for nothing.
+                        let names = [
+                            crate::ann_dir::paged_hint_name(a),
+                            crate::ann_dir::Layout::Slabs.dir_key(a),
+                            crate::ann_dir::Layout::Blocks.dir_key(a),
+                        ];
+                        let mut pending: Vec<futures::future::BoxFuture<'_, _>> = names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| {
+                                async move {
+                                    (i, crate::ann_dir::prefetch(store, wal.namespace(), n).await)
+                                }
+                                .boxed()
+                            })
+                            .collect();
+                        let mut results: [Option<Option<crate::ann_dir::Prefetched>>; 3] =
+                            Default::default();
+                        'priority: for want in 0..3 {
+                            while results[want].is_none() {
+                                let ((i, r), _, rest) = futures::future::select_all(pending).await;
+                                pending = rest;
+                                results[i] = Some(r);
                             }
-                        };
-                        let block_hint = if slab_hint.is_some() {
-                            None
-                        } else if let Some(r) = block_done {
-                            r
-                        } else {
-                            block_read.await
-                        };
-                        got.extend(slab_hint.map(|p| (slab.clone(), p)));
-                        if let Some(p) = block_hint {
-                            got.push((name.clone(), p));
+                            if results[want].as_ref().is_some_and(Option::is_some) {
+                                break 'priority;
+                            }
+                        }
+                        drop(pending);
+                        // Readers look a hint up by the directory's own name.
+                        let reader_names = [
+                            crate::ann_dir::Layout::Slabs.dir_key(a),
+                            crate::ann_dir::Layout::Slabs.dir_key(a),
+                            crate::ann_dir::Layout::Blocks.dir_key(a),
+                        ];
+                        let first = results
+                            .into_iter()
+                            .zip(reader_names)
+                            .find_map(|(r, name)| r.flatten().map(|p| (name, p)));
+                        if let Some((name, p)) = first {
+                            got.push((name, p));
                             return got;
                         }
                     }

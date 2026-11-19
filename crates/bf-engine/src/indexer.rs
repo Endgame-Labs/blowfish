@@ -294,6 +294,9 @@ pub(crate) fn retire_slabs(manifest: &mut Manifest, set: &bf_wal::SlabSet) {
         }
     }
     retire(manifest, set.dir.key.clone());
+    if let Some(pages) = &set.pages {
+        retire(manifest, pages.key.clone());
+    }
 }
 pub(crate) fn retire(manifest: &mut Manifest, key: String) {
     if !manifest.retired.iter().any(|r| r.key == key) {
@@ -960,7 +963,12 @@ impl Engine {
         );
         for (attr, set) in &manifest.ann_slabs {
             protected.insert(set.dir.key.clone());
+            protected.extend(set.pages.iter().map(|f| f.key.clone()));
             protected.insert(crate::ann_dir::hint_key(ns, &format!("ann3:{attr}")));
+            protected.insert(crate::ann_dir::hint_key(
+                ns,
+                &crate::ann_dir::paged_hint_name(attr),
+            ));
             protected.extend(
                 set.slabs
                     .iter()
