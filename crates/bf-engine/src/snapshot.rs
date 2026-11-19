@@ -36,6 +36,11 @@ enum Part {
     OnlyText,
 }
 impl OpenHint {
+    /// Whether the query ranks by text or filters on a text index, which read the segments' text
+    /// headers from the manifest.
+    fn wants_text(&self) -> bool {
+        !self.text.is_empty() || !self.bm25.is_empty()
+    }
     /// A hybrid query's ANN half needs only the directory, so it must not wait for the BM25
     /// term lookups (they finish a few hundred milliseconds later on a cold namespace).
     fn splits_text(&self, dirs: &BTreeMap<String, bf_wal::SegmentFile>) -> bool {
@@ -348,6 +353,14 @@ pub(crate) async fn catch_up(
 ) -> Result<(), ApiError> {
     catch_up_hinted(wal, state, cap, store, None).await
 }
+/// `BF_READER_COPY=0` makes queries read the full manifest (for A/B runs).
+fn reader_copy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BF_READER_COPY").is_ok_and(|v| v != "0")
+            || std::env::var_os("BF_READER_COPY").is_none()
+    })
+}
 /// A manifest that republishes the checkpoint this state already holds (garbage collection and
 /// epoch claims do) changes nothing the state depends on, so it must not discard the resident
 /// tail: rebuilding would download every unindexed WAL payload again.
@@ -385,7 +398,21 @@ pub(crate) async fn catch_up_hinted(
     for attempt in 0..3 {
         // A cold open reads the newest ANN directory's hint copy while it reads the manifest; the
         // directory's key inside it is checked against the manifest before use.
-        let (manifest, prefetched) = tokio::join!(wal.manifest_after(state.manifest_seq), async {
+        // A query that needs no text header reads the compact reader copy of the manifest;
+        // everything else (writers, indexers, text queries) wants the full one, which also
+        // replaces a compact one this state holds.
+        let want_full = hint.is_none_or(OpenHint::wants_text) || !reader_copy_enabled();
+        let (view, known) = if !want_full {
+            (bf_wal::ManifestView::Reader, state.manifest_seq)
+        } else if state.root_only {
+            (
+                bf_wal::ManifestView::Full,
+                state.manifest_seq.saturating_sub(1),
+            )
+        } else {
+            (bf_wal::ManifestView::Full, state.manifest_seq)
+        };
+        let (manifest, prefetched) = tokio::join!(wal.manifest_view_after(known, view), async {
             let mut found = BTreeMap::new();
             if let Some(hint) = hint.filter(|_| state.ann_dirs.is_empty()) {
                 let reads = hint.ann.iter().map(|a| async move {
@@ -492,6 +519,7 @@ pub(crate) async fn catch_up_hinted(
                         created_at: m.created_at,
                         updated_at: m.updated_at.unwrap_or(m.created_at),
                         segments: m.segments.into(),
+                        root_only: m.root,
                         indexed_through: m.indexed_through,
                         manifest_seq: generation,
                         corpus: if m.text_stats.is_some() {
@@ -506,8 +534,16 @@ pub(crate) async fn catch_up_hinted(
                         ..Default::default()
                     }
                 };
+            } else if state.root_only
+                && !m.root
+                && m.indexed_through > 0
+                && same_checkpoint(state, &m)
+            {
+                // The same checkpoint in full: take the text headers the compact copy left out.
+                state.segments = m.segments.into();
+                state.root_only = false;
             }
-            state.manifest_seq = generation;
+            state.manifest_seq = generation.max(state.manifest_seq);
         }
         state.checkpoint_refreshed = Instant::now();
         let tail = wal.tail_bounded(

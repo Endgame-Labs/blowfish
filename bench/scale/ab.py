@@ -43,7 +43,8 @@ def start_server(arm, append_log=False):
     shutil.rmtree(WORK, ignore_errors=True); (WORK / "cache").mkdir(parents=True)
     subprocess.run(["python3", str(HERE / "mkconfig.py"), config, str(WORK / "storage.json"), str(WORK / "cache"),
                     "--memory-gib", os.environ.get("AB_MEM_GIB", "8"), "--read-only"], check=True)
-    e = dict(os.environ, RAYON_NUM_THREADS=os.environ.get("RAYON_NUM_THREADS", "6"), MALLOC_ARENA_MAX="2", BF_TRACE_READS="1", **env)
+    # RAYON_NUM_THREADS is left to the server's default unless the environment (or the arm) sets it.
+    e = dict(os.environ, MALLOC_ARENA_MAX="2", BF_TRACE_READS="1", **env)
     global CUR_NS
     CUR_NS = ns
     log = open(WORK / "server.log", "a" if append_log else "w")

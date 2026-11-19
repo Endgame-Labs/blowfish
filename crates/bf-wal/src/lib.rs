@@ -146,6 +146,32 @@ pub struct Manifest {
     /// instead of re-reading the whole log. Absent in older manifests (zero: start from the top).
     #[serde(default)]
     pub pruned_through: u64,
+    /// Set only on the reader copy at the fixed `manifest-latest` key when it was written without
+    /// the segments' text headers (see [`Manifest::reader_copy`]). Never set on a manifest slot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub root: bool,
+}
+impl Manifest {
+    /// The compact copy a cold query that does not rank by text reads: the same manifest without
+    /// the per-segment text headers (dictionary chunk indexes, about two thirds of the bytes at 100
+    /// million rows), which only BM25 and full-text filters use and which are read from the
+    /// segments themselves when absent.
+    pub fn reader_copy(&self) -> Manifest {
+        let mut root = self.clone();
+        for segment in &mut root.segments {
+            for file in segment.files.values_mut() {
+                file.text_header = None;
+            }
+        }
+        root.root = true;
+        root
+    }
+    /// Whether any segment carries a text header.
+    fn has_text_headers(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| s.files.values().any(|f| f.text_header.is_some()))
+    }
 }
 /// A namespace-wide ANN layout: the rows of `covered` segments, repartitioned by position in
 /// vector space into slabs, each a pseudo segment with its own index and block fragment. A
@@ -183,6 +209,14 @@ pub fn record_commit(result: &Result<CreateResult, Error>, started: std::time::I
     };
     metrics::histogram!("blowfish_wal_commit_duration_seconds", "outcome" => outcome)
         .record(started.elapsed().as_secs_f64());
+}
+/// Which form of the newest manifest a reader wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestView {
+    /// The manifest slot itself, with every field.
+    Full,
+    /// The fixed-key copy, which may omit the segments' text headers.
+    Reader,
 }
 /// Immutable file reference. Lengths exclude the storage retry-identity header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -568,6 +602,9 @@ impl Wal {
     ) -> Result<CreateResult, Error> {
         // The slot holds the whole manifest (compressed when large), so a cold reader needs
         // one GET after the listing. Older slots point at a separate payload object.
+        if manifest.root {
+            return Err(Error::Format);
+        }
         let identity = Uuid::new_v4();
         let encoded = encode_manifest(manifest)?;
         let result = self
@@ -581,8 +618,20 @@ impl Wal {
         if result == CreateResult::Created {
             // A copy at a fixed key, so a cold reader fetches the manifest in the same round trip
             // as the listing that confirms it is the newest. Best effort: readers verify it.
+            // For a manifest of megabytes the copy omits the text headers, which a query that does
+            // not rank by text never reads (`Manifest::reader_copy`).
+            let above = compact_copy_above();
+            let compact = if manifest.has_text_headers() && encoded.len() > above {
+                encode_manifest(&manifest.reader_copy())
+                    .ok()
+                    // Worth the extra round trip a text query then pays only when much smaller
+                    // (a threshold of zero, for tests, takes any).
+                    .filter(|c| above == 0 || c.len() < encoded.len() / 2)
+            } else {
+                None
+            };
             let mut pointer = seq.to_be_bytes().to_vec();
-            pointer.extend_from_slice(&encoded);
+            pointer.extend_from_slice(compact.as_ref().unwrap_or(&encoded));
             let _ = self.store.put(&self.latest_key(), pointer).await;
         }
         Ok(result)
@@ -733,6 +782,33 @@ impl Wal {
     /// Discover a newer immutable manifest, skipping payload reads and decoding when
     /// the caller already holds the latest generation. Listing still observes remote publications.
     pub async fn manifest_after(&self, known: u64) -> Result<Option<(u64, Manifest)>, Error> {
+        self.manifest_view_after(known, ManifestView::Full).await
+    }
+    /// Rewrite the fixed-key reader copy of the newest manifest as the compact copy, for a namespace
+    /// published before compact copies existed. Returns the sequence and the new copy's encoded size,
+    /// or `None` when the manifest is small or has no text headers. Readers verify the copy against
+    /// the manifest log, so a copy that lags a concurrent publication is ignored, not trusted.
+    pub async fn write_reader_copy(&self) -> Result<Option<(u64, usize)>, Error> {
+        let Some((seq, manifest)) = self.latest_manifest().await? else {
+            return Ok(None);
+        };
+        if !manifest.has_text_headers() {
+            return Ok(None);
+        }
+        let compact = encode_manifest(&manifest.reader_copy())?;
+        let mut pointer = seq.to_be_bytes().to_vec();
+        pointer.extend_from_slice(&compact);
+        let size = pointer.len();
+        self.store.put(&self.latest_key(), pointer).await?;
+        Ok(Some((seq, size)))
+    }
+    /// [`Wal::manifest_after`] with a choice of view. `ManifestView::Reader` may return the compact
+    /// copy (`Manifest::root` set), which lacks the segments' text headers.
+    pub async fn manifest_view_after(
+        &self,
+        known: u64,
+        view: ManifestView,
+    ) -> Result<Option<(u64, Manifest)>, Error> {
         // A cold reader asks for the fixed-key copy while it lists; when the copy is the newest
         // manifest, that is one round trip instead of two. A copy that lags the listing is ignored.
         let t0 = std::time::Instant::now();
@@ -801,6 +877,7 @@ impl Wal {
             && copy[..8] == seq.to_be_bytes()
             && slot_payload_key(&copy[8..]).is_none()
             && let Ok(manifest) = decode_manifest(&copy[8..])
+            && (view == ManifestView::Reader || !manifest.root)
         {
             if std::env::var_os("BF_TRACE_STAGES").is_some() {
                 eprintln!("MANIFEST decoded after {} ms", t0.elapsed().as_millis());
@@ -873,6 +950,16 @@ impl<T: Send + 'static, R: Send + 'static> GroupCommit<T, R> {
 /// stays readable, so older manifests and older readers' files keep working.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const COMPRESS_ABOVE: usize = 64 << 10;
+/// Manifests whose encoding is larger than this get a compact reader copy (when it is much
+/// smaller). `BF_READER_COPY_MIN_BYTES` overrides it.
+const COMPACT_COPY_ABOVE: usize = 256 << 10;
+
+fn compact_copy_above() -> usize {
+    std::env::var("BF_READER_COPY_MIN_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(COMPACT_COPY_ABOVE)
+}
 
 fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, Error> {
     let json = serde_json::to_vec(manifest)?;
@@ -933,6 +1020,7 @@ mod manifest_codec_tests {
             retired: vec![],
             checkpoints: vec![],
             pruned_through: 0,
+            root: false,
         }
     }
 

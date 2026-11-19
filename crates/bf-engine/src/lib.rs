@@ -90,6 +90,9 @@ pub(crate) struct NamespaceState {
     pub marks: BTreeMap<Id, u64>,
     pub entries: Vec<TailEntry>,
     pub segments: Segments,
+    /// The segments came from the compact reader copy of the manifest, which has no text headers
+    /// (see `bf_wal::Manifest::reader_copy`); a writer or a text query reads the full manifest first.
+    pub root_only: bool,
     pub indexed_through: u64,
     pub manifest_seq: u64,
     pub tail_bytes: u64,
@@ -121,6 +124,7 @@ impl Default for NamespaceState {
             marks: BTreeMap::new(),
             entries: vec![],
             segments: Segments::default(),
+            root_only: false,
             indexed_through: 0,
             manifest_seq: 0,
             tail_bytes: 0,
@@ -157,6 +161,7 @@ impl NamespaceState {
             marks: BTreeMap::new(),
             entries: self.entries.clone(),
             segments: self.segments.clone(),
+            root_only: self.root_only,
             indexed_through: self.indexed_through,
             manifest_seq: self.manifest_seq,
             tail_bytes: self.tail_bytes,
@@ -346,6 +351,7 @@ impl Engine {
             owner: uuid::Uuid::new_v4(),
             namespaces: Mutex::new(HashMap::new()),
         }));
+        bf_alloc::adaptive_decay();
         indexer::start(&engine);
         engine
     }
@@ -517,6 +523,7 @@ impl Engine {
         if self.0.store.is_read_only() {
             return Err(ApiError::new(403, "server is read-only"));
         }
+        let _busy = bf_alloc::busy();
         self.check_writable(ns).await?;
         let embedded = self.embed_for_write(ns, &mut request).await?;
         let handle = self.handle(ns).await?;
@@ -1387,6 +1394,7 @@ mod tail_tests {
             retired: vec![],
             checkpoints: vec![],
             pruned_through: 0,
+            root: false,
         }
     }
 

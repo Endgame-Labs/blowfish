@@ -374,6 +374,11 @@ impl Engine {
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
         let state = {
             let mut state = handle.state.lock().await;
+            if state.root_only {
+                // Queries keep the compact manifest copy; a build must publish the segments' text
+                // headers, so take the full manifest first.
+                catch_up(&wal, &mut state, &self.0.store).await?;
+            }
             // Local commits and queued compaction are already known. Poll remote
             // writers at the configured maximum tail age while idle, rather than
             // holding this lock across two object-store calls on every tick.
@@ -437,6 +442,8 @@ impl Engine {
             return Ok(false);
         }
         crate::ann::stage(t0, "idx lock+clone");
+        // Past every early return: this pass builds or compacts, so freed pages should leave quickly.
+        let _busy = bf_alloc::busy();
         let mut state = state;
         let rebuild = state.segments.iter().any(|seg| {
             state
@@ -508,6 +515,7 @@ impl Engine {
             retired: vec![],
             checkpoints: vec![],
             pruned_through: 0,
+            root: false,
         });
         if !force
             && let Some(lease) = wal

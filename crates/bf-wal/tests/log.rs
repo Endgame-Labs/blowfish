@@ -52,6 +52,7 @@ async fn versioned_slots_conflicts_tail_and_manifest() {
         retired: vec![],
         checkpoints: vec![],
         pruned_through: 0,
+        root: false,
     };
     a.publish_manifest(1, &manifest).await.unwrap();
     assert_eq!(b.latest_manifest().await.unwrap().unwrap().0, 1);
@@ -131,6 +132,7 @@ async fn epoch_claims_fence_stalled_indexers_and_checkpoint_regression() {
         retired: vec![],
         checkpoints: vec![],
         pruned_through: 0,
+        root: false,
     };
     assert_eq!(wal.publish_fenced(0, 0, &manifest).await.unwrap(), 1);
     let stale = manifest.clone();
@@ -305,4 +307,150 @@ async fn prune_from_skips_already_pruned_sequences_and_prunes_many_concurrently(
     // The whole-range form is the same as starting at zero.
     wal.prune_payloads(100).await.unwrap();
     assert!(matches!(wal.read(100).await, Err(Error::Pruned)));
+}
+
+/// A manifest with many segments carrying text headers gets a compact reader copy at the fixed key:
+/// a reader that does not rank by text takes it, a full read (and a writer) never does, and
+/// `write_reader_copy` upgrades a namespace published without one.
+#[tokio::test]
+async fn compact_reader_copy_omits_text_headers_and_full_reads_ignore_it() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let wal = Wal::new(store.clone(), "compact").unwrap();
+    let file = |key: String, header: bool| SegmentFile {
+        key,
+        size: 10,
+        metadata_len: 1,
+        stats_index: None,
+        text_header: header.then(|| TextHeaderRef {
+            footer: "00".repeat(72),
+            // Distinct, hard-to-compress terms, so the headers dominate the encoded size.
+            chunks: (0..60)
+                .map(|i| {
+                    (
+                        format!("{:x}", uuid::Uuid::new_v4().as_u128()),
+                        i * 100,
+                        99,
+                        rand_crc(i),
+                    )
+                })
+                .collect(),
+        }),
+    };
+    let segments: Vec<Segment> = (0..400)
+        .map(|i| Segment {
+            id: format!("seg{i:04}"),
+            wal_start: 1,
+            wal_end: 2,
+            row_count: 10,
+            schema: Default::default(),
+            files: [
+                ("docs".to_string(), file(format!("s/{i}/docs"), false)),
+                ("fts:text".to_string(), file(format!("s/{i}/fts"), true)),
+            ]
+            .into(),
+            live: file(String::new(), false),
+            live_generation: 0,
+        })
+        .collect();
+    let mut manifest = Manifest {
+        format_version: 1,
+        schema: Default::default(),
+        distance_metric: Default::default(),
+        id_type: "uint".parse().unwrap(),
+        created_at: chrono::Utc::now(),
+        indexed_through: 2,
+        indexer_epoch: 0,
+        deleted: false,
+        segments,
+        stats: Default::default(),
+        text_stats: None,
+        ann_dirs: Default::default(),
+        ann_slabs: Default::default(),
+        updated_at: None,
+        retired: vec![],
+        checkpoints: vec![],
+        pruned_through: 0,
+        root: false,
+    };
+    wal.publish_manifest(1, &manifest).await.unwrap();
+    let copy = store.get("ns/compact/manifest-latest").await.unwrap();
+    let slot = store
+        .get("ns/compact/manifest/00000000000000000001.json")
+        .await
+        .unwrap();
+    assert!(
+        copy.len() < slot.len() / 2,
+        "{} vs {}",
+        copy.len(),
+        slot.len()
+    );
+
+    let (seq, reader) = wal
+        .manifest_view_after(0, ManifestView::Reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seq, 1);
+    assert!(reader.root);
+    assert_eq!(reader.segments.len(), 400);
+    assert!(
+        reader
+            .segments
+            .iter()
+            .all(|s| s.files.values().all(|f| f.text_header.is_none()))
+    );
+    // Everything else is the same.
+    assert_eq!(reader.segments[7].files["docs"].key, "s/7/docs");
+    assert_eq!(reader.segments[7].files["fts:text"].key, "s/7/fts");
+
+    for full in [
+        wal.latest_manifest().await.unwrap().unwrap(),
+        wal.manifest_after(0).await.unwrap().unwrap(),
+    ] {
+        assert!(!full.1.root);
+        assert!(
+            full.1
+                .segments
+                .iter()
+                .all(|s| s.files["fts:text"].text_header.is_some())
+        );
+    }
+    // A reader copy can never be published as a manifest.
+    manifest.root = true;
+    assert!(wal.publish_manifest(2, &manifest).await.is_err());
+    manifest.root = false;
+
+    // A namespace whose copy is a full manifest (published before compact copies) is upgraded in place.
+    store
+        .put("ns/compact/manifest-latest", {
+            let mut p = 1u64.to_be_bytes().to_vec();
+            p.extend_from_slice(&slot);
+            p
+        })
+        .await
+        .unwrap();
+    let (_, before) = wal
+        .manifest_view_after(0, ManifestView::Reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!before.root);
+    let (seq, bytes) = wal.write_reader_copy().await.unwrap().unwrap();
+    assert_eq!(seq, 1);
+    assert_eq!(bytes, copy.len());
+    let (_, after) = wal
+        .manifest_view_after(0, ManifestView::Reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after.root);
+}
+
+fn rand_crc(i: u64) -> u32 {
+    (i.wrapping_mul(2_654_435_761) & 0xffff_ffff) as u32
 }
