@@ -2,6 +2,16 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-19
+
+- **100M run (branch `wt/scale100m`): load, recluster, and cold and warm ANN, in-region and over the internet.**
+  - **Load:** 100M Cohere Wikipedia rows (English, then de, fr, es, ru) into S3 on one c7gd.2xlarge in 20,445 s, 4,891 docs/s on average (6,000 to 6,600 docs/s to 50M, 2,000 over the last 5M). Peak server RSS 6.8 GB.
+  - **Bug fixed:** the WAL payload GC re-read the whole log serially every pass, stalling indexing for minutes past 22M rows. Now `Manifest::pruned_through` plus 32-way concurrency (`Wal::prune_payloads_from`, tested).
+  - **Recluster:** 6,248 s, 160 slabs, 499,920 clusters, 98.7 MB directory, peak RSS 6.0 GB.
+  - **Cold ANN, 100M, in-region, 48 probes:** fresh 3,105 / 4,051 ms, cache-cold 2,698 / 3,071, warm 333 / 378 (10M: 662 / 991, 574 / 652, 70.7 / 84.1). Recall@10 0.941 (200 queries); 64 probes 0.9555 and 2,899 / 3,806 fresh. A cold query reads 294 MB (10M: 50.7): the two directory hints are 186 MB of it.
+  - **Over the internet (not like-for-like):** fresh 6,399 / 8,929 ms, warm 448 / 513. The 100M data stays under `big/` in the bucket until Kyle has seen the results.
+  - **Checked:** truth spot-checked against brute force on nine shards; `cargo test -p bf-wal -p bf-engine`, clippy.
+
 ## 2026-11-17
 
 - **Perf iteration 11 (10M): block fragments, fewer requests per cold ANN query.**
