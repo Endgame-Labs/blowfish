@@ -1126,7 +1126,7 @@ fn env_number<T: std::str::FromStr + Copy>(name: &str, default: T) -> T {
 /// A paged query reads cells until they hold this many times the clusters it will probe.
 fn page_margin() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_number("BF_ANN_PAGE_MARGIN", 4.0f64).max(1.0))
+    *V.get_or_init(|| env_number("BF_ANN_PAGE_MARGIN", 12.0f64).max(1.0))
 }
 
 /// How much a cell's spread pulls its rank toward the query (see `PagedDirectory::select_cells`).
@@ -1213,11 +1213,13 @@ pub(crate) async fn slab_directory(
     prefetched: Option<&Prefetched>,
     vector: &[f32],
     config: &EngineConfig,
-) -> Result<Arc<Directory>, ApiError> {
+) -> Result<(Arc<Directory>, bool), ApiError> {
     let Some(file) = set.pages.as_ref().filter(|_| paged_enabled()) else {
-        return load(store, &set.dir, prefetched).await;
+        let cached = read_cache::get::<Directory>(&set.dir.key, set.dir.metadata_len).is_some();
+        return Ok((load(store, &set.dir, prefetched).await?, cached));
     };
     let t0 = std::time::Instant::now();
+    let mut warm = read_cache::get::<PagedDirectory>(&file.key, file.metadata_len).is_some();
     let paged = load_paged(store, file, prefetched).await?;
     crate::ann::stage(t0, "directory header");
     let (rows, clusters) = paged.totals();
@@ -1244,6 +1246,7 @@ pub(crate) async fn slab_directory(
         .collect();
     // Pages of neighboring cells sit next to each other: read them as few merged ranges.
     let missing: Vec<usize> = (0..cells.len()).filter(|i| pages[*i].is_none()).collect();
+    warm &= missing.is_empty();
     let bytes = bf_vector::read_merged(
         &reader,
         missing
@@ -1290,5 +1293,5 @@ pub(crate) async fn slab_directory(
             view.entries().len()
         );
     }
-    Ok(Arc::new(view))
+    Ok((Arc::new(view), warm))
 }

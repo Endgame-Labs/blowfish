@@ -521,7 +521,7 @@ async fn from_slabs(
     if !slabs_cover(&state.segments, set) {
         return Ok(None);
     }
-    let Ok(dir) = crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
+    let Ok((dir, _)) = crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
     else {
         return Ok(None);
     };

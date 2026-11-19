@@ -176,7 +176,7 @@ impl OpenHint {
                     let name = crate::ann_dir::Layout::Slabs.dir_key(attribute);
                     tasks.push(
                         async move {
-                            let dir = crate::ann_dir::slab_directory(
+                            let (dir, warm) = crate::ann_dir::slab_directory(
                                 store,
                                 set,
                                 prefetched.get(&name),
@@ -184,6 +184,11 @@ impl OpenHint {
                                 config,
                             )
                             .await?;
+                            // Everything this query touches is already in memory: the scan's
+                            // reads would only copy cached bytes, and the query itself reads them.
+                            if warm {
+                                return Ok(());
+                            }
                             crate::ann_dir::prefetch_scan(
                                 store,
                                 &set.slabs,
