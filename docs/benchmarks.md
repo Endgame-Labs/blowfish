@@ -2325,3 +2325,106 @@ Measured per-cycle costs that grow with the namespace (after, xlarge): directori
 - Compaction is deferred, not cheaper: merging two IVF segments still re-trains k-means (37 to 45% of build CPU). A merge that keeps the source clusters, or reuses their centroids, would make the merges after a load cheap.
 - Builds are CPU-bound (k-means, zstd on text blocks) and the loader's truth computation takes cores from the server on a small machine; a lean loader (no truth) would raise the numbers here.
 - The unindexed tail still holds base64 f32 documents (7 KB per row), which sets the flush size on a small machine; holding it packed would double the flush.
+
+## 100M: Wikipedia embeddings, in-region and over the internet
+
+A 100M-row load of the Cohere Wikipedia (2023-11, multilingual v3, 1,024-dim, f16) embeddings, then `recluster`, then cold and warm ANN queries.
+Rows: the first 41M or so are English, exactly as in the 10M runs (`oracle-10m.npz` stays valid as a subset check), then German, French, Spanish, and
+Russian, in that order, until 100M (the loader's `LANGUAGES` list; ids are language index times 10^9 plus shard times 100,000 plus the row, so
+English ids are unchanged). The 200 held-out queries are English. Truth is exact top-10 cosine, kept by the loader while it streams
+(`bench/scale/data/oracle-100m.npz`), and spot-checked against brute force on nine sampled shards across all five languages (834,543 rows, 200 queries;
+no row outside the truth scores above a query's tenth-best truth score).
+
+Machine: one on-demand c7gd.2xlarge (8 vCPU, 16 GB, 441 GB local NVMe) in the same region as the bucket. Server in a 10 GiB cgroup, loader in a 4 GiB
+cgroup on the same box (`bench/scale/big/start_load.sh`).
+
+### Load
+
+| Rows | Docs/s over the last 5M | Seconds |
+|---|---:|---:|
+| 5M | 4,042 | 1,254 |
+| 10M | 6,418 | 2,034 |
+| 20M | 6,297 | 3,582 |
+| 30M | 6,555 | 6,182 |
+| 50M | 6,378 | 9,359 |
+| 70M | 5,777 | 12,881 |
+| 90M | 5,265 | 16,609 |
+| 95M | 3,760 | 17,939 |
+| 100M | 1,995 | 20,445 |
+
+100M rows in 20,445 s (5.7 h), 4,891 docs/s on average, with 525 backpressure retries. Peak server RSS 6.8 GB (7.1 GB VmHWM); minimum MemAvailable on the
+box 8.5 GB. The 10M mark came at 2,034 s, so the projection from it was 5.7 h flat (the stop line was 30 h). The rate holds at 6,000 to 6,600 docs/s to 50M and
+then declines (5,300 at 90M; 2,000 over the last 5M; I did not profile that decline). Between 21M and 25M rows the load lost about 17 minutes to a
+bug found and fixed here (below).
+
+**Bug found and fixed: the WAL payload GC re-read the whole log serially.** One hour into the load (the retention window), `collect_garbage` calls
+`prune_payloads(through)`, which loaded the record of every WAL sequence from 1 to `through` one GET at a time, every pass (every 60 s), inside the loop that
+also runs indexing. At 22M to 25M rows (about 12,000 writes) a pass took 30 to 230 s with the server idle, and the loader stalled on backpressure: the rate fell from
+6,300 to 1,600 docs/s. The fix: `Manifest::pruned_through` remembers how far the log is reclaimed, a pass reads only `(pruned_through, through]`, and the
+reads and deletes run 32 at a time (`Wal::prune_payloads_from`, with a test). After a server restart on the new binary the rate returned to 6,800 docs/s.
+The change is additive (older manifests read `pruned_through` as 0 and prune once from the top).
+
+### Recluster
+
+| Step | Time | Peak RSS |
+|---|---:|---:|
+| Copy 100M rows to the local spill (about 200 GB on NVMe) | 684 s | |
+| Assign rows to 32 coarse cells (largest 7,283,025) | 1,010 s (cumulative) | |
+| 160 slab builds (about 30 s each) | 6,248 s total | 6.0 GB (VmHWM 6.4 GB) |
+
+160 slabs, 499,920 clusters (200 rows per cluster), directory 98.7 MB (10M: 47 slabs, 49,976 clusters, 10.0 MB). The 10M recluster took 2,967 s on 4 vCPU.
+After recluster the `big/` prefix holds 945 GB in 74,124 objects (slabs 238 GB, segments 683 GB including retired ones, WAL payloads 19 GB).
+
+### Query: c7gd.2xlarge in the same region as the bucket, 100M
+
+`ab.py`, 50 queries each; recall@10 for the cold rows is over those 50; warm is 1,000 queries at concurrency 1 over the 200 oracle queries. 8 GiB block cache,
+default decoded cache, 6 rayon threads (the same setup as the 10M in-region table).
+
+| Arm | p50 / p90 ms | p99 ms | Requests, MB, waves | Recall@10 |
+|---|---|---:|---|---:|
+| 48 probes, fresh process | 3,105 / 4,051 | 6,002 | 1,186, 294.0, 4.1 | 0.950 |
+| 48 probes, cache-cold | 2,698 / 3,071 | 3,691 | 1,186, 294.0, 4.2 | 0.950 |
+| 48 probes, warm | 333 / 378 | 410 | | 0.941 (200 queries) |
+| 64 probes, fresh process | 2,899 / 3,806 | 7,210 | 1,510, 326.8, 4.1 | 0.958 |
+| 64 probes, cache-cold | 2,687 / 2,936 | 4,632 | 1,510, 326.8, 4.2 | 0.958 |
+| 64 probes, warm | 387 / 434 | 480 | | 0.9555 (200 queries) |
+
+### Query: over the internet (this VM, outside AWS), 100M, 48 probes
+
+A read-only server on a 32 GB x86 VM against the same prefix. Network floor to the bucket from here: TCP connect 33.9 / 38.4 ms (p50 / p90), TLS
+handshake 55.8 / 60.6, 4 KB GET 56.7 / 71.3, 1 MB GET 65.9 / 76.1 (in-region: 1.6, 26.9, 24.5, 30.2).
+
+| Arm | p50 / p90 ms | p99 ms | Requests, MB, waves | Recall@10 |
+|---|---|---:|---|---:|
+| fresh process | 6,399 / 8,929 | 26,901 | 1,186, 294.0, 3.5 | 0.950 |
+| cache-cold | 8,231 / 21,575 | 37,372 | 1,186, 294.0, 3.5 | 0.950 |
+| warm, 1,000 queries | 448 / 513 | 565 | | 0.941 |
+
+The cold numbers are bandwidth-bound (294 MB a query through this VM's link, with a long tail) and noisy; read them as an order of magnitude. The 64-probe
+arm was not run over the internet (each cold query moves about 300 MB through the bucket's egress).
+
+### 10M to 100M (in-region, c7gd.2xlarge, 48 probes)
+
+| | 10M | 100M | Ratio |
+|---|---:|---:|---:|
+| Cold, fresh p50 / p90 ms | 662 / 991 | 3,105 / 4,051 | 4.7x / 4.1x |
+| Cold, cache-cold p50 / p90 ms | 574 / 652 | 2,698 / 3,071 | 4.7x / 4.7x |
+| Warm p50 / p90 ms | 70.7 / 84.1 | 333 / 378 | 4.7x / 4.5x |
+| Requests, MB per cold query | 404, 50.7 | 1,186, 294.0 | 2.9x, 5.8x |
+| Waves | 3.5 | 4.1 | |
+| Recall@10 (48 probes) | 0.953 | 0.941 (0.950 on the cold 50) | |
+| Recall@10 (64 probes) | 0.9615 | 0.9555 | |
+| Slabs, clusters, directory | 47, 49,976, 10.0 MB | 160, 499,920, 98.7 MB | 3.4x, 10x, 9.9x |
+
+Per-stage timeline of one cache-cold query, 48 probes (2,694 ms):
+- wave 0, the two ANN directory hints: 2 requests, 185.7 MB, 1,093 ms (10M: 15.3 MB, 100 ms);
+- wave 1, the WAL tail: 2 requests, 94 ms;
+- wave 2, scan fragments: 1,191 requests, 115.1 MB, 753 ms (10M: 361 requests, 36.8 MB, 181 ms);
+- wave 3, rerank vectors and documents: 51 requests, 1.8 MB, 318 ms.
+
+What this says: cold and warm both grow 4 to 5x for 10x the data, much better than linear but far above the 10M numbers.
+- The directory hint is the main cold term. It grows with the cluster count (10x), and a cold query reads both layouts' hints (186 MB, 63% of the bytes and 40% of the time).
+  A directory that is read in pieces (a coarse level first), or only the layout in use, is the clear next step.
+- The scan wave reads 3x the bytes and makes 3.3x the requests: 48 probes over 160 slabs touch more slabs and larger clusters (the recluster cells are no finer than at 10M).
+- Warm queries cost 4.7x because a probe scans larger slabs, and recall is a little lower than at 10M for the same probe count (0.941 against 0.953 at 48), so 64 probes
+  (0.9555) is the like-for-like setting. Turbopuffer publishes no 100M number to compare with.

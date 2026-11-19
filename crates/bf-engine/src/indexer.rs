@@ -504,6 +504,7 @@ impl Engine {
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
+            pruned_through: 0,
         });
         if !force
             && let Some(lease) = wal
@@ -1038,7 +1039,9 @@ impl Engine {
                 .map_err(storage_error)?;
         }
         if through > 0 {
-            wal.prune_payloads(through).await.map_err(log_error)?;
+            wal.prune_payloads_from(manifest.pruned_through.min(through), through)
+                .await
+                .map_err(log_error)?;
         }
         let Some((latest, mut manifest)) = wal.latest_manifest().await.map_err(log_error)? else {
             return Ok(candidates.len());
@@ -1050,6 +1053,7 @@ impl Engine {
             .retired
             .retain(|file| !candidates.contains(&file.key));
         manifest.checkpoints.retain(|(seq, _)| *seq > through);
+        manifest.pruned_through = manifest.pruned_through.max(through);
         match wal
             .publish_fenced(claim, manifest.indexer_epoch, &manifest)
             .await

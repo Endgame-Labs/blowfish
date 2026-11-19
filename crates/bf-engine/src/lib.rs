@@ -1353,6 +1353,7 @@ mod tail_tests {
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
+            pruned_through: 0,
         }
     }
 
