@@ -2432,12 +2432,12 @@ What this says: cold and warm both grow 4 to 5x for 10x the data, much better th
 ## turbopuffer at 100M, measured by me
 
 turbopuffer publishes no 100M number, so I loaded the same 100M rows into it and measured it myself. These are my
-measurements from one VM outside Google Cloud, over the internet, with turbopuffer's reported `server_total_ms` as the
+measurements from one VM, over the internet, with turbopuffer's reported `server_total_ms` as the
 in-region equivalent. They are not turbopuffer's published figures.
 
 ### Load
 
-Namespace `blowfish-oracle-wiki100m` (gcp-us-central1), loaded with `scale_load.py --vector-type f16` in the same order as
+Namespace `blowfish-oracle-wiki100m`, loaded with `scale_load.py --vector-type f16` in the same order as
 the blowfish 100M load (English, then de, fr, es, ru), so ids match `oracle-100m.npz`. 8 writes in flight, batches of 2,000.
 
 | | |
