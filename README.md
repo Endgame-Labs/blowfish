@@ -77,9 +77,9 @@ Measured from an 8-vCPU VM in Los Angeles reaching Cloudflare R2 over the public
 - **Cold vector cost:** a cold 48-probe query makes about 400 requests and reads about 51 MB (down from about 880 requests, 117 MB, and 2,916 / 4,358 ms on the per-segment layout at 160 probes).
 - **Upsert variance:** each batch is 68 rows (about 506 KB) over 300 sequential writes; a second identical R2 session measured **2,114 / 2,563 ms**, so treat R2 upsert p50 as roughly **792 to 2,114 ms**.
 
-### Our own measurements of hosted services (10M)
+### My own measurements of hosted services (10M)
 
-We also measured turbopuffer and Amazon S3 Vectors on the same 10M 1,024-dim `f16` Wikipedia dataset. Because caches cannot be forced cold externally on either hosted service, their idle-gap latency is not directly comparable to blowfish's cold numbers:
+I also measured turbopuffer and Amazon S3 Vectors on the same 10M 1,024-dim `f16` Wikipedia dataset. Because caches cannot be forced cold externally on either hosted service, their idle-gap latency is not directly comparable to blowfish's cold numbers:
 
 - **turbopuffer (server-reported):** queries labelled `"cold"` after 5 minutes idle measured about **670 / 1,120 ms** (`p50 / p90`); a single deep-cold sample after 2 days idle measured **2,051 ms**.
 - **Amazon S3 Vectors:** recall@10 **0.894**, warm **60 / 278 ms**, and **178 / 276 ms** after 30 minutes idle.
@@ -93,7 +93,7 @@ Use blowfish to:
 - develop, test, and run CI against the turbopuffer API without a turbopuffer account or network access;
 - self-host modest workloads, or keep search indexes inside your own cloud or on-premises bucket.
 
-For production at scale, we recommend [turbopuffer](https://turbopuffer.com) itself. Because the APIs match, moving from blowfish to turbopuffer is a base-URL and API-key change.
+For production at scale, I recommend [turbopuffer](https://turbopuffer.com) itself. Because the APIs match, moving from blowfish to turbopuffer is a base-URL and API-key change.
 
 blowfish is an independent open-source project and is not affiliated with or endorsed by turbopuffer.
 

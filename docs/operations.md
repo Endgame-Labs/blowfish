@@ -2,7 +2,7 @@
 
 Object storage is the source of truth. Local process state is disposable; protect the bucket and its
 credentials. Use blowfish for development, testing, and modest deployments. For production at scale,
-we recommend turbopuffer as the upgrade path, using the same SDKs with a different base URL and key.
+I recommend turbopuffer as the upgrade path, using the same SDKs with a different base URL and key.
 
 ## Running under systemd with Caddy
 

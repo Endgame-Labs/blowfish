@@ -41,7 +41,7 @@ with a memory+NVMe cache**. Concretely:
    trips), and it vectorizes well. Ship immutable per-segment IVF first. Add SPFresh-style incremental
    split/merge/reassign (LIRE) later, when segment merges get expensive.
 7. **Full-text:** tantivy's **tokenizer pipeline** and its standalone **`Bm25Weight`** scorer, with
-   **our own posting format**: fixed-size blocks of 128 to 512 postings, `bitpacking` 128-int frames,
+   **blowfish's own posting format**: fixed-size blocks of 128 to 512 postings, `bitpacking` 128-int frames,
    block-max scores, and vectorized block-max MAXSCORE. This is exactly what turbopuffer's FTS v2 did.
    Don't use tantivy's index/segment format. It assumes a directory with random access and mmap.
 8. **Filters:** per-segment columnar attribute storage plus `roaring` bitmaps per (attribute value),
@@ -61,7 +61,7 @@ with a memory+NVMe cache**. Concretely:
 | Manifest CAS + fencing | `slatedb-txn-obj` 0.18 | Generic, published, and production-used inside SlateDB. Pre-1.0. |
 | Text analysis | `tantivy` 0.27 tokenizers (or `tantivy-tokenizer-api` plus `rust-stemmers`) | Use `tantivy::query::Bm25Weight::for_one_term` standalone. |
 | Posting compression | `bitpacking` 0.9 | turbopuffer uses it: ~741M postings/s/core decode. |
-| ANN | Own IVF + RaBitQ. Reference code: `rabitq-rs`, `lance-index` (IVF_RQ), `diskann` (MSFT, Rust) | No off-the-shelf Rust crate does object-storage IVF the way we need. |
+| ANN | Own IVF + RaBitQ. Reference code: `rabitq-rs`, `lance-index` (IVF_RQ), `diskann` (MSFT, Rust) | No off-the-shelf Rust crate does object-storage IVF the way blowfish needs. |
 | Bitmaps | `roaring` 0.12 (pure Rust) | Use `croaring` only if profiling demands it. |
 | Columnar | `arrow` / `parquet` 60.x (or Arrow IPC for segments) | Parquet for the attribute columns, a custom format for vector clusters and postings. |
 | Cache | `foyer` 0.22 | Hybrid memory+disk; used by SlateDB and RisingWave. |
@@ -73,10 +73,10 @@ with a memory+NVMe cache**. Concretely:
 1. **Conditional-write portability.** AWS S3, R2, GCS (via generation preconditions), and
    SeaweedFS support it. **MinIO community edition went into maintenance mode in Dec 2025 and was
    later archived** (it still supports `If-Match`/`If-None-Match`, but its future is uncertain).
-   **Garage reportedly lacks it.** So we need a startup self-test plus a documented fallback (see §2).
+   **Garage reportedly lacks it.** So blowfish needs a startup self-test plus a documented fallback (see §2).
 2. **Ambiguous conditional-put retries.** A PUT that succeeded but timed out, then got retried, returns
    412, so a naive client thinks it lost the race. SlateDB solves this by tagging each conditional put
-   with a ULID in object metadata and checking it after a 412/409. We must do the same (see §2.6).
+   with a ULID in object metadata and checking it after a 412/409. blowfish must do the same (see §2.6).
 3. **ANN quality under updates and filters.** Recall can drift with deletes, splits, and selective
    filters. Copy turbopuffer's **continuous recall measurement** (sample ~1% of queries and compare
    against exhaustive search) from day one.
@@ -87,7 +87,7 @@ with a memory+NVMe cache**. Concretely:
    and regex/glob with trigram indexes. Prioritize ruthlessly. Pin a compatibility test suite against
    the real API (there's a `turbopuffer` integration on this VM).
 6. **Pre-1.0 dependencies** (`slatedb-txn-obj`, `foyer`, `object_store` all break APIs between
-   minors). Pin exact versions and wrap them behind our own traits.
+   minors). Pin exact versions and wrap them behind blowfish's own traits.
 
 ### An alternative to keep in mind: build on Lance
 
@@ -403,7 +403,7 @@ inside the object body and verify on conflict.
 - **Use SlateDB itself as blowfish's KV?** turbopuffer runs its attribute and posting indexes on an LSM
   KV over object storage, so SlateDB could serve that role (one DB per namespace, keys
   `(attr, value, cluster)` mapped to bitmaps). It's tempting, but it adds a second WAL and manifest
-  under our own and ties us to a pre-1.0 format. I'd start with our own immutable segments and revisit.
+  under blowfish's own and ties it to a pre-1.0 format. I'd start with blowfish's own immutable segments and revisit.
   **(inference)**
 
 ### 3.2 Lance / LanceDB
@@ -427,7 +427,7 @@ inside the object body and verify on conflict.
   JSON file on S3 for small setups) ([Quickwit 101](https://quickwit.io/blog/quickwit-101),
   [architecture](https://quickwit.io/docs/overview/architecture)).
 - Borrow: **put everything a cold query needs for its first round trip into a small "hot" section**
-  (our segment footer, centroids, block-max metadata, and term-dictionary index). Then use coalesced
+  (the segment footer, centroids, block-max metadata, and term-dictionary index). Then use coalesced
   byte-range reads. Quickwit is append-only log search with no upserts, which is why it works
   differently from blowfish.
 
@@ -441,7 +441,7 @@ inside the object body and verify on conflict.
   then linked into a **manifest updated with `If-Match`** (a lock-free-queue construction). "A write
   must not be acknowledged until it is readable from the log." **Setsum** (an associative, commutative
   multiset checksum) checks that live plus garbage-collected data equals all data written, and it
-  caught a GC bug. Borrow setsum-style invariants for our GC, the riskiest component.
+  caught a GC bug. Borrow setsum-style invariants for blowfish's GC, the riskiest component.
 
 ### 3.5 WarpStream ([blog](https://www.warpstream.com/blog/minimizing-s3-api-costs-with-distributed-mmap))
 
@@ -491,7 +491,7 @@ inside the object body and verify on conflict.
 | `opendal` | 0.59.5 | 7M | Alternative with more backends. `object_store` is the de-facto choice for DB engines (SlateDB, Lance, DataFusion). |
 | `slatedb-txn-obj` | 0.18.1 | 0.9M | Manifest CAS and epoch fencing primitives. |
 | `slatedb` | 0.18.1 | 1.7M | Embedded LSM on object storage. |
-| `tantivy` | 0.27.0 | 5.5M | Mature BM25 engine. **Reusable pieces:** `tokenizer` (TextAnalyzer, SimpleTokenizer, LowerCaser, RemoveLongFilter, Stemmer, AsciiFoldingFilter, NgramTokenizer), `tantivy-tokenizer-api` (0.7), and **`query::Bm25Weight::for_one_term(doc_freq, total_docs, avg_fieldnorm)`** with `.score(fieldnorm_id, tf)` and `.max_score()`, which works standalone. tantivy's index format assumes a `Directory` with random reads and mmap. Quickwit makes it work on S3 with hotcache plus caching, but it's an immutable-segment append design that is awkward for upserts, deletes, and cluster-aligned addressing. **Recommend: tokenizers and the scorer only, our own postings.** |
+| `tantivy` | 0.27.0 | 5.5M | Mature BM25 engine. **Reusable pieces:** `tokenizer` (TextAnalyzer, SimpleTokenizer, LowerCaser, RemoveLongFilter, Stemmer, AsciiFoldingFilter, NgramTokenizer), `tantivy-tokenizer-api` (0.7), and **`query::Bm25Weight::for_one_term(doc_freq, total_docs, avg_fieldnorm)`** with `.score(fieldnorm_id, tf)` and `.max_score()`, which works standalone. tantivy's index format assumes a `Directory` with random reads and mmap. Quickwit makes it work on S3 with hotcache plus caching, but it's an immutable-segment append design that is awkward for upserts, deletes, and cluster-aligned addressing. **Recommend: tokenizers and the scorer only, custom postings.** |
 | `bitpacking` | 0.9.3 | 7.2M | SIMD bitpacking (simdcomp port). turbopuffer uses it for postings. |
 | `rust-stemmers` / `lindera` / `charabia` | 1.2 / 6.2 / 0.10 | — | Snowball stemmers, CJK morphology, and Meilisearch's multilingual segmenter. |
 | `roaring` | 0.12.0 | 18.6M | Pure-Rust roaring bitmaps, with serialization compatible with the portable format. `croaring` 2.9 (C bindings) is faster for some operations. |
@@ -507,7 +507,7 @@ inside the object body and verify on conflict.
 | `faiss` | 0.13 | — | FFI to C++ FAISS. Heavy build. Useful only offline, for benchmarking recall. |
 | `numkong` | 7.8.7 | 0.3M | Successor to SimSIMD (`simsimd` 6.5 last released Mar 2026): 2000+ SIMD kernels (x86, Arm, RISC-V), f16/bf16/i8 dot, cosine, L2, and Hamming. |
 | `half` | 2.7.1 | — | f16/bf16 types. |
-| `pulp` | 0.22 | — | Safe runtime-dispatched SIMD, if we write our own kernels. |
+| `pulp` | 0.22 | — | Safe runtime-dispatched SIMD, if I write custom kernels. |
 | `memmap2`, `rkyv` | 0.9 / 0.8 | — | mmap of NVMe cache files, and zero-copy segment metadata. |
 
 ### ANN choice: IVF/SPFresh versus graph indexes on object storage
