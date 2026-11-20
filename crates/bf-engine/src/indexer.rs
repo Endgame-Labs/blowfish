@@ -1269,7 +1269,11 @@ mod tests {
 
     #[test]
     fn compaction_merges_pairs_that_cannot_grow_to_a_full_group() {
-        let config = EngineConfig::default();
+        // The default cap is sized from host memory; pin it so the test doesn't depend on the machine.
+        let config = EngineConfig {
+            max_segment_rows: 200_000,
+            ..EngineConfig::default()
+        };
         // Four segments of 100K rows would pass the 200K row cap as a group of four, so the
         // first two merge instead of staying as four half-full segments forever.
         let state = state_with(&[100_000, 100_000, 100_000, 100_000]);

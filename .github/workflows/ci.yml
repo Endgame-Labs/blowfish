@@ -26,6 +26,34 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
       - run: cargo clippy -p bf-models -p blowfish --features bf-models/local-models,blowfish/local-models --all-targets -- -D warnings
       - run: cargo test -p bf-models --features local-models
+  docker:
+    # Build the image on x86_64 and arm64 (the arm64 runner stands in for Docker on Apple Silicon).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t blowfish:ci .
+      - name: Smoke test
+        run: |
+          docker run -d --name bf -p 8000:8000 blowfish:ci
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:8000/; then exit 0; fi
+            sleep 1
+          done
+          docker logs bf
+          exit 1
+  macos:
+    # Native build and tests on Apple Silicon.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p blowfish
+      - run: cargo test
   compat:
     runs-on: ubuntu-latest
     strategy:
