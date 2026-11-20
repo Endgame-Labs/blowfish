@@ -23,21 +23,28 @@ mod imp {
         b"background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 
     /// Set the dirty and muzzy decay of every arena (and of arenas made later), in milliseconds.
+    ///
+    /// Arenas are set one by one: macOS's jemalloc rejects the `MALLCTL_ARENAS_ALL` (4096) shortcut with `EFAULT`.
     pub fn set_decay_ms(ms: isize) {
-        // SAFETY: these mallctl names take a `ssize_t`, which is `isize`.
+        let report = |name: &[u8], e: tikv_jemalloc_ctl::Error| {
+            eprintln!(
+                "bf-alloc: setting {} failed: {e}",
+                String::from_utf8_lossy(name)
+            );
+        };
+        // SAFETY: these mallctl names take a `ssize_t` (`isize`), and `arenas.narenas` an `unsigned` (`u32`).
         unsafe {
-            // 4096 is MALLCTL_ARENAS_ALL: every existing arena.
-            for name in [
-                &b"arena.4096.dirty_decay_ms\0"[..],
-                b"arena.4096.muzzy_decay_ms\0",
-                b"arenas.dirty_decay_ms\0",
-                b"arenas.muzzy_decay_ms\0",
-            ] {
+            for name in [&b"arenas.dirty_decay_ms\0"[..], b"arenas.muzzy_decay_ms\0"] {
                 if let Err(e) = tikv_jemalloc_ctl::raw::write(name, ms) {
-                    eprintln!(
-                        "bf-alloc: setting {} failed: {e}",
-                        String::from_utf8_lossy(name)
-                    );
+                    report(name, e);
+                }
+            }
+            let narenas = tikv_jemalloc_ctl::raw::read::<u32>(b"arenas.narenas\0").unwrap_or(0);
+            for i in 0..narenas {
+                for kind in ["dirty", "muzzy"] {
+                    let name = format!("arena.{i}.{kind}_decay_ms\0");
+                    // Arenas that haven't been initialized yet answer `EFAULT`; they pick up `arenas.*` when created.
+                    let _ = tikv_jemalloc_ctl::raw::write(name.as_bytes(), ms);
                 }
             }
         }
