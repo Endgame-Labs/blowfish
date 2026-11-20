@@ -1,6 +1,6 @@
 # Benchmarks
 
-This page summarizes blowfish's measured query and ingest performance against turbopuffer's published numbers, along with 100M in-region results, our own measurements of turbopuffer and Amazon S3 Vectors, the network round-trip profile, 1M multi-workload breakdown, recall and result-set parity, known engineering gaps, and reproduction commands.
+This page summarizes blowfish's measured query and ingest performance against turbopuffer's published numbers, along with 100M in-region results, my own measurements of turbopuffer and Amazon S3 Vectors, the network round-trip profile, 1M multi-workload breakdown, recall and result-set parity, known engineering gaps, and reproduction commands.
 
 For the complete chronological engineering log across iterations 0 through 18, the 100M runs, the apples-to-apples R2 runs, and the AWS in-region runs, see [`../benchmarks.md`](../benchmarks.md).
 
@@ -32,9 +32,9 @@ Measured on `c7gd.2xlarge` (8 vCPU, 16 GB) in `us-west-2` reading a same-region 
 - **Cold I/O, load, and recluster:** each cold 64-probe query reads about `160 MB` (down from `326.8 MB` before the paged slab directory). Loading 100M rows took **5.7 h** (`20,445 s`, **4,891 docs/s** average); `recluster` took **1.7 h** (`6,248 s`, 160 slabs, 499,920 clusters).
 - **Over the internet (pre-paged-directory code, not remeasured):** measured before the paged slab directory and parallel slab scans from an 8-vCPU VM outside AWS at 48 probes (`294 MB` per cold query), fresh process was `6,399 / 8,929 ms` and warm was `448 / 513 ms`.
 
-### Our own measurements of hosted services (10M)
+### My own measurements of hosted services (10M)
 
-We also loaded the same 10M 1,024-dim `f16` Wikipedia dataset into live turbopuffer and Amazon S3 Vectors indexes to measure recall and idle-gap latency (`bench/scale/tpuf_cold.py` and `bench/s3vectors/measure.py`). Because caches cannot be forced cold externally on either hosted service, their idle-gap latencies are not directly comparable to blowfish's fresh-process or cache-cold measurements:
+I also loaded the same 10M 1,024-dim `f16` Wikipedia dataset into live turbopuffer and Amazon S3 Vectors indexes to measure recall and idle-gap latency (`bench/scale/tpuf_cold.py` and `bench/s3vectors/measure.py`). Because caches cannot be forced cold externally on either hosted service, their idle-gap latencies are not directly comparable to blowfish's fresh-process or cache-cold measurements:
 
 | Service (10M, 1,024-dim `f16`) | Idle / "cold" p50 / p90 (ms) | Warm p50 / p90 (ms) | Recall@10 | Caveat |
 | --- | ---: | ---: | ---: | --- |

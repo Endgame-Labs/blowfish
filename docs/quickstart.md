@@ -1,6 +1,6 @@
 # Quickstart
 
-blowfish is for development, CI, and modest self-hosted workloads. For production at scale, we
+blowfish is for development, CI, and modest self-hosted workloads. For production at scale, I
 recommend turbopuffer itself. The official SDKs use the same API, so upgrading means changing the
 base URL and API key.
 

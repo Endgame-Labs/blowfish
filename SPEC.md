@@ -20,7 +20,7 @@ log entry in the same commit.
 - An open-source, self-hostable search engine that is compatible with the turbopuffer API. Official turbopuffer SDKs
   work against it unchanged by setting the base URL.
 - It exists so people can build and test against the turbopuffer API without a turbopuffer account. For production
-  at serious scale, we recommend turbopuffer itself; because the APIs match, the upgrade is a change of base URL and
+  at serious scale, I recommend turbopuffer itself; because the APIs match, the upgrade is a change of base URL and
   API key.
 - Object storage is the only source of truth. Lose every server and disk, keep the bucket, and nothing acknowledged
   is lost. Nodes are caches.
@@ -134,8 +134,8 @@ log entry in the same commit.
 
 **Decided.**
 
-- Benchmark against turbopuffer's **published** numbers (2026-11-16), and also against turbopuffer measured by us on the
-  same data and queries, labelled as ours (2026-11-19). turbopuffer can't be forced cold: record its reported
+- Benchmark against turbopuffer's **published** numbers (2026-11-16), and also against turbopuffer measured by me on the
+  same data and queries, labelled as mine (2026-11-19). turbopuffer can't be forced cold: record its reported
   `cache_temperature` and the idle time before each sample.
 - **Vector, 10M:** within 30% of turbopuffer's published cold p50 or p90, at recall at least theirs, on the smallest
   instance that holds the numbers (2026-11-17; the earlier rule was 40%).
@@ -193,7 +193,7 @@ S3 until the run is cleaned up.
 
 - Data: the first 10M English rows as today, then rows in other languages from the same embedding model, with exact
   top-10 truth computed on the instance.
-- turbopuffer publishes nothing at 100M, so we measure it ourselves: the same 100M rows loaded into turbopuffer
+- turbopuffer publishes nothing at 100M, so I measure it myself: the same 100M rows loaded into turbopuffer
   (Kyle approved on 2026-11-19; the 1M-row check showed turbopuffer bills f16 vectors at f32 size, about $900 in
   writes for 100M, and Kyle approved that too). turbopuffer can't be guaranteed cold, so its samples are labelled by
   its reported `cache_temperature` and idle time.
@@ -219,7 +219,7 @@ S3 until the run is cleaned up.
 12. 2026-11-17: Add an Amazon S3 Vectors head-to-head; run it at 10M first and report back before 100M.
 13. 2026-11-19: `SPEC.md` started; kept current with every decision.
 14. 2026-11-19: 100M run approved.
-15. 2026-11-19: Measure turbopuffer ourselves, cold and warm, including the same 100M rows. Keep the 100M blowfish
+15. 2026-11-19: Measure turbopuffer directly, cold and warm, including the same 100M rows. Keep the 100M blowfish
     namespace in the bucket after round 17.
 16. 2026-11-19: turbopuffer 100M load approved at about $900 (it bills f16 vectors as f32).
 17. 2026-11-19: Iteration 18 built (status Proposed): slab scan tasks on the runtime, adaptive allocator decay, compact manifest reader copy.

@@ -170,7 +170,7 @@ ns.query(
 **Schema.** `embed` is a model name or `{"model", "attribute"?, "dims"?, "dtype"?}`; `null` removes it.
 
 - The embedding goes into the vector attribute named by `attribute`. Without it, blowfish creates a vector
-  column named **`embed_<attribute>`** (`embed_text` for `text`; this is our reading of turbopuffer's
+  column named **`embed_<attribute>`** (`embed_text` for `text`; this is my reading of turbopuffer's
   docs) of type `[dims]f32` (`dtype: "f16"` for half precision). With no `distance_metric`, a new
   namespace uses cosine.
 - `embed` can be added or removed at any time, but not modified. Changing it does not re-embed existing rows.

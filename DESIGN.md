@@ -4,7 +4,7 @@ Status: approved by Kyle on 2026-11-14 (decisions in §11). Build progress is tr
 
 **Where blowfish fits:** blowfish is for development, testing, CI, and modest self-hosted deployments,
 so nobody needs a turbopuffer account just to build against the turbopuffer API. It aims to be
-correct, performant, and scalable within reason. For production at serious scale, **we strongly
+correct, performant, and scalable within reason. For production at serious scale, **I strongly
 recommend turbopuffer itself** as the upgrade path. Because the APIs match, the upgrade is a change of
 base URL and API key.
 
@@ -15,7 +15,7 @@ local NVMe as caches. Existing turbopuffer SDKs work against it by setting `TURB
 
 Supporting research (endpoint-by-endpoint API notes, SDK wire quirks, and architecture prior art) lives
 in [`docs/research/`](docs/research/). The upstream OpenAPI spec that the official SDKs are generated
-from is at https://github.com/turbopuffer/turbopuffer-openapi, and it is our primary contract.
+from is at https://github.com/turbopuffer/turbopuffer-openapi, and it is blowfish's primary contract.
 
 ---
 
@@ -40,17 +40,17 @@ from is at https://github.com/turbopuffer/turbopuffer-openapi, and it is our pri
 **Non-goals (for now)**
 
 - Features that exist only because turbopuffer is a hosted service: billing, pinning to reserved
-  capacity, customer-managed encryption keys, and cross-organization copy. We return zeros or
+  capacity, customer-managed encryption keys, and cross-organization copy. blowfish returns zeros or
   defaults where the response shape requires the fields, and a clear error where it doesn't.
 - Hosted model calls (native `Embed` and model `rerank_by`). They may come later as optional
   pluggable providers.
-- Bit-for-bit identical ANN results. ANN is approximate in both systems. We match recall, not row
+- Bit-for-bit identical ANN results. ANN is approximate in both systems. blowfish matches recall, not row
   order (see §7).
 
 ## 2. Compatibility target
 
 The full surface is large. v1 covers what nearly every real client uses. Everything later is listed so
-that we return a clear `400 {"status":"error","error":"... is not supported by blowfish yet"}` instead
+that blowfish returns a clear `400 {"status":"error","error":"... is not supported by blowfish yet"}` instead
 of silently misbehaving.
 
 ### 2.1 Endpoints
@@ -64,8 +64,8 @@ of silently misbehaving.
 | `GET /v1/…/metadata` and `GET /v2/…/metadata` | ✅ | The docs say v1, the SDKs call v2; serve both |
 | `GET`/`POST /v1/namespaces/{ns}/schema` | ✅ | The SDKs' `exists()` relies on a 404 here |
 | `GET /v1/namespaces/{ns}/hint_cache_warm` | ✅ | Prefetches the namespace into cache |
-| `POST /v1/namespaces/{ns}/_debug/recall` | ✅ | We run exact search on the same node, which is cheap for us |
-| `POST /v2/namespaces/{ns}/explain_query` | ✅ | Returns our own `plan_text` |
+| `POST /v1/namespaces/{ns}/_debug/recall` | ✅ | Runs exact search on the same node, which is cheap |
+| `POST /v2/namespaces/{ns}/explain_query` | ✅ | Returns blowfish's own `plan_text` |
 | `PATCH /v1/namespaces/{ns}/metadata` | later | `read_only` is easy; pinning is a no-op |
 | Async ops (`/async`, `/v1/…/operations/{token}`) | later | The SDKs only poll when they get a 202, so sync replies are compatible |
 | Legacy v1 write/query/export (`POST /v1/namespaces/{ns}`, `GET`/`HEAD /v1/namespaces/{ns}`) | later | A thin shim, only if users ask |
@@ -83,7 +83,7 @@ of silently misbehaving.
   types).
 - `copy_from_namespace` within the same blowfish deployment and bucket (a manifest copy plus
   reference-counted segment sharing, so it is nearly free).
-- Later: `branch_from_namespace` (which our immutable-segment design makes cheap, so it's an early
+- Later: `branch_from_namespace` (which blowfish's immutable-segment design makes cheap, so it's an early
   "later"), cross-deployment copy, `encryption`, and `disable_backpressure`.
 
 ### 2.3 Types (v1)
@@ -113,24 +113,24 @@ send base64 by default). Later: `[N]i8`, sparse `{}f16` with `SparseKNN`, and mu
 - Multi-query: up to 16 queries, with `rerank_by: ["RRF", …]`.
 - `consistency: {"level": "strong" | "eventual"}` and `max_staleness_seconds`.
 - The response always carries `performance` and `billing`. Billing values are zeros. Performance
-  values are real where we have them: `server_total_ms`, `exhaustive_search_count` (the unindexed tail
-  we scanned), `approx_namespace_size`, `cache_hit_ratio`, `cache_temperature`, and
+  values are real where blowfish has them: `server_total_ms`, `exhaustive_search_count` (the unindexed tail
+  scanned), `approx_namespace_size`, `cache_hit_ratio`, `cache_temperature`, and
   `last_included_write_at`.
 - Later: `Regex` and `Fuzzy` (both need trigram indexes), `compute_attributes` with `Highlight`, and
   model `rerank_by`.
 
-### 2.5 Protocol details we must get right
+### 2.5 Protocol details blowfish must get right
 
 These come from reading the SDKs and probing the real service (details in `docs/research/`):
 
-- **Errors:** always `Content-Type: application/json` and `{"status":"error","error":"…"}`. We keep
+- **Errors:** always `Content-Type: application/json` and `{"status":"error","error":"…"}`. blowfish keeps
   turbopuffer's status codes: 400 for bad input, 404 for a missing namespace, 422 for a malformed body,
-  and 429 for backpressure. The SDKs retry 408, 409, 429, and 5xx, so we never use those for permanent
-  errors, and we send `x-should-retry: false` when a 5xx is permanent.
+  and 429 for backpressure. The SDKs retry 408, 409, 429, and 5xx, so blowfish never uses those for permanent
+  errors, and sends `x-should-retry: false` when a 5xx is permanent.
 - **Routing:** ignore unknown query parameters (the SDKs add `?stainless_overload=…`), and tell
   single from multi-query (and copy from branch) by the body.
 - **Compression:** accept `Content-Encoding: gzip` requests, and honor `Accept-Encoding`.
-- **`prefer: respond-async`:** every SDK sends it. We ignore it and answer synchronously.
+- **`prefer: respond-async`:** every SDK sends it. blowfish ignores it and answers synchronously.
 - **Retries without idempotency keys:** a retried write may arrive twice. Upserts, deletes, and plain
   patches are idempotent. Conditional writes are not, which matches turbopuffer.
 - **Auth:** `Authorization: Bearer <key>`, with role-based API keys built in (§8.1). An admin
@@ -162,7 +162,7 @@ run several API nodes and let any of them index (the work is coordinated through
 
 **Write path.** A write is validated, then joins the namespace's group-commit batch on that node. The
 batch is serialized into one WAL object and written with a conditional create. When the PUT returns,
-the write is durable, and we respond.
+the write is durable, and blowfish responds.
 
 **Read path.** A strong query makes sure the node knows the latest WAL entry (one cheap request), then
 searches the indexed segments (through the cache) plus a brute-force scan of the unindexed WAL tail.
@@ -200,15 +200,15 @@ Design rules:
 - **Every file has a footer** (offsets, checksums, format version) sized so that one ranged GET of the
   last 64 KiB usually fetches the footer and the top-level index structure together. That keeps cold
   queries to about three round trips.
-- **The file formats are our own**, built from simple parts (Arrow-style columns, roaring bitmaps,
+- **The file formats are blowfish's own**, built from simple parts (Arrow-style columns, roaring bitmaps,
   bit-packed postings, and RaBitQ codes), versioned from day one.
 
 ## 5. Consistency and concurrency
 
 The bucket's conditional create (`If-None-Match: *`) is the only coordination primitive, and the only
-one we rely on. Every S3-compatible store we target supports it on single PUTs, and we verified it on
+one blowfish relies on. Every S3-compatible store blowfish targets supports it on single PUTs, and I verified it on
 R2 (both `If-None-Match: *` and `If-Match` return 412 on conflict). Conditional multipart uploads and
-conditional deletes are not portable, so we don't use them.
+conditional deletes are not portable, so blowfish doesn't use them.
 
 ### 5.1 The WAL
 
@@ -221,11 +221,11 @@ conditional deletes are not portable, so we don't use them.
   writes serializable across nodes.
 - **Group commit:** each node batches concurrent writes per namespace and flushes one WAL entry at a
   time. The flush interval adapts: zero delay when idle, with batching kicking in under load
-  (turbopuffer commits at most one entry per second per namespace; we can do better on stores with
+  (turbopuffer commits at most one entry per second per namespace; blowfish can do better on stores with
   faster PUTs).
-- **Ambiguous retries:** if a PUT times out and its retry gets a 412, we might have won the slot on
+- **Ambiguous retries:** if a PUT times out and its retry gets a 412, the writer might have won the slot on
   the first attempt. Each WAL entry carries a random write ID in its object metadata, and after a 412
-  we `HEAD` the slot and compare (the technique SlateDB uses).
+  the writer `HEAD`s the slot and compares (the technique SlateDB uses).
 - **Backpressure:** when the unindexed tail exceeds a limit (turbopuffer's is 2 GB), writes get 429.
 
 ### 5.2 The manifest
@@ -233,7 +233,7 @@ conditional deletes are not portable, so we don't use them.
 The manifest is the namespace's index of record: schema, distance metric, ID type, segment list with
 their deletion-bitmap generations, `indexed_through` (the last WAL entry folded into segments), stats,
 and GC state. It also uses sequenced, create-only keys, and it carries an **indexer epoch** so that a
-stalled indexer that wakes up can't publish over a newer one (SlateDB-style fencing). We'll either use
+stalled indexer that wakes up can't publish over a newer one (SlateDB-style fencing). I'll either use
 or vendor `slatedb-txn-obj`, which implements exactly this protocol.
 
 The schema is part of the namespace's state, so a schema change is a WAL entry like any other. The
@@ -267,7 +267,7 @@ a retention window (default 1 hour). The window must be longer than any query's 
 - A node whose view is older than half the window refreshes the manifest before writing.
 - This rule protects against a nasty bug: a stale writer could otherwise re-create a deleted WAL slot.
 
-The retention window also gives us cheap point-in-time recovery for the last hour.
+The retention window also provides cheap point-in-time recovery for the last hour.
 
 ### 5.6 Stores without conditional writes
 
@@ -308,7 +308,7 @@ Queries therefore never need cross-segment ID lookups at runtime, apart from the
 ### 6.2 Vector search (ANN)
 
 **Choice: an IVF clustered index with RaBitQ-quantized codes and full-precision reranking**, the
-SPANN/SPFresh family that turbopuffer itself uses. We are not using HNSW. A graph index walks a chain
+SPANN/SPFresh family that turbopuffer itself uses. blowfish does not use HNSW. A graph index walks a chain
 of dependent reads, and against object storage each hop is a 60–100 ms round trip. A clustered index
 reads in a fixed number of rounds:
 
@@ -316,7 +316,7 @@ reads in a fixed number of rounds:
 2. Probe the `nprobe` nearest clusters' RaBitQ codes in one batch of parallel ranged GETs.
 3. Rerank the best candidates with full-precision vectors.
 
-Per segment, we build k-means centroids (about √n clusters, and a two-level centroid tree once a
+Per segment, blowfish builds k-means centroids (about √n clusters, and a two-level centroid tree once a
 segment passes a few million vectors). Each cluster stores its row IDs, its 1-bit RaBitQ codes, and its
 full-precision vectors, all contiguous so that one ranged GET serves one cluster.
 
@@ -333,21 +333,21 @@ full-precision vectors, all contiguous so that one ranged GET serves one cluster
 
 ### 6.3 Full-text search (BM25)
 
-- **Tokenizing:** we use `tantivy`'s tokenizer pipeline (word splitting, lowercasing, ASCII folding,
+- **Tokenizing:** blowfish uses `tantivy`'s tokenizer pipeline (word splitting, lowercasing, ASCII folding,
   stemming, and stopwords) configured to mimic turbopuffer's `word_v4` tokenizer and parameters (`k1`,
   `b`, `max_token_length`, and so on).
-- **Scoring:** we use tantivy's standalone `Bm25Weight`, not its index format, which assumes a local
-  directory with mmap. Our own format is a term dictionary (an FST) and posting lists in fixed blocks,
+- **Scoring:** blowfish uses tantivy's standalone `Bm25Weight`, not its index format, which assumes a local
+  directory with mmap. blowfish's own format is a term dictionary (an FST) and posting lists in fixed blocks,
   bit-packed with the `bitpacking` crate, with a maximum score per block. That lets block-max MAXSCORE
   skip most of the index on top-k queries. This is the same approach turbopuffer described for its
   FTS v2.
 - **Corpus statistics** (document count, average length, and document frequency per term) are
   namespace-wide, so BM25 scores don't depend on how documents are split into segments. Each segment
   stores its own counts. The manifest keeps the totals, and queries adjust them for the WAL tail.
-- **Score parity:** our goal is to match turbopuffer's BM25 scores to within a small float tolerance.
+- **Score parity:** my goal is to match turbopuffer's BM25 scores to within a small float tolerance.
   The oracle returned 0.49917623 and 0.45665967 for a three-document test. If its tokenizer has
-  undocumented details, we'll settle for rank parity and document the difference.
-- **Phrase queries:** `ContainsTokenSequence` needs token positions. We store them in a separate
+  undocumented details, I'll settle for rank parity and document the difference.
+- **Phrase queries:** `ContainsTokenSequence` needs token positions. blowfish stores them in a separate
   stream that's only read when a phrase query asks for it.
 
 ### 6.4 Hybrid search
@@ -368,8 +368,8 @@ so their results are consistent with each other.
 - **Node affinity:** in a multi-node deployment, a stateless router (or the client's own load
   balancer, using consistent hashing on the namespace name) sends a namespace to the same node most of
   the time. Correctness never depends on it.
-- **Compute:** queries run on Tokio for I/O and on a dedicated thread pool for CPU-heavy scoring. We
-  use SIMD distance kernels from `numkong` (SimSIMD's successor) and a hand-written popcount kernel for
+- **Compute:** queries run on Tokio for I/O and on a dedicated thread pool for CPU-heavy scoring. blowfish
+  uses SIMD distance kernels from `numkong` (SimSIMD's successor) and a hand-written popcount kernel for
   RaBitQ.
 - **Targets** for v1, on one node with a warm cache and 1M documents of 768-dimensional vectors:
   - ANN: p50 under 20 ms at recall@10 of at least 0.9.
@@ -392,17 +392,17 @@ most of the relevant ecosystem (tantivy, the object_store crate, SlateDB, and La
 | Bitmaps | `roaring` | |
 | Text analysis | `tantivy` (tokenizers and `Bm25Weight` only), `rust-stemmers` | |
 | Postings | `bitpacking`, `fst` | |
-| Vectors | our own IVF and RaBitQ; `numkong`, `half` | No off-the-shelf crate does object-storage IVF the way we need. `lance-index` and `rabitq-rs` are references |
-| Columns | Arrow-style layouts written by us (maybe `arrow-buffer`) | Full Parquet costs more round trips than we want |
+| Vectors | blowfish's own IVF and RaBitQ; `numkong`, `half` | No off-the-shelf crate does object-storage IVF the way blowfish needs. `lance-index` and `rabitq-rs` are references |
+| Columns | Custom Arrow-style layouts (maybe `arrow-buffer`) | Full Parquet costs more round trips than I want |
 | Observability | `tracing`, Prometheus metrics | |
 
 The pre-1.0 crates (`object_store`, `foyer`, and `slatedb-txn-obj`) are pinned exactly and wrapped
-behind our own traits.
+behind blowfish's own traits.
 
 **Considered and rejected for the core: building on Lance.** Lance already has IVF with RaBitQ, an
 inverted index, and compare-and-swap commits, so it's the fastest route to a demo. But it's a
 batch-oriented table format. Frequent small upserts create many versions and fragments that need
-compaction, and it has no notion of a brute-forced WAL tail behind a group-commit writer. We'll
+compaction, and it has no notion of a brute-forced WAL tail behind a group-commit writer. I'll
 benchmark against it instead.
 
 ### 8.1 API keys, roles, and metrics
@@ -501,7 +501,7 @@ later milestone is a performance change that the same test suite guards.
 
 1. **License:** MIT.
 2. **Positioning:** "compatible with the turbopuffer API". blowfish exists so people can build and
-   test against that API without a turbopuffer account. We strongly recommend turbopuffer as the
+   test against that API without a turbopuffer account. I strongly recommend turbopuffer as the
    upgrade path for production scale.
 3. **BM25:** scores reasonably close to turbopuffer's are fine. Ranking should match on ordinary
    corpora.

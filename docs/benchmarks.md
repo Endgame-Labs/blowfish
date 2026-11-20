@@ -10,7 +10,7 @@ Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, stro
 - **100M vector (64 probes, recall@10 `0.954`; 48 probes `0.941–0.950`):** `1,201 / 1,391 ms` cache-cold (`1,164–1,201 / 1,348–1,391 ms`), `1,243 / 1,370 ms` fresh process (`1,228–1,243 / 1,370–1,411 ms`), and `99.7 / 162.8 ms` warm (`72.6 / 90.4 ms` warm at 48 probes); about `160 MB` read per cold query; load `5.7 h` at `4,891 docs/s`, `recluster` `1.7 h` into 160 slabs ([100M load and recluster](#100m-wikipedia-embeddings-in-region-and-over-the-internet), [Iteration 17](#iteration-17-100m-cold-and-warm-ann), and [Iteration 18](#iteration-18-100m-warm-ann-under-150-ms-and-a-small-cold-manifest-read)). turbopuffer publishes no 100M number.
 - **1M BM25 (MS MARCO, `overlap@10` `1.000` vs. exact BM25):** `380 / 526 ms` fresh process and `301 / 369 ms` cache-cold ([Iteration 13](#iteration-13-bm25-1m) and [Iteration 14 in-region check](#bm25-cold-at-1m-ms-marco-round-13-code-c7gd2xlarge-in-region-50-queries-abpy)). turbopuffer published: `316 / 381 ms` cold, `13 / 18 ms` warm.
 - **Memory and ingest:** a 4 GB `c7gd.large` (swap off) holds a 10M load plus `recluster` at `2.3–2.9 GB` peak RSS (`769 / 973 ms` fresh, `623 / 740 ms` cache-cold; [Iteration 15](#iteration-15-memory-10m-load-and-recluster-on-a-c7gdlarge) and [Iteration 18 memory check](#memory-check-10m-load-and-recluster-4-gib-cgroup-swap-off-2-cpus)). Ingest holds flat at about `4,500 docs/s` to 10M on `c7gd.xlarge` ([Iteration 16](#iteration-16-ingest-throughput-that-stays-flat-as-the-namespace-grows)).
-- **Our own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; 100M load in progress); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
+- **My own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; 100M load in progress); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
 
 ## Scope and status
 
@@ -764,7 +764,7 @@ Eventual consistency, warm (32 queries, c1, repeated): ANN 35 ms per query (28.7
 Scores run 1 to 3 percent below turbopuffer's for the same ranking. `bench/scale/bm25_idf_probe.py` isolates it. For a
 single-term query the score is idf times a tf-part, and the ratio of the two systems' scores is constant across
 documents with different term frequencies and lengths, so average document length, k1, and b agree. What differs is
-the idf, by a near-constant additive offset: for 40 percent of terms turbopuffer's idf is exactly +0.169 above ours
+the idf, by a near-constant additive offset: for 40 percent of terms turbopuffer's idf is exactly +0.169 above blowfish's
 (rare terms, df 1 to 15, and common terms alike), which is ln((N'+1)/(N+1)) for an N' about 18.5 percent above the
 100,000 documents the namespace holds. The rest of the terms sit below that offset or above it (a few at +0.2 to +0.3),
 which is consistent with turbopuffer counting a different set of documents for those terms (the 200 held-out passages
@@ -1346,7 +1346,7 @@ What the floor says:
 
 - A single request is about 70 to 80 ms whatever its size up to 64 KB. A wave of N is the slowest of N draws, so the wave
   time is the tail of the latency distribution: about 150 ms at N=8, 175 to 290 at 32, 300 to 700 at 256, and 550 ms to
-  over 2 s at 1,024. The coordinator's diagnosis (we pay the tail) holds.
+  over 2 s at 1,024. The coordinator's diagnosis (queries pay the tail) holds.
 - **Connections matter as much as the tail.** The client speaks HTTP/1.1, so a wave of N needs N connections, and a new TLS
   connection costs about 65 ms. A cold process pays that for every request of its first big wave: a 256-request wave takes
   about 1.05 s on fresh connections and 0.3 to 0.4 s on warm ones. `object_store` keeps idle connections for 90 s by default,
@@ -1555,7 +1555,7 @@ latencies are client-side, in ms, with strong consistency in every request.
 - **Warm** is two unmeasured passes over the query set (one for BM25), then 1,000 queries at concurrency 1 on a keep-alive
   connection (`bench/scale/warm.py`).
 - The **network-adjusted estimate** is an estimate, shown next to the measurement and never instead of it. It is the measured
-  number minus waves times (our request RTT minus 15 ms), where 15 ms is an assumed in-region RTT, our request RTT is the 4 KB
+  number minus waves times (the request RTT minus 15 ms), where 15 ms is an assumed in-region RTT, the request RTT is the 4 KB
   GET p50 below, and waves is the mean number of sequential rounds of parallel reads in a cold query (from `BF_TRACE_READS`).
   A warm strong query is one wave: a check of the WAL tail. It ignores bandwidth, so it understates the cold ANN rows.
 
@@ -1570,14 +1570,14 @@ latencies are client-side, in ms, with strong consistency in every request.
 
 The VM is in Los Angeles (IP geolocation and the Cloudflare edge it reaches is LAX); the bucket reports `WNAM`. Connect time is
 small, so the edge is near. The 83 ms is R2's own time to first byte for a small object, which is far above an in-region object
-store, and a PUT costs about three times a GET. This is the difference we cannot remove from this VM. A same-region test needs a
-VM in the bucket's region (or an object store there that we do not run on R2), and would need a new bucket and VM, so it was not
+store, and a PUT costs about three times a GET. This is the difference I cannot remove from this VM. A same-region test needs a
+VM in the bucket's region (or an object store there that I do not run on R2), and would need a new bucket and VM, so it was not
 done. turbopuffer measures in-region next to its storage.
 
 ### Vector query: 10M docs, strong consistency
 
 blowfish is the existing 10M, 1024-dimension Wikipedia namespace (70 segments, f16 vectors, about 5.6 KB per document). turbopuffer's
-published run is 768 dimensions, so our vectors are 33 percent larger: this is a conservative upper bound. Recall@10 is against exact
+published run is 768 dimensions, so blowfish's vectors are 33 percent larger: this is a conservative upper bound. Recall@10 is against exact
 cosine truth for 200 held-out queries (`bench/scale/data/oracle-10m.npz`). turbopuffer measured 0.943 on the same queries.
 The 160-probe row is the apples-to-apples one, because it matches turbopuffer's accuracy.
 
@@ -1646,16 +1646,16 @@ between sessions, so treat the upsert numbers as a range (792 to 2,114 ms p50), 
 
 ### Differences that remain
 
-1. **Network:** we cross the Internet to R2 (83 ms for a 4 KB GET, 270 ms for a PUT), while turbopuffer measures in-region. Not removable
+1. **Network:** blowfish crosses the Internet to R2 (83 ms for a 4 KB GET, 270 ms for a PUT), while turbopuffer measures in-region. Not removable
    from this VM. The adjusted estimates above assume 15 ms in-region.
 2. **Vector dimension:** 1024 against 768 (33 percent more bytes). The 768-dimension reload was skipped, on instruction.
 3. **Layout:** the 10M namespace has 70 segments, because its last 2M rows were loaded with `BF_MAX_SEGMENT_ROWS=100000` and never
    compacted. A compacted namespace would read fewer, larger objects.
-4. **Warm consistency check:** every strong query pays one R2 round trip to check the WAL tail, which dominates our warm numbers
+4. **Warm consistency check:** every strong query pays one R2 round trip to check the WAL tail, which dominates blowfish's warm numbers
    (77 to 136 ms against about 14 ms). turbopuffer does not have to cross a network for it.
 5. **Corpus:** MS MARCO at 335 bytes per passage, not the 300 MB turbopuffer used; the queries are MS MARCO dev queries. The upsert rows
    are synthetic.
-6. **Recall:** at the 64-probe default we are below turbopuffer (0.886 against 0.943). The apples-to-apples row is 160 probes (0.947 warm,
+6. **Recall:** at the 64-probe default blowfish is below turbopuffer (0.886 against 0.943). The apples-to-apples row is 160 probes (0.947 warm,
    0.952 cold; the two differ only in which queries were drawn and the cold run's 100 against 1,000).
 7. **Sampling:** 100 cold queries each (the cold ANN arms alternated in one session, which is the only way to compare R2 at different times),
    1,000 warm queries (the 200-query ANN set repeats five times). R2 latency varies by 2x or more between sessions, as the two upsert runs show.
@@ -2459,7 +2459,7 @@ clusters), workload, and measurement code as the 100M section above. In the tabl
 
 In this bucket, small ranged reads of objects that are not hot take 100 to 125 ms at p50 (measured with boto3 from the same instance using random 8 KB
 ranges across many objects; a single hot object answered in 43 ms). Every serial wave therefore adds about 100 ms plus its tail, regardless of size. The
-changes below cut bytes and waves; we cannot change S3 latency itself.
+changes below cut bytes and waves; I cannot change S3 latency itself.
 
 ### What changed
 
@@ -2702,7 +2702,7 @@ Both are under the 3.5 GB target and equal within noise, so the adaptive decay c
 its live bytes (2,980 against 2,811 MB). The ingest peak here (3.0 GB) is higher than the 2.3 GB measured on a c7gd.large in iteration 16, for both binaries; I did not find
 out why (the cgroup setup, the loader's pace, and the host are different). The recluster peak is below the ingest peak.
 
-## turbopuffer cold samples, measured by us (10M and 1M)
+## turbopuffer cold samples, measured by me (10M and 1M)
 
 turbopuffer can't be forced cold, so `bench/scale/tpuf_cold.py` waits between queries and records the
 `cache_temperature` and `server_total_ms` turbopuffer reports (server-side, so the network to its region is excluded).
