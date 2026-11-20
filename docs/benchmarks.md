@@ -2719,3 +2719,96 @@ as blowfish's 10M and 1M runs), 2026-11-19.
 Every query that touched data turbopuffer hadn't cached was reported `cold`, even right after other queries, so its
 "cold" label is per query, not per namespace. Its published 10M cold p50 (874 ms) matches the 5-minute-idle samples; the
 2-day-idle sample is about 2.3 times that.
+
+## turbopuffer at 100M, measured by me
+
+turbopuffer publishes no 100M number, so I loaded the same 100M rows into it and measured it myself. These are my
+measurements from one VM, over the internet, with turbopuffer's reported `server_total_ms` as the
+in-region equivalent. They are not turbopuffer's published figures.
+
+### Load
+
+Namespace `blowfish-oracle-wiki100m`, loaded with `scale_load.py --vector-type f16` in the same order as
+the blowfish 100M load (English, then de, fr, es, ru), so ids match `oracle-100m.npz`. 8 writes in flight, batches of 2,000.
+
+| | |
+|---|---:|
+| Rows | 100,000,000 |
+| Load time | 53,000 s (14.7 h), 1,887 docs/s on average (2,100 to 2,400 early on) |
+| Billable bytes written (`billable_logical_bytes_written`) | 450.4 GB (4.5 GB per 1M rows) |
+| Raw bytes sent | 451.5 GB |
+| Namespace size reported by turbopuffer (`approx_logical_bytes`) | 246.8 GB |
+| 429 retries | 4,846 (and 64 transport retries; one 502 stopped the loader, and I added a 5xx retry and resumed from the checkpoint) |
+| Time from the last write to "up-to-date" | about 2 minutes |
+
+Cost: at the list rate of $2/GB the billable bytes come to about $901. With turbopuffer's batch discount the bill is likely
+lower, about $450 to $901; I have not seen the invoice.
+
+### First query after indexing
+
+Three ANN queries sent right after the index reported `up-to-date` (the first is not a deep-cold sample: the namespace had
+just been written and indexed).
+
+| Query | Client ms | `server_total_ms` | Cache temperature | Cache hit ratio | Recall@10 |
+|---|---:|---:|---|---:|---:|
+| 1 | 2,085 | 1,966 | cold | 0.15 | 1.0 |
+| 2 | 1,433 | 1,327 | cold | 0.60 | 0.9 |
+| 3 | 730 | 624 | cold | 0.66 | 1.0 |
+
+### Idle-gap samples
+
+`tpuf_cold.py` sends one ANN query after each idle gap, doubling the gap until turbopuffer reports "cold". It never did for
+the probe query at 100M: I stopped it after the 19,200 s gap, so these are idle-gap samples, not cold p50 and p90. A deep-cold
+sample after a day idle is separate.
+
+| Idle gap | `server_total_ms` | Client ms | Cache temperature | Recall@10 |
+|---:|---:|---:|---|---:|
+| 0 s (warm-up) | 14 | 132 | hot | 1.0 |
+| 300 s | 16 | 334 | hot | 0.9 |
+| 600 s | 44 | 373 | hot | 1.0 |
+| 1,200 s | 131 | 441 | warm | 1.0 |
+| 2,400 s | 145 | 435 | warm | 0.7 |
+| 4,800 s | 170 | 459 | warm | 1.0 |
+| 9,600 s | 202 | 482 | hot | 1.0 |
+| 19,200 s | 503 | 782 | warm | 0.9 |
+
+The follow-up query after each probe (a different query, no idle) came back cold twice (after the 300 s and 600 s gaps:
+842 and 542 ms server time) because its clusters had not been read yet, so "cold" depends on the query as well as the idle time.
+The probe never reported cold, and server time grew with the idle gap (16 ms at 300 s, 503 ms at 19,200 s).
+
+### Recall and warm latency
+
+`oracle_compare.py --tpuf-only` with `oracle-100m.npz`, 200 English queries per type, one pass, one request at a time (ms p50 / p90 / p99):
+
+| Query | Recall@10 | Client | `server_total_ms` | Cache temperature |
+|---|---:|---|---|---|
+| ANN | 0.947 | 310 / 525 / 636 | 232 / 426 / 535 | 14 hot, 186 warm |
+| BM25 | | 215 / 430 / 805 | 159 / 373 / 750 | 11 cold, 12 hot, 177 warm |
+| Hybrid | | 90 / 119 / 157 | 32 / 63 / 80 | 200 hot |
+| Selective ANN | 0.995 | 445 / 682 / 1,218 | 358 / 590 / 1,110 | 4 hot, 196 warm |
+| Broad ANN | 0.962 | 148 / 311 / 507 | 88 / 256 / 449 | 59 hot, 141 warm |
+
+Then 1,000 ANN queries at concurrency 1 (`tpuf_warm.py`, after one pass over the 200 queries; all 1,000 reported hot):
+
+| | p50 | p90 | p99 |
+|---|---:|---:|---:|
+| Client ms | 70.2 | 75.6 | 115.6 |
+| `server_total_ms` | 14 | 19 | 53.1 |
+
+Recall@10 over those 1,000 was 0.9465.
+
+### Beside blowfish at 100M
+
+Blowfish numbers are the current ones, from the iteration 18 section above (c7gd.2xlarge in the bucket's region; 48 probes, 64 probes in brackets).
+turbopuffer's are the measurements on this page, with server time as the in-region equivalent. Neither is a cold p50 and p90 for turbopuffer.
+
+| | blowfish | turbopuffer |
+|---|---|---|
+| ANN recall@10 | 0.941 (0.954) | 0.947 (first pass), 0.9465 (warm) |
+| Warm ANN p50 / p90 ms | 72.6 / 90.4 (99.7 / 162.8) | 14 / 19 server, 70 / 76 client (over the internet) |
+| First pass over 200 queries, ANN p50 / p90 ms | not measured | 232 / 426 server, 310 / 525 client |
+| After the load, first query | not measured | 1,966 ms server (cold) |
+| Idle 19,200 s | not measured | 503 ms server (warm) |
+| Cold, cache-cold p50 / p90 ms | 1,069 / 1,243 (1,260 / 1,392) | not measured (the namespace did not go cold in the idle-gap run) |
+
+At 10M turbopuffer's first-pass ANN had server time 88 / 203 ms; at 100M it is 232 / 426 ms, about 2.6 and 2.1 times.

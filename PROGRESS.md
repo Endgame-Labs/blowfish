@@ -4,6 +4,11 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-20
 
+- **turbopuffer at 100M, measured by me.** I loaded the same 100M rows into turbopuffer (14.7 h, 450.4 GB billable, 4,846
+  429 retries) and measured recall and latency (`docs/benchmarks.md`, "turbopuffer at 100M, measured by me"). Warm ANN
+  server time is 14 / 19 ms p50 / p90 with recall@10 of 0.9465; blowfish's current warm p50 / p90 is 72.6 / 90.4 ms at 48 probes. The
+  namespace never reported cold over idle gaps up to 19,200 s (503 ms server time, warm). `scale_load.py` now retries any
+  5xx through the shared backpressure limiter and sums turbopuffer's write billing.
 - **Docker on Apple Silicon, and macOS (issue #1).** The image now builds on arm64: trixie base images, clang, and
   numkong's SME targets off on arm64 (GCC 12 rejected numkong's inlined NEON dot-product intrinsics). CI builds and
   smoke-tests the image on x86_64 and arm64 runners and builds and tests natively on macOS. Testing on a real Mac

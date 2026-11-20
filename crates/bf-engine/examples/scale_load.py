@@ -93,7 +93,7 @@ def update_truth(query, matrix, ids, best_scores, best_ids):
 class Limiter:
     """One backpressure limiter shared by every in-flight thread.
 
-    A 429 or 503 pauses all threads until the server's `retry-after-ms` / `Retry-After` (or a
+    A 429 or any 5xx pauses all threads until the server's `retry-after-ms` / `Retry-After` (or a
     full-jitter backoff when it sends none) has passed, then spaces out new requests. The spacing
     shrinks on every success, so the load ramps back up gradually instead of all at once.
     """
@@ -124,12 +124,12 @@ class Limiter:
             self.spacing = 0.0 if self.spacing < 0.01 else self.spacing * 0.7
 
     def backpressure(self, response):
-        """Record a 429 or 503, slow every thread, and return the seconds to wait."""
+        """Record a 429 or 5xx, slow every thread, and return the seconds to wait."""
         status = response.status_code
         ms, secs = response.headers.get("retry-after-ms"), response.headers.get("retry-after")
         hint = parse_retry_after(ms, secs)
         with self.lock:
-            self.counts[status] += 1
+            self.counts[status] = self.counts.get(status, 0) + 1
             if len(self.hints) < 5:
                 self.hints.append({"status": status, "retry_after_ms": ms, "retry_after": secs})
             now = time.monotonic()
@@ -184,7 +184,7 @@ def send(client, args, body, counters, limiter):
             time.sleep(random.uniform(0, delay))
             delay = min(10, delay * 1.5)
             continue
-        if response.status_code in (429, 503):
+        if response.status_code == 429 or response.status_code >= 500:
             status = response.status_code
             counters["retries"] += status == 429
             wait = limiter.backpressure(response)
@@ -195,6 +195,12 @@ def send(client, args, body, counters, limiter):
             continue
         response.raise_for_status()
         limiter.success()
+        # turbopuffer reports billing on writes; blowfish does not. Sum what is there.
+        with contextlib.suppress(ValueError):
+            billing = response.json().get("billing") or {}
+            for name, value in billing.items():
+                if isinstance(value, (int, float)):
+                    counters["billing"][name] = counters["billing"].get(name, 0) + value
         return
 
 
@@ -218,7 +224,7 @@ def main():
     args.scratch.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     rows = raw_bytes = 0
-    counters = {"retries": 0, "transport": 0, "pauses": 0}
+    counters = {"retries": 0, "transport": 0, "pauses": 0, "billing": {}}
     limiter = Limiter()
     inflight = []
     pool = ThreadPoolExecutor(max_workers=args.inflight)
@@ -237,6 +243,8 @@ def main():
             start -= state["seconds"]
             limiter.counts[503] = int(saved["retries_503"]) if "retries_503" in saved else 0
             counters.update(retries=state["retries_429"], pauses=state["memory_pauses"], transport=state["retries_transport"])
+            if "billing" in saved.files:
+                counters["billing"] = json.loads(str(saved["billing"]))
             best_scores, best_ids, query = saved["scores"], saved["ids"], saved["query"]
             filtered = {name: (saved[f"{name}_scores"], saved[f"{name}_ids"]) for name in filtered}
         else:
@@ -318,7 +326,7 @@ def main():
                         result = dict(rows=rows, seconds=elapsed, docs_per_second=rows / elapsed,
                                       retries_429=counters["retries"], retries_503=limiter.counts[503],
                                       retry_after_samples=limiter.hints, retries_transport=counters["transport"],
-                                      memory_pauses=counters["pauses"], raw_bytes=raw_bytes)
+                                      memory_pauses=counters["pauses"], raw_bytes=raw_bytes, billing=counters["billing"])
                         (args.scratch / "ingest.json").write_text(json.dumps(result, indent=2))
                         print(json.dumps(result), flush=True)
                     # Release the previous request body and Arrow view before the
@@ -336,7 +344,7 @@ def main():
                          retries_503=limiter.counts[503],
                          memory_pauses=counters["pauses"], retries_transport=counters["transport"])
             pending = args.scratch / "truth-next.npz"
-            np.savez(pending, ids=best_ids, scores=best_scores, query=query, **state,
+            np.savez(pending, ids=best_ids, scores=best_scores, query=query, billing=json.dumps(counters["billing"]), **state,
                      **{f"{name}_{part}": value for name, pair in filtered.items()
                         for part, value in zip(("scores", "ids"), pair)})
             pending.replace(checkpoint)
