@@ -2,6 +2,16 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-20
+
+- **Docker on Apple Silicon, and macOS (issue #1).** The image now builds on arm64: trixie base images, clang, and
+  numkong's SME targets off on arm64 (GCC 12 rejected numkong's inlined NEON dot-product intrinsics). CI builds and
+  smoke-tests the image on x86_64 and arm64 runners and builds and tests natively on macOS. Testing on a real Mac
+  found two macOS bugs, now fixed: the adaptive jemalloc decay never switched (macOS rejects the all-arenas mallctl
+  shortcut, so arenas are now set one by one), and a compaction test depended on host memory. Checked: CI green on all
+  jobs, the full test suite on an M-series Mac, and the official Python SDK running vector and BM25 queries against a
+  native macOS build.
+
 ## 2026-11-19
 
 - **100M run (branch `wt/scale100m`): load, recluster, and cold and warm ANN, in-region and over the internet.**

@@ -123,6 +123,8 @@ log entry in the same commit.
 - A split manifest (a small root plus lazily read segment lists) would shrink the cold ANN read further than the compact copy's 375 KB; text-header reads on a namespace with a compact copy cost one more round trip.
 - Storage cache sizing reads only the root cgroup's `memory.max`, while the engine reads the process's own cgroup;
   make the storage cache follow the engine. Planned for v0.1.14 (Kyle, 2026-11-20).
+- Memory sizing on macOS: there is no `/proc/meminfo`, so memory-sized defaults assume 4 GB. Read `hw.memsize` there,
+  in the same shared function as the cgroup fix (v0.1.14).
 - BM25: fold term records into dictionary reads, store document lengths in blocks, and a namespace-wide text
   dictionary.
 - The text statistics object, ANN directories, and manifest are still rewritten whole on each publish. Fine at 10M;
@@ -224,3 +226,5 @@ S3 until the run is cleaned up.
 18. 2026-11-20: Full compatibility with the official SDKs, including retry and backpressure headers.
 19. 2026-11-20: Release v0.1.13. Delete the historical open-source checklist. `GET /` keeps returning
     `{"status":"🐡"}`. Unify cgroup memory detection in v0.1.14, not v0.1.13.
+20. 2026-11-20: Support Docker on Apple Silicon and native macOS builds; CI builds the image on x86_64 and arm64 and
+    tests natively on macOS (issue #1).

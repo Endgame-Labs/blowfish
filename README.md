@@ -109,6 +109,8 @@ cd blowfish
 docker compose up --build --wait blowfish
 ```
 
+The image builds on x86_64 and arm64 (including Apple Silicon); CI builds and smoke-tests both.
+
 To test against a local S3-compatible store, run the `s3` profile, which starts SeaweedFS and a `blowfish-s3` container on port `8001`:
 
 ```bash
@@ -118,7 +120,7 @@ curl --fail http://127.0.0.1:8001/_blowfish/v1/status
 
 ### Cargo (development)
 
-With a stable Rust toolchain installed:
+With a stable Rust toolchain installed, on Linux or macOS (CI tests both, including Apple Silicon):
 
 ```bash
 cargo run -p blowfish -- serve --storage-url file:///tmp/blowfish --listen 127.0.0.1:8000
