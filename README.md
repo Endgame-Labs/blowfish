@@ -353,6 +353,7 @@ Writes are group-committed to a write-ahead log in object storage using create-o
 - **Benchmarks, architecture, and research**
   - [`docs/benchmarks/README.md`](docs/benchmarks/README.md) — Benchmark summary, 10M and 100M results, methodology, parity tables, known gaps, and reproduction guide
   - [`docs/benchmarks.md`](docs/benchmarks.md) — Detailed engineering log across scale iterations 0–18 and 100M runs
+  - [`docs/cost-estimates.md`](docs/cost-estimates.md) — Estimated infrastructure and benchmark costs for blowfish (S3 and R2), turbopuffer, and Amazon S3 Vectors
   - [`DESIGN.md`](DESIGN.md) — Overall architecture, object layout, WAL group commit, indexing, and query execution
   - [`docs/design/ann-directory.md`](docs/design/ann-directory.md) — Namespace-wide ANN cluster directory, slabs, and paged directory design
   - [`docs/design/projects-and-keys.md`](docs/design/projects-and-keys.md) — Multi-project isolation and key model design

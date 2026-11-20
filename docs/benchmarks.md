@@ -2,7 +2,7 @@
 
 ## Current numbers
 
-Chronological lab notebook (iterations 0 through 18, plus 100M runs). For the concise summary and reproduction guide, see [`benchmarks/README.md`](benchmarks/README.md).
+Chronological lab notebook (iterations 0 through 18, plus 100M runs). For the concise summary and reproduction guide, see [`benchmarks/README.md`](benchmarks/README.md); for estimated infrastructure and benchmark costs, see [`cost-estimates.md`](cost-estimates.md).
 
 Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, strong consistency, 1,024-dim `f16` Cohere Wikipedia embeddings; current `main`, beyond `v0.1.12`):
 
