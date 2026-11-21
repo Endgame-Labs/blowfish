@@ -154,6 +154,11 @@ SeaweedFS setup with demo credentials, not a hardened public object-storage serv
 private, and replace demo credentials before adapting it for shared use. SIGINT and SIGTERM allow
 in-flight main-port HTTP requests to finish before shutdown.
 
+If blowfish dies on a fatal signal (SIGSEGV, SIGBUS, SIGILL, or SIGFPE), it first writes a line to stderr naming the
+signal, the fault address, and the thread, followed by the stack frames. The exit status is unchanged (139 for SIGSEGV).
+On Linux, frames inside blowfish print as offsets: resolve them with `addr2line -f -C -i -e blowfish <offset>` against
+the same binary (release builds carry debug info). Please include this output when reporting a crash.
+
 ## Large namespaces: recluster, paged directory, and compact manifest copy
 
 For namespaces with millions of vectors, three maintenance helpers in `crates/bf-engine/examples/`

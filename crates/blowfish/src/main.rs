@@ -3,6 +3,7 @@ use bf_auth::KeyStore;
 use bf_engine::{Engine, EngineConfig};
 use bf_storage::{Storage, StorageConfig};
 use blowfish::{ServerOptions, metrics_router, prometheus_handle, router};
+mod crash;
 mod keys;
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
@@ -128,6 +129,7 @@ struct Config {
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    crash::install();
     blowfish::start_alloc_monitor();
     tracing_subscriber::fmt()
         .with_env_filter(
