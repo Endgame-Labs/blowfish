@@ -60,7 +60,7 @@ impl ObjectReader {
             .store
             .range_reader_with_length(&self.file.key, self.file.size, true)
             .map_err(io::Error::other)?;
-        Ok(if self.bypass {
+        Ok(if self.bypass || !read_cache::admitting() {
             reader.bypass_cache()
         } else {
             reader

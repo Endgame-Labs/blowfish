@@ -106,6 +106,21 @@ pub(crate) struct ReadContext {
     pub cache: Arc<DecodedCache>,
     pub stats: Arc<CacheStats>,
     pub backend: Arc<bf_storage::BackendStats>,
+    /// Whether segment reads in this context admit what they fetch into the block caches.
+    /// Background one-pass scans (the recall sampler's exhaustive search) set it to false, so
+    /// they cannot evict the blocks that queries reuse.
+    pub admit: bool,
+}
+impl ReadContext {
+    /// A context with fresh statistics that admits its reads.
+    pub fn new(cache: Arc<DecodedCache>) -> Self {
+        Self {
+            cache,
+            stats: Arc::default(),
+            backend: Arc::default(),
+            admit: true,
+        }
+    }
 }
 tokio::task_local! {
     static CURRENT: ReadContext;
@@ -118,6 +133,10 @@ pub(crate) async fn scope<T>(context: ReadContext, future: impl Future<Output = 
     backend
         .scope("search", CURRENT.scope(context, future))
         .await
+}
+/// False inside a context whose reads must not fill the block caches.
+pub(crate) fn admitting() -> bool {
+    CURRENT.try_with(|c| c.admit).unwrap_or(true)
 }
 pub(crate) fn stats() -> Arc<CacheStats> {
     CURRENT.try_with(|c| c.stats.clone()).unwrap_or_default()

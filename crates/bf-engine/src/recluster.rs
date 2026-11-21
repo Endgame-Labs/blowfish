@@ -57,11 +57,7 @@ impl Engine {
         opts: &ReclusterOptions,
     ) -> Result<ReclusterReport, ApiError> {
         let _busy = bf_alloc::busy();
-        let context = crate::read_cache::ReadContext {
-            cache: self.0.read_cache.clone(),
-            stats: Default::default(),
-            backend: Default::default(),
-        };
+        let context = crate::read_cache::ReadContext::new(self.0.read_cache.clone());
         crate::read_cache::scope(context, self.recluster_inner(ns, opts)).await
     }
 
@@ -450,11 +446,7 @@ impl Engine {
     /// rebuilt) and publish it. Returns the pages object's size, or `None` when the directory is
     /// too small to page. Stops another indexer from publishing meanwhile, like [`Engine::recluster`].
     pub async fn page_slab_directory(&self, ns: &str, attr: &str) -> Result<Option<u64>, ApiError> {
-        let context = crate::read_cache::ReadContext {
-            cache: self.0.read_cache.clone(),
-            stats: Default::default(),
-            backend: Default::default(),
-        };
+        let context = crate::read_cache::ReadContext::new(self.0.read_cache.clone());
         crate::read_cache::scope(context, async {
             let store = &self.0.store;
             let wal = Wal::new(store.clone(), ns).map_err(log_error)?;

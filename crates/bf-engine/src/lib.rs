@@ -323,9 +323,40 @@ struct Inner {
     store: Storage,
     read_cache: Arc<read_cache::DecodedCache>,
     queries: Arc<tokio::sync::Semaphore>,
+    recall_sampler: Arc<RecallSampler>,
     config: EngineConfig,
     owner: uuid::Uuid,
     namespaces: Mutex<HashMap<String, Arc<Handle>>>,
+}
+/// Paces the background recall sampler: at most one exhaustive comparison runs at a time, and
+/// a new one starts at most once per interval. An exhaustive search reads every vector of the
+/// namespace (5.5 GB at 2.7M f16 rows of 1,024 dimensions), so a per-query rate alone lets it
+/// take most of the machine under load.
+#[derive(Default)]
+struct RecallSampler {
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    last: std::sync::Mutex<Option<Instant>>,
+}
+/// Held while one recall comparison runs.
+struct Sampling(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for Sampling {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+impl RecallSampler {
+    fn start(&self, interval: std::time::Duration) -> Option<Sampling> {
+        use std::sync::atomic::Ordering;
+        let mut last = self.last.lock().expect("recall sampler lock");
+        if last.is_some_and(|t| t.elapsed() < interval) {
+            return None;
+        }
+        if self.busy.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        *last = Some(Instant::now());
+        Some(Sampling(self.busy.clone()))
+    }
 }
 /// Cloneable namespace engine. Separate instances safely share a CAS-capable bucket.
 #[derive(Clone)]
@@ -347,6 +378,7 @@ impl Engine {
                 config.search_concurrency,
             )),
             queries: Arc::new(tokio::sync::Semaphore::new(config.query_concurrency.max(1))),
+            recall_sampler: Arc::default(),
             store,
             config,
             owner: uuid::Uuid::new_v4(),
@@ -372,6 +404,7 @@ impl Engine {
             store: self.0.store.scoped(sub),
             read_cache: Arc::new(self.0.read_cache.scoped(sub)),
             queries: self.0.queries.clone(),
+            recall_sampler: self.0.recall_sampler.clone(),
             config: self.0.config.clone(),
             owner: uuid::Uuid::new_v4(),
             namespaces: Mutex::new(HashMap::new()),
@@ -403,11 +436,7 @@ impl Engine {
             commits,
         });
         handles.insert(ns.into(), handle.clone());
-        let context = read_cache::ReadContext {
-            cache: self.0.read_cache.clone(),
-            stats: Default::default(),
-            backend: Default::default(),
-        };
+        let context = read_cache::ReadContext::new(self.0.read_cache.clone());
         tokio::spawn(read_cache::scope(
             context,
             commit_worker(
@@ -611,6 +640,7 @@ impl Engine {
             cache: self.0.read_cache.clone(),
             stats: stats.clone(),
             backend: backend.clone(),
+            admit: true,
         };
         let cached = if matches!(request.consistency, Consistency::Strong) {
             let handle = self.handle(ns).await?;
@@ -666,9 +696,17 @@ impl Engine {
         if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
             && (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1_000_000.0
                 < self.0.config.recall_sample_rate
+            && let Some(sampling) = self
+                .0
+                .recall_sampler
+                .start(self.0.config.recall_sample_interval)
         {
             let store = self.0.store.clone();
-            let config = self.0.config.clone();
+            // The exhaustive search reads every vector: one segment at a time, so it holds one
+            // core rather than all of them, and without filling the block caches, so it does not
+            // evict what live queries reuse.
+            let mut config = self.0.config.clone();
+            config.search_concurrency = 1;
             let sample = state.clone();
             let ann = response.clone();
             let cache = self.0.read_cache.clone();
@@ -679,12 +717,12 @@ impl Engine {
                 };
                 let runtime = tokio::runtime::Handle::current();
                 let context = read_cache::ReadContext {
-                    cache,
-                    stats: Arc::default(),
-                    backend: Arc::default(),
+                    admit: false,
+                    ..read_cache::ReadContext::new(cache)
                 };
                 let _ = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
+                    let _sampling = sampling;
                     runtime.block_on(read_cache::scope(context, async move {
                         if let Ok(exact) =
                             indexed::execute(&store, &sample, &request, &config, true).await
@@ -885,11 +923,7 @@ impl Engine {
     pub async fn recall(&self, ns: &str, request: Value) -> Result<Value, ApiError> {
         let engine = self.clone();
         let ns = ns.to_owned();
-        let context = read_cache::ReadContext {
-            cache: self.0.read_cache.clone(),
-            stats: Arc::default(),
-            backend: Arc::default(),
-        };
+        let context = read_cache::ReadContext::new(self.0.read_cache.clone());
         let permit = self
             .0
             .queries
@@ -1436,5 +1470,36 @@ mod tail_tests {
         assert!(state.docs.is_empty() && state.shadowed.is_empty() && state.entries.is_empty());
         assert_eq!(state.tail_bytes, 0);
         assert!(state.tail_since.is_none());
+    }
+}
+
+#[cfg(test)]
+mod recall_sampler_tests {
+    use super::RecallSampler;
+    use std::time::Duration;
+
+    #[test]
+    fn one_comparison_at_a_time_and_one_per_interval() {
+        let sampler = RecallSampler::default();
+        let first = sampler.start(Duration::ZERO).expect("first sample starts");
+        assert!(
+            sampler.start(Duration::ZERO).is_none(),
+            "one runs at a time"
+        );
+        drop(first);
+        assert!(
+            sampler.start(Duration::ZERO).is_some(),
+            "free again once it ends"
+        );
+        let paced = RecallSampler::default();
+        drop(
+            paced
+                .start(Duration::from_secs(3600))
+                .expect("first sample starts"),
+        );
+        assert!(
+            paced.start(Duration::from_secs(3600)).is_none(),
+            "within the interval"
+        );
     }
 }
