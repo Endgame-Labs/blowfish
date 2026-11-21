@@ -1,0 +1,9 @@
+[project]
+name = "blowfish-bench-nq"
+version = "0.1.0"
+description = "BEIR Natural Questions benchmark harness for blowfish"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=2.1",
+  "pyarrow>=18",
+]
