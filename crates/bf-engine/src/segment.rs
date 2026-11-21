@@ -85,6 +85,23 @@ impl ObjectReader {
             .await
             .map_err(io::Error::other)
     }
+    /// Read small ranges scattered over the object (rerank vectors) through small cache
+    /// blocks, so a miss fetches `BF_SPARSE_BLOCK_BYTES` (default 16 KiB) instead of a full
+    /// block, and the cache holds those vectors without the megabyte around each one.
+    pub async fn read_batch_sparse(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        static BLOCK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let block = *BLOCK.get_or_init(|| {
+            std::env::var("BF_SPARSE_BLOCK_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16 << 10)
+        });
+        self.range_reader()?
+            .sparse(block)
+            .read_batch_with_stats(&ranges, &read_cache::stats())
+            .await
+            .map_err(io::Error::other)
+    }
 }
 
 pub(crate) async fn vector_index(
@@ -1483,6 +1500,9 @@ pub(crate) fn vector_metric(metric: bf_types::DistanceMetric) -> bf_vector::Metr
 impl bf_vector::RangeRead for ObjectReader {
     async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
         ObjectReader::read_batch(self, ranges).await
+    }
+    async fn read_batch_sparse(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        ObjectReader::read_batch_sparse(self, ranges).await
     }
     fn len(&self) -> u64 {
         self.file.size

@@ -102,7 +102,7 @@ impl<R: RangeRead> Index<R> {
             return Err(bad("invalid metadata range"));
         }
         let ranges = vec![len - FOOTER_SIZE..len, 0..meta_len];
-        let bytes = read_batch(&reader, ranges).await?;
+        let bytes = read_batch(&reader, ranges, false).await?;
         let (actual, crc) = format::decode_footer(&bytes[0], len)?;
         if actual != meta_len {
             return Err(bad("manifest metadata length disagrees with footer"));
@@ -520,6 +520,17 @@ impl<R: RangeRead> Index<R> {
     async fn read_merged(&self, ranges: Vec<Range<u64>>, gap: u64, max: u64) -> Result<Vec<Bytes>> {
         read_merged(&self.reader, ranges, gap, max).await
     }
+    /// Full-precision vectors for a rerank: few rows scattered over the vector section.
+    async fn read_vectors(&self, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        merged(
+            &self.reader,
+            ranges,
+            read_gap(VECTOR_GAP),
+            VECTOR_MERGE_MAX,
+            true,
+        )
+        .await
+    }
 
     /// Fetch full-precision vectors for `(cluster, ordinal)` locations and return the
     /// exact top-k, sorted by distance then row ID.
@@ -662,9 +673,7 @@ impl<R: RangeRead> Index<R> {
                 _ => ranges.push(at..at + width as u64),
             }
         }
-        let blocks = self
-            .read_merged(ranges.clone(), read_gap(VECTOR_GAP), VECTOR_MERGE_MAX)
-            .await?;
+        let blocks = self.read_vectors(ranges.clone()).await?;
         let mut result = Vec::with_capacity(locations.len());
         let mut decoded = Vec::with_capacity(self.dims());
         let mut next = locations.iter();
@@ -744,9 +753,7 @@ impl<R: RangeRead> Index<R> {
         let t_read = std::time::Instant::now();
         let nranges = ranges.len();
         let rbytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-        let blocks = self
-            .read_merged(ranges, read_gap(VECTOR_GAP), VECTOR_MERGE_MAX)
-            .await?;
+        let blocks = self.read_vectors(ranges).await?;
         let read_ms = t_read.elapsed().as_millis();
         let t_cpu = std::time::Instant::now();
         let mut result = Vec::with_capacity(locations.len());
@@ -813,8 +820,16 @@ async fn read_one<R: RangeRead>(reader: &R, range: Range<u64>) -> Result<Bytes> 
     }
     Ok(bytes)
 }
-async fn read_batch<R: RangeRead>(reader: &R, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
-    let bytes = reader.read_batch(ranges.clone()).await?;
+async fn read_batch<R: RangeRead>(
+    reader: &R,
+    ranges: Vec<Range<u64>>,
+    sparse: bool,
+) -> Result<Vec<Bytes>> {
+    let bytes = if sparse {
+        reader.read_batch_sparse(ranges.clone()).await?
+    } else {
+        reader.read_batch(ranges.clone()).await?
+    };
     if bytes.len() != ranges.len()
         || bytes
             .iter()
@@ -834,6 +849,16 @@ pub async fn read_merged<R: RangeRead>(
     gap: u64,
     max: u64,
 ) -> Result<Vec<Bytes>> {
+    merged(reader, ranges, gap, max, false).await
+}
+
+async fn merged<R: RangeRead>(
+    reader: &R,
+    ranges: Vec<Range<u64>>,
+    gap: u64,
+    max: u64,
+    sparse: bool,
+) -> Result<Vec<Bytes>> {
     let mut order: Vec<usize> = (0..ranges.len()).collect();
     order.sort_unstable_by_key(|i| ranges[*i].start);
     let mut merged: Vec<Range<u64>> = Vec::new();
@@ -852,7 +877,7 @@ pub async fn read_merged<R: RangeRead>(
         }
     }
     let starts: Vec<u64> = merged.iter().map(|r| r.start).collect();
-    let bytes = read_batch(reader, merged).await?;
+    let bytes = read_batch(reader, merged, sparse).await?;
     let mut out = vec![Bytes::new(); ranges.len()];
     for ((bytes, start), group) in bytes.into_iter().zip(starts).zip(members) {
         for i in group {

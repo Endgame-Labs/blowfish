@@ -27,6 +27,14 @@ pub trait RangeRead: Send + Sync {
                 .await
         }
     }
+    /// Fetch ranges that are small and scattered in the object (a rerank's vectors), in
+    /// input order. A caching reader can fetch them in smaller blocks than it uses for scans.
+    fn read_batch_sparse(
+        &self,
+        ranges: Vec<Range<u64>>,
+    ) -> impl Future<Output = io::Result<Vec<Bytes>>> + Send {
+        self.read_batch(ranges)
+    }
 }
 
 impl RangeRead for Bytes {
@@ -60,6 +68,12 @@ impl<R: RangeRead + ?Sized> RangeRead for std::sync::Arc<R> {
         ranges: Vec<Range<u64>>,
     ) -> impl Future<Output = io::Result<Vec<Bytes>>> + Send {
         (**self).read_batch(ranges)
+    }
+    fn read_batch_sparse(
+        &self,
+        ranges: Vec<Range<u64>>,
+    ) -> impl Future<Output = io::Result<Vec<Bytes>>> + Send {
+        (**self).read_batch_sparse(ranges)
     }
 }
 fn checked_range(range: Range<u64>, len: usize) -> io::Result<Range<usize>> {

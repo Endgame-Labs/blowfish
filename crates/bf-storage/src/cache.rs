@@ -180,6 +180,8 @@ struct BlockKey {
     index: u64,
     offset: u64,
     len: u64,
+    /// Block size of a sparse reader's small blocks, or 0 for the configured block size.
+    small: u32,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Layout {
@@ -282,7 +284,11 @@ impl RangeCache {
     fn disk_key(&self, key: &BlockKey) -> String {
         digest(format!(
             "{}:{}:{}:{}:{}:{}",
-            self.config.block_size,
+            if key.small > 0 {
+                key.small as usize
+            } else {
+                self.config.block_size
+            },
             key.offset,
             key.len,
             key.index,
@@ -391,6 +397,8 @@ pub struct RangeReader {
     layout: Layout,
     /// Whether blocks this reader fetches (or promotes from disk) enter the memory and disk caches.
     admit: bool,
+    /// Small-block size for sparse reads (see [`RangeReader::sparse`]), or 0.
+    small: u32,
 }
 impl RangeReader {
     /// A reader that still uses cached blocks but admits none of its own: for one-pass scans
@@ -398,6 +406,24 @@ impl RangeReader {
     pub fn bypass_cache(mut self) -> Self {
         self.admit = false;
         self
+    }
+    /// A reader that caches in small blocks of `block_size` bytes (rounded up to a power of
+    /// two, at most the configured block size) instead of the configured block size. For
+    /// scattered small reads, such as a rerank's few dozen 2 KB vectors spread over a
+    /// gigabyte: a miss then fetches and caches 16 KB instead of 1 MB. Small blocks are cached
+    /// apart from full ones, so use it only for reads that are sparse in their object.
+    pub fn sparse(mut self, block_size: usize) -> Self {
+        let full = self.storage.0.cache.config.block_size;
+        let size = block_size.max(512).next_power_of_two();
+        self.small = if size >= full { 0 } else { size as u32 };
+        self
+    }
+    fn block_size(&self) -> u64 {
+        if self.small > 0 {
+            self.small as u64
+        } else {
+            self.storage.0.cache.config.block_size as u64
+        }
     }
     /// Logical object length, excluding the retry header.
     pub fn len(&self) -> u64 {
@@ -431,7 +457,7 @@ impl RangeReader {
         stats: &CacheStats,
     ) -> Result<Vec<Bytes>, Error> {
         let cache = &self.storage.0.cache;
-        let size = cache.config.block_size as u64;
+        let size = self.block_size();
         let mut requested = BTreeMap::<u64, u64>::new();
         for range in ranges {
             if range.start > range.end || range.end > self.len() {
@@ -649,6 +675,7 @@ impl RangeReader {
             index,
             offset: self.layout.offset,
             len: self.layout.len,
+            small: self.small,
         }
     }
 }
@@ -707,6 +734,7 @@ impl Storage {
             path: self.path(key).to_string().into(),
             layout,
             admit: true,
+            small: 0,
         })
     }
     /// Open an immutable object without HEAD or header probing. The caller supplies the
@@ -726,6 +754,7 @@ impl Storage {
             path: self.path(key).to_string().into(),
             layout: Layout { len, offset },
             admit: true,
+            small: 0,
         })
     }
     /// Cached whole-object read for immutable objects, sharing the range cache and single-flight.
