@@ -4,6 +4,12 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-21
 
+- **Issue #2 root cause found and fixed.** The cold-start segfault came from jemalloc 5.3: blowfish set decay with
+  the `arena.4096.*` (all-arenas) shortcut, which jemalloc accepts but then reads one past the end of its arena array,
+  into `arenas_lock`. After any contention for that lock, its wait-time counter was used as an arena pointer. The
+  decay thread first runs 500 ms after start, so builds before 0457539 crashed about half a second after "ready" on
+  some starts. Reproduced on x86_64 (11 of 20 runs at 16 contending threads, 13 of 20 at 64); the per-arena code
+  already on main had 0 failures in 80 runs, and a regression test now covers it.
 - **Crash reports on fatal signals (issue #2).** blowfish now writes the signal, fault address, thread, and stack frames
   to stderr before dying on SIGSEGV, SIGBUS, SIGILL, or SIGFPE, then hands the signal back so the exit status and Rust's
   stack-overflow message stay the same. Issue #2 (a segfault on 14 of 68 cold restarts on an M4 Max, arm64 Docker) did

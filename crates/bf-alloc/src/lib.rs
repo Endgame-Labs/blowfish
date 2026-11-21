@@ -24,7 +24,11 @@ mod imp {
 
     /// Set the dirty and muzzy decay of every arena (and of arenas made later), in milliseconds.
     ///
-    /// Arenas are set one by one: macOS's jemalloc rejects the `MALLCTL_ARENAS_ALL` (4096) shortcut with `EFAULT`.
+    /// Arenas are set one by one. Never use the `MALLCTL_ARENAS_ALL` (4096) shortcut here: jemalloc 5.3 accepts it
+    /// for `arena.<i>.*_decay_ms` but then reads `arenas[4096]`, one past the end of its 4,095-entry array. That slot
+    /// is the start of `arenas_lock`, whose first word counts the time threads waited for the lock, so after any
+    /// contention jemalloc treats that count as an arena pointer and crashes (issue #2: a segfault half a second
+    /// after start, when the decay thread first ran). Where the lock was never contended it returns `EFAULT`.
     pub fn set_decay_ms(ms: isize) {
         let report = |name: &[u8], e: tikv_jemalloc_ctl::Error| {
             eprintln!(
@@ -271,5 +275,30 @@ mod tests {
         assert_eq!(super::imp::arena0_dirty_decay_ms(), Some(30_000));
         super::imp::set_decay_ms(1_000);
         assert_eq!(super::imp::arena0_dirty_decay_ms(), Some(1_000));
+    }
+
+    /// Issue #2: after threads contend for jemalloc's `arenas_lock`, the old `arena.4096.*` write dereferenced
+    /// the lock's wait-time counter as an arena and segfaulted (11 of 20 runs at 16 threads). Setting decay must
+    /// survive that state.
+    #[test]
+    fn decay_survives_contended_arena_creation() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..4 {
+                        // SAFETY: `arenas.create` returns the new arena's index as an `unsigned`.
+                        let _ = unsafe { tikv_jemalloc_ctl::raw::read::<u32>(b"arenas.create\0") };
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        super::imp::set_decay_ms(30_000);
+        super::imp::set_decay_ms(1_000);
     }
 }
