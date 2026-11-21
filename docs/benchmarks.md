@@ -10,7 +10,7 @@ Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, stro
 - **100M vector (64 probes, recall@10 `0.954`; 48 probes `0.941–0.950`):** `1,201 / 1,391 ms` cache-cold (`1,164–1,201 / 1,348–1,391 ms`), `1,243 / 1,370 ms` fresh process (`1,228–1,243 / 1,370–1,411 ms`), and `99.7 / 162.8 ms` warm (`72.6 / 90.4 ms` warm at 48 probes); about `160 MB` read per cold query; load `5.7 h` at `4,891 docs/s`, `recluster` `1.7 h` into 160 slabs ([100M load and recluster](#100m-wikipedia-embeddings-in-region-and-over-the-internet), [Iteration 17](#iteration-17-100m-cold-and-warm-ann), and [Iteration 18](#iteration-18-100m-warm-ann-under-150-ms-and-a-small-cold-manifest-read)). turbopuffer publishes no 100M number.
 - **1M BM25 (MS MARCO, `overlap@10` `1.000` vs. exact BM25):** `380 / 526 ms` fresh process and `301 / 369 ms` cache-cold ([Iteration 13](#iteration-13-bm25-1m) and [Iteration 14 in-region check](#bm25-cold-at-1m-ms-marco-round-13-code-c7gd2xlarge-in-region-50-queries-abpy)). turbopuffer published: `316 / 381 ms` cold, `13 / 18 ms` warm.
 - **Memory and ingest:** a 4 GB `c7gd.large` (swap off) holds a 10M load plus `recluster` at `2.3–2.9 GB` peak RSS (`769 / 973 ms` fresh, `623 / 740 ms` cache-cold; [Iteration 15](#iteration-15-memory-10m-load-and-recluster-on-a-c7gdlarge) and [Iteration 18 memory check](#memory-check-10m-load-and-recluster-4-gib-cgroup-swap-off-2-cpus)). Ingest holds flat at about `4,500 docs/s` to 10M on `c7gd.xlarge` ([Iteration 16](#iteration-16-ingest-throughput-that-stays-flat-as-the-namespace-grows)).
-- **My own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; 100M load in progress); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
+- **My own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; at 100M, still `"warm"` at `201 ms` after a day idle); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
 
 ## Scope and status
 
@@ -2758,8 +2758,8 @@ just been written and indexed).
 ### Idle-gap samples
 
 `tpuf_cold.py` sends one ANN query after each idle gap, doubling the gap until turbopuffer reports "cold". It never did for
-the probe query at 100M: I stopped it after the 19,200 s gap, so these are idle-gap samples, not cold p50 and p90. A deep-cold
-sample after a day idle is separate.
+the probe query at 100M: I stopped it after the 19,200 s gap, so these are idle-gap samples, not cold p50 and p90. The last row
+is one separate sample after the namespace sat untouched for a day, and it still came back warm.
 
 | Idle gap | `server_total_ms` | Client ms | Cache temperature | Recall@10 |
 |---:|---:|---:|---|---:|
@@ -2771,6 +2771,7 @@ sample after a day idle is separate.
 | 4,800 s | 170 | 459 | warm | 1.0 |
 | 9,600 s | 202 | 482 | hot | 1.0 |
 | 19,200 s | 503 | 782 | warm | 0.9 |
+| 1 day | 201 | 454 | warm | 1.0 |
 
 The follow-up query after each probe (a different query, no idle) came back cold twice (after the 300 s and 600 s gaps:
 842 and 542 ms server time) because its clusters had not been read yet, so "cold" depends on the query as well as the idle time.
@@ -2809,6 +2810,7 @@ turbopuffer's are the measurements on this page, with server time as the in-regi
 | First pass over 200 queries, ANN p50 / p90 ms | not measured | 232 / 426 server, 310 / 525 client |
 | After the load, first query | not measured | 1,966 ms server (cold) |
 | Idle 19,200 s | not measured | 503 ms server (warm) |
+| Idle 1 day | not measured | 201 ms server (warm) |
 | Cold, cache-cold p50 / p90 ms | 1,069 / 1,243 (1,260 / 1,392) | not measured (the namespace did not go cold in the idle-gap run) |
 
 At 10M turbopuffer's first-pass ANN had server time 88 / 203 ms; at 100M it is 232 / 426 ms, about 2.6 and 2.1 times.

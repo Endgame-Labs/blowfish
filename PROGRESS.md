@@ -2,6 +2,15 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-21
+
+- **Crash reports on fatal signals (issue #2).** blowfish now writes the signal, fault address, thread, and stack frames
+  to stderr before dying on SIGSEGV, SIGBUS, SIGILL, or SIGFPE, then hands the signal back so the exit status and Rust's
+  stack-overflow message stay the same. Issue #2 (a segfault on 14 of 68 cold restarts on an M4 Max, arm64 Docker) did
+  not reproduce: 0 crashes in 120 cold restarts on an M4 across the same Docker image (small and 100K x 768 namespaces,
+  8 concurrent queries at startup) and a native macOS build. Checked: real null fault, stack overflow, and kill on Linux,
+  and real fault on macOS. Also: turbopuffer's 100M namespace still reported warm (201 ms) after a day idle.
+
 ## 2026-11-20
 
 - **turbopuffer at 100M, measured by me.** I loaded the same 100M rows into turbopuffer (14.7 h, 450.4 GB billable, 4,846
