@@ -343,7 +343,47 @@ impl PlaneQuery {
             // SAFETY: the features were detected, and `bits` holds `words * 8` bytes.
             return unsafe { self.signed_dot_avx512(bits, padded) };
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.words.is_multiple_of(2) && bits.len() >= self.words * 8 {
+            return self.signed_dot_neon(bits, padded);
+        }
         self.signed_dot(bits, padded)
+    }
+
+    /// [`Self::signed_dot`] 128 bits at a time with NEON `CNT` (part of every AArch64 CPU).
+    /// The bit counts are exact integers, so the result is bit-identical to the scalar path.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn signed_dot_neon(&self, bits: &[u8], padded: usize) -> f64 {
+        use std::arch::aarch64::*;
+        assert!(bits.len() >= self.words * 8 && self.words.is_multiple_of(2));
+        assert!(self.planes.len() >= QUERY_BITS * self.words);
+        // SAFETY: NEON is mandatory on AArch64, and every load reads 16 bytes inside `bits`
+        // (`words * 8` bytes) or a plane (`words` words), as asserted above.
+        unsafe {
+            let mut ones = vdupq_n_u16(0);
+            let mut acc = [vdupq_n_u16(0); QUERY_BITS];
+            for chunk in 0..self.words / 2 {
+                let code = vld1q_u8(bits.as_ptr().add(chunk * 16));
+                ones = vpadalq_u8(ones, vcntq_u8(code));
+                for (j, a) in acc.iter_mut().enumerate() {
+                    let plane = vld1q_u8(
+                        self.planes
+                            .as_ptr()
+                            .add(j * self.words + chunk * 2)
+                            .cast::<u8>(),
+                    );
+                    *a = vpadalq_u8(*a, vcntq_u8(vandq_u8(code, plane)));
+                }
+            }
+            let mut weighted = 0u64;
+            for (j, a) in acc.iter().enumerate() {
+                weighted += (vaddlvq_u16(*a) as u64) << j;
+            }
+            let ones = vaddlvq_u16(ones) as u64;
+            (2. * (self.delta * weighted as f64 + self.vmin * ones as f64) - self.sum)
+                / (padded as f64).sqrt()
+        }
     }
 
     /// Inner product of the residual query with the code's +-1 vector, divided by sqrt(padded).
@@ -398,6 +438,10 @@ impl PlaneQuery {
                 // SAFETY: the CPU feature was detected at runtime.
                 return unsafe { self.scan_popcnt(bytes, rows, compact, padded, emit) };
             }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if padded.is_multiple_of(128) && self.words == padded / 64 {
+            return self.scan_impl(bytes, rows, compact, padded, emit, Self::signed_dot_neon);
         }
         self.scan_impl(bytes, rows, compact, padded, emit, Self::signed_dot)
     }
@@ -676,6 +720,29 @@ mod tests {
             // SAFETY: the features were detected above.
             let fast = unsafe { plane.signed_dot_avx512(&code.bits, rq.padded) };
             assert_eq!(slow.to_bits(), fast.to_bits());
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_dot_matches_scalar() {
+        let mut rng = Rng(13);
+        for dims in [128, 1000, 1024, 1536] {
+            let mut sample = |n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|_| (rng.next() % 2000) as f32 / 1000. - 1.)
+                    .collect()
+            };
+            let rq = RaBitQ::new(dims, 5).unwrap();
+            let (q, c) = (sample(dims), sample(dims));
+            let c_rot: Vec<f32> = rq.rotate(&c).into_iter().map(|x| x as f32).collect();
+            let plane = PlaneQuery::new(&rq.rotate(&q), &c_rot);
+            for _ in 0..20 {
+                let code = rq.encode(&sample(dims), &c).unwrap();
+                let slow = plane.signed_dot(&code.bits, rq.padded);
+                let fast = plane.signed_dot_neon(&code.bits, rq.padded);
+                assert_eq!(slow.to_bits(), fast.to_bits());
+                assert_eq!(slow.to_bits(), plane.dot(&code.bits, rq.padded).to_bits());
+            }
         }
     }
     #[test]
