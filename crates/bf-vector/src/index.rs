@@ -70,17 +70,12 @@ const VECTOR_MERGE_MAX: u64 = 2 << 20;
 /// Cheap to clone (shared), so a caller can keep decoded clusters across queries and install
 /// them into each query's partial index instead of decoding the blob again.
 #[derive(Clone)]
-pub struct DecodedCluster {
-    center: Arc<[f32]>,
-    rows: Arc<RoaringBitmap>,
-    row_crcs: Arc<[u32]>,
-    ids: Arc<[u32]>,
-    codes_checked: Arc<std::sync::atomic::AtomicBool>,
-}
+pub struct DecodedCluster(Arc<format::ClusterData>);
 impl DecodedCluster {
     /// Approximate resident bytes.
     pub fn resident_bytes(&self) -> u64 {
-        (self.center.len() * 4 + self.row_crcs.len() * 8 + self.rows.serialized_size() + 128) as u64
+        (self.0.center.len() * 4 + self.0.row_crcs.len() * 8 + self.0.rows.serialized_size() + 128)
+            as u64
     }
 }
 
@@ -152,7 +147,12 @@ impl<R: RangeRead> Index<R> {
                 |c: &[f32]| -> Vec<f32> { rq.rotate(c).into_iter().map(|x| x as f32).collect() };
             metadata.parents = metadata.parents.iter().map(|p| rot(p)).collect();
             for c in &mut metadata.clusters {
-                c.center = rot(&c.center).into();
+                let data = c
+                    .data
+                    .as_mut()
+                    .and_then(Arc::get_mut)
+                    .expect("fresh cluster");
+                data.center = rot(&data.center);
             }
             metadata.flags |= format::FLAG_ROTATED;
         }
@@ -179,29 +179,19 @@ impl<R: RangeRead> Index<R> {
         stubs: Vec<StubCluster>,
     ) -> Result<Self> {
         let rq = RaBitQ::new(shape.dims, shape.seed)?;
-        // Every stub shares this thread's empty center, row set, and checksums: a query builds
-        // stubs for every cluster of each slab it probes, and only installs the probed ones.
-        thread_local! {
-            static EMPTY: (Arc<[f32]>, Arc<RoaringBitmap>, Arc<[u32]>) =
-                (Arc::from(Vec::new()), Arc::default(), Arc::from(Vec::new()));
-        }
-        let clusters = EMPTY.with(|(center, rows, row_crcs)| {
-            stubs
-                .into_iter()
-                .map(|s| format::Cluster {
-                    center: center.clone(),
-                    parent: u32::MAX,
-                    rows: rows.clone(),
-                    codes: s.codes,
-                    vectors: s.vectors,
-                    codes_crc: s.codes_crc,
-                    vectors_crc: s.vectors_crc,
-                    row_crcs: row_crcs.clone(),
-                    ids: None,
-                    codes_checked: None,
-                })
-                .collect()
-        });
+        // A query builds stubs for every cluster of each slab it probes and installs only the
+        // probed ones, so a stub holds no payload at all.
+        let clusters = stubs
+            .into_iter()
+            .map(|s| format::Cluster {
+                data: None,
+                parent: u32::MAX,
+                codes: s.codes,
+                vectors: s.vectors,
+                codes_crc: s.codes_crc,
+                vectors_crc: s.vectors_crc,
+            })
+            .collect();
         let metadata = Metadata {
             dims: shape.dims,
             count: 0,
@@ -237,17 +227,17 @@ impl<R: RangeRead> Index<R> {
             return Err(bad("invalid cluster blob"));
         }
         let row_crcs = (0..n).map(|_| p.u32()).collect::<Result<Vec<_>>>()?;
-        Ok(DecodedCluster {
-            center: center.into(),
-            ids: rows.iter().collect(),
-            rows: Arc::new(rows),
-            row_crcs: row_crcs.into(),
+        Ok(DecodedCluster(Arc::new(format::ClusterData {
+            center,
+            ids: Some(rows.iter().collect()),
+            rows,
+            row_crcs,
             codes_checked: Default::default(),
-        })
+        })))
     }
     /// Install a cluster decoded by [`Self::decode_cluster`] (shared, not copied).
     pub(crate) fn install_decoded(&mut self, cid: usize, d: &DecodedCluster) -> Result<()> {
-        if d.center.len() != self.rq.padded {
+        if d.0.center.len() != self.rq.padded {
             return Err(bad("cluster center width"));
         }
         let c = self
@@ -255,11 +245,7 @@ impl<R: RangeRead> Index<R> {
             .clusters
             .get_mut(cid)
             .ok_or_else(|| bad("cluster outside segment"))?;
-        c.center = d.center.clone();
-        c.rows = d.rows.clone();
-        c.row_crcs = d.row_crcs.clone();
-        c.ids = Some(d.ids.clone());
-        c.codes_checked = Some(d.codes_checked.clone());
+        c.data = Some(d.0.clone());
         Ok(())
     }
     /// Cluster payload for the directory blob area.
@@ -544,7 +530,8 @@ impl<R: RangeRead> Index<R> {
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
         for (cid, bytes) in clusters.iter().copied().zip(blocks) {
             let c = &self.metadata.clusters[cid];
-            let checked = c.codes_checked.as_deref();
+            // A stub's (shared, empty) payload never records a check.
+            let checked = c.data.as_deref().map(|d| &d.codes_checked);
             if !checked.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
                 check_crc(&bytes, c.codes_crc)?;
                 if let Some(f) = checked {
@@ -663,7 +650,7 @@ impl<R: RangeRead> Index<R> {
         for (cid, c) in self.metadata.clusters.iter().enumerate() {
             match filter {
                 Some(f) => {
-                    for row in (&*c.rows & f).iter() {
+                    for row in (&c.rows & f).iter() {
                         out.push((cid as u32, c.rows.rank(row) as u32 - 1));
                     }
                 }
@@ -700,7 +687,7 @@ impl<R: RangeRead> Index<R> {
         let mut locations = Vec::new();
         for (cid, c) in self.metadata.clusters.iter().enumerate() {
             if let Some(filter) = filter {
-                for row in (&*c.rows & filter).iter() {
+                for row in (&c.rows & filter).iter() {
                     locations.push((cid, c.rows.rank(row) as usize - 1));
                 }
             } else {
