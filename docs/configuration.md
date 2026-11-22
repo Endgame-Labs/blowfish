@@ -180,6 +180,20 @@ variables; the defaults suit 1,024-dimension vectors.
 `cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged copy to a namespace
 that was reclustered before paging existed, without rebuilding any slab.
 
+### Recluster leaf assignment
+
+`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. Each row
+then joins its nearest leaf among the leaves of its four nearest cells, not only its own cell's, and every leaf center
+is recomputed once from all of its rows. Rows near a cell boundary therefore sit with their true neighbors. On BEIR NQ,
+recall@10 at 64 probes went from 0.955 to 0.960, and 54 probes now give what 64 gave. The assignment searches each cell's
+leaves through about sqrt(leaves) groups, which makes the job about 1.5 times longer (240 s instead of 160 s on NQ).
+
+| What | Default | Variable |
+| --- | --- | --- |
+| Assign rows across cells (`0` clusters each cell's rows on their own, as before iteration 20) | on | `BF_RECLUSTER_GLOBAL` |
+| Leaf groups a row is compared with, over its four nearest cells | 12 | `BF_RECLUSTER_GROUPS` |
+| Rounds of recomputing leaf centers from their rows and assigning again | 1 | `BF_RECLUSTER_REFINE` |
+
 ### ANN probes and query concurrency
 
 The probe count is `ann_nprobe` (default 64; `engine.ann_nprobe`, `--ann-nprobe`, `BLOWFISH_ANN_NPROBE`, or `BF_ANN_NPROBE`)
@@ -209,6 +223,15 @@ from 0.906 to 0.958. Reclustering removes the cost: it gets the recall at the ba
 
 On x86-64 the RaBitQ scan uses AVX-512 (`VPOPCNTQ`) when the CPU has it; on arm64 it uses NEON (`CNT` and pairwise adds).
 Both give bit-identical results to the portable path.
+
+Indexes built since iteration 20 store their one-bit codes in a fast-scan layout: transposed in blocks of 32 rows, scored
+with 4-bit table lookups (byte shuffles on AVX-512BW, `TBL` on NEON, a scalar loop elsewhere, all giving the same sums).
+That is about 3 times faster per row on x86-64 and 5 times on Apple M4. Indexes in the older row-major layout are still
+read and scanned as before, so a namespace picks the layout up as its segments are rebuilt or reclustered.
+
+| What | Default | Variable |
+| --- | --- | --- |
+| Build new indexes in the fast-scan layout (`0` builds the row-major layout; reading handles both) | on | `BF_ANN_FASTSCAN` |
 
 ### Connection warming, hedging, and diagnostics
 
