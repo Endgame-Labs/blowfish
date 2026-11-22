@@ -7,3 +7,10 @@ dependencies = [
   "numpy>=2.1",
   "pyarrow>=18",
 ]
+
+[dependency-groups]
+# Same-machine baselines (qdrant.py, lance.py).
+others = [
+  "qdrant-client==1.20.0",
+  "lancedb==0.41.0",
+]

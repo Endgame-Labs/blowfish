@@ -43,3 +43,32 @@ echo "{\"url\":\"file://$(realpath $R/store)\"}" > $R/storage.json
     is 2,000 over the wall time from a common start to the last response.
 
 Queries send the vector as a JSON number array and ask only for `id` (`include_attributes: ["id"]`).
+
+## Same-machine baselines: Qdrant and LanceDB
+
+The same data and measurements, against Qdrant 1.20.0 (HTTP) and LanceDB 0.41 (in-process). Their clients are in
+the `others` dependency group.
+
+```sh
+# Qdrant: m 16, ef_construct 100, float16 vectors in RAM, optimized to one indexed segment
+docker run -d --name bf-nq-qdrant --cpuset-cpus 0-5 --memory 12g --memory-swap 12g -p 127.0.0.1:18110:6333 \
+  -v $(realpath $R)/qdrant:/qdrant/storage qdrant/qdrant:v1.20.0
+uv run --group others python -I qdrant.py $D --url http://127.0.0.1:18110     # upload, then wait until indexed
+NQ_ENGINE=qdrant QDRANT_EF=64 taskset -c 6,7 uv run python -I measure.py $D --base-url http://127.0.0.1:18110 \
+  --namespace nq --tag qdrant-ef64 --cpus 6,7
+NQ_QUALITY_K=10 NQ_ENGINE=qdrant QDRANT_EF=64 ... --parts quality              # recall@10 at limit 10 (see below)
+docker rm -f bf-nq-qdrant; docker rmi qdrant/qdrant:v1.20.0; sudo rm -rf $R/qdrant
+
+# LanceDB: IVF-PQ, 1,600 partitions, 128 sub-vectors, in this process (no HTTP), pinned and capped like a server
+systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 taskset -c 0-5 \
+  uv run --group others python -I lance.py build $D $R/lance
+systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 taskset -c 0-5 \
+  uv run --group others python -I lance.py measure $D $R/lance --probes 80,120,160 --refine 10,20 --out $R/results.jsonl
+... lance.py measure ... --quality-k 10 --quality-only                       # recall@10 at limit 10
+rm -rf $R/lance
+```
+
+Qdrant searches with `max(hnsw_ef, limit)` candidates, and LanceDB reranks `refine_factor × limit`, so a quality
+pass at `top_k` 100 overstates their recall@10 at a top-10 query's settings. Their recall@10 is measured at limit 10
+(`NQ_QUALITY_K=10`, `--quality-k 10`); blowfish's probe count does not depend on `top_k`. LanceDB runs in the
+measuring process, so its client threads share CPUs 0-5 with the engine, and its numbers carry no HTTP or JSON cost.

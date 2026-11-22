@@ -28,16 +28,28 @@ from urllib.parse import urlparse
 import numpy as np
 
 
+# Engine adapters: request path, request body, and result ids. `blowfish` speaks the turbopuffer API;
+# `qdrant` the Qdrant REST search API (set QDRANT_EF for `hnsw_ef`).
+ENGINE = os.environ.get("NQ_ENGINE", "blowfish")
+# Quality queries ask for this many results. Qdrant searches with max(hnsw_ef, limit), so its recall@10 at
+# a given hnsw_ef is measured with NQ_QUALITY_K=10 (recall@100 is then not meaningful).
+QUALITY_K = int(os.environ.get("NQ_QUALITY_K", "100"))
+
+
 def body(vec, top_k):
-    return json.dumps(
-        {"rank_by": ["vector", "ANN", [float(x) for x in vec]], "top_k": top_k, "include_attributes": ["id"]}
-    ).encode()
+    v = [float(x) for x in vec]
+    if ENGINE == "qdrant":
+        return json.dumps(
+            {"vector": v, "limit": top_k, "params": {"hnsw_ef": int(os.environ.get("QDRANT_EF", "64"))}}
+        ).encode()
+    return json.dumps({"rank_by": ["vector", "ANN", v], "top_k": top_k, "include_attributes": ["id"]}).encode()
 
 
 class Client:
     def __init__(self, base, ns):
         u = urlparse(base)
-        self.host, self.port, self.path = u.hostname, u.port, f"/v2/namespaces/{ns}/query"
+        self.host, self.port = u.hostname, u.port
+        self.path = f"/collections/{ns}/points/search" if ENGINE == "qdrant" else f"/v2/namespaces/{ns}/query"
         self.conn = http.client.HTTPConnection(self.host, self.port, timeout=600)
 
     def query(self, b: bytes):
@@ -50,7 +62,8 @@ class Client:
 
 
 def ids_of(data: bytes):
-    return [int(x["id"]) for x in json.loads(data)["rows"]]
+    d = json.loads(data)
+    return [int(x["id"]) for x in (d["result"] if ENGINE == "qdrant" else d["rows"])]
 
 
 def pin(cpus):
@@ -67,10 +80,15 @@ def quality(a, q, truth, qrels):
     def run(i):
         c = getattr(local, "c", None) or Client(a.base_url, a.namespace)
         local.c = c
-        return ids_of(c.query(body(q[i], 100)))
+        return ids_of(c.query(body(q[i], QUALITY_K)))
 
     with ThreadPoolExecutor(4) as pool:
         got = list(pool.map(run, range(len(q))))
+    return score(got, truth, qrels)
+
+
+def score(got, truth, qrels):
+    """Quality of `got` (per query, result ids, best first, top 100)."""
     r10, f1, ndcg, r100 = [], [], [], []
     for i, ids in enumerate(got):
         r10.append(len(set(ids[:10]) & set(truth[i, :10].tolist())) / 10)
@@ -85,7 +103,7 @@ def quality(a, q, truth, qrels):
         ndcg.append(dcg / idcg)
         r100.append(len(set(ids[:100]) & rel) / len(rel))
     m = lambda x: round(float(np.mean(x)), 4)
-    return {"recall10_exact": m(r10), "f1_10": m(f1), "ndcg10": m(ndcg), "recall100_qrels": m(r100), "queries": len(q)}
+    return {"recall10_exact": m(r10), "f1_10": m(f1), "ndcg10": m(ndcg), "recall100_qrels": m(r100), "queries": len(got)}
 
 
 def latency(a, q):
