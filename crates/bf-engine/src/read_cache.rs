@@ -35,7 +35,96 @@ pub(crate) struct DecodedCache {
     /// Decoded document column blocks (256 rows each), for hydrating results.
     columns: moka::sync::Cache<String, Arc<Vec<Option<serde_json::Value>>>>,
 }
-pub(crate) type ClusterCache = moka::sync::Cache<(Arc<str>, u32), bf_vector::DecodedCluster>;
+pub(crate) type ClusterCache = Arc<ClockCache<bf_vector::DecodedCluster>>;
+
+/// A byte-bounded cache of small, many, immutable values for hot paths: sharded mutexes over
+/// hash maps with CLOCK (second-chance) eviction. A lookup is one uncontended lock, a hash
+/// probe, and a clone; moka's per-read bookkeeping cost several times that under load.
+pub(crate) struct ClockCache<V> {
+    shards: Vec<Mutex<ClockShard<V>>>,
+    weigh: fn(&V) -> u64,
+}
+struct ClockShard<V> {
+    map: HashMap<(Arc<str>, u32), (V, u64, bool)>,
+    ring: std::collections::VecDeque<(Arc<str>, u32)>,
+    bytes: u64,
+    cap: u64,
+}
+impl<V: Clone> ClockCache<V> {
+    const SHARDS: usize = 64;
+    pub fn new(capacity: u64, weigh: fn(&V) -> u64) -> Self {
+        let cap = capacity / Self::SHARDS as u64;
+        Self {
+            shards: (0..Self::SHARDS)
+                .map(|_| {
+                    Mutex::new(ClockShard {
+                        map: HashMap::new(),
+                        ring: Default::default(),
+                        bytes: 0,
+                        cap,
+                    })
+                })
+                .collect(),
+            weigh,
+        }
+    }
+    fn shard(&self, key: &(Arc<str>, u32)) -> &Mutex<ClockShard<V>> {
+        use std::hash::BuildHasher;
+        static SEED: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+            std::sync::OnceLock::new();
+        let h = SEED.get_or_init(Default::default).hash_one(key);
+        &self.shards[h as usize % Self::SHARDS]
+    }
+    pub fn get(&self, key: &(Arc<str>, u32)) -> Option<V> {
+        let mut shard = self.shard(key).lock().expect("clock cache lock");
+        let (value, _, hot) = shard.map.get_mut(key)?;
+        *hot = true;
+        Some(value.clone())
+    }
+    pub fn insert(&self, key: (Arc<str>, u32), value: V) {
+        let bytes = (self.weigh)(&value);
+        let mut retired = Vec::new();
+        let mut shard = self.shard(&key).lock().expect("clock cache lock");
+        if bytes > shard.cap {
+            return;
+        }
+        if let Some((old, b, _)) = shard.map.insert(key.clone(), (value, bytes, false)) {
+            shard.bytes -= b;
+            retired.push(old);
+        } else {
+            shard.ring.push_back(key);
+        }
+        shard.bytes += bytes;
+        // Second chance: a value read since the hand last passed it goes round once more.
+        while shard.bytes > shard.cap {
+            let Some(k) = shard.ring.pop_front() else {
+                break;
+            };
+            match shard.map.get_mut(&k) {
+                Some((_, _, hot)) if *hot => {
+                    *hot = false;
+                    shard.ring.push_back(k);
+                }
+                Some(_) => {
+                    let (old, b, _) = shard.map.remove(&k).expect("present");
+                    shard.bytes -= b;
+                    retired.push(old);
+                }
+                None => {}
+            }
+        }
+        drop(shard);
+        drop(retired);
+    }
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            let mut shard = shard.lock().expect("clock cache lock");
+            shard.map.clear();
+            shard.ring.clear();
+            shard.bytes = 0;
+        }
+    }
+}
 impl DecodedCache {
     /// `budget` bytes for the general LRU, and half as much again beside it: three eighths of
     /// `budget` for decoded clusters and an eighth for decoded column blocks.
@@ -45,12 +134,10 @@ impl DecodedCache {
             entries: Arc::new(Mutex::new(Entries::default())),
             scope: String::new(),
             workers: Arc::new(Semaphore::new(workers.max(1))),
-            clusters: moka::sync::Cache::builder()
-                .max_capacity(budget / 8 * 3)
-                .weigher(|_, v: &bf_vector::DecodedCluster| {
-                    v.resident_bytes().min(u32::MAX as u64) as u32
-                })
-                .build(),
+            clusters: Arc::new(ClockCache::new(
+                budget / 8 * 3,
+                |v: &bf_vector::DecodedCluster| v.resident_bytes(),
+            )),
             columns: moka::sync::Cache::builder()
                 .max_capacity(budget / 8)
                 .weigher(|k: &String, v: &Arc<Vec<Option<serde_json::Value>>>| {
@@ -87,7 +174,7 @@ impl DecodedCache {
         let mut e = self.entries.lock().expect("decoded cache lock");
         e.values.clear();
         e.bytes = 0;
-        self.clusters.invalidate_all();
+        self.clusters.clear();
         self.columns.invalidate_all();
     }
     fn key(&self, key: &str) -> String {
@@ -212,6 +299,46 @@ mod tests {
         assert!(cache.get::<u64>("c").is_none());
         assert_eq!(*pinned, 1);
         assert_eq!(cache.entries.lock().unwrap().bytes, 8);
+    }
+
+    #[test]
+    fn clock_cache_bounds_bytes_and_gives_read_entries_a_second_chance() {
+        // 64 shards of 100 bytes; every key below lands in one shard or another, so test the
+        // invariants per shard through the public API: bytes stay bounded, and an entry read
+        // since the last sweep survives the next eviction in its shard.
+        let cache = ClockCache::<u64>::new(64 * 100, |_| 40);
+        let key = |i: u32| (Arc::<str>::from("obj"), i);
+        for i in 0..1000 {
+            cache.insert(key(i), i as u64);
+        }
+        for shard in &cache.shards {
+            let s = shard.lock().unwrap();
+            assert!(s.bytes <= 100 && s.map.len() <= 2 && s.ring.len() == s.map.len());
+        }
+        // Find two keys in one shard, read the older, insert a third: the read one stays.
+        let survivors: Vec<u32> = (0..1000)
+            .filter(|i| cache.get(&key(*i)).is_some())
+            .collect();
+        let same = |a: u32, b: u32| std::ptr::eq(cache.shard(&key(a)), cache.shard(&key(b)));
+        let (a, b) = survivors
+            .iter()
+            .flat_map(|&a| survivors.iter().map(move |&b| (a, b)))
+            .find(|&(a, b)| a != b && same(a, b))
+            .expect("a shard with two entries");
+        let shard = cache.shard(&key(a));
+        let older = *shard.lock().unwrap().ring.front().map(|(_, i)| i).unwrap();
+        let newer = if older == a { b } else { a };
+        for (_, _, hot) in shard.lock().unwrap().map.values_mut() {
+            *hot = false;
+        }
+        assert_eq!(cache.get(&key(older)), Some(older as u64));
+        let third = (1000..).find(|i| same(*i, a)).unwrap();
+        cache.insert(key(third), 7);
+        assert!(cache.get(&key(older)).is_some());
+        assert!(cache.get(&key(newer)).is_none());
+        assert_eq!(cache.get(&key(third)), Some(7));
+        cache.clear();
+        assert!(cache.get(&key(third)).is_none());
     }
 
     #[test]
