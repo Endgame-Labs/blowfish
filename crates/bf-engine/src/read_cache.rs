@@ -27,7 +27,13 @@ pub(crate) struct DecodedCache {
     /// Keys are relative to a storage view, so each view prefixes its own scope.
     scope: String,
     pub workers: Arc<Semaphore>,
+    /// Decoded directory cluster blobs (center, row set, checksums), by ANN object and cluster.
+    /// A warm query probes hundreds of clusters; decoding each blob again cost about as much
+    /// CPU as scanning its codes. Its own concurrent LRU (`budget / 2` bytes), because these
+    /// entries are small and many.
+    clusters: ClusterCache,
 }
+pub(crate) type ClusterCache = moka::sync::Cache<(Arc<str>, u32), bf_vector::DecodedCluster>;
 impl DecodedCache {
     pub fn new(budget: u64, workers: usize) -> Self {
         Self {
@@ -35,7 +41,17 @@ impl DecodedCache {
             entries: Arc::new(Mutex::new(Entries::default())),
             scope: String::new(),
             workers: Arc::new(Semaphore::new(workers.max(1))),
+            clusters: moka::sync::Cache::builder()
+                .max_capacity(budget / 2)
+                .weigher(|_, v: &bf_vector::DecodedCluster| {
+                    v.resident_bytes().min(u32::MAX as u64) as u32
+                })
+                .build(),
         }
+    }
+    /// Decoded clusters of the ANN object `object` (keys are scoped like every other entry).
+    pub fn clusters(&self, object: &str) -> (ClusterCache, Arc<str>) {
+        (self.clusters.clone(), self.key(object).into())
     }
     /// A view sharing this cache's byte budget and workers, with keys kept separate.
     pub fn scoped(&self, scope: &str) -> Self {
@@ -44,6 +60,7 @@ impl DecodedCache {
             entries: self.entries.clone(),
             scope: scope.to_owned(),
             workers: self.workers.clone(),
+            clusters: self.clusters.clone(),
         }
     }
     /// Forget every decoded entry (bench cold-cache runs).
@@ -51,6 +68,7 @@ impl DecodedCache {
         let mut e = self.entries.lock().expect("decoded cache lock");
         e.values.clear();
         e.bytes = 0;
+        self.clusters.invalidate_all();
     }
     fn key(&self, key: &str) -> String {
         if self.scope.is_empty() {

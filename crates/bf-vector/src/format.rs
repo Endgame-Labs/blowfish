@@ -1,4 +1,4 @@
-use std::{io::Cursor, ops::Range};
+use std::{io::Cursor, ops::Range, sync::Arc};
 
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
@@ -18,14 +18,18 @@ pub(crate) const FLAG_ROTATED: u32 = 1;
 pub(crate) const FLAG_COMPACT: u32 = 2;
 
 pub(crate) struct Cluster {
-    pub center: Vec<f32>,
+    pub center: Arc<[f32]>,
     pub parent: u32,
-    pub rows: RoaringBitmap,
+    pub rows: Arc<RoaringBitmap>,
     pub codes: Range<u64>,
     pub vectors: Range<u64>,
     pub codes_crc: u32,
     pub vectors_crc: u32,
-    pub row_crcs: Vec<u32>,
+    pub row_crcs: Arc<[u32]>,
+    /// Set once the code block has matched `codes_crc`. Shared by every index that installs
+    /// the same decoded cluster (see [`crate::DecodedCluster`]), so warm queries verify each
+    /// immutable code block once rather than on every scan.
+    pub codes_checked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) struct Metadata {
@@ -90,14 +94,15 @@ pub(crate) fn build_blob(
             }
             Block {
                 cluster: Cluster {
-                    center: rotated_center(&rq, &centers[c]),
+                    center: rotated_center(&rq, &centers[c]).into(),
                     parent: parent_ids[c],
-                    rows: ids,
+                    rows: Arc::new(ids),
                     codes: 0..codes.len() as u64,
                     vectors: 0..vectors_len,
                     codes_crc: crc32fast::hash(&codes),
                     vectors_crc: vectors_crc.finalize(),
-                    row_crcs,
+                    row_crcs: row_crcs.into(),
+                    codes_checked: Default::default(),
                 },
                 codes,
             }
@@ -187,7 +192,7 @@ fn encode_metadata(m: &Metadata) -> Result<Vec<u8>> {
         }
     }
     for c in &m.clusters {
-        for x in &c.center {
+        for x in c.center.iter() {
             out.extend(x.to_le_bytes());
         }
         put_u32(&mut out, c.parent);
@@ -199,7 +204,7 @@ fn encode_metadata(m: &Metadata) -> Result<Vec<u8>> {
         put_u32(&mut out, c.vectors_crc);
         put_u32(&mut out, c.rows.serialized_size() as u32);
         c.rows.serialize_into(&mut out)?;
-        for crc in &c.row_crcs {
+        for crc in c.row_crcs.iter() {
             put_u32(&mut out, *crc);
         }
     }
@@ -359,14 +364,15 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
         offset = vectors.end;
         total += code_len + vector_len;
         clusters.push(Cluster {
-            center,
+            center: center.into(),
             parent,
-            rows,
+            rows: Arc::new(rows),
             codes,
             vectors,
             codes_crc,
             vectors_crc,
-            row_crcs,
+            row_crcs: row_crcs.into(),
+            codes_checked: Default::default(),
         });
     }
     if p.remaining() != 0

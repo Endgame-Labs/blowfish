@@ -278,6 +278,7 @@ dependencies = [
  "globset",
  "half",
  "metrics",
+ "moka",
  "object_store",
  "rayon",
  "regex",

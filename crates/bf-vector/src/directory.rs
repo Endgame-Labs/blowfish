@@ -292,7 +292,7 @@ impl Section {
 /// Order `live` clusters along a greedy nearest-neighbor tour of their centers, starting at the
 /// first. Clusters that a query probes together are near each other, so they land near each
 /// other on the tour.
-fn tour<'a>(live: &[usize], center: impl Fn(usize) -> &'a Vec<f32> + Sync) -> Vec<usize> {
+fn tour<'a>(live: &[usize], center: impl Fn(usize) -> &'a [f32] + Sync) -> Vec<usize> {
     let Some(&first) = live.first() else {
         return Vec::new();
     };
@@ -362,7 +362,7 @@ impl Fragment {
             .collect();
         let mut centroid = vec![0f32; padded];
         for &c in &live {
-            for (g, x) in centroid.iter_mut().zip(&m.clusters[c].center) {
+            for (g, x) in centroid.iter_mut().zip(m.clusters[c].center.iter()) {
                 *g += *x;
             }
         }
@@ -383,7 +383,7 @@ impl Fragment {
             + if blocks_mode { 4 } else { 0 };
         // Blocks are laid out in `order`; entries stay in cluster order.
         let order = if blocks_mode {
-            tour(&live, |c| &m.clusters[c].center)
+            tour(&live, |c| &*m.clusters[c].center)
         } else {
             live.clone()
         };
@@ -453,7 +453,7 @@ impl Fragment {
             let wide = m.clusters.len() > u16::MAX as usize;
             let mut map = vec![0u32; m.count as usize];
             for (cid, c) in m.clusters.iter().enumerate() {
-                for row in &c.rows {
+                for row in c.rows.iter() {
                     *map.get_mut(row as usize)
                         .ok_or_else(|| bad("row outside segment"))? = cid as u32;
                 }
@@ -736,6 +736,18 @@ impl<R: RangeRead> PartialIndex<R> {
     /// Install a probed cluster's blob, read from the directory object.
     pub fn install(&mut self, cluster: usize, blob: &Bytes) -> Result<()> {
         self.0.install_cluster(cluster, blob)
+    }
+    /// Decode a probed cluster's blob, to keep (see [`crate::DecodedCluster`]) and install.
+    pub fn decode(&self, blob: &Bytes) -> Result<crate::DecodedCluster> {
+        self.0.decode_cluster(blob)
+    }
+    /// Install a cluster decoded earlier, by this or another partial index of the same segment.
+    pub fn install_decoded(
+        &mut self,
+        cluster: usize,
+        decoded: &crate::DecodedCluster,
+    ) -> Result<()> {
+        self.0.install_decoded(cluster, decoded)
     }
     /// The index. Only clusters that were installed may be scanned or reranked.
     pub fn index(&self) -> &Index<R> {

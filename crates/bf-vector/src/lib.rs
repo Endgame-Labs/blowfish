@@ -14,7 +14,7 @@ pub use directory::{
     DirEntry, DirSegment, Directory, Fragment, Membership, Page, PagedDirectory, PartialIndex,
 };
 pub use format::{FORMAT_VERSION, metadata_len};
-pub use index::{Candidate, Index, SearchParams, read_gap, read_merged};
+pub use index::{Candidate, DecodedCluster, Index, SearchParams, read_gap, read_merged};
 pub use reader::RangeRead;
 mod rabitq;
 pub use rabitq::{DistanceEstimate, RaBitQ, RaBitQCode};

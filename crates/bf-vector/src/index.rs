@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use bytes::Bytes;
 use roaring::RoaringBitmap;
@@ -66,6 +66,23 @@ const CODE_MERGE_MAX: u64 = 8 << 20;
 const VECTOR_GAP: u64 = 64 << 10;
 const VECTOR_MERGE_MAX: u64 = 2 << 20;
 
+/// A directory cluster blob, decoded: the rotated center, the row set, and the row checksums.
+/// Cheap to clone (shared), so a caller can keep decoded clusters across queries and install
+/// them into each query's partial index instead of decoding the blob again.
+#[derive(Clone)]
+pub struct DecodedCluster {
+    center: Arc<[f32]>,
+    rows: Arc<RoaringBitmap>,
+    row_crcs: Arc<[u32]>,
+    codes_checked: Arc<std::sync::atomic::AtomicBool>,
+}
+impl DecodedCluster {
+    /// Approximate resident bytes.
+    pub fn resident_bytes(&self) -> u64 {
+        (self.center.len() * 4 + self.row_crcs.len() * 4 + self.rows.serialized_size() + 96) as u64
+    }
+}
+
 pub(crate) struct StubCluster {
     pub codes: Range<u64>,
     pub vectors: Range<u64>,
@@ -116,10 +133,10 @@ impl<R: RangeRead> Index<R> {
             // Older indexes store raw centers. Rotating once at open lets every search
             // rotate the query once instead of once per probed cluster.
             let rot =
-                |c: &Vec<f32>| -> Vec<f32> { rq.rotate(c).into_iter().map(|x| x as f32).collect() };
-            metadata.parents = metadata.parents.iter().map(rot).collect();
+                |c: &[f32]| -> Vec<f32> { rq.rotate(c).into_iter().map(|x| x as f32).collect() };
+            metadata.parents = metadata.parents.iter().map(|p| rot(p)).collect();
             for c in &mut metadata.clusters {
-                c.center = rot(&c.center);
+                c.center = rot(&c.center).into();
             }
             metadata.flags |= format::FLAG_ROTATED;
         }
@@ -149,14 +166,15 @@ impl<R: RangeRead> Index<R> {
         let clusters = stubs
             .into_iter()
             .map(|s| format::Cluster {
-                center: Vec::new(),
+                center: Arc::from(Vec::new()),
                 parent: u32::MAX,
-                rows: RoaringBitmap::new(),
+                rows: Default::default(),
                 codes: s.codes,
                 vectors: s.vectors,
                 codes_crc: s.codes_crc,
                 vectors_crc: s.vectors_crc,
-                row_crcs: Vec::new(),
+                row_crcs: Arc::from(Vec::new()),
+                codes_checked: Default::default(),
             })
             .collect();
         let metadata = Metadata {
@@ -178,6 +196,11 @@ impl<R: RangeRead> Index<R> {
     }
     /// Install a directory cluster blob (rotated center, row set, row checksums).
     pub(crate) fn install_cluster(&mut self, cid: usize, blob: &[u8]) -> Result<()> {
+        let decoded = self.decode_cluster(blob)?;
+        self.install_decoded(cid, &decoded)
+    }
+    /// Decode a directory cluster blob without installing it.
+    pub(crate) fn decode_cluster(&self, blob: &[u8]) -> Result<DecodedCluster> {
         let padded = self.rq.padded;
         let mut p = format::Parser::new(blob);
         let center = p.vector(padded)?;
@@ -189,27 +212,40 @@ impl<R: RangeRead> Index<R> {
             return Err(bad("invalid cluster blob"));
         }
         let row_crcs = (0..n).map(|_| p.u32()).collect::<Result<Vec<_>>>()?;
+        Ok(DecodedCluster {
+            center: center.into(),
+            rows: Arc::new(rows),
+            row_crcs: row_crcs.into(),
+            codes_checked: Default::default(),
+        })
+    }
+    /// Install a cluster decoded by [`Self::decode_cluster`] (shared, not copied).
+    pub(crate) fn install_decoded(&mut self, cid: usize, d: &DecodedCluster) -> Result<()> {
+        if d.center.len() != self.rq.padded {
+            return Err(bad("cluster center width"));
+        }
         let c = self
             .metadata
             .clusters
             .get_mut(cid)
             .ok_or_else(|| bad("cluster outside segment"))?;
-        c.center = center;
-        c.rows = rows;
-        c.row_crcs = row_crcs;
+        c.center = d.center.clone();
+        c.rows = d.rows.clone();
+        c.row_crcs = d.row_crcs.clone();
+        c.codes_checked = d.codes_checked.clone();
         Ok(())
     }
     /// Cluster payload for the directory blob area.
     pub(crate) fn cluster_blob(&self, cid: usize) -> Vec<u8> {
         let c = &self.metadata.clusters[cid];
         let mut out = Vec::new();
-        for x in &c.center {
+        for x in c.center.iter() {
             out.extend(x.to_le_bytes());
         }
         out.extend((c.rows.len() as u32).to_le_bytes());
         out.extend((c.rows.serialized_size() as u32).to_le_bytes());
         c.rows.serialize_into(&mut out).expect("vec write");
-        for crc in &c.row_crcs {
+        for crc in c.row_crcs.iter() {
             out.extend(crc.to_le_bytes());
         }
         out
@@ -461,7 +497,11 @@ impl<R: RangeRead> Index<R> {
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
         for (cid, bytes) in clusters.iter().copied().zip(blocks) {
             let c = &self.metadata.clusters[cid];
-            check_crc(&bytes, c.codes_crc)?;
+            if !c.codes_checked.load(std::sync::atomic::Ordering::Relaxed) {
+                check_crc(&bytes, c.codes_crc)?;
+                c.codes_checked
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             let plane = crate::rabitq::PlaneQuery::new(&q_rot, &c.center);
             let mut rows = c.rows.iter();
             plane.scan(
@@ -554,7 +594,7 @@ impl<R: RangeRead> Index<R> {
         for (cid, c) in self.metadata.clusters.iter().enumerate() {
             match filter {
                 Some(f) => {
-                    for row in (&c.rows & f).iter() {
+                    for row in (&*c.rows & f).iter() {
                         out.push((cid as u32, c.rows.rank(row) as u32 - 1));
                     }
                 }
@@ -569,7 +609,7 @@ impl<R: RangeRead> Index<R> {
         let m = &self.metadata;
         let mut total = (m.parents.len() * (m.dims * 4 + 48)) as u64;
         for c in &m.clusters {
-            total += (c.center.len() * 4 + c.row_crcs.capacity() * 4 + 160) as u64
+            total += (c.center.len() * 4 + c.row_crcs.len() * 4 + 160) as u64
                 + c.rows.serialized_size() as u64;
         }
         total + (self.rq.padded * 8 * 4) as u64
@@ -591,7 +631,7 @@ impl<R: RangeRead> Index<R> {
         let mut locations = Vec::new();
         for (cid, c) in self.metadata.clusters.iter().enumerate() {
             if let Some(filter) = filter {
-                for row in (&c.rows & filter).iter() {
+                for row in (&*c.rows & filter).iter() {
                     locations.push((cid, c.rows.rank(row) as usize - 1));
                 }
             } else {

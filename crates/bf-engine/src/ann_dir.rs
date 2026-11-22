@@ -30,14 +30,22 @@ const BLOCK_GAP: u64 = 16 << 10;
 /// Read the blobs of `entries` (one segment's probed clusters) and, unless `exact`, their
 /// quantized codes. With block fragments both come from one set of ranged reads of the
 /// fragment; otherwise the blobs come from the fragment and the codes from the index object.
+/// Read the probed clusters' blobs and code blocks. `cached[i]` skips entry `i`'s blob (its
+/// decoded form is already at hand); blobs come back only for the others, in order.
 async fn read_clusters(
     entries: &[&bf_vector::DirEntry],
     blocks: bool,
     exact: bool,
     fragment: &Reader,
     partial: &bf_vector::PartialIndex<Reader>,
+    cached: Option<&[bool]>,
 ) -> Result<(Vec<bytes::Bytes>, Vec<bytes::Bytes>), ApiError> {
-    let blob_ranges: Vec<_> = entries.iter().map(|e| e.blob_range()).collect();
+    let blob_ranges: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !cached.is_some_and(|c| c[*i]))
+        .map(|(_, e)| e.blob_range())
+        .collect();
     if blocks {
         let n = blob_ranges.len();
         let mut ranges = blob_ranges;
@@ -496,6 +504,7 @@ pub(crate) async fn prefetch_scan(
                 false,
                 &frag_reader,
                 &partial,
+                None,
             )
             .await
             else {
@@ -555,6 +564,7 @@ pub(crate) async fn prefetch_scan(
                         true,
                         &frag_reader,
                         &partial,
+                        None,
                     ),
                     futures::future::join_all(pieces.into_iter().map(|r| vectors.read(r))),
                 );
@@ -1004,10 +1014,20 @@ pub(crate) async fn search(
                 let mut partial = dir.partial_index(i, reader).map_err(segment::index_error)?;
                 let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
                 let entry_refs: Vec<_> = seg_entries.iter().collect();
+                // Clusters decoded by earlier queries skip their blob read and decode.
+                let clusters = read_cache::context().map(|c| c.cache.clusters(&object_key));
+                let decoded: Vec<Option<bf_vector::DecodedCluster>> = wanted
+                    .iter()
+                    .map(|&c| {
+                        let (cache, key) = clusters.as_ref()?;
+                        cache.get(&(key.clone(), c as u32))
+                    })
+                    .collect();
+                let cached: Vec<bool> = decoded.iter().map(Option::is_some).collect();
                 // Documents' footers are warmed only for the segments holding likely winners (and
                 // for exactly scanned ones); the speculative document read reads the rest.
                 let (read, (), ()) = tokio::try_join!(
-                    read_clusters(&entry_refs, blocks, exact, &dir_reader, &partial),
+                    read_clusters(&entry_refs, blocks, exact, &dir_reader, &partial, Some(&cached)),
                     prefetch,
                     async {
                         if warm_docs {
@@ -1018,9 +1038,23 @@ pub(crate) async fn search(
                 )?;
                 let (blobs, codes) = read;
                 let read_done = trace_t0.elapsed().as_millis();
-                for (cluster, blob) in wanted.iter().zip(&blobs) {
+                let mut blobs = blobs.iter();
+                for (cluster, known) in wanted.iter().zip(decoded) {
+                    let d = match known {
+                        Some(d) => d,
+                        None => {
+                            let blob = blobs
+                                .next()
+                                .ok_or_else(|| segment::index_error("missing cluster blob"))?;
+                            let d = partial.decode(blob).map_err(segment::index_error)?;
+                            if let Some((cache, key)) = &clusters {
+                                cache.insert((key.clone(), *cluster as u32), d.clone());
+                            }
+                            d
+                        }
+                    };
                     partial
-                        .install(*cluster, blob)
+                        .install_decoded(*cluster, &d)
                         .map_err(segment::index_error)?;
                 }
                 let index = Arc::new(partial.into_index());
