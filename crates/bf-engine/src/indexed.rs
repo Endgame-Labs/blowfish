@@ -10,7 +10,26 @@ use std::{
 };
 
 pub(crate) fn rank_key(rank: &RankBy) -> String {
-    rank.value().to_string()
+    match rank {
+        // Exact and much cheaper than serializing the query vector as JSON: the bits in hex.
+        // (The prefix cannot begin a JSON value, so these keys never equal another kind's.)
+        RankBy::Vector {
+            attribute,
+            exact,
+            vector,
+            ..
+        } => {
+            use std::fmt::Write;
+            let mut key = String::with_capacity(attribute.len() + 12 + vector.len() * 8);
+            let _ = write!(key, "~vector {exact} {}:", attribute.len());
+            key.push_str(attribute);
+            for x in vector {
+                let _ = write!(key, "{:08x}", x.to_bits());
+            }
+            key
+        }
+        _ => rank.value().to_string(),
+    }
 }
 
 fn filter_columns(filter: &Filter, columns: &mut BTreeSet<String>) {
