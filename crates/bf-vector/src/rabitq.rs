@@ -425,7 +425,7 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, f64, bool),
+        emit: &mut impl FnMut(usize, f64, f64, bool),
     ) -> crate::Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -455,7 +455,7 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, f64, bool),
+        emit: &mut impl FnMut(usize, f64, f64, bool),
     ) -> crate::Result<()> {
         self.scan_impl(bytes, rows, compact, padded, emit, |q, bits, padded| {
             // SAFETY: the caller checked the features and that `bits` is `words * 8` bytes.
@@ -510,7 +510,7 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, f64, bool),
+        emit: &mut impl FnMut(usize, f64, f64, bool),
     ) -> crate::Result<()> {
         self.scan_impl(bytes, rows, compact, padded, emit, Self::signed_dot)
     }
@@ -522,7 +522,7 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, f64, bool),
+        emit: &mut impl FnMut(usize, f64, f64, bool),
         dot: impl Fn(&Self, &[u8], usize) -> f64,
     ) -> crate::Result<()> {
         let code = padded.div_ceil(8);
