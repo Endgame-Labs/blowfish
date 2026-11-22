@@ -4,6 +4,7 @@ use bf_engine::{Engine, EngineConfig};
 use bf_storage::{Storage, StorageConfig};
 use blowfish::{ServerOptions, metrics_router, prometheus_handle, router};
 mod crash;
+mod fdlimit;
 mod keys;
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
@@ -137,6 +138,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "blowfish=info,bf_engine=info".into()),
         )
         .init();
+    match fdlimit::raise() {
+        Some((before, after)) if after > before => {
+            tracing::info!(before, after, "raised the open-file limit")
+        }
+        Some(_) => {}
+        None => tracing::warn!("could not raise the open-file limit"),
+    }
     let command = Cli::parse().command;
     let command = match command {
         Command::Keys(keys) => return keys.run().await,
