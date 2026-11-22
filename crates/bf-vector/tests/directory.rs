@@ -182,13 +182,34 @@ async fn block_fragments_hold_blob_and_codes_together_and_scan_like_the_index() 
     }
     let got = partial
         .index()
-        .scan_blocks(&query, &wanted, codes, None)
+        .scan_blocks(&query, &wanted, codes.clone(), None)
         .unwrap();
     let expected = index.scan_clusters(&query, &wanted, None).await.unwrap();
     assert_eq!(got.len(), expected.len());
     for (a, b) in got.iter().zip(&expected) {
         assert_eq!((a.row, a.cluster, a.ordinal), (b.row, b.cluster, b.ordinal));
         assert_eq!(a.distance, b.distance);
+    }
+    // The bounded scan returns exactly the candidates that survive the error-bound test
+    // (lower bound at most the k-th smallest upper bound) applied to the full scan.
+    for k in [1, 3, 10, 50] {
+        let mut upper: Vec<f32> = got.iter().map(|c| c.distance + c.error).collect();
+        upper.sort_by(f32::total_cmp);
+        let threshold = upper[(k - 1).min(upper.len() - 1)];
+        let survivors: Vec<_> = got
+            .iter()
+            .filter(|c| c.distance - c.error <= threshold)
+            .map(|c| (c.row, c.cluster, c.ordinal))
+            .collect();
+        let bounded: Vec<_> = partial
+            .index()
+            .scan_blocks_bounded(&query, &wanted, codes.clone(), None, k)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.distance - c.error <= threshold)
+            .map(|c| (c.row, c.cluster, c.ordinal))
+            .collect();
+        assert_eq!(bounded, survivors, "k = {k}");
     }
 }
 

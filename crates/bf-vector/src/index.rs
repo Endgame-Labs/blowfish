@@ -84,6 +84,21 @@ impl DecodedCluster {
     }
 }
 
+/// An `f32` ordered by `total_cmp`, for heaps.
+#[derive(PartialEq)]
+struct OrdF32(f32);
+impl Eq for OrdF32 {}
+impl PartialOrd for OrdF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrdF32 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 pub(crate) struct StubCluster {
     pub codes: Range<u64>,
     pub vectors: Range<u64>,
@@ -468,7 +483,7 @@ impl<R: RangeRead> Index<R> {
         let t_read = std::time::Instant::now();
         let blocks = self.read_coalesced(clusters).await?;
         let read_ms = t_read.elapsed().as_millis();
-        self.scan_blocks_timed(query, clusters, blocks, filter, read_ms)
+        self.scan_blocks_timed(query, clusters, blocks, filter, read_ms, None)
     }
 
     /// Read the quantized-code blocks of `clusters` (merged into few requests), in input order.
@@ -486,7 +501,23 @@ impl<R: RangeRead> Index<R> {
         filter: Option<&RoaringBitmap>,
     ) -> Result<Vec<Candidate>> {
         validate(query, self.dims())?;
-        self.scan_blocks_timed(query, clusters, blocks, filter, 0)
+        self.scan_blocks_timed(query, clusters, blocks, filter, 0, None)
+    }
+
+    /// [`Self::scan_blocks`] for a caller that keeps only candidates whose lower bound
+    /// (`distance - error`) is at most the `k`-th smallest upper bound (`distance + error`) of
+    /// all candidates. A candidate whose lower bound already exceeds the `k`-th smallest upper
+    /// bound among this call's own candidates can never pass that test, so it is not returned.
+    pub fn scan_blocks_bounded(
+        &self,
+        query: &[f32],
+        clusters: &[usize],
+        blocks: Vec<Bytes>,
+        filter: Option<&RoaringBitmap>,
+        k: usize,
+    ) -> Result<Vec<Candidate>> {
+        validate(query, self.dims())?;
+        self.scan_blocks_timed(query, clusters, blocks, filter, 0, (k > 0).then_some(k))
     }
 
     fn scan_blocks_timed(
@@ -496,8 +527,12 @@ impl<R: RangeRead> Index<R> {
         blocks: Vec<Bytes>,
         filter: Option<&RoaringBitmap>,
         read_ms: u128,
+        keep: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let q = prepare(query, self.metric());
+        // The `k` smallest upper bounds so far, as a max-heap; `cut` is its largest once full.
+        let mut uppers = std::collections::BinaryHeap::<OrdF32>::new();
+        let mut cut = f32::INFINITY;
         let q_zero = q.iter().all(|x| *x == 0.);
         let q_rot = self.rq.rotate(&q);
         let t_cpu = std::time::Instant::now();
@@ -541,10 +576,26 @@ impl<R: RangeRead> Index<R> {
                     } else {
                         (d.max(0.), bound)
                     };
+                    let (distance, error) = (distance as f32, error as f32);
+                    if let Some(k) = keep {
+                        if distance - error > cut {
+                            return;
+                        }
+                        let upper = distance + error;
+                        if uppers.len() < k {
+                            uppers.push(OrdF32(upper));
+                        } else if upper < cut {
+                            uppers.pop();
+                            uppers.push(OrdF32(upper));
+                        }
+                        if uppers.len() == k {
+                            cut = uppers.peek().map_or(f32::INFINITY, |u| u.0);
+                        }
+                    }
                     estimated.push(Candidate {
                         row,
-                        distance: distance as f32,
-                        error: error as f32,
+                        distance,
+                        error,
                         cluster: cid as u32,
                         ordinal: ordinal as u32,
                     });

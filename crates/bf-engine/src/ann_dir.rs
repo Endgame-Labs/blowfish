@@ -1087,8 +1087,10 @@ pub(crate) async fn search(
                             Vec::new(),
                         ));
                     }
+                    // The rerank below keeps only candidates whose lower bound is within the
+                    // k-th smallest upper bound, so the scan drops the rest as it goes.
                     let found = index
-                        .scan_blocks(&vector, &wanted, codes, live.as_deref())
+                        .scan_blocks_bounded(&vector, &wanted, codes, live.as_deref(), k)
                         .map_err(segment::index_error)?;
                     Ok((Vec::new(), found))
                 })
