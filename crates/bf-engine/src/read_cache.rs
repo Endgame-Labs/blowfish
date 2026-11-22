@@ -29,12 +29,16 @@ pub(crate) struct DecodedCache {
     pub workers: Arc<Semaphore>,
     /// Decoded directory cluster blobs (center, row set, checksums), by ANN object and cluster.
     /// A warm query probes hundreds of clusters; decoding each blob again cost about as much
-    /// CPU as scanning its codes. Its own concurrent LRU (`budget / 2` bytes), because these
-    /// entries are small and many.
+    /// CPU as scanning its codes. Its own concurrent LRU, because these entries are small and
+    /// many (the general LRU's eviction scans every entry).
     clusters: ClusterCache,
+    /// Decoded document column blocks (256 rows each), for hydrating results.
+    columns: moka::sync::Cache<String, Arc<Vec<Option<serde_json::Value>>>>,
 }
 pub(crate) type ClusterCache = moka::sync::Cache<(Arc<str>, u32), bf_vector::DecodedCluster>;
 impl DecodedCache {
+    /// `budget` bytes for the general LRU, and half as much again beside it: three eighths of
+    /// `budget` for decoded clusters and an eighth for decoded column blocks.
     pub fn new(budget: u64, workers: usize) -> Self {
         Self {
             budget,
@@ -42,12 +46,26 @@ impl DecodedCache {
             scope: String::new(),
             workers: Arc::new(Semaphore::new(workers.max(1))),
             clusters: moka::sync::Cache::builder()
-                .max_capacity(budget / 2)
+                .max_capacity(budget / 8 * 3)
                 .weigher(|_, v: &bf_vector::DecodedCluster| {
                     v.resident_bytes().min(u32::MAX as u64) as u32
                 })
                 .build(),
+            columns: moka::sync::Cache::builder()
+                .max_capacity(budget / 8)
+                .weigher(|k: &String, v: &Arc<Vec<Option<serde_json::Value>>>| {
+                    (k.len() + 64 + v.len() * 48).min(u32::MAX as usize) as u32
+                })
+                .build(),
         }
+    }
+    /// A decoded column block (`key` is relative to this view, like every other key).
+    pub fn column(&self, key: &str) -> Option<Arc<Vec<Option<serde_json::Value>>>> {
+        self.columns.get(&self.key(key))
+    }
+    /// Keep a decoded column block.
+    pub fn insert_column(&self, key: &str, value: Arc<Vec<Option<serde_json::Value>>>) {
+        self.columns.insert(self.key(key), value);
     }
     /// Decoded clusters of the ANN object `object` (keys are scoped like every other entry).
     pub fn clusters(&self, object: &str) -> (ClusterCache, Arc<str>) {
@@ -61,6 +79,7 @@ impl DecodedCache {
             scope: scope.to_owned(),
             workers: self.workers.clone(),
             clusters: self.clusters.clone(),
+            columns: self.columns.clone(),
         }
     }
     /// Forget every decoded entry (bench cold-cache runs).
@@ -69,6 +88,7 @@ impl DecodedCache {
         e.values.clear();
         e.bytes = 0;
         self.clusters.invalidate_all();
+        self.columns.invalidate_all();
     }
     fn key(&self, key: &str) -> String {
         if self.scope.is_empty() {

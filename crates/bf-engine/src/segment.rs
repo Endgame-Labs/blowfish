@@ -1064,7 +1064,9 @@ pub(crate) async fn projected_rows_with(
     if rows.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let mut reader = ObjectReader::new(store, segment.files.get("docs").ok_or_else(corrupt)?);
+    let docs_file = segment.files.get("docs").ok_or_else(corrupt)?;
+    let docs_key = &docs_file.key;
+    let mut reader = ObjectReader::new(store, docs_file);
     if bypass {
         reader = reader.bypass_cache();
     }
@@ -1082,10 +1084,27 @@ pub(crate) async fn projected_rows_with(
             .filter(|(name, _)| *name == "id" || columns.is_none_or(|c| c.contains(*name)))
             .map(|(name, col)| async move {
                 let mut found: Vec<(u32, Value)> = Vec::new();
-                for batch in indices.chunks(64) {
+                // Decoded column blocks are kept in the decoded cache: a warm top-10 query
+                // hydrates about ten blocks of 256 rows, and parsing them again from JSON cost
+                // about a fifth of its CPU.
+                let block_key = |i: usize| format!("{docs_key}#{name}#{i}");
+                let context = read_cache::context().filter(|_| !bypass);
+                let mut decoded: Vec<Option<Arc<Vec<Option<Value>>>>> = indices
+                    .iter()
+                    .map(|&i| {
+                        let b = col.blocks.get(i)?;
+                        let hit = context.as_ref()?.cache.column(&block_key(i))?;
+                        context.as_ref()?.stats.record_memory_hit(b.length);
+                        Some(hit)
+                    })
+                    .collect();
+                let missing: Vec<usize> = (0..indices.len())
+                    .filter(|n| decoded[*n].is_none())
+                    .collect();
+                for batch in missing.chunks(64) {
                     let descriptors = batch
                         .iter()
-                        .map(|i| col.blocks.get(*i).ok_or_else(corrupt))
+                        .map(|n| col.blocks.get(indices[*n]).ok_or_else(corrupt))
                         .collect::<Result<Vec<_>, _>>()?;
                     let data = reader
                         .read_batch(
@@ -1096,7 +1115,8 @@ pub(crate) async fn projected_rows_with(
                         )
                         .await
                         .map_err(index_error)?;
-                    for ((&i, b), data) in batch.iter().zip(descriptors).zip(data) {
+                    for ((&n, b), data) in batch.iter().zip(descriptors).zip(data) {
+                        let i = indices[n];
                         if crc32fast::hash(&data) != b.crc {
                             return Err(corrupt());
                         }
@@ -1155,10 +1175,25 @@ pub(crate) async fn projected_rows_with(
                         if values.len() != (last - first) as usize {
                             return Err(corrupt());
                         }
-                        for row in rows.range(first..last) {
-                            if let Some(value) = &values[(row - first) as usize] {
-                                found.push((row, value.clone()));
-                            }
+                        let values = Arc::new(values);
+                        if let Some(c) = &context {
+                            c.cache.insert_column(&block_key(i), values.clone());
+                        }
+                        decoded[n] = Some(values);
+                    }
+                }
+                for (&i, values) in indices.iter().zip(&decoded) {
+                    let values = values.as_ref().ok_or_else(corrupt)?;
+                    let first = (i * BLOCK_ROWS) as u32;
+                    let last = first
+                        .saturating_add(BLOCK_ROWS as u32)
+                        .min(segment.row_count);
+                    if values.len() != (last - first) as usize {
+                        return Err(corrupt());
+                    }
+                    for row in rows.range(first..last) {
+                        if let Some(value) = &values[(row - first) as usize] {
+                            found.push((row, value.clone()));
                         }
                     }
                 }

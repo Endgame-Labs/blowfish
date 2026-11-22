@@ -29,6 +29,9 @@ pub(crate) struct Cluster {
     /// Set once the code block has matched `codes_crc`. Shared by every index that installs
     /// the same decoded cluster (see [`crate::DecodedCluster`]), so warm queries verify each
     /// immutable code block once rather than on every scan.
+    /// `rows` in order, when a decoded directory cluster supplied them (see
+    /// [`crate::DecodedCluster`]); scans and reranks then map ordinals to rows by index.
+    pub ids: Option<Arc<[u32]>>,
     /// `None` (a cluster parsed from a whole index, or a stub) checks the CRC on every scan.
     pub codes_checked: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -103,6 +106,7 @@ pub(crate) fn build_blob(
                     codes_crc: crc32fast::hash(&codes),
                     vectors_crc: vectors_crc.finalize(),
                     row_crcs: row_crcs.into(),
+                    ids: None,
                     codes_checked: None,
                 },
                 codes,
@@ -373,6 +377,7 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
             codes_crc,
             vectors_crc,
             row_crcs: row_crcs.into(),
+            ids: None,
             codes_checked: None,
         });
     }

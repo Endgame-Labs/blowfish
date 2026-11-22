@@ -74,12 +74,13 @@ pub struct DecodedCluster {
     center: Arc<[f32]>,
     rows: Arc<RoaringBitmap>,
     row_crcs: Arc<[u32]>,
+    ids: Arc<[u32]>,
     codes_checked: Arc<std::sync::atomic::AtomicBool>,
 }
 impl DecodedCluster {
     /// Approximate resident bytes.
     pub fn resident_bytes(&self) -> u64 {
-        (self.center.len() * 4 + self.row_crcs.len() * 4 + self.rows.serialized_size() + 96) as u64
+        (self.center.len() * 4 + self.row_crcs.len() * 8 + self.rows.serialized_size() + 128) as u64
     }
 }
 
@@ -181,6 +182,7 @@ impl<R: RangeRead> Index<R> {
                     codes_crc: s.codes_crc,
                     vectors_crc: s.vectors_crc,
                     row_crcs: row_crcs.clone(),
+                    ids: None,
                     codes_checked: None,
                 })
                 .collect()
@@ -222,6 +224,7 @@ impl<R: RangeRead> Index<R> {
         let row_crcs = (0..n).map(|_| p.u32()).collect::<Result<Vec<_>>>()?;
         Ok(DecodedCluster {
             center: center.into(),
+            ids: rows.iter().collect(),
             rows: Arc::new(rows),
             row_crcs: row_crcs.into(),
             codes_checked: Default::default(),
@@ -240,6 +243,7 @@ impl<R: RangeRead> Index<R> {
         c.center = d.center.clone();
         c.rows = d.rows.clone();
         c.row_crcs = d.row_crcs.clone();
+        c.ids = Some(d.ids.clone());
         c.codes_checked = Some(d.codes_checked.clone());
         Ok(())
     }
@@ -514,13 +518,17 @@ impl<R: RangeRead> Index<R> {
             }
             let plane = crate::rabitq::PlaneQuery::new(&q_rot, &c.center);
             let mut rows = c.rows.iter();
+            let ids = c.ids.as_deref();
             plane.scan(
                 &bytes,
                 c.rows.len() as usize,
                 compact,
                 self.rq.padded,
                 &mut |ordinal, d, bound, zero| {
-                    let row = rows.next().unwrap_or(u32::MAX);
+                    let row = match ids {
+                        Some(ids) => ids.get(ordinal).copied().unwrap_or(u32::MAX),
+                        None => rows.next().unwrap_or(u32::MAX),
+                    };
                     if filter.is_some_and(|f| !f.contains(row)) {
                         return;
                     }
@@ -840,10 +848,11 @@ impl<R: RangeRead> Index<R> {
                 if decoded.iter().any(|x| !x.is_finite()) {
                     return Err(bad("non-finite stored vector"));
                 }
-                let row = c
-                    .rows
-                    .select(i as u32)
-                    .ok_or_else(|| bad("invalid row ordinal"))?;
+                let row = match &c.ids {
+                    Some(ids) => ids.get(i).copied(),
+                    None => c.rows.select(i as u32),
+                }
+                .ok_or_else(|| bad("invalid row ordinal"))?;
                 result.push((row, self.metric().distance_unchecked(query, &decoded)));
             }
         }
