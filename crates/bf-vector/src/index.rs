@@ -163,20 +163,28 @@ impl<R: RangeRead> Index<R> {
         stubs: Vec<StubCluster>,
     ) -> Result<Self> {
         let rq = RaBitQ::new(shape.dims, shape.seed)?;
-        let clusters = stubs
-            .into_iter()
-            .map(|s| format::Cluster {
-                center: Arc::from(Vec::new()),
-                parent: u32::MAX,
-                rows: Default::default(),
-                codes: s.codes,
-                vectors: s.vectors,
-                codes_crc: s.codes_crc,
-                vectors_crc: s.vectors_crc,
-                row_crcs: Arc::from(Vec::new()),
-                codes_checked: Default::default(),
-            })
-            .collect();
+        // Every stub shares this thread's empty center, row set, and checksums: a query builds
+        // stubs for every cluster of each slab it probes, and only installs the probed ones.
+        thread_local! {
+            static EMPTY: (Arc<[f32]>, Arc<RoaringBitmap>, Arc<[u32]>) =
+                (Arc::from(Vec::new()), Arc::default(), Arc::from(Vec::new()));
+        }
+        let clusters = EMPTY.with(|(center, rows, row_crcs)| {
+            stubs
+                .into_iter()
+                .map(|s| format::Cluster {
+                    center: center.clone(),
+                    parent: u32::MAX,
+                    rows: rows.clone(),
+                    codes: s.codes,
+                    vectors: s.vectors,
+                    codes_crc: s.codes_crc,
+                    vectors_crc: s.vectors_crc,
+                    row_crcs: row_crcs.clone(),
+                    codes_checked: None,
+                })
+                .collect()
+        });
         let metadata = Metadata {
             dims: shape.dims,
             count: 0,
@@ -232,7 +240,7 @@ impl<R: RangeRead> Index<R> {
         c.center = d.center.clone();
         c.rows = d.rows.clone();
         c.row_crcs = d.row_crcs.clone();
-        c.codes_checked = d.codes_checked.clone();
+        c.codes_checked = Some(d.codes_checked.clone());
         Ok(())
     }
     /// Cluster payload for the directory blob area.
@@ -497,10 +505,12 @@ impl<R: RangeRead> Index<R> {
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
         for (cid, bytes) in clusters.iter().copied().zip(blocks) {
             let c = &self.metadata.clusters[cid];
-            if !c.codes_checked.load(std::sync::atomic::Ordering::Relaxed) {
+            let checked = c.codes_checked.as_deref();
+            if !checked.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
                 check_crc(&bytes, c.codes_crc)?;
-                c.codes_checked
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(f) = checked {
+                    f.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             let plane = crate::rabitq::PlaneQuery::new(&q_rot, &c.center);
             let mut rows = c.rows.iter();
