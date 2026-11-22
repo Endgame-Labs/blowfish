@@ -72,3 +72,17 @@ Qdrant searches with `max(hnsw_ef, limit)` candidates, and LanceDB reranks `refi
 pass at `top_k` 100 overstates their recall@10 at a top-10 query's settings. Their recall@10 is measured at limit 10
 (`NQ_QUALITY_K=10`, `--quality-k 10`); blowfish's probe count does not depend on `top_k`. LanceDB runs in the
 measuring process, so its client threads share CPUs 0-5 with the engine, and its numbers carry no HTTP or JSON cost.
+
+## On a Mac (vectors only)
+
+For a run on another machine, copy only `corpus.f16`, `queries.npy`, `truth.npy`, and `qrels.json`. Then load
+blowfish with `load.py --vectors-only`, which writes id and vector only, as Qdrant and LanceDB get.
+
+- **blowfish:** a native release build without the `local-models` feature. Run `blowfish serve` directly, since
+  `serve.sh` uses systemd. Cap the cache with `BLOWFISH_CACHE_MEMORY_BYTES`.
+- **Qdrant:** the official macOS arm64 release binary (`qdrant-aarch64-apple-darwin.tar.gz`), with
+  `QDRANT__STORAGE__STORAGE_PATH`, `QDRANT__SERVICE__HTTP_PORT`, and the same `qdrant.py`.
+- **LanceDB:** `lance.py` via `uv`.
+
+macOS has no `taskset`, so run with `--cpus ""`: the server and the clients share every core. Measure peak RSS with
+`/usr/bin/time -l`. Run one engine at a time, and delete its data before starting the next.
