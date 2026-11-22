@@ -225,7 +225,11 @@ pub(crate) async fn search(
             }
         }
         // Equal cluster counts and base probes at one segment reproduce per-index nprobe.
-        let scale = (clusters as f64 / (rows as f64).sqrt()).max(1.0);
+        // Segments are clustered independently here (see `ann_dir::independent_spread`).
+        let spread = crate::ann_dir::independent_spread(
+            ann.iter().map(|&i| segs[i].as_ref().unwrap().index.len()),
+        );
+        let scale = (clusters as f64 / (rows as f64).sqrt()).max(1.0) * spread;
         let probes = ((config.ann_nprobe as f64 * scale * rows as f64 / matching.max(1) as f64)
             .ceil() as usize)
             .min(clusters);

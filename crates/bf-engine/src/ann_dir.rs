@@ -461,6 +461,7 @@ pub(crate) async fn prefetch_scan(
             clusters,
             target,
             filtered: false,
+            spread: layout_spread(dir, layout, &seg_rows),
         },
         config,
     );
@@ -673,6 +674,22 @@ struct Totals {
     clusters: usize,
     target: usize,
     filtered: bool,
+    /// [`independent_spread`] of the layout.
+    spread: f64,
+}
+
+/// [`independent_spread`] over a directory's ANN segments; 1 for slabs (one clustering).
+fn layout_spread(dir: &Directory, layout: Layout, seg_rows: &[usize]) -> f64 {
+    if layout == Layout::Slabs {
+        return 1.0;
+    }
+    independent_spread(
+        dir.segments()
+            .iter()
+            .zip(seg_rows)
+            .filter(|(s, _)| !s.flat)
+            .map(|(_, n)| *n),
+    )
 }
 
 /// Clusters a query probes: `ann_nprobe` per square root of the rows' worth of clusters, more
@@ -680,6 +697,35 @@ struct Totals {
 fn probe_count(config: &EngineConfig, ann_rows: usize, clusters: usize, thin: f64) -> usize {
     let scale = (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0);
     ((config.ann_nprobe as f64 * scale * thin).ceil() as usize).min(clusters)
+}
+
+/// How many more clusters to probe because the segments were clustered independently.
+///
+/// `probe_count`'s square-root scaling fits one clustering of all the rows, as a `recluster`'s
+/// slabs share. Segments built one by one as data arrives each cluster a sample of the whole
+/// space, so a query's neighbors spread over every segment, each segment's clusters are coarser
+/// than a global clustering's, and the same probe count finds fewer of them (BEIR NQ, 2.68M rows
+/// in 25 segments: recall@10 0.907 against 0.954 reclustered). Such a layout probes
+/// `S^exponent` times as many clusters, where `S = (sum of rows)^2 / sum of rows^2` is the
+/// effective number of equal segments (tiny tail segments barely count). The exponent is
+/// `BF_ANN_SEGMENT_SPREAD` (default 0.3; 0 turns it off): NQ needed 2.5 times the probes to
+/// reach the reclustered recall, and 25^0.3 is 2.6.
+pub(crate) fn independent_spread(segment_rows: impl Iterator<Item = usize>) -> f64 {
+    static EXPONENT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let exponent = *EXPONENT.get_or_init(|| {
+        std::env::var("BF_ANN_SEGMENT_SPREAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.3)
+    });
+    let (sum, squares) = segment_rows.fold((0f64, 0f64), |(s, q), n| {
+        let n = n as f64;
+        (s + n, q + n * n)
+    });
+    if exponent <= 0.0 || squares <= 0.0 {
+        return 1.0;
+    }
+    (sum * sum / squares).max(1.0).powf(exponent)
 }
 
 /// The directory entries to probe, nearest first. `in_cluster` gives each entry's expected
@@ -697,6 +743,7 @@ fn pick_clusters(
         clusters,
         target,
         filtered,
+        spread,
     } = *t;
     let mut order: Vec<(f32, usize)> = dir
         .entries()
@@ -716,7 +763,7 @@ fn pick_clusters(
             thin
         }
     };
-    let probes = probe_count(config, ann_rows, clusters, thin);
+    let probes = probe_count(config, ann_rows, clusters, thin * spread);
     let cmp = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
     // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
     // only in the unlikely case the walk runs past them.
@@ -868,6 +915,7 @@ pub(crate) async fn search(
                     clusters,
                     target,
                     filtered,
+                    spread: layout_spread(dir.as_ref(), layout, &seg_rows),
                 },
                 config,
             );
@@ -1576,4 +1624,22 @@ pub(crate) async fn speculate_slab_scan(
 fn scan_speculation_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("BF_ANN_SPECULATE").is_ok_and(|v| v == "0"))
+}
+
+#[cfg(test)]
+mod spread_tests {
+    use super::independent_spread;
+
+    #[test]
+    fn spread_counts_effective_equal_segments() {
+        // One segment, or none: no extra probes.
+        assert_eq!(independent_spread([1000].into_iter()), 1.0);
+        assert_eq!(independent_spread(std::iter::empty()), 1.0);
+        // 25 equal segments: 25^0.3.
+        let s = independent_spread(std::iter::repeat_n(100_000, 25));
+        assert!((s - 25f64.powf(0.3)).abs() < 1e-9);
+        // Tiny tail segments barely count.
+        let tail = independent_spread([1_000_000, 100, 100].into_iter());
+        assert!(tail < 1.001, "{tail}");
+    }
 }
