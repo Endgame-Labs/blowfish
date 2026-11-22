@@ -87,6 +87,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         indexing: false,
         recall_sample_rate: 0.0,
         ann_nprobe: nprobe,
+        ann_nprobe_explicit: true,
         compaction_segments: argument("--compaction-segments", "4").parse()?,
         ..Default::default()
     };
