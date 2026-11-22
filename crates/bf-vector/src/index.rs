@@ -79,6 +79,28 @@ impl DecodedCluster {
     }
 }
 
+/// A query normalized for its metric and rotated into an index's transform space.
+pub struct RotatedQuery {
+    pub(crate) rotated: Vec<f64>,
+    /// `rotated` in single precision.
+    pub(crate) rotated32: Vec<f32>,
+    /// The normalized query is all zero.
+    pub(crate) zero: bool,
+    pub(crate) seed: u64,
+}
+impl RotatedQuery {
+    pub(crate) fn new(rq: &RaBitQ, query: &[f32], metric: Metric) -> Self {
+        let q = prepare(query, metric);
+        let rotated = rq.rotate(&q);
+        Self {
+            zero: q.iter().all(|x| *x == 0.),
+            rotated32: rotated.iter().map(|x| *x as f32).collect(),
+            rotated,
+            seed: rq.seed,
+        }
+    }
+}
+
 /// An `f32` ordered by `total_cmp`, for heaps.
 #[derive(PartialEq)]
 struct OrdF32(f32);
@@ -107,6 +129,9 @@ pub struct Index<R: RangeRead> {
     reader: R,
     metadata: Metadata,
     pub(crate) rq: RaBitQ,
+    /// The mean rotated center fast-scan codes are relative to (see [`crate::fastscan`]): for a
+    /// fast-scan index, or for a partial index, the directory section's centroid.
+    reference: Option<Arc<Vec<f32>>>,
 }
 impl<R: RangeRead> Index<R> {
     /// Open an index with two metadata reads: fixed footer, then directory.
@@ -156,10 +181,21 @@ impl<R: RangeRead> Index<R> {
             }
             metadata.flags |= format::FLAG_ROTATED;
         }
+        let reference = (metadata.flags & format::FLAG_FASTSCAN != 0).then(|| {
+            Arc::new(format::mean_center(
+                metadata
+                    .clusters
+                    .iter()
+                    .filter(|c| !c.rows.is_empty())
+                    .map(|c| c.center.as_slice()),
+                rq.padded,
+            ))
+        });
         Ok(Self {
             reader,
             metadata,
             rq,
+            reference,
         })
     }
     /// Parse only the metadata of a complete in-memory index blob (no payload reads are possible).
@@ -177,6 +213,7 @@ impl<R: RangeRead> Index<R> {
         reader: R,
         shape: &crate::directory::Shape,
         stubs: Vec<StubCluster>,
+        reference: Arc<Vec<f32>>,
     ) -> Result<Self> {
         let rq = RaBitQ::new(shape.dims, shape.seed)?;
         // A query builds stubs for every cluster of each slab it probes and installs only the
@@ -207,6 +244,7 @@ impl<R: RangeRead> Index<R> {
             reader,
             metadata,
             rq,
+            reference: Some(reference),
         })
     }
     /// Install a directory cluster blob (rotated center, row set, row checksums).
@@ -443,12 +481,11 @@ impl<R: RangeRead> Index<R> {
                 .map(|b| f32::from_le_bytes(*b))
                 .collect(),
             VectorType::I8 => raw.iter().map(|b| *b as i8 as f32).collect(),
-            VectorType::F16 => raw
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| half::f16::from_le_bytes(*b).to_f32())
-                .collect(),
+            VectorType::F16 => {
+                let mut out = Vec::with_capacity(raw.len() / 2);
+                extend_f16(raw, &mut out);
+                out
+            }
         }
     }
 
@@ -506,6 +543,32 @@ impl<R: RangeRead> Index<R> {
         self.scan_blocks_timed(query, clusters, blocks, filter, 0, (k > 0).then_some(k))
     }
 
+    /// The query normalized for the metric and rotated into the transform space. Indexes of
+    /// one vector space (one seed and dimension) share it, so a caller scanning several of them
+    /// rotates once (see [`Self::scan_blocks_bounded_rotated`]).
+    pub fn rotate_query(&self, query: &[f32]) -> Result<RotatedQuery> {
+        validate(query, self.dims())?;
+        Ok(RotatedQuery::new(&self.rq, query, self.metric()))
+    }
+
+    /// [`Self::scan_blocks_bounded`] with a query from [`Self::rotate_query`] or
+    /// [`crate::Directory::rotate_query`] of the same vector space.
+    pub fn scan_blocks_bounded_rotated(
+        &self,
+        query: &RotatedQuery,
+        clusters: &[usize],
+        blocks: Vec<Bytes>,
+        filter: Option<&RoaringBitmap>,
+        k: usize,
+    ) -> Result<Vec<Candidate>> {
+        if query.rotated.len() != self.rq.padded || query.seed != self.metadata.seed {
+            return Err(Error::InvalidInput(
+                "query rotated for another index".into(),
+            ));
+        }
+        self.scan_rotated(query, clusters, blocks, filter, 0, (k > 0).then_some(k))
+    }
+
     fn scan_blocks_timed(
         &self,
         query: &[f32],
@@ -515,12 +578,24 @@ impl<R: RangeRead> Index<R> {
         read_ms: u128,
         keep: Option<usize>,
     ) -> Result<Vec<Candidate>> {
-        let q = prepare(query, self.metric());
+        let q = RotatedQuery::new(&self.rq, query, self.metric());
+        self.scan_rotated(&q, clusters, blocks, filter, read_ms, keep)
+    }
+
+    fn scan_rotated(
+        &self,
+        query: &RotatedQuery,
+        clusters: &[usize],
+        blocks: Vec<Bytes>,
+        filter: Option<&RoaringBitmap>,
+        read_ms: u128,
+        keep: Option<usize>,
+    ) -> Result<Vec<Candidate>> {
         // The `k` smallest upper bounds so far, as a max-heap; `cut` is its largest once full.
         let mut uppers = std::collections::BinaryHeap::<OrdF32>::new();
-        let mut cut = f32::INFINITY;
-        let q_zero = q.iter().all(|x| *x == 0.);
-        let q_rot = self.rq.rotate(&q);
+        let cut = std::cell::Cell::new(f32::INFINITY);
+        let q_zero = query.zero;
+        let q_rot = &query.rotated;
         let t_cpu = std::time::Instant::now();
         let rows: usize = clusters
             .iter()
@@ -528,6 +603,14 @@ impl<R: RangeRead> Index<R> {
             .sum();
         let mut estimated = Vec::with_capacity(rows);
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
+        let padded = self.rq.padded;
+        let cosine = self.metric() == Metric::CosineDistance;
+        let mut fast: Option<crate::fastscan::FastQuery> = None;
+        let q32 = &query.rotated32;
+        let mut ordered = Vec::new();
+        // Fast-scanned clusters' candidates (a range of `estimated`), to score again with the
+        // fine tables once the cut is final.
+        let mut rescore: Vec<(Range<usize>, Bytes, usize, f32)> = Vec::new();
         for (cid, bytes) in clusters.iter().copied().zip(blocks) {
             let c = &self.metadata.clusters[cid];
             // A stub's (shared, empty) payload never records a check.
@@ -538,56 +621,109 @@ impl<R: RangeRead> Index<R> {
                     f.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            let plane = crate::rabitq::PlaneQuery::new(&q_rot, &c.center);
-            let mut rows = c.rows.iter();
-            let ids = c.ids.as_deref();
+            let n = c.rows.len() as usize;
+            let ids: &[u32] = match c.ids.as_deref() {
+                Some(ids) => ids,
+                None => {
+                    ordered.clear();
+                    ordered.extend(c.rows.iter());
+                    &ordered
+                }
+            };
+            let first = estimated.len();
+            let mut accept = |ordinal: usize, distance: f32, error: f32| {
+                if keep.is_some() && distance - error > cut.get() {
+                    return;
+                }
+                let row = ids.get(ordinal).copied().unwrap_or(u32::MAX);
+                if filter.is_some_and(|f| !f.contains(row)) {
+                    return;
+                }
+                if let Some(k) = keep {
+                    let upper = distance + error;
+                    if uppers.len() < k {
+                        uppers.push(OrdF32(upper));
+                    } else if upper < cut.get() {
+                        uppers.pop();
+                        uppers.push(OrdF32(upper));
+                    }
+                    if uppers.len() == k {
+                        cut.set(uppers.peek().map_or(f32::INFINITY, |u| u.0));
+                    }
+                }
+                estimated.push(Candidate {
+                    row,
+                    distance,
+                    error,
+                    cluster: cid as u32,
+                    ordinal: ordinal as u32,
+                });
+            };
+            // A zero query or row has a fixed cosine distance.
+            let fixed = |zero: bool| -> (f32, f32) { (if q_zero && zero { 0. } else { 1. }, 0.) };
+            if n > 0
+                && compact
+                && padded.is_multiple_of(8)
+                && bytes.len() == crate::fastscan::block_len(n, padded)
+            {
+                let reference = self
+                    .reference
+                    .as_deref()
+                    .ok_or_else(|| bad("fast-scan codes without a reference center"))?;
+                let fq =
+                    fast.get_or_insert_with(|| crate::fastscan::FastQuery::new(q_rot, reference));
+                let qc2 = Metric::EuclideanSquared.distance_unchecked(q32, &c.center);
+                fq.scan(&bytes, n, qc2, cosine, &mut |start, count, d, e, zero| {
+                    for j in 0..count {
+                        let z = zero & (1 << j) != 0;
+                        let (d, e) = if cosine && (q_zero || z) {
+                            fixed(z)
+                        } else {
+                            (d[j], e[j])
+                        };
+                        accept(start + j, d, e);
+                    }
+                })?;
+                if keep.is_some() && estimated.len() > first && fq.rounding_matters(qc2) {
+                    rescore.push((first..estimated.len(), bytes, n, qc2));
+                }
+                continue;
+            }
+            let mut consider = |ordinal: usize, d: f64, bound: f64, zero: bool| {
+                let (distance, error) = if cosine {
+                    if q_zero || zero {
+                        let (d, e) = fixed(zero);
+                        (f64::from(d), f64::from(e))
+                    } else {
+                        ((d * 0.5).clamp(0., 2.), bound * 0.5)
+                    }
+                } else {
+                    (d.max(0.), bound)
+                };
+                accept(ordinal, distance as f32, error as f32);
+            };
+            let plane = crate::rabitq::PlaneQuery::new(q_rot, &c.center);
             plane.scan(
                 &bytes,
-                c.rows.len() as usize,
+                n,
                 compact,
-                self.rq.padded,
-                &mut |ordinal, d, bound, zero| {
-                    let row = match ids {
-                        Some(ids) => ids.get(ordinal).copied().unwrap_or(u32::MAX),
-                        None => rows.next().unwrap_or(u32::MAX),
-                    };
-                    if filter.is_some_and(|f| !f.contains(row)) {
-                        return;
-                    }
-                    let (distance, error) = if self.metric() == Metric::CosineDistance {
-                        if q_zero || zero {
-                            (if q_zero && zero { 0. } else { 1. }, 0.)
-                        } else {
-                            ((d * 0.5).clamp(0., 2.), bound * 0.5)
-                        }
-                    } else {
-                        (d.max(0.), bound)
-                    };
-                    let (distance, error) = (distance as f32, error as f32);
-                    if let Some(k) = keep {
-                        if distance - error > cut {
-                            return;
-                        }
-                        let upper = distance + error;
-                        if uppers.len() < k {
-                            uppers.push(OrdF32(upper));
-                        } else if upper < cut {
-                            uppers.pop();
-                            uppers.push(OrdF32(upper));
-                        }
-                        if uppers.len() == k {
-                            cut = uppers.peek().map_or(f32::INFINITY, |u| u.0);
-                        }
-                    }
-                    estimated.push(Candidate {
-                        row,
-                        distance,
-                        error,
-                        cluster: cid as u32,
-                        ordinal: ordinal as u32,
-                    });
-                },
+                padded,
+                &mut |ordinal, d, bound, zero| consider(ordinal, d, bound, zero),
             )?;
+        }
+        // The coarse tables' rounding grows with the query's distance from the index's mean
+        // center, so rows that can still make the top `keep` get the fine score: the ordering of
+        // close rows (which decides prefetches and the rerank pool) and tighter bounds.
+        if let Some(fq) = &fast {
+            let cut = cut.get();
+            for (range, bytes, n, qc2) in rescore {
+                for c in &mut estimated[range] {
+                    if c.error == 0. || c.distance - c.error > cut {
+                        continue;
+                    }
+                    (c.distance, c.error) = fq.rescore(&bytes, n, qc2, cosine, c.ordinal as usize);
+                }
+            }
         }
         if std::env::var_os("BF_TRACE_STAGES").is_some() {
             eprintln!(
@@ -787,13 +923,7 @@ impl<R: RangeRead> Index<R> {
                             .iter()
                             .map(|x| f32::from_le_bytes(*x)),
                     ),
-                    VectorType::F16 => decoded.extend(
-                        vbytes
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|x| half::f16::from_le_bytes(*x).to_f32()),
-                    ),
+                    VectorType::F16 => extend_f16(vbytes, &mut decoded),
                 }
                 if decoded.iter().any(|x| !x.is_finite()) {
                     return Err(bad("non-finite stored vector"));
@@ -875,13 +1005,7 @@ impl<R: RangeRead> Index<R> {
                             .iter()
                             .map(|x| f32::from_le_bytes(*x)),
                     ),
-                    VectorType::F16 => decoded.extend(
-                        vbytes
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|x| half::f16::from_le_bytes(*x).to_f32()),
-                    ),
+                    VectorType::F16 => extend_f16(vbytes, &mut decoded),
                 }
                 if decoded.iter().any(|x| !x.is_finite()) {
                     return Err(bad("non-finite stored vector"));
@@ -906,6 +1030,22 @@ impl<R: RangeRead> Index<R> {
         }
         sort_truncate(&mut result, k);
         Ok(result)
+    }
+}
+
+/// Append little-endian `f16` bytes to `out` as `f32`, converting a block at a time (with the
+/// CPU's conversion instructions where it has them) instead of one value per call.
+pub(crate) fn extend_f16(bytes: &[u8], out: &mut Vec<f32>) {
+    use half::slice::HalfFloatSliceExt;
+    let start = out.len();
+    out.resize(start + bytes.len() / 2, 0.);
+    let mut buf = [half::f16::ZERO; 256];
+    for (chunk, dst) in bytes.chunks(512).zip(out[start..].chunks_mut(256)) {
+        let values = &mut buf[..chunk.len() / 2];
+        for (b, h) in chunk.as_chunks::<2>().0.iter().zip(values.iter_mut()) {
+            *h = half::f16::from_le_bytes(*b);
+        }
+        values.convert_to_f32_slice(dst);
     }
 }
 
@@ -956,6 +1096,9 @@ async fn merged<R: RangeRead>(
     max: u64,
     sparse: bool,
 ) -> Result<Vec<Bytes>> {
+    if !sparse && reader.caches_blocks() {
+        return read_batch(reader, ranges, false).await;
+    }
     let mut order: Vec<usize> = (0..ranges.len()).collect();
     order.sort_unstable_by_key(|i| ranges[*i].start);
     let mut merged: Vec<Range<u64>> = Vec::new();

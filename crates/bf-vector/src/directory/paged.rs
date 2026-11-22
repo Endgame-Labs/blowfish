@@ -43,7 +43,7 @@ struct Head {
     rows: u32,
     membership: Range<u64>,
     codes_in_fragment: bool,
-    centroid: Vec<f32>,
+    centroid: Arc<Vec<f32>>,
     /// Rows and entries the segment contributes in all (for sizing the probe plan).
     entry_rows: u64,
     entry_count: u64,
@@ -316,7 +316,7 @@ impl Directory {
                 sec.entries.iter().map(|e| u64::from(e.rows)).sum(),
             );
             put_u64(&mut header, sec.entries.len() as u64);
-            for x in &sec.centroid {
+            for x in sec.centroid.iter() {
                 header.extend(x.to_le_bytes());
             }
         }
@@ -411,7 +411,7 @@ impl PagedDirectory {
             let codes_in_fragment = p.u32()? != 0;
             let entry_rows = p.u64()?;
             let entry_count = p.u64()?;
-            let centroid = p.vector(padded)?;
+            let centroid = Arc::new(p.vector(padded)?);
             if membership.start > membership.end {
                 return Err(bad("invalid paged directory segment"));
             }
@@ -480,7 +480,7 @@ impl PagedDirectory {
         let coarse = Section {
             shape,
             clusters: ncells,
-            centroid,
+            centroid: Arc::new(centroid),
             entries,
             bits,
             rows: 0,

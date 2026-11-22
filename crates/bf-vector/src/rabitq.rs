@@ -30,7 +30,8 @@ pub struct RaBitQCode {
 pub struct RaBitQ {
     pub(crate) dims: usize,
     pub(crate) padded: usize,
-    signs: Vec<Vec<f64>>,
+    pub(crate) seed: u64,
+    signs: std::sync::Arc<Vec<Vec<f64>>>,
 }
 
 impl RaBitQ {
@@ -42,17 +43,37 @@ impl RaBitQ {
             ));
         }
         let padded = dims.next_power_of_two();
-        let mut rng = Rng(seed);
-        let signs = (0..3)
-            .map(|_| {
-                (0..padded)
-                    .map(|_| if rng.next() & 1 == 0 { -1. } else { 1. })
-                    .collect()
-            })
-            .collect();
+        // Every partial index a query builds needs the same few transforms: keep them.
+        type Signs = std::sync::Arc<Vec<Vec<f64>>>;
+        static KNOWN: std::sync::Mutex<Vec<(usize, u64, Signs)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut known = KNOWN.lock().expect("transform cache lock");
+        let signs = match known.iter().find(|(d, s, _)| *d == dims && *s == seed) {
+            Some((_, _, signs)) => signs.clone(),
+            None => {
+                let mut rng = Rng(seed);
+                let signs: Signs = std::sync::Arc::new(
+                    (0..3)
+                        .map(|_| {
+                            (0..padded)
+                                .map(|_| if rng.next() & 1 == 0 { -1. } else { 1. })
+                                .collect()
+                        })
+                        .collect(),
+                );
+                // A handful of (dimension, seed) pairs in practice; bound it regardless.
+                if known.len() >= 64 {
+                    known.remove(0);
+                }
+                known.push((dims, seed, signs.clone()));
+                signs
+            }
+        };
+        drop(known);
         Ok(Self {
             dims,
             padded,
+            seed,
             signs,
         })
     }
@@ -125,7 +146,7 @@ impl RaBitQ {
     }
 
     fn transform(&self, mut result: Vec<f64>) -> Vec<f64> {
-        for signs in &self.signs {
+        for signs in self.signs.iter() {
             for (x, sign) in result.iter_mut().zip(signs) {
                 *x *= sign;
             }
@@ -408,6 +429,11 @@ impl PlaneQuery {
         }
         (2. * (self.delta * weighted as f64 + self.vmin * ones as f64) - self.sum)
             / (padded as f64).sqrt()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signed_dot_for_tests(&self, bits: &[u8], padded: usize) -> f64 {
+        self.signed_dot(bits, padded)
     }
 
     /// Estimated squared distance (plain, without the error bound).

@@ -529,3 +529,55 @@ fn packed_build_matches_the_f32_build() {
     assert!(VectorType::I8.pack(&[0.5; 4], 4, &mut out).is_err());
     assert!(VectorType::F32.pack(&[1.0; 3], 4, &mut out).is_err());
 }
+
+#[tokio::test]
+async fn fast_scan_and_row_major_codes_rank_alike() {
+    // Far from the origin, so the fast-scan reference point (the mean center) matters.
+    let data: Vec<(u32, Vec<f32>)> = clustered(4000, 96)
+        .into_iter()
+        .map(|(r, v)| (r, v.into_iter().map(|x| x + 100.).collect()))
+        .collect();
+    for metric in [Metric::EuclideanSquared, Metric::CosineDistance] {
+        let build = |fastscan: bool| {
+            IndexBuilder::new(96, metric)
+                .unwrap()
+                .params(BuildParams {
+                    fastscan,
+                    ..Default::default()
+                })
+                .build(&data)
+                .unwrap()
+        };
+        let (fast, rows) = (build(true), build(false));
+        assert_ne!(fast.len(), rows.len(), "the layouts differ");
+        let fast = Index::open(Bytes::from(fast)).await.unwrap();
+        let rows = Index::open(Bytes::from(rows)).await.unwrap();
+        let clusters: Vec<usize> = (0..fast.cluster_count()).collect();
+        for q in [5usize, 777, 2024] {
+            let query = &data[q].1;
+            let exact = exact_search(&data, query, 10, metric, None).unwrap();
+            for index in [&fast, &rows] {
+                let got = index
+                    .search(query, 10, SearchParams::default(), None)
+                    .await
+                    .unwrap();
+                assert!(recall_at_k(&got, &exact) >= 0.9, "{metric:?} query {q}");
+            }
+            // Estimates of the two layouts agree within their error bounds.
+            let a = fast.scan_clusters(query, &clusters, None).await.unwrap();
+            let b = rows.scan_clusters(query, &clusters, None).await.unwrap();
+            assert_eq!(a.len(), b.len());
+            for (a, b) in a.iter().zip(&b) {
+                assert_eq!(a.row, b.row);
+                assert!(
+                    (a.distance - b.distance).abs() <= a.error + b.error + 1e-3,
+                    "{metric:?}: {} vs {} (bounds {} {})",
+                    a.distance,
+                    b.distance,
+                    a.error,
+                    b.error
+                );
+            }
+        }
+    }
+}
