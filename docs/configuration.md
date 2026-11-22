@@ -107,9 +107,9 @@ memory limit (host RAM, or the cgroup limit when lower):
 | Segment builds at once | 1 below 8 GiB, otherwise 2 | `BF_BUILD_CONCURRENCY` |
 | Decoded metadata cache | limit / 8, 512 MiB to 4 GiB | `BF_DECODED_CACHE_BYTES` |
 
-The decoded cache budget covers decoded segment metadata. Two caches sit beside it with their own share of that budget, so
-decoded data can take up to 1.5 times `BF_DECODED_CACHE_BYTES`: decoded ANN directory clusters (three eighths) and decoded
-document column blocks (one eighth). Size the memory limit with that in mind on small machines.
+The decoded cache budget covers all decoded data, in three parts: decoded segment metadata (two thirds), decoded ANN
+directory clusters (a quarter), and decoded document column blocks (a twelfth). Together they stay within
+`BF_DECODED_CACHE_BYTES`.
 
 `blowfish serve` reads every `BF_*` engine variable above, plus `BF_INDEX_BYTES`, `BF_MAX_SEGMENT_BYTES`, `BF_BULK_FLUSH_AGE_MS`, `BF_WAL_PIPELINE`, `BF_RETENTION_SECS`, `BF_ANN_RERANK`, `BF_EXACT_FETCH`, and `BF_FILTER_PROBE_CAP`. CLI flags and TOML keys take precedence over them. `BF_BULK_FLUSH_BYTES` follows `max_unindexed_bytes` (three quarters of it) unless set explicitly.
 

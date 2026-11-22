@@ -126,20 +126,21 @@ impl<V: Clone> ClockCache<V> {
     }
 }
 impl DecodedCache {
-    /// `budget` bytes for the general LRU, and half as much again beside it: three eighths of
-    /// `budget` for decoded clusters and an eighth for decoded column blocks.
+    /// `budget` bytes in all: two thirds for the general LRU, a quarter for decoded clusters, and
+    /// a twelfth for decoded column blocks.
     pub fn new(budget: u64, workers: usize) -> Self {
+        let (clusters, columns) = (budget / 4, budget / 12);
         Self {
-            budget,
+            budget: budget - clusters - columns,
             entries: Arc::new(Mutex::new(Entries::default())),
             scope: String::new(),
             workers: Arc::new(Semaphore::new(workers.max(1))),
             clusters: Arc::new(ClockCache::new(
-                budget / 8 * 3,
+                clusters,
                 |v: &bf_vector::DecodedCluster| v.resident_bytes(),
             )),
             columns: moka::sync::Cache::builder()
-                .max_capacity(budget / 8)
+                .max_capacity(columns)
                 .weigher(|k: &String, v: &Arc<Vec<Option<serde_json::Value>>>| {
                     (k.len() + 64 + v.len() * 48).min(u32::MAX as usize) as u32
                 })
