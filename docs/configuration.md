@@ -182,15 +182,21 @@ that was reclustered before paging existed, without rebuilding any slab.
 
 ### Recluster leaf assignment
 
-`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. Each row
-then joins its nearest leaf among the leaves of its four nearest cells, not only its own cell's, and every leaf center
-is recomputed once from all of its rows. Rows near a cell boundary therefore sit with their true neighbors. On BEIR NQ,
-recall@10 at 64 probes went from 0.955 to 0.960, and 54 probes now give what 64 gave. The assignment searches each cell's
-leaves through about sqrt(leaves) groups, which makes the job about 1.5 times longer (240 s instead of 160 s on NQ).
+`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. For a
+layout with at most 1,024 leaves in its largest cell (about 6.5M rows at the default 32 cells and 200 rows per leaf),
+each row then joins its nearest leaf among the leaves of its four nearest cells, not only its own cell's. Every leaf
+center is then recomputed once from all of its rows, so rows near a cell boundary sit with their true neighbors. On
+BEIR NQ (2.68M rows, about 420 leaves a cell), recall@10 at 64 probes went from 0.955 to 0.960, and 54 probes now give
+what 64 gave. The job took 240 s instead of 160 s.
+
+The cost grows faster than the rows. The leaves are trained with one-level k-means, and each row is compared with
+about 16 times the square root of a cell's leaves. With NQ split into 8 cells (about 1,700 leaves a cell, the size of a
+10M layout's cells), the job took 508 s instead of 93 s, at about the same peak memory (2.0 GB). Larger layouts, such
+as the published 10M and 100M ones, therefore keep the per-cell assignment unless it is forced on.
 
 | What | Default | Variable |
 | --- | --- | --- |
-| Assign rows across cells (`0` clusters each cell's rows on their own, as before iteration 20) | on | `BF_RECLUSTER_GLOBAL` |
+| Assign rows across cells: `1` always, `0` never (each cell's rows clustered on their own, as before iteration 20) | when the largest cell has at most 1,024 leaves | `BF_RECLUSTER_GLOBAL` |
 | Leaf groups a row is compared with, over its four nearest cells | 12 | `BF_RECLUSTER_GROUPS` |
 | Rounds of recomputing leaf centers from their rows and assigning again | 1 | `BF_RECLUSTER_REFINE` |
 

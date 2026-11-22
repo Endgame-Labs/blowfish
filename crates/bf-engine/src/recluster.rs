@@ -290,7 +290,17 @@ impl Engine {
         // every row joins its nearest leaf cluster over all cells (see `assign_leaves`); the
         // older layout clusters each cell's rows on their own (`BF_RECLUSTER_GLOBAL=0`).
         let max = opts.max_slab_rows.max(1);
-        let jobs: Vec<SlabJob> = if global_assignment() {
+        let most_leaves = cell_rows
+            .iter()
+            .map(|r| r.len() / opts.cluster_rows.max(1))
+            .max()
+            .unwrap_or(0);
+        let global = global_assignment(most_leaves);
+        eprintln!(
+            "recluster: {} leaf assignment (largest cell {most_leaves} leaves)",
+            if global { "cross-cell" } else { "per-cell" }
+        );
+        let jobs: Vec<SlabJob> = if global {
             let (present, read_row) = (present.clone(), read_row.clone());
             let cluster_rows = opts.cluster_rows.max(1);
             tokio::task::spawn_blocking(move || {
@@ -530,9 +540,22 @@ struct SlabJob {
     leaves: Option<(Vec<Vec<f32>>, Vec<usize>)>,
 }
 
-/// `BF_RECLUSTER_GLOBAL=0` builds slabs the older way: each cell's rows clustered on their own.
-fn global_assignment() -> bool {
-    !std::env::var("BF_RECLUSTER_GLOBAL").is_ok_and(|v| v == "0")
+/// Most leaves in one cell for which rows are assigned across cells by default. Each cell's
+/// leaves are trained with one-level k-means, whose cost grows with the square of the leaves,
+/// and each row is compared with about `16 sqrt(leaves)` centers. That is about 1.5 times the
+/// per-cell build at 400 leaves a cell (BEIR NQ, 32 cells), but 5.5 times at 1,700 (NQ in 8
+/// cells, the cell size of a 10M layout), and far more at 100M.
+const GLOBAL_MAX_LEAVES: usize = 1024;
+
+/// Whether to assign rows across cells: `BF_RECLUSTER_GLOBAL=1` always, `0` never (each cell's
+/// rows clustered on their own, as before), and otherwise when the largest cell has at most
+/// [`GLOBAL_MAX_LEAVES`] leaves.
+fn global_assignment(most_leaves: usize) -> bool {
+    match std::env::var("BF_RECLUSTER_GLOBAL").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => most_leaves <= GLOBAL_MAX_LEAVES,
+    }
 }
 
 /// A cell's leaf groups: their centers, and each group's leaves (global leaf numbers).
