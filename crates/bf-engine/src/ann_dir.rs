@@ -30,14 +30,22 @@ const BLOCK_GAP: u64 = 16 << 10;
 /// Read the blobs of `entries` (one segment's probed clusters) and, unless `exact`, their
 /// quantized codes. With block fragments both come from one set of ranged reads of the
 /// fragment; otherwise the blobs come from the fragment and the codes from the index object.
+/// Read the probed clusters' blobs and code blocks. `cached[i]` skips entry `i`'s blob (its
+/// decoded form is already at hand); blobs come back only for the others, in order.
 async fn read_clusters(
     entries: &[&bf_vector::DirEntry],
     blocks: bool,
     exact: bool,
     fragment: &Reader,
     partial: &bf_vector::PartialIndex<Reader>,
+    cached: Option<&[bool]>,
 ) -> Result<(Vec<bytes::Bytes>, Vec<bytes::Bytes>), ApiError> {
-    let blob_ranges: Vec<_> = entries.iter().map(|e| e.blob_range()).collect();
+    let blob_ranges: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !cached.is_some_and(|c| c[*i]))
+        .map(|(_, e)| e.blob_range())
+        .collect();
     if blocks {
         let n = blob_ranges.len();
         let mut ranges = blob_ranges;
@@ -349,6 +357,11 @@ pub(crate) async fn prefetch(store: &Storage, ns: &str, attr: &str) -> Option<Pr
 async fn run_parallel<T: Send + 'static>(
     tasks: Vec<futures::future::BoxFuture<'static, Result<T, ApiError>>>,
 ) -> Result<Vec<T>, ApiError> {
+    if !crate::fan_out() {
+        // Busy: poll the tasks from this one (the query's own thread), so they run one after
+        // another without handoffs.
+        return futures::future::try_join_all(tasks).await;
+    }
     let context = read_cache::context();
     let mut set = tokio::task::JoinSet::new();
     for task in tasks {
@@ -370,7 +383,7 @@ async fn run_parallel<T: Send + 'static>(
 async fn on_worker<T: Send + 'static>(
     fut: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {
-    let Some(context) = read_cache::context() else {
+    let Some(context) = read_cache::context().filter(|_| crate::fan_out()) else {
         return fut.await;
     };
     let permit = context
@@ -412,8 +425,11 @@ pub(crate) async fn prefetch_scan(
     let vector: Arc<[f32]> = vector.into();
     let distances = {
         let (dir, vector) = (dir.clone(), vector.clone());
-        on_worker(async move { dir.center_distances(&vector).map_err(segment::index_error) })
-            .await?
+        on_worker(async move {
+            dir.center_distances_on(&vector, crate::fan_out())
+                .map_err(segment::index_error)
+        })
+        .await?
     };
     crate::ann::stage(t0, "prefetch rank");
     let n = dir.segments().len();
@@ -445,6 +461,7 @@ pub(crate) async fn prefetch_scan(
             clusters,
             target,
             filtered: false,
+            spread: layout_spread(config, dir, layout, &seg_rows),
         },
         config,
     );
@@ -496,6 +513,7 @@ pub(crate) async fn prefetch_scan(
                 false,
                 &frag_reader,
                 &partial,
+                None,
             )
             .await
             else {
@@ -555,6 +573,7 @@ pub(crate) async fn prefetch_scan(
                         true,
                         &frag_reader,
                         &partial,
+                        None,
                     ),
                     futures::future::join_all(pieces.into_iter().map(|r| vectors.read(r))),
                 );
@@ -655,6 +674,28 @@ struct Totals {
     clusters: usize,
     target: usize,
     filtered: bool,
+    /// [`independent_spread`] of the layout.
+    spread: f64,
+}
+
+/// [`independent_spread`] over a directory's ANN segments; 1 for slabs (one clustering).
+fn layout_spread(
+    config: &EngineConfig,
+    dir: &Directory,
+    layout: Layout,
+    seg_rows: &[usize],
+) -> f64 {
+    if layout == Layout::Slabs {
+        return 1.0;
+    }
+    independent_spread(
+        config,
+        dir.segments()
+            .iter()
+            .zip(seg_rows)
+            .filter(|(s, _)| !s.flat)
+            .map(|(_, n)| *n),
+    )
 }
 
 /// Clusters a query probes: `ann_nprobe` per square root of the rows' worth of clusters, more
@@ -663,6 +704,50 @@ fn probe_count(config: &EngineConfig, ann_rows: usize, clusters: usize, thin: f6
     let scale = (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0);
     ((config.ann_nprobe as f64 * scale * thin).ceil() as usize).min(clusters)
 }
+
+/// How many more clusters to probe because the segments were clustered independently.
+///
+/// `probe_count`'s square-root scaling fits one clustering of all the rows, as a `recluster`'s
+/// slabs share. Segments built one by one as data arrives each cluster a sample of the whole
+/// space, so a query's neighbors spread over every segment, each segment's clusters are coarser
+/// than a global clustering's, and the same probe count finds fewer of them (BEIR NQ, 2.68M rows
+/// in 25 segments: recall@10 0.907 against 0.954 reclustered). Such a layout probes
+/// `S^exponent` times as many clusters, where `S = (sum of rows)^2 / sum of rows^2` is the
+/// effective number of equal segments (tiny tail segments barely count). The exponent is
+/// `BF_ANN_SEGMENT_SPREAD` (default 0.3; 0 turns it off): NQ needed 2.5 times the probes to
+/// reach the reclustered recall, and 25^0.3 is 2.6. The multiplier is at most
+/// [`MAX_SPREAD`] (reached at about 100 segments), so a namespace with many segments (a large
+/// load before its recluster, or one still ingesting) reads at most that many times the
+/// clusters on a cold query. An explicit `ann_nprobe` is never scaled.
+pub(crate) fn independent_spread(
+    config: &EngineConfig,
+    segment_rows: impl Iterator<Item = usize>,
+) -> f64 {
+    if config.ann_nprobe_explicit {
+        return 1.0;
+    }
+    static EXPONENT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let exponent = *EXPONENT.get_or_init(|| {
+        std::env::var("BF_ANN_SEGMENT_SPREAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.3)
+    });
+    let (sum, squares) = segment_rows.fold((0f64, 0f64), |(s, q), n| {
+        let n = n as f64;
+        (s + n, q + n * n)
+    });
+    if exponent <= 0.0 || squares <= 0.0 {
+        return 1.0;
+    }
+    (sum * sum / squares)
+        .max(1.0)
+        .powf(exponent)
+        .min(MAX_SPREAD)
+}
+
+/// Upper bound of [`independent_spread`].
+pub(crate) const MAX_SPREAD: f64 = 4.0;
 
 /// The directory entries to probe, nearest first. `in_cluster` gives each entry's expected
 /// allowed rows.
@@ -679,6 +764,7 @@ fn pick_clusters(
         clusters,
         target,
         filtered,
+        spread,
     } = *t;
     let mut order: Vec<(f32, usize)> = dir
         .entries()
@@ -698,7 +784,7 @@ fn pick_clusters(
             thin
         }
     };
-    let probes = probe_count(config, ann_rows, clusters, thin);
+    let probes = probe_count(config, ann_rows, clusters, thin * spread);
     let cmp = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
     // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
     // only in the unlikely case the walk runs past them.
@@ -775,8 +861,11 @@ pub(crate) async fn search(
     let width = dir.vector_row_bytes();
     let distances = {
         let (dir, vector) = (dir.clone(), vector.clone());
-        on_worker(async move { dir.center_distances(&vector).map_err(segment::index_error) })
-            .await?
+        on_worker(async move {
+            dir.center_distances_on(&vector, crate::fan_out())
+                .map_err(segment::index_error)
+        })
+        .await?
     };
     crate::ann::stage(t0, "rank");
     let entries = dir.entries();
@@ -847,6 +936,7 @@ pub(crate) async fn search(
                     clusters,
                     target,
                     filtered,
+                    spread: layout_spread(config, dir.as_ref(), layout, &seg_rows),
                 },
                 config,
             );
@@ -1004,10 +1094,20 @@ pub(crate) async fn search(
                 let mut partial = dir.partial_index(i, reader).map_err(segment::index_error)?;
                 let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
                 let entry_refs: Vec<_> = seg_entries.iter().collect();
+                // Clusters decoded by earlier queries skip their blob read and decode.
+                let clusters = read_cache::context().map(|c| c.cache.clusters(&object_key));
+                let decoded: Vec<Option<bf_vector::DecodedCluster>> = wanted
+                    .iter()
+                    .map(|&c| {
+                        let (cache, key) = clusters.as_ref()?;
+                        cache.get(&(key.clone(), c as u32))
+                    })
+                    .collect();
+                let cached: Vec<bool> = decoded.iter().map(Option::is_some).collect();
                 // Documents' footers are warmed only for the segments holding likely winners (and
                 // for exactly scanned ones); the speculative document read reads the rest.
                 let (read, (), ()) = tokio::try_join!(
-                    read_clusters(&entry_refs, blocks, exact, &dir_reader, &partial),
+                    read_clusters(&entry_refs, blocks, exact, &dir_reader, &partial, Some(&cached)),
                     prefetch,
                     async {
                         if warm_docs {
@@ -1018,9 +1118,23 @@ pub(crate) async fn search(
                 )?;
                 let (blobs, codes) = read;
                 let read_done = trace_t0.elapsed().as_millis();
-                for (cluster, blob) in wanted.iter().zip(&blobs) {
+                let mut blobs = blobs.iter();
+                for (cluster, known) in wanted.iter().zip(decoded) {
+                    let d = match known {
+                        Some(d) => d,
+                        None => {
+                            let blob = blobs
+                                .next()
+                                .ok_or_else(|| segment::index_error("missing cluster blob"))?;
+                            let d = partial.decode(blob).map_err(segment::index_error)?;
+                            if let Some((cache, key)) = &clusters {
+                                cache.insert((key.clone(), *cluster as u32), d.clone());
+                            }
+                            d
+                        }
+                    };
                     partial
-                        .install(*cluster, blob)
+                        .install_decoded(*cluster, &d)
                         .map_err(segment::index_error)?;
                 }
                 let index = Arc::new(partial.into_index());
@@ -1042,8 +1156,10 @@ pub(crate) async fn search(
                             Vec::new(),
                         ));
                     }
+                    // The rerank below keeps only candidates whose lower bound is within the
+                    // k-th smallest upper bound, so the scan drops the rest as it goes.
                     let found = index
-                        .scan_blocks(&vector, &wanted, codes, live.as_deref())
+                        .scan_blocks_bounded(&vector, &wanted, codes, live.as_deref(), k)
                         .map_err(segment::index_error)?;
                     Ok((Vec::new(), found))
                 })
@@ -1529,4 +1645,31 @@ pub(crate) async fn speculate_slab_scan(
 fn scan_speculation_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("BF_ANN_SPECULATE").is_ok_and(|v| v == "0"))
+}
+
+#[cfg(test)]
+mod spread_tests {
+    use super::{MAX_SPREAD, independent_spread};
+    use crate::EngineConfig;
+
+    #[test]
+    fn spread_counts_effective_equal_segments() {
+        let c = EngineConfig::default();
+        let spread = |rows: &[usize]| independent_spread(&c, rows.iter().copied());
+        // One segment, or none: no extra probes.
+        assert_eq!(spread(&[1000]), 1.0);
+        assert_eq!(spread(&[]), 1.0);
+        // 25 equal segments: 25^0.3.
+        assert!((spread(&[100_000; 25]) - 25f64.powf(0.3)).abs() < 1e-9);
+        // Tiny tail segments barely count.
+        assert!(spread(&[1_000_000, 100, 100]) < 1.001);
+        // Many segments: capped.
+        assert_eq!(spread(&[50_000; 200]), MAX_SPREAD);
+        // An explicit probe count is used as given.
+        let explicit = EngineConfig {
+            ann_nprobe_explicit: true,
+            ..EngineConfig::default()
+        };
+        assert_eq!(independent_spread(&explicit, [1; 25].into_iter()), 1.0);
+    }
 }

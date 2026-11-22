@@ -60,7 +60,7 @@ impl ObjectReader {
             .store
             .range_reader_with_length(&self.file.key, self.file.size, true)
             .map_err(io::Error::other)?;
-        Ok(if self.bypass {
+        Ok(if self.bypass || !read_cache::admitting() {
             reader.bypass_cache()
         } else {
             reader
@@ -81,6 +81,23 @@ impl ObjectReader {
     }
     pub async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
         self.range_reader()?
+            .read_batch_with_stats(&ranges, &read_cache::stats())
+            .await
+            .map_err(io::Error::other)
+    }
+    /// Read small ranges scattered over the object (rerank vectors) through small cache
+    /// blocks, so a miss fetches `BF_SPARSE_BLOCK_BYTES` (default 16 KiB) instead of a full
+    /// block, and the cache holds those vectors without the megabyte around each one.
+    pub async fn read_batch_sparse(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        static BLOCK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let block = *BLOCK.get_or_init(|| {
+            std::env::var("BF_SPARSE_BLOCK_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16 << 10)
+        });
+        self.range_reader()?
+            .sparse(block)
             .read_batch_with_stats(&ranges, &read_cache::stats())
             .await
             .map_err(io::Error::other)
@@ -1047,7 +1064,9 @@ pub(crate) async fn projected_rows_with(
     if rows.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let mut reader = ObjectReader::new(store, segment.files.get("docs").ok_or_else(corrupt)?);
+    let docs_file = segment.files.get("docs").ok_or_else(corrupt)?;
+    let docs_key = &docs_file.key;
+    let mut reader = ObjectReader::new(store, docs_file);
     if bypass {
         reader = reader.bypass_cache();
     }
@@ -1065,10 +1084,27 @@ pub(crate) async fn projected_rows_with(
             .filter(|(name, _)| *name == "id" || columns.is_none_or(|c| c.contains(*name)))
             .map(|(name, col)| async move {
                 let mut found: Vec<(u32, Value)> = Vec::new();
-                for batch in indices.chunks(64) {
+                // Decoded column blocks are kept in the decoded cache: a warm top-10 query
+                // hydrates about ten blocks of 256 rows, and parsing them again from JSON cost
+                // about a fifth of its CPU.
+                let block_key = |i: usize| format!("{docs_key}#{name}#{i}");
+                let context = read_cache::context().filter(|_| !bypass);
+                let mut decoded: Vec<Option<Arc<Vec<Option<Value>>>>> = indices
+                    .iter()
+                    .map(|&i| {
+                        let b = col.blocks.get(i)?;
+                        let hit = context.as_ref()?.cache.column(&block_key(i))?;
+                        context.as_ref()?.stats.record_memory_hit(b.length);
+                        Some(hit)
+                    })
+                    .collect();
+                let missing: Vec<usize> = (0..indices.len())
+                    .filter(|n| decoded[*n].is_none())
+                    .collect();
+                for batch in missing.chunks(64) {
                     let descriptors = batch
                         .iter()
-                        .map(|i| col.blocks.get(*i).ok_or_else(corrupt))
+                        .map(|n| col.blocks.get(indices[*n]).ok_or_else(corrupt))
                         .collect::<Result<Vec<_>, _>>()?;
                     let data = reader
                         .read_batch(
@@ -1079,7 +1115,8 @@ pub(crate) async fn projected_rows_with(
                         )
                         .await
                         .map_err(index_error)?;
-                    for ((&i, b), data) in batch.iter().zip(descriptors).zip(data) {
+                    for ((&n, b), data) in batch.iter().zip(descriptors).zip(data) {
+                        let i = indices[n];
                         if crc32fast::hash(&data) != b.crc {
                             return Err(corrupt());
                         }
@@ -1138,10 +1175,25 @@ pub(crate) async fn projected_rows_with(
                         if values.len() != (last - first) as usize {
                             return Err(corrupt());
                         }
-                        for row in rows.range(first..last) {
-                            if let Some(value) = &values[(row - first) as usize] {
-                                found.push((row, value.clone()));
-                            }
+                        let values = Arc::new(values);
+                        if let Some(c) = &context {
+                            c.cache.insert_column(&block_key(i), values.clone());
+                        }
+                        decoded[n] = Some(values);
+                    }
+                }
+                for (&i, values) in indices.iter().zip(&decoded) {
+                    let values = values.as_ref().ok_or_else(corrupt)?;
+                    let first = (i * BLOCK_ROWS) as u32;
+                    let last = first
+                        .saturating_add(BLOCK_ROWS as u32)
+                        .min(segment.row_count);
+                    if values.len() != (last - first) as usize {
+                        return Err(corrupt());
+                    }
+                    for row in rows.range(first..last) {
+                        if let Some(value) = &values[(row - first) as usize] {
+                            found.push((row, value.clone()));
                         }
                     }
                 }
@@ -1483,6 +1535,9 @@ pub(crate) fn vector_metric(metric: bf_types::DistanceMetric) -> bf_vector::Metr
 impl bf_vector::RangeRead for ObjectReader {
     async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
         ObjectReader::read_batch(self, ranges).await
+    }
+    async fn read_batch_sparse(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        ObjectReader::read_batch_sparse(self, ranges).await
     }
     fn len(&self) -> u64 {
         self.file.size

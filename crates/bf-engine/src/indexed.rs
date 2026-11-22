@@ -10,7 +10,26 @@ use std::{
 };
 
 pub(crate) fn rank_key(rank: &RankBy) -> String {
-    rank.value().to_string()
+    match rank {
+        // Exact and much cheaper than serializing the query vector as JSON: the bits in hex.
+        // (The prefix cannot begin a JSON value, so these keys never equal another kind's.)
+        RankBy::Vector {
+            attribute,
+            exact,
+            vector,
+            ..
+        } => {
+            use std::fmt::Write;
+            let mut key = String::with_capacity(attribute.len() + 12 + vector.len() * 8);
+            let _ = write!(key, "~vector {exact} {}:", attribute.len());
+            key.push_str(attribute);
+            for x in vector {
+                let _ = write!(key, "{:08x}", x.to_bits());
+            }
+            key
+        }
+        _ => rank.value().to_string(),
+    }
 }
 
 fn filter_columns(filter: &Filter, columns: &mut BTreeSet<String>) {
@@ -302,19 +321,27 @@ fn projection_columns(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    if q.include_attributes.is_none()
+    // The attributes the response projects: none, or the named ones. Any other projection
+    // (all attributes, exclusions, computed values, or per-group limits) keeps every column.
+    let projected: Option<BTreeSet<&String>> = match &q.include_attributes {
+        None => Some(BTreeSet::new()),
+        Some(IncludeAttributes::Names(names)) => Some(names.iter().collect()),
+        Some(_) => None,
+    };
+    if let Some(projected) = projected
         && q.exclude_attributes.is_none()
         && q.compute_attributes.is_none()
         && q.limit.as_ref().and_then(Limit::per).is_none()
     {
         match &q.filters {
-            None => columns.clear(),
+            // Scoring already supplied distances: only the projected attributes need reading
+            // (a top-10 query naming `id` used to parse every text column of its results).
+            None => columns.retain(|name| projected.contains(name)),
             Some(filter) if narrow_columns && q.extra.is_empty() => {
-                // Scoring already supplied distances. Only the filter needs
-                // document values when the response projects no attributes.
+                // The filter needs its attributes' document values too.
                 let mut needed = BTreeSet::new();
                 filter_columns(filter, &mut needed);
-                columns.retain(|name| needed.contains(name));
+                columns.retain(|name| needed.contains(name) || projected.contains(name));
             }
             _ => {}
         }

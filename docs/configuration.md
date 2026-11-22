@@ -107,6 +107,10 @@ memory limit (host RAM, or the cgroup limit when lower):
 | Segment builds at once | 1 below 8 GiB, otherwise 2 | `BF_BUILD_CONCURRENCY` |
 | Decoded metadata cache | limit / 8, 512 MiB to 4 GiB | `BF_DECODED_CACHE_BYTES` |
 
+The decoded cache budget covers decoded segment metadata. Two caches sit beside it with their own share of that budget, so
+decoded data can take up to 1.5 times `BF_DECODED_CACHE_BYTES`: decoded ANN directory clusters (three eighths) and decoded
+document column blocks (one eighth). Size the memory limit with that in mind on small machines.
+
 `blowfish serve` reads every `BF_*` engine variable above, plus `BF_INDEX_BYTES`, `BF_MAX_SEGMENT_BYTES`, `BF_BULK_FLUSH_AGE_MS`, `BF_WAL_PIPELINE`, `BF_RETENTION_SECS`, `BF_ANN_RERANK`, `BF_EXACT_FETCH`, and `BF_FILTER_PROBE_CAP`. CLI flags and TOML keys take precedence over them. `BF_BULK_FLUSH_BYTES` follows `max_unindexed_bytes` (three quarters of it) unless set explicitly.
 
 Note on cgroup detection: `bf-engine` reads the process's own cgroup (`/proc/self/cgroup` -> `/sys/fs/cgroup<path>/memory.max`) before falling back to `/sys/fs/cgroup/memory.max`, whereas `storage.cache.memory_bytes` reads `/sys/fs/cgroup/memory.max` only. Under a nested systemd scope, set `storage.cache.memory_bytes` explicitly if you want it sized to the scope limit rather than host RAM.
@@ -175,6 +179,36 @@ variables; the defaults suit 1,024-dimension vectors.
 
 `cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged copy to a namespace
 that was reclustered before paging existed, without rebuilding any slab.
+
+### ANN probes and query concurrency
+
+The probe count is `ann_nprobe` (default 64; `engine.ann_nprobe`, `--ann-nprobe`, `BLOWFISH_ANN_NPROBE`, or `BF_ANN_NPROBE`)
+per square root of the rows' worth of clusters. That scaling assumes one clustering of all the rows, which a reclustered
+namespace has. A namespace as loaded has one independent clustering per segment, so the neighbors of a query spread
+over every segment and the same probe count finds fewer of them. On BEIR NQ (2.68M rows in 25 segments), recall@10 was 0.907 at 64
+probes as loaded, against 0.954 reclustered. When `ann_nprobe` is left at its default, an unreclustered layout probes
+`min(S^0.3, 4)` times as many clusters. `S = (sum of rows)^2 / sum of rows^2` is the effective number of equal segments,
+so small tail segments barely count. Examples: 25 equal segments give 2.6 times the probes, a 10M namespace of 70 segments
+about 3.5 times, and 100 segments or more 4 times. Reclustered (slab) layouts are never scaled, and neither is a probe
+count you set yourself: an explicit `ann_nprobe` is used as given. There is no per-query probe parameter.
+
+The cost: each extra probed cluster is one more cluster blob and code block read, and on a cold query one more object
+store range read (adjacent clusters in the block layout are coalesced). Scanned rows and cold bytes therefore scale with the
+multiplier, at most 4 times. On NQ as loaded, warm p50 went from 5.3 to 9.4 ms and p99 from 10.5 to 29.4 ms, for recall@10
+from 0.906 to 0.958. Reclustering removes the cost: it gets the recall at the base probe count.
+
+| What | Default | Variable |
+| --- | --- | --- |
+| Exponent of the independent-segment multiplier (`0` turns it off) | 0.3 | `BF_ANN_SEGMENT_SPREAD` |
+| Queries the engine runs at once | 8 | `BF_QUERY_CONCURRENCY` |
+| Segment searches one query runs at once | 8 | `BF_SEARCH_CONCURRENCY` |
+| Queries in flight up to which one query fans its slab work out over the thread pool (more run each query on its own thread) | half the CPUs | `BF_FANOUT_QUERIES` |
+| Least time between two sampled recall comparisons | 60,000 ms | `BF_RECALL_SAMPLE_INTERVAL_MS` |
+| Cache block size for scattered small reads (rerank vectors) | 16,384 | `BF_SPARSE_BLOCK_BYTES` |
+| Turn off the AVX-512 RaBitQ scan and query quantizer (any value; for A/B runs) | unset | `BF_NO_AVX512` |
+
+On x86-64 the RaBitQ scan uses AVX-512 (`VPOPCNTQ`) when the CPU has it; on arm64 it uses NEON (`CNT` and pairwise adds).
+Both give bit-identical results to the portable path.
 
 ### Connection warming, hedging, and diagnostics
 

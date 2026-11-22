@@ -208,6 +208,82 @@ pub(crate) struct PlaneQuery {
 impl PlaneQuery {
     /// `q` and `c` are rotated, padded to the same length.
     pub(crate) fn new(q: &[f64], c: &[f32]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if avx512() && q.len().is_multiple_of(64) && c.len() == q.len() {
+            // SAFETY: the features were detected; lengths are checked above.
+            return unsafe { Self::new_avx512(q, c) };
+        }
+        Self::new_scalar(q, c)
+    }
+
+    /// [`Self::new`] eight coordinates at a time. Sums are accumulated in another order than
+    /// the scalar loop, so `norm2` and `sum` can differ from it in the last bits.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn new_avx512(q: &[f64], c: &[f32]) -> Self {
+        use std::arch::x86_64::*;
+        let n = q.len();
+        let words = n / 64;
+        let residual = |i: usize| {
+            // SAFETY: `i + 8 <= n` for both slices.
+            unsafe {
+                _mm512_sub_pd(
+                    _mm512_loadu_pd(q.as_ptr().add(i)),
+                    _mm512_cvtps_pd(_mm256_loadu_ps(c.as_ptr().add(i))),
+                )
+            }
+        };
+        let mut vmin = _mm512_set1_pd(f64::INFINITY);
+        let mut vmax = _mm512_set1_pd(f64::NEG_INFINITY);
+        let mut norm2 = _mm512_setzero_pd();
+        let mut sum = _mm512_setzero_pd();
+        for i in (0..n).step_by(8) {
+            let x = residual(i);
+            vmin = _mm512_min_pd(vmin, x);
+            vmax = _mm512_max_pd(vmax, x);
+            norm2 = _mm512_fmadd_pd(x, x, norm2);
+            sum = _mm512_add_pd(sum, x);
+        }
+        let (lo, hi) = (_mm512_reduce_min_pd(vmin), _mm512_reduce_max_pd(vmax));
+        let (norm2, sum) = (_mm512_reduce_add_pd(norm2), _mm512_reduce_add_pd(sum));
+        let levels = ((1usize << QUERY_BITS) - 1) as f64;
+        let delta = if hi > lo { (hi - lo) / levels } else { 0. };
+        let mut planes = vec![0u64; QUERY_BITS * words];
+        if delta > 0. {
+            let mut quantized = vec![0u8; n];
+            let (base, step, top, half) = (
+                _mm512_set1_pd(lo),
+                _mm512_set1_pd(delta),
+                _mm512_set1_pd(levels),
+                _mm512_set1_pd(0.5),
+            );
+            for i in (0..n).step_by(8) {
+                let level = _mm512_add_pd(
+                    _mm512_min_pd(_mm512_div_pd(_mm512_sub_pd(residual(i), base), step), top),
+                    half,
+                );
+                // Truncation of a non-negative value: the same rounding as the scalar path.
+                let bytes =
+                    _mm512_cvtepi32_epi8(_mm512_castsi256_si512(_mm512_cvttpd_epi32(level)));
+                // SAFETY: `quantized` holds `n` bytes and `i + 8 <= n`.
+                unsafe {
+                    _mm_storel_epi64(quantized.as_mut_ptr().add(i).cast(), bytes);
+                }
+            }
+            // SAFETY: the features were detected; `quantized` holds `words * 64` bytes.
+            unsafe { transpose_avx512(&quantized, words, &mut planes) };
+        }
+        Self {
+            planes,
+            words,
+            delta,
+            vmin: lo,
+            sum,
+            norm2,
+        }
+    }
+
+    fn new_scalar(q: &[f64], c: &[f32]) -> Self {
         let words = q.len().div_ceil(64);
         let mut vmin = f64::INFINITY;
         let mut vmax = f64::NEG_INFINITY;
@@ -233,7 +309,10 @@ impl PlaneQuery {
             let mut levels_q = vec![0u8; words * 64];
             for ((slot, q), c) in levels_q.iter_mut().zip(q).zip(c) {
                 let x = *q - *c as f64;
-                *slot = ((x - vmin) / delta).round().clamp(0., levels) as u8;
+                // `(x - vmin) / delta` is never negative, so adding a half and truncating rounds
+                // half away from zero exactly as `round` does, without the libm call (and the
+                // loop vectorizes). The cast saturates.
+                *slot = (((x - vmin) / delta).min(levels) + 0.5) as u8;
             }
             for (w, block) in levels_q.as_chunks::<64>().0.iter().enumerate() {
                 let mut acc = [0u64; QUERY_BITS];
@@ -254,6 +333,56 @@ impl PlaneQuery {
             vmin,
             sum,
             norm2,
+        }
+    }
+
+    /// [`Self::signed_dot`], with the AVX-512 kernel where the CPU has it.
+    pub(crate) fn dot(&self, bits: &[u8], padded: usize) -> f64 {
+        #[cfg(target_arch = "x86_64")]
+        if avx512() && self.words.is_multiple_of(8) && bits.len() >= self.words * 8 {
+            // SAFETY: the features were detected, and `bits` holds `words * 8` bytes.
+            return unsafe { self.signed_dot_avx512(bits, padded) };
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.words.is_multiple_of(2) && bits.len() >= self.words * 8 {
+            return self.signed_dot_neon(bits, padded);
+        }
+        self.signed_dot(bits, padded)
+    }
+
+    /// [`Self::signed_dot`] 128 bits at a time with NEON `CNT` (part of every AArch64 CPU).
+    /// The bit counts are exact integers, so the result is bit-identical to the scalar path.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn signed_dot_neon(&self, bits: &[u8], padded: usize) -> f64 {
+        use std::arch::aarch64::*;
+        assert!(bits.len() >= self.words * 8 && self.words.is_multiple_of(2));
+        assert!(self.planes.len() >= QUERY_BITS * self.words);
+        // SAFETY: NEON is mandatory on AArch64, and every load reads 16 bytes inside `bits`
+        // (`words * 8` bytes) or a plane (`words` words), as asserted above.
+        unsafe {
+            let mut ones = vdupq_n_u16(0);
+            let mut acc = [vdupq_n_u16(0); QUERY_BITS];
+            for chunk in 0..self.words / 2 {
+                let code = vld1q_u8(bits.as_ptr().add(chunk * 16));
+                ones = vpadalq_u8(ones, vcntq_u8(code));
+                for (j, a) in acc.iter_mut().enumerate() {
+                    let plane = vld1q_u8(
+                        self.planes
+                            .as_ptr()
+                            .add(j * self.words + chunk * 2)
+                            .cast::<u8>(),
+                    );
+                    *a = vpadalq_u8(*a, vcntq_u8(vandq_u8(code, plane)));
+                }
+            }
+            let mut weighted = 0u64;
+            for (j, a) in acc.iter().enumerate() {
+                weighted += (vaddlvq_u16(*a) as u64) << j;
+            }
+            let ones = vaddlvq_u16(ones) as u64;
+            (2. * (self.delta * weighted as f64 + self.vmin * ones as f64) - self.sum)
+                / (padded as f64).sqrt()
         }
     }
 
@@ -282,7 +411,7 @@ impl PlaneQuery {
     }
 
     /// Estimated squared distance (plain, without the error bound).
-    #[inline(always)]
+    #[cfg(test)]
     pub(crate) fn distance(&self, norm: f64, alpha: f64, bits: &[u8], padded: usize) -> f64 {
         let dot = self.signed_dot(bits, padded);
         norm * norm + self.norm2 - 2. * norm * dot / alpha
@@ -296,16 +425,81 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, f64, bool),
+        emit: &mut impl FnMut(usize, f64, f64, bool),
     ) -> crate::Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
+            if avx512() && padded.is_multiple_of(512) && self.words == padded / 64 {
+                // SAFETY: the CPU features were detected at runtime, and every code holds
+                // `padded / 8` bytes, a whole number of 64-byte vectors.
+                return unsafe { self.scan_avx512(bytes, rows, compact, padded, emit) };
+            }
             if std::is_x86_feature_detected!("popcnt") {
                 // SAFETY: the CPU feature was detected at runtime.
                 return unsafe { self.scan_popcnt(bytes, rows, compact, padded, emit) };
             }
         }
-        self.scan_impl(bytes, rows, compact, padded, emit)
+        #[cfg(target_arch = "aarch64")]
+        if padded.is_multiple_of(128) && self.words == padded / 64 {
+            return self.scan_impl(bytes, rows, compact, padded, emit, Self::signed_dot_neon);
+        }
+        self.scan_impl(bytes, rows, compact, padded, emit, Self::signed_dot)
+    }
+
+    /// The scan with the inner product computed 512 bits at a time (`VPOPCNTQ`).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vpopcntdq,popcnt")]
+    unsafe fn scan_avx512(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        compact: bool,
+        padded: usize,
+        emit: &mut impl FnMut(usize, f64, f64, bool),
+    ) -> crate::Result<()> {
+        self.scan_impl(bytes, rows, compact, padded, emit, |q, bits, padded| {
+            // SAFETY: the caller checked the features and that `bits` is `words * 8` bytes.
+            unsafe { q.signed_dot_avx512(bits, padded) }
+        })
+    }
+
+    /// [`Self::signed_dot`] for codes of a whole number of 512-bit vectors.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vpopcntdq")]
+    #[inline]
+    unsafe fn signed_dot_avx512(&self, bits: &[u8], padded: usize) -> f64 {
+        use std::arch::x86_64::*;
+        debug_assert!(bits.len() >= self.words * 8 && self.words.is_multiple_of(8));
+        let mut weighted = _mm512_setzero_si512();
+        let mut ones = _mm512_setzero_si512();
+        for chunk in 0..self.words / 8 {
+            // SAFETY: `bits` holds `words * 8` bytes and `planes` `QUERY_BITS * words` words.
+            let code = unsafe { _mm512_loadu_si512(bits.as_ptr().add(chunk * 64).cast()) };
+            ones = _mm512_add_epi64(ones, _mm512_popcnt_epi64(code));
+            macro_rules! plane {
+                ($j:literal) => {{
+                    let plane = unsafe {
+                        _mm512_loadu_si512(
+                            self.planes.as_ptr().add($j * self.words + chunk * 8).cast(),
+                        )
+                    };
+                    let count = _mm512_popcnt_epi64(_mm512_and_si512(code, plane));
+                    weighted = _mm512_add_epi64(weighted, _mm512_slli_epi64::<$j>(count));
+                }};
+            }
+            plane!(0);
+            plane!(1);
+            plane!(2);
+            plane!(3);
+            plane!(4);
+            plane!(5);
+            plane!(6);
+            plane!(7);
+        }
+        let weighted = _mm512_reduce_add_epi64(weighted) as u64;
+        let ones = _mm512_reduce_add_epi64(ones) as u64;
+        (2. * (self.delta * weighted as f64 + self.vmin * ones as f64) - self.sum)
+            / (padded as f64).sqrt()
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -316,9 +510,9 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, f64, bool),
+        emit: &mut impl FnMut(usize, f64, f64, bool),
     ) -> crate::Result<()> {
-        self.scan_impl(bytes, rows, compact, padded, emit)
+        self.scan_impl(bytes, rows, compact, padded, emit, Self::signed_dot)
     }
 
     #[inline(always)]
@@ -328,7 +522,8 @@ impl PlaneQuery {
         rows: usize,
         compact: bool,
         padded: usize,
-        emit: &mut dyn FnMut(usize, f64, f64, bool),
+        emit: &mut impl FnMut(usize, f64, f64, bool),
+        dot: impl Fn(&Self, &[u8], usize) -> f64,
     ) -> crate::Result<()> {
         let code = padded.div_ceil(8);
         let head = if compact { 8 } else { 24 };
@@ -359,14 +554,43 @@ impl PlaneQuery {
             let spread = ((1. - alpha * alpha).max(0.)).sqrt()
                 / (alpha * ((padded - 1).max(1) as f64).sqrt());
             let bound = ERROR_CONFIDENCE * 2. * norm * self.norm2.sqrt() * spread;
+            let dot = dot(self, &row[head..], padded);
             emit(
                 ordinal,
-                self.distance(norm, alpha, &row[head..], padded),
+                norm * norm + self.norm2 - 2. * norm * dot / alpha,
                 bound,
                 zero,
             );
         }
         Ok(())
+    }
+}
+
+/// Whether this CPU has the AVX-512 subsets the fast scan uses (checked once).
+#[cfg(target_arch = "x86_64")]
+fn avx512() -> bool {
+    static AVX512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVX512.get_or_init(|| {
+        std::env::var_os("BF_NO_AVX512").is_none()
+            && std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vpopcntdq")
+    })
+}
+
+/// Transpose quantized levels into bit planes, 64 values per mask: `VPTESTMB` sets bit `k` of
+/// plane `j` when bit `j` of value `k` is set.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn transpose_avx512(levels: &[u8], words: usize, planes: &mut [u64]) {
+    use std::arch::x86_64::*;
+    debug_assert!(levels.len() >= words * 64 && planes.len() >= QUERY_BITS * words);
+    for w in 0..words {
+        // SAFETY: `levels` holds `words * 64` bytes.
+        let v = unsafe { _mm512_loadu_si512(levels.as_ptr().add(w * 64).cast()) };
+        for (j, plane) in planes.chunks_exact_mut(words).take(QUERY_BITS).enumerate() {
+            plane[w] = _mm512_test_epi8_mask(v, _mm512_set1_epi8(1 << j));
+        }
     }
 }
 
@@ -449,6 +673,76 @@ mod tests {
             prop_assert!((fast.distance-e.distance).abs() < 1e-8*e.distance.abs().max(1.));
             let truth: f64 = v.iter().zip(&q).map(|(a,b)|(*a as f64-*b as f64).powi(2)).sum();
             prop_assert!((e.distance-truth).abs() <= e.error_bound);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_paths_match_scalar() {
+        if !avx512() {
+            return;
+        }
+        let dims = 1024;
+        let mut rng = Rng(11);
+        let mut sample = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| (rng.next() % 2000) as f32 / 1000. - 1.)
+                .collect()
+        };
+        let rq = RaBitQ::new(dims, 5).unwrap();
+        let (q, c) = (sample(dims), sample(dims));
+        let c_rot: Vec<f32> = rq.rotate(&c).into_iter().map(|x| x as f32).collect();
+        let plane = PlaneQuery::new(&rq.rotate(&q), &c_rot);
+        // The scalar transpose gives the same planes.
+        let words = plane.words;
+        let mut scalar = vec![0u64; QUERY_BITS * words];
+        let mut levels = vec![0u8; words * 64];
+        for ((slot, q), c) in levels.iter_mut().zip(rq.rotate(&q)).zip(&c_rot) {
+            let x = q - *c as f64;
+            *slot = ((x - plane.vmin) / plane.delta).round().clamp(0., 255.) as u8;
+        }
+        for (w, block) in levels.as_chunks::<64>().0.iter().enumerate() {
+            for (k, &v) in block.iter().enumerate() {
+                for j in 0..QUERY_BITS {
+                    scalar[j * words + w] |= (((v >> j) & 1) as u64) << k;
+                }
+            }
+        }
+        assert_eq!(plane.planes, scalar);
+        let reference = PlaneQuery::new_scalar(&rq.rotate(&q), &c_rot);
+        assert_eq!(plane.planes, reference.planes);
+        assert_eq!((plane.vmin, plane.delta), (reference.vmin, reference.delta));
+        assert!((plane.norm2 - reference.norm2).abs() <= 1e-9 * reference.norm2);
+        assert!((plane.sum - reference.sum).abs() <= 1e-9 * reference.norm2.sqrt());
+        for _ in 0..20 {
+            let v = sample(dims);
+            let code = rq.encode(&v, &c).unwrap();
+            let slow = plane.signed_dot(&code.bits, rq.padded);
+            // SAFETY: the features were detected above.
+            let fast = unsafe { plane.signed_dot_avx512(&code.bits, rq.padded) };
+            assert_eq!(slow.to_bits(), fast.to_bits());
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_dot_matches_scalar() {
+        let mut rng = Rng(13);
+        for dims in [128, 1000, 1024, 1536] {
+            let mut sample = |n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|_| (rng.next() % 2000) as f32 / 1000. - 1.)
+                    .collect()
+            };
+            let rq = RaBitQ::new(dims, 5).unwrap();
+            let (q, c) = (sample(dims), sample(dims));
+            let c_rot: Vec<f32> = rq.rotate(&c).into_iter().map(|x| x as f32).collect();
+            let plane = PlaneQuery::new(&rq.rotate(&q), &c_rot);
+            for _ in 0..20 {
+                let code = rq.encode(&sample(dims), &c).unwrap();
+                let slow = plane.signed_dot(&code.bits, rq.padded);
+                let fast = plane.signed_dot_neon(&code.bits, rq.padded);
+                assert_eq!(slow.to_bits(), fast.to_bits());
+                assert_eq!(slow.to_bits(), plane.dot(&code.bits, rq.padded).to_bits());
+            }
         }
     }
     #[test]

@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use bytes::Bytes;
 use roaring::RoaringBitmap;
@@ -66,6 +66,34 @@ const CODE_MERGE_MAX: u64 = 8 << 20;
 const VECTOR_GAP: u64 = 64 << 10;
 const VECTOR_MERGE_MAX: u64 = 2 << 20;
 
+/// A directory cluster blob, decoded: the rotated center, the row set, and the row checksums.
+/// Cheap to clone (shared), so a caller can keep decoded clusters across queries and install
+/// them into each query's partial index instead of decoding the blob again.
+#[derive(Clone)]
+pub struct DecodedCluster(Arc<format::ClusterData>);
+impl DecodedCluster {
+    /// Approximate resident bytes.
+    pub fn resident_bytes(&self) -> u64 {
+        (self.0.center.len() * 4 + self.0.row_crcs.len() * 8 + self.0.rows.serialized_size() + 128)
+            as u64
+    }
+}
+
+/// An `f32` ordered by `total_cmp`, for heaps.
+#[derive(PartialEq)]
+struct OrdF32(f32);
+impl Eq for OrdF32 {}
+impl PartialOrd for OrdF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrdF32 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 pub(crate) struct StubCluster {
     pub codes: Range<u64>,
     pub vectors: Range<u64>,
@@ -102,7 +130,7 @@ impl<R: RangeRead> Index<R> {
             return Err(bad("invalid metadata range"));
         }
         let ranges = vec![len - FOOTER_SIZE..len, 0..meta_len];
-        let bytes = read_batch(&reader, ranges).await?;
+        let bytes = read_batch(&reader, ranges, false).await?;
         let (actual, crc) = format::decode_footer(&bytes[0], len)?;
         if actual != meta_len {
             return Err(bad("manifest metadata length disagrees with footer"));
@@ -116,10 +144,15 @@ impl<R: RangeRead> Index<R> {
             // Older indexes store raw centers. Rotating once at open lets every search
             // rotate the query once instead of once per probed cluster.
             let rot =
-                |c: &Vec<f32>| -> Vec<f32> { rq.rotate(c).into_iter().map(|x| x as f32).collect() };
-            metadata.parents = metadata.parents.iter().map(rot).collect();
+                |c: &[f32]| -> Vec<f32> { rq.rotate(c).into_iter().map(|x| x as f32).collect() };
+            metadata.parents = metadata.parents.iter().map(|p| rot(p)).collect();
             for c in &mut metadata.clusters {
-                c.center = rot(&c.center);
+                let data = c
+                    .data
+                    .as_mut()
+                    .and_then(Arc::get_mut)
+                    .expect("fresh cluster");
+                data.center = rot(&data.center);
             }
             metadata.flags |= format::FLAG_ROTATED;
         }
@@ -146,17 +179,17 @@ impl<R: RangeRead> Index<R> {
         stubs: Vec<StubCluster>,
     ) -> Result<Self> {
         let rq = RaBitQ::new(shape.dims, shape.seed)?;
+        // A query builds stubs for every cluster of each slab it probes and installs only the
+        // probed ones, so a stub holds no payload at all.
         let clusters = stubs
             .into_iter()
             .map(|s| format::Cluster {
-                center: Vec::new(),
+                data: None,
                 parent: u32::MAX,
-                rows: RoaringBitmap::new(),
                 codes: s.codes,
                 vectors: s.vectors,
                 codes_crc: s.codes_crc,
                 vectors_crc: s.vectors_crc,
-                row_crcs: Vec::new(),
             })
             .collect();
         let metadata = Metadata {
@@ -178,6 +211,11 @@ impl<R: RangeRead> Index<R> {
     }
     /// Install a directory cluster blob (rotated center, row set, row checksums).
     pub(crate) fn install_cluster(&mut self, cid: usize, blob: &[u8]) -> Result<()> {
+        let decoded = self.decode_cluster(blob)?;
+        self.install_decoded(cid, &decoded)
+    }
+    /// Decode a directory cluster blob without installing it.
+    pub(crate) fn decode_cluster(&self, blob: &[u8]) -> Result<DecodedCluster> {
         let padded = self.rq.padded;
         let mut p = format::Parser::new(blob);
         let center = p.vector(padded)?;
@@ -189,27 +227,38 @@ impl<R: RangeRead> Index<R> {
             return Err(bad("invalid cluster blob"));
         }
         let row_crcs = (0..n).map(|_| p.u32()).collect::<Result<Vec<_>>>()?;
+        Ok(DecodedCluster(Arc::new(format::ClusterData {
+            center,
+            ids: Some(rows.iter().collect()),
+            rows,
+            row_crcs,
+            codes_checked: Default::default(),
+        })))
+    }
+    /// Install a cluster decoded by [`Self::decode_cluster`] (shared, not copied).
+    pub(crate) fn install_decoded(&mut self, cid: usize, d: &DecodedCluster) -> Result<()> {
+        if d.0.center.len() != self.rq.padded {
+            return Err(bad("cluster center width"));
+        }
         let c = self
             .metadata
             .clusters
             .get_mut(cid)
             .ok_or_else(|| bad("cluster outside segment"))?;
-        c.center = center;
-        c.rows = rows;
-        c.row_crcs = row_crcs;
+        c.data = Some(d.0.clone());
         Ok(())
     }
     /// Cluster payload for the directory blob area.
     pub(crate) fn cluster_blob(&self, cid: usize) -> Vec<u8> {
         let c = &self.metadata.clusters[cid];
         let mut out = Vec::new();
-        for x in &c.center {
+        for x in c.center.iter() {
             out.extend(x.to_le_bytes());
         }
         out.extend((c.rows.len() as u32).to_le_bytes());
         out.extend((c.rows.serialized_size() as u32).to_le_bytes());
         c.rows.serialize_into(&mut out).expect("vec write");
-        for crc in &c.row_crcs {
+        for crc in c.row_crcs.iter() {
             out.extend(crc.to_le_bytes());
         }
         out
@@ -420,7 +469,7 @@ impl<R: RangeRead> Index<R> {
         let t_read = std::time::Instant::now();
         let blocks = self.read_coalesced(clusters).await?;
         let read_ms = t_read.elapsed().as_millis();
-        self.scan_blocks_timed(query, clusters, blocks, filter, read_ms)
+        self.scan_blocks_timed(query, clusters, blocks, filter, read_ms, None)
     }
 
     /// Read the quantized-code blocks of `clusters` (merged into few requests), in input order.
@@ -438,7 +487,23 @@ impl<R: RangeRead> Index<R> {
         filter: Option<&RoaringBitmap>,
     ) -> Result<Vec<Candidate>> {
         validate(query, self.dims())?;
-        self.scan_blocks_timed(query, clusters, blocks, filter, 0)
+        self.scan_blocks_timed(query, clusters, blocks, filter, 0, None)
+    }
+
+    /// [`Self::scan_blocks`] for a caller that keeps only candidates whose lower bound
+    /// (`distance - error`) is at most the `k`-th smallest upper bound (`distance + error`) of
+    /// all candidates. A candidate whose lower bound already exceeds the `k`-th smallest upper
+    /// bound among this call's own candidates can never pass that test, so it is not returned.
+    pub fn scan_blocks_bounded(
+        &self,
+        query: &[f32],
+        clusters: &[usize],
+        blocks: Vec<Bytes>,
+        filter: Option<&RoaringBitmap>,
+        k: usize,
+    ) -> Result<Vec<Candidate>> {
+        validate(query, self.dims())?;
+        self.scan_blocks_timed(query, clusters, blocks, filter, 0, (k > 0).then_some(k))
     }
 
     fn scan_blocks_timed(
@@ -448,8 +513,12 @@ impl<R: RangeRead> Index<R> {
         blocks: Vec<Bytes>,
         filter: Option<&RoaringBitmap>,
         read_ms: u128,
+        keep: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let q = prepare(query, self.metric());
+        // The `k` smallest upper bounds so far, as a max-heap; `cut` is its largest once full.
+        let mut uppers = std::collections::BinaryHeap::<OrdF32>::new();
+        let mut cut = f32::INFINITY;
         let q_zero = q.iter().all(|x| *x == 0.);
         let q_rot = self.rq.rotate(&q);
         let t_cpu = std::time::Instant::now();
@@ -461,16 +530,27 @@ impl<R: RangeRead> Index<R> {
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
         for (cid, bytes) in clusters.iter().copied().zip(blocks) {
             let c = &self.metadata.clusters[cid];
-            check_crc(&bytes, c.codes_crc)?;
+            // A stub's (shared, empty) payload never records a check.
+            let checked = c.data.as_deref().map(|d| &d.codes_checked);
+            if !checked.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+                check_crc(&bytes, c.codes_crc)?;
+                if let Some(f) = checked {
+                    f.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             let plane = crate::rabitq::PlaneQuery::new(&q_rot, &c.center);
             let mut rows = c.rows.iter();
+            let ids = c.ids.as_deref();
             plane.scan(
                 &bytes,
                 c.rows.len() as usize,
                 compact,
                 self.rq.padded,
                 &mut |ordinal, d, bound, zero| {
-                    let row = rows.next().unwrap_or(u32::MAX);
+                    let row = match ids {
+                        Some(ids) => ids.get(ordinal).copied().unwrap_or(u32::MAX),
+                        None => rows.next().unwrap_or(u32::MAX),
+                    };
                     if filter.is_some_and(|f| !f.contains(row)) {
                         return;
                     }
@@ -483,10 +563,26 @@ impl<R: RangeRead> Index<R> {
                     } else {
                         (d.max(0.), bound)
                     };
+                    let (distance, error) = (distance as f32, error as f32);
+                    if let Some(k) = keep {
+                        if distance - error > cut {
+                            return;
+                        }
+                        let upper = distance + error;
+                        if uppers.len() < k {
+                            uppers.push(OrdF32(upper));
+                        } else if upper < cut {
+                            uppers.pop();
+                            uppers.push(OrdF32(upper));
+                        }
+                        if uppers.len() == k {
+                            cut = uppers.peek().map_or(f32::INFINITY, |u| u.0);
+                        }
+                    }
                     estimated.push(Candidate {
                         row,
-                        distance: distance as f32,
-                        error: error as f32,
+                        distance,
+                        error,
                         cluster: cid as u32,
                         ordinal: ordinal as u32,
                     });
@@ -519,6 +615,17 @@ impl<R: RangeRead> Index<R> {
     /// read of at most `max` bytes. Returns one `Bytes` per input range, in input order.
     async fn read_merged(&self, ranges: Vec<Range<u64>>, gap: u64, max: u64) -> Result<Vec<Bytes>> {
         read_merged(&self.reader, ranges, gap, max).await
+    }
+    /// Full-precision vectors for a rerank: few rows scattered over the vector section.
+    async fn read_vectors(&self, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        merged(
+            &self.reader,
+            ranges,
+            read_gap(VECTOR_GAP),
+            VECTOR_MERGE_MAX,
+            true,
+        )
+        .await
     }
 
     /// Fetch full-precision vectors for `(cluster, ordinal)` locations and return the
@@ -558,7 +665,7 @@ impl<R: RangeRead> Index<R> {
         let m = &self.metadata;
         let mut total = (m.parents.len() * (m.dims * 4 + 48)) as u64;
         for c in &m.clusters {
-            total += (c.center.len() * 4 + c.row_crcs.capacity() * 4 + 160) as u64
+            total += (c.center.len() * 4 + c.row_crcs.len() * 4 + 160) as u64
                 + c.rows.serialized_size() as u64;
         }
         total + (self.rq.padded * 8 * 4) as u64
@@ -662,9 +769,7 @@ impl<R: RangeRead> Index<R> {
                 _ => ranges.push(at..at + width as u64),
             }
         }
-        let blocks = self
-            .read_merged(ranges.clone(), read_gap(VECTOR_GAP), VECTOR_MERGE_MAX)
-            .await?;
+        let blocks = self.read_vectors(ranges.clone()).await?;
         let mut result = Vec::with_capacity(locations.len());
         let mut decoded = Vec::with_capacity(self.dims());
         let mut next = locations.iter();
@@ -744,9 +849,7 @@ impl<R: RangeRead> Index<R> {
         let t_read = std::time::Instant::now();
         let nranges = ranges.len();
         let rbytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-        let blocks = self
-            .read_merged(ranges, read_gap(VECTOR_GAP), VECTOR_MERGE_MAX)
-            .await?;
+        let blocks = self.read_vectors(ranges).await?;
         let read_ms = t_read.elapsed().as_millis();
         let t_cpu = std::time::Instant::now();
         let mut result = Vec::with_capacity(locations.len());
@@ -783,10 +886,11 @@ impl<R: RangeRead> Index<R> {
                 if decoded.iter().any(|x| !x.is_finite()) {
                     return Err(bad("non-finite stored vector"));
                 }
-                let row = c
-                    .rows
-                    .select(i as u32)
-                    .ok_or_else(|| bad("invalid row ordinal"))?;
+                let row = match &c.ids {
+                    Some(ids) => ids.get(i).copied(),
+                    None => c.rows.select(i as u32),
+                }
+                .ok_or_else(|| bad("invalid row ordinal"))?;
                 result.push((row, self.metric().distance_unchecked(query, &decoded)));
             }
         }
@@ -813,8 +917,16 @@ async fn read_one<R: RangeRead>(reader: &R, range: Range<u64>) -> Result<Bytes> 
     }
     Ok(bytes)
 }
-async fn read_batch<R: RangeRead>(reader: &R, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
-    let bytes = reader.read_batch(ranges.clone()).await?;
+async fn read_batch<R: RangeRead>(
+    reader: &R,
+    ranges: Vec<Range<u64>>,
+    sparse: bool,
+) -> Result<Vec<Bytes>> {
+    let bytes = if sparse {
+        reader.read_batch_sparse(ranges.clone()).await?
+    } else {
+        reader.read_batch(ranges.clone()).await?
+    };
     if bytes.len() != ranges.len()
         || bytes
             .iter()
@@ -834,6 +946,16 @@ pub async fn read_merged<R: RangeRead>(
     gap: u64,
     max: u64,
 ) -> Result<Vec<Bytes>> {
+    merged(reader, ranges, gap, max, false).await
+}
+
+async fn merged<R: RangeRead>(
+    reader: &R,
+    ranges: Vec<Range<u64>>,
+    gap: u64,
+    max: u64,
+    sparse: bool,
+) -> Result<Vec<Bytes>> {
     let mut order: Vec<usize> = (0..ranges.len()).collect();
     order.sort_unstable_by_key(|i| ranges[*i].start);
     let mut merged: Vec<Range<u64>> = Vec::new();
@@ -852,7 +974,7 @@ pub async fn read_merged<R: RangeRead>(
         }
     }
     let starts: Vec<u64> = merged.iter().map(|r| r.start).collect();
-    let bytes = read_batch(reader, merged).await?;
+    let bytes = read_batch(reader, merged, sparse).await?;
     let mut out = vec![Bytes::new(); ranges.len()];
     for ((bytes, start), group) in bytes.into_iter().zip(starts).zip(members) {
         for i in group {

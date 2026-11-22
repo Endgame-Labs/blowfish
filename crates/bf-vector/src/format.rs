@@ -1,4 +1,4 @@
-use std::{io::Cursor, ops::Range};
+use std::{io::Cursor, ops::Range, sync::Arc};
 
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
@@ -17,15 +17,37 @@ pub(crate) const FLAG_ROTATED: u32 = 1;
 /// Metadata flag: eight-byte code headers (f32 norm and alpha) and all codes stored before all vectors.
 pub(crate) const FLAG_COMPACT: u32 = 2;
 
-pub(crate) struct Cluster {
+/// A leaf cluster's decoded payload description: center, rows, and checksums. Shared (one
+/// reference count) by every index holding the cluster, including the per-query partial
+/// indexes that install a cached decoded directory cluster (see [`crate::DecodedCluster`]).
+#[derive(Default)]
+pub(crate) struct ClusterData {
     pub center: Vec<f32>,
-    pub parent: u32,
     pub rows: RoaringBitmap,
+    pub row_crcs: Vec<u32>,
+    /// `rows` in order, when a decoded directory cluster supplied them; scans and reranks
+    /// then map ordinals to rows by index.
+    pub ids: Option<Vec<u32>>,
+    /// Set once the code block has matched `codes_crc`, so a cached cluster's immutable code
+    /// block is verified once rather than on every scan.
+    pub codes_checked: std::sync::atomic::AtomicBool,
+}
+
+pub(crate) struct Cluster {
+    /// `None` for a stub (a directory cluster not installed): reads see an empty payload.
+    pub data: Option<Arc<ClusterData>>,
+    pub parent: u32,
     pub codes: Range<u64>,
     pub vectors: Range<u64>,
     pub codes_crc: u32,
     pub vectors_crc: u32,
-    pub row_crcs: Vec<u32>,
+}
+static EMPTY_CLUSTER: std::sync::LazyLock<ClusterData> = std::sync::LazyLock::new(Default::default);
+impl std::ops::Deref for Cluster {
+    type Target = ClusterData;
+    fn deref(&self) -> &ClusterData {
+        self.data.as_deref().unwrap_or(&EMPTY_CLUSTER)
+    }
 }
 
 pub(crate) struct Metadata {
@@ -90,14 +112,17 @@ pub(crate) fn build_blob(
             }
             Block {
                 cluster: Cluster {
-                    center: rotated_center(&rq, &centers[c]),
+                    data: Some(Arc::new(ClusterData {
+                        center: rotated_center(&rq, &centers[c]),
+                        rows: ids,
+                        row_crcs,
+                        ..Default::default()
+                    })),
                     parent: parent_ids[c],
-                    rows: ids,
                     codes: 0..codes.len() as u64,
                     vectors: 0..vectors_len,
                     codes_crc: crc32fast::hash(&codes),
                     vectors_crc: vectors_crc.finalize(),
-                    row_crcs,
                 },
                 codes,
             }
@@ -187,7 +212,7 @@ fn encode_metadata(m: &Metadata) -> Result<Vec<u8>> {
         }
     }
     for c in &m.clusters {
-        for x in &c.center {
+        for x in c.center.iter() {
             out.extend(x.to_le_bytes());
         }
         put_u32(&mut out, c.parent);
@@ -199,7 +224,7 @@ fn encode_metadata(m: &Metadata) -> Result<Vec<u8>> {
         put_u32(&mut out, c.vectors_crc);
         put_u32(&mut out, c.rows.serialized_size() as u32);
         c.rows.serialize_into(&mut out)?;
-        for crc in &c.row_crcs {
+        for crc in c.row_crcs.iter() {
             put_u32(&mut out, *crc);
         }
     }
@@ -359,14 +384,17 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
         offset = vectors.end;
         total += code_len + vector_len;
         clusters.push(Cluster {
-            center,
+            data: Some(Arc::new(ClusterData {
+                center,
+                rows,
+                row_crcs,
+                ..Default::default()
+            })),
             parent,
-            rows,
             codes,
             vectors,
             codes_crc,
             vectors_crc,
-            row_crcs,
         });
     }
     if p.remaining() != 0

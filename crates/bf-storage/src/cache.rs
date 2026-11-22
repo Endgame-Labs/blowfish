@@ -180,6 +180,8 @@ struct BlockKey {
     index: u64,
     offset: u64,
     len: u64,
+    /// Block size of a sparse reader's small blocks, or 0 for the configured block size.
+    small: u32,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Layout {
@@ -282,7 +284,11 @@ impl RangeCache {
     fn disk_key(&self, key: &BlockKey) -> String {
         digest(format!(
             "{}:{}:{}:{}:{}:{}",
-            self.config.block_size,
+            if key.small > 0 {
+                key.small as usize
+            } else {
+                self.config.block_size
+            },
             key.offset,
             key.len,
             key.index,
@@ -391,6 +397,8 @@ pub struct RangeReader {
     layout: Layout,
     /// Whether blocks this reader fetches (or promotes from disk) enter the memory and disk caches.
     admit: bool,
+    /// Small-block size for sparse reads (see [`RangeReader::sparse`]), or 0.
+    small: u32,
 }
 impl RangeReader {
     /// A reader that still uses cached blocks but admits none of its own: for one-pass scans
@@ -398,6 +406,24 @@ impl RangeReader {
     pub fn bypass_cache(mut self) -> Self {
         self.admit = false;
         self
+    }
+    /// A reader that caches in small blocks of `block_size` bytes (rounded up to a power of
+    /// two, at most the configured block size) instead of the configured block size. For
+    /// scattered small reads, such as a rerank's few dozen 2 KB vectors spread over a
+    /// gigabyte: a miss then fetches and caches 16 KB instead of 1 MB. Small blocks are cached
+    /// apart from full ones, so use it only for reads that are sparse in their object.
+    pub fn sparse(mut self, block_size: usize) -> Self {
+        let full = self.storage.0.cache.config.block_size;
+        let size = block_size.max(512).next_power_of_two();
+        self.small = if size >= full { 0 } else { size as u32 };
+        self
+    }
+    fn block_size(&self) -> u64 {
+        if self.small > 0 {
+            self.small as u64
+        } else {
+            self.storage.0.cache.config.block_size as u64
+        }
     }
     /// Logical object length, excluding the retry header.
     pub fn len(&self) -> u64 {
@@ -431,7 +457,7 @@ impl RangeReader {
         stats: &CacheStats,
     ) -> Result<Vec<Bytes>, Error> {
         let cache = &self.storage.0.cache;
-        let size = cache.config.block_size as u64;
+        let size = self.block_size();
         let mut requested = BTreeMap::<u64, u64>::new();
         for range in ranges {
             if range.start > range.end || range.end > self.len() {
@@ -477,147 +503,151 @@ impl RangeReader {
         stats.record_many(Tier::Disk, disk, disk_blocks);
         // Serialize only the reservation of missing blocks, not network or disk I/O. The
         // re-check under the lock closes races with fetches that finished since the lookup.
-        let mut planning = cache.planning.lock().await;
-        planning.flights.retain(|_, weak| weak.strong_count() > 0);
-        let mut pending = Vec::<(u64, Arc<Flight>)>::new();
-        let mut missing = Vec::new();
-        for (index, weight) in unresolved {
-            let key = self.block_key(index);
-            if let Some(bytes) = cache.memory.get(&key) {
-                stats.record(Tier::Memory, weight);
-                blocks.insert(index, bytes);
-                continue;
-            }
-            stats.record(Tier::Miss, weight);
-            if let Some(flight) = planning.flights.get(&key).and_then(Weak::upgrade) {
-                pending.push((index, flight));
-            } else {
-                missing.push(index);
-            }
-        }
-        let mut start = 0;
-        while start < missing.len() {
-            let mut end = start + 1;
-            let gap = cache.config.coalesce_gap_blocks as u64;
-            while end < missing.len()
-                && (missing[end] - missing[start]) < cache.config.max_coalesce_blocks as u64
-                && missing[end] <= missing[end - 1] + 1 + gap
-            {
-                end += 1;
-            }
-            let indices = missing[start..end].to_vec();
-            let reader = self.clone();
-            let admit = self.admit;
-            let first = indices[0];
-            let last = *indices.last().unwrap();
-            let group = async move {
-                let cache = &reader.storage.0.cache;
-                let _permit = cache
-                    .fetches
-                    .acquire()
-                    .await
-                    .expect("cache semaphore stays open");
-                let from = first * size;
-                let to = (last * size).saturating_add(size).min(reader.len());
-                let bytes = cache
-                    .hedge
-                    .get_range(
-                        &reader.storage.0.backend,
-                        &reader.storage.path(&reader.key),
-                        from + reader.layout.offset..to + reader.layout.offset,
-                    )
-                    .await
-                    .map_err(|e| Arc::new(Error::from(e)))?;
-                if bytes.len() as u64 != to - from {
-                    return Err(Arc::new(Error::Config("short object-store range response")));
+        // A batch that the caches answered whole never takes the lock: it is one lock for the
+        // whole store, and warm queries issue dozens of batches each.
+        if !unresolved.is_empty() {
+            let mut planning = cache.planning.lock().await;
+            planning.flights.retain(|_, weak| weak.strong_count() > 0);
+            let mut pending = Vec::<(u64, Arc<Flight>)>::new();
+            let mut missing = Vec::new();
+            for (index, weight) in unresolved {
+                let key = self.block_key(index);
+                if let Some(bytes) = cache.memory.get(&key) {
+                    stats.record(Tier::Memory, weight);
+                    blocks.insert(index, bytes);
+                    continue;
                 }
-                let mut values = Vec::with_capacity(indices.len());
-                // At most MAX_SPILLS disk writes wait at once: on a cold cache the disk is slower
-                // than the network, and an unbounded backlog would hold every fetched block in
-                // memory. A skipped write only means that block is fetched again later.
-                const MAX_SPILLS: usize = 16;
-                let spilling = admit
-                    && cache.disk.is_some()
-                    && cache
-                        .spills
-                        .pending
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                        < MAX_SPILLS;
-                let mut spill = Vec::new();
-                for index in indices {
-                    let begin = ((index - first) * size) as usize;
-                    let end = bytes.len().min(begin + size as usize);
-                    // Independent allocations keep a single cached block from pinning a whole GET.
-                    let value = Bytes::copy_from_slice(&bytes[begin..end]);
-                    let key = reader.block_key(index);
-                    if spilling {
-                        spill.push((cache.disk_key(&key), value.clone()));
-                    }
-                    if admit {
-                        cache.insert_memory(key, value.clone());
-                    }
-                    values.push(value);
+                stats.record(Tier::Miss, weight);
+                if let Some(flight) = planning.flights.get(&key).and_then(Weak::upgrade) {
+                    pending.push((index, flight));
+                } else {
+                    missing.push(index);
                 }
-                // The disk tier is written behind the read: a block-by-block write that the
-                // read awaited cost about a millisecond per 4 KB block, which made a cold 2 MB
-                // read take half a second after the network transfer had finished.
-                if let Some(disk) = cache.disk.clone().filter(|_| spilling) {
-                    let spills = cache.spills.clone();
-                    spills
-                        .pending
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    tokio::task::spawn_blocking(move || {
-                        {
-                            let mut disk = disk.lock().unwrap();
-                            for (name, value) in spill {
-                                // A full or damaged cache never makes source-of-truth reads fail.
-                                let _ = disk.insert(&name, &value);
-                            }
+            }
+            let mut start = 0;
+            while start < missing.len() {
+                let mut end = start + 1;
+                let gap = cache.config.coalesce_gap_blocks as u64;
+                while end < missing.len()
+                    && (missing[end] - missing[start]) < cache.config.max_coalesce_blocks as u64
+                    && missing[end] <= missing[end - 1] + 1 + gap
+                {
+                    end += 1;
+                }
+                let indices = missing[start..end].to_vec();
+                let reader = self.clone();
+                let admit = self.admit;
+                let first = indices[0];
+                let last = *indices.last().unwrap();
+                let group = async move {
+                    let cache = &reader.storage.0.cache;
+                    let _permit = cache
+                        .fetches
+                        .acquire()
+                        .await
+                        .expect("cache semaphore stays open");
+                    let from = first * size;
+                    let to = (last * size).saturating_add(size).min(reader.len());
+                    let bytes = cache
+                        .hedge
+                        .get_range(
+                            &reader.storage.0.backend,
+                            &reader.storage.path(&reader.key),
+                            from + reader.layout.offset..to + reader.layout.offset,
+                        )
+                        .await
+                        .map_err(|e| Arc::new(Error::from(e)))?;
+                    if bytes.len() as u64 != to - from {
+                        return Err(Arc::new(Error::Config("short object-store range response")));
+                    }
+                    let mut values = Vec::with_capacity(indices.len());
+                    // At most MAX_SPILLS disk writes wait at once: on a cold cache the disk is slower
+                    // than the network, and an unbounded backlog would hold every fetched block in
+                    // memory. A skipped write only means that block is fetched again later.
+                    const MAX_SPILLS: usize = 16;
+                    let spilling = admit
+                        && cache.disk.is_some()
+                        && cache
+                            .spills
+                            .pending
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            < MAX_SPILLS;
+                    let mut spill = Vec::new();
+                    for index in indices {
+                        let begin = ((index - first) * size) as usize;
+                        let end = bytes.len().min(begin + size as usize);
+                        // Independent allocations keep a single cached block from pinning a whole GET.
+                        let value = Bytes::copy_from_slice(&bytes[begin..end]);
+                        let key = reader.block_key(index);
+                        if spilling {
+                            spill.push((cache.disk_key(&key), value.clone()));
                         }
+                        if admit {
+                            cache.insert_memory(key, value.clone());
+                        }
+                        values.push(value);
+                    }
+                    // The disk tier is written behind the read: a block-by-block write that the
+                    // read awaited cost about a millisecond per 4 KB block, which made a cold 2 MB
+                    // read take half a second after the network transfer had finished.
+                    if let Some(disk) = cache.disk.clone().filter(|_| spilling) {
+                        let spills = cache.spills.clone();
                         spills
                             .pending
-                            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        spills.idle.notify_waiters();
-                    });
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::task::spawn_blocking(move || {
+                            {
+                                let mut disk = disk.lock().unwrap();
+                                for (name, value) in spill {
+                                    // A full or damaged cache never makes source-of-truth reads fail.
+                                    let _ = disk.insert(&name, &value);
+                                }
+                            }
+                            spills
+                                .pending
+                                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            spills.idle.notify_waiters();
+                        });
+                    }
+                    // Apply pending evictions once per coalesced fetch, so memory stays within
+                    // budget without paying for maintenance on every block.
+                    cache.memory.run_pending_tasks();
+                    Ok::<_, Arc<Error>>(Arc::new(values))
                 }
-                // Apply pending evictions once per coalesced fetch, so memory stays within
-                // budget without paying for maintenance on every block.
-                cache.memory.run_pending_tasks();
-                Ok::<_, Arc<Error>>(Arc::new(values))
+                .boxed()
+                .shared();
+                for (position, index) in missing[start..end].iter().copied().enumerate() {
+                    let fetch = group.clone();
+                    let flight = Arc::new(Flight(
+                        async move { Ok(fetch.await?[position].clone()) }
+                            .boxed()
+                            .shared(),
+                    ));
+                    planning
+                        .flights
+                        .insert(self.block_key(index), Arc::downgrade(&flight));
+                    pending.push((index, flight));
+                }
+                start = end;
             }
-            .boxed()
-            .shared();
-            for (position, index) in missing[start..end].iter().copied().enumerate() {
-                let fetch = group.clone();
-                let flight = Arc::new(Flight(
-                    async move { Ok(fetch.await?[position].clone()) }
-                        .boxed()
-                        .shared(),
-                ));
-                planning
-                    .flights
-                    .insert(self.block_key(index), Arc::downgrade(&flight));
-                pending.push((index, flight));
-            }
-            start = end;
+            drop(planning);
+            let fetched: Vec<_> = stream::iter(pending)
+                .map(|(index, flight)| async move {
+                    let bytes = flight.0.clone().await.map_err(Error::from_shared)?;
+                    Ok::<_, Error>((index, bytes))
+                })
+                // Poll enough block waiters to start all permitted coalesced GETs. The
+                // semaphore still limits actual I/O, including shared and overlapping groups.
+                .buffer_unordered(
+                    cache
+                        .config
+                        .fetch_concurrency
+                        .saturating_mul(cache.config.max_coalesce_blocks),
+                )
+                .try_collect()
+                .await?;
+            blocks.extend(fetched);
         }
-        drop(planning);
-        let fetched: Vec<_> = stream::iter(pending)
-            .map(|(index, flight)| async move {
-                let bytes = flight.0.clone().await.map_err(Error::from_shared)?;
-                Ok::<_, Error>((index, bytes))
-            })
-            // Poll enough block waiters to start all permitted coalesced GETs. The
-            // semaphore still limits actual I/O, including shared and overlapping groups.
-            .buffer_unordered(
-                cache
-                    .config
-                    .fetch_concurrency
-                    .saturating_mul(cache.config.max_coalesce_blocks),
-            )
-            .try_collect()
-            .await?;
-        blocks.extend(fetched);
         ranges
             .iter()
             .map(|range| {
@@ -649,6 +679,7 @@ impl RangeReader {
             index,
             offset: self.layout.offset,
             len: self.layout.len,
+            small: self.small,
         }
     }
 }
@@ -707,6 +738,7 @@ impl Storage {
             path: self.path(key).to_string().into(),
             layout,
             admit: true,
+            small: 0,
         })
     }
     /// Open an immutable object without HEAD or header probing. The caller supplies the
@@ -726,6 +758,7 @@ impl Storage {
             path: self.path(key).to_string().into(),
             layout: Layout { len, offset },
             admit: true,
+            small: 0,
         })
     }
     /// Cached whole-object read for immutable objects, sharing the range cache and single-flight.

@@ -10,6 +10,10 @@ Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, stro
 - **100M vector (64 probes, recall@10 `0.954`; 48 probes `0.941–0.950`):** `1,201 / 1,391 ms` cache-cold (`1,164–1,201 / 1,348–1,391 ms`), `1,243 / 1,370 ms` fresh process (`1,228–1,243 / 1,370–1,411 ms`), and `99.7 / 162.8 ms` warm (`72.6 / 90.4 ms` warm at 48 probes); about `160 MB` read per cold query; load `5.7 h` at `4,891 docs/s`, `recluster` `1.7 h` into 160 slabs ([100M load and recluster](#100m-wikipedia-embeddings-in-region-and-over-the-internet), [Iteration 17](#iteration-17-100m-cold-and-warm-ann), and [Iteration 18](#iteration-18-100m-warm-ann-under-150-ms-and-a-small-cold-manifest-read)). turbopuffer publishes no 100M number.
 - **1M BM25 (MS MARCO, `overlap@10` `1.000` vs. exact BM25):** `380 / 526 ms` fresh process and `301 / 369 ms` cache-cold ([Iteration 13](#iteration-13-bm25-1m) and [Iteration 14 in-region check](#bm25-cold-at-1m-ms-marco-round-13-code-c7gd2xlarge-in-region-50-queries-abpy)). turbopuffer published: `316 / 381 ms` cold, `13 / 18 ms` warm.
 - **Memory and ingest:** a 4 GB `c7gd.large` (swap off) holds a 10M load plus `recluster` at `2.3–2.9 GB` peak RSS (`769 / 973 ms` fresh, `623 / 740 ms` cache-cold; [Iteration 15](#iteration-15-memory-10m-load-and-recluster-on-a-c7gdlarge) and [Iteration 18 memory check](#memory-check-10m-load-and-recluster-4-gib-cgroup-swap-off-2-cpus)). Ingest holds flat at about `4,500 docs/s` to 10M on `c7gd.xlarge` ([Iteration 16](#iteration-16-ingest-throughput-that-stays-flat-as-the-namespace-grows)).
+- **One machine, BEIR NQ (2.68M x 1,024 f16, local disk; [Iteration 19](#iteration-19-beir-natural-questions-on-one-machine)):**
+  reclustered at 64 probes, recall@10 `0.955`, warm `8.3 / 18.1 ms` p50 / p99, and `444 q/s` at 16 clients on 6 pinned
+  vCPUs (was `28.7 / 732 ms` and `27 q/s`). As loaded at default settings, recall@10 is `0.960` (was `0.907`). On an
+  Apple M4: `2.8 / 4.1 ms` and `870 q/s`.
 - **My own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; at 100M, still `"warm"` at `201 ms` after a day idle); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
 
 ## Scope and status
@@ -2814,3 +2818,205 @@ turbopuffer's are the measurements on this page, with server time as the in-regi
 | Cold, cache-cold p50 / p90 ms | 1,069 / 1,243 (1,260 / 1,392) | not measured (the namespace did not go cold in the idle-gap run) |
 
 At 10M turbopuffer's first-pass ANN had server time 88 / 203 ms; at 100M it is 232 / 426 ms, about 2.6 and 2.1 times.
+
+## Iteration 19: BEIR Natural Questions on one machine
+
+An outside benchmark, "Blowfish on BEIR Natural Questions" by Kerry Kurian (2026-11-20), measured blowfish 0.1.13 on
+one machine against FAISS, Qdrant, and LanceDB. It found three problems. First, throughput flattened at about 50 to
+65 q/s on 8 CPUs, even though one query took about 12 ms. Second, warm p99 was several hundred ms. Third, recall@10 as
+loaded was 0.899 at the default 64 probes. I reproduced its numbers here, fixed the causes, and measured Qdrant and
+LanceDB on the same machine, then on a Mac.
+
+**Workload.** The BEIR NQ test split has 2,681,468 passages, 3,452 queries, and 4,201 qrels. The vectors are
+precomputed Cohere embed-english-v3 embeddings (1,024 dimensions), stored as f16, with cosine distance. Storage is a
+local directory (`file://`), with no S3. Each document carries id, vector, title, and text (BM25 on text). The harness
+is in `bench/nq/`, and its README shows how to reproduce every number below.
+
+- **Recall@10** is measured against the exact top 10 (brute force over the f16 vectors). F1@10, nDCG@10, and
+  recall@100 are measured against the qrels, using top_k 100 requests.
+- **Warm latency** is client-timed over keep-alive HTTP: one warm-up pass, then 1,000 queries at concurrency 1.
+- **Throughput** uses 2,000 queries with pre-encoded bodies and one process with one connection per client.
+
+**Machine.** This VM has 8 vCPUs and 31 GB of RAM. The 8 vCPUs share 4 L2 caches, so they are probably 4 physical
+cores with SMT. The server runs pinned to CPUs 0 to 5 (about 3 cores), in a 12 GB cgroup with swap off. Clients are
+pinned to CPUs 6 and 7. Kerry's run had 8 CPUs, so its absolute numbers are higher than my baseline. Every engine below
+had the same limits. The block cache is 3 GiB, a quarter of 12 GB as in Kerry's run, and the disk cache is off.
+
+### Before: blowfish 0.1.13 (main at 80bed53) on this VM
+
+Quality matched Kerry's within 0.01. Latency and throughput had the same shape: a flat throughput curve and a p99 of
+several hundred ms.
+
+| Config | Recall@10 (Kerry) | p50 / p95 / p99 ms (Kerry) | q/s at 1 / 4 / 16 (Kerry) |
+|---|---:|---|---|
+| As loaded, 64 probes (default) | 0.907 (0.899) | 23.5 / 250 / 620 | 24.6 / 26.4 / 27.7 |
+| As loaded, 160 probes | 0.958 (0.953) | 40.2 / 65.9 / 420 (14.7 / 113 / 358) | 13.0 / 21.8 / 18.2 (46 / 68 / 64) |
+| Reclustered, 48 probes | 0.941 | 24.1 / 42.9 / 485 | 18.1 / 20.2 / 23.3 |
+| Reclustered, 64 probes | 0.954 (0.954) | 28.7 / 457 / 732 (11.6 / 31.5 / 378) | 19.8 / 23.8 / 27.1 (31 / 37 / 49) |
+| Reclustered, 64 probes, 8 GiB cache | | 25.1 / 77.0 / 558 (10.9 / - / 235) | 19.9 / 23.8 / 31.0 (45 / 63 / 63) |
+| Reclustered, 64 probes, unpinned | | 28.7 / 156 / 647 | 17.1 / 23.5 / 21.3 |
+
+### Where the time went, and what changed
+
+Each change below is its own commit, with the numbers in its message (reclustered, 64 probes, measured at the time).
+
+1. **The tail came from the recall sampler (8020d46).** The default 1% sampler ran an exhaustive search over 5.5 GB of
+   vectors about every 100 queries. It ran on every core and through the block cache, which evicted the blocks that warm
+   queries reuse. Now one comparison runs at a time, at most once a minute (`BF_RECALL_SAMPLE_INTERVAL_MS`), one segment
+   at a time, and without filling the cache. Warm p50/p95/p99 went from 28.7/457/732 to 24.2/37.3/47.1 ms, and q/s at
+   16 clients from 27 to 73.
+2. **Rerank vectors were read through 1 MiB cache blocks (07a5c8d).** That was about 15 MB per query, which churned the
+   cache. They now go through 16 KiB blocks (`BF_SPARSE_BLOCK_BYTES`). p99 went from 47 to 40 ms.
+3. **AVX-512 for the RaBitQ scan and query planes (51f19db, 68982e0), and popcount ranking of the directory
+   (50d3ef5).** The scan uses `VPOPCNTQ`, and the bit planes use `VPTESTMB`, bit-identical to the scalar path
+   (`BF_NO_AVX512` turns this off). Directory ranking fell from 11% to 1% of CPU. On arm64, the same scan uses NEON
+   `CNT` (786e6df), also bit-identical and tested on an M4. The kernel went from 58 to 19 ns per code there.
+4. **A lock that every warm read took (b91345e).** A read batch planned its fetches under a store-wide lock, even when
+   the cache answered all of it. At 16 clients, a warm cluster read waited 21 ms. Fully cached batches now skip the
+   lock. q/s at 16 clients went from 97 to 164.
+5. **Per-query work that warm queries repeated:**
+   - Decoded directory clusters are now cached across queries, and each code block's CRC is checked once (e543658).
+     Server CPU per query went from 28 to 21 ms.
+   - Stub clusters no longer allocate (87444e7, 54775de).
+   - The vector rank key is the query's f32 bits, not its JSON (fada966).
+   - Decoded clusters live in a sharded CLOCK cache instead of moka (37b1820).
+   - Results hydrate from cached decoded column blocks (b1bca3c). More importantly, they hydrate only the projected
+     attributes (b9bd2bc): `include_attributes: ["id"]` had parsed every title and text.
+6. **Fan-out under load (0c80a65).** One query spreads its slab tasks over the thread pool. Under load, that
+   oversubscribed the CPUs. Once more queries are in flight than half the CPUs (`BF_FANOUT_QUERIES`), each query runs
+   its slab work on its own thread. A single query, such as a warm 100M query, still fans out.
+7. **The scan stops early when it can (ad28a98).** It keeps the k smallest upper bounds and drops rows that the
+   error-bounded rerank would drop anyway. Results are the same (tested for k from 1 to 50). q/s at 16 clients went
+   from about 380 to 435.
+8. **As-loaded recall at default settings (c8a9415, 034284f).** The probe count scales with the square root of the
+   rows, which fits one clustering of all rows, as `recluster`'s slabs have. A namespace as loaded has one independent
+   clustering per segment (25 here), so the same probe count finds fewer neighbours. When the probe count is left at its
+   default, an unreclustered layout now probes `min(S^0.3, 4)` times as many clusters. S is the effective number of
+   equal segments: (sum of rows)² / sum of rows². NQ gets 2.6 times the probes. If you set a probe count, it is used as
+   given. Reclustered layouts, including the 10M and 100M namespaces measured earlier, are unchanged. The cost is that
+   rows scanned and cold bytes grow by the same factor. For a 10M namespace as loaded with 70 segments, I estimate
+   3.5 times the clusters: about 710,000 rows and 91 MB of codes per cold query, against 200,000 rows and 26 MB. That
+   is an estimate from the code, not a measurement. At 100 segments or more, the multiplier is capped at 4 times.
+   Reclustering removes the cost.
+
+Dropped: reciprocal divisions in the scan (no gain), and concurrency limits and fan-out thresholds (no effect). I
+also tried 4-bit query quantization instead of 8-bit. It cut CPU by about 8% with recall@10 unchanged, but recall@100
+went from 0.9282 to 0.9275, so I left it out.
+
+The final profile at 16 clients: the RaBitQ scan, its callback, and dot products are about 42% of server CPU.
+Building the query planes is 5%, and nothing else is over 2%. In isolation, the scan costs 18.7 ns per row. That is
+about the hardware cost of a 1,024-bit code with 8-bit query planes, so further gains have to come from scanning fewer
+rows.
+
+### After: final code, fresh load, same VM
+
+I deleted the store, loaded again with the final binary, and measured each configuration. The load took 287 s (9,346
+rows/s, against 7,665 before), with 3.4 GB peak RSS. `recluster` took 162 s (32 slabs, 13,391 clusters).
+
+| Config | Recall@10 | F1@10 | nDCG@10 | Recall@100 | p50 / p95 / p99 ms | q/s at 1 / 4 / 16 |
+|---|---:|---:|---:|---:|---|---|
+| As loaded, default (64 probes, scaled 2.6 times) | **0.960** | 0.168 | 0.604 | 0.929 | 9.5 / 16.0 / 27.5 | 117.9 / 195.4 / 258.6 |
+| As loaded, 64 probes set explicitly | 0.907 | 0.161 | 0.582 | 0.887 | 5.3 / 8.2 / 9.9 | 144.9 / 302.5 / 484.6 |
+| As loaded, 160 probes | 0.961 | 0.168 | 0.604 | 0.930 | 9.1 / 15.6 / 27.8 | 115.6 / 203.8 / 274.5 |
+| Reclustered, 48 probes | 0.944 | 0.167 | 0.603 | 0.922 | 5.6 / 8.6 / 10.7 | 150.3 / 326.1 / 480.0 |
+| Reclustered, 64 probes (default) | **0.955** | 0.168 | 0.606 | 0.929 | **8.3 / 13.3 / 18.1** | 111.3 / 311.4 / **444.2** |
+| Reclustered, 64 probes, 8 GiB cache | 0.955 | | | | 8.0 / 12.1 / 14.5 | 121.1 / 272.0 / 388.5 |
+| Reclustered, 64 probes, unpinned | 0.955 | | | | 7.5 / 12.8 / 15.0 | 110.0 / 297.7 / 510.2 |
+
+The 16-client rate varies by about 10 to 15% from run to run on this VM, so I compared changes in interleaved A/B
+runs, using server CPU per query as the steadier metric. Against the baseline:
+
+- reclustered at 64 probes is 16 times the throughput at 16 clients (27.1 to 444.2 q/s);
+- p99 fell from 732 to 18.1 ms, and p50 from 28.7 to 8.3 ms;
+- as loaded at default settings, recall@10 went from 0.907 to 0.960, with no probe choice by the user.
+
+### Qdrant and LanceDB on the same VM
+
+These ran with the same limits: CPUs 0 to 5 and 12 GB, the same clients, and the same queries.
+
+- **Qdrant 1.20** ran over HTTP in Docker, with HNSW m=16, ef_construct=100, f16 vectors in RAM, and one segment.
+- **LanceDB 0.41** ran in-process, as in Kerry's run, with IVF-PQ (1,600 partitions, 128 sub-vectors) and refine 10.
+  Its client threads share its six CPUs, and it has no HTTP hop.
+
+Both widen their search with the limit, so I measured their recall@10 at limit 10. The latency and q/s rows use
+top 10, and so do blowfish's.
+
+| Engine, setting | Recall@10 | p50 / p95 / p99 ms | q/s at 1 / 4 / 16 |
+|---|---:|---|---|
+| blowfish, reclustered, 64 probes | 0.955 | 8.3 / 13.3 / 18.1 | 111 / 311 / 444 |
+| Qdrant, hnsw_ef 64 | 0.951 | 1.3 / 2.7 / 3.9 | 688 / 1,812 / 2,565 to 3,164 |
+| Qdrant, hnsw_ef 128 | 0.969 | 2.1 / 3.6 / 4.7 | 476 / 1,233 / 2,014 to 2,167 |
+| LanceDB, 120 probes | 0.956 | 48.4 / 62.9 / 68.8 | 19.4 / 68.1 / 77.9 |
+| LanceDB, 160 probes | 0.967 | 62.9 / 79.5 / 85.5 | 15.6 / 48.9 / 54.2 |
+
+At recall@10 of about 0.95, blowfish serves about 5.7 times LanceDB's throughput at 16 clients, and about one sixth of
+Qdrant's. Qdrant keeps an HNSW graph and every vector in RAM, which costs about 6 GB here. blowfish reads RaBitQ codes
+and exact vectors through a block cache over object storage, so the same server also works cold from S3.
+
+### On a Mac: blowfish, Qdrant, and LanceDB (Apple M4)
+
+I reran all three engines on a Mac mini: an Apple M4 (10 cores) with 16 GB of RAM, running macOS 26. I ran one engine
+at a time, deleted its data before starting the next, and loaded vectors only (id and vector) for all three.
+
+- **blowfish:** a native release build of the final branch, without `local-models`, on `file://` storage. The block
+  cache was 4 GiB, and the RaBitQ scan used the NEON path.
+- **Qdrant 1.20.0:** the official macOS arm64 binary, with the same collection settings as on the VM.
+- **LanceDB 0.41:** via `uv`, in-process, with the same index.
+
+macOS cannot pin CPUs, so the servers and the client processes shared all 10 cores. The rates below therefore include
+the clients' own CPU. Peak RSS is from `/usr/bin/time -l`. Recall@10 is measured at limit 10 for Qdrant and LanceDB, as
+on the VM.
+
+The as-loaded layout here had 97 segments (main's had 102), against 25 on the VM. I did not look into why; the
+vectors-only load and the Mac's memory-based segment sizing are the likely differences. At default settings, that
+many segments gets the capped 4 times the probes.
+
+**blowfish, before (main) and after (this branch):**
+
+| Config | Recall@10 | p50 / p95 / p99 ms | q/s at 1 / 4 / 16 | Peak RSS |
+|---|---:|---|---|---:|
+| main, as loaded, default | 0.896 | 8.6 / 84.2 / 145.5 | 70.0 / 97.9 / 83.4 | 5.9 GB |
+| main, reclustered, 64 probes | 0.953 | 14.3 / 204 / 656 | 24.8 / 29.5 / 38.1 | 5.9 GB |
+| main, reclustered, 48 probes | 0.940 | 10.3 / 123 / 565 | 28.5 / 25.1 / 34.3 | 6.0 GB |
+| branch, as loaded, default (4 times the probes) | **0.968** | 6.9 / 7.8 / 8.8 | 142.9 / 183.2 / 246.3 | 5.3 GB |
+| branch, reclustered, 64 probes | **0.952** | **2.8 / 3.7 / 4.1** | 327.1 / 748.3 / **869.7** | 5.4 GB |
+| branch, reclustered, 48 probes | 0.940 | 2.5 / 3.3 / 3.6 | 375.4 / 879.7 / 1,097.0 | 5.4 GB |
+
+Load and recluster:
+- main: load 129 s (1.9 GB peak RSS); `recluster` 360 s (0.9 GB).
+- branch: load 139 s (1.9 GB); `recluster` 334 s (0.7 GB).
+
+main needed `ulimit -n 10240` to run at all; see below.
+
+**All three engines on the Mac:**
+
+| Engine, setting | Recall@10 | p50 / p95 / p99 ms | q/s at 1 / 4 / 16 | Peak RSS | Build |
+|---|---:|---|---|---:|---|
+| blowfish, reclustered, 64 probes | 0.952 | 2.8 / 3.7 / 4.1 | 327 / 748 / 870 | 5.4 GB (4 GiB cache) | load 139 s, `recluster` 334 s |
+| blowfish, reclustered, 48 probes | 0.940 | 2.5 / 3.3 / 3.6 | 375 / 880 / 1,097 | 5.4 GB | |
+| Qdrant, hnsw_ef 64 | 0.952 | 0.4 / 0.6 / 0.7 | 2,028 / 5,556 / 7,572 | 16.1 GB (includes mapped files) | upload and index 616 s |
+| Qdrant, hnsw_ef 128 | 0.970 | 0.7 / 0.9 / 1.0 | 1,396 / 3,561 / 5,517 | | |
+| LanceDB, 80 probes | 0.935 | 12.9 / 13.2 / 13.4 | 78 / 226 / 394 | build 9.9 GB, queries 0.6 GB | write 19 s, index 55 s |
+| LanceDB, 120 probes | 0.955 | 18.4 / 18.9 / 19.1 | 55 / 160 / 281 | | |
+
+At recall@10 of about 0.95, blowfish on the M4 serves about 3.1 times LanceDB's throughput at 16 clients (870 against
+281 q/s) and about 11% of Qdrant's (7,572). On the VM the LanceDB gap was 5.7 times, but on the Mac LanceDB's clients
+are in-process and no core is reserved for blowfish's HTTP clients, so the Mac numbers favor it. Qdrant's lead comes
+from HNSW over vectors held in memory: a query computes a few thousand distances, where blowfish's IVF scan reads
+about 118,000 one-bit codes. The cost is memory: Qdrant's footprint was the whole Mac,
+including its mapped storage. blowfish's 5.4 GB is its 4 GiB block cache plus the decoded caches.
+
+**macOS open-file limit.** The first Mac run failed every query on the as-loaded layout with a 503 "segment is
+unavailable or corrupt". macOS starts processes with a soft limit of 256 open files, and a query on a namespace with
+about a hundred segments on `file://` storage opened more than that at once. blowfish now raises its soft limit to
+the hard limit at startup (824c5e7): 256 to 61,440 on this Mac. Linux distributions usually start at 1,024, which
+this load did not reach.
+
+### Not done and what is left
+
+- The scan is now most of the CPU and runs near its per-row cost. The next step is fewer rows per query: a better
+  first-stage estimate (for example, multi-bit RaBitQ codes) or a smaller rerank target.
+- As-loaded recall comes from probing more clusters. Recluster automatically when it pays off is still an open
+  decision in `SPEC.md`.
+- The decoded caches can now hold up to 1.5 times `BF_DECODED_CACHE_BYTES` (see `configuration.md`). Keep that in mind
+  on 4 GB machines.

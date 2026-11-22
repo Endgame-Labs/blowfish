@@ -61,6 +61,10 @@ pub struct EngineConfig {
     pub build_concurrency: usize,
     /// IVF leaf probes for ANN queries.
     pub ann_nprobe: usize,
+    /// Whether `ann_nprobe` was set by the operator (flag, TOML, or environment). An explicit
+    /// probe count is used as given; the default one is scaled up for independently clustered
+    /// segments (see `ann_dir::independent_spread`).
+    pub ann_nprobe_explicit: bool,
     /// Exact rerank budget as a multiple of the requested k.
     pub ann_rerank_factor: usize,
     /// A filtered ANN query with at most this many allowed rows fetches and ranks exactly
@@ -72,6 +76,9 @@ pub struct EngineConfig {
     pub filtered_probe_cap: usize,
     /// Fraction of ANN requests checked against exhaustive ground truth.
     pub recall_sample_rate: f64,
+    /// Least time between two sampled recall comparisons (and only one runs at a time).
+    /// `BF_RECALL_SAMPLE_INTERVAL_MS`.
+    pub recall_sample_interval: Duration,
     /// Embedding and reranking models. Without them, `Embed` and model `rerank_by` return a 400.
     pub models: Option<std::sync::Arc<bf_models::Models>>,
 }
@@ -156,10 +163,12 @@ impl Default for EngineConfig {
                 2
             },
             ann_nprobe: 64,
+            ann_nprobe_explicit: false,
             ann_rerank_factor: 32,
             exact_fetch_rows: 8192,
             filtered_probe_cap: 3,
             recall_sample_rate: 0.01,
+            recall_sample_interval: Duration::from_secs(60),
             models: None,
         }
     }
@@ -222,8 +231,18 @@ impl EngineConfig {
         if let Some(v) = number("BF_RETENTION_SECS") {
             c.retention = Duration::from_secs(v);
         }
+        if let Some(v) = number("BF_QUERY_CONCURRENCY") {
+            c.query_concurrency = v as usize;
+        }
+        if let Some(v) = number("BF_SEARCH_CONCURRENCY") {
+            c.search_concurrency = v as usize;
+        }
+        if let Some(v) = number("BF_RECALL_SAMPLE_INTERVAL_MS") {
+            c.recall_sample_interval = Duration::from_millis(v);
+        }
         if let Some(v) = number("BF_ANN_NPROBE") {
             c.ann_nprobe = v as usize;
+            c.ann_nprobe_explicit = true;
         }
         if let Some(v) = number("BF_BUILD_CONCURRENCY") {
             c.build_concurrency = v as usize;
@@ -361,11 +380,7 @@ impl Engine {
     /// but never epoch fencing.
     /// Returns false when there was no work or another indexer won the publication.
     pub async fn index_namespace(&self, ns: &str, force: bool) -> Result<bool, ApiError> {
-        let context = crate::read_cache::ReadContext {
-            cache: self.0.read_cache.clone(),
-            stats: Default::default(),
-            backend: Default::default(),
-        };
+        let context = crate::read_cache::ReadContext::new(self.0.read_cache.clone());
         crate::read_cache::scope(context, self.index_namespace_inner(ns, force)).await
     }
     async fn index_namespace_inner(&self, ns: &str, force: bool) -> Result<bool, ApiError> {

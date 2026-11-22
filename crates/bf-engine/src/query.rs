@@ -276,6 +276,10 @@ fn single(
     }
     let total = limits(q, true)?;
     let rank = q.rank_by.as_ref().expect("validated rank");
+    // Precomputed vector scores, looked up once: the key serializes the whole query vector.
+    let vector_scores = matches!(rank, RankBy::Vector { .. })
+        .then(|| state.scores.get(&crate::indexed::rank_key(rank)))
+        .flatten();
     let mut ranked = vec![];
     for (id, doc) in docs {
         let score = match rank {
@@ -308,7 +312,7 @@ fn single(
             RankBy::Vector {
                 attribute, vector, ..
             } => {
-                if let Some(scores) = state.scores.get(&crate::indexed::rank_key(rank)) {
+                if let Some(scores) = vector_scores {
                     let Some(score) = scores.get(id) else {
                         continue;
                     };

@@ -292,7 +292,7 @@ impl Section {
 /// Order `live` clusters along a greedy nearest-neighbor tour of their centers, starting at the
 /// first. Clusters that a query probes together are near each other, so they land near each
 /// other on the tour.
-fn tour<'a>(live: &[usize], center: impl Fn(usize) -> &'a Vec<f32> + Sync) -> Vec<usize> {
+fn tour<'a>(live: &[usize], center: impl Fn(usize) -> &'a [f32] + Sync) -> Vec<usize> {
     let Some(&first) = live.first() else {
         return Vec::new();
     };
@@ -362,7 +362,7 @@ impl Fragment {
             .collect();
         let mut centroid = vec![0f32; padded];
         for &c in &live {
-            for (g, x) in centroid.iter_mut().zip(&m.clusters[c].center) {
+            for (g, x) in centroid.iter_mut().zip(m.clusters[c].center.iter()) {
                 *g += *x;
             }
         }
@@ -383,7 +383,7 @@ impl Fragment {
             + if blocks_mode { 4 } else { 0 };
         // Blocks are laid out in `order`; entries stay in cluster order.
         let order = if blocks_mode {
-            tour(&live, |c| &m.clusters[c].center)
+            tour(&live, |c| &*m.clusters[c].center)
         } else {
             live.clone()
         };
@@ -453,7 +453,7 @@ impl Fragment {
             let wide = m.clusters.len() > u16::MAX as usize;
             let mut map = vec![0u32; m.count as usize];
             for (cid, c) in m.clusters.iter().enumerate() {
-                for row in &c.rows {
+                for row in c.rows.iter() {
                     *map.get_mut(row as usize)
                         .ok_or_else(|| bad("row outside segment"))? = cid as u32;
                 }
@@ -515,39 +515,20 @@ impl Fragment {
 }
 
 /// Estimated squared distance from the (rotated) query `q` to each entry of `s`, from the
-/// section's one-bit codes.
+/// section's one-bit codes. The residual query is quantized to bit planes once per section, so
+/// each entry costs a few popcounts per 64 dimensions (512 at a time with AVX-512) rather than
+/// a table lookup per byte.
 fn section_distances(s: &Section, q: &[f64]) -> Vec<f32> {
     let padded = q.len();
-    let root = (padded as f64).sqrt() as f32;
-    let qr: Vec<f32> = q
-        .iter()
-        .zip(&s.centroid)
-        .map(|(x, g)| *x as f32 - g)
-        .collect();
-    let q2: f32 = qr.iter().map(|x| x * x).sum();
-    // lut[j * 256 + v] = sum of qr over the bits set in v, for byte j.
+    let plane = crate::rabitq::PlaneQuery::new(q, &s.centroid);
     let width = bit_bytes(padded);
-    let mut lut = vec![0f32; width * 256];
-    for j in 0..width {
-        let t = &mut lut[j * 256..(j + 1) * 256];
-        for v in 1..256usize {
-            let bit = v.trailing_zeros() as usize;
-            t[v] = t[v & (v - 1)] + qr.get(j * 8 + bit).copied().unwrap_or(0.);
-        }
-    }
-    let total: f32 = qr.iter().sum();
     s.entries
         .iter()
         .enumerate()
         .map(|(n, e)| {
-            let code = &s.bits[n * width..(n + 1) * width];
-            let set: f32 = code
-                .iter()
-                .enumerate()
-                .map(|(j, b)| lut[j * 256 + *b as usize])
-                .sum();
-            let dot = (2. * set - total) / root;
-            q2 + e.norm * e.norm - 2. * e.norm * dot / e.alpha
+            let dot = plane.dot(&s.bits[n * width..(n + 1) * width], padded);
+            let (norm, alpha) = (e.norm as f64, e.alpha as f64);
+            (plane.norm2 + norm * norm - 2. * norm * dot / alpha) as f32
         })
         .collect()
 }
@@ -707,6 +688,20 @@ impl Directory {
     /// Estimated squared distance from the query to every entry's center, in entry order,
     /// from the one-bit codes. Comparable across segments because they share one rotation.
     pub fn center_distances(&self, query: &[f32]) -> Result<Vec<f32>> {
+        self.center_distances_on(query, true)
+    }
+    /// [`Self::center_distances`], on this thread alone when `parallel` is false (a busy
+    /// server gains nothing from fanning one query's ranking out over the rayon pool).
+    pub fn center_distances_on(&self, query: &[f32], parallel: bool) -> Result<Vec<f32>> {
+        if !parallel {
+            crate::distance::validate(query, self.shape.dims)?;
+            let q = self.rq.rotate(&prepare(query, self.shape.metric));
+            return Ok(self
+                .sections
+                .iter()
+                .flat_map(|s| section_distances(s, &q))
+                .collect());
+        }
         crate::distance::validate(query, self.shape.dims)?;
         let q = self.rq.rotate(&prepare(query, self.shape.metric));
         let per_segment: Vec<Vec<f32>> = self
@@ -755,6 +750,18 @@ impl<R: RangeRead> PartialIndex<R> {
     /// Install a probed cluster's blob, read from the directory object.
     pub fn install(&mut self, cluster: usize, blob: &Bytes) -> Result<()> {
         self.0.install_cluster(cluster, blob)
+    }
+    /// Decode a probed cluster's blob, to keep (see [`crate::DecodedCluster`]) and install.
+    pub fn decode(&self, blob: &Bytes) -> Result<crate::DecodedCluster> {
+        self.0.decode_cluster(blob)
+    }
+    /// Install a cluster decoded earlier, by this or another partial index of the same segment.
+    pub fn install_decoded(
+        &mut self,
+        cluster: usize,
+        decoded: &crate::DecodedCluster,
+    ) -> Result<()> {
+        self.0.install_decoded(cluster, decoded)
     }
     /// The index. Only clusters that were installed may be scanned or reranked.
     pub fn index(&self) -> &Index<R> {

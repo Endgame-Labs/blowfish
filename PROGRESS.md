@@ -2,6 +2,38 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-22
+
+- **Iteration 19: BEIR Natural Questions on one machine** (`docs/benchmarks.md`). I reproduced Kerry Kurian's outside
+  benchmark ("Blowfish on BEIR Natural Questions") on this VM: 2.68M f16 vectors at 1,024 dimensions, a server on 6
+  pinned CPUs with 12 GB. Then I fixed what it found. Reclustered at 64 probes, recall@10 is 0.955 (was 0.954):
+  - warm p50/p95/p99 went from 28.7/457/732 to 8.3/13.3/18.1 ms;
+  - 16-client throughput went from 27 to 444 q/s.
+
+  As loaded at default settings, recall@10 went from 0.907 to 0.960: the default probe count now scales up, by at most
+  4 times, for independently clustered segments. An explicit probe count is used as given, and reclustered layouts are
+  unchanged. The causes:
+  - the recall sampler's exhaustive scans;
+  - 1 MiB rerank blocks;
+  - a store-wide lock on fully cached reads;
+  - per-query decode and allocation;
+  - hydrating unprojected text;
+  - rayon fan-out under load.
+
+  The fixes added AVX-512 and NEON RaBitQ kernels, both bit-identical to the scalar path, and a bounded scan. On the
+  same VM, Qdrant 1.20 at ef 64 serves about 6 times blowfish's q/s, and LanceDB 0.41 at 120 probes about a sixth of
+  it. On an Apple M4, with all three engines, blowfish went from 38 to
+  870 q/s at 16 clients (p99 656 to 4.1 ms), against LanceDB's 281 and Qdrant's 7,572 q/s at the same recall.
+  blowfish now also raises its open-file limit at startup. macOS's default of 256 made as-loaded queries on about a
+  hundred segments fail with a 503.
+
+  Checked:
+  - `cargo test --workspace`, clippy, the compat suite (121/121), and the Python and TypeScript SDK smokes;
+  - the small `bench` ladder (10K to 200K rows, against main): same recall, lower warm ANN latency, and cold ANN within
+    run-to-run spread.
+
+  New settings are in `docs/configuration.md`.
+
 ## 2026-11-21
 
 - **Issue #2 root cause found and fixed.** The cold-start segfault came from jemalloc 5.3: blowfish set decay with
