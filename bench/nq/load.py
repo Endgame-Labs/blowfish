@@ -1,6 +1,9 @@
 """Load BEIR NQ into a running blowfish: id, f16 vector (cosine), title, and text (BM25).
 
-Usage: uv run python load.py DATA_DIR --base-url http://127.0.0.1:18100 --namespace nq [--rows N]
+Usage: uv run python load.py DATA_DIR --base-url http://127.0.0.1:18100 --namespace nq [--rows N] [--vectors-only]
+
+`--vectors-only` writes id and vector only and needs just `corpus.f16` (the same-machine Mac runs, where
+Qdrant and LanceDB get vectors only too).
 
 Document id i is corpus row i (`corpus_ids.txt` line i). Vectors go over the wire as base64 little-endian f32,
 as the official SDKs send them, and are stored as f16 (the schema declares `[1024]f16`). Writes retry on 429 and
@@ -64,31 +67,42 @@ def main():
     p.add_argument("--rows", type=int, default=0, help="stop after this many rows (0: all)")
     p.add_argument("--batch", type=int, default=5000)
     p.add_argument("--inflight", type=int, default=4)
+    p.add_argument("--vectors-only", action="store_true")
     a = p.parse_args()
     path = f"/v2/namespaces/{a.namespace}"
     vecs = np.load(a.data / "corpus.f16", mmap_mode="r")
-    files = sorted((a.data / "raw" / "corpus").glob("*.parquet"))
+    if a.vectors_only:
+        total = a.rows or len(vecs)
+        files = [None]
+    else:
+        files = sorted((a.data / "raw" / "corpus").glob("*.parquet"))
+    schema = {"vector": SCHEMA["vector"]} if a.vectors_only else SCHEMA
+
+    def batches(f):
+        if f is None:
+            for s in range(0, total, a.batch):
+                yield min(a.batch, total - s)
+        else:
+            yield from pq.ParquetFile(f).iter_batches(batch_size=a.batch, columns=["title", "text"])
+
     pool = ThreadPoolExecutor(a.inflight)
     pending = []
     row, t0, first = 0, time.monotonic(), True
     for f in files:
-        for batch in pq.ParquetFile(f).iter_batches(batch_size=a.batch, columns=["title", "text"]):
-            n = len(batch)
+        for batch in batches(f):
+            n = batch if f is None else len(batch)
             if a.rows:
                 n = min(n, a.rows - row)
             if n <= 0:
                 break
             v = np.asarray(vecs[row : row + n], dtype="<f4")
-            body = {
-                "upsert_columns": {
-                    "id": list(range(row, row + n)),
-                    "vector": [base64.b64encode(x.tobytes()).decode() for x in v],
-                    "title": batch.column("title").to_pylist()[:n],
-                    "text": batch.column("text").to_pylist()[:n],
-                }
-            }
+            cols = {"id": list(range(row, row + n)), "vector": [base64.b64encode(x.tobytes()).decode() for x in v]}
+            if f is not None:
+                cols["title"] = batch.column("title").to_pylist()[:n]
+                cols["text"] = batch.column("text").to_pylist()[:n]
+            body = {"upsert_columns": cols}
             if first:
-                body["schema"] = SCHEMA
+                body["schema"] = schema
                 body["distance_metric"] = "cosine_distance"
                 post(a.base_url, path, json.dumps(body).encode())
                 first = False
