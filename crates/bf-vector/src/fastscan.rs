@@ -135,7 +135,7 @@ impl FastQuery {
         }
         let delta = if span > 0. { span / LEVELS } else { 1. };
         let coarse = Tables::build(&x, |group, e| {
-            ((e - lows[group]) / delta + 0.5).clamp(0., LEVELS).floor()
+            ((e - lows[group]) / delta + 0.5).clamp(0., LEVELS)
         });
         Self {
             coarse,
@@ -155,13 +155,11 @@ impl FastQuery {
         self.fine.get_or_init(|| {
             let (delta, step) = (self.delta, self.fine_step());
             Tables::build(&self.x, |group, e| {
-                let level = ((e - self.lows[group]) / delta + 0.5)
-                    .clamp(0., LEVELS)
-                    .floor();
+                // As the coarse table stores it (truncated; the value is not negative).
+                let level =
+                    f32::from(((e - self.lows[group]) / delta + 0.5).clamp(0., LEVELS) as u8);
                 let residual = e - self.lows[group] - delta * level;
-                ((residual + delta / 2.) / step + 0.5)
-                    .clamp(0., LEVELS)
-                    .floor()
+                ((residual + delta / 2.) / step + 0.5).clamp(0., LEVELS)
             })
         })
     }
@@ -350,7 +348,9 @@ impl FastQuery {
     /// rotated query to the cluster's center. Distances and error bounds come out as the metric
     /// reports them (halved and clamped to `[0, 2]` for cosine, at least zero for Euclidean).
     /// Calls `emit(first ordinal, rows, distances, bounds, zero mask)` once per block of up to
-    /// 32 rows; bit `j` of the mask marks row `first + j` as an all-zero input vector. Scores
+    /// 32 rows that has any: bit `j` of `rows` marks row `first + j` as one whose lower bound
+    /// (distance minus bound) is within `cut` or that is an all-zero input vector (bit `j` of
+    /// the zero mask; its distance is the caller's to fix). Scores
     /// come from the coarse tables, with their rounding in the bounds; [`Self::rescore`] refines
     /// the rows that survive.
     pub(crate) fn scan(
@@ -359,7 +359,8 @@ impl FastQuery {
         rows: usize,
         qc2: f32,
         cosine: bool,
-        emit: &mut impl FnMut(usize, usize, &[f32; BLOCK], &[f32; BLOCK], u32),
+        cut: &std::cell::Cell<f32>,
+        emit: &mut impl FnMut(usize, u32, &[f32; BLOCK], &[f32; BLOCK], u32),
     ) -> crate::Result<()> {
         let padded = self.padded;
         if bytes.len() != block_len(rows, padded) {
@@ -389,28 +390,41 @@ impl FastQuery {
             // Padding rows get harmless factors (and are not emitted).
             let (mut sq, mut k1, mut k2, mut cb) =
                 ([0f32; BLOCK], [0f32; BLOCK], [0f32; BLOCK], [0f32; BLOCK]);
-            let mut zero = 0u32;
-            for j in 0..n {
-                sq[j] = f32::from_le_bytes(squares[start + j]);
-                let k = f32::from_le_bytes(scales[start + j]);
-                zero |= u32::from(k.is_sign_negative()) << j;
-                k1[j] = k.abs();
-                k2[j] = f32::from_le_bytes(errors[start + j]);
-                cb[j] = f32::from_le_bytes(cbs[start + j]);
-            }
+            let rows_of = |column: &[[u8; 4]], out: &mut [f32; BLOCK]| {
+                for (o, b) in out.iter_mut().zip(&column[start..start + n]) {
+                    *o = f32::from_le_bytes(*b);
+                }
+            };
+            rows_of(squares, &mut sq);
+            rows_of(scales, &mut k1);
+            rows_of(errors, &mut k2);
+            rows_of(cbs, &mut cb);
             let (mut distance, mut bound) = ([0f32; BLOCK], [0f32; BLOCK]);
-            let mut bad = false;
+            let (mut bad, mut zero, mut near) = (false, 0u32, 0u32);
+            let cut = cut.get();
             for j in 0..BLOCK {
-                bad |= !((sq[j] >= 0.) & (sq[j] < f32::INFINITY) & (k1[j] < f32::INFINITY))
+                // A negative scale marks an all-zero input vector.
+                zero |= (k1[j].to_bits() >> 31) << j;
+                let k = k1[j].abs();
+                bad |= !((sq[j] >= 0.) & (sq[j] < f32::INFINITY) & (k < f32::INFINITY))
                     | !((k2[j] >= 0.) & (k2[j] < f32::INFINITY) & (cb[j].abs() < f32::INFINITY));
                 let dot = sums[j] as f32 * scale + offset - cb[j];
-                distance[j] = ((sq[j] + qc2 - 2. * k1[j] * dot) * half).clamp(0., top);
-                bound[j] = (spread * k2[j] + 2. * k1[j] * coarse_error) * half;
+                distance[j] = ((sq[j] + qc2 - 2. * k * dot) * half).clamp(0., top);
+                bound[j] = (spread * k2[j] + 2. * k * coarse_error) * half;
+                near |= u32::from(distance[j] - bound[j] <= cut) << j;
             }
             if bad {
                 return Err(crate::format::bad("invalid quantization factors"));
             }
-            emit(start, n, &distance, &bound, zero);
+            let valid = if n == BLOCK {
+                u32::MAX
+            } else {
+                (1u32 << n) - 1
+            };
+            let emitted = (near | zero) & valid;
+            if emitted != 0 {
+                emit(start, emitted, &distance, &bound, zero);
+            }
         }
         Ok(())
     }
@@ -708,13 +722,20 @@ mod tests {
             let fq = FastQuery::new(&q, &g);
             let mut acc = 0f32;
             for b in &blocks_fast {
-                fq.scan(b, rows, 1.0, true, &mut |_, n, d, e, _| {
-                    for j in 0..n {
-                        if d[j] - e[j] < 0.5 {
-                            acc += d[j];
+                fq.scan(
+                    b,
+                    rows,
+                    1.0,
+                    true,
+                    &std::cell::Cell::new(f32::INFINITY),
+                    &mut |_, mask, d, e, _| {
+                        for j in (0..BLOCK).filter(|j| mask & (1 << j) != 0) {
+                            if d[j] - e[j] < 0.5 {
+                                acc += d[j];
+                            }
                         }
-                    }
-                })
+                    },
+                )
                 .unwrap();
             }
             let fast = t.elapsed();

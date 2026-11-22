@@ -673,17 +673,29 @@ impl<R: RangeRead> Index<R> {
                 let fq =
                     fast.get_or_insert_with(|| crate::fastscan::FastQuery::new(q_rot, reference));
                 let qc2 = Metric::EuclideanSquared.distance_unchecked(q32, &c.center);
-                fq.scan(&bytes, n, qc2, cosine, &mut |start, count, d, e, zero| {
-                    for j in 0..count {
-                        let z = zero & (1 << j) != 0;
-                        let (d, e) = if cosine && (q_zero || z) {
-                            fixed(z)
-                        } else {
-                            (d[j], e[j])
-                        };
-                        accept(start + j, d, e);
-                    }
-                })?;
+                // A zero query has a fixed distance to every row: no cut applies.
+                let open = std::cell::Cell::new(f32::INFINITY);
+                let scan_cut = if cosine && q_zero { &open } else { &cut };
+                fq.scan(
+                    &bytes,
+                    n,
+                    qc2,
+                    cosine,
+                    scan_cut,
+                    &mut |start, mut rows, d, e, zero| {
+                        while rows != 0 {
+                            let j = rows.trailing_zeros() as usize;
+                            rows &= rows - 1;
+                            let z = zero & (1 << j) != 0;
+                            let (d, e) = if cosine && (q_zero || z) {
+                                fixed(z)
+                            } else {
+                                (d[j], e[j])
+                            };
+                            accept(start + j, d, e);
+                        }
+                    },
+                )?;
                 if keep.is_some() && estimated.len() > first && fq.rounding_matters(qc2) {
                     rescore.push((first..estimated.len(), bytes, n, qc2));
                 }
