@@ -273,6 +273,16 @@ impl PlaneQuery {
         }
     }
 
+    /// [`Self::signed_dot`], with the AVX-512 kernel where the CPU has it.
+    pub(crate) fn dot(&self, bits: &[u8], padded: usize) -> f64 {
+        #[cfg(target_arch = "x86_64")]
+        if avx512() && self.words.is_multiple_of(8) && bits.len() >= self.words * 8 {
+            // SAFETY: the features were detected, and `bits` holds `words * 8` bytes.
+            return unsafe { self.signed_dot_avx512(bits, padded) };
+        }
+        self.signed_dot(bits, padded)
+    }
+
     /// Inner product of the residual query with the code's +-1 vector, divided by sqrt(padded).
     #[inline(always)]
     fn signed_dot(&self, bits: &[u8], padded: usize) -> f64 {

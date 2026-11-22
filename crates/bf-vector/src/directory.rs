@@ -515,39 +515,20 @@ impl Fragment {
 }
 
 /// Estimated squared distance from the (rotated) query `q` to each entry of `s`, from the
-/// section's one-bit codes.
+/// section's one-bit codes. The residual query is quantized to bit planes once per section, so
+/// each entry costs a few popcounts per 64 dimensions (512 at a time with AVX-512) rather than
+/// a table lookup per byte.
 fn section_distances(s: &Section, q: &[f64]) -> Vec<f32> {
     let padded = q.len();
-    let root = (padded as f64).sqrt() as f32;
-    let qr: Vec<f32> = q
-        .iter()
-        .zip(&s.centroid)
-        .map(|(x, g)| *x as f32 - g)
-        .collect();
-    let q2: f32 = qr.iter().map(|x| x * x).sum();
-    // lut[j * 256 + v] = sum of qr over the bits set in v, for byte j.
+    let plane = crate::rabitq::PlaneQuery::new(q, &s.centroid);
     let width = bit_bytes(padded);
-    let mut lut = vec![0f32; width * 256];
-    for j in 0..width {
-        let t = &mut lut[j * 256..(j + 1) * 256];
-        for v in 1..256usize {
-            let bit = v.trailing_zeros() as usize;
-            t[v] = t[v & (v - 1)] + qr.get(j * 8 + bit).copied().unwrap_or(0.);
-        }
-    }
-    let total: f32 = qr.iter().sum();
     s.entries
         .iter()
         .enumerate()
         .map(|(n, e)| {
-            let code = &s.bits[n * width..(n + 1) * width];
-            let set: f32 = code
-                .iter()
-                .enumerate()
-                .map(|(j, b)| lut[j * 256 + *b as usize])
-                .sum();
-            let dot = (2. * set - total) / root;
-            q2 + e.norm * e.norm - 2. * e.norm * dot / e.alpha
+            let dot = plane.dot(&s.bits[n * width..(n + 1) * width], padded);
+            let (norm, alpha) = (e.norm as f64, e.alpha as f64);
+            (plane.norm2 + norm * norm - 2. * norm * dot / alpha) as f32
         })
         .collect()
 }
