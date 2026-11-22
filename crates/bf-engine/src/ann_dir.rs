@@ -357,6 +357,11 @@ pub(crate) async fn prefetch(store: &Storage, ns: &str, attr: &str) -> Option<Pr
 async fn run_parallel<T: Send + 'static>(
     tasks: Vec<futures::future::BoxFuture<'static, Result<T, ApiError>>>,
 ) -> Result<Vec<T>, ApiError> {
+    if !crate::fan_out() {
+        // Busy: poll the tasks from this one (the query's own thread), so they run one after
+        // another without handoffs.
+        return futures::future::try_join_all(tasks).await;
+    }
     let context = read_cache::context();
     let mut set = tokio::task::JoinSet::new();
     for task in tasks {
@@ -378,7 +383,7 @@ async fn run_parallel<T: Send + 'static>(
 async fn on_worker<T: Send + 'static>(
     fut: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {
-    let Some(context) = read_cache::context() else {
+    let Some(context) = read_cache::context().filter(|_| crate::fan_out()) else {
         return fut.await;
     };
     let permit = context
@@ -420,8 +425,11 @@ pub(crate) async fn prefetch_scan(
     let vector: Arc<[f32]> = vector.into();
     let distances = {
         let (dir, vector) = (dir.clone(), vector.clone());
-        on_worker(async move { dir.center_distances(&vector).map_err(segment::index_error) })
-            .await?
+        on_worker(async move {
+            dir.center_distances_on(&vector, crate::fan_out())
+                .map_err(segment::index_error)
+        })
+        .await?
     };
     crate::ann::stage(t0, "prefetch rank");
     let n = dir.segments().len();
@@ -785,8 +793,11 @@ pub(crate) async fn search(
     let width = dir.vector_row_bytes();
     let distances = {
         let (dir, vector) = (dir.clone(), vector.clone());
-        on_worker(async move { dir.center_distances(&vector).map_err(segment::index_error) })
-            .await?
+        on_worker(async move {
+            dir.center_distances_on(&vector, crate::fan_out())
+                .map_err(segment::index_error)
+        })
+        .await?
     };
     crate::ann::stage(t0, "rank");
     let entries = dir.entries();

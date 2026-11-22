@@ -328,6 +328,42 @@ struct Inner {
     owner: uuid::Uuid,
     namespaces: Mutex<HashMap<String, Arc<Handle>>>,
 }
+/// Queries executing right now (holding a query permit), across every engine in the process.
+static QUERIES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a query should fan its work out over other threads (one task per probed segment or
+/// slab, the rayon pool for ranking). Fanning out cuts a lone query's latency, but each hop costs
+/// a handoff and a wakeup; once enough queries run to keep the cores busy on their own, a query
+/// runs its pieces one after another on its own thread instead, which raises throughput. The
+/// threshold is half the CPUs this process may use (`BF_FANOUT_QUERIES` overrides it).
+pub(crate) fn fan_out() -> bool {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("BF_FANOUT_QUERIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(1, |n| n.get() / 2)
+                    .max(1)
+            })
+    });
+    QUERIES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) <= limit
+}
+
+struct InFlight;
+impl InFlight {
+    fn enter() -> Self {
+        QUERIES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        QUERIES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Paces the background recall sampler: at most one exhaustive comparison runs at a time, and
 /// a new one starts at most once per interval. An exhaustive search reads every vector of the
 /// namespace (5.5 GB at 2.7M f16 rows of 1,024 dimensions), so a per-query rate alone lets it
@@ -792,6 +828,7 @@ impl Engine {
             .map_err(segment::index_error)?;
         let response = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _in_flight = InFlight::enter();
             runtime.block_on(read_cache::scope(
                 context,
                 indexed::execute(&store, &state, &request, &config, false),

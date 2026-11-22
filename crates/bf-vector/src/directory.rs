@@ -688,6 +688,20 @@ impl Directory {
     /// Estimated squared distance from the query to every entry's center, in entry order,
     /// from the one-bit codes. Comparable across segments because they share one rotation.
     pub fn center_distances(&self, query: &[f32]) -> Result<Vec<f32>> {
+        self.center_distances_on(query, true)
+    }
+    /// [`Self::center_distances`], on this thread alone when `parallel` is false (a busy
+    /// server gains nothing from fanning one query's ranking out over the rayon pool).
+    pub fn center_distances_on(&self, query: &[f32], parallel: bool) -> Result<Vec<f32>> {
+        if !parallel {
+            crate::distance::validate(query, self.shape.dims)?;
+            let q = self.rq.rotate(&prepare(query, self.shape.metric));
+            return Ok(self
+                .sections
+                .iter()
+                .flat_map(|s| section_distances(s, &q))
+                .collect());
+        }
         crate::distance::validate(query, self.shape.dims)?;
         let q = self.rq.rotate(&prepare(query, self.shape.metric));
         let per_segment: Vec<Vec<f32>> = self

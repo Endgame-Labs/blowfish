@@ -32,7 +32,7 @@ struct Seg {
 async fn on_worker<T: Send + 'static>(
     fut: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {
-    let Some(context) = read_cache::context() else {
+    let Some(context) = read_cache::context().filter(|_| crate::fan_out()) else {
         return fut.await;
     };
     let permit = context
