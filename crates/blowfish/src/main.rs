@@ -279,6 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or(config.engine.ann_nprobe)
     {
         engine_config.ann_nprobe = value;
+        engine_config.ann_nprobe_explicit = true;
     }
     if let Some(value) = tuning.ann_rerank_factor.or(config.engine.ann_rerank_factor) {
         engine_config.ann_rerank_factor = value;

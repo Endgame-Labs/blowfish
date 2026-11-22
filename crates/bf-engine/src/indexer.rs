@@ -61,6 +61,10 @@ pub struct EngineConfig {
     pub build_concurrency: usize,
     /// IVF leaf probes for ANN queries.
     pub ann_nprobe: usize,
+    /// Whether `ann_nprobe` was set by the operator (flag, TOML, or environment). An explicit
+    /// probe count is used as given; the default one is scaled up for independently clustered
+    /// segments (see `ann_dir::independent_spread`).
+    pub ann_nprobe_explicit: bool,
     /// Exact rerank budget as a multiple of the requested k.
     pub ann_rerank_factor: usize,
     /// A filtered ANN query with at most this many allowed rows fetches and ranks exactly
@@ -159,6 +163,7 @@ impl Default for EngineConfig {
                 2
             },
             ann_nprobe: 64,
+            ann_nprobe_explicit: false,
             ann_rerank_factor: 32,
             exact_fetch_rows: 8192,
             filtered_probe_cap: 3,
@@ -237,6 +242,7 @@ impl EngineConfig {
         }
         if let Some(v) = number("BF_ANN_NPROBE") {
             c.ann_nprobe = v as usize;
+            c.ann_nprobe_explicit = true;
         }
         if let Some(v) = number("BF_BUILD_CONCURRENCY") {
             c.build_concurrency = v as usize;

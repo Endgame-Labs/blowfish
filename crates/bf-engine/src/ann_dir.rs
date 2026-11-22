@@ -461,7 +461,7 @@ pub(crate) async fn prefetch_scan(
             clusters,
             target,
             filtered: false,
-            spread: layout_spread(dir, layout, &seg_rows),
+            spread: layout_spread(config, dir, layout, &seg_rows),
         },
         config,
     );
@@ -679,11 +679,17 @@ struct Totals {
 }
 
 /// [`independent_spread`] over a directory's ANN segments; 1 for slabs (one clustering).
-fn layout_spread(dir: &Directory, layout: Layout, seg_rows: &[usize]) -> f64 {
+fn layout_spread(
+    config: &EngineConfig,
+    dir: &Directory,
+    layout: Layout,
+    seg_rows: &[usize],
+) -> f64 {
     if layout == Layout::Slabs {
         return 1.0;
     }
     independent_spread(
+        config,
         dir.segments()
             .iter()
             .zip(seg_rows)
@@ -709,8 +715,17 @@ fn probe_count(config: &EngineConfig, ann_rows: usize, clusters: usize, thin: f6
 /// `S^exponent` times as many clusters, where `S = (sum of rows)^2 / sum of rows^2` is the
 /// effective number of equal segments (tiny tail segments barely count). The exponent is
 /// `BF_ANN_SEGMENT_SPREAD` (default 0.3; 0 turns it off): NQ needed 2.5 times the probes to
-/// reach the reclustered recall, and 25^0.3 is 2.6.
-pub(crate) fn independent_spread(segment_rows: impl Iterator<Item = usize>) -> f64 {
+/// reach the reclustered recall, and 25^0.3 is 2.6. The multiplier is at most
+/// [`MAX_SPREAD`] (reached at about 100 segments), so a namespace with many segments (a large
+/// load before its recluster, or one still ingesting) reads at most that many times the
+/// clusters on a cold query. An explicit `ann_nprobe` is never scaled.
+pub(crate) fn independent_spread(
+    config: &EngineConfig,
+    segment_rows: impl Iterator<Item = usize>,
+) -> f64 {
+    if config.ann_nprobe_explicit {
+        return 1.0;
+    }
     static EXPONENT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     let exponent = *EXPONENT.get_or_init(|| {
         std::env::var("BF_ANN_SEGMENT_SPREAD")
@@ -725,8 +740,14 @@ pub(crate) fn independent_spread(segment_rows: impl Iterator<Item = usize>) -> f
     if exponent <= 0.0 || squares <= 0.0 {
         return 1.0;
     }
-    (sum * sum / squares).max(1.0).powf(exponent)
+    (sum * sum / squares)
+        .max(1.0)
+        .powf(exponent)
+        .min(MAX_SPREAD)
 }
+
+/// Upper bound of [`independent_spread`].
+pub(crate) const MAX_SPREAD: f64 = 4.0;
 
 /// The directory entries to probe, nearest first. `in_cluster` gives each entry's expected
 /// allowed rows.
@@ -915,7 +936,7 @@ pub(crate) async fn search(
                     clusters,
                     target,
                     filtered,
-                    spread: layout_spread(dir.as_ref(), layout, &seg_rows),
+                    spread: layout_spread(config, dir.as_ref(), layout, &seg_rows),
                 },
                 config,
             );
@@ -1628,18 +1649,27 @@ fn scan_speculation_enabled() -> bool {
 
 #[cfg(test)]
 mod spread_tests {
-    use super::independent_spread;
+    use super::{MAX_SPREAD, independent_spread};
+    use crate::EngineConfig;
 
     #[test]
     fn spread_counts_effective_equal_segments() {
+        let c = EngineConfig::default();
+        let spread = |rows: &[usize]| independent_spread(&c, rows.iter().copied());
         // One segment, or none: no extra probes.
-        assert_eq!(independent_spread([1000].into_iter()), 1.0);
-        assert_eq!(independent_spread(std::iter::empty()), 1.0);
+        assert_eq!(spread(&[1000]), 1.0);
+        assert_eq!(spread(&[]), 1.0);
         // 25 equal segments: 25^0.3.
-        let s = independent_spread(std::iter::repeat_n(100_000, 25));
-        assert!((s - 25f64.powf(0.3)).abs() < 1e-9);
+        assert!((spread(&[100_000; 25]) - 25f64.powf(0.3)).abs() < 1e-9);
         // Tiny tail segments barely count.
-        let tail = independent_spread([1_000_000, 100, 100].into_iter());
-        assert!(tail < 1.001, "{tail}");
+        assert!(spread(&[1_000_000, 100, 100]) < 1.001);
+        // Many segments: capped.
+        assert_eq!(spread(&[50_000; 200]), MAX_SPREAD);
+        // An explicit probe count is used as given.
+        let explicit = EngineConfig {
+            ann_nprobe_explicit: true,
+            ..EngineConfig::default()
+        };
+        assert_eq!(independent_spread(&explicit, [1; 25].into_iter()), 1.0);
     }
 }
