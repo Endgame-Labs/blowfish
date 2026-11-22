@@ -226,6 +226,12 @@ impl EngineConfig {
         if let Some(v) = number("BF_RETENTION_SECS") {
             c.retention = Duration::from_secs(v);
         }
+        if let Some(v) = number("BF_QUERY_CONCURRENCY") {
+            c.query_concurrency = v as usize;
+        }
+        if let Some(v) = number("BF_SEARCH_CONCURRENCY") {
+            c.search_concurrency = v as usize;
+        }
         if let Some(v) = number("BF_RECALL_SAMPLE_INTERVAL_MS") {
             c.recall_sample_interval = Duration::from_millis(v);
         }
