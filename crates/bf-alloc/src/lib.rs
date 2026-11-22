@@ -268,8 +268,12 @@ pub fn start_monitor() {
 
 #[cfg(all(test, not(target_env = "msvc")))]
 mod tests {
+    /// Decay is process-wide, so tests that set it run one at a time.
+    static DECAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn decay_switches_for_existing_arenas() {
+        let _decay = DECAY.lock().unwrap_or_else(|e| e.into_inner());
         let _x = vec![1u8; 1 << 20]; // make sure arena 0 exists
         super::imp::set_decay_ms(30_000);
         assert_eq!(super::imp::arena0_dirty_decay_ms(), Some(30_000));
@@ -298,6 +302,7 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+        let _decay = DECAY.lock().unwrap_or_else(|e| e.into_inner());
         super::imp::set_decay_ms(30_000);
         super::imp::set_decay_ms(1_000);
     }
