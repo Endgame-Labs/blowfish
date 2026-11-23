@@ -16,7 +16,9 @@ mod read_cache;
 mod segment;
 mod snapshot;
 mod sparse;
+mod statistics;
 mod streaming;
+mod text_upgrade;
 pub use indexer::EngineConfig;
 pub use recluster::{ReclusterOptions, ReclusterReport};
 pub use reindex::{LayoutCounts, ReindexOptions, ReindexReport};
@@ -27,7 +29,6 @@ mod recluster;
 mod reindex;
 mod text;
 mod text_keys;
-mod text_upgrade;
 mod upgrade;
 mod write;
 

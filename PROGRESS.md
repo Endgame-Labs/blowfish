@@ -4,6 +4,14 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **IN1 update memory.** I remove old-row hydration from unconditional upserts, and stream overwritten-row
+  statistics in 4,096-row chunks through bypassing readers. I count dense float-vector JSON widths from
+  current ANN metadata, and move term-frequency maps into the merge worker. Metadata uses the same
+  bounded accounting. Jemalloc profiling attributes 59.6% of a 300K-row update snapshot's live heap to
+  old-document projection. I retain exact statistics, conditional writes, sparse and legacy-vector
+  handling, and the existing WAL and bucket formats. Formatting, scoped clippy, all 164 engine/text
+  tests, and compatibility 121/121 in both modes pass, including SDK retries and TypeScript checks.
+
 - **IN1 text upgrades** (`docs/benchmarks.md`, "Round IN1"). I repack format-4 postings directly into
   existing format 5, and upgrade up to 32 segments and their compact ID maps per fenced publication.
   Independent segments share a CPU and memory budget; fields within a segment run sequentially.

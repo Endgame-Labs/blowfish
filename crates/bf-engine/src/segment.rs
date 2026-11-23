@@ -1304,6 +1304,42 @@ pub(crate) async fn read_packed(
     read_ann_packed(store, segment, rows, attribute, true).await
 }
 
+/// Resident ANN metadata for projection and vector-width accounting. No vector payload is read.
+pub(crate) async fn projection_directory(
+    store: &Storage,
+    segment: &Segment,
+    file: &SegmentFile,
+    bypass: bool,
+) -> Result<Arc<bf_vector::Directory>, ApiError> {
+    let reader = ObjectReader::new(store, file);
+    let reader = if bypass {
+        reader.bypass_cache()
+    } else {
+        reader
+    };
+    let key = format!("projection-directory:{}", file.key);
+    let dir = if let Some(dir) = read_cache::get::<bf_vector::Directory>(&key, file.metadata_len) {
+        dir
+    } else {
+        let metadata = reader
+            .read(0..file.metadata_len)
+            .await
+            .map_err(index_error)?;
+        let fragment = bf_vector::Fragment::decode(&metadata).map_err(index_error)?;
+        let bytes = bf_vector::Directory::build(&[(
+            segment.id.clone(),
+            file.key.clone(),
+            file.key.clone(),
+            fragment,
+        )])
+        .map_err(index_error)?
+        .ok_or_else(corrupt)?;
+        let dir = bf_vector::Directory::decode(&bytes).map_err(index_error)?;
+        read_cache::insert(&key, dir.resident_bytes(), dir)
+    };
+    Ok(dir)
+}
+
 async fn read_ann_packed(
     store: &Storage,
     segment: &Segment,
@@ -1332,26 +1368,7 @@ async fn read_ann_packed(
     if bypass {
         reader = reader.bypass_cache();
     }
-    let key = format!("projection-directory:{}", file.key);
-    let dir = if let Some(dir) = read_cache::get::<bf_vector::Directory>(&key, file.metadata_len) {
-        dir
-    } else {
-        let metadata = reader
-            .read(0..file.metadata_len)
-            .await
-            .map_err(index_error)?;
-        let fragment = bf_vector::Fragment::decode(&metadata).map_err(index_error)?;
-        let bytes = bf_vector::Directory::build(&[(
-            segment.id.clone(),
-            file.key.clone(),
-            file.key.clone(),
-            fragment,
-        )])
-        .map_err(index_error)?
-        .ok_or_else(corrupt)?;
-        let dir = bf_vector::Directory::decode(&bytes).map_err(index_error)?;
-        read_cache::insert(&key, dir.resident_bytes(), dir)
-    };
+    let dir = projection_directory(store, segment, file, bypass).await?;
     let (dims, dtype) = segment
         .schema
         .get(attribute)

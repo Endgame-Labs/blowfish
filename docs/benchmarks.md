@@ -4020,3 +4020,35 @@ Every invocation uses `taskset -c 6,7 timeout 1200`; timed arms additionally use
 and `perf stat -e instructions,cycles`. I set `IN1_VERIFY=0` for timing and omit it for the separate
 query comparison. The original and current arms reference identical source objects; uploaded outputs
 remain available until I finish the byte comparison and remove the disposable store.
+
+
+### Update memory diagnosis
+
+I reproduce the memory growth with 300,000 NQ rows through the engine, using 1,024-dimensional f16
+vectors, original titles and text, 1,000-row requests, and 100,000-row flushes. The original engine
+peaks at 1,390 MiB for inserts and 3,378 MiB for overwrites. These diagnostic runs use host-sized
+defaults, rather than the 12 GiB scope used for the HTTP comparison below.
+
+I enable `bf-alloc/heap-profile` and collect jemalloc profiles during updates. One live-heap snapshot
+attributes 59.6% of its bytes to old-document projections and 48.5% to their packed-vector reads;
+these cumulative stacks overlap. The write preparer hydrates old rows even for unconditional
+replacements, and the indexer later materializes every overwritten row of a source segment to
+subtract statistics. Internal documents use f32 base64 for dense vectors: a 1,024-dimensional f16
+vector expands from 2,048 stored bytes to a 5,464-byte string, before other document allocations,
+packed read buffers, and cache admission. That work scales with overwritten rows and source segments.
+
+I skip stored-row hydration for unconditional upserts. Patches, deletes, and conditional writes still
+read the rows they need, including earlier in-flight groups, and UUID normalization stays shared
+between both ID sets. I accumulate overwritten-row statistics in 4,096-row chunks, bypassing cache
+admission. A current dense ANN membership map proves that every row has its float vector, so I count
+its exact canonical JSON width from dimensions and the encoded field name, without fetching vectors.
+Sparse, flat, i8, and older layouts use the ordinary decoder within the same row bound. Metadata
+statistics use this bounded scan too. I move added and removed term maps into the merge worker instead
+of cloning them, and use the merge result to decide whether to retain the previous statistics object.
+
+I compare exact row counts, logical byte totals, and text statistics with materialized documents,
+including dense, sparse, legacy, and deleted-row subsets. A regression makes old document and ANN
+objects unavailable and verifies an unconditional replacement succeeds; other checks retain patch
+conditions, conditional upserts, and metadata parity before and after indexing. One storage tradeoff
+remains: an unconditional replacement of an indexed row can now append an identical value to the WAL.
+Rows already in the tail retain their no-op comparison. Wire-level replacement semantics are unchanged.
