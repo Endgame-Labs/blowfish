@@ -109,7 +109,7 @@ Do not run old and new writers together during a format upgrade.
 
 The binary automatically accepts legacy format-1 and format-2 buckets and raises the deployment marker to format 3
 at writable startup. Namespace manifests move to format 3 on publication. Format 2 renamed the checkpoint
-field while retaining its meaning; format 3 fences the single ANN object layout. Read-only startup checks compatibility without raising the marker.
+field while retaining its meaning; format 3 fences the single ANN object layout and document-v2 objects. Read-only startup checks compatibility without raising the marker.
 The append-only `_system/format/<version>.json` markers live at the deployment root, including for
 project-scoped namespaces. Their highest generation is the required bucket version; never delete or
 lower a marker to force a downgrade.
@@ -134,8 +134,25 @@ layout. I keep the existing flat and paged slab directory formats unchanged.
 
 The background indexer upgrades older `.bfv` indexes, including ones already using fast scan, to `.bfa`.
 It copies fast-scan codes and vectors unchanged, converts older row-major codes when necessary, and does
-not retrain clusters. Flat indexes also move into a single object. Documents, the WAL, text indexes, and
-filter indexes retain their current formats. The redundant `.bff` and `.bfb` ANN fragments stop being written.
+not retrain clusters. Flat indexes also move into a single object. The redundant `.bff` and `.bfb` ANN
+fragments stop being written; the WAL, full-text indexes, and filter indexes keep their formats.
+
+After the ANN upgrade, I rewrite `docs.bfc` as version 2, one segment per fenced publication. Its directory
+records dense-vector dimensions and stored precision, and its payload contains only other attributes.
+String and string-array columns use zstd level 3 per 256-row block, with a checksum over the compressed
+bytes. I batch up to 64 source column ranges during a rewrite, while bypassing cache admission and
+checking every source block. Projection, filtered/exhaustive queries, and compaction obtain dense vectors from the segment's
+ANN object at the declared f16, f32, or i8 precision. The returned vector encoding and values are unchanged.
+Sparse and multi-vector attributes retain their existing JSON representation. I retain segment ANN objects
+after reclustering; retiring them requires the separate tier-lineage work.
+
+I also rewrite `ids.bfi` without its redundant Bloom filter in the document publication. The small,
+24-bit-per-ID `idfilter.bff` still screens existence checks before the full ID list is opened. Each document
+publication retires only the replaced document and ID objects; it preserves row ordinals, live masks,
+ANN directories, tiers, and WAL checkpoints. Old and current document objects can coexist during the
+rewrite. A restart resumes remaining segments, and a second completed run writes nothing. A failed or
+ambiguous publication leaves uploaded objects for ordinary GC, so an uncertain response cannot delete
+an object that was successfully published.
 
 Each batch replaces the old `ann:`, `annfrag:`, and `annfrag2:` file entries with `annv2:` in one fenced
 manifest publication. Old objects remain until normal garbage collection after the retention window.
@@ -157,7 +174,9 @@ blowfish reindex --storage-url s3://BUCKET/PREFIX --all                 # every 
 ```
 
 It prints progress, and I can run it beside a server that supports format 3. The report distinguishes
-current single objects from legacy row-major, fast-scan, and other indexes.
+current single objects from legacy row-major, fast-scan, and other indexes. It also reports legacy
+document counts and bytes, converted document/ID pairs, and total ANN, document, and ID rewrite bytes.
+Directory and manifest writes are extra. `--dry-run` surveys document metadata without writing anything.
 All legacy indexes are rewritten, including flat ones. `recluster` also writes the single-object layout.
 
 There is no supported in-place downgrade. To roll back, stop the upgraded processes, restore the complete
