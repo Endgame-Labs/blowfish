@@ -31,6 +31,10 @@ const BASE_GAIN: f64 = 1.25;
 const REBUILD_SHARE: f64 = 0.25;
 /// A namespace that flushed a bulk-load-sized tail this recently is still loading.
 const BULK_WINDOW: Duration = Duration::from_secs(300);
+/// How soon a deferred evaluation runs again, though nothing was published since.
+const RETRY_DEFERRED: Duration = Duration::from_secs(60);
+/// How soon a failed build is tried again.
+const RETRY_FAILED: Duration = Duration::from_secs(600);
 /// Builder memory per row of a slab (1,024 dimensions in f16: the packed rows, the blob being
 /// built, and the previous slab's blob still uploading), and the slab size bounds.
 const SLAB_ROW_BYTES: u64 = 12_000;
@@ -196,8 +200,9 @@ struct JobsState {
     pending: HashMap<String, Pending>,
     /// When each namespace last flushed a bulk-load-sized tail.
     bulk: HashMap<String, Instant>,
-    /// The manifest generation each namespace's trigger last evaluated.
-    evaluated: HashMap<String, u64>,
+    /// The manifest generation each namespace's trigger last evaluated, and when to evaluate it
+    /// again anyway (after a deferral or a failure; never while it stands).
+    evaluated: HashMap<String, (u64, Option<Instant>)>,
 }
 
 impl Jobs {
@@ -218,6 +223,26 @@ impl Jobs {
     }
     pub(crate) fn record_bulk_flush(&self, ns: &str) {
         self.lock().bulk.insert(ns.to_string(), Instant::now());
+    }
+    /// Whether `ns`'s trigger should be evaluated at manifest `generation`: once a generation,
+    /// unless a retry has come due. Marks it evaluated.
+    fn evaluate(&self, ns: &str, generation: u64) -> bool {
+        let mut state = self.lock();
+        if let Some((seen, retry)) = state.evaluated.get(ns)
+            && *seen == generation
+            && retry.is_none_or(|at| Instant::now() < at)
+        {
+            return false;
+        }
+        state.evaluated.insert(ns.to_string(), (generation, None));
+        true
+    }
+    /// Evaluate `ns` again after `wait`, even if nothing is published meanwhile: a deferral (a bulk
+    /// load, compaction, memory, or disk) or a failure must not stand until the next write.
+    fn retry_later(&self, ns: &str, wait: Duration) {
+        if let Some(entry) = self.lock().evaluated.get_mut(ns) {
+            entry.1 = Some(Instant::now() + wait);
+        }
     }
     fn bulk_recent(&self, ns: &str) -> bool {
         self.lock()
@@ -481,17 +506,14 @@ impl Engine {
             );
             (state.manifest_seq, decision, numbers)
         };
-        {
-            let mut jobs = self.0.jobs.lock();
-            if jobs.evaluated.get(ns) == Some(&generation) {
-                return;
-            }
-            jobs.evaluated.insert(ns.to_string(), generation);
+        if !self.0.jobs.evaluate(ns, generation) {
+            return;
         }
         let (attr, why) = match decision {
             Decision::Nothing => return,
             Decision::Wait(reason) => {
                 defer(ns, reason, numbers);
+                self.0.jobs.retry_later(ns, RETRY_DEFERRED);
                 return;
             }
             Decision::Build(attr, why) => (attr, why),
@@ -519,8 +541,10 @@ impl Engine {
                     seconds = report.seconds,
                     "recluster: tier installed"
                 ),
-                Ok(None) => {}
+                // Deferred (memory, disk, or another lease holder), or discarded.
+                Ok(None) => engine.0.jobs.retry_later(&ns, RETRY_DEFERRED),
                 Err(e) => {
+                    engine.0.jobs.retry_later(&ns, RETRY_FAILED);
                     metrics::counter!("blowfish_recluster_builds_total", "outcome" => "failed")
                         .increment(1);
                     tracing::warn!(namespace = ns.as_str(), error = %e, "recluster: build failed");
@@ -727,6 +751,21 @@ fn scopeguard(f: impl FnOnce()) -> impl Drop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_generation_is_evaluated_once_unless_a_deferral_comes_due() {
+        let jobs = Jobs::default();
+        assert!(jobs.evaluate("n", 7));
+        assert!(!jobs.evaluate("n", 7));
+        // A deferral (say, a bulk load) evaluates the same generation again once it comes due.
+        jobs.retry_later("n", Duration::from_secs(3600));
+        assert!(!jobs.evaluate("n", 7));
+        jobs.retry_later("n", Duration::ZERO);
+        assert!(jobs.evaluate("n", 7));
+        assert!(!jobs.evaluate("n", 7));
+        // A new publication is always evaluated.
+        assert!(jobs.evaluate("n", 8));
+    }
 
     fn segment(id: &str, rows: u32) -> bf_wal::Segment {
         serde_json::from_value(serde_json::json!({
