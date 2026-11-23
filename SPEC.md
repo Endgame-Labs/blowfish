@@ -121,8 +121,8 @@ log entry in the same commit.
 
 - **Automatic recluster (decided 2026-11-23, not built):** the indexer reclusters a namespace in the background when
   its layout would gain from it (enough independently built segments, or enough rows outside its slabs), within the
-  engine's memory budget, and on by default, with a setting to turn it off. A namespace never waits on it: queries use
-  the current layout until the new one is published.
+  engine's memory budget. It is always on: there is no setting to turn it off and no manual-only mode. A namespace
+  never waits on it: queries use the current layout until the new one is published.
 - Slabs that cover new segments, and filtered ANN on slabs.
 - A split manifest (a small root plus lazily read segment lists) would shrink the cold ANN read further than the compact copy's 375 KB; text-header reads on a namespace with a compact copy cost one more round trip.
 - Storage cache sizing reads only the root cgroup's `memory.max`, while the engine reads the process's own cgroup;
@@ -232,8 +232,8 @@ S3 until the run is cleaned up.
     `{"status":"🐡"}`. Unify cgroup memory detection in v0.1.14, not v0.1.13.
 20. 2026-11-20: Support Docker on Apple Silicon and native macOS builds; CI builds the image on x86_64 and arm64 and
     tests natively on macOS (issue #1).
-21. 2026-11-23: Recluster runs automatically in the background, on by default with an off switch ("if we have a better
-    algo we should use it").
+21. 2026-11-23: Recluster runs automatically in the background, always on ("if we have a better algo it should be
+    the default").
 22. 2026-11-23: Release v0.1.14 once the index upgrade path (`blowfish reindex`) and iteration 21 are merged and CI is
     green. After that, the coordinator cuts releases when it judges a release worthwhile ("the code is yours, release as
     appropriate").
@@ -241,3 +241,7 @@ S3 until the run is cleaned up.
     terminating instances when done.
 24. 2026-11-23: Keep improving every area in rotation: disk footprint (vectors stored twice), BM25 and hybrid speed,
     a graph index to compete with Qdrant (design doc first), and ingest throughput.
+25. 2026-11-23: One way to do each thing. When an approach is better, it becomes the only one: no settings that select
+    an inferior algorithm or layout, and no code kept to maintain one ("we don't need to keep around or maintain inferior
+    approaches. it makes things too complex"). Older on-disk formats are read only so they can be upgraded, and the
+    upgrade happens automatically; there is no supported path back to an older format.
