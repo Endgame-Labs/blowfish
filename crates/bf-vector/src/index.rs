@@ -615,13 +615,21 @@ impl<R: RangeRead> Index<R> {
             let c = &self.metadata.clusters[cid];
             // A stub's (shared, empty) payload never records a check.
             let checked = c.data.as_deref().map(|d| &d.codes_checked);
+            let n = c.rows.len() as usize;
+            let blocked = n > 0
+                && compact
+                && padded.is_multiple_of(8)
+                && bytes.len() == crate::fastscan::block_len(n, padded);
             if !checked.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
                 check_crc(&bytes, c.codes_crc)?;
+                // The fast scan trusts its factors once they are checked here.
+                if blocked {
+                    crate::fastscan::check_factors(&bytes, n, padded)?;
+                }
                 if let Some(f) = checked {
                     f.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            let n = c.rows.len() as usize;
             let ids: &[u32] = match c.ids.as_deref() {
                 Some(ids) => ids,
                 None => {
@@ -661,11 +669,7 @@ impl<R: RangeRead> Index<R> {
             };
             // A zero query or row has a fixed cosine distance.
             let fixed = |zero: bool| -> (f32, f32) { (if q_zero && zero { 0. } else { 1. }, 0.) };
-            if n > 0
-                && compact
-                && padded.is_multiple_of(8)
-                && bytes.len() == crate::fastscan::block_len(n, padded)
-            {
+            if blocked {
                 let reference = self
                     .reference
                     .as_deref()
