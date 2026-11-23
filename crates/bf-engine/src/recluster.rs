@@ -645,10 +645,7 @@ fn assign_leaves(
         t0.elapsed().as_secs_f64()
     );
     let near = NEAR_CELLS.min(coarse.len()).max(1);
-    let probes: usize = std::env::var("BF_TMP_PROBES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(GROUP_PROBES);
+    let probes = GROUP_PROBES;
     let by_distance = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
     let assign = |leaves: &[Vec<f32>]| -> Vec<u32> {
         // Each cell's leaves under about sqrt(leaves) group centers (the means of their leaves),
