@@ -550,11 +550,14 @@ fn section_distances_into(s: &Section, q: &[f64], out: &mut Vec<f32>) {
     let padded = q.len();
     let plane = crate::rabitq::PlaneQuery::new(q, &s.centroid);
     let width = bit_bytes(padded);
-    out.extend(s.entries.iter().enumerate().map(|(n, e)| {
-        let dot = plane.dot(&s.bits[n * width..(n + 1) * width], padded);
+    let start = out.len();
+    out.resize(start + s.entries.len(), 0.);
+    let distances = &mut out[start..];
+    plane.dots(&s.bits, width, s.entries.len(), padded, |n, dot| {
+        let e = &s.entries[n];
         let (norm, alpha) = (e.norm as f64, e.alpha as f64);
-        (plane.norm2 + norm * norm - 2. * norm * dot / alpha) as f32
-    }));
+        distances[n] = (plane.norm2 + norm * norm - 2. * norm * dot / alpha) as f32;
+    });
 }
 
 impl Directory {
