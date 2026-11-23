@@ -1095,3 +1095,89 @@ async fn cold_bm25_reads_term_chunks_not_whole_dictionaries() {
     eprintln!("cold BM25 read {reads} of {total} FTS and statistics bytes");
     assert!(reads * 20 < total, "read {reads} of {total}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_text_keys_remove_winner_id_column_reads() {
+    let backend = Arc::new(Counting::default());
+    let storage = Storage::from_backend_with_cache(
+        backend.clone(),
+        Path::default(),
+        false,
+        false,
+        CacheConfig {
+            memory_bytes: 64 << 20,
+            block_size: 1024,
+            max_coalesce_blocks: 256,
+            fetch_concurrency: 512,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let e = Engine::with_config(storage.clone(), config());
+    let rows: Vec<_> = (0..30000u64)
+        .map(|row| {
+            let filler = format!("{:016x}", row.wrapping_mul(0x9e3779b97f4a7c15)).repeat(4);
+            let text = if row % 3000 == 0 {
+                format!("needle {filler}")
+            } else {
+                filler
+            };
+            json!({"id":1000000000+row,"text":text})
+        })
+        .collect();
+    e.write(
+        "keys",
+        serde_json::from_value(json!({
+            "schema":{"text":{"type":"string","full_text_search":true}},"upsert_rows":rows
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    e.index_namespace("keys", true).await.unwrap();
+    let wal = bf_wal::Wal::new(storage.clone(), "keys").unwrap();
+    let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    assert!(manifest.segments[0].files["ids"].size > 128 << 10);
+    assert!(manifest.segments[0].files["text_keys"].size < 128);
+    let query =
+        || serde_json::from_value(json!({"rank_by":["text","BM25","needle"],"top_k":10})).unwrap();
+    e.drop_caches().await;
+    backend.paths.lock().unwrap().clear();
+    let with_keys = e.query("keys", query()).await.unwrap().result.rows.unwrap();
+    let fast_paths = backend.paths.lock().unwrap().clone();
+    assert!(
+        fast_paths
+            .iter()
+            .any(|(path, _)| path.contains("text-keys."))
+    );
+    let fast_docs = fast_paths
+        .iter()
+        .filter(|(path, _)| path.contains("docs.bfc"))
+        .count();
+    // The compact map replaces both the footer prefetch and winner-ID column reads.
+    assert_eq!(fast_docs, 0);
+    manifest.segments[0].files.remove("text_keys");
+    wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
+        .await
+        .unwrap();
+    e.drop_caches().await;
+    backend.paths.lock().unwrap().clear();
+    let without_keys = e.query("keys", query()).await.unwrap().result.rows.unwrap();
+    let slow_docs = backend
+        .paths
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.contains("docs.bfc"))
+        .count();
+    assert_eq!(with_keys, without_keys);
+    assert!(
+        slow_docs > fast_docs,
+        "ranged IDs need a later document-column read"
+    );
+    // The ordinary background pass backfills the optional file and then reaches a no-op.
+    assert!(e.index_namespace("keys", false).await.unwrap());
+    assert!(!e.index_namespace("keys", true).await.unwrap());
+}

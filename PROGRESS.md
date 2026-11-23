@@ -21,6 +21,49 @@ Newest first. Each entry says what works now and how it was checked.
   - Checked: fmt, workspace clippy, and `cargo test --workspace` (252 passed); compat 121/121; the branch serving main's
     store gives the same recall; and the `bench` ladder against main
     (same recall at 10K, 50K, and 200K rows, with warm ANN p50 a little lower).
+- **BM25 round: local measurements** (`docs/benchmarks.md`). I loaded 1M MS MARCO passages,
+  matched both arms to six segments, and ran the 1,000 dev queries on CPUs 6–7 at nice 10.
+  - Warm c1 p50/p90: 45.5/99.8 ms before, 18.4/44.1 ms after. Warm c16: 658.5/827.4 ms before,
+    326.3/441.3 ms after. Strict overlap@10 is 1.000 for every query at both client counts.
+  - Fresh-process queries through a local read-only S3 facade with 25 ms per request: 457/670 ms
+    before, 255/353 ms after; 189 to 117 reads, 4.35 to 3.61 MB, and 3.25 to 3.02 mean waves.
+    The mean RTT-only floor is 81.3 to 75.4 ms. The facade models dependencies, and does not model
+    AWS tails, throughput, TLS setup, or the in-region CPU. All 60 cold queries match exact truth.
+  - Live text index size: 730.4 to 743.8 MB (+1.8%), plus 246 bytes of compact ID maps. An earlier
+    copy-based bundle prototype grew indexes 33% and was replaced with the single-copy layout.
+    The warm 13/18 ms and two-wave targets remain open; AWS confirmation remains outstanding.
+    Other jobs shared the VM, so timings are sensitive to contention.
+  - New local runners (`bench/scale/bm25_local.py` and `local_s3.py`) keep temporary logs under
+    `.scratch/`, bound client and process waits, stop their exact child PIDs, and clean up on exit.
+
+- **Compact IDs for BM25:** text segments now store a checksummed row-to-ID map using numeric
+  strides or string prefixes, admitted under a fixed 128 KiB encoded-size budget. ID-only BM25
+  opens that map with text metadata and skips document footers and winner-ID column reads.
+  Larger maps record a 17-byte marker and use existing ranged ID reads, with no operator switch.
+  - The normal indexer backfills older segments once, and checkpoint comparison notices the new
+    file role. The manifest schema and bucket fence remain unchanged. The six local 1M-row
+    segments upgraded automatically; their ID maps total 246 bytes.
+  - Checked: formatting, release clippy for `bf-text` and `bf-engine`, all targets, and warnings
+    denied; 136 Rust tests; compat 121/121 in normal and forced modes; SDK retry checks 4/4 in
+    each mode; and TypeScript smoke and retry checks in each mode. The read-count regression
+    requires zero document reads, unchanged answers, and a backfill followed by an idle no-op.
+
+- **Exact BM25 bounds and bundled text reads:** text format 5 keeps dictionaries, term directories,
+  and up to 32 posting blocks per term together, with one stored copy of every payload. Bundles
+  contain at most 128 terms and use an estimated 32 KiB budget; large directories occupy their own
+  bundle. Long postings and phrase positions remain independent.
+  - Sparse contributions are summed at the same row before taking window bounds. Dense scoring skips
+    rows below the remaining-score bound. Term weights and cached exact f64 saturation factors avoid
+    repeated logarithms and divisions while preserving reference score bits. Immutable decoded sparse
+    postings use a bounded cache charged to the engine metadata budget.
+  - The background indexer rebuilds one older text field per fenced publication. Checkpoint comparison
+    notices replaced text objects even when segment IDs and live masks stay unchanged, so later passes
+    adopt the upgrade instead of repeating it. All six active indexes of the local 1M-row namespace
+    upgraded automatically. The manifest schema and bucket fence versions are unchanged.
+  - Checked: formatting, clippy for `bf-text` and `bf-engine` with all targets and warnings denied,
+    132 Rust tests, compat 121/121 in normal and forced modes, SDK retry checks 4/4 in each mode,
+    and TypeScript smoke and retry checks in each mode. Both c1 and c16 match exhaustive BM25 on all
+    1,000 dev queries. All 60 fresh-process cold queries also match.
 
 - **Bucket format fence:** format-2 manifests rename the required checkpoint field to `checkpoint_wal`,
   and every manifest decoder rejects unsupported versions. Writers and maintenance tools cannot republish

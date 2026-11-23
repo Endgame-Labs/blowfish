@@ -439,6 +439,7 @@ impl Engine {
                 && state.refreshed.elapsed() < self.0.config.index_age
                 && tier(&state, &self.0.config, force).is_empty()
                 && !needs_blocks(&state)
+                && !needs_text_upgrade(&state)
             {
                 return Ok(false);
             }
@@ -465,7 +466,7 @@ impl Engine {
                     })
             });
             let will_compact = tier(&state, &self.0.config, force);
-            let upgrade = needs_blocks(&state);
+            let upgrade = needs_blocks(&state) || needs_text_upgrade(&state);
             if state.seq == state.indexed_through
                 && will_compact.is_empty()
                 && !will_rebuild
@@ -525,7 +526,7 @@ impl Engine {
         }
         crate::ann::stage(t0, "idx hydrate");
         let compact = tier(&state, &self.0.config, force);
-        let upgrade = needs_blocks(&state);
+        let upgrade = needs_blocks(&state) || needs_text_upgrade(&state);
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
         }
@@ -872,6 +873,17 @@ impl Engine {
         for seg in &mut manifest.segments {
             segment::backfill_blocks(store, ns, seg).await?;
         }
+        // Upgrade one text field per publication to bound the working set. The epoch
+        // claim above fences competing indexers; a crash leaves only unreferenced objects.
+        for seg in &mut manifest.segments {
+            if let Some(old) = segment::upgrade_text(store, ns, seg).await? {
+                retire(&mut manifest, old);
+                break;
+            }
+            if crate::text_keys::backfill(store, ns, seg).await? {
+                break;
+            }
+        }
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest
             .segments
@@ -1150,6 +1162,16 @@ fn bulk_wait(state: &NamespaceState, config: &EngineConfig, tail_age: Duration) 
             .to_std()
             .is_ok_and(|since| since < Duration::from_secs(1))
 }
+fn needs_text_upgrade(state: &NamespaceState) -> bool {
+    state.segments.iter().any(|seg| {
+        crate::text_keys::needs(seg)
+            || seg
+                .files
+                .iter()
+                .any(|(key, file)| key.starts_with("fts:") && segment::text_needs_upgrade(file))
+    })
+}
+
 /// Whether some segment has a vector index but no block fragment yet (built before they existed).
 fn needs_blocks(state: &NamespaceState) -> bool {
     state.segments.iter().any(|seg| {

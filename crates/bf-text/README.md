@@ -52,39 +52,46 @@ Phrase positions preserve gaps, repeated terms, and input element boundaries.
 Sequence queries reject prefix matching, and indexes without positions return
 `io::ErrorKind::Unsupported` for sequence queries.
 
-## Version-1 format
+## Segment format (version 5)
 
-All integers are little-endian. There are no architecture-dependent structs or
-external crate serialization formats in the container except the versioned FST.
+All integers are little-endian. The fixed 72-byte footer records the format,
+row count, tokenizer, normalization length, region offsets, and checksums.
+Posting blocks contain at most 128 rows, with bit-packed row deltas and term
+frequencies. Block directories store first/last rows, maximum TF, minimum
+length, and offsets, lengths, and checksums for postings and phrase positions.
+Independent TF and length extrema stay conservative when corpus statistics change.
 
-| Region | Contents |
-| --- | --- |
-| Posting payloads | At most 128 postings per block; first row is in metadata, row deltas and frequencies are padded to 128 values and independently bit-packed with `BitPacker4x`; two one-byte bit widths precede the packed data |
-| Position payloads | Optional independently fetched payload per block; one `(element: u32, position: u32)` pair for each occurrence, in posting order |
-| Document lengths | One `u32` per row; zero denotes missing, and present empty text has length one |
-| Term directory | Term count, then each term's DF, block count, and 52-byte block records |
-| Dictionary | `fst::Map`, mapping UTF-8 terms to directory ordinals |
-| Footer | Fixed 72 bytes: magic, version, flags, row count, tokenizer ID, total normalization length, three region offsets, three region CRC32 checksums, and footer CRC32 |
+The dictionary is split into bundles of at most 128 consecutive terms, with a
+32 KiB payload budget. A large term directory occupies its own bundle. Each bundle
+has an FST, checksummed term directories, and the posting payloads for terms with at
+most 32 blocks. Its encoding is `FST length (u32) | reserved bytes (u32) | FST |
+padding | term directories and short postings`. The dictionary region is reserved
+before assigning absolute directory offsets, avoiding a circular dependency on
+FST size. Directories retain the version-4 layout:
+`DF (u32) | block count (u32) | 52-byte block records | crc32`. A bundle CRC
+protects the complete range. Phrase positions remain independent, and document
+lengths are packed in blocks of 128 rows. Zero length denotes a missing field.
 
-Block records contain first/last row IDs, posting count, maximum TF, minimum
-normalization length, posting offset/size/CRC32, and position offset/size/CRC32.
-The independent TF and length extrema produce conservative score bounds for
-arbitrary external statistics and scoring parameters. Storing fixed BM25 scores
-would make them unsafe when corpus statistics change.
+`text_header` extracts the footer and bundle index for the manifest.
+`SegmentReader::open_with_header` opens without I/O; lengths and query bundles
+can then load concurrently. A query reads term directories and short postings
+from those resident bundles without another backend wave, even with an uncached
+`RangeRead`. Bundle, term, and decoded-posting memos are bounded. Decoded posting
+payloads use at most 8 MiB per reader, with their allowance charged to the engine
+metadata cache; changing statistics or allowed rows never reuses scores. Sparse
+lists receive cache priority. Their known term scores are summed at the same row
+before taking window maxima, and dense terms skip rows whose remaining bound
+cannot reach the heap threshold. The rounding margin covers all query terms. Larger posting lists still use exact window bounds, reading promising windows before any remaining competitive
+windows. Scoring precomputes term weights, caches exact f64 saturation factors for
+ordinary lengths and term frequencies, and searches only each window's slice of a
+decoded posting block. The factor table refreshes when average length, k1, or b
+changes; uncommon values retain the reference arithmetic.
 
-Opening reads the final 64 KiB and, if needed, the missing directory/length region
-in one additional read. Search fetches only selected posting blocks; phrases
-fetch positions independently. The reader validates checksums, ranges, ordering,
-counts, and packed widths before decoding. It returns I/O errors for corrupt or
-unsupported formats. Storage encryption/authentication is the engine's concern.
-
-Search uses block-max MAXSCORE over 128-row windows, evaluates promising windows
-first, caches decoded posting blocks within a query, and prunes windows below
-the current top-k threshold. Independent block reads within a window run
-concurrently. Dictionary-wide subword expansion and many sequential remote
-windows remain optimization opportunities; use the engine's range cache for
-remote objects. This is an exact segment search, with property tests against
-brute-force scoring.
+Versions 1 through 4 remain readable during upgrades. New writes always use
+version 5. The engine automatically rebuilds old indexes from immutable document
+columns, one field per fenced publication; there is no layout-selection setting.
+The manifest schema is unchanged. The writer repacks the intermediate builder
+output into one copy of each posting and directory. Long postings and phrase positions precede the dictionary bundles.
 
 ## Validation and compatibility limits
 
@@ -121,15 +128,13 @@ in-memory immutable bytes and omits positions. It reports index bytes, build tim
 p50/p95 latency, posting blocks read, and row windows pruned. It does not measure
 network latency, indexing tokenization, or engine-level caching.
 
-Observed on an 8-vCPU Linux worker: **39,401,769 bytes** (39.40 bytes/document),
+Historical version-1 result on an 8-vCPU Linux worker: **39,401,769 bytes** (39.40 bytes/document),
 **14.285 seconds** to build, **3.863 ms p50**, and **6.543 ms p95**. The mean query
 read 66.5 blocks and pruned 69.8 row windows. Results depend on hardware, corpus,
 query selectivity, and concurrency.
 
-`SegmentReader::prefetch_plan(query, allowed)` computes posting ranges from the
-resident dictionary, including final-prefix expansions, and excludes positions.
-`search_prefetched` fetches this plan through `RangeRead::read_batch` in one batch
-before scoring. Override `read_batch` to coalesce cache blocks on remote stores.
-Fetched postings stay local to the query, including with byte caching disabled.
-Demand-driven `search` retains block-max I/O pruning; batching can fetch more
-bytes for broad terms in exchange for fewer dependent network stages.
+`SegmentReader::prefetch_plan(query, allowed)` warms the query's dictionary
+bundles and directories, and computes posting ranges without reading phrase
+positions. `search_prefetched` uses exact window pruning and batched posting
+reads. Override `RangeRead::read_batch` to coalesce remote reads. `search_prefetched_with_metrics` also reports posting reads, pruned windows, and
+scored rows. Both batched and demand-driven searches return exact results.

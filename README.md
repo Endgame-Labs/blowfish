@@ -77,6 +77,12 @@ Measured from an 8-vCPU VM in Los Angeles reaching Cloudflare R2 over the public
 - **Cold vector cost:** a cold 48-probe query makes about 400 requests and reads about 51 MB (down from about 880 requests, 117 MB, and 2,916 / 4,358 ms on the per-segment layout at 160 probes).
 - **Upsert variance:** each batch is 68 rows (about 506 KB) over 300 sequential writes; a second identical R2 session measured **2,114 / 2,563 ms**, so treat R2 upsert p50 as roughly **792 to 2,114 ms**.
 
+I also tested a BM25 optimization locally on 1M MS MARCO passages, restricted to two CPUs on a shared VM.
+Warm p50/p90 fell from **45.5/99.8 ms to 18.4/44.1 ms**, with exact overlap@10 **1.000** across 1,000 queries.
+A fresh-process local S3 facade with 25 ms per request fell from **457/670 ms to 255/353 ms**; it is a local
+round-trip model, and needs an in-region confirmation. The published 13/18 ms warm target remains open.
+Details and reproduction: [BM25 round](docs/benchmarks.md#bm25-round-fewer-cold-reads-and-exact-bounds-ms-marco-1m-one-machine).
+
 ### My own measurements of hosted services (10M)
 
 I also measured turbopuffer and Amazon S3 Vectors on the same 10M 1,024-dim `f16` Wikipedia dataset. Because caches cannot be forced cold externally on either hosted service, their idle-gap latency is not directly comparable to blowfish's cold numbers:

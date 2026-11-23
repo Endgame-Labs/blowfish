@@ -528,14 +528,23 @@ async fn prepare_segment(
         .files
         .get("ids")
         .is_some_and(|f| f.size > RANGED_IDS_BYTES);
-    let (allowed, indexes, whole_ids) = tokio::try_join!(
+    let use_keys =
+        columns.is_empty() && !all && !clauses.is_empty() && crate::text_keys::inline(seg);
+    let (allowed, indexes, whole_ids, keys) = tokio::try_join!(
         snapshot::allowed(store, state, seg, q.filters.as_ref()),
         open_text,
         async {
-            if clauses.is_empty() || big_ids {
+            if clauses.is_empty() || big_ids || use_keys {
                 Ok(None)
             } else {
                 segment::ids(store, seg).await.map(Some)
+            }
+        },
+        async {
+            if use_keys {
+                crate::text_keys::load(store, seg).await.map(Some)
+            } else {
+                Ok(None)
             }
         },
     )?;
@@ -609,6 +618,19 @@ async fn prepare_segment(
         selected &= rows;
     }
     crate::sparse::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?;
+    if let Some(keys) = keys {
+        for (key, hits) in bm25_hits {
+            let scores = out.scores.entry(key).or_default();
+            for hit in hits {
+                let id = keys.id(hit.row)?;
+                scores.insert(id.clone(), hit.score as f64);
+                out.docs.entry(id.clone()).or_insert_with(|| {
+                    std::sync::Arc::new(Document::from_iter([("id".into(), id.value())]))
+                });
+            }
+        }
+        return Ok(out);
+    }
     if let Some(ids) = &ids {
         for (key, hits) in bm25_hits {
             let scores = out.scores.entry(key).or_default();
