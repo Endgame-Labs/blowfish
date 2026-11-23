@@ -9,6 +9,7 @@ mod fastscan;
 mod format;
 mod index;
 mod reader;
+mod relayout;
 pub use bytes::Bytes;
 pub use cluster::{
     BuildParams, IndexBuilder, VectorType, kmeans, nearest_center, prepare_vector, squared_distance,
@@ -21,6 +22,9 @@ pub use index::{
     Candidate, DecodedCluster, Index, RotatedQuery, SearchParams, read_gap, read_merged,
 };
 pub use reader::RangeRead;
+#[cfg(feature = "legacy-fixtures")]
+pub use relayout::downgrade_layout;
+pub use relayout::{CodeLayout, code_layout, upgrade_layout};
 mod rabitq;
 pub use rabitq::{DistanceEstimate, RaBitQ, RaBitQCode};
 

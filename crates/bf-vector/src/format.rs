@@ -9,7 +9,7 @@ use crate::{
 };
 
 pub(crate) const FOOTER_SIZE: u64 = 64;
-const MAGIC: &[u8; 8] = b"BFVFOOT1";
+pub(crate) const MAGIC: &[u8; 8] = b"BFVFOOT1";
 /// Current `.bfv` file format version.
 pub const FORMAT_VERSION: u32 = 1;
 /// Metadata flag: centers and parents are stored rotated and zero-padded to the transform width.
@@ -20,13 +20,6 @@ pub(crate) const FLAG_COMPACT: u32 = 2;
 /// [`crate::fastscan`]. A reader tells the layouts apart by a code block's length too, which is
 /// what a partial index over a directory does.
 pub(crate) const FLAG_FASTSCAN: u32 = 4;
-
-/// Whether new indexes store their codes in the blocked fast-scan layout (`BF_ANN_FASTSCAN=0`
-/// writes the row-major layout, for A/B measurements and compatibility tests).
-pub(crate) fn fastscan_builds() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("BF_ANN_FASTSCAN").is_ok_and(|v| v == "0"))
-}
 
 /// The mean of the non-empty clusters' rotated centers, accumulated in cluster order in `f32`.
 /// A directory section's centroid and a fast-scan index's reference point are this same value,
@@ -111,7 +104,9 @@ pub(crate) fn build_blob(
     for (i, c) in assignments.into_iter().enumerate() {
         groups[c].push(i as u32);
     }
-    let fastscan = !flat && b.params.fastscan && rq.padded.is_multiple_of(8);
+    // Only an index with fewer than eight padded dimensions (no whole code byte per block row) keeps
+    // the row-major layout; every other index is written in the fast-scan one.
+    let fastscan = !flat && rq.padded.is_multiple_of(8);
     let rotated: Vec<Vec<f32>> = centers.par_iter().map(|c| rotated_center(&rq, c)).collect();
     let reference = mean_center(
         rotated
@@ -252,7 +247,7 @@ fn rotated_center(rq: &RaBitQ, c: &[f32]) -> Vec<f32> {
     rq.rotate(c).into_iter().map(|x| x as f32).collect()
 }
 
-fn encode_metadata(m: &Metadata) -> Result<Vec<u8>> {
+pub(crate) fn encode_metadata(m: &Metadata) -> Result<Vec<u8>> {
     let mut out = b"BFVIDX01".to_vec();
     put_u32(&mut out, m.dims as u32);
     put_u32(&mut out, m.count);

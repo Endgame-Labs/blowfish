@@ -159,6 +159,40 @@ signal, the fault address, and the thread, followed by the stack frames. The exi
 On Linux, frames inside blowfish print as offsets: resolve them with `addr2line -f -C -i -e blowfish <offset>` against
 the same binary (release builds carry debug info). Please include this output when reporting a crash.
 
+## Upgrading to v0.1.14
+
+v0.1.14 writes vector indexes in a new code layout (fast scan, about 3 times faster per row to scan). Old indexes
+still read and answer queries, and a running server upgrades them by itself: after it starts, the background indexer
+rewrites each namespace's older indexes, one at a time, in its own task, so indexing and queries carry on. You do
+not need to do anything.
+
+The upgrade reads an index, rewrites its quantized codes, and writes it back under a new object key. It does not
+retrain anything: cluster centers, row membership, and full-precision vectors are copied as they are, so queries
+return the same results. It covers the per-segment indexes and the slabs of a `recluster`, and leaves documents, the
+WAL, and the full-text and filter indexes alone. Old objects are never changed: each batch of rewritten indexes goes
+into the manifest in one conditional publish (the same path the indexer and compaction use), and the old objects are
+left for normal garbage collection after the retention window. If a compaction or another publish gets in the way,
+the upgrade retries from the newest manifest and drops work that a newer segment replaced. A publish fences an
+indexer on another node for a moment, as `recluster` does, and that indexer retries. Writes are not affected. Memory
+is bounded by the largest single index (the object plus its rewrite, about twice its size), since indexes are
+processed one at a time. It is idempotent and resumable: it skips indexes already in the new layout, and a restart
+partway through leaves the namespace readable, with every finished batch kept.
+
+To run the same upgrade now, or to see what is left, use `blowfish reindex`:
+
+```bash
+blowfish reindex --storage-url s3://BUCKET/PREFIX --dry-run NAMESPACE   # counts and bytes per layout, writes nothing
+blowfish reindex --storage-url s3://BUCKET/PREFIX NAMESPACE
+blowfish reindex --storage-url s3://BUCKET/PREFIX --all                 # every namespace in the bucket
+```
+
+It prints progress, and it is safe beside a running server on the same bucket. Flat indexes (small segments with no
+codes) have nothing to convert and are reported under "not convertible". `recluster` also writes the new layout.
+
+**Rolling back.** Indexes written by 0.1.14 in the new layout cannot be read by 0.1.13 or older: they refuse the new
+layout and fail the query rather than misreading it. If you might need to roll back, back up the bucket before
+upgrading.
+
 ## Large namespaces: recluster, paged directory, and compact manifest copy
 
 For namespaces with millions of vectors, three maintenance helpers in `crates/bf-engine/examples/`

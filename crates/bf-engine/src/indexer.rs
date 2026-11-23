@@ -268,6 +268,13 @@ pub(crate) fn start(engine: &Engine) {
     tokio::spawn(async move {
         let mut last_gc = std::time::Instant::now();
         let mut discover = true;
+        // Namespaces whose older-layout vector indexes have been upgraded (or never had any) since
+        // start, and the one upgrade that may run at a time, in its own task so it does not hold
+        // up indexing (see `reindex`).
+        let upgraded = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<
+            String,
+        >::new()));
+        let upgrading = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         loop {
             tokio::time::sleep(interval).await;
             let Some(inner) = weak.upgrade() else { break };
@@ -295,6 +302,35 @@ pub(crate) fn start(engine: &Engine) {
             for ns in names {
                 if let Err(e) = engine.index_namespace(&ns, false).await {
                     tracing::warn!(error=%e, "background indexing deferred");
+                }
+                let pending = !upgraded.lock().is_ok_and(|u| u.contains(&ns));
+                if pending && !upgrading.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    let (engine, ns, upgraded, upgrading) = (
+                        engine.clone(),
+                        ns.clone(),
+                        upgraded.clone(),
+                        upgrading.clone(),
+                    );
+                    tokio::spawn(async move {
+                        // A namespace with no checkpoint yet has no old indexes: new ones are fast-scan.
+                        match engine.reindex(&ns, &Default::default()).await {
+                            Ok(_) => {
+                                if let Ok(mut u) = upgraded.lock() {
+                                    u.insert(ns);
+                                }
+                            }
+                            Err(e) if e.status == 404 => {
+                                if let Ok(mut u) = upgraded.lock() {
+                                    u.insert(ns);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error=%e, "vector index upgrade deferred");
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                            }
+                        }
+                        upgrading.store(false, std::sync::atomic::Ordering::Release);
+                    });
                 }
                 if gc_due && let Err(e) = engine.collect_garbage(&ns).await {
                     tracing::warn!(error=%e,"background garbage collection deferred");
