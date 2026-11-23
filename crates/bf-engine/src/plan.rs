@@ -150,7 +150,7 @@ fn rank_files(rank: &RankBy, schema: &Schema, out: &mut BTreeSet<String>) {
     match rank {
         RankBy::Filter(f) => filter_files(f, schema, out),
         RankBy::Vector { attribute, .. } => {
-            out.insert(format!("ann:{attribute}"));
+            out.insert(format!("annv2:{attribute}"));
         }
         RankBy::SparseVector { attribute, .. } => {
             out.insert(format!("sparse:{attribute}"));

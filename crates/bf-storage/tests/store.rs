@@ -108,7 +108,7 @@ async fn s3_contract() {
     .unwrap();
     assert_eq!(store.mode(), StorageMode::Conditional);
     exercise(store.clone()).await;
-    store.delete("_system/format/2.json").await.unwrap();
+    store.delete("_system/format/3.json").await.unwrap();
     assert!(store.list("").await.unwrap().is_empty());
 }
 

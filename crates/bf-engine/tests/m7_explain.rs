@@ -45,7 +45,7 @@ async fn explain_identifies_real_indexes_segment_count_nprobe_and_tail() {
         "Segments touched: 1",
         "WAL tail rows: 1",
         "nprobe=7",
-        "ann:vector",
+        "annv2:vector",
         "trigram:s",
         "indexes used",
     ] {

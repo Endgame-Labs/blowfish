@@ -15,10 +15,11 @@ pub use cluster::{
     BuildParams, IndexBuilder, VectorType, dots_x4, kmeans, kmeans_two_level, nearest_center,
     prepare_vector, squared_distance,
 };
+pub use directory::upgrade;
 pub use directory::{
     DirEntry, DirSegment, Directory, Fragment, Membership, Page, PagedDirectory, PartialIndex,
 };
-pub use format::{FORMAT_VERSION, metadata_len};
+pub use format::{ANN_FORMAT_VERSION, FORMAT_VERSION, metadata_len};
 pub use index::{
     Candidate, DecodedCluster, Index, RotatedQuery, SearchParams, read_gap, read_merged,
 };

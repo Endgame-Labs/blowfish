@@ -705,3 +705,41 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
 - Audit of every behavior the SDKs rely on: `docs/research/sdk-compat-audit.md`; open items in `SPEC.md` section 2.
 - `scale_load.py`: one limiter shared by all in-flight threads, honors `retry-after-ms` / `Retry-After` (also on 503), full-jitter backoff, gradual ramp-up, and reports 429 / 503 counts and
   sample header values in its progress line. The checkpoint format is unchanged (one optional `retries_503` field).
+
+## D1: one ANN object per segment and slab
+
+I write one `ann.<column>.bfa` object per vector attribute, with resident directory metadata and dense
+membership, checksummed leaf blobs followed by their codes in locality order, one vector region, and a
+version-2 footer. I removed the ANN `.bff` and `.bfb` writers, the plain/block layout choice, the block
+backfill, and the old per-segment ANN planner. Flat and paged slab directories keep their encodings.
+
+I extended `reindex` and the background upgrade to convert every legacy ANN object, including fast-scan,
+flat, and pre-compact indexes, without retraining. Each fenced publication installs `annv2:` files and
+retires the old index and fragment entries. Slab batches can resume before the final directory is ready.
+I also fixed per-attribute cleanup after a concurrent replacement and resident generation adoption when
+successive batches have no complete directory. Mixed segment formats can temporarily use document scans;
+I document that migration latency limit in operations. Document vectors remain for D2.
+
+I raised the bucket and manifest fences to 3. The CLI reports current objects separately from legacy
+code layouts, and a dry run opens storage read-only, leaving an older bucket's marker unchanged.
+
+Validation: `cargo fmt`, strict clippy over `bf-vector`, `bf-engine`, `bf-storage`, `bf-wal`, and `blowfish`,
+and their tests (224 passed, 4 ignored). The compatibility suite passes 121/121 in both normal and forced
+indexing modes, both TypeScript smoke runs pass, and the Python compatibility unit tests pass 9/9.
+I cover exact code/vector preservation, f16/f32/i8, filtered queries, sparse slab IDs, corrupt leaf blobs
+and footers, older headers, concurrent publication, resumable slabs, and idempotence.
+
+
+### D1 measurements
+
+I measured 200K-row, 1,024-dimensional f16 namespaces against the parent: live indexed bytes/row fell
+from 4,602.05 to 4,420.90 on synthetic data, from 4,599.68 to 4,419.72 on the NQ embedding slice, and
+from 7,015.65 to 6,652.72 after recluster. ANN objects fell from 3 to 1, and from 15 to 7 with six slabs.
+The upgrades wrote 443.07 / 442.83 / 889.21 MB in 3.11 / 4.80 / 10.19 seconds, at 911 / 878 / 875 MiB RSS.
+
+I used four alternating old/new query rounds on shared CPUs 6–7. All 3,072 paired warm responses and
+60 paired cold responses matched IDs and scores; recall@10 stayed identical. Median instructions/query
+changed +0.18%, +0.15%, and -0.45%, and latency stayed within the observed spread. Cold requests fell
+in every case. Synthetic unfiltered reads grew 6.0% (4.3% reclustered), while NQ unfiltered reads were
+nearly flat and filtered bytes fell 9.5–24.2%; I document that coalescing/alignment tradeoff explicitly.
+Details and reproduction: `docs/benchmarks.md`, “Round D1”. The full 2.68M NQ corpus remains unmeasured.

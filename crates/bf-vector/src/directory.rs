@@ -1,10 +1,10 @@
 //! Namespace-level ANN directory: one immutable object listing every leaf cluster of every
 //! segment, so a query can rank clusters and address their bytes without opening any segment.
 //!
-//! Each segment contributes a *fragment* (an object written once, when the segment is built):
-//! a resident part with one entry per non-empty leaf cluster, followed by a blob area with one
-//! blob per cluster (exact rotated center, row set, row checksums) that a query reads only for
-//! the clusters it probes. The directory is the concatenation of the fragments' resident parts,
+//! Each segment contributes its ANN object's resident *fragment*: one entry per non-empty
+//! leaf cluster. The same object holds the membership map, checksummed leaf blobs (exact
+//! rotated center, row set, and row checksums), codes, and vectors. Queries read payloads
+//! only for the clusters they probe. The directory is the concatenation of the fragments' resident parts,
 //! so publishing a new segment set never reopens an existing segment: unchanged sections are
 //! carried over from the previous directory, and only new fragments are read.
 //!
@@ -15,6 +15,8 @@
 use std::{ops::Range, sync::Arc};
 
 mod paged;
+/// Readers used only while automatically upgrading older ANN objects.
+pub mod upgrade;
 pub use paged::{Page, PagedDirectory};
 
 use bytes::Bytes;
@@ -28,11 +30,9 @@ use crate::{
     index::{Index, StubCluster},
 };
 
-const DIR_MAGIC: &[u8; 8] = b"BFDIR003";
-const FRAG_MAGIC: &[u8; 8] = b"BFFRG002";
-/// Directories and fragments whose cluster blocks carry the quantized codes beside the blobs.
-const DIR_MAGIC_BLOCKS: &[u8; 8] = b"BFDIR004";
-const FRAG_MAGIC_BLOCKS: &[u8; 8] = b"BFFRG003";
+pub(crate) const ANN_MAGIC: &[u8; 8] = b"BFANN002";
+
+const DIR_MAGIC: &[u8; 8] = b"BFDIR004";
 
 /// Vector-space parameters shared by every segment in a directory.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -49,9 +49,9 @@ pub(crate) struct Shape {
 pub struct DirSegment {
     /// Segment ID.
     pub id: String,
-    /// Object key of the segment's `.bfv` index, to detect a stale directory.
+    /// Object key of the segment's `.bfa` index, to detect a stale directory.
     pub key: String,
-    /// Object key of the segment's fragment (holds the cluster blobs).
+    /// The same ANN object key, retained in the directory encoding.
     pub fragment: String,
     /// Whether the segment is a flat (exact, unclustered) index.
     pub flat: bool,
@@ -62,7 +62,7 @@ pub struct DirSegment {
     /// Byte range of the segment's row-to-cluster map inside its fragment, if it has one.
     pub membership: Option<Range<u64>>,
     /// Whether each cluster's quantized codes sit in the fragment, right after the cluster's
-    /// blob, instead of in the segment's index object (see [`Fragment::build_blocks`]).
+    /// blob. Current ANN objects always set this; older directory readers also record it.
     pub codes_in_fragment: bool,
     /// `(size, metadata length)` of the segment's index object and of its fragment, when the
     /// directory records them (a paged directory does, so a reader can open the objects without
@@ -96,8 +96,7 @@ impl DirEntry {
     pub fn vectors_range(&self) -> Range<u64> {
         self.vectors.clone()
     }
-    /// Range of this cluster's quantized codes: inside the segment's index object, or inside
-    /// its fragment when [`DirSegment::codes_in_fragment`] is set.
+    /// Range of this cluster's quantized codes in the ANN object.
     pub fn codes_range(&self) -> Range<u64> {
         self.codes.clone()
     }
@@ -231,9 +230,7 @@ impl Section {
         put_u32(out, self.rows);
         put_u64(out, self.membership.start);
         put_u64(out, self.membership.end);
-        if self.codes_in_fragment {
-            put_u32(out, 1);
-        }
+        put_u32(out, u32::from(self.codes_in_fragment));
         for x in self.centroid.iter() {
             out.extend(x.to_le_bytes());
         }
@@ -253,20 +250,17 @@ impl Section {
         out.extend(&self.bits);
     }
 
-    fn get(p: &mut Parser<'_>, segment: usize, blocks: bool) -> Result<Self> {
+    fn get(p: &mut Parser<'_>, segment: usize) -> Result<Self> {
         let shape = get_shape(p)?;
         let padded = shape.dims.next_power_of_two();
         let clusters = p.u32()? as usize;
         let n = p.u32()? as usize;
         let rows = p.u32()?;
         let membership = p.u64()?..p.u64()?;
-        let codes_in_fragment = if blocks {
-            match p.u32()? {
-                1 => true,
-                _ => return Err(bad("invalid directory section flags")),
-            }
-        } else {
-            false
+        let codes_in_fragment = match p.u32()? {
+            0 => false,
+            1 => true,
+            _ => return Err(bad("invalid directory section flags")),
         };
         if n > clusters || n > p.remaining() || membership.start > membership.end {
             return Err(bad("invalid directory section"));
@@ -358,22 +352,17 @@ fn bit_bytes(padded: usize) -> usize {
 }
 
 impl Fragment {
-    /// Build a segment's fragment from its complete `.bfv` bytes. Returns the fragment object
-    /// bytes and the length of its resident part.
-    pub fn build(index_blob: &[u8]) -> Result<(Vec<u8>, u64)> {
-        Self::build_with(index_blob, false)
+    /// Create an old fragment for migration tests; unavailable in release builds.
+    #[cfg(feature = "legacy-fixtures")]
+    pub fn legacy_fragment(index_blob: &[u8], blocks: bool) -> Result<(Vec<u8>, u64)> {
+        upgrade::legacy_fragment(index_blob, blocks)
     }
 
-    /// Like [`Fragment::build`], but each cluster's block holds the blob and then the cluster's
-    /// quantized codes (copied from `index_blob`), so probing a cluster is one ranged read, and
-    /// the blocks are ordered along a nearest-neighbor tour of the cluster centers, so the
-    /// clusters a query probes in one segment tend to be adjacent and merge into fewer reads.
-    /// There is no row-to-cluster map: filtered queries use the plain fragment.
-    pub fn build_blocks(index_blob: &[u8]) -> Result<(Vec<u8>, u64)> {
-        Self::build_with(index_blob, true)
-    }
-
-    fn build_with(index_blob: &[u8], blocks_mode: bool) -> Result<(Vec<u8>, u64)> {
+    /// Build one version-2 ANN object, with resident membership, leaf blobs and codes in tour
+    /// order, and one vector region. Existing fast-scan codes and vectors are copied unchanged.
+    pub fn build_ann(index_blob: &[u8]) -> Result<(Vec<u8>, u64)> {
+        let upgraded = crate::upgrade_layout(index_blob)?;
+        let index_blob = upgraded.as_deref().unwrap_or(index_blob);
         let index = Index::<Bytes>::metadata_only(index_blob, Bytes::new())?;
         let m = index.metadata();
         let shape = Shape {
@@ -395,38 +384,52 @@ impl Fragment {
         let mut bits = Vec::with_capacity(live.len() * bit_bytes(padded));
         let mut entries = Vec::with_capacity(live.len());
         let mut blobs = Vec::new();
-        let resident_len = 8
-            + 24
-            + 8
-            + 20
-            + padded * 4
-            + live.len() * (ENTRY_BYTES + bit_bytes(padded))
-            + 4
-            + if blocks_mode { 4 } else { 0 };
-        // Blocks are laid out in `order`; entries stay in cluster order.
-        let order = if blocks_mode {
-            tour(&live, |c| &*m.clusters[c].center)
+        let resident_len =
+            8 + 24 + 8 + 20 + padded * 4 + live.len() * (ENTRY_BYTES + bit_bytes(padded)) + 4 + 4;
+        let dense = m
+            .clusters
+            .iter()
+            .flat_map(|c| c.rows.iter())
+            .all(|r| r < m.count);
+        let map_len = if m.flat || !dense {
+            0
         } else {
-            live.clone()
+            m.count as usize
+                * if m.clusters.len() > u16::MAX as usize {
+                    4
+                } else {
+                    2
+                }
+                + 4
         };
+        let resident_len = resident_len + map_len;
+        // Blocks are laid out in `order`; entries stay in cluster order.
+        let order = tour(&live, |c| &*m.clusters[c].center);
         let mut placed: Vec<Option<(u64, usize, u64)>> = vec![None; m.clusters.len()];
         for &cid in &order {
             let c = &m.clusters[cid];
             let blob = index.cluster_blob(cid);
             let start = (resident_len + blobs.len()) as u64;
-            let codes_len = if blocks_mode {
-                c.codes.end - c.codes.start
-            } else {
-                0
-            };
+            let codes_len = c.codes.end - c.codes.start;
             placed[cid] = Some((start, blob.len(), codes_len));
             blobs.extend(blob);
-            if blocks_mode {
+            {
                 let codes = index_blob
                     .get(c.codes.start as usize..c.codes.end as usize)
                     .ok_or_else(|| bad("cluster codes outside index"))?;
                 blobs.extend_from_slice(codes);
             }
+        }
+        let mut vector_ranges = vec![0..0; m.clusters.len()];
+        let mut vector_len = 0;
+        for &cid in &order {
+            let c = &m.clusters[cid];
+            let start = (resident_len + blobs.len() + vector_len) as u64;
+            let bytes = index_blob
+                .get(c.vectors.start as usize..c.vectors.end as usize)
+                .ok_or_else(|| bad("cluster vectors outside index"))?;
+            vector_ranges[cid] = start..start + bytes.len() as u64;
+            vector_len += bytes.len();
         }
         for &cid in &live {
             let c = &m.clusters[cid];
@@ -455,12 +458,8 @@ impl Fragment {
                 segment: 0,
                 cluster: cid,
                 rows: c.rows.len() as u32,
-                codes: if blocks_mode {
-                    blob_end..blob_end + codes_len
-                } else {
-                    c.codes.clone()
-                },
-                vectors: c.vectors.clone(),
+                codes: blob_end..blob_end + codes_len,
+                vectors: vector_ranges[cid].clone(),
                 codes_crc: c.codes_crc,
                 vectors_crc: c.vectors_crc,
                 blob: start..blob_end,
@@ -471,7 +470,7 @@ impl Fragment {
         // The row-to-cluster map: with it, a filtered query knows how many allowed rows each
         // cluster holds, and where each one's vector is, without reading cluster blobs.
         let mut member = Vec::new();
-        if !m.flat && !blocks_mode {
+        if !m.flat && dense {
             let wide = m.clusters.len() > u16::MAX as usize;
             let mut map = vec![0u32; m.count as usize];
             for (cid, c) in m.clusters.iter().enumerate() {
@@ -490,7 +489,7 @@ impl Fragment {
             let crc = crc32fast::hash(&member);
             put_u32(&mut member, crc);
         }
-        let member_start = (resident_len + blobs.len()) as u64;
+        let member_start = (resident_len - map_len - 4) as u64;
         let section = Section {
             shape,
             clusters: m.clusters.len(),
@@ -499,23 +498,71 @@ impl Fragment {
             bits,
             rows: m.count,
             membership: member_start..member_start + member.len() as u64,
-            codes_in_fragment: blocks_mode,
+            codes_in_fragment: true,
             stubs: Default::default(),
         };
-        let mut out = if blocks_mode {
-            FRAG_MAGIC_BLOCKS.to_vec()
-        } else {
-            FRAG_MAGIC.to_vec()
-        };
+        let mut out = Vec::with_capacity(
+            resident_len + blobs.len() + vector_len + crate::format::FOOTER_SIZE as usize,
+        );
+        out.extend_from_slice(ANN_MAGIC);
         section.put(&mut out);
+        out.extend(member);
         let crc = crc32fast::hash(&out);
         put_u32(&mut out, crc);
         debug_assert_eq!(out.len(), resident_len);
         out.extend(blobs);
-        out.extend(member);
+        for &cid in &order {
+            let range = &m.clusters[cid].vectors;
+            out.extend_from_slice(&index_blob[range.start as usize..range.end as usize]);
+        }
+        let mut footer = vec![0u8; crate::format::FOOTER_SIZE as usize];
+        footer[..8].copy_from_slice(crate::format::ANN_FOOTER_MAGIC);
+        footer[8..12].copy_from_slice(&crate::format::ANN_FORMAT_VERSION.to_le_bytes());
+        footer[16..24].copy_from_slice(&(resident_len as u64).to_le_bytes());
+        footer[24..32]
+            .copy_from_slice(&(out.len() as u64 + crate::format::FOOTER_SIZE).to_le_bytes());
+        footer[32..36].copy_from_slice(&crc32fast::hash(&out[..resident_len]).to_le_bytes());
+        let crc = crc32fast::hash(&footer[..60]);
+        footer[60..].copy_from_slice(&crc.to_le_bytes());
+        out.extend(footer);
         Ok((out, resident_len as u64))
     }
 
+    pub(crate) fn validate(&self, resident: u64, payload_end: u64) -> Result<()> {
+        let width = self.0.shape.dims as u64 * self.0.shape.dtype.width() as u64;
+        for e in &self.0.entries {
+            if e.blob.start < resident
+                || e.blob.end != e.codes.start
+                || e.codes.start > e.codes.end
+                || e.codes.end > e.vectors.start
+                || e.vectors.start > e.vectors.end
+                || e.vectors.end > payload_end
+                || e.vectors.end - e.vectors.start != u64::from(e.rows) * width
+            {
+                return Err(bad("invalid ANN payload ranges"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn index<R: RangeRead>(&self, reader: R) -> Result<Index<R>> {
+        Index::stub(
+            reader,
+            &self.0.shape,
+            self.0.stubs(),
+            self.0.centroid.clone(),
+        )
+    }
+    pub(crate) fn blobs(&self) -> Vec<(usize, Range<u64>)> {
+        self.0
+            .entries
+            .iter()
+            .map(|e| (e.cluster, e.blob.clone()))
+            .collect()
+    }
+    pub(crate) fn rows(&self) -> u32 {
+        self.0.rows
+    }
     /// Decode a fragment's resident part (the first `metadata_len` bytes of its object).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 12 {
@@ -524,12 +571,20 @@ impl Fragment {
         let (body, tail) = bytes.split_at(bytes.len() - 4);
         check_crc(body, u32::from_le_bytes(tail.try_into().unwrap()))?;
         let mut p = Parser::new(body);
-        let magic = p.take(8)?;
-        let blocks = magic == FRAG_MAGIC_BLOCKS;
-        if !blocks && magic != FRAG_MAGIC {
-            return Err(bad("bad fragment magic"));
+        if p.take(8)? != ANN_MAGIC {
+            return Err(bad("bad ANN object magic"));
         }
-        let section = Section::get(&mut p, 0, blocks)?;
+        let section = Section::get(&mut p, 0)?;
+        if !section.codes_in_fragment {
+            return Err(bad("ANN object requires resident code ranges"));
+        }
+        if !section.membership.is_empty() {
+            if section.membership.start != (body.len() - p.remaining()) as u64 {
+                return Err(bad("invalid resident membership offset"));
+            }
+            let member = p.take((section.membership.end - section.membership.start) as usize)?;
+            Membership::decode(member, section.rows as usize, section.clusters)?;
+        }
         if p.remaining() != 0 {
             return Err(bad("inconsistent fragment length"));
         }
@@ -576,16 +631,7 @@ impl Directory {
         }) {
             return Ok(None);
         }
-        // A directory lists either plain fragments or block fragments, never a mix: the two
-        // are read differently.
-        let blocks = first.0.codes_in_fragment;
-        if sources
-            .iter()
-            .any(|(_, _, _, f)| f.0.codes_in_fragment != blocks)
-        {
-            return Ok(None);
-        }
-        let mut out = if blocks { DIR_MAGIC_BLOCKS } else { DIR_MAGIC }.to_vec();
+        let mut out = DIR_MAGIC.to_vec();
         put_u32(&mut out, sources.len() as u32);
         for (id, key, frag, f) in sources {
             put_str(&mut out, id);
@@ -611,9 +657,7 @@ impl Directory {
         let (body, tail) = bytes.split_at(bytes.len() - 4);
         check_crc(body, u32::from_le_bytes(tail.try_into().unwrap()))?;
         let mut p = Parser::new(body);
-        let magic = p.take(8)?;
-        let blocks = magic == DIR_MAGIC_BLOCKS;
-        if !blocks && magic != DIR_MAGIC {
+        if p.take(8)? != DIR_MAGIC {
             return Err(bad("bad directory magic"));
         }
         let nsegs = p.u32()? as usize;
@@ -627,7 +671,7 @@ impl Directory {
             let id = text(&mut p)?;
             let key = text(&mut p)?;
             let fragment = text(&mut p)?;
-            let section = Section::get(&mut p, s, blocks)?;
+            let section = Section::get(&mut p, s)?;
             segments.push(DirSegment {
                 id,
                 key,

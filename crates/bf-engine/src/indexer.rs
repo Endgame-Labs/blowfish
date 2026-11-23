@@ -411,7 +411,6 @@ impl Engine {
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
                 && tier(&state, &self.0.config, force).is_empty()
-                && !needs_blocks(&state)
                 && !needs_text_upgrade(&state)
             {
                 return Ok(false);
@@ -439,7 +438,7 @@ impl Engine {
                     })
             });
             let will_compact = tier(&state, &self.0.config, force);
-            let upgrade = needs_blocks(&state) || needs_text_upgrade(&state);
+            let upgrade = needs_text_upgrade(&state);
             if state.seq == state.indexed_through
                 && will_compact.is_empty()
                 && !will_rebuild
@@ -499,7 +498,7 @@ impl Engine {
         }
         crate::ann::stage(t0, "idx hydrate");
         let compact = tier(&state, &self.0.config, force);
-        let upgrade = needs_blocks(&state) || needs_text_upgrade(&state);
+        let upgrade = needs_text_upgrade(&state);
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
         }
@@ -842,10 +841,6 @@ impl Engine {
                 retire_slabs(&mut manifest, &set);
             }
         }
-        // Segments built before block fragments existed get theirs now (a one-time upgrade).
-        for seg in &mut manifest.segments {
-            segment::backfill_blocks(store, ns, seg).await?;
-        }
         // Upgrade one text field per publication to bound the working set. The epoch
         // claim above fences competing indexers; a crash leaves only unreferenced objects.
         for seg in &mut manifest.segments {
@@ -862,15 +857,12 @@ impl Engine {
             .segments
             .iter()
             .flat_map(|s| s.files.keys())
-            .filter_map(|k| k.strip_prefix("ann:").map(str::to_string))
+            .filter_map(|k| k.strip_prefix("annv2:").map(str::to_string))
             .collect();
         let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
         for attr in attributes {
             // The two layouts are independent objects: write them at the same time.
-            let layouts = [
-                crate::ann_dir::Layout::Plain,
-                crate::ann_dir::Layout::Blocks,
-            ];
+            let layouts = [crate::ann_dir::Layout::Segments];
             let built = futures::future::try_join_all(layouts.iter().map(|layout| {
                 crate::ann_dir::build(
                     store,
@@ -1142,18 +1134,6 @@ fn needs_text_upgrade(state: &NamespaceState) -> bool {
                 .files
                 .iter()
                 .any(|(key, file)| key.starts_with("fts:") && segment::text_needs_upgrade(file))
-    })
-}
-
-/// Whether some segment has a vector index but no block fragment yet (built before they existed).
-fn needs_blocks(state: &NamespaceState) -> bool {
-    state.segments.iter().any(|seg| {
-        seg.files.keys().any(|k| {
-            k.strip_prefix("ann:").is_some_and(|n| {
-                seg.files.contains_key(&format!("annfrag:{n}"))
-                    && !seg.files.contains_key(&format!("annfrag2:{n}"))
-            })
-        })
     })
 }
 
