@@ -790,7 +790,7 @@ impl Engine {
             embedding_ms: None,
             rerank_ms: None,
         };
-        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+        if crate::ann::trace_stages() {
             eprintln!(
                 "QUERY snapshot={}ms exec={}ms total={}ms",
                 snapshot_elapsed.as_millis(),
@@ -817,7 +817,7 @@ impl Engine {
         let config = self.0.config.clone();
         let t_clone = Instant::now();
         let state = state.clone();
-        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+        if crate::ann::trace_stages() {
             eprintln!("CLONE {}ms", t_clone.elapsed().as_millis());
         }
         let request = request.clone();

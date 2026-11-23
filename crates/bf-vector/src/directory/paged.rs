@@ -486,6 +486,7 @@ impl PagedDirectory {
             rows: 0,
             membership: 0..0,
             codes_in_fragment: false,
+            stubs: Default::default(),
         };
         Ok(Self {
             shape: Shape {
@@ -653,6 +654,7 @@ impl PagedDirectory {
                 rows: head.rows,
                 membership: head.membership.clone(),
                 codes_in_fragment: head.codes_in_fragment,
+                stubs: Default::default(),
             }));
         }
         Directory {

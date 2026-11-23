@@ -371,6 +371,102 @@ impl PlaneQuery {
         self.signed_dot(bits, padded)
     }
 
+    /// [`Self::dot`] of each of `rows` codes packed `width` bytes apart in `bits`, passed to `f`
+    /// with its row number (the same values, bit for bit). With AVX-512 and 512 or 1,024 padded
+    /// dimensions the query's planes stay in registers across rows.
+    pub(crate) fn dots(
+        &self,
+        bits: &[u8],
+        width: usize,
+        rows: usize,
+        padded: usize,
+        mut f: impl FnMut(usize, f64),
+    ) {
+        assert!(bits.len() >= rows * width);
+        #[cfg(target_arch = "x86_64")]
+        if avx512() && self.words.is_multiple_of(8) && width == self.words * 8 {
+            // SAFETY: the features were detected, and each row holds `words * 8` bytes.
+            return unsafe { self.dots_avx512(bits, rows, padded, &mut f) };
+        }
+        for n in 0..rows {
+            f(n, self.dot(&bits[n * width..(n + 1) * width], padded));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vpopcntdq")]
+    unsafe fn dots_avx512(
+        &self,
+        bits: &[u8],
+        rows: usize,
+        padded: usize,
+        f: &mut impl FnMut(usize, f64),
+    ) {
+        use std::arch::x86_64::*;
+        #[target_feature(enable = "avx512f,avx512bw,avx512vpopcntdq")]
+        #[inline]
+        fn rows_with<const C: usize>(
+            q: &PlaneQuery,
+            bits: &[u8],
+            rows: usize,
+            padded: usize,
+            f: &mut impl FnMut(usize, f64),
+        ) {
+            debug_assert!(q.words == C * 8 && bits.len() >= rows * C * 64);
+            // SAFETY (every load): `planes` holds `QUERY_BITS * words` words, and `bits` holds
+            // `rows` codes of `words * 8 = C * 64` bytes; the caller enabled the features.
+            let planes: [[__m512i; C]; QUERY_BITS] = std::array::from_fn(|j| {
+                std::array::from_fn(|c| unsafe {
+                    _mm512_loadu_si512(q.planes.as_ptr().add(j * q.words + c * 8).cast())
+                })
+            });
+            for n in 0..rows {
+                let mut weighted = _mm512_setzero_si512();
+                let mut ones = _mm512_setzero_si512();
+                for c in 0..C {
+                    let at = (n * C + c) * 64;
+                    let code = unsafe { _mm512_loadu_si512(bits.as_ptr().add(at).cast()) };
+                    ones = _mm512_add_epi64(ones, _mm512_popcnt_epi64(code));
+                    macro_rules! plane {
+                        ($j:literal) => {{
+                            let count = _mm512_popcnt_epi64(_mm512_and_si512(code, planes[$j][c]));
+                            weighted = _mm512_add_epi64(weighted, _mm512_slli_epi64::<$j>(count));
+                        }};
+                    }
+                    plane!(0);
+                    plane!(1);
+                    plane!(2);
+                    plane!(3);
+                    plane!(4);
+                    plane!(5);
+                    plane!(6);
+                    plane!(7);
+                }
+                let weighted = _mm512_reduce_add_epi64(weighted) as u64;
+                let ones = _mm512_reduce_add_epi64(ones) as u64;
+                f(
+                    n,
+                    (2. * (q.delta * weighted as f64 + q.vmin * ones as f64) - q.sum)
+                        / (padded as f64).sqrt(),
+                );
+            }
+        }
+        match self.words / 8 {
+            1 => rows_with::<1>(self, bits, rows, padded, f),
+            2 => rows_with::<2>(self, bits, rows, padded, f),
+            _ => {
+                let width = self.words * 8;
+                for n in 0..rows {
+                    // SAFETY: as for `dots`.
+                    let dot = unsafe {
+                        self.signed_dot_avx512(&bits[n * width..(n + 1) * width], padded)
+                    };
+                    f(n, dot);
+                }
+            }
+        }
+    }
+
     /// [`Self::signed_dot`] 128 bits at a time with NEON `CNT` (part of every AArch64 CPU).
     /// The bit counts are exact integers, so the result is bit-identical to the scalar path.
     #[cfg(target_arch = "aarch64")]
@@ -745,6 +841,33 @@ mod tests {
             // SAFETY: the features were detected above.
             let fast = unsafe { plane.signed_dot_avx512(&code.bits, rq.padded) };
             assert_eq!(slow.to_bits(), fast.to_bits());
+        }
+    }
+    #[test]
+    fn batched_dots_match_scalar() {
+        let mut rng = Rng(17);
+        for dims in [100, 512, 1000, 1024, 1536] {
+            let mut sample = |n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|_| (rng.next() % 2000) as f32 / 1000. - 1.)
+                    .collect()
+            };
+            let rq = RaBitQ::new(dims, 5).unwrap();
+            let (q, c) = (sample(dims), sample(dims));
+            let c_rot: Vec<f32> = rq.rotate(&c).into_iter().map(|x| x as f32).collect();
+            let plane = PlaneQuery::new(&rq.rotate(&q), &c_rot);
+            let codes: Vec<Vec<u8>> = (0..7)
+                .map(|_| rq.encode(&sample(dims), &c).unwrap().bits)
+                .collect();
+            let width = codes[0].len();
+            let bits = codes.concat();
+            let mut seen = 0;
+            plane.dots(&bits, width, codes.len(), rq.padded, |n, dot| {
+                let slow = plane.signed_dot(&codes[n], rq.padded);
+                assert_eq!(dot.to_bits(), slow.to_bits(), "dims {dims} row {n}");
+                seen += 1;
+            });
+            assert_eq!(seen, codes.len());
         }
     }
     #[cfg(target_arch = "aarch64")]

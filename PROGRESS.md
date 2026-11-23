@@ -4,6 +4,19 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Iteration 22: the fixed costs of a warm vector query** (`docs/benchmarks.md`).
+  - A warm reclustered NQ query takes 15.3 M instructions against main's 25.5 M (−40%), and 21.4 M cycles against
+    26.6 M (−20%), with the same results (recall@10 0.961). At 16 clients on a shared VM that was 574 against 509 q/s,
+    and 657 q/s at 48 probes (recall@10 0.951). The 1,000 q/s gate is not met: a query still costs about 7 ms of CPU at
+    64 probes and 5.9 ms at 48. The default stays at 64 probes until recall at 10M and 100M layouts supports 48.
+  - Changes: a typed reader for plain `rank_by` vectors, query bodies parsed without `serde_path_to_error`, vectorized
+    fast-scan bookkeeping with factors checked once a cluster, one batched kernel for directory center dots, integer
+    probe-pick keys, stub lists built once a section, and the per-slab SipHash of the query vector removed from the
+    scan memo key.
+  - Checked: fmt, workspace clippy, and `cargo test --workspace` (256 passed); compat 121/121; the branch serves
+    main's reclustered store with identical recall; and the `bench` ladder against main (same recall at 10K, 50K, and
+    200K rows, with warm ANN p50 lower).
+
 - **Iteration 21: one recluster assignment at every size, and a lighter query path** (`docs/benchmarks.md`).
   - `recluster` trains a large cell's leaves two-level and assigns rows across cells in blocks of 4, against leaf groups.
     Cross-cell assignment is now the only one. At 32 cells on BEIR NQ it takes 138 s against main's 253 s, at the same

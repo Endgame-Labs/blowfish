@@ -68,7 +68,7 @@ pub(crate) async fn search(
     if state.segments.iter().any(|s| !s.files.contains_key(&key)) {
         return Ok(None);
     }
-    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+    if crate::ann::trace_stages() {
         eprintln!(
             "ANN snapshot: segments={} shadowed={} directories={:?} tail_docs={}",
             state.segments.len(),
@@ -412,7 +412,7 @@ async fn from_directory(
         crate::ann_dir::live_masks(store, state, q.filters.as_ref())
     );
     // A directory in an unknown (older) format is ignored: queries open each segment.
-    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+    if crate::ann::trace_stages() {
         match &dir {
             Ok(d) => eprintln!(
                 "DIRECTORY covers={} dir_segments={} state_segments={}",
@@ -480,10 +480,15 @@ async fn from_directory(
     Ok(None)
 }
 
+/// Whether `BF_TRACE_STAGES` is set (read once: a query checks it many times).
+pub(crate) fn trace_stages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BF_TRACE_STAGES").is_some())
+}
+
 /// `BF_TRACE_STAGES=1` prints elapsed time at each ANN stage (diagnostics only).
 pub(crate) fn stage(t0: std::time::Instant, name: &str) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("BF_TRACE_STAGES").is_some()) {
+    if trace_stages() {
         eprintln!("STAGE {name} {} ms", t0.elapsed().as_millis());
     }
 }
@@ -555,7 +560,7 @@ async fn from_slabs(
         }
         Some(Arc::new(mask))
     };
-    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+    if crate::ann::trace_stages() {
         eprintln!(
             "SLABS slabs={} masked={}",
             view.segments.len(),

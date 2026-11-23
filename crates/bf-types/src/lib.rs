@@ -144,6 +144,10 @@ pub fn decode_vector(value: &Value) -> Result<Vec<f32>, ApiError> {
     } else {
         return Err(ApiError::bad("expected a vector array or base64 string"));
     };
+    check_vector(values)
+}
+/// The checks [`decode_vector`] applies to every decoded vector.
+pub(crate) fn check_vector(values: Vec<f32>) -> Result<Vec<f32>, ApiError> {
     if values.is_empty() || values.iter().any(|n| !n.is_finite()) {
         return Err(ApiError::bad(
             "vectors must contain finite numbers and at least one dimension",

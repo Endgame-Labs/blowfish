@@ -46,6 +46,12 @@ pub struct Candidate {
     pub ordinal: u32,
 }
 
+/// Whether `BF_TRACE_STAGES` is set (read once).
+fn trace_stages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BF_TRACE_STAGES").is_some())
+}
+
 /// Ranges closer than this many bytes are read together: the gap is fetched and dropped.
 /// `BF_READ_GAP_KB` overrides every merge gap below (experiments and tuning).
 pub fn read_gap(default: u64) -> u64 {
@@ -116,6 +122,7 @@ impl Ord for OrdF32 {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct StubCluster {
     pub codes: Range<u64>,
     pub vectors: Range<u64>,
@@ -212,19 +219,19 @@ impl<R: RangeRead> Index<R> {
     pub(crate) fn stub(
         reader: R,
         shape: &crate::directory::Shape,
-        stubs: Vec<StubCluster>,
+        stubs: &[StubCluster],
         reference: Arc<Vec<f32>>,
     ) -> Result<Self> {
         let rq = RaBitQ::new(shape.dims, shape.seed)?;
         // A query builds stubs for every cluster of each slab it probes and installs only the
         // probed ones, so a stub holds no payload at all.
         let clusters = stubs
-            .into_iter()
+            .iter()
             .map(|s| format::Cluster {
                 data: None,
                 parent: u32::MAX,
-                codes: s.codes,
-                vectors: s.vectors,
+                codes: s.codes.clone(),
+                vectors: s.vectors.clone(),
                 codes_crc: s.codes_crc,
                 vectors_crc: s.vectors_crc,
             })
@@ -491,7 +498,7 @@ impl<R: RangeRead> Index<R> {
 
     /// Rows stored in one leaf cluster.
     pub fn cluster_rows(&self, cluster: usize) -> usize {
-        self.metadata.clusters[cluster].rows.len() as usize
+        self.metadata.clusters[cluster].len()
     }
 
     /// Estimate distances for every row (passing `filter`) in the given leaf clusters,
@@ -599,7 +606,7 @@ impl<R: RangeRead> Index<R> {
         let t_cpu = std::time::Instant::now();
         let rows: usize = clusters
             .iter()
-            .map(|c| self.metadata.clusters[*c].rows.len() as usize)
+            .map(|c| self.metadata.clusters[*c].len())
             .sum();
         let mut estimated = Vec::with_capacity(rows);
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
@@ -615,13 +622,21 @@ impl<R: RangeRead> Index<R> {
             let c = &self.metadata.clusters[cid];
             // A stub's (shared, empty) payload never records a check.
             let checked = c.data.as_deref().map(|d| &d.codes_checked);
+            let n = c.len();
+            let blocked = n > 0
+                && compact
+                && padded.is_multiple_of(8)
+                && bytes.len() == crate::fastscan::block_len(n, padded);
             if !checked.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
                 check_crc(&bytes, c.codes_crc)?;
+                // The fast scan trusts its factors once they are checked here.
+                if blocked {
+                    crate::fastscan::check_factors(&bytes, n, padded)?;
+                }
                 if let Some(f) = checked {
                     f.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            let n = c.rows.len() as usize;
             let ids: &[u32] = match c.ids.as_deref() {
                 Some(ids) => ids,
                 None => {
@@ -661,11 +676,7 @@ impl<R: RangeRead> Index<R> {
             };
             // A zero query or row has a fixed cosine distance.
             let fixed = |zero: bool| -> (f32, f32) { (if q_zero && zero { 0. } else { 1. }, 0.) };
-            if n > 0
-                && compact
-                && padded.is_multiple_of(8)
-                && bytes.len() == crate::fastscan::block_len(n, padded)
-            {
+            if blocked {
                 let reference = self
                     .reference
                     .as_deref()
@@ -737,7 +748,7 @@ impl<R: RangeRead> Index<R> {
                 }
             }
         }
-        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+        if trace_stages() {
             eprintln!(
                 "SCAN clusters={} read={}ms cpu={}ms rows={}",
                 clusters.len(),
@@ -802,7 +813,7 @@ impl<R: RangeRead> Index<R> {
                         out.push((cid as u32, c.rows.rank(row) as u32 - 1));
                     }
                 }
-                None => out.extend((0..c.rows.len() as u32).map(|i| (cid as u32, i))),
+                None => out.extend((0..c.len() as u32).map(|i| (cid as u32, i))),
             }
         }
         out
@@ -839,7 +850,7 @@ impl<R: RangeRead> Index<R> {
                     locations.push((cid, c.rows.rank(row) as usize - 1));
                 }
             } else {
-                locations.extend((0..c.rows.len() as usize).map(|i| (cid, i)));
+                locations.extend((0..c.len()).map(|i| (cid, i)));
             }
         }
         self.rerank(query, k, locations).await
@@ -965,8 +976,8 @@ impl<R: RangeRead> Index<R> {
                 end += 1;
             }
             let cluster = &self.metadata.clusters[cid];
-            if (end - pos) * 3 >= cluster.rows.len() as usize {
-                plans.push((cid, 0, cluster.rows.len() as usize, true));
+            if (end - pos) * 3 >= cluster.len() {
+                plans.push((cid, 0, cluster.len(), true));
             } else {
                 for (_, i) in &locations[pos..end] {
                     if let Some(last) = plans.last_mut()
@@ -1033,7 +1044,7 @@ impl<R: RangeRead> Index<R> {
                 result.push((row, self.metric().distance_unchecked(query, &decoded)));
             }
         }
-        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+        if trace_stages() {
             eprintln!(
                 "RERANK locations={} ranges={} bytes={} read={}ms cpu={}ms",
                 locations.len(),

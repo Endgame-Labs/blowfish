@@ -31,6 +31,45 @@ pub(crate) fn block_len(rows: usize, padded: usize) -> usize {
     16 * rows + padded / 8 * BLOCK * rows.div_ceil(BLOCK)
 }
 
+/// Check a cluster's code block once, before its first scan: its length, and finite factors
+/// within their ranges. [`FastQuery::scan`] then trusts them.
+pub(crate) fn check_factors(bytes: &[u8], rows: usize, padded: usize) -> crate::Result<()> {
+    if bytes.len() != block_len(rows, padded) {
+        return Err(crate::format::bad("code block length mismatch"));
+    }
+    let factor = |i: usize| {
+        bytes[i * 4 * rows..(i + 1) * 4 * rows]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+    };
+    let ok = factor(0).all(|sq| (0. ..f32::INFINITY).contains(&sq))
+        && factor(1).all(|k| k.abs() < f32::INFINITY)
+        && factor(2).all(|e| (0. ..f32::INFINITY).contains(&e))
+        && factor(3).all(|cb| cb.abs() < f32::INFINITY);
+    if !ok {
+        return Err(crate::format::bad("invalid quantization factors"));
+    }
+    Ok(())
+}
+
+/// Load one block's factor column (up to [`BLOCK`] rows; the rest stay zero). Inlined, so it is
+/// compiled with its caller's target features; a full block loads a fixed-size array rather
+/// than calling `memcpy`.
+#[inline(always)]
+fn rows_of(column: &[[u8; 4]], out: &mut [f32; BLOCK]) {
+    if let Ok(full) = <&[[u8; 4]; BLOCK]>::try_from(column) {
+        for (o, b) in out.iter_mut().zip(full) {
+            *o = f32::from_le_bytes(*b);
+        }
+    } else {
+        for (o, b) in out.iter_mut().zip(column) {
+            *o = f32::from_le_bytes(*b);
+        }
+    }
+}
+
 /// One row's code: its sign bits and the factors its estimate needs.
 pub(crate) struct RowCode {
     /// `padded / 8` bytes, least significant bit first.
@@ -111,6 +150,23 @@ impl FastQuery {
     /// `q` is the rotated query and `g` the index's mean center, both of the padded length (a
     /// multiple of 8).
     pub(crate) fn new(q: &[f64], g: &[f32]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if avx512bw() {
+            // SAFETY: the CPU features were detected.
+            return unsafe { Self::new_avx512(q, g) };
+        }
+        Self::new_body(q, g)
+    }
+
+    /// [`Self::new`] compiled for AVX-512 (the table arithmetic vectorizes 16 lanes wide).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn new_avx512(q: &[f64], g: &[f32]) -> Self {
+        Self::new_body(q, g)
+    }
+
+    #[inline(always)]
+    fn new_body(q: &[f64], g: &[f32]) -> Self {
         let padded = q.len();
         debug_assert!(padded.is_multiple_of(8) && g.len() == padded);
         let x: Vec<f32> = q
@@ -178,10 +234,25 @@ impl FastQuery {
 impl Tables {
     /// Tables over `x` (a multiple of 8 long) with entry `level(group, value)` for each subset
     /// sum `value` of a group's four coordinates.
+    #[inline(always)]
     fn build(x: &[f32], level: impl Fn(usize, f32) -> f32) -> Self {
         let groups = x.len() / 4;
         let mut lut = vec![0u8; groups * 16];
-        let mut entries = [0f32; 16];
+        // Entry `n` of a group's table is the sum of the coordinates whose bit is set in `n`,
+        // added in bit order (lanes of one vector, with no dependency between entries).
+        const BIT: [[f32; 16]; 4] = {
+            let mut bits = [[0f32; 16]; 4];
+            let mut n = 0;
+            while n < 16 {
+                let mut i = 0;
+                while i < 4 {
+                    bits[i][n] = ((n >> i) & 1) as f32;
+                    i += 1;
+                }
+                n += 1;
+            }
+            bits
+        };
         for (g, (group, table)) in x
             .as_chunks::<4>()
             .0
@@ -189,9 +260,11 @@ impl Tables {
             .zip(lut.as_chunks_mut::<16>().0)
             .enumerate()
         {
-            // Each entry adds one coordinate to an entry with one bit fewer.
-            for n in 1..16usize {
-                entries[n] = entries[n & (n - 1)] + group[n.trailing_zeros() as usize];
+            let mut entries = [0f32; 16];
+            for (i, bits) in BIT.iter().enumerate() {
+                for (e, b) in entries.iter_mut().zip(bits) {
+                    *e += b * group[i];
+                }
             }
             for (slot, e) in table.iter_mut().zip(entries) {
                 *slot = level(g, e) as u8;
@@ -362,10 +435,47 @@ impl FastQuery {
         cut: &std::cell::Cell<f32>,
         emit: &mut impl FnMut(usize, u32, &[f32; BLOCK], &[f32; BLOCK], u32),
     ) -> crate::Result<()> {
-        let padded = self.padded;
-        if bytes.len() != block_len(rows, padded) {
+        if bytes.len() != block_len(rows, self.padded) {
             return Err(crate::format::bad("code block length mismatch"));
         }
+        #[cfg(target_arch = "x86_64")]
+        if self.padded.is_multiple_of(16) && avx512bw() {
+            // SAFETY: the CPU features were detected, and the length was checked above.
+            unsafe { self.scan_avx512(bytes, rows, qc2, cosine, cut, emit) };
+            return Ok(());
+        }
+        self.scan_blocks(bytes, rows, qc2, cosine, cut, emit);
+        Ok(())
+    }
+
+    /// [`Self::scan`] compiled for AVX-512, so the per-row arithmetic is vectorized 16 lanes
+    /// wide and the table kernel is inlined.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn scan_avx512(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        qc2: f32,
+        cosine: bool,
+        cut: &std::cell::Cell<f32>,
+        emit: &mut impl FnMut(usize, u32, &[f32; BLOCK], &[f32; BLOCK], u32),
+    ) {
+        self.scan_blocks(bytes, rows, qc2, cosine, cut, emit)
+    }
+
+    /// The body of [`Self::scan`]. The factors were checked once by [`check_factors`].
+    #[inline(always)]
+    fn scan_blocks(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        qc2: f32,
+        cosine: bool,
+        cut: &std::cell::Cell<f32>,
+        emit: &mut impl FnMut(usize, u32, &[f32; BLOCK], &[f32; BLOCK], u32),
+    ) {
+        let padded = self.padded;
         let (factors, codes) = bytes.split_at(16 * rows);
         let factor = |i: usize| factors[i * 4 * rows..(i + 1) * 4 * rows].as_chunks::<4>().0;
         let (squares, scales, errors, cbs) = (factor(0), factor(1), factor(2), factor(3));
@@ -383,38 +493,28 @@ impl FastQuery {
         };
         let width = padded / 8 * BLOCK;
         let mut sums = [0u32; BLOCK];
-        for (b, block) in codes.chunks_exact(width).enumerate() {
+        for (blk, block) in codes.chunks_exact(width).enumerate() {
             self.coarse.block_sums(padded, block, &mut sums);
-            let start = b * BLOCK;
+            let start = blk * BLOCK;
             let n = (rows - start).min(BLOCK);
-            // Padding rows get harmless factors (and are not emitted).
+            // Padding rows get zero factors (and are not emitted).
             let (mut sq, mut k1, mut k2, mut cb) =
                 ([0f32; BLOCK], [0f32; BLOCK], [0f32; BLOCK], [0f32; BLOCK]);
-            let rows_of = |column: &[[u8; 4]], out: &mut [f32; BLOCK]| {
-                for (o, b) in out.iter_mut().zip(&column[start..start + n]) {
-                    *o = f32::from_le_bytes(*b);
-                }
-            };
-            rows_of(squares, &mut sq);
-            rows_of(scales, &mut k1);
-            rows_of(errors, &mut k2);
-            rows_of(cbs, &mut cb);
+            rows_of(&squares[start..start + n], &mut sq);
+            rows_of(&scales[start..start + n], &mut k1);
+            rows_of(&errors[start..start + n], &mut k2);
+            rows_of(&cbs[start..start + n], &mut cb);
             let (mut distance, mut bound) = ([0f32; BLOCK], [0f32; BLOCK]);
-            let (mut bad, mut zero, mut near) = (false, 0u32, 0u32);
+            let (mut zero, mut near) = (0u32, 0u32);
             let cut = cut.get();
             for j in 0..BLOCK {
                 // A negative scale marks an all-zero input vector.
                 zero |= (k1[j].to_bits() >> 31) << j;
                 let k = k1[j].abs();
-                bad |= !((sq[j] >= 0.) & (sq[j] < f32::INFINITY) & (k < f32::INFINITY))
-                    | !((k2[j] >= 0.) & (k2[j] < f32::INFINITY) & (cb[j].abs() < f32::INFINITY));
                 let dot = sums[j] as f32 * scale + offset - cb[j];
                 distance[j] = ((sq[j] + qc2 - 2. * k * dot) * half).clamp(0., top);
                 bound[j] = (spread * k2[j] + 2. * k * coarse_error) * half;
                 near |= u32::from(distance[j] - bound[j] <= cut) << j;
-            }
-            if bad {
-                return Err(crate::format::bad("invalid quantization factors"));
             }
             let valid = if n == BLOCK {
                 u32::MAX
@@ -426,7 +526,6 @@ impl FastQuery {
                 emit(start, emitted, &distance, &bound, zero);
             }
         }
-        Ok(())
     }
 
     /// Table rounding at `step`: up to half a step per group, about uniform and independent,
@@ -737,6 +836,23 @@ mod tests {
                 .unwrap();
             }
             let fast = t.elapsed();
+            // With a cut no row passes, as for most blocks of a real query.
+            let t = std::time::Instant::now();
+            for b in &blocks_fast {
+                fq.scan(
+                    b,
+                    rows,
+                    1.0,
+                    true,
+                    &std::cell::Cell::new(f32::NEG_INFINITY),
+                    &mut |_, mask, _, _, _| acc += mask as f32,
+                )
+                .unwrap();
+            }
+            eprintln!(
+                "scan, nothing emitted {:.1} ns/row",
+                t.elapsed().as_nanos() as f64 / (rows * clusters) as f64
+            );
             let t = std::time::Instant::now();
             let mut sums = [0u32; BLOCK];
             let mut total = 0u32;

@@ -17,6 +17,8 @@ Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, stro
   [Iteration 20](#iteration-20-fewer-cycles-per-row-and-better-placed-rows-beir-nq-one-machine): `573 q/s` at recall@10
   `0.954` reclustered (54 probes, against main's `395 q/s` at `0.955` in the same interleaved run), `0.960` at the
   default 64 probes, and `387 q/s` as loaded (main `269`).
+  [Iteration 22](#iteration-22-the-fixed-costs-of-a-warm-vector-query-beir-nq-one-machine): 40% fewer instructions and
+  20% fewer cycles a query at the same recall@10 (`0.961`), and `574 q/s` against main's `509` on a shared VM.
 - **My own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; at 100M, still `"warm"` at `201 ms` after a day idle); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
 
 ## Scope and status
@@ -3362,3 +3364,112 @@ its temporary server logs and child processes on exit. Its warm output labels c1
 with `clients`; use each group separately when comparing timings. The exhaustive scorer takes
 the original corpus JSONL on stdin and the checked-in workload as its argument. Delete the
 corpus, stores, results, and other run artifacts after recording the measurements.
+
+## Iteration 22: the fixed costs of a warm vector query (BEIR NQ, one machine)
+
+This used the same workload, VM, and limits as [Iteration 21](#iteration-21-one-recluster-assignment-at-every-size-and-a-lighter-query-path-beir-nq-one-machine):
+the NQ store reclustered by main (32 cells, 13,391 leaves), the server pinned to CPUs 0-5, and 16 clients on CPUs 6-7.
+The goal was 1,000 q/s at recall@10 0.95 or more, against a design target of 5 vCPU-ms a query. I worked on the costs
+every query pays whatever it probes: request parsing, scan bookkeeping, center ranking, setup per slab, and hashing.
+There are no format changes.
+
+### Results
+
+Another worker's builds shared the VM, so the load average was 7 to 13 throughout and the server was never saturated.
+Wall-clock q/s moved by up to 15% between passes of the same binary. I report hardware counters from `perf stat` on the
+server process, divided by the queries served, which repeat within 0.2% (instructions) and about 3% (cycles). Each row is
+the mean of two interleaved rounds of two passes, after four warm-up passes.
+
+| Config | Recall@10 | Recall@100 (qrels) | Instructions per query | Cycles per query | q/s at 16 |
+|---|---:|---:|---:|---:|---:|
+| main, 64 probes | 0.961 | 0.937 | 25.5 M | 26.6 M | 509 |
+| branch, 64 probes (default) | 0.961 | 0.937 | **15.3 M** | **21.4 M** | 574 |
+| branch, 48 probes | 0.951 | 0.930 | 13.3 M | 17.6 M | 657 |
+
+The branch returns the same results as main (identical recall and nDCG). Instructions per query fell by 40%, and
+cycles by 20%. The cycle saving is smaller because the work that remains, the fast-scan kernel and memory traffic, runs
+at a lower IPC. Across all of this round's runs, branch q/s at 64 probes ranged from 533 to 697, and main's from 430 to 613.
+1-client latency at 64 probes was 4.3 / 7.8 / 11.2 ms p50 / p95 / p99 (iteration 21: 5.3 / 8.2 / 9.7 ms).
+
+**The gate is not met.** At 64 probes a query costs about 7 ms of CPU here (21.4 M cycles), so 6 saturated vCPUs top out
+near 850 q/s. At 48 probes (recall@10 0.951) it costs about 5.9 ms, or about 1,000 q/s with 6 vCPUs to itself, which this
+shared VM never gave the server. 5 vCPU-ms a query needs about 25% fewer cycles than the branch spends at 48 probes.
+
+### Recall against probes
+
+Reclustered NQ, branch (the same at main):
+
+| Probes | 40 | 44 | 48 | 52 | 56 | 60 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Recall@10 | 0.944 | 0.948 | 0.951 | 0.954 | 0.957 | 0.959 | 0.961 |
+| Recall@100 (qrels) | 0.927 | 0.929 | 0.930 | 0.933 | 0.935 | 0.936 | 0.937 |
+
+I kept the default at 64. 48 probes clears 0.95 on NQ, but the 100M layout measured 0.941 at 48 and 0.954 at 64
+([Iteration 18](#iteration-18-100m-warm-ann-under-150-ms-and-a-small-cold-manifest-read)), and the 200K `bench` ladder
+gives 0.94 at 64. Lowering it needs recall at 10M- and 100M-sized layouts first.
+
+### What changed
+
+- **A typed `rank_by` reader.** A plain `["vector", "ANN", [numbers]]` is read straight into `f32`s. Everything else
+  is rebuilt as a JSON value and goes through the old parser, and a test checks both readers agree on results and errors.
+  The re-serialized form prints each number in its shortest `f32` form, as before.
+- **Query bodies without path tracking.** axum's `Json` runs every value through `serde_path_to_error`. A body that
+  parses is now read with `serde_json` directly, and only a body that fails is parsed again through `Json`, so every
+  rejection is unchanged.
+- **Fast-scan bookkeeping.** The per-block distance and bound math runs 32 lanes at a time in AVX-512 code (the build
+  target is baseline x86-64, so the hot functions are compiled twice and chosen at run time). A cluster's quantization
+  factors are checked once, with its CRC, instead of on every block of every scan. Factor loads no longer call `memcpy`.
+- **Center ranking in one kernel.** A directory section's center dots run in one AVX-512 loop with the query's bit
+  planes held in registers (for 512 and 1,024 padded dimensions), bit-identical to the per-center dot.
+- **Probe picking on integers.** Candidates are `u64` keys (the distance in total order, then the entry), and each
+  probed segment takes its entries from the picked indices instead of filtering all of its entries through a hash set.
+- **Per-slab setup.** Each directory section builds its stub list once instead of on every query, row counts read the
+  checksum count instead of walking the row bitmap, and `BF_TRACE_STAGES` is read once.
+- **The scan memo key.** Every probed slab hashed the whole 1,024-value query vector with SipHash, and took the memo's
+  lock, even on warm queries where the memo is empty. The vector is now hashed once a query, with foldhash, and an
+  empty memo is skipped. Vector rank keys write their hex digits directly instead of through `format!`.
+
+### Profile (16 clients, reclustered, 64 probes)
+
+This profile is of the branch just before the center-ranking kernel, which then cut another 2.9 M instructions a query.
+
+| Area | Share of CPU |
+|---|---:|
+| Fast-scan kernel (`block_sums_avx512`) | 14.8% |
+| Fast-scan bookkeeping (`FastQuery::scan`) | 6.0% |
+| Center ranking (dots, then distances) | 8.8% |
+| JSON request parsing (the vector's numbers) | 4.2% |
+| `memcpy` (mostly block-cache reads that cross blocks) | about 4% |
+| Block-cache and decoded-cluster lookups | about 3% |
+| Rerank distances (`l2_squared`) | 2.9% |
+| Per-query table setup (`FastQuery::new`) | 1.7% |
+| Scan memo key (SipHash of the vector, per slab; now removed) | 1.4% |
+| Vector rank key (`format!` per value; now removed) | 1.3% |
+| Per-slab index stubs (build and drop) | 1.4% |
+
+Against iteration 21's profile, JSON parsing fell from about 5% (plus `serde_path_to_error`) to 4.2%, bookkeeping from
+8.5% to 6.0%, and table setup from 2.7% to 1.7%. The kernel's share grew because the total shrank; its cost did not change.
+
+### Checks
+
+- `cargo fmt`, workspace clippy with warnings denied, and `cargo test --workspace` (256 passed, 4 ignored) all pass,
+  including `read_cache::cold_ann_has_three_read_stages`. It failed once in a workspace run while an NQ server was also
+  running on the VM, and passed in 7 runs alone and in the final workspace run.
+- The compat suite passes 121/121.
+- Old indexes: every number above is the branch serving a store that main built and reclustered.
+- The `bench` ladder (768 dimensions, 64 probes, against main) gives the same recall at 10K, 50K, and 200K rows
+  (1.0, 1.0, and 0.94). With 300 queries each, warm ANN p50 was 0.67 / 1.61 / 3.65 ms against main's 0.83 / 2.50 / 4.04
+  ms, and p99 was no higher. The default 20-query runs were within their spread (cold open 0.6 to 3.7 ms on both).
+
+### Tried and dropped
+
+- **Two blocks per fast-scan kernel call**, sharing each table load. It was slower in isolation (8.5 against 6.1 ns a
+  row): the two blocks' accumulators did not fit in registers alongside the tables.
+- **An `f32` array `map` for factor loads** compiled to a call per block. A plain loop is vectorized.
+
+### What is left
+
+- The fast-scan kernel is now the largest cost (about 1 ms a query at 64 probes). Fewer clusters per query, from a
+  graph over leaf centers (`docs/design/graph-index.md`), is the next lever for both q/s and recall.
+- JSON parsing of the 1,024 numbers is still about 4%. Base64 vectors would skip it.
+- Each probed slab still builds and drops an index of stubs (about 1.4%), and cache lookups cost about 3%.

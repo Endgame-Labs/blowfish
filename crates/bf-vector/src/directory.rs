@@ -119,6 +119,32 @@ struct Section {
     membership: Range<u64>,
     /// Quantized codes live in the fragment, after each cluster's blob.
     codes_in_fragment: bool,
+    /// Every cluster's ranges, by cluster ID, for [`Directory::partial_index`] (built once).
+    stubs: std::sync::OnceLock<Vec<StubCluster>>,
+}
+impl Section {
+    fn stubs(&self) -> &[StubCluster] {
+        self.stubs.get_or_init(|| {
+            let mut stubs = vec![
+                StubCluster {
+                    codes: 0..0,
+                    vectors: 0..0,
+                    codes_crc: 0,
+                    vectors_crc: 0,
+                };
+                self.clusters
+            ];
+            for e in &self.entries {
+                stubs[e.cluster] = StubCluster {
+                    codes: e.codes.clone(),
+                    vectors: e.vectors.clone(),
+                    codes_crc: e.codes_crc,
+                    vectors_crc: e.vectors_crc,
+                };
+            }
+            stubs
+        })
+    }
 }
 
 /// A parsed directory. Cheap to share: entries and center codes stay resident.
@@ -285,6 +311,7 @@ impl Section {
             rows,
             membership,
             codes_in_fragment,
+            stubs: Default::default(),
         })
     }
 }
@@ -473,6 +500,7 @@ impl Fragment {
             rows: m.count,
             membership: member_start..member_start + member.len() as u64,
             codes_in_fragment: blocks_mode,
+            stubs: Default::default(),
         };
         let mut out = if blocks_mode {
             FRAG_MAGIC_BLOCKS.to_vec()
@@ -514,18 +542,22 @@ impl Fragment {
 /// each entry costs a few popcounts per 64 dimensions (512 at a time with AVX-512) rather than
 /// a table lookup per byte.
 fn section_distances(s: &Section, q: &[f64]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(s.entries.len());
+    section_distances_into(s, q, &mut out);
+    out
+}
+fn section_distances_into(s: &Section, q: &[f64], out: &mut Vec<f32>) {
     let padded = q.len();
     let plane = crate::rabitq::PlaneQuery::new(q, &s.centroid);
     let width = bit_bytes(padded);
-    s.entries
-        .iter()
-        .enumerate()
-        .map(|(n, e)| {
-            let dot = plane.dot(&s.bits[n * width..(n + 1) * width], padded);
-            let (norm, alpha) = (e.norm as f64, e.alpha as f64);
-            (plane.norm2 + norm * norm - 2. * norm * dot / alpha) as f32
-        })
-        .collect()
+    let start = out.len();
+    out.resize(start + s.entries.len(), 0.);
+    let distances = &mut out[start..];
+    plane.dots(&s.bits, width, s.entries.len(), padded, |n, dot| {
+        let e = &s.entries[n];
+        let (norm, alpha) = (e.norm as f64, e.alpha as f64);
+        distances[n] = (plane.norm2 + norm * norm - 2. * norm * dot / alpha) as f32;
+    });
 }
 
 impl Directory {
@@ -620,6 +652,12 @@ impl Directory {
             .first()
             .map(|s| s.shape)
             .ok_or_else(|| bad("empty directory"))?;
+        // Computed once here rather than by every query's plan.
+        let mut totals = vec![(0usize, 0usize); segments.len()];
+        for e in &entries {
+            totals[e.segment].0 += e.rows as usize;
+            totals[e.segment].1 += 1;
+        }
         Ok(Self {
             shape: Shape {
                 flat: false,
@@ -630,7 +668,7 @@ impl Directory {
             entries,
             rq: RaBitQ::new(shape.dims, shape.seed)?,
             metadata_len: bytes.len() as u64,
-            totals: None,
+            totals: Some(totals),
         })
     }
 
@@ -704,19 +742,22 @@ impl Directory {
                 "query rotated for another directory".into(),
             ));
         }
+        let mut out = Vec::with_capacity(self.entries.len());
         if !parallel {
-            return Ok(self
-                .sections
-                .iter()
-                .flat_map(|s| section_distances(s, q))
-                .collect());
+            for s in &self.sections {
+                section_distances_into(s, q, &mut out);
+            }
+            return Ok(out);
         }
         let per_segment: Vec<Vec<f32>> = self
             .sections
             .par_iter()
             .map(|s| section_distances(s, q))
             .collect();
-        Ok(per_segment.into_iter().flatten().collect())
+        for d in per_segment {
+            out.extend_from_slice(&d);
+        }
+        Ok(out)
     }
     /// [`Self::center_distances`], on this thread alone when `parallel` is false (a busy
     /// server gains nothing from fanning one query's ranking out over the rayon pool).
@@ -748,22 +789,7 @@ impl Directory {
         reader: R,
     ) -> Result<PartialIndex<R>> {
         let seg = &self.segments[segment];
-        let mut stubs: Vec<StubCluster> = (0..seg.clusters)
-            .map(|_| StubCluster {
-                codes: 0..0,
-                vectors: 0..0,
-                codes_crc: 0,
-                vectors_crc: 0,
-            })
-            .collect();
-        for e in &self.sections[segment].entries {
-            stubs[e.cluster] = StubCluster {
-                codes: e.codes.clone(),
-                vectors: e.vectors.clone(),
-                codes_crc: e.codes_crc,
-                vectors_crc: e.vectors_crc,
-            };
-        }
+        let stubs = self.sections[segment].stubs();
         let shape = Shape {
             flat: seg.flat,
             ..self.shape

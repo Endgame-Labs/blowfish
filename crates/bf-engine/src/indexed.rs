@@ -23,9 +23,14 @@ pub(crate) fn rank_key(rank: &RankBy) -> String {
             let mut key = String::with_capacity(attribute.len() + 12 + vector.len() * 8);
             let _ = write!(key, "~vector {exact} {}:", attribute.len());
             key.push_str(attribute);
-            for x in vector {
-                let _ = write!(key, "{:08x}", x.to_bits());
+            // `{:08x}` of each value's bits, without a formatter call per value.
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut hex = Vec::with_capacity(vector.len() * 8);
+            for x in vector.iter() {
+                let bits = x.to_bits();
+                hex.extend((0..8).rev().map(|n| HEX[(bits >> (n * 4)) as usize & 15]));
             }
+            key.push_str(std::str::from_utf8(&hex).expect("hex digits are ASCII"));
             key
         }
         _ => rank.value().to_string(),
@@ -776,4 +781,21 @@ async fn prepare_scalar(
     crate::sparse::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out);
     crate::pattern::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod rank_key_tests {
+    use super::*;
+
+    #[test]
+    fn vector_key_is_each_value_bits_in_hex() {
+        let vector = vec![0.0f32, -0.0, 1.5, -3.25e-7, f32::MAX, 7.0e-45];
+        let rank: RankBy =
+            serde_json::from_value(serde_json::json!(["vector", "ANN", vector])).unwrap();
+        let mut want = "~vector false 6:vector".to_string();
+        for x in &vector {
+            want += &format!("{:08x}", x.to_bits());
+        }
+        assert_eq!(rank_key(&rank), want);
+    }
 }

@@ -172,6 +172,8 @@ pub enum RankBy {
         attribute: String,
         exact: bool,
         vector: Vec<f32>,
+        /// The vector as sent, for [`RankBy::value`]. `Null` when it was a plain number array:
+        /// the request parser keeps only `vector` then, and `value` writes it back as numbers.
         wire_vector: Value,
     },
     /// Hosted embedding syntax is preserved so execution can return a clear 400.
@@ -404,9 +406,28 @@ impl RankBy {
             Self::Vector {
                 attribute,
                 exact,
+                vector,
                 wire_vector,
-                ..
-            } => json!([attribute, if *exact { "kNN" } else { "ANN" }, wire_vector]),
+            } => {
+                let wire = if wire_vector.is_null() {
+                    // Each f32's shortest decimal form, as the client most likely sent it
+                    // (`0.1`, not the widened `0.10000000149011612`).
+                    Value::Array(
+                        vector
+                            .iter()
+                            .map(|x| {
+                                serde_json::Number::from_f64(
+                                    x.to_string().parse().expect("f32 prints as f64"),
+                                )
+                                .map_or(Value::Null, Value::Number)
+                            })
+                            .collect(),
+                    )
+                } else {
+                    wire_vector.clone()
+                };
+                json!([attribute, if *exact { "kNN" } else { "ANN" }, wire])
+            }
             Self::UnsupportedEmbed {
                 attribute,
                 exact,
@@ -477,7 +498,247 @@ macro_rules! tuple_serde {
     };
 }
 tuple_serde!(Filter);
-tuple_serde!(RankBy);
+
+impl Serialize for RankBy {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.value().serialize(s)
+    }
+}
+/// A request's `rank_by`. A dense vector query (`[attr, "ANN" | "kNN", [numbers...]]`, nearly
+/// every query) is read straight into `f32`s, without a `serde_json::Value` per number; every
+/// other form is read as a `Value` and goes through [`RankBy::parse`], so both give the same
+/// results and errors.
+impl<'de> Deserialize<'de> for RankBy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(RankVisitor)
+    }
+}
+struct RankVisitor;
+impl RankVisitor {
+    fn parse<E: serde::de::Error>(v: Value) -> Result<RankBy, E> {
+        RankBy::parse(v).map_err(E::custom)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for RankVisitor {
+    type Value = RankBy;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a rank_by expression")
+    }
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<RankBy, E> {
+        Self::parse(Value::Bool(v))
+    }
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<RankBy, E> {
+        Self::parse(Value::from(v))
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<RankBy, E> {
+        Self::parse(Value::from(v))
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<RankBy, E> {
+        Self::parse(Value::from(v))
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<RankBy, E> {
+        Self::parse(Value::String(v.into()))
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<RankBy, E> {
+        Self::parse(Value::Null)
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<RankBy, E> {
+        Self::parse(Value::Null)
+    }
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<RankBy, D::Error> {
+        d.deserialize_any(self)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<RankBy, A::Error> {
+        Self::parse(Value::deserialize(
+            serde::de::value::MapAccessDeserializer::new(map),
+        )?)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<RankBy, A::Error> {
+        let mut items: Vec<Value> = Vec::with_capacity(3);
+        let rest = |mut items: Vec<Value>, mut seq: A| -> Result<RankBy, A::Error> {
+            while let Some(v) = seq.next_element::<Value>()? {
+                items.push(v);
+            }
+            Self::parse(Value::Array(items))
+        };
+        let Some(first) = seq.next_element::<Value>()? else {
+            return rest(items, seq);
+        };
+        let named = first.is_string();
+        items.push(first);
+        if !named {
+            return rest(items, seq);
+        }
+        let Some(second) = seq.next_element::<Value>()? else {
+            return rest(items, seq);
+        };
+        let exact = second == "kNN";
+        let vector = exact || second == "ANN";
+        items.push(second);
+        if !vector {
+            return rest(items, seq);
+        }
+        let Some(arg) = seq.next_element::<VectorArg>()? else {
+            return rest(items, seq);
+        };
+        let floats = match arg {
+            VectorArg::Floats(floats) => floats,
+            VectorArg::Other(v) => {
+                items.push(v);
+                return rest(items, seq);
+            }
+        };
+        match seq.next_element::<Value>()? {
+            // Within `check_expression`'s node limit, a plain number array parses exactly as
+            // `RankBy::parse` would: the tuple has three elements, and `decode_vector`'s checks.
+            None if floats.len() <= MAX_FAST_VECTOR => {
+                let Value::String(attribute) = items.swap_remove(0) else {
+                    unreachable!("checked above")
+                };
+                let vector = crate::check_vector(floats).map_err(serde::de::Error::custom)?;
+                Ok(RankBy::Vector {
+                    attribute,
+                    exact,
+                    vector,
+                    wire_vector: Value::Null,
+                })
+            }
+            extra => {
+                items.push(json!(floats));
+                items.extend(extra);
+                rest(items, seq)
+            }
+        }
+    }
+}
+/// The longest number array the fast path takes; a longer one goes through `check_expression`
+/// (and fails its node limit there, as it always has).
+const MAX_FAST_VECTOR: usize = 65_000;
+
+/// The third element of a vector rank tuple: numbers read as `f32` (through `f64`, as
+/// `decode_vector` reads them), or anything else as a `Value`.
+enum VectorArg {
+    Floats(Vec<f32>),
+    Other(Value),
+}
+impl<'de> Deserialize<'de> for VectorArg {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = VectorArg;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a vector")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<VectorArg, A::Error> {
+                let mut floats = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+                loop {
+                    match seq.next_element::<Element>()? {
+                        None => return Ok(VectorArg::Floats(floats)),
+                        Some(Element::Number(x)) => floats.push(x as f32),
+                        Some(Element::Other(v)) => {
+                            // Not a plain number array (a multi-vector, an `Embed` call, or an
+                            // error): keep it whole for `RankBy::parse`. Numbers before this
+                            // element only matter to an error message, so `f32` is close enough.
+                            let mut all: Vec<Value> = floats.iter().map(|x| json!(x)).collect();
+                            all.push(v);
+                            while let Some(v) = seq.next_element::<Value>()? {
+                                all.push(v);
+                            }
+                            return Ok(VectorArg::Other(Value::Array(all)));
+                        }
+                    }
+                }
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<VectorArg, E> {
+                Ok(VectorArg::Other(Value::String(v.into())))
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<VectorArg, E> {
+                Ok(VectorArg::Other(Value::Bool(v)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<VectorArg, E> {
+                Ok(VectorArg::Other(Value::from(v)))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<VectorArg, E> {
+                Ok(VectorArg::Other(Value::from(v)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<VectorArg, E> {
+                Ok(VectorArg::Other(Value::from(v)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<VectorArg, E> {
+                Ok(VectorArg::Other(Value::Null))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<VectorArg, E> {
+                Ok(VectorArg::Other(Value::Null))
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<VectorArg, D::Error> {
+                d.deserialize_any(self)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<VectorArg, A::Error> {
+                Ok(VectorArg::Other(Value::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+/// One element of a vector array: a number, or anything else as a `Value`.
+enum Element {
+    Number(f64),
+    Other(Value),
+}
+impl<'de> Deserialize<'de> for Element {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Element;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a vector element")
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Element, E> {
+                Ok(Element::Number(v))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Element, E> {
+                Ok(Element::Number(v as f64))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Element, E> {
+                Ok(Element::Number(v as f64))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Element, E> {
+                Ok(Element::Other(Value::String(v.into())))
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Element, E> {
+                Ok(Element::Other(Value::Bool(v)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Element, E> {
+                Ok(Element::Other(Value::Null))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Element, E> {
+                Ok(Element::Other(Value::Null))
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Element, D::Error> {
+                d.deserialize_any(self)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Element, A::Error> {
+                Ok(Element::Other(Value::deserialize(
+                    serde::de::value::SeqAccessDeserializer::new(seq),
+                )?))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Element, A::Error> {
+                Ok(Element::Other(Value::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
 
 /// A named aggregation function.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -567,5 +828,77 @@ impl From<GroupBy> for Value {
                 json!({label:["ForEachUnique",attribute]})
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The direct reader and `RankBy::parse` agree on every input, valid or not.
+    #[test]
+    fn rank_by_reader_matches_parse() {
+        let long: Vec<f32> = (0..65_100).map(|i| i as f32).collect();
+        let cases = [
+            json!(["vector", "ANN", [0.1, 0.2, -3, 4e-3, 1e10]]),
+            json!(["vector", "kNN", [1, 2, 3]]),
+            json!(["vector", "ANN", "AACAPwAAAAA="]),
+            json!(["vector", "ANN", []]),
+            json!(["vector", "ANN", [1, "x"]]),
+            json!(["vector", "ANN", [1, null]]),
+            json!(["vector", "ANN", [1e300, 2]]),
+            json!(["vector", "ANN", [[1, 2], [3, 4]]]),
+            json!(["vector", "ANN", ["Embed", {"text": "hi"}]]),
+            json!(["vector", "ANN", [1, 2], 3]),
+            json!(["vector", "ANN"]),
+            json!(["vector", "ANN", 5]),
+            json!(["vector", "ANN", {"a": 1}]),
+            json!(["vector", "ANN", long]),
+            json!(["text", "BM25", "hello"]),
+            json!(["Sum", [["text", "BM25", "a"], ["vector", "ANN", [1, 2]]]]),
+            json!(["Product", 2, ["text", "BM25", "a"]]),
+            json!([["a", "asc"], ["b", "desc"]]),
+            json!(["a", "desc"]),
+            json!([]),
+            json!([1]),
+            json!(1.5),
+            json!("x"),
+            json!({"a": 1}),
+            json!(true),
+        ];
+        for case in cases {
+            let text = case.to_string();
+            let read = serde_json::from_str::<RankBy>(&text).map_err(|e| e.to_string());
+            let parsed = RankBy::parse(case.clone()).map_err(|e| e.to_string());
+            match (&read, &parsed) {
+                (Ok(a), Ok(b)) => {
+                    // The direct reader drops the wire copy of a number array.
+                    let strip = |r: &RankBy| match r.clone() {
+                        RankBy::Vector {
+                            attribute,
+                            exact,
+                            vector,
+                            wire_vector,
+                        } => RankBy::Vector {
+                            attribute,
+                            exact,
+                            vector,
+                            wire_vector: if wire_vector.is_array() {
+                                Value::Null
+                            } else {
+                                wire_vector
+                            },
+                        },
+                        other => other,
+                    };
+                    assert_eq!(strip(a), strip(b), "{text:.200}");
+                }
+                (Err(a), Err(b)) => assert!(a.contains(b.as_str()), "{a} / {b}"),
+                _ => panic!("{text:.200}: {read:?} against {parsed:?}"),
+            }
+        }
+        // A number array is written back in its shortest form.
+        let read: RankBy = serde_json::from_str(r#"["v","ANN",[0.1,0.25]]"#).unwrap();
+        assert_eq!(read.value(), json!(["v", "ANN", [0.1, 0.25]]));
     }
 }
