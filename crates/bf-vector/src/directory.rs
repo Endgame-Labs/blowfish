@@ -119,6 +119,32 @@ struct Section {
     membership: Range<u64>,
     /// Quantized codes live in the fragment, after each cluster's blob.
     codes_in_fragment: bool,
+    /// Every cluster's ranges, by cluster ID, for [`Directory::partial_index`] (built once).
+    stubs: std::sync::OnceLock<Vec<StubCluster>>,
+}
+impl Section {
+    fn stubs(&self) -> &[StubCluster] {
+        self.stubs.get_or_init(|| {
+            let mut stubs = vec![
+                StubCluster {
+                    codes: 0..0,
+                    vectors: 0..0,
+                    codes_crc: 0,
+                    vectors_crc: 0,
+                };
+                self.clusters
+            ];
+            for e in &self.entries {
+                stubs[e.cluster] = StubCluster {
+                    codes: e.codes.clone(),
+                    vectors: e.vectors.clone(),
+                    codes_crc: e.codes_crc,
+                    vectors_crc: e.vectors_crc,
+                };
+            }
+            stubs
+        })
+    }
 }
 
 /// A parsed directory. Cheap to share: entries and center codes stay resident.
@@ -285,6 +311,7 @@ impl Section {
             rows,
             membership,
             codes_in_fragment,
+            stubs: Default::default(),
         })
     }
 }
@@ -473,6 +500,7 @@ impl Fragment {
             rows: m.count,
             membership: member_start..member_start + member.len() as u64,
             codes_in_fragment: blocks_mode,
+            stubs: Default::default(),
         };
         let mut out = if blocks_mode {
             FRAG_MAGIC_BLOCKS.to_vec()
@@ -758,22 +786,7 @@ impl Directory {
         reader: R,
     ) -> Result<PartialIndex<R>> {
         let seg = &self.segments[segment];
-        let mut stubs: Vec<StubCluster> = (0..seg.clusters)
-            .map(|_| StubCluster {
-                codes: 0..0,
-                vectors: 0..0,
-                codes_crc: 0,
-                vectors_crc: 0,
-            })
-            .collect();
-        for e in &self.sections[segment].entries {
-            stubs[e.cluster] = StubCluster {
-                codes: e.codes.clone(),
-                vectors: e.vectors.clone(),
-                codes_crc: e.codes_crc,
-                vectors_crc: e.vectors_crc,
-            };
-        }
+        let stubs = self.sections[segment].stubs();
         let shape = Shape {
             flat: seg.flat,
             ..self.shape

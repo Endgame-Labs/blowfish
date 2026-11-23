@@ -54,6 +54,22 @@ pub(crate) fn check_factors(bytes: &[u8], rows: usize, padded: usize) -> crate::
     Ok(())
 }
 
+/// Load one block's factor column (up to [`BLOCK`] rows; the rest stay zero). Inlined, so it is
+/// compiled with its caller's target features; a full block loads a fixed-size array rather
+/// than calling `memcpy`.
+#[inline(always)]
+fn rows_of(column: &[[u8; 4]], out: &mut [f32; BLOCK]) {
+    if let Ok(full) = <&[[u8; 4]; BLOCK]>::try_from(column) {
+        for (o, b) in out.iter_mut().zip(full) {
+            *o = f32::from_le_bytes(*b);
+        }
+    } else {
+        for (o, b) in out.iter_mut().zip(column) {
+            *o = f32::from_le_bytes(*b);
+        }
+    }
+}
+
 /// One row's code: its sign bits and the factors its estimate needs.
 pub(crate) struct RowCode {
     /// `padded / 8` bytes, least significant bit first.
@@ -484,21 +500,10 @@ impl FastQuery {
             // Padding rows get zero factors (and are not emitted).
             let (mut sq, mut k1, mut k2, mut cb) =
                 ([0f32; BLOCK], [0f32; BLOCK], [0f32; BLOCK], [0f32; BLOCK]);
-            let rows_of = |column: &[[u8; 4]], out: &mut [f32; BLOCK]| {
-                let column = &column[start..start + n];
-                // A full block converts a fixed-size array (vector loads, not a `memcpy` call).
-                if let Ok(full) = <&[[u8; 4]; BLOCK]>::try_from(column) {
-                    *out = full.map(f32::from_le_bytes);
-                } else {
-                    for (o, b) in out.iter_mut().zip(column) {
-                        *o = f32::from_le_bytes(*b);
-                    }
-                }
-            };
-            rows_of(squares, &mut sq);
-            rows_of(scales, &mut k1);
-            rows_of(errors, &mut k2);
-            rows_of(cbs, &mut cb);
+            rows_of(&squares[start..start + n], &mut sq);
+            rows_of(&scales[start..start + n], &mut k1);
+            rows_of(&errors[start..start + n], &mut k2);
+            rows_of(&cbs[start..start + n], &mut cb);
             let (mut distance, mut bound) = ([0f32; BLOCK], [0f32; BLOCK]);
             let (mut zero, mut near) = (0u32, 0u32);
             let cut = cut.get();

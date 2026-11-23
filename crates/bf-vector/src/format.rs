@@ -55,6 +55,13 @@ pub(crate) struct ClusterData {
     pub codes_checked: std::sync::atomic::AtomicBool,
 }
 
+impl ClusterData {
+    /// Rows in the cluster: one checksum per row, so no walk over the bitmap's containers.
+    pub fn len(&self) -> usize {
+        self.row_crcs.len()
+    }
+}
+
 pub(crate) struct Cluster {
     /// `None` for a stub (a directory cluster not installed): reads see an empty payload.
     pub data: Option<Arc<ClusterData>>,
