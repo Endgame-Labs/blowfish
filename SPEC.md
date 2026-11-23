@@ -89,8 +89,9 @@ log entry in the same commit.
 - **Spatial slabs** (round 12): `recluster` partitions a namespace into slabs of small leaves, so a cold query reads a
   few contiguous ranges instead of every segment's clusters. Unfiltered ANN uses slabs only while they cover exactly
   the live segments; `BF_ANN_SLABS=0` turns them off.
-- **No graph indexes** (HNSW, DiskANN, and similar). The peak-jumping research ruled them out for a cold,
-  object-storage-first engine: their random hops each cost an object-store round trip.
+- **No row-level graph indexes** (HNSW, DiskANN, and similar over rows). The peak-jumping research ruled them out for a
+  cold, object-storage-first engine: their random hops each cost an object-store round trip. A graph over leaf centers,
+  held with the paged directory, is allowed (decision 26; `docs/design/graph-index.md`).
 - **BM25** (round 13): window-pruned posting reads (exact, not approximate), the term record stored before its
   blocks (text segment format v4), and text headers in the manifest. Result quality is checked as overlap@10 against
   exact BM25 (k1 1.2, b 0.75).
@@ -101,7 +102,7 @@ log entry in the same commit.
 **Proposed.**
 
 - Recluster runs by hand (`examples/recluster.rs`). New segments written after a recluster are not covered by slabs
-  until the next one.
+  until the next one. Decided 2026-11-23: recluster becomes automatic and on by default (see Open).
 - **Paged slab directory** (iteration 17): once a recluster's directory lists 100,000 or more clusters it also writes a
   paged copy (a small resident header with one one-bit code per cell of about 24 neighboring clusters, then one page per
   cell). A cold query reads the header (in the manifest's wave, from a hint object) and only the pages of the cells it
@@ -119,7 +120,11 @@ log entry in the same commit.
 
 **Open.**
 
-- Automatic recluster, slabs that cover new segments, and filtered ANN on slabs.
+- **Automatic recluster (decided 2026-11-23, not built):** the indexer reclusters a namespace in the background when
+  its layout would gain from it (enough independently built segments, or enough rows outside its slabs), within the
+  engine's memory budget. It is always on: there is no setting to turn it off and no manual-only mode. A namespace
+  never waits on it: queries use the current layout until the new one is published.
+- Slabs that cover new segments, and filtered ANN on slabs.
 - A split manifest (a small root plus lazily read segment lists) would shrink the cold ANN read further than the compact copy's 375 KB; text-header reads on a namespace with a compact copy cost one more round trip.
 - Storage cache sizing reads only the root cgroup's `memory.max`, while the engine reads the process's own cgroup;
   make the storage cache follow the engine. Planned for v0.1.14 (Kyle, 2026-11-20).
@@ -228,3 +233,19 @@ S3 until the run is cleaned up.
     `{"status":"🐡"}`. Unify cgroup memory detection in v0.1.14, not v0.1.13.
 20. 2026-11-20: Support Docker on Apple Silicon and native macOS builds; CI builds the image on x86_64 and arm64 and
     tests natively on macOS (issue #1).
+21. 2026-11-23: Recluster runs automatically in the background, always on ("if we have a better algo it should be
+    the default").
+22. 2026-11-23: Release v0.1.14 once the index upgrade path (`blowfish reindex`) and iteration 21 are merged and CI is
+    green. After that, the coordinator cuts releases when it judges a release worthwhile ("the code is yours, release as
+    appropriate").
+23. 2026-11-23: Rerun the 10M and 100M in-region AWS benchmarks with the fast-scan layout, at most about $40 in total,
+    terminating instances when done.
+24. 2026-11-23: Keep improving every area in rotation: disk footprint (vectors stored twice), BM25 and hybrid speed,
+    a graph index to compete with Qdrant (design doc first), and ingest throughput.
+25. 2026-11-23: One way to do each thing. When an approach is better, it becomes the only one: no settings that select
+    an inferior algorithm or layout, and no code kept to maintain one ("we don't need to keep around or maintain inferior
+    approaches. it makes things too complex"). Older on-disk formats are read only so they can be upgraded, and the
+    upgrade happens automatically; there is no supported path back to an older format.
+26. 2026-11-23: Work toward Qdrant's throughput with a graph over leaf centers, not over rows, after cutting fixed
+    per-query cost (`docs/design/graph-index.md`). Before any change to the manifest or bucket format, ship a format
+    fence so older binaries can't rewrite or garbage-collect an upgraded bucket (`docs/design/simplify.md`).
