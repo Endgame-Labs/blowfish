@@ -101,7 +101,7 @@ log entry in the same commit.
 **Proposed.**
 
 - Recluster runs by hand (`examples/recluster.rs`). New segments written after a recluster are not covered by slabs
-  until the next one.
+  until the next one. Decided 2026-11-23: recluster becomes automatic and on by default (see Open).
 - **Paged slab directory** (iteration 17): once a recluster's directory lists 100,000 or more clusters it also writes a
   paged copy (a small resident header with one one-bit code per cell of about 24 neighboring clusters, then one page per
   cell). A cold query reads the header (in the manifest's wave, from a hint object) and only the pages of the cells it
@@ -119,7 +119,11 @@ log entry in the same commit.
 
 **Open.**
 
-- Automatic recluster, slabs that cover new segments, and filtered ANN on slabs.
+- **Automatic recluster (decided 2026-11-23, not built):** the indexer reclusters a namespace in the background when
+  its layout would gain from it (enough independently built segments, or enough rows outside its slabs), within the
+  engine's memory budget, and on by default, with a setting to turn it off. A namespace never waits on it: queries use
+  the current layout until the new one is published.
+- Slabs that cover new segments, and filtered ANN on slabs.
 - A split manifest (a small root plus lazily read segment lists) would shrink the cold ANN read further than the compact copy's 375 KB; text-header reads on a namespace with a compact copy cost one more round trip.
 - Storage cache sizing reads only the root cgroup's `memory.max`, while the engine reads the process's own cgroup;
   make the storage cache follow the engine. Planned for v0.1.14 (Kyle, 2026-11-20).
@@ -228,3 +232,12 @@ S3 until the run is cleaned up.
     `{"status":"🐡"}`. Unify cgroup memory detection in v0.1.14, not v0.1.13.
 20. 2026-11-20: Support Docker on Apple Silicon and native macOS builds; CI builds the image on x86_64 and arm64 and
     tests natively on macOS (issue #1).
+21. 2026-11-23: Recluster runs automatically in the background, on by default with an off switch ("if we have a better
+    algo we should use it").
+22. 2026-11-23: Release v0.1.14 once the index upgrade path (`blowfish reindex`) and iteration 21 are merged and CI is
+    green. After that, the coordinator cuts releases when it judges a release worthwhile ("the code is yours, release as
+    appropriate").
+23. 2026-11-23: Rerun the 10M and 100M in-region AWS benchmarks with the fast-scan layout, at most about $40 in total,
+    terminating instances when done.
+24. 2026-11-23: Keep improving every area in rotation: disk footprint (vectors stored twice), BM25 and hybrid speed,
+    a graph index to compete with Qdrant (design doc first), and ingest throughput.
