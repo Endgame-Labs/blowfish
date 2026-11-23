@@ -307,3 +307,65 @@ mod tests {
         super::imp::set_decay_ms(1_000);
     }
 }
+
+/// Memory this process may use, in bytes: the host's RAM or its cgroup's limit, whichever is
+/// smaller. On Linux the process's own cgroup (a systemd scope or a container) wins over the root
+/// file; macOS reads `hw.memsize`. Every memory-sized default reads this one function, and it
+/// assumes 4 GiB when nothing can be read.
+pub fn memory_limit_bytes() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let host = host_memory_bytes().unwrap_or(4 << 30);
+        cgroup_limit_bytes().map_or(host, |limit| host.min(limit))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn host_memory_bytes() -> Option<u64> {
+    let out = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = meminfo.lines().find_map(|l| {
+        l.strip_prefix("MemTotal:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })?;
+    Some(kb.saturating_mul(1024))
+}
+
+fn cgroup_limit_bytes() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("0::").map(str::to_string))
+        })
+        .and_then(|path| {
+            std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.max", path.trim_end())).ok()
+        });
+    own.or_else(|| std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+#[cfg(test)]
+mod memory_tests {
+    #[test]
+    fn memory_limit_reads_the_host() {
+        let limit = super::memory_limit_bytes();
+        assert!(limit >= 64 << 20, "implausible memory limit {limit}");
+        assert!(
+            super::host_memory_bytes().is_some(),
+            "host RAM unreadable on this OS"
+        );
+        assert!(limit <= super::host_memory_bytes().unwrap());
+    }
+}

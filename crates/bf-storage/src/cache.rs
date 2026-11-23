@@ -53,26 +53,10 @@ pub struct CacheConfig {
 }
 impl Default for CacheConfig {
     fn default() -> Self {
-        // Respect Linux container limits as well as host RAM. Portable fallback: 1 GiB.
-        let host = std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|s| {
-                s.lines().find_map(|l| {
-                    l.strip_prefix("MemTotal:")?
-                        .split_whitespace()
-                        .next()?
-                        .parse::<u64>()
-                        .ok()
-                })
-            })
-            .map(|kb| kb.saturating_mul(1024))
-            .unwrap_or(4 << 30);
-        let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(host);
+        // The host or cgroup limit, the same reading the engine uses.
+        let limit = bf_alloc::memory_limit_bytes();
         Self {
-            memory_bytes: (host.min(limit) / 4).min(8 << 30),
+            memory_bytes: (limit / 4).min(8 << 30),
             disk_bytes: 64 << 30,
             disk_dir: None,
             namespace: None,

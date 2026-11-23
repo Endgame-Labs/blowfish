@@ -113,11 +113,11 @@ directory clusters (a quarter), and decoded document column blocks (a twelfth). 
 
 `blowfish serve` reads every `BF_*` engine variable above, plus `BF_INDEX_BYTES`, `BF_MAX_SEGMENT_BYTES`, `BF_BULK_FLUSH_AGE_MS`, `BF_WAL_PIPELINE`, `BF_RETENTION_SECS`, `BF_ANN_RERANK`, `BF_EXACT_FETCH`, and `BF_FILTER_PROBE_CAP`. CLI flags and TOML keys take precedence over them. `BF_BULK_FLUSH_BYTES` follows `max_unindexed_bytes` (three quarters of it) unless set explicitly.
 
-Note on cgroup detection: `bf-engine` reads the process's own cgroup (`/proc/self/cgroup` -> `/sys/fs/cgroup<path>/memory.max`) before falling back to `/sys/fs/cgroup/memory.max`, whereas `storage.cache.memory_bytes` reads `/sys/fs/cgroup/memory.max` only. Under a nested systemd scope, set `storage.cache.memory_bytes` explicitly if you want it sized to the scope limit rather than host RAM.
+Memory detection: every memory-sized default, the block cache included, reads one limit: the smaller of host RAM and the process's own cgroup (`/proc/self/cgroup` -> `/sys/fs/cgroup<path>/memory.max`, then `/sys/fs/cgroup/memory.max`). On macOS host RAM comes from `hw.memsize`. When nothing can be read it assumes 4 GiB.
 
 The row caps assume 1,024-dimension vectors. Builds and compactions keep vectors packed at their stored precision (2 KB per f16 row)
 and normalize on the fly, compaction and `recluster` reads bypass the in-memory block cache, and the text statistics object is
-merged by streaming, so none of these terms grows with the namespace. `examples/recluster.rs` sizes `max_slab_rows` from `/proc/meminfo` at 12 KB per row, clamped to 50,000–700,000
+merged by streaming, so none of these terms grows with the namespace. `examples/recluster.rs` sizes `max_slab_rows` from the same memory limit at 12 KB per row, clamped to 50,000–700,000
 (about 350,000 on a 4 GB machine). Diagnostics:
 `BF_MEM_LOG_SECS=N` prints allocator and RSS statistics every N seconds, `/metrics` exposes
 `blowfish_alloc_bytes{kind}` (allocated, active, resident, and retained), and a build with `--features heap-profile` writes jemalloc

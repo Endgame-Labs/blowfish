@@ -126,10 +126,6 @@ log entry in the same commit.
   never waits on it: queries use the current layout until the new one is published.
 - Slabs that cover new segments, and filtered ANN on slabs.
 - A split manifest (a small root plus lazily read segment lists) would shrink the cold ANN read further than the compact copy's 375 KB; text-header reads on a namespace with a compact copy cost one more round trip.
-- Storage cache sizing reads only the root cgroup's `memory.max`, while the engine reads the process's own cgroup;
-  make the storage cache follow the engine. Planned for v0.1.14 (Kyle, 2026-11-20).
-- Memory sizing on macOS: there is no `/proc/meminfo`, so memory-sized defaults assume 4 GB. Read `hw.memsize` there,
-  in the same shared function as the cgroup fix (v0.1.14).
 - BM25: fold term records into dictionary reads, store document lengths in blocks, and a namespace-wide text
   dictionary.
 - The text statistics object, ANN directories, and manifest are still rewritten whole on each publish. Fine at 10M;

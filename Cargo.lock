@@ -314,6 +314,7 @@ name = "bf-storage"
 version = "0.1.13"
 dependencies = [
  "async-trait",
+ "bf-alloc",
  "bytes",
  "chrono",
  "crc32fast",

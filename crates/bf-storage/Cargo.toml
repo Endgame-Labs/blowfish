@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 async-trait = "0.1.92"
 metrics = "=0.24.6"
+bf-alloc = { path = "../bf-alloc" }
 moka = { version = "=0.12.16", features = ["sync"] }
 sha2 = "=0.11.1"
 crc32fast = "=1.5.5"

@@ -63,15 +63,14 @@ WantedBy=multi-user.target
 ```
 
 Set `storage.cache.disk_dir` under `/var/lib/blowfish`. blowfish links jemalloc and sizes its
-memory-sensitive defaults from host RAM or cgroup `memory.max` (see [configuration](configuration.md)):
+memory-sensitive defaults from host RAM or the process's cgroup `memory.max` (`hw.memsize` on macOS; see [configuration](configuration.md)):
 unindexed WAL backpressure (`limit / 8`, 128 MiB to 2 GB), decoded metadata cache (`limit / 8`,
 512 MiB to 4 GiB), memory block cache (`limit / 4`, up to 8 GiB), segment row cap, and build
 concurrency. jemalloc switches adaptively between a 1 s page decay during writes, segment builds,
 compactions, and `recluster` and a 30 s decay while only queries run. On a 4 GB `c7gd.large`
-with swap off, a 10M-row load plus `recluster` peaks at 2.3–2.9 GB RSS. Because `storage.cache.memory_bytes`
-reads `/sys/fs/cgroup/memory.max` rather than nested systemd scope limits, set explicit memory and
-disk cache budgets under systemd (for example, a 1 GiB memory cache and a 32 GiB disk cache on a
-shared host). The process limit covers more than the byte cache: decoded indexes, document state,
+with swap off, a 10M-row load plus `recluster` peaks at 2.3–2.9 GB RSS. The engine and the block cache read the same
+limit, including a nested systemd scope's, so set explicit cache budgets only when the host is shared with other
+services (for example, a 1 GiB memory cache and a 32 GiB disk cache). The process limit covers more than the byte cache: decoded indexes, document state,
 requests, and background work also consume memory. Tune WAL backpressure and concurrency for the
 workload; hitting `MemoryMax` can kill the process. On `429` backpressure and `503` transient
 storage errors, blowfish emits `Retry-After`, `retry-after-ms`, and `x-should-retry` headers so

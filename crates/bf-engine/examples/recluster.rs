@@ -43,17 +43,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// packed f16 rows, the blob being built, and the previous slab's blob still uploading), within
 /// 50,000 to 700,000. A 4 GB machine gets about 350,000 rows, which keeps the builder near 2.4 GB.
 fn default_slab_rows() -> usize {
-    let kb = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines().find_map(|l| {
-                l.strip_prefix("MemTotal:")?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<u64>()
-                    .ok()
-            })
-        })
-        .unwrap_or(4 << 20);
-    ((kb * 1024 / 12_000) as usize).clamp(50_000, 700_000)
+    ((bf_alloc::memory_limit_bytes() / 12_000) as usize).clamp(50_000, 700_000)
 }

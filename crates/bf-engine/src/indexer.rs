@@ -82,35 +82,8 @@ pub struct EngineConfig {
     /// Embedding and reranking models. Without them, `Embed` and model `rerank_by` return a 400.
     pub models: Option<std::sync::Arc<bf_models::Models>>,
 }
-/// Memory this process may use: host RAM or the cgroup limit, whichever is smaller (4 GiB if unknown).
 fn memory_limit_bytes() -> u64 {
-    let host = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines().find_map(|l| {
-                l.strip_prefix("MemTotal:")?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<u64>()
-                    .ok()
-            })
-        })
-        .map_or(4 << 30, |kb| kb.saturating_mul(1024));
-    // The process's own cgroup (a systemd scope or a container) first, then the root file.
-    let own = std::fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("0::").map(str::to_string))
-        })
-        .and_then(|path| {
-            std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.max", path.trim_end())).ok()
-        });
-    let limit = own
-        .or_else(|| std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(host);
-    host.min(limit)
+    bf_alloc::memory_limit_bytes()
 }
 /// An eighth of the memory this process may use, within 512 MiB to 4 GiB. Entries are charged at
 /// their resident size, so this bounds real memory.
