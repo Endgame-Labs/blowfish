@@ -71,6 +71,11 @@ def main():
     p.add_argument(
         "--skip", type=int, default=0, help="start at this row (rewrite the rows after it, as updates)"
     )
+    p.add_argument(
+        "--title-suffix",
+        default="",
+        help="append this to every title, so rewritten rows differ (identical upserts are no-ops)",
+    )
     a = p.parse_args()
     path = f"/v2/namespaces/{a.namespace}"
     vecs = np.load(a.data / "corpus.f16", mmap_mode="r")
@@ -109,7 +114,7 @@ def main():
             v = np.asarray(vecs[row : row + n], dtype="<f4")
             cols = {"id": list(range(row, row + n)), "vector": [base64.b64encode(x.tobytes()).decode() for x in v]}
             if f is not None:
-                cols["title"] = batch.column("title").to_pylist()[:n]
+                cols["title"] = [t + a.title_suffix for t in batch.column("title").to_pylist()[:n]]
                 cols["text"] = batch.column("text").to_pylist()[:n]
             body = {"upsert_columns": cols}
             if first and not a.skip:

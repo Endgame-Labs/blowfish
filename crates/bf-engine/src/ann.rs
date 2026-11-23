@@ -621,6 +621,12 @@ async fn from_tiers(
     Ok(Some((scores, docs)))
 }
 
+/// Live-row masks of recluster tiers whose covered segments changed since the build, by tier
+/// directory and the changed segments' live objects.
+static TIER_MASKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<RoaringBitmap>>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Unfiltered ANN from one tier's slabs: the same directory search, over slabs as pseudo
 /// segments, with winners mapped back to their segments (at `at` among the live segments) for
 /// hydration.
@@ -650,8 +656,27 @@ async fn from_slabs(
     let changed: Vec<usize> = (0..set.covered.len())
         .filter(|p| state.segments[at[*p]].live_generation != set.covered[*p].live_generation)
         .collect();
+    // The mask depends only on the tier and the changed segments' live objects, which are
+    // immutable: build it once, not on every query.
+    let mask_key = (!changed.is_empty()).then(|| {
+        let mut key = set.dir.key.clone();
+        for p in &changed {
+            key.push('|');
+            key.push_str(&state.segments[at[*p]].live.key);
+        }
+        key
+    });
+    let cached = mask_key.as_ref().and_then(|key| {
+        TIER_MASKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    });
     let mask = if changed.is_empty() {
         None
+    } else if cached.is_some() {
+        cached
     } else {
         let mut mask = RoaringBitmap::new();
         let loaded = futures::future::try_join_all(
@@ -672,7 +697,16 @@ async fn from_slabs(
                 mask.insert_range(c.base..c.base + c.rows);
             }
         }
-        Some(Arc::new(mask))
+        let mask = Arc::new(mask);
+        if let Some(key) = mask_key {
+            let mut masks = TIER_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+            // A few tiers' current masks; older generations are dropped wholesale.
+            if masks.len() >= 16 {
+                masks.clear();
+            }
+            masks.insert(key, mask.clone());
+        }
+        Some(mask)
     };
     if crate::ann::trace_stages() {
         eprintln!(

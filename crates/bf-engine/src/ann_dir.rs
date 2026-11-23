@@ -691,6 +691,29 @@ fn layout_spread(
     )
 }
 
+/// The probe share of segments searched beside a recluster tier (the ones not `skipped`).
+///
+/// `probe_count` sizes a probe for the rows it is given as if they were the whole namespace:
+/// about `ann_nprobe` times the square root of their count. One clustering of all the rows would
+/// reach these rows in proportion to their share of them, so a query of the whole namespace
+/// probes `sqrt(rows / all rows)` of that here (1 when nothing is skipped). The tier answers for
+/// the rest.
+fn tier_share(dir: &Directory, seg_rows: &[usize], skipped: &dyn Fn(usize) -> bool) -> f64 {
+    let (mut mine, mut all) = (0usize, 0usize);
+    for (i, (seg, rows)) in dir.segments().iter().zip(seg_rows).enumerate() {
+        if !seg.flat {
+            all += rows;
+            if !skipped(i) {
+                mine += rows;
+            }
+        }
+    }
+    if mine == all || all == 0 {
+        return 1.0;
+    }
+    (mine as f64 / all as f64).sqrt()
+}
+
 /// Clusters a query probes: `ann_nprobe` per square root of the rows' worth of clusters, more
 /// when `thin` (total rows over matching rows) says the clusters are sparse.
 fn probe_count(config: &EngineConfig, ann_rows: usize, clusters: usize, thin: f64) -> usize {
@@ -868,9 +891,10 @@ pub(crate) async fn search(
     // One rotation serves the ranking and every segment's scan (they share one vector space).
     let rotated = Arc::new(dir.rotate_query(&vector).map_err(segment::index_error)?);
     let distances = {
-        let (dir, rotated) = (dir.clone(), rotated.clone());
+        let (dir, rotated, skip) = (dir.clone(), rotated.clone(), skip.to_vec());
         on_worker(async move {
-            dir.center_distances_rotated(&rotated, crate::fan_out())
+            // Segments a recluster tier answers for are not ranked at all.
+            dir.center_distances_rotated_except(&rotated, crate::fan_out(), &skip)
                 .map_err(segment::index_error)
         })
         .await?
@@ -947,7 +971,8 @@ pub(crate) async fn search(
                     clusters,
                     target,
                     filtered,
-                    spread: layout_spread(config, dir.as_ref(), layout, &seg_rows, &skipped),
+                    spread: layout_spread(config, dir.as_ref(), layout, &seg_rows, &skipped)
+                        * tier_share(dir.as_ref(), &seg_rows, &skipped),
                 },
                 config,
             );
