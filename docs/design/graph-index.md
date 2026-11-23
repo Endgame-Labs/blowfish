@@ -1,6 +1,6 @@
 # Closing the throughput gap with Qdrant
 
-Status: proposed (2026-11-23). Answers SPEC decision 24 ("a graph index to compete with Qdrant, design doc first").
+Status: G3 on hold (2026-11-23). The G2 study ([`graph-study.md`](graph-study.md)) found smaller leaves cut rows scanned, but a degree-16 center graph costs 30–84% of scan time, far over the 10% gate. Answers SPEC decision 24 ("a graph index to compete with Qdrant, design doc first").
 Follows decision 25: one layout and one query path, reached by automatic upgrade, with no setting that picks the
 old one.
 

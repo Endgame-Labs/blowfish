@@ -4,6 +4,11 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **G2: a graph over leaf centers, studied offline** (`docs/design/graph-study.md`). On all of BEIR NQ, 64-row leaves
+  with exhaustive center ranking scan 32.7% fewer rows at recall@10 0.95, but a degree-16 center graph costs 30–84%
+  of scan time to rank, against a 10% gate. G3 (the graph in the directory format) is on hold until center search
+  is cheaper. Graph-guided recluster assignment ran 1.59x faster at a 100M-sized cell shape, with routing coverage
+  0.949 → 0.949 at 1,024 probes; it needs a full-pipeline check before it replaces anything.
 - **Iteration 22: the fixed costs of a warm vector query** (`docs/benchmarks.md`).
   - A warm reclustered NQ query takes 15.3 M instructions against main's 25.5 M (−40%), and 21.4 M cycles against
     26.6 M (−20%), with the same results (recall@10 0.961). At 16 clients on a shared VM that was 574 against 509 q/s,
