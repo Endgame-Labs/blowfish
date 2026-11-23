@@ -687,3 +687,9 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
 - Audit of every behavior the SDKs rely on: `docs/research/sdk-compat-audit.md`; open items in `SPEC.md` section 2.
 - `scale_load.py`: one limiter shared by all in-flight threads, honors `retry-after-ms` / `Retry-After` (also on 503), full-jitter backoff, gradual ramp-up, and reports 429 / 503 counts and
   sample header values in its progress line. The checkpoint format is unchanged (one optional `retries_503` field).
+
+## v0.1.14 in-region rerun: harness
+
+- Added a checkpoint-only S3 copy runner for the 10M vector, 100M vector, and 1M MS MARCO namespaces. It copies current manifests, live files, matching ANN hints, and bucket format markers beneath `v014/`, rejects an uncheckpointed WAL tail, and checks source stability after copying. Retired objects and checkpointed WAL are excluded.
+- Added a bounded fresh-process, cache-cold, warm c1, and warm c16 runner using the existing cold-query and warm-query methods. Results include exact-truth overlap, NumPy percentiles, throughput, and server RSS high-water marks. The existing cold runner now bounds child shutdown, readiness, and client subprocesses.
+- Validation: formatting, workspace clippy with warnings denied, all 263 Rust tests, three checkpoint-copy regressions, and Python syntax checks pass. AWS measurements are still in progress; this entry establishes the harness, not performance results.
