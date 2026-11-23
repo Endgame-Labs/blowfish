@@ -4,6 +4,15 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **IN1 resident WAL overlays.** I preserve resident document Arcs across maintenance publications and
+  advancing checkpoints whose WAL prefix is already known. I reject stale generations, gaps, copy
+  overlays, and unknown checkpoints, and preserve capped-read behavior. A follow-up heap profile
+  attributes 828 MiB to checkpoint replay after old-row hydration is removed. The counted-store
+  regression now observes zero WAL-payload downloads after a maintenance file replacement. I update
+  the compact-reader flag on adoption, and leave compaction selection unchanged. Formatting, scoped
+  clippy, all 167 engine/text tests, and compatibility 121/121 in both modes pass, including retries
+  and TypeScript checks.
+
 - **IN1 update memory.** I remove old-row hydration from unconditional upserts, and stream overwritten-row
   statistics in 4,096-row chunks through bypassing readers. I count dense float-vector JSON widths from
   current ANN metadata, and move term-frequency maps into the merge worker. Metadata uses the same

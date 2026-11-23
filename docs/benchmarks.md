@@ -4052,3 +4052,25 @@ objects unavailable and verifies an unconditional replacement succeeds; other ch
 conditions, conditional upserts, and metadata parity before and after indexing. One storage tradeoff
 remains: an unconditional replacement of an indexed row can now append an identical value to the WAL.
 Rows already in the tail retain their no-op comparison. Wire-level replacement semantics are unchanged.
+
+
+### Resident tail adoption
+
+After removing old-row projections, I profile the remaining update peak. A 681K-row HTTP-run snapshot
+attributes 84.2% of live allocations to documents created by WAL replay, including 828 MiB from
+checkpoint refresh. Maintenance can replace segment files without advancing the indexed WAL
+checkpoint. The existing adoption helper rejects an equal checkpoint, so compaction-only publications
+fall back to rebuilding the resident overlay from stored WAL payloads. That duplicates large buffers
+and stalls writers while the namespace lock is held.
+
+I adopt both advancing and equal checkpoints from a complete resident WAL history, retaining the
+later document Arcs and trimming only writes covered by the checkpoint. I reject older publication
+generations, gaps, copy overlays, and checkpoints beyond the locally known sequence. Capped reads
+retain their storage-replay path and cap enforcement. Adoption also carries the compact-reader flag,
+so a later text request still opens full headers. This changes checkpoint adoption, rather than
+compaction selection or tiers.
+
+I verify Arc identity across a maintenance file replacement, exact trimming across an advancing
+checkpoint, rejection of stale generations and copy histories, capped snapshots, and actual query
+results. A counted object-store regression confirms a changed document-file key triggers zero reads
+of the already resident WAL payload. All 167 engine/text tests and compatibility in both modes pass.

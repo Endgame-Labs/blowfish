@@ -1173,3 +1173,43 @@ async fn compact_text_keys_remove_winner_id_column_reads() {
     assert!(e.index_namespace("keys", false).await.unwrap());
     assert!(!e.index_namespace("keys", true).await.unwrap());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_file_replacements_do_not_download_the_known_wal_tail() {
+    let backend = Arc::new(Counting::default());
+    let storage = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let engine = Engine::with_config(storage.clone(), config());
+    let write = |from: usize| {
+        let docs: Vec<_> = (from..from + 1000)
+            .map(|id| json!({"id":id,"vector":[id as f32,1.],"pad":"x".repeat(200)}))
+            .collect();
+        engine.write("maintenance",serde_json::from_value(json!({"distance_metric":"euclidean_squared","schema":{"pad":{"type":"string","filterable":false}},"upsert_rows":docs})).unwrap())
+    };
+    write(0).await.unwrap();
+    engine.index_namespace("maintenance", true).await.unwrap();
+    write(1000).await.unwrap();
+    let wal = bf_wal::Wal::new(storage.clone(), "maintenance").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    let file = m.segments[0].files.get_mut("docs").unwrap();
+    let bytes = storage.get(&file.key).await.unwrap();
+    file.key = "ns/maintenance/docs-replacement.bfc".into();
+    storage.create_unique(&file.key, bytes).await.unwrap();
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+    backend.payload_reads.store(0, Ordering::SeqCst);
+    let result = engine
+        .query(
+            "maintenance",
+            serde_json::from_value(json!({"rank_by":["vector","ANN",[1500.,1.]],"top_k":1}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.result.rows.unwrap()[0]["id"], 1500);
+    assert_eq!(
+        backend.payload_reads.load(Ordering::SeqCst),
+        0,
+        "an immutable-file replacement must retain the resident overlay"
+    );
+}

@@ -522,37 +522,42 @@ pub(crate) async fn catch_up_hinted(
                 && generation > state.manifest_seq
                 && !same_checkpoint(state, &m)
             {
-                *state = if m.deleted {
-                    NamespaceState {
-                        seq: m.indexed_through,
-                        indexed_through: m.indexed_through,
-                        manifest_seq: generation,
-                        ..Default::default()
-                    }
-                } else {
-                    NamespaceState {
-                        seq: m.indexed_through,
-                        exists: true,
-                        schema: m.schema,
-                        metric: m.distance_metric,
-                        created_at: m.created_at,
-                        updated_at: m.updated_at.unwrap_or(m.created_at),
-                        segments: m.segments.into(),
-                        root_only: m.root,
-                        indexed_through: m.indexed_through,
-                        manifest_seq: generation,
-                        corpus: if m.text_stats.is_some() {
-                            Default::default()
-                        } else {
-                            crate::text::checkpoint_corpus(&m.stats)
-                        },
-                        text_stats: m.text_stats.map(std::sync::Arc::new),
-                        ann_dirs: m.ann_dirs,
-                        ann_tiers: m.ann_tiers.into(),
-                        stats: m.stats.into(),
-                        ..Default::default()
-                    }
-                };
+                // A maintenance publication can replace segments while retaining this checkpoint,
+                // and remote indexing can advance through rows already in our resident overlay.
+                // Preserve their Arcs instead of downloading and decoding the complete tail again.
+                if !(cap.is_none() && state.fast_forward(&m, generation, m.indexed_through)) {
+                    *state = if m.deleted {
+                        NamespaceState {
+                            seq: m.indexed_through,
+                            indexed_through: m.indexed_through,
+                            manifest_seq: generation,
+                            ..Default::default()
+                        }
+                    } else {
+                        NamespaceState {
+                            seq: m.indexed_through,
+                            exists: true,
+                            schema: m.schema,
+                            metric: m.distance_metric,
+                            created_at: m.created_at,
+                            updated_at: m.updated_at.unwrap_or(m.created_at),
+                            segments: m.segments.into(),
+                            root_only: m.root,
+                            indexed_through: m.indexed_through,
+                            manifest_seq: generation,
+                            corpus: if m.text_stats.is_some() {
+                                Default::default()
+                            } else {
+                                crate::text::checkpoint_corpus(&m.stats)
+                            },
+                            text_stats: m.text_stats.map(std::sync::Arc::new),
+                            ann_dirs: m.ann_dirs,
+                            ann_tiers: m.ann_tiers.into(),
+                            stats: m.stats.into(),
+                            ..Default::default()
+                        }
+                    };
+                }
             } else if state.root_only
                 && !m.root
                 && m.indexed_through > 0
