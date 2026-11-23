@@ -268,9 +268,11 @@ on, and there is no setting to turn it off. The design is `docs/design/auto-recl
     the base's rows and a quarter of the delta's.
   - Once the delta and the rows outside it reach half the base, everything merges into a new base, which reuses the
     old base's coarse cells unless the rows have grown four times since they were trained.
-  - Once deletes and updates mask a fifth of the tiers' rows, they are rebuilt as a new base without them.
+  - Once deletes and updates mask a fifth of the tiers' rows, they are rebuilt as a new base without them, after any
+    delta that is due (a delta takes seconds; a new base takes as long as the first one).
   - A tier whose format is older than the binary's is rebuilt as a base.
-  - A build waits while compaction has merges pending, and for five minutes after a bulk load's flush (unless the
+  - A build waits while compaction has merges it would run now (a long write tail defers compaction, and then the
+    build doesn't wait for it), and for five minutes after a bulk load's flush (unless the
     load has outgrown what the tiers cover). A bulk load's flush is one of at least a quarter of the bulk flush rows,
     written at 2,000 rows a second or more; a steady stream of writes slower than that gets deltas as it goes. The
     time of that flush is kept in the manifest, so a restart doesn't start a build in the middle of a load.

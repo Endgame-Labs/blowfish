@@ -89,8 +89,13 @@ The indexer evaluates this after each publication, from manifest numbers only, s
 5. **Bulk-load guard:** while a bulk load is running (the indexer flushed in bulk mode in the last 5 minutes),
    steps 2 to 4 wait, unless uncovered rows exceed the covered rows. A load-then-query namespace therefore pays
    about one full build after the load, plus at most a few doubling builds during it.
-6. **Compaction first:** a build starts only when the namespace has no pending compaction (`tier()` returns
-   nothing). Otherwise the build would cover segments that are about to disappear.
+6. **Compaction first:** a build starts only when the indexer would not compact now (`tier()` without `force`
+   returns nothing). Otherwise the build would cover segments that are about to disappear. (Round R3 first asked
+   `tier()` with `force`, which lists merges the indexer defers while a long write tail is pending: under 1,000
+   upserts a second on NQ, every evaluation deferred and the rows outside the base reached 300,000 in six minutes.)
+7. **Order:** a merge first, then a delta, then a masked-rows rebuild. (A masked rebuild of NQ took 10 minutes
+   under 1,000 upserts a second, and with it ahead of the delta, the rows outside the tiers stayed above 20% while
+   it ran.)
 
 What the policy costs, simulated for a namespace growing steadily in 200,000-row segments (first base at 1M rows):
 

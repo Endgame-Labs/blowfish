@@ -233,7 +233,8 @@ pub(crate) fn decide(
 
 /// With a base installed: a merge once the delta and the rows outside it reach half the base, a
 /// delta once the rows outside the tiers reach [`DELTA_SHARE`] of the base and
-/// [`DELTA_GROWTH`] of the delta, and otherwise nothing.
+/// [`DELTA_GROWTH`] of the delta, a new base once [`MASKED_SHARE`] of the tiers' rows are
+/// masked, and otherwise nothing.
 fn next_tier(l: &Layout) -> Option<&'static str> {
     let (base, delta, outside) = (
         l.base_rows as f64,
@@ -246,11 +247,13 @@ fn next_tier(l: &Layout) -> Option<&'static str> {
     if delta + outside >= MERGE_SHARE * base {
         return Some("merge");
     }
-    if l.masked_rows as f64 >= MASKED_SHARE * l.covered_rows as f64 {
-        return Some("masked");
+    // A delta first: it takes seconds and covers the new rows, where a masked rebuild takes as
+    // long as a base build, and steady updates would otherwise leave their rows outside the
+    // tiers for all of it.
+    if l.uncovered_rows > 0 && outside >= (DELTA_SHARE * base).max(DELTA_GROWTH * delta) {
+        return Some("delta");
     }
-    (l.uncovered_rows > 0 && outside >= (DELTA_SHARE * base).max(DELTA_GROWTH * delta))
-        .then_some("delta")
+    (l.masked_rows as f64 >= MASKED_SHARE * l.covered_rows as f64).then_some("masked")
 }
 
 /// The tier a foreground run builds whatever the thresholds say: a base when there is none or a
@@ -681,8 +684,10 @@ impl Engine {
             if !state.exists || state.manifest_seq == 0 || state.root_only {
                 return;
             }
+            // A merge the indexer would run now. While a long write tail defers compaction (as
+            // under steady writes), waiting for it would leave the new rows outside the tiers.
             let compacting =
-                !crate::indexer::tier(&state, &self.0.config, true, &protected).is_empty();
+                !crate::indexer::tier(&state, &self.0.config, false, &protected).is_empty();
             let bulk = state.bulk_load_at.is_some_and(|at| {
                 (chrono::Utc::now() - at)
                     .to_std()
@@ -1153,6 +1158,12 @@ mod tests {
         let (decision, numbers) = decide(&more, &tiers, Some(340_000), false, false);
         assert_eq!(decision, Decision::Nothing);
         assert_eq!(numbers, None);
+        // With both due, the delta goes first (steady updates mask the base as fast as they
+        // write rows outside it).
+        more.push(segment("m", 10_000));
+        let (decision, numbers) = decide(&more, &tiers, Some(330_000), false, false);
+        assert_eq!(decision, Decision::Build("v".into(), "delta"));
+        assert_eq!(numbers.unwrap().masked_rows, 90_000);
     }
 
     #[test]
