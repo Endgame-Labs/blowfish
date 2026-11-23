@@ -274,8 +274,6 @@ pub(crate) struct Target {
     pub segments: Vec<bf_wal::Segment>,
     pub coarse: Option<(bf_wal::SegmentFile, u64)>,
     pub base_dir: Option<String>,
-    /// For a delta, the rows its base holds.
-    pub base_rows: u64,
 }
 
 /// The build `kind` makes for `attr` over `manifest`.
@@ -307,7 +305,6 @@ fn target(manifest: &Manifest, attr: &str, kind: Kind) -> Target {
                     .collect(),
                 coarse: base.coarse.clone().map(|f| (f, base.coarse_rows)),
                 base_dir: Some(base.dir.key.clone()),
-                base_rows: base.rows(),
             }
         }
         // A delta needs a current base with its cells; anything else is a new base.
@@ -318,7 +315,6 @@ fn target(manifest: &Manifest, attr: &str, kind: Kind) -> Target {
                 .and_then(|b| b.coarse.clone().map(|f| (f, b.coarse_rows)))
                 .filter(|(_, rows)| all <= rows.saturating_mul(COARSE_GROWTH)),
             base_dir: None,
-            base_rows: 0,
         },
     }
 }

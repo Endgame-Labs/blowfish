@@ -96,8 +96,8 @@ log entry in the same commit.
   epoch claim are gone.
 - **Delta tier** (round R3 of `docs/design/auto-recluster.md`): rows written after the base get a delta tier, built on
   the base's coarse cells once they reach 4% of the base (and a quarter of the delta), and merged into a new base at
-  half of it, or once deletes and updates mask a fifth of the tiers' rows. The base and the delta rank their leaves as
-  one list with one probe count. The bulk-load guard is kept
+  half of it, or once deletes and updates mask a fifth of the tiers' rows. The base probes as it would alone, the
+  delta `sqrt(its share)` of what it would alone, and the two share one rerank bound and one hydration. The bulk-load guard is kept
   in the manifest (`bulk_load_at`), and build records are deleted once their tier is installed or dropped.
 - **No row-level graph indexes** (HNSW, DiskANN, and similar over rows). The peak-jumping research ruled them out for a
   cold, object-storage-first engine: their random hops each cost an object-store round trip. A graph over leaf centers,

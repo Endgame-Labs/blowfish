@@ -796,44 +796,44 @@ fn pick_clusters(
     picked
 }
 
-/// Recluster tiers searched for one query, ranking their leaves as one list.
+/// Recluster tiers searched for one query, a base and its delta, as one search.
 ///
-/// A delta's leaves are trained to cover about as much of the vector space as the base's (they
-/// hold fewer rows, in proportion to the delta's share of the rows), so the query's nearest
-/// leaves over both tiers are what one tier over all of their rows would probe. Searched apart,
-/// each tier would size its probe for its own rows, as if it were the whole namespace, and a small
-/// delta beside a base would scan about `sqrt(delta share)` more rows than one tier. Together,
-/// they agree on one probe budget for all of their rows (in rows: the probe count times the mean
-/// leaf), and walk their nearest leaves as one list until it is spent, in two exchanges: their
-/// totals, then their nearest leaves. A tier that stops early (no rows to rank, or an error)
+/// The base probes as it would alone (its rows are most of the namespace, and its leaves the
+/// same as when it was the only tier), and the delta `sqrt(its share of the matching rows)` of
+/// what it would alone, the rule for any rows searched beside a tier (see [`tier_share`]): one
+/// clustering of all the rows would reach them in about that proportion. (Their leaves don't
+/// rank as one list: a delta's leaves hold as many rows as the base's over a sparser sample, so
+/// their centers sit nearer every query, and a merged walk spends most of the probe on them.)
+/// After the scan they agree on what to rerank and hydrate: the k-th smallest upper bound over
+/// all of their candidates (so a tier reranks only candidates that can still make the global top
+/// k), and the k-th smallest exact distance (so a tier hydrates only its rows in the global top
+/// k). Each agreement is one exchange; a tier that stops early (no rows to rank, or an error)
 /// withdraws, and the others go on without it.
 pub(crate) struct Joint {
-    parts: usize,
     state: std::sync::Mutex<JointState>,
     changed: tokio::sync::Notify,
 }
 
-/// One part's nearest entries, nearest first, as (distance order key, expected allowed rows,
-/// rows).
-type Head = Vec<(u32, f64, u32)>;
-
 #[derive(Default)]
 struct JointState {
-    /// Each part's (ANN rows, matching rows, clusters, wanted candidates); `Some(None)` once it
-    /// withdrew.
-    totals: Vec<Option<Option<[usize; 4]>>>,
-    /// Each part's nearest entries (see [`Head`]).
-    heads: Vec<Option<Option<Head>>>,
+    /// Each part's matching rows; `Some(None)` once it withdrew.
+    totals: Vec<Option<Option<usize>>>,
+    /// Each part's smallest values for each exchange after the scan (see [`Seat::nth_smallest`]).
+    rounds: [Vec<Option<Option<Vec<f32>>>>; ROUNDS],
 }
+
+/// The exchanges after the scan: upper bounds, then exact distances.
+const ROUNDS: usize = 2;
+const UPPER_BOUNDS: usize = 0;
+const EXACT: usize = 1;
 
 impl Joint {
     /// One seat for each of `parts` tiers.
     pub(crate) fn seats(parts: usize) -> Vec<Seat> {
         let joint = Arc::new(Joint {
-            parts,
             state: std::sync::Mutex::new(JointState {
                 totals: vec![None; parts],
-                heads: vec![None; parts],
+                rounds: std::array::from_fn(|_| vec![None; parts]),
             }),
             changed: tokio::sync::Notify::new(),
         });
@@ -868,124 +868,100 @@ pub(crate) struct Seat {
 }
 
 impl Seat {
-    /// Leave the plan: the other tiers stop waiting for this one.
-    pub(crate) fn withdraw(&self) {
+    /// Leave the probe plan (this tier ranked nothing, or ranked already): the other tiers stop
+    /// waiting for its totals and leaves.
+    fn leave_plan(&self) {
         let mut state = self.joint.lock();
-        let totals = &mut state.totals[self.part];
-        if totals.is_none() {
-            *totals = Some(None);
-        }
-        let heads = &mut state.heads[self.part];
-        if heads.is_none() {
-            *heads = Some(None);
+        let part = self.part;
+        state.totals[part].get_or_insert(None);
+        drop(state);
+        self.joint.changed.notify_waiters();
+    }
+
+    /// Leave the plan and every exchange after it: the other tiers stop waiting for this one.
+    fn withdraw(&self) {
+        let mut state = self.joint.lock();
+        let part = self.part;
+        state.totals[part].get_or_insert(None);
+        for round in &mut state.rounds {
+            round[part].get_or_insert(None);
         }
         drop(state);
         self.joint.changed.notify_waiters();
     }
 
-    /// This tier's share of the joint probe: the entries of `dir` among the nearest leaves of all
-    /// the tiers, nearest first (see [`pick_clusters`] for the walk one directory does alone).
+    /// The `n`-th smallest (counting from 1) of all the tiers' `values` in exchange `round`, or
+    /// infinity when they hold fewer than `n`. Each tier sends only its own `n` smallest.
+    async fn nth_smallest(&self, round: usize, mut values: Vec<f32>, n: usize) -> f32 {
+        if n == 0 {
+            return f32::INFINITY;
+        }
+        if values.len() > n {
+            values.select_nth_unstable_by(n - 1, f32::total_cmp);
+            values.truncate(n);
+        }
+        {
+            let mut state = self.joint.lock();
+            let slot = &mut state.rounds[round][self.part];
+            if slot.is_some() {
+                // Withdrawn: this tier is on its own.
+                values.sort_unstable_by(f32::total_cmp);
+                return values.get(n - 1).copied().unwrap_or(f32::INFINITY);
+            }
+            *slot = Some(Some(values));
+        }
+        self.joint.changed.notify_waiters();
+        self.joint
+            .wait(|state| {
+                let all: Option<Vec<&Option<Vec<f32>>>> =
+                    state.rounds[round].iter().map(Option::as_ref).collect();
+                let mut merged: Vec<f32> = all?.into_iter().flatten().flatten().copied().collect();
+                if merged.len() < n {
+                    return Some(f32::INFINITY);
+                }
+                merged.select_nth_unstable_by(n - 1, f32::total_cmp);
+                Some(merged[n - 1])
+            })
+            .await
+    }
+
+    /// This tier's probe beside the others (see [`Joint`]): the base probes as it would alone,
+    /// and a delta `sqrt(its share of the matching rows)` of what it would alone. Returns the
+    /// entries and that scale, which also scales the tier's rerank cap.
     async fn pick(
         &self,
         dir: &Directory,
         distances: &[f32],
         in_cluster: &(dyn Fn(usize) -> f64 + Sync),
         t: &Totals,
-        wanted: usize,
         config: &EngineConfig,
-    ) -> Vec<usize> {
+    ) -> (Vec<usize>, f64) {
         {
             let mut state = self.joint.lock();
-            state.totals[self.part] = Some(Some([t.ann_rows, t.matching, t.clusters, wanted]));
+            state.totals[self.part] = Some(Some(t.matching));
         }
         self.joint.changed.notify_waiters();
-        let parts = self.joint.parts;
-        let [ann_rows, matching, clusters, wanted] = self
+        let matching: usize = self
             .joint
             .wait(|state| {
-                let all: Option<Vec<&Option<[usize; 4]>>> =
+                let all: Option<Vec<&Option<usize>>> =
                     state.totals.iter().map(Option::as_ref).collect();
-                let all = all?;
-                let mut sum = [0usize; 4];
-                for part in all.into_iter().flatten() {
-                    sum[0] += part[0];
-                    sum[1] += part[1];
-                    sum[2] += part[2];
-                    sum[3] = sum[3].max(part[3]);
-                }
-                Some(sum)
+                Some(all?.into_iter().flatten().sum())
             })
             .await;
-        let thin = ann_rows as f64 / matching.max(1) as f64;
-        let probes = probe_count(config, ann_rows, clusters, thin * t.spread);
-        let target = wanted.min(matching);
-        // The budget in rows, so that a tier of smaller leaves (a delta) walks more of them.
-        let budget = probes as f64 * ann_rows as f64 / clusters.max(1) as f64;
-        // This tier's nearest entries: enough that the joint walk never runs past them.
-        let own_leaf = t.ann_rows as f64 / t.clusters.max(1) as f64;
-        let flat: Vec<bool> = dir.segments().iter().map(|s| s.flat).collect();
-        let mut order: Vec<u64> = dir
-            .entries()
-            .iter()
-            .enumerate()
-            .filter(|(n, e)| !flat[e.segment] && e.rows > 0 && in_cluster(*n) > 0.0)
-            .map(|(n, _)| (u64::from(total_order_key(distances[n])) << 32) | n as u64)
-            .collect();
-        let head = ((budget / own_leaf.max(1.0) * 2.0) as usize + 64).min(order.len());
-        if head < order.len() {
-            order.select_nth_unstable(head);
-            order.truncate(head);
+        if self.part == 0 {
+            return (pick_clusters(dir, distances, in_cluster, t, config), 1.0);
         }
-        order.sort_unstable();
-        let mine: Head = order
-            .iter()
-            .map(|key| {
-                let n = (key & u64::from(u32::MAX)) as usize;
-                ((key >> 32) as u32, in_cluster(n), dir.entries()[n].rows)
-            })
-            .collect();
-        {
-            let mut state = self.joint.lock();
-            state.heads[self.part] = Some(Some(mine));
-        }
-        self.joint.changed.notify_waiters();
-        let part = self.part;
-        let take = self
-            .joint
-            .wait(|state| {
-                let heads: Option<Vec<&Option<Head>>> =
-                    state.heads.iter().map(Option::as_ref).collect();
-                let heads = heads?;
-                // Walk every head as one list, nearest first (ties by part), as one directory's
-                // walk would: until the row budget and the rerank target are both reached.
-                let mut at = vec![0usize; parts];
-                let (mut walked, mut candidates) = (0f64, 0f64);
-                loop {
-                    let next = (0..parts)
-                        .filter_map(|p| {
-                            let head = heads[p].as_ref()?;
-                            head.get(at[p])
-                                .map(|(key, allowed, rows)| (*key, p, *allowed, *rows))
-                        })
-                        .min_by_key(|(key, p, _, _)| (*key, *p));
-                    let Some((_, p, allowed, rows)) = next else {
-                        break;
-                    };
-                    at[p] += 1;
-                    walked += f64::from(rows);
-                    candidates += allowed;
-                    if walked >= budget && candidates >= target as f64 {
-                        break;
-                    }
-                }
-                Some(at[part])
-            })
-            .await;
-        order
-            .iter()
-            .take(take)
-            .map(|key| (key & u64::from(u32::MAX)) as usize)
-            .collect()
+        let scale = (t.matching as f64 / matching.max(1) as f64).sqrt();
+        let mine = Totals {
+            spread: t.spread * scale,
+            target: (t.target as f64 * scale).ceil() as usize,
+            ..*t
+        };
+        (
+            pick_clusters(dir, distances, in_cluster, &mine, config),
+            scale,
+        )
     }
 }
 
@@ -1089,6 +1065,8 @@ pub(crate) async fn search(
         }
     }
     let target = k.saturating_mul(config.ann_rerank_factor).min(matching);
+    // The most candidates reranked (a delta beside its base reranks fewer: see `Seat::pick`).
+    let mut rerank_cap = target;
     // Filtered: allowed rows in each cluster, exactly, from the row-to-cluster maps.
     let counts: Vec<Vec<u32>> = if filtered {
         dir.segments()
@@ -1136,16 +1114,11 @@ pub(crate) async fn search(
             };
             let picked = match joint {
                 Some(seat) => {
-                    let wanted = k.saturating_mul(config.ann_rerank_factor);
-                    seat.pick(
-                        dir.as_ref(),
-                        &distances,
-                        &in_cluster,
-                        &totals,
-                        wanted,
-                        config,
-                    )
-                    .await
+                    let (picked, scale) = seat
+                        .pick(dir.as_ref(), &distances, &in_cluster, &totals, config)
+                        .await;
+                    rerank_cap = ((target as f64 * scale).ceil() as usize).max(k);
+                    picked
                 }
                 None => pick_clusters(dir.as_ref(), &distances, &in_cluster, &totals, config),
             };
@@ -1164,9 +1137,9 @@ pub(crate) async fn search(
             }
         }
     }
-    // A tier that ranked nothing leaves the joint plan to the others.
+    // A tier that ranked nothing leaves the probe plan to the others.
     if let Some(seat) = joint {
-        seat.withdraw();
+        seat.leave_plan();
     }
     // Flat segments, and every ANN segment when the namespace is small, are scanned exactly.
     let mut exact_segments = BTreeSet::new();
@@ -1419,18 +1392,28 @@ pub(crate) async fn search(
     };
     // Error-bounded reranking: only candidates whose lower bound can still beat the k-th best
     // upper bound need their exact distance. `ann_rerank_factor` stays as a cap.
-    if k > 0 && pool.len() > k {
+    // Beside other tiers, the bound is the k-th best over all of their candidates (exactly
+    // scanned rows count with their exact distance).
+    if let Some(seat) = joint {
+        let upper: Vec<f32> = pool
+            .iter()
+            .map(|(_, c)| c.distance + c.error)
+            .chain(winners.iter().map(|w| w.0))
+            .collect();
+        let threshold = seat.nth_smallest(UPPER_BOUNDS, upper, k).await;
+        pool.retain(|(_, c)| c.distance - c.error <= threshold);
+    } else if k > 0 && pool.len() > k {
         let mut upper: Vec<f32> = pool.iter().map(|(_, c)| c.distance + c.error).collect();
         upper.select_nth_unstable_by(k - 1, f32::total_cmp);
         let threshold = upper[k - 1];
         pool.retain(|(_, c)| c.distance - c.error <= threshold);
     }
-    if pool.len() > target {
-        pool.select_nth_unstable_by(target, cmp);
-        pool.truncate(target);
+    if pool.len() > rerank_cap {
+        pool.select_nth_unstable_by(rerank_cap, cmp);
+        pool.truncate(rerank_cap);
     }
     if crate::ann::trace_stages() {
-        eprintln!("RERANK pool={} cap={target}", pool.len());
+        eprintln!("RERANK pool={} cap={rerank_cap}", pool.len());
     }
     // Start reading the likeliest winners' documents while their vectors are reranked.
     let mut speculative: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
@@ -1482,6 +1465,15 @@ pub(crate) async fn search(
     );
     winners.extend(reranked?.into_iter().flatten());
     crate::ann::stage(t0, "rerank");
+    // Beside other tiers, only this tier's rows in the global top k are hydrated (with every row
+    // tied with the k-th distance, as below).
+    if let Some(seat) = joint {
+        let edge = seat
+            .nth_smallest(EXACT, winners.iter().map(|w| w.0).collect(), k)
+            .await;
+        winners.retain(|w| w.0 <= edge);
+        seat.withdraw();
+    }
 
     // Top k by (distance, segment, row), extended by every row tied with the k-th distance so
     // that the final tie-break by ID is the same as the per-segment path's.

@@ -265,8 +265,10 @@ on, and there is no setting to turn it off. The design is `docs/design/auto-recl
     written at 2,000 rows a second or more; a steady stream of writes slower than that gets deltas as it goes. The
     time of that flush is kept in the manifest, so a restart doesn't start a build in the middle of a load.
 - **What queries see.** Unfiltered ANN queries use one plan over the tiers and the segments written since, so new
-  writes never send queries back to the slower per-segment path. The base and the delta rank their leaves as one
-  list and share one probe count, so a delta costs about its share of rows, not a second search. Deletes and updates
+  writes never send queries back to the slower per-segment path. The base probes as it would alone, and the delta
+  probes and reranks `sqrt(its share of the rows)` of what it would alone, the same rule as for rows outside the
+  tiers. The two agree on one rerank bound and hydrate only the global top k, so a delta costs about its share of
+  rows, not a second search. Deletes and updates
   of covered rows are masked. Filtered ANN, BM25, and everything else use the segments as before. Compaction leaves
   covered segments alone.
 - **What it costs.** A build uses half the cores, and waits between slabs whenever the indexer flushes or
