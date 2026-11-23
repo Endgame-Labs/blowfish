@@ -557,6 +557,8 @@ fn block_distances<'a>(
 const NEAR_CELLS: usize = 4;
 /// Training rows per leaf cluster (as the index builder samples).
 const LEAF_SAMPLES: usize = 32;
+/// Most leaves in a cell that train one-level (about the index builder's two-level threshold).
+const ONE_LEVEL_LEAVES: usize = 1024;
 /// Leaf groups searched per row, over its near cells.
 const GROUP_PROBES: usize = 12;
 
@@ -603,15 +605,32 @@ fn assign_leaves(
                 .map_init(Vec::new, |buf, g| read_row(*g, buf))
                 .collect();
             let refs: Vec<&[f32]> = sample.iter().map(|v| v.as_slice()).collect();
-            // Two-level training: one-level compares every sample with every leaf, so its cost
-            // grows with the square of the leaves (5.5 times the per-cell build at 1,700 leaves
-            // a cell). Each parent's leaves are also a balanced group for the assignment below.
-            let (_, children) = bf_vector::kmeans_two_level(&refs, k, 8, 42 + cell as u64);
-            let mut cell_groups = Vec::with_capacity(children.len());
-            for group in children {
-                let first = leaves.len() as u32;
-                leaves.extend(group);
-                cell_groups.push((first..leaves.len() as u32).collect::<Vec<u32>>());
+            // Leaves are grouped under about sqrt(k) centers for the assignment below. A large
+            // cell trains two-level, and its parents' leaves are the groups: one-level training
+            // compares every sample with every leaf, so its cost grows with the square of the
+            // leaves (5.5 times the per-cell build at 1,700 leaves a cell). A small cell trains
+            // one-level (0.003 more recall@10 on NQ at 420 leaves a cell), and its leaves are
+            // grouped by a k-means over them.
+            let mut cell_groups = Vec::new();
+            if k > ONE_LEVEL_LEAVES {
+                let (_, children) = bf_vector::kmeans_two_level(&refs, k, 8, 42 + cell as u64);
+                for group in children {
+                    let first = leaves.len() as u32;
+                    leaves.extend(group);
+                    cell_groups.push((first..leaves.len() as u32).collect::<Vec<u32>>());
+                }
+            } else {
+                let trained = bf_vector::kmeans(&refs, k, 8, 42 + cell as u64);
+                let trained_refs: Vec<&[f32]> = trained.iter().map(Vec::as_slice).collect();
+                let g = (trained.len() as f64).sqrt().ceil() as usize;
+                let centers = bf_vector::kmeans(&trained_refs, g, 8, 7 + cell as u64);
+                cell_groups = vec![Vec::new(); centers.len()];
+                for leaf in &trained {
+                    cell_groups[bf_vector::nearest_center(leaf, &centers)]
+                        .push(leaves.len() as u32);
+                    leaves.push(leaf.clone());
+                }
+                cell_groups.retain(|g| !g.is_empty());
             }
             members.push(cell_groups);
         } else {
@@ -626,7 +645,10 @@ fn assign_leaves(
         t0.elapsed().as_secs_f64()
     );
     let near = NEAR_CELLS.min(coarse.len()).max(1);
-    let probes = GROUP_PROBES;
+    let probes: usize = std::env::var("BF_TMP_PROBES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(GROUP_PROBES);
     let by_distance = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
     let assign = |leaves: &[Vec<f32>]| -> Vec<u32> {
         // Each cell's leaves under about sqrt(leaves) group centers (the means of their leaves),
