@@ -2,7 +2,7 @@
 # Start (or resume) the 100M load on the benchmark instance as three systemd services:
 # the writable server (10 GiB cgroup), the loader (4 GiB cgroup), and a 30 s RSS/docs-per-second monitor.
 # Usage: start_load.sh [--resume] [ROWS=100000000]
-# Needs: scale-server and recluster built (bench/scale/build.sh), bench/scale/config.local, SCALE_SCRATCH.
+# Needs: scale-server built (bench/scale/build.sh), bench/scale/config.local, SCALE_SCRATCH.
 # Never point this at a prefix that holds other namespaces: a writable server indexes and garbage-collects all of them.
 set -euo pipefail
 BIG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

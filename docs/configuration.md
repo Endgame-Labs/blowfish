@@ -117,8 +117,9 @@ Memory detection: every memory-sized default, the block cache included, reads on
 
 The row caps assume 1,024-dimension vectors. Builds and compactions keep vectors packed at their stored precision (2 KB per f16 row)
 and normalize on the fly, compaction and `recluster` reads bypass the in-memory block cache, and the text statistics object is
-merged by streaming, so none of these terms grows with the namespace. `examples/recluster.rs` sizes `max_slab_rows` from the same memory limit at 12 KB per row, clamped to 50,000–700,000
-(about 350,000 on a 4 GB machine). Diagnostics:
+merged by streaming, so none of these terms grows with the namespace. The automatic recluster sizes its slabs from the same limit: what is left after the block cache, the decoded cache, the
+unindexed limit, and a running segment build, at 12 KB per row, clamped to 50,000–700,000. It defers when fewer than
+50,000 rows fit. Diagnostics:
 `BF_MEM_LOG_SECS=N` prints allocator and RSS statistics every N seconds, `/metrics` exposes
 `blowfish_alloc_bytes{kind}` (allocated, active, resident, and retained), and a build with `--features heap-profile` writes jemalloc
 heap profiles when run with `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19` and `BF_HEAP_DUMP_DIR=DIR` (interval `BF_HEAP_DUMP_SECS`, default 30).
@@ -160,7 +161,7 @@ publication, or until you run
 
 ### Paged ANN directory (large reclustered namespaces)
 
-`recluster` writes the slab directory twice: whole (for older readers) and, once it lists at least 100,000 clusters, as a
+The automatic recluster writes the slab directory twice: whole (for older readers) and, once it lists at least 100,000 clusters, as a
 paged copy. A cold query reads the paged copy's small header (segment table, one one-bit code per cell, and a page table) and
 then only the pages of the cells nearest the query, instead of the whole directory (about 100 MB at 100M rows). Queries
 rank only the clusters in those pages, so warm queries also skip ranking every cluster. All of these are environment
@@ -170,15 +171,20 @@ variables; the defaults suit 1,024-dimension vectors.
 | --- | --- | --- |
 | Cells' entries a query reads, as a multiple of the clusters it will probe (higher: more recall, more bytes) | 16 | `BF_ANN_PAGE_MARGIN` |
 | How strongly a cell's spread pulls it up the ranking (see `PagedDirectory::select_cells`) | 0.5 | `BF_ANN_PAGE_KAPPA` |
-| Entries per cell when `recluster` (or `repage`) builds the paged copy | 24 | `BF_ANN_PAGE_ENTRIES` |
+| Entries per cell when the recluster builds the paged copy | 24 | `BF_ANN_PAGE_ENTRIES` |
 | Smallest directory (in clusters) that gets a paged copy | 100,000 | `BF_ANN_PAGED_MIN_ENTRIES` |
 
-`cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged copy to a namespace
-that was reclustered before paging existed, without rebuilding any slab.
+### Automatic recluster
+
+The indexer reclusters a namespace in the background when its layout would gain from it, and installs the new tier in
+its next publication (see [operations](operations.md#large-namespaces-automatic-recluster-and-compact-manifest-copy)).
+It is always on and has no settings: 32 coarse cells, leaves of about 200 rows, half the cores, and slabs sized from
+memory as above. Its spill file goes in the disk cache's directory (`storage.cache.disk_dir`), or the system's temporary
+directory when there is no disk cache.
 
 ### Recluster leaf assignment
 
-`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. A cell
+The recluster partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. A cell
 with more than 1,024 leaves trains two-level (about the square root of the leaves as parents, then each parent's share of
 leaves); a smaller one trains one-level and groups its leaves by a small k-means. Each row then joins its nearest leaf
 among the leaves of its four nearest cells, not only its own cell's, searching the 12 nearest leaf groups. Every
@@ -254,7 +260,7 @@ older or slower path, and setting it now has no effect:
 | `BF_RECLUSTER_REFINE` | Refinement rounds after assignment | Exactly one |
 | `BF_ANN_DIRECTORY` | `0` forced the per-segment ANN path | Directories are always used when present |
 | `BF_ANN_BLOCKS` | `0` turned off the block layout for unfiltered queries | Always on |
-| `BF_ANN_SLABS` | `0` ignored a recluster's slabs | Slabs are always used while they cover the live segments |
+| `BF_ANN_SLABS` | `0` ignored a recluster's slabs | A recluster tier is always used for the rows it covers |
 | `BF_ANN_PAGED` | `0` read the whole slab directory | Paged directories are always read in pieces |
 | `BF_ANN_SCAN_MEMO` | `0` turned off scanning while a cold query's reads arrive | Always on |
 | `BF_ANN_SPECULATE` | `0` waited for the manifest before starting scan reads | Always on |

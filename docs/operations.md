@@ -215,25 +215,41 @@ signal, the fault address, and the thread, followed by the stack frames. The exi
 On Linux, frames inside blowfish print as offsets: resolve them with `addr2line -f -C -i -e blowfish <offset>` against
 the same binary (release builds carry debug info). Please include this output when reporting a crash.
 
-## Large namespaces: recluster, paged directory, and compact manifest copy
+## Large namespaces: automatic recluster and compact manifest copy
 
-For namespaces with millions of vectors, three maintenance helpers in `crates/bf-engine/examples/`
-reduce cold ANN latency without rewriting documents:
+**Automatic recluster.** A namespace as loaded has one clustering per segment, so a query's neighbors are spread over
+every segment. The indexer rebuilds such a namespace's vectors into one namespace-wide layout, a tier of spatial slabs
+with leaves of about 200 rows, in the background. Queries then scan far fewer rows for the same recall. It is always
+on, and there is no setting to turn it off. The design is `docs/design/auto-recluster.md`.
 
-- **Namespace-wide spatial slabs (`examples/recluster.rs`):** groups all live vectors in a namespace
-  into spatial slabs (about 200 rows per cluster) so unfiltered cold ANN queries probe far fewer
-  rows and clusters. At 100,000+ clusters, `recluster` automatically writes a paged copy of the slab
-  directory beside the flat directory. Note: slabs serve unfiltered ANN only, and new segments
-  flushed after `recluster` cause queries to fall back to the per-segment path until the next
-  manual `recluster`.
-  ```bash
-  cargo run --release -p bf-engine --example recluster -- storage.json NAMESPACE ATTRIBUTE SCRATCH_DIR
-  ```
-- **Paged slab directory for older reclustered namespaces (`examples/repage.rs`):** adds a paged slab
-  directory copy to a namespace that was reclustered before paging existed, without rebuilding slabs.
-  ```bash
-  cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE
-  ```
+- **When it runs.** After each publication, the indexer checks the namespace's layout from manifest numbers alone.
+  A namespace with at least 100,000 rows in two or more segments gets its first tier once a default query would scan
+  1.25 times fewer rows with it. A namespace with a tier gets a new one once the rows outside it reach a quarter of
+  its rows (an interim rule until the delta tier lands), or when the tier's format is older than the binary's. A
+  build waits while compaction has merges pending, and while a bulk load is still flushing (unless the load has
+  outgrown what the tier covers).
+- **What queries see.** Unfiltered ANN queries use one plan over the tier and the segments written since, so new
+  writes never send queries back to the slower per-segment path. Deletes and updates of covered rows are masked.
+  Filtered ANN, BM25, and everything else use the segments as before. Compaction leaves covered segments alone.
+- **What it costs.** A build uses half the cores, and waits between slabs whenever the indexer flushes or
+  compacts. It reserves memory from the engine's budget (what is left after the block cache, the decoded cache,
+  and the unindexed limit), at 12 KB per row of a slab, and defers when fewer than 50,000 rows fit. Its spill file
+  (every row's vector at stored precision: about 2 KB a row at 1,024 dimensions in f16) goes in the disk cache's
+  directory, or the system's temporary directory without one, and the build defers unless 1.1 times its size is
+  free. Deferrals are counted in `blowfish_recluster_deferred_total`.
+- **Safety.** A build reads a snapshot of the manifest and never stops indexing. It writes a create-only build
+  record (`ns/<ns>/indexer/build-*.json`), refreshed every 10 minutes, and GC keeps the build's objects while a
+  record is less than 20 minutes old. The finished tier is installed by the indexer's next publication, under its
+  normal fence, and only if every segment it covers is still there. A crashed build leaves orphaned objects that GC
+  deletes after the retention window. Only the node holding the namespace's indexer lease builds, and read-only
+  deployments never do.
+- **Logs and metrics.** Each decision is logged (`recluster: starting a build`, `recluster: deferred`, `recluster:
+  tier installed`) with the numbers behind it. The `blowfish_recluster_*` metrics are listed in
+  [metrics](metrics.md).
+
+A namespace reclustered by hand with an older release is read as a tier and rewritten in the new manifest format at
+its next publication. The manual `examples/recluster.rs` and `examples/repage.rs` tools are gone.
+
 - **Compact manifest copy for older large namespaces (`examples/readercopy.rs`):** rewrites the
   fixed-key `manifest-latest` object without per-segment text headers (375 KB instead of 3.4 MB at
   100M rows) for namespaces published before compact copies existed. Safe to run alongside live

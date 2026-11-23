@@ -68,6 +68,9 @@ def main():
     p.add_argument("--batch", type=int, default=5000)
     p.add_argument("--inflight", type=int, default=4)
     p.add_argument("--vectors-only", action="store_true")
+    p.add_argument(
+        "--skip", type=int, default=0, help="start at this row (rewrite the rows after it, as updates)"
+    )
     a = p.parse_args()
     path = f"/v2/namespaces/{a.namespace}"
     vecs = np.load(a.data / "corpus.f16", mmap_mode="r")
@@ -91,6 +94,14 @@ def main():
     for f in files:
         for batch in batches(f):
             n = batch if f is None else len(batch)
+            if row + n <= a.skip:
+                row += n
+                continue
+            if row < a.skip:
+                cut = a.skip - row
+                row, n = a.skip, n - cut
+                if f is not None:
+                    batch = batch.slice(cut)
             if a.rows:
                 n = min(n, a.rows - row)
             if n <= 0:
@@ -101,9 +112,12 @@ def main():
                 cols["title"] = batch.column("title").to_pylist()[:n]
                 cols["text"] = batch.column("text").to_pylist()[:n]
             body = {"upsert_columns": cols}
-            if first:
+            if first and not a.skip:
                 body["schema"] = schema
                 body["distance_metric"] = "cosine_distance"
+                post(a.base_url, path, json.dumps(body).encode())
+                first = False
+            elif first:
                 post(a.base_url, path, json.dumps(body).encode())
                 first = False
             else:
@@ -119,6 +133,7 @@ def main():
     for x in pending:
         x.result()
     el = time.monotonic() - t0
+    row -= a.skip
     print(json.dumps({"rows": row, "seconds": round(el, 1), "rows_per_s": round(row / el)}), flush=True)
 
 

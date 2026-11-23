@@ -86,9 +86,14 @@ log entry in the same commit.
 **Decided.**
 
 - **Vectors:** IVF with RaBitQ, with full-precision rerank. Defaults: `ann_nprobe = 64` and `ann_rerank_factor = 32`.
-- **Spatial slabs** (round 12): `recluster` partitions a namespace into slabs of small leaves, so a cold query reads a
-  few contiguous ranges instead of every segment's clusters. Unfiltered ANN uses slabs only while they cover exactly
-  the live segments.
+- **Spatial slabs** (round 12): a recluster partitions a namespace into slabs of small leaves, so a cold query reads a
+  few contiguous ranges instead of every segment's clusters.
+- **Automatic recluster** (decision 21, rounds R1 and R2 of `docs/design/auto-recluster.md`): the indexer builds a
+  namespace's base tier of slabs in the background when its layout would gain from it, and installs it in its own
+  fenced publication. Unfiltered ANN runs one plan over the tier and the segments written since, so new writes keep
+  slab-speed queries; compaction leaves covered segments alone. Manifest and bucket format 3 (`ann_tiers` replaces
+  `ann_slabs`, which is read once and rewritten). `examples/recluster.rs`, `examples/repage.rs`, and the recluster's
+  epoch claim are gone.
 - **No row-level graph indexes** (HNSW, DiskANN, and similar over rows). The peak-jumping research ruled them out for a
   cold, object-storage-first engine: their random hops each cost an object-store round trip. A graph over leaf centers,
   held with the paged directory, is allowed (decision 26; `docs/design/graph-index.md`).
@@ -101,14 +106,12 @@ log entry in the same commit.
 
 **Proposed.**
 
-- Recluster runs by hand (`examples/recluster.rs`). New segments written after a recluster are not covered by slabs
-  until the next one. Decided 2026-11-23: recluster becomes automatic and on by default (see Open).
 - **Paged slab directory** (iteration 17): once a recluster's directory lists 100,000 or more clusters it also writes a
   paged copy (a small resident header with one one-bit code per cell of about 24 neighboring clusters, then one page per
   cell). A cold query reads the header (in the manifest's wave, from a hint object) and only the pages of the cells it
   probes, and starts the scan reads from the header before the manifest arrives. The flat directory stays for older
   readers. Queries read about 16 times the clusters they probe, which keeps recall equal to the flat directory's.
-  Existing reclustered namespaces get a paged copy with `examples/repage.rs`, without rebuilding slabs.
+  A reclustered namespace without a paged copy gets one at its next automatic rebuild.
 - **Warm path and allocator** (iteration 18): each slab's scan task runs on its own runtime task, so a warm 100M query uses
   every core (warm p50 160 to 100 ms at 64 probes). jemalloc's page decay is adaptive: 1 s while writes, builds, compaction,
   or `recluster` run and for 15 s after, 30 s while only queries run (`bf-alloc`, `BF_BUSY_DECAY_MS`, `BF_IDLE_DECAY_MS`,
@@ -120,11 +123,9 @@ log entry in the same commit.
 
 **Open.**
 
-- **Automatic recluster (decided 2026-11-23, not built):** the indexer reclusters a namespace in the background when
-  its layout would gain from it (enough independently built segments, or enough rows outside its slabs), within the
-  engine's memory budget. It is always on: there is no setting to turn it off and no manual-only mode. A namespace
-  never waits on it: queries use the current layout until the new one is published.
-- Slabs that cover new segments, and filtered ANN on slabs.
+- **Automatic recluster, rounds R3 to R5:** the delta tier (until then, a full rebuild once rows outside the base reach a
+  quarter of it), lineage so covered segments can compact, and the 100M run with the job on.
+- Filtered ANN on slabs.
 - A split manifest (a small root plus lazily read segment lists) would shrink the cold ANN read further than the compact copy's 375 KB; text-header reads on a namespace with a compact copy cost one more round trip.
 - BM25: fold term records into dictionary reads, store document lengths in blocks, and a namespace-wide text
   dictionary.
