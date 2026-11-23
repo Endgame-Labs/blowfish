@@ -491,7 +491,7 @@ async fn migration_200k_benchmark() {
                         attribute: "vector".into(),
                         cells: 6,
                         cluster_rows: 200,
-                        max_slab_rows: 50_000,
+                        max_slab_rows: 60_000,
                         scratch: scratch.path().join("spill"),
                     },
                 )

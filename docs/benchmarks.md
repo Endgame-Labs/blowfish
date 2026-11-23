@@ -3573,8 +3573,75 @@ its timed interval. The reported write bytes cover ANN objects; directory and ma
 A second run rewrote zero objects and published nothing in all three cases. The parent binary refused
 every upgraded prefix with `BucketFormat { required: 3, supported: 2 }`. A CLI dry run left an isolated
 format-2 prefix unchanged. Concurrent writes, partial slab batches, and resident generation refresh are
-covered separately by Rust tests. Mixed-format segment sets can temporarily use document scans until
-the current directory can be published; this benchmark measures the completed layouts.
+covered separately by Rust tests. The follow-up below checks queries during conversion, including mixed
+segment and slab sets.
+
+### Queries during the automatic upgrade
+
+I followed up with queries at 0%, 50%, and 100% conversion. I loaded each 200K-row namespace in four
+50K-row batches; the indexer combined them into two ANN segments. I also measured each namespace
+reclustered into six slabs, with 997 leaves. I used a 60K-row cap for NQ; synthetic data produced the
+same six slabs at both the 50K and 60K caps used in its two passes. That gives actual halfway checkpoints:
+one of two segment indexes, or three of six slabs, converted. I constructed legacy-format fixtures from
+the same trained clusters and vectors, then used the real fenced reindex publisher, one object per batch.
+
+I ran two complete passes per input on CPUs 6–7, with two Tokio workers and two Rayon workers. At each
+checkpoint, a new engine warmed all 128 requests and then timed them: 64 unfiltered ANN queries and
+64 with `bucket Eq 3`. I used 48 probes, a rerank factor of 32, `top_k: 10`, and IDs in the projection.
+Recall uses exact neighbors for the first 16 queries of each kind. These are separate query and segment
+layouts from the completed-layout comparison above; I compare their migration stages with each other.
+
+I report the median of the two run percentiles below. These are local warm timings. A new engine shares
+the storage cache, and I retained the OS page cache, so I do not label its first query as cold.
+
+| Namespace / query | 0% p50 / p90 ms | 50% p50 / p90 ms | 100% p50 / p90 ms | Median ANN rows, every stage | Recall@10, every stage |
+|---|---:|---:|---:|---:|---:|
+| Synthetic, segments, ANN | 2.71 / 5.20 | 2.21 / 3.14 | 2.22 / 3.38 | 43,733 | 0.86250 |
+| Synthetic, segments, filtered | 2.39 / 5.95 | 2.07 / 3.23 | 2.10 / 3.49 | 14,453 | 0.90000 |
+| Synthetic, slabs, ANN | 1.79 / 2.43 | 2.25 / 2.91 | 2.50 / 3.82 | 21,816 | 0.99375 |
+| Synthetic, slabs, filtered | 1.76 / 2.50 | 2.27 / 3.28 | 2.65 / 4.28 | 14,453 | 0.90000 |
+| NQ, segments, ANN | 1.27 / 2.08 | 1.09 / 1.75 | 1.00 / 1.48 | 28,836 | 0.96875 |
+| NQ, segments, filtered | 2.77 / 3.55 | 2.48 / 3.33 | 2.24 / 2.87 | 82,943 | 1.00000 |
+| NQ, slabs, ANN | 1.31 / 2.24 | 1.56 / 3.00 | 1.77 / 3.30 | 24,297 | 0.97500 |
+| NQ, slabs, filtered | 2.60 / 3.50 | 3.18 / 5.25 | 3.51 / 5.55 | 82,943 | 1.00000 |
+
+Every timed query recorded zero `document_scan_rows`: none of the 3,072 timed responses required a
+scan of document vectors. All ID lists matched their zero-converted baseline. The minimum, median, and
+maximum `ann_rows_scanned` also matched at every checkpoint and on both passes. I count rows in selected
+leaf code blocks or exact ANN ranges, including filtered-out rows in a fetched code block.
+
+Mixed slab p50 increased about 26% on synthetic data and 20% on NQ relative to zero converted. The
+filtered rows in those same slab runs still use the unchanged, fully converted segment indexes; their
+p50 increased about 29% and 22%, respectively. I therefore cannot attribute the timing drift to the
+mixed format alone. The table retains that variation, including p90, while the probe work and recall
+remain unchanged. I measured no S3 cold queries or 100M queries in this follow-up. The small directories
+here are flat; regression tests separately force paged directories through every slab conversion batch.
+
+The original failure happened when any segment lacked `annv2:`, or a partial batch left a directory
+whose immutable keys no longer covered its segments or slabs. I now rebuild directories across mixed
+objects. Before the first publication, upgrade-only readers use an existing old directory or assemble
+resident leaf metadata without writing storage. Legacy code flags and membership maps feed the same
+global leaf selection and rerank as current objects; migration does not require document-vector scans.
+
+I keep the reproduction harness in `crates/bf-engine/src/reindex_migration_tests.rs`. I build it with:
+
+```sh
+source ~/.cargo/env
+CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_LTO=false \
+  nice -n 19 cargo test --release -p bf-engine --lib migration_200k_benchmark --no-run -j 2
+```
+
+I set `TEST_BINARY` to the test executable printed by Cargo, then run:
+
+```sh
+RAYON_NUM_THREADS=2 TOKIO_WORKER_THREADS=2 taskset -c 6,7 timeout 1800 \
+  "$TEST_BINARY" migration_200k_benchmark --ignored --nocapture
+```
+
+For NQ, I additionally set `D1_CORPUS_F16` to raw little-endian f16 corpus bytes and `D1_QUERIES_F32`
+to the first 64 query vectors as raw f32. The preparation harness's `corpus.f16` is a NumPy file, so
+I strip its NumPy header before exporting the first 200K rows. I keep inputs and logs under `.scratch/`;
+the test removes its disposable object store when it finishes.
 
 ### Reproduction notes
 
