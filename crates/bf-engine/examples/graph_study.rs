@@ -667,7 +667,27 @@ fn assignment_study(
     truth: &[Vec<u32>],
 ) {
     let count = counts(&layout.leaf_of, layout.leaves.len());
-    for beam in [8, 16, 32, 64] {
+    const COVERAGE_PROBES: &[usize] = &[256, 524, 1024, 2048, 4096, 8192];
+    // The frozen query order is shared by every assignment and probe count. I keep only
+    // its longest measured prefix, outside the timed assignment work.
+    let query_order: Vec<Vec<u32>> = queries
+        .par_iter()
+        .map(|q| {
+            let plane = codes.query(q);
+            let mut ranking: Vec<_> = (0..layout.leaves.len())
+                .filter(|&l| count[l] > 0)
+                .map(|l| Hit(codes.score(&plane, l), l))
+                .collect();
+            let keep = *COVERAGE_PROBES.last().unwrap();
+            if ranking.len() > keep {
+                ranking.select_nth_unstable(keep - 1);
+                ranking.truncate(keep);
+            }
+            ranking.sort_unstable();
+            ranking.into_iter().map(|h| h.1 as u32).collect()
+        })
+        .collect();
+    for candidates in [8, 16, 32, 64] {
         let t = Instant::now();
         let results: Vec<_> = (0..corpus.rows)
             .into_par_iter()
@@ -679,13 +699,13 @@ fn assignment_study(
                     let (found, visited) = search.run(
                         &graph.edges,
                         &[graph.entry],
-                        beam * 2,
+                        candidates * 2,
                         |l| count[l] > 0,
                         |l| codes.score(&plane, l),
                     );
                     let best = found
                         .iter()
-                        .take(beam)
+                        .take(candidates)
                         .map(|h| Hit(bf_vector::squared_distance(&q, &layout.leaves[h.1]), h.1))
                         .min()
                         .unwrap();
@@ -696,36 +716,32 @@ fn assignment_study(
             )
             .collect();
         let seconds = t.elapsed().as_secs_f64();
-        for &probes in &[256, 524, 1024] {
+        let new_assignment: Vec<_> = results.iter().map(|r| r.0).collect();
+        let new_counts = counts(&new_assignment, layout.leaves.len());
+        for &probes in COVERAGE_PROBES {
             let mut before = 0;
             let mut after = 0;
             let mut old_rows = 0;
             let mut new_rows = 0;
-            let new_assignment: Vec<_> = results.iter().map(|r| r.0).collect();
-            let new_counts = counts(&new_assignment, layout.leaves.len());
-            for (q, gt) in queries.iter().zip(truth) {
-                let plane = codes.query(q);
-                let mut ranking: Vec<_> = (0..layout.leaves.len())
-                    .filter(|&l| count[l] > 0)
-                    .map(|l| Hit(codes.score(&plane, l), l))
-                    .collect();
-                ranking.sort_unstable();
-                ranking.truncate(probes);
-                let chosen: Vec<_> = ranking.iter().map(|h| h.1).collect();
-                old_rows += chosen.iter().map(|&l| count[l]).sum::<usize>();
-                new_rows += chosen.iter().map(|&l| new_counts[l]).sum::<usize>();
+            for (order, gt) in query_order.iter().zip(truth) {
+                let chosen = &order[..probes.min(order.len())];
+                old_rows += chosen.iter().map(|&l| count[l as usize]).sum::<usize>();
+                new_rows += chosen
+                    .iter()
+                    .map(|&l| new_counts[l as usize])
+                    .sum::<usize>();
                 before += gt
                     .iter()
-                    .filter(|&&r| chosen.contains(&(layout.leaf_of[r as usize] as usize)))
+                    .filter(|&&r| chosen.contains(&layout.leaf_of[r as usize]))
                     .count();
                 after += gt
                     .iter()
-                    .filter(|&&r| chosen.contains(&(new_assignment[r as usize] as usize)))
+                    .filter(|&&r| chosen.contains(&new_assignment[r as usize]))
                     .count();
             }
             let n = queries.len() as f64;
             println!(
-                "ASSIGN_COVERAGE,8,{size},{beam},{probes},{:.6},{:.6},{:.1},{:.1}",
+                "ASSIGN_COVERAGE,8,{size},{candidates},{probes},{:.6},{:.6},{:.1},{:.1}",
                 before as f64 / (n * 10.0),
                 after as f64 / (n * 10.0),
                 old_rows as f64 / n,
@@ -743,7 +759,7 @@ fn assignment_study(
         let old: f64 = results.iter().map(|r| r.3 as f64).sum();
         let new: f64 = results.iter().map(|r| r.2 as f64).sum();
         println!(
-            "ASSIGN,8,{size},{beam},{seconds:.6},{:.6},{:.6},{:.1},{:.6}",
+            "ASSIGN,8,{size},{candidates},{seconds:.6},{:.6},{:.6},{:.1},{:.6}",
             agree as f64 / corpus.rows as f64,
             better as f64 / corpus.rows as f64,
             visits as f64 / corpus.rows as f64,
