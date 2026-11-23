@@ -2,8 +2,10 @@
 mod cache;
 mod diagnostics;
 mod disk;
+mod format;
 mod hedge;
 pub use diagnostics::{BackendMeasurement, BackendStats};
+pub use format::BUCKET_FORMAT_VERSION;
 mod observed;
 use bytes::Bytes;
 pub use cache::{CacheConfig, CacheStats, CacheStatsSnapshot, RangeReader};
@@ -15,7 +17,7 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -41,6 +43,10 @@ pub enum Error {
     WriterActive,
     #[error("storage is read-only or its writer heartbeat failed")]
     ReadOnly,
+    #[error(
+        "bucket requires format version {required}; this binary supports up to {supported}; upgrade blowfish before writing or garbage collection"
+    )]
+    BucketFormat { required: u64, supported: u64 },
     #[error("object-store request failed")]
     Backend(#[source] object_store::Error),
     #[error("local storage I/O failed")]
@@ -117,6 +123,7 @@ struct Inner {
     mode: StorageMode,
     read_only: bool,
     healthy: AtomicBool,
+    required_format: AtomicU64,
     writer: Uuid,
     serial: Mutex<()>,
     activity: Arc<observed::Activity>,
@@ -310,6 +317,8 @@ impl Storage {
         let cache = cache::RangeCache::open(cache).await?;
         let activity = Arc::new(observed::Activity::default());
         let backend: Arc<dyn ObjectStore> = Arc::new(observed::Observed(backend, activity.clone()));
+        // Refuse newer buckets before even the mutating CAS probe or heartbeat.
+        let required_format = format::check(&*backend, &prefix).await?;
         let conditional = if read_only {
             true
         } else {
@@ -328,6 +337,7 @@ impl Storage {
                 mode,
                 read_only,
                 healthy: AtomicBool::new(true),
+                required_format: AtomicU64::new(required_format),
                 writer: Uuid::new_v4(),
                 serial: Mutex::new(()),
                 activity,
@@ -349,6 +359,10 @@ impl Storage {
                 }
             });
         }
+        if !read_only {
+            store.ensure_bucket_format().await?;
+        }
+        store.spawn_bucket_format_refresher();
         Ok(store)
     }
     /// Selected write coordination mode.
@@ -387,6 +401,13 @@ impl Storage {
         Self(self.0.clone(), Arc::from(joined))
     }
     fn writable(&self) -> Result<(), Error> {
+        let required = self.0.required_format.load(Ordering::Acquire);
+        if required > BUCKET_FORMAT_VERSION {
+            return Err(Error::BucketFormat {
+                required,
+                supported: BUCKET_FORMAT_VERSION,
+            });
+        }
         if self.0.read_only || !self.0.healthy.load(Ordering::Acquire) {
             Err(Error::ReadOnly)
         } else {

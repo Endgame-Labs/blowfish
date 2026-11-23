@@ -226,11 +226,12 @@ Both give bit-identical results to the portable path.
 Indexes built since iteration 20 store their one-bit codes in a fast-scan layout: transposed in blocks of 32 rows, scored
 with 4-bit table lookups (byte shuffles on AVX-512BW, `TBL` on NEON, a scalar loop elsewhere, all giving the same sums).
 That is about 3 times faster per row on x86-64 and 5 times on Apple M4. Indexes in the older row-major layout are still
-read and scanned as before, so a namespace picks the layout up as its segments are rebuilt or reclustered.
+read and scanned as before, and the background indexer upgrades them to the new layout.
 
-| What | Default | Variable |
-| --- | --- | --- |
-| Build new indexes in the fast-scan layout (`0` builds the row-major layout; reading handles both) | on | `BF_ANN_FASTSCAN` |
+A running server upgrades older-layout indexes to this layout in the background; `blowfish reindex NAMESPACE` (or
+`--all`, with `--dry-run` to report counts and bytes per layout) does the same upgrade now. It takes the storage flags and
+variables of `serve` (`--config`, `--storage-url`, `--storage-endpoint`, `--storage-region`, `--storage-profile`). See
+"Upgrading to v0.1.14" in [operations](operations.md).
 
 ### Connection warming, hedging, and diagnostics
 

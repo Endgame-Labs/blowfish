@@ -95,11 +95,68 @@ services with `sudo systemctl enable --now blowfish caddy`. Use
 application has finished its storage probe: wait for an authenticated `GET /` through Caddy to
 return 200. Missing credentials should return 401.
 
-For each deployment, record the source commit, retain the previous installed binary for rollback,
+For each deployment, record the source commit, retain the previous installed binary for recovery,
 replace the binary atomically, and restart the service deliberately. Verify an SDK write, vector
 search, full-text search, and filter through the proxy; restart, wait for readiness, and repeat the
 queries before deleting the test namespace. Check the object-store prefix directly as well.
 Namespace deletion can retain permanent WAL fences; do not remove these manually.
+
+## Upgrading to v0.1.14
+
+Before upgrading, stop every writer and background maintenance process using the deployment prefix.
+If rollback might be necessary, I recommend a consistent backup of the **entire bucket prefix before
+starting the new binary** (see Backups and recovery). Retaining the old executable alone is insufficient.
+Do not run old and new writers together during a format upgrade.
+
+The binary automatically accepts legacy format-1 buckets and raises the deployment marker to format 2
+at writable startup. Namespace manifests move to format 2 on publication; the checkpoint field changes
+its name while retaining its meaning. Read-only startup checks compatibility without raising the marker.
+The append-only `_system/format/<version>.json` markers live at the deployment root, including for
+project-scoped namespaces. Their highest generation is the required bucket version; never delete or
+lower a marker to force a downgrade.
+
+Startup and garbage collection freshly check the bucket fence. Writes and manifest publication use
+the shared cached result, refreshed every 60 seconds in the background and on manifest publication
+conflicts or decode failures. A newer marker permanently disables mutations through that process,
+even if the marker is later removed; steady-state writes add no marker requests. Every manifest decoder
+also rejects unsupported versions, including the compact reader copy, so an older supported binary
+cannot republish an unfamiliar manifest
+or garbage-collect its objects. Format-2 manifests rename the required `indexed_through` wire field to
+`checkpoint_wal`; released binaries through v0.1.13 fail to decode them instead of discarding new fields.
+Those releases predate the bucket marker, so the marker alone cannot stop them from starting or touching
+namespaces whose manifests have not yet been upgraded. Stop all older processes before upgrading.
+
+v0.1.14 writes vector indexes in a new code layout (fast scan, about 3 times faster per row to scan). Old indexes
+still read and answer queries, and a running server upgrades them by itself: after it starts, the background indexer
+rewrites each namespace's older indexes, one at a time, in its own task, so indexing and queries carry on. You do
+not need to run a separate index upgrade command.
+
+The upgrade reads an index, rewrites its quantized codes, and writes it back under a new object key. It does not
+retrain anything: cluster centers, row membership, and full-precision vectors are copied as they are, so queries
+return the same results. It covers the per-segment indexes and the slabs of a `recluster`, and leaves documents, the
+WAL, and the full-text and filter indexes alone. Old objects are never changed: each batch of rewritten indexes goes
+into the manifest in one conditional publish (the same path the indexer and compaction use), and the old objects are
+left for normal garbage collection after the retention window. If a compaction or another publish gets in the way,
+the upgrade retries from the newest manifest and drops work that a newer segment replaced. A publish fences an
+indexer on another node for a moment, as `recluster` does, and that indexer retries. Writes are not affected. Memory
+is bounded by the largest single index (the object plus its rewrite, about twice its size), since indexes are
+processed one at a time. It is idempotent and resumable: it skips indexes already in the new layout, and a restart
+partway through leaves the namespace readable, with every finished batch kept.
+
+To run the same upgrade now, or to see what is left, use `blowfish reindex`:
+
+```bash
+blowfish reindex --storage-url s3://BUCKET/PREFIX --dry-run NAMESPACE   # counts and bytes per layout, writes nothing
+blowfish reindex --storage-url s3://BUCKET/PREFIX NAMESPACE
+blowfish reindex --storage-url s3://BUCKET/PREFIX --all                 # every namespace in the bucket
+```
+
+It prints progress, and it is safe beside a running server on the same bucket. Flat indexes (small segments with no
+codes) have nothing to convert and are reported under "not convertible". `recluster` also writes the new layout.
+
+There is no supported in-place downgrade. To roll back, stop the upgraded processes, restore the complete
+pre-upgrade backup into an empty prefix, and start the matching older binary there. Writes acknowledged
+after that backup are absent from the restored copy. Test the restore and queries before resuming traffic.
 
 ## Storage and writers
 

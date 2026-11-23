@@ -4,6 +4,36 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Bucket format fence:** format-2 manifests rename the required checkpoint field to `checkpoint_wal`,
+  and every manifest decoder rejects unsupported versions. Writers and maintenance tools cannot republish
+  unfamiliar manifests. Legacy format-1 manifests remain readable and upgrade on publication.
+  - Append-only, create-only `_system/format/<version>.json` markers raise the deployment's required
+    generation monotonically. Startup checks before its mutating probe; writes, indexing, and GC check
+    again. Project-scoped engines share the root fence. Observing a newer marker disables all mutations
+    through that process. Read-only startup never raises the marker.
+  - Verified against a real binary built from tag `v0.1.13`: it created a legacy local bucket, this branch
+    read and upgraded it, and the old binary then failed decoding with `missing field indexed_through`.
+    Queries and writes returned 500, indexing and GC deferred, and all object hashes stayed unchanged
+    during the old-binary run. The new binary still returned both acknowledged rows afterward.
+  - Writable and read-only startup refused a newer marker without changing the bucket. All verification
+    used local filesystem storage. The upgrade and backup requirements are in `docs/operations.md`.
+  - Checked formatting, workspace clippy with all targets and warnings denied, and workspace tests
+    (243 passed, 4 ignored). Compat passed 121/121 in both normal and forced-indexing modes, alongside
+    SDK retry checks and the TypeScript smoke suite. Idle indexing still performs no object-store I/O.
+
+- **Automatic upgrade of old vector indexes** (`docs/operations.md`, "Upgrading to v0.1.14"). Indexes in the older
+  row-major layout only became fast-scan when compaction or `recluster` rewrote them, so a read-only namespace stayed
+  on the old layout. The background indexer now rewrites each per-segment index and each `recluster` slab in the
+  fast-scan layout by itself, from the stored codes (no retraining), one index at a time. It writes new objects, then
+  swaps a batch into the manifest with the fenced publish the indexer uses, retires the old objects for garbage
+  collection, and rebuilds the ANN directories. It skips indexes already upgraded. `blowfish reindex [NAMESPACE|--all]
+  [--dry-run]` runs the same upgrade now and reports counts and bytes per layout.
+  - Per SPEC decision 25 (one way to do each thing): `BF_ANN_FASTSCAN` and the row-major writer are gone, and there is no
+    way back to the old layout. Reading it stays, so it can be upgraded. Tests make old-layout files with
+    `bf_vector::downgrade_layout`, which only the `legacy-fixtures` feature builds.
+  - Checked: `bf-engine/tests/reindex.rs` (answers identical, a rerun is a no-op, writes racing an upgrade are kept,
+    slabs upgraded, and a server with indexing on upgrades by itself) and `bf-vector/tests/relayout.rs`.
+
 - **Iteration 20: more q/s on BEIR NQ** (`docs/benchmarks.md`). This used the same VM and limits as iteration 19, with
   interleaved runs against main.
   - Reclustered: 573 q/s at 16 clients at recall@10 0.954, against main's 395 at 0.955. At the default 64 probes,
@@ -29,7 +59,7 @@ Newest first. Each entry says what works now and how it was checked.
   - the `bf-vector` and `bf-engine` tests on an Apple M4 (NEON);
   - the `bench` ladder against main (same recall at 10K, 50K, and 200K rows).
 
-  New settings (`BF_ANN_FASTSCAN`, `BF_RECLUSTER_GLOBAL`, `BF_RECLUSTER_GROUPS`, and `BF_RECLUSTER_REFINE`) are in
+  New settings (`BF_RECLUSTER_GLOBAL`, `BF_RECLUSTER_GROUPS`, and `BF_RECLUSTER_REFINE`) are in
   `docs/configuration.md`.
 
 ## 2026-11-22

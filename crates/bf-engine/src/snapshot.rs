@@ -496,9 +496,6 @@ pub(crate) async fn catch_up_hinted(
             found
         });
         if let Some((generation, m)) = manifest.map_err(log_error)? {
-            if m.format_version != 1 {
-                return Err(ApiError::new(500, "unsupported manifest format"));
-            }
             if m.indexed_through > 0
                 && generation > state.manifest_seq
                 && !same_checkpoint(state, &m)

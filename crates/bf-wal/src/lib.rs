@@ -7,6 +7,18 @@ use uuid::Uuid;
 
 /// Current WAL encoding: one version byte followed by zstd-compressed JSON.
 pub const FORMAT_VERSION: u8 = 1;
+/// Current manifest generation. Format 1 is accepted only for automatic upgrade.
+pub const MANIFEST_FORMAT_VERSION: u8 = 2;
+
+fn manifest_version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let version = u64::deserialize(d)?;
+    if !(1..=u64::from(MANIFEST_FORMAT_VERSION)).contains(&version) {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported manifest format version {version}; this binary supports 1 through {MANIFEST_FORMAT_VERSION}; upgrade blowfish"
+        )));
+    }
+    Ok(version as u8)
+}
 /// A fully validated, deterministic write batch. Conditions are resolved before persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteBatch {
@@ -102,14 +114,19 @@ impl CommitRecord {
         Ok(record)
     }
 }
-/// A create-only manifest snapshot, extensible by later indexers.
+/// A create-only manifest snapshot. Extensions require a format generation bump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
+    #[serde(deserialize_with = "manifest_version")]
     pub format_version: u8,
     pub schema: Schema,
     pub distance_metric: DistanceMetric,
     pub id_type: AttributeType,
     pub created_at: DateTime<Utc>,
+    /// Format 2 deliberately omits the old required `indexed_through` wire field,
+    /// fencing released binaries whose serde readers ignored unknown fields.
+    #[serde(rename = "checkpoint_wal", alias = "indexed_through")]
     pub indexed_through: u64,
     pub indexer_epoch: u64,
     /// A tombstone checkpoint retains ordering without retaining namespace contents.
@@ -129,8 +146,7 @@ pub struct Manifest {
     /// opening each segment otherwise.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub ann_dirs: std::collections::BTreeMap<String, SegmentFile>,
-    /// Namespace-wide ANN layouts (`recluster`), one per vector attribute. Older binaries ignore
-    /// this field and keep answering from the segments' own clusters.
+    /// Namespace-wide ANN layouts (`recluster`), one per vector attribute.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub ann_slabs: std::collections::BTreeMap<String, SlabSet>,
     /// Last indexed write timestamp; absent on legacy schema-only manifests.
@@ -177,6 +193,7 @@ impl Manifest {
 /// vector space into slabs, each a pseudo segment with its own index and block fragment. A
 /// slab's row IDs are global row numbers (`SlabCover::base` plus the segment-local row).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlabSet {
     pub covered: Vec<SlabCover>,
     pub slabs: Vec<Segment>,
@@ -189,6 +206,7 @@ pub struct SlabSet {
 }
 /// One covered segment's span of global row numbers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlabCover {
     pub segment: String,
     pub base: u32,
@@ -220,6 +238,7 @@ pub enum ManifestView {
 }
 /// Immutable file reference. Lengths exclude the storage retry-identity header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SegmentFile {
     pub key: String,
     pub size: u64,
@@ -256,6 +275,7 @@ pub struct FieldStatsIndex {
 }
 /// One immutable segment and its current live-row generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Segment {
     pub id: String,
     pub wal_start: u64,
@@ -301,6 +321,8 @@ pub enum Error {
     Storage(#[from] bf_storage::Error),
     #[error("invalid WAL JSON")]
     Json(#[from] serde_json::Error),
+    #[error("unsupported or corrupt manifest: {0}")]
+    Manifest(String),
     #[error("invalid WAL compression")]
     Io(#[from] std::io::Error),
     #[error("unsupported or corrupt WAL format")]
@@ -381,6 +403,7 @@ impl Wal {
     /// in the slot and upload nothing. Staging several slots concurrently and committing them in
     /// order with `commit` keeps many uploads in flight at once.
     pub async fn stage(&self, seq: u64, entry: &WalEntry) -> Result<Staged, Error> {
+        self.store.cached_bucket_format()?;
         let payload_key = self.staged_payload_key(seq, entry.write_id);
         let json = if entry.tombstone {
             vec![]
@@ -428,6 +451,7 @@ impl Wal {
         entry: &WalEntry,
         staged: &Staged,
     ) -> Result<CreateResult, Error> {
+        self.store.cached_bucket_format()?;
         let inline = staged.inline;
         let record = CommitRecord {
             write_id: entry.write_id,
@@ -600,6 +624,9 @@ impl Wal {
         seq: u64,
         manifest: &Manifest,
     ) -> Result<CreateResult, Error> {
+        self.store.cached_bucket_format()?;
+        // Even direct publishers must not overwrite a namespace they cannot understand.
+        self.latest_manifest().await?;
         // The slot holds the whole manifest (compressed when large), so a cold reader needs
         // one GET after the listing. Older slots point at a separate payload object.
         if manifest.root {
@@ -615,6 +642,9 @@ impl Wal {
                 identity,
             )
             .await?;
+        if result == CreateResult::Conflict {
+            self.store.check_bucket_format().await?;
+        }
         if result == CreateResult::Created {
             // A copy at a fixed key, so a cold reader fetches the manifest in the same round trip
             // as the listing that confirms it is the newest. Best effort: readers verify it.
@@ -723,6 +753,8 @@ impl Wal {
     /// up to `after` is already reclaimed). Slots are processed concurrently: a serial pass over a
     /// long log would stall indexing for minutes.
     pub async fn prune_payloads_from(&self, after: u64, through: u64) -> Result<(), Error> {
+        self.store.check_bucket_format().await?;
+        self.latest_manifest().await?;
         use futures::StreamExt;
         let mut work = futures::stream::iter(after.saturating_add(1)..=through)
             .map(|seq| async move {
@@ -777,6 +809,7 @@ impl Wal {
     }
     /// Read the most recent manifest if one exists.
     pub async fn latest_manifest(&self) -> Result<Option<(u64, Manifest)>, Error> {
+        self.store.cached_bucket_format()?;
         self.manifest_after(0).await
     }
     /// Discover a newer immutable manifest, skipping payload reads and decoding when
@@ -789,6 +822,7 @@ impl Wal {
     /// or `None` when the manifest is small or has no text headers. Readers verify the copy against
     /// the manifest log, so a copy that lags a concurrent publication is ignored, not trusted.
     pub async fn write_reader_copy(&self) -> Result<Option<(u64, usize)>, Error> {
+        self.store.cached_bucket_format()?;
         let Some((seq, manifest)) = self.latest_manifest().await? else {
             return Ok(None);
         };
@@ -805,6 +839,23 @@ impl Wal {
     /// [`Wal::manifest_after`] with a choice of view. `ManifestView::Reader` may return the compact
     /// copy (`Manifest::root` set), which lacks the segments' text headers.
     pub async fn manifest_view_after(
+        &self,
+        known: u64,
+        view: ManifestView,
+    ) -> Result<Option<(u64, Manifest)>, Error> {
+        self.store.cached_bucket_format()?;
+        let result = self.manifest_view_after_inner(known, view).await;
+        if matches!(
+            &result,
+            Err(Error::Manifest(_) | Error::Format | Error::Io(_))
+        ) {
+            // A newer writer may have advanced the bucket while this process was running.
+            // Refresh only on failure; successful reads and publications need no marker I/O.
+            self.store.check_bucket_format().await?;
+        }
+        result
+    }
+    async fn manifest_view_after_inner(
         &self,
         known: u64,
         view: ManifestView,
@@ -876,13 +927,14 @@ impl Wal {
             && copy.len() > 8
             && copy[..8] == seq.to_be_bytes()
             && slot_payload_key(&copy[8..]).is_none()
-            && let Ok(manifest) = decode_manifest(&copy[8..])
-            && (view == ManifestView::Reader || !manifest.root)
         {
-            if std::env::var_os("BF_TRACE_STAGES").is_some() {
-                eprintln!("MANIFEST decoded after {} ms", t0.elapsed().as_millis());
+            let manifest = decode_manifest(&copy[8..])?;
+            if view == ManifestView::Reader || !manifest.root {
+                if std::env::var_os("BF_TRACE_STAGES").is_some() {
+                    eprintln!("MANIFEST decoded after {} ms", t0.elapsed().as_millis());
+                }
+                return Ok(Some((seq, manifest)));
             }
-            return Ok(Some((seq, manifest)));
         }
         let bytes = self.store.get(&last.key).await?;
         let manifest = if let Some(payload) = slot_payload_key(&bytes) {
@@ -962,6 +1014,20 @@ fn compact_copy_above() -> usize {
 }
 
 fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, Error> {
+    if !(1..=MANIFEST_FORMAT_VERSION).contains(&manifest.format_version) {
+        return Err(Error::Manifest(format!(
+            "unsupported format version {}; this binary supports up to {MANIFEST_FORMAT_VERSION}",
+            manifest.format_version
+        )));
+    }
+    let mut upgraded;
+    let manifest = if manifest.format_version < MANIFEST_FORMAT_VERSION {
+        upgraded = manifest.clone();
+        upgraded.format_version = MANIFEST_FORMAT_VERSION;
+        &upgraded
+    } else {
+        manifest
+    };
     let json = serde_json::to_vec(manifest)?;
     if json.len() <= COMPRESS_ABOVE {
         return Ok(json);
@@ -985,9 +1051,9 @@ pub fn slot_payload_key(slot: &[u8]) -> Option<String> {
 fn decode_manifest(bytes: &[u8]) -> Result<Manifest, Error> {
     if bytes.starts_with(&ZSTD_MAGIC) {
         let json = zstd::stream::decode_all(bytes).map_err(|_| Error::Format)?;
-        return Ok(serde_json::from_slice(&json)?);
+        return serde_json::from_slice(&json).map_err(|e| Error::Manifest(e.to_string()));
     }
-    Ok(serde_json::from_slice(bytes)?)
+    serde_json::from_slice(bytes).map_err(|e| Error::Manifest(e.to_string()))
 }
 
 #[cfg(test)]
@@ -1040,5 +1106,36 @@ mod manifest_codec_tests {
                 .len(),
             20_000
         );
+    }
+
+    #[test]
+    fn every_manifest_encoding_and_direct_deserializer_rejects_future_versions() {
+        let mut value = serde_json::to_value(manifest_with_terms(3)).unwrap();
+        for version in [0, 3, 256, u64::MAX] {
+            value["format_version"] = serde_json::json!(version);
+            let json = serde_json::to_vec(&value).unwrap();
+            let compressed = zstd::stream::encode_all(json.as_slice(), 3).unwrap();
+            for bytes in [&json, &compressed] {
+                assert!(
+                    decode_manifest(bytes)
+                        .unwrap_err()
+                        .to_string()
+                        .contains(&format!("unsupported manifest format version {version}"))
+                );
+            }
+            assert!(serde_json::from_slice::<Manifest>(&json).is_err());
+        }
+        let mut future = manifest_with_terms(3);
+        future.format_version = 3;
+        assert!(encode_manifest(&future).is_err());
+        // Also fail closed if an extension accidentally forgets to raise its version.
+        let mut value = serde_json::to_value(manifest_with_terms(3)).unwrap();
+        value["future_objects"] = serde_json::json!(["segments/new-layout"]);
+        assert!(decode_manifest(&serde_json::to_vec(&value).unwrap()).is_err());
+        let file = serde_json::json!({
+            "key": "segments/known", "size": 1, "metadata_len": 0,
+            "future_object": "segments/new-layout"
+        });
+        assert!(serde_json::from_value::<SegmentFile>(file).is_err());
     }
 }

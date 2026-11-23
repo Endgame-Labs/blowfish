@@ -23,6 +23,28 @@ struct Cli {
 enum Command {
     /// Manage API keys on a running server.
     Keys(keys::Keys),
+    /// Upgrade a namespace's older-layout vector indexes to the fast-scan layout now. A running
+    /// server does this in the background by itself. Safe beside a running server.
+    Reindex {
+        /// Namespace to upgrade (or use --all).
+        namespace: Option<String>,
+        /// Upgrade every namespace in the bucket.
+        #[arg(long, conflicts_with = "namespace")]
+        all: bool,
+        /// Report index counts and bytes per layout, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, env = "BLOWFISH_STORAGE_URL")]
+        storage_url: Option<String>,
+        #[arg(long, env = "BLOWFISH_STORAGE_ENDPOINT")]
+        storage_endpoint: Option<String>,
+        #[arg(long, env = "BLOWFISH_STORAGE_REGION")]
+        storage_region: Option<String>,
+        #[arg(long, env = "BLOWFISH_STORAGE_PROFILE")]
+        storage_profile: Option<String>,
+    },
     /// Serve the turbopuffer-compatible HTTP API.
     Serve {
         #[arg(long)]
@@ -150,6 +172,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Keys(keys) => return keys.run().await,
         command => command,
     };
+    if let Command::Reindex {
+        namespace,
+        all,
+        dry_run,
+        config,
+        storage_url,
+        storage_endpoint,
+        storage_region,
+        storage_profile,
+    } = command
+    {
+        let mut config: Config = if let Some(path) = config {
+            toml::from_str(&std::fs::read_to_string(path)?)?
+        } else {
+            Config::default()
+        };
+        if let Some(url) = storage_url.or(config.storage_url) {
+            config.storage.url = url;
+        }
+        if let Some(endpoint) = storage_endpoint {
+            config.storage.endpoint = Some(endpoint);
+        }
+        if let Some(region) = storage_region {
+            config.storage.region = Some(region);
+        }
+        if let Some(profile) = storage_profile {
+            config.storage.profile = Some(profile);
+        }
+        let storage = Storage::open(&config.storage).await?;
+        let engine = Engine::with_config(
+            storage,
+            EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.0,
+                ..EngineConfig::from_env()
+            },
+        );
+        let opts = bf_engine::ReindexOptions {
+            dry_run,
+            ..Default::default()
+        };
+        let names = match (namespace, all) {
+            (Some(ns), false) => vec![ns],
+            (None, true) => engine.namespace_names().await?,
+            _ => return Err("give a namespace, or --all".into()),
+        };
+        for ns in names {
+            match engine.reindex(&ns, &opts).await {
+                Ok(r) => {
+                    let line = |name: &str, c: &bf_engine::LayoutCounts| {
+                        println!(
+                            "{ns} {name}: row-major {} ({} bytes), fast-scan {} ({} bytes), not convertible {} ({} bytes)",
+                            c.row_major.0,
+                            c.row_major.1,
+                            c.fast_scan.0,
+                            c.fast_scan.1,
+                            c.other.0,
+                            c.other.1
+                        )
+                    };
+                    line("segments", &r.segments);
+                    line("slabs", &r.slabs);
+                    if !dry_run {
+                        println!(
+                            "{ns}: rewrote {} segment indexes and {} slabs ({} bytes written, {} superseded) in {} publications, {:.1}s",
+                            r.converted_segments,
+                            r.converted_slabs,
+                            r.bytes_written,
+                            r.superseded,
+                            r.publications,
+                            r.seconds
+                        );
+                    }
+                }
+                Err(e) => eprintln!("{ns}: skipped: {e:?}"),
+            }
+        }
+        return Ok(());
+    }
     let Command::Serve {
         config,
         storage_url,

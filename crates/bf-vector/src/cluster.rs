@@ -38,9 +38,6 @@ pub struct BuildParams {
     pub samples_per_cluster: usize,
     /// Build a two-level centroid tree at this row count.
     pub two_level_threshold: usize,
-    /// Store quantized codes in the blocked fast-scan layout (the default; `BF_ANN_FASTSCAN=0`
-    /// turns it off) rather than row by row. Readers handle both.
-    pub fastscan: bool,
 }
 impl Default for BuildParams {
     fn default() -> Self {
@@ -51,7 +48,6 @@ impl Default for BuildParams {
             iterations: 8,
             samples_per_cluster: 32,
             two_level_threshold: 262_144,
-            fastscan: crate::format::fastscan_builds(),
         }
     }
 }
