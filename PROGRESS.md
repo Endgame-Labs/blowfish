@@ -4,6 +4,11 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Stored-precision ANN projection.** I added `Index::read_packed_rows`: sparse projection reads checked
+  vector ranges, while bulk reads stream whole leaves and restore segment row order. I verify whole-leaf
+  checksums for recluster and compaction reads. The f16, f32, i8, sparse-row, and corruption tests pass,
+  alongside strict clippy and formatting.
+
 - **Automatic recluster, rounds R1 and R2** (`docs/design/auto-recluster.md`, `docs/benchmarks.md`).
   - The server reclusters by itself. After each publication the indexer checks the trigger, from manifest numbers
     only. It builds a base tier when a first base would gain enough (100,000 rows and two or more segments), when rows

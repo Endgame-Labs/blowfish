@@ -524,6 +524,66 @@ impl<R: RangeRead> Index<R> {
         self.dims() * self.vector_type().width()
     }
 
+    /// Read the requested rows at their stored precision, sorted by row, with verified
+    /// checksums. Missing rows are omitted. A partial index reads only its installed
+    /// clusters; callers must install every cluster that can contain a requested row first.
+    /// Sparse reads use batches of at most 1,024 vectors and sparse cache blocks. Bulk reads
+    /// (including compaction) read whole leaves, at most 16 at a time, and restore row order.
+    pub async fn read_packed_rows(&self, wanted: &RoaringBitmap) -> Result<(Vec<u32>, Vec<u8>)> {
+        let mut present = RoaringBitmap::new();
+        for c in &self.metadata.clusters {
+            present |= &c.rows & wanted;
+        }
+        let rows: Vec<u32> = present.iter().collect();
+        let width = self.vector_row_bytes();
+        let mut out = vec![0; rows.len() * width];
+        let mut locations = Vec::with_capacity(rows.len());
+        let mut whole = Vec::new();
+        for (cid, c) in self.metadata.clusters.iter().enumerate() {
+            let selected = &c.rows & wanted;
+            if !selected.is_empty() && selected.len() * 3 >= c.rows.len() {
+                whole.push(cid);
+                continue;
+            }
+            for row in selected {
+                let ordinal = (c.rows.rank(row) - 1) as usize;
+                let at = c.vectors.start + (ordinal * width) as u64;
+                if at + width as u64 > c.vectors.end {
+                    return Err(bad("vector ordinal outside cluster"));
+                }
+                locations.push((row, at, c.row_crcs[ordinal]));
+            }
+        }
+        for batch in whole.chunks(16) {
+            let leaves =
+                futures::future::try_join_all(batch.iter().map(|cid| self.read_cluster_rows(*cid)))
+                    .await?;
+            for (leaf_rows, bytes) in leaves {
+                for (row, raw) in leaf_rows.iter().zip(bytes.chunks_exact(width)) {
+                    if let Ok(slot) = rows.binary_search(row) {
+                        out[slot * width..(slot + 1) * width].copy_from_slice(raw);
+                    }
+                }
+            }
+        }
+        for batch in locations.chunks(1024) {
+            let bytes = self
+                .read_vectors(
+                    batch
+                        .iter()
+                        .map(|(_, at, _)| *at..*at + width as u64)
+                        .collect(),
+                )
+                .await?;
+            for ((row, _, crc), bytes) in batch.iter().zip(bytes) {
+                check_crc(&bytes, *crc)?;
+                let slot = rows.binary_search(row).expect("present row");
+                out[slot * width..(slot + 1) * width].copy_from_slice(&bytes);
+            }
+        }
+        Ok((rows, out))
+    }
+
     /// Every row of one leaf cluster (ascending) and its raw full-precision vectors
     /// (`vector_row_bytes` each, in row order), read in one ranged read. Used by reclustering.
     pub async fn read_cluster_rows(&self, cluster: usize) -> Result<(Vec<u32>, Bytes)> {
@@ -536,6 +596,7 @@ impl<R: RangeRead> Index<R> {
         if bytes.len() != rows.len() * self.vector_row_bytes() {
             return Err(bad("cluster vector length disagrees with its rows"));
         }
+        check_crc(&bytes, c.vectors_crc)?;
         Ok((rows, bytes))
     }
 
