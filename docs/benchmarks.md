@@ -3970,3 +3970,53 @@ omit `D2_WARMUP`, set `D2_QUERIES=1`, choose `D2_QUERY_OFFSET=0..9`, and select 
 runs the public fenced upgrader. `D2_ACTION=recluster` builds a synthetic tier and updates both saved
 format fixtures to reference it. I collect RSS with `/usr/bin/time -v`, and remove every disposable
 store, source snapshot, build directory, input copy, and log after retaining these results.
+
+
+## Round IN1: text upgrades and update memory (2026-11-23)
+
+### Text upgrades
+
+I measure 960,000 synthetic text documents in 16 immutable 60,000-row segments, with 100 tokens per
+row and a 10,007-term vocabulary. Every source field uses text format 4 and lacks `text_keys`. Each
+segment is larger than half the 100,000-row cap, so no compaction runs during the upgrade. I discard
+an earlier fixture whose smaller segments mixed compaction into the measurement.
+
+I compare the original indexer from `12e58da` with direct format-4 repacking, using the same fixture,
+format-5 bundler, checksum validation, and test harness. I pin both arms to CPUs 6–7, use two Rayon
+workers and two Tokio workers, and build at nice 19 with two Cargo jobs, release debug information,
+and LTO disabled. These are local-file measurements on a shared VM, with the OS page cache retained.
+I use A/B/A/B order, resetting to the identical immutable source manifest before every arm.
+
+| Metric | Rebuild from documents | Repack postings |
+| --- | ---: | ---: |
+| Timed upgrade seconds, median [range] | 62.73 [58.11–67.34] | 4.81 [4.28–5.34] |
+| Fenced data publications | 32 | 1 |
+| Whole-process CPU seconds, median | 64.94 | 7.66 |
+| Whole-process instructions, billions | 277.98 | 13.09 |
+| Peak RSS, median MiB | 1,985 | 1,009 |
+| Exact output text bytes | 932,481,488 | 932,481,488 |
+| overlap@10, 32 verification queries | 1.000 | 1.000 |
+
+I get 13.0× wall throughput and 8.5× fields per CPU-hour, exceeding the 5× target. Instructions fall
+21.2×. CPU time and instruction counts include startup and a final checksum scan over every output
+field, with query verification disabled in those timed arms. RSS includes that scan too. I separately
+compare all 932,481,488 payload bytes between complete old and new publications: every byte matches.
+Another run compares every top-10 ID and score against the format-4 source on 32 queries. Unit tests
+also preserve missing and empty fields, phrase positions, long postings, short postings, and lengths.
+
+A sampled profile of the original pass puts 41.3% of its sampled cycles in `SegmentBuilder::add_document`.
+The old path decodes document columns, tokenizes them, rebuilds postings, and publishes each field
+and each ID backfill separately. I now copy existing compressed postings and positions through the
+format-5 bundler, process fields sequentially within each segment, and run segments concurrently
+under an estimated memory budget. Up to 32 segments and their ID maps share one publication.
+Formats 1–3 retain the document rebuild solely for automatic migration. I add no layout setting,
+format version, or bucket-fence generation.
+
+I keep the reproduction harness in `crates/bf-engine/src/ingest_benchmark.rs`. I compile the original
+and current engines with the same harness and the test-only `bf-text/legacy-fixtures` feature, then
+use its `build-text` and `upgrade` actions against a disposable `IN1_RUN` under `.scratch/`. I set
+`IN1_SEGMENTS=16`, `IN1_SEGMENT_ROWS=60000`, `RAYON_NUM_THREADS=2`, and `TOKIO_WORKER_THREADS=2`.
+Every invocation uses `taskset -c 6,7 timeout 1200`; timed arms additionally use `/usr/bin/time -v`
+and `perf stat -e instructions,cycles`. I set `IN1_VERIFY=0` for timing and omit it for the separate
+query comparison. The original and current arms reference identical source objects; uploaded outputs
+remain available until I finish the byte comparison and remove the disposable store.

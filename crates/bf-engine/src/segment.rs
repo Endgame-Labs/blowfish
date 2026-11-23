@@ -608,7 +608,12 @@ fn build_text(
             }
         }
     }
-    let bytes = builder.finish().map_err(index_error)?;
+    text_file_parts(builder.finish().map_err(index_error)?)
+}
+
+fn text_file_parts(
+    bytes: Vec<u8>,
+) -> Result<(Vec<u8>, u64, Option<bf_wal::TextHeaderRef>), ApiError> {
     // bf-text v1 stores the document-length region offset at footer byte 32.
     let footer = &bytes[bytes.len() - 72..];
     let lengths_offset = u64::from_le_bytes(footer[32..40].try_into().expect("v1 footer"));
@@ -631,9 +636,7 @@ fn build_text(
     Ok((bytes, metadata_len, header))
 }
 
-/// Old text layouts are rebuilt from the immutable document column, one field at
-/// a time, under the indexer's existing epoch claim. Row ordinals and missing
-/// fields are preserved, including rows hidden by the current live mask.
+/// Whether a text object needs the current layout or a manifest header.
 pub(crate) fn text_needs_upgrade(file: &SegmentFile) -> bool {
     file.text_header
         .as_ref()
@@ -653,26 +656,42 @@ pub(crate) async fn upgrade_text(
     else {
         return Ok(None);
     };
-    let attribute = key.strip_prefix("fts:").expect("text file");
-    let params = seg
-        .schema
-        .get(attribute)
-        .and_then(|s| s.text_config())
-        .ok_or_else(corrupt)?;
-    let rows = (0..seg.row_count).collect();
-    let columns = std::collections::BTreeSet::from([attribute.to_string()]);
-    let mut documents = projected_rows(store, seg, &rows, Some(&columns)).await?;
-    let values = (0..seg.row_count)
-        .map(|row| {
-            documents
-                .get_mut(&row)
-                .and_then(|d| d.remove(attribute))
-                .filter(|v| !v.is_null())
-        })
-        .collect();
-    let (bytes, metadata, header) = tokio::task::spawn_blocking(move || build_text(values, params))
+    let source = ObjectReader::new(store, &old)
+        .bypass_cache()
+        .read(0..old.size)
         .await
-        .map_err(index_error)??;
+        .map_err(index_error)?
+        .to_vec();
+    let converted = tokio::task::spawn_blocking(move || bf_text::upgrade_segment(source))
+        .await
+        .map_err(index_error)?
+        .map_err(index_error)?;
+    let (bytes, metadata, header) = if let Some(bytes) = converted {
+        text_file_parts(bytes)?
+    } else {
+        // Formats 1–3 lack colocated records. Only these layouts need document tokenization.
+        let attribute = key.strip_prefix("fts:").expect("text file");
+        let params = seg
+            .schema
+            .get(attribute)
+            .and_then(|s| s.text_config())
+            .ok_or_else(corrupt)?;
+        let rows = (0..seg.row_count).collect();
+        let columns = std::collections::BTreeSet::from([attribute.to_string()]);
+        let mut documents = projected_rows_with(store, seg, &rows, Some(&columns), true).await?;
+        let values = (0..seg.row_count)
+            .map(|row| {
+                documents
+                    .get_mut(&row)
+                    .and_then(|d| d.remove(attribute))
+                    .filter(|v| !v.is_null())
+            })
+            .collect();
+        drop(documents);
+        tokio::task::spawn_blocking(move || build_text(values, params))
+            .await
+            .map_err(index_error)??
+    };
     let mut file = put_file(
         store,
         format!(

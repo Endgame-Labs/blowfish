@@ -86,6 +86,17 @@ pub(super) fn bundle(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
             let blocks = (0..count)
                 .map(|_| BlockMeta::decode(&mut c))
                 .collect::<io::Result<Vec<_>>>()?;
+            for b in &blocks {
+                let start = usize::try_from(b.positions)
+                    .map_err(|_| invalid("position offset overflow"))?;
+                let end = start
+                    .checked_add(b.positions_size as usize)
+                    .ok_or_else(|| invalid("position size overflow"))?;
+                if start < positions || end > chunks_start {
+                    return Err(invalid("phrase positions outside their region"));
+                }
+                verify(checked_slice(&bytes, start..end)?, b.positions_crc)?;
+            }
             terms.push(Term {
                 text: text.to_vec(),
                 df,
@@ -213,7 +224,7 @@ mod tests {
         }
         let old = builder.finish_colocated().unwrap();
         assert!(!text_header(&old).unwrap().unwrap().is_current());
-        let new = bundle(old.clone()).unwrap();
+        let new = upgrade_segment(old.clone()).unwrap().unwrap();
         assert!(text_header(&new).unwrap().unwrap().is_current());
         let a = block_on(SegmentReader::open(Arc::new(MemoryRangeRead::from(old)))).unwrap();
         let b = block_on(SegmentReader::open(Arc::new(MemoryRangeRead::from(new)))).unwrap();
@@ -229,6 +240,61 @@ mod tests {
                 block_on(a.contains_token_sequence(&query)).unwrap(),
                 block_on(b.contains_token_sequence(&query)).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn upgrade_is_byte_identical_to_a_fresh_build_with_long_and_short_postings() {
+        for positions in [false, true] {
+            let build = || {
+                let mut b = SegmentBuilder::new(positions);
+                b.add_missing_document().unwrap();
+                b.add_document(&[]).unwrap();
+                for row in 0..9000 {
+                    b.add_document(&crate::tokenize(
+                        &format!("common café rare{} common", row % 113),
+                        &FtsParams::default(),
+                    ))
+                    .unwrap();
+                }
+                b
+            };
+            let old = build().finish_colocated().unwrap();
+            let expected = build().finish().unwrap();
+            let upgraded = upgrade_segment(old).unwrap().unwrap();
+            assert_eq!(upgraded, expected);
+            assert_eq!(
+                upgrade_segment(upgraded.clone()).unwrap().unwrap(),
+                upgraded
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_rejects_corrupt_postings_positions_lengths_dictionary_and_footer() {
+        let mut b = SegmentBuilder::new(true);
+        b.add_document(&crate::tokenize("fish fish water", &FtsParams::default()))
+            .unwrap();
+        let bytes = b.finish_colocated().unwrap();
+        let header = text_header(&bytes).unwrap().unwrap();
+        let footer = &header.footer;
+        let lengths = u64::from_le_bytes(footer[32..40].try_into().unwrap()) as usize;
+        let positions = u64::from_le_bytes(footer[40..48].try_into().unwrap()) as usize;
+        let dictionary = u64::from_le_bytes(footer[48..56].try_into().unwrap()) as usize;
+        for at in [
+            0,
+            positions,
+            lengths,
+            header.chunks[0].1 as usize,
+            dictionary,
+            bytes.len() - 1,
+        ] {
+            let mut bad = bytes.clone();
+            bad[at] ^= 1;
+            assert!(upgrade_segment(bad).is_err(), "corruption at {at}");
+        }
+        for end in [0, 1, 71, bytes.len() - 1] {
+            assert!(upgrade_segment(bytes[..end].to_vec()).is_err());
         }
     }
 }

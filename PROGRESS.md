@@ -4,6 +4,15 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **IN1 text upgrades** (`docs/benchmarks.md`, "Round IN1"). I repack format-4 postings directly into
+  existing format 5, and upgrade up to 32 segments and their compact ID maps per fenced publication.
+  Independent segments share a CPU and memory budget; fields within a segment run sequentially.
+  On 960K synthetic text rows in 16 segments, alternating runs improve wall throughput by 13.0× and
+  fields per CPU-hour by 8.5×, with 21.2× fewer instructions. I compare all 932.48 MB of output text
+  bytes exactly and retain overlap@10 of 1.000. Peak process RSS falls from 1,985 to 1,009 MiB.
+  I keep format 5 and fence generation 3, with older text formats read only for automatic migration.
+  Formatting, scoped clippy, crate tests, and compatibility in both modes pass.
+
 - **D2/D3 measurements** (`docs/benchmarks.md`, "Rounds D2 and D3"). I measure 200K synthetic rows and
   all 2,681,468 NQ passages with canonical schemas. As loaded, I reduce indexed bytes/row from 5,406 to
   2,887 on synthetic data, and from 5,945 to 3,581 on NQ. NQ text compresses by 2.53×. Reclustered

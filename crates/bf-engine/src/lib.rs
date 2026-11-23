@@ -8,6 +8,8 @@ mod filter;
 mod highlight;
 mod indexed;
 mod indexer;
+#[cfg(test)]
+mod ingest_benchmark;
 mod pattern;
 mod plan;
 mod read_cache;
@@ -25,6 +27,7 @@ mod recluster;
 mod reindex;
 mod text;
 mod text_keys;
+mod text_upgrade;
 mod upgrade;
 mod write;
 

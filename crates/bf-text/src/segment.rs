@@ -294,6 +294,12 @@ impl SegmentBuilder {
         bundle::bundle(self.finish_colocated()?)
     }
 
+    /// Produce format-4 bytes solely for migration tests and measurements.
+    #[cfg(feature = "legacy-fixtures")]
+    pub fn finish_colocated_fixture(self) -> io::Result<Vec<u8>> {
+        self.finish_colocated()
+    }
+
     fn finish_colocated(self) -> io::Result<Vec<u8>> {
         let packer = BitPacker4x::new();
         // Phase 1: compress every term's blocks. `post` holds the blocks of all terms in order and
@@ -584,9 +590,56 @@ pub struct TextHeader {
 }
 impl TextHeader {
     /// Whether this header describes the current dictionary-bundled layout.
-    /// Older layouts remain readable while the indexer rebuilds them.
+    /// Older layouts remain readable while the indexer upgrades them.
     pub fn is_current(&self) -> bool {
         self.footer.get(8..12) == Some(VERSION_BUNDLED.to_le_bytes().as_slice())
+    }
+}
+
+/// Upgrade colocated format-4 postings to format 5 without decoding or tokenizing documents.
+/// Current bytes are returned unchanged. Formats 1–3 return `None`, so callers can rebuild
+/// from their immutable document columns. The footer, lengths, and dictionary index are checked;
+/// format-4 conversion also checks posting and phrase payloads. Unknown formats are errors.
+pub fn upgrade_segment(bytes: Vec<u8>) -> io::Result<Option<Vec<u8>>> {
+    let footer = checked_slice(&bytes, bytes.len().saturating_sub(FOOTER)..bytes.len())?;
+    if footer.len() != FOOTER || &footer[..8] != MAGIC {
+        return Err(invalid("text segment has no valid footer"));
+    }
+    verify(
+        &footer[..FOOTER - 4],
+        u32::from_le_bytes(footer[68..72].try_into().unwrap()),
+    )?;
+    let version = u32::from_le_bytes(footer[8..12].try_into().unwrap());
+    match version {
+        VERSION | VERSION_LAZY | VERSION_CHUNKED => Ok(None),
+        VERSION_COLOCATED | VERSION_BUNDLED => {
+            let _header = text_header(&bytes)?.ok_or_else(|| invalid("missing text header"))?;
+            let lengths = u64::from_le_bytes(footer[32..40].try_into().unwrap()) as usize;
+            let positions = u64::from_le_bytes(footer[40..48].try_into().unwrap()) as usize;
+            let dictionary = u64::from_le_bytes(footer[48..56].try_into().unwrap()) as usize;
+            if u32::from_le_bytes(footer[12..16].try_into().unwrap()) > 1
+                || !(positions <= lengths
+                    && lengths <= dictionary
+                    && dictionary < bytes.len() - FOOTER)
+            {
+                return Err(invalid("invalid text segment offsets or flags"));
+            }
+            tokenizer_of(u32::from_le_bytes(footer[20..24].try_into().unwrap()))?;
+            verify(
+                checked_slice(&bytes, lengths..dictionary)?,
+                u32::from_le_bytes(footer[56..60].try_into().unwrap()),
+            )?;
+            verify(
+                checked_slice(&bytes, dictionary..bytes.len() - FOOTER)?,
+                u32::from_le_bytes(footer[64..68].try_into().unwrap()),
+            )?;
+            if version == VERSION_BUNDLED {
+                Ok(Some(bytes))
+            } else {
+                bundle::bundle(bytes).map(Some)
+            }
+        }
+        _ => Err(invalid("unknown text segment format")),
     }
 }
 /// The header of a finished version 4 or 5 segment (`None` for older versions).

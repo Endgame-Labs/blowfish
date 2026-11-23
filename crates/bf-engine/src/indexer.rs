@@ -873,16 +873,11 @@ impl Engine {
         manifest.deleted = false;
         manifest.segments = segments;
         retire_stale_tiers(&mut manifest);
-        // Upgrade one text field per publication to bound the working set. The epoch
-        // claim above fences competing indexers; a crash leaves only unreferenced objects.
-        for seg in &mut manifest.segments {
-            if let Some(old) = segment::upgrade_text(store, ns, seg).await? {
-                retire(&mut manifest, old);
-                break;
-            }
-            if crate::text_keys::backfill(store, ns, seg).await? {
-                break;
-            }
+        // Rewrite bounded batches under this publication's epoch claim. A failed or fenced
+        // pass leaves only unreferenced objects for GC; it never deletes uncertain uploads.
+        let old = crate::text_upgrade::upgrade(store, ns, &mut manifest.segments).await?;
+        for key in old {
+            retire(&mut manifest, key);
         }
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest
