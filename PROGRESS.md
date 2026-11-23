@@ -4,6 +4,19 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Document footprint, rounds D2 and D3.** I write document-v2 without dense-vector payloads, compress string
+  and string-array blocks with zstd level 3, and remove the redundant `ids.bfi` Bloom filter. Vector projection
+  and compaction read checksummed ANN vectors at their declared precision. The automatic upgrade and
+  `blowfish reindex` convert ANN first, then publish one document/ID pair at a time, leaving indexed queries,
+  ANN directories, tiers, live masks, and WAL checkpoints intact. Generation stays at 3.
+  I test byte-identical f16/f32/i8 projection, missing vectors, compressed-block corruption, negative ID lookups
+  that never open `ids.bfi`, compaction round trips, automatic startup conversion, and indexed queries at 0%,
+  50%, and 100% document conversion. I also inject failed and unresolved ambiguous publications, and verify
+  that referenced objects survive. Strict clippy and the three changed crates’ tests pass; all 121 compatibility
+  scenarios pass in both normal and forced-indexing modes, both TypeScript runs pass, and all nine compatibility
+  unit tests pass. Footprint and latency measurements follow separately.
+
+
 - **Stored-precision ANN projection.** I added `Index::read_packed_rows`: sparse projection reads checked
   vector ranges, while bulk reads stream whole leaves and restore segment row order. I verify whole-leaf
   checksums for recluster and compaction reads. The f16, f32, i8, sparse-row, and corruption tests pass,

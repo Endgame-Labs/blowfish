@@ -1,10 +1,10 @@
-//! ANN object upgrade (`blowfish reindex`): merge each older index and its fragments into one
-//! object, upgrading row-major codes to fast scan. The indexer runs it once per namespace.
+//! Segment format upgrade (`blowfish reindex`): merge legacy ANN objects, then remove duplicate
+//! document vectors, compress text blocks, and discard the redundant ID Bloom filter.
 //!
 //! Index objects are immutable, so a rewrite writes new objects under new keys and then swaps
-//! them into the manifest in one fenced publication. Nothing else changes: documents, the WAL,
-//! the full-text and filter indexes, and every cluster center, row membership, and full-precision
-//! vector stay as they are, and nothing is retrained (see `bf_vector::convert_layout`).
+//! them into the manifest in one fenced publication. The WAL, full-text and filter indexes,
+//! cluster centers, row membership, and full-precision vector bytes stay unchanged; no training
+//! is repeated (see `bf_vector::convert_layout`). Document batches preserve every ANN directory.
 //!
 //! The job has three phases per batch of segments (and then per batch of recluster slabs):
 //!
@@ -23,7 +23,7 @@
 //!    publication does not touch, and `indexed_through` is carried over unchanged.
 //!
 //! A batch's swap is durable on its own, so a run interrupted between batches keeps what it
-//! published, and running it again skips every single ANN object.
+//! published. Running it again skips current ANN objects and document-v2 objects.
 use crate::{Engine, ann_dir, log_error, segment};
 use bf_types::ApiError;
 use bf_vector::CodeLayout;
@@ -84,10 +84,14 @@ pub struct ReindexReport {
     pub segments: LayoutCounts,
     /// A recluster's slabs before the run.
     pub slabs: LayoutCounts,
+    /// Legacy document objects before the run: count and stored bytes.
+    pub documents: (usize, u64),
+    /// Document and ID pairs rewritten and published after their ANN sources are current.
+    pub converted_documents: usize,
     /// Indexes rewritten and published (segments, then slabs).
     pub converted_segments: usize,
     pub converted_slabs: usize,
-    /// Bytes of index objects written.
+    /// Bytes of ANN, document, and ID objects written (directory and manifest writes excluded).
     pub bytes_written: u64,
     /// Converted indexes dropped because a concurrent publication replaced their segment.
     pub superseded: usize,
@@ -111,10 +115,11 @@ struct Converted {
 enum Batch {
     Segments(Vec<Converted>),
     Slabs(String, Vec<Converted>),
+    Documents(Vec<Converted>),
 }
 
 impl Engine {
-    /// Rewrite legacy vector indexes of `ns` as single ANN objects. Safe beside a running server on the
+    /// Upgrade legacy ANN and document objects of `ns`. Safe beside a running server on the
     /// same bucket (see the module notes). Prints progress to standard error.
     pub async fn reindex(
         &self,
@@ -160,6 +165,12 @@ impl Engine {
         };
         let attrs = attributes(&manifest);
         let mut report = ReindexReport::default();
+        for seg in &manifest.segments {
+            if segment::upgrade::needs_upgrade(store, seg).await? {
+                report.documents.0 += 1;
+                report.documents.1 += seg.files["docs"].size;
+            }
+        }
         // Survey: one small ranged read per index.
         let mut todo: Vec<(String, String, SegmentFile)> = Vec::new();
         for seg in &manifest.segments {
@@ -293,6 +304,25 @@ impl Engine {
                     .await?;
             }
         }
+        // Documents are last: every checkpoint keeps its ANN source, and document-only
+        // publications leave all ANN directories and recluster tiers byte-for-byte intact.
+        let latest = wal
+            .latest_manifest()
+            .await
+            .map_err(log_error)?
+            .ok_or_else(|| ApiError::new(404, "namespace has no checkpoint"))?
+            .1;
+        for seg in &latest.segments {
+            if !segment::upgrade::needs_upgrade(store, seg).await? {
+                continue;
+            }
+            let converted = convert_documents(store, ns, seg).await?;
+            let bytes = converted.bytes;
+            report.bytes_written += bytes;
+            // One segment per publication bounds memory and makes interrupted upgrades resumable.
+            self.publish_batch(&wal, ns, Batch::Documents(vec![converted]), &mut report)
+                .await?;
+        }
         report.seconds = t0.elapsed().as_secs_f64();
         Ok(report)
     }
@@ -365,19 +395,11 @@ impl Engine {
         batch: Batch,
         report: &mut ReindexReport,
     ) -> Result<(), ApiError> {
-        let result = self.publish_batch_inner(wal, ns, &batch, report).await;
-        if !matches!(result, Ok(true)) {
-            // Nothing references the converted objects of a batch that was not (or only partly)
-            // swapped in; `inner` has already deleted the superseded ones on success.
-            if result.is_err() {
-                for c in batch.converted() {
-                    for (_, f) in &c.new {
-                        let _ = self.0.store.delete(&f.key).await;
-                    }
-                }
-            }
-        }
-        result.map(|_| ())
+        // A storage error can follow a successful publication. Keep every uploaded object
+        // on an ambiguous failure: ordinary GC decides which keys are actually unreferenced.
+        self.publish_batch_inner(wal, ns, &batch, report)
+            .await
+            .map(|_| ())
     }
 
     async fn publish_batch_inner(
@@ -417,6 +439,7 @@ impl Engine {
             let (applied, superseded) = match batch {
                 Batch::Segments(list) => apply_segments(store, ns, &mut manifest, list).await?,
                 Batch::Slabs(attr, list) => self.apply_slabs(ns, &mut manifest, attr, list).await?,
+                Batch::Documents(list) => apply_documents(&mut manifest, list),
             };
             if applied == 0 {
                 // Everything was replaced by someone else; the claim published nothing new.
@@ -436,6 +459,7 @@ impl Engine {
                     match batch {
                         Batch::Segments(_) => report.converted_segments += applied,
                         Batch::Slabs(..) => report.converted_slabs += applied,
+                        Batch::Documents(_) => report.converted_documents += applied,
                     }
                     report.publications += 1;
                     report.superseded += superseded.len();
@@ -561,9 +585,60 @@ impl Engine {
 impl Batch {
     fn converted(&self) -> impl Iterator<Item = &Converted> {
         match self {
-            Batch::Segments(l) | Batch::Slabs(_, l) => l.iter(),
+            Batch::Segments(l) | Batch::Slabs(_, l) | Batch::Documents(l) => l.iter(),
         }
     }
+}
+
+async fn convert_documents(
+    store: &bf_storage::Storage,
+    ns: &str,
+    seg: &Segment,
+) -> Result<Converted, ApiError> {
+    let new = segment::upgrade::rewrite(store, ns, seg).await?;
+    let bytes = new.iter().map(|(_, f)| f.size).sum();
+    Ok(Converted {
+        id: seg.id.clone(),
+        attr: "docs".into(),
+        old_ann: seg.files["docs"].key.clone(),
+        new,
+        old: ["docs", "ids"]
+            .iter()
+            .filter_map(|role| seg.files.get(*role).cloned())
+            .collect(),
+        bytes,
+    })
+}
+
+fn apply_documents(
+    manifest: &mut Manifest,
+    list: &[Converted],
+) -> (usize, BTreeSet<(String, String)>) {
+    let (mut applied, mut superseded) = (0, BTreeSet::new());
+    for c in list {
+        let current = manifest
+            .segments
+            .iter_mut()
+            .find(|s| s.id == c.id)
+            .filter(|s| {
+                s.files.get("docs").is_some_and(|f| f.key == c.old_ann)
+                    && c.old
+                        .iter()
+                        .all(|f| s.files.values().any(|current| current.key == f.key))
+            });
+        let Some(seg) = current else {
+            superseded.insert((c.id.clone(), c.attr.clone()));
+            continue;
+        };
+        for (role, file) in &c.new {
+            seg.files.insert(role.clone(), file.clone());
+        }
+        for old in &c.old {
+            crate::indexer::retire(manifest, old.key.clone());
+        }
+        applied += 1;
+    }
+    (applied, superseded)
 }
 
 /// The vector attributes to process.
@@ -797,3 +872,11 @@ mod tests {
 #[cfg(test)]
 #[path = "reindex_migration_tests.rs"]
 mod migration_tests;
+
+#[cfg(test)]
+#[path = "document_migration_tests.rs"]
+mod document_migration_tests;
+
+#[cfg(test)]
+#[path = "document_benchmark.rs"]
+mod document_benchmark;
