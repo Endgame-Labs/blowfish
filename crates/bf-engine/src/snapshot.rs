@@ -20,6 +20,8 @@ pub(crate) struct OpenHint {
     /// dictionary chunks, term records, and corpus statistics chunks) in the snapshot wave.
     bm25: Vec<(String, serde_json::Value, bool)>,
     docs: bool,
+    /// Every sub-query can return text hits using only compact row-to-ID maps.
+    only_text_ids: bool,
     /// Filters of ANN sub-queries: their per-segment bitmaps are opened in the snapshot wave.
     filters: Vec<Filter>,
     /// A lone unfiltered ANN query `(attribute, vector, k)`: its scan reads start in the snapshot
@@ -65,6 +67,7 @@ impl OpenHint {
             text: BTreeSet::new(),
             bm25: Vec::new(),
             docs: false,
+            only_text_ids: true,
             filters: Vec::new(),
         };
         for q in request
@@ -102,6 +105,12 @@ impl OpenHint {
                 }
                 None => {}
             }
+            hint.only_text_ids &= matches!(q.rank_by, Some(RankBy::Bm25 { .. }))
+                && q.filters.is_none()
+                && q.include_attributes.is_none()
+                && q.exclude_attributes.is_none()
+                && q.compute_attributes.is_none()
+                && q.limit.as_ref().and_then(Limit::per).is_none();
             hint.docs |= q.include_attributes.is_some()
                 || q.exclude_attributes.is_some()
                 || q.compute_attributes.is_some()
@@ -271,6 +280,12 @@ impl OpenHint {
                         tasks.push(segment::vector_index(store, file).map_ok(drop).boxed());
                     }
                 }
+                let compact_ids = self.only_text_ids && crate::text_keys::inline(seg);
+                if with_text && compact_ids {
+                    tasks.push(
+                        timed("text_keys", crate::text_keys::load(store, seg).map_ok(drop)).boxed(),
+                    );
+                }
                 for attribute in self.text.iter().filter(|_| with_text) {
                     if let Some(file) = seg.files.get(&format!("fts:{attribute}")) {
                         tasks.push(
@@ -294,7 +309,7 @@ impl OpenHint {
                     .get("ids")
                     .is_none_or(|f| f.size <= crate::indexed::RANGED_IDS_BYTES);
                 if (with_rest && !self.ann.is_empty() && !by_dir)
-                    || (with_text && !self.text.is_empty() && small_ids)
+                    || (with_text && !self.text.is_empty() && small_ids && !compact_ids)
                 {
                     tasks.push(
                         timed("ids", segment::ids(store, seg))
@@ -314,7 +329,7 @@ impl OpenHint {
                 if (with_rest
                     && self.docs
                     && !(by_dir && self.text.is_empty() && !self.ann.is_empty()))
-                    || (with_text && !self.text.is_empty() && !small_ids)
+                    || (with_text && !self.text.is_empty() && !small_ids && !compact_ids)
                 {
                     tasks.push(segment::warm_docs(store, seg).map(|()| Ok(())).boxed());
                 }
@@ -377,11 +392,11 @@ fn same_checkpoint(state: &NamespaceState, m: &bf_wal::Manifest) -> bool {
                     // before the next upgrade pass or query.
                     && a.files
                         .iter()
-                        .filter(|(k, _)| k.starts_with("fts:"))
+                        .filter(|(k, _)| k.starts_with("fts:") || k.as_str() == crate::text_keys::ROLE)
                         .map(|(k, f)| (k, &f.key))
                         .eq(b.files
                             .iter()
-                            .filter(|(k, _)| k.starts_with("fts:"))
+                            .filter(|(k, _)| k.starts_with("fts:") || k.as_str() == crate::text_keys::ROLE)
                             .map(|(k, f)| (k, &f.key)))
         })
         && state.text_stats.as_ref().map(|f| &f.key) == m.text_stats.as_ref().map(|f| &f.key)

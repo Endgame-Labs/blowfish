@@ -4,6 +4,18 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Compact IDs for BM25:** text segments now store a checksummed row-to-ID map using numeric
+  strides or string prefixes, admitted under a fixed 128 KiB encoded-size budget. ID-only BM25
+  opens that map with text metadata and skips document footers and winner-ID column reads.
+  Larger maps record a 17-byte marker and use existing ranged ID reads, with no operator switch.
+  - The normal indexer backfills older segments once, and checkpoint comparison notices the new
+    file role. The manifest schema and bucket fence remain unchanged. The six local 1M-row
+    segments upgraded automatically; their ID maps total 246 bytes.
+  - Checked: formatting, release clippy for `bf-text` and `bf-engine`, all targets, and warnings
+    denied; 136 Rust tests; compat 121/121 in normal and forced modes; SDK retry checks 4/4 in
+    each mode; and TypeScript smoke and retry checks in each mode. The read-count regression
+    requires zero document reads, unchanged answers, and a backfill followed by an idle no-op.
+
 - **Exact BM25 bounds and bundled text reads:** text format 5 keeps dictionaries, term directories,
   and up to 32 posting blocks per term together, with one stored copy of every payload. Bundles
   contain at most 128 terms and use an estimated 32 KiB budget; large directories occupy their own

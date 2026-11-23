@@ -880,6 +880,9 @@ impl Engine {
                 retire(&mut manifest, old);
                 break;
             }
+            if crate::text_keys::backfill(store, ns, seg).await? {
+                break;
+            }
         }
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest
@@ -1161,9 +1164,11 @@ fn bulk_wait(state: &NamespaceState, config: &EngineConfig, tail_age: Duration) 
 }
 fn needs_text_upgrade(state: &NamespaceState) -> bool {
     state.segments.iter().any(|seg| {
-        seg.files
-            .iter()
-            .any(|(key, file)| key.starts_with("fts:") && segment::text_needs_upgrade(file))
+        crate::text_keys::needs(seg)
+            || seg
+                .files
+                .iter()
+                .any(|(key, file)| key.starts_with("fts:") && segment::text_needs_upgrade(file))
     })
 }
 

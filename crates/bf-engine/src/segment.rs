@@ -832,6 +832,12 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
         )
         .await?,
     );
+    if !fts_jobs.is_empty() {
+        files.insert(
+            crate::text_keys::ROLE.into(),
+            crate::text_keys::put(store, &prefix, &ids).await?,
+        );
+    }
     files.insert(
         "ids".into(),
         put_value(store, format!("{prefix}/ids.bfi"), &IdIndex { ids, bloom }).await?,

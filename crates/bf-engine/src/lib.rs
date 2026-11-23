@@ -23,6 +23,7 @@ mod query;
 mod recluster;
 mod reindex;
 mod text;
+mod text_keys;
 mod write;
 
 use bf_storage::{CreateResult, Storage};
