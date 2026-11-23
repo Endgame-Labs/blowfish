@@ -24,7 +24,7 @@ async fn query(engine: &Engine) -> Vec<bf_types::Document> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_text_headers_are_automatically_rebuilt_and_retired() {
+async fn text_postings_are_automatically_rebundled_and_retired() {
     let store = Storage::open(&StorageConfig {
         url: "memory://".into(),
         ..Default::default()
@@ -55,9 +55,29 @@ async fn missing_text_headers_are_automatically_rebuilt_and_retired() {
     let wal = Wal::new(store.clone(), "text-upgrade").unwrap();
     let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
     let before_stats = manifest.text_stats.clone();
+    let expected_bytes = store
+        .get(&manifest.segments[0].files["fts:text"].key)
+        .await
+        .unwrap();
+    let mut builder = bf_text::SegmentBuilder::new(true);
+    for value in [Some("fox rare fox"), Some("fox dog"), None, Some("")] {
+        if let Some(value) = value {
+            builder
+                .add_document(&bf_text::tokenize(value, &Default::default()))
+                .unwrap();
+        } else {
+            builder.add_missing_document().unwrap();
+        }
+    }
+    let bytes = builder.finish_colocated_fixture().unwrap();
+    let mut file = manifest.segments[0].files["fts:text"].clone();
+    file.key = "ns/text-upgrade/fixture-v4.bft".into();
+    file.size = bytes.len() as u64;
+    file.metadata_len = 0;
+    store.create_unique(&file.key, bytes).await.unwrap();
+    manifest.segments[0].files.insert("fts:text".into(), file);
     let old = manifest.segments[0].files["fts:text"].key.clone();
-    // A missing header is how older text formats appear in a manifest. Rebuilding
-    // from the document column also handles formats that cannot be converted in place.
+    // Missing manifest headers also occur for current bytes. Both cases avoid document reads.
     let old_keys: Vec<_> = manifest.segments[0]
         .files
         .iter()
@@ -71,24 +91,27 @@ async fn missing_text_headers_are_automatically_rebuilt_and_retired() {
         .await
         .unwrap();
     let upgrader = Engine::with_config(store.clone(), config);
-    for completed in 1..=old_keys.len() {
-        assert!(
-            upgrader
-                .index_namespace("text-upgrade", false)
-                .await
-                .unwrap()
-        );
-        let (_, current) = wal.latest_manifest().await.unwrap().unwrap();
-        let upgraded = old_keys
-            .iter()
-            .filter(|(key, old)| current.segments[0].files[key].key != *old)
-            .count();
-        assert_eq!(
-            upgraded, completed,
-            "each pass must adopt the previous text generation"
-        );
-    }
+    assert!(
+        upgrader
+            .index_namespace("text-upgrade", false)
+            .await
+            .unwrap()
+    );
     let (_, after) = wal.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(
+        old_keys
+            .iter()
+            .filter(|(key, old)| after.segments[0].files[key].key != *old)
+            .count(),
+        old_keys.len()
+    );
+    assert_eq!(
+        store
+            .get(&after.segments[0].files["fts:text"].key)
+            .await
+            .unwrap(),
+        expected_bytes
+    );
     assert_ne!(after.segments[0].files["fts:text"].key, old);
     assert!(after.segments[0].files["fts:text"].text_header.is_some());
     assert!(after.retired.iter().any(|f| f.key == old));
@@ -102,5 +125,81 @@ async fn missing_text_headers_are_automatically_rebuilt_and_retired() {
             .index_namespace("text-upgrade", true)
             .await
             .unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batches_resume_without_document_reads_or_repeated_id_backfills() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let config = EngineConfig {
+        indexing: false,
+        lease_duration: std::time::Duration::ZERO,
+        recall_sample_rate: 0.0,
+        max_segment_rows: 1,
+        compaction_segments: usize::MAX,
+        ..Default::default()
+    };
+    let engine = Engine::with_config(store.clone(), config.clone());
+    let rows: Vec<_> = (0..40)
+        .map(|id| json!({"id":id,"text":"fish water"}))
+        .collect();
+    engine.write("text-upgrade",serde_json::from_value(json!({"schema":{"text":{"type":"string","full_text_search":true}},"upsert_rows":rows})).unwrap()).await.unwrap();
+    engine.index_namespace("text-upgrade", true).await.unwrap();
+    let q: QueryRequest =
+        serde_json::from_value(json!({"rank_by":["text","BM25","fish"],"top_k":10})).unwrap();
+    let expected = engine
+        .query("text-upgrade", q.clone())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    let wal = Wal::new(store.clone(), "text-upgrade").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(m.segments.len(), 40);
+    for s in &mut m.segments {
+        s.files.get_mut("fts:text").unwrap().text_header = None;
+        s.files.remove("text_keys");
+        // A rebundle and ID backfill must use postings and IDs, even with documents unavailable.
+        store.delete(&s.files["docs"].key).await.unwrap();
+    }
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+    let upgrader = Engine::with_config(store.clone(), config);
+    for completed in [32, 40] {
+        assert!(
+            upgrader
+                .index_namespace("text-upgrade", false)
+                .await
+                .unwrap()
+        );
+        let (_, m) = wal.latest_manifest().await.unwrap().unwrap();
+        assert_eq!(
+            m.segments
+                .iter()
+                .filter(|s| s.files["fts:text"].text_header.is_some())
+                .count(),
+            completed
+        );
+        assert_eq!(
+            m.segments
+                .iter()
+                .filter(|s| s.files.contains_key("text_keys"))
+                .count(),
+            completed
+        );
+    }
+    assert!(
+        !upgrader
+            .index_namespace("text-upgrade", false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        upgrader.query("text-upgrade", q).await.unwrap().result.rows,
+        expected
     );
 }

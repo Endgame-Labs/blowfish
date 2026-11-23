@@ -3970,3 +3970,186 @@ omit `D2_WARMUP`, set `D2_QUERIES=1`, choose `D2_QUERY_OFFSET=0..9`, and select 
 runs the public fenced upgrader. `D2_ACTION=recluster` builds a synthetic tier and updates both saved
 format fixtures to reference it. I collect RSS with `/usr/bin/time -v`, and remove every disposable
 store, source snapshot, build directory, input copy, and log after retaining these results.
+
+
+## Round IN1: text upgrades and update memory (2026-11-23)
+
+### Text upgrades
+
+I measure 960,000 synthetic text documents in 16 immutable 60,000-row segments, with 100 tokens per
+row and a 10,007-term vocabulary. Every source field uses text format 4 and lacks `text_keys`. Each
+segment is larger than half the 100,000-row cap, so no compaction runs during the upgrade. I discard
+an earlier fixture whose smaller segments mixed compaction into the measurement.
+
+I compare the original indexer from `12e58da` with direct format-4 repacking, using the same fixture,
+format-5 bundler, checksum validation, and test harness. I pin both arms to CPUs 6–7, use two Rayon
+workers and two Tokio workers, and build at nice 19 with two Cargo jobs, release debug information,
+and LTO disabled. These are local-file measurements on a shared VM, with the OS page cache retained.
+I use A/B/A/B order, resetting to the identical immutable source manifest before every arm.
+
+| Metric | Rebuild from documents | Repack postings |
+| --- | ---: | ---: |
+| Timed upgrade seconds, median [range] | 62.73 [58.11–67.34] | 4.81 [4.28–5.34] |
+| Fenced data publications | 32 | 1 |
+| Whole-process CPU seconds, median | 64.94 | 7.66 |
+| Whole-process instructions, billions | 277.98 | 13.09 |
+| Peak RSS, median MiB | 1,985 | 1,009 |
+| Exact output text bytes | 932,481,488 | 932,481,488 |
+| overlap@10, 32 verification queries | 1.000 | 1.000 |
+
+I get 13.0× wall throughput and 8.5× fields per CPU-hour, exceeding the 5× target. Instructions fall
+21.2×. CPU time and instruction counts include startup and a final checksum scan over every output
+field, with query verification disabled in those timed arms. RSS includes that scan too. I separately
+compare all 932,481,488 payload bytes between complete old and new publications: every byte matches.
+Another run compares every top-10 ID and score against the format-4 source on 32 queries. Unit tests
+also preserve missing and empty fields, phrase positions, long postings, short postings, and lengths.
+
+A sampled profile of the original pass puts 41.3% of its sampled cycles in `SegmentBuilder::add_document`.
+The old path decodes document columns, tokenizes them, rebuilds postings, and publishes each field
+and each ID backfill separately. I now copy existing compressed postings and positions through the
+format-5 bundler, process fields sequentially within each segment, and run segments concurrently
+under an estimated memory budget. Up to 32 segments and their ID maps share one publication.
+Formats 1–3 retain the document rebuild solely for automatic migration. I add no layout setting,
+format version, or bucket-fence generation.
+
+I keep the reproduction harness in `crates/bf-engine/src/ingest_benchmark.rs`. I compile the original
+and current engines with the same harness and the test-only `bf-text/legacy-fixtures` feature, then
+use its `build-text` and `upgrade` actions against a disposable `IN1_RUN` under `.scratch/`. I set
+`IN1_SEGMENTS=16`, `IN1_SEGMENT_ROWS=60000`, `RAYON_NUM_THREADS=2`, and `TOKIO_WORKER_THREADS=2`.
+Every invocation uses `taskset -c 6,7 timeout 1200`; timed arms additionally use `/usr/bin/time -v`
+and `perf stat -e instructions,cycles`. I set `IN1_VERIFY=0` for timing and omit it for the separate
+query comparison. The original and current arms reference identical source objects; uploaded outputs
+remain available until I finish the byte comparison and remove the disposable store.
+
+
+### Update memory diagnosis
+
+I reproduce the memory growth with 300,000 NQ rows through the engine, using 1,024-dimensional f16
+vectors, original titles and text, 1,000-row requests, and 100,000-row flushes. The original engine
+peaks at 1,390 MiB for inserts and 3,378 MiB for overwrites. These diagnostic runs use host-sized
+defaults, rather than the 12 GiB scope used for the HTTP comparison below.
+
+I enable `bf-alloc/heap-profile` and collect jemalloc profiles during updates. One live-heap snapshot
+attributes 59.6% of its bytes to old-document projections and 48.5% to their packed-vector reads;
+these cumulative stacks overlap. The write preparer hydrates old rows even for unconditional
+replacements, and the indexer later materializes every overwritten row of a source segment to
+subtract statistics. Internal documents use f32 base64 for dense vectors: a 1,024-dimensional f16
+vector expands from 2,048 stored bytes to a 5,464-byte string, before other document allocations,
+packed read buffers, and cache admission. That work scales with overwritten rows and source segments.
+
+I skip stored-row hydration for unconditional upserts. Patches, deletes, and conditional writes still
+read the rows they need, including earlier in-flight groups, and UUID normalization stays shared
+between both ID sets. I accumulate overwritten-row statistics in 4,096-row chunks, bypassing cache
+admission. A current dense ANN membership map proves that every row has its float vector, so I count
+its exact canonical JSON width from dimensions and the encoded field name, without fetching vectors.
+Sparse, flat, i8, and older layouts use the ordinary decoder within the same row bound. Metadata
+statistics use this bounded scan too. I move added and removed term maps into the merge worker instead
+of cloning them, and use the merge result to decide whether to retain the previous statistics object.
+
+I compare exact row counts, logical byte totals, and text statistics with materialized documents,
+including dense, sparse, legacy, and deleted-row subsets. A regression makes old document and ANN
+objects unavailable and verifies an unconditional replacement succeeds; other checks retain patch
+conditions, conditional upserts, and metadata parity before and after indexing. One storage tradeoff
+remains: an unconditional replacement of an indexed row can now append an identical value to the WAL.
+Rows already in the tail retain their no-op comparison. Wire-level replacement semantics are unchanged.
+
+
+### Resident tail adoption
+
+After removing old-row projections, I profile the remaining update peak. A 681K-row HTTP-run snapshot
+attributes 84.2% of live allocations to documents created by WAL replay, including 828 MiB from
+checkpoint refresh. Maintenance can replace segment files without advancing the indexed WAL
+checkpoint. The existing adoption helper rejects an equal checkpoint, so compaction-only publications
+fall back to rebuilding the resident overlay from stored WAL payloads. That duplicates large buffers
+and stalls writers while the namespace lock is held.
+
+I adopt both advancing and equal checkpoints from a complete resident WAL history, retaining the
+later document Arcs and trimming only writes covered by the checkpoint. I reject older publication
+generations, gaps, copy overlays, and checkpoints beyond the locally known sequence. Capped reads
+retain their storage-replay path and cap enforcement. Adoption also carries the compact-reader flag,
+so a later text request still opens full headers. This changes checkpoint adoption, rather than
+compaction selection or tiers.
+
+I verify Arc identity across a maintenance file replacement, exact trimming across an advancing
+checkpoint, rejection of stale generations and copy histories, capped snapshots, and actual query
+results. A counted object-store regression confirms a changed document-file key triggers zero reads
+of the already resident WAL payload. All 167 engine/text tests and compatibility in both modes pass.
+
+
+### NQ HTTP comparison
+
+I compare `12e58da` with the final memory implementation at `09f3fb1` in two alternating old/new pairs.
+I load the first 681,468 prepared NQ passages into a fresh local prefix per arm, using their original
+Cohere vectors, titles, and text, then overwrite every existing row with the same vector and text and
+an appended title suffix. The source namespace is this 681K-row slice, rather than the full 2.68M rows
+from the original report. I use the real HTTP server and `bench/nq/load.py`, 5,000-row columnar
+requests, four clients, default server tuning, two Tokio workers, and two Rayon workers.
+
+I pin servers, clients, and profiling to CPUs 6–7 inside a 12 GiB scope. Both release builds have heap
+profiling and debug information enabled, with LTO disabled, and use nice 19 and two build jobs. I set
+jemalloc sampling to 2 MiB, log allocator statistics once per second, and retain the OS page cache.
+I finish other local checks before the measured arms; other workers still share the VM.
+
+After each phase I wait, with a timeout, for the immutable manifest's WAL checkpoint to equal the WAL
+head and its row count to equal 681,468. Acknowledgement rates come from the client; indexed rates
+include that drain. RSS comes from the server's `/proc` high-water mark, sampled after each phase.
+The overwrite high-water mark is cumulative over both phases. I report the median and full range
+of two runs per implementation.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Insert acknowledgement rows/s | 5,181 [4,955–5,407] | 5,735 [5,602–5,867] |
+| Insert rows/s through full indexing | 4,601 [4,368–4,833] | 5,033 [4,903–5,163] |
+| Insert peak RSS, GiB | 2.90 [2.89–2.91] | 2.78 [2.59–2.97] |
+| Overwrite acknowledgement rows/s | 3,590 [3,160–4,019] | 3,940 [3,877–4,003] |
+| Overwrite rows/s through full indexing | 3,149 [2,839–3,459] | 3,382 [3,357–3,407] |
+| Peak RSS after overwrites, GiB | 6.40 [6.26–6.53] | 3.14 [3.09–3.19] |
+| RSS immediately after overwrite drain, GiB | 4.52 [3.91–5.14] | 0.67 [0.64–0.70] |
+| Whole-server instructions, trillions | 3.123 [2.949–3.296] | 3.136 [3.076–3.197] |
+| Whole-server CPU seconds | 614.62 [577.87–651.37] | 616.48 [594.71–638.25] |
+
+I reduce the median overwrite peak by 51%, from 2.20 times the insert peak to 1.13 times it. Insert
+acknowledgement throughput is 10.7% higher in this local sample. The overwrite-throughput ranges and
+combined CPU counters overlap, so these runs establish the memory improvement without establishing
+a general CPU-throughput gain. Whole-server counters cover both phases, drains, startup, and the
+projection checks. Default background scheduling produces 9–14 initial segments and 7–16 segments
+after overwrites; I keep compaction policy unchanged throughout the comparison.
+
+I check IDs 0, 100,000, and 681,467 after each measured overwrite phase: every title has the suffix,
+and every returned base64 vector matches its original stored f16 bytes exactly. All four arms finish
+at 681,468 indexed rows. I make no full-namespace, 100M, or in-region S3 claim from this slice.
+
+I reproduce the server builds with:
+
+```sh
+source ~/.cargo/env
+CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_LTO=false CARGO_INCREMENTAL=0 \
+  nice -n 19 cargo build --release -p blowfish --features heap-profile -j 2
+```
+
+I run each server against a fresh `.scratch/` prefix in a `MemoryMax=12G` user scope, with
+`taskset -c 6,7`, `RAYON_NUM_THREADS=2`, `TOKIO_WORKER_THREADS=2`, `BF_MEM_LOG_SECS=1`,
+`BF_HEAP_DUMP_SECS=30`, a scratch heap directory, and
+`_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:21`. I collect server instructions and cycles with
+`perf stat -e instructions,cycles`. The client commands use the prepared data directory and an
+isolated localhost port:
+
+```sh
+taskset -c 6,7 timeout 1800 uv run --project bench/nq python bench/nq/load.py DATA \
+  --base-url http://127.0.0.1:PORT --namespace in1 --rows 681468 --batch 5000 --inflight 4
+taskset -c 6,7 timeout 1800 uv run --project bench/nq python bench/nq/load.py DATA \
+  --base-url http://127.0.0.1:PORT --namespace in1 --rows 681468 --batch 5000 --inflight 4 \
+  --title-suffix ' IN1 updated'
+```
+
+I wait for the checkpoint after each command, capture the server high-water mark, verify projections,
+and stop its exact PID. I delete each disposable store after its arm, and remove inputs, profiles,
+logs, build snapshots, and scratch output after preserving these numbers.
+
+### Failed upgrade groups
+
+I also wait for every launched segment job when a text conversion fails. Blocking conversion work
+cannot be cancelled by dropping its future; returning early could let a retry spend the same budget
+while the previous job still runs. A regression checks that a failed group drains its launched peer,
+leaves uploaded objects for GC, and adopts no partial results. This error-path correction does not
+change the normal NQ workload above, whose text objects and ID maps are already current.

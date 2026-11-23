@@ -15,7 +15,7 @@ pub use scoring::{CorpusStats, Query, score_document};
 mod segment;
 pub use segment::{
     MemoryRangeRead, RangeRead, SearchHit, SearchMetrics, SegmentBuilder, SegmentReader,
-    TextHeader, text_header,
+    TextHeader, text_header, upgrade_segment,
 };
 
 mod fuzzy;
