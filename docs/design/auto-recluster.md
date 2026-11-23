@@ -1,6 +1,6 @@
 # Automatic recluster
 
-Status: proposed (2026-11-23). Implements SPEC decision 21 under decision 25: recluster is always on, with no off
+Status: rounds R1 to R3 built (2026-11-23); R4 and R5 proposed. Implements SPEC decision 21 under decision 25: recluster is always on, with no off
 switch and no manual mode. `examples/recluster.rs` goes away once this ships.
 
 ## The problem, in numbers
@@ -42,9 +42,11 @@ today's `SlabSet` (slabs, their covered segments with bases and live generations
 in no tier are in **uncovered** segments, which keep their own ANN objects.
 
 One query plan covers all three:
-- It ranks leaves across both tiers' directories and the uncovered segments' entries in the namespace directory,
-  with the probe count scaled for the uncovered part only (the existing `S^0.3` rule applied to uncovered
-  segments).
+- The base probes as it would alone. The delta, and the uncovered segments' entries in the namespace directory,
+  each probe `sqrt(their share of the rows)` of a standalone probe (with the existing `S^0.3` rule for uncovered
+  segments). The base and the delta share one rerank bound and hydrate only the global top k. (Round R3 first
+  ranked both tiers' leaves as one list. A delta's leaves hold as many rows as the base's over a sparser sample, so
+  their centers sit nearer every query, and that walk spent most of the probe on them: see `docs/benchmarks.md`.)
 - Deletes and updates in covered segments are masks over global rows, as today. Rows whose newest version is in an
   uncovered segment or the WAL tail shadow older ones, as today.
 - This is the open SPEC item "slabs that cover new segments", and it is what makes slabs useful while writes
@@ -76,15 +78,24 @@ The indexer evaluates this after each publication, from manifest numbers only, s
    - The gain `G` is their ratio. Below 100,000 live rows, or with a single segment, `G` is 1.
    - A tier written in an older format counts as `G = infinity` (the automatic upgrade).
 2. **Base build:** no base, and `G >= 1.25`.
-3. **Delta build:** uncovered rows reach 10% of the base's rows. The delta is rebuilt from its own rows plus the
-   uncovered rows, against the base's coarse cells.
-4. **Merge:** the delta reaches half the base, or masked rows reach 20% of a tier. All rows are rebuilt into a new
+3. **Delta build:** uncovered rows reach 4% of the base's rows and a quarter of the delta's. The delta is rebuilt
+   from its own rows plus the uncovered rows, against the base's coarse cells. (Round R3 lowered this from the
+   10% first proposed: on NQ, 5% of rows outside the base cost 35% more instructions per query, and a delta build of
+   a few percent of the rows is cheap. The quarter-of-the-delta rule keeps a growing delta from being rebuilt more
+   than about eight times before it merges.)
+4. **Merge:** the delta reaches half the base, or masked rows reach 20% of a tier. (Round R3 estimates masked rows
+   from manifest numbers: the tiers' rows minus the live rows outside the uncovered segments.) All rows are rebuilt into a new
    base, and the delta is dropped.
 5. **Bulk-load guard:** while a bulk load is running (the indexer flushed in bulk mode in the last 5 minutes),
    steps 2 to 4 wait, unless uncovered rows exceed the covered rows. A load-then-query namespace therefore pays
    about one full build after the load, plus at most a few doubling builds during it.
-6. **Compaction first:** a build starts only when the namespace has no pending compaction (`tier()` returns
-   nothing). Otherwise the build would cover segments that are about to disappear.
+6. **Compaction first:** a build starts only when the indexer would not compact now (`tier()` without `force`
+   returns nothing). Otherwise the build would cover segments that are about to disappear. (Round R3 first asked
+   `tier()` with `force`, which lists merges the indexer defers while a long write tail is pending: under 1,000
+   upserts a second on NQ, every evaluation deferred and the rows outside the base reached 300,000 in six minutes.)
+7. **Order:** a merge first, then a delta, then a masked-rows rebuild. (A masked rebuild of NQ took 10 minutes
+   under 1,000 upserts a second, and with it ahead of the delta, the rows outside the tiers stayed above 20% while
+   it ran.)
 
 What the policy costs, simulated for a namespace growing steadily in 200,000-row segments (first base at 1M rows):
 

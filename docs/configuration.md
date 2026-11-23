@@ -178,8 +178,10 @@ variables; the defaults suit 1,024-dimension vectors.
 
 The indexer reclusters a namespace in the background when its layout would gain from it, and installs the new tier in
 its next publication (see [operations](operations.md#large-namespaces-automatic-recluster-and-compact-manifest-copy)).
-It is always on and has no settings: 32 coarse cells, leaves of about 200 rows, half the cores, and slabs sized from
-memory as above. Its spill file goes in the disk cache's directory (`storage.cache.disk_dir`), or the system's temporary
+It is always on and has no settings: a base and at most one delta tier, 32 coarse cells (shared by the base and its
+delta), leaves of about 200 rows, half the cores, and slabs sized from memory as above. A delta is built once the rows
+outside the tiers reach 4% of the base (and a quarter of the delta), and merges into a new base at half of it, or once
+deletes and updates mask a fifth of the tiers' rows. Its spill file goes in the disk cache's directory (`storage.cache.disk_dir`), or the system's temporary
 directory when there is no disk cache.
 
 ### Recluster leaf assignment

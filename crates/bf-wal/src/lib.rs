@@ -191,6 +191,10 @@ pub struct Manifest {
     /// Last indexed write timestamp; absent on legacy schema-only manifests.
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
+    /// When the indexer last flushed a bulk-load-sized tail. The automatic recluster holds its
+    /// builds while a load runs, and this keeps that across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bulk_load_at: Option<DateTime<Utc>>,
     /// Objects retired by a publication, with the start of their retention window.
     #[serde(default)]
     pub retired: Vec<RetiredObject>,
@@ -246,6 +250,18 @@ pub struct SlabSet {
     /// format 2 manifests, whose slab sets are format 1.
     #[serde(default = "tier_format_default")]
     pub format: u32,
+    /// The coarse cells the slabs were partitioned by (`cells x dims` little-endian f32, in the
+    /// metric's prepared space). A delta tier is built against its base's cells, and a merge
+    /// reuses them. Absent on a delta tier, and on tiers built before format 3 kept them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coarse: Option<SegmentFile>,
+    /// Rows the coarse cells were trained over (a merge retrains them once the base has grown four
+    /// times past this).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub coarse_rows: u64,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 impl SlabSet {
     /// Rows the slabs hold (covered rows that were live when they were built).
@@ -1136,6 +1152,7 @@ mod manifest_codec_tests {
             ann_dirs: Default::default(),
             ann_tiers: Default::default(),
             updated_at: None,
+            bulk_load_at: None,
             retired: vec![],
             checkpoints: vec![],
             pruned_through: 0,

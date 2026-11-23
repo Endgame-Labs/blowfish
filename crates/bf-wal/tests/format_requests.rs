@@ -73,6 +73,7 @@ async fn steady_state_publication_request_count() {
         retired: vec![],
         checkpoints: vec![],
         pruned_through: 0,
+        bulk_load_at: None,
         root: false,
     };
     for sequence in 1..=3 {

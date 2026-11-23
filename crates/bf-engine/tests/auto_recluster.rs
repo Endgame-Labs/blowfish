@@ -177,7 +177,12 @@ async fn referenced_slab_objects(store: &Storage) -> Vec<String> {
         .ann_tiers
         .values()
         .flatten()
-        .flat_map(|t| t.slabs.iter().flat_map(|s| s.files.values()))
+        .flat_map(|t| {
+            t.slabs
+                .iter()
+                .flat_map(|s| s.files.values())
+                .chain(t.coarse.iter())
+        })
         .map(|f| f.key.clone())
         .collect();
     out.sort();
@@ -254,4 +259,188 @@ async fn a_failed_or_ambiguous_install_publication_is_retried_and_keeps_every_re
             assert_eq!(top(&fresh, q).await, json!(q));
         }
     }
+}
+
+async fn write_rows(engine: &Engine, ids: impl Iterator<Item = usize>, shift: usize) {
+    let docs: Vec<_> = ids
+        .map(|n| json!({"id": n, "vector": vector(n + shift)}))
+        .collect();
+    engine
+        .write(
+            "t",
+            serde_json::from_value(
+                json!({"distance_metric": "euclidean_squared", "upsert_rows": docs}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    engine.index_namespace("t", true).await.unwrap();
+}
+async fn tiers(store: &Storage) -> Vec<bf_wal::SlabSet> {
+    let wal = bf_wal::Wal::new(store.clone(), "t").unwrap();
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    manifest
+        .ann_tiers
+        .get("vector")
+        .cloned()
+        .unwrap_or_default()
+}
+async fn nearest(e: &Engine, v: Vec<f32>) -> Value {
+    let request =
+        serde_json::from_value(json!({"rank_by": ["vector", "ANN", v], "top_k": 3})).unwrap();
+    e.query("t", request).await.unwrap().result.rows.unwrap()[0]["id"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writes_after_a_base_get_a_delta_on_its_cells_and_then_merge_into_a_new_base() {
+    let (_faults, store, engine) = setup().await;
+    let scratch = tempfile::tempdir().unwrap();
+    engine
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    let base = tiers(&store).await;
+    assert_eq!(base.len(), 1);
+    let cells = base[0]
+        .coarse
+        .clone()
+        .expect("a base keeps its coarse cells");
+    assert_eq!(base[0].coarse_rows, 6000);
+    // Build records are deleted once the tier is installed.
+    let records = |keys: Vec<String>| keys.iter().filter(|k| k.contains("/build-")).count();
+    assert_eq!(records(keys(&store, "ns/t/indexer/").await), 0);
+
+    // New rows, and rewritten ones (their old versions are masked in the base): a delta.
+    write_rows(&engine, 6000..6400, 0).await;
+    write_rows(&engine, 100..200, 50_000).await;
+    let report = engine
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    assert_eq!(report.rows, 500);
+    let two = tiers(&store).await;
+    assert_eq!(two.len(), 2);
+    assert_eq!(two[0].dir.key, base[0].dir.key, "the base stays");
+    assert!(two[1].coarse.is_none(), "a delta uses its base's cells");
+    assert_eq!(records(keys(&store, "ns/t/indexer/").await), 0);
+    for q in [17usize, 3017, 6100, 6399] {
+        assert_eq!(top(&engine, q).await, json!(q));
+    }
+    // A rewritten row answers with its new vector only.
+    assert_eq!(nearest(&engine, vector(150 + 50_000)).await, json!(150));
+    assert_ne!(nearest(&engine, vector(150)).await, json!(150));
+
+    // More rows: the delta is rebuilt with them, the old delta retired, and the base kept.
+    write_rows(&engine, 6400..6600, 0).await;
+    engine
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    let rebuilt = tiers(&store).await;
+    assert_eq!(rebuilt.len(), 2);
+    assert_eq!(rebuilt[0].dir.key, base[0].dir.key);
+    assert_ne!(rebuilt[1].dir.key, two[1].dir.key);
+    assert_eq!(rebuilt[1].rows(), 700);
+    // GC (retention zero) keeps every object the tiers use, the shared cells included.
+    engine.collect_garbage("t").await.unwrap();
+    for set in &rebuilt {
+        for key in set
+            .slabs
+            .iter()
+            .flat_map(|s| s.files.values())
+            .map(|f| &f.key)
+            .chain([&set.dir.key, &cells.key])
+        {
+            assert!(store.get(key).await.is_ok(), "{key} survives GC");
+        }
+    }
+    let fresh = Engine::new(store.clone());
+    for q in [17usize, 6500, 6150] {
+        assert_eq!(top(&fresh, q).await, json!(q));
+    }
+
+    // Half the base outside it: a merge into one new base, on the same cells.
+    write_rows(&engine, 6600..9000, 0).await;
+    let report = engine
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    assert_eq!(report.rows, 9000);
+    let merged = tiers(&store).await;
+    assert_eq!(merged.len(), 1);
+    assert_ne!(merged[0].dir.key, base[0].dir.key);
+    assert_eq!(merged[0].coarse.as_ref().map(|f| &f.key), Some(&cells.key));
+    assert_eq!(merged[0].coarse_rows, 6000);
+    engine.collect_garbage("t").await.unwrap();
+    assert!(store.get(&cells.key).await.is_ok());
+    for q in [17usize, 6500, 8999] {
+        assert_eq!(top(&engine, q).await, json!(q));
+    }
+    assert_eq!(nearest(&engine, vector(150 + 50_000)).await, json!(150));
+    assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_load_flush_is_kept_in_the_manifest_so_a_restart_still_waits() {
+    let store = Storage::open(&bf_storage::StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let engine = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            bulk_flush_rows: 400,
+            ..Default::default()
+        },
+    );
+    let bulk_at = || async {
+        let wal = bf_wal::Wal::new(store.clone(), "t").unwrap();
+        wal.latest_manifest().await.unwrap().unwrap().1.bulk_load_at
+    };
+    // A few rows: not a load.
+    write_rows(&engine, 0..50, 0).await;
+    assert!(bulk_at().await.is_none());
+    // Thousands of rows at once: a load's flush, recorded with the checkpoint.
+    write_rows(&engine, 50..5000, 0).await;
+    let at = bulk_at().await.expect("a bulk load's flush is recorded");
+    assert!((chrono::Utc::now() - at).num_seconds() < 60);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delta_whose_rows_are_all_deleted_leaves_the_joint_plan_to_the_base() {
+    let (_faults, store, engine) = setup().await;
+    let scratch = tempfile::tempdir().unwrap();
+    engine
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    write_rows(&engine, 6000..6300, 0).await;
+    engine
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    assert_eq!(tiers(&store).await.len(), 2);
+    assert_eq!(top(&engine, 6100).await, json!(6100));
+    let deletes: Vec<usize> = (6000..6300).collect();
+    engine
+        .write(
+            "t",
+            serde_json::from_value(json!({"deletes": deletes})).unwrap(),
+        )
+        .await
+        .unwrap();
+    engine.index_namespace("t", true).await.unwrap();
+    // The delta ranks nothing and withdraws; the base answers alone, without waiting for it.
+    for q in [17usize, 5999] {
+        let found = tokio::time::timeout(Duration::from_secs(30), top(&engine, q))
+            .await
+            .expect("no query waits on a withdrawn tier");
+        assert_eq!(found, json!(q));
+    }
+    assert_ne!(top(&engine, 6100).await, json!(6100));
 }

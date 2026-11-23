@@ -345,6 +345,11 @@ pub(crate) fn retire_stale_tiers(manifest: &mut Manifest) {
                 stale.push((attr.clone(), n));
             }
         }
+        // A delta is built against its base's cells and never answers without it.
+        if stale.iter().any(|(a, n)| a == attr && *n == 0) {
+            stale.retain(|(a, _)| a != attr);
+            stale.extend((0..tiers.len()).map(|n| (attr.clone(), n)));
+        }
     }
     for (attr, n) in stale.into_iter().rev() {
         let tiers = manifest.ann_tiers.get_mut(&attr).expect("listed above");
@@ -356,14 +361,17 @@ pub(crate) fn retire_stale_tiers(manifest: &mut Manifest) {
     }
 }
 pub(crate) fn retire_slabs(manifest: &mut Manifest, set: &bf_wal::SlabSet) {
-    for seg in &set.slabs {
-        for file in seg.files.values() {
-            retire(manifest, file.key.clone());
+    // Objects another remaining tier still uses (a delta's base, or cells shared) stay.
+    let kept: std::collections::BTreeSet<String> = manifest
+        .ann_tiers
+        .values()
+        .flatten()
+        .flat_map(crate::auto_recluster::tier_keys)
+        .collect();
+    for key in crate::auto_recluster::tier_keys(set) {
+        if !kept.contains(&key) {
+            retire(manifest, key);
         }
-    }
-    retire(manifest, set.dir.key.clone());
-    if let Some(pages) = &set.pages {
-        retire(manifest, pages.key.clone());
     }
 }
 pub(crate) fn retire(manifest: &mut Manifest, key: String) {
@@ -587,6 +595,7 @@ impl Engine {
             retired: vec![],
             checkpoints: vec![],
             pruned_through: 0,
+            bulk_load_at: None,
             root: false,
         });
         if !force
@@ -974,6 +983,14 @@ impl Engine {
             retire(&mut manifest, previous.key);
         }
         crate::ann::stage(t0, "idx text_stats");
+        // A load-sized flush, written at a load's rate: the recluster trigger holds builds while
+        // loads continue, across restarts too. A steady stream of writes is not a load: its rows
+        // go into delta tiers as they come.
+        if state.docs.len() >= self.0.config.bulk_flush_rows.max(4) / 4
+            && state.docs.len() as f64 / age.as_secs_f64().max(1.0) >= BULK_LOAD_ROWS_PER_SEC
+        {
+            manifest.bulk_load_at = Some(Utc::now());
+        }
         // A finished recluster tier joins this publication if its segments are still here.
         let installed = self.0.jobs.install(ns, &mut manifest);
         let generation = match wal
@@ -986,10 +1003,6 @@ impl Engine {
         };
         if let Some(installed) = installed {
             installed.published();
-        }
-        // A load-sized flush: the recluster trigger holds builds while loads continue.
-        if state.docs.len() >= self.0.config.bulk_flush_rows.max(4) / 4 {
-            self.0.jobs.record_bulk_flush(ns);
         }
         crate::ann::stage(t0, "idx publish");
         crate::drain::record(state.tail_bytes, t0.elapsed());
@@ -1066,18 +1079,12 @@ impl Engine {
             .iter()
             .flat_map(|(attr, tiers)| tiers.iter().map(move |set| (attr, set)))
         {
-            protected.insert(set.dir.key.clone());
-            protected.extend(set.pages.iter().map(|f| f.key.clone()));
+            protected.extend(crate::auto_recluster::tier_keys(set));
             protected.insert(crate::ann_dir::hint_key(ns, &format!("ann3:{attr}")));
             protected.insert(crate::ann_dir::hint_key(
                 ns,
                 &crate::ann_dir::paged_hint_name(attr),
             ));
-            protected.extend(
-                set.slabs
-                    .iter()
-                    .flat_map(|s| s.files.values().map(|f| f.key.clone())),
-            );
         }
         // Objects of recluster builds still running (their records are fresh).
         let building = crate::auto_recluster::building_prefixes(&self.0.store, ns).await?;
@@ -1181,6 +1188,9 @@ impl Engine {
         Ok(candidates.len())
     }
 }
+/// A flush of a tail written at least this fast is a bulk load's (NQ loads at about 10,000 rows a
+/// second; the continuous-write test writes 1,000).
+const BULK_LOAD_ROWS_PER_SEC: f64 = 2_000.0;
 /// True while a bulk load is still writing and its tail is under the bulk-flush limits: wait
 /// for more rows rather than building a small segment now.
 fn bulk_wait(state: &NamespaceState, config: &EngineConfig, tail_age: Duration) -> bool {

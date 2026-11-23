@@ -258,15 +258,31 @@ every segment. The indexer rebuilds such a namespace's vectors into one namespac
 with leaves of about 200 rows, in the background. Queries then scan far fewer rows for the same recall. It is always
 on, and there is no setting to turn it off. The design is `docs/design/auto-recluster.md`.
 
+- **Tiers.** A vector attribute has at most two tiers: a **base** over most rows, and a **delta** over rows written
+  since, partitioned by the base's coarse cells. Rows in neither are in uncovered segments, which keep their own
+  indexes.
 - **When it runs.** After each publication, the indexer checks the namespace's layout from manifest numbers alone.
-  A namespace with at least 100,000 rows in two or more segments gets its first tier once a default query would scan
-  1.25 times fewer rows with it. A namespace with a tier gets a new one once the rows outside it reach a quarter of
-  its rows (an interim rule until the delta tier lands), or when the tier's format is older than the binary's. A
-  build waits while compaction has merges pending, and while a bulk load is still flushing (unless the load has
-  outgrown what the tier covers).
-- **What queries see.** Unfiltered ANN queries use one plan over the tier and the segments written since, so new
-  writes never send queries back to the slower per-segment path. Deletes and updates of covered rows are masked.
-  Filtered ANN, BM25, and everything else use the segments as before. Compaction leaves covered segments alone.
+  - A namespace with at least 100,000 rows in two or more segments gets its first base once a default query would
+    scan 1.25 times fewer rows with it.
+  - With a base, the rows outside the tiers get a delta (rebuilt with the current delta's rows) once they reach 4% of
+    the base's rows and a quarter of the delta's.
+  - Once the delta and the rows outside it reach half the base, everything merges into a new base, which reuses the
+    old base's coarse cells unless the rows have grown four times since they were trained.
+  - Once deletes and updates mask a fifth of the tiers' rows, they are rebuilt as a new base without them, after any
+    delta that is due (a delta takes seconds; a new base takes as long as the first one).
+  - A tier whose format is older than the binary's is rebuilt as a base.
+  - A build waits while compaction has merges it would run now (a long write tail defers compaction, and then the
+    build doesn't wait for it), and for five minutes after a bulk load's flush (unless the
+    load has outgrown what the tiers cover). A bulk load's flush is one of at least a quarter of the bulk flush rows,
+    written at 2,000 rows a second or more; a steady stream of writes slower than that gets deltas as it goes. The
+    time of that flush is kept in the manifest, so a restart doesn't start a build in the middle of a load.
+- **What queries see.** Unfiltered ANN queries use one plan over the tiers and the segments written since, so new
+  writes never send queries back to the slower per-segment path. The base probes as it would alone, and the delta
+  probes and reranks `sqrt(its share of the rows)` of what it would alone, the same rule as for rows outside the
+  tiers. The two agree on one rerank bound and hydrate only the global top k, so a delta costs about its share of
+  rows, not a second search. Deletes and updates
+  of covered rows are masked. Filtered ANN, BM25, and everything else use the segments as before. Compaction leaves
+  covered segments alone.
 - **What it costs.** A build uses half the cores, and waits between slabs whenever the indexer flushes or
   compacts. It reserves memory from the engine's budget (what is left after the block cache, the decoded cache,
   and the unindexed limit), at 12 KB per row of a slab, and defers when fewer than 50,000 rows fit. Its spill file
@@ -276,7 +292,8 @@ on, and there is no setting to turn it off. The design is `docs/design/auto-recl
 - **Safety.** A build reads a snapshot of the manifest and never stops indexing. It writes a create-only build
   record (`ns/<ns>/indexer/build-*.json`), refreshed every 10 minutes, and GC keeps the build's objects while a
   record is less than 20 minutes old. The finished tier is installed by the indexer's next publication, under its
-  normal fence, and only if every segment it covers is still there. A crashed build leaves orphaned objects that GC
+  normal fence, and only if every segment it covers is still there (and, for a delta, its base is still installed).
+  The build's records are deleted once the tier is installed or dropped. A crashed build leaves orphaned objects that GC
   deletes after the retention window. Only the node holding the namespace's indexer lease builds, and read-only
   deployments never do.
 - **Logs and metrics.** Each decision is logged (`recluster: starting a build`, `recluster: deferred`, `recluster:

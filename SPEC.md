@@ -94,6 +94,11 @@ log entry in the same commit.
   slab-speed queries; compaction leaves covered segments alone. Manifest and bucket format 3 (`ann_tiers` replaces
   `ann_slabs`, which is read once and rewritten). `examples/recluster.rs`, `examples/repage.rs`, and the recluster's
   epoch claim are gone.
+- **Delta tier** (round R3 of `docs/design/auto-recluster.md`): rows written after the base get a delta tier, built on
+  the base's coarse cells once they reach 4% of the base (and a quarter of the delta), and merged into a new base at
+  half of it, or once deletes and updates mask a fifth of the tiers' rows. The base probes as it would alone, the
+  delta `sqrt(its share)` of what it would alone, and the two share one rerank bound and one hydration. The bulk-load guard is kept
+  in the manifest (`bulk_load_at`), and build records are deleted once their tier is installed or dropped.
 - **No row-level graph indexes** (HNSW, DiskANN, and similar over rows). The peak-jumping research ruled them out for a
   cold, object-storage-first engine: their random hops each cost an object-store round trip. A graph over leaf centers,
   held with the paged directory, is allowed (decision 26; `docs/design/graph-index.md`).
@@ -123,8 +128,8 @@ log entry in the same commit.
 
 **Open.**
 
-- **Automatic recluster, rounds R3 to R5:** the delta tier (until then, a full rebuild once rows outside the base reach a
-  quarter of it), lineage so covered segments can compact, and the 100M run with the job on.
+- **Automatic recluster, rounds R4 and R5:** lineage so covered segments can compact (until then, rows deleted from a
+  covered segment stay in it), and the 100M run with the job on.
 - Filtered ANN on slabs.
 - A split manifest (a small root plus lazily read segment lists) would shrink the cold ANN read further than the compact copy's 375 KB; text-header reads on a namespace with a compact copy cost one more round trip.
 - BM25: fold term records into dictionary reads, store document lengths in blocks, and a namespace-wide text

@@ -553,6 +553,7 @@ pub(crate) async fn catch_up_hinted(
                             text_stats: m.text_stats.map(std::sync::Arc::new),
                             ann_dirs: m.ann_dirs,
                             ann_tiers: m.ann_tiers.into(),
+                            bulk_load_at: m.bulk_load_at,
                             stats: m.stats.into(),
                             ..Default::default()
                         }
