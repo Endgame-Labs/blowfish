@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **D2/D3 measurements** (`docs/benchmarks.md`, "Rounds D2 and D3"). I measure 200K synthetic rows and
+  all 2,681,468 NQ passages with canonical schemas. As loaded, I reduce indexed bytes/row from 5,406 to
+  2,887 on synthetic data, and from 5,945 to 3,581 on NQ. NQ text compresses by 2.53×. Reclustered
+  synthetic data drops from 7,637 to 5,118 bytes/row; D4 still needs to retire its covered segment ANN
+  objects to reach the reclustered target. I run alternating warm/cold queries with hardware counters,
+  both vector encodings, actual old/new compaction code, and the fenced upgrader. All 6,656 timed
+  responses and 280 cold responses match, with zero document-vector scans. The full NQ document upgrade
+  rewrites 557.85 MB in 17.14 s at 206 MiB peak RSS; a second run changes nothing. All 198 Rust tests,
+  strict clippy, both 121-scenario compatibility modes, both TypeScript smokes, and nine Python unit
+  tests pass. Warm timings and NQ compaction vary on the shared VM; I retain their full run spread.
+
 - **Bounded document-upgrade reads.** I batch up to 64 source column ranges through the bypassing
   reader, so adjacent document blocks share aligned reads. I retain each block's checksum check and
   test a corrupt legacy source explicitly. Formatting, strict clippy, and all 198 Rust tests in
@@ -19,7 +30,7 @@ Newest first. Each entry says what works now and how it was checked.
   50%, and 100% document conversion. I also inject failed and unresolved ambiguous publications, and verify
   that referenced objects survive. Strict clippy and the three changed crates’ tests pass; all 121 compatibility
   scenarios pass in both normal and forced-indexing modes, both TypeScript runs pass, and all nine compatibility
-  unit tests pass. Footprint and latency measurements follow separately.
+  unit tests pass. I record footprint, query, compaction, and upgrade measurements in `docs/benchmarks.md`.
 
 - **Stored-precision ANN projection.** I added `Index::read_packed_rows`: sparse projection reads checked
   vector ranges, while bulk reads stream whole leaves and restore segment row order. I verify whole-leaf

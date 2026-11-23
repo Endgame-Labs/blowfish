@@ -140,7 +140,8 @@ fragments stop being written; the WAL, full-text indexes, and filter indexes kee
 After the ANN upgrade, I rewrite `docs.bfc` as version 2, one segment per fenced publication. Its directory
 records dense-vector dimensions and stored precision, and its payload contains only other attributes.
 String and string-array columns use zstd level 3 per 256-row block, with a checksum over the compressed
-bytes. Projection, filtered/exhaustive queries, and compaction obtain dense vectors from the segment's
+bytes. I batch up to 64 source column ranges during a rewrite, while bypassing cache admission and
+checking every source block. Projection, filtered/exhaustive queries, and compaction obtain dense vectors from the segment's
 ANN object at the declared f16, f32, or i8 precision. The returned vector encoding and values are unchanged.
 Sparse and multi-vector attributes retain their existing JSON representation. I retain segment ANN objects
 after reclustering; retiring them requires the separate tier-lineage work.

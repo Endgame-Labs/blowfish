@@ -131,6 +131,8 @@ async fn document_footprint_benchmark() {
         engine.write("t",serde_json::from_value(json!({"schema":schema,"distance_metric":"cosine_distance","upsert_rows":[{"id":0,"vector":synth(0),"text":"fish","title":"fish","bucket":0}]})).unwrap()).await.unwrap();
         engine.index_namespace("t", true).await.unwrap();
         let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+        // Match the server's canonical schema, including inferred filter defaults.
+        let schema = m.schema.clone();
         m.segments.clear();
         m.ann_dirs.clear();
         m.stats.rows = rows as u64;
@@ -329,7 +331,9 @@ async fn document_footprint_benchmark() {
                 }
                 if projected {
                     q["include_attributes"] = json!(["vector"]);
-                    q["vector_encoding"] = json!("base64");
+                    q["vector_encoding"] = json!(
+                        std::env::var("D2_VECTOR_ENCODING").unwrap_or_else(|_| "base64".into())
+                    );
                 }
                 if kind == "text" {
                     q["include_attributes"] = json!(["title", "text"]);
