@@ -152,7 +152,7 @@ impl<R: RangeRead> Index<R> {
         let footer = read_one(&reader, len - FOOTER_SIZE..len).await?;
         let (meta_len, crc) = format::decode_footer(&footer, len)?;
         let bytes = read_one(&reader, 0..meta_len).await?;
-        Self::from_metadata(reader, &bytes, crc, len)
+        Self::open_metadata(reader, &bytes, crc, len).await
     }
     /// Open footer and front metadata in one parallel range-read batch, using
     /// the metadata length recorded when building or publishing the segment.
@@ -167,7 +167,34 @@ impl<R: RangeRead> Index<R> {
         if actual != meta_len {
             return Err(bad("manifest metadata length disagrees with footer"));
         }
-        Self::from_metadata(reader, &bytes[1], crc, len)
+        Self::open_metadata(reader, &bytes[1], crc, len).await
+    }
+    async fn open_metadata(reader: R, bytes: &[u8], crc: u32, len: u64) -> Result<Self> {
+        if bytes.starts_with(crate::directory::ANN_MAGIC) {
+            format::check_crc(bytes, crc)?;
+            let fragment = crate::Fragment::decode(bytes)?;
+            fragment.validate(bytes.len() as u64, len - FOOTER_SIZE)?;
+            let mut index = fragment.index(reader)?;
+            let blobs = fragment.blobs();
+            if blobs
+                .iter()
+                .any(|(_, r)| r.start < bytes.len() as u64 || r.end > len - FOOTER_SIZE)
+            {
+                return Err(bad("cluster blob outside ANN object"));
+            }
+            let data = read_batch(
+                &index.reader,
+                blobs.iter().map(|(_, r)| r.clone()).collect(),
+                false,
+            )
+            .await?;
+            for ((cid, _), data) in blobs.into_iter().zip(data) {
+                index.install_cluster(cid, &data)?;
+            }
+            index.metadata.count = fragment.rows();
+            return Ok(index);
+        }
+        Self::from_metadata(reader, bytes, crc, len)
     }
     fn from_metadata(reader: R, bytes: &[u8], crc: u32, len: u64) -> Result<Self> {
         let mut metadata = format::decode_metadata(bytes, crc, len - FOOTER_SIZE)?;
@@ -212,6 +239,21 @@ impl<R: RangeRead> Index<R> {
             return Err(bad("missing footer"));
         }
         let (meta_len, crc) = format::decode_footer(&blob[(len - FOOTER_SIZE) as usize..], len)?;
+        if blob.starts_with(crate::directory::ANN_MAGIC) {
+            format::check_crc(&blob[..meta_len as usize], crc)?;
+            let fragment = crate::Fragment::decode(&blob[..meta_len as usize])?;
+            fragment.validate(meta_len, len - FOOTER_SIZE)?;
+            let mut index = fragment.index(reader)?;
+            for (cid, range) in fragment.blobs() {
+                index.install_cluster(
+                    cid,
+                    blob.get(range.start as usize..range.end as usize)
+                        .ok_or_else(|| bad("blob outside ANN object"))?,
+                )?;
+            }
+            index.metadata.count = fragment.rows();
+            return Ok(index);
+        }
         Self::from_metadata(reader, &blob[..meta_len as usize], crc, len)
     }
     /// A partial index over a namespace directory: only the code and vector ranges are known
@@ -243,7 +285,13 @@ impl<R: RangeRead> Index<R> {
             dtype: shape.dtype,
             seed: shape.seed,
             flat: shape.flat,
-            flags: format::FLAG_ROTATED | format::FLAG_COMPACT,
+            flags: format::FLAG_ROTATED
+                | format::FLAG_COMPACT
+                | if !shape.flat && rq.padded.is_multiple_of(8) {
+                    format::FLAG_FASTSCAN
+                } else {
+                    0
+                },
             parents: Vec::new(),
             clusters,
         };
@@ -261,8 +309,13 @@ impl<R: RangeRead> Index<R> {
     }
     /// Decode a directory cluster blob without installing it.
     pub(crate) fn decode_cluster(&self, blob: &[u8]) -> Result<DecodedCluster> {
+        if blob.len() < 4 {
+            return Err(bad("truncated cluster blob"));
+        }
+        let (body, crc) = blob.split_at(blob.len() - 4);
+        check_crc(body, u32::from_le_bytes(crc.try_into().unwrap()))?;
         let padded = self.rq.padded;
-        let mut p = format::Parser::new(blob);
+        let mut p = format::Parser::new(body);
         let center = p.vector(padded)?;
         let n = p.u32()? as usize;
         let len = p.u32()? as usize;
@@ -272,6 +325,9 @@ impl<R: RangeRead> Index<R> {
             return Err(bad("invalid cluster blob"));
         }
         let row_crcs = (0..n).map(|_| p.u32()).collect::<Result<Vec<_>>>()?;
+        if p.remaining() != 0 {
+            return Err(bad("unexpected cluster blob bytes"));
+        }
         Ok(DecodedCluster(Arc::new(format::ClusterData {
             center,
             ids: Some(rows.iter().collect()),
@@ -306,7 +362,13 @@ impl<R: RangeRead> Index<R> {
         for crc in c.row_crcs.iter() {
             out.extend(crc.to_le_bytes());
         }
+        let crc = crc32fast::hash(&out);
+        out.extend(crc.to_le_bytes());
         out
+    }
+    #[cfg(feature = "legacy-fixtures")]
+    pub(crate) fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
     }
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata

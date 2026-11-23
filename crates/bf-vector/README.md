@@ -1,16 +1,16 @@
 # bf-vector 🐡
 
 Standalone f32/f16 distance kernels, deterministic IVF with corrected one-bit
-residual codes, exact reranking, and an immutable range-readable `.bfv` format.
+residual codes, exact reranking, and an immutable range-readable `.bfa` object format.
 There are no dependencies on other blowfish crates.
 
 ```rust
-use bf_vector::{Bytes, Index, IndexBuilder, Metric, SearchParams, metadata_len};
+use bf_vector::{Bytes, Index, IndexBuilder, Metric, SearchParams, Fragment};
 
 # async fn example() -> bf_vector::Result<()> {
 let vectors = vec![(7, vec![1.0, 0.0]), (19, vec![0.0, 1.0])];
 let blob = IndexBuilder::new(2, Metric::CosineDistance)?.build(&vectors)?;
-let metadata_bytes = metadata_len(&blob)?;
+let (blob, metadata_bytes) = Fragment::build_ann(&blob)?;
 // Record metadata_bytes alongside the immutable object key in the manifest.
 let index = Index::open_with_metadata_len(Bytes::from(blob), metadata_bytes).await?;
 let nearest = index.search(&[1.0, 0.0], 10, SearchParams::default(), None).await?;
@@ -148,3 +148,12 @@ slice; 64 probes reached 0.946, which is why the default was raised. Recall on
 different corpora still needs measurement. The million-vector synthetic result
 is encouraging for routing and throughput, but its well-separated clusters
 make it easier than broad real-world embedding distributions.
+
+`Fragment::build_ann` packs a builder's index into one version-2 ANN object. I keep the resident
+directory entries and dense row-to-cluster map at the front, put each leaf's exact center, row set,
+row checksums, and codes together in tour order, and follow them with the vectors and footer.
+Fast-scan codes and stored vectors are copied byte for byte. Sparse global slab IDs retain their
+row sets without allocating a dense map over the namespace. `Fragment::decode` reads just the
+resident bytes for directory publication; `Index::open` also loads the leaf blobs for full-index
+operations such as recluster. Legacy `.bfv` objects are accepted as upgrade input, and no `.bff`
+or `.bfb` fragment writer remains.

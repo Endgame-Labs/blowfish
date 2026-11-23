@@ -107,9 +107,9 @@ If rollback might be necessary, I recommend a consistent backup of the **entire 
 starting the new binary** (see Backups and recovery). Retaining the old executable alone is insufficient.
 Do not run old and new writers together during a format upgrade.
 
-The binary automatically accepts legacy format-1 buckets and raises the deployment marker to format 2
-at writable startup. Namespace manifests move to format 2 on publication; the checkpoint field changes
-its name while retaining its meaning. Read-only startup checks compatibility without raising the marker.
+The binary automatically accepts legacy format-1 and format-2 buckets and raises the deployment marker to format 3
+at writable startup. Namespace manifests move to format 3 on publication. Format 2 renamed the checkpoint
+field while retaining its meaning; format 3 fences the single ANN object layout. Read-only startup checks compatibility without raising the marker.
 The append-only `_system/format/<version>.json` markers live at the deployment root, including for
 project-scoped namespaces. Their highest generation is the required bucket version; never delete or
 lower a marker to force a downgrade.
@@ -125,22 +125,26 @@ or garbage-collect its objects. Format-2 manifests rename the required `indexed_
 Those releases predate the bucket marker, so the marker alone cannot stop them from starting or touching
 namespaces whose manifests have not yet been upgraded. Stop all older processes before upgrading.
 
-v0.1.14 writes vector indexes in a new code layout (fast scan, about 3 times faster per row to scan). Old indexes
-still read and answer queries, and a running server upgrades them by itself: after it starts, the background indexer
-rewrites each namespace's older indexes, one at a time, in its own task, so indexing and queries carry on. You do
-not need to run a separate index upgrade command.
+v0.1.14 writes one `ann.<column>.bfa` object per vector attribute in each segment or slab. Its resident
+metadata includes the directory entries and, for dense segment rows, the row-to-cluster map. Each leaf
+stores a checksummed blob with its exact center, row set, and row checksums, followed by its quantized
+codes. Leaves follow locality order; one region of full-precision vectors and a checksummed footer
+end the object. Both filtered and unfiltered queries use this
+layout. I keep the existing flat and paged slab directory formats unchanged.
 
-The upgrade reads an index, rewrites its quantized codes, and writes it back under a new object key. It does not
-retrain anything: cluster centers, row membership, and full-precision vectors are copied as they are, so queries
-return the same results. It covers the per-segment indexes and the slabs of a `recluster`, and leaves documents, the
-WAL, and the full-text and filter indexes alone. Old objects are never changed: each batch of rewritten indexes goes
-into the manifest in one conditional publish (the same path the indexer and compaction use), and the old objects are
-left for normal garbage collection after the retention window. If a compaction or another publish gets in the way,
-the upgrade retries from the newest manifest and drops work that a newer segment replaced. A publish fences an
-indexer on another node for a moment, as `recluster` does, and that indexer retries. Writes are not affected. Memory
-is bounded by the largest single index (the object plus its rewrite, about twice its size), since indexes are
-processed one at a time. It is idempotent and resumable: it skips indexes already in the new layout, and a restart
-partway through leaves the namespace readable, with every finished batch kept.
+The background indexer upgrades older `.bfv` indexes, including ones already using fast scan, to `.bfa`.
+It copies fast-scan codes and vectors unchanged, converts older row-major codes when necessary, and does
+not retrain clusters. Flat indexes also move into a single object. Documents, the WAL, text indexes, and
+filter indexes retain their current formats. The redundant `.bff` and `.bfb` ANN fragments stop being written.
+
+Each batch replaces the old `ann:`, `annfrag:`, and `annfrag2:` file entries with `annv2:` in one fenced
+manifest publication. Old objects remain until normal garbage collection after the retention window.
+The pass retries publication conflicts and skips a segment that compaction replaced. I can interrupt it
+and resume later: published batches remain durable, and objects already in the new layout are skipped.
+I bound memory by the largest index and its rewrite; older code encodings can also need an intermediate
+conversion. Queries use segment directories when available and can scan document columns while a mixed
+segment set has no new directory; this can temporarily increase query latency. Slab
+batches retain the old directory until the final batch can replace it, including its paged copy.
 
 To run the same upgrade now, or to see what is left, use `blowfish reindex`:
 
@@ -150,8 +154,9 @@ blowfish reindex --storage-url s3://BUCKET/PREFIX NAMESPACE
 blowfish reindex --storage-url s3://BUCKET/PREFIX --all                 # every namespace in the bucket
 ```
 
-It prints progress, and it is safe beside a running server on the same bucket. Flat indexes (small segments with no
-codes) have nothing to convert and are reported under "not convertible". `recluster` also writes the new layout.
+It prints progress, and it is safe beside a running server on the same bucket. The report distinguishes
+current single objects from legacy row-major, fast-scan, and other indexes.
+All legacy indexes are rewritten, including flat ones. `recluster` also writes the single-object layout.
 
 There is no supported in-place downgrade. To roll back, stop the upgraded processes, restore the complete
 pre-upgrade backup into an empty prefix, and start the matching older binary there. Writes acknowledged

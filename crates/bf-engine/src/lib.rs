@@ -105,7 +105,7 @@ pub(crate) struct NamespaceState {
     /// Object holding the checkpoint's per-term text statistics (loaded only for BM25 queries
     /// and by the indexer), when the manifest keeps them out of line.
     pub text_stats: Option<Arc<bf_wal::SegmentFile>>,
-    /// Namespace ANN directories by `ann:<attribute>`, valid for exactly `segments`.
+    /// Namespace ANN directories by `annv2:<attribute>`, valid for exactly `segments`.
     pub ann_dirs: BTreeMap<String, bf_wal::SegmentFile>,
     /// Namespace-wide ANN layouts by attribute (valid while their covered segments are live).
     pub ann_slabs: Arc<BTreeMap<String, bf_wal::SlabSet>>,

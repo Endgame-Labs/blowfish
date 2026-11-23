@@ -383,7 +383,7 @@ async fn prepare_one(
     let mut scores = BTreeMap::new();
     let columns = projection_columns(state, q, narrow_columns);
     for seg in &state.segments {
-        let file = seg.files.get(&format!("ann:{attribute}"));
+        let file = seg.files.get(&format!("annv2:{attribute}"));
         let (allowed, index, ids) = tokio::try_join!(
             snapshot::allowed(store, state, seg, q.filters.as_ref()),
             async {

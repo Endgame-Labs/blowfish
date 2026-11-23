@@ -9,9 +9,12 @@ use crate::{
 };
 
 pub(crate) const FOOTER_SIZE: u64 = 64;
+pub(crate) const ANN_FOOTER_MAGIC: &[u8; 8] = b"BFAFOOT2";
 pub(crate) const MAGIC: &[u8; 8] = b"BFVFOOT1";
 /// Current `.bfv` file format version.
 pub const FORMAT_VERSION: u32 = 1;
+/// Current single ANN object format version.
+pub const ANN_FORMAT_VERSION: u32 = 2;
 /// Metadata flag: centers and parents are stored rotated and zero-padded to the transform width.
 pub(crate) const FLAG_ROTATED: u32 = 1;
 /// Metadata flag: eight-byte code headers (f32 norm and alpha) and all codes stored before all vectors.
@@ -326,11 +329,19 @@ pub fn metadata_len(blob: &[u8]) -> Result<u64> {
 }
 
 pub(crate) fn decode_footer(bytes: &[u8], len: u64) -> Result<(u64, u32)> {
-    if bytes.len() != FOOTER_SIZE as usize || &bytes[..8] != MAGIC {
+    if bytes.len() != FOOTER_SIZE as usize
+        || (&bytes[..8] != MAGIC && &bytes[..8] != ANN_FOOTER_MAGIC)
+    {
         return Err(bad("bad footer magic or size"));
     }
     let mut p = Parser::new(&bytes[8..]);
-    if p.u32()? != FORMAT_VERSION {
+    if p.u32()?
+        != if &bytes[..8] == ANN_FOOTER_MAGIC {
+            ANN_FORMAT_VERSION
+        } else {
+            FORMAT_VERSION
+        }
+    {
         return Err(bad("unsupported format version"));
     }
     if p.u32()? != 0 {

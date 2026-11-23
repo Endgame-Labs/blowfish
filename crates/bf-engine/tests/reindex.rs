@@ -48,14 +48,22 @@ async fn layouts(store: &Storage) -> (Vec<CodeLayout>, Vec<CodeLayout>) {
     let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
     let mut seg = Vec::new();
     for s in &manifest.segments {
-        let f = &s.files["ann:vector"];
+        let f = s
+            .files
+            .get("annv2:vector")
+            .or_else(|| s.files.get("ann:vector"))
+            .unwrap();
         let head = store.get_range(&f.key, 0..64).await.unwrap();
         seg.push(bf_vector::code_layout(&head).unwrap());
     }
     let mut slabs = Vec::new();
     if let Some(set) = manifest.ann_slabs.get("vector") {
         for s in &set.slabs {
-            let f = &s.files["ann:vector"];
+            let f = s
+                .files
+                .get("annv2:vector")
+                .or_else(|| s.files.get("ann:vector"))
+                .unwrap();
             let head = store.get_range(&f.key, 0..64).await.unwrap();
             slabs.push(bf_vector::code_layout(&head).unwrap());
         }
@@ -70,16 +78,13 @@ async fn downgrade(store: &Storage) {
     let mut slabs = m.ann_slabs.get("vector").map(|s| s.slabs.clone());
     let mut segments = std::mem::take(&mut m.segments);
     for seg in segments.iter_mut().chain(slabs.iter_mut().flatten()) {
-        let old = seg.files["ann:vector"].clone();
+        let old = seg.files["annv2:vector"].clone();
         let blob = store.get(&old.key).await.unwrap();
         let Some(blob) = bf_vector::downgrade_layout(&blob).unwrap() else {
             continue;
         };
-        let (blocks, blocks_meta) = bf_vector::Fragment::build_blocks(&blob).unwrap();
-        let plain = seg
-            .files
-            .contains_key("annfrag:vector")
-            .then(|| bf_vector::Fragment::build(&blob).unwrap());
+
+        seg.files.remove("annv2:vector");
         let meta = bf_vector::metadata_len(&blob).unwrap();
         let put = async |name: &str, data: Vec<u8>, meta: u64| {
             let key = format!("ns/t/test/{}.{name}", uuid::Uuid::new_v4());
@@ -95,13 +100,10 @@ async fn downgrade(store: &Storage) {
         };
         seg.files
             .insert("ann:vector".into(), put("bfv", blob, meta).await);
-        seg.files.insert(
-            "annfrag2:vector".into(),
-            put("bfb", blocks, blocks_meta).await,
-        );
-        if let Some((plain, plain_meta)) = plain {
+        // The upgrade reads the old index, so retired fragment contents need not be decoded.
+        for (name, ext) in [("annfrag:vector", "bff"), ("annfrag2:vector", "bfb")] {
             seg.files
-                .insert("annfrag:vector".into(), put("bff", plain, plain_meta).await);
+                .insert(name.into(), put(ext, vec![0; 16], 16).await);
         }
     }
     m.segments = segments;
@@ -301,4 +303,46 @@ async fn assert_current_manifest(store: &Storage) {
     let wire = serde_json::to_value(manifest).unwrap();
     assert!(wire.get("checkpoint_wal").is_some());
     assert!(wire.get("indexed_through").is_none());
+}
+
+#[tokio::test]
+async fn legacy_flat_indexes_also_upgrade_and_retire_the_old_object() {
+    let (_dir, store) = scratch_store().await;
+    let writer = engine(&store);
+    write(&writer, json!({"distance_metric":"euclidean_squared","upsert_rows":(0..50).map(|id| json!({"id":id,"vector":vector(id)})).collect::<Vec<_>>()})).await;
+    writer.index_namespace("t", true).await.unwrap();
+    let wal = Wal::new(store.clone(), "t").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    let blob = bf_vector::IndexBuilder::new(64, bf_vector::Metric::EuclideanSquared)
+        .unwrap()
+        .build(
+            &(0..50)
+                .map(|id| (id as u32, vector(id)))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let key = "ns/t/segments/legacy-flat.bfv";
+    let file = SegmentFile {
+        key: key.into(),
+        size: blob.len() as u64,
+        metadata_len: bf_vector::metadata_len(&blob).unwrap(),
+        stats_index: None,
+        text_header: None,
+    };
+    store.create_unique(key, blob).await.unwrap();
+    m.segments[0].files.remove("annv2:vector");
+    m.segments[0].files.insert("ann:vector".into(), file);
+    m.ann_dirs.clear();
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+    let report = writer.reindex("t", &options()).await.unwrap();
+    assert_eq!(report.segments.other.0, 1);
+    assert_eq!(report.converted_segments, 1);
+    let (_, m) = wal.latest_manifest().await.unwrap().unwrap();
+    assert!(m.segments[0].files.contains_key("annv2:vector"));
+    assert!(!m.segments[0].files.contains_key("ann:vector"));
+    assert!(m.retired.iter().any(|r| r.key == key));
+    assert_eq!(ids(&engine(&store), 5).await[0], json!(5));
+    let again = writer.reindex("t", &options()).await.unwrap();
+    assert_eq!(again.segments.single_object.0, 1);
+    assert_eq!(again.converted_segments, 0);
 }

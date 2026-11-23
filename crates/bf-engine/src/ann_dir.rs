@@ -12,8 +12,7 @@ use std::{
     sync::Arc,
 };
 
-/// Fetch merged ranges at most this far apart as one request.
-const BLOB_GAP: u64 = 64 << 10;
+/// Maximum merged read of leaf blobs and codes.
 const BLOB_MERGE_MAX: u64 = 8 << 20;
 /// Exact-scan vector prefetch is split into concurrent reads of this size.
 const PREFETCH_PIECE: u64 = 1 << 20;
@@ -23,21 +22,17 @@ const EXACT_ROWS: usize = 2048;
 /// Never hold more than this many bytes of exact vectors for one query.
 const EXACT_BYTES: usize = 256 << 20;
 
-/// Fetch merged ranges at most this far apart as one request, for block fragments (a block is
-/// tens of KB, so only adjacent blocks should merge).
+/// Merge nearby leaf blocks, which hold blobs and codes together.
 const BLOCK_GAP: u64 = 16 << 10;
 
 /// Read the blobs of `entries` (one segment's probed clusters) and, unless `exact`, their
-/// quantized codes. With block fragments both come from one set of ranged reads of the
-/// fragment; otherwise the blobs come from the fragment and the codes from the index object.
+/// quantized codes from the same ANN object.
 /// Read the probed clusters' blobs and code blocks. `cached[i]` skips entry `i`'s blob (its
 /// decoded form is already at hand); blobs come back only for the others, in order.
 async fn read_clusters(
     entries: &[&bf_vector::DirEntry],
-    blocks: bool,
     exact: bool,
     fragment: &Reader,
-    partial: &bf_vector::PartialIndex<Reader>,
     cached: Option<&[bool]>,
 ) -> Result<(Vec<bytes::Bytes>, Vec<bytes::Bytes>), ApiError> {
     let blob_ranges: Vec<_> = entries
@@ -46,7 +41,7 @@ async fn read_clusters(
         .filter(|(i, _)| !cached.is_some_and(|c| c[*i]))
         .map(|(_, e)| e.blob_range())
         .collect();
-    if blocks {
+    {
         let n = blob_ranges.len();
         let mut ranges = blob_ranges;
         if !exact {
@@ -61,31 +56,8 @@ async fn read_clusters(
         .await
         .map_err(segment::index_error)?;
         let codes = all.split_off(n);
-        return Ok((all, codes));
+        Ok((all, codes))
     }
-    let wanted: Vec<usize> = entries.iter().map(|e| e.cluster).collect();
-    let read_blobs = async {
-        bf_vector::read_merged(
-            fragment,
-            blob_ranges,
-            bf_vector::read_gap(BLOB_GAP),
-            BLOB_MERGE_MAX,
-        )
-        .await
-        .map_err(segment::index_error)
-    };
-    let read_codes = async {
-        if exact {
-            Ok(Vec::new())
-        } else {
-            partial
-                .index()
-                .read_codes(&wanted)
-                .await
-                .map_err(segment::index_error)
-        }
-    };
-    tokio::try_join!(read_blobs, read_codes)
 }
 
 /// Split full-precision vector ranges into concurrent reads of at most `PREFETCH_PIECE` bytes.
@@ -138,32 +110,21 @@ pub(crate) async fn load(
     Ok(read_cache::insert(&file.key, resident, dir))
 }
 
-/// Which fragment layout a directory lists. `Plain` fragments hold cluster blobs, and the
-/// quantized codes stay in the segment's index object (two reads per probed cluster). `Blocks`
-/// fragments hold each cluster's blob and codes together, in locality order, and serve
-/// unfiltered queries; they sit beside the plain ones, so older readers keep working.
+/// The current segment directory or the namespace-wide slab directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Layout {
-    Plain,
-    Blocks,
-    /// Block fragments of a namespace-wide recluster's slabs (`SlabSet`).
+    Segments,
     Slabs,
 }
 impl Layout {
-    /// Key of the directory in the manifest.
     pub(crate) fn dir_key(self, attr: &str) -> String {
         match self {
-            Self::Plain => format!("ann:{attr}"),
-            Self::Blocks => format!("ann2:{attr}"),
+            Self::Segments => format!("annv2:{attr}"),
             Self::Slabs => format!("ann3:{attr}"),
         }
     }
-    /// Key of a segment's fragment in its file map.
     pub(crate) fn frag_key(self, attr: &str) -> String {
-        match self {
-            Self::Plain => format!("annfrag:{attr}"),
-            Self::Blocks | Self::Slabs => format!("annfrag2:{attr}"),
-        }
+        format!("annv2:{attr}")
     }
 }
 
@@ -174,7 +135,7 @@ pub(crate) fn covers(
     attr: &str,
     layout: Layout,
 ) -> bool {
-    let key = format!("ann:{attr}");
+    let key = format!("annv2:{attr}");
     let frag = layout.frag_key(attr);
     dir.segments().len() == segments.len()
         && dir.segments().iter().zip(segments).all(|(d, s)| {
@@ -185,7 +146,7 @@ pub(crate) fn covers(
 }
 
 /// Build (or keep) the directory of `layout` for `attr` over `segments`. Returns `None`
-/// when some segment lacks the index or its fragment, or the segments do not share one vector
+/// when some segment lacks its ANN object, or the segments do not share one vector
 /// space. Incremental: sections of segments already in `previous` are carried over, and only
 /// new segments' fragments (small, one ranged read each) are read.
 pub(crate) async fn build(
@@ -196,14 +157,10 @@ pub(crate) async fn build(
     layout: Layout,
     previous: Option<&bf_wal::SegmentFile>,
 ) -> Result<Option<bf_wal::SegmentFile>, ApiError> {
-    let key = format!("ann:{attr}");
+    let key = format!("annv2:{attr}");
     let key = key.as_str();
     let frag_key = layout.frag_key(attr);
-    if segments.is_empty()
-        || segments
-            .iter()
-            .any(|s| !s.files.contains_key(key) || !s.files.contains_key(&frag_key))
-    {
+    if segments.is_empty() || segments.iter().any(|s| !s.files.contains_key(key)) {
         return Ok(None);
     }
     let old = match previous {
@@ -271,8 +228,7 @@ pub(crate) async fn build(
         format!(
             "ns/{ns}/segments/ann-dir{}-{}.bfd",
             match layout {
-                Layout::Plain => "",
-                Layout::Blocks => "2",
+                Layout::Segments => "v2",
                 Layout::Slabs => "3",
             },
             uuid::Uuid::new_v4()
@@ -474,7 +430,7 @@ pub(crate) async fn prefetch_scan(
         let e = &dir.entries()[p];
         chosen.entry(e.segment).or_default().push(e.cluster);
     }
-    let key = format!("ann:{attribute}");
+    let key = format!("annv2:{attribute}");
     let frag_key = layout.frag_key(attribute);
     let memoize = layout == Layout::Slabs;
     let vector_key = vector_hash(&vector);
@@ -498,15 +454,7 @@ pub(crate) async fn prefetch_scan(
                 return;
             };
             let frag_reader = Reader::new(store, frag);
-            let Ok((blobs, codes)) = read_clusters(
-                &seg_entries,
-                dir.segments()[i].codes_in_fragment,
-                false,
-                &frag_reader,
-                &partial,
-                None,
-            )
-            .await
+            let Ok((blobs, codes)) = read_clusters(&seg_entries, false, &frag_reader, None).await
             else {
                 return;
             };
@@ -551,21 +499,11 @@ pub(crate) async fn prefetch_scan(
                     return;
                 };
                 let seg_entries: Vec<_> = dir.segment_entries(i).iter().collect();
-                let Ok(partial) = dir.partial_index(i, Reader::new(store, file)) else {
-                    return;
-                };
                 let frag_reader = Reader::new(store, frag);
                 let vectors = Reader::new(store, file);
                 let pieces = vector_pieces(seg_entries.iter().map(|e| e.vectors_range()));
                 let _ = tokio::join!(
-                    read_clusters(
-                        &seg_entries,
-                        dir.segments()[i].codes_in_fragment,
-                        true,
-                        &frag_reader,
-                        &partial,
-                        None,
-                    ),
+                    read_clusters(&seg_entries, true, &frag_reader, None,),
                     futures::future::join_all(pieces.into_iter().map(|r| vectors.read(r))),
                 );
             }
@@ -620,7 +558,7 @@ pub(crate) async fn memberships(
     dir: &Directory,
     attr: &str,
 ) -> Result<Vec<Option<Arc<Membership>>>, ApiError> {
-    let frag_key = format!("annfrag:{attr}");
+    let frag_key = format!("annv2:{attr}");
     futures::future::try_join_all(dir.segments().iter().zip(segments).map(|(d, seg)| {
         let frag_key = &frag_key;
         async move {
@@ -855,7 +793,7 @@ pub(crate) async fn search(
     let filtered = members.is_some();
     let members = members.unwrap_or_default();
     let t0 = std::time::Instant::now();
-    let key = format!("ann:{attribute}");
+    let key = format!("annv2:{attribute}");
     let vector: Arc<[f32]> = vector.into();
     let width = dir.vector_row_bytes();
     // One rotation serves the ranking and every segment's scan (they share one vector space).
@@ -1038,7 +976,6 @@ pub(crate) async fn search(
             .get(&layout.frag_key(attribute))
             .cloned()
             .ok_or_else(|| segment::index_error("segment lost its ANN fragment"))?;
-        let blocks = dir.segments()[i].codes_in_fragment;
         let warm_docs = exact || likely.contains(&i);
         let (segment_docs, docs_store) = (state.segments[i].clone(), store.clone());
         let dir_reader = Reader::new(store, &frag_file);
@@ -1102,7 +1039,7 @@ pub(crate) async fn search(
                 // Documents' footers are warmed only for the segments holding likely winners (and
                 // for exactly scanned ones); the speculative document read reads the rest.
                 let (read, (), ()) = tokio::try_join!(
-                    read_clusters(&entry_refs, blocks, exact, &dir_reader, &partial, Some(&cached)),
+                    read_clusters(&entry_refs, exact, &dir_reader, Some(&cached)),
                     prefetch,
                     async {
                         if warm_docs {
@@ -1361,7 +1298,7 @@ pub(crate) async fn build_paged(
         return Ok(None);
     }
     let per_cell = env_number("BF_ANN_PAGE_ENTRIES", 24usize).max(1);
-    let (key, frag_key) = (format!("ann:{attr}"), Layout::Slabs.frag_key(attr));
+    let (key, frag_key) = (format!("annv2:{attr}"), Layout::Slabs.frag_key(attr));
     let files: Vec<[(u64, u64); 2]> = slabs
         .iter()
         .map(|s| {
@@ -1579,6 +1516,10 @@ pub(crate) async fn speculate_slab_scan(
     let Ok(decoded) = PagedDirectory::decode(&bytes) else {
         return;
     };
+    // Old paged hints can survive an upgrade batch; never speculate reads of retired fragments.
+    if decoded.segments().iter().any(|s| s.key != s.fragment) {
+        return;
+    }
     let file = bf_wal::SegmentFile {
         key,
         size: decoded.object_len(),
@@ -1593,7 +1534,7 @@ pub(crate) async fn speculate_slab_scan(
         return;
     };
     let (ann, frag) = (
-        format!("ann:{attribute}"),
+        format!("annv2:{attribute}"),
         Layout::Slabs.frag_key(attribute),
     );
     let slabs: Option<Vec<bf_wal::Segment>> = paged

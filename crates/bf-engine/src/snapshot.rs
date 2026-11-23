@@ -51,7 +51,7 @@ impl OpenHint {
             && self
                 .ann
                 .iter()
-                .all(|a| dirs.contains_key(&format!("ann:{a}")))
+                .all(|a| dirs.contains_key(&format!("annv2:{a}")))
     }
     pub(crate) fn for_request(
         request: &QueryRequest,
@@ -172,7 +172,7 @@ impl OpenHint {
             let by_dir = self
                 .ann
                 .iter()
-                .all(|a| dirs.contains_key(&format!("ann:{a}")));
+                .all(|a| dirs.contains_key(&format!("annv2:{a}")));
             for attribute in self.ann.iter().filter(|_| with_rest) {
                 // A lone unfiltered ANN query reads the block-layout directory when there is one.
                 // A recluster's slabs, when they cover exactly these segments, take the scan.
@@ -218,21 +218,13 @@ impl OpenHint {
                     );
                     continue;
                 }
-                let blocks = self
-                    .scan
-                    .as_ref()
-                    .filter(|(a, _, _)| a == attribute)
-                    .and_then(|_| dirs.get(&crate::ann_dir::Layout::Blocks.dir_key(attribute)));
-                let chosen = match blocks {
-                    Some(file) => Some((
+                let chosen = dirs.get(&format!("annv2:{attribute}")).map(|file| {
+                    (
                         file,
-                        crate::ann_dir::Layout::Blocks,
-                        crate::ann_dir::Layout::Blocks.dir_key(attribute),
-                    )),
-                    None => dirs
-                        .get(&format!("ann:{attribute}"))
-                        .map(|f| (f, crate::ann_dir::Layout::Plain, attribute.clone())),
-                };
+                        crate::ann_dir::Layout::Segments,
+                        format!("annv2:{attribute}"),
+                    )
+                });
                 if let Some((file, layout, hint_name)) = chosen {
                     let filtered = !self.filters.is_empty();
                     let scan = self.scan.as_ref().filter(|(a, _, _)| a == attribute);
@@ -274,7 +266,7 @@ impl OpenHint {
                     }
                 }
                 for attribute in self.ann.iter().filter(|_| !by_dir && with_rest) {
-                    if let Some(file) = seg.files.get(&format!("ann:{attribute}")) {
+                    if let Some(file) = seg.files.get(&format!("annv2:{attribute}")) {
                         tasks.push(segment::vector_index(store, file).map_ok(drop).boxed());
                     }
                 }
@@ -377,17 +369,10 @@ fn same_checkpoint(state: &NamespaceState, m: &bf_wal::Manifest) -> bool {
         && state.segments.iter().zip(&m.segments).all(|(a, b)| {
             a.id == b.id
                     && a.live.key == b.live.key
-                    // A text-layout upgrade keeps row ordinals and live masks,
-                    // but replaces the immutable index object. Adopt that generation
-                    // before the next upgrade pass or query.
-                    && a.files
-                        .iter()
-                        .filter(|(k, _)| k.starts_with("fts:") || k.as_str() == crate::text_keys::ROLE)
-                        .map(|(k, f)| (k, &f.key))
-                        .eq(b.files
-                            .iter()
-                            .filter(|(k, _)| k.starts_with("fts:") || k.as_str() == crate::text_keys::ROLE)
-                            .map(|(k, f)| (k, &f.key)))
+                    // Upgrade batches can keep the checkpoint and directory set unchanged.
+                    // Adopt every immutable file replacement before a query or publication.
+                    && a.files.iter().map(|(k, f)| (k, &f.key))
+                        .eq(b.files.iter().map(|(k, f)| (k, &f.key)))
         })
         && state.text_stats.as_ref().map(|f| &f.key) == m.text_stats.as_ref().map(|f| &f.key)
         && state.ann_dirs.len() == m.ann_dirs.len()
@@ -443,7 +428,7 @@ pub(crate) async fn catch_up_hinted(
                         let names = [
                             crate::ann_dir::paged_hint_name(a),
                             crate::ann_dir::Layout::Slabs.dir_key(a),
-                            crate::ann_dir::Layout::Blocks.dir_key(a),
+                            crate::ann_dir::Layout::Segments.dir_key(a),
                         ];
                         let mut pending: Vec<futures::future::BoxFuture<'_, _>> = names
                             .iter()
@@ -472,7 +457,7 @@ pub(crate) async fn catch_up_hinted(
                         let reader_names = [
                             crate::ann_dir::Layout::Slabs.dir_key(a),
                             crate::ann_dir::Layout::Slabs.dir_key(a),
-                            crate::ann_dir::Layout::Blocks.dir_key(a),
+                            crate::ann_dir::Layout::Segments.dir_key(a),
                         ];
                         let first = results
                             .into_iter()
@@ -500,9 +485,9 @@ pub(crate) async fn catch_up_hinted(
                         }
                     }
                     got.extend(
-                        crate::ann_dir::prefetch(store, wal.namespace(), a)
+                        crate::ann_dir::prefetch(store, wal.namespace(), &format!("annv2:{a}"))
                             .await
-                            .map(|p| (a.clone(), p)),
+                            .map(|p| (format!("annv2:{a}"), p)),
                     );
                     got
                 });
