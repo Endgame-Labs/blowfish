@@ -337,7 +337,7 @@ impl OpenHint {
 async fn timed<T>(label: &'static str, fut: impl std::future::Future<Output = T>) -> T {
     let start = Instant::now();
     let out = fut.await;
-    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+    if crate::ann::trace_stages() {
         eprintln!("WARM {label} {} ms", start.elapsed().as_millis());
     }
     out

@@ -456,7 +456,7 @@ pub(crate) async fn prefetch_scan(
         },
         config,
     );
-    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+    if crate::ann::trace_stages() {
         eprintln!(
             "PREFETCH matching={matching} k={k} picked={} target={target}",
             picked.len()
@@ -754,12 +754,15 @@ fn pick_clusters(
         filtered,
         spread,
     } = *t;
-    let mut order: Vec<(f32, usize)> = dir
+    // Each candidate as one integer key, ordered as (distance by `f32::total_cmp`, entry): the
+    // partition and sort below compare integers.
+    let flat: Vec<bool> = dir.segments().iter().map(|s| s.flat).collect();
+    let mut order: Vec<u64> = dir
         .entries()
         .iter()
         .enumerate()
-        .filter(|(n, e)| !dir.segments()[e.segment].flat && e.rows > 0 && in_cluster(*n) > 0.0)
-        .map(|(n, _)| (distances[n], n))
+        .filter(|(n, e)| !flat[e.segment] && e.rows > 0 && in_cluster(*n) > 0.0)
+        .map(|(n, _)| (u64::from(total_order_key(distances[n])) << 32) | n as u64)
         .collect();
     // Deleted rows and filtered-out rows thin the probed clusters, so probe more (a filter at
     // most `filtered_probe_cap` times) and keep probing until the allowed candidates reach
@@ -773,27 +776,26 @@ fn pick_clusters(
         }
     };
     let probes = probe_count(config, ann_rows, clusters, thin * spread);
-    let cmp = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
     // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
     // only in the unlikely case the walk runs past them.
     let mut sorted = if order.len() > probes.saturating_mul(8).max(256) {
         let head = probes * 2 + 64;
-        order.select_nth_unstable_by(head, cmp);
-        order[..head].sort_unstable_by(cmp);
+        order.select_nth_unstable(head);
+        order[..head].sort_unstable();
         head
     } else {
-        order.sort_unstable_by(cmp);
+        order.sort_unstable();
         order.len()
     };
     let (mut count, mut candidates) = (0usize, 0f64);
-    let mut picked = Vec::new();
+    let mut picked = Vec::with_capacity(probes);
     let mut at = 0;
     while at < order.len() {
         if at == sorted {
-            order[sorted..].sort_unstable_by(cmp);
+            order[sorted..].sort_unstable();
             sorted = order.len();
         }
-        let n = order[at].1;
+        let n = (order[at] & u64::from(u32::MAX)) as usize;
         at += 1;
         picked.push(n);
         count += 1;
@@ -803,6 +805,16 @@ fn pick_clusters(
         }
     }
     picked
+}
+
+/// `x`'s bits mapped so that unsigned order is `f32::total_cmp` order.
+fn total_order_key(x: f32) -> u32 {
+    let bits = x.to_bits();
+    if bits >> 31 == 1 {
+        !bits
+    } else {
+        bits | 1 << 31
+    }
 }
 
 struct Probed {
@@ -903,6 +915,7 @@ pub(crate) async fn search(
             None => e.rows as f64 * fraction[e.segment],
         }
     };
+    // Each probed segment's entries (indices into `entries`).
     let mut chosen: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     let mut exact_all = false;
     let mut likely = BTreeSet::new();
@@ -940,10 +953,7 @@ pub(crate) async fn search(
                 exact_all = true;
             } else {
                 for n in picked {
-                    chosen
-                        .entry(entries[n].segment)
-                        .or_default()
-                        .push(entries[n].cluster);
+                    chosen.entry(entries[n].segment).or_default().push(n);
                 }
             }
         }
@@ -955,10 +965,8 @@ pub(crate) async fn search(
             exact_segments.insert(i);
             chosen.insert(
                 i,
-                entries
-                    .iter()
-                    .filter(|e| e.segment == i)
-                    .map(|e| e.cluster)
+                (0..entries.len())
+                    .filter(|n| entries[*n].segment == i)
                     .collect(),
             );
         }
@@ -1017,7 +1025,6 @@ pub(crate) async fn search(
         let (dir, vector, rotated) = (dir.clone(), vector.clone(), rotated.clone());
         let exact = exact_segments.contains(&i);
         let flat = dir.segments()[i].flat;
-        let cs = cs.clone();
         let file = state.segments[i]
             .files
             .get(&key)
@@ -1036,14 +1043,11 @@ pub(crate) async fn search(
         let (segment_docs, docs_store) = (state.segments[i].clone(), store.clone());
         let dir_reader = Reader::new(store, &frag_file);
         let live = lives[i].clone();
-        let wanted_set: std::collections::HashSet<usize, foldhash::fast::RandomState> =
-            cs.iter().copied().collect();
-        let seg_entries: Vec<_> = dir
-            .segment_entries(i)
-            .iter()
-            .filter(|e| wanted_set.contains(&e.cluster))
-            .cloned()
-            .collect();
+        // In directory order (as the segment lists them), which keeps nearby clusters' reads
+        // together.
+        let mut ns = cs.clone();
+        ns.sort_unstable();
+        let seg_entries: Vec<_> = ns.iter().map(|n| entries[*n].clone()).collect();
         let trace_t0 = t0;
         tasks.push(
             async move {
@@ -1155,7 +1159,7 @@ pub(crate) async fn search(
                     Ok((Vec::new(), found))
                 })
                 .await?;
-                if std::env::var_os("BF_TRACE_STAGES").is_some() {
+                if crate::ann::trace_stages() {
                     eprintln!(
                         "TASK seg={i} clusters={} start={task_start} read={read_done} install={install_done} scan={}",
                         probed.clusters.len(),
@@ -1202,7 +1206,7 @@ pub(crate) async fn search(
         pool.select_nth_unstable_by(target, cmp);
         pool.truncate(target);
     }
-    if std::env::var_os("BF_TRACE_STAGES").is_some() {
+    if crate::ann::trace_stages() {
         eprintln!("RERANK pool={} cap={target}", pool.len());
     }
     // Start reading the likeliest winners' documents while their vectors are reranked.
@@ -1643,5 +1647,34 @@ mod spread_tests {
             ..EngineConfig::default()
         };
         assert_eq!(independent_spread(&explicit, [1; 25].into_iter()), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::total_order_key;
+
+    #[test]
+    fn total_order_keys_sort_as_total_cmp() {
+        let xs = [
+            f32::NEG_INFINITY,
+            -2.5,
+            -0.0,
+            0.0,
+            1e-30,
+            0.5,
+            3.0,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        for a in xs {
+            for b in xs {
+                assert_eq!(
+                    total_order_key(a).cmp(&total_order_key(b)),
+                    a.total_cmp(&b),
+                    "{a} {b}"
+                );
+            }
+        }
     }
 }
