@@ -91,17 +91,32 @@ pub(crate) async fn rewrite(
             )
         });
         let mut blocks = Vec::with_capacity(column.blocks.len());
-        for old in &column.blocks {
-            let data = read_block(&reader, old).await?;
-            let b = if compressed {
-                let bytes = zstd::bulk::compress(&data, 3).map_err(index_error)?;
-                let mut b = block(&mut body, &bytes);
-                b.uncompressed_length = Some(data.len());
-                b
-            } else {
-                block(&mut body, &data)
-            };
-            blocks.push(b);
+        // A bypassing reader does not admit blocks. Batch adjacent column ranges so it
+        // reads each aligned cache block once, rather than once per small document block.
+        for batch in column.blocks.chunks(64) {
+            let data = reader
+                .read_batch(
+                    batch
+                        .iter()
+                        .map(|b| b.offset..b.offset + b.length)
+                        .collect(),
+                )
+                .await
+                .map_err(index_error)?;
+            for (old, data) in batch.iter().zip(data) {
+                if crc32fast::hash(&data) != old.crc {
+                    return Err(corrupt());
+                }
+                let b = if compressed {
+                    let bytes = zstd::bulk::compress(&data, 3).map_err(index_error)?;
+                    let mut b = block(&mut body, &bytes);
+                    b.uncompressed_length = Some(data.len());
+                    b
+                } else {
+                    block(&mut body, &data)
+                };
+                blocks.push(b);
+            }
         }
         dir.columns.insert(
             name.clone(),

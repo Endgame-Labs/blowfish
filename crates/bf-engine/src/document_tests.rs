@@ -214,3 +214,41 @@ async fn compressed_block_corruption_fails_before_decode() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn document_upgrade_rejects_corrupt_source_blocks() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let (schema, docs) = input(700);
+    let mut segment = build_with(
+        &store,
+        "t",
+        &schema,
+        DistanceMetric::CosineDistance,
+        &docs,
+        BTreeMap::new(),
+        0,
+        1,
+    )
+    .await
+    .unwrap();
+    upgrade::make_legacy(&store, &mut segment).await.unwrap();
+    let file = &segment.files["docs"];
+    let dir = directory(&ObjectReader::new(&store, file)).await.unwrap();
+    let mut bytes = read_whole(&store, file).await.unwrap().to_vec();
+    bytes[dir.columns["text"].blocks[0].offset as usize] ^= 1;
+    let file = put_file(
+        &store,
+        "corrupt-legacy-documents".into(),
+        bytes,
+        file.metadata_len,
+    )
+    .await
+    .unwrap();
+    segment.files.insert("docs".into(), file);
+    assert!(upgrade::rewrite(&store, "t", &segment).await.is_err());
+}

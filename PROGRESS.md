@@ -4,6 +4,11 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Bounded document-upgrade reads.** I batch up to 64 source column ranges through the bypassing
+  reader, so adjacent document blocks share aligned reads. I retain each block's checksum check and
+  test a corrupt legacy source explicitly. Formatting, strict clippy, and all 198 Rust tests in
+  `bf-engine`, `bf-vector`, and `blowfish` pass.
+
 - **Document footprint, rounds D2 and D3.** I write document-v2 without dense-vector payloads, compress string
   and string-array blocks with zstd level 3, and remove the redundant `ids.bfi` Bloom filter. Vector projection
   and compaction read checksummed ANN vectors at their declared precision. The automatic upgrade and
@@ -15,7 +20,6 @@ Newest first. Each entry says what works now and how it was checked.
   that referenced objects survive. Strict clippy and the three changed crates’ tests pass; all 121 compatibility
   scenarios pass in both normal and forced-indexing modes, both TypeScript runs pass, and all nine compatibility
   unit tests pass. Footprint and latency measurements follow separately.
-
 
 - **Stored-precision ANN projection.** I added `Index::read_packed_rows`: sparse projection reads checked
   vector ranges, while bulk reads stream whole leaves and restore segment row order. I verify whole-leaf
