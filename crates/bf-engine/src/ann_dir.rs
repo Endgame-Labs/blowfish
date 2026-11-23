@@ -167,15 +167,6 @@ impl Layout {
     }
 }
 
-/// `BF_ANN_BLOCKS=0` turns the block layout off for queries (A/B measurements only).
-pub(crate) fn blocks_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("BF_ANN_BLOCKS").is_ok_and(|v| v != "0")
-            || std::env::var_os("BF_ANN_BLOCKS").is_none()
-    })
-}
-
 /// Whether `dir` lists exactly these segments' indexes for `attr`, in order.
 pub(crate) fn covers(
     dir: &Directory,
@@ -485,7 +476,7 @@ pub(crate) async fn prefetch_scan(
     }
     let key = format!("ann:{attribute}");
     let frag_key = layout.frag_key(attribute);
-    let memoize = layout == Layout::Slabs && scan_memo_enabled();
+    let memoize = layout == Layout::Slabs;
     let vector_key: Arc<[f32]> = vector.clone();
     let reads = chosen.into_iter().map(|(i, cs)| {
         let vector = vector.clone();
@@ -497,7 +488,8 @@ pub(crate) async fn prefetch_scan(
             else {
                 return;
             };
-            let wanted_set: std::collections::HashSet<usize> = cs.iter().copied().collect();
+            let wanted_set: std::collections::HashSet<usize, foldhash::fast::RandomState> =
+                cs.iter().copied().collect();
             let seg_entries: Vec<_> = dir
                 .segment_entries(i)
                 .iter()
@@ -714,7 +706,7 @@ fn probe_count(config: &EngineConfig, ann_rows: usize, clusters: usize, thin: f6
 /// in 25 segments: recall@10 0.907 against 0.954 reclustered). Such a layout probes
 /// `S^exponent` times as many clusters, where `S = (sum of rows)^2 / sum of rows^2` is the
 /// effective number of equal segments (tiny tail segments barely count). The exponent is
-/// `BF_ANN_SEGMENT_SPREAD` (default 0.3; 0 turns it off): NQ needed 2.5 times the probes to
+/// [`SPREAD_EXPONENT`] (0.3): NQ needed 2.5 times the probes to
 /// reach the reclustered recall, and 25^0.3 is 2.6. The multiplier is at most
 /// [`MAX_SPREAD`] (reached at about 100 segments), so a namespace with many segments (a large
 /// load before its recluster, or one still ingesting) reads at most that many times the
@@ -726,25 +718,21 @@ pub(crate) fn independent_spread(
     if config.ann_nprobe_explicit {
         return 1.0;
     }
-    static EXPONENT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    let exponent = *EXPONENT.get_or_init(|| {
-        std::env::var("BF_ANN_SEGMENT_SPREAD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.3)
-    });
     let (sum, squares) = segment_rows.fold((0f64, 0f64), |(s, q), n| {
         let n = n as f64;
         (s + n, q + n * n)
     });
-    if exponent <= 0.0 || squares <= 0.0 {
+    if squares <= 0.0 {
         return 1.0;
     }
     (sum * sum / squares)
         .max(1.0)
-        .powf(exponent)
+        .powf(SPREAD_EXPONENT)
         .min(MAX_SPREAD)
 }
+
+/// Exponent of the independent-segment multiplier.
+const SPREAD_EXPONENT: f64 = 0.3;
 
 /// Upper bound of [`independent_spread`].
 pub(crate) const MAX_SPREAD: f64 = 4.0;
@@ -1037,7 +1025,7 @@ pub(crate) async fn search(
             .ok_or_else(|| segment::index_error("segment lost its ANN index"))?;
         let reader = Reader::new(store, &file);
         let object_key = file.key.clone();
-        let memo_hit = layout == Layout::Slabs && scan_memo_enabled() && !exact;
+        let memo_hit = layout == Layout::Slabs && !exact;
         let frag_file = state.segments[i]
             .files
             .get(&layout.frag_key(attribute))
@@ -1048,7 +1036,8 @@ pub(crate) async fn search(
         let (segment_docs, docs_store) = (state.segments[i].clone(), store.clone());
         let dir_reader = Reader::new(store, &frag_file);
         let live = lives[i].clone();
-        let wanted_set: std::collections::HashSet<usize> = cs.iter().copied().collect();
+        let wanted_set: std::collections::HashSet<usize, foldhash::fast::RandomState> =
+            cs.iter().copied().collect();
         let seg_entries: Vec<_> = dir
             .segment_entries(i)
             .iter()
@@ -1330,13 +1319,6 @@ pub(crate) async fn search(
     Ok((scores, docs))
 }
 
-/// `BF_ANN_PAGED=0` makes queries read a recluster's whole slab directory instead of its coarse
-/// header and the pages they probe (A/B measurements only).
-pub(crate) fn paged_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("BF_ANN_PAGED").is_ok_and(|v| v == "0"))
-}
-
 fn env_number<T: std::str::FromStr + Copy>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
@@ -1445,7 +1427,7 @@ pub(crate) async fn slab_directory(
     vector: &[f32],
     config: &EngineConfig,
 ) -> Result<(Arc<Directory>, bool), ApiError> {
-    let Some(file) = set.pages.as_ref().filter(|_| paged_enabled()) else {
+    let Some(file) = set.pages.as_ref() else {
         let cached = read_cache::get::<Directory>(&set.dir.key, set.dir.metadata_len).is_some();
         return Ok((load(store, &set.dir, prefetched).await?, cached));
     };
@@ -1557,12 +1539,6 @@ fn scan_memo_take(key: &ScanKey) -> Option<Scanned> {
         .map(|(_, v)| v)
 }
 
-/// `BF_ANN_SCAN_MEMO=0` leaves the scan to the query (A/B measurements only).
-fn scan_memo_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("BF_ANN_SCAN_MEMO").is_ok_and(|v| v == "0"))
-}
-
 /// Start a cold unfiltered ANN query's directory pages and scan reads from the hint alone, before
 /// the manifest has been read: a paged directory's header lists every slab (key, sizes, and
 /// fragment), so nothing else is needed to know what to read. The reads land in the caches, and
@@ -1577,7 +1553,7 @@ pub(crate) async fn speculate_slab_scan(
     config: &EngineConfig,
 ) {
     let (key, bytes) = hint;
-    if !PagedDirectory::is_paged(&bytes) || !paged_enabled() || !scan_speculation_enabled() {
+    if !PagedDirectory::is_paged(&bytes) {
         return;
     }
     let Ok(decoded) = PagedDirectory::decode(&bytes) else {
@@ -1641,12 +1617,6 @@ pub(crate) async fn speculate_slab_scan(
         )
         .await;
     }
-}
-
-/// `BF_ANN_SPECULATE=0` waits for the manifest before reading the scan (A/B measurements only).
-fn scan_speculation_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("BF_ANN_SPECULATE").is_ok_and(|v| v == "0"))
 }
 
 #[cfg(test)]

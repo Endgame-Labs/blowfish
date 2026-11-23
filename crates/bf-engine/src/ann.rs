@@ -77,59 +77,53 @@ pub(crate) async fn search(
             state.docs.len()
         );
     }
-    // `BF_ANN_DIRECTORY=0` forces the per-segment path (A/B measurements only).
-    static DIRECTORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*DIRECTORY.get_or_init(|| std::env::var("BF_ANN_DIRECTORY").is_ok_and(|v| v == "0")) {
-        // A namespace-wide recluster (slabs) answers unfiltered queries while it covers exactly
-        // the live segments; otherwise (new segments since it was built) fall through.
-        if q.filters.is_none()
-            && slabs_enabled()
-            && let Some(set) = state.ann_slabs.get(attribute)
-            && let Some(found) = from_slabs(
-                store, state, attribute, vector, config, k, columns, set, None,
-            )
-            .await?
-        {
-            return Ok(Some(found));
-        }
-        // Unfiltered queries prefer the block layout (one read per probed cluster); filtered ones
-        // need the plain fragments' row-to-cluster maps.
-        if q.filters.is_none()
-            && crate::ann_dir::blocks_enabled()
-            && let Some(file) = state.ann_dirs.get(&Layout::Blocks.dir_key(attribute))
-            && let Some(found) = from_directory(
-                store,
-                state,
-                q,
-                attribute,
-                vector,
-                config,
-                k,
-                columns,
-                file,
-                Layout::Blocks,
-            )
-            .await?
-        {
-            return Ok(Some(found));
-        }
-        if let Some(file) = state.ann_dirs.get(&key)
-            && let Some(found) = from_directory(
-                store,
-                state,
-                q,
-                attribute,
-                vector,
-                config,
-                k,
-                columns,
-                file,
-                Layout::Plain,
-            )
-            .await?
-        {
-            return Ok(Some(found));
-        }
+    // A namespace-wide recluster (slabs) answers unfiltered queries while it covers exactly
+    // the live segments; otherwise (new segments since it was built) fall through.
+    if q.filters.is_none()
+        && let Some(set) = state.ann_slabs.get(attribute)
+        && let Some(found) = from_slabs(
+            store, state, attribute, vector, config, k, columns, set, None,
+        )
+        .await?
+    {
+        return Ok(Some(found));
+    }
+    // Unfiltered queries prefer the block layout (one read per probed cluster); filtered ones
+    // need the plain fragments' row-to-cluster maps.
+    if q.filters.is_none()
+        && let Some(file) = state.ann_dirs.get(&Layout::Blocks.dir_key(attribute))
+        && let Some(found) = from_directory(
+            store,
+            state,
+            q,
+            attribute,
+            vector,
+            config,
+            k,
+            columns,
+            file,
+            Layout::Blocks,
+        )
+        .await?
+    {
+        return Ok(Some(found));
+    }
+    if let Some(file) = state.ann_dirs.get(&key)
+        && let Some(found) = from_directory(
+            store,
+            state,
+            q,
+            attribute,
+            vector,
+            config,
+            k,
+            columns,
+            file,
+            Layout::Plain,
+        )
+        .await?
+    {
+        return Ok(Some(found));
     }
     let vector: Arc<[f32]> = vector.into();
     let t0 = std::time::Instant::now();
@@ -492,12 +486,6 @@ pub(crate) fn stage(t0: std::time::Instant, name: &str) {
     if *ON.get_or_init(|| std::env::var_os("BF_TRACE_STAGES").is_some()) {
         eprintln!("STAGE {name} {} ms", t0.elapsed().as_millis());
     }
-}
-
-/// `BF_ANN_SLABS=0` ignores a recluster's slabs (A/B measurements only).
-pub(crate) fn slabs_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("BF_ANN_SLABS").is_ok_and(|v| v == "0"))
 }
 
 /// Whether the slab set covers exactly the live segments, in order.

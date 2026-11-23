@@ -35,6 +35,10 @@ pub(crate) struct DecodedCache {
     /// Decoded document column blocks (256 rows each), for hydrating results.
     columns: moka::sync::Cache<String, Arc<Vec<Option<serde_json::Value>>>>,
 }
+/// foldhash, seeded per process (the keys are object keys and cluster numbers).
+type FastHash = foldhash::fast::RandomState;
+/// An ANN object's key and a cluster number in it.
+type ClusterKey = (Arc<str>, u32);
 pub(crate) type ClusterCache = Arc<ClockCache<bf_vector::DecodedCluster>>;
 
 /// A byte-bounded cache of small, many, immutable values for hot paths: sharded mutexes over
@@ -45,7 +49,7 @@ pub(crate) struct ClockCache<V> {
     weigh: fn(&V) -> u64,
 }
 struct ClockShard<V> {
-    map: HashMap<(Arc<str>, u32), (V, u64, bool)>,
+    map: HashMap<ClusterKey, (V, u64, bool), FastHash>,
     ring: std::collections::VecDeque<(Arc<str>, u32)>,
     bytes: u64,
     cap: u64,
@@ -58,7 +62,7 @@ impl<V: Clone> ClockCache<V> {
             shards: (0..Self::SHARDS)
                 .map(|_| {
                     Mutex::new(ClockShard {
-                        map: HashMap::new(),
+                        map: HashMap::default(),
                         ring: Default::default(),
                         bytes: 0,
                         cap,
@@ -70,8 +74,9 @@ impl<V: Clone> ClockCache<V> {
     }
     fn shard(&self, key: &(Arc<str>, u32)) -> &Mutex<ClockShard<V>> {
         use std::hash::BuildHasher;
-        static SEED: std::sync::OnceLock<std::collections::hash_map::RandomState> =
-            std::sync::OnceLock::new();
+        // foldhash, seeded per process: SipHash on each of a warm query's hundreds of cluster
+        // lookups cost about 2% of CPU.
+        static SEED: std::sync::OnceLock<foldhash::fast::RandomState> = std::sync::OnceLock::new();
         let h = SEED.get_or_init(Default::default).hash_one(key);
         &self.shards[h as usize % Self::SHARDS]
     }

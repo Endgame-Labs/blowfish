@@ -434,7 +434,7 @@ impl<R: RangeRead> Index<R> {
             .metadata
             .clusters
             .iter()
-            .map(|c| Metric::EuclideanSquared.distance_unchecked(&q, &c.center))
+            .map(|c| crate::distance::l2_squared_f32(&q, &c.center))
             .collect())
     }
 
@@ -672,7 +672,7 @@ impl<R: RangeRead> Index<R> {
                     .ok_or_else(|| bad("fast-scan codes without a reference center"))?;
                 let fq =
                     fast.get_or_insert_with(|| crate::fastscan::FastQuery::new(q_rot, reference));
-                let qc2 = Metric::EuclideanSquared.distance_unchecked(q32, &c.center);
+                let qc2 = crate::distance::l2_squared_f32(q32, &c.center);
                 // A zero query has a fixed distance to every row: no cut applies.
                 let open = std::cell::Cell::new(f32::INFINITY);
                 let scan_cut = if cosine && q_zero { &open } else { &cut };
@@ -873,7 +873,7 @@ impl<R: RangeRead> Index<R> {
             .metadata
             .clusters
             .iter()
-            .map(|c| Metric::EuclideanSquared.distance_unchecked(q, &c.center))
+            .map(|c| crate::distance::l2_squared_f32(q, &c.center))
             .collect();
         order.sort_unstable_by(|a, b| {
             let ca = &self.metadata.clusters[*a];
@@ -1006,7 +1006,10 @@ impl<R: RangeRead> Index<R> {
                     continue;
                 }
                 let vbytes = &bytes[(i - start) * width..(i - start + 1) * width];
-                check_crc(vbytes, c.row_crcs[i])?;
+                // A whole cluster's vectors were checked at once above.
+                if !whole {
+                    check_crc(vbytes, c.row_crcs[i])?;
+                }
                 decoded.clear();
                 match self.vector_type() {
                     VectorType::I8 => decoded.extend(vbytes.iter().map(|x| *x as i8 as f32)),

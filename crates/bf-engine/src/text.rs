@@ -650,7 +650,7 @@ mod tests {
             .unwrap();
         file.stats_index = Some(index);
         let state = NamespaceState {
-            text_stats: Some(file.clone()),
+            text_stats: Some(file.clone().into()),
             ..Default::default()
         };
         assert_eq!(

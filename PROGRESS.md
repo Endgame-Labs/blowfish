@@ -4,6 +4,24 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Iteration 21: one recluster assignment at every size, and a lighter query path** (`docs/benchmarks.md`).
+  - `recluster` trains a large cell's leaves two-level and assigns rows across cells in blocks of 4, against leaf groups.
+    Cross-cell assignment is now the only one. At 32 cells on BEIR NQ it takes 138 s against main's 253 s, at the same
+    recall@10 (0.961). At 8 cells (10M-sized cells) it gives 0.961 against the old per-cell 0.950, at about the same
+    time and memory. A 100M-shaped cell run (about 16,000 leaves a cell) puts a 100M assignment at about 5 hours on 8
+    vCPUs, against 1.7 hours for the last full 100M recluster.
+  - Queries: k-means, center distances, and rerank use new 16-lane f32 kernels in place of numkong's. The text stats header
+    is shared instead of copied into every query's state. Rerank checks a whole cluster's CRC once, and the
+    decoded-cluster cache hashes with foldhash. On NQ, reclustered q/s at 16 clients went from 580 to 616 at the same
+    recall, and as-loaded 1-client p99 went from 27.9 to 9.3 ms.
+  - Per SPEC decision 25, these settings are removed: `BF_RECLUSTER_GLOBAL`, `BF_RECLUSTER_GROUPS`,
+    `BF_RECLUSTER_REFINE`, `BF_ANN_DIRECTORY`, `BF_ANN_BLOCKS`, `BF_ANN_SLABS`, `BF_ANN_PAGED`, `BF_ANN_SCAN_MEMO`,
+    `BF_ANN_SPECULATE`, `BF_READER_COPY`, `BF_ANN_SEGMENT_SPREAD`, `BF_IVF_CLUSTER_FACTOR`, and `BF_NO_AVX512`. They are
+    listed in `docs/configuration.md`.
+  - Checked: fmt, workspace clippy, and `cargo test --workspace` (252 passed); compat 121/121; the branch serving main's
+    store gives the same recall; and the `bench` ladder against main
+    (same recall at 10K, 50K, and 200K rows, with warm ANN p50 a little lower).
+
 - **Bucket format fence:** format-2 manifests rename the required checkpoint field to `checkpoint_wal`,
   and every manifest decoder rejects unsupported versions. Writers and maintenance tools cannot republish
   unfamiliar manifests. Legacy format-1 manifests remain readable and upgrade on publication.
@@ -59,8 +77,8 @@ Newest first. Each entry says what works now and how it was checked.
   - the `bf-vector` and `bf-engine` tests on an Apple M4 (NEON);
   - the `bench` ladder against main (same recall at 10K, 50K, and 200K rows).
 
-  New settings (`BF_RECLUSTER_GLOBAL`, `BF_RECLUSTER_GROUPS`, and `BF_RECLUSTER_REFINE`) are in
-  `docs/configuration.md`.
+  New settings (`BF_RECLUSTER_GLOBAL`, `BF_RECLUSTER_GROUPS`, and `BF_RECLUSTER_REFINE`) were added here and
+  removed again in iteration 21.
 
 ## 2026-11-22
 

@@ -424,7 +424,7 @@ pub(crate) fn nearest(v: &[f32], centers: &[Vec<f32>]) -> usize {
     centers
         .iter()
         .enumerate()
-        .map(|(i, c)| (i, Metric::EuclideanSquared.distance_unchecked(v, c)))
+        .map(|(i, c)| (i, crate::distance::l2_squared_f32(v, c)))
         .min_by(|(ia, a), (ib, b)| a.total_cmp(b).then(ia.cmp(ib)))
         .unwrap()
         .0
@@ -468,6 +468,46 @@ pub fn kmeans(data: &[&[f32]], k: usize, iterations: usize, seed: u64) -> Vec<Ve
     train(data, k.min(data.len()), iterations, &mut Rng(seed))
 }
 
+/// Two-level Lloyd k-means, as the index builder trains large inputs: about `sqrt(k)` parent
+/// centers over all of `data`, then each parent's share of the leaves over the rows nearest to it.
+/// Each training row is compared with about `2 sqrt(k)` centers per iteration instead of `k`, so
+/// thousands of leaves train in seconds. Returns the parents and, for each, its leaves (at least
+/// one each: a parent no row chose keeps its own center as a leaf). Deterministic for a seed.
+pub fn kmeans_two_level(
+    data: &[&[f32]],
+    k: usize,
+    iterations: usize,
+    seed: u64,
+) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>) {
+    let k = k.min(data.len()).max(1);
+    let p = ((k as f64).sqrt().ceil() as usize).min(k);
+    let mut rng = Rng(seed);
+    let parents = train(data, p, iterations, &mut rng);
+    let mut groups: Vec<Vec<&[f32]>> = vec![Vec::new(); parents.len()];
+    let nearest_parent: Vec<usize> = data.par_iter().map(|v| nearest(v, &parents)).collect();
+    for (v, g) in data.iter().zip(nearest_parent) {
+        groups[g].push(v);
+    }
+    let seeds: Vec<u64> = (0..parents.len()).map(|_| rng.next()).collect();
+    let children = groups
+        .par_iter()
+        .enumerate()
+        .map(|(parent, group)| {
+            let requested = k / p + usize::from(parent < k % p);
+            if group.is_empty() || requested == 0 {
+                return vec![parents[parent].clone()];
+            }
+            train(
+                group,
+                requested.min(group.len()),
+                iterations,
+                &mut Rng(seeds[parent]),
+            )
+        })
+        .collect();
+    (parents, children)
+}
+
 /// Index of the center nearest to `v` (squared Euclidean distance).
 pub fn nearest_center(v: &[f32], centers: &[Vec<f32>]) -> usize {
     nearest(v, centers)
@@ -476,7 +516,13 @@ pub fn nearest_center(v: &[f32], centers: &[Vec<f32>]) -> usize {
 /// Squared Euclidean distance between two vectors of equal length, unvalidated (for hot loops
 /// over vectors already checked, such as rows against k-means centers).
 pub fn squared_distance(a: &[f32], b: &[f32]) -> f32 {
-    Metric::EuclideanSquared.distance_unchecked(a, b)
+    crate::distance::l2_squared_f32(a, b)
+}
+
+/// Dot products of four rows with one center, reading the center once (rows and center of equal
+/// length, unvalidated). For nearest-center searches over many rows, as a recluster's.
+pub fn dots_x4(rows: [&[f32]; 4], center: &[f32]) -> [f32; 4] {
+    crate::distance::dots_f32_x4(rows, center)
 }
 
 /// Unit-normalize `v` for cosine metrics; a copy for Euclidean ones.

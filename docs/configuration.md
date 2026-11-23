@@ -157,7 +157,6 @@ publication, or until you run
 | What | Default | Variable |
 | --- | --- | --- |
 | Smallest manifest (encoded bytes) that gets a compact copy | 262,144 | `BF_READER_COPY_MIN_BYTES` |
-| Read the compact copy for ANN queries (set to `0` to read the full manifest, for A/B runs) | on | `BF_READER_COPY` |
 
 ### Paged ANN directory (large reclustered namespaces)
 
@@ -169,36 +168,28 @@ variables; the defaults suit 1,024-dimension vectors.
 
 | What | Default | Variable |
 | --- | --- | --- |
-| Read paged directories (set to `0` to read the whole slab directory, for A/B runs) | on | `BF_ANN_PAGED` |
 | Cells' entries a query reads, as a multiple of the clusters it will probe (higher: more recall, more bytes) | 16 | `BF_ANN_PAGE_MARGIN` |
 | How strongly a cell's spread pulls it up the ranking (see `PagedDirectory::select_cells`) | 0.5 | `BF_ANN_PAGE_KAPPA` |
 | Entries per cell when `recluster` (or `repage`) builds the paged copy | 24 | `BF_ANN_PAGE_ENTRIES` |
 | Smallest directory (in clusters) that gets a paged copy | 100,000 | `BF_ANN_PAGED_MIN_ENTRIES` |
-| Scan each slab's clusters while a cold query's other reads are still arriving (set to `0` for A/B runs) | on | `BF_ANN_SCAN_MEMO` |
-| Start a cold query's directory pages and scan reads from the hint, before the manifest arrives (set to `0` for A/B runs) | on | `BF_ANN_SPECULATE` |
 
 `cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged copy to a namespace
 that was reclustered before paging existed, without rebuilding any slab.
 
 ### Recluster leaf assignment
 
-`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. For a
-layout with at most 1,024 leaves in its largest cell (about 6.5M rows at the default 32 cells and 200 rows per leaf),
-each row then joins its nearest leaf among the leaves of its four nearest cells, not only its own cell's. Every leaf
-center is then recomputed once from all of its rows, so rows near a cell boundary sit with their true neighbors. On
-BEIR NQ (2.68M rows, about 420 leaves a cell), recall@10 at 64 probes went from 0.955 to 0.960, and 54 probes now give
-what 64 gave. The job took 240 s instead of 160 s.
+`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. A cell
+with more than 1,024 leaves trains two-level (about the square root of the leaves as parents, then each parent's share of
+leaves); a smaller one trains one-level and groups its leaves by a small k-means. Each row then joins its nearest leaf
+among the leaves of its four nearest cells, not only its own cell's, searching the 12 nearest leaf groups. Every
+leaf center is then recomputed once from all of its rows and the rows assigned again, so rows near a cell boundary sit
+with their true neighbors. There are no settings: this is the only assignment.
 
-The cost grows faster than the rows. The leaves are trained with one-level k-means, and each row is compared with
-about 16 times the square root of a cell's leaves. With NQ split into 8 cells (about 1,700 leaves a cell, the size of a
-10M layout's cells), the job took 508 s instead of 93 s, at about the same peak memory (2.0 GB). Larger layouts, such
-as the published 10M and 100M ones, therefore keep the per-cell assignment unless it is forced on.
-
-| What | Default | Variable |
-| --- | --- | --- |
-| Assign rows across cells: `1` always, `0` never (each cell's rows clustered on their own, as before iteration 20) | when the largest cell has at most 1,024 leaves | `BF_RECLUSTER_GLOBAL` |
-| Leaf groups a row is compared with, over its four nearest cells | 12 | `BF_RECLUSTER_GROUPS` |
-| Rounds of recomputing leaf centers from their rows and assigning again | 1 | `BF_RECLUSTER_REFINE` |
+On BEIR NQ (2.68M rows), recall@10 at 64 probes is 0.961 at the default 32 cells (0.955 with each cell clustered on its
+own), and 0.961 with the rows forced into 8 cells (about 1,700 leaves a cell, the size of a 10M layout's cells; 0.950 on
+its own). The 8-cell job took about the same time and memory as the per-cell assignment it replaced: see
+[Iteration 21](benchmarks.md#iteration-21-one-recluster-assignment-at-every-size-and-a-lighter-query-path-beir-nq-one-machine),
+which also estimates the cost at 100M.
 
 ### ANN probes and query concurrency
 
@@ -219,13 +210,11 @@ from 0.906 to 0.958. Reclustering removes the cost: it gets the recall at the ba
 
 | What | Default | Variable |
 | --- | --- | --- |
-| Exponent of the independent-segment multiplier (`0` turns it off) | 0.3 | `BF_ANN_SEGMENT_SPREAD` |
 | Queries the engine runs at once | 8 | `BF_QUERY_CONCURRENCY` |
 | Segment searches one query runs at once | 8 | `BF_SEARCH_CONCURRENCY` |
 | Queries in flight up to which one query fans its slab work out over the thread pool (more run each query on its own thread) | half the CPUs | `BF_FANOUT_QUERIES` |
 | Least time between two sampled recall comparisons | 60,000 ms | `BF_RECALL_SAMPLE_INTERVAL_MS` |
 | Cache block size for scattered small reads (rerank vectors) | 16,384 | `BF_SPARSE_BLOCK_BYTES` |
-| Turn off the AVX-512 RaBitQ scan and query quantizer (any value; for A/B runs) | unset | `BF_NO_AVX512` |
 
 On x86-64 the RaBitQ scan uses AVX-512 (`VPOPCNTQ`) when the CPU has it; on arm64 it uses NEON (`CNT` and pairwise adds).
 Both give bit-identical results to the portable path.
@@ -249,10 +238,28 @@ These environment-only switches are read directly by the storage and engine crat
 | `BF_WARM_CONNECTIONS` | adaptive (starts at `storage.warm_connections`, `256`) | Fix the S3 warm connection pool size (`0` disables connection warming) |
 | `BF_WARM_FLOOR` | `16` | Minimum idle S3 connections kept warm after an idle window |
 | `BF_HEDGE_BUDGET` | `storage.cache.hedge_budget` (`0.1`) | Extra-request fraction for hedged ranged GETs up to 1 MiB (`0` disables) |
-| `BF_ANN_DIRECTORY` | on | Set to `0` to force the per-segment ANN path (A/B runs) |
-| `BF_ANN_SLABS` | on | Set to `0` to ignore `recluster` slabs (A/B runs) |
-| `BF_ANN_BLOCKS` | on | Set to `0` to ignore block fragments (A/B runs) |
-| `BF_IVF_CLUSTER_FACTOR` | `1.0` | Multiplier on leaf cluster size during IVF builds |
 | `BF_READ_GAP_KB` | layout default | Override read range-merge gap in KiB |
 | `BF_TRACE_READS` | off | Print each backend read and its timing to stderr |
 | `BF_TRACE_STAGES` | off | Print per-stage query and indexer timings to stderr |
+
+### Removed settings
+
+Following SPEC decision 25 (one way to do each thing), these environment variables are gone. Each one only chose an
+older or slower path, and setting it now has no effect:
+
+| Variable | What it did | Now |
+| --- | --- | --- |
+| `BF_RECLUSTER_GLOBAL` | Chose cross-cell or per-cell leaf assignment in `recluster` | Cross-cell assignment is the only one |
+| `BF_RECLUSTER_GROUPS` | Leaf groups searched per row during assignment | Fixed at 12 |
+| `BF_RECLUSTER_REFINE` | Refinement rounds after assignment | Exactly one |
+| `BF_ANN_DIRECTORY` | `0` forced the per-segment ANN path | Directories are always used when present |
+| `BF_ANN_BLOCKS` | `0` turned off the block layout for unfiltered queries | Always on |
+| `BF_ANN_SLABS` | `0` ignored a recluster's slabs | Slabs are always used while they cover the live segments |
+| `BF_ANN_PAGED` | `0` read the whole slab directory | Paged directories are always read in pieces |
+| `BF_ANN_SCAN_MEMO` | `0` turned off scanning while a cold query's reads arrive | Always on |
+| `BF_ANN_SPECULATE` | `0` waited for the manifest before starting scan reads | Always on |
+| `BF_READER_COPY` | `0` made ANN queries read the full manifest | The compact copy is always read |
+| `BF_ANN_SEGMENT_SPREAD` | Exponent of the as-loaded probe multiplier | Fixed at 0.3 |
+| `BF_IVF_CLUSTER_FACTOR` | Made index-build leaf clusters larger | Leaf clusters are sqrt(rows) |
+| `BF_NO_AVX512` | Turned off the AVX-512 scan kernels | AVX-512 is used whenever the CPU has it |
+| `BF_ANN_FASTSCAN` | Chose the row-major code layout (removed with the reindex work) | Fast-scan is the only layout written |

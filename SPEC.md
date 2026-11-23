@@ -88,7 +88,7 @@ log entry in the same commit.
 - **Vectors:** IVF with RaBitQ, with full-precision rerank. Defaults: `ann_nprobe = 64` and `ann_rerank_factor = 32`.
 - **Spatial slabs** (round 12): `recluster` partitions a namespace into slabs of small leaves, so a cold query reads a
   few contiguous ranges instead of every segment's clusters. Unfiltered ANN uses slabs only while they cover exactly
-  the live segments; `BF_ANN_SLABS=0` turns them off.
+  the live segments.
 - **No row-level graph indexes** (HNSW, DiskANN, and similar over rows). The peak-jumping research ruled them out for a
   cold, object-storage-first engine: their random hops each cost an object-store round trip. A graph over leaf centers,
   held with the paged directory, is allowed (decision 26; `docs/design/graph-index.md`).
