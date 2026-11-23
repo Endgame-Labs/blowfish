@@ -527,7 +527,7 @@ pub(crate) async fn catch_up_hinted(
                         } else {
                             crate::text::checkpoint_corpus(&m.stats)
                         },
-                        text_stats: m.text_stats,
+                        text_stats: m.text_stats.map(std::sync::Arc::new),
                         ann_dirs: m.ann_dirs,
                         ann_slabs: m.ann_slabs.into(),
                         stats: m.stats.into(),
@@ -574,7 +574,7 @@ pub(crate) async fn catch_up_hinted(
                         Part::OnlyText,
                         &store,
                         &segments,
-                        text.as_ref(),
+                        text.as_deref(),
                         &dirs,
                         &slabs,
                         &none,
@@ -594,7 +594,7 @@ pub(crate) async fn catch_up_hinted(
                     part,
                     store,
                     &segments,
-                    text.as_ref(),
+                    text.as_deref(),
                     &dirs,
                     &slabs,
                     &prefetched,
