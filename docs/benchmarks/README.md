@@ -299,10 +299,8 @@ At 10M documents, the default `nprobe = 64` drops below turbopuffer's recall (`0
 
 The scale and apples-to-apples harness lives in [`bench/scale/`](../../bench/scale/), the 100M workload scripts live in [`bench/scale/big/`](../../bench/scale/big/), and the Amazon S3 Vectors comparison scripts live in [`bench/s3vectors/`](../../bench/s3vectors/). Private bucket endpoints, profiles, and namespace names stay in `bench/scale/config.local`, which is git-ignored; all build outputs, caches, downloaded shards, and logs stay under `.scratch/scale/` (`SCALE_SCRATCH`).
 
-For large reclustered namespaces, three helper examples live in `crates/bf-engine/examples/`:
+The server reclusters large namespaces on its own (see [operations](../operations.md#large-namespaces-automatic-recluster-and-compact-manifest-copy)). One helper example remains in `crates/bf-engine/examples/`:
 
-- `cargo run --release -p bf-engine --example recluster -- storage.json NAMESPACE ATTRIBUTE SCRATCH_DIR` builds the namespace-wide spatial slab layout (and writes a paged slab directory automatically at 100,000+ clusters).
-- `cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged slab directory to a previously reclustered namespace without rebuilding slabs.
 - `cargo run --release -p bf-engine --example readercopy -- storage.json NAMESPACE` rewrites `manifest-latest` in compact form (omitting text headers) for a namespace published before compact copies existed.
 
 1. **Create `bench/scale/config.local` from [`bench/scale/config.example.json`](../../bench/scale/config.example.json) and build the benchmark server:**
