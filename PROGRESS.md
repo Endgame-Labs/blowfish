@@ -855,3 +855,8 @@ together, and RRF's ANN branch starts while text statistics load. Explicit ID-on
 compact IDs without hydrating document columns. I compare hybrid and RRF results with the exhaustive
 evaluator across indexed rows and the WAL tail. Formatting, clippy with warnings denied, and all
 172 tests in `bf-text` and `bf-engine` pass; three benchmark tests remain ignored.
+
+I extend the local harness with measured-pass perf counters or call stacks, selectable client counts,
+and elapsed-time throughput summaries. An aligned NQ workload generator emits BM25, ANN, two-list
+multi-query, and server-side RRF requests from the prepared benchmark data. Profile outputs stay
+under `.scratch/`, and profiler attachment uses the harness's exact server PID.

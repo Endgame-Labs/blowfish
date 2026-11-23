@@ -67,15 +67,46 @@ def trace(path):
     return {"reads": len(reads), "bytes": sum(r[2] for r in reads), "waves": waves}
 
 
-def summary(rows, clients, delay_ms):
+def summary(rows, clients, delay_ms, seconds=None):
     ms = sorted(row["ms"] for row in rows)
     out = {"queries": len(rows), "clients": clients, "p50_ms": ms[len(ms) // 2],
            "p90_ms": ms[min(len(ms) - 1, len(ms) * 9 // 10)]}
+    if seconds is not None:
+        out.update(seconds=seconds, queries_per_second=len(rows) / seconds)
     if rows and "waves" in rows[0]:
         for key in ["reads", "bytes", "waves"]:
             out[f"mean_{key}"] = statistics.mean(row[key] for row in rows)
         out["round_trip_floor_ms"] = out["mean_waves"] * delay_ms
     print(json.dumps(out), file=sys.stderr, flush=True)
+
+
+@contextlib.contextmanager
+def profile(args, pid, clients):
+    """Profile only the measured pass, attaching to this harness's exact child PID."""
+    if args.perf is None:
+        yield
+        return
+    args.profile_dir.mkdir(parents=True, exist_ok=True)
+    path = args.profile_dir / f"c{clients}"
+    command = [str(args.perf)]
+    if args.perf_record:
+        command += ["record", "-g", "--call-graph", "dwarf,8192", "-F", "199",
+                    "-o", str(path.with_suffix(".data"))]
+    else:
+        command += ["stat", "-e", "instructions,cycles", "-x", ",",
+                    "-o", str(path.with_suffix(".stat"))]
+    child = subprocess.Popen(["timeout", "600", *command, "-p", str(pid)])
+    try:
+        # Allow perf to attach before the first request.
+        time.sleep(0.2)
+        yield
+    finally:
+        child.send_signal(signal.SIGINT)
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
 
 
 async def measure(args, work):
@@ -98,21 +129,24 @@ async def measure(args, work):
 
         if args.mode == "warm":
             command += ["--storage-url", args.store.resolve().as_uri()]
-            with process(command, work / "server.log", env):
+            with process(command, work / "server.log", env) as server:
                 await ready(client, url)
                 for item in items:
                     await one(item)
-                for clients in [1, 16]:
+                for clients in args.clients:
                     semaphore = asyncio.Semaphore(clients)
 
                     async def bounded(item):
                         async with semaphore:
                             return dict(await one(item), clients=clients)
 
-                    rows = await asyncio.gather(*(bounded(item) for item in items))
+                    with profile(args, server.pid, clients):
+                        start = time.monotonic()
+                        rows = await asyncio.gather(*(bounded(item) for item in items))
+                        seconds = time.monotonic() - start
                     for row in rows:
                         print(json.dumps(row), flush=True)
-                    summary(rows, clients, args.delay_ms)
+                    summary(rows, clients, args.delay_ms, seconds)
         else:
             env.update(BF_TRACE_READS="1", BF_TRACE_STAGES="1", BF_WARM_CONNECTIONS="0",
                        AWS_ACCESS_KEY_ID="local", AWS_SECRET_ACCESS_KEY="local", AWS_DEFAULT_REGION="us-east-1")
@@ -146,9 +180,18 @@ def main():
     parser.add_argument("--queries", type=int, default=1000)
     parser.add_argument("--port", type=int, default=18323)
     parser.add_argument("--delay-ms", type=float, default=25)
+    parser.add_argument("--clients", type=int, nargs="+", default=[1, 16])
+    parser.add_argument("--perf", type=Path, help="perf executable; collect measured-pass instruction counts")
+    parser.add_argument("--perf-record", action="store_true", help="collect call stacks instead of counters")
+    parser.add_argument("--profile-dir", type=Path, help="profile output directory, under .scratch/")
     args = parser.parse_args()
     if args.queries <= 0 or args.delay_ms < 0:
         parser.error("queries must be positive, and delay-ms must be nonnegative")
+    if any(c < 1 or c > 16 for c in args.clients):
+        parser.error("clients must be between one and sixteen")
+    if args.perf is not None and (args.profile_dir is None or
+                                 not args.profile_dir.resolve().is_relative_to(ROOT / ".scratch")):
+        parser.error("--perf requires --profile-dir under .scratch/")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     scratch = ROOT / ".scratch"
     scratch.mkdir(exist_ok=True)
