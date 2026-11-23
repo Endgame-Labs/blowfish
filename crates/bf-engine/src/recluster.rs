@@ -6,16 +6,21 @@
 //! into a few dozen **slabs** (a coarse k-means over a sample), and clusters each slab finely
 //! with the ordinary index builder. A slab is a pseudo segment (an index object with the
 //! quantized codes and full-precision vectors, plus a block fragment), listed in
-//! `Manifest::ann_slabs` with a block-layout directory over the slabs. A slab's row IDs are
+//! `Manifest::ann_tiers` with a block-layout directory over the slabs. A slab's row IDs are
 //! global row numbers (`SlabCover::base` plus the segment-local row), so a winner maps back to its
 //! segment and row without a lookup table, and documents and attributes stay where they are.
 //!
 //! The job streams: segment vectors are copied once into a local spill file (never more than a
 //! slab's rows are in memory at a time), the coarse partition is trained on a sample, and the
 //! slabs are built and uploaded one after another.
-use crate::{Engine, ann_dir, log_error, segment};
+//!
+//! The build runs as the automatic recluster's job (`auto_recluster.rs`): it reads a manifest
+//! snapshot, claims nothing, and hands the finished tier to the indexer, which installs it in its
+//! next fenced publication. It runs on a pool of half the cores, and between slabs it waits while
+//! the indexer flushes or compacts.
+use crate::{Engine, ann_dir, auto_recluster::Job, log_error, segment};
 use bf_types::ApiError;
-use bf_wal::{Manifest, Segment, SlabCover, SlabSet, Wal};
+use bf_wal::{Segment, SlabCover, SlabSet, Wal};
 use futures::{StreamExt, TryStreamExt};
 use rayon::prelude::*;
 use std::os::unix::fs::FileExt;
@@ -46,35 +51,78 @@ pub struct ReclusterReport {
     pub seconds: f64,
 }
 
+/// The leaf clusters and coarse cells every build uses.
+pub(crate) const CELLS: usize = 32;
+pub(crate) const CLUSTER_ROWS: usize = 200;
+
+/// A finished build: the tier, ready for the indexer to install.
+pub(crate) struct Built {
+    pub set: SlabSet,
+    pub report: ReclusterReport,
+}
+
+/// The pool builds run on: half the cores (at least one), so queries keep the rest.
+fn pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads((cores / 2).max(1))
+            .thread_name(|i| format!("bf-recluster-{i}"))
+            .build()
+            .expect("recluster pool")
+    })
+}
+
+/// Run `f` on a blocking thread, inside the build pool.
+async fn on_pool<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(move || pool().install(f))
+        .await
+        .map_err(segment::index_error)
+}
+
 impl Engine {
-    /// Build a namespace-wide ANN layout for `opts.attribute` over every live segment and publish
-    /// it. Additive: segments, documents, and the per-segment directories are untouched, and a
-    /// previous layout is retired. Stops an indexer on another node from publishing meanwhile
-    /// (it claims a new epoch), so run it with the namespace's indexing otherwise idle.
+    /// Recluster `ns` now: the automatic recluster's job, run in the foreground whatever its
+    /// trigger says. It builds a base tier over every segment of the newest manifest, then runs
+    /// index passes until one installs it. For tests and benchmarks; a server does this by itself.
     pub async fn recluster(
         &self,
         ns: &str,
         opts: &ReclusterOptions,
     ) -> Result<ReclusterReport, ApiError> {
-        let _busy = bf_alloc::busy();
-        let context = crate::read_cache::ReadContext::new(self.0.read_cache.clone());
-        crate::read_cache::scope(context, self.recluster_inner(ns, opts)).await
+        self.run_recluster_job(ns, opts).await
     }
 
-    async fn recluster_inner(
+    /// Build a base tier for `opts.attribute` over every segment of `manifest` (a snapshot: no
+    /// claim is taken, and indexing continues). Uploads its slabs and directory, and publishes
+    /// nothing.
+    // Boxed with an explicit `Send`: the build's streams of closures otherwise trip rustc's
+    // higher-ranked `Send` inference when the job is spawned.
+    pub(crate) fn build_tier<'a>(
+        &'a self,
+        ns: &'a str,
+        manifest: &'a bf_wal::Manifest,
+        opts: &'a ReclusterOptions,
+        job: &'a Job,
+    ) -> futures::future::BoxFuture<'a, Result<Built, ApiError>> {
+        Box::pin(async move {
+            let _busy = bf_alloc::busy();
+            let context = crate::read_cache::ReadContext::new(self.0.read_cache.clone());
+            crate::read_cache::scope(context, self.build_tier_inner(ns, manifest, opts, job)).await
+        })
+    }
+
+    async fn build_tier_inner(
         &self,
         ns: &str,
+        manifest: &bf_wal::Manifest,
         opts: &ReclusterOptions,
-    ) -> Result<ReclusterReport, ApiError> {
+        job: &Job,
+    ) -> Result<Built, ApiError> {
         let t0 = std::time::Instant::now();
         let store = &self.0.store;
         let attr = opts.attribute.as_str();
         let wal = Wal::new(store.clone(), ns).map_err(log_error)?;
-        let (old_sequence, mut manifest) = wal
-            .latest_manifest()
-            .await
-            .map_err(log_error)?
-            .ok_or_else(|| ApiError::new(404, "namespace has no checkpoint"))?;
         let (ann_key, frag_key) = (format!("annv2:{attr}"), format!("annv2:{attr}"));
         if manifest.segments.is_empty()
             || manifest
@@ -86,22 +134,6 @@ impl Engine {
                 400,
                 "every segment needs an ANN index and a block fragment",
             ));
-        }
-        // Claim a new epoch: it fences any other indexer's publication until ours.
-        let epoch = manifest.indexer_epoch;
-        manifest.indexer_epoch += 1;
-        let claim = wal
-            .publish_fenced(old_sequence, epoch, &manifest)
-            .await
-            .map_err(log_error)?;
-        let mut manifest = wal
-            .latest_manifest()
-            .await
-            .map_err(log_error)?
-            .ok_or_else(|| ApiError::new(503, "manifest disappeared"))?
-            .1;
-        if manifest.indexer_epoch != epoch + 1 {
-            return Err(ApiError::new(409, "another indexer claimed the namespace"));
         }
 
         // Global row numbers: segment bases in manifest order.
@@ -143,15 +175,15 @@ impl Engine {
         let spill = Arc::new(spill);
         let result = self
             .recluster_with_spill(
-                &mut manifest,
+                manifest,
                 &wal,
-                claim,
                 opts,
                 covered,
                 spill.clone(),
                 (dims, width, dtype, metric),
                 first,
                 t0,
+                job,
             )
             .await;
         drop(spill);
@@ -162,31 +194,32 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn recluster_with_spill(
         &self,
-        manifest: &mut Manifest,
+        manifest: &bf_wal::Manifest,
         wal: &Wal,
-        claim: u64,
         opts: &ReclusterOptions,
         covered: Vec<SlabCover>,
         spill: Arc<std::fs::File>,
         (dims, width, dtype, metric): (usize, usize, bf_vector::VectorType, bf_vector::Metric),
         first: Arc<bf_vector::Index<segment::ObjectReader>>,
         t0: std::time::Instant,
-    ) -> Result<ReclusterReport, ApiError> {
+        job: &Job,
+    ) -> Result<Built, ApiError> {
         let store = &self.0.store;
         let (attr, ns) = (opts.attribute.as_str(), wal.namespace().to_string());
         let ann_key = format!("annv2:{attr}");
         let segments = manifest.segments.clone();
-        let copied: Vec<Vec<u32>> =
-            futures::stream::iter(segments.iter().zip(&covered).map(|(seg, cover)| {
+        let bases: Vec<u32> = covered.iter().map(|c| c.base).collect();
+        let copied: Vec<Vec<u32>> = futures::stream::iter(segments.into_iter().zip(bases).map(
+            |(seg, base): (Segment, u32)| {
                 let spill = spill.clone();
                 let ann_key = ann_key.clone();
-                let base = cover.base;
                 async move {
-                    let index = segment_index(store, seg, &ann_key).await?;
+                    job.pause().await;
+                    let index = segment_index(store, &seg, &ann_key).await?;
                     let live = if seg.live_generation == 0 {
                         None
                     } else {
-                        Some(segment::live(store, seg).await?)
+                        Some(segment::live(store, &seg).await?)
                     };
                     let mut present = Vec::new();
                     let clusters = index.cluster_count();
@@ -211,18 +244,19 @@ impl Engine {
                     }
                     Ok::<_, ApiError>(present)
                 }
-            }))
-            .buffer_unordered(6)
-            .try_collect()
-            .await?;
+            },
+        ))
+        .buffer_unordered(6)
+        .try_collect()
+        .await?;
         let mut present: Vec<u32> = copied.into_iter().flatten().collect();
         present.sort_unstable();
         if present.is_empty() {
             return Err(ApiError::new(400, "no live rows to recluster"));
         }
         tracing::info!(rows = present.len(), "recluster: vectors copied");
-        eprintln!(
-            "recluster: copied {} rows in {:.0}s",
+        tracing::info!(
+            "recluster {ns}: copied {} rows in {:.0}s",
             present.len(),
             t0.elapsed().as_secs_f64()
         );
@@ -244,7 +278,7 @@ impl Engine {
         let (assignment, cell_rows, coarse) = {
             let (present, read_row) = (present.clone(), read_row.clone());
             let cells_n = cells;
-            tokio::task::spawn_blocking(move || {
+            on_pool(move || {
                 let mut state = 0x9E37_79B9_7F4A_7C15u64;
                 let mut next = move || {
                     state ^= state << 13;
@@ -276,11 +310,10 @@ impl Engine {
                 }
                 (assignment.len(), cell_rows, centers)
             })
-            .await
-            .map_err(segment::index_error)?
+            .await?
         };
-        eprintln!(
-            "recluster: {assignment} rows in {} cells (largest {}) at {:.0}s",
+        tracing::info!(
+            "recluster {ns}: {assignment} rows in {} cells (largest {}) at {:.0}s",
             cell_rows.len(),
             cell_rows.iter().map(Vec::len).max().unwrap_or(0),
             t0.elapsed().as_secs_f64()
@@ -293,14 +326,13 @@ impl Engine {
         let jobs: Vec<SlabJob> = {
             let (present, read_row) = (present.clone(), read_row.clone());
             let cluster_rows = opts.cluster_rows.max(1);
-            tokio::task::spawn_blocking(move || {
+            on_pool(move || {
                 assign_leaves(&present, &read_row, &coarse, cell_rows, cluster_rows, max)
             })
-            .await
-            .map_err(segment::index_error)?
+            .await?
         };
-        eprintln!(
-            "recluster: {} slabs planned at {:.0}s",
+        tracing::info!(
+            "recluster {ns}: {} slabs planned at {:.0}s",
             jobs.len(),
             t0.elapsed().as_secs_f64()
         );
@@ -321,7 +353,9 @@ impl Engine {
             clusters += k;
             let spill = spill.clone();
             let rows_n = rows.len() as u32;
-            let blob = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, u64), ApiError> {
+            // Between slabs, let a queued flush or compaction run first.
+            job.pause().await;
+            let blob = on_pool(move || -> Result<(Vec<u8>, u64), ApiError> {
                 // Rows stay packed at the stored precision (about 2 KB each at 1,024 dims in f16).
                 let mut data = vec![0u8; rows.len() * width];
                 for (g, chunk) in rows.iter().zip(data.chunks_exact_mut(width)) {
@@ -342,10 +376,10 @@ impl Engine {
                     .map_err(segment::index_error)?;
                 bf_vector::Fragment::build_ann(&blob).map_err(segment::index_error)
             })
-            .await
-            .map_err(segment::index_error)??;
+            .await??;
             let (blob, meta) = blob;
-            let id = format!("slab-{}", uuid::Uuid::new_v4());
+            // Under the job's prefix, which its build record protects from GC until published.
+            let id = format!("{}{n:05}", job.slab_prefix());
             let (store2, ns2, attr2, id2, uploads2) = (
                 store.clone(),
                 ns.clone(),
@@ -386,8 +420,8 @@ impl Engine {
                 });
                 Ok(())
             }));
-            eprintln!(
-                "recluster: slab {} built at {:.0}s",
+            tracing::info!(
+                "recluster {ns}: slab {} built at {:.0}s",
                 n + 1,
                 t0.elapsed().as_secs_f64()
             );
@@ -398,23 +432,8 @@ impl Engine {
         slabs.extend(uploads.lock().await.drain(..));
         slabs.sort_by(|a, b| a.id.cmp(&b.id));
 
-        // The directory over the slabs, then publish.
-        let dir = ann_dir::build(store, &ns, &slabs, attr, ann_dir::Layout::Slabs, None)
-            .await?
-            .ok_or_else(|| ApiError::new(500, "slab directory not built"))?;
-        // A directory this large is read in pieces: write the paged copy, and the hint a cold
-        // query reads beside the manifest (the paged header, or else the whole directory).
-        let paged_dir = ann_dir::load(store, &dir, None).await?;
-        let pages = ann_dir::build_paged(store, &ns, attr, paged_dir.clone(), &slabs).await?;
-        if pages.is_none() {
-            let bytes = segment::ObjectReader::new(store, &dir)
-                .bypass_cache()
-                .read(0..dir.size)
-                .await
-                .map_err(segment::index_error)?;
-            ann_dir::write_hint(store, &ns, ann_dir::Layout::Slabs, attr, &dir.key, &bytes).await;
-        }
-        drop(paged_dir);
+        // The directory over the slabs. The indexer publishes the tier.
+        let (dir, pages) = slab_directories(store, &ns, attr, &slabs).await?;
         let report = ReclusterReport {
             rows: present.len() as u64,
             slabs: slabs.len(),
@@ -422,63 +441,44 @@ impl Engine {
             directory_bytes: dir.size,
             seconds: 0.0,
         };
-        if let Some(old) = manifest.ann_slabs.remove(attr) {
-            crate::indexer::retire_slabs(manifest, &old);
-        }
-        manifest.ann_slabs.insert(
-            attr.to_string(),
-            SlabSet {
+        Ok(Built {
+            set: SlabSet {
                 covered,
                 slabs,
                 dir,
                 pages,
+                format: bf_wal::TIER_FORMAT_VERSION,
             },
-        );
-        wal.publish_fenced(claim, manifest.indexer_epoch, manifest)
-            .await
-            .map_err(log_error)?;
-        Ok(ReclusterReport {
-            seconds: t0.elapsed().as_secs_f64(),
-            ..report
+            report: ReclusterReport {
+                seconds: t0.elapsed().as_secs_f64(),
+                ..report
+            },
         })
     }
 }
 
-impl Engine {
-    /// Write a paged copy of the namespace's slab directory beside the flat one (no slab is
-    /// rebuilt) and publish it. Returns the pages object's size, or `None` when the directory is
-    /// too small to page. Stops another indexer from publishing meanwhile, like [`Engine::recluster`].
-    pub async fn page_slab_directory(&self, ns: &str, attr: &str) -> Result<Option<u64>, ApiError> {
-        let context = crate::read_cache::ReadContext::new(self.0.read_cache.clone());
-        crate::read_cache::scope(context, async {
-            let store = &self.0.store;
-            let wal = Wal::new(store.clone(), ns).map_err(log_error)?;
-            let (sequence, mut manifest) = wal
-                .latest_manifest()
-                .await
-                .map_err(log_error)?
-                .ok_or_else(|| ApiError::new(404, "namespace has no checkpoint"))?;
-            let set = manifest
-                .ann_slabs
-                .get(attr)
-                .ok_or_else(|| ApiError::new(400, "namespace has no slabs"))?;
-            let dir = ann_dir::load(store, &set.dir, None).await?;
-            let Some(pages) = ann_dir::build_paged(store, ns, attr, dir, &set.slabs).await? else {
-                return Ok(None);
-            };
-            let size = pages.size;
-            let old = manifest.ann_slabs.get_mut(attr).expect("checked above");
-            if let Some(previous) = old.pages.replace(pages) {
-                crate::indexer::retire(&mut manifest, previous.key);
-            }
-            let epoch = manifest.indexer_epoch;
-            wal.publish_fenced(sequence, epoch, &manifest)
-                .await
-                .map_err(log_error)?;
-            Ok(Some(size))
-        })
-        .await
+/// Write the directory over `slabs`, and for a large one its paged copy; then the hint a cold
+/// query reads beside the manifest (the paged header, or else the whole directory).
+pub(crate) async fn slab_directories(
+    store: &bf_storage::Storage,
+    ns: &str,
+    attr: &str,
+    slabs: &[Segment],
+) -> Result<(bf_wal::SegmentFile, Option<bf_wal::SegmentFile>), ApiError> {
+    let dir = ann_dir::build(store, ns, slabs, attr, ann_dir::Layout::Slabs, None)
+        .await?
+        .ok_or_else(|| ApiError::new(500, "slab directory not built"))?;
+    let paged_dir = ann_dir::load(store, &dir, None).await?;
+    let pages = ann_dir::build_paged(store, ns, attr, paged_dir, slabs).await?;
+    if pages.is_none() {
+        let bytes = segment::ObjectReader::new(store, &dir)
+            .bypass_cache()
+            .read(0..dir.size)
+            .await
+            .map_err(segment::index_error)?;
+        ann_dir::write_hint(store, ns, ann_dir::Layout::Slabs, attr, &dir.key, &bytes).await;
     }
+    Ok((dir, pages))
 }
 
 /// Open a segment's index directly (not through the decoded cache: a recluster reads each once).
@@ -626,7 +626,7 @@ fn assign_leaves(
         ranges.push(start..leaves.len());
     }
     drop(cell_rows);
-    eprintln!(
+    tracing::info!(
         "recluster: {} leaves trained in {:.0}s",
         leaves.len(),
         t0.elapsed().as_secs_f64()
@@ -809,7 +809,7 @@ fn assign_leaves(
             })
             .flatten_iter()
             .collect();
-        eprintln!(
+        tracing::info!(
             "recluster: {:.0} centers compared per row",
             compared.into_inner() as f64 / present.len().max(1) as f64
         );
@@ -820,7 +820,7 @@ fn assign_leaves(
         leaf_of
     };
     let mut leaf_of = assign(&leaves);
-    eprintln!(
+    tracing::info!(
         "recluster: rows assigned at {:.0}s",
         t0.elapsed().as_secs_f64()
     );
@@ -852,7 +852,7 @@ fn assign_leaves(
             .collect();
         leaves = centers;
         leaf_of = assign(&leaves);
-        eprintln!("recluster: refined at {:.0}s", t0.elapsed().as_secs_f64());
+        tracing::info!("recluster: refined at {:.0}s", t0.elapsed().as_secs_f64());
     }
     // Each cell's leaves, with the rows that chose them, in ascending row order.
     let cell_of: Vec<usize> = ranges

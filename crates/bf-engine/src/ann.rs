@@ -6,6 +6,7 @@ use crate::{EngineConfig, NamespaceState, ann_dir::Layout, segment};
 use bf_storage::Storage;
 use bf_types::*;
 use bf_vector::RoaringBitmap;
+use futures::FutureExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -33,12 +34,12 @@ pub(crate) async fn search(
             state.docs.len()
         );
     }
-    // A namespace-wide recluster (slabs) answers unfiltered queries while it covers exactly
-    // the live segments; otherwise (new segments since it was built) fall through.
+    // A recluster's tiers answer unfiltered queries for the rows they cover, and the namespace
+    // directory for the rest (segments written since).
     if q.filters.is_none()
-        && let Some(set) = state.ann_slabs.get(attribute)
-        && let Some(found) = from_slabs(
-            store, state, attribute, vector, config, k, columns, set, None,
+        && let Some(tiers) = state.ann_tiers.get(attribute)
+        && let Some(found) = from_tiers(
+            store, state, q, attribute, vector, config, k, columns, tiers,
         )
         .await?
     {
@@ -63,6 +64,7 @@ pub(crate) async fn search(
             columns,
             Some(file),
             Layout::Segments,
+            &[],
         )
         .await?
     {
@@ -84,6 +86,7 @@ pub(crate) async fn search(
             columns,
             None,
             Layout::Segments,
+            &[],
         )
         .await;
     }
@@ -104,6 +107,7 @@ async fn from_directory(
     columns: &BTreeSet<String>,
     file: Option<&bf_wal::SegmentFile>,
     layout: Layout,
+    skip: &[bool],
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     // Filtered queries compute each segment's allowed rows (live rows that pass the filter)
     // alongside the directory, and read each segment's row-to-cluster map, so the
@@ -170,6 +174,7 @@ async fn from_directory(
                 members,
                 layout,
                 None,
+                skip,
             )
             .await?;
             if slack > 0 {
@@ -200,17 +205,151 @@ pub(crate) fn stage(t0: std::time::Instant, name: &str) {
     }
 }
 
-/// Whether the slab set covers exactly the live segments, in order.
-pub(crate) fn slabs_cover(segments: &[bf_wal::Segment], set: &bf_wal::SlabSet) -> bool {
-    segments.len() == set.covered.len()
-        && segments
+/// Where each of a tier's covered segments is among `segments`, or `None` when one is gone. A
+/// covered segment stays listed while its tier does (compaction skips it, and one whose rows were
+/// all deleted is kept with no live rows), and a publication that removes one anyway retires the
+/// tier, so `None` is only seen in a moment between the two.
+pub(crate) fn tier_positions(
+    segments: &[bf_wal::Segment],
+    set: &bf_wal::SlabSet,
+) -> Option<Vec<usize>> {
+    // Segments keep their relative order across publications, so one forward walk finds them.
+    let mut at = Vec::with_capacity(set.covered.len());
+    let mut j = 0;
+    for c in &set.covered {
+        let found = segments[j..]
             .iter()
-            .zip(&set.covered)
-            .all(|(s, c)| s.id == c.segment && s.row_count == c.rows)
+            .position(|s| s.id == c.segment)
+            .map(|p| p + j)
+            .or_else(|| segments.iter().position(|s| s.id == c.segment))?;
+        if segments[found].row_count != c.rows {
+            return None;
+        }
+        at.push(found);
+        j = found + 1;
+    }
+    Some(at)
 }
 
-/// Unfiltered ANN from a recluster's slabs: the same directory search, over slabs as pseudo
-/// segments, with winners mapped back to their segments for hydration.
+/// Queries the tiers answered (tests check the plan is used).
+#[cfg(test)]
+pub(crate) static TIER_ANSWERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether every tier of `tiers` can answer for its covered segments (see [`tier_positions`]).
+pub(crate) fn tiers_usable(segments: &[bf_wal::Segment], tiers: &[bf_wal::SlabSet]) -> bool {
+    tiers.iter().all(|t| tier_positions(segments, t).is_some())
+}
+
+/// Unfiltered ANN over a recluster's tiers and the segments no tier covers, as one plan: each
+/// tier's slabs and the uncovered segments (through the namespace directory, with the covered
+/// segments left out of its probe plan) are searched at the same time, and their exactly
+/// reranked winners merged. `None` when some part cannot answer, so the caller falls back.
+#[allow(clippy::too_many_arguments)]
+async fn from_tiers(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+    attribute: &str,
+    vector: &[f32],
+    config: &EngineConfig,
+    k: usize,
+    columns: &BTreeSet<String>,
+    tiers: &[bf_wal::SlabSet],
+) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+    let mut covered = vec![false; state.segments.len()];
+    let mut positions = Vec::with_capacity(tiers.len());
+    for set in tiers {
+        let Some(at) = tier_positions(&state.segments, set) else {
+            return Ok(None);
+        };
+        for i in &at {
+            covered[*i] = true;
+        }
+        positions.push(at);
+    }
+    let uncovered = covered.iter().any(|c| !c);
+    let parts = tiers.iter().zip(&positions).map(|(set, at)| {
+        from_slabs(
+            store, state, attribute, vector, config, k, columns, set, at, None,
+        )
+        .boxed()
+    });
+    // Segments with no ANN object at all leave the whole query to the document scan.
+    if uncovered
+        && state
+            .segments
+            .iter()
+            .any(|s| crate::upgrade::files(s, attribute).is_none())
+    {
+        return Ok(None);
+    }
+    let rest = uncovered.then(|| {
+        let covered = &covered;
+        async move {
+            let file = crate::upgrade::directory_file(&state.ann_dirs, attribute).map(|(f, _)| f);
+            from_directory(
+                store,
+                state,
+                q,
+                attribute,
+                vector,
+                config,
+                k,
+                columns,
+                file,
+                Layout::Segments,
+                covered,
+            )
+            .await
+        }
+        .boxed()
+    });
+    let found = futures::future::try_join_all(parts.chain(rest)).await?;
+    if crate::ann::trace_stages() {
+        eprintln!(
+            "TIERS tiers={} uncovered_segments={}",
+            tiers.len(),
+            covered.iter().filter(|c| !**c).count()
+        );
+    }
+    let mut ranked: Vec<(f64, Id, Document)> = Vec::new();
+    for part in found {
+        let Some((scores, mut docs)) = part else {
+            return Ok(None);
+        };
+        for (id, score) in scores {
+            if let Some(doc) = docs.remove(&id) {
+                ranked.push((score, id, doc));
+            }
+        }
+    }
+    #[cfg(test)]
+    TIER_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut scores = BTreeMap::new();
+    let mut docs = BTreeMap::new();
+    for (score, id, doc) in ranked {
+        if scores.len() == k {
+            break;
+        }
+        if let std::collections::btree_map::Entry::Vacant(e) = scores.entry(id.clone()) {
+            e.insert(score);
+            docs.insert(id, doc);
+        }
+    }
+    Ok(Some((scores, docs)))
+}
+
+/// Live-row masks of recluster tiers whose covered segments changed since the build, by tier
+/// directory and the changed segments' live objects.
+static TIER_MASKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<RoaringBitmap>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Unfiltered ANN from one tier's slabs: the same directory search, over slabs as pseudo
+/// segments, with winners mapped back to their segments (at `at` among the live segments) for
+/// hydration.
 #[allow(clippy::too_many_arguments)]
 async fn from_slabs(
     store: &Storage,
@@ -221,11 +360,9 @@ async fn from_slabs(
     k: usize,
     columns: &BTreeSet<String>,
     set: &bf_wal::SlabSet,
+    at: &[usize],
     prefetched: Option<&crate::ann_dir::Prefetched>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    if !slabs_cover(&state.segments, set) {
-        return Ok(None);
-    }
     let Ok((dir, _)) = crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
     else {
         return Ok(None);
@@ -236,36 +373,60 @@ async fn from_slabs(
         return Ok(None);
     }
     // Rows deleted since the slabs were built: a mask over global row numbers.
-    let changed: Vec<usize> = (0..state.segments.len())
-        .filter(|i| state.segments[*i].live_generation != set.covered[*i].live_generation)
+    let changed: Vec<usize> = (0..set.covered.len())
+        .filter(|p| state.segments[at[*p]].live_generation != set.covered[*p].live_generation)
         .collect();
+    // The mask depends only on the tier and the changed segments' live objects, which are
+    // immutable: build it once, not on every query.
+    let mask_key = (!changed.is_empty()).then(|| {
+        let mut key = set.dir.key.clone();
+        for p in &changed {
+            key.push('|');
+            key.push_str(&state.segments[at[*p]].live.key);
+        }
+        key
+    });
+    let cached = mask_key.as_ref().and_then(|key| {
+        TIER_MASKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    });
     let mask = if changed.is_empty() {
         None
+    } else if cached.is_some() {
+        cached
     } else {
         let mut mask = RoaringBitmap::new();
         let loaded = futures::future::try_join_all(
             changed
                 .iter()
-                .map(|i| segment::live(store, &state.segments[*i])),
+                .map(|p| segment::live(store, &state.segments[at[*p]])),
         )
         .await?;
-        for (n, i) in changed.iter().enumerate() {
-            let c = &set.covered[*i];
-            mask.insert_range(c.base..c.base + c.rows);
-            let mut live = RoaringBitmap::new();
+        for (n, p) in changed.iter().enumerate() {
+            let c = &set.covered[*p];
             for r in &loaded[n] {
-                live.insert(c.base + r);
+                mask.insert(c.base + r);
             }
-            mask -= RoaringBitmap::from_iter(c.base..c.base + c.rows);
-            mask |= live;
         }
         // Unchanged segments stay fully live.
-        for (i, c) in set.covered.iter().enumerate() {
-            if !changed.contains(&i) {
+        for (p, c) in set.covered.iter().enumerate() {
+            if !changed.contains(&p) {
                 mask.insert_range(c.base..c.base + c.rows);
             }
         }
-        Some(Arc::new(mask))
+        let mask = Arc::new(mask);
+        if let Some(key) = mask_key {
+            let mut masks = TIER_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+            // A few tiers' current masks; older generations are dropped wholesale.
+            if masks.len() >= 16 {
+                masks.clear();
+            }
+            masks.insert(key, mask.clone());
+        }
+        Some(mask)
     };
     if crate::ann::trace_stages() {
         eprintln!(
@@ -292,7 +453,8 @@ async fn from_slabs(
         attribute,
         None,
         Layout::Slabs,
-        Some((state, &set.covered)),
+        Some((state, &set.covered, at)),
+        &[],
     )
     .await?;
     if slack > 0 {

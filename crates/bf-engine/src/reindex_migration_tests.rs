@@ -109,7 +109,7 @@ fn state(m: &Manifest) -> crate::NamespaceState {
     crate::NamespaceState {
         segments: m.segments.clone().into(),
         ann_dirs: m.ann_dirs.clone(),
-        ann_slabs: m.ann_slabs.clone().into(),
+        ann_tiers: m.ann_tiers.clone().into(),
         schema: m.schema.clone(),
         metric: m.distance_metric,
         ..Default::default()
@@ -294,7 +294,7 @@ async fn every_legacy_reader_keeps_ann_at_each_segment_checkpoint() {
 }
 
 async fn force_pages(store: &Storage, m: &mut Manifest) {
-    let set = m.ann_slabs.get_mut("vector").unwrap();
+    let set = &mut m.ann_tiers.get_mut("vector").unwrap()[0];
     let dir = ann_dir::load(store, &set.dir, None).await.unwrap();
     let files = set
         .slabs
@@ -349,7 +349,7 @@ async fn old_slabs_keep_serving_through_flat_and_paged_conversion_batches() {
     let before = ann_answer(&store, &engine, &current, false, true).await;
     for paged in [false, true] {
         let mut m = current.clone();
-        let set = m.ann_slabs.get_mut("vector").unwrap();
+        let set = &mut m.ann_tiers.get_mut("vector").unwrap()[0];
         legacyize(&store, &mut set.slabs, "vector", "blocks", false).await;
         set.dir = ann_dir::build(
             &store,
@@ -377,7 +377,7 @@ async fn old_slabs_keep_serving_through_flat_and_paged_conversion_batches() {
             if n == count {
                 break;
             }
-            let slab = &m.ann_slabs["vector"].slabs[n];
+            let slab = &m.ann_tiers["vector"][0].slabs[n];
             let c = engine
                 .convert_slab("t", slab, "vector", &slab.files["ann:vector"])
                 .await
@@ -523,7 +523,7 @@ async fn migration_200k_benchmark() {
         if slab {
             legacyize(
                 &store,
-                &mut m.ann_slabs.get_mut("vector").unwrap().slabs,
+                &mut m.ann_tiers.get_mut("vector").unwrap()[0].slabs,
                 "vector",
                 "blocks",
                 false,
@@ -534,7 +534,7 @@ async fn migration_200k_benchmark() {
             m.ann_dirs.clear();
         }
         if slab {
-            let set = m.ann_slabs.get_mut("vector").unwrap();
+            let set = &mut m.ann_tiers.get_mut("vector").unwrap()[0];
             set.dir = ann_dir::build(
                 &store,
                 "t",
@@ -550,7 +550,7 @@ async fn migration_200k_benchmark() {
         }
         wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
         let total = if slab {
-            m.ann_slabs["vector"].slabs.len()
+            m.ann_tiers["vector"][0].slabs.len()
         } else {
             m.segments.len()
         };
@@ -560,7 +560,7 @@ async fn migration_200k_benchmark() {
             while converted < target {
                 let (_, m) = wal.latest_manifest().await.unwrap().unwrap();
                 let seg = if slab {
-                    &m.ann_slabs["vector"].slabs[converted]
+                    &m.ann_tiers["vector"][0].slabs[converted]
                 } else {
                     &m.segments[converted]
                 };

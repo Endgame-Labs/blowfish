@@ -19,6 +19,9 @@ Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, stro
   default 64 probes, and `387 q/s` as loaded (main `269`).
   [Iteration 22](#iteration-22-the-fixed-costs-of-a-warm-vector-query-beir-nq-one-machine): 40% fewer instructions and
   20% fewer cycles a query at the same recall@10 (`0.961`), and `574 q/s` against main's `509` on a shared VM.
+  [Automatic recluster](#automatic-recluster-rounds-r1-and-r2-beir-nq-one-machine): the server reclusters NQ by itself
+  in `231 s` after the load, at recall@10 `0.962` and `587 q/s`. With 5% of rows rewritten afterwards, a query costs
+  `20.9 M` instructions against `15.5 M` fully covered.
 - **My own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; at 100M, still `"warm"` at `201 ms` after a day idle); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
 
 ## Scope and status
@@ -3677,3 +3680,94 @@ single-request workload without `warmup` produces the cold backend request and b
 I validate with strict clippy and the tests for the five changed crates (224 passed, 4 ignored),
 121/121 compatibility scenarios in both normal and forced indexing modes, both TypeScript smoke runs,
 and 9/9 Python compatibility unit tests.
+
+## Automatic recluster, rounds R1 and R2 (BEIR NQ, one machine)
+
+This round makes the recluster automatic (`docs/design/auto-recluster.md`, rounds R1 and R2): the server builds a base
+tier of slabs in the background and installs it in its own indexer publication. Unfiltered ANN runs one plan over the
+tier and the segments written since. Same VM and harness as
+[Iteration 22](#iteration-22-the-fixed-costs-of-a-warm-vector-query-beir-nq-one-machine): server pinned to CPUs 0-5 in
+a 12 GB scope, clients on CPUs 6-7, 64 probes, and other workers' builds sharing the VM (load average 4 to 15), so I
+report hardware counters per query next to wall-clock q/s.
+
+### Load, then the job, unattended
+
+I loaded all 2,681,468 rows into a fresh store (`load.py`, four requests in flight) and did nothing else.
+
+- **Load:** 268.7 s (9,979 rows/s). Compaction was pending at every publication of the load, so the trigger deferred
+  31 times (`reason="compaction"`) and no build competed with ingest.
+- **Trigger:** about a minute after the last write, the trigger saw 2,681,468 rows in 27 segments and no tier
+  (gain 4.2) and started a base build.
+- **Build:** 231 s on half of the six cores: vectors copied at 15 s, cells at 21 s, 13,393 leaves trained at 64 s,
+  rows assigned at 104 s, refined at 172 s, 32 slabs planned at 193 s and written by 231 s. The job sized slabs at
+  536,870 rows from the memory budget. Server RSS during the build was at most 791 MB (sampled every 20 s); the
+  server's peak, 3.4 GB, was during the load.
+- **Queries afterwards:**
+
+| Layout | Recall@10 | Recall@100 (qrels) | nDCG@10 | p50 / p95 / p99 ms (1 client) | q/s at 1 / 4 / 16 |
+|---|---:|---:|---:|---|---|
+| main, reclustered by hand (Iteration 22) | 0.961 | 0.937 | | 4.3 / 7.8 / 11.2 | 574 at 16 |
+| automatic tier | **0.962** | 0.934 | 0.608 | 4.4 / 7.8 / 10.9 | 181 / 307 / **587** |
+
+The automatic tier answers like main's hand-built one. With four warm-up passes, a query costs 15.5 M instructions
+and 19.9 M cycles (Iteration 22: 15.3 M and 21.4 M).
+
+An earlier run of the same load, with a different flush timing, built at 175,000 rows (168 s) and again at 1,595,000
+(257 s) during the load, then deferred for the bulk load and never evaluated again: a deferral marked the manifest
+generation as evaluated, and no more publications came. A deferred or failed evaluation now comes due again after a
+minute (ten for a failure).
+
+### Writes after the tier
+
+I rewrote the last 5% of rows (134,073 rows, titles changed so the upserts are not no-ops) and measured instructions and
+cycles per query at 16 clients (four warm-up passes, then four measured; the q/s columns are from `run.sh`).
+
+| Layout | Instructions / query | Cycles / query | Recall@10 | q/s at 16 |
+|---|---:|---:|---:|---:|
+| tier covers every row | 15.5 M | 19.9 M | 0.962 | 587 |
+| 5% of covered rows deleted (tier masked, nothing outside it) | 16.3 M | 21.5 M | | |
+| 5% rewritten, first R1 plan (two warm-up passes) | 35.3 M | 36.7 M | 0.962 | 420 |
+| 5% rewritten, this round | **20.9 M** | 28.1 M | 0.959 | 511 |
+
+The first R1 plan searched the rows outside the tier through the namespace directory with covered segments skipped,
+but it still ranked every covered segment's centers, rebuilt the tier's live-row mask on every query, and probed the
+134,073 rows as if they were a namespace of their own: about a third of the tier's scanned rows for 5% of the data.
+Now covered segments' sections are left out of the center ranking, the mask is built once per live generation, and
+the search beside a tier probes `sqrt(rows outside / all rows)` of a standalone probe, the share one clustering of all
+rows would give them. Recall@10 went from 0.960 to 0.959 with that last change.
+
+The 5.4 M instructions still over a fully covered query are the second search's fixed costs (five more segments, a
+second rerank pool, and plan work over the whole directory). R3's delta tier replaces that search.
+
+### The rebuild trigger
+
+I then rewrote 25.4% of rows (681,468, another title change) in 105 s. The trigger deferred for the bulk load at every
+minute for five minutes (`reason="bulk_load"`, covered 2,681,468, outside 681,468, gain 3.6), then rebuilt the base
+over every live row in 287 s. The build added about 150 MB to the 6.5 GB the server held after the write load (its peak,
+9.2 GB, was during the writes, not the build).
+
+### Crash safety
+
+`crates/bf-engine/tests/auto_recluster.rs` injects failures into the object store:
+
+- A build that dies after uploading two slab objects leaves the namespace answering from its current tier. GC (retention
+  zero) keeps the dead build's objects while its record is fresh, and deletes them as orphans once it is stale. The
+  installed tier's objects stay, and the spill directory is empty.
+- An install publication that fails, before or after writing (the ambiguous case), is retried. GC at retention zero then
+  keeps every slab the manifest references, and a fresh engine answers from the tier.
+
+Both found bugs before they passed: the build-record listing used a partial path segment and found no records, and GC
+deleted fresh records at retention zero.
+
+I also killed the server with `kill -9` during a rebuild on NQ (a 25% rewrite, 681,468 rows), three times, and
+restarted it on the same store:
+
+| Kill point | Slabs uploaded | After restart | Referenced tier objects | Restarted build |
+|---|---:|---|---|---|
+| Assignment, 90 s in | 0 | same top 3 at once | 33 of 33 | installed in 227 s |
+| 215 s in (a slow VM, still before uploads) | 0 | same top 3 at once | 33 of 33 | installed in 260 s |
+| After the last slab, before install | 32 | same top 3 at once | 33 of 33 | installed in 245 s |
+
+In every case the old tier kept answering, and no referenced object was missing before or after the new install. The
+killed build's 32 uploaded slabs stayed in the bucket under their fresh record, for GC to reclaim once the record is
+stale. A failed or ambiguous install publication is covered by the fault test above, not by a real kill.

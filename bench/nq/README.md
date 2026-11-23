@@ -13,15 +13,13 @@ D=../../.scratch/nq-data; R=../../.scratch/nq-run
 mkdir -p $D $R
 ./download.sh $D                          # about 6 GB from the Hugging Face Hub (dataset CohereLabs/beir-embed-english-v3, subset nq)
 uv run python -I prepare.py $D            # corpus.f16, queries, qrels, and the exact top 100 (truth.npy, about 5 minutes)
-cargo build --release -p blowfish --bin blowfish -p bf-engine --example recluster   # from the repo root
+cargo build --release -p blowfish --bin blowfish   # from the repo root
 NQ_CPUS=0-5 ./serve.sh $R/store 18100 &   # the server: 12 GB cgroup, pinned to CPUs 0-5
 uv run python -I load.py $D --base-url http://127.0.0.1:18100 --namespace nq
-# wait for indexing to go idle, stop the server, then measure the as-loaded layout:
-./run.sh $R/store $D loaded-64 BLOWFISH_ANN_NPROBE=64
-# recluster (server stopped), then measure again:
-echo "{\"url\":\"file://$(realpath $R/store)\"}" > $R/storage.json
-../../target/release/examples/recluster $R/storage.json nq vector $R/rc-tmp
+# leave the server running: it indexes, then reclusters on its own. Wait until
+# blowfish_recluster_builds_total{outcome="installed"} counts the last build and indexing is idle, stop it, then:
 ./run.sh $R/store $D reclustered-64 BLOWFISH_ANN_NPROBE=64
+# writes after the recluster: rewrite the last 5% of rows (load.py --skip), let indexing settle, and measure again
 ```
 
 - `serve.sh STORE [PORT]` runs `target/release/blowfish serve` on `file://STORE` in a systemd scope with

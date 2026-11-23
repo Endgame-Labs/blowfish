@@ -184,9 +184,9 @@ impl Engine {
         let mut slab_todo: Vec<(String, Vec<(Segment, SegmentFile)>)> = Vec::new();
         {
             for attr in &attrs {
-                if let Some(set) = manifest.ann_slabs.get(attr) {
+                if let Some(tiers) = manifest.ann_tiers.get(attr) {
                     let mut list = Vec::new();
-                    for slab in &set.slabs {
+                    for slab in tiers.iter().flat_map(|set| &set.slabs) {
                         if let Some(file) = slab
                             .files
                             .get(&format!("annv2:{attr}"))
@@ -467,7 +467,7 @@ impl Engine {
         list: &[Converted],
     ) -> Result<(usize, BTreeSet<(String, String)>), ApiError> {
         let store = &self.0.store;
-        let Some(set) = manifest.ann_slabs.get(attr).cloned() else {
+        let Some(tiers) = manifest.ann_tiers.get(attr).cloned() else {
             return Ok((
                 0,
                 list.iter()
@@ -475,16 +475,23 @@ impl Engine {
                     .collect(),
             ));
         };
-        let mut slabs = set.slabs.clone();
         let (mut applied, mut superseded) = (0usize, BTreeSet::new());
-        let mut retired = Vec::new();
-        for c in list {
-            match slabs.iter_mut().find(|s| s.id == c.id) {
-                Some(slab)
-                    if slab
-                        .files
-                        .get(&format!("ann:{attr}"))
-                        .is_some_and(|f| f.key == c.old_ann) =>
+        // Slab IDs some tier still lists: a converted slab no tier lists was replaced meanwhile.
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        let mut updated = Vec::with_capacity(tiers.len());
+        for set in tiers {
+            let mut slabs = set.slabs.clone();
+            let mut retired = Vec::new();
+            let mut changed = 0usize;
+            for c in list {
+                let Some(slab) = slabs.iter_mut().find(|s| s.id == c.id) else {
+                    continue;
+                };
+                found.insert(c.id.clone());
+                if slab
+                    .files
+                    .get(&format!("ann:{attr}"))
+                    .is_some_and(|f| f.key == c.old_ann)
                 {
                     for prefix in ["ann:", "annfrag:", "annfrag2:"] {
                         slab.files.remove(&format!("{prefix}{}", c.attr));
@@ -493,56 +500,60 @@ impl Engine {
                         slab.files.insert(key.clone(), file.clone());
                     }
                     retired.extend(c.old.iter().map(|f| f.key.clone()));
-                    applied += 1;
-                }
-                _ => {
+                    changed += 1;
+                } else {
                     superseded.insert((c.id.clone(), c.attr.clone()));
                 }
             }
-        }
-        if applied == 0 {
-            return Ok((0, superseded));
-        }
-        // The directory over the slabs, as a recluster writes it.
-        let Some(dir) =
-            ann_dir::build(store, ns, &slabs, attr, ann_dir::Layout::Slabs, None).await?
-        else {
-            // Keep the old set protected if a concurrent replacement cannot supply a directory.
-            // Ordinary partial batches build a directory covering both old and current slabs.
+            if changed == 0 {
+                updated.push(set);
+                continue;
+            }
+            applied += changed;
+            // The directory over the tier's slabs, as a recluster writes it. A partial batch's
+            // directory covers both old and current slab objects, so queries stay on the tier.
+            let Some(dir) =
+                ann_dir::build(store, ns, &slabs, attr, ann_dir::Layout::Slabs, None).await?
+            else {
+                // Keep the old set protected if a concurrent replacement cannot supply a
+                // directory.
+                for key in retired {
+                    crate::indexer::retire(manifest, key);
+                }
+                updated.push(SlabSet { slabs, ..set });
+                continue;
+            };
+            let paged_dir = ann_dir::load(store, &dir, None).await?;
+            let pages = ann_dir::build_paged(store, ns, attr, paged_dir.clone(), &slabs).await?;
+            if pages.is_none() {
+                let bytes = segment::ObjectReader::new(store, &dir)
+                    .bypass_cache()
+                    .read(0..dir.size)
+                    .await
+                    .map_err(segment::index_error)?;
+                ann_dir::write_hint(store, ns, ann_dir::Layout::Slabs, attr, &dir.key, &bytes)
+                    .await;
+            }
             for key in retired {
                 crate::indexer::retire(manifest, key);
             }
-            manifest
-                .ann_slabs
-                .insert(attr.to_string(), SlabSet { slabs, ..set });
-            return Ok((applied, superseded));
-        };
-        let paged_dir = ann_dir::load(store, &dir, None).await?;
-        let pages = ann_dir::build_paged(store, ns, attr, paged_dir.clone(), &slabs).await?;
-        if pages.is_none() {
-            let bytes = segment::ObjectReader::new(store, &dir)
-                .bypass_cache()
-                .read(0..dir.size)
-                .await
-                .map_err(segment::index_error)?;
-            ann_dir::write_hint(store, ns, ann_dir::Layout::Slabs, attr, &dir.key, &bytes).await;
-        }
-        for key in retired {
-            crate::indexer::retire(manifest, key);
-        }
-        crate::indexer::retire(manifest, set.dir.key.clone());
-        if let Some(old) = &set.pages {
-            crate::indexer::retire(manifest, old.key.clone());
-        }
-        manifest.ann_slabs.insert(
-            attr.to_string(),
-            SlabSet {
-                covered: set.covered,
+            crate::indexer::retire(manifest, set.dir.key.clone());
+            if let Some(old) = &set.pages {
+                crate::indexer::retire(manifest, old.key.clone());
+            }
+            updated.push(SlabSet {
                 slabs,
                 dir,
                 pages,
-            },
-        );
+                ..set
+            });
+        }
+        for c in list {
+            if !found.contains(&c.id) {
+                superseded.insert((c.id.clone(), c.attr.clone()));
+            }
+        }
+        manifest.ann_tiers.insert(attr.to_string(), updated);
         Ok((applied, superseded))
     }
 }
@@ -566,7 +577,7 @@ fn attributes(manifest: &Manifest) -> Vec<String> {
                 .or_else(|| k.strip_prefix("annv2:"))
                 .map(str::to_string)
         })
-        .chain(manifest.ann_slabs.keys().cloned())
+        .chain(manifest.ann_tiers.keys().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()

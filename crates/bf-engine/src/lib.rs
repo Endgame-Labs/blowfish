@@ -1,6 +1,7 @@
 //! Immutable segment indexes with a WAL overlay and an exhaustive reference evaluator.
 mod ann;
 mod ann_dir;
+mod auto_recluster;
 mod branch;
 mod drain;
 mod filter;
@@ -108,8 +109,8 @@ pub(crate) struct NamespaceState {
     pub text_stats: Option<Arc<bf_wal::SegmentFile>>,
     /// Namespace ANN directories by `annv2:<attribute>`, valid for exactly `segments`.
     pub ann_dirs: BTreeMap<String, bf_wal::SegmentFile>,
-    /// Namespace-wide ANN layouts by attribute (valid while their covered segments are live).
-    pub ann_slabs: Arc<BTreeMap<String, bf_wal::SlabSet>>,
+    /// Recluster tiers by vector attribute (see `bf_wal::Manifest::ann_tiers`).
+    pub ann_tiers: Arc<BTreeMap<String, Vec<bf_wal::SlabSet>>>,
     pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
     pub corpus: Arc<BTreeMap<String, bf_text::CorpusStats>>,
     pub created_at: DateTime<Utc>,
@@ -137,7 +138,7 @@ impl Default for NamespaceState {
             stats: Default::default(),
             text_stats: None,
             ann_dirs: BTreeMap::new(),
-            ann_slabs: Arc::default(),
+            ann_tiers: Arc::default(),
             scores: BTreeMap::new(),
             corpus: Arc::default(),
             created_at: Utc::now(),
@@ -174,7 +175,7 @@ impl NamespaceState {
             stats: self.stats.clone(),
             text_stats: self.text_stats.clone(),
             ann_dirs: self.ann_dirs.clone(),
-            ann_slabs: self.ann_slabs.clone(),
+            ann_tiers: self.ann_tiers.clone(),
             scores: BTreeMap::new(),
             corpus: self.corpus.clone(),
             created_at: self.created_at,
@@ -301,7 +302,7 @@ impl NamespaceState {
         };
         self.text_stats = manifest.text_stats.clone().map(Arc::new);
         self.ann_dirs = manifest.ann_dirs.clone();
-        self.ann_slabs = manifest.ann_slabs.clone().into();
+        self.ann_tiers = manifest.ann_tiers.clone().into();
         self.stats = manifest.stats.clone().into();
         self.checkpoint_refreshed = Instant::now();
         true
@@ -335,6 +336,8 @@ struct Inner {
     config: EngineConfig,
     owner: uuid::Uuid,
     namespaces: Mutex<HashMap<String, Arc<Handle>>>,
+    /// The automatic recluster's builds and the tiers waiting to be installed.
+    jobs: auto_recluster::Jobs,
 }
 /// Queries executing right now (holding a query permit), across every engine in the process.
 static QUERIES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -427,6 +430,7 @@ impl Engine {
             config,
             owner: uuid::Uuid::new_v4(),
             namespaces: Mutex::new(HashMap::new()),
+            jobs: Default::default(),
         }));
         bf_alloc::adaptive_decay();
         indexer::start(&engine);
@@ -452,6 +456,7 @@ impl Engine {
             config: self.0.config.clone(),
             owner: uuid::Uuid::new_v4(),
             namespaces: Mutex::new(HashMap::new()),
+            jobs: Default::default(),
         }));
         indexer::start(&engine);
         engine
@@ -1478,7 +1483,7 @@ mod tail_tests {
             stats: Default::default(),
             text_stats: None,
             ann_dirs: Default::default(),
-            ann_slabs: Default::default(),
+            ann_tiers: Default::default(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],

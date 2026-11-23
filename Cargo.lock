@@ -278,6 +278,7 @@ dependencies = [
  "futures",
  "globset",
  "half",
+ "libc",
  "metrics",
  "moka",
  "object_store",

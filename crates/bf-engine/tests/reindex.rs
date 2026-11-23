@@ -57,7 +57,7 @@ async fn layouts(store: &Storage) -> (Vec<CodeLayout>, Vec<CodeLayout>) {
         seg.push(bf_vector::code_layout(&head).unwrap());
     }
     let mut slabs = Vec::new();
-    if let Some(set) = manifest.ann_slabs.get("vector") {
+    if let Some(set) = manifest.ann_tiers.get("vector").and_then(|t| t.first()) {
         for s in &set.slabs {
             let f = s
                 .files
@@ -75,7 +75,7 @@ async fn layouts(store: &Storage) -> (Vec<CodeLayout>, Vec<CodeLayout>) {
 async fn downgrade(store: &Storage) {
     let wal = Wal::new(store.clone(), "t").unwrap();
     let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
-    let mut slabs = m.ann_slabs.get("vector").map(|s| s.slabs.clone());
+    let mut slabs = m.ann_tiers.get("vector").map(|t| t[0].slabs.clone());
     let mut segments = std::mem::take(&mut m.segments);
     for seg in segments.iter_mut().chain(slabs.iter_mut().flatten()) {
         let old = seg.files["annv2:vector"].clone();
@@ -115,7 +115,7 @@ async fn downgrade(store: &Storage) {
     }
     m.segments = segments;
     if let Some(slabs) = slabs {
-        m.ann_slabs.get_mut("vector").unwrap().slabs = slabs;
+        m.ann_tiers.get_mut("vector").unwrap()[0].slabs = slabs;
     }
     m.ann_dirs.clear();
     let epoch = m.indexer_epoch;

@@ -54,6 +54,20 @@ async fn one_bit_centers_rank_clusters_and_fragments_round_trip() {
         let query: Vec<f32> = rows(1, dims, q * 3 + 1)[0].1.clone();
         let estimated = dir.center_distances(&query).unwrap();
         assert_eq!(estimated.len(), dir.entries().len());
+        // Leaving a segment out of the ranking changes only its own entries.
+        let rotated = dir.rotate_query(&query).unwrap();
+        for parallel in [false, true] {
+            let except = dir
+                .center_distances_rotated_except(&rotated, parallel, &[false, true])
+                .unwrap();
+            for ((e, d), all) in dir.entries().iter().zip(&except).zip(&estimated) {
+                if e.segment == 1 {
+                    assert_eq!(*d, f32::INFINITY);
+                } else {
+                    assert_eq!(d, all);
+                }
+            }
+        }
         // Per segment, the exact nearest cluster must be among the five nearest estimates.
         for (s, index) in indexes.iter().enumerate() {
             let exact = index.center_distances(&query).unwrap();

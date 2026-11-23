@@ -144,6 +144,15 @@ struct Heartbeat {
     updated_at: DateTime<Utc>,
 }
 impl Storage {
+    /// The block cache's memory budget in bytes, and the directory of its disk tier when it has
+    /// one (background jobs size themselves around the first and put scratch files in the second).
+    pub fn cache_limits(&self) -> (u64, Option<std::path::PathBuf>) {
+        let config = &self.0.cache.config;
+        (
+            config.memory_bytes,
+            config.disk_dir.clone().filter(|_| config.disk_bytes > 0),
+        )
+    }
     /// Empty this store's block caches. For benchmarks that need a cache-cold, process-warm
     /// state; no public route calls it.
     pub fn drop_caches(&self) {

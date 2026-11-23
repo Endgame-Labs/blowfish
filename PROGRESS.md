@@ -4,6 +4,31 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Automatic recluster, rounds R1 and R2** (`docs/design/auto-recluster.md`, `docs/benchmarks.md`).
+  - The server reclusters by itself. After each publication the indexer checks the trigger, from manifest numbers
+    only. It builds a base tier when a first base would gain enough (100,000 rows and two or more segments), when rows
+    outside the tier reach a quarter of it, or when the tier is in an older format. It waits during a bulk load and
+    while compaction is pending, and a deferral comes due again after a minute.
+  - The build runs on half the cores and waits between slabs while the indexer works. It sizes slabs from the memory
+    left after the caches, checks free disk for its spill file, writes a build record that keeps GC off its objects,
+    and hands the tier to the indexer's next fenced publication, which installs it only if the segments it covers are
+    still live. There is no epoch claim, no setting, and no manual mode; `Engine::recluster` runs the same job in the
+    foreground. Metrics are under `blowfish_recluster_*`.
+  - Queries: unfiltered ANN searches the tier's slabs and the segments outside it at once, and merges them. Compaction
+    leaves covered segments alone. Manifest and bucket format 3: `ann_tiers` replaces `ann_slabs`, which is read once
+    and rewritten.
+  - `examples/recluster.rs`, `examples/repage.rs`, and the recluster's epoch claim are deleted.
+  - NQ, unattended: loaded in 269 s, base built 231 s later with at most 791 MB RSS during the build, then recall@10
+    0.962 and 587 q/s at 16 clients (main reclustered by hand: 0.961 and 574). With 5% of rows rewritten, 20.9 M
+    instructions a query against 15.5 M fully covered, at recall@10 0.959. A 25% rewrite triggered a rebuild after the
+    bulk window, in 287 s.
+  - Crash safety: `kill -9` during a rebuild on NQ (during assignment, and after all 32 slabs were uploaded but
+    before install) left the old tier answering at once with every referenced object present, and the restarted
+    server rebuilt in 227–260 s.
+  - Checked after merging D1: fmt, workspace clippy, and `cargo test --workspace` (285 passed, including
+    fault-injection tests for a build that dies midway and for failed and ambiguous install publications); compat
+    121/121.
+
 - **G2: a graph over leaf centers, studied offline** (`docs/design/graph-study.md`). On all of BEIR NQ, 64-row leaves
   with exhaustive center ranking scan 32.7% fewer rows at recall@10 0.95, but a degree-16 center graph costs 30–84%
   of scan time to rank, against a 10% gate. G3 (the graph in the directory format) is on hold until center search

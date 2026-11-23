@@ -803,6 +803,42 @@ impl Directory {
         }
         Ok(out)
     }
+    /// [`Self::center_distances_rotated`], leaving out the segments marked in `skip` (by segment
+    /// index; missing marks count as kept): their entries get an infinite distance and cost
+    /// nothing. A recluster tier answers for those segments' rows.
+    pub fn center_distances_rotated_except(
+        &self,
+        query: &crate::RotatedQuery,
+        parallel: bool,
+        skip: &[bool],
+    ) -> Result<Vec<f32>> {
+        if !skip.iter().any(|s| *s) {
+            return self.center_distances_rotated(query, parallel);
+        }
+        let q = &query.rotated;
+        if q.len() != self.rq.padded || query.seed != self.shape.seed {
+            return Err(crate::Error::InvalidInput(
+                "query rotated for another directory".into(),
+            ));
+        }
+        let one = |(i, s): (usize, &Arc<Section>)| {
+            if skip.get(i).copied().unwrap_or(false) {
+                vec![f32::INFINITY; s.entries.len()]
+            } else {
+                section_distances(s, q)
+            }
+        };
+        let parts: Vec<Vec<f32>> = if parallel {
+            self.sections.par_iter().enumerate().map(one).collect()
+        } else {
+            self.sections.iter().enumerate().map(one).collect()
+        };
+        let mut out = Vec::with_capacity(self.entries.len());
+        for d in parts {
+            out.extend_from_slice(&d);
+        }
+        Ok(out)
+    }
     /// [`Self::center_distances`], on this thread alone when `parallel` is false (a busy
     /// server gains nothing from fanning one query's ranking out over the rayon pool).
     pub fn center_distances_on(&self, query: &[f32], parallel: bool) -> Result<Vec<f32>> {

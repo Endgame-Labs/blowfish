@@ -82,7 +82,7 @@ async fn a_paged_slab_directory_answers_like_the_segments() {
     let _ = std::fs::remove_dir_all(&scratch);
     let wal = Wal::new(store.clone(), "t").unwrap();
     let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
-    let set = &manifest.ann_slabs["vector"];
+    let set = &manifest.ann_tiers["vector"][0];
     let pages = set.pages.as_ref().expect("a paged copy was written");
     assert!(pages.metadata_len < pages.size);
     // The header and pages decode, and list every cluster the flat directory lists.
