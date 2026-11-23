@@ -403,7 +403,7 @@ impl Wal {
     /// in the slot and upload nothing. Staging several slots concurrently and committing them in
     /// order with `commit` keeps many uploads in flight at once.
     pub async fn stage(&self, seq: u64, entry: &WalEntry) -> Result<Staged, Error> {
-        self.store.check_bucket_format().await?;
+        self.store.cached_bucket_format()?;
         let payload_key = self.staged_payload_key(seq, entry.write_id);
         let json = if entry.tombstone {
             vec![]
@@ -451,7 +451,7 @@ impl Wal {
         entry: &WalEntry,
         staged: &Staged,
     ) -> Result<CreateResult, Error> {
-        self.store.check_bucket_format().await?;
+        self.store.cached_bucket_format()?;
         let inline = staged.inline;
         let record = CommitRecord {
             write_id: entry.write_id,
@@ -624,7 +624,7 @@ impl Wal {
         seq: u64,
         manifest: &Manifest,
     ) -> Result<CreateResult, Error> {
-        self.store.ensure_bucket_format().await?;
+        self.store.cached_bucket_format()?;
         // Even direct publishers must not overwrite a namespace they cannot understand.
         self.latest_manifest().await?;
         // The slot holds the whole manifest (compressed when large), so a cold reader needs
@@ -642,6 +642,9 @@ impl Wal {
                 identity,
             )
             .await?;
+        if result == CreateResult::Conflict {
+            self.store.check_bucket_format().await?;
+        }
         if result == CreateResult::Created {
             // A copy at a fixed key, so a cold reader fetches the manifest in the same round trip
             // as the listing that confirms it is the newest. Best effort: readers verify it.
@@ -806,7 +809,7 @@ impl Wal {
     }
     /// Read the most recent manifest if one exists.
     pub async fn latest_manifest(&self) -> Result<Option<(u64, Manifest)>, Error> {
-        self.store.check_bucket_format().await?;
+        self.store.cached_bucket_format()?;
         self.manifest_after(0).await
     }
     /// Discover a newer immutable manifest, skipping payload reads and decoding when
@@ -819,7 +822,7 @@ impl Wal {
     /// or `None` when the manifest is small or has no text headers. Readers verify the copy against
     /// the manifest log, so a copy that lags a concurrent publication is ignored, not trusted.
     pub async fn write_reader_copy(&self) -> Result<Option<(u64, usize)>, Error> {
-        self.store.ensure_bucket_format().await?;
+        self.store.cached_bucket_format()?;
         let Some((seq, manifest)) = self.latest_manifest().await? else {
             return Ok(None);
         };
@@ -836,6 +839,23 @@ impl Wal {
     /// [`Wal::manifest_after`] with a choice of view. `ManifestView::Reader` may return the compact
     /// copy (`Manifest::root` set), which lacks the segments' text headers.
     pub async fn manifest_view_after(
+        &self,
+        known: u64,
+        view: ManifestView,
+    ) -> Result<Option<(u64, Manifest)>, Error> {
+        self.store.cached_bucket_format()?;
+        let result = self.manifest_view_after_inner(known, view).await;
+        if matches!(
+            &result,
+            Err(Error::Manifest(_) | Error::Format | Error::Io(_))
+        ) {
+            // A newer writer may have advanced the bucket while this process was running.
+            // Refresh only on failure; successful reads and publications need no marker I/O.
+            self.store.check_bucket_format().await?;
+        }
+        result
+    }
+    async fn manifest_view_after_inner(
         &self,
         known: u64,
         view: ManifestView,

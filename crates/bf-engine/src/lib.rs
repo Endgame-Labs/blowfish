@@ -16,10 +16,12 @@ mod sparse;
 mod streaming;
 pub use indexer::EngineConfig;
 pub use recluster::{ReclusterOptions, ReclusterReport};
+pub use reindex::{LayoutCounts, ReindexOptions, ReindexReport};
 mod metadata;
 mod models;
 mod query;
 mod recluster;
+mod reindex;
 mod text;
 mod write;
 

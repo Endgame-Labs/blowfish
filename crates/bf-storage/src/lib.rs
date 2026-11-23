@@ -318,7 +318,7 @@ impl Storage {
         let activity = Arc::new(observed::Activity::default());
         let backend: Arc<dyn ObjectStore> = Arc::new(observed::Observed(backend, activity.clone()));
         // Refuse newer buckets before even the mutating CAS probe or heartbeat.
-        format::check(&*backend, &prefix).await?;
+        let required_format = format::check(&*backend, &prefix).await?;
         let conditional = if read_only {
             true
         } else {
@@ -337,7 +337,7 @@ impl Storage {
                 mode,
                 read_only,
                 healthy: AtomicBool::new(true),
-                required_format: AtomicU64::new(1),
+                required_format: AtomicU64::new(required_format),
                 writer: Uuid::new_v4(),
                 serial: Mutex::new(()),
                 activity,
@@ -362,6 +362,7 @@ impl Storage {
         if !read_only {
             store.ensure_bucket_format().await?;
         }
+        store.spawn_bucket_format_refresher();
         Ok(store)
     }
     /// Selected write coordination mode.

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Test-only: `downgrade_layout`, which writes the row-major layout an older release used.
+legacy-fixtures = []
+
 [dependencies]
 bytes = "=1.12.1"
 crc32fast = "=1.5.5"
@@ -17,5 +21,6 @@ roaring = "=0.12.0"
 thiserror = "=2.0.21"
 
 [dev-dependencies]
+bf-vector = { path = ".", features = ["legacy-fixtures"] }
 proptest = "=1.12.0"
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread"] }

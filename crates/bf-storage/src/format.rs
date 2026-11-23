@@ -2,6 +2,10 @@
 use crate::{Error, Storage};
 use futures::TryStreamExt;
 use object_store::{ObjectStore, path::Path};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
 /// Highest bucket generation this binary can safely write or garbage-collect.
 pub const BUCKET_FORMAT_VERSION: u64 = 2;
@@ -31,18 +35,52 @@ pub(crate) async fn check(backend: &dyn ObjectStore, root: &Path) -> Result<u64,
 }
 
 impl Storage {
+    /// Read the deployment's cached generation without any object-store request. Startup seeds
+    /// it, the background task refreshes it every 60 seconds, and callers refresh on manifest
+    /// conflicts or decode failures. Once a newer generation is observed, this process stays fenced.
+    pub fn cached_bucket_format(&self) -> Result<u64, Error> {
+        let required = self.0.required_format.load(Ordering::Acquire);
+        if required > BUCKET_FORMAT_VERSION {
+            return Err(Error::BucketFormat {
+                required,
+                supported: BUCKET_FORMAT_VERSION,
+            });
+        }
+        Ok(required)
+    }
+
     /// Check the deployment root, even through a project-scoped view. Always lists the
     /// marker generations afresh; a cached marker must never authorize garbage collection.
     pub async fn check_bucket_format(&self) -> Result<u64, Error> {
         let result = check(&*self.0.backend, &self.0.prefix).await;
-        if let Err(Error::BucketFormat { required, .. }) = &result {
-            // Once observed, fence every mutation through every scoped handle, including
-            // non-WAL system writes. Removing a marker cannot revive this process.
-            self.0
-                .required_format
-                .fetch_max(*required, std::sync::atomic::Ordering::AcqRel);
-        }
-        result
+        let required = match &result {
+            Ok(version) => *version,
+            Err(Error::BucketFormat { required, .. }) => *required,
+            Err(_) => return result,
+        };
+        // Share the monotonic latch with every mutation and scoped handle. A successful later
+        // listing cannot revive a process that has already observed an unsupported generation.
+        self.0.required_format.fetch_max(required, Ordering::AcqRel);
+        self.cached_bucket_format()
+    }
+
+    pub(crate) fn spawn_bucket_format_refresher(&self) {
+        let weak = Arc::downgrade(&self.0);
+        tokio::spawn(async move {
+            loop {
+                // Sleep after each completed refresh, avoiding bursts after a slow LIST. The
+                // weak reference lets idle stores and their caches be dropped immediately.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let Some(inner) = weak.upgrade() else { break };
+                let store = Storage(inner, Arc::from(""));
+                if store.cached_bucket_format().is_err() {
+                    break;
+                }
+                // Transient errors leave the last successful result cached until the next tick.
+                // Unsupported generations latch every mutation off inside the fresh check.
+                let _ = store.check_bucket_format().await;
+            }
+        });
     }
 
     /// Raise the deployment's format generation with a create-only object. Generations are

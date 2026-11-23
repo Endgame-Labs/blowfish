@@ -84,3 +84,40 @@ async fn read_only_legacy_startup_does_not_create_a_marker() {
     );
     assert_eq!(writer.list("_system/format/").await.unwrap().len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn background_refresh_is_delayed_shared_and_permanently_fails_closed() {
+    use object_store::{ObjectStoreExt, path::Path};
+    use std::{sync::Arc, time::Duration};
+
+    let backend = Arc::new(object_store::memory::InMemory::new());
+    let store = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let scoped = store.scoped("projects/test");
+    // Arm the background timer. Clones and scoped views do not start extra refreshers.
+    tokio::task::yield_now().await;
+    let marker = Path::from("_system/format/3.json");
+    backend.put(&marker, "{}".into()).await.unwrap();
+    tokio::time::advance(Duration::from_secs(59)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        scoped.cached_bucket_format().unwrap(),
+        BUCKET_FORMAT_VERSION
+    );
+    scoped.create("before-refresh", "ok").await.unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        scoped.cached_bucket_format(),
+        Err(Error::BucketFormat { required: 3, .. })
+    ));
+    backend.delete(&marker).await.unwrap();
+    // Even an explicit successful re-list cannot lower the process's observed generation.
+    assert!(matches!(
+        store.check_bucket_format().await,
+        Err(Error::BucketFormat { required: 3, .. })
+    ));
+    assert!(scoped.put("after-refresh", "blocked").await.is_err());
+    assert!(store.delete("projects/test/before-refresh").await.is_err());
+}
