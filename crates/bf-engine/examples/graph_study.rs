@@ -921,10 +921,11 @@ mod tests {
     }
     #[test]
     fn scan_codes_pages_and_numpy_match_exact_truth() {
-        std::fs::create_dir_all(".scratch").unwrap();
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
         let temp = tempfile::Builder::new()
             .prefix("graph-study-test-")
-            .tempdir_in(".scratch")
+            .tempdir_in(&scratch)
             .unwrap();
         let path = temp.path().join("corpus.f16");
         let mut bytes = Vec::new();

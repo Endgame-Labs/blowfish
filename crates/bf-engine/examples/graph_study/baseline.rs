@@ -57,8 +57,8 @@ const GROUP_PROBES: usize = 12;
 /// of its rows and assign again once. A row near a cell boundary then sits in the cluster
 /// whose center is nearest to it, wherever that cluster's slab is, so the clusters a query
 /// probes hold more of its neighbors: on BEIR NQ, a row's own cluster was its nearest one only
-/// 80% of the time with each cell clustered on its own. Each cell's leaves (and the rows that
-/// chose them) make one slab, or several when they hold more than `max` rows.
+/// 80% of the time with each cell clustered on its own. I return the centers and row assignments
+/// before production slab slicing.
 pub(super) fn build(
     present: &[u32],
     read_row: &(dyn Fn(u32, &mut Vec<u8>) -> Vec<f32> + Sync),
