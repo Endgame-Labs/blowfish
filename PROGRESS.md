@@ -4,6 +4,43 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **IN1 measured NQ updates and ingest** (`docs/benchmarks.md`, "Round IN1"). I run two alternating
+  old/new HTTP pairs on 681,468 NQ rows, four clients, CPUs 6–7, and a 12 GiB scope. Median overwrite
+  peak RSS falls from 6.40 to 3.14 GiB, about 13% above the new insert peak of 2.78 GiB. Plain insert
+  acknowledgement throughput is 5,181 to 5,735 rows/s; through full indexing it is 4,601 to 5,033.
+  Combined server CPU and instruction ranges overlap. I verify exact f16 vector bytes and changed
+  titles at three boundary IDs in every arm, and finish all arms at 681,468 indexed rows. I also
+  drain launched text-conversion peers after an error before a retry can spend their memory budget.
+  This adds a regression for failed batches without changing formats or compaction policy.
+  Formatting, scoped clippy, all 168 engine/text tests, and compatibility 121/121 in both modes pass,
+  including SDK retry checks and TypeScript smoke and retry checks.
+
+- **IN1 resident WAL overlays.** I preserve resident document Arcs across maintenance publications and
+  advancing checkpoints whose WAL prefix is already known. I reject stale generations, gaps, copy
+  overlays, and unknown checkpoints, and preserve capped-read behavior. A follow-up heap profile
+  attributes 828 MiB to checkpoint replay after old-row hydration is removed. The counted-store
+  regression now observes zero WAL-payload downloads after a maintenance file replacement. I update
+  the compact-reader flag on adoption, and leave compaction selection unchanged. Formatting, scoped
+  clippy, all 167 engine/text tests, and compatibility 121/121 in both modes pass, including retries
+  and TypeScript checks.
+
+- **IN1 update memory.** I remove old-row hydration from unconditional upserts, and stream overwritten-row
+  statistics in 4,096-row chunks through bypassing readers. I count dense float-vector JSON widths from
+  current ANN metadata, and move term-frequency maps into the merge worker. Metadata uses the same
+  bounded accounting. Jemalloc profiling attributes 59.6% of a 300K-row update snapshot's live heap to
+  old-document projection. I retain exact statistics, conditional writes, sparse and legacy-vector
+  handling, and the existing WAL and bucket formats. Formatting, scoped clippy, all 164 engine/text
+  tests, and compatibility 121/121 in both modes pass, including SDK retries and TypeScript checks.
+
+- **IN1 text upgrades** (`docs/benchmarks.md`, "Round IN1"). I repack format-4 postings directly into
+  existing format 5, and upgrade up to 32 segments and their compact ID maps per fenced publication.
+  Independent segments share a CPU and memory budget; fields within a segment run sequentially.
+  On 960K synthetic text rows in 16 segments, alternating runs improve wall throughput by 13.0× and
+  fields per CPU-hour by 8.5×, with 21.2× fewer instructions. I compare all 932.48 MB of output text
+  bytes exactly and retain overlap@10 of 1.000. Peak process RSS falls from 1,985 to 1,009 MiB.
+  I keep format 5 and fence generation 3, with older text formats read only for automatic migration.
+  Formatting, scoped clippy, crate tests, and compatibility in both modes pass.
+
 - **D2/D3 measurements** (`docs/benchmarks.md`, "Rounds D2 and D3"). I measure 200K synthetic rows and
   all 2,681,468 NQ passages with canonical schemas. As loaded, I reduce indexed bytes/row from 5,406 to
   2,887 on synthetic data, and from 5,945 to 3,581 on NQ. NQ text compresses by 2.53×. Reclustered

@@ -135,7 +135,17 @@ layout. I keep the existing flat and paged slab directory formats unchanged.
 The background indexer upgrades older `.bfv` indexes, including ones already using fast scan, to `.bfa`.
 It copies fast-scan codes and vectors unchanged, converts older row-major codes when necessary, and does
 not retrain clusters. Flat indexes also move into a single object. The redundant `.bff` and `.bfb` ANN
-fragments stop being written; the WAL, full-text indexes, and filter indexes keep their formats.
+fragments stop being written; the WAL and filter indexes keep their formats.
+
+The ordinary indexer upgrades text objects to format 5 in batches of at most 32 segments per fenced
+publication. I repack format-4 postings directly, preserving their compressed payloads, phrase positions,
+document lengths, and exact scores. A missing manifest header on a current object only needs a copy
+and header extraction. Formats 1–3 are rebuilt from the immutable text column. Each segment's fields
+run sequentially; independent segments run concurrently, limited by available CPUs and an estimated
+working-set budget of one eighth of process memory, capped at 1 GiB. An oversized segment runs alone.
+I bypass cache admission for source text and document reads, and backfill its compact `text_keys` map
+in the same batch. Completed batches survive interruption, and another pass skips current objects.
+This uses the existing text format 5, manifest schema, and generation-3 bucket fence.
 
 After the ANN upgrade, I rewrite `docs.bfc` as version 2, one segment per fenced publication. Its directory
 records dense-vector dimensions and stored precision, and its payload contains only other attributes.

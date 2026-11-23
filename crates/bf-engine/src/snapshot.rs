@@ -522,38 +522,43 @@ pub(crate) async fn catch_up_hinted(
                 && generation > state.manifest_seq
                 && !same_checkpoint(state, &m)
             {
-                *state = if m.deleted {
-                    NamespaceState {
-                        seq: m.indexed_through,
-                        indexed_through: m.indexed_through,
-                        manifest_seq: generation,
-                        ..Default::default()
-                    }
-                } else {
-                    NamespaceState {
-                        seq: m.indexed_through,
-                        exists: true,
-                        schema: m.schema,
-                        metric: m.distance_metric,
-                        created_at: m.created_at,
-                        updated_at: m.updated_at.unwrap_or(m.created_at),
-                        segments: m.segments.into(),
-                        root_only: m.root,
-                        indexed_through: m.indexed_through,
-                        manifest_seq: generation,
-                        corpus: if m.text_stats.is_some() {
-                            Default::default()
-                        } else {
-                            crate::text::checkpoint_corpus(&m.stats)
-                        },
-                        text_stats: m.text_stats.map(std::sync::Arc::new),
-                        ann_dirs: m.ann_dirs,
-                        ann_tiers: m.ann_tiers.into(),
-                        bulk_load_at: m.bulk_load_at,
-                        stats: m.stats.into(),
-                        ..Default::default()
-                    }
-                };
+                // A maintenance publication can replace segments while retaining this checkpoint,
+                // and remote indexing can advance through rows already in our resident overlay.
+                // Preserve their Arcs instead of downloading and decoding the complete tail again.
+                if !(cap.is_none() && state.fast_forward(&m, generation, m.indexed_through)) {
+                    *state = if m.deleted {
+                        NamespaceState {
+                            seq: m.indexed_through,
+                            indexed_through: m.indexed_through,
+                            manifest_seq: generation,
+                            ..Default::default()
+                        }
+                    } else {
+                        NamespaceState {
+                            seq: m.indexed_through,
+                            exists: true,
+                            schema: m.schema,
+                            metric: m.distance_metric,
+                            created_at: m.created_at,
+                            updated_at: m.updated_at.unwrap_or(m.created_at),
+                            segments: m.segments.into(),
+                            root_only: m.root,
+                            indexed_through: m.indexed_through,
+                            manifest_seq: generation,
+                            corpus: if m.text_stats.is_some() {
+                                Default::default()
+                            } else {
+                                crate::text::checkpoint_corpus(&m.stats)
+                            },
+                            text_stats: m.text_stats.map(std::sync::Arc::new),
+                            ann_dirs: m.ann_dirs,
+                            ann_tiers: m.ann_tiers.into(),
+                            bulk_load_at: m.bulk_load_at,
+                            stats: m.stats.into(),
+                            ..Default::default()
+                        }
+                    };
+                }
             } else if state.root_only
                 && !m.root
                 && m.indexed_through > 0
@@ -687,7 +692,8 @@ pub(crate) async fn materialize(
     }
     Ok(full)
 }
-/// Point writes fetch their current IDs; by-filter and schema-drop writes use a scan.
+/// Patches and conditions hydrate named rows; unconditional replacements need no old documents.
+/// By-filter writes still use a namespace scan.
 pub(crate) async fn for_writes(
     store: &Storage,
     state: &NamespaceState,
@@ -695,6 +701,7 @@ pub(crate) async fn for_writes(
     overlay: &[std::sync::Arc<bf_wal::WalEntry>],
 ) -> Result<NamespaceState, ApiError> {
     let mut wanted = BTreeSet::new();
+    let mut hydrate = BTreeSet::new();
     for p in pending {
         let Operation::Write(req, _) = &p.request else {
             continue;
@@ -723,20 +730,65 @@ pub(crate) async fn for_writes(
                 }
             }
         }
+        // Replacements never inspect old rows unless they have a condition. Patches and
+        // deletes need their old values (and existence), including earlier in-flight groups.
+        if req.upsert_condition.is_some() {
+            for row in req.upsert_rows.iter().flatten() {
+                if let Some(value) = row.get("id")
+                    && let Ok(id) = serde_json::from_value::<Id>(value.clone())
+                {
+                    hydrate.insert(id);
+                }
+            }
+            if let Some(ids) = req
+                .upsert_columns
+                .as_ref()
+                .and_then(|c| c.get("id"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for value in ids {
+                    if let Ok(id) = serde_json::from_value::<Id>(value.clone()) {
+                        hydrate.insert(id);
+                    }
+                }
+            }
+        }
+        for row in req.patch_rows.iter().flatten() {
+            if let Some(value) = row.get("id")
+                && let Ok(id) = serde_json::from_value::<Id>(value.clone())
+            {
+                hydrate.insert(id);
+            }
+        }
+        if let Some(ids) = req
+            .patch_columns
+            .as_ref()
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for value in ids {
+                if let Ok(id) = serde_json::from_value::<Id>(value.clone()) {
+                    hydrate.insert(id);
+                }
+            }
+        }
+        hydrate.extend(req.deletes.iter().flatten().cloned());
         wanted.extend(req.deletes.iter().flatten().cloned());
     }
     if state.schema.get("id").and_then(|s| s.data_type.as_ref())
         == Some(&AttributeType::Scalar(ScalarType::Uuid))
     {
-        wanted = wanted
-            .into_iter()
-            .map(|id| match id {
-                Id::String(s) => uuid::Uuid::parse_str(&s)
-                    .map(|id| Id::String(id.to_string()))
-                    .unwrap_or(Id::String(s)),
-                id => id,
-            })
-            .collect();
+        for ids in [&mut wanted, &mut hydrate] {
+            *ids = std::mem::take(ids)
+                .into_iter()
+                .map(|id| match id {
+                    Id::String(s) => uuid::Uuid::parse_str(&s)
+                        .map(|id| Id::String(id.to_string()))
+                        .unwrap_or(Id::String(s)),
+                    id => id,
+                })
+                .collect();
+        }
     }
     // A write reads only the rows it names: tail rows by ID here, segment rows below.
     let mut full = state.without_docs();
@@ -745,12 +797,17 @@ pub(crate) async fn for_writes(
             full.docs.insert(id.clone(), doc.clone());
         }
     }
-    for seg in &state.segments {
-        let live = segment::live(store, seg).await?;
-        let wanted = wanted.difference(&state.shadowed).cloned().collect();
-        let rows = segment::lookup_many(store, seg, &wanted).await? & live;
-        full.docs
-            .extend(crate::shared(segment::documents(store, seg, &rows).await?));
+    let hydrate = hydrate
+        .difference(&state.shadowed)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !hydrate.is_empty() {
+        for seg in &state.segments {
+            let live = segment::live(store, seg).await?;
+            let rows = segment::lookup_many(store, seg, &hydrate).await? & live;
+            full.docs
+                .extend(crate::shared(segment::documents(store, seg, &rows).await?));
+        }
     }
     // Groups that are staged but not yet committed come first in the log: a write must see their
     // effect on the rows it names (and their schema), without applying every in-flight document.
@@ -775,13 +832,9 @@ pub(crate) async fn statistics(
         for seg in &state.segments {
             let rows = segment::lookup_many(store, seg, &state.shadowed).await?
                 & segment::live(store, seg).await?;
-            let old = segment::documents(store, seg, &rows).await?;
-            stats.rows = stats.rows.saturating_sub(old.len() as u64);
-            let bytes: u64 = old
-                .values()
-                .map(|d| serde_json::to_vec(d).expect("document serializes").len() as u64)
-                .sum();
-            stats.logical_bytes = stats.logical_bytes.saturating_sub(bytes);
+            let old = crate::statistics::rows(store, seg, &rows, &state.schema, false).await?;
+            stats.rows = stats.rows.saturating_sub(old.rows);
+            stats.logical_bytes = stats.logical_bytes.saturating_sub(old.logical_bytes);
         }
     }
     stats.rows += state.docs.len() as u64;

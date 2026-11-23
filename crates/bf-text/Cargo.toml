@@ -20,3 +20,7 @@ unicode-segmentation = "=1.13.3"
 
 [dev-dependencies]
 proptest = "=1.12.0"
+
+[features]
+# Historical bytes for migration tests and benchmarks only.
+legacy-fixtures = []

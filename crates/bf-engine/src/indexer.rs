@@ -714,11 +714,28 @@ impl Engine {
                 let keep = snapshot::allowed(store, &state, &seg, None).await?;
                 let deleted = &live - &keep;
                 if !deleted.is_empty() {
-                    let removed = segment::documents(store, &seg, &deleted).await?;
                     if external {
-                        adjust(&mut removed_stats, &removed, true, &state.schema);
+                        crate::statistics::adjust(
+                            store,
+                            &seg,
+                            &deleted,
+                            &state.schema,
+                            &mut removed_stats,
+                            true,
+                            true,
+                        )
+                        .await?;
                     } else {
-                        adjust(&mut manifest.stats, &removed, false, &state.schema);
+                        crate::statistics::adjust(
+                            store,
+                            &seg,
+                            &deleted,
+                            &state.schema,
+                            &mut manifest.stats,
+                            false,
+                            true,
+                        )
+                        .await?;
                     }
                     retire(&mut manifest, seg.live.key.clone());
                     // A covered segment stays listed, with no live rows, while its tier does:
@@ -828,18 +845,20 @@ impl Engine {
             // The statistics merge needs only the tail's statistics and the previous object, not
             // the built segments, so it runs beside the builds (it is mostly object-store
             // transfer, and the builds leave cores idle while they wait on uploads).
-            let removed_text = removed_stats.text.clone();
+            let removed_text = std::mem::take(&mut removed_stats.text);
             let previous_for_merge = previous_text.clone();
             let text_merge = async {
-                let tail_stats = match stats_job {
+                let mut tail_stats = match stats_job {
                     Some(job) => Some(job.await.map_err(segment::index_error)?),
                     None => None,
                 };
                 if !external {
                     return Ok::<_, ApiError>((tail_stats, None));
                 }
-                let empty = NamespaceStats::default();
-                let added_text = &tail_stats.as_ref().unwrap_or(&empty).text;
+                let added_text = tail_stats
+                    .as_mut()
+                    .map(|s| std::mem::take(&mut s.text))
+                    .unwrap_or_default();
                 if added_text.is_empty() && removed_text.is_empty() {
                     return Ok((tail_stats, None));
                 }
@@ -848,7 +867,6 @@ impl Engine {
                     .expect("external statistics object");
                 let old = segment::read_whole_uncached(store, previous).await?;
                 let index = previous.stats_index.clone().expect("chunked statistics");
-                let (added_text, removed_text) = (added_text.clone(), removed_text.clone());
                 let (bytes, index) = tokio::task::spawn_blocking(move || {
                     crate::text::merge_text_stats(&old, &index, &added_text, &removed_text)
                 })
@@ -882,16 +900,11 @@ impl Engine {
         manifest.deleted = false;
         manifest.segments = segments;
         retire_stale_tiers(&mut manifest);
-        // Upgrade one text field per publication to bound the working set. The epoch
-        // claim above fences competing indexers; a crash leaves only unreferenced objects.
-        for seg in &mut manifest.segments {
-            if let Some(old) = segment::upgrade_text(store, ns, seg).await? {
-                retire(&mut manifest, old);
-                break;
-            }
-            if crate::text_keys::backfill(store, ns, seg).await? {
-                break;
-            }
+        // Rewrite bounded batches under this publication's epoch claim. A failed or fenced
+        // pass leaves only unreferenced objects for GC; it never deletes uncertain uploads.
+        let old = crate::text_upgrade::upgrade(store, ns, &mut manifest.segments).await?;
+        for key in old {
+            retire(&mut manifest, key);
         }
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest
@@ -933,7 +946,7 @@ impl Engine {
         manifest.created_at = state.created_at;
         manifest.updated_at = Some(state.updated_at);
         manifest.indexed_through = state.seq;
-        if external && added_stats.text.is_empty() && removed_stats.text.is_empty() {
+        if external && merged_text.is_none() {
             // Nothing changed in the text statistics (a compaction, say): keep the object.
             manifest.stats.rows = manifest
                 .stats

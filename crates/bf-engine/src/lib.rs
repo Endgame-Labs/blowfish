@@ -8,13 +8,17 @@ mod filter;
 mod highlight;
 mod indexed;
 mod indexer;
+#[cfg(test)]
+mod ingest_benchmark;
 mod pattern;
 mod plan;
 mod read_cache;
 mod segment;
 mod snapshot;
 mod sparse;
+mod statistics;
 mod streaming;
+mod text_upgrade;
 pub use indexer::EngineConfig;
 pub use recluster::{ReclusterOptions, ReclusterReport};
 pub use reindex::{LayoutCounts, ReindexOptions, ReindexReport};
@@ -264,10 +268,9 @@ impl NamespaceState {
             copy: false,
         });
     }
-    /// Advance this live state to a manifest this node just published, which indexed every
-    /// entry through `through`: adopt the manifest's checkpoint and drop the tail IDs whose
-    /// last write was indexed, without re-reading the WAL. Returns false (leaving the state
-    /// unchanged) when the tail cannot be trimmed from memory, so the caller must catch up.
+    /// Adopt a checkpoint covered by this resident WAL history, retaining later document Arcs.
+    /// Maintenance can replace segments without advancing `through`. Gaps, copies, and older
+    /// checkpoints return false without changing state, so the caller can replay from storage.
     pub(crate) fn fast_forward(
         &mut self,
         manifest: &bf_wal::Manifest,
@@ -275,7 +278,8 @@ impl NamespaceState {
         through: u64,
     ) -> bool {
         if manifest.deleted
-            || self.indexed_through >= through
+            || generation < self.manifest_seq
+            || self.indexed_through > through
             || self.seq < through
             || self.entries.iter().any(|e| e.copy)
             || self
@@ -298,6 +302,7 @@ impl NamespaceState {
         self.tail_since = self.entries.first().map(|e| e.at);
         self.scores.clear();
         self.segments = manifest.segments.clone().into();
+        self.root_only = manifest.root;
         self.indexed_through = through;
         self.manifest_seq = generation;
         self.corpus = if manifest.text_stats.is_some() {
@@ -1535,6 +1540,113 @@ mod tail_tests {
         assert!(state.docs.is_empty() && state.shadowed.is_empty() && state.entries.is_empty());
         assert_eq!(state.tail_bytes, 0);
         assert!(state.tail_since.is_none());
+    }
+
+    #[test]
+    fn maintenance_adoption_preserves_arcs_and_rejects_stale_generations_and_copies() {
+        let mut state = NamespaceState::default();
+        state.replay(1, &entry(&[1], &[]));
+        assert!(state.fast_forward(&manifest(1), 2, 1));
+        state.replay(2, &entry(&[1, 2], &[]));
+        let arc = state.docs[&Id::Uint(1)].clone();
+        let bytes = state.tail_bytes;
+        let mut newer = manifest(1);
+        newer.root = true;
+        assert!(state.fast_forward(&newer, 3, 1));
+        assert!(Arc::ptr_eq(&arc, &state.docs[&Id::Uint(1)]));
+        assert_eq!(state.tail_bytes, bytes);
+        assert_eq!(state.seq, 2);
+        assert_eq!(state.shadowed.len(), 2);
+        assert!(state.root_only);
+        assert!(
+            !state.fast_forward(&manifest(1), 2, 1),
+            "never regress to an older publication"
+        );
+        assert_eq!(state.manifest_seq, 3);
+        state.entries.last_mut().unwrap().copy = true;
+        assert!(
+            !state.fast_forward(&manifest(1), 4, 1),
+            "copy overlays need descriptor replay"
+        );
+        state.entries.last_mut().unwrap().copy = false;
+        state.entries[0].seq = 3;
+        assert!(
+            !state.fast_forward(&manifest(1), 4, 1),
+            "a missing tail prefix cannot be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_checkpoint_files_retain_a_known_tail_but_respect_eventual_caps() {
+        let store = Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store.clone(),
+            EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.0,
+                ..Default::default()
+            },
+        );
+        engine.write("adopt",serde_json::from_value(json!({"schema":{"pad":{"type":"string","filterable":false}},"upsert_rows":[{"id":1,"pad":"base"}]})).unwrap()).await.unwrap();
+        engine.index_namespace("adopt", true).await.unwrap();
+        engine
+            .write(
+                "adopt",
+                serde_json::from_value(
+                    json!({"upsert_rows":[{"id":1,"pad":"x".repeat(70000)},{"id":2,"pad":"new"}]}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let handle = engine.handle("adopt").await.unwrap();
+        let before = handle.state.lock().await.clone();
+        let wal = Wal::new(store.clone(), "adopt").unwrap();
+        let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+        let file = m.segments[0].files.get_mut("docs").unwrap();
+        let bytes = store.get(&file.key).await.unwrap();
+        file.key = "ns/adopt/maintenance-docs.bfc".into();
+        store.create_unique(&file.key, bytes).await.unwrap();
+        wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+        let mut uncapped = before.clone();
+        snapshot::catch_up(&wal, &mut uncapped, None, &store)
+            .await
+            .unwrap();
+        for id in [Id::Uint(1), Id::Uint(2)] {
+            assert!(Arc::ptr_eq(&before.docs[&id], &uncapped.docs[&id]));
+        }
+        assert_eq!(uncapped.entries.len(), before.entries.len());
+        assert_eq!(uncapped.tail_bytes, before.tail_bytes);
+        assert_eq!(
+            uncapped.segments[0].files["docs"].key,
+            "ns/adopt/maintenance-docs.bfc"
+        );
+        let mut capped = before;
+        snapshot::catch_up(&wal, &mut capped, Some(1), &store)
+            .await
+            .unwrap();
+        assert!(capped.docs.is_empty());
+        assert_eq!(capped.seq, m.indexed_through);
+        let rows = engine
+            .query(
+                "adopt",
+                serde_json::from_value(
+                    json!({"rank_by":["id","asc"],"top_k":10,"include_attributes":true}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .result
+            .rows
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["pad"], "x".repeat(70000));
     }
 }
 
