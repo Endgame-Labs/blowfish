@@ -1,5 +1,6 @@
 //! A recluster's slabs answer unfiltered ANN like the segments do, honor later deletes and tail
-//! writes, and are ignored (not wrong) once a segment appears that they do not cover.
+//! writes, and keep answering for their rows once new segments appear: one plan searches the tier
+//! and the segments it does not cover, and compaction leaves covered segments alone.
 use bf_engine::{Engine, EngineConfig, ReclusterOptions};
 use bf_storage::{Storage, StorageConfig};
 use bf_types::{QueryRequest, WriteRequest};
@@ -34,7 +35,7 @@ async fn write(e: &Engine, body: Value) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn slabs_answer_like_segments_and_yield_to_new_segments() {
+async fn slabs_answer_like_segments_and_keep_answering_beside_new_segments() {
     let store = Storage::open(&StorageConfig {
         url: "memory://".into(),
         ..Default::default()
@@ -76,7 +77,7 @@ async fn slabs_answer_like_segments_and_yield_to_new_segments() {
     assert_eq!(report.rows, 9000);
     let wal = Wal::new(store.clone(), "t").unwrap();
     let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
-    assert!(manifest.ann_slabs.contains_key("vector"));
+    assert!(manifest.ann_tiers.contains_key("vector"));
     for (q, want) in queries.iter().zip(&before) {
         let got = ids(&engine(&store), *q).await;
         assert_eq!(got[0], json!(q), "the query's own row is first");
@@ -91,11 +92,68 @@ async fn slabs_answer_like_segments_and_yield_to_new_segments() {
     writer.index_namespace("t", true).await.unwrap();
     let after = ids(&engine(&store), 1234).await;
     assert!(!after.contains(&json!(1234)));
-    // A new segment makes the slabs stale; answers stay right through the per-segment path.
-    let docs: Vec<_> = (9000..9100)
-        .map(|n| json!({"id":n,"vector":vector(n)}))
+    // New segments after the build stay outside the tier, which keeps answering for its rows:
+    // one plan searches both, so new rows and old ones rank together.
+    let covered: Vec<String> = manifest.ann_tiers["vector"][0]
+        .covered
+        .iter()
+        .map(|c| c.segment.clone())
         .collect();
-    write(&writer, json!({"upsert_rows":docs})).await;
+    for round in 0..6usize {
+        let docs: Vec<_> = (0..100)
+            .map(|n| 9000 + round * 100 + n)
+            .map(|n| json!({"id":n,"vector":vector(n)}))
+            .collect();
+        write(&writer, json!({"upsert_rows":docs})).await;
+        writer.index_namespace("t", true).await.unwrap();
+    }
+    // An update moves a covered row into a new segment: only the new version answers.
+    write(
+        &writer,
+        json!({"upsert_rows":[{"id":5,"vector":vector(9999)}]}),
+    )
+    .await;
     writer.index_namespace("t", true).await.unwrap();
-    assert_eq!(ids(&engine(&store), 9050).await[0], json!(9050));
+    // Forced passes compact the new segments together, never the covered ones.
+    for _ in 0..4 {
+        writer.index_namespace("t", true).await.unwrap();
+    }
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    let tier = &manifest.ann_tiers["vector"][0];
+    assert_eq!(
+        tier.covered
+            .iter()
+            .map(|c| c.segment.clone())
+            .collect::<Vec<_>>(),
+        covered
+    );
+    for id in &covered {
+        assert!(manifest.segments.iter().any(|s| &s.id == id));
+    }
+    assert!(
+        manifest.segments.len() < covered.len() + 6,
+        "the uncovered segments were compacted"
+    );
+    let fresh = engine(&store);
+    assert_eq!(ids(&fresh, 9050).await[0], json!(9050));
+    assert_eq!(ids(&fresh, 9550).await[0], json!(9550));
+    assert_eq!(ids(&fresh, 4321).await[0], json!(4321));
+    assert_eq!(ids(&fresh, 9999).await[0], json!(5));
+    assert!(!ids(&fresh, 5).await.contains(&json!(5)));
+    assert!(!ids(&fresh, 1234).await.contains(&json!(1234)));
+    // A covered segment whose rows are all deleted stays listed, masked, while the tier lives.
+    let first: Vec<usize> = (0..3000).filter(|n| *n != 5 && *n != 1234).collect();
+    write(&writer, json!({"deletes": first})).await;
+    writer.index_namespace("t", true).await.unwrap();
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    assert!(manifest.segments.iter().any(|s| s.id == covered[0]));
+    assert_eq!(manifest.ann_tiers["vector"][0].covered.len(), 3);
+    let fresh = engine(&store);
+    assert_eq!(ids(&fresh, 4321).await[0], json!(4321));
+    assert!(
+        ids(&fresh, 100)
+            .await
+            .iter()
+            .all(|id| id.as_u64().unwrap() >= 3000)
+    );
 }

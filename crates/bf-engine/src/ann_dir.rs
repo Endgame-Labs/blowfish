@@ -452,7 +452,7 @@ pub(crate) async fn prefetch_scan(
             clusters,
             target,
             filtered: false,
-            spread: layout_spread(config, dir, layout, &seg_rows),
+            spread: layout_spread(config, dir, layout, &seg_rows, &|_| false),
         },
         config,
     );
@@ -669,12 +669,13 @@ struct Totals {
     spread: f64,
 }
 
-/// [`independent_spread`] over a directory's ANN segments; 1 for slabs (one clustering).
+/// [`independent_spread`] over a directory's searched ANN segments; 1 for slabs (one clustering).
 fn layout_spread(
     config: &EngineConfig,
     dir: &Directory,
     layout: Layout,
     seg_rows: &[usize],
+    skipped: &dyn Fn(usize) -> bool,
 ) -> f64 {
     if layout == Layout::Slabs {
         return 1.0;
@@ -684,8 +685,9 @@ fn layout_spread(
         dir.segments()
             .iter()
             .zip(seg_rows)
-            .filter(|(s, _)| !s.flat)
-            .map(|(_, n)| *n),
+            .enumerate()
+            .filter(|(i, (s, _))| !s.flat && !skipped(*i))
+            .map(|(_, (_, n))| *n),
     )
 }
 
@@ -824,7 +826,9 @@ struct Probed {
 }
 
 /// Answer an unfiltered ANN query from the directory. The caller has checked that the
-/// directory covers `state.segments` and that no tail ID shadows a segment row.
+/// directory covers `state.segments` and that no tail ID shadows a segment row. Segments marked
+/// in `skip` (rows a recluster tier answers for) are left out entirely: of the probe plan, its
+/// totals, and every scan.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search(
     store: &Storage,
@@ -838,20 +842,23 @@ pub(crate) async fn search(
     attribute: &str,
     members: Option<Vec<Option<Arc<Membership>>>>,
     layout: Layout,
-    real: Option<(&NamespaceState, &[bf_wal::SlabCover])>,
+    real: Option<(&NamespaceState, &[bf_wal::SlabCover], &[usize])>,
+    skip: &[bool],
 ) -> Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError> {
     // With slabs, `state` lists the slabs and `real` the segments that hold the documents: a
-    // slab row is a global row number, mapped back by the covered segments' bases.
+    // slab row is a global row number, mapped back by the covered segments' bases to a covered
+    // segment, and from there to its position among the live segments.
     let docs_state = real.map_or(state, |r| r.0);
     let to_real = |i: usize, row: u32| -> (usize, u32) {
         match real {
             None => (i, row),
-            Some((_, covers)) => {
+            Some((_, covers, at)) => {
                 let p = covers.partition_point(|c| c.base <= row).saturating_sub(1);
-                (p, row - covers[p].base)
+                (at[p], row - covers[p].base)
             }
         }
     };
+    let skipped = |i: usize| skip.get(i).copied().unwrap_or(false);
     let filtered = members.is_some();
     let members = members.unwrap_or_default();
     let t0 = std::time::Instant::now();
@@ -884,7 +891,9 @@ pub(crate) async fn search(
     // Expected allowed rows per cluster of each segment: the segment's allowed fraction.
     let mut fraction = vec![1.0f64; dir.segments().len()];
     for (i, seg) in dir.segments().iter().enumerate() {
-        if !seg.flat {
+        if skipped(i) {
+            fraction[i] = 0.0;
+        } else if !seg.flat {
             ann_rows += seg_rows[i];
             matching += live_rows(i).min(seg_rows[i]);
             clusters += seg_clusters[i];
@@ -923,7 +932,7 @@ pub(crate) async fn search(
     if matching > 0 {
         if filtered && matching <= config.exact_fetch_rows.max(target) {
             for (i, seg) in dir.segments().iter().enumerate() {
-                if !seg.flat && live_rows(i) > 0 {
+                if !seg.flat && !skipped(i) && live_rows(i) > 0 {
                     exact_rows.insert(i);
                 }
             }
@@ -938,7 +947,7 @@ pub(crate) async fn search(
                     clusters,
                     target,
                     filtered,
-                    spread: layout_spread(config, dir.as_ref(), layout, &seg_rows),
+                    spread: layout_spread(config, dir.as_ref(), layout, &seg_rows, &skipped),
                 },
                 config,
             );
@@ -960,7 +969,7 @@ pub(crate) async fn search(
     // Flat segments, and every ANN segment when the namespace is small, are scanned exactly.
     let mut exact_segments = BTreeSet::new();
     for (i, seg) in dir.segments().iter().enumerate() {
-        if seg.flat || exact_all {
+        if (seg.flat || exact_all) && !skipped(i) {
             exact_segments.insert(i);
             chosen.insert(
                 i,

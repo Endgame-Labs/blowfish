@@ -276,6 +276,7 @@ pub(crate) fn start(engine: &Engine) {
                 if let Err(e) = engine.index_namespace(&ns, false).await {
                     tracing::warn!(error=%e, "background indexing deferred");
                 }
+                engine.consider_recluster(&ns).await;
                 let pending = !upgraded.lock().is_ok_and(|u| u.contains(&ns));
                 if pending && !upgrading.swap(true, std::sync::atomic::Ordering::AcqRel) {
                     let (engine, ns, upgraded, upgrading) = (
@@ -314,6 +315,45 @@ pub(crate) fn start(engine: &Engine) {
             }
         }
     });
+}
+/// Segments some recluster tier covers. Compaction leaves them alone (a tier addresses their rows
+/// by position), and a flush keeps them listed even once every row is deleted.
+pub(crate) fn covered_segments(manifest: &Manifest) -> std::collections::BTreeSet<String> {
+    manifest
+        .ann_tiers
+        .values()
+        .flatten()
+        .flat_map(|set| set.covered.iter().map(|c| c.segment.clone()))
+        .collect()
+}
+/// A recluster tier holds rows of the segments it covers: once a covered segment is gone (a
+/// schema rebuild, or deletion of the namespace), it can never answer again, so retire it.
+pub(crate) fn retire_stale_tiers(manifest: &mut Manifest) {
+    let live: BTreeMap<&str, u32> = manifest
+        .segments
+        .iter()
+        .map(|s| (s.id.as_str(), s.row_count))
+        .collect();
+    let mut stale = Vec::new();
+    for (attr, tiers) in &manifest.ann_tiers {
+        for (n, set) in tiers.iter().enumerate() {
+            if !set
+                .covered
+                .iter()
+                .all(|c| live.get(c.segment.as_str()) == Some(&c.rows))
+            {
+                stale.push((attr.clone(), n));
+            }
+        }
+    }
+    for (attr, n) in stale.into_iter().rev() {
+        let tiers = manifest.ann_tiers.get_mut(&attr).expect("listed above");
+        let set = tiers.remove(n);
+        if tiers.is_empty() {
+            manifest.ann_tiers.remove(&attr);
+        }
+        retire_slabs(manifest, &set);
+    }
 }
 pub(crate) fn retire_slabs(manifest: &mut Manifest, set: &bf_wal::SlabSet) {
     for seg in &set.slabs {
@@ -396,6 +436,10 @@ impl Engine {
         let t0 = std::time::Instant::now();
         let handle = self.handle(ns).await?;
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
+        // A built recluster tier waiting to be installed is work too, as are the segments a build
+        // covers (compaction leaves them alone).
+        let protected = self.0.jobs.protected(ns);
+        let installing = self.0.jobs.has_pending(ns);
         let state = {
             let mut state = handle.state.lock().await;
             if state.root_only {
@@ -410,9 +454,10 @@ impl Engine {
                 && state.seq > 0
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
-                && tier(&state, &self.0.config, force).is_empty()
+                && tier(&state, &self.0.config, force, &protected).is_empty()
                 && !needs_blocks(&state)
                 && !needs_text_upgrade(&state)
+                && !installing
             {
                 return Ok(false);
             }
@@ -438,8 +483,8 @@ impl Engine {
                         })
                     })
             });
-            let will_compact = tier(&state, &self.0.config, force);
-            let upgrade = needs_blocks(&state) || needs_text_upgrade(&state);
+            let will_compact = tier(&state, &self.0.config, force, &protected);
+            let upgrade = needs_blocks(&state) || needs_text_upgrade(&state) || installing;
             if state.seq == state.indexed_through
                 && will_compact.is_empty()
                 && !will_rebuild
@@ -470,6 +515,8 @@ impl Engine {
         crate::ann::stage(t0, "idx lock+clone");
         // Past every early return: this pass builds or compacts, so freed pages should leave quickly.
         let _busy = bf_alloc::busy();
+        // A recluster build waits between slabs while this runs.
+        let _indexing = crate::auto_recluster::indexing();
         let mut state = state;
         let rebuild = state.segments.iter().any(|seg| {
             state
@@ -498,8 +545,8 @@ impl Engine {
             crate::text::hydrate(&self.0.store, &mut state).await?;
         }
         crate::ann::stage(t0, "idx hydrate");
-        let compact = tier(&state, &self.0.config, force);
-        let upgrade = needs_blocks(&state) || needs_text_upgrade(&state);
+        let compact = tier(&state, &self.0.config, force, &protected);
+        let upgrade = needs_blocks(&state) || needs_text_upgrade(&state) || installing;
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
         }
@@ -536,7 +583,7 @@ impl Engine {
             stats: Default::default(),
             text_stats: None,
             ann_dirs: Default::default(),
-            ann_slabs: Default::default(),
+            ann_tiers: Default::default(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
@@ -652,6 +699,8 @@ impl Engine {
         } else {
             let mut segments = vec![];
             crate::ann::stage(t0, "idx pre-live");
+            let mut covered = covered_segments(&manifest);
+            covered.extend(protected.iter().cloned());
             for mut seg in state.segments.iter().cloned() {
                 let live = segment::live(store, &seg).await?;
                 let keep = snapshot::allowed(store, &state, &seg, None).await?;
@@ -664,7 +713,9 @@ impl Engine {
                         adjust(&mut manifest.stats, &removed, false, &state.schema);
                     }
                     retire(&mut manifest, seg.live.key.clone());
-                    if keep.is_empty() {
+                    // A covered segment stays listed, with no live rows, while its tier does:
+                    // the tier still holds its rows, and queries mask them out.
+                    if keep.is_empty() && !covered.contains(&seg.id) {
                         for file in seg.files.values() {
                             retire(&mut manifest, file.key.clone());
                         }
@@ -822,26 +873,7 @@ impl Engine {
         };
         manifest.deleted = false;
         manifest.segments = segments;
-        // A recluster's slabs hold rows of the segments they cover: once a covered segment is
-        // gone (compaction, deletion of the namespace), they can never answer again.
-        let stale: Vec<String> = manifest
-            .ann_slabs
-            .iter()
-            .filter(|(_, set)| {
-                !set.covered.iter().all(|c| {
-                    manifest
-                        .segments
-                        .iter()
-                        .any(|s| s.id == c.segment && s.row_count == c.rows)
-                })
-            })
-            .map(|(a, _)| a.clone())
-            .collect();
-        for attr in stale {
-            if let Some(set) = manifest.ann_slabs.remove(&attr) {
-                retire_slabs(&mut manifest, &set);
-            }
-        }
+        retire_stale_tiers(&mut manifest);
         // Segments built before block fragments existed get theirs now (a one-time upgrade).
         for seg in &mut manifest.segments {
             segment::backfill_blocks(store, ns, seg).await?;
@@ -937,6 +969,8 @@ impl Engine {
             retire(&mut manifest, previous.key);
         }
         crate::ann::stage(t0, "idx text_stats");
+        // A finished recluster tier joins this publication if its segments are still here.
+        let installed = self.0.jobs.install(ns, &mut manifest);
         let generation = match wal
             .publish_fenced(claim, manifest.indexer_epoch, &manifest)
             .await
@@ -945,6 +979,13 @@ impl Engine {
             Err(bf_wal::Error::Fenced) => return Ok(false),
             Err(e) => return Err(log_error(e)),
         };
+        if let Some(installed) = installed {
+            installed.published();
+        }
+        // A load-sized flush: the recluster trigger holds builds while loads continue.
+        if state.docs.len() >= self.0.config.bulk_flush_rows.max(4) / 4 {
+            self.0.jobs.record_bulk_flush(ns);
+        }
         crate::ann::stage(t0, "idx publish");
         crate::drain::record(state.tail_bytes, t0.elapsed());
         let mut current = handle.state.lock().await;
@@ -997,7 +1038,10 @@ impl Engine {
             for file in std::mem::take(&mut manifest.ann_dirs).into_values() {
                 retire(&mut manifest, file.key);
             }
-            for set in std::mem::take(&mut manifest.ann_slabs).into_values() {
+            for set in std::mem::take(&mut manifest.ann_tiers)
+                .into_values()
+                .flatten()
+            {
                 retire_slabs(&mut manifest, &set);
             }
             manifest.deleted = true;
@@ -1012,7 +1056,11 @@ impl Engine {
                 .keys()
                 .map(|k| crate::ann_dir::hint_key(ns, k.trim_start_matches("ann:"))),
         );
-        for (attr, set) in &manifest.ann_slabs {
+        for (attr, set) in manifest
+            .ann_tiers
+            .iter()
+            .flat_map(|(attr, tiers)| tiers.iter().map(move |set| (attr, set)))
+        {
             protected.insert(set.dir.key.clone());
             protected.extend(set.pages.iter().map(|f| f.key.clone()));
             protected.insert(crate::ann_dir::hint_key(ns, &format!("ann3:{attr}")));
@@ -1026,6 +1074,8 @@ impl Engine {
                     .flat_map(|s| s.files.values().map(|f| f.key.clone())),
             );
         }
+        // Objects of recluster builds still running (their records are fresh).
+        let building = crate::auto_recluster::building_prefixes(&self.0.store, ns).await?;
         for seg in &manifest.segments {
             protected.extend(
                 seg.files
@@ -1058,7 +1108,10 @@ impl Engine {
             format!("ns/{ns}/indexer/"),
         ] {
             for object in self.0.store.list(&prefix).await.map_err(storage_error)? {
-                if object.last_modified <= cutoff && !protected.contains(&object.key) {
+                if object.last_modified <= cutoff
+                    && !protected.contains(&object.key)
+                    && !building.iter().any(|p| object.key.starts_with(p.as_str()))
+                {
                     candidates.insert(object.key);
                 }
             }
@@ -1157,7 +1210,26 @@ fn needs_blocks(state: &NamespaceState) -> bool {
     })
 }
 
-fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<String> {
+/// The segments to merge next, if any. Segments a recluster tier covers are never merged (a tier
+/// addresses their rows by position), nor are those in `protected` (a build covering them is
+/// running or waiting to be installed).
+pub(crate) fn tier(
+    state: &NamespaceState,
+    config: &EngineConfig,
+    force: bool,
+    protected: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let covered: std::collections::BTreeSet<&str> = state
+        .ann_tiers
+        .values()
+        .flatten()
+        .flat_map(|set| set.covered.iter().map(|c| c.segment.as_str()))
+        .collect();
+    let candidates: Vec<&bf_wal::Segment> = state
+        .segments
+        .iter()
+        .filter(|s| !covered.contains(s.id.as_str()) && !protected.contains(&s.id))
+        .collect();
     if !force
         && state.shadowed.len() >= config.index_rows
         && state.segments.len() < config.defer_compaction_segments
@@ -1166,7 +1238,7 @@ fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<Strin
     }
     let count = config.compaction_segments.max(2);
     let mut tiers: BTreeMap<u32, (Vec<String>, u64, u64)> = BTreeMap::new();
-    for seg in &state.segments {
+    for seg in candidates.iter().copied() {
         let bucket = seg.row_count.max(1).ilog2();
         let group = tiers.entry(bucket).or_default();
         let bytes = seg.files.values().map(|file| file.size).sum::<u64>();
@@ -1193,9 +1265,9 @@ fn tier(state: &NamespaceState, config: &EngineConfig, force: bool) -> Vec<Strin
     // whatever their tier: the odd-sized tail of a bulk load still ends up in a few large
     // segments. Segments past half the cap never qualify, so this stops by itself.
     let floor = (config.max_segment_rows.max(1) / 8) as u32;
-    let mut by_size: Vec<_> = state
-        .segments
+    let mut by_size: Vec<_> = candidates
         .iter()
+        .copied()
         .filter(|seg| seg.row_count >= floor)
         .collect();
     by_size.sort_by_key(|seg| (seg.row_count, seg.id.clone()));
@@ -1329,18 +1401,48 @@ mod tests {
         // Four segments of 100K rows would pass the 200K row cap as a group of four, so the
         // first two merge instead of staying as four half-full segments forever.
         let state = state_with(&[100_000, 100_000, 100_000, 100_000]);
-        assert_eq!(tier(&state, &config, false), vec!["s0", "s1"]);
+        assert_eq!(
+            tier(&state, &config, false, &Default::default()),
+            vec!["s0", "s1"]
+        );
         // A lone segment, or segments already at the cap, stay as they are.
-        assert!(tier(&state_with(&[100_000]), &config, false).is_empty());
-        assert!(tier(&state_with(&[190_000, 190_000]), &config, false).is_empty());
+        assert!(tier(&state_with(&[100_000]), &config, false, &Default::default()).is_empty());
+        assert!(
+            tier(
+                &state_with(&[190_000, 190_000]),
+                &config,
+                false,
+                &Default::default()
+            )
+            .is_empty()
+        );
         // Small segments still merge four at a time.
         let small = state_with(&[1000, 1100, 1200, 1300, 1400]);
-        assert_eq!(tier(&small, &config, false).len(), 4);
+        assert_eq!(tier(&small, &config, false, &Default::default()).len(), 4);
         // Odd sizes in different tiers merge while their total fits under the cap.
         let odd = state_with(&[70_000, 90_000, 150_000]);
-        assert_eq!(tier(&odd, &config, false), vec!["s0", "s1"]);
+        assert_eq!(
+            tier(&odd, &config, false, &Default::default()),
+            vec!["s0", "s1"]
+        );
         // Small ones are left to their own tiers.
-        assert!(tier(&state_with(&[300, 50_000]), &config, false).is_empty());
-        assert!(tier(&state_with(&[110_000, 150_000]), &config, false).is_empty());
+        assert!(
+            tier(
+                &state_with(&[300, 50_000]),
+                &config,
+                false,
+                &Default::default()
+            )
+            .is_empty()
+        );
+        assert!(
+            tier(
+                &state_with(&[110_000, 150_000]),
+                &config,
+                false,
+                &Default::default()
+            )
+            .is_empty()
+        );
     }
 }

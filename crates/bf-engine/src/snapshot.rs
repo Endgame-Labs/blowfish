@@ -144,7 +144,7 @@ impl OpenHint {
         segments: &[bf_wal::Segment],
         text: Option<&bf_wal::SegmentFile>,
         dirs: &BTreeMap<String, bf_wal::SegmentFile>,
-        slabs: &BTreeMap<String, bf_wal::SlabSet>,
+        tiers: &BTreeMap<String, Vec<bf_wal::SlabSet>>,
         prefetched: &BTreeMap<String, crate::ann_dir::Prefetched>,
         schema: &Schema,
     ) {
@@ -175,16 +175,23 @@ impl OpenHint {
                 .all(|a| dirs.contains_key(&format!("ann:{a}")));
             for attribute in self.ann.iter().filter(|_| with_rest) {
                 // A lone unfiltered ANN query reads the block-layout directory when there is one.
-                // A recluster's slabs, when they cover exactly these segments, take the scan.
-                let slab = self
+                // A recluster's tiers take the scan of the rows they cover; the block-layout
+                // directory is still loaded for the segments they don't.
+                let tiered = self
                     .scan
                     .as_ref()
                     .filter(|(a, _, _)| a == attribute)
-                    .and_then(|_| slabs.get(attribute))
-                    .filter(|set| crate::ann::slabs_cover(segments, set));
-                if let Some(set) = slab
-                    && let Some((_, vector, k)) = self.scan.as_ref()
-                {
+                    .and_then(|_| tiers.get(attribute))
+                    .filter(|t| crate::ann::tiers_usable(segments, t));
+                let covers_all = tiered.is_some_and(|t| {
+                    segments
+                        .iter()
+                        .all(|s| t.iter().any(|set| set.covers(&s.id)))
+                });
+                for set in tiered.into_iter().flatten() {
+                    let Some((_, vector, k)) = self.scan.as_ref() else {
+                        break;
+                    };
                     let config = &self.config;
                     let name = crate::ann_dir::Layout::Slabs.dir_key(attribute);
                     tasks.push(
@@ -216,6 +223,8 @@ impl OpenHint {
                         }
                         .boxed(),
                     );
+                }
+                if covers_all {
                     continue;
                 }
                 let blocks = self
@@ -235,7 +244,13 @@ impl OpenHint {
                 };
                 if let Some((file, layout, hint_name)) = chosen {
                     let filtered = !self.filters.is_empty();
-                    let scan = self.scan.as_ref().filter(|(a, _, _)| a == attribute);
+                    // With tiers, only the uncovered segments are searched through the directory:
+                    // a prefetch of its plan over every segment would read the wrong clusters.
+                    let scan = self
+                        .scan
+                        .as_ref()
+                        .filter(|(a, _, _)| a == attribute)
+                        .filter(|_| tiered.is_none());
                     let config = &self.config;
                     tasks.push(
                         async move {
@@ -395,11 +410,12 @@ fn same_checkpoint(state: &NamespaceState, m: &bf_wal::Manifest) -> bool {
             .ann_dirs
             .iter()
             .all(|(k, f)| m.ann_dirs.get(k).is_some_and(|g| g.key == f.key))
-        && state.ann_slabs.len() == m.ann_slabs.len()
-        && state
-            .ann_slabs
-            .iter()
-            .all(|(k, f)| m.ann_slabs.get(k).is_some_and(|g| g.dir.key == f.dir.key))
+        && state.ann_tiers.len() == m.ann_tiers.len()
+        && state.ann_tiers.iter().all(|(k, f)| {
+            m.ann_tiers.get(k).is_some_and(|g| {
+                g.len() == f.len() && g.iter().zip(f.iter()).all(|(a, b)| a.dir.key == b.dir.key)
+            })
+        })
 }
 pub(crate) async fn catch_up_hinted(
     wal: &Wal,
@@ -541,7 +557,7 @@ pub(crate) async fn catch_up_hinted(
                         },
                         text_stats: m.text_stats.map(std::sync::Arc::new),
                         ann_dirs: m.ann_dirs,
-                        ann_slabs: m.ann_slabs.into(),
+                        ann_tiers: m.ann_tiers.into(),
                         stats: m.stats.into(),
                         ..Default::default()
                     }
@@ -566,7 +582,7 @@ pub(crate) async fn catch_up_hinted(
             // The checkpoint's files do not depend on the tail: open them meanwhile.
             let (segments, text) = (state.segments.clone(), state.text_stats.clone());
             let dirs = state.ann_dirs.clone();
-            let slabs = state.ann_slabs.clone();
+            let slabs = state.ann_tiers.clone();
             let schema = state.schema.clone();
             if hint.splits_text(&dirs) {
                 // The text half keeps warming behind the query: its reads are single-flighted
