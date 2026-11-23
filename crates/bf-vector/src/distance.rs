@@ -59,11 +59,10 @@ impl Metric {
 
     pub(crate) fn distance_unchecked(self, a: &[f32], b: &[f32]) -> f32 {
         match self {
-            Self::EuclideanSquared => f32::sqeuclidean(a, b).unwrap() as f32,
+            Self::EuclideanSquared => l2_squared_f32(a, b),
             Self::CosineDistance => {
-                let aa = f32::dot(a, a).unwrap();
-                let bb = f32::dot(b, b).unwrap();
-                let ab = f32::dot(a, b).unwrap();
+                let (aa, bb, ab) = norms_and_dot_f32(a, b);
+                let (aa, bb, ab) = (aa as f64, bb as f64, ab as f64);
                 if !aa.is_finite()
                     || !bb.is_finite()
                     || !ab.is_finite()
@@ -194,6 +193,56 @@ pub(crate) fn l2_squared_f32(a: &[f32], b: &[f32]) -> f32 {
         }
     }
     l2_squared_lanes(a, b)
+}
+
+/// `(|a|^2, |b|^2, <a, b>)` in one pass, with sixteen `f32` lanes per sum (compiled for
+/// AVX-512 or AVX2 when the CPU has them).
+pub(crate) fn norms_and_dot_f32(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512f") {
+            // SAFETY: the CPU supports AVX-512F (checked above).
+            return unsafe { norms_and_dot_avx512(a, b) };
+        }
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: the CPU supports AVX2 and FMA (checked above).
+            return unsafe { norms_and_dot_avx2(a, b) };
+        }
+    }
+    norms_and_dot_lanes(a, b)
+}
+
+#[inline(always)]
+fn norms_and_dot_lanes(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    let (mut aa, mut bb, mut ab) = ([0f32; 16], [0f32; 16], [0f32; 16]);
+    let ((ca, ra), (cb, rb)) = (a.as_chunks::<16>(), b.as_chunks::<16>());
+    for (x, y) in ca.iter().zip(cb) {
+        for i in 0..16 {
+            aa[i] += x[i] * x[i];
+            bb[i] += y[i] * y[i];
+            ab[i] += x[i] * y[i];
+        }
+    }
+    let (mut saa, mut sbb, mut sab): (f32, f32, f32) =
+        (aa.iter().sum(), bb.iter().sum(), ab.iter().sum());
+    for (x, y) in ra.iter().zip(rb) {
+        saa += x * x;
+        sbb += y * y;
+        sab += x * y;
+    }
+    (saa, sbb, sab)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn norms_and_dot_avx512(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    norms_and_dot_lanes(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn norms_and_dot_avx2(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    norms_and_dot_lanes(a, b)
 }
 
 #[inline(always)]
