@@ -61,8 +61,10 @@ pub(crate) async fn upgrade(
             .iter()
             .map(|(i, _)| (*i, segments[*i].clone()))
             .collect::<Vec<_>>();
+        // Blocking conversion work cannot be cancelled by dropping its future. Drain launched
+        // peers on error before another pass can spend the same working-set budget.
         let converted =
-            futures::future::try_join_all(group.into_iter().map(|(i, mut seg)| async move {
+            futures::future::join_all(group.into_iter().map(|(i, mut seg)| async move {
                 let mut old = Vec::new();
                 while let Some(key) = segment::upgrade_text(store, ns, &mut seg).await? {
                     old.push(key);
@@ -70,7 +72,9 @@ pub(crate) async fn upgrade(
                 text_keys::backfill(store, ns, &mut seg).await?;
                 Ok::<_, ApiError>((i, seg, old))
             }))
-            .await?;
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
         for (i, seg, old) in converted {
             segments[i] = seg;
             retired.extend(old);
@@ -78,4 +82,66 @@ pub(crate) async fn upgrade(
         remaining = &remaining[count..];
     }
     Ok(retired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Engine, EngineConfig};
+    use bf_storage::StorageConfig;
+    use bf_wal::Wal;
+    use serde_json::json;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_group_drains_launched_peers_without_adopting_partial_results() {
+        let store = Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store.clone(),
+            EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.0,
+                ..Default::default()
+            },
+        );
+        engine.write("failure",serde_json::from_value(json!({"schema":{"text":{"type":"string","full_text_search":true}},"upsert_rows":[{"id":1,"text":"fish and water"}]})).unwrap()).await.unwrap();
+        engine.index_namespace("failure", true).await.unwrap();
+        let (_, m) = Wal::new(store.clone(), "failure")
+            .unwrap()
+            .latest_manifest()
+            .await
+            .unwrap()
+            .unwrap();
+        let mut segments = vec![m.segments[0].clone(), m.segments[0].clone()];
+        segments[0].id = "broken".into();
+        segments[1].id = "peer".into();
+        for s in &mut segments {
+            s.files.get_mut("fts:text").unwrap().text_header = None;
+        }
+        segments[0].files.get_mut("fts:text").unwrap().key = "ns/failure/missing-text.bft".into();
+        let before: Vec<_> = segments
+            .iter()
+            .map(|s| s.files["fts:text"].key.clone())
+            .collect();
+        assert!(upgrade(&store, "failure", &mut segments).await.is_err());
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| s.files["fts:text"].key.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() >= 2) {
+            let peer = store.list("ns/failure/segments/peer/").await.unwrap();
+            assert_eq!(
+                peer.len(),
+                1,
+                "the peer must finish its upload before the failed group returns"
+            );
+        }
+    }
 }

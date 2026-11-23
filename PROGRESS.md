@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **IN1 measured NQ updates and ingest** (`docs/benchmarks.md`, "Round IN1"). I run two alternating
+  old/new HTTP pairs on 681,468 NQ rows, four clients, CPUs 6–7, and a 12 GiB scope. Median overwrite
+  peak RSS falls from 6.40 to 3.14 GiB, about 13% above the new insert peak of 2.78 GiB. Plain insert
+  acknowledgement throughput is 5,181 to 5,735 rows/s; through full indexing it is 4,601 to 5,033.
+  Combined server CPU and instruction ranges overlap. I verify exact f16 vector bytes and changed
+  titles at three boundary IDs in every arm, and finish all arms at 681,468 indexed rows. I also
+  drain launched text-conversion peers after an error before a retry can spend their memory budget.
+  This adds a regression for failed batches without changing formats or compaction policy.
+  Formatting, scoped clippy, all 168 engine/text tests, and compatibility 121/121 in both modes pass,
+  including SDK retry checks and TypeScript smoke and retry checks.
+
 - **IN1 resident WAL overlays.** I preserve resident document Arcs across maintenance publications and
   advancing checkpoints whose WAL prefix is already known. I reject stale generations, gaps, copy
   overlays, and unknown checkpoints, and preserve capped-read behavior. A follow-up heap profile

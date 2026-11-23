@@ -4074,3 +4074,82 @@ I verify Arc identity across a maintenance file replacement, exact trimming acro
 checkpoint, rejection of stale generations and copy histories, capped snapshots, and actual query
 results. A counted object-store regression confirms a changed document-file key triggers zero reads
 of the already resident WAL payload. All 167 engine/text tests and compatibility in both modes pass.
+
+
+### NQ HTTP comparison
+
+I compare `12e58da` with the final memory implementation at `09f3fb1` in two alternating old/new pairs.
+I load the first 681,468 prepared NQ passages into a fresh local prefix per arm, using their original
+Cohere vectors, titles, and text, then overwrite every existing row with the same vector and text and
+an appended title suffix. The source namespace is this 681K-row slice, rather than the full 2.68M rows
+from the original report. I use the real HTTP server and `bench/nq/load.py`, 5,000-row columnar
+requests, four clients, default server tuning, two Tokio workers, and two Rayon workers.
+
+I pin servers, clients, and profiling to CPUs 6–7 inside a 12 GiB scope. Both release builds have heap
+profiling and debug information enabled, with LTO disabled, and use nice 19 and two build jobs. I set
+jemalloc sampling to 2 MiB, log allocator statistics once per second, and retain the OS page cache.
+I finish other local checks before the measured arms; other workers still share the VM.
+
+After each phase I wait, with a timeout, for the immutable manifest's WAL checkpoint to equal the WAL
+head and its row count to equal 681,468. Acknowledgement rates come from the client; indexed rates
+include that drain. RSS comes from the server's `/proc` high-water mark, sampled after each phase.
+The overwrite high-water mark is cumulative over both phases. I report the median and full range
+of two runs per implementation.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Insert acknowledgement rows/s | 5,181 [4,955–5,407] | 5,735 [5,602–5,867] |
+| Insert rows/s through full indexing | 4,601 [4,368–4,833] | 5,033 [4,903–5,163] |
+| Insert peak RSS, GiB | 2.90 [2.89–2.91] | 2.78 [2.59–2.97] |
+| Overwrite acknowledgement rows/s | 3,590 [3,160–4,019] | 3,940 [3,877–4,003] |
+| Overwrite rows/s through full indexing | 3,149 [2,839–3,459] | 3,382 [3,357–3,407] |
+| Peak RSS after overwrites, GiB | 6.40 [6.26–6.53] | 3.14 [3.09–3.19] |
+| RSS immediately after overwrite drain, GiB | 4.52 [3.91–5.14] | 0.67 [0.64–0.70] |
+| Whole-server instructions, trillions | 3.123 [2.949–3.296] | 3.136 [3.076–3.197] |
+| Whole-server CPU seconds | 614.62 [577.87–651.37] | 616.48 [594.71–638.25] |
+
+I reduce the median overwrite peak by 51%, from 2.20 times the insert peak to 1.13 times it. Insert
+acknowledgement throughput is 10.7% higher in this local sample. The overwrite-throughput ranges and
+combined CPU counters overlap, so these runs establish the memory improvement without establishing
+a general CPU-throughput gain. Whole-server counters cover both phases, drains, startup, and the
+projection checks. Default background scheduling produces 9–14 initial segments and 7–16 segments
+after overwrites; I keep compaction policy unchanged throughout the comparison.
+
+I check IDs 0, 100,000, and 681,467 after each measured overwrite phase: every title has the suffix,
+and every returned base64 vector matches its original stored f16 bytes exactly. All four arms finish
+at 681,468 indexed rows. I make no full-namespace, 100M, or in-region S3 claim from this slice.
+
+I reproduce the server builds with:
+
+```sh
+source ~/.cargo/env
+CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_LTO=false CARGO_INCREMENTAL=0 \
+  nice -n 19 cargo build --release -p blowfish --features heap-profile -j 2
+```
+
+I run each server against a fresh `.scratch/` prefix in a `MemoryMax=12G` user scope, with
+`taskset -c 6,7`, `RAYON_NUM_THREADS=2`, `TOKIO_WORKER_THREADS=2`, `BF_MEM_LOG_SECS=1`,
+`BF_HEAP_DUMP_SECS=30`, a scratch heap directory, and
+`_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:21`. I collect server instructions and cycles with
+`perf stat -e instructions,cycles`. The client commands use the prepared data directory and an
+isolated localhost port:
+
+```sh
+taskset -c 6,7 timeout 1800 uv run --project bench/nq python bench/nq/load.py DATA \
+  --base-url http://127.0.0.1:PORT --namespace in1 --rows 681468 --batch 5000 --inflight 4
+taskset -c 6,7 timeout 1800 uv run --project bench/nq python bench/nq/load.py DATA \
+  --base-url http://127.0.0.1:PORT --namespace in1 --rows 681468 --batch 5000 --inflight 4 \
+  --title-suffix ' IN1 updated'
+```
+
+I wait for the checkpoint after each command, capture the server high-water mark, verify projections,
+and stop its exact PID. I delete each disposable store after its arm, and remove inputs, profiles,
+logs, build snapshots, and scratch output after preserving these numbers.
+
+### Failed upgrade groups
+
+I also wait for every launched segment job when a text conversion fails. Blocking conversion work
+cannot be cancelled by dropping its future; returning early could let a retry spend the same budget
+while the previous job still runs. A regression checks that a failed group drains its launched peer,
+leaves uploaded objects for GC, and adopts no partial results. This error-path correction does not
+change the normal NQ workload above, whose text objects and ID maps are already current.
