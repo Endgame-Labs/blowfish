@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{collections::BTreeMap, io, ops::Range, sync::Arc};
 
+#[path = "segment_upgrade.rs"]
+pub(crate) mod upgrade;
+
 const MAGIC: &[u8; 8] = b"BFSEG001";
 const FOOTER: usize = 32;
 const BLOCK_ROWS: usize = 256;
@@ -18,9 +21,13 @@ struct Block {
     offset: u64,
     length: u64,
     crc: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uncompressed_length: Option<usize>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Column {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    compressed: bool,
     blocks: Vec<Block>,
     /// Vector blocks use native f16/f32 little-endian elements, separate from attributes.
     vector: Option<(usize, bool)>,
@@ -29,6 +36,11 @@ struct Column {
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Directory {
+    #[serde(skip)]
+    version: u32,
+    /// Dense attributes live in ANN objects: dimensions, f16, and i8, respectively.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    vectors: BTreeMap<String, (usize, bool, bool)>,
     columns: BTreeMap<String, Column>,
 }
 
@@ -222,15 +234,86 @@ fn block(body: &mut Vec<u8>, bytes: &[u8]) -> Block {
         offset: body.len() as u64,
         length: bytes.len() as u64,
         crc: crc32fast::hash(bytes),
+        uncompressed_length: None,
     };
     body.extend_from_slice(bytes);
     b
 }
-fn finish(mut body: Vec<u8>, directory: &Directory) -> Result<(Vec<u8>, u64), ApiError> {
+
+/// Document-v2 keeps dense-vector shape metadata, but no vector payload. Every string column
+/// is zstd level 3, independently per 256-row block; checksums cover the compressed bytes.
+fn encode_documents(schema: &Schema, rows: &[&Document]) -> Result<(Vec<u8>, u64), ApiError> {
+    let mut body = Vec::new();
+    let mut dir = Directory::default();
+    for (name, config) in schema {
+        if let Some((dims, dtype)) = dense_type(config) {
+            dir.vectors.insert(
+                name.clone(),
+                (
+                    dims,
+                    dtype == bf_vector::VectorType::F16,
+                    dtype == bf_vector::VectorType::I8,
+                ),
+            );
+            continue;
+        }
+        let compressed = matches!(
+            config.data_type,
+            Some(
+                AttributeType::Scalar(bf_types::ScalarType::String)
+                    | AttributeType::Array(bf_types::ScalarType::String)
+            )
+        );
+        let mut blocks = Vec::new();
+        for chunk in rows.chunks(BLOCK_ROWS) {
+            let data = encode(&chunk.iter().map(|d| d.get(name)).collect::<Vec<_>>())?;
+            let b = if compressed {
+                let encoded = zstd::bulk::compress(&data, 3).map_err(index_error)?;
+                let mut b = block(&mut body, &encoded);
+                b.uncompressed_length = Some(data.len());
+                b
+            } else {
+                block(&mut body, &data)
+            };
+            blocks.push(b);
+        }
+        dir.columns.insert(
+            name.clone(),
+            Column {
+                blocks,
+                vector: None,
+                vector_i8: false,
+                compressed,
+            },
+        );
+    }
+    finish_version(body, &dir, 2)
+}
+
+fn decode_column(data: &[u8], col: &Column, b: &Block) -> Result<Vec<Option<Value>>, ApiError> {
+    if col.compressed {
+        let length = b.uncompressed_length.ok_or_else(corrupt)?;
+        let bytes = zstd::bulk::decompress(data, length).map_err(index_error)?;
+        if bytes.len() != length {
+            return Err(corrupt());
+        }
+        decode(&bytes)
+    } else {
+        decode(data)
+    }
+}
+fn finish(body: Vec<u8>, directory: &Directory) -> Result<(Vec<u8>, u64), ApiError> {
+    finish_version(body, directory, 1)
+}
+fn finish_version(
+    mut body: Vec<u8>,
+    directory: &Directory,
+    version: u32,
+) -> Result<(Vec<u8>, u64), ApiError> {
     let dir = encode(directory)?;
     let mut footer = Vec::with_capacity(FOOTER);
     footer.extend_from_slice(MAGIC);
-    footer.extend_from_slice(&1u32.to_le_bytes());
+    footer.extend_from_slice(&version.to_le_bytes());
     footer.extend_from_slice(&(body.len() as u64).to_le_bytes());
     footer.extend_from_slice(&(dir.len() as u32).to_le_bytes());
     footer.extend_from_slice(&crc32fast::hash(&dir).to_le_bytes());
@@ -265,7 +348,7 @@ fn decode_directory(
     }
     let footer = &bytes[bytes.len() - FOOTER..];
     if &footer[..8] != MAGIC
-        || u32::from_le_bytes(footer[8..12].try_into().unwrap()) != 1
+        || !matches!(u32::from_le_bytes(footer[8..12].try_into().unwrap()), 1 | 2)
         || crc32fast::hash(&footer[..28]) != u32::from_le_bytes(footer[28..32].try_into().unwrap())
     {
         return Err(corrupt());
@@ -279,7 +362,14 @@ fn decode_directory(
     if crc32fast::hash(data) != u32::from_le_bytes(footer[24..28].try_into().unwrap()) {
         return Err(corrupt());
     }
-    let dir: Directory = decode(data)?;
+    let mut dir: Directory = decode(data)?;
+    dir.version = u32::from_le_bytes(footer[8..12].try_into().unwrap());
+    if dir.vectors.iter().any(|(name, (dims, f16, i8))| {
+        *dims == 0 || *dims > 65536 || (*f16 && *i8) || dir.columns.contains_key(name)
+    }) || (dir.version == 2 && dir.columns.values().any(|c| c.vector.is_some()))
+    {
+        return Err(corrupt());
+    }
     for col in dir.columns.values() {
         for b in &col.blocks {
             if b.offset
@@ -336,11 +426,13 @@ pub(crate) async fn put_value<T: Serialize>(
         columns: BTreeMap::from([(
             "value".into(),
             Column {
+                compressed: false,
                 blocks: vec![b],
                 vector: None,
                 vector_i8: false,
             },
         )]),
+        ..Default::default()
     };
     let (bytes, meta) = finish(body, &dir)?;
     put_file(store, key, bytes, meta).await
@@ -372,7 +464,6 @@ pub(crate) async fn get_value<T: DeserializeOwned + Send + Sync + 'static>(
 #[derive(Serialize, Deserialize)]
 pub(crate) struct IdIndex {
     ids: Vec<Id>,
-    bloom: Vec<u8>,
 }
 impl std::ops::Deref for IdIndex {
     type Target = Vec<Id>;
@@ -492,17 +583,6 @@ async fn id_filter(store: &Storage, segment: &Segment) -> Result<Option<Arc<IdFi
     let filter = IdFilter::from_bytes(&bytes).ok_or_else(corrupt)?;
     let size = filter.resident_bytes();
     Ok(Some(read_cache::insert(&key, size, filter)))
-}
-fn hashes(id: &Id, bits: usize) -> [usize; 3] {
-    let data = serde_json::to_vec(id).expect("ID serializes");
-    let h = data.iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ *b as u64).wrapping_mul(0x100000001b3)
-    });
-    [
-        h as usize % bits,
-        h.rotate_left(21) as usize % bits,
-        h.rotate_left(42) as usize % bits,
-    ]
 }
 /// Build documents and filter dictionaries in sorted global-ID order.
 /// Tokenize in parallel (bounded chunks keep memory flat), then feed the builder in row order.
@@ -658,7 +738,7 @@ pub(crate) fn dense_type(
 /// Build a segment from `docs` (ID order). A vector attribute in `vectors` is taken from there
 /// (and `docs` need not carry it); any other is packed from the documents. Vectors stay at their
 /// stored precision from here on: the ANN build, which runs on a blocking worker, owns the packed
-/// bytes (4 KB per row less than a decoded f32 copy), and the column blocks copy them verbatim.
+/// bytes (4 KB per row less than a decoded f32 copy), with no duplicate vector column in the document object.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
     store: &Storage,
@@ -675,8 +755,6 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
     let id = segment_id();
     let prefix = format!("ns/{ns}/segments/{id}");
     let mut files = BTreeMap::new();
-    let mut body = vec![];
-    let mut dir = Directory::default();
     let rows: Vec<&Document> = docs.values().map(|d| d.borrow()).collect();
     for (name, config) in schema {
         if let Some((dims, dtype)) = dense_type(config)
@@ -702,37 +780,11 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
         if packed.dims != dimensions || packed.dtype != dtype {
             return Err(corrupt());
         }
-        let width = dimensions * dtype.width();
-        let mut blocks = vec![];
-        let mut next = 0usize;
-        for first in (0..row_count).step_by(BLOCK_ROWS) {
-            let last = first.saturating_add(BLOCK_ROWS as u32).min(row_count);
-            let mut data = Vec::with_capacity((last - first) as usize * (1 + width));
-            for r in first..last {
-                if packed.rows.get(next) == Some(&r) {
-                    data.push(1);
-                    data.extend_from_slice(&packed.data[next * width..(next + 1) * width]);
-                    next += 1;
-                } else {
-                    data.push(0);
-                }
-            }
-            blocks.push(block(&mut body, &data));
-        }
-        let vector_i8 = matches!(config.data_type, Some(AttributeType::VectorI8 { .. }));
-        dir.columns.insert(
-            name.clone(),
-            Column {
-                blocks,
-                vector: Some((dimensions, dtype == bf_vector::VectorType::F16)),
-                vector_i8,
-            },
-        );
         let metric = vector_metric(metric);
         // Leaf clusters: sqrt(rows).
         let job = tokio::task::spawn_blocking(move || {
             let params = bf_vector::BuildParams {
-                clusters: Some((packed.rows.len() as f64).sqrt().ceil() as usize),
+                clusters: Some(((packed.rows.len() as f64).sqrt().ceil() as usize).max(1)),
                 ..Default::default()
             };
             bf_vector::IndexBuilder::new(dimensions, metric)?
@@ -753,36 +805,12 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
             fts_jobs.push((name.clone(), column, job));
         }
     }
-    for (name, config) in schema {
-        if dense_type(config).is_some() {
-            continue;
-        }
-        let mut blocks = vec![];
-        for chunk in rows.chunks(BLOCK_ROWS) {
-            let data = encode(&chunk.iter().map(|d| d.get(name)).collect::<Vec<_>>())?;
-            blocks.push(block(&mut body, &data));
-        }
-        dir.columns.insert(
-            name.clone(),
-            Column {
-                blocks,
-                vector: None,
-                vector_i8: false,
-            },
-        );
-    }
-    let (bytes, meta) = finish(body, &dir)?;
+    let (bytes, meta) = encode_documents(schema, &rows)?;
     files.insert(
         "docs".into(),
         put_file(store, format!("{prefix}/docs.bfc"), bytes, meta).await?,
     );
     let ids: Vec<_> = docs.keys().cloned().collect();
-    let mut bloom = vec![0u8; (ids.len() * 10).div_ceil(8).max(1)];
-    for id in &ids {
-        for bit in hashes(id, bloom.len() * 8) {
-            bloom[bit / 8] |= 1 << (bit % 8);
-        }
-    }
     let filter = IdFilter::build(&ids);
     files.insert(
         "idfilter".into(),
@@ -802,7 +830,7 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
     }
     files.insert(
         "ids".into(),
-        put_value(store, format!("{prefix}/ids.bfi"), &IdIndex { ids, bloom }).await?,
+        put_value(store, format!("{prefix}/ids.bfi"), &IdIndex { ids }).await?,
     );
     let mut body = vec![];
     let mut dir = Directory::default();
@@ -825,6 +853,7 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
         dir.columns.insert(
             name.clone(),
             Column {
+                compressed: false,
                 blocks: vec![b],
                 vector: None,
                 vector_i8: false,
@@ -946,16 +975,12 @@ pub(crate) async fn ids(store: &Storage, segment: &Segment) -> Result<Arc<IdInde
         .and_then(|c| c.blocks.first())
         .ok_or_else(corrupt)?;
     let index: IdIndex = decode(&read_block(&reader, b).await?)?;
-    if index.ids.len() != segment.row_count as usize
-        || index.bloom.is_empty()
-        || index.ids.windows(2).any(|w| w[0] >= w[1])
-    {
+    if index.ids.len() != segment.row_count as usize || index.ids.windows(2).any(|w| w[0] >= w[1]) {
         return Err(corrupt());
     }
     Ok(read_cache::insert(
         &key,
         (index.ids.capacity() * std::mem::size_of::<Id>()
-            + index.bloom.capacity()
             + index
                 .ids
                 .iter()
@@ -989,17 +1014,8 @@ pub(crate) async fn lookup_many(
         None => wanted,
     };
     let index = ids(store, segment).await?;
-    if index.bloom.is_empty() || index.ids.len() != segment.row_count as usize {
-        return Err(corrupt());
-    }
     let mut rows = RoaringBitmap::new();
     for id in wanted {
-        if hashes(id, index.bloom.len() * 8)
-            .iter()
-            .any(|b| index.bloom[b / 8] & (1 << (b % 8)) == 0)
-        {
-            continue;
-        }
         if let Ok(row) = index.ids.binary_search(id) {
             rows.insert(row as u32);
         }
@@ -1126,52 +1142,15 @@ pub(crate) async fn projected_rows_with(
                             .saturating_add(BLOCK_ROWS as u32)
                             .min(segment.row_count);
                         let values: Vec<Option<Value>> = if let Some((dims, f16)) = col.vector {
-                            let mut pos = 0;
-                            let mut values = vec![];
-                            for _ in first..last {
-                                let present = *data.get(pos).ok_or_else(corrupt)?;
-                                pos += 1;
-                                if present == 0 {
-                                    values.push(None);
-                                    continue;
-                                }
-                                if present != 1 {
-                                    return Err(corrupt());
-                                }
-                                let mut v = vec![];
-                                for _ in 0..dims {
-                                    let width = if col.vector_i8 {
-                                        1
-                                    } else if f16 {
-                                        2
-                                    } else {
-                                        4
-                                    };
-                                    let bytes = data.get(pos..pos + width).ok_or_else(corrupt)?;
-                                    let x = if col.vector_i8 {
-                                        bytes[0] as i8 as f32
-                                    } else if f16 {
-                                        half::f16::from_le_bytes(bytes.try_into().unwrap()).to_f32()
-                                    } else {
-                                        f32::from_le_bytes(bytes.try_into().unwrap())
-                                    };
-                                    v.push(x);
-                                    pos += width;
-                                }
-                                values.push(Some(if col.vector_i8 {
-                                    serde_json::json!(
-                                        v.iter().map(|x| *x as i8).collect::<Vec<_>>()
-                                    )
-                                } else {
-                                    Value::String(bf_types::encode_vector(&v, false))
-                                }));
-                            }
-                            if pos != data.len() {
-                                return Err(corrupt());
-                            }
-                            values
+                            upgrade::decode_vectors(
+                                &data,
+                                (last - first) as usize,
+                                dims,
+                                f16,
+                                col.vector_i8,
+                            )?
                         } else {
-                            decode(&data)?
+                            decode_column(&data, col, b)?
                         };
                         if values.len() != (last - first) as usize {
                             return Err(corrupt());
@@ -1205,6 +1184,45 @@ pub(crate) async fn projected_rows_with(
     for (name, found) in fetched {
         for (row, value) in found {
             docs.get_mut(&row).unwrap().insert(name.clone(), value);
+        }
+    }
+    for (name, &(dims, f16, i8)) in &dir.vectors {
+        if columns.is_some_and(|c| !c.contains(name)) {
+            continue;
+        }
+        let (present, packed) = read_ann_packed(store, segment, rows, name, bypass).await?;
+        let dtype = if i8 {
+            bf_vector::VectorType::I8
+        } else if f16 {
+            bf_vector::VectorType::F16
+        } else {
+            bf_vector::VectorType::F32
+        };
+        let width = dims * dtype.width();
+        for (row, bytes) in present.into_iter().zip(packed.chunks_exact(width)) {
+            let value = if i8 {
+                serde_json::json!(bytes.iter().map(|x| *x as i8).collect::<Vec<_>>())
+            } else {
+                let vector: Vec<f32> = if f16 {
+                    bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|x| half::f16::from_le_bytes(*x).to_f32())
+                        .collect()
+                } else {
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|x| f32::from_le_bytes(*x))
+                        .collect()
+                };
+                Value::String(bf_types::encode_vector(&vector, false))
+            };
+            docs.get_mut(&row)
+                .ok_or_else(corrupt)?
+                .insert(name.clone(), value);
         }
     }
     Ok(docs)
@@ -1264,68 +1282,128 @@ pub(crate) async fn read_packed(
     rows: &RoaringBitmap,
     attribute: &str,
 ) -> Result<(Vec<u32>, Vec<u8>), ApiError> {
-    let reader =
-        ObjectReader::new(store, segment.files.get("docs").ok_or_else(corrupt)?).bypass_cache();
-    let dir = directory(&reader).await?;
-    let col = dir.columns.get(attribute).ok_or_else(corrupt)?;
-    let (dims, f16) = col.vector.ok_or_else(corrupt)?;
-    let width = dims
-        * if col.vector_i8 {
-            1
-        } else if f16 {
-            2
-        } else {
-            4
-        };
-    let blocks: std::collections::BTreeSet<_> =
-        rows.iter().map(|row| row as usize / BLOCK_ROWS).collect();
-    let indices: Vec<_> = blocks.into_iter().collect();
-    let (mut present, mut out) = (Vec::new(), Vec::new());
-    for batch in indices.chunks(16) {
-        let descriptors = batch
+    read_ann_packed(store, segment, rows, attribute, true).await
+}
+
+async fn read_ann_packed(
+    store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    attribute: &str,
+    bypass: bool,
+) -> Result<(Vec<u32>, Vec<u8>), ApiError> {
+    let Some(file) = segment.files.get(&format!("annv2:{attribute}")) else {
+        if let Some(file) = segment.files.get(&format!("ann:{attribute}")) {
+            let reader = ObjectReader::new(store, file);
+            let reader = if bypass {
+                reader.bypass_cache()
+            } else {
+                reader
+            };
+            let index = bf_vector::Index::open_with_metadata_len(reader, file.metadata_len)
+                .await
+                .map_err(index_error)?;
+            return index.read_packed_rows(rows).await.map_err(index_error);
+        }
+        // While D1 is pending, the document-v1 column remains a safe source at every
+        // checkpoint. It disappears only after the current ANN object is published.
+        return upgrade::read_packed(store, segment, rows, attribute).await;
+    };
+    let mut reader = ObjectReader::new(store, file);
+    if bypass {
+        reader = reader.bypass_cache();
+    }
+    let key = format!("projection-directory:{}", file.key);
+    let dir = if let Some(dir) = read_cache::get::<bf_vector::Directory>(&key, file.metadata_len) {
+        dir
+    } else {
+        let metadata = reader
+            .read(0..file.metadata_len)
+            .await
+            .map_err(index_error)?;
+        let fragment = bf_vector::Fragment::decode(&metadata).map_err(index_error)?;
+        let bytes = bf_vector::Directory::build(&[(
+            segment.id.clone(),
+            file.key.clone(),
+            file.key.clone(),
+            fragment,
+        )])
+        .map_err(index_error)?
+        .ok_or_else(corrupt)?;
+        let dir = bf_vector::Directory::decode(&bytes).map_err(index_error)?;
+        read_cache::insert(&key, dir.resident_bytes(), dir)
+    };
+    let (dims, dtype) = segment
+        .schema
+        .get(attribute)
+        .and_then(dense_type)
+        .ok_or_else(corrupt)?;
+    let mut partial = dir.partial_index(0, reader.clone()).map_err(index_error)?;
+    if dir.dims() != dims || partial.index().vector_type() != dtype {
+        return Err(corrupt());
+    }
+    let membership =
+        crate::ann_dir::memberships(store, std::slice::from_ref(segment), &dir, attribute)
+            .await?
+            .pop()
+            .flatten();
+    let counts = membership
+        .as_ref()
+        .map(|m| m.counts(rows, dir.segments()[0].clusters));
+    // Sparse vector columns and flat objects do not have a row-to-cluster map. Their leaf
+    // row sets supply membership instead, including the distinction between null and present.
+    let entries: Vec<_> = dir
+        .entries()
+        .iter()
+        .filter(|e| counts.as_ref().is_none_or(|c| c[e.cluster] > 0))
+        .collect();
+    let clusters = read_cache::context()
+        .filter(|_| !bypass)
+        .map(|c| c.cache.clusters(&file.key));
+    for batch in entries.chunks(16) {
+        let decoded: Vec<_> = batch
             .iter()
-            .map(|i| col.blocks.get(*i).ok_or_else(corrupt))
-            .collect::<Result<Vec<_>, _>>()?;
-        let data = reader
+            .map(|entry| {
+                clusters
+                    .as_ref()
+                    .and_then(|(cache, key)| cache.get(&(key.clone(), entry.cluster as u32)))
+            })
+            .collect();
+        let blobs = reader
             .read_batch(
-                descriptors
+                batch
                     .iter()
-                    .map(|b| b.offset..b.offset + b.length)
+                    .zip(&decoded)
+                    .filter(|(_, d)| d.is_none())
+                    .map(|(e, _)| e.blob_range())
                     .collect(),
             )
             .await
             .map_err(index_error)?;
-        for ((&i, b), data) in batch.iter().zip(descriptors).zip(data) {
-            if crc32fast::hash(&data) != b.crc {
-                return Err(corrupt());
-            }
-            let first = (i * BLOCK_ROWS) as u32;
-            let last = first
-                .saturating_add(BLOCK_ROWS as u32)
-                .min(segment.row_count);
-            let mut pos = 0;
-            for row in first..last {
-                let flag = *data.get(pos).ok_or_else(corrupt)?;
-                pos += 1;
-                match flag {
-                    0 => {}
-                    1 => {
-                        let bytes = data.get(pos..pos + width).ok_or_else(corrupt)?;
-                        if rows.contains(row) {
-                            present.push(row);
-                            out.extend_from_slice(bytes);
-                        }
-                        pos += width;
+        let mut blobs = blobs.iter();
+        for (entry, known) in batch.iter().zip(decoded) {
+            let decoded = match known {
+                Some(decoded) => decoded,
+                None => {
+                    let decoded = partial
+                        .decode(blobs.next().ok_or_else(corrupt)?)
+                        .map_err(index_error)?;
+                    if let Some((cache, key)) = &clusters {
+                        cache.insert((key.clone(), entry.cluster as u32), decoded.clone());
                     }
-                    _ => return Err(corrupt()),
+                    decoded
                 }
-            }
-            if pos != data.len() {
-                return Err(corrupt());
-            }
+            };
+            partial
+                .install_decoded(entry.cluster, &decoded)
+                .map_err(index_error)?;
         }
     }
-    Ok((present, out))
+    partial
+        .index()
+        .read_packed_rows(rows)
+        .await
+        .map_err(index_error)
 }
 /// Join the per-segment packed vectors of a compaction into one column per attribute in the
 /// order of `docs` (the merged documents, by ID).
@@ -1609,3 +1687,7 @@ mod id_filter_tests {
         assert!(IdFilter::from_bytes(&[0u8; 40]).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "document_tests.rs"]
+mod document_tests;

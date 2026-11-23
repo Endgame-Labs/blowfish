@@ -154,3 +154,57 @@ async fn flat_empty_and_sparse_global_rows_round_trip() {
         );
     }
 }
+
+#[tokio::test]
+async fn packed_projection_preserves_precision_sparse_rows_and_checksums() {
+    for dtype in [VectorType::F16, VectorType::F32, VectorType::I8] {
+        for n in [7, 1500] {
+            let mut data = rows(n, 16, true);
+            if dtype == VectorType::I8 {
+                for (_, v) in &mut data {
+                    for x in v {
+                        *x = (*x * 100.).round();
+                    }
+                }
+            }
+            let source = IndexBuilder::new(16, Metric::CosineDistance)
+                .unwrap()
+                .vector_type(dtype)
+                .build(&data)
+                .unwrap();
+            let (blob, metadata) = Fragment::build_ann(&source).unwrap();
+            let index = Index::open_with_metadata_len(Bytes::from(blob.clone()), metadata)
+                .await
+                .unwrap();
+            let wanted: RoaringBitmap = (0..n as u32 * 17 + 10).filter(|r| r % 3 == 1).collect();
+            let (present, raw) = index.read_packed_rows(&wanted).await.unwrap();
+            let mut expected = Vec::new();
+            let mut expected_rows = Vec::new();
+            for (row, v) in data.iter().filter(|(row, _)| wanted.contains(*row)) {
+                expected_rows.push(*row);
+                dtype.pack(v, 16, &mut expected).unwrap();
+            }
+            assert_eq!(present, expected_rows);
+            assert_eq!(raw, expected);
+            let dir = Directory::decode(
+                &Directory::build(&[(
+                    "s".into(),
+                    "ann".into(),
+                    "ann".into(),
+                    Fragment::decode(&blob[..metadata as usize]).unwrap(),
+                )])
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+            let mut corrupt = blob;
+            let range = dir.entries()[0].vectors_range();
+            corrupt[range.start as usize] ^= 1;
+            let index = Index::open_with_metadata_len(Bytes::from(corrupt), metadata)
+                .await
+                .unwrap();
+            let all = data.iter().map(|(r, _)| *r).collect();
+            assert!(index.read_packed_rows(&all).await.is_err());
+        }
+    }
+}

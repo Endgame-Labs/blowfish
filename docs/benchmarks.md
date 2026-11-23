@@ -3771,3 +3771,202 @@ restarted it on the same store:
 In every case the old tier kept answering, and no referenced object was missing before or after the new install. The
 killed build's 32 uploaded slabs stayed in the bucket under their fresh record, for GC to reclaim once the record is
 stale. A failed or ambiguous install publication is covered by the fault test above, not by a real kill.
+
+## Rounds D2 and D3: vector-free documents and compressed text
+
+I measured document-v2 on 200,000 synthetic rows and all 2,681,468 BEIR NQ passages, using the
+`bench/nq` prepared Cohere vectors, query vectors, titles, and text. Both workloads use 1,024-dimensional
+f16 vectors, cosine distance, 100,000-row segments, a `bucket = id % 16` filter, and full-text indexing.
+I build persisted segment fixtures with the server's canonical schema, including its default title
+filter index: two segments for synthetic data and 27 for NQ. I also measure the synthetic namespace
+reclustered into six slabs with leaves targeted at 200 rows.
+
+I compare the post-D1 layout with document-v2: the two arms reference identical trained `.bfa` objects,
+filter indexes, full-text indexes, live masks, and row ordinals. Test-only code reconstructs document-v1
+and its original JSON-encoded ID Bloom filter from those same stored vectors. Query trials use one
+binary against alternating immutable document/ID sets. Compaction additionally uses the actual
+pre-D2 code at `6eaa244`, built with the same release settings, for its old arm.
+
+I pin every benchmark to CPUs 6–7, with two Tokio workers and two Rayon workers, and build at
+`nice -n 19`, with two Cargo jobs, release debug info disabled, and LTO disabled. Other work shares
+the VM. These are local-file engine measurements. Cold samples start a fresh process with empty
+blowfish caches; I retain the OS page cache. I make no S3 cold-latency or BM25 quality claim here.
+
+### Active footprint
+
+I sum manifest-referenced segment file sizes, live masks, and ANN directories, including slabs when
+present. WAL objects, manifest history, unreferenced fixture files, and retained old objects are excluded.
+GB and MB below are decimal.
+
+| Namespace | Indexed GB, before → after | Bytes/row, before → after | Reduction |
+|---|---:|---:|---:|
+| Synthetic, as loaded | 1.081 → 0.577 | 5,406 → 2,887 | 46.6% |
+| NQ, as loaded | 15.942 → 9.602 | 5,945 → 3,581 | 39.8% |
+| Synthetic, reclustered | 1.527 → 1.024 | 7,637 → 5,118 | 33.0% |
+
+NQ lands at 3,581 bytes/row as loaded. The reclustered synthetic namespace still keeps 444.60 MB of
+segment ANN objects beside 446.09 MB of slab ANN objects. The design's 3,600-byte reclustered target
+still needs D4's retirement of covered segment ANN objects and its lineage support.
+
+| Namespace | `docs.bfc` MB, before → after | String block payload MB, before → after | String compression |
+|---|---:|---:|---:|
+| Synthetic | 506.32 → 3.27 | 94.56 → 1.31 | 72.26× |
+| NQ | 6866.73 → 537.51 | 1343.01 → 508.12 | 2.64× |
+
+Synthetic text is deliberately repetitive; its ratio is unrepresentative of natural documents. NQ's
+text column alone compresses by 2.53×, close to the design's assumed 2.5×. Each removed dense vector
+column saves 2,049 payload bytes/row at this dimension and precision. Removing `ids.bfi`'s Bloom
+filter saves another 3.78 bytes/row in its existing JSON encoding. The separate 24-bit `idfilter.bff`
+remains unchanged; tests make the ID object unreadable and verify that absent-ID checks never open it.
+
+### Warm and cold queries
+
+I alternate four old/new pairs. Each arm warms 64 held-out vectors across four query kinds, then times
+the same 256 requests: ANN with `include_attributes: false`, ANN filtered by `bucket Eq 3`, vector
+projection in base64, and title/text projection. I use 48 probes, a rerank factor of 32, `top_k: 10`,
+and strong consistency. Warm values are medians of the four run percentiles; brackets give the full
+range of the four p50 values. Cold values are medians of ten paired requests per kind, each in its own
+fresh process. I repeat default float-vector projection separately with two alternating old/new pairs.
+
+The existing planner retains scalar columns internally for `include_attributes: false`, while an
+explicit `["id"]` projection narrows them. These measurements include that scalar-prefetch work;
+compressed text contributes to the unprojected query's cold-read and CPU changes. ANN codes and
+search kernels are unchanged.
+
+| Namespace / query | Warm p50 ms [min–max], before → after | Warm p99 ms, before → after | Cold p50 ms, before → after |
+|---|---:|---:|---:|
+| Synthetic / ANN | 3.64 [2.82–4.78] → 3.55 [3.46–3.73] | 9.81 → 12.35 | 77.51 → 54.22 |
+| Synthetic / filtered ANN | 3.61 [2.81–4.19] → 3.43 [2.81–3.68] | 10.11 → 12.42 | 96.12 → 62.83 |
+| Synthetic / vectors, base64 | 3.72 [2.86–5.00] → 4.16 [3.27–4.68] | 12.75 → 11.13 | 178.88 → 46.86 |
+| Synthetic / title + text | 3.40 [2.61–4.63] → 3.45 [2.73–3.79] | 12.19 → 12.61 | 79.93 → 52.76 |
+| NQ / ANN | 9.27 [7.21–9.58] → 9.39 [8.22–10.19] | 16.25 → 21.26 | 285.29 → 263.08 |
+| NQ / filtered ANN | 21.12 [17.50–23.95] → 22.02 [19.56–24.61] | 35.21 → 40.66 | 600.76 → 619.52 |
+| NQ / vectors, base64 | 9.40 [7.34–10.37] → 10.18 [8.40–11.33] | 26.52 → 37.69 | 295.78 → 265.03 |
+| NQ / title + text | 9.21 [7.01–9.83] → 8.99 [7.78–10.73] | 18.43 → 17.45 | 275.69 → 266.44 |
+| Synthetic, slabs / ANN | 3.03 [2.59–3.18] → 3.38 [3.10–3.53] | 8.79 → 8.38 | 78.06 → 44.41 |
+| Synthetic, slabs / filtered ANN | 3.13 [2.38–3.62] → 3.53 [3.05–3.78] | 8.40 → 8.72 | 90.38 → 62.65 |
+| Synthetic, slabs / vectors, base64 | 2.96 [2.43–3.80] → 3.82 [3.52–4.41] | 13.62 → 11.67 | 157.94 → 48.32 |
+| Synthetic, slabs / title + text | 2.91 [2.08–3.31] → 3.19 [2.95–3.72] | 8.98 → 7.81 | 74.77 → 42.74 |
+
+| Float-vector projection | Warm p50 ms [min–max], before → after | Warm p99 ms, before → after | Cold p50 ms, before → after |
+|---|---:|---:|---:|
+| Synthetic | 3.62 [3.50–3.74] → 3.79 [3.58–4.00] | 10.07 → 12.02 | 165.54 → 44.22 |
+| NQ | 9.59 [9.08–10.10] → 10.10 [9.02–11.18] | 17.67 → 25.39 | 342.77 → 318.63 |
+
+Warm vector projection adds some work to fetch, check, and encode individual ANN rows instead of
+cloning a decoded document-column value. Its measured p50 rises modestly, within the observed run
+ranges; tail values are noisy. I do not establish a warm wall-clock speedup. Cold synthetic vector
+projection improves substantially, while NQ's cold time remains dominated by its ANN reads.
+
+I compare 6,656 timed responses and 280 paired cold responses across these trials: every returned ID,
+distance, text attribute, and vector value matches. Base64 vector strings match exactly, and every
+query records zero document-scan rows. ANN scan counts also match throughout the alternating warm
+trials. Separate tests compare serialized projections at f16, f32, and i8 precision, cover float and base64
+responses, and run indexed queries
+at 0%, 50%, and 100% of fenced document conversion. I make no new recall claim from these format-only
+trials; both arms share the same codes, centers, memberships, and vectors.
+
+### Instructions and backend reads
+
+I run `perf stat` over every arm. Counts include process setup, request construction, the warm-up pass,
+the timed pass, and result serialization, divided by both passes' query count. They include the initial
+column hydration cost and do not isolate steady-state warm-query CPU. Mixed runs divide by 512, and
+float-only runs divide by 128. Values below are median M instructions/query, with the full run range.
+
+| Workload | Before, M instructions/query [min–max] | After, M instructions/query [min–max] |
+|---|---:|---:|
+| Synthetic, mixed | 45.50 [45.47–47.19] | 15.79 [15.74–15.84] |
+| NQ, mixed | 101.29 [97.85–106.25] | 62.26 [61.45–63.47] |
+| Synthetic, slabs, mixed | 43.96 [43.86–44.34] | 15.84 [15.81–15.93] |
+| Synthetic, float vectors | 147.36 [145.13–149.59] | 24.73 [24.70–24.75] |
+| NQ, float vectors | 228.83 [225.74–231.93] | 49.33 [49.12–49.54] |
+
+I also collect physical backend requests and transferred bytes for every fresh-process cold query.
+The table gives means across ten queries per arm; snapshot and search reads are both included.
+
+| Namespace / query | Requests, before → after | MB read, before → after |
+|---|---:|---:|
+| Synthetic / ANN | 55.8 → 35.3 | 67.90 → 31.99 |
+| Synthetic / filtered ANN | 89.1 → 65.5 | 71.50 → 34.54 |
+| Synthetic / vectors, base64 | 64.9 → 35.3 | 83.53 → 31.99 |
+| Synthetic / title + text | 55.8 → 35.3 | 67.90 → 31.99 |
+| NQ / ANN | 193.3 → 182.5 | 302.95 → 288.09 |
+| NQ / filtered ANN | 335.7 → 317.6 | 559.19 → 534.69 |
+| NQ / vectors, base64 | 182.6 → 176.3 | 295.93 → 279.70 |
+| NQ / title + text | 193.3 → 182.5 | 302.95 → 288.09 |
+| Synthetic, slabs / ANN | 55.5 → 33.4 | 66.81 → 30.99 |
+| Synthetic, slabs / filtered ANN | 89.1 → 65.5 | 71.50 → 34.54 |
+| Synthetic, slabs / vectors, base64 | 63.0 → 51.5 | 80.57 → 35.98 |
+| Synthetic, slabs / title + text | 55.6 → 33.4 | 66.82 → 30.99 |
+
+### Compaction and upgrade
+
+I compact the first two 100,000-row segments of each corpus into one segment. The old arm reads
+vectors from document-v1 and writes the original layout using `6eaa244`; the new arm reads vectors
+from ANN leaves and writes document-v2. Four alternating pairs give the wall-time median and full
+range below. The final two pairs additionally collect whole-process `perf stat` instruction counts.
+Uploads include the compacted segment's indexes and documents; no manifest is published for these
+isolated compaction outputs.
+
+| Corpus / 200K-row compaction | Seconds [min–max], before → after | G instructions, before → after | MB written, before → after |
+|---|---:|---:|---:|
+| Synthetic | 12.81 [12.06–13.69] → 11.96 [11.34–12.17] | 115.69 → 113.66 | 1079.36 → 575.55 |
+| NQ slice | 21.08 [20.44–22.21] → 21.42 [19.70–25.41] | 139.13 → 142.53 | 1186.67 → 709.39 |
+
+NQ compaction writes 40.2% fewer bytes and uses 2.4% more instructions. Its later paired wall timings
+reverse the difference seen in the first two pairs, so I retain the full spread and make no NQ
+compaction speedup claim. Compaction selection, tier coverage, lineage, and retirement policy are unchanged.
+
+I run the real fenced upgrade on the as-loaded legacy document sets. ANN is already current, so the
+rewrite bytes below are documents and IDs. Directory and manifest writes are extra. Each segment gets
+one publication after its epoch claim. The upgrader batches up to 64 source column ranges through its
+bypassing reader and checks every source block before compression.
+
+| Namespace | Document/ID pairs | MB rewritten | Seconds | Peak RSS MiB |
+|---|---:|---:|---:|---:|
+| Synthetic, 200K | 2 | 4.560 | 0.373 | 49.4 |
+| NQ, 2,681,468 | 27 | 557.853 | 17.138 | 206.1 |
+
+Both second runs rewrite zero objects, write zero bytes, and publish nothing. Tests cover stale
+conversions, concurrent publication, an upgrade without writes, and failures before publication or
+after a durable write whose verification GET also fails. Referenced objects survive that ambiguous
+case. Old document and ID objects remain protected for normal GC retention.
+
+### Reproduction
+
+The tracked harness is `crates/bf-engine/src/document_benchmark.rs`. I build it with:
+
+```sh
+source ~/.cargo/env
+CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_LTO=false \
+  nice -n 19 cargo test --release -p bf-engine --lib document_footprint_benchmark --no-run -j 2
+```
+
+I set `D2_TEST_BINARY` to Cargo's printed executable, and use a disposable directory under `.scratch/`:
+
+```sh
+export D2_RUN="$PWD/.scratch/d2-repro"
+export RAYON_NUM_THREADS=2 TOKIO_WORKER_THREADS=2
+D2_ACTION=build taskset -c 6,7 timeout 1800 \
+  "$D2_TEST_BINARY" document_footprint_benchmark --ignored --nocapture --test-threads=1
+```
+
+`build` writes canonical document-v2 segments, saves `current.json`, reconstructs the exact legacy
+column and Bloom encodings, saves `legacy.json`, and selects the legacy manifest. For NQ I additionally
+set `D2_ROWS=2681468`, `D2_CORPUS` to the harness's NumPy `corpus.f16`, `D2_QUERIES_F32` to `queries.npy`,
+and `D2_ATTRS` to JSONL objects containing `title` and `text`, in the same parquet row order. The reader
+accepts NumPy headers or raw packed arrays; I export attributes from the original parquet using `uv`
+and `pyarrow`, without re-encoding vector values.
+
+I select an arm with `D2_ACTION=legacy` or `current`, then invoke `D2_ACTION=query D2_WARMUP=1` under
+`perf stat -x ';' --no-big-num -e instructions,cycles`, alternating four old/new pairs. Every invocation
+uses `taskset -c 6,7 timeout 1800` and the same ignored-test arguments shown above. For cold requests I
+omit `D2_WARMUP`, set `D2_QUERIES=1`, choose `D2_QUERY_OFFSET=0..9`, and select `D2_KIND=ann`, `filtered`,
+`vector`, or `text`; each request gets a fresh process. Float-only trials additionally use
+`D2_KIND=vector D2_VECTOR_ENCODING=float`, with two alternating old/new pairs.
+
+`D2_ACTION=compact` reads and rebuilds the first two source segments; its matching baseline calls
+`compaction_rows`, `merge_packed`, and `build_with` from the pre-D2 source snapshot. `D2_ACTION=upgrade`
+runs the public fenced upgrader. `D2_ACTION=recluster` builds a synthetic tier and updates both saved
+format fixtures to reference it. I collect RSS with `/usr/bin/time -v`, and remove every disposable
+store, source snapshot, build directory, input copy, and log after retaining these results.

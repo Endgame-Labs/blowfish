@@ -280,3 +280,18 @@ legacy row-major, legacy fast-scan, legacy other, and current single-object coun
 legacy fast-scan or flat index needs the object upgrade. Existing flat and paged slab directory sizing
 settings keep their meaning. The deployment marker and manifest version are 3; I stop older writers
 before starting an upgrade, and restore a complete prefix backup if I need to roll back.
+
+
+### Document-v2 storage
+
+I write document-v2 alongside the single ANN layout, under bucket and manifest generation 3. Dense
+vectors live in ANN objects; string and string-array document blocks use zstd level 3. Compression
+is automatic, with no setting or alternate writer. Other attribute blocks retain their JSON encoding.
+Vector projection reads checksummed ANN ranges, and compaction streams whole leaves at stored precision.
+`BF_SPARSE_BLOCK_BYTES` controls the same small cache blocks for vector projection as for reranking.
+
+The background format upgrade converts ANN objects first, then rewrites one document/ID pair per fenced
+publication. `blowfish reindex` runs the same upgrade and reports pending legacy document counts and bytes,
+alongside ANN layout counts. I retain the separate `idfilter.bff` for existence checks; `ids.bfi` no longer
+stores its older, redundant Bloom filter. I stop older writers before upgrading and keep a complete prefix
+backup for rollback, as described in [operations](operations.md).

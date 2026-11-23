@@ -23,7 +23,7 @@ struct Cli {
 enum Command {
     /// Manage API keys on a running server.
     Keys(keys::Keys),
-    /// Upgrade a namespace's vector indexes to single ANN objects now. A running
+    /// Upgrade a namespace's ANN and document formats now. A running
     /// server does this in the background by itself. Safe beside a running server.
     Reindex {
         /// Namespace to upgrade (or use --all).
@@ -31,7 +31,7 @@ enum Command {
         /// Upgrade every namespace in the bucket.
         #[arg(long, conflicts_with = "namespace")]
         all: bool,
-        /// Report index counts and bytes per layout, and write nothing.
+        /// Report ANN layouts and legacy document counts and bytes, and write nothing.
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -240,11 +240,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     line("segments", &r.segments);
                     line("slabs", &r.slabs);
+                    println!(
+                        "{ns} documents: legacy {} ({} bytes)",
+                        r.documents.0, r.documents.1
+                    );
                     if !dry_run {
                         println!(
-                            "{ns}: rewrote {} segment indexes and {} slabs ({} bytes written, {} superseded) in {} publications, {:.1}s",
+                            "{ns}: rewrote {} segment indexes, {} slabs, and {} document/ID pairs ({} bytes written, {} superseded) in {} publications, {:.1}s",
                             r.converted_segments,
                             r.converted_slabs,
+                            r.converted_documents,
                             r.bytes_written,
                             r.superseded,
                             r.publications,
