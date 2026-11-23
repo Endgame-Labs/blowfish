@@ -23,7 +23,7 @@ struct Cli {
 enum Command {
     /// Manage API keys on a running server.
     Keys(keys::Keys),
-    /// Upgrade a namespace's older-layout vector indexes to the fast-scan layout now. A running
+    /// Upgrade a namespace's vector indexes to single ANN objects now. A running
     /// server does this in the background by itself. Safe beside a running server.
     Reindex {
         /// Namespace to upgrade (or use --all).
@@ -200,6 +200,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(profile) = storage_profile {
             config.storage.profile = Some(profile);
         }
+        // A survey must not raise the bucket fence and disable an older writer.
+        if dry_run {
+            config.storage.read_only = true;
+        }
         let storage = Storage::open(&config.storage).await?;
         let engine = Engine::with_config(
             storage,
@@ -223,13 +227,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(r) => {
                     let line = |name: &str, c: &bf_engine::LayoutCounts| {
                         println!(
-                            "{ns} {name}: row-major {} ({} bytes), fast-scan {} ({} bytes), not convertible {} ({} bytes)",
+                            "{ns} {name}: legacy row-major {} ({} bytes), legacy fast-scan {} ({} bytes), legacy other {} ({} bytes), single-object {} ({} bytes)",
                             c.row_major.0,
                             c.row_major.1,
                             c.fast_scan.0,
                             c.fast_scan.1,
                             c.other.0,
-                            c.other.1
+                            c.other.1,
+                            c.single_object.0,
+                            c.single_object.1
                         )
                     };
                     line("segments", &r.segments);

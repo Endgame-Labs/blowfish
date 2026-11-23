@@ -123,7 +123,7 @@ impl Engine {
         let store = &self.0.store;
         let attr = opts.attribute.as_str();
         let wal = Wal::new(store.clone(), ns).map_err(log_error)?;
-        let (ann_key, frag_key) = (format!("ann:{attr}"), format!("annfrag2:{attr}"));
+        let (ann_key, frag_key) = (format!("annv2:{attr}"), format!("annv2:{attr}"));
         if manifest.segments.is_empty()
             || manifest
                 .segments
@@ -206,7 +206,7 @@ impl Engine {
     ) -> Result<Built, ApiError> {
         let store = &self.0.store;
         let (attr, ns) = (opts.attribute.as_str(), wal.namespace().to_string());
-        let ann_key = format!("ann:{attr}");
+        let ann_key = format!("annv2:{attr}");
         let segments = manifest.segments.clone();
         let bases: Vec<u32> = covered.iter().map(|c| c.base).collect();
         let copied: Vec<Vec<u32>> = futures::stream::iter(segments.into_iter().zip(bases).map(
@@ -355,7 +355,7 @@ impl Engine {
             let rows_n = rows.len() as u32;
             // Between slabs, let a queued flush or compaction run first.
             job.pause().await;
-            let blob = on_pool(move || -> Result<(Vec<u8>, Vec<u8>, u64), ApiError> {
+            let blob = on_pool(move || -> Result<(Vec<u8>, u64), ApiError> {
                 // Rows stay packed at the stored precision (about 2 KB each at 1,024 dims in f16).
                 let mut data = vec![0u8; rows.len() * width];
                 for (g, chunk) in rows.iter().zip(data.chunks_exact_mut(width)) {
@@ -374,13 +374,10 @@ impl Engine {
                 let blob = builder
                     .build_packed_assigned(rows, data, centers, assignment)
                     .map_err(segment::index_error)?;
-                let (frag, frag_meta) =
-                    bf_vector::Fragment::build_blocks(&blob).map_err(segment::index_error)?;
-                Ok((blob, frag, frag_meta))
+                bf_vector::Fragment::build_ann(&blob).map_err(segment::index_error)
             })
             .await??;
-            let (blob, frag, frag_meta) = blob;
-            let meta = bf_vector::metadata_len(&blob).map_err(segment::index_error)?;
+            let (blob, meta) = blob;
             // Under the job's prefix, which its build record protects from GC until published.
             let id = format!("{}{n:05}", job.slab_prefix());
             let (store2, ns2, attr2, id2, uploads2) = (
@@ -398,21 +395,13 @@ impl Engine {
                 let prefix = format!("ns/{ns2}/slabs/{id2}");
                 let ann = segment::put_file(
                     &store2,
-                    format!("{prefix}/ann.{}.bfv", uuid::Uuid::new_v4()),
+                    format!("{prefix}/ann.{}.bfa", uuid::Uuid::new_v4()),
                     blob,
                     meta,
                 )
                 .await?;
-                let frag = segment::put_file(
-                    &store2,
-                    format!("{prefix}/ann2.{}.bfb", uuid::Uuid::new_v4()),
-                    frag,
-                    frag_meta,
-                )
-                .await?;
                 let mut files = std::collections::BTreeMap::new();
-                files.insert(format!("ann:{attr2}"), ann);
-                files.insert(format!("annfrag2:{attr2}"), frag);
+                files.insert(format!("annv2:{attr2}"), ann);
                 uploads2.lock().await.push(Segment {
                     id: id2,
                     wal_start: 0,

@@ -216,7 +216,10 @@ async fn legacy_manifest_upgrades_on_publication_without_losing_state() {
     wal.publish_fenced(seq, legacy.indexer_epoch, &legacy)
         .await
         .unwrap();
-    assert_eq!(store.check_bucket_format().await.unwrap(), 3);
+    assert_eq!(
+        store.check_bucket_format().await.unwrap(),
+        bf_storage::BUCKET_FORMAT_VERSION
+    );
     let (_, upgraded) = wal.latest_manifest().await.unwrap().unwrap();
     assert_eq!(upgraded.format_version, MANIFEST_FORMAT_VERSION);
     assert_eq!(upgraded.indexed_through, manifest.indexed_through);
@@ -261,7 +264,10 @@ async fn manifest_conflict_and_decode_failure_refresh_and_latch_the_cached_marke
             store.put("ns/test/manifest-latest", copy).await.unwrap();
         }
         store.create("_system/format/4.json", "{}").await.unwrap();
-        assert_eq!(store.cached_bucket_format().unwrap(), 3);
+        assert_eq!(
+            store.cached_bucket_format().unwrap(),
+            bf_storage::BUCKET_FORMAT_VERSION
+        );
         let error = if decode_failure {
             wal.latest_manifest().await.unwrap_err()
         } else {

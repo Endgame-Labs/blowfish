@@ -1,5 +1,5 @@
-//! Layout upgrade (`blowfish reindex`): rewrite a namespace's older row-major vector indexes in
-//! the fast-scan code layout. The background indexer runs it by itself, once per namespace.
+//! ANN object upgrade (`blowfish reindex`): merge each older index and its fragments into one
+//! object, upgrading row-major codes to fast scan. The indexer runs it once per namespace.
 //!
 //! Index objects are immutable, so a rewrite writes new objects under new keys and then swaps
 //! them into the manifest in one fenced publication. Nothing else changes: documents, the WAL,
@@ -9,7 +9,7 @@
 //! The job has three phases per batch of segments (and then per batch of recluster slabs):
 //!
 //! 1. **Convert** (no lock, no claim). One index at a time: read the object, rewrite its codes,
-//!    rebuild its fragments, and upload all of it under fresh keys. A crash here leaves unreferenced
+//!    merge its payloads, and upload one object under a fresh key. A crash here leaves unreferenced
 //!    objects and an unchanged manifest.
 //! 2. **Claim**. Publish the latest manifest with the epoch advanced by one. This fences an
 //!    indexer on another node that read the old manifest: its publication fails and it retries
@@ -23,7 +23,7 @@
 //!    publication does not touch, and `indexed_through` is carried over unchanged.
 //!
 //! A batch's swap is durable on its own, so a run interrupted between batches keeps what it
-//! published, and running it again skips every index already in the fast-scan layout.
+//! published, and running it again skips every single ANN object.
 use crate::{Engine, ann_dir, log_error, segment};
 use bf_types::ApiError;
 use bf_vector::CodeLayout;
@@ -51,20 +51,26 @@ impl Default for ReindexOptions {
     }
 }
 
-/// How many index objects, and how many bytes, are in each layout.
+/// Index counts and bytes in the current object format and each legacy code layout.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayoutCounts {
     pub row_major: (usize, u64),
     pub fast_scan: (usize, u64),
-    /// Flat indexes and formats too old to convert.
+    /// Current single ANN objects (including flat indexes).
+    pub single_object: (usize, u64),
+    /// Legacy flat indexes and pre-compact code layouts.
     pub other: (usize, u64),
 }
 impl LayoutCounts {
-    fn add(&mut self, layout: CodeLayout, bytes: u64) {
-        let slot = match layout {
-            CodeLayout::RowMajor => &mut self.row_major,
-            CodeLayout::FastScan => &mut self.fast_scan,
-            CodeLayout::Other => &mut self.other,
+    fn add(&mut self, layout: CodeLayout, bytes: u64, current: bool) {
+        let slot = if current {
+            &mut self.single_object
+        } else {
+            match layout {
+                CodeLayout::RowMajor => &mut self.row_major,
+                CodeLayout::FastScan => &mut self.fast_scan,
+                CodeLayout::Other => &mut self.other,
+            }
         };
         slot.0 += 1;
         slot.1 += bytes;
@@ -108,7 +114,7 @@ enum Batch {
 }
 
 impl Engine {
-    /// Rewrite the row-major vector indexes of `ns` in the fast-scan layout. Safe beside a running server on the
+    /// Rewrite legacy vector indexes of `ns` as single ANN objects. Safe beside a running server on the
     /// same bucket (see the module notes). Prints progress to standard error.
     pub async fn reindex(
         &self,
@@ -158,10 +164,18 @@ impl Engine {
         let mut todo: Vec<(String, String, SegmentFile)> = Vec::new();
         for seg in &manifest.segments {
             for attr in &attrs {
-                if let Some(file) = seg.files.get(&format!("ann:{attr}")) {
+                if let Some(file) = seg
+                    .files
+                    .get(&format!("annv2:{attr}"))
+                    .or_else(|| seg.files.get(&format!("ann:{attr}")))
+                {
                     let layout = self.layout_of(file).await?;
-                    report.segments.add(layout, file.size);
-                    if layout == CodeLayout::RowMajor {
+                    report.segments.add(
+                        layout,
+                        file.size,
+                        seg.files.contains_key(&format!("annv2:{attr}")),
+                    );
+                    if seg.files.contains_key(&format!("ann:{attr}")) {
                         todo.push((seg.id.clone(), attr.clone(), file.clone()));
                     }
                 }
@@ -173,10 +187,18 @@ impl Engine {
                 if let Some(tiers) = manifest.ann_tiers.get(attr) {
                     let mut list = Vec::new();
                     for slab in tiers.iter().flat_map(|set| &set.slabs) {
-                        if let Some(file) = slab.files.get(&format!("ann:{attr}")) {
+                        if let Some(file) = slab
+                            .files
+                            .get(&format!("annv2:{attr}"))
+                            .or_else(|| slab.files.get(&format!("ann:{attr}")))
+                        {
                             let layout = self.layout_of(file).await?;
-                            report.slabs.add(layout, file.size);
-                            if layout == CodeLayout::RowMajor {
+                            report.slabs.add(
+                                layout,
+                                file.size,
+                                slab.files.contains_key(&format!("annv2:{attr}")),
+                            );
+                            if slab.files.contains_key(&format!("ann:{attr}")) {
                                 list.push((slab.clone(), file.clone()));
                             }
                         }
@@ -189,9 +211,15 @@ impl Engine {
             tracing::info!(
                 "reindex {ns}: {} segment indexes to rewrite of {}, {} slabs of {}",
                 todo.len(),
-                report.segments.row_major.0 + report.segments.fast_scan.0 + report.segments.other.0,
+                report.segments.row_major.0
+                    + report.segments.fast_scan.0
+                    + report.segments.other.0
+                    + report.segments.single_object.0,
                 slab_todo.iter().map(|(_, l)| l.len()).sum::<usize>(),
-                report.slabs.row_major.0 + report.slabs.fast_scan.0 + report.slabs.other.0,
+                report.slabs.row_major.0
+                    + report.slabs.fast_scan.0
+                    + report.slabs.other.0
+                    + report.slabs.single_object.0,
             );
         }
         if opts.dry_run {
@@ -279,15 +307,7 @@ impl Engine {
         bf_vector::code_layout(&head).map_err(segment::index_error)
     }
 
-    /// Rewrite one object's codes (on a blocking thread), or `None` when it needs nothing.
-    async fn convert_object(&self, file: &SegmentFile) -> Result<Option<Vec<u8>>, ApiError> {
-        let blob = segment::read_whole_uncached(&self.0.store, file).await?;
-        tokio::task::spawn_blocking(move || bf_vector::upgrade_layout(&blob))
-            .await
-            .map_err(segment::index_error)?
-            .map_err(segment::index_error)
-    }
-
+    /// Copy an old index into one ANN object, upgrading its codes if necessary.
     async fn convert_segment_index(
         &self,
         ns: &str,
@@ -295,56 +315,33 @@ impl Engine {
         attr: &str,
         file: &SegmentFile,
     ) -> Result<Converted, ApiError> {
-        let store = &self.0.store;
-        let blob = self
-            .convert_object(file)
-            .await?
-            .ok_or_else(|| ApiError::new(500, "index needs no conversion"))?;
-        let prefix = format!("ns/{ns}/segments/{}", seg.id);
-        let meta = bf_vector::metadata_len(&blob).map_err(segment::index_error)?;
-        let (want_plain, want_blocks) = (
-            seg.files.contains_key(&format!("annfrag:{attr}")),
-            seg.files.contains_key(&format!("annfrag2:{attr}")),
-        );
-        let (blob, plain, blocks) = tokio::task::spawn_blocking(move || {
-            let plain = want_plain
-                .then(|| bf_vector::Fragment::build(&blob))
-                .transpose()?;
-            let blocks = want_blocks
-                .then(|| bf_vector::Fragment::build_blocks(&blob))
-                .transpose()?;
-            Ok::<_, bf_vector::Error>((blob, plain, blocks))
-        })
-        .await
-        .map_err(segment::index_error)?
-        .map_err(segment::index_error)?;
-        let mut bytes = blob.len() as u64;
-        let mut old = vec![file.clone()];
-        let mut new = vec![(
+        let blob = segment::read_whole_uncached(&self.0.store, file).await?;
+        let (blob, meta) =
+            tokio::task::spawn_blocking(move || bf_vector::Fragment::build_ann(&blob))
+                .await
+                .map_err(segment::index_error)?
+                .map_err(segment::index_error)?;
+        let bytes = blob.len() as u64;
+        let kind = if seg.id.starts_with("slab-") {
+            "slabs"
+        } else {
+            "segments"
+        };
+        let key = format!("ns/{ns}/{kind}/{}/ann.{}.bfa", seg.id, uuid::Uuid::new_v4());
+        let new = segment::put_file(&self.0.store, key, blob, meta).await?;
+        let old = [
             format!("ann:{attr}"),
-            segment::put_file(
-                store,
-                format!("{prefix}/ann.{}.bfv", uuid::Uuid::new_v4()),
-                blob,
-                meta,
-            )
-            .await?,
-        )];
-        for (key, ext, built) in [
-            (format!("annfrag:{attr}"), "bff", plain),
-            (format!("annfrag2:{attr}"), "bfb", blocks),
-        ] {
-            let Some((data, meta)) = built else { continue };
-            bytes += data.len() as u64;
-            old.extend(seg.files.get(&key).cloned());
-            let object = format!("{prefix}/ann.{}.{ext}", uuid::Uuid::new_v4());
-            new.push((key, segment::put_file(store, object, data, meta).await?));
-        }
+            format!("annfrag:{attr}"),
+            format!("annfrag2:{attr}"),
+        ]
+        .iter()
+        .filter_map(|k| seg.files.get(k).cloned())
+        .collect();
         Ok(Converted {
             id: seg.id.clone(),
             attr: attr.to_string(),
             old_ann: file.key.clone(),
-            new,
+            new: vec![(format!("annv2:{attr}"), new)],
             old,
             bytes,
         })
@@ -357,43 +354,7 @@ impl Engine {
         attr: &str,
         file: &SegmentFile,
     ) -> Result<Converted, ApiError> {
-        let store = &self.0.store;
-        let id = slab.id.as_str();
-        let blob = self
-            .convert_object(file)
-            .await?
-            .ok_or_else(|| ApiError::new(500, "index needs no conversion"))?;
-        let meta = bf_vector::metadata_len(&blob).map_err(segment::index_error)?;
-        let (frag, frag_meta) =
-            bf_vector::Fragment::build_blocks(&blob).map_err(segment::index_error)?;
-        let prefix = format!("ns/{ns}/slabs/{id}");
-        let bytes = (blob.len() + frag.len()) as u64;
-        let ann = segment::put_file(
-            store,
-            format!("{prefix}/ann.{}.bfv", uuid::Uuid::new_v4()),
-            blob,
-            meta,
-        )
-        .await?;
-        let frag = segment::put_file(
-            store,
-            format!("{prefix}/ann2.{}.bfb", uuid::Uuid::new_v4()),
-            frag,
-            frag_meta,
-        )
-        .await?;
-        let old = slab.files.values().cloned().collect();
-        Ok(Converted {
-            id: id.to_string(),
-            attr: attr.to_string(),
-            old_ann: file.key.clone(),
-            new: vec![
-                (format!("ann:{attr}"), ann),
-                (format!("annfrag2:{attr}"), frag),
-            ],
-            old,
-            bytes,
-        })
+        self.convert_segment_index(ns, slab, attr, file).await
     }
 
     /// Claim, swap the batch into the newest manifest, and publish; repeat on a conflict.
@@ -478,7 +439,10 @@ impl Engine {
                     }
                     report.publications += 1;
                     report.superseded += superseded.len();
-                    for c in batch.converted().filter(|c| superseded.contains(&c.id)) {
+                    for c in batch
+                        .converted()
+                        .filter(|c| superseded.contains(&(c.id.clone(), c.attr.clone())))
+                    {
                         for (_, f) in &c.new {
                             let _ = store.delete(&f.key).await;
                         }
@@ -501,15 +465,21 @@ impl Engine {
         manifest: &mut Manifest,
         attr: &str,
         list: &[Converted],
-    ) -> Result<(usize, BTreeSet<String>), ApiError> {
+    ) -> Result<(usize, BTreeSet<(String, String)>), ApiError> {
         let store = &self.0.store;
         let Some(tiers) = manifest.ann_tiers.get(attr).cloned() else {
-            return Ok((0, list.iter().map(|c| c.id.clone()).collect()));
+            return Ok((
+                0,
+                list.iter()
+                    .map(|c| (c.id.clone(), c.attr.clone()))
+                    .collect(),
+            ));
         };
         let (mut applied, mut superseded) = (0usize, BTreeSet::new());
+        // Slab IDs some tier still lists: a converted slab no tier lists was replaced meanwhile.
         let mut found: BTreeSet<String> = BTreeSet::new();
-        let mut updated = tiers.clone();
-        for set in updated.iter_mut() {
+        let mut updated = Vec::with_capacity(tiers.len());
+        for set in tiers {
             let mut slabs = set.slabs.clone();
             let mut retired = Vec::new();
             let mut changed = 0usize;
@@ -523,21 +493,47 @@ impl Engine {
                     .get(&format!("ann:{attr}"))
                     .is_some_and(|f| f.key == c.old_ann)
                 {
+                    for prefix in ["ann:", "annfrag:", "annfrag2:"] {
+                        slab.files.remove(&format!("{prefix}{}", c.attr));
+                    }
                     for (key, file) in &c.new {
                         slab.files.insert(key.clone(), file.clone());
                     }
                     retired.extend(c.old.iter().map(|f| f.key.clone()));
                     changed += 1;
                 } else {
-                    superseded.insert(c.id.clone());
+                    superseded.insert((c.id.clone(), c.attr.clone()));
                 }
             }
             if changed == 0 {
+                updated.push(set);
                 continue;
             }
             applied += changed;
-            // The directory over the slabs, as a recluster writes it.
-            let (dir, pages) = crate::recluster::slab_directories(store, ns, attr, &slabs).await?;
+            // The directory over the tier's slabs, as a recluster writes it. A partial batch's
+            // directory covers both old and current slab objects, so queries stay on the tier.
+            let Some(dir) =
+                ann_dir::build(store, ns, &slabs, attr, ann_dir::Layout::Slabs, None).await?
+            else {
+                // Keep the old set protected if a concurrent replacement cannot supply a
+                // directory.
+                for key in retired {
+                    crate::indexer::retire(manifest, key);
+                }
+                updated.push(SlabSet { slabs, ..set });
+                continue;
+            };
+            let paged_dir = ann_dir::load(store, &dir, None).await?;
+            let pages = ann_dir::build_paged(store, ns, attr, paged_dir.clone(), &slabs).await?;
+            if pages.is_none() {
+                let bytes = segment::ObjectReader::new(store, &dir)
+                    .bypass_cache()
+                    .read(0..dir.size)
+                    .await
+                    .map_err(segment::index_error)?;
+                ann_dir::write_hint(store, ns, ann_dir::Layout::Slabs, attr, &dir.key, &bytes)
+                    .await;
+            }
             for key in retired {
                 crate::indexer::retire(manifest, key);
             }
@@ -545,21 +541,17 @@ impl Engine {
             if let Some(old) = &set.pages {
                 crate::indexer::retire(manifest, old.key.clone());
             }
-            *set = SlabSet {
-                covered: set.covered.clone(),
+            updated.push(SlabSet {
                 slabs,
                 dir,
                 pages,
-                format: set.format,
-            };
+                ..set
+            });
         }
-        superseded.extend(
-            list.iter()
-                .filter(|c| !found.contains(&c.id))
-                .map(|c| c.id.clone()),
-        );
-        if applied == 0 {
-            return Ok((0, superseded));
+        for c in list {
+            if !found.contains(&c.id) {
+                superseded.insert((c.id.clone(), c.attr.clone()));
+            }
         }
         manifest.ann_tiers.insert(attr.to_string(), updated);
         Ok((applied, superseded))
@@ -580,7 +572,11 @@ fn attributes(manifest: &Manifest) -> Vec<String> {
         .segments
         .iter()
         .flat_map(|s| s.files.keys())
-        .filter_map(|k| k.strip_prefix("ann:").map(str::to_string))
+        .filter_map(|k| {
+            k.strip_prefix("ann:")
+                .or_else(|| k.strip_prefix("annv2:"))
+                .map(str::to_string)
+        })
         .chain(manifest.ann_tiers.keys().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -595,7 +591,7 @@ async fn apply_segments(
     ns: &str,
     manifest: &mut Manifest,
     list: &[Converted],
-) -> Result<(usize, BTreeSet<String>), ApiError> {
+) -> Result<(usize, BTreeSet<(String, String)>), ApiError> {
     let (mut applied, mut superseded) = (0usize, BTreeSet::new());
     for c in list {
         let current = manifest
@@ -608,9 +604,12 @@ async fn apply_segments(
                     .is_some_and(|f| f.key == c.old_ann)
             });
         let Some(seg) = current else {
-            superseded.insert(c.id.clone());
+            superseded.insert((c.id.clone(), c.attr.clone()));
             continue;
         };
+        for prefix in ["ann:", "annfrag:", "annfrag2:"] {
+            seg.files.remove(&format!("{prefix}{}", c.attr));
+        }
         for (key, file) in &c.new {
             seg.files.insert(key.clone(), file.clone());
         }
@@ -626,11 +625,15 @@ async fn apply_segments(
         .segments
         .iter()
         .flat_map(|s| s.files.keys())
-        .filter_map(|k| k.strip_prefix("ann:").map(str::to_string))
+        .filter_map(|k| {
+            k.strip_prefix("annv2:")
+                .or_else(|| k.strip_prefix("ann:"))
+                .map(str::to_string)
+        })
         .collect();
     let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
     for attr in attributes {
-        let layouts = [ann_dir::Layout::Plain, ann_dir::Layout::Blocks];
+        let layouts = [ann_dir::Layout::Segments];
         let built = futures::future::try_join_all(layouts.iter().map(|layout| {
             ann_dir::build(
                 store,
@@ -655,3 +658,142 @@ async fn apply_segments(
     }
     Ok((applied, superseded))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bf_storage::{Storage, StorageConfig};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn superseded_attribute_does_not_discard_another_attribute_of_the_same_segment() {
+        let store = Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store.clone(),
+            crate::EngineConfig {
+                indexing: false,
+                ..Default::default()
+            },
+        );
+        engine
+            .write(
+                "t",
+                serde_json::from_value(json!({
+                    "distance_metric":"euclidean_squared",
+                    "schema":{"a":{"type":"[2]f32","ann":true},"b":{"type":"[2]f32","ann":true}},
+                    "upsert_rows":[{"id":1,"a":[1.,2.],"b":[3.,4.]}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine.index_namespace("t", true).await.unwrap();
+        let wal = Wal::new(store.clone(), "t").unwrap();
+        let (_, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+        let seg = &mut manifest.segments[0];
+        let a = seg.files.remove("annv2:a").unwrap();
+        let b = seg.files.remove("annv2:b").unwrap();
+        seg.files.insert("ann:a".into(), a.clone());
+        seg.files.insert("ann:b".into(), b.clone());
+        let list = vec![
+            Converted {
+                id: seg.id.clone(),
+                attr: "a".into(),
+                old_ann: a.key.clone(),
+                new: vec![("annv2:a".into(), a.clone())],
+                old: vec![],
+                bytes: a.size,
+            },
+            Converted {
+                id: seg.id.clone(),
+                attr: "b".into(),
+                old_ann: "already-replaced".into(),
+                new: vec![("annv2:b".into(), b)],
+                old: vec![],
+                bytes: 0,
+            },
+        ];
+        let (applied, superseded) = apply_segments(&store, "t", &mut manifest, &list)
+            .await
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert!(manifest.segments[0].files.contains_key("annv2:a"));
+        assert!(manifest.segments[0].files.contains_key("ann:b"));
+        assert_eq!(
+            superseded,
+            BTreeSet::from([(list[1].id.clone(), "b".into())])
+        );
+        assert!(!superseded.contains(&(list[0].id.clone(), "a".into())));
+    }
+    #[tokio::test]
+    async fn successive_upgrade_batches_without_a_directory_refresh_resident_file_keys() {
+        let store = Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store.clone(),
+            crate::EngineConfig {
+                indexing: false,
+                ..Default::default()
+            },
+        );
+        engine
+            .write(
+                "t",
+                serde_json::from_value(json!({
+                    "distance_metric":"euclidean_squared",
+                    "schema":{"a":{"type":"[2]f32","ann":true}},
+                    "upsert_rows":[{"id":1,"a":[1.,2.]}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine.index_namespace("t", true).await.unwrap();
+        let wal = Wal::new(store.clone(), "t").unwrap();
+        for batch in 0..2 {
+            let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+            let file = manifest.segments[0].files.get_mut("annv2:a").unwrap();
+            let blob = store.get(&file.key).await.unwrap();
+            let replacement = format!("ns/t/segments/rewrite-{batch}.bfa");
+            store.create_unique(&replacement, blob).await.unwrap();
+            file.key = replacement.clone();
+            manifest.ann_dirs.clear();
+            wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
+                .await
+                .unwrap();
+            let handle = engine.handle("t").await.unwrap();
+            {
+                let mut state = handle.state.lock().await;
+                crate::snapshot::catch_up(&wal, &mut state, None, &store)
+                    .await
+                    .unwrap();
+            }
+            let result = engine
+                .query(
+                    "t",
+                    serde_json::from_value(json!({"rank_by":["a","ANN",[1.,2.]],"top_k":1}))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.result.rows.unwrap()[0]["id"], 1);
+            assert_eq!(
+                handle.state.lock().await.segments[0].files["annv2:a"].key,
+                replacement
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "reindex_migration_tests.rs"]
+mod migration_tests;

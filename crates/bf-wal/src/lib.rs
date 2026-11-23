@@ -173,9 +173,9 @@ pub struct Manifest {
     /// Separate object holding `stats.text` (a map of field to `TextStats`), when non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_stats: Option<SegmentFile>,
-    /// Namespace ANN directories, one per vector attribute (`ann:<attribute>` to object). A
+    /// Namespace ANN directories, one per vector attribute (`annv2:<attribute>` to object). A
     /// directory is valid only while its segment list equals `segments`; readers fall back to
-    /// opening each segment otherwise.
+    /// scanning document columns otherwise.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub ann_dirs: std::collections::BTreeMap<String, SegmentFile>,
     /// Namespace-wide ANN layouts (the automatic recluster's tiers) per vector attribute: a base,
@@ -1164,7 +1164,7 @@ mod manifest_codec_tests {
     #[test]
     fn every_manifest_encoding_and_direct_deserializer_rejects_future_versions() {
         let mut value = serde_json::to_value(manifest_with_terms(3)).unwrap();
-        for version in [0, 4, 256, u64::MAX] {
+        for version in [0, u64::from(MANIFEST_FORMAT_VERSION) + 1, 256, u64::MAX] {
             value["format_version"] = serde_json::json!(version);
             let json = serde_json::to_vec(&value).unwrap();
             let compressed = zstd::stream::encode_all(json.as_slice(), 3).unwrap();
@@ -1179,7 +1179,7 @@ mod manifest_codec_tests {
             assert!(serde_json::from_slice::<Manifest>(&json).is_err());
         }
         let mut future = manifest_with_terms(3);
-        future.format_version = 4;
+        future.format_version = MANIFEST_FORMAT_VERSION + 1;
         assert!(encode_manifest(&future).is_err());
         // Also fail closed if an extension accidentally forgets to raise its version.
         let mut value = serde_json::to_value(manifest_with_terms(3)).unwrap();

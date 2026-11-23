@@ -241,6 +241,8 @@ pub(crate) struct ReadContext {
     /// Background one-pass scans (the recall sampler's exhaustive search) set it to false, so
     /// they cannot evict the blocks that queries reuse.
     pub admit: bool,
+    pub ann_rows: Arc<std::sync::atomic::AtomicU64>,
+    pub document_scan_rows: Arc<std::sync::atomic::AtomicU64>,
 }
 impl ReadContext {
     /// A context with fresh statistics that admits its reads.
@@ -250,6 +252,8 @@ impl ReadContext {
             stats: Arc::default(),
             backend: Arc::default(),
             admit: true,
+            ann_rows: Arc::default(),
+            document_scan_rows: Arc::default(),
         }
     }
 }

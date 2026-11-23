@@ -330,7 +330,7 @@ async fn ivf_ann_recall_filtered_knn_and_f16_files() {
         .await
         .unwrap()
         .unwrap();
-    let f = &m.segments[0].files["ann:small"];
+    let f = &m.segments[0].files["annv2:small"];
     let index = bf_vector::Index::open(e.storage().get(&f.key).await.unwrap())
         .await
         .unwrap();

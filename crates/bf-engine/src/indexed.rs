@@ -383,7 +383,7 @@ async fn prepare_one(
     let mut scores = BTreeMap::new();
     let columns = projection_columns(state, q, narrow_columns);
     for seg in &state.segments {
-        let file = seg.files.get(&format!("ann:{attribute}"));
+        let file = seg.files.get(&format!("annv2:{attribute}"));
         let (allowed, index, ids) = tokio::try_join!(
             snapshot::allowed(store, state, seg, q.filters.as_ref()),
             async {
@@ -399,6 +399,11 @@ async fn prepare_one(
         }
         let Some(index) = index else {
             // Version-one document-only segments remain readable during rollout.
+            if let Some(context) = crate::read_cache::context() {
+                context
+                    .document_scan_rows
+                    .fetch_add(allowed.len(), std::sync::atomic::Ordering::Relaxed);
+            }
             let docs = segment::documents(store, seg, &allowed).await?;
             for (id, mut doc) in docs {
                 doc.retain(|name, _| state.schema.contains_key(name));

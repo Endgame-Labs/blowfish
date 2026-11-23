@@ -259,7 +259,7 @@ older or slower path, and setting it now has no effect:
 | `BF_RECLUSTER_GROUPS` | Leaf groups searched per row during assignment | Fixed at 12 |
 | `BF_RECLUSTER_REFINE` | Refinement rounds after assignment | Exactly one |
 | `BF_ANN_DIRECTORY` | `0` forced the per-segment ANN path | Directories are always used when present |
-| `BF_ANN_BLOCKS` | `0` turned off the block layout for unfiltered queries | Always on |
+| `BF_ANN_BLOCKS` | `0` turned off the block layout for unfiltered queries | One `.bfa` object serves filtered and unfiltered queries |
 | `BF_ANN_SLABS` | `0` ignored a recluster's slabs | A recluster tier is always used for the rows it covers |
 | `BF_ANN_PAGED` | `0` read the whole slab directory | Paged directories are always read in pieces |
 | `BF_ANN_SCAN_MEMO` | `0` turned off scanning while a cold query's reads arrive | Always on |
@@ -269,3 +269,12 @@ older or slower path, and setting it now has no effect:
 | `BF_IVF_CLUSTER_FACTOR` | Made index-build leaf clusters larger | Leaf clusters are sqrt(rows) |
 | `BF_NO_AVX512` | Turned off the AVX-512 scan kernels | AVX-512 is used whenever the CPU has it |
 | `BF_ANN_FASTSCAN` | Chose the row-major code layout (removed with the reindex work) | Fast-scan is the only layout written |
+
+### Single ANN objects and upgrades
+
+I write one `.bfa` ANN object per vector attribute in each segment or slab; there is no layout setting.
+`blowfish reindex` runs the same automatic upgrade as the background indexer, and `--dry-run` reports
+legacy row-major, legacy fast-scan, legacy other, and current single-object counts and bytes. Even a
+legacy fast-scan or flat index needs the object upgrade. Existing flat and paged slab directory sizing
+settings keep their meaning. The deployment marker and manifest version are 3; I stop older writers
+before starting an upgrade, and restore a complete prefix backup if I need to roll back.

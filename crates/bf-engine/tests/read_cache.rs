@@ -308,11 +308,7 @@ async fn cold_open_reads_the_directory_hint_alongside_the_manifest() {
         .into_iter()
         .filter(|o| o.key.contains("ann-dir-latest"))
         .collect();
-    assert_eq!(
-        hints.len(),
-        2,
-        "one hint per vector attribute and directory layout"
-    );
+    assert_eq!(hints.len(), 1, "one hint per vector attribute");
     for hint in &hints {
         writable.delete(&hint.key).await.unwrap();
     }
@@ -570,7 +566,7 @@ async fn cold_ann_over_twenty_segments_uses_the_directory() {
         .filter(|o| {
             futures::future::ready(
                 o.as_ref()
-                    .is_ok_and(|o| o.location.as_ref().ends_with(".bfv")),
+                    .is_ok_and(|o| o.location.as_ref().ends_with(".bfa")),
             )
         })
         .count()
@@ -601,9 +597,7 @@ async fn cold_ann_over_twenty_segments_uses_the_directory() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(path, range)| {
-                path.ends_with(".bfv") && range.as_ref().is_none_or(|r| r.start == 0)
-            })
+            .filter(|(path, range)| path.ends_with(".bfa") && range.is_none())
             .count();
         eprintln!(
             "ids_only={ids_only} waves={waves} requests={requests} metadata={metadata_reads}"
@@ -614,7 +608,7 @@ async fn cold_ann_over_twenty_segments_uses_the_directory() {
             }
         }
         assert!(waves <= max_waves, "{waves} waves");
-        assert_eq!(metadata_reads, 0, "no segment index is opened");
+        assert_eq!(metadata_reads, 0, "no ANN object is fetched whole");
         assert!(requests < 100, "{requests} requests");
         let exact = engine
             .query_exhaustive(
@@ -686,7 +680,7 @@ async fn directory_cost_and_publication_do_not_grow_with_segment_count() {
             .collect();
         let count = |ext: &str| reads.iter().filter(|p| p.contains(ext)).count();
         // Publishing opens no existing segment's index, and reads only new fragments.
-        publish_reads.push((batch, count(".bfv"), count(".bff"), count(".bfd")));
+        publish_reads.push((batch, count(".bfa"), count(".bfd")));
         if batch + 1 == 6 || batch + 1 == 60 {
             let engine = Engine::with_config(store(backend.clone()).await, config());
             backend.waves.store(0, Ordering::SeqCst);
@@ -703,18 +697,16 @@ async fn directory_cost_and_publication_do_not_grow_with_segment_count() {
         }
     }
     eprintln!("cold (segments, waves, requests): {cold:?}");
-    eprintln!("publication reads (batch, bfv, bff, bfd): {publish_reads:?}");
+    eprintln!("publication reads (batch, bfa, bfd): {publish_reads:?}");
     assert!(cold.iter().all(|c| c.1 <= 3), "waves {cold:?}");
     // Requests follow the number of probed clusters, not the segment count: ten times the
     // segments (and rows) stays well under ten times the requests.
     assert!(cold[1].2 <= cold[0].2 * 6, "requests grew: {cold:?}");
     assert!(cold[1].2 < 100, "requests {cold:?}");
-    for (batch, bfv, bff, bfd) in &publish_reads {
-        assert_eq!(*bfv, 0, "batch {batch} reopened a segment index");
-        // The new segment's fragment, plus the compacted segment's when compaction ran.
-        assert!(*bff <= 2, "batch {batch} read {bff} fragments");
-        // One previous directory per layout (plain and block fragments).
-        assert!(*bfd <= 2, "batch {batch} read {bfd} directories");
+    for (batch, bfa, bfd) in &publish_reads {
+        // Only the new object and the compacted object contribute resident metadata.
+        assert!(*bfa <= 2, "batch {batch} read {bfa} ANN objects");
+        assert!(*bfd <= 1, "batch {batch} read {bfd} directories");
     }
 }
 

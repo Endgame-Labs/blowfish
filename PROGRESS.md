@@ -4,6 +4,32 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Automatic recluster, rounds R1 and R2** (`docs/design/auto-recluster.md`, `docs/benchmarks.md`).
+  - The server reclusters by itself. After each publication the indexer checks the trigger, from manifest numbers
+    only. It builds a base tier when a first base would gain enough (100,000 rows and two or more segments), when rows
+    outside the tier reach a quarter of it, or when the tier is in an older format. It waits during a bulk load and
+    while compaction is pending, and a deferral comes due again after a minute.
+  - The build runs on half the cores and waits between slabs while the indexer works. It sizes slabs from the memory
+    left after the caches, checks free disk for its spill file, writes a build record that keeps GC off its objects,
+    and hands the tier to the indexer's next fenced publication, which installs it only if the segments it covers are
+    still live. There is no epoch claim, no setting, and no manual mode; `Engine::recluster` runs the same job in the
+    foreground. Metrics are under `blowfish_recluster_*`.
+  - Queries: unfiltered ANN searches the tier's slabs and the segments outside it at once, and merges them. Compaction
+    leaves covered segments alone. Manifest and bucket format 3: `ann_tiers` replaces `ann_slabs`, which is read once
+    and rewritten.
+  - `examples/recluster.rs`, `examples/repage.rs`, and the recluster's epoch claim are deleted.
+  - NQ, unattended: loaded in 269 s, base built 231 s later with at most 791 MB RSS during the build, then recall@10
+    0.962 and 587 q/s at 16 clients (main reclustered by hand: 0.961 and 574). With 5% of rows rewritten, 20.9 M
+    instructions a query against 15.5 M fully covered, at recall@10 0.959. A 25% rewrite triggered a rebuild after the
+    bulk window, in 287 s.
+  - Checked: fmt, workspace clippy, and tests of bf-wal, bf-storage, bf-vector, and bf-engine (with fault-injection
+    tests for a build that dies midway and for failed and ambiguous install publications); compat (see the report).
+
+- **G2: a graph over leaf centers, studied offline** (`docs/design/graph-study.md`). On all of BEIR NQ, 64-row leaves
+  with exhaustive center ranking scan 32.7% fewer rows at recall@10 0.95, but a degree-16 center graph costs 30–84%
+  of scan time to rank, against a 10% gate. G3 (the graph in the directory format) is on hold until center search
+  is cheaper. Graph-guided recluster assignment ran 1.59x faster at a 100M-sized cell shape, with routing coverage
+  0.949 → 0.949 at 1,024 probes; it needs a full-pipeline check before it replaces anything.
 - **Iteration 22: the fixed costs of a warm vector query** (`docs/benchmarks.md`).
   - A warm reclustered NQ query takes 15.3 M instructions against main's 25.5 M (−40%), and 21.4 M cycles against
     26.6 M (−20%), with the same results (recall@10 0.961). At 16 clients on a shared VM that was 574 against 509 q/s,
@@ -700,3 +726,41 @@ unfiltered ANN answers from them while they cover the live segments. 10M cold, f
 - Audit of every behavior the SDKs rely on: `docs/research/sdk-compat-audit.md`; open items in `SPEC.md` section 2.
 - `scale_load.py`: one limiter shared by all in-flight threads, honors `retry-after-ms` / `Retry-After` (also on 503), full-jitter backoff, gradual ramp-up, and reports 429 / 503 counts and
   sample header values in its progress line. The checkpoint format is unchanged (one optional `retries_503` field).
+
+## D1: one ANN object per segment and slab
+
+I write one `ann.<column>.bfa` object per vector attribute, with resident directory metadata and dense
+membership, checksummed leaf blobs followed by their codes in locality order, one vector region, and a
+version-2 footer. I removed the ANN `.bff` and `.bfb` writers, the plain/block layout choice, the block
+backfill, and the old per-segment ANN planner. Flat and paged slab directories keep their encodings.
+
+I extended `reindex` and the background upgrade to convert every legacy ANN object, including fast-scan,
+flat, and pre-compact indexes, without retraining. Each fenced publication installs `annv2:` files and
+retires the old index and fragment entries. Slab batches can resume before the final directory is ready.
+I also fixed per-attribute cleanup after a concurrent replacement and resident generation adoption when
+successive batches have no complete directory. Mixed segment formats can temporarily use document scans;
+I document that migration latency limit in operations. Document vectors remain for D2.
+
+I raised the bucket and manifest fences to 3. The CLI reports current objects separately from legacy
+code layouts, and a dry run opens storage read-only, leaving an older bucket's marker unchanged.
+
+Validation: `cargo fmt`, strict clippy over `bf-vector`, `bf-engine`, `bf-storage`, `bf-wal`, and `blowfish`,
+and their tests (224 passed, 4 ignored). The compatibility suite passes 121/121 in both normal and forced
+indexing modes, both TypeScript smoke runs pass, and the Python compatibility unit tests pass 9/9.
+I cover exact code/vector preservation, f16/f32/i8, filtered queries, sparse slab IDs, corrupt leaf blobs
+and footers, older headers, concurrent publication, resumable slabs, and idempotence.
+
+
+### D1 measurements
+
+I measured 200K-row, 1,024-dimensional f16 namespaces against the parent: live indexed bytes/row fell
+from 4,602.05 to 4,420.90 on synthetic data, from 4,599.68 to 4,419.72 on the NQ embedding slice, and
+from 7,015.65 to 6,652.72 after recluster. ANN objects fell from 3 to 1, and from 15 to 7 with six slabs.
+The upgrades wrote 443.07 / 442.83 / 889.21 MB in 3.11 / 4.80 / 10.19 seconds, at 911 / 878 / 875 MiB RSS.
+
+I used four alternating old/new query rounds on shared CPUs 6–7. All 3,072 paired warm responses and
+60 paired cold responses matched IDs and scores; recall@10 stayed identical. Median instructions/query
+changed +0.18%, +0.15%, and -0.45%, and latency stayed within the observed spread. Cold requests fell
+in every case. Synthetic unfiltered reads grew 6.0% (4.3% reclustered), while NQ unfiltered reads were
+nearly flat and filtered bytes fell 9.5–24.2%; I document that coalescing/alignment tradeoff explicitly.
+Details and reproduction: `docs/benchmarks.md`, “Round D1”. The full 2.68M NQ corpus remains unmeasured.

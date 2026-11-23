@@ -32,7 +32,7 @@ async fn one_bit_centers_rank_clusters_and_fragments_round_trip() {
     let mut indexes = Vec::new();
     for s in 0..3 {
         let blob = builder.build(&rows(2000, dims, s)).unwrap();
-        let (fragment, meta) = Fragment::build(&blob).unwrap();
+        let (fragment, meta) = Fragment::build_ann(&blob).unwrap();
         assert!(meta < fragment.len() as u64);
         let frag = Fragment::decode(&fragment[..meta as usize]).unwrap();
         sources.push((format!("s{s}"), format!("k{s}"), format!("f{s}"), frag));
@@ -101,7 +101,7 @@ async fn membership_gives_exact_cluster_counts_and_vector_locations() {
         });
     let data = rows(3000, dims, 5);
     let blob = builder.build(&data).unwrap();
-    let (fragment, meta) = Fragment::build(&blob).unwrap();
+    let (fragment, meta) = Fragment::build_ann(&blob).unwrap();
     let frag = Fragment::decode(&fragment[..meta as usize]).unwrap();
     let bytes = Directory::build(&[("s".into(), "k".into(), "f".into(), frag)])
         .unwrap()
@@ -126,7 +126,7 @@ async fn membership_gives_exact_cluster_counts_and_vector_locations() {
         .exact_search(&query, 10, Some(&allowed))
         .await
         .unwrap();
-    let partial = dir.partial_index(0, Bytes::from(blob)).unwrap();
+    let partial = dir.partial_index(0, Bytes::from(fragment)).unwrap();
     let locations = membership.locations(&allowed, |_| true);
     assert_eq!(locations.len() as u64, allowed.len());
     let got = partial.exact_at(&query, 10, locations).await.unwrap();
@@ -134,7 +134,7 @@ async fn membership_gives_exact_cluster_counts_and_vector_locations() {
 }
 
 #[tokio::test]
-async fn block_fragments_hold_blob_and_codes_together_and_scan_like_the_index() {
+async fn ann_object_holds_blob_and_codes_together_and_scans_like_the_index() {
     let dims = 64;
     let builder = IndexBuilder::new(dims, Metric::CosineDistance)
         .unwrap()
@@ -144,7 +144,7 @@ async fn block_fragments_hold_blob_and_codes_together_and_scan_like_the_index() 
         });
     let blob = builder.build(&rows(4000, dims, 9)).unwrap();
     let index = Index::open(Bytes::from(blob.clone())).await.unwrap();
-    let (fragment, meta) = Fragment::build_blocks(&blob).unwrap();
+    let (fragment, meta) = Fragment::build_ann(&blob).unwrap();
     assert!(meta < fragment.len() as u64);
     let frag = Fragment::decode(&fragment[..meta as usize]).unwrap();
     let bytes = Directory::build(&[("s".into(), "k".into(), "f".into(), frag)])
@@ -153,33 +153,15 @@ async fn block_fragments_hold_blob_and_codes_together_and_scan_like_the_index() 
     let dir = Directory::decode(&bytes).unwrap();
     let seg = &dir.segments()[0];
     assert!(seg.codes_in_fragment);
-    assert!(seg.membership.is_none());
+    assert!(seg.membership.is_some());
     // Each block is the blob followed by the codes, so one range covers both.
     for e in dir.entries() {
         assert_eq!(e.blob_range().end, e.codes_range().start);
     }
-    // A plain fragment and a block fragment cannot share a directory.
-    let (plain, plain_meta) = Fragment::build(&blob).unwrap();
-    let mixed = Directory::build(&[
-        (
-            "a".into(),
-            "k".into(),
-            "f".into(),
-            Fragment::decode(&fragment[..meta as usize]).unwrap(),
-        ),
-        (
-            "b".into(),
-            "k".into(),
-            "f".into(),
-            Fragment::decode(&plain[..plain_meta as usize]).unwrap(),
-        ),
-    ])
-    .unwrap();
-    assert!(mixed.is_none());
     // Probing clusters through the fragment gives the index's own estimates.
     let query: Vec<f32> = rows(1, dims, 5)[0].1.clone();
     let wanted: Vec<usize> = dir.entries().iter().take(6).map(|e| e.cluster).collect();
-    let mut partial = dir.partial_index(0, Bytes::from(blob)).unwrap();
+    let mut partial = dir.partial_index(0, Bytes::from(fragment.clone())).unwrap();
     let mut codes = Vec::new();
     for e in dir.entries().iter().take(6) {
         let b = e.blob_range();
@@ -239,7 +221,7 @@ async fn paged_directory_round_trips_and_selects_the_nearest_cells() {
     let mut sources = Vec::new();
     for s in 0..3 {
         let blob = builder.build(&rows(2000, dims, s)).unwrap();
-        let (fragment, meta) = Fragment::build_blocks(&blob).unwrap();
+        let (fragment, meta) = Fragment::build_ann(&blob).unwrap();
         let frag = Fragment::decode(&fragment[..meta as usize]).unwrap();
         sources.push((format!("s{s}"), format!("k{s}"), format!("f{s}"), frag));
     }

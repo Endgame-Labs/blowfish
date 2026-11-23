@@ -19,6 +19,9 @@ Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, stro
   default 64 probes, and `387 q/s` as loaded (main `269`).
   [Iteration 22](#iteration-22-the-fixed-costs-of-a-warm-vector-query-beir-nq-one-machine): 40% fewer instructions and
   20% fewer cycles a query at the same recall@10 (`0.961`), and `574 q/s` against main's `509` on a shared VM.
+  [Automatic recluster](#automatic-recluster-rounds-r1-and-r2-beir-nq-one-machine): the server reclusters NQ by itself
+  in `231 s` after the load, at recall@10 `0.962` and `587 q/s`. With 5% of rows rewritten afterwards, a query costs
+  `20.9 M` instructions against `15.5 M` fully covered.
 - **My own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; at 100M, still `"warm"` at `201 ms` after a day idle); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
 
 ## Scope and status
@@ -3473,3 +3476,285 @@ Against iteration 21's profile, JSON parsing fell from about 5% (plus `serde_pat
   graph over leaf centers (`docs/design/graph-index.md`), is the next lever for both q/s and recall.
 - JSON parsing of the 1,024 numbers is still about 4%. Base64 vectors would skip it.
 - Each probed slab still builds and drops an index of stubs (about 1.4%), and cache lookups cost about 3%.
+
+## Round D1: one ANN object per segment and slab (2026-11-23)
+
+I compared parent `587b8fe` with D1 (`c4d1878`) on three local namespaces, each with 200,000 rows and
+1,024-dimensional f16 vectors. The synthetic namespace has one final segment; its reclustered copy adds
+six slabs and 998 leaves. The NQ slice uses the first 200,000 corpus embeddings and the first 128 held-out
+queries prepared by `bench/nq`, with the harness's short synthetic text and bucket attributes. I measured
+ANN recall against exact neighbors within the slice; the full 2.68M corpus and qrels scoring remain unmeasured.
+
+I used release builds with debug information and LTO disabled on a shared x86-64 VM, pinned every client
+and engine process to CPUs 6–7, and limited Rayon and Tokio to two workers. Another CPU study shared those
+cores, so I used four alternating old/new rounds for latency and instruction counts. I restored isolated
+format-2 controls from retained pre-upgrade checkpoints and immutable objects; the upgraded prefixes kept
+their format-3 fences. Both source snapshots used the same updated `bench.rs` input harness.
+
+### Live indexed footprint
+
+I summed manifest-referenced segment files, live masks, ANN directories, slabs, and text statistics.
+These are logical object payload bytes; I exclude WAL history, manifests, retired objects awaiting GC,
+and the storage layer's 24-byte create envelope. The remaining `.bff` object is the ID filter.
+
+| Namespace | ANN objects, before → after | ANN bytes/row, before → after | Indexed bytes/row, before → after | Indexed reduction |
+|---|---:|---:|---:|---:|
+| Synthetic, as loaded | 3 → 1 | 2,396.02 → 2,215.33 | 4,602.05 → 4,420.90 | 3.94% |
+| NQ slice, as loaded | 3 → 1 | 2,393.65 → 2,214.15 | 4,599.68 → 4,419.72 | 3.91% |
+| Synthetic, reclustered | 15 → 7 | 4,808.50 → 4,446.04 | 7,015.65 → 6,652.72 | 5.17% |
+
+I removed the duplicate ANN codes and cluster blobs in this round. Document vectors and the additive
+slab vector copies remain for D2 and D4; the larger disk-footprint target depends on those rounds.
+
+### Query parity and latency
+
+I used `scale_query` with 48 probes, `top_k: 10`, strong consistency, and only IDs in the projection.
+Each alternating run warmed 256 queries and timed the same 256: 128 unfiltered and 128 with
+`bucket Eq 3` (one sixteenth of the rows). Warm values below are medians of four run percentiles.
+Cold values are medians of ten paired queries, each in a fresh process with empty blowfish caches.
+The OS page cache was retained; these are local file measurements, not S3 cold measurements.
+
+| Namespace / query | Warm p50 ms, before → after | Warm p99 ms, before → after | Cold p50 ms, before → after |
+|---|---:|---:|---:|
+| Synthetic, as loaded, ann | 2.64 → 2.61 | 14.87 → 14.15 | 30.89 → 33.14 |
+| Synthetic, as loaded, filtered | 2.59 → 2.55 | 15.48 → 12.76 | 47.15 → 34.36 |
+| NQ slice, as loaded, ann | 1.48 → 1.47 | 8.47 → 9.06 | 30.33 → 27.83 |
+| NQ slice, as loaded, filtered | 2.67 → 2.82 | 12.74 → 14.15 | 65.35 → 64.28 |
+| Synthetic, reclustered, ann | 3.27 → 2.83 | 15.75 → 14.84 | 51.41 → 43.67 |
+| Synthetic, reclustered, filtered | 2.74 → 2.34 | 11.88 → 12.07 | 54.75 → 38.95 |
+
+I found no latency regression outside the observed spread. For example, synthetic unfiltered warm p50
+ranged from 2.46 to 2.91 ms before and 2.04 to 3.08 ms after; its cold samples ranged from 24.52 to
+35.51 ms before and 24.86 to 43.26 ms after. Shared-core scheduling makes the tail percentiles noisy.
+
+I compared 3,072 paired timed responses and 60 additional paired cold responses: every ID list matched,
+and every distance matched within 1e-6. The 20-query recall@10 checks also remained identical: synthetic
+as loaded `0.985`, NQ `0.985`, and reclustered synthetic `1.000`; filtered recall was `0.965`, `0.975`,
+and `0.965`, respectively. Unit tests additionally compare the stored codes and vector bytes directly.
+
+### Instructions and cold reads
+
+I ran `perf stat` over each old/new arm. Instructions per query include process setup, the 256-query
+warm-up pass, the 256 timed queries, diagnostics, and result serialization, divided by 512. Each workload
+is half filtered and half unfiltered ANN. The table reports median and full range across four runs.
+
+| Namespace | Old M instructions/query [min–max] | New M instructions/query [min–max] | Median change |
+|---|---:|---:|---:|
+| Synthetic, as loaded | 11.276 [11.253–12.185] | 11.297 [11.264–12.162] | +0.18% |
+| NQ slice, as loaded | 8.860 [8.819–9.687] | 8.873 [8.825–9.731] | +0.15% |
+| Synthetic, reclustered | 12.287 [12.233–13.105] | 12.232 [12.221–13.276] | -0.45% |
+
+I recorded backend requests and transferred bytes for the ten cold queries per case. These include
+snapshot requests and search reads, with decimal MB. Repeating the first query four times gave exactly
+the same request count and byte total in every arm.
+
+| Namespace / query | Mean requests, before → after | Mean MB read, before → after | Byte change |
+|---|---:|---:|---:|
+| Synthetic, as loaded, ann | 32.5 → 31.2 | 26.55 → 28.15 | +6.0% |
+| Synthetic, as loaded, filtered | 46.0 → 43.6 | 32.07 → 24.32 | -24.2% |
+| NQ slice, as loaded, ann | 32.2 → 31.7 | 22.18 → 22.05 | -0.6% |
+| NQ slice, as loaded, filtered | 67.2 → 65.5 | 42.87 → 38.81 | -9.5% |
+| Synthetic, reclustered, ann | 36.1 → 32.2 | 32.29 → 33.67 | +4.3% |
+| Synthetic, reclustered, filtered | 46.0 → 43.6 | 32.07 → 24.32 | -24.2% |
+
+All six cases use fewer backend requests. The synthetic unfiltered cases read more bytes; I infer
+coalescing gaps and cache-block alignment after moving vectors into tour order account for that tradeoff.
+The NQ unfiltered mean is nearly unchanged, and filtered reads shrink substantially. I keep this byte
+increase visible as a tradeoff; the local latency spread does not establish an S3 speedup.
+
+### Upgrade
+
+I ran `blowfish reindex` on each old prefix while pinned to CPUs 6–7, without queries running during
+its timed interval. The reported write bytes cover ANN objects; directory and manifest writes are extra.
+
+| Namespace | Segment indexes + slabs rewritten | ANN bytes written | Wall seconds | Peak RSS MiB |
+|---|---:|---:|---:|---:|
+| Synthetic, as loaded | 1 + 0 | 443,066,848 | 3.11 | 911 |
+| NQ slice, as loaded | 1 + 0 | 442,829,696 | 4.80 | 878 |
+| Synthetic, reclustered | 1 + 6 | 889,207,104 | 10.19 | 875 |
+
+A second run rewrote zero objects and published nothing in all three cases. The parent binary refused
+every upgraded prefix with `BucketFormat { required: 3, supported: 2 }`. A CLI dry run left an isolated
+format-2 prefix unchanged. Concurrent writes, partial slab batches, and resident generation refresh are
+covered separately by Rust tests. The follow-up below checks queries during conversion, including mixed
+segment and slab sets.
+
+### Queries during the automatic upgrade
+
+I followed up with queries at 0%, 50%, and 100% conversion. I loaded each 200K-row namespace in four
+50K-row batches; the indexer combined them into two ANN segments. I also measured each namespace
+reclustered into six slabs, with 997 leaves. I used a 60K-row cap for NQ; synthetic data produced the
+same six slabs at both the 50K and 60K caps used in its two passes. That gives actual halfway checkpoints:
+one of two segment indexes, or three of six slabs, converted. I constructed legacy-format fixtures from
+the same trained clusters and vectors, then used the real fenced reindex publisher, one object per batch.
+
+I ran two complete passes per input on CPUs 6–7, with two Tokio workers and two Rayon workers. At each
+checkpoint, a new engine warmed all 128 requests and then timed them: 64 unfiltered ANN queries and
+64 with `bucket Eq 3`. I used 48 probes, a rerank factor of 32, `top_k: 10`, and IDs in the projection.
+Recall uses exact neighbors for the first 16 queries of each kind. These are separate query and segment
+layouts from the completed-layout comparison above; I compare their migration stages with each other.
+
+I report the median of the two run percentiles below. These are local warm timings. A new engine shares
+the storage cache, and I retained the OS page cache, so I do not label its first query as cold.
+
+| Namespace / query | 0% p50 / p90 ms | 50% p50 / p90 ms | 100% p50 / p90 ms | Median ANN rows, every stage | Recall@10, every stage |
+|---|---:|---:|---:|---:|---:|
+| Synthetic, segments, ANN | 2.71 / 5.20 | 2.21 / 3.14 | 2.22 / 3.38 | 43,733 | 0.86250 |
+| Synthetic, segments, filtered | 2.39 / 5.95 | 2.07 / 3.23 | 2.10 / 3.49 | 14,453 | 0.90000 |
+| Synthetic, slabs, ANN | 1.79 / 2.43 | 2.25 / 2.91 | 2.50 / 3.82 | 21,816 | 0.99375 |
+| Synthetic, slabs, filtered | 1.76 / 2.50 | 2.27 / 3.28 | 2.65 / 4.28 | 14,453 | 0.90000 |
+| NQ, segments, ANN | 1.27 / 2.08 | 1.09 / 1.75 | 1.00 / 1.48 | 28,836 | 0.96875 |
+| NQ, segments, filtered | 2.77 / 3.55 | 2.48 / 3.33 | 2.24 / 2.87 | 82,943 | 1.00000 |
+| NQ, slabs, ANN | 1.31 / 2.24 | 1.56 / 3.00 | 1.77 / 3.30 | 24,297 | 0.97500 |
+| NQ, slabs, filtered | 2.60 / 3.50 | 3.18 / 5.25 | 3.51 / 5.55 | 82,943 | 1.00000 |
+
+Every timed query recorded zero `document_scan_rows`: none of the 3,072 timed responses required a
+scan of document vectors. All ID lists matched their zero-converted baseline. The minimum, median, and
+maximum `ann_rows_scanned` also matched at every checkpoint and on both passes. I count rows in selected
+leaf code blocks or exact ANN ranges, including filtered-out rows in a fetched code block.
+
+Mixed slab p50 increased about 26% on synthetic data and 20% on NQ relative to zero converted. The
+filtered rows in those same slab runs still use the unchanged, fully converted segment indexes; their
+p50 increased about 29% and 22%, respectively. I therefore cannot attribute the timing drift to the
+mixed format alone. The table retains that variation, including p90, while the probe work and recall
+remain unchanged. I measured no S3 cold queries or 100M queries in this follow-up. The small directories
+here are flat; regression tests separately force paged directories through every slab conversion batch.
+
+The original failure happened when any segment lacked `annv2:`, or a partial batch left a directory
+whose immutable keys no longer covered its segments or slabs. I now rebuild directories across mixed
+objects. Before the first publication, upgrade-only readers use an existing old directory or assemble
+resident leaf metadata without writing storage. Legacy code flags and membership maps feed the same
+global leaf selection and rerank as current objects; migration does not require document-vector scans.
+
+I keep the reproduction harness in `crates/bf-engine/src/reindex_migration_tests.rs`. I build it with:
+
+```sh
+source ~/.cargo/env
+CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_LTO=false \
+  nice -n 19 cargo test --release -p bf-engine --lib migration_200k_benchmark --no-run -j 2
+```
+
+I set `TEST_BINARY` to the test executable printed by Cargo, then run:
+
+```sh
+RAYON_NUM_THREADS=2 TOKIO_WORKER_THREADS=2 taskset -c 6,7 timeout 1800 \
+  "$TEST_BINARY" migration_200k_benchmark --ignored --nocapture
+```
+
+For NQ, I additionally set `D1_CORPUS_F16` to raw little-endian f16 corpus bytes and `D1_QUERIES_F32`
+to the first 64 query vectors as raw f32. The preparation harness's `corpus.f16` is a NumPy file, so
+I strip its NumPy header before exporting the first 200K rows. I keep inputs and logs under `.scratch/`;
+the test removes its disposable object store when it finishes.
+
+### Reproduction notes
+
+I use separate source snapshots and build directories for the parent and D1, copy the updated
+`crates/bf-engine/examples/bench.rs` into the parent snapshot, and save a consistent old-prefix copy
+before running the upgrade. Every data directory and log belongs under `.scratch/` and is removed after
+I copy the useful results here. The 200K input command is:
+
+```sh
+source ~/.cargo/env
+CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_LTO=false \
+  nice -n 19 cargo build --release -p bf-engine --example bench --example scale_query -j 2
+RAYON_NUM_THREADS=2 TOKIO_WORKER_THREADS=2 taskset -c 6,7 timeout 1800 \
+  target/release/examples/bench --url "file://$PWD/.scratch/d1/store" \
+  --rows 200000 --dims 1024 --batch 25000 --queries 128 --recall-queries 20 \
+  --nprobe 48 --vector-type f16
+```
+
+For NQ, I export the first 200K rows from the harness's NumPy `corpus.f16` file to raw little-endian f16,
+and the first 128 `queries.npy` rows to raw f32. I add `--corpus-f16 RAW_CORPUS --queries-f32 RAW_QUERIES`.
+The indexed-byte and ANN-object totals are included in the harness output. For the alternating runs,
+I supply `scale_query` a read-only storage JSON and a workload JSON containing 128 held-out vectors,
+each once unfiltered and once with `bucket Eq 3`, and run four old/new rounds:
+
+```sh
+BF_ANN_NPROBE=48 RAYON_NUM_THREADS=2 TOKIO_WORKER_THREADS=2 \
+  "$PERF" stat -x ";" --no-big-num -e instructions,cycles -o "$RUN/counters.txt" -- \
+  taskset -c 6,7 timeout 180 "$SCALE_QUERY" storage.json workloads.json NAMESPACE 1 warmup
+```
+
+I use the installed `perf` executable directly when its kernel-version wrapper cannot find it. A
+single-request workload without `warmup` produces the cold backend request and byte diagnostics.
+I validate with strict clippy and the tests for the five changed crates (224 passed, 4 ignored),
+121/121 compatibility scenarios in both normal and forced indexing modes, both TypeScript smoke runs,
+and 9/9 Python compatibility unit tests.
+
+## Automatic recluster, rounds R1 and R2 (BEIR NQ, one machine)
+
+This round makes the recluster automatic (`docs/design/auto-recluster.md`, rounds R1 and R2): the server builds a base
+tier of slabs in the background and installs it in its own indexer publication. Unfiltered ANN runs one plan over the
+tier and the segments written since. Same VM and harness as
+[Iteration 22](#iteration-22-the-fixed-costs-of-a-warm-vector-query-beir-nq-one-machine): server pinned to CPUs 0-5 in
+a 12 GB scope, clients on CPUs 6-7, 64 probes, and other workers' builds sharing the VM (load average 4 to 15), so I
+report hardware counters per query next to wall-clock q/s.
+
+### Load, then the job, unattended
+
+I loaded all 2,681,468 rows into a fresh store (`load.py`, four requests in flight) and did nothing else.
+
+- **Load:** 268.7 s (9,979 rows/s). Compaction was pending at every publication of the load, so the trigger deferred
+  31 times (`reason="compaction"`) and no build competed with ingest.
+- **Trigger:** about a minute after the last write, the trigger saw 2,681,468 rows in 27 segments and no tier
+  (gain 4.2) and started a base build.
+- **Build:** 231 s on half of the six cores: vectors copied at 15 s, cells at 21 s, 13,393 leaves trained at 64 s,
+  rows assigned at 104 s, refined at 172 s, 32 slabs planned at 193 s and written by 231 s. The job sized slabs at
+  536,870 rows from the memory budget. Server RSS during the build was at most 791 MB (sampled every 20 s); the
+  server's peak, 3.4 GB, was during the load.
+- **Queries afterwards:**
+
+| Layout | Recall@10 | Recall@100 (qrels) | nDCG@10 | p50 / p95 / p99 ms (1 client) | q/s at 1 / 4 / 16 |
+|---|---:|---:|---:|---|---|
+| main, reclustered by hand (Iteration 22) | 0.961 | 0.937 | | 4.3 / 7.8 / 11.2 | 574 at 16 |
+| automatic tier | **0.962** | 0.934 | 0.608 | 4.4 / 7.8 / 10.9 | 181 / 307 / **587** |
+
+The automatic tier answers like main's hand-built one. With four warm-up passes, a query costs 15.5 M instructions
+and 19.9 M cycles (Iteration 22: 15.3 M and 21.4 M).
+
+An earlier run of the same load, with a different flush timing, built at 175,000 rows (168 s) and again at 1,595,000
+(257 s) during the load, then deferred for the bulk load and never evaluated again: a deferral marked the manifest
+generation as evaluated, and no more publications came. A deferred or failed evaluation now comes due again after a
+minute (ten for a failure).
+
+### Writes after the tier
+
+I rewrote the last 5% of rows (134,073 rows, titles changed so the upserts are not no-ops) and measured instructions and
+cycles per query at 16 clients (four warm-up passes, then four measured; the q/s columns are from `run.sh`).
+
+| Layout | Instructions / query | Cycles / query | Recall@10 | q/s at 16 |
+|---|---:|---:|---:|---:|
+| tier covers every row | 15.5 M | 19.9 M | 0.962 | 587 |
+| 5% of covered rows deleted (tier masked, nothing outside it) | 16.3 M | 21.5 M | | |
+| 5% rewritten, first R1 plan (two warm-up passes) | 35.3 M | 36.7 M | 0.962 | 420 |
+| 5% rewritten, this round | **20.9 M** | 28.1 M | 0.959 | 511 |
+
+The first R1 plan searched the rows outside the tier through the namespace directory with covered segments skipped,
+but it still ranked every covered segment's centers, rebuilt the tier's live-row mask on every query, and probed the
+134,073 rows as if they were a namespace of their own: about a third of the tier's scanned rows for 5% of the data.
+Now covered segments' sections are left out of the center ranking, the mask is built once per live generation, and
+the search beside a tier probes `sqrt(rows outside / all rows)` of a standalone probe, the share one clustering of all
+rows would give them. Recall@10 went from 0.960 to 0.959 with that last change.
+
+The 5.4 M instructions still over a fully covered query are the second search's fixed costs (five more segments, a
+second rerank pool, and plan work over the whole directory). R3's delta tier replaces that search.
+
+### The rebuild trigger
+
+I then rewrote 25.4% of rows (681,468, another title change) in 105 s. The trigger deferred for the bulk load at every
+minute for five minutes (`reason="bulk_load"`, covered 2,681,468, outside 681,468, gain 3.6), then rebuilt the base
+over every live row in 287 s. The build added about 150 MB to the 6.5 GB the server held after the write load (its peak,
+9.2 GB, was during the writes, not the build).
+
+### Crash safety
+
+`crates/bf-engine/tests/auto_recluster.rs` injects failures into the object store:
+
+- A build that dies after uploading two slab objects leaves the namespace answering from its current tier. GC (retention
+  zero) keeps the dead build's objects while its record is fresh, and deletes them as orphans once it is stale. The
+  installed tier's objects stay, and the spill directory is empty.
+- An install publication that fails, before or after writing (the ambiguous case), is retried. GC at retention zero then
+  keeps every slab the manifest references, and a fresh engine answers from the tier.
+
+Both found bugs before they passed: the build-record listing used a partial path segment and found no records, and GC
+deleted fresh records at retention zero.

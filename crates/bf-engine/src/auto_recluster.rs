@@ -101,7 +101,7 @@ pub(crate) fn layout(
         .iter()
         .flat_map(|t| t.covered.iter().map(|c| c.segment.as_str()))
         .collect();
-    let key = format!("ann:{attr}");
+    let key = format!("annv2:{attr}");
     let uncovered: Vec<u64> = segments
         .iter()
         .filter(|s| s.files.contains_key(&key) && !covered.contains(s.id.as_str()))
@@ -146,16 +146,16 @@ pub(crate) fn decide(
     bulk: bool,
     compacting: bool,
 ) -> (Decision, Option<Layout>) {
-    // Vector attributes every segment has an index and a block fragment for.
+    // Vector attributes every segment has a current ANN object for (an older layout is upgraded
+    // first, by `reindex`).
     let attrs: BTreeSet<String> = segments
         .iter()
         .flat_map(|s| s.files.keys())
-        .filter_map(|k| k.strip_prefix("ann:").map(str::to_string))
+        .filter_map(|k| k.strip_prefix("annv2:").map(str::to_string))
         .filter(|a| {
-            segments.iter().all(|s| {
-                s.files.contains_key(&format!("ann:{a}"))
-                    && s.files.contains_key(&format!("annfrag2:{a}"))
-            })
+            segments
+                .iter()
+                .all(|s| s.files.contains_key(&format!("annv2:{a}")))
         })
         .collect();
     for attr in attrs {
@@ -771,8 +771,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "id": id, "wal_start": 0, "wal_end": 0, "row_count": rows,
             "files": {
-                "ann:v": {"key": format!("{id}/a"), "size": 1, "metadata_len": 0},
-                "annfrag2:v": {"key": format!("{id}/b"), "size": 1, "metadata_len": 0}
+                "annv2:v": {"key": format!("{id}/a"), "size": 1, "metadata_len": 0}
             },
             "live": {"key": "k", "size": 0, "metadata_len": 0},
             "live_generation": 0
