@@ -366,6 +366,7 @@ name = "bf-vector"
 version = "0.1.13"
 dependencies = [
  "base64 0.23.1",
+ "bf-vector",
  "bytes",
  "crc32fast",
  "futures",

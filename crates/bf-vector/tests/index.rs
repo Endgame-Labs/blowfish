@@ -538,17 +538,8 @@ async fn fast_scan_and_row_major_codes_rank_alike() {
         .map(|(r, v)| (r, v.into_iter().map(|x| x + 100.).collect()))
         .collect();
     for metric in [Metric::EuclideanSquared, Metric::CosineDistance] {
-        let build = |fastscan: bool| {
-            IndexBuilder::new(96, metric)
-                .unwrap()
-                .params(BuildParams {
-                    fastscan,
-                    ..Default::default()
-                })
-                .build(&data)
-                .unwrap()
-        };
-        let (fast, rows) = (build(true), build(false));
+        let fast = IndexBuilder::new(96, metric).unwrap().build(&data).unwrap();
+        let rows = bf_vector::downgrade_layout(&fast).unwrap().unwrap();
         assert_ne!(fast.len(), rows.len(), "the layouts differ");
         let fast = Index::open(Bytes::from(fast)).await.unwrap();
         let rows = Index::open(Bytes::from(rows)).await.unwrap();
