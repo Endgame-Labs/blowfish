@@ -182,23 +182,16 @@ that was reclustered before paging existed, without rebuilding any slab.
 
 ### Recluster leaf assignment
 
-`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. For a
-layout with at most 1,024 leaves in its largest cell (about 6.5M rows at the default 32 cells and 200 rows per leaf),
-each row then joins its nearest leaf among the leaves of its four nearest cells, not only its own cell's. Every leaf
-center is then recomputed once from all of its rows, so rows near a cell boundary sit with their true neighbors. On
-BEIR NQ (2.68M rows, about 420 leaves a cell), recall@10 at 64 probes went from 0.955 to 0.960, and 54 probes now give
-what 64 gave. The job took 240 s instead of 160 s.
+`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters two-level on a sample of its rows
+(about the square root of the leaves as parents, then each parent's share of leaves). Each row then joins its nearest
+leaf among the leaves of its four nearest cells, not only its own cell's, searching the 12 nearest parent groups. Every
+leaf center is then recomputed once from all of its rows and the rows assigned again, so rows near a cell boundary sit
+with their true neighbors. There are no settings: this is the only assignment.
 
-The cost grows faster than the rows. The leaves are trained with one-level k-means, and each row is compared with
-about 16 times the square root of a cell's leaves. With NQ split into 8 cells (about 1,700 leaves a cell, the size of a
-10M layout's cells), the job took 508 s instead of 93 s, at about the same peak memory (2.0 GB). Larger layouts, such
-as the published 10M and 100M ones, therefore keep the per-cell assignment unless it is forced on.
-
-| What | Default | Variable |
-| --- | --- | --- |
-| Assign rows across cells: `1` always, `0` never (each cell's rows clustered on their own, as before iteration 20) | when the largest cell has at most 1,024 leaves | `BF_RECLUSTER_GLOBAL` |
-| Leaf groups a row is compared with, over its four nearest cells | 12 | `BF_RECLUSTER_GROUPS` |
-| Rounds of recomputing leaf centers from their rows and assigning again | 1 | `BF_RECLUSTER_REFINE` |
+On BEIR NQ (2.68M rows), recall@10 at 64 probes is 0.960 at the default 32 cells (0.955 with each cell clustered on its
+own), and 0.961 with the rows forced into 8 cells (about 1,700 leaves a cell, the size of a 10M layout's cells; 0.950 on
+its own). The 8-cell job took about the same time and memory as the per-cell assignment it replaced: see
+[Iteration 21](benchmarks.md#iteration-21).
 
 ### ANN probes and query concurrency
 

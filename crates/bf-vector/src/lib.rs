@@ -11,7 +11,8 @@ mod index;
 mod reader;
 pub use bytes::Bytes;
 pub use cluster::{
-    BuildParams, IndexBuilder, VectorType, kmeans, nearest_center, prepare_vector, squared_distance,
+    BuildParams, IndexBuilder, VectorType, dots_x4, kmeans, kmeans_two_level, nearest_center,
+    prepare_vector, squared_distance,
 };
 pub use directory::{
     DirEntry, DirSegment, Directory, Fragment, Membership, Page, PagedDirectory, PartialIndex,

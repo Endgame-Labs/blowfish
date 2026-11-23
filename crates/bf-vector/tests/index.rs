@@ -581,3 +581,30 @@ async fn fast_scan_and_row_major_codes_rank_alike() {
         }
     }
 }
+
+#[test]
+fn two_level_kmeans_gives_the_leaves_asked_for_and_is_deterministic() {
+    let mut state = 7u64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    };
+    let data: Vec<Vec<f32>> = (0..3_000)
+        .map(|_| (0..16).map(|_| next()).collect())
+        .collect();
+    let refs: Vec<&[f32]> = data.iter().map(Vec::as_slice).collect();
+    let (parents, children) = bf_vector::kmeans_two_level(&refs, 100, 4, 9);
+    assert_eq!(parents.len(), 10);
+    assert_eq!(children.len(), 10);
+    assert_eq!(children.iter().map(Vec::len).sum::<usize>(), 100);
+    assert!(children.iter().flatten().all(|c| c.len() == 16));
+    assert_eq!(
+        bf_vector::kmeans_two_level(&refs, 100, 4, 9),
+        (parents, children)
+    );
+    // Fewer rows than leaves: one leaf per row at most.
+    let (_, few) = bf_vector::kmeans_two_level(&refs[..5], 100, 4, 9);
+    assert!(few.iter().map(Vec::len).sum::<usize>() <= 5);
+}
