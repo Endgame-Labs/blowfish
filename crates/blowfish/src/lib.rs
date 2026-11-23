@@ -6,7 +6,7 @@ mod operations;
 use axum::{
     Extension, Json, Router,
     extract::{
-        DefaultBodyLimit, MatchedPath, Path, Query, Request, State,
+        DefaultBodyLimit, FromRequest, MatchedPath, Path, Query, Request, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode},
@@ -557,12 +557,45 @@ async fn write(
     }
     Ok(Json(response).into_response())
 }
+/// `Json<T>`, with the same rejections, that parses a valid body without
+/// `serde_path_to_error`'s per-value path tracking (several percent of a vector query's CPU).
+/// Only a body that fails to parse is parsed again through `Json`, for its error path.
+struct FastJson<T>(T);
+impl<T, S> FromRequest<S> for FastJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = JsonRejection;
+    async fn from_request(req: Request, state: &S) -> Result<Self, JsonRejection> {
+        // As `Json` decides it, so every other body gets `Json`'s own rejection.
+        let json = req
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<mime::Mime>().ok())
+            .is_some_and(|m| {
+                m.type_() == "application"
+                    && (m.subtype() == "json" || m.suffix().is_some_and(|s| s == "json"))
+            });
+        if !json {
+            return Json::<T>::from_request(req, state)
+                .await
+                .map(|Json(v)| Self(v));
+        }
+        let bytes = axum::body::Bytes::from_request(req, state).await?;
+        match serde_json::from_slice(&bytes) {
+            Ok(v) => Ok(Self(v)),
+            Err(_) => Json::<T>::from_bytes(&bytes).map(|Json(v)| Self(v)),
+        }
+    }
+}
 async fn query(
     Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
-    input: Result<Json<QueryRequest>, JsonRejection>,
+    input: Result<FastJson<QueryRequest>, JsonRejection>,
 ) -> Result<Json<QueryResponse>, HttpError> {
-    let request = body(input)?;
+    let request = body(input.map(|FastJson(v)| Json(v)))?;
     let response = s.engine.query(&ns, request.clone()).await?;
     record_query(&request);
     metrics::counter!("blowfish_query_rows_scanned_total")

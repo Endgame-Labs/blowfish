@@ -489,6 +489,7 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
+ "mime",
  "percent-encoding",
  "reqwest",
  "serde",
