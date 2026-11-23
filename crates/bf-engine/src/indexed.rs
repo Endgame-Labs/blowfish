@@ -2,7 +2,7 @@
 use crate::{EngineConfig, NamespaceState, filter, query, segment, snapshot};
 use bf_storage::Storage;
 use bf_types::*;
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use std::{
     cmp::Ordering,
@@ -71,16 +71,16 @@ pub(crate) async fn execute(
     if let Some(queries) = &request.queries
         && request.rerank_by.is_none()
     {
-        let mut results = Vec::with_capacity(queries.len());
-        for q in queries {
+        let results = futures::future::try_join_all(queries.iter().map(|q| async move {
             let mut q = q.clone();
             q.vector_encoding = request.vector_encoding;
-            results.push(
+            Ok::<_, ApiError>(
                 Box::pin(execute(store, state, &q, config, force_exact))
                     .await?
                     .result,
-            );
-        }
+            )
+        }))
+        .await?;
         return Ok(QueryResponse {
             result: Default::default(),
             results: Some(results),
@@ -88,7 +88,6 @@ pub(crate) async fn execute(
             billing: Default::default(),
         });
     }
-    let mut prepared = state.clone();
     let mut clauses = vec![];
     for q in request
         .queries
@@ -99,8 +98,8 @@ pub(crate) async fn execute(
             text_clauses(rank, &mut clauses);
         }
     }
+    let mut terms = crate::text::QueryTerms::new();
     if !clauses.is_empty() {
-        let mut terms = crate::text::QueryTerms::new();
         for clause in &clauses {
             if let RankBy::Bm25 {
                 attribute, query, ..
@@ -113,9 +112,10 @@ pub(crate) async fn execute(
                     .extend(crate::text::tokens(query, &cfg).into_iter().map(|t| t.text));
             }
         }
-        prepared.corpus = crate::text::global_stats(store, state, &terms).await?;
     }
-    let state = &prepared;
+    // Only text subqueries wait for corpus statistics. In a cold RRF request,
+    // ANN can start its directory and scan reads while those chunks arrive.
+    let statistics = crate::text::global_stats(store, state, &terms).shared();
     let mut candidates = state.clone();
     candidates.docs.clear();
     // Subqueries (for example the ANN and BM25 halves of a hybrid query) read independent
@@ -127,14 +127,36 @@ pub(crate) async fn execute(
             .unwrap_or(std::slice::from_ref(request))
             .iter()
             .map(|q| {
-                prepare(
-                    store,
-                    state,
-                    q,
-                    config,
-                    force_exact,
-                    request.queries.is_none(),
-                )
+                let statistics = statistics.clone();
+                async move {
+                    let mut text = Vec::new();
+                    if let Some(rank) = &q.rank_by {
+                        text_clauses(rank, &mut text);
+                    }
+                    if text.is_empty() {
+                        prepare(
+                            store,
+                            state,
+                            q,
+                            config,
+                            force_exact,
+                            request.queries.is_none(),
+                        )
+                        .await
+                    } else {
+                        let mut prepared = state.clone();
+                        prepared.corpus = statistics.await?;
+                        prepare(
+                            store,
+                            &prepared,
+                            q,
+                            config,
+                            force_exact,
+                            request.queries.is_none(),
+                        )
+                        .await
+                    }
+                }
             }),
     )
     .await?;
@@ -145,6 +167,9 @@ pub(crate) async fn execute(
         for (rank, scores) in part.scores {
             candidates.scores.entry(rank).or_default().extend(scores);
         }
+    }
+    if !clauses.is_empty() {
+        candidates.corpus = statistics.await?;
     }
     query::execute(&candidates, request)
 }
@@ -211,6 +236,13 @@ async fn prepare(
     force_exact: bool,
     narrow_columns: bool,
 ) -> Result<NamespaceState, ApiError> {
+    let threshold = (matches!(q.rank_by, Some(RankBy::Bm25 { .. }))
+        && q.limit.as_ref().and_then(Limit::per).is_none())
+    .then(|| {
+        std::sync::Arc::new(bf_text::SearchThreshold::new(
+            q.total().unwrap_or(10) + q.offset,
+        ))
+    });
     if matches!(q.rank_by, Some(RankBy::MultiVector { .. })) {
         return snapshot::materialize(store, state).await;
     }
@@ -238,15 +270,35 @@ async fn prepare(
         {
             let mut tail = state.clone();
             tail.segments.clear();
-            let mut out = prepare_one(store, &tail, q, config, force_exact, narrow_columns).await?;
+            let mut out = prepare_one(
+                store,
+                &tail,
+                q,
+                config,
+                force_exact,
+                narrow_columns,
+                threshold.as_deref(),
+            )
+            .await?;
             out.docs.extend(crate::shared(docs));
             out.scores.entry(rank_key(rank)).or_default().extend(scores);
             trim_candidates(&mut out, q);
             return Ok(out);
         }
     }
-    let Some(context) = crate::read_cache::context().filter(|_| state.segments.len() > 1) else {
-        let mut out = prepare_one(store, state, q, config, force_exact, narrow_columns).await?;
+    let Some(context) = crate::read_cache::context()
+        .filter(|_| state.segments.len() > 1 && (threshold.is_none() || crate::fan_out()))
+    else {
+        let mut out = prepare_one(
+            store,
+            state,
+            q,
+            config,
+            force_exact,
+            narrow_columns,
+            threshold.as_deref(),
+        )
+        .await?;
         trim_candidates(&mut out, q);
         return Ok(out);
     };
@@ -260,6 +312,7 @@ async fn prepare(
         let config = config.clone();
         let q = q.clone();
         let base = base.clone();
+        let threshold = threshold.clone();
         async move {
             let permit = context
                 .cache
@@ -275,7 +328,15 @@ async fn prepare(
                 state.segments.push(segment);
                 runtime.block_on(crate::read_cache::scope(
                     context,
-                    prepare_one(&store, &state, &q, &config, force_exact, narrow_columns),
+                    prepare_one(
+                        &store,
+                        &state,
+                        &q,
+                        &config,
+                        force_exact,
+                        narrow_columns,
+                        threshold.as_deref(),
+                    ),
                 ))
             })
             .await
@@ -294,7 +355,16 @@ async fn prepare(
     }
     let mut tail = state.clone();
     tail.segments.clear();
-    let part = prepare_one(store, &tail, q, config, force_exact, narrow_columns).await?;
+    let part = prepare_one(
+        store,
+        &tail,
+        q,
+        config,
+        force_exact,
+        narrow_columns,
+        threshold.as_deref(),
+    )
+    .await?;
     out.docs.extend(part.docs);
     for (rank, scores) in part.scores {
         out.scores.entry(rank).or_default().extend(scores);
@@ -360,6 +430,7 @@ async fn prepare_one(
     config: &EngineConfig,
     force_exact: bool,
     narrow_columns: bool,
+    threshold: Option<&bf_text::SearchThreshold>,
 ) -> Result<NamespaceState, ApiError> {
     let Some(
         rank @ RankBy::Vector {
@@ -370,7 +441,7 @@ async fn prepare_one(
         },
     ) = &q.rank_by
     else {
-        return prepare_scalar(store, state, q).await;
+        return prepare_scalar(store, state, q, threshold).await;
     };
     if state.metric == DistanceMetric::CosineDistance && vector.iter().all(|x| *x == 0.0) {
         return snapshot::materialize(store, state).await;
@@ -485,6 +556,20 @@ pub(crate) fn recall(ann: &QueryResponse, exact: &QueryResponse) -> f64 {
 
 /// ID indexes above this size are not read whole by BM25 queries.
 pub(crate) const RANGED_IDS_BYTES: u64 = 128 << 10;
+/// A plain BM25 query whose response needs only IDs and scores.
+pub(crate) fn text_ids_only(q: &QueryRequest) -> bool {
+    let ids = match &q.include_attributes {
+        None | Some(IncludeAttributes::All(false)) => true,
+        Some(IncludeAttributes::Names(names)) => names.iter().all(|name| name == "id"),
+        _ => false,
+    };
+    matches!(q.rank_by, Some(RankBy::Bm25 { .. }))
+        && ids
+        && q.filters.is_none()
+        && q.exclude_attributes.is_none()
+        && q.compute_attributes.is_none()
+        && q.limit.as_ref().and_then(Limit::per).is_none()
+}
 pub(crate) fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) {
     match rank {
         RankBy::Bm25 { .. } => clauses.push(rank),
@@ -512,6 +597,7 @@ async fn prepare_segment(
     all: bool,
     k: usize,
     columns: &BTreeSet<String>,
+    threshold: Option<&bf_text::SearchThreshold>,
     mut out: NamespaceState,
 ) -> Result<NamespaceState, ApiError> {
     let open_text = async {
@@ -595,10 +681,16 @@ async fn prepare_segment(
         let stats = state.corpus.get(attribute).unwrap_or(&fallback);
         let top = if all { allowed.len() as usize } else { k };
         let hits = if let Some(reader) = indexes.get(attribute) {
-            reader
-                .search_prefetched(&query, stats, &cfg, top, Some(&allowed))
-                .await
-                .map_err(segment::index_error)?
+            if let Some(threshold) = threshold {
+                reader
+                    .search_prefetched_shared(&query, stats, &cfg, Some(&allowed), threshold)
+                    .await
+            } else {
+                reader
+                    .search_prefetched(&query, stats, &cfg, top, Some(&allowed))
+                    .await
+            }
+            .map_err(segment::index_error)?
         } else {
             let columns = BTreeSet::from([attribute.clone()]);
             let docs = segment::projected_documents(store, seg, &allowed, Some(&columns)).await?;
@@ -677,6 +769,7 @@ async fn prepare_scalar(
     store: &Storage,
     state: &NamespaceState,
     q: &QueryRequest,
+    threshold: Option<&bf_text::SearchThreshold>,
 ) -> Result<NamespaceState, ApiError> {
     let mut clauses = vec![];
     if let Some(rank) = &q.rank_by {
@@ -706,13 +799,7 @@ async fn prepare_scalar(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    if plain_text
-        && q.filters.is_none()
-        && q.include_attributes.is_none()
-        && q.exclude_attributes.is_none()
-        && q.compute_attributes.is_none()
-        && q.limit.as_ref().and_then(Limit::per).is_none()
-    {
+    if text_ids_only(q) {
         columns.clear();
     }
     for clause in &clauses {
@@ -728,6 +815,7 @@ async fn prepare_scalar(
             all,
             k,
             &columns,
+            threshold,
             out.clone(),
         )
     }))

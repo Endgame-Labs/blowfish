@@ -105,16 +105,13 @@ impl OpenHint {
                 }
                 None => {}
             }
-            hint.only_text_ids &= matches!(q.rank_by, Some(RankBy::Bm25 { .. }))
-                && q.filters.is_none()
-                && q.include_attributes.is_none()
-                && q.exclude_attributes.is_none()
-                && q.compute_attributes.is_none()
-                && q.limit.as_ref().and_then(Limit::per).is_none();
-            hint.docs |= q.include_attributes.is_some()
-                || q.exclude_attributes.is_some()
-                || q.compute_attributes.is_some()
-                || q.filters.is_some();
+            let text_ids = crate::indexed::text_ids_only(q);
+            hint.only_text_ids &= text_ids;
+            hint.docs |= !text_ids
+                && (q.include_attributes.is_some()
+                    || q.exclude_attributes.is_some()
+                    || q.compute_attributes.is_some()
+                    || q.filters.is_some());
         }
         if prefetch_scan
             && request.queries.is_none()

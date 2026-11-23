@@ -1150,6 +1150,24 @@ async fn compact_text_keys_remove_winner_id_column_reads() {
         .count();
     // The compact map replaces both the footer prefetch and winner-ID column reads.
     assert_eq!(fast_docs, 0);
+    for projection in [json!(["id"]), json!([]), json!(false)] {
+        e.drop_caches().await;
+        backend.paths.lock().unwrap().clear();
+        let request = serde_json::from_value(json!({
+            "rank_by":["text","BM25","needle"],"top_k":10,"include_attributes":projection,
+        }))
+        .unwrap();
+        let result = e.query("keys", request).await.unwrap().result.rows.unwrap();
+        assert_eq!(result, with_keys);
+        assert!(
+            backend
+                .paths
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(path, _)| !path.contains("docs.bfc"))
+        );
+    }
     manifest.segments[0].files.remove("text_keys");
     wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
         .await

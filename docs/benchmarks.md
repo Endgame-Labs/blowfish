@@ -4247,3 +4247,177 @@ cannot be cancelled by dropping its future; returning early could let a retry sp
 while the previous job still runs. A regression checks that a failed group drains its launched peer,
 leaves uploaded objects for GC, and adopts no partial results. This error-path correction does not
 change the normal NQ workload above, whose text objects and ID maps are already current.
+
+## BM25 round 2: exact MaxScore and hybrid concurrency
+
+I reload the first 1,000,000 MS MARCO passages and use the same 1,000 checked-in dev queries,
+strong consistency, default BM25 parameters, and exhaustive top-10 truth as the previous BM25
+round. Both arms read one immutable format-5 file store, compacted into six segments of 105,000,
+160,000, 200,000, 200,000, 200,000, and 135,000 rows. There is no reindex or layout difference
+between the measured arms. The baseline is `3f2c120`; the implementation is `94c2c77`, `2e30d1d`, and `dba02d0`.
+
+I build both arms with the production release profile: thin LTO, four codegen units, and debug
+level 1. Builds use nice 19 and two jobs, and finish before measurement. I pin servers, clients,
+and perf to CPUs 6–7 at nice 10, with two Rayon workers and two Tokio workers. The block cache
+is 1 GiB, with 4,000-byte blocks, 512-block coalescing, and fetch concurrency 512. I keep the OS
+page cache. This is a local measurement on a shared VM, with a reserved quiet window.
+
+Each warm arm starts a fresh server, makes one unmeasured pass, and then measures all 1,000 queries
+at one and 16 clients over keep-alive HTTP. I run A/B/A/B, attaching `perf stat -e instructions,cycles`
+only during each measured pass. Counts cover the server's threads and exclude the client. I use
+instruction counts as the primary speed evidence and paired wall times as supporting evidence.
+The tables give the median of two runs; I also report the individual warm p50/p90 pairs.
+
+### Diagnosis and changes
+
+The initial `perf record -g` profiles at one and 16 clients attribute about 37% of samples to the
+search loop and 8% to posting decode. Long queries with many common words dominate the tail.
+A posting frame can span many row windows: broadcasting its best posting to every window makes
+unrelated rows look competitive, even when sparse terms identify only a few useful candidates.
+
+- I keep query terms in canonical order and address frames and windows directly. Posting batches
+  use sorted vectors, avoiding repeated tree lookups and directory searches. Auxiliary window
+  metadata is bounded, including for broad prefix expansion.
+- I use block-max MaxScore to generate candidates from essential terms. Low-impact common terms
+  score only those candidates, using row seeks when a frame has few competitive rows. Strict
+  comparisons retain score ties, and final additions keep the reference f32 order.
+- I cache normalization maxima at the actual row windows represented in decoded dense frames.
+  Windows without a posting contribute zero. These bounds are independent of IDF and query
+  frequency, and reset with average length, k1, or b. Admission is capped at 8 MiB per reader,
+  with a conservative 16 MiB cache charge. Short decoded lists accumulate their scores once.
+- I retain validated dense frames in an 8 MiB CLOCK cache, with a separate 8 MiB allowance
+  protecting sparse lists. Sparse partial bounds use f32 storage and a conservative rounding
+  allowance for both accumulation stages. Actual scores retain the reference f32 operation order.
+- I share a monotone score floor across a query's disjoint live segments. A segment publishes only
+  after finding k real hits; other segments can then reject strictly lower bounds. I also apply
+  the engine's existing fanout rule to BM25, reducing worker handoffs under concurrent load.
+- I run independent multi-query branches together, and let RRF's ANN branch start while text
+  statistics load. Explicit `include_attributes: ["id"]`, `[]`, and `false` use compact IDs and
+  avoid document-column reads in both opening metadata and result hydration.
+
+The engine selects this plan automatically. Segment formats and bucket fence generation stay
+unchanged. The text crate adds `SearchThreshold::new(k)` and `search_prefetched_shared` for merging
+exact top-k contributions across disjoint live segments.
+
+### Results
+
+| Metric | Baseline | New |
+| --- | ---: | ---: |
+| Warm c1, p50 / p90 | 18.4 / 42.4 ms | 11.3 / 21.8 ms |
+| Warm c16, p50 / p90 | 311.4 / 393.9 ms | 149.2 / 236.8 ms |
+| Warm c1 throughput | 44.8 queries/s | 75.8 queries/s |
+| Warm c16 throughput | 50.2 queries/s | 99.9 queries/s |
+| Server instructions/query, c1 | 118.31 million | 32.41 million |
+| Server instructions/query, c16 | 118.58 million | 30.60 million |
+| Peak server RSS after c16 | 582 MiB | 640 MiB |
+| Fresh-process facade, p50 / p90 | 257.6 / 372.0 ms | 250.9 / 365.7 ms |
+| Cold reads/query, mean | 115.47 | 113.71 |
+| Cold MB/query, mean | 3.636 | 3.624 |
+| Cold waves/query, mean | 2.98 | 2.99 |
+| overlap@10, all 1,000 queries | 1.000 | 1.000 |
+
+Server instruction counts fall 72.6% at one client and 74.2% at 16 clients. Median throughput
+at 16 clients is 1.99× the baseline. The extra decoded data costs about 58 MiB of peak RSS in
+this workload. Cold latency stays within the observed variation, with essentially flat bytes
+and waves.
+
+Wall times vary substantially on this VM. I retain the paired observations below instead of
+presenting the fastest pass as a reproducible machine limit. The summary above is the median
+of each pair, and the instruction counts are the stronger evidence for the change.
+
+| Client count | A1 p50 / p90 | B1 p50 / p90 | A2 p50 / p90 | B2 p50 / p90 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 14.5 / 33.7 ms | 9.9 / 19.1 ms | 22.2 / 51.1 ms | 12.7 / 24.4 ms |
+| 16 | 292.6 / 364.1 ms | 135.8 / 211.2 ms | 330.1 / 423.8 ms | 162.5 / 262.5 ms |
+
+Cold p90 spans 363–381 ms in the baseline and 359–373 ms in the new arm. Warm p50 is below
+13 ms in both repeats; **the 18 ms warm p90 target remains open**. I do not establish an
+in-region latency result from this local facade.
+
+The worst long, common-word queries remain expensive. Query 672 falls from 149.7 to 76.0 ms,
+query 769 from 101.8 to 44.7 ms, and query 439 ("what is the gas called that they give you at
+the dentist") from 89.5 to 53.1 ms, using each query's median across the two c1 passes.
+Final sampled profiles still spend about 30–33% in search and 6% initializing frame-cache
+slots; decode falls to about 3%. Avoiding dense-frame probes before window pruning is a
+remaining profiling lead.
+
+All 12,240 measured and profiled BM25 responses, including both client counts and all cold
+repeats, match the exhaustive top-10 IDs and baseline scores exactly. There are 1,000 unique
+queries. The baseline binary SHA-256 is
+`c4bccdcbe01117f9cd8943255f98eb0736ae83fd6208cf6783949370e688611e`; the final binary is
+`ffc75d69c3f893f432e5ffe6ba8c669e69ac2e9ab38f0d0b1cf5a627c801827f`.
+
+
+### Hybrid measurement
+
+I load 100,000 BEIR NQ rows with their 1,024-dimensional f16 embeddings, titles, and text, and use
+the first 200 aligned test query vectors and texts. I measure BM25 and ANN separately, a multi-query
+returning both lists, and a multi-query with server-side RRF at limit 10. Each subquery requests
+ten IDs. These runs use the same cache, CPU, strong-consistency, warm-up, and A/B/A/B procedure.
+The cold RRF samples use the first 30 queries and a fresh process per query through the same
+25 ms facade.
+
+| Warm NQ workload | Baseline p50 / p90 | New p50 / p90 | Instructions/query, before → after |
+| --- | ---: | ---: | ---: |
+| BM25 | 7.0 / 10.8 ms | 4.8 / 7.4 ms | 15.27 → 6.59 million |
+| ANN | 9.1 / 16.9 ms | 8.8 / 18.2 ms | 13.31 → 12.36 million |
+| Two-list multi-query | 14.8 / 22.6 ms | 12.0 / 15.8 ms | 27.05 → 18.46 million |
+| Multi-query with RRF | 12.3 / 18.8 ms | 10.5 / 14.0 ms | 27.11 → 18.40 million |
+
+The two-list hybrid uses 31.8% fewer instructions, and RRF uses 32.1% fewer. ANN is a control;
+I change no vector index, tier, or distance kernel, and its wall-time movement is inconsistent.
+Both hybrid forms return the same IDs and scores in every repeat. I independently fuse the
+two lists with rank constant 60 and verify the server's RRF result, including every cold sample.
+
+| Fresh-process NQ RRF through the facade | Baseline | New |
+| --- | ---: | ---: |
+| p50 / p90 | 335.1 / 391.5 ms | 302.8 / 366.0 ms |
+| Reads/query, mean | 233.05 | 192.93 |
+| MB/query, mean | 12.467 | 10.443 |
+| Waves/query, mean | 2.75 | 2.37 |
+
+The concurrent statistics read and ID-only projection remove a serial dependency and document
+reads. Cold RRF reads fall 17.2%, and bytes fall 16.2%. These figures apply to this 100K NQ
+fixture; I do not extrapolate them to the 1M MS MARCO workload.
+
+
+### Validation and reproduction
+
+Formatting, clippy with all targets and warnings denied, and all 175 tests in `bf-text` and
+`bf-engine` pass; three benchmark tests remain ignored. Regressions cover long posting lists,
+normalization changes, broad prefixes, concurrent shared thresholds, live-row masks, ties,
+indexed/tail hybrid results, exhaustive RRF parity, protected cache budgets, rounded sparse
+partials, and ID-only reads. Compatibility passes 121/121
+in normal and forced indexing modes, plus 4/4 SDK retry checks and TypeScript smoke and retry checks
+in each mode.
+
+I prepare the disposable MS MARCO store and exhaustive truth using the preceding BM25 round's
+loader and scorer. Both binaries use the same completed format-5 store. I keep each binary
+separately, and repeat these commands in A/B/A/B order with distinct output names. `RUN` and
+`STORE` are owned directories under `.scratch/`, and `PERF` names an installed perf executable.
+
+```sh
+source ~/.cargo/env
+nice -n 19 cargo build --release -p blowfish -j 2
+# BINARY selects one separately built production-profile arm.
+timeout 1800 taskset -c 6,7 nice -n 10 uv run bench/scale/bm25_local.py warm \
+  --binary "$BINARY" --store "$STORE" --perf "$PERF" --profile-dir "$RUN/stat" \
+  > "$RUN/warm.jsonl" 2> "$RUN/warm.log"
+timeout 1800 taskset -c 6,7 nice -n 10 uv run bench/scale/bm25_local.py warm \
+  --binary "$BINARY" --store "$STORE" --perf "$PERF" --perf-record \
+  --profile-dir "$RUN/stacks" > "$RUN/profile.jsonl" 2> "$RUN/profile.log"
+timeout 360 taskset -c 6,7 nice -n 10 uv run bench/scale/bm25_local.py cold \
+  --binary "$BINARY" --store "$STORE" --queries 60 > "$RUN/cold.jsonl" 2> "$RUN/cold.log"
+uv run python bench/scale/bm25_overlap.py "$RUN/truth.json" "$RUN/warm.jsonl"
+# DATA is prepared with bench/nq, and NQ_STORE contains the first 100,000 indexed rows.
+timeout 120 uv run bench/scale/nq_hybrid_workload.py "$DATA" "$RUN" --queries 200
+timeout 180 taskset -c 6,7 nice -n 10 uv run bench/scale/bm25_local.py warm \
+  --binary "$BINARY" --store "$NQ_STORE" --namespace nq --queries 200 --clients 1 \
+  --workload "$RUN/nq-rrf.json" --perf "$PERF" --profile-dir "$RUN/rrf-stat" \
+  > "$RUN/rrf.jsonl" 2> "$RUN/rrf.log"
+```
+
+The harness terminates its exact server and profiler PIDs, and removes temporary server logs.
+I remove input copies, disposable stores, profiles, and build snapshots after preserving these
+numbers. The facade models fixed dependent round trips and local transfer; I have not measured
+this revision against an in-region S3 bucket or hosted turbopuffer.

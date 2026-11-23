@@ -1,7 +1,7 @@
 use bf_text::{
-    CorpusStats, FtsParams, MemoryRangeRead, Query, RangeRead, SearchHit, SegmentBuilder,
-    SegmentReader, Token, Tokenizer, matches_all_tokens, matches_any_token, matches_token_sequence,
-    score_document, tokenize, tokenize_array,
+    CorpusStats, FtsParams, MemoryRangeRead, Query, RangeRead, SearchHit, SearchThreshold,
+    SegmentBuilder, SegmentReader, Token, Tokenizer, matches_all_tokens, matches_any_token,
+    matches_token_sequence, score_document, tokenize, tokenize_array,
 };
 use bytes::Bytes;
 use futures::executor::block_on;
@@ -320,6 +320,8 @@ proptest! {
         for allowed in [None,Some(&allowed)] {
             let actual=block_on(reader.search(&query,&stats,&params,k,allowed)).unwrap();
             assert_hits(&actual,&expected(&docs,&query,&stats,&params,k,allowed));
+            let prefetched=block_on(reader.search_prefetched(&query,&stats,&params,k,allowed)).unwrap();
+            prop_assert_eq!(prefetched, actual);
         }
         let all:RoaringBitmap=docs.iter().enumerate().filter(|(_,d)|matches_all_tokens(d,&query,params.tokenizer)).map(|(i,_)|i as u32).collect();
         prop_assert_eq!(block_on(reader.contains_all_tokens(&query)).unwrap(),all);
@@ -327,6 +329,194 @@ proptest! {
             let phrase:RoaringBitmap=docs.iter().enumerate().filter(|(_,d)|matches_token_sequence(d,&query)).map(|(i,_)|i as u32).collect();
             prop_assert_eq!(block_on(reader.contains_token_sequence(&query)).unwrap(),phrase);
         }
+    }
+}
+
+#[test]
+fn long_lists_preserve_exact_scores_with_rare_terms_stopwords_and_prefixes() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..32_769)
+        .map(|row| {
+            let mut words = vec!["common", "the", "of"];
+            if row % 5 == 0 {
+                words.push("common");
+            }
+            if row % 97 == 0 {
+                words.push("rare");
+            }
+            if row % 193 == 0 {
+                words.push("other");
+            }
+            if row % 257 == 0 {
+                words.push("prefix");
+            }
+            if row % 128 == 0 {
+                words.extend(["boundary", "boundary"]);
+            }
+            if row == 32_768 {
+                words.extend(std::iter::repeat_n("rare", 1_030));
+            }
+            tokenize(&words.join(" "), &params)
+        })
+        .collect();
+    let reader = open(build(&docs, false, params.tokenizer));
+    let mut stats = CorpusStats::from_documents(&docs);
+    stats.merge(&CorpusStats::from_documents(&[tokenize(
+        "external rare common",
+        &params,
+    )]));
+    let allowed: RoaringBitmap = (129..3_000).chain(32_760..32_780).collect();
+    for (text, prefix) in [
+        ("common the of", false),
+        ("the rare rare of other boundary", false),
+        ("rare common pre", true),
+        ("common pre", true),
+        ("pre", true),
+    ] {
+        let query = Query::new(tokenize(text, &params), prefix);
+        for k in [1, 10, 129] {
+            for filter in [None, Some(&allowed)] {
+                let reference = expected(&docs, &query, &stats, &params, k, filter);
+                for _ in 0..2 {
+                    let hits =
+                        block_on(reader.search_prefetched(&query, &stats, &params, k, filter))
+                            .unwrap();
+                    assert_eq!(
+                        hits,
+                        reference,
+                        "{text}, k={k}, filtered={}",
+                        filter.is_some()
+                    );
+                }
+            }
+        }
+    }
+    // Reuse the same reader after both IDF-only changes and normalization changes.
+    // Cached frame maxima must remain independent of IDF and query frequency,
+    // and must be discarded with the old normalization table.
+    stats.total_docs *= 2;
+    let query = Query::new(tokenize("rare rare common of", &params), false);
+    for (k1, b, k3, average_scale) in [
+        (1.2, 0.75, 19.0, 1.0),
+        (0.01, 1.0, 0.01, 1.3),
+        (4.0, 0.0, 8.0, 0.8),
+        (1.2, 0.75, 8.0, 1.0),
+    ] {
+        let params = FtsParams {
+            k1,
+            b,
+            k3,
+            ..params.clone()
+        };
+        stats.average_doc_length *= average_scale;
+        let reference = expected(&docs, &query, &stats, &params, 10, None);
+        for _ in 0..2 {
+            assert_eq!(
+                block_on(reader.search_prefetched(&query, &stats, &params, 10, None)).unwrap(),
+                reference
+            );
+        }
+    }
+}
+
+#[test]
+fn broad_prefix_expansion_keeps_window_metadata_bounded_and_scores_exact() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..4_097)
+        .map(|row| tokenize(&format!("common p{row:05}a p{row:05}b"), &params))
+        .collect();
+    let reader = open(build(&docs, false, params.tokenizer));
+    let stats = CorpusStats::from_documents(&docs);
+    let query = Query::new(tokenize("common p", &params), true);
+    let allowed: RoaringBitmap = (1_001..1_123).collect();
+    for filter in [None, Some(&allowed)] {
+        let hits = block_on(reader.search_prefetched(&query, &stats, &params, 10, filter)).unwrap();
+        assert_eq!(hits, expected(&docs, &query, &stats, &params, 10, filter));
+    }
+}
+
+#[test]
+fn shared_threshold_keeps_global_top_k_ties_and_late_winners() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..30_000)
+        .map(|row| {
+            tokenize(
+                if (10_000..20_000).contains(&row) {
+                    "common common needle prefix"
+                } else {
+                    "common filler filler filler filler filler filler prefix"
+                },
+                &params,
+            )
+        })
+        .collect();
+    let readers: Vec<_> = docs
+        .chunks(10_000)
+        .map(|part| open(build(part, false, params.tokenizer)))
+        .collect();
+    let stats = CorpusStats::from_documents(&docs);
+    for (text, prefix) in [
+        ("common", false),
+        ("common needle needle", false),
+        ("common pre", true),
+    ] {
+        let query = Query::new(tokenize(text, &params), prefix);
+        for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2]] {
+            let threshold = SearchThreshold::new(10);
+            let mut hits = Vec::new();
+            for part in order {
+                let result = block_on(
+                    readers[part]
+                        .search_prefetched_shared(&query, &stats, &params, None, &threshold),
+                )
+                .unwrap();
+                if part == 2 && order[0] == 1 {
+                    assert!(
+                        result.is_empty(),
+                        "the established floor excludes every weaker row"
+                    );
+                }
+                hits.extend(result.into_iter().map(|mut hit| {
+                    hit.row += part as u32 * 10_000;
+                    hit
+                }));
+            }
+            hits.sort_unstable_by(|a, b| b.cmp(a));
+            hits.truncate(10);
+            assert_eq!(hits, expected(&docs, &query, &stats, &params, 10, None));
+        }
+        let threshold = SearchThreshold::new(10);
+        let mut hits: Vec<_> = std::thread::scope(|scope| {
+            let tasks: Vec<_> = readers
+                .iter()
+                .enumerate()
+                .map(|(part, reader)| {
+                    let query = &query;
+                    let stats = &stats;
+                    let threshold = &threshold;
+                    let params = &params;
+                    scope.spawn(move || {
+                        block_on(
+                            reader.search_prefetched_shared(query, stats, params, None, threshold),
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .map(|mut hit| {
+                            hit.row += part as u32 * 10_000;
+                            hit
+                        })
+                        .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            tasks
+                .into_iter()
+                .flat_map(|task| task.join().unwrap())
+                .collect()
+        });
+        hits.sort_unstable_by(|a, b| b.cmp(a));
+        hits.truncate(10);
+        assert_eq!(hits, expected(&docs, &query, &stats, &params, 10, None));
     }
 }
 
@@ -615,4 +805,83 @@ fn row_aligned_sparse_bounds_prune_disjoint_term_maxima() {
     assert_hits(&hits, &expected(&docs, &query, &stats, &params, 10, None));
     assert!(metrics.windows_pruned > 100, "{metrics:?}");
     assert!(metrics.rows_scored < 4000, "{metrics:?}");
+}
+
+#[test]
+fn dense_frames_reuse_data_but_rescore_changed_statistics_and_masks() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..16_384)
+        .map(|row| {
+            tokenize(
+                if row % 7 == 0 {
+                    "common common needle"
+                } else {
+                    "common filler filler filler"
+                },
+                &params,
+            )
+        })
+        .collect();
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let reader = block_on(SegmentReader::open(Arc::new(Recording {
+        bytes: build(&docs, false, params.tokenizer).into(),
+        reads: reads.clone(),
+    })))
+    .unwrap();
+    let mut stats = CorpusStats::from_documents(&docs);
+    let query = Query::new(tokenize("common", &params), false);
+    block_on(reader.search_prefetched(&query, &stats, &params, docs.len(), None)).unwrap();
+    stats.total_docs *= 2;
+    stats.average_doc_length *= 1.7;
+    let params = FtsParams {
+        k1: 0.73,
+        b: 1.0,
+        k3: 0.13,
+        ..params
+    };
+    let query = Query::new(tokenize("common common", &params), false);
+    let allowed: RoaringBitmap = (0..docs.len() as u32).filter(|row| row % 5 == 0).collect();
+    reads.lock().unwrap().clear();
+    let hits =
+        block_on(reader.search_prefetched(&query, &stats, &params, 10, Some(&allowed))).unwrap();
+    assert_eq!(
+        hits,
+        expected(&docs, &query, &stats, &params, 10, Some(&allowed))
+    );
+    assert!(
+        reads.lock().unwrap().is_empty(),
+        "validated dense data needs no repeated range read"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+    #[test]
+    fn rounded_sparse_partials_preserve_exact_top_k(
+        k1 in 0.01f32..4.0, b in 0.0f32..1.0, k3 in 0.01f32..20.0,
+        repeats in 1usize..5, bias in 0u32..64,
+    ) {
+        let params = FtsParams { k1, b, k3, ..FtsParams::default() };
+        let docs: Vec<_> = (0..8_192u32).map(|row| {
+            let mut words = vec!["a", "c", "e"];
+            if row % 5 == 0 { words.push("c"); }
+            for (divisor, term) in [(7,"b"),(11,"d"),(13,"f")] {
+                if row % divisor == 0 { words.push(term); }
+            }
+            words.extend(std::iter::repeat_n("filler", (row % 9) as usize));
+            words.into_iter().enumerate().map(|(i,t)| Token::new(t,i as u32)).collect()
+        }).collect();
+        let reader = open(build(&docs, false, params.tokenizer));
+        let mut stats = CorpusStats::from_documents(&docs);
+        stats.total_docs += u64::from(bias);
+        let query = Query::new((0..repeats).flat_map(|_| ["a","b","c","d","e","f"])
+            .enumerate().map(|(i,t)| Token::new(t,i as u32)).collect(), false);
+        let allowed: RoaringBitmap = (0..docs.len() as u32).filter(|row| (row+bias)%3 != 0).collect();
+        for k in [1,10,31] {
+            for filter in [None,Some(&allowed)] {
+                let hits = block_on(reader.search_prefetched(&query,&stats,&params,k,filter)).unwrap();
+                prop_assert_eq!(hits, expected(&docs,&query,&stats,&params,k,filter));
+            }
+        }
+    }
 }

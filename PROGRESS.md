@@ -852,3 +852,47 @@ changed +0.18%, +0.15%, and -0.45%, and latency stayed within the observed sprea
 in every case. Synthetic unfiltered reads grew 6.0% (4.3% reclustered), while NQ unfiltered reads were
 nearly flat and filtered bytes fell 9.5–24.2%; I document that coalescing/alignment tradeoff explicitly.
 Details and reproduction: `docs/benchmarks.md`, “Round D1”. The full 2.68M NQ corpus remains unmeasured.
+
+## 2026-11-23 — BM25 round 2
+
+I add exact block-max MaxScore candidate selection, direct window metadata, and one-pass accumulation
+when every selected posting list is available. A bounded cache keeps normalization maxima per row
+window, independent of IDF and query frequency, and resets when normalization parameters or average
+length change. I retain reference f32 addition order, prefix semantics, live-row filtering, and ties.
+The text crate also exposes a shared top-k score floor for disjoint live segments. Existing segment
+formats and the bucket fence stay unchanged. Property tests and targeted regressions cover long
+posting lists, broad prefixes, changed statistics, and concurrent segment searches.
+
+I wire the shared floor across engine BM25 segments and apply the engine's existing fanout rule,
+reducing worker handoffs as concurrent queries increase. Independent multi-query branches execute
+together, and RRF's ANN branch starts while text statistics load. Explicit ID-only projections use
+compact IDs without hydrating document columns. I compare hybrid and RRF results with the exhaustive
+evaluator across indexed rows and the WAL tail. Formatting, clippy with warnings denied, and all
+172 tests in `bf-text` and `bf-engine` pass; three benchmark tests remain ignored.
+
+I extend the local harness with measured-pass perf counters or call stacks, selectable client counts,
+and elapsed-time throughput summaries. An aligned NQ workload generator emits BM25, ANN, two-list
+multi-query, and server-side RRF requests from the prepared benchmark data. Profile outputs stay
+under `.scratch/`, and profiler attachment uses the harness's exact server PID.
+
+I retain validated dense frames in a separate 8 MiB CLOCK cache, preserving the sparse cache's own
+8 MiB allowance. This avoids repeating common-word decoding and range-cache bookkeeping. Sparse
+partial bounds use f32 storage; the conservative margin covers rounding in both partial and final
+sums, while result scoring keeps its reference operation order. New regressions verify cache
+budgets, sparse-frame protection, changed statistics and masks, and exact rankings with interleaved
+dense and sparse terms. All 175 tests and both compatibility modes pass. The harness also records
+peak server RSS and keeps perf's build-ID cache under the run's scratch directory.
+
+I measure the production-profile binaries in A/B/A/B order on the same immutable 1M MS MARCO store.
+Server instructions fall 72.6% at one client and 74.2% at 16 clients; 16-client throughput rises
+from 50.2 to 99.9 queries/s. Median warm p50/p90 is 18.4/42.4 to 11.3/21.8 ms, with substantial
+wall-time variation recorded in the benchmark doc. Both new p50 repeats are below 13 ms; the
+18 ms p90 target remains open. Peak c16 RSS rises from 582 to 640 MiB. The 25 ms local facade
+measures 258/372 to 251/366 ms cold, within the observed variation. All 12,240 responses match
+exhaustive IDs and baseline scores exactly across the 1,000 unique queries.
+
+On 100K NQ, two-list hybrid instructions fall 31.8%, and RRF instructions fall 32.1%; cold RRF
+moves from 335/392 to 303/366 ms, with reads falling from 233 to 193 per query. All NQ lists,
+scores, and independently fused RRF results match. Full methodology, paired repetitions, cache
+budgets, and the remaining p90 gap are in `docs/benchmarks.md`, "BM25 round 2". I update only the
+README's local BM25 paragraph; the in-region figures retain their existing measurements.
