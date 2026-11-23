@@ -583,6 +583,64 @@ fn build_text(
     Ok((bytes, metadata_len, header))
 }
 
+/// Old text layouts are rebuilt from the immutable document column, one field at
+/// a time, under the indexer's existing epoch claim. Row ordinals and missing
+/// fields are preserved, including rows hidden by the current live mask.
+pub(crate) fn text_needs_upgrade(file: &SegmentFile) -> bool {
+    file.text_header
+        .as_ref()
+        .is_none_or(|h| text_header_of(h).is_ok_and(|h| !h.is_current()))
+}
+
+pub(crate) async fn upgrade_text(
+    store: &Storage,
+    ns: &str,
+    seg: &mut Segment,
+) -> Result<Option<String>, ApiError> {
+    let Some((key, old)) = seg
+        .files
+        .iter()
+        .find(|(key, file)| key.starts_with("fts:") && text_needs_upgrade(file))
+        .map(|(k, f)| (k.clone(), f.clone()))
+    else {
+        return Ok(None);
+    };
+    let attribute = key.strip_prefix("fts:").expect("text file");
+    let params = seg
+        .schema
+        .get(attribute)
+        .and_then(|s| s.text_config())
+        .ok_or_else(corrupt)?;
+    let rows = (0..seg.row_count).collect();
+    let columns = std::collections::BTreeSet::from([attribute.to_string()]);
+    let mut documents = projected_rows(store, seg, &rows, Some(&columns)).await?;
+    let values = (0..seg.row_count)
+        .map(|row| {
+            documents
+                .get_mut(&row)
+                .and_then(|d| d.remove(attribute))
+                .filter(|v| !v.is_null())
+        })
+        .collect();
+    let (bytes, metadata, header) = tokio::task::spawn_blocking(move || build_text(values, params))
+        .await
+        .map_err(index_error)??;
+    let mut file = put_file(
+        store,
+        format!(
+            "ns/{ns}/segments/{}/fts.{}.bft",
+            seg.id,
+            uuid::Uuid::new_v4()
+        ),
+        bytes,
+        metadata,
+    )
+    .await?;
+    file.text_header = header;
+    seg.files.insert(key, file);
+    Ok(Some(old.key))
+}
+
 /// One vector attribute's values at the stored precision, for the rows that have one: row
 /// positions (ascending, within the segment being built) and their packed little-endian bytes.
 pub(crate) struct PackedColumn {

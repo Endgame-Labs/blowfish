@@ -113,6 +113,97 @@ pub(crate) fn term_score(
         * (qf as f64 * (k3 + 1.0) / (qf as f64 + k3))) as f32
 }
 
+/// The common saturation factor is independent of the term's IDF and query frequency.
+/// Cache its exact f64 values for ordinary passage lengths and term frequencies.
+/// Unusual values use the reference arithmetic directly.
+pub(crate) struct Saturation {
+    key: (u32, u32, u64),
+    values: Vec<f64>,
+}
+impl Saturation {
+    const LENGTHS: usize = 1025;
+    const FREQUENCIES: usize = 17;
+    pub(crate) const BYTES: usize = Self::LENGTHS * Self::FREQUENCIES * 8 + 64;
+    pub(crate) fn new(stats: &CorpusStats, p: &FtsParams) -> Self {
+        let k1 = p.k1 as f64;
+        let b = p.b as f64;
+        let mut values = Vec::with_capacity(Self::LENGTHS * Self::FREQUENCIES);
+        for length in 0..Self::LENGTHS {
+            let norm = k1 * (1.0 - b + b * length as f64 / stats.average_doc_length);
+            for tf in 0..Self::FREQUENCIES {
+                values.push(tf as f64 * (k1 + 1.0) / (tf as f64 + norm));
+            }
+        }
+        Self {
+            key: (
+                p.k1.to_bits(),
+                p.b.to_bits(),
+                stats.average_doc_length.to_bits(),
+            ),
+            values,
+        }
+    }
+    pub(crate) fn matches(&self, stats: &CorpusStats, p: &FtsParams) -> bool {
+        self.key
+            == (
+                p.k1.to_bits(),
+                p.b.to_bits(),
+                stats.average_doc_length.to_bits(),
+            )
+    }
+    fn get(&self, tf: u32, length: u32) -> Option<f64> {
+        ((tf as usize) < Self::FREQUENCIES && (length as usize) < Self::LENGTHS)
+            .then(|| self.values[length as usize * Self::FREQUENCIES + tf as usize])
+    }
+}
+
+/// Query-invariant work for one term. Keep the reference scorer's operation order so
+/// precomputation cannot move a rounded score across a top-k tie or pruning bound.
+pub(crate) struct TermWeight {
+    idf: f64,
+    query: f64,
+    k1: f64,
+    b: f64,
+    average: f64,
+}
+
+impl TermWeight {
+    pub(crate) fn new(qf: u32, df: u64, stats: &CorpusStats, p: &FtsParams) -> Self {
+        let n = stats.total_docs as f64;
+        let df = df.min(stats.total_docs) as f64;
+        let k3 = p.k3 as f64;
+        Self {
+            idf: if qf == 0 || df == 0.0 || n == 0.0 || stats.average_doc_length <= 0.0 {
+                0.0
+            } else {
+                (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+            },
+            query: qf as f64 * (k3 + 1.0) / (qf as f64 + k3),
+            k1: p.k1 as f64,
+            b: p.b as f64,
+            average: stats.average_doc_length,
+        }
+    }
+
+    pub(crate) fn score_cached(&self, tf: u32, length: u32, table: &Saturation) -> f32 {
+        if tf == 0 || self.idf == 0.0 {
+            return 0.0;
+        }
+        match table.get(tf, length) {
+            Some(saturation) => (self.idf * saturation * self.query) as f32,
+            None => self.score(tf, length),
+        }
+    }
+
+    pub(crate) fn score(&self, tf: u32, length: u32) -> f32 {
+        if tf == 0 || self.idf == 0.0 {
+            return 0.0;
+        }
+        let norm = self.k1 * (1.0 - self.b + self.b * length as f64 / self.average);
+        (self.idf * (tf as f64 * (self.k1 + 1.0) / (tf as f64 + norm)) * self.query) as f32
+    }
+}
+
 /// Score a tokenized document using externally supplied corpus statistics.
 ///
 /// This uses Lucene's positive IDF, exact retained-token lengths, standard BM25
@@ -146,4 +237,54 @@ pub fn score_document(
         score += 1.0;
     }
     score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_weights_preserve_reference_score_bits() {
+        for k1 in [0.0, 0.5, 1.2, 3.0] {
+            for b in [0.0, 0.75, 1.0] {
+                for k3 in [0.0, 8.0, 100.0] {
+                    let p = FtsParams {
+                        k1,
+                        b,
+                        k3,
+                        ..Default::default()
+                    };
+                    for n in [0, 1, 128, 1_000_000] {
+                        for average in [0.0, 1.0, 73.8123] {
+                            let stats = CorpusStats {
+                                total_docs: n,
+                                average_doc_length: average,
+                                ..Default::default()
+                            };
+                            let table = Saturation::new(&stats, &p);
+                            for df in [0, 1, n / 2, n, n + 1] {
+                                for qf in [0, 1, 3, 10] {
+                                    let weight = TermWeight::new(qf, df, &stats, &p);
+                                    for tf in [0, 1, 4, 16, 17, 128] {
+                                        for length in [1, 32, 128, 1023, 1024, 1025, 4096] {
+                                            assert_eq!(
+                                                weight.score_cached(tf, length, &table).to_bits(),
+                                                term_score(tf, length, qf, df, &stats, &p)
+                                                    .to_bits()
+                                            );
+                                            assert_eq!(
+                                                weight.score(tf, length).to_bits(),
+                                                term_score(tf, length, qf, df, &stats, &p)
+                                                    .to_bits()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

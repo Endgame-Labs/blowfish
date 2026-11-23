@@ -236,14 +236,12 @@ fn small_open_one_read_and_positions_are_lazy() {
     reads.lock().unwrap().clear();
     let q = Query::new(tokenize("fox", &p), false);
     block_on(reader.search(&q, &stats, &p, 10, None)).unwrap();
-    // The term's block directory (version 2 loads it on demand), then its one posting block.
-    assert_eq!(reads.lock().unwrap().len(), 2);
-    // One-bit docs plus two-bit frequency in a 128-value block, plus two header bytes.
-    let range = reads.lock().unwrap()[1].clone();
-    assert!(range.end - range.start <= 514);
-    reads.lock().unwrap().clear();
+    // Statistics fetched the dictionary bundle, including this short term's
+    // directory and postings. Scoring needs no further backend read.
+    assert!(reads.lock().unwrap().is_empty());
     block_on(reader.contains_token_sequence(&q)).unwrap();
-    assert!(reads.lock().unwrap().len() >= 2);
+    // Phrase positions stay separate from dictionary and scoring payloads.
+    assert_eq!(reads.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -289,10 +287,10 @@ fn corrupt_sections_and_short_reads_return_errors() {
         );
     }
     let mut corrupt = bytes.clone();
-    corrupt[0] ^= 1;
+    let header = bf_text::text_header(&bytes).unwrap().unwrap();
+    corrupt[header.chunks[0].1 as usize] ^= 1;
     let reader = open(corrupt);
-    let q = Query::new(tokenize("dog fox", &p), false);
-    assert!(block_on(reader.search(&q, &block_on(reader.stats()).unwrap(), &p, 10, None)).is_err());
+    assert!(block_on(reader.stats()).is_err());
     for len in 0..72 {
         assert!(
             block_on(SegmentReader::open(Arc::new(MemoryRangeRead::from(
@@ -425,7 +423,7 @@ fn prefetched_postings_match_demand_search_with_prefixes_repetition_and_filters(
 #[test]
 fn chunked_dictionary_reads_only_the_query_terms_chunks() {
     let p = FtsParams::default();
-    // 12,000 distinct terms span six dictionary chunks.
+    // 12,000 distinct terms span many dictionary bundles.
     let docs: Vec<_> = (0..4000)
         .map(|i| {
             tokenize(
@@ -452,7 +450,7 @@ fn chunked_dictionary_reads_only_the_query_terms_chunks() {
     let hits = block_on(reader.search(&q, &stats, &p, 10, None)).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].row, 3000);
-    // Only the term's dictionary chunk, its record, and its posting block.
+    // Only the term's dictionary bundle, including its record and posting block.
     let bytes_read: u64 = reads.lock().unwrap().iter().map(|r| r.end - r.start).sum();
     assert!(bytes_read < total / 10, "{bytes_read} of {total}");
     // Every term resolves across chunk boundaries, and prefixes span chunks.
@@ -469,7 +467,7 @@ fn chunked_dictionary_reads_only_the_query_terms_chunks() {
     assert_eq!(stats.document_frequencies.len(), 12000);
 }
 
-/// Version 4 segments open from a header kept elsewhere (no object read), load lengths on demand, and
+/// Current segments open from a header kept elsewhere (no object read), load lengths on demand, and
 /// the pruned prefetching search matches the exhaustive reference on a corpus with hot and rare terms.
 #[test]
 fn header_opened_reader_searches_like_the_full_reader() {
@@ -491,7 +489,7 @@ fn header_opened_reader_searches_like_the_full_reader() {
     let bytes = build(&docs, true, Tokenizer::WordV4);
     let header = bf_text::text_header(&bytes)
         .unwrap()
-        .expect("version 4 header");
+        .expect("current text header");
     let source = Arc::new(MemoryRangeRead::from(bytes.clone()));
     let hinted = SegmentReader::open_with_header(source, &header).unwrap();
     let full = open(bytes);
@@ -511,4 +509,110 @@ fn header_opened_reader_searches_like_the_full_reader() {
         assert_hits(&a, &want);
         assert_hits(&b, &want);
     }
+}
+
+#[test]
+fn dictionary_bundle_fetches_short_terms_without_a_record_or_posting_wave() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..2000)
+        .map(|i| tokenize(&format!("common unique{i:05}"), &params))
+        .collect();
+    let bytes = build(&docs, true, params.tokenizer);
+    let header = bf_text::text_header(&bytes).unwrap().unwrap();
+    assert!(header.is_current());
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let reader = SegmentReader::open_with_header(
+        Arc::new(Recording {
+            bytes: bytes.into(),
+            reads: reads.clone(),
+        }),
+        &header,
+    )
+    .unwrap();
+    assert!(reads.lock().unwrap().is_empty());
+    let query = Query::new(tokenize("unique01000", &params), false);
+    block_on(reader.prefetch_plan(&query, None)).unwrap();
+    assert_eq!(
+        reads.lock().unwrap().len(),
+        2,
+        "lengths and one dictionary bundle"
+    );
+    reads.lock().unwrap().clear();
+    let stats = CorpusStats::from_documents(&docs);
+    let hits = block_on(reader.search_prefetched(&query, &stats, &params, 10, None)).unwrap();
+    assert_hits(&hits, &expected(&docs, &query, &stats, &params, 10, None));
+    assert!(
+        reads.lock().unwrap().is_empty(),
+        "record and postings arrived with the dictionary"
+    );
+}
+
+#[test]
+fn decoded_blocks_are_reused_with_new_statistics_and_allowed_rows() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..20000)
+        .map(|i| {
+            tokenize(
+                if i % 32 == 0 {
+                    "common needle"
+                } else {
+                    "common"
+                },
+                &params,
+            )
+        })
+        .collect();
+    let bytes = build(&docs, false, params.tokenizer);
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let reader = block_on(SegmentReader::open(Arc::new(Recording {
+        bytes: bytes.into(),
+        reads: reads.clone(),
+    })))
+    .unwrap();
+    let mut stats = CorpusStats::from_documents(&docs);
+    let query = Query::new(tokenize("needle", &params), false);
+    // Read all sparse-term blocks, so any later allowed mask is covered.
+    block_on(reader.search_prefetched(&query, &stats, &params, docs.len(), None)).unwrap();
+    stats.total_docs *= 3;
+    stats.average_doc_length *= 1.5;
+    let allowed = (0..20000).filter(|row| row % 13 == 0).collect();
+    let query = Query::new(tokenize("needle needle", &params), false);
+    reads.lock().unwrap().clear();
+    let hits =
+        block_on(reader.search_prefetched(&query, &stats, &params, 10, Some(&allowed))).unwrap();
+    assert_hits(
+        &hits,
+        &expected(&docs, &query, &stats, &params, 10, Some(&allowed)),
+    );
+    assert!(
+        reads.lock().unwrap().is_empty(),
+        "decoded immutable blocks need no range reads"
+    );
+}
+
+#[test]
+fn row_aligned_sparse_bounds_prune_disjoint_term_maxima() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..20000)
+        .map(|row| {
+            let mut tokens = vec![Token::new("common", 0)];
+            // Two sparse terms share many row windows, but usually occur on different
+            // rows. Only twelve rows contain both and establish the true top-k threshold.
+            if row % 32 == 0 {
+                tokens.push(Token::new("alpha", 1));
+            }
+            if row % 32 == 1 || (row < 384 && row % 32 == 0) {
+                tokens.push(Token::new("beta", 2));
+            }
+            tokens
+        })
+        .collect();
+    let reader = open(build(&docs, false, params.tokenizer));
+    let stats = CorpusStats::from_documents(&docs);
+    let query = Query::new(tokenize("common alpha beta", &params), false);
+    let (hits, metrics) =
+        block_on(reader.search_prefetched_with_metrics(&query, &stats, &params, 10, None)).unwrap();
+    assert_hits(&hits, &expected(&docs, &query, &stats, &params, 10, None));
+    assert!(metrics.windows_pruned > 100, "{metrics:?}");
+    assert!(metrics.rows_scored < 4000, "{metrics:?}");
 }

@@ -4,6 +4,23 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Exact BM25 bounds and bundled text reads:** text format 5 keeps dictionaries, term directories,
+  and up to 32 posting blocks per term together, with one stored copy of every payload. Bundles
+  contain at most 128 terms and use an estimated 32 KiB budget; large directories occupy their own
+  bundle. Long postings and phrase positions remain independent.
+  - Sparse contributions are summed at the same row before taking window bounds. Dense scoring skips
+    rows below the remaining-score bound. Term weights and cached exact f64 saturation factors avoid
+    repeated logarithms and divisions while preserving reference score bits. Immutable decoded sparse
+    postings use a bounded cache charged to the engine metadata budget.
+  - The background indexer rebuilds one older text field per fenced publication. Checkpoint comparison
+    notices replaced text objects even when segment IDs and live masks stay unchanged, so later passes
+    adopt the upgrade instead of repeating it. All six active indexes of the local 1M-row namespace
+    upgraded automatically. The manifest schema and bucket fence versions are unchanged.
+  - Checked: formatting, clippy for `bf-text` and `bf-engine` with all targets and warnings denied,
+    132 Rust tests, compat 121/121 in normal and forced modes, SDK retry checks 4/4 in each mode,
+    and TypeScript smoke and retry checks in each mode. Both c1 and c16 match exhaustive BM25 on all
+    1,000 dev queries. All 60 fresh-process cold queries also match.
+
 - **Bucket format fence:** format-2 manifests rename the required checkpoint field to `checkpoint_wal`,
   and every manifest decoder rejects unsupported versions. Writers and maintenance tools cannot republish
   unfamiliar manifests. Legacy format-1 manifests remain readable and upgrade on publication.

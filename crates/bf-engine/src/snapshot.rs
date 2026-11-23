@@ -369,11 +369,21 @@ fn same_checkpoint(state: &NamespaceState, m: &bf_wal::Manifest) -> bool {
         && !m.deleted
         && m.indexed_through == state.indexed_through
         && state.segments.len() == m.segments.len()
-        && state
-            .segments
-            .iter()
-            .zip(&m.segments)
-            .all(|(a, b)| a.id == b.id && a.live.key == b.live.key)
+        && state.segments.iter().zip(&m.segments).all(|(a, b)| {
+            a.id == b.id
+                    && a.live.key == b.live.key
+                    // A text-layout upgrade keeps row ordinals and live masks,
+                    // but replaces the immutable index object. Adopt that generation
+                    // before the next upgrade pass or query.
+                    && a.files
+                        .iter()
+                        .filter(|(k, _)| k.starts_with("fts:"))
+                        .map(|(k, f)| (k, &f.key))
+                        .eq(b.files
+                            .iter()
+                            .filter(|(k, _)| k.starts_with("fts:"))
+                            .map(|(k, f)| (k, &f.key)))
+        })
         && state.text_stats.as_ref().map(|f| &f.key) == m.text_stats.as_ref().map(|f| &f.key)
         && state.ann_dirs.len() == m.ann_dirs.len()
         && state
