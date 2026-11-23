@@ -175,6 +175,7 @@ async fn from_directory(
                 layout,
                 None,
                 skip,
+                None,
             )
             .await?;
             if slack > 0 {
@@ -269,12 +270,38 @@ async fn from_tiers(
         positions.push(at);
     }
     let uncovered = covered.iter().any(|c| !c);
-    let parts = tiers.iter().zip(&positions).map(|(set, at)| {
-        from_slabs(
-            store, state, attribute, vector, config, k, columns, set, at, None,
-        )
-        .boxed()
-    });
+    // A base and its delta rank their leaves as one list.
+    let seats = if tiers.len() > 1 {
+        crate::ann_dir::Joint::seats(tiers.len())
+            .into_iter()
+            .map(Some)
+            .collect()
+    } else {
+        vec![None]
+    };
+    let parts = tiers
+        .iter()
+        .zip(&positions)
+        .zip(seats)
+        .map(|((set, at), seat)| {
+            async move {
+                from_slabs(
+                    store,
+                    state,
+                    attribute,
+                    vector,
+                    config,
+                    k,
+                    columns,
+                    set,
+                    at,
+                    None,
+                    seat.as_ref(),
+                )
+                .await
+            }
+            .boxed()
+        });
     // Segments with no ANN object at all leave the whole query to the document scan.
     if uncovered
         && state
@@ -362,6 +389,7 @@ async fn from_slabs(
     set: &bf_wal::SlabSet,
     at: &[usize],
     prefetched: Option<&crate::ann_dir::Prefetched>,
+    seat: Option<&crate::ann_dir::Seat>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     let Ok((dir, _)) = crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
     else {
@@ -455,6 +483,7 @@ async fn from_slabs(
         Layout::Slabs,
         Some((state, &set.covered, at)),
         &[],
+        seat,
     )
     .await?;
     if slack > 0 {

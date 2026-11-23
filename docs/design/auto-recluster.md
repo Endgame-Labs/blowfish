@@ -1,6 +1,6 @@
 # Automatic recluster
 
-Status: proposed (2026-11-23). Implements SPEC decision 21 under decision 25: recluster is always on, with no off
+Status: rounds R1 to R3 built (2026-11-23); R4 and R5 proposed. Implements SPEC decision 21 under decision 25: recluster is always on, with no off
 switch and no manual mode. `examples/recluster.rs` goes away once this ships.
 
 ## The problem, in numbers
@@ -76,9 +76,13 @@ The indexer evaluates this after each publication, from manifest numbers only, s
    - The gain `G` is their ratio. Below 100,000 live rows, or with a single segment, `G` is 1.
    - A tier written in an older format counts as `G = infinity` (the automatic upgrade).
 2. **Base build:** no base, and `G >= 1.25`.
-3. **Delta build:** uncovered rows reach 10% of the base's rows. The delta is rebuilt from its own rows plus the
-   uncovered rows, against the base's coarse cells.
-4. **Merge:** the delta reaches half the base, or masked rows reach 20% of a tier. All rows are rebuilt into a new
+3. **Delta build:** uncovered rows reach 4% of the base's rows and a quarter of the delta's. The delta is rebuilt
+   from its own rows plus the uncovered rows, against the base's coarse cells. (Round R3 lowered this from the
+   10% first proposed: on NQ, 5% of rows outside the base cost 35% more instructions per query, and a delta build of
+   a few percent of the rows is cheap. The quarter-of-the-delta rule keeps a growing delta from being rebuilt more
+   than about eight times before it merges.)
+4. **Merge:** the delta reaches half the base, or masked rows reach 20% of a tier. (Round R3 estimates masked rows
+   from manifest numbers: the tiers' rows minus the live rows outside the uncovered segments.) All rows are rebuilt into a new
    base, and the delta is dropped.
 5. **Bulk-load guard:** while a bulk load is running (the indexer flushed in bulk mode in the last 5 minutes),
    steps 2 to 4 wait, unless uncovered rows exceed the covered rows. A load-then-query namespace therefore pays

@@ -52,6 +52,7 @@ async fn versioned_slots_conflicts_tail_and_manifest() {
         retired: vec![],
         checkpoints: vec![],
         pruned_through: 0,
+        bulk_load_at: None,
         root: false,
     };
     a.publish_manifest(1, &manifest).await.unwrap();
@@ -132,6 +133,7 @@ async fn epoch_claims_fence_stalled_indexers_and_checkpoint_regression() {
         retired: vec![],
         checkpoints: vec![],
         pruned_through: 0,
+        bulk_load_at: None,
         root: false,
     };
     assert_eq!(wal.publish_fenced(0, 0, &manifest).await.unwrap(), 1);
@@ -375,6 +377,7 @@ async fn compact_reader_copy_omits_text_headers_and_full_reads_ignore_it() {
         retired: vec![],
         checkpoints: vec![],
         pruned_through: 0,
+        bulk_load_at: None,
         root: false,
     };
     wal.publish_manifest(1, &manifest).await.unwrap();

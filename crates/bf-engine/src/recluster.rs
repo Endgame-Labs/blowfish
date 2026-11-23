@@ -18,7 +18,11 @@
 //! snapshot, claims nothing, and hands the finished tier to the indexer, which installs it in its
 //! next fenced publication. It runs on a pool of half the cores, and between slabs it waits while
 //! the indexer flushes or compacts.
-use crate::{Engine, ann_dir, auto_recluster::Job, log_error, segment};
+use crate::{
+    Engine, ann_dir,
+    auto_recluster::{Job, Kind, Target},
+    log_error, segment,
+};
 use bf_types::ApiError;
 use bf_wal::{Segment, SlabCover, SlabSet, Wal};
 use futures::{StreamExt, TryStreamExt};
@@ -83,8 +87,10 @@ async fn on_pool<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> R
 
 impl Engine {
     /// Recluster `ns` now: the automatic recluster's job, run in the foreground whatever its
-    /// trigger says. It builds a base tier over every segment of the newest manifest, then runs
-    /// index passes until one installs it. For tests and benchmarks; a server does this by itself.
+    /// thresholds say. Over the newest manifest it builds a delta tier when a base is installed
+    /// and rows are outside the tiers (unless a merge is due), and otherwise a base over every
+    /// segment; then it runs index passes until one installs the tier. For tests and benchmarks;
+    /// a server does this by itself.
     pub async fn recluster(
         &self,
         ns: &str,
@@ -93,22 +99,27 @@ impl Engine {
         self.run_recluster_job(ns, opts).await
     }
 
-    /// Build a base tier for `opts.attribute` over every segment of `manifest` (a snapshot: no
-    /// claim is taken, and indexing continues). Uploads its slabs and directory, and publishes
-    /// nothing.
+    /// Build the tier `target` describes for `opts.attribute` over `manifest` (a snapshot: no
+    /// claim is taken, and indexing continues). Uploads its slabs, directory, and (for a base
+    /// that trains them) coarse cells, and publishes nothing.
     // Boxed with an explicit `Send`: the build's streams of closures otherwise trip rustc's
     // higher-ranked `Send` inference when the job is spawned.
     pub(crate) fn build_tier<'a>(
         &'a self,
         ns: &'a str,
         manifest: &'a bf_wal::Manifest,
+        target: &'a Target,
         opts: &'a ReclusterOptions,
         job: &'a Job,
     ) -> futures::future::BoxFuture<'a, Result<Built, ApiError>> {
         Box::pin(async move {
             let _busy = bf_alloc::busy();
             let context = crate::read_cache::ReadContext::new(self.0.read_cache.clone());
-            crate::read_cache::scope(context, self.build_tier_inner(ns, manifest, opts, job)).await
+            crate::read_cache::scope(
+                context,
+                self.build_tier_inner(ns, manifest, target, opts, job),
+            )
+            .await
         })
     }
 
@@ -116,17 +127,18 @@ impl Engine {
         &self,
         ns: &str,
         manifest: &bf_wal::Manifest,
+        target: &Target,
         opts: &ReclusterOptions,
         job: &Job,
     ) -> Result<Built, ApiError> {
         let t0 = std::time::Instant::now();
+        let segments = &target.segments;
         let store = &self.0.store;
         let attr = opts.attribute.as_str();
         let wal = Wal::new(store.clone(), ns).map_err(log_error)?;
         let (ann_key, frag_key) = (format!("annv2:{attr}"), format!("annv2:{attr}"));
-        if manifest.segments.is_empty()
-            || manifest
-                .segments
+        if segments.is_empty()
+            || segments
                 .iter()
                 .any(|s| !s.files.contains_key(&ann_key) || !s.files.contains_key(&frag_key))
         {
@@ -139,7 +151,7 @@ impl Engine {
         // Global row numbers: segment bases in manifest order.
         let mut covered = Vec::new();
         let mut total: u64 = 0;
-        for seg in &manifest.segments {
+        for seg in segments {
             covered.push(SlabCover {
                 segment: seg.id.clone(),
                 base: total as u32,
@@ -151,7 +163,7 @@ impl Engine {
         if total >= u64::from(u32::MAX) {
             return Err(ApiError::new(400, "too many rows for one recluster"));
         }
-        let first = segment_index(store, &manifest.segments[0], &ann_key).await?;
+        let first = segment_index(store, &segments[0], &ann_key).await?;
         let (dims, width) = (first.dims(), first.vector_row_bytes());
         let (dtype, metric) = (
             first.vector_type(),
@@ -175,7 +187,7 @@ impl Engine {
         let spill = Arc::new(spill);
         let result = self
             .recluster_with_spill(
-                manifest,
+                target,
                 &wal,
                 opts,
                 covered,
@@ -194,7 +206,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn recluster_with_spill(
         &self,
-        manifest: &bf_wal::Manifest,
+        target: &Target,
         wal: &Wal,
         opts: &ReclusterOptions,
         covered: Vec<SlabCover>,
@@ -207,7 +219,7 @@ impl Engine {
         let store = &self.0.store;
         let (attr, ns) = (opts.attribute.as_str(), wal.namespace().to_string());
         let ann_key = format!("annv2:{attr}");
-        let segments = manifest.segments.clone();
+        let segments = target.segments.clone();
         let bases: Vec<u32> = covered.iter().map(|c| c.base).collect();
         let copied: Vec<Vec<u32>> = futures::stream::iter(segments.into_iter().zip(bases).map(
             |(seg, base): (Segment, u32)| {
@@ -261,7 +273,8 @@ impl Engine {
             t0.elapsed().as_secs_f64()
         );
 
-        // Pass 2: coarse partition. Train on a sample, then assign every row.
+        // Pass 2: coarse partition. Train on a sample (or take the base's cells), then assign
+        // every row.
         let present = Arc::new(present);
         let read_row = {
             let spill = spill.clone();
@@ -274,30 +287,38 @@ impl Engine {
                 bf_vector::prepare_vector(&first.decode_stored(buf), metric)
             }
         };
+        let reused = match &target.coarse {
+            Some((file, rows)) => {
+                Some((read_coarse(store, file, dims).await?, file.clone(), *rows))
+            }
+            None => None,
+        };
         let cells = opts.cells.max(1).min(present.len());
         let (assignment, cell_rows, coarse) = {
             let (present, read_row) = (present.clone(), read_row.clone());
             let cells_n = cells;
+            let known = reused.as_ref().map(|(centers, _, _)| centers.clone());
             on_pool(move || {
-                let mut state = 0x9E37_79B9_7F4A_7C15u64;
-                let mut next = move || {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    state
-                };
-                // A coarse partition needs a few hundred points per cell, not the whole corpus.
-                let sample_n = (cells_n * 600).clamp(8_000, 50_000).min(present.len());
-                let picks: Vec<u32> = (0..sample_n)
-                    .map(|_| present[next() as usize % present.len()])
-                    .collect();
-                let sample: Vec<Vec<f32>> = picks
-                    .par_iter()
-                    .map_init(Vec::new, |buf, g| read_row(*g, buf))
-                    .collect();
-                let refs: Vec<&[f32]> = sample.iter().map(|v| v.as_slice()).collect();
-                let centers = bf_vector::kmeans(&refs, cells_n, 8, 7);
-                drop(sample);
+                let centers = known.unwrap_or_else(|| {
+                    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+                    let mut next = move || {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state
+                    };
+                    // A coarse partition needs a few hundred points per cell, not the whole corpus.
+                    let sample_n = (cells_n * 600).clamp(8_000, 50_000).min(present.len());
+                    let picks: Vec<u32> = (0..sample_n)
+                        .map(|_| present[next() as usize % present.len()])
+                        .collect();
+                    let sample: Vec<Vec<f32>> = picks
+                        .par_iter()
+                        .map_init(Vec::new, |buf, g| read_row(*g, buf))
+                        .collect();
+                    let refs: Vec<&[f32]> = sample.iter().map(|v| v.as_slice()).collect();
+                    bf_vector::kmeans(&refs, cells_n, 8, 7)
+                });
                 let assignment: Vec<u16> = present
                     .par_iter()
                     .map_init(Vec::new, |buf, g| {
@@ -311,6 +332,22 @@ impl Engine {
                 (assignment.len(), cell_rows, centers)
             })
             .await?
+        };
+        // A base keeps its cells for the deltas built against it and for its merge.
+        let coarse_file = match (target.kind, reused) {
+            (Kind::Delta, _) => None,
+            (Kind::Base, Some((_, file, rows))) => Some((file, rows)),
+            (Kind::Base, None) => {
+                let mut bytes = Vec::with_capacity(coarse.len() * dims * 4);
+                for x in coarse.iter().flatten() {
+                    bytes.extend_from_slice(&x.to_le_bytes());
+                }
+                let key = format!("ns/{ns}/slabs/{}coarse.bin", job.slab_prefix());
+                Some((
+                    segment::put_file(store, key, bytes, 0).await?,
+                    present.len() as u64,
+                ))
+            }
         };
         tracing::info!(
             "recluster {ns}: {assignment} rows in {} cells (largest {}) at {:.0}s",
@@ -432,8 +469,10 @@ impl Engine {
         slabs.extend(uploads.lock().await.drain(..));
         slabs.sort_by(|a, b| a.id.cmp(&b.id));
 
-        // The directory over the slabs. The indexer publishes the tier.
-        let (dir, pages) = slab_directories(store, &ns, attr, &slabs).await?;
+        // The directory over the slabs. The indexer publishes the tier. The cold-query hint is
+        // the base's (a delta's directory is small, and read beside it).
+        let (dir, pages) =
+            slab_directories(store, &ns, attr, &slabs, target.kind == Kind::Base).await?;
         let report = ReclusterReport {
             rows: present.len() as u64,
             slabs: slabs.len(),
@@ -448,6 +487,8 @@ impl Engine {
                 dir,
                 pages,
                 format: bf_wal::TIER_FORMAT_VERSION,
+                coarse_rows: coarse_file.as_ref().map_or(0, |(_, rows)| *rows),
+                coarse: coarse_file.map(|(file, _)| file),
             },
             report: ReclusterReport {
                 seconds: t0.elapsed().as_secs_f64(),
@@ -464,13 +505,14 @@ pub(crate) async fn slab_directories(
     ns: &str,
     attr: &str,
     slabs: &[Segment],
+    hint: bool,
 ) -> Result<(bf_wal::SegmentFile, Option<bf_wal::SegmentFile>), ApiError> {
     let dir = ann_dir::build(store, ns, slabs, attr, ann_dir::Layout::Slabs, None)
         .await?
         .ok_or_else(|| ApiError::new(500, "slab directory not built"))?;
     let paged_dir = ann_dir::load(store, &dir, None).await?;
     let pages = ann_dir::build_paged(store, ns, attr, paged_dir, slabs).await?;
-    if pages.is_none() {
+    if pages.is_none() && hint {
         let bytes = segment::ObjectReader::new(store, &dir)
             .bypass_cache()
             .read(0..dir.size)
@@ -479,6 +521,30 @@ pub(crate) async fn slab_directories(
         ann_dir::write_hint(store, ns, ann_dir::Layout::Slabs, attr, &dir.key, &bytes).await;
     }
     Ok((dir, pages))
+}
+
+/// A base's coarse cells, as `build_tier` wrote them.
+async fn read_coarse(
+    store: &bf_storage::Storage,
+    file: &bf_wal::SegmentFile,
+    dims: usize,
+) -> Result<Vec<Vec<f32>>, ApiError> {
+    let bytes = segment::read_whole_uncached(store, file).await?;
+    if dims == 0 || bytes.is_empty() || bytes.len() % (dims * 4) != 0 {
+        return Err(segment::index_error(
+            "coarse cells do not match the vectors",
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(dims * 4)
+        .map(|cell| {
+            cell.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|x| f32::from_le_bytes(*x))
+                .collect()
+        })
+        .collect())
 }
 
 /// Open a segment's index directly (not through the decoded cache: a recluster reads each once).

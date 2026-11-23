@@ -796,6 +796,197 @@ fn pick_clusters(
     picked
 }
 
+/// Recluster tiers searched for one query, ranking their leaves as one list.
+///
+/// Each tier's leaves hold about the same number of rows (one clustering of each tier's rows into
+/// leaves of the same size), so the query's nearest leaves over all tiers are what a single tier
+/// over all of their rows would probe. Searched apart, each tier would size its probe for its own
+/// rows, as if it were the whole namespace, and a small delta beside a base would scan about
+/// `sqrt(delta share)` more rows than one tier. Together, they agree on one probe count for all
+/// of their rows and walk their nearest leaves as one list, in two exchanges: their totals, then
+/// their nearest leaves. A tier that stops early (no rows to rank, or an error) withdraws, and the
+/// others go on without it.
+pub(crate) struct Joint {
+    parts: usize,
+    state: std::sync::Mutex<JointState>,
+    changed: tokio::sync::Notify,
+}
+
+/// One part's nearest entries, nearest first, as (distance order key, expected rows).
+type Head = Vec<(u32, f64)>;
+
+#[derive(Default)]
+struct JointState {
+    /// Each part's (ANN rows, matching rows, clusters, wanted candidates); `Some(None)` once it
+    /// withdrew.
+    totals: Vec<Option<Option<[usize; 4]>>>,
+    /// Each part's nearest entries, nearest first, as (distance order key, expected rows).
+    heads: Vec<Option<Option<Head>>>,
+}
+
+impl Joint {
+    /// One seat for each of `parts` tiers.
+    pub(crate) fn seats(parts: usize) -> Vec<Seat> {
+        let joint = Arc::new(Joint {
+            parts,
+            state: std::sync::Mutex::new(JointState {
+                totals: vec![None; parts],
+                heads: vec![None; parts],
+            }),
+            changed: tokio::sync::Notify::new(),
+        });
+        (0..parts)
+            .map(|part| Seat {
+                joint: joint.clone(),
+                part,
+            })
+            .collect()
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, JointState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Wait until `ready` returns a value (it is checked under the lock after every change).
+    async fn wait<T>(&self, ready: impl Fn(&JointState) -> Option<T>) -> T {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(out) = ready(&self.lock()) {
+                return out;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One tier's place in a [`Joint`] plan.
+pub(crate) struct Seat {
+    joint: Arc<Joint>,
+    part: usize,
+}
+
+impl Seat {
+    /// Leave the plan: the other tiers stop waiting for this one.
+    pub(crate) fn withdraw(&self) {
+        let mut state = self.joint.lock();
+        let totals = &mut state.totals[self.part];
+        if totals.is_none() {
+            *totals = Some(None);
+        }
+        let heads = &mut state.heads[self.part];
+        if heads.is_none() {
+            *heads = Some(None);
+        }
+        drop(state);
+        self.joint.changed.notify_waiters();
+    }
+
+    /// This tier's share of the joint probe: the entries of `dir` among the nearest leaves of all
+    /// the tiers, nearest first (see [`pick_clusters`] for the walk one directory does alone).
+    async fn pick(
+        &self,
+        dir: &Directory,
+        distances: &[f32],
+        in_cluster: &(dyn Fn(usize) -> f64 + Sync),
+        t: &Totals,
+        wanted: usize,
+        config: &EngineConfig,
+    ) -> Vec<usize> {
+        {
+            let mut state = self.joint.lock();
+            state.totals[self.part] = Some(Some([t.ann_rows, t.matching, t.clusters, wanted]));
+        }
+        self.joint.changed.notify_waiters();
+        let parts = self.joint.parts;
+        let [ann_rows, matching, clusters, wanted] = self
+            .joint
+            .wait(|state| {
+                let all: Option<Vec<&Option<[usize; 4]>>> =
+                    state.totals.iter().map(Option::as_ref).collect();
+                let all = all?;
+                let mut sum = [0usize; 4];
+                for part in all.into_iter().flatten() {
+                    sum[0] += part[0];
+                    sum[1] += part[1];
+                    sum[2] += part[2];
+                    sum[3] = sum[3].max(part[3]);
+                }
+                Some(sum)
+            })
+            .await;
+        let thin = ann_rows as f64 / matching.max(1) as f64;
+        let probes = probe_count(config, ann_rows, clusters, thin * t.spread);
+        let target = wanted.min(matching);
+        // This tier's nearest entries: enough that the joint walk never runs past them.
+        let flat: Vec<bool> = dir.segments().iter().map(|s| s.flat).collect();
+        let mut order: Vec<u64> = dir
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(n, e)| !flat[e.segment] && e.rows > 0 && in_cluster(*n) > 0.0)
+            .map(|(n, _)| (u64::from(total_order_key(distances[n])) << 32) | n as u64)
+            .collect();
+        let head = (probes * 2 + 64).min(order.len());
+        if head < order.len() {
+            order.select_nth_unstable(head);
+            order.truncate(head);
+        }
+        order.sort_unstable();
+        let mine: Head = order
+            .iter()
+            .map(|key| {
+                let n = (key & u64::from(u32::MAX)) as usize;
+                ((key >> 32) as u32, in_cluster(n))
+            })
+            .collect();
+        {
+            let mut state = self.joint.lock();
+            state.heads[self.part] = Some(Some(mine));
+        }
+        self.joint.changed.notify_waiters();
+        let part = self.part;
+        let take = self
+            .joint
+            .wait(|state| {
+                let heads: Option<Vec<&Option<Head>>> =
+                    state.heads.iter().map(Option::as_ref).collect();
+                let heads = heads?;
+                // Walk every head as one list, nearest first (ties by part), as one directory's
+                // walk would: until the probe count and the rerank target are both reached.
+                let mut at = vec![0usize; parts];
+                let (mut count, mut candidates) = (0usize, 0f64);
+                loop {
+                    let next = (0..parts)
+                        .filter_map(|p| {
+                            let head = heads[p].as_ref()?;
+                            head.get(at[p]).map(|(key, rows)| (*key, p, *rows))
+                        })
+                        .min_by_key(|(key, p, _)| (*key, *p));
+                    let Some((_, p, rows)) = next else { break };
+                    at[p] += 1;
+                    count += 1;
+                    candidates += rows;
+                    if count >= probes && candidates >= target as f64 {
+                        break;
+                    }
+                }
+                Some(at[part])
+            })
+            .await;
+        order
+            .iter()
+            .take(take)
+            .map(|key| (key & u64::from(u32::MAX)) as usize)
+            .collect()
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.withdraw();
+    }
+}
+
 /// `x`'s bits mapped so that unsigned order is `f32::total_cmp` order.
 fn total_order_key(x: f32) -> u32 {
     let bits = x.to_bits();
@@ -832,6 +1023,7 @@ pub(crate) async fn search(
     layout: Layout,
     real: Option<(&NamespaceState, &[bf_wal::SlabCover], &[usize])>,
     skip: &[bool],
+    joint: Option<&Seat>,
 ) -> Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError> {
     // With slabs, `state` lists the slabs and `real` the segments that hold the documents: a
     // slab row is a global row number, mapped back by the covered segments' bases to a covered
@@ -925,21 +1117,30 @@ pub(crate) async fn search(
                 }
             }
         } else {
-            let picked = pick_clusters(
-                dir.as_ref(),
-                &distances,
-                &in_cluster,
-                &Totals {
-                    ann_rows,
-                    matching,
-                    clusters,
-                    target,
-                    filtered,
-                    spread: layout_spread(config, dir.as_ref(), layout, &seg_rows, &skipped)
-                        * tier_share(dir.as_ref(), &seg_rows, &skipped),
-                },
-                config,
-            );
+            let totals = Totals {
+                ann_rows,
+                matching,
+                clusters,
+                target,
+                filtered,
+                spread: layout_spread(config, dir.as_ref(), layout, &seg_rows, &skipped)
+                    * tier_share(dir.as_ref(), &seg_rows, &skipped),
+            };
+            let picked = match joint {
+                Some(seat) => {
+                    let wanted = k.saturating_mul(config.ann_rerank_factor);
+                    seat.pick(
+                        dir.as_ref(),
+                        &distances,
+                        &in_cluster,
+                        &totals,
+                        wanted,
+                        config,
+                    )
+                    .await
+                }
+                None => pick_clusters(dir.as_ref(), &distances, &in_cluster, &totals, config),
+            };
             let count = picked.len();
             likely = likely_segments(dir.as_ref(), &picked);
             if !filtered
@@ -954,6 +1155,10 @@ pub(crate) async fn search(
                 }
             }
         }
+    }
+    // A tier that ranked nothing leaves the joint plan to the others.
+    if let Some(seat) = joint {
+        seat.withdraw();
     }
     // Flat segments, and every ANN segment when the namespace is small, are scanned exactly.
     let mut exact_segments = BTreeSet::new();

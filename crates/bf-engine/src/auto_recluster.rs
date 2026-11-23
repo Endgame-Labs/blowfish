@@ -1,19 +1,23 @@
-//! The automatic recluster (`docs/design/auto-recluster.md`): when a namespace gets a new base
-//! tier, how the build runs beside indexing and queries, and how the indexer installs it.
+//! The automatic recluster (`docs/design/auto-recluster.md`): when a namespace gets a new tier,
+//! how the build runs beside indexing and queries, and how the indexer installs it.
 //!
+//! - **What.** A vector attribute has at most two tiers: a base, and a delta over rows written
+//!   since, built against the base's coarse cells. Rows in neither are in uncovered segments.
 //! - **When.** After each publication the background indexer evaluates the trigger from manifest
-//!   numbers only ([`decide`]). A namespace with no tier gets one once its layout would gain from it;
-//!   one with a tier gets a new base once the rows outside it reach a quarter of its rows (until
-//!   the delta tier exists), or when its format is older than this binary's.
+//!   numbers only ([`decide`]). A namespace with no tier gets a base once its layout would gain
+//!   from it. With a base, the rows outside the tiers get a delta (rebuilt with them) once they
+//!   reach a small share of the base, and the delta merges into a new base once it reaches half
+//!   of it. A tier in an older format is rebuilt. While a bulk load runs, builds wait.
 //! - **How.** One build per process, on half the cores, waiting between slabs while the indexer
 //!   flushes or compacts. It reserves memory from the engine's budget and checks the scratch disk
 //!   first, and defers (counting the reason) when either is short.
 //! - **Safely.** The build reads a manifest snapshot and claims nothing. A create-only build record,
-//!   rewritten every ten minutes, keeps GC away from its slabs until they are published. The
-//!   finished tier waits in memory until the indexer's next pass, which checks that the segments it
-//!   covers are still live and installs it in its own fenced publication. Compaction leaves the
-//!   segments of a running or waiting build alone, so the check only fails when another node
-//!   changed them.
+//!   rewritten every ten minutes until the tier is installed or dropped, keeps GC away from its
+//!   objects. The finished tier waits in memory until the indexer's next pass, which checks that
+//!   the segments it covers are still live (and, for a delta, that its base is still installed)
+//!   and installs it in its own fenced publication; then the records are deleted. Compaction
+//!   leaves the segments of a running or waiting build alone, so the check only fails when
+//!   another node changed them.
 use crate::{Engine, log_error, recluster, storage_error};
 use bf_types::ApiError;
 use bf_wal::{Manifest, SlabSet, Wal};
@@ -27,9 +31,18 @@ use std::{
 const MIN_ROWS: u64 = 100_000;
 /// A first base is built once it would scan this many times fewer rows.
 const BASE_GAIN: f64 = 1.25;
-/// Until the delta tier (round R3), the base is rebuilt once rows outside it reach this share of it.
-const REBUILD_SHARE: f64 = 0.25;
-/// A namespace that flushed a bulk-load-sized tail this recently is still loading.
+/// Rows outside the tiers get a delta once they reach this share of the base's rows, and this
+/// share of the delta's (so a growing delta is rebuilt a bounded number of times).
+const DELTA_SHARE: f64 = 0.04;
+const DELTA_GROWTH: f64 = 0.25;
+/// The delta (with the rows outside it) merges into a new base at this share of the base, and
+/// the tiers are rebuilt once deletes and updates mask this share of their rows.
+const MERGE_SHARE: f64 = 0.5;
+const MASKED_SHARE: f64 = 0.2;
+/// A merge retrains the coarse cells once the rows have grown this many times past the rows
+/// they were trained over.
+const COARSE_GROWTH: u64 = 4;
+/// A namespace whose indexer flushed a bulk-load-sized tail this recently is still loading.
 const BULK_WINDOW: Duration = Duration::from_secs(300);
 /// How soon a deferred evaluation runs again, though nothing was published since.
 const RETRY_DEFERRED: Duration = Duration::from_secs(60);
@@ -73,16 +86,41 @@ pub(crate) enum Decision {
     Nothing,
     /// A build would help, but waits for this reason.
     Wait(&'static str),
-    /// Build a new base for this attribute, for this reason.
+    /// Build a tier for this attribute, for this reason (`delta` builds a delta tier; every
+    /// other reason a new base over all rows).
     Build(String, &'static str),
+}
+
+/// Which tier a build makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// A base over every row, replacing the attribute's tiers.
+    Base,
+    /// A delta over the current delta's rows and the rows outside the tiers, against the base's
+    /// coarse cells.
+    Delta,
+}
+impl Kind {
+    fn of(reason: &str) -> Self {
+        if reason == "delta" {
+            Self::Delta
+        } else {
+            Self::Base
+        }
+    }
 }
 
 /// The layout numbers the trigger reads, for one vector attribute.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Layout {
     pub covered_rows: u64,
+    pub base_rows: u64,
+    pub delta_rows: u64,
     pub uncovered_rows: u64,
     pub uncovered_segments: usize,
+    /// Rows the tiers hold that were deleted or updated since (estimated from the namespace's
+    /// live rows: what is not live outside the tiers).
+    pub masked_rows: u64,
     /// Rows a default query scans now over rows it would scan after a rebuild (1 when there is
     /// nothing to gain, infinity for a tier in an older format).
     pub gain: f64,
@@ -112,8 +150,11 @@ pub(crate) fn layout(
     let uncovered_rows: u64 = uncovered.iter().sum();
     let mut out = Layout {
         covered_rows,
+        base_rows: tiers.first().map_or(0, SlabSet::rows),
+        delta_rows: tiers.get(1).map_or(0, SlabSet::rows),
         uncovered_rows,
         uncovered_segments: uncovered.len(),
+        masked_rows: 0,
         gain: 1.0,
     };
     if tiers.iter().any(|t| t.format < bf_wal::TIER_FORMAT_VERSION) {
@@ -138,11 +179,13 @@ pub(crate) fn layout(
     out
 }
 
-/// The trigger, from manifest numbers only. `bulk` says a bulk load flushed recently, and
-/// `compacting` that a merge is pending (a build would cover segments about to disappear).
+/// The trigger, from manifest numbers only. `live_rows` is the namespace's live row count (when
+/// known), `bulk` says a bulk load flushed recently, and `compacting` that a merge is pending (a
+/// build would cover segments about to disappear).
 pub(crate) fn decide(
     segments: &[bf_wal::Segment],
     tiers: &std::collections::BTreeMap<String, Vec<SlabSet>>,
+    live_rows: Option<u64>,
     bulk: bool,
     compacting: bool,
 ) -> (Decision, Option<Layout>) {
@@ -160,14 +203,20 @@ pub(crate) fn decide(
         .collect();
     for attr in attrs {
         let tiered = tiers.get(&attr).filter(|t| !t.is_empty());
-        let l = layout(segments, tiered, &attr);
+        let mut l = layout(segments, tiered, &attr);
+        if let Some(live) = live_rows {
+            l.masked_rows = l
+                .covered_rows
+                .saturating_sub(live.saturating_sub(l.uncovered_rows));
+        }
         let why = match tiered {
             _ if l.gain.is_infinite() => "upgrade",
             None if l.gain >= BASE_GAIN => "base",
-            Some(_) if l.uncovered_rows as f64 >= REBUILD_SHARE * l.covered_rows as f64 => {
-                "rebuild"
-            }
-            _ => continue,
+            None => continue,
+            Some(_) => match next_tier(&l) {
+                Some(why) => why,
+                None => continue,
+            },
         };
         // A load-then-query namespace builds once its load ends, plus doubling builds while the
         // load outgrows what is covered.
@@ -182,10 +231,101 @@ pub(crate) fn decide(
     (Decision::Nothing, None)
 }
 
+/// With a base installed: a merge once the delta and the rows outside it reach half the base, a
+/// delta once the rows outside the tiers reach [`DELTA_SHARE`] of the base and
+/// [`DELTA_GROWTH`] of the delta, and otherwise nothing.
+fn next_tier(l: &Layout) -> Option<&'static str> {
+    let (base, delta, outside) = (
+        l.base_rows as f64,
+        l.delta_rows as f64,
+        l.uncovered_rows as f64,
+    );
+    if l.uncovered_rows == 0 && l.delta_rows == 0 && l.masked_rows == 0 {
+        return None;
+    }
+    if delta + outside >= MERGE_SHARE * base {
+        return Some("merge");
+    }
+    if l.masked_rows as f64 >= MASKED_SHARE * l.covered_rows as f64 {
+        return Some("masked");
+    }
+    (l.uncovered_rows > 0 && outside >= (DELTA_SHARE * base).max(DELTA_GROWTH * delta))
+        .then_some("delta")
+}
+
+/// The tier a foreground run builds whatever the thresholds say: a base when there is none or a
+/// merge is due, else a delta when rows are outside the tiers, else a new base.
+fn forced_kind(segments: &[bf_wal::Segment], tiers: Option<&Vec<SlabSet>>, attr: &str) -> Kind {
+    let Some(tiers) = tiers.filter(|t| !t.is_empty()) else {
+        return Kind::Base;
+    };
+    let l = layout(segments, Some(tiers), attr);
+    if l.gain.is_infinite() || l.uncovered_rows == 0 || next_tier(&l) == Some("merge") {
+        Kind::Base
+    } else {
+        Kind::Delta
+    }
+}
+
+/// What a build reads and makes: its kind, the segments whose rows it covers (in manifest order),
+/// the coarse cells it reuses, and for a delta the directory key of the base it was built against.
+pub(crate) struct Target {
+    pub kind: Kind,
+    pub segments: Vec<bf_wal::Segment>,
+    pub coarse: Option<(bf_wal::SegmentFile, u64)>,
+    pub base_dir: Option<String>,
+}
+
+/// The build `kind` makes for `attr` over `manifest`.
+fn target(manifest: &Manifest, attr: &str, kind: Kind) -> Target {
+    let tiers = manifest
+        .ann_tiers
+        .get(attr)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let base = tiers
+        .first()
+        .filter(|b| b.format == bf_wal::TIER_FORMAT_VERSION);
+    let all: u64 = manifest
+        .segments
+        .iter()
+        .map(|s| u64::from(s.row_count))
+        .sum();
+    match (kind, base) {
+        (Kind::Delta, Some(base)) if base.coarse.is_some() => {
+            let in_base: BTreeSet<&str> = base.covered.iter().map(|c| c.segment.as_str()).collect();
+            let key = format!("annv2:{attr}");
+            Target {
+                kind,
+                segments: manifest
+                    .segments
+                    .iter()
+                    .filter(|s| s.files.contains_key(&key) && !in_base.contains(s.id.as_str()))
+                    .cloned()
+                    .collect(),
+                coarse: base.coarse.clone().map(|f| (f, base.coarse_rows)),
+                base_dir: Some(base.dir.key.clone()),
+            }
+        }
+        // A delta needs a current base with its cells; anything else is a new base.
+        _ => Target {
+            kind: Kind::Base,
+            segments: manifest.segments.clone(),
+            coarse: base
+                .and_then(|b| b.coarse.clone().map(|f| (f, b.coarse_rows)))
+                .filter(|(_, rows)| all <= rows.saturating_mul(COARSE_GROWTH)),
+            base_dir: None,
+        },
+    }
+}
+
 /// A finished tier waiting for the indexer's next publication.
 pub(crate) struct Pending {
     attr: String,
     set: SlabSet,
+    kind: Kind,
+    /// For a delta, the directory key of the base it was built against.
+    base_dir: Option<String>,
     built_at: Instant,
     outcome: tokio::sync::watch::Sender<Option<bool>>,
 }
@@ -198,8 +338,6 @@ struct JobsState {
     /// Segments a running build covers.
     building: HashMap<String, BTreeSet<String>>,
     pending: HashMap<String, Pending>,
-    /// When each namespace last flushed a bulk-load-sized tail.
-    bulk: HashMap<String, Instant>,
     /// The manifest generation each namespace's trigger last evaluated, and when to evaluate it
     /// again anyway (after a deferral or a failure; never while it stands).
     evaluated: HashMap<String, (u64, Option<Instant>)>,
@@ -221,9 +359,6 @@ impl Jobs {
     pub(crate) fn has_pending(&self, ns: &str) -> bool {
         self.lock().pending.contains_key(ns)
     }
-    pub(crate) fn record_bulk_flush(&self, ns: &str) {
-        self.lock().bulk.insert(ns.to_string(), Instant::now());
-    }
     /// Whether `ns`'s trigger should be evaluated at manifest `generation`: once a generation,
     /// unless a retry has come due. Marks it evaluated.
     fn evaluate(&self, ns: &str, generation: u64) -> bool {
@@ -244,15 +379,9 @@ impl Jobs {
             entry.1 = Some(Instant::now() + wait);
         }
     }
-    fn bulk_recent(&self, ns: &str) -> bool {
-        self.lock()
-            .bulk
-            .get(ns)
-            .is_some_and(|t| t.elapsed() < BULK_WINDOW)
-    }
     /// Take the namespace's waiting tier for installation in `manifest`. Returns a guard that puts
     /// it back unless [`Installing::published`] is called, or `None` when there is none (or it
-    /// was dropped: its covered segments changed, or it waited too long).
+    /// was dropped: its covered segments changed, its base was replaced, or it waited too long).
     pub(crate) fn install<'a>(
         &'a self,
         ns: &str,
@@ -277,17 +406,41 @@ impl Jobs {
             discard(ns, &pending, "coverage");
             return None;
         }
-        let previous = manifest
+        let current = manifest
             .ann_tiers
-            .insert(pending.attr.clone(), vec![pending.set.clone()]);
+            .get(&pending.attr)
+            .cloned()
+            .unwrap_or_default();
         // An earlier publication may already hold this tier (its reply was lost): nothing to retire.
-        for old in previous
-            .into_iter()
-            .flatten()
+        let (installed, replaced): (Vec<SlabSet>, Vec<SlabSet>) = match pending.kind {
+            Kind::Base => (vec![pending.set.clone()], current),
+            Kind::Delta => {
+                let Some(base) = current
+                    .first()
+                    .filter(|b| Some(&b.dir.key) == pending.base_dir.as_ref())
+                else {
+                    discard(ns, &pending, "superseded");
+                    return None;
+                };
+                (
+                    vec![base.clone(), pending.set.clone()],
+                    current.into_iter().skip(1).collect(),
+                )
+            }
+        };
+        // Objects the new tiers still use (a base built with its predecessor's cells) stay.
+        let kept: BTreeSet<String> = installed.iter().flat_map(tier_keys).collect();
+        for old in replaced
+            .iter()
             .filter(|old| old.dir.key != pending.set.dir.key)
         {
-            crate::indexer::retire_slabs(manifest, &old);
+            for key in tier_keys(old) {
+                if !kept.contains(&key) {
+                    crate::indexer::retire(manifest, key);
+                }
+            }
         }
+        manifest.ann_tiers.insert(pending.attr.clone(), installed);
         Some(Installing {
             jobs: self,
             ns: ns.to_string(),
@@ -300,6 +453,7 @@ impl Jobs {
         ns: &str,
         attr: &str,
         set: SlabSet,
+        target: &Target,
     ) -> tokio::sync::watch::Receiver<Option<bool>> {
         let (outcome, rx) = tokio::sync::watch::channel(None);
         let mut state = self.lock();
@@ -309,6 +463,8 @@ impl Jobs {
             Pending {
                 attr: attr.to_string(),
                 set,
+                kind: target.kind,
+                base_dir: target.base_dir.clone(),
                 built_at: Instant::now(),
                 outcome,
             },
@@ -317,6 +473,19 @@ impl Jobs {
         }
         rx
     }
+}
+
+/// Every object a tier references: its slabs, its directories, and its coarse cells.
+pub(crate) fn tier_keys(set: &SlabSet) -> Vec<String> {
+    let mut out: Vec<String> = set
+        .slabs
+        .iter()
+        .flat_map(|s| s.files.values().map(|f| f.key.clone()))
+        .collect();
+    out.push(set.dir.key.clone());
+    out.extend(set.pages.iter().map(|f| f.key.clone()));
+    out.extend(set.coarse.iter().map(|f| f.key.clone()));
+    out
 }
 
 fn discard(ns: &str, pending: &Pending, reason: &'static str) {
@@ -353,6 +522,7 @@ impl Drop for Installing<'_> {
 
 /// A running build: its identity, its build record, and its claim on its covered segments.
 pub(crate) struct Job {
+    id: String,
     slab_prefix: String,
     record: Option<tokio::task::JoinHandle<()>>,
     jobs: Option<(std::sync::Arc<crate::Inner>, String)>,
@@ -366,6 +536,25 @@ impl Job {
     pub(crate) async fn pause(&self) {
         while INDEXING.load(Ordering::Acquire) > 0 {
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    /// Stop refreshing the build record and delete it: the tier was installed (the manifest now
+    /// protects its objects) or dropped (they are orphans for GC).
+    async fn finish(mut self, store: &bf_storage::Storage, ns: &str) {
+        if let Some(record) = self.record.take() {
+            record.abort();
+            let _ = record.await;
+        }
+        let records = format!("ns/{ns}/indexer/build-{}-", self.id);
+        match store.list(&format!("ns/{ns}/indexer/")).await {
+            Ok(objects) => {
+                for object in objects.iter().filter(|o| o.key.starts_with(&records)) {
+                    if let Err(e) = store.delete(&object.key).await {
+                        tracing::warn!(error = %e, "recluster: build record not deleted");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "recluster: build records not listed"),
         }
     }
 }
@@ -465,13 +654,9 @@ fn free_bytes(path: &std::path::Path) -> Option<u64> {
     Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
-/// Bytes of the spill file a build of `manifest` writes (every row's vector at stored precision).
-fn spill_bytes(manifest: &Manifest, attr: &str) -> u64 {
-    let rows: u64 = manifest
-        .segments
-        .iter()
-        .map(|s| u64::from(s.row_count))
-        .sum();
+/// Bytes of the spill file a build over `segments` writes (every row's vector at stored precision).
+fn spill_bytes(manifest: &Manifest, segments: &[bf_wal::Segment], attr: &str) -> u64 {
+    let rows: u64 = segments.iter().map(|s| u64::from(s.row_count)).sum();
     let dims = manifest
         .schema
         .get(attr)
@@ -498,10 +683,17 @@ impl Engine {
             }
             let compacting =
                 !crate::indexer::tier(&state, &self.0.config, true, &protected).is_empty();
+            let bulk = state.bulk_load_at.is_some_and(|at| {
+                (chrono::Utc::now() - at)
+                    .to_std()
+                    .is_ok_and(|since| since < BULK_WINDOW)
+                    || at > chrono::Utc::now()
+            });
             let (decision, numbers) = decide(
                 &state.segments,
                 &state.ann_tiers,
-                self.0.jobs.bulk_recent(ns),
+                Some(state.stats.rows),
+                bulk,
                 compacting,
             );
             (state.manifest_seq, decision, numbers)
@@ -573,12 +765,16 @@ impl Engine {
         {
             return Ok(None);
         }
+        let target = target(&manifest, attr, Kind::of(why));
+        if target.segments.is_empty() {
+            return Ok(None);
+        }
         let Some(max_slab_rows) = slab_rows(self) else {
             defer(ns, "memory", None);
             return Ok(None);
         };
         let scratch = scratch_dir(self);
-        let need = (spill_bytes(&manifest, attr) as f64 * DISK_MARGIN) as u64;
+        let need = (spill_bytes(&manifest, &target.segments, attr) as f64 * DISK_MARGIN) as u64;
         if free_bytes(&scratch).is_none_or(|free| free < need) {
             defer(ns, "disk", None);
             return Ok(None);
@@ -593,31 +789,34 @@ impl Engine {
         tracing::info!(
             namespace = ns,
             reason = why,
+            kind = ?target.kind,
+            segments = target.segments.len(),
+            reuses_cells = target.coarse.is_some(),
             max_slab_rows,
             "recluster: building"
         );
-        self.build_and_install(ns, &manifest, &opts, false)
+        self.build_and_install(ns, &manifest, &target, &opts, false)
             .await
             .map(Some)
     }
 
-    /// The job: build a tier over `manifest`'s segments, then wait until an index pass installs
+    /// The job: build a tier for `target` over `manifest`, then wait until an index pass installs
     /// it. `drive` runs those index passes from here (a foreground run, or an engine whose
     /// background indexing is off); otherwise the background indexer runs them.
     pub(crate) async fn build_and_install(
         &self,
         ns: &str,
         manifest: &Manifest,
+        target: &Target,
         opts: &recluster::ReclusterOptions,
         drive: bool,
     ) -> Result<recluster::ReclusterReport, ApiError> {
         let started = Instant::now();
         metrics::gauge!("blowfish_recluster_running").set(1.0);
         let _gauge = scopeguard(|| metrics::gauge!("blowfish_recluster_running").set(0.0));
-        let job = self.start_job(ns, manifest).await?;
-        let built = self.build_tier(ns, manifest, opts, &job).await?;
-        let mut rx = self.0.jobs.stage(ns, &opts.attribute, built.set);
-        drop(job);
+        let job = self.start_job(ns, &target.segments).await?;
+        let built = self.build_tier(ns, manifest, target, opts, &job).await?;
+        let mut rx = self.0.jobs.stage(ns, &opts.attribute, built.set, target);
         let deadline = Instant::now() + INSTALL_TIMEOUT;
         let mut failures = 0;
         let installed = loop {
@@ -632,7 +831,8 @@ impl Engine {
                     failures += 1;
                     tracing::warn!(error = %e, "recluster: install pass deferred");
                     if failures >= 20 {
-                        // The tier stays staged: a later index pass may still install it.
+                        // The tier stays staged, and its record keeps being refreshed until the
+                        // job is dropped: a later index pass may still install it.
                         return Err(e);
                     }
                 }
@@ -643,6 +843,8 @@ impl Engine {
                 let _ = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
             }
         };
+        // Installed, the manifest protects the tier's objects; dropped, they are orphans.
+        job.finish(&self.0.store, ns).await;
         let seconds = started.elapsed().as_secs_f64();
         metrics::histogram!("blowfish_recluster_build_seconds").record(seconds);
         if !installed {
@@ -650,7 +852,7 @@ impl Engine {
                 .increment(1);
             return Err(ApiError::new(
                 409,
-                "the built tier was not installed: its segments changed meanwhile",
+                "the built tier was not installed: its segments or base changed meanwhile",
             ));
         }
         metrics::counter!("blowfish_recluster_builds_total", "outcome" => "installed").increment(1);
@@ -663,7 +865,7 @@ impl Engine {
 
     /// Register a build: its covered segments (compaction leaves them alone) and its first build
     /// record (written before any object is uploaded), refreshed every [`RECORD_INTERVAL`].
-    async fn start_job(&self, ns: &str, manifest: &Manifest) -> Result<Job, ApiError> {
+    async fn start_job(&self, ns: &str, segments: &[bf_wal::Segment]) -> Result<Job, ApiError> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let slab_prefix = format!("slab-{id}-");
         let record = BuildRecord {
@@ -678,7 +880,7 @@ impl Engine {
             .map_err(storage_error)?;
         self.0.jobs.lock().building.insert(
             ns.to_string(),
-            manifest.segments.iter().map(|s| s.id.clone()).collect(),
+            segments.iter().map(|s| s.id.clone()).collect(),
         );
         let (key_ns, key_id) = (ns.to_string(), id.clone());
         let refresh = tokio::spawn(async move {
@@ -695,6 +897,7 @@ impl Engine {
             }
         });
         Ok(Job {
+            id,
             slab_prefix,
             record: Some(refresh),
             jobs: Some((self.0.clone(), ns.to_string())),
@@ -717,7 +920,14 @@ impl Engine {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let _running = Running;
-        self.build_and_install(ns, &manifest, opts, true).await
+        let kind = forced_kind(
+            &manifest.segments,
+            manifest.ann_tiers.get(&opts.attribute),
+            &opts.attribute,
+        );
+        let target = target(&manifest, &opts.attribute, kind);
+        self.build_and_install(ns, &manifest, &target, opts, true)
+            .await
     }
 }
 
@@ -802,9 +1012,15 @@ mod tests {
     fn small_or_single_segment_namespaces_never_build() {
         let none = Default::default();
         let small = [segment("a", 30_000), segment("b", 30_000)];
-        assert_eq!(decide(&small, &none, false, false).0, Decision::Nothing);
+        assert_eq!(
+            decide(&small, &none, None, false, false).0,
+            Decision::Nothing
+        );
         let single = [segment("a", 500_000)];
-        assert_eq!(decide(&single, &none, false, false).0, Decision::Nothing);
+        assert_eq!(
+            decide(&single, &none, None, false, false).0,
+            Decision::Nothing
+        );
     }
 
     #[test]
@@ -813,24 +1029,24 @@ mod tests {
         let loaded: Vec<_> = (0..25)
             .map(|i| segment(&format!("s{i}"), 100_000))
             .collect();
-        let (decision, numbers) = decide(&loaded, &none, false, false);
+        let (decision, numbers) = decide(&loaded, &none, None, false, false);
         assert_eq!(decision, Decision::Build("v".into(), "base"));
         // 25 segments of 100K: 25^0.3 more probes of about 316-row clusters, against 200-row leaves.
         let gain = numbers.unwrap().gain;
         assert!((gain - 2.6 * 316.0 / 200.0).abs() < 0.2, "{gain}");
         assert_eq!(
-            decide(&loaded, &none, false, true).0,
+            decide(&loaded, &none, None, false, true).0,
             Decision::Wait("compaction")
         );
         // No base yet, so uncovered rows exceed covered ones: a load does not hold the first one.
         assert_eq!(
-            decide(&loaded, &none, true, false).0,
+            decide(&loaded, &none, None, true, false).0,
             Decision::Build("v".into(), "base")
         );
     }
 
     #[test]
-    fn a_base_is_rebuilt_at_a_quarter_uncovered_or_an_older_format() {
+    fn rows_outside_a_base_get_a_delta_that_merges_at_half_the_base() {
         let mut segments: Vec<_> = (0..4).map(|i| segment(&format!("s{i}"), 100_000)).collect();
         let covered: Vec<(&str, u32)> = vec![
             ("s0", 100_000),
@@ -838,29 +1054,126 @@ mod tests {
             ("s2", 100_000),
             ("s3", 100_000),
         ];
+        let base = tier(&covered, 1);
         let mut tiers = std::collections::BTreeMap::new();
-        tiers.insert("v".to_string(), vec![tier(&covered, 1)]);
-        assert_eq!(decide(&segments, &tiers, false, false).0, Decision::Nothing);
-        segments.push(segment("new", 50_000));
-        let (decision, numbers) = decide(&segments, &tiers, false, false);
+        tiers.insert("v".to_string(), vec![base.clone()]);
+        assert_eq!(
+            decide(&segments, &tiers, None, false, false).0,
+            Decision::Nothing
+        );
+        // 2.5% of the base outside it: not yet.
+        segments.push(segment("n0", 10_000));
+        let (decision, numbers) = decide(&segments, &tiers, None, false, false);
         assert_eq!(decision, Decision::Nothing);
         assert_eq!(numbers, None);
-        segments.push(segment("new2", 60_000));
+        // 5%: a delta.
+        segments.push(segment("n1", 10_000));
         assert_eq!(
-            decide(&segments, &tiers, false, false).0,
-            Decision::Build("v".into(), "rebuild")
+            decide(&segments, &tiers, None, false, false).0,
+            Decision::Build("v".into(), "delta")
         );
-        // While a load runs, a rebuild waits until it outgrows the base.
+        // While a load runs, it waits until the load outgrows what is covered.
         assert_eq!(
-            decide(&segments, &tiers, true, false).0,
+            decide(&segments, &tiers, None, true, false).0,
             Decision::Wait("bulk_load")
         );
+        // With a 20K delta installed, the next one waits for 4% of the base again (the delta's
+        // quarter is less).
+        tiers.insert(
+            "v".to_string(),
+            vec![base.clone(), tier(&[("n0", 10_000), ("n1", 10_000)], 1)],
+        );
+        assert_eq!(
+            decide(&segments, &tiers, None, false, false).0,
+            Decision::Nothing
+        );
+        segments.push(segment("n2", 16_000));
+        assert_eq!(
+            decide(&segments, &tiers, None, false, false).0,
+            Decision::Build("v".into(), "delta")
+        );
+        // A large delta is rebuilt only once a quarter of it is outside.
+        tiers.insert(
+            "v".to_string(),
+            vec![base.clone(), tier(&[("n0", 100_000), ("n1", 60_000)], 1)],
+        );
+        segments.truncate(4);
+        segments.extend([segment("n0", 100_000), segment("n1", 60_000)]);
+        segments.push(segment("n2", 30_000));
+        assert_eq!(
+            decide(&segments, &tiers, None, false, false).0,
+            Decision::Nothing
+        );
+        segments.push(segment("n3", 10_000));
+        let (decision, numbers) = decide(&segments, &tiers, None, false, false);
+        assert_eq!(decision, Decision::Build("v".into(), "merge"));
+        let numbers = numbers.unwrap();
+        assert_eq!(
+            (
+                numbers.base_rows,
+                numbers.delta_rows,
+                numbers.uncovered_rows
+            ),
+            (400_000, 160_000, 40_000)
+        );
+        // An older format rebuilds at once, load or not.
         tiers.insert("v".to_string(), vec![tier(&covered, 0)]);
         segments.truncate(4);
         assert_eq!(
-            decide(&segments, &tiers, true, false).0,
+            decide(&segments, &tiers, None, true, false).0,
             Decision::Build("v".into(), "upgrade")
         );
+    }
+
+    #[test]
+    fn a_base_whose_rows_are_a_fifth_masked_is_rebuilt() {
+        let segments: Vec<_> = (0..4).map(|i| segment(&format!("s{i}"), 100_000)).collect();
+        let mut tiers = std::collections::BTreeMap::new();
+        tiers.insert(
+            "v".to_string(),
+            vec![tier(
+                &[
+                    ("s0", 100_000),
+                    ("s1", 100_000),
+                    ("s2", 100_000),
+                    ("s3", 100_000),
+                ],
+                1,
+            )],
+        );
+        let at = |live| decide(&segments, &tiers, Some(live), false, false);
+        assert_eq!(at(400_000).0, Decision::Nothing);
+        assert_eq!(at(330_000).0, Decision::Nothing);
+        let (decision, numbers) = at(320_000);
+        assert_eq!(decision, Decision::Build("v".into(), "masked"));
+        assert_eq!(numbers.unwrap().masked_rows, 80_000);
+        // Rows outside the tier are live rows the tier does not mask.
+        let mut more = segments.clone();
+        more.push(segment("n", 10_000));
+        let (decision, numbers) = decide(&more, &tiers, Some(340_000), false, false);
+        assert_eq!(decision, Decision::Nothing);
+        assert_eq!(numbers, None);
+    }
+
+    #[test]
+    fn a_foreground_run_builds_a_delta_beside_a_base_unless_a_merge_is_due() {
+        let mut segments: Vec<_> = (0..4).map(|i| segment(&format!("s{i}"), 100_000)).collect();
+        let base = tier(
+            &[
+                ("s0", 100_000),
+                ("s1", 100_000),
+                ("s2", 100_000),
+                ("s3", 100_000),
+            ],
+            1,
+        );
+        assert_eq!(forced_kind(&segments, None, "v"), Kind::Base);
+        let tiers = vec![base];
+        assert_eq!(forced_kind(&segments, Some(&tiers), "v"), Kind::Base);
+        segments.push(segment("n", 1_000));
+        assert_eq!(forced_kind(&segments, Some(&tiers), "v"), Kind::Delta);
+        segments.push(segment("m", 300_000));
+        assert_eq!(forced_kind(&segments, Some(&tiers), "v"), Kind::Base);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
