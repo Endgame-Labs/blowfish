@@ -1,4 +1,4 @@
-//! Offline G2 study. Usage: graph_study DATA_DIR RUN_DIR [query_count=3452] [sizes=200,100,64,32] [cells=32].
+//! Offline G2 study. Usage: graph_study DATA_DIR RUN_DIR [query_count=3452] [sizes=200,100,64,32] [cells=32] [assignment=codes|exact|both].
 //! A cell count of eight runs only the frozen-center assignment comparison.
 //! Inputs are the NumPy files produced by `bench/nq/prepare.py`. No server or bucket is used.
 //! The run directory must be new; it is removed on success, error, or unwinding.
@@ -657,6 +657,7 @@ fn evaluate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // I compare two scorers over the same frozen fixtures.
 fn assignment_study(
     corpus: &Npy,
     layout: &baseline::Layout,
@@ -665,6 +666,7 @@ fn assignment_study(
     size: usize,
     queries: &[Vec<f32>],
     truth: &[Vec<u32>],
+    exact: bool,
 ) {
     let count = counts(&layout.leaf_of, layout.leaves.len());
     const COVERAGE_PROBES: &[usize] = &[256, 524, 1024, 2048, 4096, 8192];
@@ -687,7 +689,13 @@ fn assignment_study(
             ranking.into_iter().map(|h| h.1 as u32).collect()
         })
         .collect();
-    for candidates in [8, 16, 32, 64] {
+    let budgets: &[usize] = if exact {
+        &[4, 8, 16, 32]
+    } else {
+        &[8, 16, 32, 64]
+    };
+    let prefix = if exact { "ASSIGN_F32" } else { "ASSIGN" };
+    for &candidates in budgets {
         let t = Instant::now();
         let results: Vec<_> = (0..corpus.rows)
             .into_par_iter()
@@ -695,20 +703,32 @@ fn assignment_study(
                 || (Vec::new(), Search::new(layout.leaves.len())),
                 |(buf, search), r| {
                     let q = corpus.vector(r, buf);
-                    let plane = codes.query(&q);
-                    let (found, visited) = search.run(
-                        &graph.edges,
-                        &[graph.entry],
-                        candidates * 2,
-                        |l| count[l] > 0,
-                        |l| codes.score(&plane, l),
-                    );
-                    let best = found
-                        .iter()
-                        .take(candidates)
-                        .map(|h| Hit(bf_vector::squared_distance(&q, &layout.leaves[h.1]), h.1))
-                        .min()
-                        .unwrap();
+                    let (best, visited) = if exact {
+                        let (found, visited) = search.run(
+                            &graph.edges,
+                            &[graph.entry],
+                            candidates,
+                            |l| count[l] > 0,
+                            |l| bf_vector::squared_distance(&q, &layout.leaves[l]),
+                        );
+                        (found[0], visited)
+                    } else {
+                        let plane = codes.query(&q);
+                        let (found, visited) = search.run(
+                            &graph.edges,
+                            &[graph.entry],
+                            candidates * 2,
+                            |l| count[l] > 0,
+                            |l| codes.score(&plane, l),
+                        );
+                        let best = found
+                            .iter()
+                            .take(candidates)
+                            .map(|h| Hit(bf_vector::squared_distance(&q, &layout.leaves[h.1]), h.1))
+                            .min()
+                            .unwrap();
+                        (best, visited)
+                    };
                     let old = layout.leaf_of[r] as usize;
                     let old_d = bf_vector::squared_distance(&q, &layout.leaves[old]);
                     (best.1 as u32, visited, best.0, old_d)
@@ -741,7 +761,7 @@ fn assignment_study(
             }
             let n = queries.len() as f64;
             println!(
-                "ASSIGN_COVERAGE,8,{size},{candidates},{probes},{:.6},{:.6},{:.1},{:.1}",
+                "{prefix}_COVERAGE,8,{size},{candidates},{probes},{:.6},{:.6},{:.1},{:.1}",
                 before as f64 / (n * 10.0),
                 after as f64 / (n * 10.0),
                 old_rows as f64 / n,
@@ -759,7 +779,7 @@ fn assignment_study(
         let old: f64 = results.iter().map(|r| r.3 as f64).sum();
         let new: f64 = results.iter().map(|r| r.2 as f64).sum();
         println!(
-            "ASSIGN,8,{size},{candidates},{seconds:.6},{:.6},{:.6},{:.1},{:.6}",
+            "{prefix},8,{size},{candidates},{seconds:.6},{:.6},{:.6},{:.1},{:.6}",
             agree as f64 / corpus.rows as f64,
             better as f64 / corpus.rows as f64,
             visits as f64 / corpus.rows as f64,
@@ -770,7 +790,10 @@ fn assignment_study(
 fn main() -> AnyResult<()> {
     let a: Vec<_> = std::env::args().collect();
     if a.len() < 3 {
-        return Err("expected DATA_DIR RUN_DIR [query_count] [sizes] [cells]".into());
+        return Err(
+            "expected DATA_DIR RUN_DIR [query_count] [sizes] [cells] [assignment=codes|exact|both]"
+                .into(),
+        );
     }
     let run = PathBuf::from(&a[2]);
     std::fs::create_dir(&run)?;
@@ -821,6 +844,10 @@ fn main() -> AnyResult<()> {
         .map(str::parse)
         .collect::<std::result::Result<_, _>>()?;
     let cells = a.get(5).map(|s| s.parse()).transpose()?.unwrap_or(32);
+    let assignment = a.get(6).map(String::as_str).unwrap_or("codes");
+    if !["codes", "exact", "both"].contains(&assignment) {
+        return Err("assignment must be codes, exact, or both".into());
+    }
     if cells == 0 || sizes.contains(&0) {
         return Err("cells and leaf sizes must be positive".into());
     }
@@ -861,7 +888,12 @@ fn main() -> AnyResult<()> {
         let codes = Codes::new(&layout);
         println!("CODES,{cells},{size},{:.6}", t.elapsed().as_secs_f64());
         if cells == 8 {
-            assignment_study(&corpus, &layout, &graph, &codes, size, &q, &gt);
+            if assignment != "exact" {
+                assignment_study(&corpus, &layout, &graph, &codes, size, &q, &gt, false);
+            }
+            if assignment != "codes" {
+                assignment_study(&corpus, &layout, &graph, &codes, size, &q, &gt, true);
+            }
             continue;
         }
         let t = Instant::now();
