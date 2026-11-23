@@ -4,6 +4,21 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Iteration 22: local BM25 measurements** (`docs/benchmarks.md`). I loaded 1M MS MARCO passages,
+  matched both arms to six segments, and ran the 1,000 dev queries on CPUs 6–7 at nice 10.
+  - Warm c1 p50/p90: 45.5/99.8 ms before, 18.4/44.1 ms after. Warm c16: 658.5/827.4 ms before,
+    326.3/441.3 ms after. Strict overlap@10 is 1.000 for every query at both client counts.
+  - Fresh-process queries through a local read-only S3 facade with 25 ms per request: 457/670 ms
+    before, 255/353 ms after; 189 to 117 reads, 4.35 to 3.61 MB, and 3.25 to 3.02 mean waves.
+    The mean RTT-only floor is 81.3 to 75.4 ms. The facade models dependencies, and does not model
+    AWS tails, throughput, TLS setup, or the in-region CPU. All 60 cold queries match exact truth.
+  - Live text index size: 730.4 to 743.8 MB (+1.8%), plus 246 bytes of compact ID maps. An earlier
+    copy-based bundle prototype grew indexes 33% and was replaced with the single-copy layout.
+    The warm 13/18 ms and two-wave targets remain open; AWS confirmation remains outstanding.
+    Other jobs shared the VM, so timings are sensitive to contention.
+  - New local runners (`bench/scale/bm25_local.py` and `local_s3.py`) keep temporary logs under
+    `.scratch/`, bound client and process waits, stop their exact child PIDs, and clean up on exit.
+
 - **Compact IDs for BM25:** text segments now store a checksummed row-to-ID map using numeric
   strides or string prefixes, admitted under a fixed 128 KiB encoded-size budget. ID-only BM25
   opens that map with text metadata and skips document footers and winner-ID column reads.

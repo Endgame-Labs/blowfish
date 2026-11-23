@@ -3119,3 +3119,137 @@ a cell, the one-level training alone makes it impractical. It would also hold ab
 - Center ranking and per-index table setup are now a few percent each. A finer IVF pays only with a cheaper center
   search, such as a small index over the centers.
 - Training the cross-cell assignment two-level would carry its recall gain to 10M and 100M layouts.
+
+## Iteration 22: BM25
+
+I measured the first 1,000,000 MS MARCO passages locally, with the 1,000 checked-in dev queries,
+strong consistency, default BM25 parameters, and exhaustive top-10 truth from
+`bf-text/examples/exact_bm25.rs`. The baseline is the existing main release binary (SHA-256
+`dfec618d9fddd80279ad3968460a0896c6ea7341f39b8328d4e10aec972329c3`). Both stores contain the
+same documents in six segments, after the same final compaction. This run uses no cloud bucket.
+
+I restricted servers, clients, and profiling to CPUs 6–7 at nice 10 on the shared 8-vCPU VM.
+Another worker also used the VM, including a CPU-intensive recluster run and builds; timings
+are sensitive to that contention. Builds use nice 19 and two jobs. The memory cache is 1 GiB, with 4,000-byte blocks, 512-block
+coalescing, and fetch concurrency 512, matching the earlier scale harness. Warm measurements
+follow one complete workload pass. Cold measurements use a fresh process per query for the
+first 60 queries, through a read-only local S3 facade with a fixed 25 ms delay per request.
+
+### What changed
+
+- **Dictionary bundles, text format 5.** Each bundle contains an FST, term directories, and the
+  posting payloads for terms with at most 32 blocks. The reader slices these bytes directly,
+  even when its `RangeRead` has no cache. Bundles have at most 128 terms and an estimated 32 KiB
+  payload budget; large directories occupy their own bundle. Query dictionaries and directories
+  arrive together, and rare terms need no separate posting fetch. Large terms keep exact window
+  bounds and two posting batches when needed.
+- **Less repeated CPU work.** A sampled baseline profile attributed about 57% of CPU samples to
+  BM25 search and another 8% to posting decode. Scoring now precomputes term weights and caches
+  exact f64 saturation factors by average length, k1, and b. Both preserve the reference operation
+  order. Scoring binary-searches each row window's posting slice, uses dense block cache slots,
+  and removes redundant allowed-row membership probes for fully live segments.
+  Readers retain at most 8 MiB of decoded sparse posting payloads and 8,192 blocks, with
+  conservative memory allowances charged to the engine cache. Sparse term scores are summed
+  at the same row before taking window maxima. Dense terms skip rows whose remaining bound
+  cannot reach the current heap threshold, with a rounding margin covering all query terms.
+  Scores and query answers are never cached.
+- **Compact winner IDs.** A checksummed row-to-ID map uses numeric strides or string prefix
+  compression and a fixed 128 KiB admission budget. ID-only BM25 fetches admitted maps with
+  opening metadata, avoiding document footers and late winner-ID reads. The six local maps
+  total 246 bytes. Larger maps record a 17-byte marker and keep ranged ID reads. New segments
+  write the map, and ordinary indexer publications backfill older segments once. The existing
+  segment-file map carries an optional `text_keys` role, with no manifest schema change.
+- **Automatic upgrades.** The background indexer rebuilds one older text field from immutable
+  document columns per fenced publication and retires its old object for normal GC. Checkpoint
+  comparison now notices changed text object keys even when segment IDs and live masks stay the
+  same; otherwise repeated passes could rebuild the same field. Versions 1–4 remain readable
+  during upgrades. New writes always use version 5, with no layout-selection setting.
+
+The manifest schema is unchanged, so its version and the bucket fence do not increase. Text
+footers carry version 5 through the existing manifest header representation. The writer repacks
+its intermediate output into one copy of each posting and directory. A reserved FST region
+breaks the dependency between dictionary size and its absolute directory offsets.
+
+### Results
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Cold reads/query, mean | 189.0 | 117.2 |
+| Cold MB/query, mean | 4.350 | 3.606 |
+| Cold waves/query, mean | 3.25 | 3.02 |
+| RTT-only model, mean | 81.3 ms | 75.4 ms |
+| RTT-only model, p50 / p90 | 75 / 100 ms | 75 / 100 ms |
+| Fresh-process local facade, p50 / p90 | 457.3 / 669.6 ms | 254.5 / 352.7 ms |
+| Warm c1, p50 / p90 | 45.5 / 99.8 ms | 18.4 / 44.1 ms |
+| Warm c16, p50 / p90 | 658.5 / 827.4 ms | 326.3 / 441.3 ms |
+| overlap@10, all 1,000 queries | 1.000 | 1.000 |
+| Live text index bytes | 730,399,461 | 743,799,785 |
+| Compact ID-map bytes | — | 246 |
+
+The local facade's p90 fell 47%, warm c1 p50 fell 59%, and warm c16 p50 fell 50%. Reads fell
+38%, and bytes fell 17%. Live text indexes grew 1.8%. Both warm client counts match
+exhaustive top-10 truth on every query, and all 60 cold queries also match.
+
+The final binary SHA-256 is
+`34d713d68ab02f02c07e680351fdbfda34b16d1ae4e306d48de3918a4d3e9b97`.
+
+The targets remain open. Warm c1 on this shared two-CPU allocation is above 13/18 ms, and the
+mean wave count remains above two. I did not measure AWS latency in this round. The in-region
+fresh-process p90 below 381 ms and warm 13/18 ms targets require the coordinator's confirmation;
+these local timings do not establish a win over the published turbopuffer numbers.
+
+Formatting, clippy for `bf-text` and `bf-engine` with all targets and warnings denied, and all
+136 tests in those crates passed. I disabled test debug symbols and incremental compilation
+to keep artifacts within the shared disk budget. Compat passed 121/121 in normal and forced
+modes, with 4/4 SDK retry checks and the TypeScript smoke and retry checks in each mode.
+
+### Interpreting the cold model
+
+`bench/scale/local_s3.py` serves an immutable local file store over a read-only S3 facade.
+`bench/scale/bm25_local.py cold` starts a fresh server per query and counts `BF_TRACE_READS` with
+exactly the idle-gap rule used by `waves.py` and `timeline.py`: a wave starts when every earlier
+read has finished. Overlapping independent reads can hide dependencies, so this count and
+`waves × 25 ms` are lower bounds, not an estimate of total AWS latency. The measured facade
+latency also includes local CPU, Python HTTP handling, and transfer; it does not reproduce S3's
+latency distribution, throttling, TLS setup, or the c7gd CPU. The coordinator must confirm the
+fresh-process p90 target in-region. The observed wave histogram is six queries at two waves,
+47 at three, and seven at four. Removing independent footer reads can expose idle gaps that
+those reads previously bridged; this coarse count can rise even as latency and bytes fall.
+The first query falls from 101 reads and three waves in the baseline to 42 reads and two waves,
+with no document-file reads on the new path. Broad posting batches remain the main extra dependency.
+
+The first diagnostic pass used the production CLI's default 1 MiB cache blocks. It fetched
+roughly 48–88 MB on individual cold queries and was discarded. The reported runs use the earlier
+scale harness's 4,000-byte blocks. I also discarded a warm pass that overlapped exhaustive truth
+generation, and reran the baseline after matching the final segment count.
+
+An early bundle prototype duplicated original records and postings. It measured 28.7/66.9 ms
+warm c1 and 412/619 ms through the facade, with 169 reads, 4.35 MB, and 3.12 waves. Its text
+indexes grew from 730 MB to 969 MB. I discarded that layout: the final writer has one copy of
+each payload, colocates moderately sized lists too, and uses row-aligned sparse bounds.
+
+### Reproduction
+
+Build the server and exact scorer with the throttled Cargo commands, and use
+`bench/scale/msmarco_load.py` to load a dedicated local `file://` store. Keep its data and outputs
+under `.scratch/`, and stop only the exact load-server PID. Let indexing, compaction, and automatic
+text upgrades finish before measuring. Run the baseline against its own version-4 store;
+an older binary cannot query the new text format.
+
+```sh
+source ~/.cargo/env
+nice -n 19 cargo build -j 2 --release -p blowfish --bin blowfish
+nice -n 19 cargo build -j 2 --release -p bf-text --example exact_bm25
+# STORE is an already indexed local directory under .scratch/.
+timeout 1800 taskset -c 6-7 nice -n 10 uv run bench/scale/bm25_local.py warm \
+  --binary target/release/blowfish --store "$STORE" > .scratch/warm.jsonl
+timeout 1800 taskset -c 6-7 nice -n 10 uv run bench/scale/bm25_local.py cold \
+  --binary target/release/blowfish --store "$STORE" --queries 60 > .scratch/cold.jsonl
+uv run python bench/scale/bm25_overlap.py .scratch/truth.json .scratch/warm.jsonl
+```
+
+The local runner writes JSON summaries to stderr, emits per-query JSONL to stdout, and removes
+its temporary server logs and child processes on exit. Its warm output labels c1 and c16 rows
+with `clients`; use each group separately when comparing timings. The exhaustive scorer takes
+the original corpus JSONL on stdin and the checked-in workload as its argument. Delete the
+corpus, stores, results, and other run artifacts after recording the measurements.
