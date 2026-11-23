@@ -89,8 +89,9 @@ log entry in the same commit.
 - **Spatial slabs** (round 12): `recluster` partitions a namespace into slabs of small leaves, so a cold query reads a
   few contiguous ranges instead of every segment's clusters. Unfiltered ANN uses slabs only while they cover exactly
   the live segments; `BF_ANN_SLABS=0` turns them off.
-- **No graph indexes** (HNSW, DiskANN, and similar). The peak-jumping research ruled them out for a cold,
-  object-storage-first engine: their random hops each cost an object-store round trip.
+- **No row-level graph indexes** (HNSW, DiskANN, and similar over rows). The peak-jumping research ruled them out for a
+  cold, object-storage-first engine: their random hops each cost an object-store round trip. A graph over leaf centers,
+  held with the paged directory, is allowed (decision 26; `docs/design/graph-index.md`).
 - **BM25** (round 13): window-pruned posting reads (exact, not approximate), the term record stored before its
   blocks (text segment format v4), and text headers in the manifest. Result quality is checked as overlap@10 against
   exact BM25 (k1 1.2, b 0.75).
@@ -245,3 +246,6 @@ S3 until the run is cleaned up.
     an inferior algorithm or layout, and no code kept to maintain one ("we don't need to keep around or maintain inferior
     approaches. it makes things too complex"). Older on-disk formats are read only so they can be upgraded, and the
     upgrade happens automatically; there is no supported path back to an older format.
+26. 2026-11-23: Work toward Qdrant's throughput with a graph over leaf centers, not over rows, after cutting fixed
+    per-query cost (`docs/design/graph-index.md`). Before any change to the manifest or bucket format, ship a format
+    fence so older binaries can't rewrite or garbage-collect an upgraded bucket (`docs/design/simplify.md`).
