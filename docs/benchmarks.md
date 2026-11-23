@@ -3825,6 +3825,40 @@ The plan took four tries, and the first three are worth recording:
 - **Build records:** after every install on NQ, the build's record was gone from `indexer/`. The job deletes it
   whether its tier was installed or discarded.
 
+### Continuous writes
+
+The design's test is 10M rows plus 1,000 upserts a second for an hour. I ran it on NQ (2,681,468 rows) for 25 minutes,
+starting from a fresh base: the writer upserts random existing rows (same vector, new title), and once a minute or two
+a probe measures recall@10 on 300 queries and their latency, one at a time, while the writes go on. At this rate the
+writer replaces the whole namespace every 45 minutes, four times the design's rate for its size.
+
+| Minutes | Delta rows | Rows outside the tiers | Recall@10 | p50 / p90 ms |
+|---:|---:|---:|---:|---|
+| 0 | 0 | 0 | 0.962 | 48 / 109 |
+| 3 | 120,752 | 8,487 | 0.955 | 101 / 323 |
+| 10 | 483,390 | 32,539 | 0.951 | 88 / 344 |
+| 15 (base rebuild running) | 605,582 | 174,566 | 0.947 | 302 / 630 |
+| 23 (base rebuild running) | 605,582 | 651,300 | 0.945 | 284 / 470 |
+| 25 (new base, then a delta) | 599,022 | 48,350 | 0.947 | 56 / 411 |
+
+- **Writes:** 1,500,000 upserts, none rejected.
+- **Deltas:** every two to three minutes, in 6 to 55 s, kept the rows outside the tiers at or under 5.4% (143,521 rows
+  at most).
+- **Masked rebuilds:** once the delta was built and a fifth of the tiers' rows were masked, the job rebuilt the base,
+  in 11.3 minutes under the writes. Only one build runs at a time, so the rows outside the tiers grew to 651,300 (24%)
+  before it installed. The delta then covered them within a minute, and the next masked rebuild started straight
+  away: at this rate the base is always being rebuilt.
+- **Latency:** not within 10% of a fresh base (4.5 ms). A traced query during the writes spent 10 ms in the ANN plan
+  over the tiers and the segments outside them, and about 470 ms reading the 63,245 rows not yet indexed (the
+  strongly consistent WAL tail), so the tail dominates, not the tiers.
+- **Recall@10** stayed between 0.945 and 0.962.
+
+Two problems turned up in earlier runs and are fixed. The trigger asked whether compaction had merges pending with
+`force`, which lists merges the indexer defers while a long write tail is pending, so under steady writes every
+evaluation deferred, and the rows outside the base reached 300,000 in six minutes with no build. It now waits only
+for merges the indexer would run. A masked rebuild also came ahead of a due delta, so updates stayed outside the
+tiers for a whole base build. A delta now goes first.
+
 ### Crash safety
 
 I killed the server (`kill -9`) 2 s into a delta build on NQ, after one build record was written and before the slab

@@ -14,6 +14,9 @@ Newest first. Each entry says what works now and how it was checked.
   against 0.961; 4.8 points of that is the masked rows any rewrite leaves in the base. The side search it replaces
   cost 36% more. A `kill -9` during a delta build leaves the tiers answering, and the restarted build installs.
   New tests cover delta, merge, masked rebuilds, the guard across restarts, and an all-deleted delta.
+  Under 1,000 upserts a second on NQ for 25 minutes, no write was rejected, deltas every two to three minutes held
+  the rows outside the tiers at or under 5.4%, and recall@10 stayed at 0.945 to 0.962. An 11-minute masked rebuild let them
+  reach 24% while it ran, and p50 latency was 50 to 300 ms, mostly reading the unindexed WAL tail.
 
 - **IN1 measured NQ updates and ingest** (`docs/benchmarks.md`, "Round IN1"). I run two alternating
   old/new HTTP pairs on 681,468 NQ rows, four clients, CPUs 6–7, and a 12 GiB scope. Median overwrite
