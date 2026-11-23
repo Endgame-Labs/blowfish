@@ -161,7 +161,7 @@ async fn facade_reports_bytes_hits_evictions_errors_and_lifetimes() {
             "blowfish_object_store_requests_total",
             &[("op", "list"), ("status", "ok")]
         ),
-        1.0
+        2.0 // Startup also checks the bucket's format generations.
     );
     drop(reader);
     drop(store);

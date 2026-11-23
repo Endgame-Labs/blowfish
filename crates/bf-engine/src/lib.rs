@@ -983,6 +983,7 @@ impl Engine {
 fn storage_error(e: bf_storage::Error) -> ApiError {
     tracing::error!(error=?e,"storage operation failed");
     match e {
+        e @ bf_storage::Error::BucketFormat { .. } => ApiError::new(500, e.to_string()),
         bf_storage::Error::ReadOnly => ApiError::new(403, "server is read-only"),
         _ => ApiError::new(503, "object storage is unavailable"),
     }
@@ -990,6 +991,10 @@ fn storage_error(e: bf_storage::Error) -> ApiError {
 fn log_error(e: bf_wal::Error) -> ApiError {
     tracing::error!(error=?e,"WAL operation failed");
     match e {
+        bf_wal::Error::Manifest(_) => ApiError::new(
+            500,
+            "unsupported or corrupt manifest; upgrade blowfish if the bucket uses a newer format",
+        ),
         bf_wal::Error::Storage(e) => storage_error(e),
         bf_wal::Error::Api(e) => e,
         _ => ApiError::new(500, "stored WAL is corrupt or unsupported"),

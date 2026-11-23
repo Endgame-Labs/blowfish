@@ -95,11 +95,37 @@ services with `sudo systemctl enable --now blowfish caddy`. Use
 application has finished its storage probe: wait for an authenticated `GET /` through Caddy to
 return 200. Missing credentials should return 401.
 
-For each deployment, record the source commit, retain the previous installed binary for rollback,
+For each deployment, record the source commit, retain the previous installed binary for recovery,
 replace the binary atomically, and restart the service deliberately. Verify an SDK write, vector
 search, full-text search, and filter through the proxy; restart, wait for readiness, and repeat the
 queries before deleting the test namespace. Check the object-store prefix directly as well.
 Namespace deletion can retain permanent WAL fences; do not remove these manually.
+
+## Upgrading
+
+Before upgrading, stop every writer and background maintenance process using the deployment prefix.
+If rollback might be necessary, I recommend a consistent backup of the **entire bucket prefix before
+starting the new binary** (see Backups and recovery). Retaining the old executable alone is insufficient.
+Do not run old and new writers together during a format upgrade.
+
+The binary automatically accepts legacy format-1 buckets and raises the deployment marker to format 2
+at writable startup. Namespace manifests move to format 2 on publication; the checkpoint field changes
+its name while retaining its meaning. Read-only startup checks compatibility without raising the marker.
+The append-only `_system/format/<version>.json` markers live at the deployment root, including for
+project-scoped namespaces. Their highest generation is the required bucket version; never delete or
+lower a marker to force a downgrade.
+
+Startup, writes, manifest publication, and garbage collection check the bucket fence. A newer marker
+causes refusal with the required version. Every manifest decoder also rejects unsupported versions,
+including the compact reader copy, so an older supported binary cannot republish an unfamiliar manifest
+or garbage-collect its objects. Format-2 manifests rename the required `indexed_through` wire field to
+`checkpoint_wal`; released binaries through v0.1.13 fail to decode them instead of discarding new fields.
+Those releases predate the bucket marker, so the marker alone cannot stop them from starting or touching
+namespaces whose manifests have not yet been upgraded. Stop all older processes before upgrading.
+
+There is no supported in-place downgrade. To roll back, stop the upgraded processes, restore the complete
+pre-upgrade backup into an empty prefix, and start the matching older binary there. Writes acknowledged
+after that backup are absent from the restored copy. Test the restore and queries before resuming traffic.
 
 ## Storage and writers
 
