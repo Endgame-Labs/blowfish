@@ -7,8 +7,40 @@ use uuid::Uuid;
 
 /// Current WAL encoding: one version byte followed by zstd-compressed JSON.
 pub const FORMAT_VERSION: u8 = 1;
-/// Current manifest generation. Format 1 is accepted only for automatic upgrade.
-pub const MANIFEST_FORMAT_VERSION: u8 = 2;
+/// Current manifest generation. Formats 1 and 2 are accepted only for automatic upgrade (format 3
+/// replaced format 2's single `ann_slabs` layout with `ann_tiers`).
+pub const MANIFEST_FORMAT_VERSION: u8 = 3;
+/// Current format of a tier's slabs and directory. A tier written in an older one is rebuilt by
+/// the automatic recluster.
+pub const TIER_FORMAT_VERSION: u32 = 1;
+fn tier_format_default() -> u32 {
+    1
+}
+
+/// `ann_tiers` as written (attribute to tiers), or format 2's `ann_slabs` (attribute to one slab
+/// set), read as a base tier: the next publication writes it back as `ann_tiers`.
+fn tiers_or_slabs<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, Vec<SlabSet>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Tiers {
+        Many(Vec<SlabSet>),
+        One(Box<SlabSet>),
+    }
+    let map = std::collections::BTreeMap::<String, Tiers>::deserialize(d)?;
+    Ok(map
+        .into_iter()
+        .map(|(attr, tiers)| {
+            let tiers = match tiers {
+                Tiers::Many(list) => list,
+                Tiers::One(set) => vec![*set],
+            };
+            (attr, tiers)
+        })
+        .filter(|(_, tiers)| !tiers.is_empty())
+        .collect())
+}
 
 fn manifest_version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
     let version = u64::deserialize(d)?;
@@ -146,9 +178,16 @@ pub struct Manifest {
     /// opening each segment otherwise.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub ann_dirs: std::collections::BTreeMap<String, SegmentFile>,
-    /// Namespace-wide ANN layouts (`recluster`), one per vector attribute.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub ann_slabs: std::collections::BTreeMap<String, SlabSet>,
+    /// Namespace-wide ANN layouts (the automatic recluster's tiers) per vector attribute: a base,
+    /// and later at most one delta. Rows of segments no tier covers are searched through
+    /// `ann_dirs`. Format 2 manifests' `ann_slabs` is read as a base tier.
+    #[serde(
+        default,
+        alias = "ann_slabs",
+        deserialize_with = "tiers_or_slabs",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub ann_tiers: std::collections::BTreeMap<String, Vec<SlabSet>>,
     /// Last indexed write timestamp; absent on legacy schema-only manifests.
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
@@ -203,6 +242,20 @@ pub struct SlabSet {
     /// reads the header and only the pages of the cells it probes, never the whole of `dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pages: Option<SegmentFile>,
+    /// The format of the slabs and directory ([`TIER_FORMAT_VERSION`] when written). Absent in
+    /// format 2 manifests, whose slab sets are format 1.
+    #[serde(default = "tier_format_default")]
+    pub format: u32,
+}
+impl SlabSet {
+    /// Rows the slabs hold (covered rows that were live when they were built).
+    pub fn rows(&self) -> u64 {
+        self.slabs.iter().map(|s| u64::from(s.row_count)).sum()
+    }
+    /// Whether `segment` is one of the covered segments.
+    pub fn covers(&self, segment: &str) -> bool {
+        self.covered.iter().any(|c| c.segment == segment)
+    }
 }
 /// One covered segment's span of global row numbers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1081,7 +1134,7 @@ mod manifest_codec_tests {
             stats,
             text_stats: None,
             ann_dirs: Default::default(),
-            ann_slabs: Default::default(),
+            ann_tiers: Default::default(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
@@ -1111,7 +1164,7 @@ mod manifest_codec_tests {
     #[test]
     fn every_manifest_encoding_and_direct_deserializer_rejects_future_versions() {
         let mut value = serde_json::to_value(manifest_with_terms(3)).unwrap();
-        for version in [0, 3, 256, u64::MAX] {
+        for version in [0, 4, 256, u64::MAX] {
             value["format_version"] = serde_json::json!(version);
             let json = serde_json::to_vec(&value).unwrap();
             let compressed = zstd::stream::encode_all(json.as_slice(), 3).unwrap();
@@ -1126,7 +1179,7 @@ mod manifest_codec_tests {
             assert!(serde_json::from_slice::<Manifest>(&json).is_err());
         }
         let mut future = manifest_with_terms(3);
-        future.format_version = 3;
+        future.format_version = 4;
         assert!(encode_manifest(&future).is_err());
         // Also fail closed if an extension accidentally forgets to raise its version.
         let mut value = serde_json::to_value(manifest_with_terms(3)).unwrap();
@@ -1137,5 +1190,31 @@ mod manifest_codec_tests {
             "future_object": "segments/new-layout"
         });
         assert!(serde_json::from_value::<SegmentFile>(file).is_err());
+    }
+
+    #[test]
+    fn format_two_slab_sets_are_read_as_base_tiers_and_written_back_as_tiers() {
+        let mut value = serde_json::to_value(manifest_with_terms(3)).unwrap();
+        value["format_version"] = serde_json::json!(2);
+        let file = serde_json::json!({"key": "ns/a/slabs/dir", "size": 1, "metadata_len": 0});
+        value["ann_slabs"] = serde_json::json!({
+            "vector": {
+                "covered": [{"segment": "s1", "base": 0, "rows": 5, "live_generation": 0}],
+                "slabs": [],
+                "dir": file,
+            }
+        });
+        let old = decode_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let tiers = &old.ann_tiers["vector"];
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].covered[0].segment, "s1");
+        assert_eq!(tiers[0].format, 1);
+        let written: serde_json::Value =
+            serde_json::from_slice(&encode_manifest(&old).unwrap()).unwrap();
+        assert_eq!(written["format_version"], 3);
+        assert!(written.get("ann_slabs").is_none());
+        assert_eq!(written["ann_tiers"]["vector"][0]["covered"][0]["rows"], 5);
+        let again = decode_manifest(&serde_json::to_vec(&written).unwrap()).unwrap();
+        assert_eq!(again.ann_tiers["vector"][0].format, 1);
     }
 }

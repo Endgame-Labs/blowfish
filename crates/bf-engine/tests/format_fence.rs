@@ -73,7 +73,7 @@ async fn future_manifest_fences_readers_writers_indexer_compaction_gc_and_tools(
         assert!(
             error
                 .to_string()
-                .contains("unsupported manifest format version 3")
+                .contains("unsupported manifest format version 4")
         );
     }
     assert!(wal.manifest_after(seq).await.is_err());
@@ -148,7 +148,7 @@ async fn a_newer_root_marker_fences_running_and_project_scoped_mutators() {
     let (seq, manifest) = wal.latest_manifest().await.unwrap().unwrap();
     let entry = bf_wal::WalEntry::new(vec![]);
     let staged = wal.stage(2, &entry).await.unwrap();
-    store.create("_system/format/3.json", "{}").await.unwrap();
+    store.create("_system/format/4.json", "{}").await.unwrap();
     let before = inventory(&store).await;
     assert!(
         engine
@@ -156,7 +156,7 @@ async fn a_newer_root_marker_fences_running_and_project_scoped_mutators() {
             .await
             .unwrap_err()
             .message
-            .contains("version 3")
+            .contains("version 4")
     );
     assert!(
         engine
@@ -202,7 +202,7 @@ async fn legacy_manifest_upgrades_on_publication_without_losing_state() {
         .await
         .unwrap();
     store.delete("ns/test/manifest-latest").await.unwrap();
-    store.delete("_system/format/2.json").await.unwrap();
+    store.delete("_system/format/3.json").await.unwrap();
     // Open the legacy bucket as an upgrader would, raising its marker at startup.
     let reopened = Storage::open(&StorageConfig {
         url: format!("file://{}", _dir.path().display()),
@@ -216,7 +216,7 @@ async fn legacy_manifest_upgrades_on_publication_without_losing_state() {
     wal.publish_fenced(seq, legacy.indexer_epoch, &legacy)
         .await
         .unwrap();
-    assert_eq!(store.check_bucket_format().await.unwrap(), 2);
+    assert_eq!(store.check_bucket_format().await.unwrap(), 3);
     let (_, upgraded) = wal.latest_manifest().await.unwrap().unwrap();
     assert_eq!(upgraded.format_version, MANIFEST_FORMAT_VERSION);
     assert_eq!(upgraded.indexed_through, manifest.indexed_through);
@@ -260,16 +260,16 @@ async fn manifest_conflict_and_decode_failure_refresh_and_latch_the_cached_marke
             copy.extend(serde_json::to_vec(&future).unwrap());
             store.put("ns/test/manifest-latest", copy).await.unwrap();
         }
-        store.create("_system/format/3.json", "{}").await.unwrap();
-        assert_eq!(store.cached_bucket_format().unwrap(), 2);
+        store.create("_system/format/4.json", "{}").await.unwrap();
+        assert_eq!(store.cached_bucket_format().unwrap(), 3);
         let error = if decode_failure {
             wal.latest_manifest().await.unwrap_err()
         } else {
             // Reusing an occupied manifest slot loses its CAS without decoding a future manifest.
             wal.publish_manifest(sequence, &manifest).await.unwrap_err()
         };
-        assert!(error.to_string().contains("requires format version 3"));
-        std::fs::remove_file(dir.path().join("_system/format/3.json")).unwrap();
+        assert!(error.to_string().contains("requires format version 4"));
+        std::fs::remove_file(dir.path().join("_system/format/4.json")).unwrap();
         assert!(store.check_bucket_format().await.is_err());
         assert!(wal.stage(2, &bf_wal::WalEntry::new(vec![])).await.is_err());
         assert!(
