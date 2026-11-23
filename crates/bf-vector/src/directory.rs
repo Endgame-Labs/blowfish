@@ -15,6 +15,8 @@
 use std::{ops::Range, sync::Arc};
 
 mod paged;
+/// Readers used only while automatically upgrading older ANN objects.
+pub mod upgrade;
 pub use paged::{Page, PagedDirectory};
 
 use bytes::Bytes;
@@ -228,7 +230,7 @@ impl Section {
         put_u32(out, self.rows);
         put_u64(out, self.membership.start);
         put_u64(out, self.membership.end);
-        put_u32(out, 1);
+        put_u32(out, u32::from(self.codes_in_fragment));
         for x in self.centroid.iter() {
             out.extend(x.to_le_bytes());
         }
@@ -255,10 +257,11 @@ impl Section {
         let n = p.u32()? as usize;
         let rows = p.u32()?;
         let membership = p.u64()?..p.u64()?;
-        if p.u32()? != 1 {
-            return Err(bad("invalid directory section flags"));
-        }
-        let codes_in_fragment = true;
+        let codes_in_fragment = match p.u32()? {
+            0 => false,
+            1 => true,
+            _ => return Err(bad("invalid directory section flags")),
+        };
         if n > clusters || n > p.remaining() || membership.start > membership.end {
             return Err(bad("invalid directory section"));
         }
@@ -349,6 +352,12 @@ fn bit_bytes(padded: usize) -> usize {
 }
 
 impl Fragment {
+    /// Create an old fragment for migration tests; unavailable in release builds.
+    #[cfg(feature = "legacy-fixtures")]
+    pub fn legacy_fragment(index_blob: &[u8], blocks: bool) -> Result<(Vec<u8>, u64)> {
+        upgrade::legacy_fragment(index_blob, blocks)
+    }
+
     /// Build one version-2 ANN object, with resident membership, leaf blobs and codes in tour
     /// order, and one vector region. Existing fast-scan codes and vectors are copied unchanged.
     pub fn build_ann(index_blob: &[u8]) -> Result<(Vec<u8>, u64)> {
@@ -566,6 +575,9 @@ impl Fragment {
             return Err(bad("bad ANN object magic"));
         }
         let section = Section::get(&mut p, 0)?;
+        if !section.codes_in_fragment {
+            return Err(bad("ANN object requires resident code ranges"));
+        }
         if !section.membership.is_empty() {
             if section.membership.start != (body.len() - p.remaining()) as u64 {
                 return Err(bad("invalid resident membership offset"));
@@ -618,9 +630,6 @@ impl Directory {
             (t.dims, t.metric, t.dtype, t.seed) != (s.dims, s.metric, s.dtype, s.seed)
         }) {
             return Ok(None);
-        }
-        if sources.iter().any(|(_, _, _, f)| !f.0.codes_in_fragment) {
-            return Err(bad("upgrade legacy fragments before directory publication"));
         }
         let mut out = DIR_MAGIC.to_vec();
         put_u32(&mut out, sources.len() as u32);

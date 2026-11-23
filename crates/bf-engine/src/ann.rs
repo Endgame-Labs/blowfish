@@ -11,8 +11,8 @@ use std::{
     sync::Arc,
 };
 
-/// Returns `None` when a segment lacks an ANN index for the attribute (legacy segments),
-/// so the caller can scan document columns until the upgrade publishes a directory.
+/// Search current and upgrading objects through one namespace-wide leaf plan. Only segments
+/// without any ANN index require the document-only fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search(
     store: &Storage,
@@ -24,10 +24,6 @@ pub(crate) async fn search(
     k: usize,
     columns: &BTreeSet<String>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    let key = format!("annv2:{attribute}");
-    if state.segments.iter().any(|s| !s.files.contains_key(&key)) {
-        return Ok(None);
-    }
     if crate::ann::trace_stages() {
         eprintln!(
             "ANN snapshot: segments={} shadowed={} directories={:?} tail_docs={}",
@@ -48,7 +44,14 @@ pub(crate) async fn search(
     {
         return Ok(Some(found));
     }
-    if let Some(file) = state.ann_dirs.get(&key)
+    if state
+        .segments
+        .iter()
+        .any(|s| crate::upgrade::files(s, attribute).is_none())
+    {
+        return Ok(None);
+    }
+    if let Some((file, _)) = crate::upgrade::directory_file(&state.ann_dirs, attribute)
         && let Some(found) = from_directory(
             store,
             state,
@@ -58,12 +61,31 @@ pub(crate) async fn search(
             config,
             k,
             columns,
-            file,
+            Some(file),
             Layout::Segments,
         )
         .await?
     {
         return Ok(Some(found));
+    }
+    if state
+        .segments
+        .iter()
+        .any(|s| s.files.contains_key(&format!("ann:{attribute}")))
+    {
+        return from_directory(
+            store,
+            state,
+            q,
+            attribute,
+            vector,
+            config,
+            k,
+            columns,
+            None,
+            Layout::Segments,
+        )
+        .await;
     }
     Ok(None)
 }
@@ -80,7 +102,7 @@ async fn from_directory(
     config: &EngineConfig,
     k: usize,
     columns: &BTreeSet<String>,
-    file: &bf_wal::SegmentFile,
+    file: Option<&bf_wal::SegmentFile>,
     layout: Layout,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     // Filtered queries compute each segment's allowed rows (live rows that pass the filter)
@@ -88,10 +110,15 @@ async fn from_directory(
     // directory ranks clusters by their allowed rows without opening any segment's index
     // or ID index.
     let (dir, lives) = tokio::join!(
-        crate::ann_dir::load(store, file, None),
+        async {
+            match file {
+                Some(f) => crate::ann_dir::load(store, f, None).await,
+                None => crate::upgrade::directory(store, &state.segments, attribute).await,
+            }
+        },
         crate::ann_dir::live_masks(store, state, q.filters.as_ref())
     );
-    // A directory in an unknown (older) format is ignored: queries scan document columns.
+    // Upgrade readers normalize older directories before the current planner uses them.
     if crate::ann::trace_stages() {
         match &dir {
             Ok(d) => eprintln!(

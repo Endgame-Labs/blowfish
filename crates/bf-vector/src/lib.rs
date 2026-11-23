@@ -15,6 +15,7 @@ pub use cluster::{
     BuildParams, IndexBuilder, VectorType, dots_x4, kmeans, kmeans_two_level, nearest_center,
     prepare_vector, squared_distance,
 };
+pub use directory::upgrade;
 pub use directory::{
     DirEntry, DirSegment, Directory, Fragment, Membership, Page, PagedDirectory, PartialIndex,
 };

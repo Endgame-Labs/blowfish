@@ -98,13 +98,20 @@ async fn downgrade(store: &Storage) {
             store.create_unique(&key, data).await.unwrap();
             file
         };
+        // Real legacy fragments must keep serving while the rewrite proceeds.
+        for (name, ext, blocks) in [
+            ("annfrag:vector", "bff", false),
+            ("annfrag2:vector", "bfb", true),
+        ] {
+            if !blocks && seg.files.is_empty() {
+                continue;
+            }
+            let (fragment, resident) = bf_vector::Fragment::legacy_fragment(&blob, blocks).unwrap();
+            seg.files
+                .insert(name.into(), put(ext, fragment, resident).await);
+        }
         seg.files
             .insert("ann:vector".into(), put("bfv", blob, meta).await);
-        // The upgrade reads the old index, so retired fragment contents need not be decoded.
-        for (name, ext) in [("annfrag:vector", "bff"), ("annfrag2:vector", "bfb")] {
-            seg.files
-                .insert(name.into(), put(ext, vec![0; 16], 16).await);
-        }
     }
     m.segments = segments;
     if let Some(slabs) = slabs {

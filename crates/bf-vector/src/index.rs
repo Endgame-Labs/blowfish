@@ -366,7 +366,6 @@ impl<R: RangeRead> Index<R> {
         out.extend(crc.to_le_bytes());
         out
     }
-    #[cfg(feature = "legacy-fixtures")]
     pub(crate) fn metadata_mut(&mut self) -> &mut Metadata {
         &mut self.metadata
     }

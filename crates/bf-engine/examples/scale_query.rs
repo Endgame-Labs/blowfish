@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let (response, diagnostic) = engine.query_with_diagnostics(&ns, request).await?;
             Ok::<_, Box<dyn Error>>(json!({
                 "i":i,"kind":input["kind"],"query_id":input["query_id"],
+                "ann_rows_scanned":diagnostic.ann_rows_scanned,"document_scan_rows":diagnostic.document_scan_rows,
                 "ms":tick.elapsed().as_secs_f64()*1000.0,
                 "snapshot_ms":diagnostic.snapshot_elapsed.as_secs_f64()*1000.0,
                 "execution_ms":diagnostic.execution_elapsed.as_secs_f64()*1000.0,

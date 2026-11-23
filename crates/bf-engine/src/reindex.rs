@@ -507,8 +507,8 @@ impl Engine {
         let Some(dir) =
             ann_dir::build(store, ns, &slabs, attr, ann_dir::Layout::Slabs, None).await?
         else {
-            // A batch may leave old slabs for the next batch. Keep the old directory's objects
-            // protected; readers scan documents until every slab has the current format.
+            // Keep the old set protected if a concurrent replacement cannot supply a directory.
+            // Ordinary partial batches build a directory covering both old and current slabs.
             for key in retired {
                 crate::indexer::retire(manifest, key);
             }
@@ -614,7 +614,11 @@ async fn apply_segments(
         .segments
         .iter()
         .flat_map(|s| s.files.keys())
-        .filter_map(|k| k.strip_prefix("annv2:").map(str::to_string))
+        .filter_map(|k| {
+            k.strip_prefix("annv2:")
+                .or_else(|| k.strip_prefix("ann:"))
+                .map(str::to_string)
+        })
         .collect();
     let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
     for attr in attributes {
@@ -778,3 +782,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "reindex_migration_tests.rs"]
+mod migration_tests;

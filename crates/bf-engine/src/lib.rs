@@ -24,6 +24,7 @@ mod recluster;
 mod reindex;
 mod text;
 mod text_keys;
+mod upgrade;
 mod write;
 
 use bf_storage::{CreateResult, Storage};
@@ -317,6 +318,10 @@ pub struct QueryDiagnostics {
     pub backend: Vec<bf_storage::BackendMeasurement>,
     /// Logical cache-byte accounting, separate from physical backend bytes.
     pub cache: bf_storage::CacheStatsSnapshot,
+    /// Rows in the leaf code blocks or exact ANN vector ranges visited by the query.
+    pub ann_rows_scanned: u64,
+    /// Rows whose document vectors were read because their ANN index was unavailable.
+    pub document_scan_rows: u64,
 }
 struct Handle {
     state: Arc<Mutex<NamespaceState>>,
@@ -676,11 +681,12 @@ impl Engine {
         let backend = Arc::new(bf_storage::BackendStats::default());
         let stats = Arc::new(bf_storage::CacheStats::default());
         let context = read_cache::ReadContext {
-            cache: self.0.read_cache.clone(),
             stats: stats.clone(),
             backend: backend.clone(),
-            admit: true,
+            ..read_cache::ReadContext::new(self.0.read_cache.clone())
         };
+        let ann_rows = context.ann_rows.clone();
+        let document_scan_rows = context.document_scan_rows.clone();
         let cached = if matches!(request.consistency, Consistency::Strong) {
             let handle = self.handle(ns).await?;
             let state = handle.state.lock().await;
@@ -803,6 +809,8 @@ impl Engine {
             execution_elapsed,
             backend: backend.snapshot(),
             cache: stats.snapshot(),
+            ann_rows_scanned: ann_rows.load(std::sync::atomic::Ordering::Relaxed),
+            document_scan_rows: document_scan_rows.load(std::sync::atomic::Ordering::Relaxed),
         };
         Ok((response, diagnostics))
     }

@@ -51,7 +51,7 @@ impl OpenHint {
             && self
                 .ann
                 .iter()
-                .all(|a| dirs.contains_key(&format!("annv2:{a}")))
+                .all(|a| crate::upgrade::directory_file(dirs, a).is_some())
     }
     pub(crate) fn for_request(
         request: &QueryRequest,
@@ -172,7 +172,7 @@ impl OpenHint {
             let by_dir = self
                 .ann
                 .iter()
-                .all(|a| dirs.contains_key(&format!("annv2:{a}")));
+                .all(|a| crate::upgrade::directory_file(dirs, a).is_some());
             for attribute in self.ann.iter().filter(|_| with_rest) {
                 // A lone unfiltered ANN query reads the block-layout directory when there is one.
                 // A recluster's slabs, when they cover exactly these segments, take the scan.
@@ -218,13 +218,8 @@ impl OpenHint {
                     );
                     continue;
                 }
-                let chosen = dirs.get(&format!("annv2:{attribute}")).map(|file| {
-                    (
-                        file,
-                        crate::ann_dir::Layout::Segments,
-                        format!("annv2:{attribute}"),
-                    )
-                });
+                let chosen = crate::upgrade::directory_file(dirs, attribute)
+                    .map(|(file, hint_name)| (file, crate::ann_dir::Layout::Segments, hint_name));
                 if let Some((file, layout, hint_name)) = chosen {
                     let filtered = !self.filters.is_empty();
                     let scan = self.scan.as_ref().filter(|(a, _, _)| a == attribute);

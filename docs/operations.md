@@ -142,9 +142,11 @@ manifest publication. Old objects remain until normal garbage collection after t
 The pass retries publication conflicts and skips a segment that compaction replaced. I can interrupt it
 and resume later: published batches remain durable, and objects already in the new layout are skipped.
 I bound memory by the largest index and its rewrite; older code encodings can also need an intermediate
-conversion. Queries use segment directories when available and can scan document columns while a mixed
-segment set has no new directory; this can temporarily increase query latency. Slab
-batches retain the old directory until the final batch can replace it, including its paged copy.
+conversion. Queries continue using ANN throughout the rewrite. Each publication builds a directory
+covering both old and current objects, including mixed slab sets and their paged copies. Before the first
+publication, upgrade-only readers use the existing directory or assemble resident leaf metadata without
+writing storage. I keep the same global probe selection and rerank across the conversion; upgrading an
+index never requires a document-vector scan.
 
 To run the same upgrade now, or to see what is left, use `blowfish reindex`:
 
