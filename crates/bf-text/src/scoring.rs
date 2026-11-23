@@ -119,11 +119,22 @@ pub(crate) fn term_score(
 pub(crate) struct Saturation {
     key: (u32, u32, u64),
     values: Vec<f64>,
+    /// Exact row-window maxima, independent of IDF and query frequency. They belong
+    /// to this normalization table, so changed statistics cannot reuse them.
+    pub(crate) maxima: std::sync::Mutex<BoundCache>,
+}
+
+#[derive(Default)]
+pub(crate) struct BoundCache {
+    pub(crate) frames: std::collections::HashMap<u64, Vec<(usize, f64)>>,
+    bytes: usize,
 }
 impl Saturation {
     const LENGTHS: usize = 1025;
     const FREQUENCIES: usize = 17;
-    pub(crate) const BYTES: usize = Self::LENGTHS * Self::FREQUENCIES * 8 + 64;
+    const MAX_BOUND_BYTES: usize = 8 << 20;
+    pub(crate) const BYTES: usize =
+        Self::LENGTHS * Self::FREQUENCIES * 8 + Self::MAX_BOUND_BYTES * 2 + 64;
     pub(crate) fn new(stats: &CorpusStats, p: &FtsParams) -> Self {
         let k1 = p.k1 as f64;
         let b = p.b as f64;
@@ -141,6 +152,7 @@ impl Saturation {
                 stats.average_doc_length.to_bits(),
             ),
             values,
+            maxima: Default::default(),
         }
     }
     pub(crate) fn matches(&self, stats: &CorpusStats, p: &FtsParams) -> bool {
@@ -154,6 +166,49 @@ impl Saturation {
     fn get(&self, tf: u32, length: u32) -> Option<f64> {
         ((tf as usize) < Self::FREQUENCIES && (length as usize) < Self::LENGTHS)
             .then(|| self.values[length as usize * Self::FREQUENCIES + tf as usize])
+    }
+    pub(crate) fn remember(
+        &self,
+        offset: u64,
+        postings: &[(u32, u32)],
+        lengths: &[u32],
+        window_rows: usize,
+    ) {
+        {
+            let maxima = self.maxima.lock().unwrap();
+            if maxima.bytes >= Self::MAX_BOUND_BYTES || maxima.frames.contains_key(&offset) {
+                return;
+            }
+        }
+        let k1 = f32::from_bits(self.key.0) as f64;
+        let b = f32::from_bits(self.key.1) as f64;
+        let average = f64::from_bits(self.key.2);
+        let mut windows: Vec<(usize, f64)> = Vec::new();
+        for &(row, tf) in postings {
+            let length = lengths[row as usize];
+            let saturation = self
+                .get(tf, length)
+                .unwrap_or_else(|| {
+                    let norm = k1 * (1.0 - b + b * length as f64 / average);
+                    tf as f64 * (k1 + 1.0) / (tf as f64 + norm)
+                })
+                .max(0.0);
+            let window = row as usize / window_rows;
+            if let Some((last, maximum)) = windows.last_mut()
+                && *last == window
+            {
+                *maximum = maximum.max(saturation);
+            } else {
+                windows.push((window, saturation));
+            }
+        }
+        // Include vector capacity, map capacity, and allocation overhead in admission.
+        let charge = windows.capacity() * std::mem::size_of::<(usize, f64)>() + 64;
+        let mut maxima = self.maxima.lock().unwrap();
+        if maxima.bytes + charge <= Self::MAX_BOUND_BYTES && !maxima.frames.contains_key(&offset) {
+            maxima.bytes += charge;
+            maxima.frames.insert(offset, windows);
+        }
     }
 }
 
@@ -185,14 +240,20 @@ impl TermWeight {
         }
     }
 
+    #[inline]
     pub(crate) fn score_cached(&self, tf: u32, length: u32, table: &Saturation) -> f32 {
         if tf == 0 || self.idf == 0.0 {
             return 0.0;
         }
         match table.get(tf, length) {
-            Some(saturation) => (self.idf * saturation * self.query) as f32,
+            Some(saturation) => self.score_saturation(saturation),
             None => self.score(tf, length),
         }
+    }
+
+    #[inline]
+    pub(crate) fn score_saturation(&self, saturation: f64) -> f32 {
+        (self.idf * saturation * self.query) as f32
     }
 
     pub(crate) fn score(&self, tf: u32, length: u32) -> f32 {

@@ -545,6 +545,123 @@ pub struct SearchMetrics {
     pub rows_scored: usize,
 }
 
+/// A monotone score floor for one top-k query over disjoint live segments.
+///
+/// Readers publish a floor only after finding `k` actual hits. Other segments
+/// can then omit strictly lower scores, while retaining ties. Create a fresh
+/// threshold for each query; never share it across queries or rank expressions.
+pub struct SearchThreshold {
+    k: usize,
+    score: std::sync::atomic::AtomicU32,
+}
+impl SearchThreshold {
+    /// Start a query whose merged result needs at most `k` hits.
+    pub fn new(k: usize) -> Self {
+        Self {
+            k,
+            score: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn publish(&self, heap: &BinaryHeap<Reverse<SearchHit>>) {
+        if self.k > 0 && heap.len() == self.k {
+            // Nonnegative finite scores and positive infinity have ordered bits.
+            let score = heap.peek().unwrap().0.score.to_bits();
+            if score > self.score.load(std::sync::atomic::Ordering::Relaxed) {
+                self.score
+                    .fetch_max(score, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+enum SearchMode<'a> {
+    Demand,
+    Prefetched,
+    Shared(&'a SearchThreshold),
+}
+
+fn search_floor(
+    heap: &BinaryHeap<Reverse<SearchHit>>,
+    k: usize,
+    shared: Option<&SearchThreshold>,
+) -> Option<f64> {
+    let local = if heap.len() == k {
+        heap.peek().map_or(0.0, |hit| hit.0.score)
+    } else {
+        0.0
+    };
+    let shared = shared.map_or(0.0, |threshold| {
+        f32::from_bits(threshold.score.load(std::sync::atomic::Ordering::Relaxed))
+    });
+    let floor = local.max(shared);
+    (floor > 0.0).then_some(f64::from(floor))
+}
+
+/// Query-local terms stay in dictionary order, preserving reference f32 addition.
+struct SearchTerm {
+    meta: Arc<TermMeta>,
+    weight: TermWeight,
+    prefix: bool,
+    postings: Vec<Option<Postings>>,
+    spans: Vec<Range<usize>>,
+    bounds: Vec<f64>,
+    small: bool,
+}
+
+impl SearchTerm {
+    fn new(meta: Arc<TermMeta>, weight: TermWeight, prefix: bool) -> Self {
+        Self {
+            meta,
+            weight,
+            prefix,
+            postings: Vec::new(),
+            spans: Vec::new(),
+            bounds: Vec::new(),
+            small: false,
+        }
+    }
+
+    fn cache_windows(&mut self, windows: usize) {
+        // Sweep the ordered blocks once instead of binary-searching each term's
+        // directory again during planning, fetching, candidate selection, and scoring.
+        let (mut first, mut last) = (0, 0);
+        let meta = &self.meta;
+        self.spans = (0..windows)
+            .map(|w| {
+                while first < meta.blocks.len() && (meta.blocks[first].last as usize) < w * BLOCK {
+                    first += 1;
+                }
+                last = last.max(first);
+                while last < meta.blocks.len()
+                    && (meta.blocks[last].first as usize) < (w + 1) * BLOCK
+                {
+                    last += 1;
+                }
+                first..last
+            })
+            .collect();
+    }
+
+    fn span(&self, window: usize) -> Range<usize> {
+        if let Some(span) = self.spans.get(window) {
+            return span.clone();
+        }
+        let blocks = &self.meta.blocks;
+        blocks.partition_point(|b| (b.last as usize) < window * BLOCK)
+            ..blocks.partition_point(|b| (b.first as usize) < (window + 1) * BLOCK)
+    }
+
+    fn bound(&self, window: usize, saturation: &Saturation) -> f64 {
+        self.bounds.get(window).copied().unwrap_or_else(|| {
+            self.meta.blocks[self.span(window)]
+                .iter()
+                .map(|b| f64::from(b.upper_bound(&self.weight, saturation)))
+                .fold(0.0, f64::max)
+        }) + f64::from(self.prefix)
+    }
+}
+
 /// Where a reader finds each term's block directory.
 enum Terms {
     /// Version 1: every term decoded at open, addressed by dictionary ordinal.
@@ -1463,6 +1580,7 @@ impl SegmentReader {
         packer.decompress(&bytes[2 + n..], &mut tfs, tf_bits);
         let mut row = b.first;
         let mut out = Vec::with_capacity(b.count as usize);
+        let lengths = self.lens();
         for i in 0..b.count as usize {
             if (i == 0 && deltas[i] != 0)
                 || (i > 0 && deltas[i] == 0)
@@ -1475,8 +1593,8 @@ impl SegmentReader {
                 .checked_add(deltas[i])
                 .ok_or_else(|| invalid("posting row overflow"))?;
             if row > b.last
-                || tfs[i] > self.lens()[row as usize]
-                || self.lens()[row as usize] < b.min_length
+                || tfs[i] > lengths[row as usize]
+                || lengths[row as usize] < b.min_length
             {
                 return Err(invalid("posting row out of bounds"));
             }
@@ -1542,9 +1660,9 @@ impl SegmentReader {
         ranges.dedup();
         ranges
     }
-    /// Batch all posting ranges before scoring. This trades block-max I/O pruning
-    /// for one parallel posting stage, which is useful on remote storage.
-    /// The fetched payloads remain query-local even when the backend cache is disabled.
+    /// Exact BM25 with block-max MaxScore and parallel posting reads. Promising
+    /// windows establish a top-k threshold before the remaining competitive
+    /// frames are fetched. Payloads remain query-local even without a backend cache.
     pub async fn search_prefetched(
         &self,
         query: &Query,
@@ -1553,9 +1671,32 @@ impl SegmentReader {
         k: usize,
         allowed: Option<&RoaringBitmap>,
     ) -> io::Result<Vec<SearchHit>> {
-        self.search_internal(query, stats, params, k, allowed, true)
+        self.search_internal(query, stats, params, k, allowed, SearchMode::Prefetched)
             .await
             .map(|(hits, _)| hits)
+    }
+    /// Contribute to a shared top-k query over disjoint live segments.
+    ///
+    /// This may return fewer than `k` hits when another segment has established
+    /// a higher floor. Merge all readers' results before truncating to `k`.
+    pub async fn search_prefetched_shared(
+        &self,
+        query: &Query,
+        stats: &CorpusStats,
+        params: &FtsParams,
+        allowed: Option<&RoaringBitmap>,
+        threshold: &SearchThreshold,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.search_internal(
+            query,
+            stats,
+            params,
+            threshold.k,
+            allowed,
+            SearchMode::Shared(threshold),
+        )
+        .await
+        .map(|(hits, _)| hits)
     }
     /// Batched, exact search with posting-read, scored-row, and pruning counters.
     pub async fn search_prefetched_with_metrics(
@@ -1566,7 +1707,7 @@ impl SegmentReader {
         k: usize,
         allowed: Option<&RoaringBitmap>,
     ) -> io::Result<(Vec<SearchHit>, SearchMetrics)> {
-        self.search_internal(query, stats, params, k, allowed, true)
+        self.search_internal(query, stats, params, k, allowed, SearchMode::Prefetched)
             .await
     }
     /// Top-k BM25 with namespace-wide statistics, optional live/allowed rows, and
@@ -1592,7 +1733,7 @@ impl SegmentReader {
         k: usize,
         allowed: Option<&RoaringBitmap>,
     ) -> io::Result<(Vec<SearchHit>, SearchMetrics)> {
-        self.search_internal(query, stats, params, k, allowed, false)
+        self.search_internal(query, stats, params, k, allowed, SearchMode::Demand)
             .await
     }
     async fn search_internal(
@@ -1602,8 +1743,14 @@ impl SegmentReader {
         params: &FtsParams,
         k: usize,
         allowed: Option<&RoaringBitmap>,
-        prefetch: bool,
+        mode: SearchMode<'_>,
     ) -> io::Result<(Vec<SearchHit>, SearchMetrics)> {
+        let prefetch = !matches!(mode, SearchMode::Demand);
+        let threshold = if let SearchMode::Shared(threshold) = mode {
+            Some(threshold)
+        } else {
+            None
+        };
         params.validate().map_err(|e| input(&e))?;
         self.ensure_lengths().await?;
         let mut metrics = SearchMetrics::default();
@@ -1635,135 +1782,177 @@ impl SegmentReader {
                 selections.entry(id).or_insert((0, false, 0)).1 = true;
             }
         }
-        let weights: BTreeMap<_, _> = selections
-            .iter()
-            .map(|(&id, &(qf, _, df))| (id, TermWeight::new(qf, df, stats, params)))
-            .collect();
         let saturation = self.saturation(stats, params);
+        let lengths = self.lens();
         let metas = self.load(selections.keys().copied()).await?;
-        // Global 128-row windows share a safe bound formed from intersecting
-        // posting blocks. Descending bounds fill the heap early (block-max MAXSCORE).
         let windows = (self.num_docs() as usize).div_ceil(BLOCK);
-        let mut bounds = vec![0.0f64; windows];
-        let mut prefix_windows = vec![false; windows];
-        let mut heap: BinaryHeap<Reverse<SearchHit>> = BinaryHeap::new();
-        // Block ordinals are dense within each selected term. Direct slots avoid
-        // a tree search for every cache probe in every intersecting row window.
-        let mut cache: BTreeMap<u64, Vec<Option<Postings>>> = {
-            let memo = self.decoded.lock().unwrap();
-            metas
-                .iter()
-                .map(|(&id, meta)| {
-                    (
-                        id,
-                        meta.blocks
-                            .iter()
-                            .map(|b| memo.blocks.get(&b.offset).cloned())
-                            .collect(),
-                    )
-                })
-                .collect()
+        // Bound auxiliary window metadata, including broad prefix expansions.
+        let cached_windows = if windows.saturating_mul(selections.len()) <= 65_536 {
+            windows
+        } else {
+            0
         };
-        let roundoff = (selections.len() as f64 + 8.0) * f64::from(f32::EPSILON);
+        let mut terms: Vec<_> = selections
+            .iter()
+            .map(|(&id, &(qf, prefix, df))| {
+                SearchTerm::new(
+                    metas[&id].clone(),
+                    TermWeight::new(qf, df, stats, params),
+                    prefix,
+                )
+            })
+            .collect();
+        if terms.is_empty() {
+            return Ok((Vec::new(), metrics));
+        }
+        {
+            let memo = self.decoded.lock().unwrap();
+            for term in &mut terms {
+                term.postings = term
+                    .meta
+                    .blocks
+                    .iter()
+                    .map(|b| memo.blocks.get(&b.offset).cloned())
+                    .collect();
+                term.small = prefetch
+                    && !term.prefix
+                    && (term.meta.blocks.len() <= SMALL_BLOCKS
+                        || (self.sparse_term(term.meta.df)
+                            && term.postings.iter().all(Option::is_some)));
+            }
+        }
+        let roundoff = (terms.len() as f64 + 8.0) * f64::from(f32::EPSILON);
         let margin = if roundoff < 1.0 {
             1.0 / (1.0 - roundoff)
         } else {
             f64::INFINITY
         };
-        let mut row_bounds = Vec::new();
-        let mut dense_bounds = Vec::new();
+        let mut bounds = vec![0.0f64; windows];
+        let mut prefix_windows = vec![false; windows];
+        let mut heap: BinaryHeap<Reverse<SearchHit>> = BinaryHeap::new();
         if prefetch {
-            // Short exact terms are read whole (their record and blocks usually arrived together
-            // while the dictionary was consulted), so their windows are known exactly: a window's
-            // bound for such a term is the best score any of its postings gives, and a window with
-            // no posting gets nothing. Long terms keep per-block bounds, at most one per window.
-            let mut small = Vec::new();
-            for (&id, &(_, prefix, _)) in &selections {
-                if !prefix
-                    && (metas[&id].blocks.len() <= SMALL_BLOCKS
-                        || (self.sparse_term(metas[&id].df)
-                            && cache[&id].iter().all(Option::is_some)))
-                {
-                    small.push(id);
-                }
-            }
-            // Sum known sparse contributions at the same row before taking a
-            // window maximum. Summing independent term maxima falsely assumes
-            // different matching rows co-occur, and makes stopword blocks competitive.
-            if !small.is_empty() {
-                row_bounds = vec![0.0f64; self.docs as usize];
-            }
-            let mut ranges: Vec<_> = small
+            let wanted = terms
                 .iter()
-                .flat_map(|id| {
-                    metas[id]
-                        .blocks
+                .enumerate()
+                .filter(|(_, term)| term.small)
+                .flat_map(|(t, term)| {
+                    term.postings
                         .iter()
                         .enumerate()
-                        .filter(|(i, _)| cache[id][*i].is_none())
-                        .map(|(_, b)| b)
+                        .filter(|(_, p)| p.is_none())
+                        .map(move |(b, _)| (t, b))
                 })
-                .map(|b| b.offset..b.offset + b.size as u64)
                 .collect();
-            ranges.sort_unstable_by_key(|r| r.start);
-            if !ranges.is_empty() {
-                let values = self.read_ranges(ranges.clone()).await?;
-                if values.len() != ranges.len() {
-                    return Err(invalid("invalid posting batch length"));
-                }
-                let values: BTreeMap<_, _> = ranges
-                    .into_iter()
-                    .zip(values)
-                    .map(|(r, v)| (r.start, v))
-                    .collect();
-                for &id in &small {
-                    for (block, b) in metas[&id].blocks.iter().enumerate() {
-                        if cache[&id][block].is_none() {
-                            cache.get_mut(&id).unwrap()[block] =
-                                Some(self.decode_postings(b, &values[&b.offset], metas[&id].df)?);
-                            metrics.blocks_read += 1;
+            self.read_search_blocks(&mut terms, wanted, &saturation, &mut metrics)
+                .await?;
+        }
+        if terms.iter().all(|term| term.small) {
+            // Every posting is already available. Accumulate once in reference
+            // order instead of building window bounds and scoring those rows again.
+            let mut scores = vec![0.0f32; self.docs as usize];
+            let mut touched = Vec::new();
+            for term in &terms {
+                for postings in term.postings.iter().flatten() {
+                    for &(row, tf) in postings.iter() {
+                        if allowed.is_some_and(|rows| !rows.contains(row)) {
+                            continue;
                         }
+                        let score =
+                            term.weight
+                                .score_cached(tf, lengths[row as usize], &saturation);
+                        if score <= 0.0 {
+                            continue;
+                        }
+                        if scores[row as usize] == 0.0 {
+                            touched.push(row);
+                        }
+                        scores[row as usize] += score;
                     }
                 }
             }
-            for (&id, &(_, prefix, _)) in &selections {
+            metrics.rows_scored = touched.len();
+            let floor = search_floor(&heap, k, threshold);
+            for row in touched {
+                if floor.is_some_and(|floor| f64::from(scores[row as usize]) < floor) {
+                    continue;
+                }
+                let hit = SearchHit {
+                    row,
+                    score: scores[row as usize],
+                };
+                if heap.len() < k {
+                    heap.push(Reverse(hit));
+                } else if hit > heap.peek().unwrap().0 {
+                    *heap.peek_mut().unwrap() = Reverse(hit);
+                }
+            }
+            if let Some(threshold) = threshold {
+                threshold.publish(&heap);
+            }
+            let mut hits: Vec<_> = heap.into_iter().map(|r| r.0).collect();
+            hits.sort_unstable_by(|a, b| b.cmp(a));
+            return Ok((hits, metrics));
+        }
+        let mut row_bounds = if terms.iter().any(|term| term.small) {
+            vec![0.0f64; self.docs as usize]
+        } else {
+            Vec::new()
+        };
+        for term in &mut terms {
+            term.cache_windows(cached_windows);
+        }
+        {
+            let maxima = saturation.maxima.lock().unwrap();
+            for term in &mut terms {
                 let mut best = vec![0.0f64; windows];
-                if small.contains(&id) {
-                    let weight = &weights[&id];
-                    for postings in cache[&id].iter().flatten() {
+                if term.small {
+                    for postings in term.postings.iter().flatten() {
                         for &(row, tf) in postings.iter() {
-                            let score =
-                                weight.score_cached(tf, self.lens()[row as usize], &saturation);
-                            row_bounds[row as usize] += f64::from(score);
+                            let score = f64::from(term.weight.score_cached(
+                                tf,
+                                lengths[row as usize],
+                                &saturation,
+                            ));
+                            row_bounds[row as usize] += score;
+                            best[row as usize / BLOCK] = best[row as usize / BLOCK].max(score);
                         }
                     }
                 } else {
-                    for b in &metas[&id].blocks {
-                        let bound = b.upper_bound(&weights[&id], &saturation) as f64;
-                        for w in b.first as usize / BLOCK..=b.last as usize / BLOCK {
-                            best[w] = best[w].max(bound);
-                            prefix_windows[w] |= prefix;
+                    for b in &term.meta.blocks {
+                        if let Some(windows) = maxima.frames.get(&b.offset) {
+                            // A frame can span many row windows. Its best posting
+                            // cannot make an unrelated window competitive.
+                            for &(w, maximum) in windows {
+                                let bound = f64::from(
+                                    term.weight.score_saturation(maximum)
+                                        * (1.0 + 8.0 * f32::EPSILON),
+                                );
+                                best[w] = best[w].max(bound);
+                                prefix_windows[w] |= term.prefix;
+                            }
+                        } else {
+                            let bound = f64::from(b.upper_bound(&term.weight, &saturation));
+                            for w in b.first as usize / BLOCK..=b.last as usize / BLOCK {
+                                // A row occurs in only one of the intersecting frames.
+                                best[w] = best[w].max(bound);
+                                prefix_windows[w] |= term.prefix;
+                            }
                         }
                     }
-                }
-                for (w, v) in best.into_iter().enumerate() {
-                    bounds[w] += v;
-                }
-            }
-            dense_bounds = bounds.clone();
-            for (w, scores) in row_bounds.chunks(BLOCK).enumerate() {
-                bounds[w] += scores.iter().copied().fold(0.0, f64::max);
-            }
-        } else {
-            for (&id, &(_, prefix, _)) in &selections {
-                for b in &metas[&id].blocks {
-                    let bound = b.upper_bound(&weights[&id], &saturation) as f64;
-                    for w in b.first as usize / BLOCK..=b.last as usize / BLOCK {
-                        bounds[w] += bound;
-                        prefix_windows[w] |= prefix;
+                    for (bound, &value) in bounds.iter_mut().zip(&best) {
+                        *bound += value;
                     }
                 }
+                if cached_windows > 0 {
+                    term.bounds = best;
+                }
             }
+        }
+        let dense_bounds = bounds.clone();
+        // Known sparse terms must co-occur at a row, rather than at unrelated
+        // maxima in the same window. This tightens the bound before any dense read.
+        for (w, scores) in row_bounds.chunks(BLOCK).enumerate() {
+            bounds[w] += scores.iter().copied().fold(0.0, f64::max);
         }
         let mut order: Vec<_> = bounds
             .into_iter()
@@ -1772,21 +1961,21 @@ impl SegmentReader {
             .filter(|(_, b)| *b > 0.0)
             .collect();
         order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        // In prefetch mode, posting blocks arrive in at most a few parallel batches, chosen by
-        // window bound: the most promising windows first, which fills the heap and sets a threshold;
-        // then every window whose bound can still reach the threshold. Exactness is unchanged: a
-        // window is skipped only when its bound is below the heap's k-th score.
         let mut next = 0;
         let mut batch_size = if prefetch { FIRST_WINDOWS } else { usize::MAX };
+        let mut by_bound = Vec::with_capacity(terms.len());
+        let mut essential = vec![true; terms.len()];
         while next < order.len() {
             let mut batch = Vec::new();
             while next < order.len() && batch.len() < batch_size {
                 let (window, bound) = order[next];
-                next += 1;
-                if heap.len() == k && bound < heap.peek().unwrap().0.score as f64 {
-                    metrics.windows_pruned += 1;
-                    continue;
+                if search_floor(&heap, k, threshold).is_some_and(|floor| bound < floor) {
+                    // Bounds descend, and the heap threshold only rises.
+                    metrics.windows_pruned += order.len() - next;
+                    next = order.len();
+                    break;
                 }
+                next += 1;
                 let start = (window * BLOCK) as u32;
                 let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
                 if allowed.is_some_and(|rows| rows.range(start..end).next().is_none()) {
@@ -1809,143 +1998,154 @@ impl SegmentReader {
             }
             batch_size = usize::MAX;
             if prefetch {
-                let mut wanted = std::collections::BTreeSet::new();
+                let mut wanted = Vec::new();
                 for &(window, _) in &batch {
-                    let start = (window * BLOCK) as u32;
-                    let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
-                    for &id in selections.keys() {
-                        let blocks = &metas[&id].blocks;
-                        let first = blocks.partition_point(|b| b.last < start);
-                        for (block, b) in blocks
-                            .iter()
-                            .enumerate()
-                            .skip(first)
-                            .take_while(|(_, b)| b.first < end)
-                        {
-                            if cache[&id][block].is_none()
+                    for (t, term) in terms.iter().enumerate() {
+                        for b in term.span(window) {
+                            let meta = &term.meta.blocks[b];
+                            if term.postings[b].is_none()
                                 && allowed.is_none_or(|rows| {
-                                    rows.range(b.first..=b.last).next().is_some()
+                                    rows.range(meta.first..=meta.last).next().is_some()
                                 })
                             {
-                                wanted.insert((id, block));
+                                wanted.push((t, b));
                             }
                         }
                     }
                 }
-                let wanted: Vec<_> = wanted.into_iter().collect();
-                let mut ranges: Vec<_> = wanted
-                    .iter()
-                    .map(|&(id, block)| {
-                        let b = &metas[&id].blocks[block];
-                        b.offset..b.offset + b.size as u64
-                    })
-                    .collect();
-                ranges.sort_unstable_by_key(|r| r.start);
-                let values = self.read_ranges(ranges.clone()).await?;
-                if values.len() != ranges.len() {
-                    return Err(invalid("invalid posting batch length"));
-                }
-                let values: BTreeMap<_, _> = ranges
-                    .into_iter()
-                    .zip(values)
-                    .map(|(r, v)| (r.start, v))
-                    .collect();
-                for (id, block) in wanted {
-                    let b = &metas[&id].blocks[block];
-                    cache.get_mut(&id).unwrap()[block] =
-                        Some(self.decode_postings(b, &values[&b.offset], metas[&id].df)?);
-                    metrics.blocks_read += 1;
-                }
+                wanted.sort_unstable();
+                wanted.dedup();
+                self.read_search_blocks(&mut terms, wanted, &saturation, &mut metrics)
+                    .await?;
             }
             for (window, bound) in batch {
-                if heap.len() == k && bound < heap.peek().unwrap().0.score as f64 {
+                if search_floor(&heap, k, threshold).is_some_and(|floor| bound < floor) {
                     metrics.windows_pruned += 1;
                     continue;
                 }
                 let start = (window * BLOCK) as u32;
                 let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
-                if allowed.is_some_and(|rows| rows.range(start..end).next().is_none()) {
-                    continue;
-                }
-                let mut needed = Vec::new();
-                for &id in selections.keys() {
-                    let blocks = &metas[&id].blocks;
-                    let first = blocks.partition_point(|b| b.last < start);
-                    for (block, b) in blocks
-                        .iter()
-                        .enumerate()
-                        .skip(first)
-                        .take_while(|(_, b)| b.first < end)
-                    {
-                        if cache[&id][block].is_none()
-                            && allowed
-                                .is_none_or(|rows| rows.range(b.first..=b.last).next().is_some())
-                        {
-                            needed.push((id, block, b));
+                if !prefetch {
+                    let mut wanted = Vec::new();
+                    for (t, term) in terms.iter().enumerate() {
+                        for b in term.span(window) {
+                            let meta = &term.meta.blocks[b];
+                            if term.postings[b].is_none()
+                                && allowed.is_none_or(|rows| {
+                                    rows.range(meta.first..=meta.last).next().is_some()
+                                })
+                            {
+                                wanted.push((t, b));
+                            }
                         }
                     }
+                    self.read_search_blocks(&mut terms, wanted, &saturation, &mut metrics)
+                        .await?;
                 }
-                let results = try_join_all(
-                    needed
-                        .iter()
-                        .map(|(id, _, b)| self.postings(b, metas[id].df)),
-                )
-                .await?;
-                for ((id, block, _), postings) in needed.into_iter().zip(results) {
-                    metrics.blocks_read += 1;
-                    cache.get_mut(&id).unwrap()[block] = Some(postings);
-                }
-                // Sparse row contributions are exact. Once the heap is full,
-                // dense terms cannot rescue a row whose remaining score bound is
-                // below the threshold, even if another row made its window competitive.
-                let floor = (heap.len() == k).then(|| heap.peek().unwrap().0.score as f64);
-                let competitive: [bool; BLOCK] = std::array::from_fn(|i| {
-                    let row = start as usize + i;
-                    row < end as usize
-                        && floor.is_none_or(|floor| {
-                            row_bounds.is_empty()
-                                || (row_bounds[row]
-                                    + dense_bounds[window]
-                                    + f64::from(prefix_windows[window]))
-                                    * margin
-                                    >= floor
-                        })
-                });
-                let mut scores = [0.0f32; BLOCK];
-                let mut prefix_matches = [false; BLOCK];
-                for (&id, &(_, prefix, _)) in &selections {
-                    let blocks = &metas[&id].blocks;
-                    let first = blocks.partition_point(|b| b.last < start);
-                    for (block, _) in blocks
-                        .iter()
-                        .enumerate()
-                        .skip(first)
-                        .take_while(|(_, b)| b.first < end)
-                    {
-                        let Some(postings) = cache[&id][block].as_ref() else {
-                            continue;
-                        };
-                        let lo = postings.partition_point(|(row, _)| *row < start);
-                        let hi = postings.partition_point(|(row, _)| *row < end);
-                        let weight = &weights[&id];
-                        for &(row, tf) in &postings[lo..hi] {
-                            let i = (row - start) as usize;
-                            if competitive[i] && allowed.is_none_or(|rows| rows.contains(row)) {
-                                scores[i] +=
-                                    weight.score_cached(tf, self.lens()[row as usize], &saturation);
-                                prefix_matches[i] |= prefix;
+                let floor = search_floor(&heap, k, threshold);
+                let mut candidates = [true; BLOCK];
+                if let Some(floor) = floor {
+                    // Block-max MaxScore: low-impact terms cannot create a hit on
+                    // their own. Generate candidates only from the essential terms.
+                    // Strict inequality retains every score tie. Prefix expansions
+                    // each get a conservative flat contribution, counted only once
+                    // when computing the final score.
+                    by_bound.clear();
+                    by_bound.extend(
+                        terms
+                            .iter()
+                            .enumerate()
+                            .map(|(t, term)| (t, term.bound(window, &saturation))),
+                    );
+                    by_bound.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+                    essential.fill(true);
+                    let mut nonessential = 0.0;
+                    let mut skipped = 0;
+                    for &(t, bound) in &by_bound {
+                        if (nonessential + bound) * margin >= floor {
+                            break;
+                        }
+                        nonessential += bound;
+                        essential[t] = false;
+                        skipped += 1;
+                    }
+                    if skipped > 0 {
+                        candidates.fill(false);
+                        for (_, term) in terms.iter().enumerate().filter(|(t, _)| essential[*t]) {
+                            for b in term.span(window) {
+                                let Some(postings) = &term.postings[b] else {
+                                    continue;
+                                };
+                                let lo = postings.partition_point(|&(row, _)| row < start);
+                                for &(row, _) in
+                                    postings[lo..].iter().take_while(|&&(row, _)| row < end)
+                                {
+                                    candidates[(row - start) as usize] = true;
+                                }
                             }
                         }
                     }
                 }
-                for row in start..end {
-                    if allowed.is_some_and(|rows| !rows.contains(row)) {
-                        continue;
+                // Test the sparse bound and allowed mask once per candidate, not
+                // again for every term that hits it.
+                let competitive: Vec<_> = (start..end)
+                    .filter(|&row| {
+                        candidates[(row - start) as usize]
+                            && allowed.is_none_or(|rows| rows.contains(row))
+                            && floor.is_none_or(|floor| {
+                                row_bounds.is_empty()
+                                    || (row_bounds[row as usize]
+                                        + dense_bounds[window]
+                                        + f64::from(prefix_windows[window]))
+                                        * margin
+                                        >= floor
+                            })
+                    })
+                    .collect();
+                if competitive.is_empty() {
+                    continue;
+                }
+                candidates.fill(false);
+                for &row in &competitive {
+                    candidates[(row - start) as usize] = true;
+                }
+                let mut scores = [0.0f32; BLOCK];
+                let mut prefix_matches = [false; BLOCK];
+                for term in &terms {
+                    for b in term.span(window) {
+                        let Some(postings) = &term.postings[b] else {
+                            continue;
+                        };
+                        let lo = postings.partition_point(|&(row, _)| row < start);
+                        let hi = postings.partition_point(|&(row, _)| row < end);
+                        let postings = &postings[lo..hi];
+                        let mut add = |row: u32, tf| {
+                            let i = (row - start) as usize;
+                            scores[i] +=
+                                term.weight
+                                    .score_cached(tf, lengths[row as usize], &saturation);
+                            prefix_matches[i] |= term.prefix;
+                        };
+                        if competitive.len() * 8 < postings.len() {
+                            // A common-word frame can have 128 entries but only one
+                            // rare-term candidate. Seek those rows instead of scanning
+                            // the entire frame and testing the same mask repeatedly.
+                            for &row in &competitive {
+                                if let Ok(i) = postings.binary_search_by_key(&row, |&(r, _)| r) {
+                                    add(row, postings[i].1);
+                                }
+                            }
+                        } else {
+                            for &(row, tf) in postings {
+                                if candidates[(row - start) as usize] {
+                                    add(row, tf);
+                                }
+                            }
+                        }
                     }
+                }
+                for row in competitive {
                     let i = (row - start) as usize;
-                    if !competitive[i] {
-                        continue;
-                    }
                     let score = scores[i] + f32::from(prefix_matches[i]);
                     if score <= 0.0 {
                         continue;
@@ -1958,11 +2158,54 @@ impl SegmentReader {
                         *heap.peek_mut().unwrap() = Reverse(hit);
                     }
                 }
+                if let Some(threshold) = threshold {
+                    threshold.publish(&heap);
+                }
             }
         }
         let mut hits: Vec<_> = heap.into_iter().map(|r| r.0).collect();
         hits.sort_unstable_by(|a, b| b.cmp(a));
         Ok((hits, metrics))
+    }
+
+    /// Read missing frames in address order, keeping direct term/block ordinals.
+    async fn read_search_blocks(
+        &self,
+        terms: &mut [SearchTerm],
+        mut wanted: Vec<(usize, usize)>,
+        saturation: &Saturation,
+        metrics: &mut SearchMetrics,
+    ) -> io::Result<()> {
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        wanted.sort_unstable_by_key(|&(t, b)| terms[t].meta.blocks[b].offset);
+        let ranges = wanted
+            .iter()
+            .map(|&(t, b)| {
+                let meta = &terms[t].meta.blocks[b];
+                meta.offset..meta.offset + u64::from(meta.size)
+            })
+            .collect();
+        let values = self.read_ranges(ranges).await?;
+        if values.len() != wanted.len() {
+            return Err(invalid("invalid posting batch length"));
+        }
+        for ((t, b), bytes) in wanted.into_iter().zip(values) {
+            let term = &mut terms[t];
+            term.postings[b] =
+                Some(self.decode_postings(&term.meta.blocks[b], &bytes, term.meta.df)?);
+            if !self.sparse_term(term.meta.df) {
+                saturation.remember(
+                    term.meta.blocks[b].offset,
+                    term.postings[b].as_ref().unwrap(),
+                    self.lens(),
+                    BLOCK,
+                );
+            }
+            metrics.blocks_read += 1;
+        }
+        Ok(())
     }
     async fn bitmap(&self, ids: &[u64]) -> io::Result<RoaringBitmap> {
         let metas = self.load(ids.iter().copied()).await?;

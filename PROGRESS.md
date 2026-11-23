@@ -838,3 +838,13 @@ changed +0.18%, +0.15%, and -0.45%, and latency stayed within the observed sprea
 in every case. Synthetic unfiltered reads grew 6.0% (4.3% reclustered), while NQ unfiltered reads were
 nearly flat and filtered bytes fell 9.5–24.2%; I document that coalescing/alignment tradeoff explicitly.
 Details and reproduction: `docs/benchmarks.md`, “Round D1”. The full 2.68M NQ corpus remains unmeasured.
+
+## 2026-11-23 — BM25 round 2
+
+I add exact block-max MaxScore candidate selection, direct window metadata, and one-pass accumulation
+when every selected posting list is available. A bounded cache keeps normalization maxima per row
+window, independent of IDF and query frequency, and resets when normalization parameters or average
+length change. I retain reference f32 addition order, prefix semantics, live-row filtering, and ties.
+The text crate also exposes a shared top-k score floor for disjoint live segments. Existing segment
+formats and the bucket fence stay unchanged. Property tests and targeted regressions cover long
+posting lists, broad prefixes, changed statistics, and concurrent segment searches.
