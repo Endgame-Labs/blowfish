@@ -860,3 +860,11 @@ I extend the local harness with measured-pass perf counters or call stacks, sele
 and elapsed-time throughput summaries. An aligned NQ workload generator emits BM25, ANN, two-list
 multi-query, and server-side RRF requests from the prepared benchmark data. Profile outputs stay
 under `.scratch/`, and profiler attachment uses the harness's exact server PID.
+
+I retain validated dense frames in a separate 8 MiB CLOCK cache, preserving the sparse cache's own
+8 MiB allowance. This avoids repeating common-word decoding and range-cache bookkeeping. Sparse
+partial bounds use f32 storage; the conservative margin covers rounding in both partial and final
+sums, while result scoring keeps its reference operation order. New regressions verify cache
+budgets, sparse-frame protection, changed statistics and masks, and exact rankings with interleaved
+dense and sparse terms. All 175 tests and both compatibility modes pass. The harness also records
+peak server RSS and keeps perf's build-ID cache under the run's scratch directory.

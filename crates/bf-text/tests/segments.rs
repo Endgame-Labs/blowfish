@@ -806,3 +806,82 @@ fn row_aligned_sparse_bounds_prune_disjoint_term_maxima() {
     assert!(metrics.windows_pruned > 100, "{metrics:?}");
     assert!(metrics.rows_scored < 4000, "{metrics:?}");
 }
+
+#[test]
+fn dense_frames_reuse_data_but_rescore_changed_statistics_and_masks() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..16_384)
+        .map(|row| {
+            tokenize(
+                if row % 7 == 0 {
+                    "common common needle"
+                } else {
+                    "common filler filler filler"
+                },
+                &params,
+            )
+        })
+        .collect();
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let reader = block_on(SegmentReader::open(Arc::new(Recording {
+        bytes: build(&docs, false, params.tokenizer).into(),
+        reads: reads.clone(),
+    })))
+    .unwrap();
+    let mut stats = CorpusStats::from_documents(&docs);
+    let query = Query::new(tokenize("common", &params), false);
+    block_on(reader.search_prefetched(&query, &stats, &params, docs.len(), None)).unwrap();
+    stats.total_docs *= 2;
+    stats.average_doc_length *= 1.7;
+    let params = FtsParams {
+        k1: 0.73,
+        b: 1.0,
+        k3: 0.13,
+        ..params
+    };
+    let query = Query::new(tokenize("common common", &params), false);
+    let allowed: RoaringBitmap = (0..docs.len() as u32).filter(|row| row % 5 == 0).collect();
+    reads.lock().unwrap().clear();
+    let hits =
+        block_on(reader.search_prefetched(&query, &stats, &params, 10, Some(&allowed))).unwrap();
+    assert_eq!(
+        hits,
+        expected(&docs, &query, &stats, &params, 10, Some(&allowed))
+    );
+    assert!(
+        reads.lock().unwrap().is_empty(),
+        "validated dense data needs no repeated range read"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+    #[test]
+    fn rounded_sparse_partials_preserve_exact_top_k(
+        k1 in 0.01f32..4.0, b in 0.0f32..1.0, k3 in 0.01f32..20.0,
+        repeats in 1usize..5, bias in 0u32..64,
+    ) {
+        let params = FtsParams { k1, b, k3, ..FtsParams::default() };
+        let docs: Vec<_> = (0..8_192u32).map(|row| {
+            let mut words = vec!["a", "c", "e"];
+            if row % 5 == 0 { words.push("c"); }
+            for (divisor, term) in [(7,"b"),(11,"d"),(13,"f")] {
+                if row % divisor == 0 { words.push(term); }
+            }
+            words.extend(std::iter::repeat_n("filler", (row % 9) as usize));
+            words.into_iter().enumerate().map(|(i,t)| Token::new(t,i as u32)).collect()
+        }).collect();
+        let reader = open(build(&docs, false, params.tokenizer));
+        let mut stats = CorpusStats::from_documents(&docs);
+        stats.total_docs += u64::from(bias);
+        let query = Query::new((0..repeats).flat_map(|_| ["a","b","c","d","e","f"])
+            .enumerate().map(|(i,t)| Token::new(t,i as u32)).collect(), false);
+        let allowed: RoaringBitmap = (0..docs.len() as u32).filter(|row| (row+bias)%3 != 0).collect();
+        for k in [1,10,31] {
+            for filter in [None,Some(&allowed)] {
+                let hits = block_on(reader.search_prefetched(&query,&stats,&params,k,filter)).unwrap();
+                prop_assert_eq!(hits, expected(&docs,&query,&stats,&params,k,filter));
+            }
+        }
+    }
+}

@@ -41,14 +41,79 @@ const MAX_BLOCK_BYTES: usize = 1026;
 const CHUNK_TERMS: usize = 2048;
 /// Decoded dictionary chunks kept per reader before the memo is reset.
 const MEMO_CHUNKS: usize = 512;
-/// Decoded posting payloads per immutable reader, evicted in insertion order.
+/// Separate decoded posting budgets for sparse and dense lists.
 const MEMO_POSTING_BYTES: usize = 8 << 20;
 type Postings = Arc<[(u32, u32)]>;
+struct CachedPostings {
+    postings: Postings,
+    dense: bool,
+    recent: bool,
+}
 #[derive(Default)]
 struct DecodedPostings {
-    blocks: std::collections::HashMap<u64, Postings>,
+    blocks: std::collections::HashMap<u64, CachedPostings>,
     order: std::collections::VecDeque<u64>,
     bytes: usize,
+    dense_order: std::collections::VecDeque<u64>,
+    dense_bytes: usize,
+}
+impl DecodedPostings {
+    fn get(&mut self, offset: u64) -> Option<Postings> {
+        let cached = self.blocks.get_mut(&offset)?;
+        if cached.dense {
+            cached.recent = true;
+        }
+        Some(cached.postings.clone())
+    }
+
+    fn insert(&mut self, offset: u64, postings: Postings, dense: bool) {
+        let bytes = postings.len() * 8;
+        self.blocks.insert(
+            offset,
+            CachedPostings {
+                postings,
+                dense,
+                recent: false,
+            },
+        );
+        if dense {
+            self.dense_bytes += bytes;
+            self.dense_order.push_back(offset);
+            // CLOCK protects frequently queried common words. Sparse lists retain
+            // their own budget, so long lists cannot evict exact sparse bounds.
+            while self.dense_bytes > MEMO_POSTING_BYTES
+                || self.dense_order.len() > MEMO_POSTING_BYTES / 1024
+            {
+                let offset = self
+                    .dense_order
+                    .pop_front()
+                    .expect("dense posting memo is nonempty");
+                match self.blocks.get_mut(&offset) {
+                    Some(cached) if cached.recent => {
+                        cached.recent = false;
+                        self.dense_order.push_back(offset);
+                    }
+                    Some(_) => {
+                        let cached = self.blocks.remove(&offset).unwrap();
+                        self.dense_bytes -= cached.postings.len() * 8;
+                    }
+                    None => {}
+                }
+            }
+        } else {
+            self.bytes += bytes;
+            self.order.push_back(offset);
+            while self.bytes > MEMO_POSTING_BYTES || self.order.len() > MEMO_POSTING_BYTES / 1024 {
+                let offset = self
+                    .order
+                    .pop_front()
+                    .expect("sparse posting memo is nonempty");
+                if let Some(cached) = self.blocks.remove(&offset) {
+                    self.bytes -= cached.postings.len() * 8;
+                }
+            }
+        }
+    }
 }
 const DF_BITS: u32 = 28;
 const DF_MASK: u64 = (1 << DF_BITS) - 1;
@@ -1266,7 +1331,7 @@ impl SegmentReader {
                     + sizes.into_iter().take(MEMO_CHUNKS).sum::<usize>()
             }
         };
-        (terms + dictionary + self.docs as usize * 4 + MEMO_POSTING_BYTES * 2 + Saturation::BYTES)
+        (terms + dictionary + self.docs as usize * 4 + MEMO_POSTING_BYTES * 4 + Saturation::BYTES)
             as u64
     }
     /// The decoded lengths. Callers that read postings or score call `ensure_lengths` first.
@@ -1553,7 +1618,7 @@ impl SegmentReader {
     }
 
     async fn postings(&self, b: &BlockMeta, df: u32) -> io::Result<Postings> {
-        if let Some(postings) = self.decoded.lock().unwrap().blocks.get(&b.offset).cloned() {
+        if let Some(postings) = self.decoded.lock().unwrap().get(b.offset) {
             return Ok(postings);
         }
         self.ensure_lengths().await?;
@@ -1604,24 +1669,11 @@ impl SegmentReader {
             return Err(invalid("invalid last posting row"));
         }
         let out: Postings = out.into();
-        // Sparse lists can replace loose block spans with exact row-window bounds.
-        // Dense stopword lists would evict those useful lists before the next query.
-        if !self.sparse_term(df) {
-            return Ok(out);
-        }
         let mut memo = self.decoded.lock().unwrap();
-        if let Some(existing) = memo.blocks.get(&b.offset) {
-            return Ok(existing.clone());
+        if let Some(existing) = memo.get(b.offset) {
+            return Ok(existing);
         }
-        memo.bytes += out.len() * 8;
-        memo.order.push_back(b.offset);
-        memo.blocks.insert(b.offset, out.clone());
-        while memo.bytes > MEMO_POSTING_BYTES || memo.blocks.len() > MEMO_POSTING_BYTES / 1024 {
-            let offset = memo.order.pop_front().expect("posting memo is nonempty");
-            if let Some(old) = memo.blocks.remove(&offset) {
-                memo.bytes -= old.len() * 8;
-            }
-        }
+        memo.insert(b.offset, out.clone(), !self.sparse_term(df));
         Ok(out)
     }
     /// Posting payload ranges for exact terms and the final prefix expansion.
@@ -1662,7 +1714,8 @@ impl SegmentReader {
     }
     /// Exact BM25 with block-max MaxScore and parallel posting reads. Promising
     /// windows establish a top-k threshold before the remaining competitive
-    /// frames are fetched. Payloads remain query-local even without a backend cache.
+    /// frames are fetched. Batch payloads stay available throughout scoring,
+    /// including when the backend has no cache.
     pub async fn search_prefetched(
         &self,
         query: &Query,
@@ -1806,13 +1859,13 @@ impl SegmentReader {
             return Ok((Vec::new(), metrics));
         }
         {
-            let memo = self.decoded.lock().unwrap();
+            let mut memo = self.decoded.lock().unwrap();
             for term in &mut terms {
                 term.postings = term
                     .meta
                     .blocks
                     .iter()
-                    .map(|b| memo.blocks.get(&b.offset).cloned())
+                    .map(|b| memo.get(b.offset))
                     .collect();
                 term.small = prefetch
                     && !term.prefix
@@ -1821,6 +1874,9 @@ impl SegmentReader {
                             && term.postings.iter().all(Option::is_some)));
             }
         }
+        // Sparse partials and final scores each accumulate at most n positive
+        // terms. Two n-unit-roundoff allowances fit within n * EPSILON; the
+        // additional margin covers bounds and the prefix contribution.
         let roundoff = (terms.len() as f64 + 8.0) * f64::from(f32::EPSILON);
         let margin = if roundoff < 1.0 {
             1.0 / (1.0 - roundoff)
@@ -1894,7 +1950,7 @@ impl SegmentReader {
             return Ok((hits, metrics));
         }
         let mut row_bounds = if terms.iter().any(|term| term.small) {
-            vec![0.0f64; self.docs as usize]
+            vec![0.0f32; self.docs as usize]
         } else {
             Vec::new()
         };
@@ -1908,13 +1964,12 @@ impl SegmentReader {
                 if term.small {
                     for postings in term.postings.iter().flatten() {
                         for &(row, tf) in postings.iter() {
-                            let score = f64::from(term.weight.score_cached(
-                                tf,
-                                lengths[row as usize],
-                                &saturation,
-                            ));
+                            let score =
+                                term.weight
+                                    .score_cached(tf, lengths[row as usize], &saturation);
                             row_bounds[row as usize] += score;
-                            best[row as usize / BLOCK] = best[row as usize / BLOCK].max(score);
+                            best[row as usize / BLOCK] =
+                                best[row as usize / BLOCK].max(f64::from(score));
                         }
                     }
                 } else {
@@ -1952,7 +2007,7 @@ impl SegmentReader {
         // Known sparse terms must co-occur at a row, rather than at unrelated
         // maxima in the same window. This tightens the bound before any dense read.
         for (w, scores) in row_bounds.chunks(BLOCK).enumerate() {
-            bounds[w] += scores.iter().copied().fold(0.0, f64::max);
+            bounds[w] += f64::from(scores.iter().copied().fold(0.0, f32::max));
         }
         let mut order: Vec<_> = bounds
             .into_iter()
@@ -2094,7 +2149,7 @@ impl SegmentReader {
                             && allowed.is_none_or(|rows| rows.contains(row))
                             && floor.is_none_or(|floor| {
                                 row_bounds.is_empty()
-                                    || (row_bounds[row as usize]
+                                    || (f64::from(row_bounds[row as usize])
                                         + dense_bounds[window]
                                         + f64::from(prefix_windows[window]))
                                         * margin
@@ -2426,4 +2481,33 @@ async fn read_exact(source: &dyn RangeRead, range: Range<u64>) -> io::Result<Byt
         ));
     }
     Ok(data)
+}
+
+#[cfg(test)]
+mod posting_cache_tests {
+    use super::*;
+
+    #[test]
+    fn dense_clock_is_bounded_and_cannot_evict_sparse_frames() {
+        let mut memo = DecodedPostings::default();
+        let postings: Postings = vec![(0, 1); BLOCK].into();
+        memo.insert(0, postings.clone(), false);
+        let capacity = MEMO_POSTING_BYTES / (BLOCK * 8);
+        for offset in 1..=capacity as u64 {
+            memo.insert(offset, postings.clone(), true);
+        }
+        assert!(memo.get(1).is_some());
+        memo.insert(capacity as u64 + 1, postings.clone(), true);
+        assert!(memo.get(1).is_some(), "a read earns a second chance");
+        assert!(memo.get(2).is_none());
+        for offset in capacity as u64 + 2..=capacity as u64 * 2 {
+            memo.insert(offset, postings.clone(), true);
+        }
+        assert!(memo.get(0).is_some());
+        assert!(memo.get(capacity as u64 * 2).is_some());
+        assert!(memo.bytes <= MEMO_POSTING_BYTES);
+        assert!(memo.dense_bytes <= MEMO_POSTING_BYTES);
+        assert!(memo.dense_order.len() <= capacity);
+        assert_eq!(memo.order.len(), 1);
+    }
 }

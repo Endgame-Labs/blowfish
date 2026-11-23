@@ -67,12 +67,21 @@ def trace(path):
     return {"reads": len(reads), "bytes": sum(r[2] for r in reads), "waves": waves}
 
 
-def summary(rows, clients, delay_ms, seconds=None):
+def summary(rows, clients, delay_ms, seconds=None, server_pid=None):
     ms = sorted(row["ms"] for row in rows)
     out = {"queries": len(rows), "clients": clients, "p50_ms": ms[len(ms) // 2],
            "p90_ms": ms[min(len(ms) - 1, len(ms) * 9 // 10)]}
     if seconds is not None:
         out.update(seconds=seconds, queries_per_second=len(rows) / seconds)
+    if server_pid is not None:
+        try:
+            status = Path(f"/proc/{server_pid}/status").read_text()
+        except OSError:
+            pass
+        else:
+            for line in status.splitlines():
+                if line.startswith("VmHWM:"):
+                    out["peak_rss_bytes"] = int(line.split()[1]) * 1024
     if rows and "waves" in rows[0]:
         for key in ["reads", "bytes", "waves"]:
             out[f"mean_{key}"] = statistics.mean(row[key] for row in rows)
@@ -95,7 +104,8 @@ def profile(args, pid, clients):
     else:
         command += ["stat", "-e", "instructions,cycles", "-x", ",",
                     "-o", str(path.with_suffix(".stat"))]
-    child = subprocess.Popen(["timeout", "600", *command, "-p", str(pid)])
+    env = dict(os.environ, PERF_BUILDID_DIR=str(args.profile_dir / "buildid"))
+    child = subprocess.Popen(["timeout", "600", *command, "-p", str(pid)], env=env)
     try:
         # Allow perf to attach before the first request.
         time.sleep(0.2)
@@ -146,7 +156,7 @@ async def measure(args, work):
                         seconds = time.monotonic() - start
                     for row in rows:
                         print(json.dumps(row), flush=True)
-                    summary(rows, clients, args.delay_ms, seconds)
+                    summary(rows, clients, args.delay_ms, seconds, server.pid)
         else:
             env.update(BF_TRACE_READS="1", BF_TRACE_STAGES="1", BF_WARM_CONNECTIONS="0",
                        AWS_ACCESS_KEY_ID="local", AWS_SECRET_ACCESS_KEY="local", AWS_DEFAULT_REGION="us-east-1")
