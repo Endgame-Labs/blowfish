@@ -171,7 +171,6 @@ impl OpenHint {
                     .scan
                     .as_ref()
                     .filter(|(a, _, _)| a == attribute)
-                    .filter(|_| crate::ann::slabs_enabled())
                     .and_then(|_| slabs.get(attribute))
                     .filter(|set| crate::ann::slabs_cover(segments, set));
                 if let Some(set) = slab
@@ -214,7 +213,6 @@ impl OpenHint {
                     .scan
                     .as_ref()
                     .filter(|(a, _, _)| a == attribute)
-                    .filter(|_| crate::ann_dir::blocks_enabled())
                     .and_then(|_| dirs.get(&crate::ann_dir::Layout::Blocks.dir_key(attribute)));
                 let chosen = match blocks {
                     Some(file) => Some((
@@ -353,14 +351,6 @@ pub(crate) async fn catch_up(
 ) -> Result<(), ApiError> {
     catch_up_hinted(wal, state, cap, store, None).await
 }
-/// `BF_READER_COPY=0` makes queries read the full manifest (for A/B runs).
-fn reader_copy_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("BF_READER_COPY").is_ok_and(|v| v != "0")
-            || std::env::var_os("BF_READER_COPY").is_none()
-    })
-}
 /// A manifest that republishes the checkpoint this state already holds (garbage collection and
 /// epoch claims do) changes nothing the state depends on, so it must not discard the resident
 /// tail: rebuilding would download every unindexed WAL payload again.
@@ -401,7 +391,7 @@ pub(crate) async fn catch_up_hinted(
         // A query that needs no text header reads the compact reader copy of the manifest;
         // everything else (writers, indexers, text queries) wants the full one, which also
         // replaces a compact one this state holds.
-        let want_full = hint.is_none_or(OpenHint::wants_text) || !reader_copy_enabled();
+        let want_full = hint.is_none_or(OpenHint::wants_text);
         let (view, known) = if !want_full {
             (bf_wal::ManifestView::Reader, state.manifest_seq)
         } else if state.root_only {
@@ -419,7 +409,7 @@ pub(crate) async fn catch_up_hinted(
                     // A lone unfiltered ANN query wants the block-layout directory: try its hint
                     // first, and the plain one when the namespace has none.
                     let mut got = Vec::new();
-                    if hint.scan.is_some() && crate::ann_dir::blocks_enabled() {
+                    if hint.scan.is_some() {
                         // The recluster's paged slab directory, its flat slab directory, and
                         // the block directory are fetched together: which one answers is decided
                         // once the manifest is read. They are tried in that order, and the

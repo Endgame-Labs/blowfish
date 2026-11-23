@@ -529,14 +529,12 @@ impl FastQuery {
     }
 }
 
-/// Whether this CPU has AVX-512BW (checked once; `BF_NO_AVX512` turns it off).
+/// Whether this CPU has AVX-512BW (checked once).
 #[cfg(target_arch = "x86_64")]
 fn avx512bw() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("BF_NO_AVX512").is_none()
-            && std::is_x86_feature_detected!("avx512f")
-            && std::is_x86_feature_detected!("avx512bw")
+        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
     })
 }
 

@@ -43,7 +43,7 @@ I also loaded the same 10M 1,024-dim `f16` Wikipedia dataset into live turbopuff
 
 ### 10M vector: probe sweep and layout comparison (`v0.1.12` baseline)
 
-Cold `p50 / p90` in milliseconds on `c7gd.2xlarge` across the 32-slab `recluster` layout (`BF_ANN_NPROBE` = 40, 48, and 64) and the 70-segment per-segment baseline (`BF_ANN_SLABS=0`, 160 probes), from the `v0.1.12` in-region sweep (warm slab latency has since dropped to `36.6 / 50.8 ms` at 48 probes and cache-cold to `533 / 656 ms`):
+Cold `p50 / p90` in milliseconds on `c7gd.2xlarge` across the 32-slab `recluster` layout (`BF_ANN_NPROBE` = 40, 48, and 64) and the 70-segment per-segment baseline (160 probes), from the `v0.1.12` in-region sweep (warm slab latency has since dropped to `36.6 / 50.8 ms` at 48 probes and cache-cold to `533 / 656 ms`):
 
 | Arm | Fresh p50 / p90 (ms) | Gap vs. published | Cache-cold p50 / p90 (ms) | Gap vs. published | Recall@10 |
 | --- | ---: | ---: | ---: | ---: | ---: |

@@ -235,7 +235,6 @@ queries use it, and filtered ones keep using the plain directory and its maps. B
 - Readers that predate block fragments ignore the new manifest keys and keep using `ann:<attribute>`.
 - A segment built before block fragments gets its `annfrag2:` file from the next indexing pass, which publishes even when there is
   nothing to flush (one whole read of the segment's index object each, a one-time cost; 70 segments of 440 MB took 540 s).
-- `BF_ANN_BLOCKS=0` makes queries ignore the block layout (A/B only).
 
 The scan prefetch: the snapshot wave starts the scan's reads (and the exact reads of flat segments) as soon as the directory is
 loaded, in parallel with the WAL tail read, for a lone unfiltered ANN query. The query's own scan then finds them in the block

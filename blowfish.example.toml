@@ -41,10 +41,10 @@ ann_nprobe = 64
 ann_rerank_factor = 32
 recall_sample_rate = 0.01
 # Large reclustered namespaces read their ANN directory in pieces. These are environment-only
-# variables (see docs/configuration.md): BF_ANN_PAGED (0 turns it off), BF_ANN_PAGE_MARGIN (16),
-# BF_ANN_PAGE_KAPPA (0.5), BF_ANN_PAGE_ENTRIES (24), BF_ANN_PAGED_MIN_ENTRIES (100000), BF_ANN_SCAN_MEMO, and BF_ANN_SPECULATE.
+# variables (see docs/configuration.md): BF_ANN_PAGE_MARGIN (16),
+# BF_ANN_PAGE_KAPPA (0.5), BF_ANN_PAGE_ENTRIES (24), and BF_ANN_PAGED_MIN_ENTRIES (100000).
 # The allocator switches from a 1 s to a 30 s page decay while only queries run (BF_BUSY_DECAY_MS, BF_IDLE_DECAY_MS,
-# BF_DECAY_LINGER_MS), and a large manifest gets a compact reader copy for cold ANN queries (BF_READER_COPY,
+# BF_DECAY_LINGER_MS), and a large manifest gets a compact reader copy for cold ANN queries (size threshold
 # BF_READER_COPY_MIN_BYTES). Both are environment-only; see docs/configuration.md.
 
 [storage.cache]

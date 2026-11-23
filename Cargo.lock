@@ -273,6 +273,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
+ "foldhash",
  "fst",
  "futures",
  "globset",
