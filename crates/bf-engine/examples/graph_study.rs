@@ -1,4 +1,5 @@
 //! Offline G2 study. Usage: graph_study DATA_DIR RUN_DIR [query_count=3452] [sizes=200,100,64,32] [cells=32].
+//! A cell count of eight runs only the frozen-center assignment comparison.
 //! Inputs are the NumPy files produced by `bench/nq/prepare.py`. No server or bucket is used.
 //! The run directory must be new; it is removed on success, error, or unwinding.
 use bf_alloc as _;
@@ -845,6 +846,7 @@ fn main() -> AnyResult<()> {
         println!("CODES,{cells},{size},{:.6}", t.elapsed().as_secs_f64());
         if cells == 8 {
             assignment_study(&corpus, &layout, &graph, &codes, size, &q, &gt);
+            continue;
         }
         let t = Instant::now();
         let scanner = Scanner::build(&corpus, &layout, &run)?;
