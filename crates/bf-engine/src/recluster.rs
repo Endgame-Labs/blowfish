@@ -58,6 +58,8 @@ pub struct ReclusterReport {
 /// The leaf clusters and coarse cells every build uses.
 pub(crate) const CELLS: usize = 32;
 pub(crate) const CLUSTER_ROWS: usize = 200;
+/// The smallest leaf a delta trains (a fast-scan block holds 32 rows).
+const MIN_DELTA_LEAF_ROWS: usize = 8;
 
 /// A finished build: the tier, ready for the indexer to install.
 pub(crate) struct Built {
@@ -362,9 +364,25 @@ impl Engine {
         let max = opts.max_slab_rows.max(1);
         let jobs: Vec<SlabJob> = {
             let (present, read_row) = (present.clone(), read_row.clone());
-            let cluster_rows = opts.cluster_rows.max(1);
+            // A delta's leaves cover about as much of the space as its base's: fewer rows each,
+            // in proportion to its share of the rows, so the two rank as one list (see
+            // `ann_dir::Joint`). Its few rows go in as few slabs as memory allows.
+            let cluster_rows = match target.kind {
+                Kind::Base => opts.cluster_rows.max(1),
+                Kind::Delta => {
+                    let share =
+                        present.len() as f64 / (present.len() as u64 + target.base_rows) as f64;
+                    ((opts.cluster_rows as f64 * share).round() as usize).clamp(
+                        MIN_DELTA_LEAF_ROWS,
+                        opts.cluster_rows.max(MIN_DELTA_LEAF_ROWS),
+                    )
+                }
+            };
+            let pack = target.kind == Kind::Delta;
             on_pool(move || {
-                assign_leaves(&present, &read_row, &coarse, cell_rows, cluster_rows, max)
+                let jobs =
+                    assign_leaves(&present, &read_row, &coarse, cell_rows, cluster_rows, max);
+                if pack { pack_slabs(jobs, max) } else { jobs }
             })
             .await?
         };
@@ -561,6 +579,35 @@ async fn segment_index(
     .await
     .map(Arc::new)
     .map_err(segment::index_error)
+}
+
+/// Consecutive slabs merged while they fit in `max` rows together (a delta's cells are small).
+fn pack_slabs(jobs: Vec<SlabJob>, max: usize) -> Vec<SlabJob> {
+    let mut out: Vec<SlabJob> = Vec::new();
+    for job in jobs {
+        match out.last_mut() {
+            Some(last) if last.rows.len() + job.rows.len() <= max => {
+                let offset = last.centers.len();
+                let mut rows: Vec<(u32, usize)> = last
+                    .rows
+                    .iter()
+                    .copied()
+                    .zip(last.assignment.iter().copied())
+                    .chain(
+                        job.rows
+                            .iter()
+                            .copied()
+                            .zip(job.assignment.iter().map(|a| a + offset)),
+                    )
+                    .collect();
+                rows.sort_unstable();
+                (last.rows, last.assignment) = rows.into_iter().unzip();
+                last.centers.extend(job.centers);
+            }
+            _ => out.push(job),
+        }
+    }
+    out
 }
 
 /// One slab to build: its global rows (ascending), its leaf clusters' centers, and each row's

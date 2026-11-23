@@ -798,29 +798,31 @@ fn pick_clusters(
 
 /// Recluster tiers searched for one query, ranking their leaves as one list.
 ///
-/// Each tier's leaves hold about the same number of rows (one clustering of each tier's rows into
-/// leaves of the same size), so the query's nearest leaves over all tiers are what a single tier
-/// over all of their rows would probe. Searched apart, each tier would size its probe for its own
-/// rows, as if it were the whole namespace, and a small delta beside a base would scan about
-/// `sqrt(delta share)` more rows than one tier. Together, they agree on one probe count for all
-/// of their rows and walk their nearest leaves as one list, in two exchanges: their totals, then
-/// their nearest leaves. A tier that stops early (no rows to rank, or an error) withdraws, and the
-/// others go on without it.
+/// A delta's leaves are trained to cover about as much of the vector space as the base's (they
+/// hold fewer rows, in proportion to the delta's share of the rows), so the query's nearest
+/// leaves over both tiers are what one tier over all of their rows would probe. Searched apart,
+/// each tier would size its probe for its own rows, as if it were the whole namespace, and a small
+/// delta beside a base would scan about `sqrt(delta share)` more rows than one tier. Together,
+/// they agree on one probe budget for all of their rows (in rows: the probe count times the mean
+/// leaf), and walk their nearest leaves as one list until it is spent, in two exchanges: their
+/// totals, then their nearest leaves. A tier that stops early (no rows to rank, or an error)
+/// withdraws, and the others go on without it.
 pub(crate) struct Joint {
     parts: usize,
     state: std::sync::Mutex<JointState>,
     changed: tokio::sync::Notify,
 }
 
-/// One part's nearest entries, nearest first, as (distance order key, expected rows).
-type Head = Vec<(u32, f64)>;
+/// One part's nearest entries, nearest first, as (distance order key, expected allowed rows,
+/// rows).
+type Head = Vec<(u32, f64, u32)>;
 
 #[derive(Default)]
 struct JointState {
     /// Each part's (ANN rows, matching rows, clusters, wanted candidates); `Some(None)` once it
     /// withdrew.
     totals: Vec<Option<Option<[usize; 4]>>>,
-    /// Each part's nearest entries, nearest first, as (distance order key, expected rows).
+    /// Each part's nearest entries (see [`Head`]).
     heads: Vec<Option<Option<Head>>>,
 }
 
@@ -917,7 +919,10 @@ impl Seat {
         let thin = ann_rows as f64 / matching.max(1) as f64;
         let probes = probe_count(config, ann_rows, clusters, thin * t.spread);
         let target = wanted.min(matching);
+        // The budget in rows, so that a tier of smaller leaves (a delta) walks more of them.
+        let budget = probes as f64 * ann_rows as f64 / clusters.max(1) as f64;
         // This tier's nearest entries: enough that the joint walk never runs past them.
+        let own_leaf = t.ann_rows as f64 / t.clusters.max(1) as f64;
         let flat: Vec<bool> = dir.segments().iter().map(|s| s.flat).collect();
         let mut order: Vec<u64> = dir
             .entries()
@@ -926,7 +931,7 @@ impl Seat {
             .filter(|(n, e)| !flat[e.segment] && e.rows > 0 && in_cluster(*n) > 0.0)
             .map(|(n, _)| (u64::from(total_order_key(distances[n])) << 32) | n as u64)
             .collect();
-        let head = (probes * 2 + 64).min(order.len());
+        let head = ((budget / own_leaf.max(1.0) * 2.0) as usize + 64).min(order.len());
         if head < order.len() {
             order.select_nth_unstable(head);
             order.truncate(head);
@@ -936,7 +941,7 @@ impl Seat {
             .iter()
             .map(|key| {
                 let n = (key & u64::from(u32::MAX)) as usize;
-                ((key >> 32) as u32, in_cluster(n))
+                ((key >> 32) as u32, in_cluster(n), dir.entries()[n].rows)
             })
             .collect();
         {
@@ -952,21 +957,24 @@ impl Seat {
                     state.heads.iter().map(Option::as_ref).collect();
                 let heads = heads?;
                 // Walk every head as one list, nearest first (ties by part), as one directory's
-                // walk would: until the probe count and the rerank target are both reached.
+                // walk would: until the row budget and the rerank target are both reached.
                 let mut at = vec![0usize; parts];
-                let (mut count, mut candidates) = (0usize, 0f64);
+                let (mut walked, mut candidates) = (0f64, 0f64);
                 loop {
                     let next = (0..parts)
                         .filter_map(|p| {
                             let head = heads[p].as_ref()?;
-                            head.get(at[p]).map(|(key, rows)| (*key, p, *rows))
+                            head.get(at[p])
+                                .map(|(key, allowed, rows)| (*key, p, *allowed, *rows))
                         })
-                        .min_by_key(|(key, p, _)| (*key, *p));
-                    let Some((_, p, rows)) = next else { break };
+                        .min_by_key(|(key, p, _, _)| (*key, *p));
+                    let Some((_, p, allowed, rows)) = next else {
+                        break;
+                    };
                     at[p] += 1;
-                    count += 1;
-                    candidates += rows;
-                    if count >= probes && candidates >= target as f64 {
+                    walked += f64::from(rows);
+                    candidates += allowed;
+                    if walked >= budget && candidates >= target as f64 {
                         break;
                     }
                 }
