@@ -723,3 +723,18 @@ and their tests (224 passed, 4 ignored). The compatibility suite passes 121/121 
 indexing modes, both TypeScript smoke runs pass, and the Python compatibility unit tests pass 9/9.
 I cover exact code/vector preservation, f16/f32/i8, filtered queries, sparse slab IDs, corrupt leaf blobs
 and footers, older headers, concurrent publication, resumable slabs, and idempotence.
+
+
+### D1 measurements
+
+I measured 200K-row, 1,024-dimensional f16 namespaces against the parent: live indexed bytes/row fell
+from 4,602.05 to 4,420.90 on synthetic data, from 4,599.68 to 4,419.72 on the NQ embedding slice, and
+from 7,015.65 to 6,652.72 after recluster. ANN objects fell from 3 to 1, and from 15 to 7 with six slabs.
+The upgrades wrote 443.07 / 442.83 / 889.21 MB in 3.11 / 4.80 / 10.19 seconds, at 911 / 878 / 875 MiB RSS.
+
+I used four alternating old/new query rounds on shared CPUs 6–7. All 3,072 paired warm responses and
+60 paired cold responses matched IDs and scores; recall@10 stayed identical. Median instructions/query
+changed +0.18%, +0.15%, and -0.45%, and latency stayed within the observed spread. Cold requests fell
+in every case. Synthetic unfiltered reads grew 6.0% (4.3% reclustered), while NQ unfiltered reads were
+nearly flat and filtered bytes fell 9.5–24.2%; I document that coalescing/alignment tradeoff explicitly.
+Details and reproduction: `docs/benchmarks.md`, “Round D1”. The full 2.68M NQ corpus remains unmeasured.

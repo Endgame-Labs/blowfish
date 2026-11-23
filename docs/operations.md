@@ -154,7 +154,7 @@ blowfish reindex --storage-url s3://BUCKET/PREFIX NAMESPACE
 blowfish reindex --storage-url s3://BUCKET/PREFIX --all                 # every namespace in the bucket
 ```
 
-It prints progress, and it is safe beside a running server on the same bucket. The report distinguishes
+It prints progress, and I can run it beside a server that supports format 3. The report distinguishes
 current single objects from legacy row-major, fast-scan, and other indexes.
 All legacy indexes are rewritten, including flat ones. `recluster` also writes the single-object layout.
 
