@@ -77,11 +77,14 @@ Measured from an 8-vCPU VM in Los Angeles reaching Cloudflare R2 over the public
 - **Cold vector cost:** a cold 48-probe query makes about 400 requests and reads about 51 MB (down from about 880 requests, 117 MB, and 2,916 / 4,358 ms on the per-segment layout at 160 probes).
 - **Upsert variance:** each batch is 68 rows (about 506 KB) over 300 sequential writes; a second identical R2 session measured **2,114 / 2,563 ms**, so treat R2 upsert p50 as roughly **792 to 2,114 ms**.
 
-I also tested a BM25 optimization locally on 1M MS MARCO passages, restricted to two CPUs on a shared VM.
-Warm p50/p90 fell from **45.5/99.8 ms to 18.4/44.1 ms**, with exact overlap@10 **1.000** across 1,000 queries.
-A fresh-process local S3 facade with 25 ms per request fell from **457/670 ms to 255/353 ms**; it is a local
-round-trip model, and needs an in-region confirmation. The published 13/18 ms warm target remains open.
-Details and reproduction: [BM25 round](docs/benchmarks.md#bm25-round-fewer-cold-reads-and-exact-bounds-ms-marco-1m-one-machine).
+I also measured exact BM25 locally on 1M MS MARCO passages, restricted to two CPUs on a shared VM.
+The new scorer uses **73% fewer server instructions** at one client and **74% fewer** at 16 clients,
+with `overlap@10` **1.000**. Across two A/B repeats, warm p50/p90 ranges are **9.9–12.7 / 19.1–24.4 ms**;
+16-client throughput is **91–109 queries/s**, against **47–53** before. Peak server RSS rises about
+58 MiB. A fresh-process local S3 facade with 25 ms per request measures a median **251/366 ms**, against
+**258/372 ms** before. This is a local round-trip model; the **18 ms warm p90 target remains open**,
+and I have not confirmed this revision in-region.
+Details and reproduction: [BM25 measurements](docs/benchmarks.md#bm25-round-2-exact-maxscore-and-hybrid-concurrency).
 
 ### My own measurements of hosted services (10M)
 

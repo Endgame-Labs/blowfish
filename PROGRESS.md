@@ -868,3 +868,17 @@ sums, while result scoring keeps its reference operation order. New regressions 
 budgets, sparse-frame protection, changed statistics and masks, and exact rankings with interleaved
 dense and sparse terms. All 175 tests and both compatibility modes pass. The harness also records
 peak server RSS and keeps perf's build-ID cache under the run's scratch directory.
+
+I measure the production-profile binaries in A/B/A/B order on the same immutable 1M MS MARCO store.
+Server instructions fall 72.6% at one client and 74.2% at 16 clients; 16-client throughput rises
+from 50.2 to 99.9 queries/s. Median warm p50/p90 is 18.4/42.4 to 11.3/21.8 ms, with substantial
+wall-time variation recorded in the benchmark doc. Both new p50 repeats are below 13 ms; the
+18 ms p90 target remains open. Peak c16 RSS rises from 582 to 640 MiB. The 25 ms local facade
+measures 258/372 to 251/366 ms cold, within the observed variation. All 12,240 responses match
+exhaustive IDs and baseline scores exactly across the 1,000 unique queries.
+
+On 100K NQ, two-list hybrid instructions fall 31.8%, and RRF instructions fall 32.1%; cold RRF
+moves from 335/392 to 303/366 ms, with reads falling from 233 to 193 per query. All NQ lists,
+scores, and independently fused RRF results match. Full methodology, paired repetitions, cache
+budgets, and the remaining p90 gap are in `docs/benchmarks.md`, "BM25 round 2". I update only the
+README's local BM25 paragraph; the in-region figures retain their existing measurements.
