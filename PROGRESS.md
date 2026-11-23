@@ -22,8 +22,12 @@ Newest first. Each entry says what works now and how it was checked.
     0.962 and 587 q/s at 16 clients (main reclustered by hand: 0.961 and 574). With 5% of rows rewritten, 20.9 M
     instructions a query against 15.5 M fully covered, at recall@10 0.959. A 25% rewrite triggered a rebuild after the
     bulk window, in 287 s.
-  - Checked: fmt, workspace clippy, and tests of bf-wal, bf-storage, bf-vector, and bf-engine (with fault-injection
-    tests for a build that dies midway and for failed and ambiguous install publications); compat (see the report).
+  - Crash safety: `kill -9` during a rebuild on NQ (during assignment, and after all 32 slabs were uploaded but
+    before install) left the old tier answering at once with every referenced object present, and the restarted
+    server rebuilt in 227–260 s.
+  - Checked after merging D1: fmt, workspace clippy, and `cargo test --workspace` (285 passed, including
+    fault-injection tests for a build that dies midway and for failed and ambiguous install publications); compat
+    121/121.
 
 - **G2: a graph over leaf centers, studied offline** (`docs/design/graph-study.md`). On all of BEIR NQ, 64-row leaves
   with exhaustive center ranking scan 32.7% fewer rows at recall@10 0.95, but a degree-16 center graph costs 30–84%

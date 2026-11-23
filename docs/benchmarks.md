@@ -3758,3 +3758,16 @@ over every live row in 287 s. The build added about 150 MB to the 6.5 GB the ser
 
 Both found bugs before they passed: the build-record listing used a partial path segment and found no records, and GC
 deleted fresh records at retention zero.
+
+I also killed the server with `kill -9` during a rebuild on NQ (a 25% rewrite, 681,468 rows), three times, and
+restarted it on the same store:
+
+| Kill point | Slabs uploaded | After restart | Referenced tier objects | Restarted build |
+|---|---:|---|---|---|
+| Assignment, 90 s in | 0 | same top 3 at once | 33 of 33 | installed in 227 s |
+| 215 s in (a slow VM, still before uploads) | 0 | same top 3 at once | 33 of 33 | installed in 260 s |
+| After the last slab, before install | 32 | same top 3 at once | 33 of 33 | installed in 245 s |
+
+In every case the old tier kept answering, and no referenced object was missing before or after the new install. The
+killed build's 32 uploaded slabs stayed in the bucket under their fresh record, for GC to reclaim once the record is
+stale. A failed or ambiguous install publication is covered by the fault test above, not by a real kill.
