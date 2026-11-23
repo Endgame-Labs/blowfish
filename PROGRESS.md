@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Automatic recluster, round R3** (`docs/benchmarks.md`, "Automatic recluster, round R3"). Rows written after
+  the base get a delta tier on the base's coarse cells once they reach 4% of the base (and a quarter of the delta);
+  it builds in 6 to 11 s on NQ. The delta merges into a new base at half the base, and a base whose rows are a fifth
+  masked is rebuilt (on NQ, 373 s on the old cells). The bulk-load guard is kept in the manifest (`bulk_load_at`),
+  and build records are deleted once their tier is installed or discarded. Beside its base, the delta probes
+  `sqrt(its share)` of a standalone probe, and the two share one rerank bound and one hydration. With 5% of NQ
+  rewritten, a query costs 11.3% more instructions than with a base over every row (gate: 10%), at recall@10 0.960
+  against 0.961; 4.8 points of that is the masked rows any rewrite leaves in the base. The side search it replaces
+  cost 36% more. A `kill -9` during a delta build leaves the tiers answering, and the restarted build installs.
+  New tests cover delta, merge, masked rebuilds, the guard across restarts, and an all-deleted delta.
+
 - **IN1 measured NQ updates and ingest** (`docs/benchmarks.md`, "Round IN1"). I run two alternating
   old/new HTTP pairs on 681,468 NQ rows, four clients, CPUs 6–7, and a 12 GiB scope. Median overwrite
   peak RSS falls from 6.40 to 3.14 GiB, about 13% above the new insert peak of 2.78 GiB. Plain insert

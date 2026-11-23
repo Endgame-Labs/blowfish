@@ -3772,6 +3772,66 @@ In every case the old tier kept answering, and no referenced object was missing 
 killed build's 32 uploaded slabs stayed in the bucket under their fresh record, for GC to reclaim once the record is
 stale. A failed or ambiguous install publication is covered by the fault test above, not by a real kill.
 
+## Automatic recluster, round R3 (BEIR NQ, one machine)
+
+Round R3 adds the delta tier, the merge and masked-rows rebuilds, the persistent bulk-load guard, and build-record
+cleanup (`docs/design/auto-recluster.md`). Same VM and harness as rounds R1 and R2: the server is pinned to CPUs 0-5,
+the clients to CPUs 6-7, 64 probes, and other workers share the VM. Instruction counts here are user-space
+instructions per query from `perf stat` over 4,000 one-client queries (two passes), after two warm-up passes. To
+compare layouts under the same load, I ran two servers at once on hard-linked copies of one store and alternated the
+measurements between them.
+
+### The gate: 5% of rows rewritten
+
+The fully covered store is a base over all 2,681,468 rows. The other copy has its last 134,073 rows rewritten (new
+titles, same vectors), which the server answers from a delta built on the base's coarse cells (6 to 11 s with 656
+leaves in one slab; a base build takes about 5 minutes). Recall is against the exact top 10 over 3,452 queries.
+
+| Layout | Instructions / query | Recall@10 | Recall@100 (qrels) | p50 / p95 ms |
+|---|---:|---:|---:|---|
+| base over every row | 16.03 M | 0.961 | 0.934 | 4.5 / 8.8 |
+| 5% of rows deleted (base masked, nothing outside it) | 16.80 M (+4.8%) | | | |
+| 5% rewritten, side search (rounds R1 and R2) | +36% (16 clients) | 0.960 | | |
+| 5% rewritten, base and delta | **17.84 M (+11.3%)** | **0.960** | **0.934** | 4.7 / 7.4 |
+
+The gate asked for at most 10% more instructions at equal recall. This lands at 11.3% (17.78 to 17.95 M over five
+runs, against 16.03 to 16.11 M), with recall@10 down 0.001 and recall@100 unchanged. Of the 1.8 M extra instructions,
+0.8 M is the 5% of base rows the rewrite masked, which any update pays until a rebuild (the masked-only copy shows
+it). The base probes 5.3% more leaves to find the same live rows. The other 1.0 M is the delta: 26 more leaves (about
+5% more scanned rows) and a second plan, rerank, and hydration.
+
+The plan took four tries, and the first three are worth recording:
+
+- **One list over both tiers' leaves:** a delta's leaves hold as many rows as the base's over a sparser sample, so
+  their centers sit nearer every query, and the walk spent up to 446 of about 550 probes on the delta's 656 leaves.
+  The base lost recall: 0.955 against 0.961.
+- **Delta leaves as dense as the base's** (about 10 rows each): 13,391 more centers to rank cost 45% more
+  instructions per query, and recall still fell to 0.959.
+- **One row budget split by share:** the base got 95% of the probe and lost recall on its own rows (0.956 against
+  0.959).
+- **Now:** the base probes as it would alone, the delta `sqrt(its share)` of what it would alone (the rule rows
+  outside the tiers already use), and the two exchange the k-th smallest upper bound before reranking and the k-th
+  exact distance before hydrating. The base's own rows come back at the same recall as with no delta (0.9592 on the
+  first 1,000 queries in both). The delta's rows, 2% of the true top 10, come back at 0.918.
+
+### Merges, masked rows, and the bulk-load guard
+
+- **Masked rebuild:** after rewriting 440,000 more rows on the base and delta, the masked rows reached 574,073 (20% of
+  the tiers' 2,815,541 rows). The guard deferred the build each minute for five minutes, then the job rebuilt the
+  base on the old coarse cells (`reuses_cells=true`) in 373 s, and the delta was dropped.
+- **Bulk-load guard across restarts:** every load above set `bulk_load_at` in the manifest, and builds waited for
+  five minutes after the last bulk flush. `a_bulk_load_flush_is_kept_in_the_manifest_so_a_restart_still_waits`
+  checks that a restarted server still waits.
+- **Build records:** after every install on NQ, the build's record was gone from `indexer/`. The job deletes it
+  whether its tier was installed or discarded.
+
+### Crash safety
+
+I killed the server (`kill -9`) 2 s into a delta build on NQ, after one build record was written and before the slab
+upload. The installed base and old delta kept answering at once on restart (recall@10 on base rows 0.957 over 300
+queries, with the rewritten rows searched beside the tiers). The restarted build installed in 11 s and deleted its own
+record. The killed build's record stays until it is stale, and GC then reclaims its objects, as in round R2's tests.
+
 ## Rounds D2 and D3: vector-free documents and compressed text
 
 I measured document-v2 on 200,000 synthetic rows and all 2,681,468 BEIR NQ passages, using the

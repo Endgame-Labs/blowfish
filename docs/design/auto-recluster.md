@@ -42,9 +42,11 @@ today's `SlabSet` (slabs, their covered segments with bases and live generations
 in no tier are in **uncovered** segments, which keep their own ANN objects.
 
 One query plan covers all three:
-- It ranks leaves across both tiers' directories and the uncovered segments' entries in the namespace directory,
-  with the probe count scaled for the uncovered part only (the existing `S^0.3` rule applied to uncovered
-  segments).
+- The base probes as it would alone. The delta, and the uncovered segments' entries in the namespace directory,
+  each probe `sqrt(their share of the rows)` of a standalone probe (with the existing `S^0.3` rule for uncovered
+  segments). The base and the delta share one rerank bound and hydrate only the global top k. (Round R3 first
+  ranked both tiers' leaves as one list. A delta's leaves hold as many rows as the base's over a sparser sample, so
+  their centers sit nearer every query, and that walk spent most of the probe on them: see `docs/benchmarks.md`.)
 - Deletes and updates in covered segments are masks over global rows, as today. Rows whose newest version is in an
   uncovered segment or the WAL tail shadow older ones, as today.
 - This is the open SPEC item "slabs that cover new segments", and it is what makes slabs useful while writes
