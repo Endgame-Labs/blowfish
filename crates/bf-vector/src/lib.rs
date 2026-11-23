@@ -5,16 +5,21 @@
 mod cluster;
 mod directory;
 mod distance;
+mod fastscan;
 mod format;
 mod index;
 mod reader;
 pub use bytes::Bytes;
-pub use cluster::{BuildParams, IndexBuilder, VectorType, kmeans, nearest_center, prepare_vector};
+pub use cluster::{
+    BuildParams, IndexBuilder, VectorType, kmeans, nearest_center, prepare_vector, squared_distance,
+};
 pub use directory::{
     DirEntry, DirSegment, Directory, Fragment, Membership, Page, PagedDirectory, PartialIndex,
 };
 pub use format::{FORMAT_VERSION, metadata_len};
-pub use index::{Candidate, DecodedCluster, Index, SearchParams, read_gap, read_merged};
+pub use index::{
+    Candidate, DecodedCluster, Index, RotatedQuery, SearchParams, read_gap, read_merged,
+};
 pub use reader::RangeRead;
 mod rabitq;
 pub use rabitq::{DistanceEstimate, RaBitQ, RaBitQCode};

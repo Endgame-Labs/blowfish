@@ -107,9 +107,9 @@ memory limit (host RAM, or the cgroup limit when lower):
 | Segment builds at once | 1 below 8 GiB, otherwise 2 | `BF_BUILD_CONCURRENCY` |
 | Decoded metadata cache | limit / 8, 512 MiB to 4 GiB | `BF_DECODED_CACHE_BYTES` |
 
-The decoded cache budget covers decoded segment metadata. Two caches sit beside it with their own share of that budget, so
-decoded data can take up to 1.5 times `BF_DECODED_CACHE_BYTES`: decoded ANN directory clusters (three eighths) and decoded
-document column blocks (one eighth). Size the memory limit with that in mind on small machines.
+The decoded cache budget covers all decoded data, in three parts: decoded segment metadata (two thirds), decoded ANN
+directory clusters (a quarter), and decoded document column blocks (a twelfth). Together they stay within
+`BF_DECODED_CACHE_BYTES`.
 
 `blowfish serve` reads every `BF_*` engine variable above, plus `BF_INDEX_BYTES`, `BF_MAX_SEGMENT_BYTES`, `BF_BULK_FLUSH_AGE_MS`, `BF_WAL_PIPELINE`, `BF_RETENTION_SECS`, `BF_ANN_RERANK`, `BF_EXACT_FETCH`, and `BF_FILTER_PROBE_CAP`. CLI flags and TOML keys take precedence over them. `BF_BULK_FLUSH_BYTES` follows `max_unindexed_bytes` (three quarters of it) unless set explicitly.
 
@@ -180,6 +180,26 @@ variables; the defaults suit 1,024-dimension vectors.
 `cargo run --release -p bf-engine --example repage -- storage.json NAMESPACE ATTRIBUTE` adds a paged copy to a namespace
 that was reclustered before paging existed, without rebuilding any slab.
 
+### Recluster leaf assignment
+
+`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. For a
+layout with at most 1,024 leaves in its largest cell (about 6.5M rows at the default 32 cells and 200 rows per leaf),
+each row then joins its nearest leaf among the leaves of its four nearest cells, not only its own cell's. Every leaf
+center is then recomputed once from all of its rows, so rows near a cell boundary sit with their true neighbors. On
+BEIR NQ (2.68M rows, about 420 leaves a cell), recall@10 at 64 probes went from 0.955 to 0.960, and 54 probes now give
+what 64 gave. The job took 240 s instead of 160 s.
+
+The cost grows faster than the rows. The leaves are trained with one-level k-means, and each row is compared with
+about 16 times the square root of a cell's leaves. With NQ split into 8 cells (about 1,700 leaves a cell, the size of a
+10M layout's cells), the job took 508 s instead of 93 s, at about the same peak memory (2.0 GB). Larger layouts, such
+as the published 10M and 100M ones, therefore keep the per-cell assignment unless it is forced on.
+
+| What | Default | Variable |
+| --- | --- | --- |
+| Assign rows across cells: `1` always, `0` never (each cell's rows clustered on their own, as before iteration 20) | when the largest cell has at most 1,024 leaves | `BF_RECLUSTER_GLOBAL` |
+| Leaf groups a row is compared with, over its four nearest cells | 12 | `BF_RECLUSTER_GROUPS` |
+| Rounds of recomputing leaf centers from their rows and assigning again | 1 | `BF_RECLUSTER_REFINE` |
+
 ### ANN probes and query concurrency
 
 The probe count is `ann_nprobe` (default 64; `engine.ann_nprobe`, `--ann-nprobe`, `BLOWFISH_ANN_NPROBE`, or `BF_ANN_NPROBE`)
@@ -209,6 +229,15 @@ from 0.906 to 0.958. Reclustering removes the cost: it gets the recall at the ba
 
 On x86-64 the RaBitQ scan uses AVX-512 (`VPOPCNTQ`) when the CPU has it; on arm64 it uses NEON (`CNT` and pairwise adds).
 Both give bit-identical results to the portable path.
+
+Indexes built since iteration 20 store their one-bit codes in a fast-scan layout: transposed in blocks of 32 rows, scored
+with 4-bit table lookups (byte shuffles on AVX-512BW, `TBL` on NEON, a scalar loop elsewhere, all giving the same sums).
+That is about 3 times faster per row on x86-64 and 5 times on Apple M4. Indexes in the older row-major layout are still
+read and scanned as before, so a namespace picks the layout up as its segments are rebuilt or reclustered.
+
+| What | Default | Variable |
+| --- | --- | --- |
+| Build new indexes in the fast-scan layout (`0` builds the row-major layout; reading handles both) | on | `BF_ANN_FASTSCAN` |
 
 ### Connection warming, hedging, and diagnostics
 

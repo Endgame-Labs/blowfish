@@ -38,6 +38,9 @@ pub struct BuildParams {
     pub samples_per_cluster: usize,
     /// Build a two-level centroid tree at this row count.
     pub two_level_threshold: usize,
+    /// Store quantized codes in the blocked fast-scan layout (the default; `BF_ANN_FASTSCAN=0`
+    /// turns it off) rather than row by row. Readers handle both.
+    pub fastscan: bool,
 }
 impl Default for BuildParams {
     fn default() -> Self {
@@ -48,6 +51,7 @@ impl Default for BuildParams {
             iterations: 8,
             samples_per_cluster: 32,
             two_level_threshold: 262_144,
+            fastscan: crate::format::fastscan_builds(),
         }
     }
 }
@@ -160,6 +164,64 @@ impl IndexBuilder {
             parent_ids,
             assignments,
             flat,
+        )
+    }
+    /// Build from packed rows (as [`IndexBuilder::build_packed`]) that the caller has already
+    /// clustered: `centers` are the leaf centers, prepared for the metric (unit length for
+    /// cosine), and `assignment[i]` is the cluster of the `i`-th input row. A namespace-wide
+    /// recluster assigns rows against every slab's centers, then builds each slab from its share.
+    pub fn build_packed_assigned(
+        &self,
+        ids: Vec<u32>,
+        data: Vec<u8>,
+        centers: Vec<Vec<f32>>,
+        assignment: Vec<usize>,
+    ) -> Result<Vec<u8>> {
+        if ids.len() > u32::MAX as usize
+            || data.len() != ids.len() * self.row_bytes()
+            || assignment.len() != ids.len()
+            || centers.is_empty()
+            || centers.len() > 65_536
+            || centers.iter().any(|c| c.len() != self.dims)
+            || assignment.iter().any(|c| *c >= centers.len())
+        {
+            return Err(Error::InvalidInput(
+                "invalid rows, centers, or assignment".into(),
+            ));
+        }
+        let order = if ids.windows(2).all(|w| w[0] <= w[1]) {
+            Vec::new()
+        } else {
+            let mut order: Vec<u32> = (0..ids.len() as u32).collect();
+            order.sort_unstable_by_key(|i| ids[*i as usize]);
+            order
+        };
+        // Assignments in ID order, as the blob writer walks the rows.
+        let assignment = if order.is_empty() {
+            assignment
+        } else {
+            order.iter().map(|i| assignment[*i as usize]).collect()
+        };
+        let packed = Packed {
+            dims: self.dims,
+            dtype: self.dtype,
+            metric: self.metric,
+            ids,
+            data,
+            order,
+        };
+        if (0..packed.len().saturating_sub(1)).any(|i| packed.row_id(i) == packed.row_id(i + 1)) {
+            return Err(Error::InvalidInput("duplicate row ID".into()));
+        }
+        let k = centers.len();
+        crate::format::build_blob(
+            self,
+            &packed,
+            centers,
+            vec![],
+            vec![u32::MAX; k],
+            assignment,
+            false,
         )
     }
     /// Build from already-half-precision vectors, preserving their values.
@@ -290,12 +352,11 @@ impl Packed {
                 .map(|b| f32::from_le_bytes(*b))
                 .collect(),
             VectorType::I8 => raw.iter().map(|b| *b as i8 as f32).collect(),
-            VectorType::F16 => raw
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| half::f16::from_le_bytes(*b).to_f32())
-                .collect(),
+            VectorType::F16 => {
+                let mut out = Vec::with_capacity(raw.len() / 2);
+                crate::index::extend_f16(raw, &mut out);
+                out
+            }
         };
         prepare_owned(v, self.metric)
     }
@@ -414,6 +475,12 @@ pub fn kmeans(data: &[&[f32]], k: usize, iterations: usize, seed: u64) -> Vec<Ve
 /// Index of the center nearest to `v` (squared Euclidean distance).
 pub fn nearest_center(v: &[f32], centers: &[Vec<f32>]) -> usize {
     nearest(v, centers)
+}
+
+/// Squared Euclidean distance between two vectors of equal length, unvalidated (for hot loops
+/// over vectors already checked, such as rows against k-means centers).
+pub fn squared_distance(a: &[f32], b: &[f32]) -> f32 {
+    Metric::EuclideanSquared.distance_unchecked(a, b)
 }
 
 /// Unit-normalize `v` for cosine metrics; a copy for Euclidean ones.

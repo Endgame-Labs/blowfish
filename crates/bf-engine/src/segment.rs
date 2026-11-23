@@ -1545,6 +1545,9 @@ impl bf_vector::RangeRead for ObjectReader {
     async fn read(&self, range: Range<u64>) -> io::Result<Bytes> {
         ObjectReader::read(self, range).await
     }
+    fn caches_blocks(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait::async_trait]

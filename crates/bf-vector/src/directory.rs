@@ -109,7 +109,7 @@ struct Section {
     shape: Shape,
     /// Cluster count of the segment, including empty clusters.
     clusters: usize,
-    centroid: Vec<f32>,
+    centroid: Arc<Vec<f32>>,
     entries: Vec<DirEntry>,
     /// One-bit codes, `padded / 8` bytes per entry.
     bits: Vec<u8>,
@@ -208,7 +208,7 @@ impl Section {
         if self.codes_in_fragment {
             put_u32(out, 1);
         }
-        for x in &self.centroid {
+        for x in self.centroid.iter() {
             out.extend(x.to_le_bytes());
         }
         for e in &self.entries {
@@ -245,7 +245,7 @@ impl Section {
         if n > clusters || n > p.remaining() || membership.start > membership.end {
             return Err(bad("invalid directory section"));
         }
-        let centroid = p.vector(padded)?;
+        let centroid = Arc::new(p.vector(padded)?);
         let entries = (0..n)
             .map(|_| {
                 let cluster = p.u32()? as usize;
@@ -360,15 +360,10 @@ impl Fragment {
         let live: Vec<usize> = (0..m.clusters.len())
             .filter(|c| !m.clusters[*c].rows.is_empty())
             .collect();
-        let mut centroid = vec![0f32; padded];
-        for &c in &live {
-            for (g, x) in centroid.iter_mut().zip(m.clusters[c].center.iter()) {
-                *g += *x;
-            }
-        }
-        for g in &mut centroid {
-            *g /= live.len().max(1) as f32;
-        }
+        let centroid = Arc::new(crate::format::mean_center(
+            live.iter().map(|c| &*m.clusters[*c].center),
+            padded,
+        ));
         let root = (padded as f64).sqrt();
         let mut bits = Vec::with_capacity(live.len() * bit_bytes(padded));
         let mut entries = Vec::with_capacity(live.len());
@@ -411,7 +406,7 @@ impl Fragment {
             let r: Vec<f64> = c
                 .center
                 .iter()
-                .zip(&centroid)
+                .zip(centroid.iter())
                 .map(|(x, g)| (*x - *g) as f64)
                 .collect();
             let norm = r.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -690,6 +685,39 @@ impl Directory {
     pub fn center_distances(&self, query: &[f32]) -> Result<Vec<f32>> {
         self.center_distances_on(query, true)
     }
+    /// The query normalized for the metric and rotated, for [`Self::center_distances_rotated`]
+    /// and for scanning any of the directory's segments
+    /// ([`crate::Index::scan_blocks_bounded_rotated`]).
+    pub fn rotate_query(&self, query: &[f32]) -> Result<crate::RotatedQuery> {
+        crate::distance::validate(query, self.shape.dims)?;
+        Ok(crate::RotatedQuery::new(&self.rq, query, self.shape.metric))
+    }
+    /// [`Self::center_distances_on`] for a query from [`Self::rotate_query`].
+    pub fn center_distances_rotated(
+        &self,
+        query: &crate::RotatedQuery,
+        parallel: bool,
+    ) -> Result<Vec<f32>> {
+        let q = &query.rotated;
+        if q.len() != self.rq.padded || query.seed != self.shape.seed {
+            return Err(crate::Error::InvalidInput(
+                "query rotated for another directory".into(),
+            ));
+        }
+        if !parallel {
+            return Ok(self
+                .sections
+                .iter()
+                .flat_map(|s| section_distances(s, q))
+                .collect());
+        }
+        let per_segment: Vec<Vec<f32>> = self
+            .sections
+            .par_iter()
+            .map(|s| section_distances(s, q))
+            .collect();
+        Ok(per_segment.into_iter().flatten().collect())
+    }
     /// [`Self::center_distances`], on this thread alone when `parallel` is false (a busy
     /// server gains nothing from fanning one query's ranking out over the rayon pool).
     pub fn center_distances_on(&self, query: &[f32], parallel: bool) -> Result<Vec<f32>> {
@@ -740,7 +768,12 @@ impl Directory {
             flat: seg.flat,
             ..self.shape
         };
-        Ok(PartialIndex(Index::stub(reader, &shape, stubs)?))
+        Ok(PartialIndex(Index::stub(
+            reader,
+            &shape,
+            stubs,
+            self.sections[segment].centroid.clone(),
+        )?))
     }
 }
 

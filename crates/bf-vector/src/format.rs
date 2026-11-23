@@ -16,6 +16,35 @@ pub const FORMAT_VERSION: u32 = 1;
 pub(crate) const FLAG_ROTATED: u32 = 1;
 /// Metadata flag: eight-byte code headers (f32 norm and alpha) and all codes stored before all vectors.
 pub(crate) const FLAG_COMPACT: u32 = 2;
+/// Metadata flag (with [`FLAG_COMPACT`]): each cluster's codes are in the blocked layout of
+/// [`crate::fastscan`]. A reader tells the layouts apart by a code block's length too, which is
+/// what a partial index over a directory does.
+pub(crate) const FLAG_FASTSCAN: u32 = 4;
+
+/// Whether new indexes store their codes in the blocked fast-scan layout (`BF_ANN_FASTSCAN=0`
+/// writes the row-major layout, for A/B measurements and compatibility tests).
+pub(crate) fn fastscan_builds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("BF_ANN_FASTSCAN").is_ok_and(|v| v == "0"))
+}
+
+/// The mean of the non-empty clusters' rotated centers, accumulated in cluster order in `f32`.
+/// A directory section's centroid and a fast-scan index's reference point are this same value,
+/// so a partial index can rebuild the reference from the section.
+pub(crate) fn mean_center<'a>(centers: impl Iterator<Item = &'a [f32]>, padded: usize) -> Vec<f32> {
+    let mut mean = vec![0f32; padded];
+    let mut n = 0usize;
+    for c in centers {
+        for (g, x) in mean.iter_mut().zip(c) {
+            *g += *x;
+        }
+        n += 1;
+    }
+    for g in &mut mean {
+        *g /= n.max(1) as f32;
+    }
+    mean
+}
 
 /// A leaf cluster's decoded payload description: center, rows, and checksums. Shared (one
 /// reference count) by every index holding the cluster, including the per-query partial
@@ -82,6 +111,17 @@ pub(crate) fn build_blob(
     for (i, c) in assignments.into_iter().enumerate() {
         groups[c].push(i as u32);
     }
+    let fastscan = !flat && b.params.fastscan && rq.padded.is_multiple_of(8);
+    let rotated: Vec<Vec<f32>> = centers.par_iter().map(|c| rotated_center(&rq, c)).collect();
+    let reference = mean_center(
+        rotated
+            .iter()
+            .zip(&groups)
+            .filter(|(_, g)| !g.is_empty())
+            .map(|(c, _)| c.as_slice()),
+        rq.padded,
+    );
+    let root = (rq.padded as f64).sqrt();
     // Only the quantized codes are materialized per cluster. The full-precision bytes are the
     // packed input rows verbatim, so they are checksummed here and copied once into the blob.
     let blocks: Vec<Block> = groups
@@ -93,6 +133,7 @@ pub(crate) fn build_blob(
             let mut vectors_crc = crc32fast::Hasher::new();
             let mut vectors_len = 0u64;
             let mut ids = RoaringBitmap::new();
+            let mut fast_rows = Vec::new();
             for &i in group {
                 let i = i as usize;
                 ids.insert(rows.row_id(i));
@@ -105,15 +146,45 @@ pub(crate) fn build_blob(
                     let code = rq.encode_unchecked(&training, &centers[c]);
                     let zero = training.iter().all(|x| *x == 0.);
                     let alpha = (code.alpha as f32).clamp(1e-6, 1.);
-                    codes.extend((code.norm as f32).to_le_bytes());
-                    codes.extend((if zero { -alpha } else { alpha }).to_le_bytes());
-                    codes.extend(code.bits);
+                    let signed = if zero { -alpha } else { alpha };
+                    if fastscan {
+                        // `<b, c - g> / sqrt(D)`: the part of the residual inner product that
+                        // does not depend on the query (see `fastscan`).
+                        let cb = rotated[c]
+                            .iter()
+                            .zip(&reference)
+                            .enumerate()
+                            .map(|(i, (c, g))| {
+                                let x = *c as f64 - *g as f64;
+                                if code.bits[i / 8] & (1 << (i % 8)) != 0 {
+                                    x
+                                } else {
+                                    -x
+                                }
+                            })
+                            .sum::<f64>()
+                            / root;
+                        fast_rows.push(crate::fastscan::RowCode {
+                            bits: code.bits,
+                            norm: code.norm as f32,
+                            alpha,
+                            cb: cb as f32,
+                            zero,
+                        });
+                    } else {
+                        codes.extend((code.norm as f32).to_le_bytes());
+                        codes.extend(signed.to_le_bytes());
+                        codes.extend(code.bits);
+                    }
                 }
+            }
+            if fastscan {
+                codes = crate::fastscan::encode(&fast_rows, rq.padded);
             }
             Block {
                 cluster: Cluster {
                     data: Some(Arc::new(ClusterData {
-                        center: rotated_center(&rq, &centers[c]),
+                        center: rotated[c].clone(),
                         rows: ids,
                         row_crcs,
                         ..Default::default()
@@ -137,7 +208,7 @@ pub(crate) fn build_blob(
         dtype: b.dtype,
         seed: b.params.seed,
         flat,
-        flags: FLAG_ROTATED | FLAG_COMPACT,
+        flags: FLAG_ROTATED | FLAG_COMPACT | if fastscan { FLAG_FASTSCAN } else { 0 },
         parents: parents.iter().map(|p| rotated_center(&rq, p)).collect(),
         clusters,
     };
@@ -313,7 +384,8 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
         || nclusters > 65_536
         || nparents > nclusters
         || (flat && (nclusters != 1 || nparents != 0))
-        || flags & !(FLAG_ROTATED | FLAG_COMPACT) != 0
+        || flags & !(FLAG_ROTATED | FLAG_COMPACT | FLAG_FASTSCAN) != 0
+        || (flags & FLAG_FASTSCAN != 0 && (flags & FLAG_COMPACT == 0 || flat))
     {
         return Err(bad("invalid centroid directory"));
     }
@@ -367,6 +439,8 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
         let row_crcs = (0..n).map(|_| p.u32()).collect::<Result<Vec<_>>>()?;
         let code_len = if flat {
             0
+        } else if flags & FLAG_FASTSCAN != 0 {
+            crate::fastscan::block_len(n, dims.next_power_of_two()) as u64
         } else {
             n as u64
                 * ((if compact { 8 } else { 24 }) + dims.next_power_of_two().div_ceil(8)) as u64

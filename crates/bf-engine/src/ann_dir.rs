@@ -859,10 +859,12 @@ pub(crate) async fn search(
     let key = format!("ann:{attribute}");
     let vector: Arc<[f32]> = vector.into();
     let width = dir.vector_row_bytes();
+    // One rotation serves the ranking and every segment's scan (they share one vector space).
+    let rotated = Arc::new(dir.rotate_query(&vector).map_err(segment::index_error)?);
     let distances = {
-        let (dir, vector) = (dir.clone(), vector.clone());
+        let (dir, rotated) = (dir.clone(), rotated.clone());
         on_worker(async move {
-            dir.center_distances_on(&vector, crate::fan_out())
+            dir.center_distances_rotated(&rotated, crate::fan_out())
                 .map_err(segment::index_error)
         })
         .await?
@@ -1024,7 +1026,7 @@ pub(crate) async fn search(
         );
     }
     for (&i, cs) in &chosen {
-        let (dir, vector) = (dir.clone(), vector.clone());
+        let (dir, vector, rotated) = (dir.clone(), vector.clone(), rotated.clone());
         let exact = exact_segments.contains(&i);
         let flat = dir.segments()[i].flat;
         let cs = cs.clone();
@@ -1159,7 +1161,7 @@ pub(crate) async fn search(
                     // The rerank below keeps only candidates whose lower bound is within the
                     // k-th smallest upper bound, so the scan drops the rest as it goes.
                     let found = index
-                        .scan_blocks_bounded(&vector, &wanted, codes, live.as_deref(), k)
+                        .scan_blocks_bounded_rotated(&rotated, &wanted, codes, live.as_deref(), k)
                         .map_err(segment::index_error)?;
                     Ok((Vec::new(), found))
                 })

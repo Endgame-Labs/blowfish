@@ -241,7 +241,7 @@ impl Engine {
             }
         };
         let cells = opts.cells.max(1).min(present.len());
-        let (assignment, cell_rows) = {
+        let (assignment, cell_rows, coarse) = {
             let (present, read_row) = (present.clone(), read_row.clone());
             let cells_n = cells;
             tokio::task::spawn_blocking(move || {
@@ -274,7 +274,7 @@ impl Engine {
                 for (g, c) in present.iter().zip(&assignment) {
                     cell_rows[*c as usize].push(*g);
                 }
-                (assignment.len(), cell_rows)
+                (assignment.len(), cell_rows, centers)
             })
             .await
             .map_err(segment::index_error)?
@@ -286,23 +286,57 @@ impl Engine {
             t0.elapsed().as_secs_f64()
         );
 
-        // Pass 3: one slab per cell (a huge cell is split), built and uploaded in turn.
+        // Pass 3: one slab per cell (a huge cell is split), built and uploaded in turn. By default
+        // every row joins its nearest leaf cluster over all cells (see `assign_leaves`); the
+        // older layout clusters each cell's rows on their own (`BF_RECLUSTER_GLOBAL=0`).
         let max = opts.max_slab_rows.max(1);
-        let mut jobs: Vec<Vec<u32>> = Vec::new();
-        for rows in cell_rows {
-            if rows.is_empty() {
-                continue;
+        let most_leaves = cell_rows
+            .iter()
+            .map(|r| r.len() / opts.cluster_rows.max(1))
+            .max()
+            .unwrap_or(0);
+        let global = global_assignment(most_leaves);
+        eprintln!(
+            "recluster: {} leaf assignment (largest cell {most_leaves} leaves)",
+            if global { "cross-cell" } else { "per-cell" }
+        );
+        let jobs: Vec<SlabJob> = if global {
+            let (present, read_row) = (present.clone(), read_row.clone());
+            let cluster_rows = opts.cluster_rows.max(1);
+            tokio::task::spawn_blocking(move || {
+                assign_leaves(&present, &read_row, &coarse, cell_rows, cluster_rows, max)
+            })
+            .await
+            .map_err(segment::index_error)?
+        } else {
+            let mut jobs = Vec::new();
+            for rows in cell_rows {
+                if rows.is_empty() {
+                    continue;
+                }
+                let pieces = rows.len().div_ceil(max);
+                let size = rows.len().div_ceil(pieces);
+                jobs.extend(rows.chunks(size).map(|rows| SlabJob {
+                    rows: rows.to_vec(),
+                    leaves: None,
+                }));
             }
-            let pieces = rows.len().div_ceil(max);
-            let size = rows.len().div_ceil(pieces);
-            jobs.extend(rows.chunks(size).map(<[u32]>::to_vec));
-        }
+            jobs
+        };
+        eprintln!(
+            "recluster: {} slabs planned at {:.0}s",
+            jobs.len(),
+            t0.elapsed().as_secs_f64()
+        );
         let mut slabs: Vec<Segment> = Vec::new();
         let mut clusters = 0usize;
         let mut pending: Option<tokio::task::JoinHandle<Result<(), ApiError>>> = None;
         let uploads = Arc::new(tokio::sync::Mutex::new(Vec::<Segment>::new()));
-        for (n, rows) in jobs.into_iter().enumerate() {
-            let k = (rows.len() / opts.cluster_rows.max(1)).max(1);
+        for (n, SlabJob { rows, leaves }) in jobs.into_iter().enumerate() {
+            let k = match &leaves {
+                Some((centers, _)) => centers.len(),
+                None => (rows.len() / opts.cluster_rows.max(1)).max(1),
+            };
             clusters += k;
             let spill = spill.clone();
             let rows_n = rows.len() as u32;
@@ -319,12 +353,17 @@ impl Engine {
                         clusters: Some(k),
                         ..Default::default()
                     };
-                    let blob = bf_vector::IndexBuilder::new(dims, metric)
+                    let builder = bf_vector::IndexBuilder::new(dims, metric)
                         .map_err(segment::index_error)?
                         .params(params)
-                        .vector_type(dtype)
-                        .build_packed(rows, data)
-                        .map_err(segment::index_error)?;
+                        .vector_type(dtype);
+                    let blob = match leaves {
+                        Some((centers, assignment)) => {
+                            builder.build_packed_assigned(rows, data, centers, assignment)
+                        }
+                        None => builder.build_packed(rows, data),
+                    }
+                    .map_err(segment::index_error)?;
                     let (frag, frag_meta) =
                         bf_vector::Fragment::build_blocks(&blob).map_err(segment::index_error)?;
                     Ok((blob, frag, frag_meta))
@@ -492,4 +531,249 @@ async fn segment_index(
     .await
     .map(Arc::new)
     .map_err(segment::index_error)
+}
+
+/// One slab to build: its global rows (ascending) and, when the rows were assigned against
+/// every cell's leaf clusters, those clusters' centers and each row's cluster among them.
+struct SlabJob {
+    rows: Vec<u32>,
+    leaves: Option<(Vec<Vec<f32>>, Vec<usize>)>,
+}
+
+/// Most leaves in one cell for which rows are assigned across cells by default. Each cell's
+/// leaves are trained with one-level k-means, whose cost grows with the square of the leaves,
+/// and each row is compared with about `16 sqrt(leaves)` centers. That is about 1.5 times the
+/// per-cell build at 400 leaves a cell (BEIR NQ, 32 cells), but 5.5 times at 1,700 (NQ in 8
+/// cells, the cell size of a 10M layout), and far more at 100M.
+const GLOBAL_MAX_LEAVES: usize = 1024;
+
+/// Whether to assign rows across cells: `BF_RECLUSTER_GLOBAL=1` always, `0` never (each cell's
+/// rows clustered on their own, as before), and otherwise when the largest cell has at most
+/// [`GLOBAL_MAX_LEAVES`] leaves.
+fn global_assignment(most_leaves: usize) -> bool {
+    match std::env::var("BF_RECLUSTER_GLOBAL").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => most_leaves <= GLOBAL_MAX_LEAVES,
+    }
+}
+
+/// A cell's leaf groups: their centers, and each group's leaves (global leaf numbers).
+type LeafGroups = (Vec<Vec<f32>>, Vec<Vec<u32>>);
+
+/// Coarse cells a row's nearest leaf is looked for in.
+const NEAR_CELLS: usize = 4;
+/// Training rows per leaf cluster (as the index builder samples).
+const LEAF_SAMPLES: usize = 32;
+/// Leaf groups searched per row, over its near cells (`BF_RECLUSTER_GROUPS`).
+fn group_probes() -> usize {
+    std::env::var("BF_RECLUSTER_GROUPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12usize)
+        .max(1)
+}
+/// Rounds of recomputing every leaf center from all of its rows, then assigning again
+/// (`BF_RECLUSTER_REFINE`).
+fn refine_rounds() -> usize {
+    std::env::var("BF_RECLUSTER_REFINE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Train each cell's leaf clusters on a sample of its rows, then give every row the nearest leaf
+/// among the leaves of its `NEAR_CELLS` nearest cells, and recompute each leaf's center from all
+/// of its rows (`refine_rounds` times). A row near a cell boundary then sits in the cluster
+/// whose center is nearest to it, wherever that cluster's slab is, so the clusters a query
+/// probes hold more of its neighbors: on BEIR NQ, a row's own cluster was its nearest one only
+/// 80% of the time with each cell clustered on its own. Each cell's leaves (and the rows that
+/// chose them) make one slab, or several when they hold more than `max` rows.
+fn assign_leaves(
+    present: &[u32],
+    read_row: &(dyn Fn(u32, &mut Vec<u8>) -> Vec<f32> + Sync),
+    coarse: &[Vec<f32>],
+    cell_rows: Vec<Vec<u32>>,
+    cluster_rows: usize,
+    max: usize,
+) -> Vec<SlabJob> {
+    let distance = bf_vector::squared_distance;
+    let mut leaves: Vec<Vec<f32>> = Vec::new();
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(cell_rows.len());
+    for (cell, rows) in cell_rows.iter().enumerate() {
+        let start = leaves.len();
+        if !rows.is_empty() {
+            let k = (rows.len() / cluster_rows).max(1);
+            // A deterministic sample: a partial Fisher-Yates shuffle seeded by the cell.
+            let mut picks = rows.clone();
+            let n = (k * LEAF_SAMPLES).min(picks.len());
+            let mut state =
+                0x2545_F491_4F6C_DD1Du64 ^ (cell as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for i in 0..n {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let j = i + (state as usize) % (picks.len() - i);
+                picks.swap(i, j);
+            }
+            picks.truncate(n);
+            let sample: Vec<Vec<f32>> = picks
+                .par_iter()
+                .map_init(Vec::new, |buf, g| read_row(*g, buf))
+                .collect();
+            let refs: Vec<&[f32]> = sample.iter().map(|v| v.as_slice()).collect();
+            leaves.extend(bf_vector::kmeans(&refs, k, 8, 42 + cell as u64));
+        }
+        ranges.push(start..leaves.len());
+    }
+    drop(cell_rows);
+    let near = NEAR_CELLS.min(coarse.len()).max(1);
+    let probes = group_probes();
+    let assign = |leaves: &[Vec<f32>]| -> Vec<u32> {
+        // Each cell's leaves under about sqrt(leaves) group centers, so a row compares against
+        // the groups of its near cells and the leaves of its nearest groups only, not every leaf
+        // of every near cell (a 10M layout has about 1,600 leaves a cell).
+        let groups: Vec<LeafGroups> = ranges
+            .par_iter()
+            .enumerate()
+            .map(|(cell, range)| {
+                let refs: Vec<&[f32]> = leaves[range.clone()].iter().map(Vec::as_slice).collect();
+                if refs.is_empty() {
+                    return (Vec::new(), Vec::new());
+                }
+                let g = (refs.len() as f64).sqrt().ceil() as usize;
+                let centers = bf_vector::kmeans(&refs, g, 8, 7 + cell as u64);
+                let mut members = vec![Vec::new(); centers.len()];
+                for (i, leaf) in refs.iter().enumerate() {
+                    members[bf_vector::nearest_center(leaf, &centers)]
+                        .push((range.start + i) as u32);
+                }
+                (centers, members)
+            })
+            .collect();
+        present
+            .par_iter()
+            .map_init(Vec::new, |buf, g| {
+                let v = read_row(*g, buf);
+                let mut cells: Vec<(f32, usize)> = coarse
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (distance(&v, c), i))
+                    .collect();
+                let by_distance =
+                    |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+                if cells.len() > near {
+                    cells.select_nth_unstable_by(near - 1, by_distance);
+                    cells.truncate(near);
+                }
+                let mut near_groups: Vec<(f32, usize)> = Vec::new();
+                for (_, cell) in cells {
+                    for (j, center) in groups[cell].0.iter().enumerate() {
+                        near_groups.push((distance(&v, center), cell << 32 | j));
+                    }
+                }
+                if near_groups.len() > probes {
+                    near_groups.select_nth_unstable_by(probes - 1, by_distance);
+                    near_groups.truncate(probes);
+                }
+                let mut best = (f32::INFINITY, u32::MAX);
+                for (_, key) in near_groups {
+                    for &l in &groups[key >> 32].1[key & 0xFFFF_FFFF] {
+                        let d = distance(&v, &leaves[l as usize]);
+                        if d < best.0 || (d == best.0 && l < best.1) {
+                            best = (d, l);
+                        }
+                    }
+                }
+                best.1
+            })
+            .collect()
+    };
+    let mut leaf_of = assign(&leaves);
+    for _ in 0..refine_rounds() {
+        let mut members: Vec<Vec<u32>> = vec![Vec::new(); leaves.len()];
+        for (g, l) in present.iter().zip(&leaf_of) {
+            members[*l as usize].push(*g);
+        }
+        let dims = leaves.first().map_or(0, Vec::len);
+        let centers: Vec<Vec<f32>> = members
+            .par_iter()
+            .zip(leaves.par_iter())
+            .map_init(Vec::new, |buf, (rows, old)| {
+                if rows.is_empty() {
+                    return old.clone();
+                }
+                let mut sum = vec![0f64; dims];
+                for g in rows {
+                    for (s, x) in sum.iter_mut().zip(read_row(*g, buf)) {
+                        *s += f64::from(x);
+                    }
+                }
+                sum.iter()
+                    .map(|s| (*s / rows.len() as f64) as f32)
+                    .collect()
+            })
+            .collect();
+        leaves = centers;
+        leaf_of = assign(&leaves);
+    }
+    // Each cell's leaves, with the rows that chose them, in ascending row order.
+    let cell_of: Vec<usize> = ranges
+        .iter()
+        .enumerate()
+        .flat_map(|(cell, r)| std::iter::repeat_n(cell, r.len()))
+        .collect();
+    let mut by_cell: Vec<Vec<(u32, u32)>> = vec![Vec::new(); ranges.len()];
+    for (g, l) in present.iter().zip(&leaf_of) {
+        by_cell[cell_of[*l as usize]].push((*g, *l));
+    }
+    drop(leaf_of);
+    let mut jobs = Vec::new();
+    for (cell, rows) in by_cell.into_iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        let range = ranges[cell].clone();
+        // A cell over `max` rows is split by leaves into pieces of about equal rows.
+        let mut counts = vec![0usize; range.len()];
+        for (_, l) in &rows {
+            counts[*l as usize - range.start] += 1;
+        }
+        let pieces = rows.len().div_ceil(max);
+        let target = rows.len().div_ceil(pieces);
+        let mut piece_of = vec![0usize; range.len()];
+        let (mut piece, mut filled) = (0usize, 0usize);
+        for (i, n) in counts.iter().enumerate() {
+            if filled > 0 && filled + n > target && piece + 1 < pieces {
+                piece += 1;
+                filled = 0;
+            }
+            piece_of[i] = piece;
+            filled += n;
+        }
+        for p in 0..=piece {
+            let local: Vec<usize> = (0..range.len()).filter(|i| piece_of[*i] == p).collect();
+            let mut index_of = vec![usize::MAX; range.len()];
+            for (j, i) in local.iter().enumerate() {
+                index_of[*i] = j;
+            }
+            let (ids, assignment): (Vec<u32>, Vec<usize>) = rows
+                .iter()
+                .filter(|(_, l)| piece_of[*l as usize - range.start] == p)
+                .map(|(g, l)| (*g, index_of[*l as usize - range.start]))
+                .unzip();
+            if ids.is_empty() {
+                continue;
+            }
+            let centers = local
+                .iter()
+                .map(|i| leaves[range.start + i].clone())
+                .collect();
+            jobs.push(SlabJob {
+                rows: ids,
+                leaves: Some((centers, assignment)),
+            });
+        }
+    }
+    jobs
 }

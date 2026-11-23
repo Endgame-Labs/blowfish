@@ -2,6 +2,36 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-23
+
+- **Iteration 20: more q/s on BEIR NQ** (`docs/benchmarks.md`). This used the same VM and limits as iteration 19, with
+  interleaved runs against main.
+  - Reclustered: 573 q/s at 16 clients at recall@10 0.954, against main's 395 at 0.955. At the default 64 probes,
+    recall@10 is 0.960, up from 0.955.
+  - As loaded at default settings: 387 q/s against 269, at the same recall (0.958).
+
+  What changed:
+  - New indexes use a fast-scan code layout. It holds 32-row transposed blocks scored with 4-bit table shuffles
+    (AVX-512BW, NEON, and scalar, all with the same sums), and it is about 3 times faster per row (5 times on an Apple
+    M4). The table rounding is part of the error bound, and the candidates are rescored with a fine table where the
+    rounding matters.
+  - The scan applies the cut inside its block loop.
+  - Cached reads are zero-copy, the query is rotated once per query, and f16 converts a block at a time.
+  - `recluster` assigns rows to their nearest leaf across their four nearest cells. It does this by default only when
+    cells hold at most 1,024 leaves, so the 10M and 100M layouts are unchanged. Forced on with 10M-size cells, it took
+    5 times the per-cell job.
+  - The decoded cache now stays within `BF_DECODED_CACHE_BYTES`.
+
+  Old indexes still read: the branch on main's reclustered store gives the same recall.
+
+  Checked:
+  - `cargo test --workspace`, clippy, and the compat suite (121/121);
+  - the `bf-vector` and `bf-engine` tests on an Apple M4 (NEON);
+  - the `bench` ladder against main (same recall at 10K, 50K, and 200K rows).
+
+  New settings (`BF_ANN_FASTSCAN`, `BF_RECLUSTER_GLOBAL`, `BF_RECLUSTER_GROUPS`, and `BF_RECLUSTER_REFINE`) are in
+  `docs/configuration.md`.
+
 ## 2026-11-22
 
 - **Iteration 19: BEIR Natural Questions on one machine** (`docs/benchmarks.md`). I reproduced Kerry Kurian's outside

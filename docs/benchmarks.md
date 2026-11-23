@@ -14,6 +14,9 @@ Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, stro
   reclustered at 64 probes, recall@10 `0.955`, warm `8.3 / 18.1 ms` p50 / p99, and `444 q/s` at 16 clients on 6 pinned
   vCPUs (was `28.7 / 732 ms` and `27 q/s`). As loaded at default settings, recall@10 is `0.960` (was `0.907`). On an
   Apple M4: `2.8 / 4.1 ms` and `870 q/s`.
+  [Iteration 20](#iteration-20-fewer-cycles-per-row-and-better-placed-rows-beir-nq-one-machine): `573 q/s` at recall@10
+  `0.954` reclustered (54 probes, against main's `395 q/s` at `0.955` in the same interleaved run), `0.960` at the
+  default 64 probes, and `387 q/s` as loaded (main `269`).
 - **My own hosted-service measurements (10M, caches cannot be forced cold externally):** turbopuffer (server-reported) `"cold"`-labelled after 5 min idle about `670 / 1,120 ms` (one deep-cold sample after 2 days idle `2,051 ms`; at 100M, still `"warm"` at `201 ms` after a day idle); Amazon S3 Vectors recall@10 `0.894`, warm `60 / 278 ms`, `"cold"` after 30 min idle `178 / 276 ms`.
 
 ## Scope and status
@@ -3018,5 +3021,101 @@ this load did not reach.
   first-stage estimate (for example, multi-bit RaBitQ codes) or a smaller rerank target.
 - As-loaded recall comes from probing more clusters. Recluster automatically when it pays off is still an open
   decision in `SPEC.md`.
-- The decoded caches can now hold up to 1.5 times `BF_DECODED_CACHE_BYTES` (see `configuration.md`). Keep that in mind
-  on 4 GB machines.
+- The decoded caches could hold up to 1.5 times `BF_DECODED_CACHE_BYTES`. [Iteration 20](#iteration-20-fewer-cycles-per-row-and-better-placed-rows-beir-nq-one-machine)
+  fixed that.
+
+## Iteration 20: fewer cycles per row and better-placed rows (BEIR NQ, one machine)
+
+Same workload, VM, and limits as [Iteration 19](#iteration-19-beir-natural-questions-on-one-machine): 2.68M f16
+vectors at 1,024 dimensions, the server pinned to 6 vCPUs in a 12 GB cgroup, a 3 GiB block cache, and clients on the
+other 2 vCPUs. The goal was more q/s at 16 clients at recall@10 of at least 0.95, both reclustered and as loaded.
+
+### Results
+
+Each layout was built by its own binary: main's load and `recluster`, and a fresh load and `recluster` with the branch.
+The quality and latency columns come from one run each. The q/s column is the mean of two interleaved rounds of all five
+configurations (16 clients, after two warm-up passes).
+
+| Config | Recall@10 | Recall@100 (qrels) | p50 / p95 / p99 ms | q/s at 16 (rounds) |
+|---|---:|---:|---|---|
+| main, reclustered, 64 probes | 0.955 | 0.928 | 9.8 / 14.8 / 17.4 | 395 (411, 379) |
+| branch, reclustered, 54 probes | 0.954 | 0.927 | 4.8 / 7.7 / 11.7 | **573** (589, 557) |
+| branch, reclustered, 64 probes (default) | **0.960** | 0.933 | 4.9 / 7.3 / 9.6 | 538 (572, 505) |
+| main, as loaded, default | 0.958 | 0.924 | 9.6 / 16.1 / 27.3 | 269 (260, 278) |
+| branch, as loaded, default | 0.958 | 0.925 | 7.2 / 13.0 / 28.9 | **387** (371, 402) |
+
+At the same recall, reclustered throughput rose by 45% and as-loaded throughput by 44%. At the default 64 probes, the
+branch's reclustered layout has recall@10 of 0.960, up from 0.955, and still serves 36% more q/s. This is short of the
+1,000 q/s stretch target.
+
+### What changed
+
+- **Fast-scan code layout.** A new index stores each cluster's one-bit RaBitQ codes transposed in blocks of 32 rows.
+  Next to them it keeps four `f32` factors per row, so the estimate needs no division or square root: `|r|^2`,
+  `|r| / alpha`, the error scale, and `<b, c - g> / sqrt(D)`.
+  - A query builds one table per index: 16 entries for each group of 4 dimensions. The table holds the query's offset
+    from the index's mean center `g`, quantized to 7 bits. A byte shuffle then looks up 4 dimensions of 64 rows at once
+    (`vpshufb` on AVX-512BW, `TBL` on NEON, and a scalar loop elsewhere, all with the same integer sums).
+  - Per row, that is about 3 times faster than the bit-plane popcount scan on this VM: 5 against 24 ns for the kernel
+    with its bookkeeping. On an Apple M4 it is 5 times faster (5.4 against 26.5 ns).
+- **Table rounding is in the error bound.** The 7-bit tables round once per group, and the resulting error grows with
+  the query's distance from `g`, not from the row's cluster center. On NQ it is about 1% of the RaBitQ error. On tight
+  clusters (a query that nearly duplicates a row), it reordered the near-ties and cost a cold query an extra read wave.
+  The bound now includes it. Clusters where it is more than a tenth of the RaBitQ term rescore their candidates with a
+  second table of the rounding residuals, which has about 100 times less error than the coarse table.
+- **The cut is applied inside the scan.** A block reports a bitmask of the rows whose lower bound beats the current
+  k-th upper bound, so most rows never reach the per-row bookkeeping (+7%).
+- **Smaller costs.** These changes removed:
+  - Copies from the block cache (a reader backed by it now gets ranges unmerged).
+  - A second query rotation per segment (the directory search rotates once).
+  - Rebuilding the RaBitQ sign vectors for every partial index (they are cached).
+  - Per-value f16 conversion (now a block at a time).
+  - A scalar query-to-center distance (now SIMD).
+- **Cross-cell leaf assignment in `recluster`.** Each cell's leaves were clustered on that cell's rows alone. On NQ, a
+  row's own cluster was its nearest center only 80% of the time, and the losses sat at cell boundaries. A coverage
+  analysis showed this: the clusters a query probes held about the recall measured, and adaptive probing or exact
+  center ranking did not help. Now every row joins its nearest leaf among its four nearest cells, and the leaf centers
+  are recomputed once. Recall@10 at 64 probes went from 0.955 to 0.960, and 54 probes now match the old 64.
+- **The decoded cache budget is honored.** `BF_DECODED_CACHE_BYTES` is now split into two thirds for metadata, a
+  quarter for clusters, and a twelfth for columns. Before, the parts could total 1.5 times the setting.
+
+### Cost and limits of the cross-cell assignment
+
+| Layout | Per-cell `recluster` | Cross-cell `recluster` | Peak RSS (per-cell / cross-cell) |
+|---|---|---|---|
+| NQ, 32 cells (about 420 leaves a cell) | 158 s | 240 s | not measured |
+| NQ, 8 cells (about 1,700 leaves a cell, the size of a 10M layout's cells) | 93 s | 508 s | 1.95 / 2.04 GB |
+
+Each cell's leaves are trained with one-level k-means, and every row is compared with about 16 times the square root of
+its cell's leaves. The cost therefore grows faster than the rows. The cross-cell assignment runs by default only when
+the largest cell has at most 1,024 leaves (about 6.5M rows at the default 32 cells). The published 10M and 100M layouts
+keep the per-cell assignment and the same build time. `BF_RECLUSTER_GLOBAL=1` forces the cross-cell assignment, and `0`
+turns it off.
+
+Forcing it at 10M would take about 5 times the per-cell job, judging by the 8-cell run. At 100M, with about 15,600 leaves
+a cell, the one-level training alone makes it impractical. It would also hold about 2 GB of leaf centers, plus about
+1.2 GB of per-row assignment arrays. Making it scale needs two-level leaf training, as in the per-slab builder.
+
+### Checks
+
+- Old indexes still work: the branch reading main's reclustered store gives recall@10 of 0.9548, the same as main.
+- `cargo test --workspace`, clippy, and the compat suite (121/121) pass. The `bf-vector` and `bf-engine` tests also
+  pass on an Apple M4 (NEON).
+- The `bench` ladder (768 dimensions, 64 probes, against main) gives the same recall at 10K, 50K, and 200K rows
+  (1.0, 1.0, and 0.94). Warm ANN p50 was 1.0 / 1.7–1.8 / 5.4 ms against main's 1.1 / 1.9–2.8 / 5.9 ms, and cold
+  ANN was within run-to-run spread.
+
+### Tried and dropped
+
+- **Finer leaves (100 rows each, 26,797 clusters).** They gave more recall per scanned row (0.955 at 38 probes), but
+  center ranking doubled. At matched recall the layout was 3 to 4% slower.
+- **Refining every block near the cut with the fine table,** or rescoring every surviving candidate. Both kept
+  recall but cost 16 to 20% of throughput on NQ, where the rounding barely matters.
+- **Adaptive, distance-threshold probing** (offline analysis). It covered no more of the true top 10 per row read than
+  a fixed probe count did.
+
+### What is left
+
+- Center ranking and per-index table setup are now a few percent each. A finer IVF pays only with a cheaper center
+  search, such as a small index over the centers.
+- Training the cross-cell assignment two-level would carry its recall gain to 10M and 100M layouts.
