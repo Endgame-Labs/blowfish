@@ -3119,3 +3119,113 @@ a cell, the one-level training alone makes it impractical. It would also hold ab
 - Center ranking and per-index table setup are now a few percent each. A finer IVF pays only with a cheaper center
   search, such as a small index over the centers.
 - Training the cross-cell assignment two-level would carry its recall gain to 10M and 100M layouts.
+
+## Iteration 21: one recluster assignment at every size, and a lighter query path (BEIR NQ, one machine)
+
+This used the same workload, VM, and limits as [Iteration 20](#iteration-20-fewer-cycles-per-row-and-better-placed-rows-beir-nq-one-machine).
+I had three goals: profile the 16-client query path and cut its top costs, make the cross-cell leaf assignment affordable
+at 10M- and 100M-sized cells so it can be the only `recluster` assignment, and keep the small ladder and old indexes
+unchanged. Per SPEC decision 25, I also removed every setting that only chose a slower path (see "Removed settings"
+in [configuration](configuration.md)).
+
+### Results
+
+"Before" is main at the start of this round's final pass, which includes the reindex and format-fence work. Each
+binary built its own reclustered layout (32 cells, the default 64 probes). The as-loaded rows share one store. Quality
+and 1-client latency come from one run each. q/s is the mean of three interleaved rounds of two passes each (16
+clients, after a warm-up pass). I turned the recall sampler off for the q/s passes, for the reason given below.
+
+| Config | Recall@10 | Recall@100 (qrels) | p50 / p95 / p99 ms | q/s at 16 | Server CPU per query |
+|---|---:|---:|---|---:|---:|
+| main, reclustered | 0.961 | 0.932 | 5.3 / 7.7 / 9.6 | 580 | 7.7 ms |
+| branch, reclustered | 0.961 | 0.933 | 5.3 / 8.2 / 9.7 | **616** | 7.3 ms |
+| main, as loaded | 0.956 | 0.927 | 7.2 / 13.3 / 27.9 | 392 | 12.1 ms |
+| branch, as loaded | 0.956 | 0.927 | **5.2 / 7.3 / 9.3** | 400 | 11.8 ms |
+
+Reclustered throughput rose by 6% at the same recall, which is just past this VM's noise. As loaded, q/s is unchanged,
+but 1-client tail latency fell by two thirds. This is far from the 1,000 q/s stretch target. See "What is left".
+
+The recall sampler does one exhaustive, single-core scan of the namespace at most once a minute. Whether that scan
+lands inside a 10-second measured pass decides that pass's q/s. With the sampler on, the same as-loaded comparison
+read 388 against 360 q/s in one set of rounds. With it off, it read 392 against 400.
+
+### Recluster cost
+
+| Layout | main | branch | Recall@10 at 64 probes (main / branch) |
+|---|---|---|---|
+| NQ, 32 cells (about 420 leaves a cell) | 253 s, 0.69 GB | **138 s**, 0.69 GB | 0.961 / 0.961 |
+| NQ, 8 cells (about 1,700 leaves a cell, a 10M layout's cells) | 216 s, 2.60 GB (per-cell) | 230 s, 2.66 GB | 0.950 / **0.961** |
+| NQ, 8 cells at 21 rows a leaf (about 16,000 leaves a cell, a 100M layout's cells) | not run | 939 s, 3.22 GB | not measured |
+
+I measured the 32-cell rows on the quiet VM. The 8-cell rows come from one session under load from other builds.
+At 8 cells, main uses its per-cell assignment because cross-cell would have taken about 515 s. The branch's
+cross-cell assignment there costs 6% more time than main's per-cell one, and it raises recall@10 from 0.950 to 0.961.
+
+**At 100M.** The 100M-shaped run spent 81 s training leaves and about 240 s on each of its two assignment passes. Each
+row was compared with about 4,080 centers. The assignment cost per row depends on the shape (cells, leaves, and
+groups), not on the row count, so 100M rows would take about 480 s × 37 ≈ 5 hours of assignment on these 8 vCPUs, or
+about 1.25 hours on 32. The last 100M recluster took 1.7 hours in all. The leaf centers would need about 2 GB of
+memory. Dropping the refine pass halves the assignment time, at a cost of 0.003 recall@10 on NQ. A graph over leaf
+centers (`docs/design/graph-index.md`) could replace the group stage.
+
+### What changed
+
+- **Two-level leaf training in `recluster`.** A cell with more than 1,024 leaves trains sqrt(k) parents and then the
+  children under each parent, in parallel. A smaller cell still trains one-level, which gives 0.003 more recall@10 on NQ
+  at 32 cells. Each cell's leaves are grouped: under their parent, or by a small k-means for a one-level cell.
+- **Blocked cross-cell assignment.** A row compares the groups of its 4 nearest cells, then the leaves of its 12 nearest
+  groups. Rows are counting-sorted by nearest group and processed 4 at a time over the union of their candidates, with
+  a 4-row dot-product kernel (`|r|^2 + |c|^2 - 2<r, c>`). Neighbors in that order share leaves, which stay in cache.
+  At 8 cells a row is compared with about 1,230 centers, and the run takes 230 s against about 515 s for the
+  iteration 20 assignment.
+- **Cross-cell is the only assignment.** I removed the per-cell path, `BF_RECLUSTER_GLOBAL`, `BF_RECLUSTER_GROUPS`, and
+  `BF_RECLUSTER_REFINE`. The group count (12) and the single refine round are now constants.
+- **f32 distance kernels.** numkong's f32 squared Euclidean took 300 to 700 ns per 1,024-dimension pair here. A 16-lane
+  AVX-512 kernel (with AVX2 and portable fallbacks) takes about 65 ns. It now serves k-means, the query-to-center
+  distances, and rerank. Cosine rerank computes its two norms and the dot product in one pass.
+- **A query's state clone no longer copies the text stats header.** It is shared behind an `Arc`.
+- **Rerank checks a whole cluster's CRC once** instead of once per row as well.
+- **foldhash for the decoded-cluster cache and per-query cluster sets.** SipHash ran twice per lookup (shard and map),
+  and a warm query makes about 500 lookups.
+
+### Profile (16 clients, reclustered, sampler off)
+
+| Area | Share of CPU |
+|---|---:|
+| Fast-scan kernel (`block_sums_avx512`) | 11.6% |
+| Fast-scan bookkeeping (`FastQuery::scan`) | 8.5% |
+| Per-index table setup (`FastQuery::new`) | 2.7% |
+| RaBitQ center ranking (`signed_dot_avx512`, directory sections) | 5.4% |
+| Query-to-center distances | 2.5% |
+| JSON request parsing (`serde_json` through `serde_path_to_error`) | about 5% |
+| `memcpy` | about 5% |
+| Cache lookups and hashing (before foldhash) | about 4% |
+
+A warm query probes about 524 clusters (64 probes, scaled by clusters over sqrt(rows)) and scans about 105,000 rows.
+Before this round, the profile also showed two other costs: about 9% from cloning the text stats header, and the numkong
+distances. I removed both. Scanning is now the largest cost by far, so more q/s at this recall needs fewer clusters per
+query, not cheaper bookkeeping.
+
+### Checks
+
+- `cargo fmt`, workspace clippy with warnings denied, and `cargo test --workspace` (252 passed) all pass.
+  `read_cache::cold_ann_has_three_read_stages` passed in every run.
+- The compat suite passes 121/121.
+- Old indexes: the branch serves main's as-loaded store with the same recall (0.956).
+- The `bench` ladder (768 dimensions, 64 probes, against main) gives the same recall at 10K, 50K, and 200K rows
+  (1.0, 1.0, and 0.94). Warm ANN p50 was 1.3 / 2.8 / 4.9 ms against main's 1.5 / 3.1 / 5.3 ms. Cold ANN (9.5 / 10.0 /
+  8.0 ms against 9.1 / 10.0 / 13.6) was within run-to-run spread.
+
+### Tried and dropped
+
+- **Locality order alone, or 8-row blocks.** Sorting rows did not speed up the assignment without blocking, and 8-row
+  blocks made the candidate union too large. 4-row blocks with balanced groups worked.
+- **Final means without a second assignment.** This lost 0.003 recall@10, so the refine pass stays.
+- **Two-level training for every cell.** At 32 cells it gave 0.9577 recall@10 against main's 0.961, and 20 group probes
+  did not recover it (0.9584). Small cells train one-level.
+
+### What is left
+
+- Fewer clusters per query. A graph over leaf centers (`docs/design/graph-index.md`) is the next round.
+- A typed parser for `rank_by` vectors would remove most of the 5% spent on JSON parsing.
+- At 100M, the assignment would need a cheaper group stage or no refine pass to stay near the old build time.

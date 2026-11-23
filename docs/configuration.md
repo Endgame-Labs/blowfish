@@ -178,16 +178,18 @@ that was reclustered before paging existed, without rebuilding any slab.
 
 ### Recluster leaf assignment
 
-`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters two-level on a sample of its rows
-(about the square root of the leaves as parents, then each parent's share of leaves). Each row then joins its nearest
-leaf among the leaves of its four nearest cells, not only its own cell's, searching the 12 nearest parent groups. Every
+`recluster` partitions the rows into coarse cells and trains each cell's leaf clusters on a sample of its rows. A cell
+with more than 1,024 leaves trains two-level (about the square root of the leaves as parents, then each parent's share of
+leaves); a smaller one trains one-level and groups its leaves by a small k-means. Each row then joins its nearest leaf
+among the leaves of its four nearest cells, not only its own cell's, searching the 12 nearest leaf groups. Every
 leaf center is then recomputed once from all of its rows and the rows assigned again, so rows near a cell boundary sit
 with their true neighbors. There are no settings: this is the only assignment.
 
-On BEIR NQ (2.68M rows), recall@10 at 64 probes is 0.960 at the default 32 cells (0.955 with each cell clustered on its
+On BEIR NQ (2.68M rows), recall@10 at 64 probes is 0.961 at the default 32 cells (0.955 with each cell clustered on its
 own), and 0.961 with the rows forced into 8 cells (about 1,700 leaves a cell, the size of a 10M layout's cells; 0.950 on
 its own). The 8-cell job took about the same time and memory as the per-cell assignment it replaced: see
-[Iteration 21](benchmarks.md#iteration-21).
+[Iteration 21](benchmarks.md#iteration-21-one-recluster-assignment-at-every-size-and-a-lighter-query-path-beir-nq-one-machine),
+which also estimates the cost at 100M.
 
 ### ANN probes and query concurrency
 
