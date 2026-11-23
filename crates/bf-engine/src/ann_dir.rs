@@ -477,10 +477,9 @@ pub(crate) async fn prefetch_scan(
     let key = format!("ann:{attribute}");
     let frag_key = layout.frag_key(attribute);
     let memoize = layout == Layout::Slabs;
-    let vector_key: Arc<[f32]> = vector.clone();
+    let vector_key = vector_hash(&vector);
     let reads = chosen.into_iter().map(|(i, cs)| {
         let vector = vector.clone();
-        let vector_key = vector_key.clone();
         let (key, frag_key) = (&key, &frag_key);
         async move {
             let (Some(file), Some(frag)) =
@@ -533,7 +532,7 @@ pub(crate) async fn prefetch_scan(
             })
             .await;
             if let Ok(found) = found {
-                scan_memo_put(scan_key(&file.key, &vector_key, &wanted), (index, found));
+                scan_memo_put(scan_key(&file.key, vector_key, &wanted), (index, found));
             }
         }
     });
@@ -1021,6 +1020,7 @@ pub(crate) async fn search(
             .boxed(),
         );
     }
+    let vector_key = vector_hash(&vector);
     for (&i, cs) in &chosen {
         let (dir, vector, rotated) = (dir.clone(), vector.clone(), rotated.clone());
         let exact = exact_segments.contains(&i);
@@ -1057,7 +1057,7 @@ pub(crate) async fn search(
                 if memo_hit && live.is_none() {
                     let wanted: Vec<usize> = seg_entries.iter().map(|e| e.cluster).collect();
                     if let Some((index, found)) =
-                        scan_memo_take(&scan_key(&object_key, &vector, &wanted))
+                        scan_memo_take(&scan_key(&object_key, vector_key, &wanted))
                     {
                         let probed = Probed {
                             segment: i,
@@ -1513,11 +1513,24 @@ type ScanKey = (String, u64);
 static SCAN_MEMO: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<ScanKey, (std::time::Instant, Scanned)>>,
 > = std::sync::OnceLock::new();
+/// Entries in `SCAN_MEMO`: a warm query (nothing prefetched) skips the lock.
+static SCAN_MEMO_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Seeds the memo's key hashes (once per process).
+static SCAN_HASH: std::sync::OnceLock<foldhash::quality::RandomState> = std::sync::OnceLock::new();
 
-fn scan_key(object: &str, vector: &[f32], clusters: &[usize]) -> ScanKey {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    vector.iter().for_each(|x| x.to_bits().hash(&mut h));
+/// A query vector's hash, computed once a query for every segment's memo key.
+fn vector_hash(vector: &[f32]) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = SCAN_HASH.get_or_init(Default::default).build_hasher();
+    vector.iter().for_each(|x| h.write_u32(x.to_bits()));
+    h.write_usize(vector.len());
+    h.finish()
+}
+
+fn scan_key(object: &str, vector: u64, clusters: &[usize]) -> ScanKey {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut h = SCAN_HASH.get_or_init(Default::default).build_hasher();
+    h.write_u64(vector);
     clusters.hash(&mut h);
     (object.to_string(), h.finish())
 }
@@ -1533,14 +1546,17 @@ fn scan_memo_put(key: ScanKey, value: Scanned) {
     if memo.len() < 4096 && (held + value.1.len()) * 24 < (128 << 20) {
         memo.insert(key, (now, value));
     }
+    SCAN_MEMO_LEN.store(memo.len(), std::sync::atomic::Ordering::Relaxed);
 }
 
 fn scan_memo_take(key: &ScanKey) -> Option<Scanned> {
-    let memo = SCAN_MEMO.get()?;
-    memo.lock()
-        .expect("scan memo lock")
-        .remove(key)
-        .map(|(_, v)| v)
+    if SCAN_MEMO_LEN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let mut memo = SCAN_MEMO.get()?.lock().expect("scan memo lock");
+    let taken = memo.remove(key).map(|(_, v)| v);
+    SCAN_MEMO_LEN.store(memo.len(), std::sync::atomic::Ordering::Relaxed);
+    taken
 }
 
 /// Start a cold unfiltered ANN query's directory pages and scan reads from the hint alone, before
