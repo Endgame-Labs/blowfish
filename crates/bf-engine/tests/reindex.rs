@@ -186,6 +186,7 @@ async fn reindex_upgrades_and_survives_concurrent_writes() {
         })
     };
     let report = writer.reindex("t", &options()).await.unwrap();
+    assert_current_manifest(&store).await;
     racer.await.unwrap();
     assert!(report.converted_segments + report.superseded >= 3);
     writer.index_namespace("t", true).await.unwrap();
@@ -243,6 +244,34 @@ async fn the_background_indexer_upgrades_old_indexes() {
     downgrade(&store).await;
     assert_eq!(layouts(&store).await.0, vec![CodeLayout::RowMajor; 3]);
     // A server with indexing on finds the namespace and upgrades it unasked.
+    // Reproduce a legacy checkpoint: writable startup has already raised the root marker,
+    // but no namespace publication has changed the format-1 manifest yet.
+    let wal = Wal::new(store.clone(), "t").unwrap();
+    let (sequence, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    let mut legacy = serde_json::to_value(manifest).unwrap();
+    legacy["format_version"] = json!(1);
+    legacy["indexed_through"] = legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("checkpoint_wal")
+        .unwrap();
+    store
+        .put(
+            &format!("ns/t/manifest/{sequence:020}.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .await
+        .unwrap();
+    store.delete("ns/t/manifest-latest").await.unwrap();
+    assert_eq!(
+        wal.latest_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .format_version,
+        1
+    );
     let server = Engine::with_config(
         store.clone(),
         EngineConfig {
@@ -261,5 +290,15 @@ async fn the_background_indexer_upgrades_old_indexes() {
         assert!(std::time::Instant::now() < deadline, "not upgraded in time");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+    assert_current_manifest(&store).await;
     assert_eq!(answers(&store, &queries).await, before);
+}
+
+async fn assert_current_manifest(store: &Storage) {
+    let wal = Wal::new(store.clone(), "t").unwrap();
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(manifest.format_version, bf_wal::MANIFEST_FORMAT_VERSION);
+    let wire = serde_json::to_value(manifest).unwrap();
+    assert!(wire.get("checkpoint_wal").is_some());
+    assert!(wire.get("indexed_through").is_none());
 }

@@ -4,6 +4,23 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-23
 
+- **Bucket format fence:** format-2 manifests rename the required checkpoint field to `checkpoint_wal`,
+  and every manifest decoder rejects unsupported versions. Writers and maintenance tools cannot republish
+  unfamiliar manifests. Legacy format-1 manifests remain readable and upgrade on publication.
+  - Append-only, create-only `_system/format/<version>.json` markers raise the deployment's required
+    generation monotonically. Startup checks before its mutating probe; writes, indexing, and GC check
+    again. Project-scoped engines share the root fence. Observing a newer marker disables all mutations
+    through that process. Read-only startup never raises the marker.
+  - Verified against a real binary built from tag `v0.1.13`: it created a legacy local bucket, this branch
+    read and upgraded it, and the old binary then failed decoding with `missing field indexed_through`.
+    Queries and writes returned 500, indexing and GC deferred, and all object hashes stayed unchanged
+    during the old-binary run. The new binary still returned both acknowledged rows afterward.
+  - Writable and read-only startup refused a newer marker without changing the bucket. All verification
+    used local filesystem storage. The upgrade and backup requirements are in `docs/operations.md`.
+  - Checked formatting, workspace clippy with all targets and warnings denied, and workspace tests
+    (243 passed, 4 ignored). Compat passed 121/121 in both normal and forced-indexing modes, alongside
+    SDK retry checks and the TypeScript smoke suite. Idle indexing still performs no object-store I/O.
+
 - **Automatic upgrade of old vector indexes** (`docs/operations.md`, "Upgrading to v0.1.14"). Indexes in the older
   row-major layout only became fast-scan when compaction or `recluster` rewrote them, so a read-only namespace stayed
   on the old layout. The background indexer now rewrites each per-segment index and each `recluster` slab in the

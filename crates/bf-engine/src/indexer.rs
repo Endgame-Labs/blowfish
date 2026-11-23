@@ -442,6 +442,7 @@ impl Engine {
             {
                 return Ok(false);
             }
+            self.0.store.cached_bucket_format().map_err(storage_error)?;
             catch_up(&wal, &mut state, &self.0.store).await?;
             // Decide whether there is work before cloning: the tail can hold hundreds of MiB,
             // and a clone under this lock stalls every concurrent write.
@@ -549,7 +550,7 @@ impl Engine {
             return Ok(false);
         }
         let mut manifest = old.map(|(_, m)| m).unwrap_or_else(|| Manifest {
-            format_version: 1,
+            format_version: bf_wal::MANIFEST_FORMAT_VERSION,
             schema: state.schema.clone(),
             distance_metric: state.metric,
             id_type: state.schema["id"].data_type.clone().expect("id schema"),
@@ -974,6 +975,11 @@ impl Engine {
     /// Reclaim retired files and checkpointed WAL payloads after the retention window.
     /// Permanent WAL slot records continue to fence every stale writer.
     pub async fn collect_garbage(&self, ns: &str) -> Result<usize, ApiError> {
+        self.0
+            .store
+            .check_bucket_format()
+            .await
+            .map_err(storage_error)?;
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
         let Some((sequence, mut manifest)) = wal.latest_manifest().await.map_err(log_error)? else {
             return Ok(0);
