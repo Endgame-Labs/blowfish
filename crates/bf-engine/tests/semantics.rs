@@ -233,6 +233,61 @@ async fn score_expressions_aggregations_groups_and_diversification() {
     );
 }
 #[tokio::test]
+async fn hybrid_subqueries_keep_request_order_scores_and_separate_projections() {
+    let e = engine().await;
+    seed(&e).await;
+    let text = json!({"rank_by":["text","BM25","fox"],"top_k":2,"include_attributes":["text"]});
+    let vector = json!({"rank_by":["vector","ANN",[0.1,0.2,0.4]],"top_k":3,"include_attributes":["vector"],"filters":["color","Eq","red"]});
+    // Cover both the WAL tail and immutable indexes, including a mixed indexed/tail snapshot.
+    for indexed in [false, true] {
+        if indexed {
+            e.index_namespace("test", true).await.unwrap();
+            write(&e, "test", json!({"upsert_rows":[{"id":4,"vector":[0.1,0.2,0.4],"text":"fox fox","color":"red"}]})).await.unwrap();
+        }
+        let expected_text = query(&e, "test", text.clone()).await["rows"].clone();
+        let expected_vector = query(&e, "test", vector.clone()).await["rows"].clone();
+        let rrf = json!({"queries":[text, vector],"rerank_by":["RRF"],"limit":3,"vector_encoding":"base64"});
+        let reference = serde_json::to_value(
+            e.query_exhaustive("test", serde_json::from_value(rrf.clone()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            query(&e, "test", rrf).await["results"],
+            reference["results"]
+        );
+        for (clauses, expected) in [
+            (
+                json!([text, vector]),
+                json!([{"rows":expected_text},{"rows":expected_vector}]),
+            ),
+            (
+                json!([vector, text]),
+                json!([{"rows":expected_vector},{"rows":expected_text}]),
+            ),
+        ] {
+            let result = query(
+                &e,
+                "test",
+                json!({"queries":clauses,"vector_encoding":"base64"}),
+            )
+            .await;
+            let mut expected = expected;
+            for result in expected.as_array_mut().unwrap() {
+                for row in result["rows"].as_array_mut().unwrap() {
+                    if let Some(vector) = row.get_mut("vector") {
+                        *vector =
+                            Value::String(encode_vector(&decode_vector(vector).unwrap(), false));
+                    }
+                }
+            }
+            assert_eq!(result["results"], expected);
+        }
+    }
+}
+
+#[tokio::test]
 async fn snapshot_multi_query_rrf_copy_delete_and_recreate() {
     let e = engine().await;
     seed(&e).await;

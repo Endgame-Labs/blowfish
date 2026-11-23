@@ -848,3 +848,10 @@ length change. I retain reference f32 addition order, prefix semantics, live-row
 The text crate also exposes a shared top-k score floor for disjoint live segments. Existing segment
 formats and the bucket fence stay unchanged. Property tests and targeted regressions cover long
 posting lists, broad prefixes, changed statistics, and concurrent segment searches.
+
+I wire the shared floor across engine BM25 segments and apply the engine's existing fanout rule,
+reducing worker handoffs as concurrent queries increase. Independent multi-query branches execute
+together, and RRF's ANN branch starts while text statistics load. Explicit ID-only projections use
+compact IDs without hydrating document columns. I compare hybrid and RRF results with the exhaustive
+evaluator across indexed rows and the WAL tail. Formatting, clippy with warnings denied, and all
+172 tests in `bf-text` and `bf-engine` pass; three benchmark tests remain ignored.
