@@ -1,5 +1,6 @@
 //! Paired D4 object-store measurements. All configuration and output paths are supplied by the caller.
-//! Usage: d4 STORAGE_JSON MODE OUTPUT [WORKLOAD_JSON]; modes: index, recluster, gc, and measure.
+//! Usage: d4 STORAGE_JSON MODE OUTPUT [WORKLOAD_JSON] [QUERY_INDEX].
+//! Modes: index, recluster, gc, measure, short (64 queries), and first (one fresh-process query).
 use bf_engine::{Engine, EngineConfig, ReclusterOptions};
 use bf_storage::{Storage, StorageConfig};
 use bf_types::QueryRequest;
@@ -64,13 +65,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "gc" => {
             result["deleted"] = json!(engine.collect_garbage("nq").await?);
         }
-        "measure" => {
+        "first" => {
             let requests: Vec<QueryRequest> = serde_json::from_slice(&std::fs::read(&args[3])?)?;
+            let i: usize = args.get(4).map_or(Ok(0), |i| i.parse())?;
+            let start = Instant::now();
+            let answer = engine.query("nq", requests[i].clone()).await?;
+            result["first_ms"] = json!(start.elapsed().as_secs_f64() * 1000.0);
+            result["rows"] = json!(answer.result.rows);
+        }
+        "measure" | "short" => {
+            let mut requests: Vec<QueryRequest> =
+                serde_json::from_slice(&std::fs::read(&args[3])?)?;
+            let short = args[1] == "short";
+            if short {
+                requests.truncate(64);
+            }
             if requests.is_empty() {
                 return Err("empty workload".into());
             }
             let mut cold = Vec::new();
-            for q in requests.iter().take(100) {
+            for q in requests.iter().take(if short { 20 } else { 100 }) {
                 engine.drop_caches().await;
                 let start = Instant::now();
                 engine.query("nq", q.clone()).await?;

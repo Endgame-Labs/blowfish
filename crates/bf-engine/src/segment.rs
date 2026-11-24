@@ -1611,17 +1611,30 @@ pub(crate) fn merge_packed<D>(
     }
     Ok(out)
 }
-/// Evaluate scalar, array, range, and boolean filters over sorted value dictionaries.
-pub(crate) fn filter_rows<'a>(
-    store: &'a Storage,
-    segment: &'a Segment,
-    f: &'a Filter,
-    schema: &'a Schema,
-    live: &'a RoaringBitmap,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoaringBitmap, ApiError>> + Send + 'a>>
-{
-    filter_rows_from(store, None, segment, f, schema, live)
+/// Cache a predicate over one immutable live generation, before applying WAL shadows. Snapshot
+/// prefetch and the tier planner share this result, rather than decoding and scanning a large
+/// value dictionary twice on every query. Schema and file keys also fence schema-only changes.
+pub(crate) async fn filter_live_from(
+    store: &Storage,
+    source: Option<crate::vector_locator::Source<'_>>,
+    segment: &Segment,
+    f: &Filter,
+    schema: &Schema,
+) -> Result<Arc<RoaringBitmap>, ApiError> {
+    let key =
+        serde_json::to_string(&("filter-live-v1", segment, f, schema)).map_err(index_error)?;
+    if let Some(rows) = read_cache::get(&key, 0) {
+        return Ok(rows);
+    }
+    let live = live(store, segment).await?;
+    let rows = filter_rows_from(store, source, segment, f, schema, &live).await?;
+    // Roaring containers can reserve more than their serialized form. Charge a conservative
+    // multiple, plus the key and Arc, to the existing bounded decoded metadata cache.
+    let bytes = rows.serialized_size() as u64 * 2 + key.len() as u64 + 128;
+    Ok(read_cache::insert(&key, bytes, rows))
 }
+
+/// Evaluate scalar, array, range, and boolean filters over sorted value dictionaries.
 pub(crate) fn filter_rows_from<'a>(
     store: &'a Storage,
     source: Option<crate::vector_locator::Source<'a>>,

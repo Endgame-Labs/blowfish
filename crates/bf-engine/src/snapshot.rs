@@ -260,12 +260,11 @@ impl OpenHint {
             for seg in segments {
                 if by_dir && with_rest {
                     for f in &self.filters {
-                        // Populate the cache with the live mask and the filter's dictionary
-                        // blocks; the query recomputes the (cheap) bitmap from them.
+                        // Share the immutable predicate result with the query. High-cardinality
+                        // ID dictionaries are expensive to decode and evaluate repeatedly.
                         tasks.push(
                             async move {
-                                let live = segment::live(store, seg).await?;
-                                segment::filter_rows(store, seg, f, schema, &live)
+                                segment::filter_live_from(store, None, seg, f, schema)
                                     .await
                                     .map(drop)
                             }
@@ -676,14 +675,17 @@ pub(crate) async fn allowed_with(
     f: Option<&Filter>,
     unshadow: bool,
 ) -> Result<RoaringBitmap, ApiError> {
-    let mut live = segment::live(store, seg).await?;
+    let mut live = if let Some(f) = f {
+        filter::validate(f, &state.schema, false)?;
+        segment::filter_live_from(store, Some(state.into()), seg, f, &state.schema)
+            .await?
+            .as_ref()
+            .clone()
+    } else {
+        segment::live(store, seg).await?
+    };
     if unshadow && !state.shadowed.is_empty() {
         live -= segment::lookup_many(store, seg, &state.shadowed).await?;
-    }
-    if let Some(f) = f {
-        filter::validate(f, &state.schema, false)?;
-        live = segment::filter_rows_from(store, Some(state.into()), seg, f, &state.schema, &live)
-            .await?;
     }
     Ok(live)
 }

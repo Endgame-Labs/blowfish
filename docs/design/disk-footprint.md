@@ -241,6 +241,10 @@ Filtered tier queries shift exact per-segment filter results back through lineag
 then intersect them with each slab's resident row list. Their probe plan uses those matching counts
 and the filtered probe cap. Sparse global slab IDs have no dense row-to-cluster map, so they use the
 existing masked code scan, rather than the dense segment map's direct exact-fetch shortcut.
+Snapshot warm-up and the planner share bounded cached predicate results for each immutable
+segment live generation. The key includes its files, schema, and predicate; WAL shadows are
+removed afterward. This avoids repeatedly decoding high-cardinality ID-filter dictionaries,
+without reusing a mask across a flush, schema change, or compaction.
 
 Branches and copies use version-2 pins containing covering tiers and vector lineage, as well as
 segments. GC protects every pinned slab, directory, row list, coarse-cell object, and lineage map.

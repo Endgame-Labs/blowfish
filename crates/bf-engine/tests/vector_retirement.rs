@@ -222,6 +222,60 @@ async fn retired_vectors_survive_gc_projection_exact_filtered_recluster_compacti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_tier_filters_follow_tail_shadows_live_generations_and_lineage() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let scratch = scratch();
+    let (e, _) = setup(&store, scratch.path()).await;
+    e.collect_garbage("t").await.unwrap();
+    let filtered = json!({"rank_by":["vector","ANN",vector(853)],"filters":["group","Lt",4],"include_attributes":true,"top_k":10});
+    let mut exact = filtered.clone();
+    exact["rank_by"][1] = json!("kNN");
+    let want = query(&e, "t", exact.clone()).await;
+    for _ in 0..2 {
+        assert_eq!(query(&e, "t", filtered.clone()).await, want);
+    }
+    // A cached immutable predicate must never admit a tail-shadowed row. Tail rows are
+    // evaluated separately, and the live generation will change when the tail is flushed.
+    write(
+        &e,
+        "t",
+        json!({"patch_rows":[{"id":853,"group":4}],"deletes":[858],"upsert_rows":[{"id":1801,"group":3,"vector":vector(853),"optional":vector(860)}]}),
+    )
+    .await;
+    let changed = query(&e, "t", exact.clone()).await;
+    assert_eq!(changed[0]["id"], 1801);
+    assert!(
+        changed
+            .iter()
+            .all(|doc| doc["id"] != 853 && doc["id"] != 858)
+    );
+    assert_eq!(query(&e, "t", filtered.clone()).await, changed);
+    e.index_namespace("t", true).await.unwrap();
+    assert_eq!(query(&e, "t", filtered.clone()).await, changed);
+    let merging = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            compaction_segments: 2,
+            max_segment_rows: 3000,
+            ..config()
+        },
+    );
+    merging.index_namespace("t", true).await.unwrap();
+    merging.collect_garbage("t").await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(query(&e, "t", filtered.clone()).await, changed);
+    }
+    e.drop_caches().await;
+    assert_eq!(query(&e, "t", filtered).await, changed);
+    assert_eq!(query(&engine(&store), "t", exact).await, changed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn branches_and_copies_pin_tiers_and_lineage_after_source_deletion() {
     let store = Storage::open(&StorageConfig {
         url: "memory://".into(),
