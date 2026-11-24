@@ -486,6 +486,7 @@ impl Engine {
             stop: Arc::default(),
         }));
         bf_alloc::adaptive_decay();
+        auto_recluster::sweep_spills(&engine);
         indexer::start(&engine);
         engine
     }

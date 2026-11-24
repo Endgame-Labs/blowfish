@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Recluster readiness after bulk loads, 2.94x sooner** (round RR1; `docs/benchmarks.md`, "Round RR1").
+  An active bulk load now defers recluster builds instead of building and discarding intermediate tiers, and the
+  first base starts as soon as the load goes quiet, ahead of the remaining segment compaction (its sources are
+  protected before the task yields). Leaf assignment uses a four-row dot-product kernel with independent FMA
+  chains (NEON, AVX2, and AVX-512), and training and coarse assignment run in bounded 128-row matrix batches.
+  Spill files are owned per build with a lock and cleaned up on every exit path, including panics, and
+  abandoned ones are swept at startup. On NQ (c7gd.2xlarge, in-region S3): full-tier readiness after the last
+  acknowledged write went from 756.7 s to 257.5 s, the full build from 426.4 s to 255.0 s (1.67x; the 2x build
+  target was not met), and recall@10 from 0.9494 / 0.9602 to 0.9501 / 0.9603 at 48 / 64 probes. New metric:
+  `blowfish_recluster_stage_seconds{stage}`.
+
 - **Compiled warm tiers** (round X1; `docs/benchmarks.md`, "Round X1"). Once a recluster tier is resident, the
   engine compiles a generation-scoped view of it (codes, factors, leaf metadata, and a sparse cache of exact
   vectors charged to the decoded-cache budget) and runs warm queries on it synchronously, with reusable

@@ -35,6 +35,58 @@ async fn write(e: &Engine, body: Value) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clustered_f16_rows_and_masked_holes_keep_their_global_ids() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let writer = engine(&store);
+    // Above the flat-index threshold: source cluster order differs from global row order.
+    for batch in 0..2 {
+        let docs: Vec<_> = (batch * 3000..(batch + 1) * 3000)
+            .map(|id| json!({"id": id, "vector": vector(id)}))
+            .collect();
+        write(
+            &writer,
+            json!({
+                "distance_metric": "euclidean_squared",
+                "schema": {"vector": {"type": "[64]f16", "ann": true}},
+                "upsert_rows": docs
+            }),
+        )
+        .await;
+        writer.index_namespace("t", true).await.unwrap();
+    }
+    let deleted: Vec<_> = (0..6000).step_by(7).collect();
+    write(&writer, json!({"deletes": deleted})).await;
+    writer.index_namespace("t", true).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let report = writer
+        .recluster(
+            "t",
+            &ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 4,
+                cluster_rows: 60,
+                max_slab_rows: 3000,
+                scratch: scratch.path().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.rows, 6000 - deleted.len() as u64);
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    let fresh = engine(&store);
+    for id in [1usize, 1234, 4321, 5998] {
+        let found = ids(&fresh, id).await;
+        assert_eq!(found[0], json!(id));
+        assert!(found.iter().all(|v| v.as_u64().unwrap() % 7 != 0));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slabs_answer_like_segments_and_keep_answering_beside_new_segments() {
     let store = Storage::open(&StorageConfig {
         url: "memory://".into(),

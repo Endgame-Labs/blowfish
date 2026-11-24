@@ -289,12 +289,23 @@ async fn a_failed_slot_fails_every_later_group_and_leaves_no_visible_or_orphaned
         )
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        payload_objects(&store, "crash").await,
-        slots(&store, "crash").await,
-        "abandoned payloads of the failed groups were removed"
-    );
+    // Abandoned payloads are removed in the background; poll with a deadline instead of a fixed
+    // sleep, so a busy machine doesn't fail the test.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (payloads, slots) = (
+            payload_objects(&store, "crash").await,
+            slots(&store, "crash").await,
+        );
+        if payloads == slots || tokio::time::Instant::now() >= deadline {
+            assert_eq!(
+                payloads, slots,
+                "abandoned payloads of the failed groups were removed"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
