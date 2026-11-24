@@ -79,6 +79,21 @@ pub(crate) fn checkpoint_corpus(
         .into()
 }
 type TextMap = BTreeMap<String, TextStats>;
+
+/// Equal positive additions and removals cancel exactly, including document counts,
+/// lengths, and per-term document frequencies. Keep the immutable checkpoint object
+/// instead of decoding and rebuilding every vocabulary chunk for a zero-net update.
+pub(crate) fn unchanged_stats(added: &TextMap, removed: &TextMap) -> bool {
+    added.len() == removed.len()
+        && added.iter().all(|(name, a)| {
+            removed.get(name).is_some_and(|b| {
+                a.documents == b.documents
+                    && a.total_length == b.total_length
+                    && a.document_frequencies == b.document_frequencies
+            })
+        })
+}
+
 const STATS_MAGIC: &[u8; 8] = b"BFSTAT01";
 const CHUNKED_MAGIC: &[u8; 8] = b"BFSTAT02";
 /// Terms per statistics chunk.

@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Fast queries under steady writes** (round W1; `docs/benchmarks.md`, worker harness
+  `crates/bf-engine/bench/steady_writes.py`). Queries over the unindexed WAL tail decoded every resident
+  vector from base64 on each query. A byte-bounded cache of decoded tail vectors (inside the existing decoded
+  cache budget), a bounded global top-k, and parallel exact scoring of wide tails fix that, with identical
+  results. Steady writes are no longer mistaken for a bulk load, removal-statistics scans are bounded,
+  maintenance reads decode only the fields they need, and unchanged full-text statistics are reused. On NQ at
+  1,000 upserts a second (quiet VM), ANN query p50/p90 went from 156/451 ms to 15/28 ms, with recall@10
+  0.9511 vs 0.9517 over 300 matched queries (no detected shift); at 300/s, 160/280 to 29/41 ms under load.
+  BM25 under 1,000 writes/s: 4.2/9.2 s to 1.7/2.1 s. All 3.79M writes across 40 runs were acknowledged.
+  Indexing defaults (five-second flush age, 2,048-row flat threshold, ANN overfetch) are unchanged.
+
 - **Text format 6: compressed phrase positions** (`docs/benchmarks.md`, "Round T1"). Phrase positions were
   stored as two raw `u32`s per token occurrence, 62% of the text index. Format 6 drops the element index for
   scalar string fields and delta-codes positions, losslessly. On 1M MS MARCO, text indexes go from 743.5 MB to

@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, time::Duration};
 /// Node-local indexing and query tuning. No option changes the durable write ordering.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
-    /// Byte budget for decoded immutable segment metadata (charged at resident size).
+    /// Byte budget for decoded immutable metadata and resident WAL vectors (charged at resident size).
     /// Zero disables admission. In-flight queries can pin evicted entries until completion.
     pub decoded_cache_bytes: u64,
     /// Maximum concurrent segment scoring tasks across all queries on this engine.
@@ -22,7 +22,7 @@ pub struct EngineConfig {
     pub index_rows: usize,
     /// Minimum logical WAL bytes before a background flush.
     pub index_bytes: u64,
-    /// Flush small tails after this age.
+    /// Flush small tails after this age, and estimate the rate of arriving writes within it.
     pub index_age: Duration,
     /// While writes are still arriving, keep accumulating the tail up to this many distinct
     /// rows (or `bulk_flush_age`) before building a segment, so a bulk load builds a few large
@@ -58,7 +58,8 @@ pub struct EngineConfig {
     pub wal_pipeline: usize,
     /// Eventual reads include at most this many logical WAL bytes.
     pub eventual_tail_bytes: u64,
-    /// Segments built concurrently when one flush or compaction yields several.
+    /// Segments built concurrently when one flush or compaction yields several. Up to two
+    /// overwritten-row statistics scans share this limit and the existing aggregate row bound.
     pub build_concurrency: usize,
     /// IVF leaf probes for ANN queries.
     pub ann_nprobe: usize,
@@ -721,34 +722,16 @@ impl Engine {
             crate::ann::stage(t0, "idx pre-live");
             let mut covered = covered_segments(&manifest);
             covered.extend(protected.iter().cloned());
-            for mut seg in state.segments.iter().cloned() {
-                let live = segment::live(store, &seg).await?;
-                let keep = snapshot::allowed(store, &state, &seg, None).await?;
+            let (masks, removed) =
+                crate::statistics::removals(store, &state, self.0.config.build_concurrency).await?;
+            if external {
+                removed_stats = removed;
+            } else {
+                crate::statistics::merge(&mut manifest.stats, removed, false);
+            }
+            for (mut seg, (live, keep)) in state.segments.iter().cloned().zip(masks) {
                 let deleted = &live - &keep;
                 if !deleted.is_empty() {
-                    if external {
-                        crate::statistics::adjust(
-                            store,
-                            &seg,
-                            &deleted,
-                            &state.schema,
-                            &mut removed_stats,
-                            true,
-                            true,
-                        )
-                        .await?;
-                    } else {
-                        crate::statistics::adjust(
-                            store,
-                            &seg,
-                            &deleted,
-                            &state.schema,
-                            &mut manifest.stats,
-                            false,
-                            true,
-                        )
-                        .await?;
-                    }
                     retire(&mut manifest, seg.live.key.clone());
                     // A covered segment stays listed, with no live rows, while its tier does:
                     // the tier still holds its rows, and queries mask them out.
@@ -905,7 +888,7 @@ impl Engine {
                     .as_mut()
                     .map(|s| std::mem::take(&mut s.text))
                     .unwrap_or_default();
-                if added_text.is_empty() && removed_text.is_empty() {
+                if crate::text::unchanged_stats(&added_text, &removed_text) {
                     return Ok((tail_stats, None));
                 }
                 let previous = previous_for_merge
@@ -1247,10 +1230,12 @@ impl Engine {
 /// A flush of a tail written at least this fast is a bulk load's (NQ loads at about 10,000 rows a
 /// second; the continuous-write test writes 1,000).
 const BULK_LOAD_ROWS_PER_SEC: f64 = 2_000.0;
-/// True while a bulk load is still writing and its tail is under the bulk-flush limits: wait
-/// for more rows rather than building a small segment now.
+/// Give arriving writes one normal flush-age window to establish their rate, then accumulate
+/// only bulk loads. A steady stream below the bulk rate must not leave a minute of exact scans.
 fn bulk_wait(state: &NamespaceState, config: &EngineConfig, tail_age: Duration) -> bool {
     config.index_age >= Duration::from_secs(1)
+        && (tail_age < config.index_age
+            || state.docs.len() as f64 / tail_age.as_secs_f64().max(1.0) >= BULK_LOAD_ROWS_PER_SEC)
         && state.shadowed.len() < config.bulk_flush_rows
         && tail_age < config.bulk_flush_age
         && state.tail_bytes < config.bulk_flush_bytes.min(config.max_unindexed_bytes)
@@ -1442,6 +1427,39 @@ async fn build_segments<D: std::borrow::Borrow<bf_types::Document> + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steady_writes_flush_at_normal_age_but_bulk_loads_keep_accumulating() {
+        let config = EngineConfig {
+            bulk_flush_rows: 100_000,
+            bulk_flush_bytes: 1_000_000_000,
+            ..Default::default()
+        };
+        for rate in [100, 300, 1000, 3000] {
+            let mut state = NamespaceState {
+                updated_at: Utc::now(),
+                ..Default::default()
+            };
+            for id in 0..rate * 6 {
+                state
+                    .docs
+                    .insert(bf_types::Id::Uint(id), std::sync::Arc::default());
+                state.shadowed.insert(bf_types::Id::Uint(id));
+            }
+            assert_eq!(
+                bulk_wait(&state, &config, Duration::from_secs(6)),
+                rate >= 2000,
+                "rate={rate}"
+            );
+            assert!(bulk_wait(&state, &config, Duration::from_secs(1)));
+            assert!(!bulk_wait(&state, &config, config.bulk_flush_age));
+            state.updated_at = Utc::now() - chrono::Duration::seconds(2);
+            assert!(!bulk_wait(&state, &config, Duration::from_secs(6)));
+            state.updated_at = Utc::now();
+            state.tail_bytes = config.bulk_flush_bytes;
+            assert!(!bulk_wait(&state, &config, Duration::from_secs(6)));
+        }
+    }
 
     fn state_with(rows: &[u32]) -> NamespaceState {
         let mut state = NamespaceState::default();

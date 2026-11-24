@@ -4,6 +4,185 @@ use bf_types::DistanceMetric;
 use serde_json::json;
 use std::collections::BTreeSet;
 
+#[test]
+fn selected_column_decode_matches_full_values_and_rejects_malformed_skipped_values() {
+    let raw=serde_json::to_vec(&json!([null,"café 🐡","quote \" and slash \\", [1,null,2], {"nested":[true,"é"]},false,3.25,"line\nend"])).unwrap();
+    for compressed in [false, true] {
+        let bytes = if compressed {
+            zstd::bulk::compress(&raw, 3).unwrap()
+        } else {
+            raw.clone()
+        };
+        let mut body = Vec::new();
+        let mut descriptor = block(&mut body, &bytes);
+        if compressed {
+            descriptor.uncompressed_length = Some(raw.len());
+        }
+        let column = Column {
+            blocks: vec![descriptor.clone()],
+            vector: None,
+            vector_i8: false,
+            compressed,
+        };
+        let selected: RoaringBitmap = [100, 101, 103, 104, 107].into_iter().collect();
+        let full = decode_column(&bytes, &column, &descriptor).unwrap();
+        let expected: Vec<_> = full
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, value)| {
+                let row = 100 + i as u32;
+                selected
+                    .contains(row)
+                    .then_some(value.map(|v| (row, v)))
+                    .flatten()
+            })
+            .collect();
+        assert_eq!(
+            decode_selected_column(&bytes, &column, &descriptor, 100, 8, &selected).unwrap(),
+            expected
+        );
+    }
+    let selected = RoaringBitmap::from_iter([0]);
+    for invalid in [
+        b"[1,{,3]".as_slice(),
+        b"[1,2]",
+        b"[1,2,3,4]",
+        b"[1,2,3] false",
+    ] {
+        let mut body = Vec::new();
+        let descriptor = block(&mut body, invalid);
+        let column = Column {
+            blocks: vec![descriptor.clone()],
+            vector: None,
+            vector_i8: false,
+            compressed: false,
+        };
+        assert!(decode_selected_column(invalid, &column, &descriptor, 0, 3, &selected).is_err());
+    }
+}
+
+#[tokio::test]
+async fn small_wide_vector_flushes_remain_exact_and_preserve_top_k() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let schema: Schema =
+        serde_json::from_value(json!({"id":{"type":"uint"},"vector":{"type":"[1024]f16"}}))
+            .unwrap();
+    let mut docs: BTreeMap<Id, Document> = BTreeMap::new();
+    for id in 0..2560u64 {
+        let mut vector = vec![0.0; 1024];
+        vector[0] = 1.0;
+        vector[1] = id as f32 / 128.0;
+        docs.insert(
+            Id::Uint(id),
+            serde_json::from_value(
+                json!({"id":id,"vector":bf_types::encode_vector(&vector,false)}),
+            )
+            .unwrap(),
+        );
+    }
+    let mut segments = Vec::new();
+    for first in (0..2560u64).step_by(512) {
+        let part: BTreeMap<Id, Document> = docs
+            .range(Id::Uint(first)..Id::Uint(first + 512))
+            .map(|(id, doc)| (id.clone(), doc.clone()))
+            .collect();
+        let seg = build_with(
+            &store,
+            "wide",
+            &schema,
+            DistanceMetric::EuclideanSquared,
+            &part,
+            BTreeMap::new(),
+            0,
+            1,
+        )
+        .await
+        .unwrap();
+        let index = vector_index(&store, &seg.files["annv2:vector"])
+            .await
+            .unwrap();
+        assert!(
+            index.is_flat(),
+            "small flushes retain the established exact index plan"
+        );
+        segments.push(seg);
+    }
+    let mut vector = vec![0.0; 1024];
+    vector[0] = 1.0;
+    let mut state = crate::NamespaceState {
+        schema,
+        metric: DistanceMetric::EuclideanSquared,
+        segments: segments.into(),
+        ..Default::default()
+    };
+    let directory = crate::ann_dir::build(
+        &store,
+        "wide",
+        &state.segments,
+        "vector",
+        crate::ann_dir::Layout::Segments,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    state.ann_dirs.insert("annv2:vector".into(), directory);
+    let request: bf_types::QueryRequest =
+        serde_json::from_value(json!({"rank_by":["vector","ANN",vector],"top_k":10})).unwrap();
+    for hidden in [0, 1, 31, 96] {
+        state.docs.clear();
+        state.shadowed.clear();
+        let mut reference = docs.clone();
+        for id in 0..hidden {
+            state.shadowed.insert(Id::Uint(id));
+            if id % 2 == 0 {
+                reference.remove(&Id::Uint(id));
+            } else {
+                let mut replacement = reference[&Id::Uint(id)].clone();
+                let mut vector = vec![0.0; 1024];
+                vector[0] = 1.0;
+                vector[1] = 100.0 + id as f32;
+                replacement.insert(
+                    "vector".into(),
+                    json!(bf_types::encode_vector(&vector, false)),
+                );
+                reference.insert(Id::Uint(id), replacement.clone());
+                state
+                    .docs
+                    .insert(Id::Uint(id), std::sync::Arc::new(replacement));
+            }
+        }
+        let actual = crate::indexed::execute(
+            &store,
+            &state,
+            &request,
+            &crate::EngineConfig::default(),
+            false,
+        )
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap();
+        let mut exhaustive = state.clone();
+        exhaustive.docs = crate::shared(reference);
+        let expected = crate::query::execute(&exhaustive, &request)
+            .unwrap()
+            .result
+            .rows
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "{hidden} nearest indexed rows shadowed by replacements and deletes"
+        );
+    }
+}
+
 pub(super) fn input(n: u32) -> (Schema, BTreeMap<Id, Document>) {
     let schema = serde_json::from_value(json!({
         "id":{"type":"uint"}, "text":{"type":"string"}, "tags":{"type":"[]string"},

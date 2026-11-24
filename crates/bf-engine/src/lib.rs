@@ -20,6 +20,9 @@ mod sparse;
 mod statistics;
 mod stop;
 mod streaming;
+mod tail;
+#[cfg(test)]
+mod tail_benchmark;
 mod text_upgrade;
 pub use indexer::EngineConfig;
 pub use recluster::{ReclusterOptions, ReclusterReport};
