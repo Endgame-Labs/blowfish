@@ -7254,3 +7254,243 @@ measurement before such a change.
 The coordinator should update PROGRESS.md, benchmark/design documentation, and run workspace plus
 both-mode SDK compatibility checks before merging. No additional crate change is required for the three
 scheduling fixes. Cross-node persistence of retry hints would require broader metadata work.
+
+## Round C3: automatic leaf populations and matched probes
+
+A small tier keeps **200-row leaves**. A tier with at least **10 million live vector rows** builds
+**640-row leaves**. This is a conservative, two-regime policy: no intermediate population is
+promoted. The 320-row NQ experiment failed the warm gate. Larger tiers stay capped at 640
+until they have their own measurements. There is no new configuration setting or format
+version, and existing tiers keep their layout until their next normal rebuild.
+
+The planner reads the stored leaf population, rather than assuming every tier has the new
+layout. The default quality budget remains 64 for 200-row leaves and becomes **70** for
+640-row leaves, before the existing cluster-count, live-row, and delta-share adjustments.
+The asynchronous, paged, and compiled planners share this calculation. C2's 56-probe point
+matched the historical 200-row layout; it did not match a fresh build from current main.
+
+### Controls and protocol
+
+Baseline source: `4552a00`. All copies were owned, and existing checkpoints were read-only.
+The 10M comparison used two fresh builds from the same upgraded checkpoint, with 32 coarse
+cells, a 250,000-row slab cap, eight builder threads, and the same main builder. Both fresh
+layouts contain 55 slabs. This removes the historical 32-versus-55-slab confound.
+
+Cold qualification runs use an owned c7gd.4xlarge in us-west-2: 16 Graviton3 cores, 32 GiB
+RAM, and local NVMe. Every query drops application caches while retaining the process and
+connections. Arms alternate AB/BA over all 200 exact-truth queries. Each arm has 8 GiB raw
+cache, 512 MiB decoded metadata, a 48 GiB NVMe cache, 4,000-byte blocks, 512-request fetch
+concurrency, and eight Tokio/Rayon workers. No build or test runs on the measurement host.
+GET counts include started hedges; bytes count completed reads. Temporal read waves come
+from trace overlap and are distinct from the dependency-wave regression tests.
+
+NQ warm tests use a separate c7g.4xlarge, with server cores 0–7 and client cores 8–15.
+The frozen local copies contain all 2,681,468 f16 vectors, 1,024 dimensions, and 3,452 query
+vectors with exact truth. Requests ask for ten IDs, use strong consistency, and are encoded
+before measurement. Sixteen keep-alive client processes run every query. Each arm gets
+4 GiB raw cache, 4 GiB decoded metadata, and no disk cache. Independent server processes
+run in forward/reverse order, with two complete warm epochs before measurement. The final
+confirmation uses four measured epochs per process. Cache hit ratio, tail rows, population,
+compiled-query counts, and ordered IDs are checked alongside throughput.
+
+The initial Spot measurement host was interrupted before its 10M rebuild finished. Its
+completed owned checkpoints survived; unfinished builds restarted on an on-demand host.
+No interrupted build time is reported as a completed result.
+
+### Why NQ retains fine leaves
+
+A 320-row NQ build had 8,365 leaves, 32 slabs, and a 1,780,580-byte directory. At matched
+full-workload recall, it needed quality budgets of 60 and 80 in the old planner's units,
+against main's 48 and 64. Simply reducing probes as in the 10M experiment lost recall.
+
+| Layout | Quality target | Recall@10, all 3,452 queries | Mean warm q/s |
+| --- | ---: | ---: | ---: |
+| Main, 200-row leaves | 0.95 | 0.951970 | 1,811.4 |
+| 320-row leaves | 0.95 | 0.951188 | 1,590.2 |
+| Main, 200-row leaves | 0.96 | 0.961674 | 1,551.4 |
+| 320-row leaves | 0.96 | 0.962572 | 1,331.5 |
+
+These are four measured epochs per arm, from two processes, after two warm epochs each.
+The 320-row layout loses **12.2% / 14.2%** throughput. Its compiled path answers about
+3,240 of 3,452 queries per epoch, against all 3,452 for main; missing exact rows in the
+bounded sparse-vector cache cause the remaining fallbacks. That explains part of the
+regression, without establishing that it is the only CPU cost.
+
+On the paired first-200-query cold workload, 320-row leaves also lost recall: **0.9570
+versus 0.9635**, despite the small full-workload recall difference. Planned rows grew from
+111,343 to 136,900. This layout is rejected. Retaining 200-row leaves preserves the complete
+warm plan and ordered answers, including the hard queries in that cold slice.
+
+The final retained-200 policy passes the warm gate at both recall targets. A longer initial
+confirmation showed a 0.92% high-target throughput drop. The compiled tier now caches its
+immutable row total and nonempty leaf positions once, rather than recovering them through
+two strided metadata walks per query. The added word per leaf is charged to its decoded-cache
+reservation. The final source was then rebuilt and replayed independently:
+
+| Layout | Target | Recall@10 | Mean warm q/s | Epoch q/s range | Peak RSS, GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Main, 200 rows | 0.95 | 0.951970 | 1,881.4 | 1,845–1,897 | 4.74 |
+| C3, 200 rows | 0.95 | 0.951970 | 1,907.2 | 1,885–1,936 | 3.64 |
+| Main, 200 rows | 0.96 | 0.961674 | 1,624.2 | 1,594–1,646 | 3.82 |
+| C3, 200 rows | 0.96 | 0.961674 | 1,638.0 | 1,623–1,666 | 3.91 |
+
+This is eight measured epochs per arm, from two independent processes. Mean throughput
+increases **1.37% / 0.85%** at the two targets; the small gains are within the epoch ranges.
+Every measured epoch has cache hit ratio 1.0, no exhaustive tail, the correct population,
+and all 3,452 queries on the compiled path. All ordered IDs match main at each target,
+across all 32 measured epochs. RSS variation is reported without attributing it to the
+small metadata cache.
+
+### The 10M control changed the probe calibration
+
+The historical original and its lossless upgrade both recall **0.9615** at a 64-unit quality
+budget. A fresh 200-row build recalls **0.9690**. The 640-row build at C2's effective 56
+recalls **0.9620**, so it fails the fresh-control tolerance by 0.007. Comparing only with
+the historical layout would have hidden this loss.
+
+The NVMe calibration replay found **0.9700** at effective 70 for 640-row leaves, against
+0.9690 for the paired fresh control. It reduced p50/p90 from **405.6 / 513.2 ms** to
+**357.8 / 461.8 ms**, GET attempts from 622.28 to 352.34, and completed bytes from
+58.27 to 47.56 MB. Planned rows increased **3.15%**, from 220,243 to 227,174. The selected
+budget is the lowest measured coarse budget that matches the fresh control's recall.
+A higher 73.5-unit tuning point recalled 0.9710, but scanned 237,927 rows; it is not the
+default. Multi-arm replays now reverse alternate full rotations to balance every pair's
+order; two-arm confirmation retains strict AB/BA order.
+
+The final-source, independent two-arm confirmation gives:
+
+| Layout | p50 / p90, ms | Recall@10 | GET attempts | Completed MB | Planned rows | Read waves |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fresh 200 rows, 64 units | 377.57 / 465.56 | 0.9690 | 620.555 | 58.404 | 220,243 | 3.205 |
+| 640 rows, effective 70 | 325.12 / 413.34 | 0.9700 | 354.915 | 47.646 | 227,174 | 3.240 |
+
+The selected layout cuts p50 **13.9%**, p90 **11.2%**, GET attempts **42.8%**, and completed
+bytes **18.4%**. Recall improves 0.0010; planned rows rise 3.15%, which is the measured cost
+of matching the fresh control's higher recall. An earlier independent production-policy
+replay also improved p50/p90, from 390.52 / 486.59 ms to 354.43 / 456.02 ms, with the same
+0.9690 / 0.9700 recalls. All coarse plans, ordered IDs, and distances match exactly between
+that replay and the final source's 200-query confirmation.
+
+The final paired NQ cold confirmation, retaining the 200-row layout, gives:
+
+| Reader | p50 / p90, ms | Recall@10 | GET attempts | Completed MB | Planned rows |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Main | 246.29 / 357.35 | 0.9635 | 382.580 | 28.088 | 111,343 |
+| C3 | 242.60 / 326.67 | 0.9635 | 381.985 | 26.952 | 111,343 |
+
+All 200 ordered ID lists, distances, and planned row counts match exactly. p50 falls 1.50%,
+p90 falls 8.59%, and completed bytes fall 4.04%. Temporal read waves average 3.160 / 3.180.
+The earlier independent pair had p50 235.83 / 234.70 ms and identical recall, but p90
+307.26 / 315.08 ms; the small NQ timing differences vary between runs. The retained layout
+and recall remain unchanged, while redundant routing bytes are avoided.
+
+### Build cost and readiness
+
+| Corpus | Target leaf rows | Recluster/job seconds | Peak RSS, GiB |
+| --- | ---: | ---: | ---: |
+| NQ, main automatic build | 200 | 127.49 | 1.04 |
+| NQ, rejected candidate | 320 | 101.77 | 0.78 |
+| 10M, fresh main builder | 200 | 627.37 | 2.02 |
+| 10M, coarse leaves | 640 | 479.43 | 1.84 |
+
+NQ's automatic-job timer includes installation. The standalone rebuilds returned only
+after their tiers were installed: process wall times were 108.04 seconds for NQ/320,
+638.27 seconds for 10M/200, and 488.07 seconds for 10M/640, including the current-format
+survey before building. HTTP queries could continue against the previous layout during
+the build. The NQ control RSS is the monitored writer's VmHWM; the standalone figures
+come from `/usr/bin/time -v`.
+
+The fresh 10M directories contain 49,985 versus 15,611 leaves, and 10,040,671 versus
+3,303,367 bytes. Coarse leaves reduce build time by 23.6% on this same host. These are
+16-core-host, eight-builder-thread results, not a direct speedup over C2's smaller host.
+The existing automatic slab cap continues to follow the engine's memory budget.
+
+### The upgraded-copy finding
+
+The lossless upgrade preserves 32 slabs and every center. Its directory is 9,938,808 bytes,
+against 9,938,840 before upgrade. The extra read is a **5,352,604-byte segment-directory
+hint**, which reindex creates. The cold-open code raced that hint with the slab hints.
+It could finish before the larger flat slab hint, downloading a full directory that the
+query did not use. The extra hint object and its unnecessary request are confirmed; total
+transferred bytes also depend on cancellation timing. C2's 20–30 ms upgraded-copy slowdown did not reproduce
+consistently in C3, so it is not presented as a fixed penalty.
+
+The fix gates segment speculation on either a manifest proving there is no slab tier,
+or both slab hints being absent. Paged and flat slab hints retain their priority. Filtered
+queries still request the segment hint directly. Coordination state is allocated only for
+a cold, unfiltered open. Delaying the segment hint until all slab requests finish added an
+untiered read wave and was rejected by the existing tests; the manifest notification keeps
+those queries within their original three-wave budget.
+
+On the same upgraded 200-row prefix, the final 200-pair replay reports:
+
+| Reader | p50 / p90, ms | Recall@10 | GET attempts | Completed MB | Read waves |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Main | 350.37 / 459.69 | 0.9615 | 612.075 | 67.206 | 3.325 |
+| C3 | 359.53 / 461.63 | 0.9615 | 613.045 | 62.168 | 3.225 |
+
+All 200 ordered ID lists, distances, and planned row counts match exactly. Mean routing
+bytes fall from 15.05 to 9.99 MB, and total completed bytes fall 7.50%. Started GET attempts
+are slightly higher because hedges vary; eliminating one hint does not guarantee fewer
+attempts elsewhere. Median time outside the instrumented ANN stages is 117.53 / 117.90 ms.
+
+This replay has **2.61% higher p50 and 0.42% higher p90** after the fix. An earlier NVMe
+pair also showed +1.08% / +5.66%, while the initial GP3 diagnostic showed a reduction from
+405.82 / 513.22 ms to 366.50 / 450.86 ms. The byte waste is fixed, but a latency gain is
+not established. Original-versus-upgraded main-reader diagnostics also reversed C2's
+latency ordering. There is no evidence that 32-versus-55 slab packing caused the lossless
+upgrade penalty: the upgraded tier retained its original 32 slabs and identical answers.
+
+### 100M projection and follow-up
+
+No 100M rebuild was attempted under this round's total $5 cap. At the capped 640 rows,
+100M would have about **156,250 leaves**, versus about 500,000 at 200 rows. At 1,024
+dimensions, the measured directory bytes per leaf project to roughly **33 MB**. The
+70-unit quality mapping implies about **1,094 nominal leaf probes and 700,000 nominal
+rows**, versus 3,200 and 640,000 for a 200-row tier at 64 units. Actual selected populations,
+coalesced GETs, recall, and latency are unmeasured. In particular, this is not a recall claim.
+
+Assignment uses neighboring parent groups, rather than comparing every row with every
+leaf. A rough work model is `N * sqrt(N / leaf_rows)` at fixed coarse-cell count; 10× rows
+would mean about 31.6× assignment work at fixed leaf population. Large coarse cells also
+switch to two-level training above 1,024 leaves, so extrapolating one build duration would
+be unreliable. A paired 100M legacy upgrade, 200-row control, and 640-row rebuild would
+require several host-hours per arm and would risk this round's remaining budget.
+
+Follow up with an owned 100M copy, a fresh same-builder control, all 200 independent oracle
+queries, repeated cache-cold pairs, warm throughput, installation time, and peak RSS. Check
+the training transition and recall before changing the cap or its probe mapping. Intermediate
+populations need their own matched-recall warm and cold evidence before the 10M threshold
+is lowered. Other embedding models and dimensions have not been calibrated in this round.
+The warm throughput gate is NQ; 10M and 100M warm parity are not established here.
+
+### Reproduction and validation
+
+`crates/bf-engine/examples/recluster_copy.rs` accepts `auto` as the leaf target. Numeric
+targets remain available for controlled experiments; writes are restricted to owned `tmp/`
+S3 copies, and scratch must be under `.scratch/`. `ReclusterReport::cluster_rows` records
+the selected target. Automatic background jobs pass zero internally to select from their
+live population. No leaf-size configuration or forced-rewrite trigger was added.
+
+`cold_ab.py --nq-data DATA` uses prepared NQ queries and truth. Its per-query records include
+GET attempts, completed bytes, planned rows, read waves, bytes by object kind, and stage
+service times. `warm_ab.py` takes private arm configs and supports `--epochs`; its server
+storage is always read-only. Delete outputs after retaining the results.
+
+Final policy source is `836ce91`, with the hint coordination in `a828c4e` and the paired
+harness improvements in `9277654` / `f4028dc`. Local and EC2 source hashes match. Native
+ARM `cargo fmt --check`, `cargo clippy -p bf-engine -p bf-vector --all-targets -- -D warnings`,
+`cargo test -p bf-engine -p bf-vector`, and the `recluster_copy` example test pass: **229
+passed, zero failed, and seven existing ignored tests**. Both release examples build.
+Tests cover automatic target selection, legacy probe invariance, coarse budgeting,
+compiled/reference equality with masks and eviction, missing hints, and the original
+untiered three-wave limit. Both Python harnesses pass Ruff.
+
+Measurements and builds used about 0.54 interrupted Spot c7gd.4xlarge hours, 1.90 Spot
+c7g.4xlarge hours, and 1.47 on-demand c7gd.4xlarge hours. The conservative total estimate
+is **$3–4**, below the $5 cap, allowing $1/hour for the on-demand host plus request and
+storage charges; this is an estimate, not a billing audit. All owned instances terminated,
+their tagged key pairs and security groups were deleted, and their EBS roots were removed.
+Cleanup deleted 5,239 current objects totaling 409.8 GB from the owned temporary prefix;
+zero current objects and zero multipart uploads were verified. Existing prefixes were
+read-only. Local run artifacts were removed after retaining these measurements.

@@ -404,6 +404,7 @@ pub(crate) async fn prefetch_scan(
         &distances,
         &in_cluster,
         &Totals {
+            layout,
             ann_rows,
             matching,
             clusters,
@@ -630,6 +631,7 @@ fn likely_segments(dir: &Directory, picked: &[usize]) -> BTreeSet<usize> {
 
 /// Row and cluster totals the probe plan is sized from.
 struct Totals {
+    layout: Layout,
     ann_rows: usize,
     matching: usize,
     clusters: usize,
@@ -686,9 +688,19 @@ fn tier_share(dir: &Directory, seg_rows: &[usize], skipped: &dyn Fn(usize) -> bo
 
 /// Clusters a query probes: `ann_nprobe` per square root of the rows' worth of clusters, more
 /// when `thin` (total rows over matching rows) says the clusters are sparse.
-fn probe_count(config: &EngineConfig, ann_rows: usize, clusters: usize, thin: f64) -> usize {
-    let scale = (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0);
-    ((config.ann_nprobe as f64 * scale * thin).ceil() as usize).min(clusters)
+fn probe_count(
+    config: &EngineConfig,
+    ann_rows: usize,
+    clusters: usize,
+    thin: f64,
+    layout: Layout,
+) -> usize {
+    let budget = if layout == Layout::Slabs {
+        bf_vector::tier_probe_budget(config.ann_nprobe, ann_rows, clusters)
+    } else {
+        config.ann_nprobe as f64 * (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0)
+    };
+    ((budget * thin).ceil() as usize).min(clusters)
 }
 
 /// How many more clusters to probe because the segments were clustered independently.
@@ -741,6 +753,7 @@ fn pick_clusters(
     config: &EngineConfig,
 ) -> Vec<usize> {
     let Totals {
+        layout,
         ann_rows,
         matching,
         clusters,
@@ -769,7 +782,7 @@ fn pick_clusters(
             thin
         }
     };
-    let probes = probe_count(config, ann_rows, clusters, thin * spread);
+    let probes = probe_count(config, ann_rows, clusters, thin * spread, layout);
     // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
     // only in the unlikely case the walk runs past them.
     let mut sorted = if order.len() > probes.saturating_mul(8).max(256) {
@@ -1145,6 +1158,7 @@ pub(crate) async fn search(
             }
         } else {
             let totals = Totals {
+                layout,
                 ann_rows,
                 matching,
                 clusters,
@@ -1930,8 +1944,9 @@ async fn paged_view(
 ) -> Result<(Arc<Directory>, bool), ApiError> {
     let t0 = std::time::Instant::now();
     let (rows, clusters) = paged.totals();
-    let want = (probe_count(config, rows as usize, clusters as usize, 1.0) as f64 * page_margin())
-        .ceil() as usize;
+    let want = (probe_count(config, rows as usize, clusters as usize, 1.0, Layout::Slabs) as f64
+        * page_margin())
+    .ceil() as usize;
     let kappa = page_kappa();
     let cells = {
         let (paged, vector) = (paged.clone(), vector.to_vec());

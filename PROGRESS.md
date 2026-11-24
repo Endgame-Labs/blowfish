@@ -4,6 +4,14 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Coarser leaves for large tiers, chosen automatically** (round C3; `docs/benchmarks.md`, "Round C3"). Recluster
+  now uses 200-row leaves below 10M live vectors and 640-row leaves at or above, and the planner maps the probe
+  count to the stored layout (64 becomes 70 on 640-row leaves), with no setting. At 10M, against a fresh 200-row
+  control at matched recall (0.9690 vs 0.9700), cold p50 falls from 378 to 325 ms (-13.9%), GETs from 621 to 355,
+  and bytes from 58.4 to 47.6 MB per query; the build is 23.6% faster with lower peak memory. NQ keeps 200-row
+  leaves and its warm speed (+0.9-1.4%). Existing tiers change on their next normal recluster. Upgraded tiers no
+  longer download a redundant 5.35 MB segment-directory hint per cold query.
+
 - **Bulk loads no longer start reclustering early** (round RR2; `docs/benchmarks.md`, "Round RR2"). Load detection
   now holds through each 429's advertised Retry-After, compaction stays deferred across those retries, and the
   quiet period starts when queued writes actually complete instead of when their batch was prepared. On full NQ
