@@ -772,6 +772,57 @@ impl Directory {
         self.shape.dims * self.shape.dtype.width()
     }
 
+    pub(crate) fn prepare_resident(
+        &self,
+        query: &[f32],
+        scratch: &mut crate::ResidentQueryScratch,
+    ) -> Result<()> {
+        crate::distance::validate(query, self.shape.dims)?;
+        scratch.normalized.clear();
+        let norm = if self.shape.metric == crate::Metric::CosineDistance {
+            query
+                .iter()
+                .map(|x| f64::from(*x).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        } else {
+            0.
+        };
+        scratch.normalized.extend(query.iter().map(|x| {
+            if norm > 0. {
+                (f64::from(*x) / norm) as f32
+            } else {
+                *x
+            }
+        }));
+        let q = &mut scratch.rotated;
+        q.zero = scratch.normalized.iter().all(|x| *x == 0.);
+        q.seed = self.shape.seed;
+        self.rq.rotate_into(&scratch.normalized, &mut q.rotated);
+        q.rotated32.clear();
+        q.rotated32.extend(q.rotated.iter().map(|x| *x as f32));
+        scratch.distances.clear();
+        for section in &self.sections {
+            scratch.plane.reset(&q.rotated, &section.centroid);
+            let plane = &scratch.plane;
+            let start = scratch.distances.len();
+            scratch.distances.resize(start + section.entries.len(), 0.);
+            let distances = &mut scratch.distances[start..];
+            plane.dots(
+                &section.bits,
+                bit_bytes(q.rotated.len()),
+                section.entries.len(),
+                q.rotated.len(),
+                |n, dot| {
+                    let e = &section.entries[n];
+                    let (norm, alpha) = (f64::from(e.norm), f64::from(e.alpha));
+                    distances[n] = (plane.norm2 + norm * norm - 2. * norm * dot / alpha) as f32;
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Estimated squared distance from the query to every entry's center, in entry order,
     /// from the one-bit codes. Comparable across segments because they share one rotation.
     pub fn center_distances(&self, query: &[f32]) -> Result<Vec<f32>> {

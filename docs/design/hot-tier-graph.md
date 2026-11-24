@@ -150,7 +150,7 @@ while shared engine overhead and the automatic lifecycle are addressed.
    Run at low priority, with one builder and at most two background CPU workers while serving.
    The 350 s measurement used all 32 cores; background completion time must be measured separately.
 2. Promote only after ten minutes of sustained eligible query heat, when a 15-minute EWMA forecasts
-   at least twice the measured construction CPU saving over the next 24 hours. Estimate savings
+   query CPU savings of at least twice the measured construction CPU cost over the next 24 hours. Estimate savings
    from sampled namespace IVF and graph CPU, rather than transferring NQ constants to other data.
    These are proposed internal policy thresholds, with no new user-facing algorithm knobs.
 3. Reserve the maximum of construction and load-phase memory, plus the existing foreground working

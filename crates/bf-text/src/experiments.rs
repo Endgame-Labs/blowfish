@@ -614,3 +614,81 @@ fn lossless_msmarco() {
         serde_json::json!({"occurrences":occurrences,"raw_bytes":raw_bytes,"compressed_bytes":compressed_bytes})
     );
 }
+
+#[test]
+#[ignore = "requires five format-6 corpus segments; validates every posting and position"]
+fn compact_msmarco() {
+    let root = root();
+    let output = root.join("compact");
+    std::fs::create_dir_all(&output).unwrap();
+    let start = Instant::now();
+    let (mut before, mut after, mut occurrences, mut blocks) = (0, 0, 0u64, 0);
+    for part in 0..5 {
+        let old = std::fs::read(root.join(format!("segment-{part}.bft"))).unwrap();
+        before += old.len();
+        let new = upgrade_segment(old.clone()).unwrap().unwrap();
+        after += new.len();
+        std::fs::write(output.join(format!("segment-{part}.bft")), &new).unwrap();
+        let a = reader(old);
+        let b = reader(new);
+        assert_eq!(a.doc_lengths(), b.doc_lengths());
+        assert_eq!(
+            futures::executor::block_on(a.stats()).unwrap(),
+            futures::executor::block_on(b.stats()).unwrap()
+        );
+        let aa = futures::executor::block_on(a.all_terms()).unwrap();
+        let bb = futures::executor::block_on(b.all_terms()).unwrap();
+        assert_eq!(aa.len(), bb.len());
+        for (a_chunk, b_chunk) in aa.chunks(128).zip(bb.chunks(128)) {
+            let am = futures::executor::block_on(a.load(a_chunk.iter().map(|(_, h)| *h))).unwrap();
+            let bm = futures::executor::block_on(b.load(b_chunk.iter().map(|(_, h)| *h))).unwrap();
+            for ((word, ah), (other, bh)) in a_chunk.iter().zip(b_chunk) {
+                assert_eq!(word, other);
+                let x = &am[ah];
+                let y = &bm[bh];
+                assert_eq!(x.df, y.df);
+                assert_eq!(x.blocks.len(), y.blocks.len());
+                for (x, y) in x.blocks.iter().zip(&y.blocks) {
+                    assert_eq!(
+                        (x.first, x.last, x.count, x.max_tf, x.min_length),
+                        (y.first, y.last, y.count, y.max_tf, y.min_length)
+                    );
+                    let p = futures::executor::block_on(a.postings(x, am[ah].df)).unwrap();
+                    assert_eq!(
+                        p,
+                        futures::executor::block_on(b.postings(y, bm[bh].df)).unwrap()
+                    );
+                    let left = futures::executor::block_on(
+                        a.source
+                            .read(x.positions..x.positions + u64::from(x.positions_size)),
+                    )
+                    .unwrap();
+                    let right = futures::executor::block_on(
+                        b.source
+                            .read(y.positions..y.positions + u64::from(y.positions_size)),
+                    )
+                    .unwrap();
+                    verify(&left, x.positions_crc).unwrap();
+                    verify(&right, y.positions_crc).unwrap();
+                    assert_eq!(left, right);
+                    if !left.is_empty() {
+                        let mut decoder = positions::Decoder::new(&left, true).unwrap();
+                        for &(_, tf) in p.iter() {
+                            decoder.document(tf).unwrap();
+                            occurrences += u64::from(tf);
+                        }
+                        decoder.finish().unwrap();
+                    }
+                    blocks += 1;
+                }
+            }
+        }
+    }
+    for name in ["stats.json", "workload.json"] {
+        std::fs::copy(root.join(name), output.join(name)).unwrap();
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({"format":7,"before":before,"after":after,"blocks":blocks,"occurrences":occurrences,"transcode_and_validate_seconds":start.elapsed().as_secs_f64()})
+    );
+}

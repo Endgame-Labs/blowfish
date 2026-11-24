@@ -145,7 +145,19 @@ impl RaBitQ {
         self.transform(result)
     }
 
+    pub(crate) fn rotate_into(&self, v: &[f32], result: &mut Vec<f64>) {
+        result.clear();
+        result.extend(v.iter().map(|x| f64::from(*x)));
+        result.resize(self.padded, 0.);
+        self.transform_in_place(result);
+    }
+
     fn transform(&self, mut result: Vec<f64>) -> Vec<f64> {
+        self.transform_in_place(&mut result);
+        result
+    }
+
+    fn transform_in_place(&self, result: &mut [f64]) {
         for signs in self.signs.iter() {
             for (x, sign) in result.iter_mut().zip(signs) {
                 *x *= sign;
@@ -163,11 +175,10 @@ impl RaBitQ {
                 stride *= 2;
             }
             let scale = 1. / (self.padded as f64).sqrt();
-            for x in &mut result {
+            for x in result.iter_mut() {
                 *x *= scale;
             }
         }
-        result
     }
 
     pub(crate) fn estimate_rotated(&self, code: &RaBitQCode, q: &[f64]) -> DistanceEstimate {
@@ -216,7 +227,9 @@ pub(crate) const QUERY_BITS: usize = 8;
 
 /// A residual query quantized to `QUERY_BITS` bit planes, so that a one-bit code's inner
 /// product costs a few popcounts per 64 dimensions instead of a table lookup per byte.
+#[derive(Default)]
 pub(crate) struct PlaneQuery {
+    quantized: Vec<u8>,
     /// `planes[j * words + w]` holds bit `j` of the quantized coordinates `64w..64w+64`.
     planes: Vec<u64>,
     words: usize,
@@ -229,19 +242,26 @@ pub(crate) struct PlaneQuery {
 impl PlaneQuery {
     /// `q` and `c` are rotated, padded to the same length.
     pub(crate) fn new(q: &[f64], c: &[f32]) -> Self {
+        let mut out = Self::default();
+        out.reset(q, c);
+        out
+    }
+
+    pub(crate) fn reset(&mut self, q: &[f64], c: &[f32]) {
         #[cfg(target_arch = "x86_64")]
         if avx512() && q.len().is_multiple_of(64) && c.len() == q.len() {
             // SAFETY: the features were detected; lengths are checked above.
-            return unsafe { Self::new_avx512(q, c) };
+            unsafe { self.reset_avx512(q, c) };
+            return;
         }
-        Self::new_scalar(q, c)
+        self.reset_scalar(q, c);
     }
 
     /// [`Self::new`] eight coordinates at a time. Sums are accumulated in another order than
     /// the scalar loop, so `norm2` and `sum` can differ from it in the last bits.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw")]
-    unsafe fn new_avx512(q: &[f64], c: &[f32]) -> Self {
+    unsafe fn reset_avx512(&mut self, q: &[f64], c: &[f32]) {
         use std::arch::x86_64::*;
         let n = q.len();
         let words = n / 64;
@@ -269,9 +289,12 @@ impl PlaneQuery {
         let (norm2, sum) = (_mm512_reduce_add_pd(norm2), _mm512_reduce_add_pd(sum));
         let levels = ((1usize << QUERY_BITS) - 1) as f64;
         let delta = if hi > lo { (hi - lo) / levels } else { 0. };
-        let mut planes = vec![0u64; QUERY_BITS * words];
+        self.planes.clear();
+        self.planes.resize(QUERY_BITS * words, 0);
+        let planes = &mut self.planes;
         if delta > 0. {
-            let mut quantized = vec![0u8; n];
+            self.quantized.resize(n, 0);
+            let quantized = &mut self.quantized;
             let (base, step, top, half) = (
                 _mm512_set1_pd(lo),
                 _mm512_set1_pd(delta),
@@ -292,19 +315,23 @@ impl PlaneQuery {
                 }
             }
             // SAFETY: the features were detected; `quantized` holds `words * 64` bytes.
-            unsafe { transpose_avx512(&quantized, words, &mut planes) };
+            unsafe { transpose_avx512(quantized, words, planes) };
         }
-        Self {
-            planes,
-            words,
-            delta,
-            vmin: lo,
-            sum,
-            norm2,
-        }
+        self.words = words;
+        self.delta = delta;
+        self.vmin = lo;
+        self.sum = sum;
+        self.norm2 = norm2;
     }
 
+    #[cfg(all(test, target_arch = "x86_64"))]
     fn new_scalar(q: &[f64], c: &[f32]) -> Self {
+        let mut out = Self::default();
+        out.reset_scalar(q, c);
+        out
+    }
+
+    fn reset_scalar(&mut self, q: &[f64], c: &[f32]) {
         let words = q.len().div_ceil(64);
         let mut vmin = f64::INFINITY;
         let mut vmax = f64::NEG_INFINITY;
@@ -323,11 +350,15 @@ impl PlaneQuery {
         } else {
             0.
         };
-        let mut planes = vec![0u64; QUERY_BITS * words];
+        self.planes.clear();
+        self.planes.resize(QUERY_BITS * words, 0);
+        let planes = &mut self.planes;
         if delta > 0. {
             // Quantize into bytes first (a loop the compiler vectorizes), then transpose each
             // 64-value block into one word per bit plane in registers.
-            let mut levels_q = vec![0u8; words * 64];
+            self.quantized.clear();
+            self.quantized.resize(words * 64, 0);
+            let levels_q = &mut self.quantized;
             for ((slot, q), c) in levels_q.iter_mut().zip(q).zip(c) {
                 let x = *q - *c as f64;
                 // `(x - vmin) / delta` is never negative, so adding a half and truncating rounds
@@ -347,14 +378,11 @@ impl PlaneQuery {
                 }
             }
         }
-        Self {
-            planes,
-            words,
-            delta,
-            vmin,
-            sum,
-            norm2,
-        }
+        self.words = words;
+        self.delta = delta;
+        self.vmin = vmin;
+        self.sum = sum;
+        self.norm2 = norm2;
     }
 
     /// [`Self::signed_dot`], with the AVX-512 kernel where the CPU has it.

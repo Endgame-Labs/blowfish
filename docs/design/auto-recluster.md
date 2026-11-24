@@ -1,6 +1,7 @@
 # Automatic recluster
 
-Status: rounds R1 to R3 built (2026-11-23), R4's lineage built (2026-11-24); R5 proposed. Implements SPEC decision 21 under decision 25: recluster is always on, with no off
+Status: rounds R1 to R3 built (2026-11-23), R4's lineage and RR1's readiness improvements built (2026-11-24);
+R5 proposed. Implements SPEC decision 21 under decision 25: recluster is always on, with no off
 switch and no manual mode. `examples/recluster.rs` goes away once this ships.
 
 ## The problem, in numbers
@@ -111,13 +112,18 @@ The indexer evaluates this after each publication, from manifest numbers only, s
 4. **Merge:** the delta reaches half the base, or masked rows reach 20% of a tier. (Round R3 estimates masked rows
    from manifest numbers: the tiers' rows minus the live rows outside the uncovered segments.) All rows are rebuilt into a new
    base, and the delta is dropped.
-5. **Bulk-load guard:** while a bulk load is running (the indexer flushed in bulk mode in the last 5 minutes),
-   steps 2 to 4 wait, unless uncovered rows exceed the covered rows. A load-then-query namespace therefore pays
-   about one full build after the load, plus at most a few doubling builds during it.
-6. **Compaction first:** a build starts only when the indexer would not compact now (`tier()` without `force`
-   returns nothing). Otherwise the build would cover segments that are about to disappear. (Round R3 first asked
-   `tier()` with `force`, which lists merges the indexer defers while a long write tail is pending: under 1,000
-   upserts a second on NQ, every evaluation deferred and the rows outside the base reached 300,000 in six minutes.)
+5. **Bulk-load guard:** a bulk-rate flush in the last 5 minutes classifies the namespace as recently loading.
+   While it has an unindexed tail or its last write was less than 2 seconds ago, steps 2 to 4 wait,
+   including a first base with no covered rows and a delta beside an existing base build. No doubling
+   exception starts intermediate tiers. Once writes have been quiet for 2 seconds and indexing has caught up,
+   the guard releases; its deferred evaluation retries every 2 seconds, even without a new publication.
+   Queries keep searching segments and any existing tiers during the load. Format upgrades still run.
+6. **First base before remaining compaction:** once a load settles, the first base takes priority over further
+   segment merges. Its source segments are protected before the build's first await, including while its initial
+   build record is written; cancellation or failure releases that protection. After installation, compaction
+   preserves the tier through format-4 lineage. Other rebuilds and deltas still wait when `tier()` without
+   `force` would compact now. Using `force` here would also defer merges the indexer leaves alone under steady
+   writes, allowing the rows outside the tiers to grow unnecessarily.
 7. **Order:** a merge first, then a delta, then a masked-rows rebuild. (A masked rebuild of NQ took 10 minutes
    under 1,000 upserts a second, and with it ahead of the delta, the rows outside the tiers stayed above 20% while
    it ran.)
@@ -154,12 +160,33 @@ of a fresh recluster at any time, and the build work happens in the background.
     a base build, and a tenth to a half of that for a delta.
   - It goes in the engine's scratch directory (the disk cache directory when one is set, otherwise the system
     temporary directory), and needs 1.1 times its size free.
+  - Each build owns a `process-<pid>-<uuid>` directory under `blowfish-recluster`, with an exclusive
+    `owner.lock` held until cleanup. A drop guard removes its spill and directory on success, failure,
+    cancellation, shutdown, or panic unwinding. Open blocking-worker descriptors remain valid after unlinking.
+    Startup and new builds sweep only directories whose owner lock can be acquired; another live process's
+    spill stays. Creation, sweeping, and removal serialize on the root directory's lock, so recovery cannot
+    race a creator before its owner lock exists. Legacy loose spills have no ownership lock and are left alone.
+  - Vectors are appended a whole source cluster at a time. A four-byte physical-row address per global row
+    replaces the previous scatter of one small write per vector. This mapping is local to the build; bucket
+    objects and manifests keep their existing formats. Masked rows are never included in training or slabs.
   - Otherwise the job reports `reason="disk"` and waits. It never fills the disk the cache or the OS needs.
 - **Input:** for covered rows, the tier's own slabs (one sequential read per slab); for uncovered rows, the segment
   ANN objects. Rows masked as deleted are skipped. Nothing is read twice.
 - **Incremental:** a delta build reuses the base's coarse cells (kept in the tier), so it skips coarse training and
   reads only delta and uncovered rows. A merge reuses the coarse cells too, unless the base has grown four times
   since they were trained.
+- **Distance batches:** one-level Lloyd training and coarse assignment compare bounded batches of 128 rows with
+  packed centers. Leaf assignment compares four rows directly with each selected center through the shared NEON,
+  AVX2, or AVX-512 FMA kernel; it does not repack selected centers into a temporary matrix. Kernels run on the existing build pool,
+  without a second thread pool. Sampling, seeds, iteration counts, near-cell and group counts, and the final
+  refinement pass stay the same. Center sums remain in input order in f64, independent of worker scheduling.
+  No full-precision corpus is materialized in memory. Batched training and coarse assignment fall back to direct
+  coordinate differences when finite Euclidean inputs have overflowing norms, preserving zero distance for
+  identical large vectors.
+- **Stage telemetry:** `blowfish_recluster_stage_seconds{stage=...}` and matching build logs report copy,
+  coarse and leaf training, coarse and leaf assignment, center refinement, spill reads and writes, encoding,
+  uploads, and directory construction. Spill service times summed across workers and overlapping upload times
+  are reported separately from the build's elapsed time.
 
 ### Publishing safely against concurrent writes
 
@@ -227,9 +254,9 @@ layout until the new one is published.
 | Storage overlap (old and new tier until GC, 1 h) | negligible | 238 GB-hours, about $0.01 |
 | Steady growth to this size, total build work | 3.7 times one base build | 3.9 times, about 6.5 h of 8-vCPU time spread over the load |
 
-At 100M, a load-then-query namespace pays about one base build after the load (1.7 to 3 h), plus doubling builds
-while the guard trips. On a single c7gd.2xlarge doing both, the job takes CPU from ingest. The bulk-load guard
-exists so that it mostly doesn't.
+At 100M, a load-then-query namespace pays one base build after the load (the historical build took 1.7 to
+3 h), without intermediate doubling builds. The bulk-load guard reserves build CPU for ingest until the
+load settles; queries remain available against segments throughout.
 
 ## How to measure success
 

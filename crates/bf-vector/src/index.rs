@@ -76,7 +76,7 @@ const VECTOR_MERGE_MAX: u64 = 2 << 20;
 /// Cheap to clone (shared), so a caller can keep decoded clusters across queries and install
 /// them into each query's partial index instead of decoding the blob again.
 #[derive(Clone)]
-pub struct DecodedCluster(Arc<format::ClusterData>);
+pub struct DecodedCluster(pub(crate) Arc<format::ClusterData>);
 impl DecodedCluster {
     /// Approximate resident bytes.
     pub fn resident_bytes(&self) -> u64 {
@@ -122,15 +122,26 @@ impl Ord for OrdF32 {
     }
 }
 
+/// Reusable worker-local buffers for scanning immutable code blocks.
+#[derive(Default)]
+pub struct ScanScratch {
+    uppers: std::collections::BinaryHeap<OrdF32>,
+    final_uppers: Vec<f32>,
+    estimated: Vec<Candidate>,
+    fast: Option<crate::fastscan::FastQuery>,
+    ordered: Vec<u32>,
+    rescore: Vec<(Range<usize>, usize, usize, f32)>,
+}
+
 /// A parsed immutable index. Metadata and centroids stay resident; codes and
 /// vectors are fetched through the reader for each search (usually cache-backed).
 pub struct Index<R: RangeRead> {
     reader: R,
-    metadata: Metadata,
+    pub(crate) metadata: Metadata,
     pub(crate) rq: RaBitQ,
     /// The mean rotated center fast-scan codes are relative to (see [`crate::fastscan`]): for a
     /// fast-scan index, or for a partial index, the directory section's centroid.
-    reference: Option<Arc<Vec<f32>>>,
+    pub(crate) reference: Option<Arc<Vec<f32>>>,
     /// Cluster blobs come from a fragment written before v0.1.15, whose blobs carry no
     /// checksum (see [`Self::decode_cluster`]).
     legacy_blobs: bool,
@@ -734,29 +745,85 @@ impl<R: RangeRead> Index<R> {
         read_us: u128,
         keep: Option<(usize, f32)>,
     ) -> Result<Vec<Candidate>> {
-        let (keep, upper_bound) = keep.map_or((None, f32::INFINITY), |(k, bound)| (Some(k), bound));
+        let mut scratch = ScanScratch::default();
+        self.scan_into(
+            query,
+            clusters,
+            |position, _| &blocks[position],
+            filter,
+            read_us,
+            keep,
+            &mut scratch,
+        )?;
+        Ok(scratch.estimated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_into<'a, 'b>(
+        &self,
+        query: &RotatedQuery,
+        clusters: &[usize],
+        block: impl Fn(usize, usize) -> &'b [u8],
+        filter: Option<&RoaringBitmap>,
+        read_us: u128,
+        keep: Option<(usize, f32)>,
+        scratch: &'a mut ScanScratch,
+    ) -> Result<&'a [Candidate]> {
+        self.scan_with(
+            query,
+            clusters,
+            block,
+            |cid| &self.metadata.clusters[cid],
+            filter,
+            read_us,
+            keep,
+            scratch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_with<'a, 'b, 'c>(
+        &self,
+        query: &RotatedQuery,
+        clusters: &[usize],
+        block: impl Fn(usize, usize) -> &'b [u8],
+        cluster: impl Fn(usize) -> &'c format::Cluster,
+        filter: Option<&RoaringBitmap>,
+        read_us: u128,
+        keep: Option<(usize, f32)>,
+        scratch: &'a mut ScanScratch,
+    ) -> Result<&'a [Candidate]> {
         // The `k` smallest upper bounds so far, as a max-heap; `cut` is its largest once full.
-        let mut uppers = std::collections::BinaryHeap::<OrdF32>::new();
+        scratch.uppers.clear();
+        scratch.estimated.clear();
+        scratch.rescore.clear();
+        let ScanScratch {
+            uppers,
+            final_uppers,
+            estimated,
+            fast,
+            ordered,
+            rescore,
+        } = scratch;
+        let (keep, upper_bound) = keep.map_or((None, f32::INFINITY), |(k, bound)| (Some(k), bound));
         let cut = std::cell::Cell::new(upper_bound);
         let q_zero = query.zero;
         let q_rot = &query.rotated;
         let t_cpu = std::time::Instant::now();
-        let rows: usize = clusters
-            .iter()
-            .map(|c| self.metadata.clusters[*c].len())
-            .sum();
-        let mut estimated = Vec::with_capacity(rows);
+        let rows: usize = clusters.iter().map(|c| cluster(*c).len()).sum();
+        estimated.reserve(rows);
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
         let padded = self.rq.padded;
         let cosine = self.metric() == Metric::CosineDistance;
-        let mut fast: Option<crate::fastscan::FastQuery> = None;
+        let mut prepare_fast = true;
         let q32 = &query.rotated32;
-        let mut ordered = Vec::new();
+
         // Fast-scanned clusters' candidates (a range of `estimated`), to score again with the
         // fine tables once the cut is final.
-        let mut rescore: Vec<(Range<usize>, Bytes, usize, f32)> = Vec::new();
-        for (cid, bytes) in clusters.iter().copied().zip(blocks) {
-            let c = &self.metadata.clusters[cid];
+
+        for (position, cid) in clusters.iter().copied().enumerate() {
+            let bytes = block(position, cid);
+            let c = cluster(cid);
             // A stub's (shared, empty) payload never records a check.
             let checked = c.data.as_deref().map(|d| &d.codes_checked);
             let n = c.len();
@@ -765,10 +832,10 @@ impl<R: RangeRead> Index<R> {
                 && padded.is_multiple_of(8)
                 && bytes.len() == crate::fastscan::block_len(n, padded);
             if !checked.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
-                check_crc(&bytes, c.codes_crc)?;
+                check_crc(bytes, c.codes_crc)?;
                 // The fast scan trusts its factors once they are checked here.
                 if blocked {
-                    crate::fastscan::check_factors(&bytes, n, padded)?;
+                    crate::fastscan::check_factors(bytes, n, padded)?;
                 }
                 if let Some(f) = checked {
                     f.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -779,7 +846,7 @@ impl<R: RangeRead> Index<R> {
                 None => {
                     ordered.clear();
                     ordered.extend(c.rows.iter());
-                    &ordered
+                    ordered
                 }
             };
             let first = estimated.len();
@@ -818,14 +885,20 @@ impl<R: RangeRead> Index<R> {
                     .reference
                     .as_deref()
                     .ok_or_else(|| bad("fast-scan codes without a reference center"))?;
-                let fq =
-                    fast.get_or_insert_with(|| crate::fastscan::FastQuery::new(q_rot, reference));
+                if prepare_fast {
+                    match fast {
+                        Some(fq) => fq.reset(q_rot, reference),
+                        None => *fast = Some(crate::fastscan::FastQuery::new(q_rot, reference)),
+                    }
+                    prepare_fast = false;
+                }
+                let fq = fast.as_ref().expect("prepared fast query");
                 let qc2 = crate::distance::l2_squared_f32(q32, &c.center);
                 // A zero query has a fixed distance to every row: no cut applies.
                 let open = std::cell::Cell::new(f32::INFINITY);
                 let scan_cut = if cosine && q_zero { &open } else { &cut };
                 fq.scan(
-                    &bytes,
+                    bytes,
                     n,
                     qc2,
                     cosine,
@@ -845,7 +918,7 @@ impl<R: RangeRead> Index<R> {
                     },
                 )?;
                 if keep.is_some() && estimated.len() > first && fq.rounding_matters(qc2) {
-                    rescore.push((first..estimated.len(), bytes, n, qc2));
+                    rescore.push((first..estimated.len(), position, n, qc2));
                 }
                 continue;
             }
@@ -863,25 +936,22 @@ impl<R: RangeRead> Index<R> {
                 accept(ordinal, distance as f32, error as f32);
             };
             let plane = crate::rabitq::PlaneQuery::new(q_rot, &c.center);
-            plane.scan(
-                &bytes,
-                n,
-                compact,
-                padded,
-                &mut |ordinal, d, bound, zero| consider(ordinal, d, bound, zero),
-            )?;
+            plane.scan(bytes, n, compact, padded, &mut |ordinal, d, bound, zero| {
+                consider(ordinal, d, bound, zero)
+            })?;
         }
         // The coarse tables' rounding grows with the query's distance from the index's mean
         // center, so rows that can still make the top `keep` get the fine score: the ordering of
         // close rows (which decides prefetches and the rerank pool) and tighter bounds.
-        if let Some(fq) = &fast {
+        if !prepare_fast && let Some(fq) = fast {
             let cut = cut.get();
-            for (range, bytes, n, qc2) in rescore {
-                for c in &mut estimated[range] {
+            for (range, position, n, qc2) in rescore.iter() {
+                let bytes = block(*position, clusters[*position]);
+                for c in &mut estimated[range.clone()] {
                     if c.error == 0. || c.distance - c.error > cut {
                         continue;
                     }
-                    (c.distance, c.error) = fq.rescore(&bytes, n, qc2, cosine, c.ordinal as usize);
+                    (c.distance, c.error) = fq.rescore(bytes, *n, *qc2, cosine, c.ordinal as usize);
                 }
             }
         }
@@ -893,9 +963,10 @@ impl<R: RangeRead> Index<R> {
             // returning candidates to the namespace-wide merge. Its k-th upper bound
             // cannot be smaller than the global one, so every possible winner remains.
             // Recompute after fine rescoring, which can change both distance and error.
-            let mut upper: Vec<f32> = estimated.iter().map(|c| c.distance + c.error).collect();
-            upper.select_nth_unstable_by(k - 1, f32::total_cmp);
-            let threshold = upper_bound.min(upper[k - 1]);
+            final_uppers.clear();
+            final_uppers.extend(estimated.iter().map(|c| c.distance + c.error));
+            final_uppers.select_nth_unstable_by(k - 1, f32::total_cmp);
+            let threshold = upper_bound.min(final_uppers[k - 1]);
             estimated.retain(|c| c.distance - c.error <= threshold);
         }
         if trace_stages() {
@@ -946,12 +1017,25 @@ impl<R: RangeRead> Index<R> {
         k: usize,
         locations: Vec<(u32, u32)>,
     ) -> Result<Vec<(u32, f32)>> {
+        self.rerank_candidates_recorded(query, k, locations, None)
+            .await
+    }
+
+    /// [`Self::rerank_candidates`], recording validated immutable vector rows for a resident
+    /// tier. Only payloads already fetched by the ordinary rerank are recorded.
+    pub async fn rerank_candidates_recorded(
+        &self,
+        query: &[f32],
+        k: usize,
+        locations: Vec<(u32, u32)>,
+        recorder: Option<&dyn crate::VectorRecorder>,
+    ) -> Result<Vec<(u32, f32)>> {
         validate(query, self.dims())?;
         let locations = locations
             .into_iter()
             .map(|(c, i)| (c as usize, i as usize))
             .collect();
-        self.rerank(query, k, locations).await
+        self.rerank_recorded(query, k, locations, recorder).await
     }
 
     /// Every `(cluster, ordinal)` location whose row passes `filter`.
@@ -1129,7 +1213,17 @@ impl<R: RangeRead> Index<R> {
         &self,
         query: &[f32],
         k: usize,
+        locations: Vec<(usize, usize)>,
+    ) -> Result<Vec<(u32, f32)>> {
+        self.rerank_recorded(query, k, locations, None).await
+    }
+
+    async fn rerank_recorded(
+        &self,
+        query: &[f32],
+        k: usize,
         mut locations: Vec<(usize, usize)>,
+        recorder: Option<&dyn crate::VectorRecorder>,
     ) -> Result<Vec<(u32, f32)>> {
         locations.sort_unstable();
         locations.dedup();
@@ -1208,6 +1302,14 @@ impl<R: RangeRead> Index<R> {
                     None => c.rows.select(i as u32),
                 }
                 .ok_or_else(|| bad("invalid row ordinal"))?;
+                if let Some(recorder) = recorder {
+                    recorder.record(crate::ValidatedVector::new(
+                        row,
+                        self.dims(),
+                        self.vector_type(),
+                        vbytes,
+                    ));
+                }
                 result.push((row, self.metric().distance_unchecked(query, &decoded)));
             }
         }

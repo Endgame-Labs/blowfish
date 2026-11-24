@@ -4,6 +4,38 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Text format 7: 1.69x smaller text indexes** (round B5; `docs/benchmarks.md`, "Round B5"). Partial posting
+  blocks now store only their real rows (LEB128 row deltas and term frequencies) instead of padding to 128, and
+  block directories use variable-width records with offsets derived from frame sizes. On 1M MS MARCO
+  passages, the text index went from 336.3 MB to 198.8 MB (a further 40.9% on top of format 6), lossless for
+  every posting and all 56.7M phrase occurrences, with identical scores and ordered hits on 1,000 queries,
+  flat warm CPU, unchanged cold latency (154.8 vs 156.7 ms p50), and build cost +4.4%. Format-6 segments
+  upgrade automatically in the background (about 4 s for 1M rows). Two other ideas were tested and rejected:
+  block-max pruning over clustered 64-document forward blocks (2.2x more instructions) and cross-segment cold
+  term packing (1.04x, below its gate). The BM25 CPU and cold latency targets stay open.
+
+- **Recluster readiness after bulk loads, 2.94x sooner** (round RR1; `docs/benchmarks.md`, "Round RR1").
+  An active bulk load now defers recluster builds instead of building and discarding intermediate tiers, and the
+  first base starts as soon as the load goes quiet, ahead of the remaining segment compaction (its sources are
+  protected before the task yields). Leaf assignment uses a four-row dot-product kernel with independent FMA
+  chains (NEON, AVX2, and AVX-512), and training and coarse assignment run in bounded 128-row matrix batches.
+  Spill files are owned per build with a lock and cleaned up on every exit path, including panics, and
+  abandoned ones are swept at startup. On NQ (c7gd.2xlarge, in-region S3): full-tier readiness after the last
+  acknowledged write went from 756.7 s to 257.5 s, the full build from 426.4 s to 255.0 s (1.67x; the 2x build
+  target was not met), and recall@10 from 0.9494 / 0.9602 to 0.9501 / 0.9603 at 48 / 64 probes. New metric:
+  `blowfish_recluster_stage_seconds{stage}`.
+
+- **Compiled warm tiers** (round X1; `docs/benchmarks.md`, "Round X1"). Once a recluster tier is resident, the
+  engine compiles a generation-scoped view of it (codes, factors, leaf metadata, and a sparse cache of exact
+  vectors charged to the decoded-cache budget) and runs warm queries on it synchronously, with reusable
+  per-thread scratch and no I/O; any miss falls back to the normal planner. Paired on a c7g.2xlarge, all 3,452
+  NQ queries at 16 clients, on top of the cold-streaming and shared-bound work: +31.2% q/s at 48 probes and
+  +27.6% at 64, with 10.1% fewer instructions per query, recall 0.9517 / 0.9618, and every ordered top 10
+  identical. Cold queries are unchanged (120 paired cold queries, identical results, no detectable shift). Peak
+  RSS is about 0.9 GB higher, within the cache budget. A resident ceiling harness
+  (`crates/bf-engine/examples/resident_ceiling.rs`) shows the server still reaches about 58% of the same scan
+  run in-process; that gap is the next round's target.
+
 - **BM25: impact-ordered postings and SIMD scoring, tested and rejected** (round B4; `docs/benchmarks.md`,
   "Round B4"). On 1,000 MS MARCO queries (c7g.2xlarge, paired), exact term-at-a-time scoring over
   impact-ordered blocks cost 127.7M instructions per query against 17.8M for the current reader, because

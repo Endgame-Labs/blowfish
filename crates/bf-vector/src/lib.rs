@@ -9,6 +9,11 @@ mod fastscan;
 mod format;
 mod index;
 mod reader;
+mod resident;
+pub use resident::{
+    CompiledHits, CompiledTier, ResidentIndex, ResidentQueryScratch, ValidatedVector,
+    VectorRecorder,
+};
 mod relayout;
 pub use bytes::Bytes;
 pub use cluster::{
@@ -21,7 +26,8 @@ pub use directory::{
 };
 pub use format::{ANN_FORMAT_VERSION, FORMAT_VERSION, metadata_len};
 pub use index::{
-    Candidate, DecodedCluster, Index, RotatedQuery, SearchParams, read_gap, read_merged,
+    Candidate, DecodedCluster, Index, RotatedQuery, ScanScratch, SearchParams, read_gap,
+    read_merged,
 };
 pub use reader::RangeRead;
 #[cfg(feature = "legacy-fixtures")]

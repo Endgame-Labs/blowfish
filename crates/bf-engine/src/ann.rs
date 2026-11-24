@@ -176,6 +176,7 @@ async fn from_directory(
                 None,
                 skip,
                 None,
+                None,
             )
             .await?;
             if slack > 0 {
@@ -494,6 +495,7 @@ async fn from_slabs(
     }
     #[cfg(feature = "experimental-hot-graph")]
     let hot_mask = mask.clone();
+    let warm_eligible = mask.is_none() && seat.is_none();
     let lives = vec![mask; view.segments.len()];
     let slack = if state.shadowed.is_empty() {
         0
@@ -509,6 +511,9 @@ async fn from_slabs(
     let (mut scores, mut docs) = match accelerated {
         Some(found) => found,
         None => {
+            let warm = warm_eligible
+                .then(|| crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone()))
+                .flatten();
             crate::ann_dir::search(
                 store,
                 &view,
@@ -524,10 +529,12 @@ async fn from_slabs(
                 Some((state, &set.covered, at)),
                 &[],
                 seat,
+                warm,
             )
             .await?
         }
     };
+
     if slack > 0 {
         let pooled = scores.len();
         scores.retain(|id, _| !state.shadowed.contains(id));

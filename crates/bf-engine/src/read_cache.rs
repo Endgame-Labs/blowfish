@@ -236,13 +236,29 @@ impl DecodedCache {
         entry.value.clone().downcast().ok()
     }
     fn insert<T: Any + Send + Sync>(&self, key: &str, bytes: u64, value: Arc<T>) {
+        self.install(key, bytes, value, false);
+    }
+    fn install<T: Any + Send + Sync>(
+        &self,
+        key: &str,
+        bytes: u64,
+        value: Arc<T>,
+        once: bool,
+    ) -> Arc<T> {
         if bytes > self.budget || self.budget == 0 {
-            return;
+            return value;
         }
         let mut retired = Vec::new();
         let key = self.key(key);
         let mut entries = self.entries.lock().expect("decoded cache lock");
         let key = (TypeId::of::<T>(), key);
+        if once && entries.values.contains_key(&key) {
+            entries.clock += 1;
+            let used = entries.clock;
+            let entry = entries.values.get_mut(&key).expect("present cache entry");
+            entry.used = used;
+            return entry.value.clone().downcast().expect("cache type key");
+        }
         if let Some(old) = entries.values.remove(&key) {
             entries.bytes -= old.bytes;
             retired.push(old);
@@ -261,11 +277,19 @@ impl DecodedCache {
         entries.clock += 1;
         let used = entries.clock;
         entries.bytes += bytes;
-        entries.values.insert(key, Entry { value, bytes, used });
+        entries.values.insert(
+            key,
+            Entry {
+                value: value.clone(),
+                bytes,
+                used,
+            },
+        );
         drop(entries);
         // Large posting directories can own millions of allocations. Their
         // destruction must not serialize unrelated cache lookups or insertions.
         drop(retired);
+        value
     }
 }
 #[derive(Clone)]
@@ -326,9 +350,50 @@ pub(crate) fn insert<T: Any + Send + Sync>(key: &str, bytes: u64, value: T) -> A
     value
 }
 
+/// The current query's general decoded-cache budget (zero outside a query context).
+pub(crate) fn capacity() -> u64 {
+    context().map_or(0, |c| c.cache.budget)
+}
+/// Reserve a complete resident view atomically. Concurrent cold queries share one winner,
+/// and the rejected candidate is dropped after releasing the cache lock.
+pub(crate) fn insert_once<T: Any + Send + Sync>(key: &str, bytes: u64, value: T) -> Option<Arc<T>> {
+    let context = context()?;
+    if bytes > context.cache.budget || context.cache.budget == 0 {
+        return None;
+    }
+    Some(context.cache.install(key, bytes, Arc::new(value), true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn atomic_resident_admission_shares_one_bounded_generation() {
+        let cache = Arc::new(DecodedCache::new(192, 1));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8u64)
+            .map(|i| {
+                let (cache, barrier) = (cache.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache.install("generation", 64, Arc::new(i), true)
+                })
+            })
+            .collect();
+        let pinned: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(pinned.iter().all(|value| Arc::ptr_eq(value, &pinned[0])));
+        assert_eq!(cache.entries.lock().unwrap().bytes, 64);
+        assert_eq!(cache.entries.lock().unwrap().values.len(), 1);
+        let other = cache
+            .scoped("other")
+            .install("generation", 64, Arc::new(99u64), true);
+        assert_eq!(*other, 99);
+        assert!(!Arc::ptr_eq(&other, &pinned[0]));
+        cache.clear();
+        assert!(cache.get::<u64>("generation").is_none());
+        assert!(pinned.iter().all(|value| Arc::ptr_eq(value, &pinned[0])));
+    }
+
     #[test]
     fn clock_initializes_once_across_threads_and_retries_errors() {
         let cache = Arc::new(ClockCache::<u64, u64>::new(64 * 1024, |_| 8));

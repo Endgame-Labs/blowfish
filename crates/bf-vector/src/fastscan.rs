@@ -134,6 +134,7 @@ struct Tables {
 pub(crate) struct FastQuery {
     coarse: Tables,
     fine: std::cell::OnceCell<Tables>,
+    spare_fine: std::cell::RefCell<Option<Tables>>,
     /// The offset `q - g`, kept to build the fine tables on first use.
     x: Vec<f32>,
     /// Each group's smallest entry.
@@ -196,6 +197,7 @@ impl FastQuery {
         Self {
             coarse,
             fine: std::cell::OnceCell::new(),
+            spare_fine: std::cell::RefCell::new(None),
             base: lows.iter().sum(),
             sum: x.iter().sum(),
             x,
@@ -205,18 +207,55 @@ impl FastQuery {
         }
     }
 
+    /// Rebuild the same tables while retaining this worker's allocations.
+    pub(crate) fn reset(&mut self, q: &[f64], g: &[f32]) {
+        if let Some(tables) = self.fine.take() {
+            *self.spare_fine.get_mut() = Some(tables);
+        }
+        self.padded = q.len();
+        self.x.clear();
+        self.x
+            .extend(q.iter().zip(g).map(|(q, g)| (*q - f64::from(*g)) as f32));
+        self.lows.clear();
+        let mut span = 0f32;
+        for group in self.x.as_chunks::<4>().0 {
+            let (mut low, mut high) = (0f32, 0f32);
+            for v in group {
+                if *v < 0. {
+                    low += v;
+                } else {
+                    high += v;
+                }
+            }
+            self.lows.push(low);
+            span = span.max(high - low);
+        }
+        self.delta = if span > 0. { span / LEVELS } else { 1. };
+        self.base = self.lows.iter().sum();
+        self.sum = self.x.iter().sum();
+        self.coarse.rebuild(&self.x, |group, e| {
+            ((e - self.lows[group]) / self.delta + 0.5).clamp(0., LEVELS)
+        });
+    }
+
     /// The fine tables: entry `e`'s residual after the coarse level `L`, `e - low - delta * L`
     /// (within half a step), as `round((residual + delta / 2) / fine_step)`.
     fn fine(&self) -> &Tables {
         self.fine.get_or_init(|| {
             let (delta, step) = (self.delta, self.fine_step());
-            Tables::build(&self.x, |group, e| {
+            let mut tables = self
+                .spare_fine
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(Tables::empty);
+            tables.rebuild(&self.x, |group, e| {
                 // As the coarse table stores it (truncated; the value is not negative).
                 let level =
                     f32::from(((e - self.lows[group]) / delta + 0.5).clamp(0., LEVELS) as u8);
                 let residual = e - self.lows[group] - delta * level;
                 ((residual + delta / 2.) / step + 0.5).clamp(0., LEVELS)
-            })
+            });
+            tables
         })
     }
 
@@ -236,8 +275,24 @@ impl Tables {
     /// sum `value` of a group's four coordinates.
     #[inline(always)]
     fn build(x: &[f32], level: impl Fn(usize, f32) -> f32) -> Self {
+        let mut tables = Self::empty();
+        tables.rebuild(x, level);
+        tables
+    }
+
+    fn empty() -> Self {
+        Self {
+            lut: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            wide: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn rebuild(&mut self, x: &[f32], level: impl Fn(usize, f32) -> f32) {
         let groups = x.len() / 4;
-        let mut lut = vec![0u8; groups * 16];
+        self.lut.resize(groups * 16, 0);
+        let lut = &mut self.lut;
         // Entry `n` of a group's table is the sum of the coordinates whose bit is set in `n`,
         // added in bit order (lanes of one vector, with no dependency between entries).
         const BIT: [[f32; 16]; 4] = {
@@ -271,9 +326,10 @@ impl Tables {
             }
         }
         #[cfg(target_arch = "x86_64")]
-        let wide = {
+        {
             let padded = x.len();
-            let mut wide = vec![0u8; padded / 16 * 128];
+            self.wide.resize(padded / 16 * 128, 0);
+            let wide = &mut self.wide;
             for (i, out) in wide.as_chunks_mut::<128>().0.iter_mut().enumerate() {
                 // Bytes 0..32 of a 64-byte load are chunk 2i (groups 4i, 4i+1) for 32 rows, and
                 // bytes 32..64 chunk 2i+1 (groups 4i+2, 4i+3); a shuffle stays in 16-byte lanes.
@@ -288,12 +344,6 @@ impl Tables {
                     out[64 + lane * 16..64 + lane * 16 + 16].copy_from_slice(table(hi));
                 }
             }
-            wide
-        };
-        Self {
-            lut,
-            #[cfg(target_arch = "x86_64")]
-            wide,
         }
     }
 
