@@ -393,3 +393,8 @@ batches as they arrive, and overlap a bounded vector and document prefetch with
 the remaining scan. The probe set and final rerank bound are unchanged. Resident
 queries, filtered queries, busy processes, cache-bypass reads, and searches sharing
 a plan across tiers keep the per-slab path.
+
+A hot compiled ANN tier retains every validated exact vector when its full code,
+metadata, and vector reservation fits the decoded-cache budget. Larger tiers keep
+a bounded sparse vector cache. Admission only retains rows already read by normal
+queries; it never fetches the full tier eagerly.

@@ -27,7 +27,7 @@ thread_local! {
 }
 impl WarmTier {
     /// A first query uses only the normal cold path. A second query can reserve a compiled
-    /// view if its complete code working set and sparse-vector cache fit the decoded budget.
+    /// view if its complete code working set and exact-vector cache fit the decoded budget.
     pub fn for_tier(key: &str, directory: Arc<Directory>) -> Option<Arc<Self>> {
         if let Some(warm) = read_cache::get::<Self>(key, 0) {
             return Some(warm);
@@ -49,8 +49,28 @@ impl WarmTier {
         // normal reader. A compiled view always describes the complete immutable tier.
         let listed: usize = directory.entries().iter().map(|e| e.rows as usize).sum();
         let total: usize = directory.segment_totals().iter().map(|(n, _)| n).sum();
-        let vector_budget = CompiledTier::code_bytes(&directory);
-        let reservation = CompiledTier::reservation(&directory).saturating_add(vector_budget);
+        let code_reservation = CompiledTier::reservation(&directory);
+        // ValidatedVector::resident_bytes charges its payload, descriptor, and 128 bytes
+        // per cache entry. Physical vector ranges conservatively cover every row payload.
+        let all_vectors = directory.entries().iter().fold(0u64, |bytes, entry| {
+            let range = entry.vectors_range();
+            bytes
+                .saturating_add(range.end - range.start)
+                .saturating_add(
+                    u64::from(entry.rows)
+                        .saturating_mul((std::mem::size_of::<ValidatedVector>() + 128) as u64),
+                )
+        });
+        // A code-sized sparse cache can thrash even on a fully memory-resident small
+        // namespace. Retain every validated row when the entire tier fits the budget;
+        // large tiers keep the bounded sparse policy and ordinary miss fallback.
+        let vector_budget =
+            if code_reservation.saturating_add(all_vectors) <= read_cache::capacity() {
+                all_vectors.max(CompiledTier::code_bytes(&directory))
+            } else {
+                CompiledTier::code_bytes(&directory)
+            };
+        let reservation = code_reservation.saturating_add(vector_budget);
         if listed != total || total <= 2048 || reservation > read_cache::capacity() {
             seen.0.store(2, Ordering::Relaxed);
             return None;
@@ -232,6 +252,27 @@ mod tests {
         assert!(
             compiled.hits.load(Ordering::Relaxed) > 0,
             "exercise the real compiled branch"
+        );
+        // A varied small working set must stay compiled when all exact rows fit. A
+        // code-sized vector cache loses these rows between queries, despite ample budget.
+        // Keep zero-vector/all-tie queries in the correctness checks above: their
+        // deliberately oversized winner set uses the ordinary path, even when resident.
+        let requests: Vec<_> = (1..=32).map(|i| request(i * 193 % 6000)).collect();
+        for body in &requests {
+            assert_eq!(
+                query(&warm, body.clone()).await,
+                query(&normal, body.clone()).await
+            );
+        }
+        compiled.vectors.run_pending_tasks();
+        let before = compiled.hits.load(Ordering::Relaxed);
+        for body in requests {
+            query(&warm, body).await;
+        }
+        assert_eq!(
+            compiled.hits.load(Ordering::Relaxed) - before,
+            32,
+            "a resident exact working set must not fall back after warming"
         );
         // A concurrent reader cannot return an old speculative result over an unindexed write.
         writer.write("compiled", serde_json::from_value::<WriteRequest>(json!({
