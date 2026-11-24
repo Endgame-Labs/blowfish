@@ -1,6 +1,7 @@
 //! Paired D4 object-store measurements. All configuration and output paths are supplied by the caller.
 //! Usage: d4 STORAGE_JSON MODE OUTPUT [WORKLOAD_JSON] [QUERY_INDEX].
-//! Modes: index, recluster, gc, measure, short (64 queries), first (one fresh-process query),
+//! Modes: flush (checkpoint the overlay without compaction), index (retire a fully flushed snapshot), recluster, gc,
+//! measure, short (64 queries), first (one fresh-process query),
 //! warm (2,000-query prewarm, then serial and concurrent queries), and quality (rows only).
 use bf_engine::{Engine, EngineConfig, QueryDiagnostics, ReclusterOptions};
 use bf_storage::{Storage, StorageConfig};
@@ -83,7 +84,7 @@ fn counters(command: &str) -> Result<(), Box<dyn Error>> {
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let mut config: StorageConfig = serde_json::from_slice(&std::fs::read(&args[0])?)?;
-    if !matches!(args[1].as_str(), "index" | "recluster" | "gc") {
+    if !matches!(args[1].as_str(), "flush" | "index" | "recluster" | "gc") {
         // Reader controls must never advance the baseline bucket marker.
         config.read_only = true;
     }
@@ -95,10 +96,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tuning.retention = Duration::from_secs(seconds.parse()?);
     }
     tuning.indexing = false;
-    if matches!(args[1].as_str(), "index" | "recluster" | "gc") {
+    if matches!(args[1].as_str(), "flush" | "index" | "recluster" | "gc") {
         tuning.retention = Duration::ZERO;
     }
     tuning.recall_sample_rate = 0.0;
+    if args[1] == "flush" {
+        // Keep this fixture's existing segment geometry while checkpointing its final overlay.
+        // A high row floor, unlimited byte cap, and unreachable group count disable compaction.
+        tuning.max_segment_rows = u32::MAX as usize;
+        tuning.max_segment_bytes = u64::MAX;
+        tuning.compaction_segments = usize::MAX;
+    }
     if args[1] == "index" {
         // Isolate the retirement publication from compaction in the paired snapshot.
         tuning.max_segment_bytes = 1;
@@ -116,8 +124,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
     let t0 = Instant::now();
     match args[1].as_str() {
-        "index" => {
+        "flush" | "index" => {
             for _ in 0..100 {
+                if args[1] == "index" {
+                    let wal = bf_wal::Wal::new(store.clone(), "nq")?;
+                    let through = wal
+                        .latest_manifest()
+                        .await?
+                        .map_or(0, |(_, m)| m.indexed_through);
+                    if wal.head().await? > through {
+                        return Err("retirement index mode requires a fully flushed snapshot; run flush first".into());
+                    }
+                }
                 if !engine.index_namespace("nq", true).await? {
                     break;
                 }

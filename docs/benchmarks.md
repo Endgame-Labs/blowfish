@@ -7899,6 +7899,11 @@ Use separate `CARGO_TARGET_DIR` directories when building the two source archive
 reuse an executable from the other archive. The measurement harness records its compiled manifest
 and bucket versions, and verifies that the older executable refuses the candidate before timing it.
 The harness is `crates/bf-engine/examples/d4.rs`; the data loader is `bench/nq/load.py --vectors-only`.
+Its `flush` mode checkpoints the remaining WAL overlay without compaction. Retirement-only `index`
+mode requires an already checkpointed snapshot and rejects a pending tail: its one-byte segment
+cap exists solely to prevent compaction while retiring references. Using that cap with an unindexed
+tail would build one-row segments. This was caught during preparation of the added filter fixture;
+those attempted objects are excluded from all timing samples and collected before the paired copy.
 
 ### Original paired matrix, before the shared cache pool
 
