@@ -120,7 +120,7 @@ def run(a):
         try:
             for process in processes:
                 process.start()
-            if a.pid and not a.no_perf:
+            if (a.pid or a.perf_cpus) and not a.no_perf:
                 perf = subprocess.Popen(
                     [
                         "sudo",
@@ -129,8 +129,7 @@ def run(a):
                         "-x,",
                         "-e",
                         a.perf_events,
-                        "-p",
-                        str(a.pid),
+                        *(["-C", a.perf_cpus] if a.perf_cpus else ["-p", str(a.pid)]),
                         "-o",
                         str(a.out.with_suffix(f".{rep}.perf")),
                     ],
@@ -236,9 +235,14 @@ if __name__ == "__main__":
         "--perf-events", default="instructions,cycles,context-switches,cpu-migrations"
     )
     p.add_argument("--pid", type=int)
-    p.add_argument(
+    counting = p.add_mutually_exclusive_group()
+    counting.add_argument(
         "--no-perf", action="store_true",
         help="record process CPU from --pid without attaching PMU counters",
+    )
+    counting.add_argument(
+        "--perf-cpus",
+        help="collect CPU-wide counters on these exclusive server CPUs, avoiding per-task PMU switching",
     )
     p.add_argument("--repeats", type=int, default=4)
     p.add_argument("--cold", action="store_true")
