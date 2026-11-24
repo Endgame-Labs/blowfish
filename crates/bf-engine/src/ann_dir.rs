@@ -1096,8 +1096,8 @@ type Real<'a> = (
     &'a [bf_wal::SlabCover],
     &'a crate::lineage::Placement,
 );
-/// Streaming pays for itself on large cold slab searches; small and resident searches keep
-/// the per-slab path.
+/// Large slab searches can amortize parallel read and scan planning; small and busy
+/// workloads retain their per-slab path.
 fn stream_scan(dir: &Directory, layout: Layout) -> bool {
     crate::fan_out()
         && read_cache::admitting()
@@ -1379,25 +1379,25 @@ pub(crate) async fn search(
     // that have not run yet. Read planning stays concurrent; busy warm queries scan on their own
     // thread.
     let scan_upper = Arc::new(std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()));
-    // Sample a selected code range per slab. This costs no I/O, and keeps resident
-    // workloads on the existing per-slab scan rather than creating many small tasks.
+    // Native mappings are resident even when the block cache has no retention budget.
+    // Otherwise, sample a selected code range per slab without starting I/O.
+    let parallel_slab_scan = stream_scan(&dir, layout) && !filtered && joint.is_none();
+    let resident = parallel_slab_scan
+        && (store.has_mapped_reads()
+            || chosen.iter().all(|(&i, cs)| {
+                let seg = &dir.segments()[i];
+                let Some(file) = state.segments[i].files.values().find(|f| f.key == seg.key) else {
+                    return false;
+                };
+                let Ok(reader) = store.range_reader_with_length(&file.key, file.size, true) else {
+                    return false;
+                };
+                cs.first()
+                    .is_none_or(|&n| reader.is_memory_resident(entries[n].codes_range()))
+            }));
     // Streaming seeds the raw cache before its scan readers start. With no retention budget,
     // completed seed reads are discarded, and fast backends fetch them again for the scans.
-    let streaming = store.cache_limits().0 > 0
-        && stream_scan(&dir, layout)
-        && !filtered
-        && joint.is_none()
-        && chosen.iter().any(|(&i, cs)| {
-            let seg = &dir.segments()[i];
-            let Some(file) = state.segments[i].files.values().find(|f| f.key == seg.key) else {
-                return true;
-            };
-            let Ok(reader) = store.range_reader_with_length(&file.key, file.size, true) else {
-                return true;
-            };
-            cs.first()
-                .is_some_and(|&n| !reader.is_memory_resident(entries[n].codes_range()))
-        });
+    let streaming = store.cache_limits().0 > 0 && parallel_slab_scan && !resident;
     let mut bulk = tokio::task::JoinSet::new();
     if streaming {
         let mut order: Vec<_> = chosen
@@ -1441,6 +1441,24 @@ pub(crate) async fn search(
             let _ = ready.await;
         }
     }
+    // A query may put most of its probed rows in one coarse slab. Bound resident CPU
+    // batches by the query's work and available share of workers, so that slab can use
+    // idle workers without repeating a lone query's fine-grained plan under concurrency.
+    // Busy resident queries retain their per-slab scan; streamed reads retain small batches.
+    let resident_batch_rows = (resident && crate::fan_out()).then(|| {
+        let rows: usize = chosen
+            .values()
+            .flatten()
+            .map(|&n| entries[n].rows as usize)
+            .sum();
+        let queries = crate::QUERIES_IN_FLIGHT
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
+        let workers = config.search_concurrency.max(1).div_ceil(queries);
+        let row_bytes = dir.dims().next_power_of_two() / 8 + 16;
+        rows.div_ceil(workers.saturating_mul(2))
+            .max((512 * 1024 / row_bytes).max(1))
+    });
     let mut batches = Vec::new();
     for (&i, cs) in &chosen {
         if streaming && !exact_segments.contains(&i) {
@@ -1448,6 +1466,22 @@ pub(crate) async fn search(
             ranked.sort_unstable_by(|&a, &b| distances[a].total_cmp(&distances[b]));
             for chunk in ranked.chunks(4) {
                 batches.push((i, chunk.to_vec()));
+            }
+        } else if let Some(max_rows) = resident_batch_rows
+            && !exact_segments.contains(&i)
+        {
+            let (mut start, mut rows) = (0, 0);
+            for (end, &n) in cs.iter().enumerate() {
+                let next = entries[n].rows as usize;
+                if end > start && rows + next > max_rows {
+                    batches.push((i, cs[start..end].to_vec()));
+                    start = end;
+                    rows = 0;
+                }
+                rows += next;
+            }
+            if start < cs.len() {
+                batches.push((i, cs[start..].to_vec()));
             }
         } else {
             batches.push((i, cs.clone()));
