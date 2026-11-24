@@ -142,6 +142,7 @@ mod tests {
         for seg in &state.segments {
             store.delete(&seg.files["docs"].key).await.unwrap();
         }
+        store.drop_caches();
         for budget in [0, 1 << 24] {
             let context =
                 read_cache::ReadContext::new(Arc::new(read_cache::DecodedCache::new(budget, 2)));
