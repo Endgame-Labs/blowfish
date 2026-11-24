@@ -700,7 +700,7 @@ struct SearchTerm {
     prefix: bool,
     postings: Vec<Option<Postings>>,
     spans: Vec<Range<usize>>,
-    bounds: Vec<f64>,
+    bounds: crate::scratch::Windows,
     small: bool,
 }
 
@@ -712,7 +712,7 @@ impl SearchTerm {
             prefix,
             postings: Vec::new(),
             spans: Vec::new(),
-            bounds: Vec::new(),
+            bounds: Default::default(),
             small: false,
         }
     }
@@ -2067,8 +2067,7 @@ impl SegmentReader {
         if terms.iter().all(|term| term.small) {
             // Every posting is already available. Accumulate once in reference
             // order instead of building window bounds and scoring those rows again.
-            let mut scores = vec![0.0f32; self.docs as usize];
-            let mut touched = Vec::new();
+            let mut scores = crate::scratch::Rows::take(self.docs as usize);
             for term in &terms {
                 for postings in term.postings.iter().flatten() {
                     for &(row, tf) in postings.iter() {
@@ -2081,16 +2080,13 @@ impl SegmentReader {
                         if score <= 0.0 {
                             continue;
                         }
-                        if scores[row as usize] == 0.0 {
-                            touched.push(row);
-                        }
-                        scores[row as usize] += score;
+                        scores.add(row, score);
                     }
                 }
             }
-            metrics.rows_scored = touched.len();
+            metrics.rows_scored = scores.touched().len();
             let floor = search_floor(&heap, k, threshold);
-            for row in touched {
+            for &row in scores.touched() {
                 if floor.is_some_and(|floor| f64::from(scores[row as usize]) < floor) {
                     continue;
                 }
@@ -2111,75 +2107,94 @@ impl SegmentReader {
             hits.sort_unstable_by(|a, b| b.cmp(a));
             return Ok((hits, metrics));
         }
-        let mut row_bounds = if terms.iter().any(|term| term.small) {
-            vec![0.0f32; self.docs as usize]
+        let mut row_bounds = crate::scratch::Rows::take(if terms.iter().any(|term| term.small) {
+            self.docs as usize
         } else {
-            Vec::new()
-        };
+            0
+        });
         for term in &mut terms {
             term.cache_windows(cached_windows);
         }
-        {
-            let mut maxima = saturation.maxima.lock().unwrap();
-            for term in &mut terms {
-                let mut best = vec![0.0f64; windows];
-                if term.small {
-                    for postings in term.postings.iter().flatten() {
-                        for &(row, tf) in postings.iter() {
-                            let score =
-                                term.weight
-                                    .score_cached(tf, lengths[row as usize], &saturation);
-                            row_bounds[row as usize] += score;
-                            best[row as usize / BLOCK] =
-                                best[row as usize / BLOCK].max(f64::from(score));
+        for term in &mut terms {
+            let mut best = crate::scratch::Windows::take(windows);
+            if term.small {
+                for postings in term.postings.iter().flatten() {
+                    for &(row, tf) in postings.iter() {
+                        let score =
+                            term.weight
+                                .score_cached(tf, lengths[row as usize], &saturation);
+                        row_bounds.add(row, score);
+                        best[row as usize / BLOCK] =
+                            best[row as usize / BLOCK].max(f64::from(score));
+                    }
+                }
+            } else {
+                let key = term.meta.blocks.first().map(|b| b.offset);
+                let mut apply = |normalized: &[f64]| {
+                    for (w, &maximum) in normalized.iter().enumerate() {
+                        if maximum >= 0.0 {
+                            best[w] = f64::from(
+                                term.weight.score_saturation(maximum) * (1.0 + 8.0 * f32::EPSILON),
+                            );
+                            prefix_windows[w] |= term.prefix;
                         }
                     }
-                } else {
-                    let key = term.meta.blocks.first().map(|b| b.offset);
-                    let mut apply = |normalized: &[f64]| {
-                        for (w, &maximum) in normalized.iter().enumerate() {
-                            if maximum >= 0.0 {
-                                best[w] = f64::from(
-                                    term.weight.score_saturation(maximum)
-                                        * (1.0 + 8.0 * f32::EPSILON),
-                                );
-                                prefix_windows[w] |= term.prefix;
-                            }
-                        }
-                    };
-                    if let Some(cached) = key.and_then(|key| maxima.term(key)) {
-                        // Reuse query-independent window maxima while the set of
-                        // decoded frame bounds is unchanged. New frames invalidate
-                        // this summary, allowing their tighter bounds to take effect.
-                        apply(cached);
+                };
+                // Clone immutable cached bounds under a read lock. Sparse
+                // scoring, normalization, and query weights run without it.
+                let (known_frames, cached, frames) = {
+                    let maxima = saturation.maxima.read().unwrap();
+                    let cached = key.and_then(|key| maxima.term(key));
+                    let frames: Vec<_> = if cached.is_none() {
+                        term.meta
+                            .blocks
+                            .iter()
+                            .map(|b| maxima.frames.get(&b.offset).cloned())
+                            .collect()
                     } else {
-                        let mut normalized = vec![-1.0f64; windows];
-                        for b in &term.meta.blocks {
-                            if let Some(windows) = maxima.frames.get(&b.offset) {
-                                for &(w, maximum) in windows {
-                                    normalized[w] = normalized[w].max(maximum);
-                                }
-                            } else {
-                                let maximum = saturation.factor(b.max_tf, b.min_length).max(0.0);
-                                for value in &mut normalized
-                                    [b.first as usize / BLOCK..=b.last as usize / BLOCK]
-                                {
-                                    *value = value.max(maximum);
-                                }
+                        Vec::new()
+                    };
+                    (maxima.frames.len(), cached, frames)
+                };
+                if let Some(cached) = cached {
+                    // Reuse query-independent window maxima while the set of
+                    // decoded frame bounds is unchanged. New frames invalidate
+                    // this summary, allowing their tighter bounds to take effect.
+                    apply(&cached);
+                } else {
+                    let mut normalized = vec![-1.0f64; windows];
+                    for (b, frame) in term.meta.blocks.iter().zip(frames) {
+                        if let Some(windows) = frame {
+                            for &(w, maximum) in windows.iter() {
+                                normalized[w] = normalized[w].max(maximum);
+                            }
+                        } else {
+                            let maximum = saturation.factor(b.max_tf, b.min_length).max(0.0);
+                            for value in
+                                &mut normalized[b.first as usize / BLOCK..=b.last as usize / BLOCK]
+                            {
+                                *value = value.max(maximum);
                             }
                         }
-                        apply(&normalized);
-                        if let Some(key) = key {
-                            maxima.remember_term(key, normalized);
-                        }
                     }
-                    for (bound, &value) in bounds.iter_mut().zip(&best) {
-                        *bound += value;
+                    apply(&normalized);
+                    if let Some(key) = key {
+                        let normalized = normalized.into();
+                        // Publish the generation actually observed, even if
+                        // another query admitted tighter frames in the meantime.
+                        saturation.maxima.write().unwrap().remember_term(
+                            key,
+                            normalized,
+                            known_frames,
+                        );
                     }
                 }
-                if cached_windows > 0 {
-                    term.bounds = best;
+                for (bound, &value) in bounds.iter_mut().zip(best.iter()) {
+                    *bound += value;
                 }
+            }
+            if cached_windows > 0 {
+                term.bounds = best;
             }
         }
         let dense_bounds = bounds.clone();
@@ -2765,6 +2780,68 @@ mod posting_cache_tests {
                 .filter(|cached| cached.dense && cached.recent)
                 .count();
             assert!(probed > 0 && probed < dense / 4, "{probed}/{dense}");
+        });
+    }
+
+    #[test]
+    fn later_queries_rebuild_tighter_bounds_from_decoded_frames() {
+        futures::executor::block_on(async {
+            let params = FtsParams::default();
+            let docs: Vec<_> = (0..16_384)
+                .map(|row| {
+                    if row % 128 == 0 {
+                        let mut tokens = vec![crate::Token::new("common", 0); 16];
+                        tokens.extend(vec![crate::Token::new("filler", 0); 128]);
+                        tokens
+                    } else {
+                        vec![crate::Token::new("common", 0)]
+                    }
+                })
+                .collect();
+            let mut builder = SegmentBuilder::new(false);
+            for doc in &docs {
+                builder.add_document(doc).unwrap();
+            }
+            let reader =
+                SegmentReader::open(Arc::new(MemoryRangeRead::from(builder.finish().unwrap())))
+                    .await
+                    .unwrap();
+            let stats = CorpusStats::from_documents(&docs);
+            let saturation = reader.saturation(&stats, &params);
+            let id = reader.term("common").await.unwrap().unwrap();
+            let meta = reader.load([id]).await.unwrap().remove(&id).unwrap();
+            let key = meta.blocks[0].offset;
+            let coarse = meta
+                .blocks
+                .iter()
+                .map(|b| saturation.factor(b.max_tf, b.min_length))
+                .fold(0.0, f64::max);
+            let query = Query::new(crate::tokenize("common", &params), false);
+            reader
+                .search_prefetched(&query, &stats, &params, docs.len(), None)
+                .await
+                .unwrap();
+            assert!(
+                saturation.maxima.read().unwrap().term(key).is_none(),
+                "new frame maxima invalidate the original directory-only summary"
+            );
+            let hits = reader
+                .search_prefetched(&query, &stats, &params, 10, None)
+                .await
+                .unwrap();
+            let tightened = saturation.maxima.read().unwrap().term(key).unwrap();
+            assert!(tightened.iter().copied().fold(0.0, f64::max) < coarse);
+            let mut expected: Vec<_> = docs
+                .iter()
+                .enumerate()
+                .map(|(row, doc)| SearchHit {
+                    row: row as u32,
+                    score: crate::score_document(doc, &query, &stats, &params),
+                })
+                .collect();
+            expected.sort_unstable_by(|a, b| b.cmp(a));
+            expected.truncate(10);
+            assert_eq!(hits, expected);
         });
     }
 
