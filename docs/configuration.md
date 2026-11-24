@@ -218,7 +218,7 @@ from 0.906 to 0.958. Reclustering removes the cost: it gets the recall at the ba
 
 | What | Default | Variable |
 | --- | --- | --- |
-| Queries the engine runs at once | 8 | `BF_QUERY_CONCURRENCY` |
+| Queries the engine runs at once | twice the available CPUs, at least 8 | `BF_QUERY_CONCURRENCY` |
 | Segment searches one query runs at once | 8 | `BF_SEARCH_CONCURRENCY` |
 | Queries in flight up to which one query fans its slab work out over the thread pool (more run each query on its own thread) | half the CPUs | `BF_FANOUT_QUERIES` |
 | Least time between two sampled recall comparisons (the first waits this long after startup, and a comparison that took `t` delays the next by at least `50 × t`) | 60,000 ms | `BF_RECALL_SAMPLE_INTERVAL_MS` |

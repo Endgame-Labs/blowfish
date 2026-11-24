@@ -1274,3 +1274,62 @@ async fn maintenance_file_replacements_do_not_download_the_known_wal_tail() {
         "an immutable-file replacement must retain the resident overlay"
     );
 }
+
+/// Controlled strong-read latency gate. Run with `--ignored --nocapture`; the store delays
+/// each WAL HEAD by ten milliseconds, while cached tail rows need no other backend reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "controlled 10 ms HEAD latency benchmark"]
+async fn strong_head_latency_benchmark() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable, config());
+    writer
+        .write(
+            "head-latency",
+            serde_json::from_value(json!({
+                "upsert_rows":[{"id":1,"n":7}],
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let reader = Engine::with_config(store(backend.clone()).await, config());
+    let request: bf_types::QueryRequest = serde_json::from_value(json!({
+        "rank_by":["id","asc"],"top_k":1,"include_attributes":true,
+    }))
+    .unwrap();
+    reader.query("head-latency", request.clone()).await.unwrap();
+    backend.delay.store(true, Ordering::SeqCst);
+    let barrier = Arc::new(tokio::sync::Barrier::new(17));
+    let runs = (0..16)
+        .map(|_| {
+            let (reader, request, barrier) = (reader.clone(), request.clone(), barrier.clone());
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let mut times = Vec::new();
+                for _ in 0..64 {
+                    let start = std::time::Instant::now();
+                    let result = reader.query("head-latency", request.clone()).await.unwrap();
+                    times.push(start.elapsed().as_secs_f64() * 1000.);
+                    assert_eq!(result.result.rows.unwrap()[0]["n"], 7);
+                }
+                times
+            })
+        })
+        .collect::<Vec<_>>();
+    let start = std::time::Instant::now();
+    barrier.wait().await;
+    let mut times = Vec::new();
+    for run in runs {
+        times.extend(run.await.unwrap());
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    times.sort_by(f64::total_cmp);
+    println!(
+        "{}",
+        json!({"clients":16,"queries":times.len(),"head_delay_ms":10,
+        "qps":times.len() as f64/elapsed,"p50":times[times.len()/2],"p90":times[times.len()*9/10]})
+    );
+}

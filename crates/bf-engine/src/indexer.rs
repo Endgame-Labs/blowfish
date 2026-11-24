@@ -14,7 +14,7 @@ pub struct EngineConfig {
     pub decoded_cache_bytes: u64,
     /// Maximum concurrent segment scoring tasks across all queries on this engine.
     pub search_concurrency: usize,
-    /// Maximum concurrent query drivers; each runs outside the Tokio reactor.
+    /// Maximum admitted query drivers, including plans waiting on I/O or a CPU worker.
     pub query_concurrency: usize,
     /// Disable indexing to keep a WAL-only differential reference node.
     pub indexing: bool,
@@ -113,7 +113,10 @@ impl Default for EngineConfig {
         Self {
             decoded_cache_bytes: default_decoded_cache_bytes(),
             search_concurrency: 8,
-            query_concurrency: 8,
+            // Queue another core's worth of work while drivers await I/O or HTTP progress.
+            // Keep the existing minimum: one permit per core reduced four-core throughput.
+            query_concurrency: std::thread::available_parallelism()
+                .map_or(8, |n| n.get().saturating_mul(2).max(8)),
             indexing: true,
             index_rows: 1000,
             index_bytes: 8 * 1024 * 1024,

@@ -30,6 +30,7 @@ pub use reindex::{LayoutCounts, ReindexOptions, ReindexReport};
 mod metadata;
 mod models;
 mod query;
+mod query_worker;
 mod recluster;
 mod reindex;
 mod text;
@@ -803,20 +804,23 @@ impl Engine {
             if let Some(cached) = cached {
                 let ((snapshot, elapsed), searched) = tokio::join!(
                     snapshot,
-                    self.search_snapshot(&cached, &request, context.clone())
+                    self.search_snapshot(&cached, &request, context.clone(), true)
                 );
                 let (state, _) = snapshot?;
                 let (response, execution) =
                     if state.seq == cached.seq && state.manifest_seq == cached.manifest_seq {
                         searched?
                     } else {
-                        self.search_snapshot(&state, &request, context).await?
+                        self.search_snapshot(&state, &request, context, true)
+                            .await?
                     };
                 (state, response, execution, elapsed)
             } else {
                 let (snapshot, elapsed) = snapshot.await;
-                let (state, _) = snapshot?;
-                let (response, execution) = self.search_snapshot(&state, &request, context).await?;
+                let (state, warm) = snapshot?;
+                let (response, execution) = self
+                    .search_snapshot(&state, &request, context, warm)
+                    .await?;
                 (state, response, execution, elapsed)
             };
         if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
@@ -903,6 +907,7 @@ impl Engine {
         state: &NamespaceState,
         request: &QueryRequest,
         context: read_cache::ReadContext,
+        warm: bool,
     ) -> Result<(QueryResponse, std::time::Duration), ApiError> {
         let start = Instant::now();
         let store = self.0.store.clone();
@@ -913,7 +918,6 @@ impl Engine {
             eprintln!("CLONE {}us", t_clone.elapsed().as_micros());
         }
         let request = request.clone();
-        let runtime = tokio::runtime::Handle::current();
         let permit = self
             .0
             .queries
@@ -921,16 +925,21 @@ impl Engine {
             .acquire_owned()
             .await
             .map_err(segment::index_error)?;
-        let response = tokio::task::spawn_blocking(move || {
+        let query = async move {
             let _permit = permit;
             let _in_flight = InFlight::enter();
-            runtime.block_on(read_cache::scope(
+            read_cache::scope(
                 context,
                 indexed::execute(&store, &state, &request, &config, false),
-            ))
-        })
-        .await
-        .map_err(segment::index_error)??;
+            )
+            .await
+        };
+        let response = if warm {
+            query_worker::run(query).await??
+        } else {
+            metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "cold").increment(1);
+            query_worker::run_io(tokio::runtime::Handle::current(), query).await??
+        };
         Ok((response, start.elapsed()))
     }
     /// Run the exhaustive reference evaluator on the same persistent snapshot machinery.

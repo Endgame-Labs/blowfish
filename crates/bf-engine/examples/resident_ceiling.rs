@@ -146,10 +146,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap();
                 }
                 let mut ids = vec![Vec::with_capacity(10); queries.len()];
-                let counter = Counter::open().expect("instructions counter unavailable");
+                let counter = Counter::open(1).expect("instructions counter unavailable");
+                let cycles = Counter::open(0).expect("cycle counter unavailable");
                 barrier.wait();
                 let tick = Instant::now();
                 counter.start();
+                cycles.start();
                 let mut count = 0;
                 for _ in 0..repeats {
                     for i in (thread..queries.len()).step_by(threads) {
@@ -162,8 +164,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                         count += 1;
                     }
                 }
+                let cycles = cycles.stop();
                 let instructions = counter.stop();
-                (count, instructions, tick.elapsed().as_secs_f64(), ids)
+                (
+                    count,
+                    instructions,
+                    tick.elapsed().as_secs_f64(),
+                    ids,
+                    cycles,
+                )
             }));
         }
         handles
@@ -173,6 +182,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
     let count: usize = results.iter().map(|r| r.0).sum();
     let instructions: u64 = results.iter().map(|r| r.1).sum();
+    let cycles: u64 = results.iter().map(|r| r.4).sum();
     let seconds = results.iter().map(|r| r.2).fold(0., f64::max);
     if let Some(path) = tier_ids {
         let mut ids = vec![Vec::new(); queries.len()];
@@ -191,7 +201,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "{}",
-        serde_json::json!({"queries":count, "threads":threads, "probes":probes, "seconds":seconds, "qps":count as f64/seconds, "instructions_per_query":instructions as f64/count as f64, "resident_bytes":resident_bytes, "startup_and_warm_seconds":all_started.elapsed().as_secs_f64()-seconds, "peak_rss_bytes":rss("VmHWM:"), "rss_bytes":rss("VmRSS:")})
+        serde_json::json!({"queries":count, "threads":threads, "probes":probes, "seconds":seconds, "qps":count as f64/seconds, "instructions_per_query":instructions as f64/count as f64, "cycles_per_query":cycles as f64/count as f64, "resident_bytes":resident_bytes, "startup_and_warm_seconds":all_started.elapsed().as_secs_f64()-seconds, "peak_rss_bytes":rss("VmHWM:"), "rss_bytes":rss("VmRSS:")})
     );
     Ok(())
 }
@@ -212,12 +222,12 @@ fn rss(field: &str) -> Option<u64> {
 struct Counter(File);
 #[cfg(target_os = "linux")]
 impl Counter {
-    fn open() -> std::io::Result<Self> {
+    fn open(event: u64) -> std::io::Result<Self> {
         use std::os::fd::FromRawFd;
-        // perf_event_attr v0 (64 bytes): hardware instructions, user space only, disabled.
+        // perf_event_attr v0 (64 bytes): hardware event, user space only, disabled.
         let mut attr = [0u64; 8];
         attr[0] = 64u64 << 32;
-        attr[1] = 1;
+        attr[1] = event;
         attr[5] = 1 | (1 << 5) | (1 << 6);
         // SAFETY: valid attr pointer, this thread, no CPU affinity, and no group.
         let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
@@ -250,10 +260,8 @@ impl Counter {
 struct Counter;
 #[cfg(not(target_os = "linux"))]
 impl Counter {
-    fn open() -> std::io::Result<Self> {
-        Err(std::io::Error::other(
-            "instruction counts require Linux perf",
-        ))
+    fn open(_event: u64) -> std::io::Result<Self> {
+        Err(std::io::Error::other("hardware counts require Linux perf"))
     }
     fn start(&self) {}
     fn stop(self) -> u64 {
