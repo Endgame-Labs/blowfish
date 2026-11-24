@@ -1,9 +1,10 @@
 # Disposable row graphs for hot recluster tiers (Round G3)
 
-Status: measured query-path experiment, behind `experimental-hot-graph`. This is a proposal for
-SPEC 27's hot tier, reopening decision 26 only for an expendable RAM accelerator. The bucket's
-IVF representation, manifest, recovery path, and cold query plan stay authoritative. No stored
-format or default server behavior changes in this experiment.
+Status: measured query-path experiment behind `experimental-hot-graph`. The current implementation
+fails the end-to-end Qdrant gate. This is a proposal for SPEC 27's hot tier, reopening decision 26
+only for an expendable RAM accelerator. The bucket's IVF representation, manifest, recovery path,
+and cold query plan stay authoritative. No stored format or default server behavior changes.
+
 
 ## Why rows, rather than leaf centers
 
@@ -121,3 +122,57 @@ API additions. `prepare_hot_graph_nq` creates a fresh fixture through writes, in
 The integration test covers low-budget refusal, source extraction, node mapping, graph use, live
 masks, WAL deletes, WAL upserts, uncovered indexed segments, multiple recluster tiers, filtered
 fallback, and zero-query fallback. Vector tests cover invalid input and masked exact rerank.
+
+
+## Bounded construction result
+
+The G3 example now implements partition-and-stitch Vamana with R=32, L=64, and two pruning passes.
+It streams codes, keeps one partition resident, and spills global adjacency. At about 47% overlap,
+full NQ construction including SQ8 took 350 s and 0.887 GiB peak RSS on 32 Graviton3 cores. This
+solves the monolithic builder's memory peak in the experiment, while missing the proposed 70 s
+build target. At 23.65% overlap, recall is more than 0.01 below monolithic HNSW at comparable work;
+higher overlap recovers the curve. Four medoid entry points offer little further improvement.
+This is an experimental original builder, with warm local input and substantial local spill, rather
+than a production S3 background builder. Promotion must account for build CPU amortization and spill
+capacity, as well as resident memory. No bounded on-M4 construction or shipped-path win is claimed.
+
+The final paired M4 result is 5,472 versus Qdrant's 8,502 q/s near recall 0.95, and 5,136 versus
+6,976 near 0.961. The search core remains promising, but the current prototype should stay disabled
+while shared engine overhead and the automatic lifecycle are addressed.
+
+
+## Concrete shipping sequence
+
+1. Build from immutable tier data after installation, using size-capped spatial partitions,
+   two-pass R32/L64 Vamana, approximately 46.5% boundary overlap on this NQ layout, and streamed
+   SQ8 encoding. Spill adjacency and codes until construction ends, then load the resident graph.
+   Bound and subdivide oversized partitions; the measured NQ peak does not establish a 100M bound.
+   Run at low priority, with one builder and at most two background CPU workers while serving.
+   The 350 s measurement used all 32 cores; background completion time must be measured separately.
+2. Promote only after ten minutes of sustained eligible query heat, when a 15-minute EWMA forecasts
+   at least twice the measured construction CPU saving over the next 24 hours. Estimate savings
+   from sampled namespace IVF and graph CPU, rather than transferring NQ constants to other data.
+   These are proposed internal policy thresholds, with no new user-facing algorithm knobs.
+3. Reserve the maximum of construction and load-phase memory, plus the existing foreground working
+   set and a 20% process headroom allowance. Account for codes, compact links, source metadata,
+   row maps, allocator overhead, and visited bytes per query worker. Refuse admission when it cannot
+   fit. The current NQ prototype's useful warm regime is about 5.2 GiB process RSS; a 4 GiB host
+   therefore stays on IVF. Total charged memory, including local file cache, needs a cgroup gate.
+4. Own graphs per engine and backend, keyed by namespace generation, attribute, and immutable tier
+   identity. Small writes keep using the same graph with current masks and WAL shadowing. Indexed
+   deltas keep their existing plan and merge normally. Recluster replacement invalidates the old
+   key; namespace deletion cancels construction and evicts immediately. Recheck identity before
+   publication. Rebuild or fall back when more than 10% of source rows are masked, pending a measured
+   mask-recall calibration. Evict a whole graph after 30 idle minutes, or for a higher-benefit tier.
+5. Select query effort through the existing recall monitoring policy, with conservative per-namespace
+   calibration. Fixed NQ ef104/160 values are experiment controls, not shipping defaults. Keep filters,
+   unsupported metrics and precision, oversized top-k, and insufficient live candidates on IVF.
+6. Enable this only after Q2 reduces shared query overhead and a bounded constructor runs on the
+   target host, followed by the same matched-recall HTTP gate. Add optional persistence only after
+   a separate format review; no new `.bfa` section or manifest reference is justified by this study.
+
+Still missing are a production bounded builder and its foreground interference measurements,
+subpartitioning for skew and 100M tiers, compact adjacency, process-wide reservations tied to
+engine ownership, heat admission, cancellation and eviction, mask-recall calibration, and a real
+on-M4 bounded-build comparison. Bulk reads bypass the foreground cache in the prototype, while
+rerank metadata opens use its existing reader; production construction must isolate those too.

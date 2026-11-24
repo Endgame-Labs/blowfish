@@ -90,7 +90,8 @@ pub(crate) fn available(key: &str) -> bool {
 impl Engine {
     /// Build the first recluster tier's RAM accelerator, without publishing any stored object.
     ///
-    /// Reads bypass the block cache. Unsupported metrics, precision, insufficient budget, and
+    /// Bulk source reads bypass the block cache; exact-rerank metadata uses the existing reader.
+    /// Unsupported metrics, precision, insufficient budget, and
     /// a missing tier return `None`, leaving the ordinary query plan available throughout.
     /// This prototype admits one graph per process, rather than implementing an automatic LRU.
     pub async fn build_hot_graph(

@@ -37,7 +37,6 @@ mod format {
 use data::{Matrix, Result as AnyResult, Vectors};
 use graph::{Graph, Search};
 use half::f16;
-use rayon::prelude::*;
 use std::{path::Path, sync::Arc, time::Instant};
 fn main() -> AnyResult<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -102,24 +101,21 @@ fn main() -> AnyResult<()> {
         let repeats = args.get(6).map(|s| s.parse()).transpose()?.unwrap_or(1);
         let rerank = args.get(7).map(|s| s.parse()).transpose()?.unwrap_or(80);
         let region = measure::Region::begin();
-        let results: Vec<_> = (0..queries.len() * repeats)
-            .into_par_iter()
-            .with_min_len((queries.len() * repeats).div_ceil(rayon::current_num_threads()))
-            .map_init(
-                || packet::PacketSearch::new(packets.len()),
-                |s, i| {
-                    let q = data::normalized(&queries[i % queries.len()]);
-                    let (h, p, r) = packets.search(&g, &v, &q, ef, rerank, s);
-                    (
-                        h.iter()
-                            .filter(|h| truth[i % truth.len()].contains(&h.id))
-                            .count(),
-                        p,
-                        r,
-                    )
-                },
-            )
-            .collect();
+        let results = measure::parallel(
+            queries.len() * repeats,
+            || packet::PacketSearch::new(packets.len()),
+            |s, i| {
+                let q = data::normalized(&queries[i % queries.len()]);
+                let (h, p, r) = packets.search(&g, &v, &q, ef, rerank, s);
+                (
+                    h.iter()
+                        .filter(|h| truth[i % truth.len()].contains(&h.id))
+                        .count(),
+                    p,
+                    r,
+                )
+            },
+        );
         let seconds = region.end();
         let n = results.len() as f64;
         println!(
@@ -139,9 +135,10 @@ fn main() -> AnyResult<()> {
         let probes = args.get(5).map(|s| s.parse()).transpose()?.unwrap_or(48);
         let repeats = args.get(6).map(|s| s.parse()).transpose()?.unwrap_or(1);
         let region = measure::Region::begin();
-        let results: Vec<_> = (0..queries.len() * repeats)
-            .into_par_iter()
-            .map(|i| {
+        let results = measure::parallel(
+            queries.len() * repeats,
+            || (),
+            |_, i| {
                 let q = data::normalized(&queries[i % queries.len()]);
                 let (hits, rows, rerank) = index.search(&v, &q, probes);
                 let got = hits
@@ -149,8 +146,8 @@ fn main() -> AnyResult<()> {
                     .filter(|h| truth[i % truth.len()].contains(&h.id))
                     .count();
                 (got, rows, rerank)
-            })
-            .collect();
+            },
+        );
         let seconds = region.end();
         let n = results.len() as f64;
         println!(
@@ -163,7 +160,7 @@ fn main() -> AnyResult<()> {
             rayon::current_num_threads(),
             data::rss_kib()
         );
-    } else if args[1] == "search" || args[1] == "search8" {
+    } else if matches!(args[1].as_str(), "search" | "search8" | "search8-seeds") {
         let g = Graph::read(Path::new(&args[3]))?;
         if g.levels.len() != v.len() {
             return Err("graph/corpus mismatch".into());
@@ -172,7 +169,7 @@ fn main() -> AnyResult<()> {
         let truth = Matrix::load(&dir.join("truth.npy"), "<i4", 4, usize::MAX)?.truth();
         let ef = args.get(5).map(|s| s.parse()).transpose()?.unwrap_or(64);
         let repeats = args.get(6).map(|s| s.parse()).transpose()?.unwrap_or(1);
-        let codes = if args[1] == "search8" {
+        let codes = if args[1] != "search" {
             Some(quant::Codes::read(Path::new(&format!(
                 "{}.codes8",
                 args[3]
@@ -186,37 +183,56 @@ fn main() -> AnyResult<()> {
             .transpose()?
             .unwrap_or(50usize);
         let region = measure::Region::begin();
-        let results: Vec<_> = (0..queries.len() * repeats)
-            .into_par_iter()
-            .with_min_len((queries.len() * repeats).div_ceil(rayon::current_num_threads()))
-            .map_init(
-                || Search::new(v.len()),
-                |s, i| {
-                    let q = data::normalized(&queries[i % queries.len()]);
-                    let half: Vec<_> = q.iter().map(|x| f16::from_f32(*x)).collect();
-                    let (mut hits, count) = if let Some(c) = &codes {
-                        let (q8, scale) = c.prepare(&q);
-                        let (mut h, n) = g.search(ef, s, |id| c.score(&q8, scale, id));
-                        h.truncate(rerank);
-                        for x in &mut h {
-                            x.distance = v.rerank(&q, x.id);
-                        }
-                        h.sort_unstable();
-                        (h, n)
+        let results = measure::parallel(
+            queries.len() * repeats,
+            || Search::new(v.len()),
+            |s, i| {
+                let q = data::normalized(&queries[i % queries.len()]);
+                let (mut hits, count) = if let Some(c) = &codes {
+                    let (q8, scale) = c.prepare(&q);
+                    let (mut h, n) = if args[1] == "search8-seeds" {
+                        let upper = g.levels[g.entry as usize]
+                            .get(1)
+                            .expect("stitched medoid layer");
+                        let mut seeds = upper
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(g.entry))
+                            .map(|id| graph::Hit {
+                                id,
+                                distance: c.score(&q8, scale, id),
+                            })
+                            .collect::<Vec<_>>();
+                        let scored = seeds.len();
+                        seeds.sort_unstable();
+                        seeds.truncate(4);
+                        let (hits, count) =
+                            g.search_seeded(ef, s, &seeds, |id| c.score(&q8, scale, id));
+                        (hits, count + scored - seeds.len())
                     } else {
-                        g.search(ef, s, |id| v.query(&half, id))
+                        g.search(ef, s, |id| c.score(&q8, scale, id))
                     };
-                    hits.truncate(10);
-                    let got = hits
-                        .iter()
-                        .take(10)
-                        .filter(|h| truth[i % truth.len()].contains(&h.id))
-                        .count();
-                    (got, count)
-                },
-            )
-            .collect();
+                    h.truncate(rerank);
+                    for x in &mut h {
+                        x.distance = v.rerank(&q, x.id);
+                    }
+                    h.sort_unstable();
+                    (h, n)
+                } else {
+                    let half: Vec<_> = q.iter().map(|x| f16::from_f32(*x)).collect();
+                    g.search(ef, s, |id| v.query(&half, id))
+                };
+                hits.truncate(10);
+                let got = hits
+                    .iter()
+                    .take(10)
+                    .filter(|h| truth[i % truth.len()].contains(&h.id))
+                    .count();
+                (got, count)
+            },
+        );
         let elapsed = region.end();
+        let rerank = if codes.is_some() { rerank } else { 0 };
         let variant = if codes.is_some() { "i8" } else { "f16" };
         println!(
             "variant={variant} rerank={rerank} ef={ef} queries={} recall={:.6} distances={:.1} seconds={elapsed:.4} qps={:.2} threads={} rss_kib={}",

@@ -148,6 +148,48 @@ impl Graph {
         }
         Ok(Self { levels, entry })
     }
+    /// Start one beam at several already-scored entry points (the stitched-graph probe).
+    pub fn search_seeded(
+        &self,
+        ef: usize,
+        scratch: &mut Search,
+        seeds: &[Hit],
+        mut score: impl FnMut(u32) -> f32,
+    ) -> (Vec<Hit>, usize) {
+        assert!(ef >= seeds.len() && !seeds.is_empty());
+        scratch.reset();
+        let mut count = 0;
+        for &seed in seeds {
+            if scratch.visit(seed.id) {
+                scratch.frontier.push(Reverse(seed));
+                scratch.nearest.push(seed);
+                count += 1;
+            }
+        }
+        while let Some(Reverse(candidate)) = scratch.frontier.pop() {
+            if scratch.nearest.len() >= ef && candidate > *scratch.nearest.peek().unwrap() {
+                break;
+            }
+            for &id in &self.levels[candidate.id as usize][0] {
+                if !scratch.visit(id) {
+                    continue;
+                }
+                let h = Hit {
+                    id,
+                    distance: score(id),
+                };
+                count += 1;
+                if scratch.nearest.len() < ef || h < *scratch.nearest.peek().unwrap() {
+                    scratch.frontier.push(Reverse(h));
+                    scratch.nearest.push(h);
+                    if scratch.nearest.len() > ef {
+                        scratch.nearest.pop();
+                    }
+                }
+            }
+        }
+        (scratch.nearest.clone().into_sorted_vec(), count)
+    }
     pub fn search(
         &self,
         ef: usize,
@@ -330,5 +372,38 @@ mod retrieval_tests {
                 exact.iter().take(10).map(|h| h.id).collect::<Vec<_>>()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod seeded_tests {
+    use super::*;
+    #[test]
+    fn multiple_entries_search_disconnected_partitions_in_one_beam() {
+        let g = Graph {
+            levels: vec![vec![vec![1]], vec![vec![0]], vec![vec![3]], vec![vec![2]]],
+            entry: 0,
+        };
+        let d = [0.1, 0.3, 0.2, 0.4];
+        let (hits, count) = g.search_seeded(
+            4,
+            &mut Search::new(4),
+            &[
+                Hit {
+                    id: 0,
+                    distance: d[0],
+                },
+                Hit {
+                    id: 2,
+                    distance: d[2],
+                },
+            ],
+            |id| d[id as usize],
+        );
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![0, 2, 1, 3]
+        );
+        assert_eq!(count, 4);
     }
 }

@@ -96,3 +96,20 @@ all rows are indexed before measurement. The caller owns its server, directory, 
 builder. It computes normalized empirical slab means, then the fraction of rows near their two closest
 means at several distance-ratio thresholds. It reads a cluster at a time, checks existing CRCs, and
 reports overlap without building a graph. It is not a Vamana implementation or a stitched-recall test.
+
+`stitch_graph EXPORTED_IVF NQ_DATA SCRATCH_DIRECTORY RATIO` is the bounded construction probe.
+It spills primary and boundary rows to scratch, builds one partition at a time with a compact,
+two-pass Vamana graph (R=32, L=64, alpha=1 then 1.2), and robust-prunes reciprocal and stitched
+edges. Global adjacency stays in a scratch file. Eight-bit codes are encoded per partition and
+written in original corpus-ID order using the existing G3 code encoding; no full-corpus encoding
+buffer is needed. The final graph uses the existing G3 graph encoding, with one base layer and a
+dense upper layer of partition medoids. `search8-seeds` starts one beam at the four closest medoids.
+This is an original experimental builder, rather than a production DiskANN implementation. Use a
+caller cleanup trap to remove its whole output directory after both construction and search finish.
+
+The final scheduler gives each worker one reusable state and a strided query stream. This avoids
+repeat-aligned, identical streams and uses non-power-of-two pools fully. Earlier all-core rates from
+the coarse-chunk scheduler are superseded. macOS native query-region counters and HTTP server
+counters use the stable `RUSAGE_INFO_V4` task interface; Linux uses perf. The HTTP driver reports
+process RSS, and native macOS runs print RSS with their query-region counters. Peak build memory
+still comes from the platform's external `time` command.

@@ -21,6 +21,19 @@ import time
 import numpy as np
 
 
+def mac_counters(pid):
+    # Stable RUSAGE_INFO_V4 ABI from Apple's sys/resource.h: UUID (16 bytes),
+    # followed by u64 fields. This reads all threads of the target task.
+    import ctypes
+    values = (ctypes.c_uint64 * 64)()
+    library = ctypes.CDLL('/usr/lib/libproc.dylib')
+    library.proc_pid_rusage.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+    if library.proc_pid_rusage(pid, 4, ctypes.byref(values)) != 0:
+        return None
+    return {'instructions': values[31], 'cycles': values[32],
+            'rss_bytes': values[8], 'peak_footprint_bytes': values[30]}
+
+
 def request(connection, body):
     connection.request('POST', ROUTE, body, {'content-type': 'application/json'})
     response = connection.getresponse()
@@ -106,7 +119,14 @@ if __name__ == '__main__':
     quality = overlap / (len(queries) * 10)
     print(json.dumps({'recall_at_10': quality, 'warmup': run(1)}), flush=True)
     if sys.platform == 'darwin':
+        before = mac_counters(pid)
         measured = run(repeats)
+        after = mac_counters(pid)
+        if before is not None and after is not None:
+            measured.update(after)
+            for key in ('instructions', 'cycles'):
+                measured[key] -= before[key]
+                measured[key + '_per_query'] = measured[key] / measured['queries']
         measured.update(recall_at_10=quality, engine=engine, ef=ef, server_pid=pid)
         Path(str(stem) + '.json').write_text(json.dumps(measured, indent=2) + '\n')
         print(json.dumps(measured), flush=True)
@@ -127,6 +147,8 @@ if __name__ == '__main__':
         perf.wait(timeout=10)
         if perf.returncode not in (0, -signal.SIGINT, 128 + signal.SIGINT):
             raise RuntimeError('perf failed')
+        status = Path(f'/proc/{pid}/status').read_text()
+        measured['rss_bytes'] = int(next(line for line in status.splitlines() if line.startswith('VmRSS:')).split()[1]) * 1024
         measured.update(recall_at_10=quality, engine=engine, ef=ef, server_pid=pid,
                         client_cpu_seconds=resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime)
         Path(str(stem) + '.json').write_text(json.dumps(measured, indent=2) + '\n')

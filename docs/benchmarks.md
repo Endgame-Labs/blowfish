@@ -4912,8 +4912,8 @@ which is what D4 would save. `disk-footprint.md` lists what retiring them needs.
 
 ## Round G3: disposable graphs for hot tiers
 
-Status: kill tests in progress. These are offline experiments; production queries, manifests,
-S3 layouts, and cold-path behavior are unchanged. The harness is
+These are disposable experiments and a feature-gated query-path prototype. Default production
+queries, manifests, S3 layouts, and cold-path behavior are unchanged. The harness is
 `crates/bf-vector/examples/hot_graph.rs`, with reproducible commands in `examples/g3/README.md`.
 
 ### Shared-VM baseline and packet kill test
@@ -4964,6 +4964,155 @@ while sharing the two CPUs with other study work. The harness keeps the entire f
 its approximately 5.9 GiB query RSS is not a sparse-rerank-cache memory result. Eight-bit encoding
 of the corpus took 55.6 s, including writing the scratch codes. Full row-graph construction was
 moved to an isolated Graviton instance to avoid contention on the shared VM; its paired results follow.
+
+### Isolated Graviton kill tests
+
+Full NQ on a dedicated c7g.8xlarge: 32 physical Graviton3 cores, 64 GiB nominal RAM, Linux,
+Rust 1.100, NumKong 7.8.7, and Clang 22. Unsupported SME compile targets were disabled; NEON
+and SVE remained enabled. `hnsw_rs` 0.3.5 is MIT OR Apache-2.0. The row graph uses M=16,
+construction ef=100, original f16 cosine distances, and a shuffled insertion order. Both row
+scorers reuse identical links. Layer sampling and parallel insertion are nondeterministic.
+
+The following are **corrected** all-core medians of three runs over 110,464 queries each
+(32 passes over all 3,452 queries). One reusable state and a strided stream per worker avoid
+identical repeat-aligned streams and use every worker on non-power-of-two pools. Earlier rates
+from the coarse-chunk loop are superseded. Counters cover query setup, scoring, heaps, exact
+rerank, and recall accounting, excluding loading and construction.
+
+| Variant | Recall@10 | Row scores/query | Instructions/query | 32-core q/s, median (range) |
+|---|---:|---:|---:|---:|
+| Resident IVF, 50 probes | 0.950637 | 86,668 | 20.362M | 9,992 (9,989–9,992) |
+| Row graph, f16, ef112 | 0.952462 | 1,998 | 3.105M | 24,668 (24,664–24,776) |
+| Same graph, rotated SQ8, ef104, rerank30 | 0.950174 | 1,886 | 1.262M | 44,610 (44,531–44,964) |
+| Resident IVF, 66 probes | 0.961095 | 113,745 | 23.745M | 8,304 (8,278–8,306) |
+| Row graph, f16, ef160 | 0.961790 | 2,639 | 4.106M | 18,528 (18,506–18,621) |
+| Same graph, rotated SQ8, ef160, rerank30 | 0.961472 | 2,638 | 1.550M | 32,060 (31,834–32,153) |
+
+Both row variants survive the 2x gate. SQ8 is 4.46x/3.86x faster than the qualifying IVF
+points, with about 16.1x/15.3x fewer instructions. F16 is 2.47x/2.23x faster. Row-score counts
+are not equal-cost operations: IVF uses one-bit fast scan, while the row graph uses full f16
+or eight-bit dot products and graph bookkeeping. The updated main-library IVF implementation
+is included in this final baseline; its output recall and selected row counts are unchanged.
+
+The packet graph still fails on ARM: ef480 reaches 0.951912 at 100,764 scored rows and about
+20.66M instructions; ef640 reaches 0.960718 at 127,145 rows and about 25.74M instructions.
+Corrected 32-core throughput is 5,557/4,428 q/s, below IVF at both points. It does not deliver a 2x saving.
+
+The HNSW builder plus link extraction took 205.98 s; corpus loading, construction, teardown,
+and scratch serialization took 215.29 s, with 13.00 GiB peak RSS. These are warm local-input
+measurements, not S3 promotion timings. Native query RSS is about 6.31 GiB for f16 and 8.88 GiB
+for SQ8 because the kill-test harness retains the entire f16 corpus in both cases.
+
+### Corrected M4 native results
+
+The same EC2-built graph, original NQ corpus, and all-query truth were measured on an otherwise
+reserved 10-core M4. These are three-run medians with the corrected strided scheduler. macOS
+query-region task instructions and cycles come from `RUSAGE_INFO_V4`, excluding load/build.
+Native rates exclude HTTP, namespace snapshots, storage readers, and hydration.
+
+| Variant | Recall@10 | M4 q/s, median (range) | Instructions/query |
+|---|---:|---:|---:|
+| F16, ef112 | 0.952462 | 9,141 (9,133–9,176) | 2.846M |
+| SQ8, ef104, rerank30 | 0.950174 | 15,142 (15,089–15,172) | 1.622M |
+| F16, ef160 | 0.961790 | 6,871 (6,865–6,872) | 3.767M |
+| SQ8, ef160, rerank30 | 0.961472 | 11,160 (11,042–11,188) | 2.126M |
+
+These imported-graph measurements do not demonstrate construction on the M4. They establish a
+promising search core, rather than a shipped-path Qdrant win.
+
+### Real query path: the Qdrant target is not met
+
+The prototype is compiled only with `experimental-hot-graph`. It routes through the real
+`Engine::query`, source-tier placement, live masks, normal sparse exact rerank, projected rows,
+WAL shadowing, and delta merge. NQ was prepared afresh through normal writes, indexing, and
+reclustering. The M4 comparison imports the trusted EC2-built graph over corpus IDs, translates
+those IDs into the fresh tier's coordinates, and opens its exact-rerank metadata. The full f16
+corpus is released; graph, SQ8, source metadata, and row-location capacity total 3.62 GB (3.37 GiB).
+
+Paired M4 HTTP results use 16 persistent clients, top-10 requests, all-query quality, warm-up,
+and 110,464 timed queries per run. The table reports three-run medians. Qdrant is the official
+1.20.0 release, cosine, f16 in RAM, M=16, ef_construct=100, no payloads, and one indexed segment
+plus an empty write segment. A fresh Qdrant build needed different ef values from the earlier
+reference; actual recall, rather than nominal ef, sets the comparison.
+
+| Engine and budget | Recall@10 | M4 HTTP q/s, median (range) | Server instructions/query | Warm process RSS |
+|---|---:|---:|---:|---:|
+| Graph ef104, rerank30, 4 GiB range-cache cap | 0.950174 | 5,472 (5,247–5,509) | 3.771M | 5.15–5.19 GiB |
+| Qdrant ef72 | 0.950377 | 8,502 (8,494–8,554) | 2.023M | 5.55 GiB |
+| Graph ef160, rerank30, 4 GiB range-cache cap | 0.961472 | 5,136 (5,128–5,171) | 4.267M | 5.18–5.21 GiB |
+| Qdrant ef104 | 0.961124 | 6,976 (6,892–7,039) | 2.335M | 5.55 GiB |
+
+The graph is 36%/26% slower at nearby recall. Its native core gains do not survive roughly
+2.15M additional server instructions per query on this machine. Server task counters exclude
+client work. A paired 24-server-core Graviton check also loses: graph ef104 achieves 11,267 q/s
+at 0.950174 versus Qdrant ef66's 14,097 at 0.950261. Graph ef160 achieves 9,912 at 0.961472.
+The Graviton profile attributes 27.7% of cycles to i8 dots and 22.2% to graph traversal; JSON,
+exact distance, copies, cache operations, scheduling, and the surrounding engine account for the
+rest. Shared-wrapper optimization belongs to the subsequent Q2 study.
+
+### Sparse-cache budget curve
+
+All points use the same graph and exact rerank30 through the existing range cache. These are
+single budget-sweep runs; the repeated comparison above is the final Qdrant gate. RSS includes
+the process's retained graph and working cache, rather than the configured cap alone.
+
+| Range-cache cap / sparse block | M4 q/s at 0.950174 / 0.961472 | M4 RSS | Graviton q/s at the same recalls |
+|---|---:|---:|---:|
+| No admission / 16 KiB | 2,622 / 2,505 | 4.12–4.13 GiB | 3,614 / 3,519 |
+| 256 MiB / 16 KiB | 2,371 / 2,321 | 4.40 GiB | 1,533 / 1,531 |
+| 256 MiB / 2 KiB | not measured | not measured | 807 / 812 |
+| 1 GiB / 2 KiB | 4,799 / 4,753 | 4.92–4.93 GiB | 10,586 / 9,448 |
+| 2 GiB / 16 KiB | 5,282 / 5,220 | 5.12–5.14 GiB | 11,267 / 9,912 |
+| 4 GiB / 16 KiB | 5,332 / 5,228 | 5.58–5.62 GiB | 11,546 / 10,183 |
+
+Small-cache admission and eviction can cost more than bypassing admission, even over warm local
+files. A smaller block alone does not solve the shared-pool cliff. These runs repeatedly warm the
+same test queries; they do not establish an unseen-query miss rate. RSS excludes some OS file
+cache and is not a cgroup limit or total charged-memory result. No total-memory win is claimed.
+
+### Bounded Vamana construction
+
+The proposed distance-ratio boundary rule first needed calibration. Over normalized empirical
+means of the existing 32 spatial slabs, a ratio of 1.15 duplicates 74.17% of rows, exceeding the
+50% overlap ceiling. Ratios 1.03, 1.05, and 1.10 yield 23.65%, 36.09%, and 59.09%. This
+prerequisite probe took 9.93 s and 52.9 MiB peak RSS.
+
+`stitch_graph` implements two-pass Vamana (R=32, build L=64, alpha=1 then 1.2), reciprocal robust
+pruning, and robust-pruned stitching. It holds one partition in RAM, spills other partitions,
+and stores global adjacency in a scratch file. The final variant also encodes SQ8 per partition
+and writes it in corpus-ID order, so no full-corpus encoding buffer is hidden outside the memory
+measurement. Its streamed codes match a full ARM encoding byte-for-byte; cross-ISA codebooks
+are not assumed bit-identical. Source slabs and spill files are warm local files in these runs.
+
+| Boundary ratio | Extra row copies | Build time | Peak build RSS | Search result |
+|---|---:|---:|---:|---|
+| 1.03 | 23.65% | 295.36 s, adjacency only | 0.738 GiB | 0.930243 at 2,400 scores; 0.951333 needs 4,133 |
+| 1.07 | 46.50% | 349.96 s, including SQ8 | 0.887 GiB | Four medoid entries: 0.953505 at 2,370 scores; 0.959849 at 2,826; 0.963760 at 3,268 |
+
+The lower-overlap graph misses the 0.01 recall-gap gate relative to monolithic HNSW. The higher-
+overlap graph recovers the quality/cost curve, stays below 1 GiB, and reaches both recall targets,
+but misses the proposed 70 s construction target by 5x. Four medoid entries save roughly 32 scores
+and barely alter recall. This establishes bounded construction feasibility, with slower build and
+search than the monolithic graph; it does not demonstrate a bounded M4 constructor or a Qdrant win.
+Local spill capacity, CPU amortization, foreground headroom, and better topology/layout remain
+shipping work. No adjacency is added to `.bfa`, and no graph sidecar is published to S3.
+
+### Outcome and validation
+
+Keep the row-graph search core as an experimental hot-tier candidate; reject this packet variant.
+Do not enable the current graph in the shipped server. The real-path Qdrant gate fails at both
+recall targets. The proposed automatic lifecycle, budget reservations, generation checks, delta
+handling, filtering, and optional persistence are documented in `docs/design/hot-tier-graph.md`.
+The prototype uses explicit promotion and one process-global entry; automatic heat admission,
+backend-scoped ownership, eviction, cancellation, and compact production storage are not implemented.
+
+Tests cover budget refusal, source extraction, original row coordinates, live masks, WAL deletes
+and upserts, uncovered segments, multiple tiers, filtered and zero-query fallback, exact rerank,
+streamed construction primitives, and independent worker scheduling. Default and feature-enabled
+crate gates are run before committing. A scheduling-sensitive cold-wave assertion failed once
+under the parallel VM suite, then passed in isolation and in the serial default suite; no assertion was weakened.
+The feature-enabled suite also passes. Results were retained before removing experimental data,
+processes, staging objects, and cloud resources.
 
 ## Round Q1: warm vector query cost
 
