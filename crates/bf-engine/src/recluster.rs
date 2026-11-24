@@ -78,6 +78,11 @@ fn pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// A build stopped between rows because the server is shutting down.
+fn shutting_down() -> ApiError {
+    ApiError::new(503, "the server is shutting down")
+}
+
 /// Run `f` on a blocking thread, inside the build pool.
 async fn on_pool<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
     tokio::task::spawn_blocking(move || pool().install(f))
@@ -298,6 +303,7 @@ impl Engine {
             let (present, read_row) = (present.clone(), read_row.clone());
             let cells_n = cells;
             let known = reused.as_ref().map(|(centers, _, _)| centers.clone());
+            let stop = self.0.stop.clone();
             on_pool(move || {
                 let centers = known.unwrap_or_else(|| {
                     let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -322,16 +328,18 @@ impl Engine {
                 let assignment: Vec<u16> = present
                     .par_iter()
                     .map_init(Vec::new, |buf, g| {
-                        bf_vector::nearest_center(&read_row(*g, buf), &centers) as u16
+                        (!stop.stopping())
+                            .then(|| bf_vector::nearest_center(&read_row(*g, buf), &centers) as u16)
                     })
-                    .collect();
+                    .collect::<Option<_>>()?;
                 let mut cell_rows: Vec<Vec<u32>> = vec![Vec::new(); centers.len()];
                 for (g, c) in present.iter().zip(&assignment) {
                     cell_rows[*c as usize].push(*g);
                 }
-                (assignment.len(), cell_rows, centers)
+                Some((assignment.len(), cell_rows, centers))
             })
             .await?
+            .ok_or_else(shutting_down)?
         };
         // A base keeps its cells for the deltas built against it and for its merge.
         let coarse_file = match (target.kind, reused) {
@@ -365,12 +373,21 @@ impl Engine {
             let cluster_rows = opts.cluster_rows.max(1);
             // A delta's few rows go in as few slabs as memory allows.
             let pack = target.kind == Kind::Delta;
+            let stop = self.0.stop.clone();
             on_pool(move || {
-                let jobs =
-                    assign_leaves(&present, &read_row, &coarse, cell_rows, cluster_rows, max);
-                if pack { pack_slabs(jobs, max) } else { jobs }
+                let jobs = assign_leaves(
+                    &present,
+                    &read_row,
+                    &coarse,
+                    cell_rows,
+                    cluster_rows,
+                    max,
+                    &|| stop.stopping(),
+                )?;
+                Some(if pack { pack_slabs(jobs, max) } else { jobs })
             })
             .await?
+            .ok_or_else(shutting_down)?
         };
         tracing::info!(
             "recluster {ns}: {} slabs planned at {:.0}s",
@@ -654,7 +671,8 @@ const GROUP_PROBES: usize = 12;
 /// whose center is nearest to it, wherever that cluster's slab is, so the clusters a query
 /// probes hold more of its neighbors: on BEIR NQ, a row's own cluster was its nearest one only
 /// 80% of the time with each cell clustered on its own. Each cell's leaves (and the rows that
-/// chose them) make one slab, or several when they hold more than `max` rows.
+/// chose them) make one slab, or several when they hold more than `max` rows. `None` once
+/// `stopping` says so (checked between cells and rows).
 fn assign_leaves(
     present: &[u32],
     read_row: &(dyn Fn(u32, &mut Vec<u8>) -> Vec<f32> + Sync),
@@ -662,7 +680,8 @@ fn assign_leaves(
     cell_rows: Vec<Vec<u32>>,
     cluster_rows: usize,
     max: usize,
-) -> Vec<SlabJob> {
+    stopping: &(dyn Fn() -> bool + Sync),
+) -> Option<Vec<SlabJob>> {
     let distance = bf_vector::squared_distance;
     let t0 = std::time::Instant::now();
     let mut leaves: Vec<Vec<f32>> = Vec::new();
@@ -670,6 +689,9 @@ fn assign_leaves(
     // Each cell's leaf groups (global leaf numbers).
     let mut members: Vec<Vec<Vec<u32>>> = Vec::with_capacity(cell_rows.len());
     for (cell, rows) in cell_rows.iter().enumerate() {
+        if stopping() {
+            return None;
+        }
         let start = leaves.len();
         if !rows.is_empty() {
             let k = (rows.len() / cluster_rows).max(1);
@@ -733,7 +755,7 @@ fn assign_leaves(
     let near = NEAR_CELLS.min(coarse.len()).max(1);
     let probes = GROUP_PROBES;
     let by_distance = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
-    let assign = |leaves: &[Vec<f32>]| -> Vec<u32> {
+    let assign = |leaves: &[Vec<f32>]| -> Option<Vec<u32>> {
         // Each cell's leaves under about sqrt(leaves) group centers (the means of their leaves),
         // so a row compares against the groups of its near cells and the leaves of its nearest
         // groups only, not every leaf of every near cell (a 100M layout has about 15,600 leaves a
@@ -800,15 +822,20 @@ fn assign_leaves(
         let nearest_group: Vec<u32> = present
             .par_iter()
             .map_init(Vec::new, |buf, g| {
+                if stopping() {
+                    return None;
+                }
                 let v = read_row(*g, buf);
-                near_groups(&v)
-                    .into_iter()
-                    .min_by(by_distance)
-                    .map_or(0, |(_, key)| {
-                        (offsets[key >> 32] + (key & 0xFFFF_FFFF)) as u32
-                    })
+                Some(
+                    near_groups(&v)
+                        .into_iter()
+                        .min_by(by_distance)
+                        .map_or(0, |(_, key)| {
+                            (offsets[key >> 32] + (key & 0xFFFF_FFFF)) as u32
+                        }),
+                )
             })
-            .collect();
+            .collect::<Option<_>>()?;
         // A counting sort of row positions by nearest group.
         let mut starts = vec![0usize; group_count + 1];
         for g in &nearest_group {
@@ -836,6 +863,9 @@ fn assign_leaves(
         let ordered: Vec<u32> = order
             .par_chunks(ASSIGN_BLOCK)
             .map_init(Vec::new, |buf, block| {
+                if stopping() {
+                    return None;
+                }
                 let rows: Vec<Vec<f32>> = block
                     .iter()
                     .map(|i| read_row(present[*i as usize], buf))
@@ -893,21 +923,28 @@ fn assign_leaves(
                     let l = candidates[n] as usize;
                     (leaves[l].as_slice(), leaf_norms[l])
                 });
-                leaf_d
-                    .iter()
-                    .map(|d| {
-                        let mut best = (f32::INFINITY, u32::MAX);
-                        for (d, &l) in d.iter().zip(&candidates) {
-                            if *d < best.0 || (*d == best.0 && l < best.1) {
-                                best = (*d, l);
+                Some(
+                    leaf_d
+                        .iter()
+                        .map(|d| {
+                            let mut best = (f32::INFINITY, u32::MAX);
+                            for (d, &l) in d.iter().zip(&candidates) {
+                                if *d < best.0 || (*d == best.0 && l < best.1) {
+                                    best = (*d, l);
+                                }
                             }
-                        }
-                        best.1
-                    })
-                    .collect::<Vec<u32>>()
+                            best.1
+                        })
+                        .collect::<Vec<u32>>(),
+                )
             })
+            .while_some()
             .flatten_iter()
             .collect();
+        // `while_some` ends at the first block skipped for shutdown.
+        if stopping() {
+            return None;
+        }
         tracing::info!(
             "recluster: {:.0} centers compared per row",
             compared.into_inner() as f64 / present.len().max(1) as f64
@@ -916,9 +953,9 @@ fn assign_leaves(
         for (i, l) in order.iter().zip(ordered) {
             leaf_of[*i as usize] = l;
         }
-        leaf_of
+        Some(leaf_of)
     };
-    let mut leaf_of = assign(&leaves);
+    let mut leaf_of = assign(&leaves)?;
     tracing::info!(
         "recluster: rows assigned at {:.0}s",
         t0.elapsed().as_secs_f64()
@@ -950,7 +987,7 @@ fn assign_leaves(
             })
             .collect();
         leaves = centers;
-        leaf_of = assign(&leaves);
+        leaf_of = assign(&leaves)?;
         tracing::info!("recluster: refined at {:.0}s", t0.elapsed().as_secs_f64());
     }
     // Each cell's leaves, with the rows that chose them, in ascending row order.
@@ -1012,5 +1049,5 @@ fn assign_leaves(
             });
         }
     }
-    jobs
+    Some(jobs)
 }

@@ -180,12 +180,9 @@ impl Engine {
                     .get(&format!("annv2:{attr}"))
                     .or_else(|| seg.files.get(&format!("ann:{attr}")))
                 {
-                    let layout = self.layout_of(file).await?;
-                    report.segments.add(
-                        layout,
-                        file.size,
-                        seg.files.contains_key(&format!("annv2:{attr}")),
-                    );
+                    let current = seg.files.contains_key(&format!("annv2:{attr}"));
+                    let layout = self.survey_layout(file, current).await?;
+                    report.segments.add(layout, file.size, current);
                     if seg.files.contains_key(&format!("ann:{attr}")) {
                         todo.push((seg.id.clone(), attr.clone(), file.clone()));
                     }
@@ -203,12 +200,9 @@ impl Engine {
                             .get(&format!("annv2:{attr}"))
                             .or_else(|| slab.files.get(&format!("ann:{attr}")))
                         {
-                            let layout = self.layout_of(file).await?;
-                            report.slabs.add(
-                                layout,
-                                file.size,
-                                slab.files.contains_key(&format!("annv2:{attr}")),
-                            );
+                            let current = slab.files.contains_key(&format!("annv2:{attr}"));
+                            let layout = self.survey_layout(file, current).await?;
+                            report.slabs.add(layout, file.size, current);
                             if slab.files.contains_key(&format!("ann:{attr}")) {
                                 list.push((slab.clone(), file.clone()));
                             }
@@ -325,6 +319,19 @@ impl Engine {
         }
         report.seconds = t0.elapsed().as_secs_f64();
         Ok(report)
+    }
+
+    /// A legacy index's code layout. A current one is counted as a single object whatever its
+    /// layout, so the survey reads nothing for it: every start surveys every namespace.
+    async fn survey_layout(
+        &self,
+        file: &SegmentFile,
+        current: bool,
+    ) -> Result<CodeLayout, ApiError> {
+        if current {
+            return Ok(CodeLayout::FastScan);
+        }
+        self.layout_of(file).await
     }
 
     async fn layout_of(&self, file: &SegmentFile) -> Result<CodeLayout, ApiError> {

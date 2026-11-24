@@ -17,6 +17,7 @@ mod segment;
 mod snapshot;
 mod sparse;
 mod statistics;
+mod stop;
 mod streaming;
 mod text_upgrade;
 pub use indexer::EngineConfig;
@@ -349,6 +350,8 @@ struct Inner {
     namespaces: Mutex<HashMap<String, Arc<Handle>>>,
     /// The automatic recluster's builds and the tiers waiting to be installed.
     jobs: auto_recluster::Jobs,
+    /// Shutdown of background work, shared with scoped engines.
+    stop: Arc<stop::Stop>,
 }
 /// Queries executing right now (holding a query permit), across every engine in the process.
 static QUERIES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -386,34 +389,62 @@ impl Drop for InFlight {
     }
 }
 
-/// Paces the background recall sampler: at most one exhaustive comparison runs at a time, and
-/// a new one starts at most once per interval. An exhaustive search reads every vector of the
-/// namespace (5.5 GB at 2.7M f16 rows of 1,024 dimensions), so a per-query rate alone lets it
-/// take most of the machine under load.
-#[derive(Default)]
+/// Paces the background recall sampler. An exhaustive comparison reads every vector of the
+/// namespace (5.5 GB at 2.7M f16 rows of 1,024 dimensions), so a per-query rate alone would let
+/// it take most of the machine under load. One runs at a time; the first comes one interval after
+/// the engine starts, not with the first queries after every restart; and the next waits at least
+/// one interval, and at least [`RECALL_SAMPLE_DUTY`] times as long as the last one took, so it
+/// never holds more than about 2% of one core, whatever the namespace's size.
 struct RecallSampler {
     busy: Arc<std::sync::atomic::AtomicBool>,
-    last: std::sync::Mutex<Option<Instant>>,
+    not_before: Arc<std::sync::Mutex<Instant>>,
+}
+const RECALL_SAMPLE_DUTY: u32 = 50;
+impl Default for RecallSampler {
+    fn default() -> Self {
+        Self {
+            busy: Arc::default(),
+            not_before: Arc::new(std::sync::Mutex::new(Instant::now())),
+        }
+    }
 }
 /// Held while one recall comparison runs.
-struct Sampling(Arc<std::sync::atomic::AtomicBool>);
+struct Sampling {
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    not_before: Arc<std::sync::Mutex<Instant>>,
+    started: Instant,
+}
 impl Drop for Sampling {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        let took = self.started.elapsed();
+        let mut not_before = self.not_before.lock().unwrap_or_else(|e| e.into_inner());
+        *not_before = (*not_before).max(Instant::now() + took * RECALL_SAMPLE_DUTY);
+        self.busy.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 impl RecallSampler {
+    /// A sampler whose first comparison may start `interval` from now.
+    fn new(interval: std::time::Duration) -> Self {
+        let sampler = Self::default();
+        *sampler.not_before.lock().expect("recall sampler lock") = Instant::now() + interval;
+        sampler
+    }
     fn start(&self, interval: std::time::Duration) -> Option<Sampling> {
         use std::sync::atomic::Ordering;
-        let mut last = self.last.lock().expect("recall sampler lock");
-        if last.is_some_and(|t| t.elapsed() < interval) {
+        let mut not_before = self.not_before.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if now < *not_before {
             return None;
         }
         if self.busy.swap(true, Ordering::AcqRel) {
             return None;
         }
-        *last = Some(Instant::now());
-        Some(Sampling(self.busy.clone()))
+        *not_before = now + interval;
+        Some(Sampling {
+            busy: self.busy.clone(),
+            not_before: self.not_before.clone(),
+            started: now,
+        })
     }
 }
 /// Cloneable namespace engine. Separate instances safely share a CAS-capable bucket.
@@ -436,12 +467,13 @@ impl Engine {
                 config.search_concurrency,
             )),
             queries: Arc::new(tokio::sync::Semaphore::new(config.query_concurrency.max(1))),
-            recall_sampler: Arc::default(),
+            recall_sampler: Arc::new(RecallSampler::new(config.recall_sample_interval)),
             store,
             config,
             owner: uuid::Uuid::new_v4(),
             namespaces: Mutex::new(HashMap::new()),
             jobs: Default::default(),
+            stop: Arc::default(),
         }));
         bf_alloc::adaptive_decay();
         indexer::start(&engine);
@@ -468,9 +500,31 @@ impl Engine {
             owner: uuid::Uuid::new_v4(),
             namespaces: Mutex::new(HashMap::new()),
             jobs: Default::default(),
+            stop: self.0.stop.clone(),
         }));
         indexer::start(&engine);
         engine
+    }
+    /// Signal this engine's background work to stop, without waiting (see [`Engine::shutdown`]).
+    pub fn begin_shutdown(&self) {
+        self.0.stop.begin();
+    }
+    /// Stop this engine's background work, and its scoped engines': indexing, compaction, GC,
+    /// upgrades, recluster builds, and recall samples stop at their next await point, and a
+    /// build's CPU-bound passes between rows. Waits up to `grace` for them, and says whether they
+    /// all stopped. Requests keep being served. Everything stopped is crash-safe and resumes on
+    /// the next start (an interrupted build's record stays until it is stale, then GC reclaims
+    /// its objects).
+    pub async fn shutdown(&self, grace: std::time::Duration) -> bool {
+        self.begin_shutdown();
+        let stopped = self.0.stop.drained(grace).await;
+        if !stopped {
+            tracing::warn!(
+                running = self.0.stop.running(),
+                "background jobs still running at shutdown"
+            );
+        }
+        stopped
     }
     /// Access the underlying store for operational inspection.
     pub fn storage(&self) -> &Storage {
@@ -772,6 +826,7 @@ impl Engine {
             let ann = response.clone();
             let cache = self.0.read_cache.clone();
             let queries = self.0.queries.clone();
+            let stop = self.0.stop.clone();
             tokio::spawn(async move {
                 let Ok(permit) = queries.acquire_owned().await else {
                     return;
@@ -785,8 +840,9 @@ impl Engine {
                     let _permit = permit;
                     let _sampling = sampling;
                     runtime.block_on(read_cache::scope(context, async move {
-                        if let Ok(exact) =
-                            indexed::execute(&store, &sample, &request, &config, true).await
+                        if let Some(Ok(exact)) = stop
+                            .run(indexed::execute(&store, &sample, &request, &config, true))
+                            .await
                         {
                             metrics::histogram!("blowfish_ann_recall")
                                 .record(indexed::recall(&ann, &exact));
@@ -1664,6 +1720,8 @@ mod recall_sampler_tests {
             "one runs at a time"
         );
         drop(first);
+        // Past the few microseconds of pacing the instant comparison earned.
+        std::thread::sleep(Duration::from_millis(5));
         assert!(
             sampler.start(Duration::ZERO).is_some(),
             "free again once it ends"
@@ -1678,5 +1736,23 @@ mod recall_sampler_tests {
             paced.start(Duration::from_secs(3600)).is_none(),
             "within the interval"
         );
+    }
+
+    #[test]
+    fn the_first_comparison_waits_an_interval_and_long_ones_wait_longer() {
+        // A restart does not compare at once.
+        assert!(
+            RecallSampler::new(Duration::from_secs(3600))
+                .start(Duration::ZERO)
+                .is_none()
+        );
+        // A comparison that took 20 ms holds off the next for about a second, past the interval.
+        let sampler = RecallSampler::new(Duration::ZERO);
+        let sampling = sampler.start(Duration::ZERO).expect("starts");
+        std::thread::sleep(Duration::from_millis(20));
+        drop(sampling);
+        assert!(sampler.start(Duration::ZERO).is_none());
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(sampler.start(Duration::ZERO).is_some());
     }
 }

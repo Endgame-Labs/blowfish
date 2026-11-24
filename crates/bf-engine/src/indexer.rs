@@ -238,7 +238,17 @@ pub(crate) fn start(engine: &Engine) {
     }
     let weak = std::sync::Arc::downgrade(&engine.0);
     let interval = engine.0.config.index_interval.max(Duration::from_millis(1));
-    tokio::spawn(async move {
+    let stop = engine.0.stop.clone();
+    // Shutdown drops the loop at its next await, mid-pass if need be: a pass publishes only
+    // through a fenced manifest write, so a dropped one leaves orphans for GC, as a crash does.
+    tokio::spawn(async move { stop.clone().run(index_loop(weak, interval, stop)).await });
+}
+async fn index_loop(
+    weak: std::sync::Weak<crate::Inner>,
+    interval: Duration,
+    stop: std::sync::Arc<crate::stop::Stop>,
+) {
+    {
         let mut last_gc = std::time::Instant::now();
         let mut discover = true;
         // Namespaces whose older-layout vector indexes have been upgraded (or never had any) since
@@ -285,9 +295,15 @@ pub(crate) fn start(engine: &Engine) {
                         upgraded.clone(),
                         upgrading.clone(),
                     );
+                    let stop = stop.clone();
                     tokio::spawn(async move {
                         // A namespace with no checkpoint yet has no old indexes: new ones are fast-scan.
-                        match engine.reindex(&ns, &Default::default()).await {
+                        let Some(result) = stop.run(engine.reindex(&ns, &Default::default())).await
+                        else {
+                            // Shutting down: a later start resumes the upgrade.
+                            return;
+                        };
+                        match result {
                             Ok(_) => {
                                 if let Ok(mut u) = upgraded.lock() {
                                     u.insert(ns);
@@ -314,7 +330,7 @@ pub(crate) fn start(engine: &Engine) {
                 last_gc = std::time::Instant::now();
             }
         }
-    });
+    }
 }
 /// Segments some recluster tier covers. Compaction leaves them alone (a tier addresses their rows
 /// by position), and a flush keeps them listed even once every row is deleted.
