@@ -151,6 +151,9 @@ log entry in the same commit.
 - **Memory:** a 10M load and recluster fit on a 4 GB instance (c7gd.large) with swap off, peak RSS at most 3.5 GB,
   without slowing ingest or queries (2026-11-17). Met in round 15.
 - **Ingest:** docs/s stays flat as a namespace grows, so 100M is practical (round 16).
+- **One machine, warm vectors:** match or beat Qdrant's 16-client q/s at equal recall@10 (0.95 and 0.96) on the same
+  Apple M4 with BEIR NQ, without regressing cold queries from S3 (2026-11-24). Design changes are allowed; a winning
+  design replaces the old one.
 - Engineering moves in iterations: profile, diagnose, fix, wipe the data, and measure again. When hill-climbing stops
   paying off, test bigger hypotheses on a branch, even ones that change the index layout or the storage scheme
   (2026-11-17).
@@ -251,3 +254,7 @@ S3 until the run is cleaned up.
 26. 2026-11-23: Work toward Qdrant's throughput with a graph over leaf centers, not over rows, after cutting fixed
     per-query cost (`docs/design/graph-index.md`). Before any change to the manifest or bucket format, ship a format
     fence so older binaries can't rewrite or garbage-collect an upgraded bucket (`docs/design/simplify.md`).
+27. 2026-11-24: Beat Qdrant on warm one-machine vector throughput (section 6), changing the design if needed ("if you
+    have to change design to make it so, so be it"). If two rounds of profiling and tuning don't get there, switch to
+    divergent ideation across several models, including side-by-side studies of Qdrant's implementation, and test the
+    best ideas from each.
