@@ -834,7 +834,18 @@ fn rare_pair_msmarco() {
                         })
                         .fold(0.0f32, f32::max);
                     let (left, right) = (&lists[terms[a].0], &lists[terms[b].0]);
-                    let mut hits = Vec::new();
+                    let weights: Vec<_> = terms
+                        .iter()
+                        .map(|&(term, qf)| {
+                            TermWeight::new(
+                                qf,
+                                *stats.document_frequencies.get(term).unwrap_or(&0),
+                                &stats,
+                                &params,
+                            )
+                        })
+                        .collect();
+                    let mut heap = BinaryHeap::<std::cmp::Reverse<SearchHit>>::new();
                     let mut j = 0;
                     for &(row, _) in left {
                         while j < right.len() && right[j].0 < row {
@@ -850,20 +861,21 @@ fn rare_pair_msmarco() {
                             matched += 1;
                         }
                         let mut score = 0.0;
-                        for &(term, qf) in &terms {
-                            let list = &lists[term];
+                        for ((term, _), weight) in terms.iter().zip(&weights) {
+                            let list = &lists[*term];
                             if let Ok(at) = list.binary_search_by_key(&row, |x| x.0) {
-                                let weight = TermWeight::new(
-                                    qf,
-                                    *stats.document_frequencies.get(term).unwrap_or(&0),
-                                    &stats,
-                                    &params,
-                                );
                                 score += weight.score(list[at].1, lengths[row as usize]);
                             }
                         }
-                        hits.push(SearchHit { row, score });
+                        let hit = SearchHit { row, score };
+                        if heap.len() < 10 {
+                            heap.push(std::cmp::Reverse(hit));
+                        } else if heap.peek().is_some_and(|worst| hit > worst.0) {
+                            heap.pop();
+                            heap.push(std::cmp::Reverse(hit));
+                        }
                     }
+                    let mut hits: Vec<_> = heap.into_iter().map(|hit| hit.0).collect();
                     hits.sort_unstable_by(|a, b| b.cmp(a));
                     hits.truncate(10);
                     if hits.len() == 10 && hits[9].score > upper {
