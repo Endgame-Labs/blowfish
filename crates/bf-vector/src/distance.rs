@@ -309,15 +309,29 @@ unsafe fn l2_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
 /// rows' and centers' squared norms, `|r - c|^2 = |r|^2 + |c|^2 - 2 <r, c>` at about a third of
 /// the cost of four separate squared distances.
 pub(crate) fn dots_f32_x4(rows: [&[f32]; 4], center: &[f32]) -> [f32; 4] {
+    if !rows.iter().all(|r| r.len() == center.len()) {
+        return rows.map(|r| dot_lanes(r, center));
+    }
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx512f") && rows.iter().all(|r| r.len() == center.len())
-        {
+        if std::is_x86_feature_detected!("avx512f") {
             // SAFETY: the CPU supports AVX-512F, and every row is as long as the center.
             return unsafe { dots_x4_avx512(rows, center) };
         }
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2 and FMA were checked, and slice lengths match.
+            return unsafe { dots_x4_avx2(rows, center) };
+        }
     }
-    rows.map(|r| dot_lanes(r, center))
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline, and slice lengths match.
+        unsafe { dots_x4_neon(rows, center) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        rows.map(|r| dot_lanes(r, center))
+    }
 }
 
 #[inline(always)]
@@ -343,18 +357,114 @@ unsafe fn dots_x4_avx512(rows: [&[f32]; 4], center: &[f32]) -> [f32; 4] {
     let n = center.len();
     let pc = center.as_ptr();
     let pr = rows.map(|r| r.as_ptr());
-    let mut acc = [_mm512_setzero_ps(); 4];
+    // Sixteen independent FMA chains hide latency while one center load serves every row.
+    let mut acc = [[_mm512_setzero_ps(); 4]; 4];
     let mut i = 0;
-    // SAFETY: loads read 16 lanes at `i`, below `n`, from slices of length `n`.
+    // SAFETY: each vector load is bounded by n, and the caller checked every slice length.
     unsafe {
+        while i + 64 <= n {
+            for j in 0..4 {
+                let c = _mm512_loadu_ps(pc.add(i + j * 16));
+                for (s, p) in acc.iter_mut().zip(pr) {
+                    s[j] = _mm512_fmadd_ps(_mm512_loadu_ps(p.add(i + j * 16)), c, s[j]);
+                }
+            }
+            i += 64;
+        }
         while i + 16 <= n {
             let c = _mm512_loadu_ps(pc.add(i));
             for (s, p) in acc.iter_mut().zip(pr) {
-                *s = _mm512_fmadd_ps(_mm512_loadu_ps(p.add(i)), c, *s);
+                s[0] = _mm512_fmadd_ps(_mm512_loadu_ps(p.add(i)), c, s[0]);
             }
             i += 16;
         }
-        let mut out = acc.map(|s| _mm512_reduce_add_ps(s));
+        let mut out = acc.map(|s| {
+            _mm512_reduce_add_ps(_mm512_add_ps(
+                _mm512_add_ps(s[0], s[1]),
+                _mm512_add_ps(s[2], s[3]),
+            ))
+        });
+        for (o, r) in out.iter_mut().zip(rows) {
+            for k in i..n {
+                *o += r[k] * center[k];
+            }
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dots_x4_avx2(rows: [&[f32]; 4], center: &[f32]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let n = center.len();
+    let pc = center.as_ptr();
+    let pr = rows.map(|r| r.as_ptr());
+    // Eight chains leave room for inputs in AVX2's sixteen vector registers.
+    let mut acc = [[_mm256_setzero_ps(); 2]; 4];
+    let mut i = 0;
+    // SAFETY: the caller checked AVX2, FMA, and matching slice lengths; loads stay below n.
+    unsafe {
+        while i + 16 <= n {
+            for j in 0..2 {
+                let c = _mm256_loadu_ps(pc.add(i + j * 8));
+                for (s, p) in acc.iter_mut().zip(pr) {
+                    s[j] = _mm256_fmadd_ps(_mm256_loadu_ps(p.add(i + j * 8)), c, s[j]);
+                }
+            }
+            i += 16;
+        }
+        while i + 8 <= n {
+            let c = _mm256_loadu_ps(pc.add(i));
+            for (s, p) in acc.iter_mut().zip(pr) {
+                s[0] = _mm256_fmadd_ps(_mm256_loadu_ps(p.add(i)), c, s[0]);
+            }
+            i += 8;
+        }
+        let mut out = acc.map(|s| {
+            let sum = _mm256_add_ps(s[0], s[1]);
+            let sum = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps::<1>(sum));
+            let sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+            _mm_cvtss_f32(_mm_add_ss(sum, _mm_shuffle_ps::<0x55>(sum, sum)))
+        });
+        for (o, r) in out.iter_mut().zip(rows) {
+            for k in i..n {
+                *o += r[k] * center[k];
+            }
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dots_x4_neon(rows: [&[f32]; 4], center: &[f32]) -> [f32; 4] {
+    use std::arch::aarch64::*;
+    let n = center.len();
+    let pc = center.as_ptr();
+    let pr = rows.map(|r| r.as_ptr());
+    let mut acc = [[vdupq_n_f32(0.); 4]; 4];
+    let mut i = 0;
+    // SAFETY: NEON is available on aarch64, the caller checked lengths, and loads stay below n.
+    unsafe {
+        while i + 16 <= n {
+            for j in 0..4 {
+                let c = vld1q_f32(pc.add(i + j * 4));
+                for (s, p) in acc.iter_mut().zip(pr) {
+                    s[j] = vfmaq_f32(s[j], vld1q_f32(p.add(i + j * 4)), c);
+                }
+            }
+            i += 16;
+        }
+        while i + 4 <= n {
+            let c = vld1q_f32(pc.add(i));
+            for (s, p) in acc.iter_mut().zip(pr) {
+                s[0] = vfmaq_f32(s[0], vld1q_f32(p.add(i)), c);
+            }
+            i += 4;
+        }
+        let mut out =
+            acc.map(|s| vaddvq_f32(vaddq_f32(vaddq_f32(s[0], s[1]), vaddq_f32(s[2], s[3]))));
         for (o, r) in out.iter_mut().zip(rows) {
             for k in i..n {
                 *o += r[k] * center[k];
@@ -368,6 +478,54 @@ unsafe fn dots_x4_avx512(rows: [&[f32]; 4], center: &[f32]) -> [f32; 4] {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn check_four_dots(rows: [&[f32]; 4], center: &[f32], got: [f32; 4]) {
+        for (row, got) in rows.into_iter().zip(got) {
+            let products: Vec<f64> = row
+                .iter()
+                .zip(center)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .collect();
+            let expected: f64 = products.iter().sum();
+            let scale: f64 = products.iter().map(|v| v.abs()).sum();
+            assert!(
+                (f64::from(got) - expected).abs() <= 1e-5 * scale.max(1.),
+                "{got} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn four_row_kernels_match_scalar_at_vector_boundaries_and_unaligned_offsets() {
+        for n in [
+            0, 1, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 1024, 1027,
+        ] {
+            let data: Vec<Vec<f32>> = (0..5)
+                .map(|r| {
+                    (0..n + 1)
+                        .map(|d| ((r * 7919 + d * 104729) as f64).sin() as f32)
+                        .collect()
+                })
+                .collect();
+            // Offset every slice by one element, exercising unaligned vector loads.
+            let rows = std::array::from_fn(|r| &data[r][1..]);
+            let center = &data[4][1..];
+            check_four_dots(rows, center, dots_f32_x4(rows, center));
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avx512f") {
+                    // SAFETY: this test checked the feature, and all slice lengths match.
+                    check_four_dots(rows, center, unsafe { dots_x4_avx512(rows, center) });
+                }
+                if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                    // SAFETY: both features were checked, and all slice lengths match.
+                    check_four_dots(rows, center, unsafe { dots_x4_avx2(rows, center) });
+                }
+            }
+        }
+        let rows = [&[1., 2.][..], &[3.][..], &[][..], &[4., 5., 6.][..]];
+        check_four_dots(rows, &[7., 8.], dots_f32_x4(rows, &[7., 8.]));
+    }
 
     proptest! {
         #[test]
