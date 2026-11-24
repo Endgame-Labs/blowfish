@@ -7873,8 +7873,7 @@ us-west-2, with S3 in the same region. The baseline's final base has 38 slabs, w
 leaf. I copied that namespace's objects to a separate candidate prefix before upgrading it. Query
 runs use the engine directly, strong consistency, a 3 GiB memory block cache, and no disk cache.
 The original matrix sets retention to zero, matching its immediate-GC setup. A separate short
-comparison of the final integrated branch uses the normal one-hour retention, which also exercises
-warm searches that overlap checkpoint refresh. The harness records the resolved retention and
+comparison of the final integrated branch uses the normal one-hour retention. The harness records the resolved retention and
 cache budgets; set `BF_RETENTION_SECS=0` to reproduce the original matrix's query configuration.
 
 The retirement pass keeps the snapshot's segment layout fixed. Compaction and lineage are tested
@@ -7891,7 +7890,7 @@ GC removes the redundant objects:
 | Total | 12.135 | 6.201 |
 
 The exact reduction is 5,933,965,463 bytes, or 48.9%. All 18 segment ANN objects disappear, and all
-38 tier ANN objects keep their original keys and bytes. The 38 row-list objects total 10,726,936
+38 tier ANN objects keep their original relative keys and bytes. The 38 row-list objects total 10,726,936
 bytes, including their checksums and storage headers; their resident u32 lists use 10,725,872 bytes.
 The automatic upgrade takes 54.0 seconds, and the following GC takes 0.8 seconds. The format-4
 executable rejects the upgraded prefix with `BucketFormat { required: 5, supported: 4 }`.
@@ -7901,4 +7900,109 @@ reuse an executable from the other archive. The measurement harness records its 
 and bucket versions, and verifies that the older executable refuses the candidate before timing it.
 The harness is `crates/bf-engine/examples/d4.rs`; the data loader is `bench/nq/load.py --vectors-only`.
 
-Paired latency, throughput, and recall measurements are in progress.
+### Original paired matrix, before the shared cache pool
+
+The frozen baseline is `293251c`. This matrix isolates D4 from the concurrent X1, RR1, and Q2
+query changes: its candidate combines the core retirement reader, the immutable predicate cache,
+the selectivity-adjusted filtered planner, and the warm-hint correction. It uses the initial fixed
+predicate reservation, superseded by the shared pool measured below. The first baseline pass was
+retained while candidate fixes were built between runs; the second pass reverses arm order. No
+build, profiler, or corpus computation overlaps any timed run.
+
+At each probe setting, each ANN process measures 100 cache-cold queries, warms its first 1,000,
+and checks all 3,452 query results while timing the first 1,000. Its sixteen clients then measure
+2,000 requests after a separate 2,000-request prewarm. Cache-cold means clearing both engine and
+storage caches on the same process, with the connection pool retained. These are steady-state
+cache budgets, rather than an assertion that every touched vector fits memory. Table ranges are
+the two process measurements, not confidence intervals.
+
+| Probes | Arm | Cold p50 / p90 (ms) | Warm p50 / p90 (ms) | 16-client q/s |
+|---:|---|---|---|---:|
+| 48 | baseline | 292.8–319.6 / 442.8–506.5 | 41.1–42.7 / 51.9–67.6 | 23.49–23.67 |
+| 48 | candidate | 288.5–336.7 / 394.2–546.4 | 40.3–40.6 / 56.7–61.8 | 21.85–22.32 |
+| 64 | baseline | 301.5–324.3 / 452.8–476.8 | 41.6–43.0 / 56.4–57.8 | 23.30–23.69 |
+| 64 | candidate | 314.0–349.7 / 459.6–517.5 | 41.9–42.1 / 52.4–58.8 | 22.02–23.03 |
+
+All 3,452 ordered top-ten row objects, including distances, match in every paired pass. Recall@10
+is 0.9497682503 at 48 probes, and 0.9599652375 at 64 probes, for both arms. Warm p50 improves or overlaps the baseline, and cold/p90
+ranges overlap, but sixteen-client throughput falls 6.3% at 48 probes, and 4.1% at 64 probes on
+average. That initial throughput result fails the no-regression gate; the controls below separate
+reader CPU, the fixed cache reservation, and the storage prefix.
+
+Filtered runs use the same first 64 queries with `id < 268147`, about 10% of rows. Each run has 64
+cache-cold samples, a 64-request prewarm, 64 timed warm requests, and 64 requests at sixteen
+clients. Exact filtered cosine truth is recomputed from those 268,147 stored f16 vectors, using
+float32 normalization and scoring.
+
+| Probes | Arm | Cold p50 / p90 (ms) | Warm p50 / p90 (ms) | 16-client q/s |
+|---:|---|---|---|---:|
+| 48 | baseline | 3343.7–3418.0 / 3479.8–3550.6 | 3019.0–3056.3 / 3036.0–3072.8 | 0.65–0.66 |
+| 48 | candidate | 2263.2–2295.2 / 2450.5–2532.3 | 67.7–74.2 / 72.0–90.3 | 18.31–23.56 |
+| 64 | baseline | 3372.7–3473.4 / 3496.6–3626.4 | 3018.0–3070.5 / 3032.1–3096.8 | 0.65 |
+| 64 | candidate | 2230.9–2265.9 / 2420.5–2590.3 | 67.2–71.3 / 81.4–98.9 | 21.21–24.73 |
+
+All 64 ordered row objects match in all four pairs, with recall@10 of 1.0. The combined change
+cuts warm p50 from about three seconds to 67–74 ms, and improves cold filtered latency too.
+The cache controls below distinguish the shared predicate optimization from probing the tiers.
+The earlier cap-three tier pilot lost recall and is excluded: the retained planner compensates
+for full selectivity, with its survivor margin, rather than adopting a query-specific probe floor.
+
+### Controlled reader and cache checks
+
+The initial throughput gap is checkpoint latency variation, rather than a vector decode regression.
+Eight diagnostic runs use 2,000 prewarm requests, 1,000 serial timed requests, and 2,000 requests at
+sixteen clients. Hardware counters cover only the 3,000 timed requests, using perf FIFO control and
+an acknowledgement at each boundary. Retention is explicitly zero, and every reader is read-only.
+The original decoded budget is 2,054,084,096 bytes; the larger control doubles it to 4,108,168,192.
+All 1,000 ordered recorded responses match the original baseline in every control.
+
+| Reader and storage prefix | Decoded budget | M instructions/query | CPU ms/query | Search ms/query at 16 clients | Checkpoint ms/query, including queueing | 16-client q/s |
+|---|---|---:|---:|---:|---:|---:|
+| baseline, original prefix | original | 34.5107 | 10.8587 | 2.6456 | 659.55 | 24.069 |
+| D4 reader, same original prefix | original | 34.5219 | 10.8482 | 2.6442 | 702.75 | 22.594 |
+| D4 reader, retired prefix | original | 34.5904 | 11.0538 | 2.6895 | 794.31 | 20.009 |
+| D4 reader, smaller fixed predicate reservation, original prefix | original | 34.4389 | 10.9269 | 2.6810 | 823.85 | 19.296 |
+| D4 reader, shared pool, original prefix | original | 34.5432 | 11.0538 | 2.6564 | 800.71 | 19.810 |
+| D4 reader, shared pool, retired prefix | original | 34.6245 | 10.8921 | 2.6433 | 681.73 | 23.242 |
+| D4 reader, original prefix | doubled | 34.5173 | 10.8274 | 2.6429 | 721.83 | 22.002 |
+| baseline, original prefix | doubled | 34.5042 | 10.8365 | 2.6463 | 734.29 | 21.601 |
+
+The same-prefix pair reproduces a 6.13% throughput loss while instructions rise only 0.032%,
+cycles fall 0.30%, and search execution is unchanged. Its concurrent checkpoint LIST average
+rises from 30.60 to 32.35 ms, and GET average rises from 9.43 to 10.10 ms. Neither concurrent
+search performs a backend read. Forced refresh serializes those checkpoint operations; the
+reader does not become slower from retiring the duplicate vectors. The nominal fixed column
+reservation suggested a cache-admission cliff, but these counters do not support it as the
+cause of this NQ throughput gap. The shared pool is a resource-allocation improvement.
+
+The separate cache controls use the same first sixteen filtered requests at 48 probes, the original
+decoded budget, and normal one-hour retention. Each process has sixteen cache-cold samples,
+sixteen warm-up requests, sixteen timed serial requests, and sixteen requests at sixteen clients.
+All sixteen ordered responses match. These short throughput samples identify the remaining
+filter regression; they are not long throughput confidence intervals.
+
+| Reader | Cold p50 / p90 (ms) | Warm p50 / p90 (ms) | 16-client q/s |
+|---|---|---|---:|
+| original baseline, no predicate cache | 3410.34 / 3596.88 | 1521.96 / 1609.64 | 5.07 |
+| baseline plus shared predicate cache | 1902.19 / 2108.25 | 12.05 / 14.89 | 600.92 |
+| D4 tier reader, predicate lookup disabled | 3735.50 / 4105.54 | 1548.04 / 1570.02 | 4.96 |
+| D4 with shared predicates and derived slab masks | 2605.99 / 2961.32 | 14.34 / 28.31 | 240.84 |
+
+Caching the derived masks improves D4 from 166.42 to 240.84 q/s in these controls, but D4 still
+loses about 2.5 times in throughput against the proper cache-enabled segment comparator.
+The large speedup against the uncached original therefore belongs primarily to immutable
+predicate reuse. That optimization is independent of retirement and was split into `wt/d4-pred`
+(commit `6e0df84`), then merged into main at `edb79c9`, with no format change.
+
+A diagnostic of the exact masks for the ID-prefix predicate finds all 38 slabs partially selected:
+zero slabs are empty, and zero are fully selected. Among 13,391 leaf clusters, 1,030 are empty,
+seven are fully selected, and 12,354 are partial. Whole-slab row bounds skip no slabs, and exact
+empty-cluster exclusion skips only 7.7% of leaves. This diagnostic reads metadata while timing
+is paused; its duration is excluded from query measurements.
+
+**Merge decision:** format 5 remains on the reviewed D4 branch. It fails the cached filtered
+throughput gate and is not approved for main. An index-only ID-band/local-filter directory,
+pointing into the existing exact vector payload, is the next design round. Lowering probes to
+recover throughput is not an acceptable substitute: the earlier pilot lost neighbors.
+
+Additional filter selectivity controls and the final integrated-reader confirmation follow below.

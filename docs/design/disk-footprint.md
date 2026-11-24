@@ -184,8 +184,12 @@ segments, at the same bytes.
 
 ### D4 after round AR3: what is left
 
-Status (2026-11-24): the reader migration, fenced retirement, and crash tests are implemented below.
-NQ measurements and their limits are recorded in the Round D4 section of `docs/benchmarks.md`.
+Status (2026-11-24): the reader migration, fenced retirement, and crash tests are implemented on the
+D4 branch. Format 5 is held from main because cached ID-local filtered throughput regresses against
+the standalone predicate cache. That cache landed independently without a format change. The next
+round is an index-only ID-band/local-filter directory into the existing vector payload, preserving
+filter locality while storing exact vectors once. NQ measurements and their limits are recorded in
+the Round D4 section of `docs/benchmarks.md`.
 
 Round AR3 built R4's lineage: compaction now merges covered segments and records where their rows went. It did
 not retire the covered segments' ANN objects. On NQ (2.68M rows, 1,024 dims in f16, everything covered by a base),

@@ -220,7 +220,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 return Err("empty workload".into());
             }
             let mut cold = Vec::new();
-            for q in requests.iter().take(if short { 20 } else { 100 }) {
+            let cold_queries = std::env::var("BF_D4_COLD_QUERIES")
+                .ok()
+                .map(|value| value.parse::<usize>())
+                .transpose()?
+                .unwrap_or(if short { 20 } else { 100 });
+            if cold_queries == 0 {
+                return Err("cold-query count must be positive".into());
+            }
+            for q in requests.iter().take(cold_queries) {
                 engine.drop_caches().await;
                 let start = Instant::now();
                 engine.query("nq", q.clone()).await?;
