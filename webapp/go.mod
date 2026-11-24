@@ -1,3 +1,3 @@
-module github.com/dorkitude/blowfish/webapp
+module github.com/endgame-labs/blowfish/webapp
 
 go 1.22

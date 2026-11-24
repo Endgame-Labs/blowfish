@@ -2,7 +2,7 @@
 name = "compat"
 version = "0.1.0"
 authors = [
-    { name = "dorkitude" }
+    { name = "Endgame Labs, Inc." }
 ]
 requires-python = ">=3.12"
 dependencies = [

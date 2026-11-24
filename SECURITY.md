@@ -15,9 +15,9 @@ Do **not** open a public GitHub issue or pull request for an undisclosed vulnera
 
 Report vulnerabilities privately through GitHub private vulnerability reporting:
 
-https://github.com/dorkitude/blowfish/security/advisories/new
+https://github.com/endgame-labs/blowfish/security/advisories/new
 
-If private vulnerability reporting is unavailable on the repository, contact the maintainer privately through their GitHub profile (https://github.com/dorkitude) to arrange a secure channel before sharing details.
+If private vulnerability reporting is unavailable on the repository, contact the maintainer privately through the Endgame Labs GitHub organization (https://github.com/endgame-labs) to arrange a secure channel before sharing details.
 
 Please include:
 

@@ -206,7 +206,7 @@ follow-up.
 ## Reproduction
 
 The study code is not in `main`: it copies a frozen production baseline that would drift. It lives on the
-[`study/graph-g2`](https://github.com/dorkitude/blowfish/tree/study/graph-g2) branch (commit `7fac0af`), and the
+[`study/graph-g2`](https://github.com/endgame-labs/blowfish/tree/study/graph-g2) branch (commit `7fac0af`), and the
 paths below refer to that branch.
 
 I added `crates/bf-engine/examples/graph_study.rs`, with study-only graph and baseline helpers. I added

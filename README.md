@@ -1,7 +1,7 @@
 # blowfish
 
-[![CI](https://github.com/dorkitude/blowfish/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dorkitude/blowfish/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/dorkitude/blowfish)](https://github.com/dorkitude/blowfish/releases/latest)
+[![CI](https://github.com/endgame-labs/blowfish/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/endgame-labs/blowfish/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/endgame-labs/blowfish)](https://github.com/endgame-labs/blowfish/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-2024_edition-orange.svg?logo=rust)](https://www.rust-lang.org)
 [![turbopuffer API compatible](https://img.shields.io/badge/turbopuffer_API-compatible-6f42c1.svg)](compat/README.md)
@@ -154,7 +154,7 @@ blowfish is an independent open-source project and is not affiliated with or end
 Run on a local volume for development (port `8000`, auth off):
 
 ```bash
-git clone https://github.com/dorkitude/blowfish.git
+git clone https://github.com/endgame-labs/blowfish.git
 cd blowfish
 docker compose up --build --wait blowfish
 ```

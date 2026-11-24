@@ -28,7 +28,7 @@ log entry in the same commit.
   single-writer mode.
 - One static binary and one config file. Scale out by running more copies.
 - Role-based API keys, an admin super key, and Prometheus metrics come built in.
-- License: MIT. The repo is public at `dorkitude/blowfish`.
+- License: MIT. The repo is public at `endgame-labs/blowfish` (moved from `dorkitude/blowfish` on 2026-11-24). Copyright holder: Endgame Labs, Inc.
 
 ## 2. Compatibility
 

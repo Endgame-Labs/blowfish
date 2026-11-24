@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.16"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/dorkitude/blowfish"
+repository = "https://github.com/endgame-labs/blowfish"
 
 [profile.release]
 debug = 1

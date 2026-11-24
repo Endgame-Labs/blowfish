@@ -213,7 +213,7 @@ Do not publish credentials, customer data, or an exploit against someone else's 
 Report privately through the repository's Security tab when private vulnerability reporting
 is enabled:
 
-https://github.com/dorkitude/blowfish/security/advisories/new
+https://github.com/endgame-labs/blowfish/security/advisories/new
 
 If private reporting is unavailable, contact the maintainer privately through their GitHub
 profile to arrange a secure channel. Include the affected commit/version, a minimal reproducer
