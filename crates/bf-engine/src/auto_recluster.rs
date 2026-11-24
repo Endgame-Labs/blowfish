@@ -1,21 +1,25 @@
 //! The automatic recluster (`docs/design/auto-recluster.md`): when a namespace gets a new tier,
 //! how the build runs beside indexing and queries, and how the indexer installs it.
 //!
-//! - **What.** A vector attribute has at most two tiers: a base, and a delta over rows written
-//!   since, built against the base's coarse cells. Rows in neither are in uncovered segments.
+//! - **What.** A vector attribute has a base tier and deltas over rows written since, built
+//!   against the base's coarse cells: one delta, or two while a new base builds (the one from
+//!   before it, and one over the rows written during it). Rows in none are in uncovered segments.
 //! - **When.** After each publication the background indexer evaluates the trigger from manifest
 //!   numbers only ([`decide`]). A namespace with no tier gets a base once its layout would gain
 //!   from it. With a base, the rows outside the tiers get a delta (rebuilt with them) once they
 //!   reach a small share of the base, and the delta merges into a new base once it reaches half
 //!   of it. A tier in an older format is rebuilt. While a bulk load runs, builds wait.
-//! - **How.** One build per process, on half the cores, waiting between slabs while the indexer
-//!   flushes or compacts. It reserves memory from the engine's budget and checks the scratch disk
-//!   first, and defers (counting the reason) when either is short.
+//! - **How.** One base build and one delta build per process, on half the cores, waiting between
+//!   slabs while the indexer flushes or compacts. A delta may build beside a base (over the rows
+//!   outside it, on half the memory), never the other way around. A build reserves memory from
+//!   the engine's budget and checks the scratch disk first, and defers (counting the reason) when
+//!   either is short.
 //! - **Safely.** The build reads a manifest snapshot and claims nothing. A create-only build record,
 //!   rewritten every ten minutes until the tier is installed or dropped, keeps GC away from its
 //!   objects. The finished tier waits in memory until the indexer's next pass, which checks that
-//!   the segments it covers are still live (and, for a delta, that its base is still installed)
-//!   and installs it in its own fenced publication; then the records are deleted. Compaction
+//!   the segments it covers are still live (and, for a delta, that the base does not cover them)
+//!   and installs it in its own fenced publication, retiring the tiers it overlaps; then the
+//!   records are deleted. Compaction
 //!   leaves the segments of a running or waiting build alone, so the check only fails when
 //!   another node changed them.
 use crate::{Engine, log_error, recluster, storage_error};
@@ -62,8 +66,16 @@ pub(crate) const RECORD_INTERVAL: Duration = Duration::from_secs(600);
 /// A finished tier the indexer could not install within this long is dropped.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(3600);
 
-/// Whether a build is running in this process (one at a time, across scoped engines).
-static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Whether a base build, and a delta build, is running in this process (one of each at a time,
+/// across scoped engines).
+static BASE_RUNNING: AtomicBool = AtomicBool::new(false);
+static DELTA_RUNNING: AtomicBool = AtomicBool::new(false);
+fn slot(kind: Kind) -> &'static AtomicBool {
+    match kind {
+        Kind::Base => &BASE_RUNNING,
+        Kind::Delta => &DELTA_RUNNING,
+    }
+}
 /// Index passes doing work right now, across the process. Builds yield to them.
 static INDEXING: AtomicUsize = AtomicUsize::new(0);
 
@@ -92,7 +104,7 @@ pub(crate) enum Decision {
 }
 
 /// Which tier a build makes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Kind {
     /// A base over every row, replacing the attribute's tiers.
     Base,
@@ -154,7 +166,7 @@ pub(crate) fn layout(
     let mut out = Layout {
         covered_rows,
         base_rows: tiers.first().map_or(0, SlabSet::rows),
-        delta_rows: tiers.get(1).map_or(0, SlabSet::rows),
+        delta_rows: tiers.iter().skip(1).map(SlabSet::rows).sum(),
         uncovered_rows,
         uncovered_segments: uncovered.len(),
         masked_rows: 0,
@@ -260,6 +272,45 @@ fn next_tier(l: &Layout) -> Option<&'static str> {
     (l.masked_rows as f64 >= MASKED_SHARE * l.covered_rows as f64).then_some("masked")
 }
 
+/// The trigger while a base builds over `building`: a delta over the rows outside it, once they
+/// reach the delta thresholds (against the base, and against the delta already built beside it).
+fn decide_beside(
+    segments: &[bf_wal::Segment],
+    tiers: &std::collections::BTreeMap<String, Vec<SlabSet>>,
+    lineage: &[bf_wal::Lineage],
+    building: &BTreeSet<String>,
+    compacting: bool,
+) -> Decision {
+    let classes = crate::lineage::classes(segments, tiers, lineage);
+    for (attr, sets) in tiers {
+        let Some(base) = sets.first().filter(|b| b.coarse.is_some()) else {
+            continue;
+        };
+        let key = format!("annv2:{attr}");
+        let (mut outside, mut beside) = (0u64, 0u64);
+        for s in segments
+            .iter()
+            .filter(|s| s.files.contains_key(&key) && !building.contains(&s.id))
+        {
+            match classes.get(&s.id) {
+                Some(class) if class.contains(&base.dir.key) => {}
+                Some(class) if !class.is_empty() => beside += u64::from(s.row_count),
+                _ => outside += u64::from(s.row_count),
+            }
+        }
+        let base_rows = base.rows() as f64;
+        if outside > 0
+            && outside as f64 >= (DELTA_SHARE * base_rows).max(DELTA_GROWTH * beside as f64)
+        {
+            if compacting {
+                return Decision::Wait("compaction");
+            }
+            return Decision::Build(attr.clone(), "delta");
+        }
+    }
+    Decision::Nothing
+}
+
 /// The tier a foreground run builds whatever the thresholds say: a base when there is none or a
 /// merge is due, else a delta when rows are outside the tiers, else a new base.
 fn forced_kind(
@@ -280,16 +331,16 @@ fn forced_kind(
 }
 
 /// What a build reads and makes: its kind, the segments whose rows it covers (in manifest order),
-/// the coarse cells it reuses, and for a delta the directory key of the base it was built against.
+/// and the coarse cells it reuses.
 pub(crate) struct Target {
     pub kind: Kind,
     pub segments: Vec<bf_wal::Segment>,
     pub coarse: Option<(bf_wal::SegmentFile, u64)>,
-    pub base_dir: Option<String>,
 }
 
-/// The build `kind` makes for `attr` over `manifest`.
-fn target(manifest: &Manifest, attr: &str, kind: Kind) -> Target {
+/// The build `kind` makes for `attr` over `manifest`. A delta leaves out the segments of a base
+/// building beside it (`building`).
+fn target(manifest: &Manifest, attr: &str, kind: Kind, building: &BTreeSet<String>) -> Target {
     let tiers = manifest
         .ann_tiers
         .get(attr)
@@ -317,11 +368,14 @@ fn target(manifest: &Manifest, attr: &str, kind: Kind) -> Target {
                 segments: manifest
                     .segments
                     .iter()
-                    .filter(|s| s.files.contains_key(&key) && !in_base.contains(&s.id))
+                    .filter(|s| {
+                        s.files.contains_key(&key)
+                            && !in_base.contains(&s.id)
+                            && !building.contains(&s.id)
+                    })
                     .cloned()
                     .collect(),
                 coarse: base.coarse.clone().map(|f| (f, base.coarse_rows)),
-                base_dir: Some(base.dir.key.clone()),
             }
         }
         // A delta needs a current base with its cells; anything else is a new base.
@@ -331,7 +385,6 @@ fn target(manifest: &Manifest, attr: &str, kind: Kind) -> Target {
             coarse: base
                 .and_then(|b| b.coarse.clone().map(|f| (f, b.coarse_rows)))
                 .filter(|(_, rows)| all <= rows.saturating_mul(COARSE_GROWTH)),
-            base_dir: None,
         },
     }
 }
@@ -341,20 +394,18 @@ pub(crate) struct Pending {
     attr: String,
     set: SlabSet,
     kind: Kind,
-    /// For a delta, the directory key of the base it was built against.
-    base_dir: Option<String>,
     built_at: Instant,
     outcome: tokio::sync::watch::Sender<Option<bool>>,
 }
 
-/// Per-engine job bookkeeping, keyed by namespace.
+/// Per-engine job bookkeeping, keyed by namespace and kind.
 #[derive(Default)]
 pub(crate) struct Jobs(std::sync::Mutex<JobsState>);
 #[derive(Default)]
 struct JobsState {
     /// Segments a running build covers.
-    building: HashMap<String, BTreeSet<String>>,
-    pending: HashMap<String, Pending>,
+    building: HashMap<(String, Kind), BTreeSet<String>>,
+    pending: HashMap<(String, Kind), Pending>,
     /// The manifest generation each namespace's trigger last evaluated, and when to evaluate it
     /// again anyway (after a deferral or a failure; never while it stands).
     evaluated: HashMap<String, (u64, Option<Instant>)>,
@@ -367,14 +418,28 @@ impl Jobs {
     /// Segments compaction must leave alone because a build covers them (running or waiting).
     pub(crate) fn protected(&self, ns: &str) -> BTreeSet<String> {
         let state = self.lock();
-        let mut out = state.building.get(ns).cloned().unwrap_or_default();
-        if let Some(p) = state.pending.get(ns) {
-            out.extend(p.set.covered.iter().map(|c| c.segment.clone()));
+        let mut out = BTreeSet::new();
+        for kind in [Kind::Base, Kind::Delta] {
+            let key = (ns.to_string(), kind);
+            out.extend(state.building.get(&key).into_iter().flatten().cloned());
+            if let Some(p) = state.pending.get(&key) {
+                out.extend(p.set.covered.iter().map(|c| c.segment.clone()));
+            }
         }
         out
     }
     pub(crate) fn has_pending(&self, ns: &str) -> bool {
-        self.lock().pending.contains_key(ns)
+        let state = self.lock();
+        [Kind::Base, Kind::Delta]
+            .into_iter()
+            .any(|kind| state.pending.contains_key(&(ns.to_string(), kind)))
+    }
+    /// The segments of a base building for `ns` in this process.
+    fn building_base(&self, ns: &str) -> Option<BTreeSet<String>> {
+        self.lock()
+            .building
+            .get(&(ns.to_string(), Kind::Base))
+            .cloned()
     }
     /// Whether `ns`'s trigger should be evaluated at manifest `generation`: once a generation,
     /// unless a retry has come due. Marks it evaluated.
@@ -396,15 +461,20 @@ impl Jobs {
             entry.1 = Some(Instant::now() + wait);
         }
     }
-    /// Take the namespace's waiting tier for installation in `manifest`. Returns a guard that puts
-    /// it back unless [`Installing::published`] is called, or `None` when there is none (or it
-    /// was dropped: its covered segments changed, its base was replaced, or it waited too long).
+    /// Take the namespace's waiting tier (a base before a delta) for installation in `manifest`.
+    /// Returns a guard that puts it back unless [`Installing::published`] is called, or `None`
+    /// when there is none (or it was dropped: its covered segments changed, the base covers its
+    /// rows, or it waited too long).
     pub(crate) fn install<'a>(
         &'a self,
         ns: &str,
         manifest: &mut Manifest,
     ) -> Option<Installing<'a>> {
-        let pending = self.lock().pending.remove(ns)?;
+        let pending = {
+            let mut state = self.lock();
+            let base = state.pending.remove(&(ns.to_string(), Kind::Base));
+            base.or_else(|| state.pending.remove(&(ns.to_string(), Kind::Delta)))?
+        };
         if pending.built_at.elapsed() > INSTALL_TIMEOUT {
             discard(ns, &pending, "timeout");
             return None;
@@ -428,20 +498,47 @@ impl Jobs {
             .get(&pending.attr)
             .cloned()
             .unwrap_or_default();
+        // The tiers holding rows of the segments the new tier covers (themselves, or merged into
+        // them): the new tier replaces them. A delta built beside a base covers none of its rows,
+        // so the base keeps it; a delta whose rows a newer base holds is superseded.
+        let classes = crate::lineage::classes(
+            &manifest.segments,
+            &std::collections::BTreeMap::from([(pending.attr.clone(), current.clone())]),
+            &manifest.lineage,
+        );
+        let overlaps = |old: &SlabSet| {
+            old.dir.key == pending.set.dir.key
+                || pending.set.covered.iter().any(|c| {
+                    classes
+                        .get(&c.segment)
+                        .is_some_and(|class| class.contains(&old.dir.key))
+                })
+        };
+        let deltas = current.iter().skip(1);
         // An earlier publication may already hold this tier (its reply was lost): nothing to retire.
         let (installed, replaced): (Vec<SlabSet>, Vec<SlabSet>) = match pending.kind {
-            Kind::Base => (vec![pending.set.clone()], current),
+            Kind::Base => (
+                std::iter::once(pending.set.clone())
+                    .chain(deltas.clone().filter(|d| !overlaps(d)).cloned())
+                    .collect(),
+                current
+                    .iter()
+                    .take(1)
+                    .chain(deltas.filter(|d| overlaps(d)))
+                    .cloned()
+                    .collect(),
+            ),
             Kind::Delta => {
-                let Some(base) = current
-                    .first()
-                    .filter(|b| Some(&b.dir.key) == pending.base_dir.as_ref())
-                else {
+                let Some(base) = current.first().filter(|b| !overlaps(b)) else {
                     discard(ns, &pending, "superseded");
                     return None;
                 };
                 (
-                    vec![base.clone(), pending.set.clone()],
-                    current.into_iter().skip(1).collect(),
+                    std::iter::once(base.clone())
+                        .chain(deltas.clone().filter(|d| !overlaps(d)).cloned())
+                        .chain(std::iter::once(pending.set.clone()))
+                        .collect(),
+                    deltas.filter(|d| overlaps(d)).cloned().collect(),
                 )
             }
         };
@@ -474,14 +571,13 @@ impl Jobs {
     ) -> tokio::sync::watch::Receiver<Option<bool>> {
         let (outcome, rx) = tokio::sync::watch::channel(None);
         let mut state = self.lock();
-        state.building.remove(ns);
+        state.building.remove(&(ns.to_string(), target.kind));
         if let Some(old) = state.pending.insert(
-            ns.to_string(),
+            (ns.to_string(), target.kind),
             Pending {
                 attr: attr.to_string(),
                 set,
                 kind: target.kind,
-                base_dir: target.base_dir.clone(),
                 built_at: Instant::now(),
                 outcome,
             },
@@ -530,9 +626,7 @@ impl Drop for Installing<'_> {
         // The publication failed or was fenced: the next pass tries again.
         if let Some(p) = self.pending.take() {
             let mut state = self.jobs.lock();
-            if !state.pending.contains_key(&self.ns) {
-                state.pending.insert(self.ns.clone(), p);
-            }
+            state.pending.entry((self.ns.clone(), p.kind)).or_insert(p);
         }
     }
 }
@@ -542,7 +636,7 @@ pub(crate) struct Job {
     id: String,
     slab_prefix: String,
     record: Option<tokio::task::JoinHandle<()>>,
-    jobs: Option<(std::sync::Arc<crate::Inner>, String)>,
+    jobs: Option<(std::sync::Arc<crate::Inner>, String, Kind)>,
 }
 impl Job {
     /// The ID prefix of this build's slabs (`ns/<ns>/slabs/<prefix>...` holds its objects).
@@ -580,8 +674,8 @@ impl Drop for Job {
         if let Some(record) = self.record.take() {
             record.abort();
         }
-        if let Some((inner, ns)) = self.jobs.take() {
-            inner.jobs.lock().building.remove(&ns);
+        if let Some((inner, ns, kind)) = self.jobs.take() {
+            inner.jobs.lock().building.remove(&(ns, kind));
         }
     }
 }
@@ -630,7 +724,7 @@ pub(crate) async fn building_prefixes(
 
 /// Memory a slab build may use: the budget after the block cache, the decoded cache, the
 /// unindexed limit, and a segment build if one is running, as rows of a slab; `None` below the floor.
-fn slab_rows(engine: &Engine) -> Option<usize> {
+fn slab_rows(engine: &Engine, beside: bool) -> Option<usize> {
     let config = &engine.0.config;
     let (cache, _) = engine.0.store.cache_limits();
     let in_flight = if INDEXING.load(Ordering::Acquire) > 0 {
@@ -643,6 +737,7 @@ fn slab_rows(engine: &Engine) -> Option<usize> {
         .saturating_sub(config.decoded_cache_bytes)
         .saturating_sub(config.max_unindexed_bytes)
         .saturating_sub(in_flight);
+    let available = if beside { available / 2 } else { available };
     let rows = (available / SLAB_ROW_BYTES) as usize;
     (rows >= MIN_SLAB_ROWS).then_some(rows.min(MAX_SLAB_ROWS))
 }
@@ -686,9 +781,11 @@ impl Engine {
     /// Evaluate the trigger for `ns` after an index pass, and start a build in the background if
     /// it says so. Costs nothing when nothing was published since the last evaluation.
     pub(crate) async fn consider_recluster(&self, ns: &str) {
-        if RUNNING.load(Ordering::Acquire) || self.0.jobs.has_pending(ns) {
+        // A base never starts beside a delta, and a waiting tier installs first.
+        if DELTA_RUNNING.load(Ordering::Acquire) || self.0.jobs.has_pending(ns) {
             return;
         }
+        let building = self.0.jobs.building_base(ns);
         let Some(handle) = self.0.namespaces.lock().await.get(ns).cloned() else {
             return;
         };
@@ -708,14 +805,27 @@ impl Engine {
                     .is_ok_and(|since| since < BULK_WINDOW)
                     || at > chrono::Utc::now()
             });
-            let (decision, numbers) = decide(
-                &state.segments,
-                &state.ann_tiers,
-                &state.lineage,
-                Some(state.stats.rows),
-                bulk,
-                compacting,
-            );
+            let (decision, numbers) = match &building {
+                // Beside a base building here, only a delta over the rows outside it.
+                Some(building) => (
+                    decide_beside(
+                        &state.segments,
+                        &state.ann_tiers,
+                        &state.lineage,
+                        building,
+                        compacting,
+                    ),
+                    None,
+                ),
+                None => decide(
+                    &state.segments,
+                    &state.ann_tiers,
+                    &state.lineage,
+                    Some(state.stats.rows),
+                    bulk,
+                    compacting,
+                ),
+            };
             (state.manifest_seq, decision, numbers)
         };
         if !self.0.jobs.evaluate(ns, generation) {
@@ -730,14 +840,17 @@ impl Engine {
             }
             Decision::Build(attr, why) => (attr, why),
         };
-        if RUNNING.swap(true, Ordering::AcqRel) {
-            // Another namespace's build started meanwhile: evaluate again after it.
+        let kind = Kind::of(why);
+        if (kind == Kind::Base && DELTA_RUNNING.load(Ordering::Acquire))
+            || slot(kind).swap(true, Ordering::AcqRel)
+        {
+            // Another build of this kind started meanwhile: evaluate again after it.
             self.0.jobs.lock().evaluated.remove(ns);
             return;
         }
         let (engine, ns) = (self.clone(), ns.to_string());
         tokio::spawn(async move {
-            let _running = Running;
+            let _running = Running(vec![kind]);
             tracing::info!(
                 namespace = ns.as_str(),
                 attribute = attr.as_str(),
@@ -794,11 +907,18 @@ impl Engine {
         {
             return Ok(None);
         }
-        let target = target(&manifest, attr, Kind::of(why));
+        let kind = Kind::of(why);
+        let building = match kind {
+            Kind::Delta => self.0.jobs.building_base(ns).unwrap_or_default(),
+            Kind::Base => BTreeSet::new(),
+        };
+        let target = target(&manifest, attr, kind, &building);
         if target.segments.is_empty() {
             return Ok(None);
         }
-        let Some(max_slab_rows) = slab_rows(self) else {
+        // Beside a base build, a delta takes half the memory (the base sized its slabs first).
+        let beside = kind == Kind::Delta && BASE_RUNNING.load(Ordering::Acquire);
+        let Some(max_slab_rows) = slab_rows(self, beside) else {
             defer(ns, "memory", None);
             return Ok(None);
         };
@@ -843,7 +963,7 @@ impl Engine {
         let started = Instant::now();
         metrics::gauge!("blowfish_recluster_running").set(1.0);
         let _gauge = scopeguard(|| metrics::gauge!("blowfish_recluster_running").set(0.0));
-        let job = self.start_job(ns, &target.segments).await?;
+        let job = self.start_job(ns, target.kind, &target.segments).await?;
         let built = self.build_tier(ns, manifest, target, opts, &job).await?;
         let mut rx = self.0.jobs.stage(ns, &opts.attribute, built.set, target);
         let deadline = Instant::now() + INSTALL_TIMEOUT;
@@ -894,7 +1014,12 @@ impl Engine {
 
     /// Register a build: its covered segments (compaction leaves them alone) and its first build
     /// record (written before any object is uploaded), refreshed every [`RECORD_INTERVAL`].
-    async fn start_job(&self, ns: &str, segments: &[bf_wal::Segment]) -> Result<Job, ApiError> {
+    async fn start_job(
+        &self,
+        ns: &str,
+        kind: Kind,
+        segments: &[bf_wal::Segment],
+    ) -> Result<Job, ApiError> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let slab_prefix = format!("slab-{id}-");
         let record = BuildRecord {
@@ -908,7 +1033,7 @@ impl Engine {
             .await
             .map_err(storage_error)?;
         self.0.jobs.lock().building.insert(
-            ns.to_string(),
+            (ns.to_string(), kind),
             segments.iter().map(|s| s.id.clone()).collect(),
         );
         let (key_ns, key_id) = (ns.to_string(), id.clone());
@@ -929,7 +1054,7 @@ impl Engine {
             id,
             slab_prefix,
             record: Some(refresh),
-            jobs: Some((self.0.clone(), ns.to_string())),
+            jobs: Some((self.0.clone(), ns.to_string(), kind)),
         })
     }
 
@@ -945,17 +1070,31 @@ impl Engine {
             .await
             .map_err(log_error)?
             .ok_or_else(|| ApiError::new(404, "namespace has no checkpoint"))?;
-        while RUNNING.swap(true, Ordering::AcqRel) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Beside a base building here, a delta over the rows outside it.
+        let (_running, kind, building) = match self.0.jobs.building_base(ns) {
+            Some(building) => {
+                while DELTA_RUNNING.swap(true, Ordering::AcqRel) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                (Running(vec![Kind::Delta]), Kind::Delta, building)
+            }
+            None => {
+                let kind = forced_kind(
+                    &manifest.segments,
+                    &manifest.lineage,
+                    manifest.ann_tiers.get(&opts.attribute),
+                    &opts.attribute,
+                );
+                (acquire(kind).await, kind, BTreeSet::new())
+            }
+        };
+        let target = target(&manifest, &opts.attribute, kind, &building);
+        if target.segments.is_empty() {
+            return Err(ApiError::new(
+                409,
+                "no rows outside the base building beside this run",
+            ));
         }
-        let _running = Running;
-        let kind = forced_kind(
-            &manifest.segments,
-            &manifest.lineage,
-            manifest.ann_tiers.get(&opts.attribute),
-            &opts.attribute,
-        );
-        let target = target(&manifest, &opts.attribute, kind);
         self.0
             .stop
             .clone()
@@ -971,11 +1110,26 @@ fn defer(ns: &str, reason: &'static str, numbers: Option<Layout>) {
     tracing::info!(namespace = ns, reason, numbers = ?numbers, "recluster: deferred");
 }
 
-/// Clears [`RUNNING`] when a build ends, however it ends.
-struct Running;
+/// Clears its build slots when a build ends, however it ends.
+struct Running(Vec<Kind>);
 impl Drop for Running {
     fn drop(&mut self) {
-        RUNNING.store(false, Ordering::Release);
+        for kind in &self.0 {
+            slot(*kind).store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Take the build slot of `kind`, waiting for the build holding it (and for a base, until no
+/// delta runs).
+async fn acquire(kind: Kind) -> Running {
+    loop {
+        if !(kind == Kind::Base && DELTA_RUNNING.load(Ordering::Acquire))
+            && !slot(kind).swap(true, Ordering::AcqRel)
+        {
+            return Running(vec![kind]);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1040,6 +1194,51 @@ mod tests {
             "format": format
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn beside_a_base_build_only_rows_outside_it_get_a_delta() {
+        let mut base = tier(
+            &[("a", 600_000), ("b", 400_000)],
+            bf_wal::TIER_FORMAT_VERSION,
+        );
+        base.coarse = Some(
+            serde_json::from_value(serde_json::json!(
+                {"key": "c", "size": 1, "metadata_len": 0}
+            ))
+            .unwrap(),
+        );
+        let mut delta = tier(&[("c", 30_000)], bf_wal::TIER_FORMAT_VERSION);
+        delta.dir.key = "d2".into();
+        let tiers = std::collections::BTreeMap::from([("v".to_string(), vec![base, delta])]);
+        let building: BTreeSet<String> = ["a", "b", "c", "d"].map(String::from).into();
+        let mut segments = vec![
+            segment("a", 600_000),
+            segment("b", 400_000),
+            segment("c", 30_000),
+            segment("d", 90_000),
+        ];
+        // Everything outside the tiers is in the base building: nothing to do, though a delta
+        // would be due without it.
+        assert_eq!(
+            decide_beside(&segments, &tiers, &[], &building, false),
+            Decision::Nothing
+        );
+        // Rows written since it started: below the delta share of the base, then above it.
+        segments.push(segment("e", 30_000));
+        assert_eq!(
+            decide_beside(&segments, &tiers, &[], &building, false),
+            Decision::Nothing
+        );
+        segments.push(segment("f", 20_000));
+        assert_eq!(
+            decide_beside(&segments, &tiers, &[], &building, false),
+            Decision::Build("v".into(), "delta")
+        );
+        assert_eq!(
+            decide_beside(&segments, &tiers, &[], &building, true),
+            Decision::Wait("compaction")
+        );
     }
 
     #[test]

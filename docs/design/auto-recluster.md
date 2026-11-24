@@ -35,9 +35,10 @@ Today recluster is a manual example, and it doesn't survive normal operation:
 
 ## Design
 
-### Layout: a base tier, at most one delta tier, and uncovered segments
+### Layout: a base tier, delta tiers, and uncovered segments
 
-`Manifest::ann_slabs` becomes `ann_tiers: attr -> [SlabSet]`, with at most two entries: a base and a delta. Each is
+`Manifest::ann_slabs` becomes `ann_tiers: attr -> [SlabSet]`: a base and a delta, plus, while a new base builds, a
+second delta over the rows written since it started (see "Deltas beside a base build"). Each is
 today's `SlabSet` (slabs, their covered segments with bases and live generations, and the paged directory). Rows
 in no tier are in **uncovered** segments, which keep their own ANN objects.
 
@@ -77,6 +78,19 @@ they became.
 `Manifest.lineage` is a format-4 field: the bucket and manifest fences went to 4, and v0.1.15 fails closed on an
 upgraded bucket.
 
+### Deltas beside a base build
+
+A base build takes minutes (seven on NQ), and under steady writes the rows written meanwhile used to stay outside
+the tiers until it finished. Now a delta builds beside it (round AR3):
+- It covers the segments outside the base and outside the building base's segments, against the current base's
+  cells. It installs as an extra tier: the base, the delta from before, and this one.
+- A tier being installed replaces the tiers holding rows of the segments it covers (directly or through lineage),
+  and keeps the rest. So the new base replaces the old base and the old delta and keeps the delta built beside it,
+  and the next ordinary delta (over every row outside the base) replaces that one. A delta whose rows a newer base
+  holds is discarded (`superseded`).
+- A delta no longer needs to have been built against the installed base: queries never read the coarse cells, so
+  they only shape how well the delta clusters.
+
 ### When it runs
 
 The indexer evaluates this after each publication, from manifest numbers only, so the check costs nothing.
@@ -107,6 +121,8 @@ The indexer evaluates this after each publication, from manifest numbers only, s
 7. **Order:** a merge first, then a delta, then a masked-rows rebuild. (A masked rebuild of NQ took 10 minutes
    under 1,000 upserts a second, and with it ahead of the delta, the rows outside the tiers stayed above 20% while
    it ran.)
+8. **Beside a base build:** while a new base builds, only a delta over the rows outside it is considered, by the
+   delta thresholds of step 3 (see "Deltas beside a base build").
 
 What the policy costs, simulated for a namespace growing steadily in 200,000-row segments (first base at 1M rows):
 
@@ -121,8 +137,9 @@ of a fresh recluster at any time, and the build work happens in the background.
 
 ### How it runs: background, bounded, and yielding
 
-- **One job per process, run by the namespace's indexer** (the lease holder). It uses a dedicated build pool of half
-  the cores (at least one), so queries keep the rest.
+- **One base job and one delta job per process, run by the namespace's indexer** (the lease holder). They use a
+  dedicated build pool of half the cores (at least one), so queries keep the rest. A delta may start beside a base
+  build, never the reverse; beside one, it sizes its slabs from half the memory.
 - **Memory:**
   - The job reserves from the engine's memory budget. `max_slab_rows` is the memory available after the block
     cache, the decoded cache, the unindexed limit, and any in-flight segment build, divided by 12,000 bytes a row,
