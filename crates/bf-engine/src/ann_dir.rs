@@ -1658,10 +1658,7 @@ pub(crate) async fn search(
         let mut launched = false;
         while let Some(result) = scans.join_next().await {
             results.push(result.map_err(segment::index_error)??);
-            // A staged scan finishes within a few milliseconds of its leading batches.
-            // Wait for its complete candidate set instead of fetching guesses that cannot
-            // be retracted. Remote scans retain their useful object-store overlap.
-            if !locally_staged && !launched && results.len() * 5 >= count * 2 && !scans.is_empty() {
+            if !launched && results.len() * 5 >= count * 2 && !scans.is_empty() {
                 launched = true;
                 let mut leading: Vec<_> = results
                     .iter()
@@ -1669,10 +1666,17 @@ pub(crate) async fn search(
                     .flat_map(|(n, (_, (_, found)))| found.iter().map(move |c| (n, c)))
                     .collect();
                 leading.sort_unstable_by(|a, b| a.1.distance.total_cmp(&b.1.distance));
-                leading.truncate(k.saturating_mul(8).min(80));
+                // Staged batches leave a short overlap window. Read only their best vector
+                // guesses, and leave document guesses to the complete candidate set below.
+                let early_vectors = if locally_staged { 4 } else { 8 };
+                leading.truncate(k.saturating_mul(early_vectors).min(early_vectors * 10));
                 let mut locations: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
                 let mut rows: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
-                let docs_limit = k.saturating_mul(3).min(30);
+                let docs_limit = if locally_staged {
+                    0
+                } else {
+                    k.saturating_mul(3).min(30)
+                };
                 for (rank, (n, c)) in leading.into_iter().enumerate() {
                     locations.entry(n).or_default().push((c.cluster, c.ordinal));
                     if rank < docs_limit
