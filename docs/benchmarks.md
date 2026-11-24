@@ -5971,3 +5971,352 @@ A Spot c7g.2xlarge was reclaimed during an incomplete repeat. Incomplete counter
 are discarded; the final table comes entirely from the replacement on-demand
 host. No S3 objects are created, and both hosts and their temporary access
 resources are cleaned up at the end of the round.
+
+## Round Q2: warm query dispatch after X1
+
+Measured on 2026-11-24 on one owned Spot c7g.4xlarge. Eight Graviton3 CPUs run
+the server, and the other eight run sixteen independent keep-alive clients.
+Both binaries use Rust 1.100.0, Clang 19, and the LLVM 22 linker. The baseline is
+X1's `3e12797`; its production source is identical to merged main `ab4172d`.
+The candidate is built on `ab4172d`. This is a paired ARM server experiment,
+not an Apple M4 or Qdrant comparison.
+
+The standard `bench/nq/load.py` loader builds a new store from the prepared NQ
+data, and measurements wait for the final automatic recluster. Its immutable
+single tier contains 2,681,468 f16 vectors, 1,024 dimensions, 32 slabs, and
+13,391 leaves. This layout differs slightly from X1's historical store; compare
+arms within this round. Each process warms all 3,452 queries three times, then
+measures four full epochs. Requests use strong consistency, top ten, and ID-only
+projection. Raw and decoded cache budgets are each 4 GiB, with no disk cache,
+indexing, or recall sampling. Linux counters cover all server threads, including
+kernel work, unless explicitly marked user-only below.
+
+### Retained dispatcher and admission policy
+
+Warm plans run their first poll on a fixed, CPU-sized Rayon pool. A resident plan
+returns its result directly through a oneshot. If the plan yields, the same pinned
+future resumes through the existing blocking-pool/runtime continuation. It keeps
+its I/O, locks, scratch, and execution state. Dispatch adds no separate cache-only
+execution probe and does not restart the planner on a miss. Cold namespace snapshots retain the original path.
+Metrics distinguish `ready`, `yielded`, and `cold` dispatches through
+`blowfish_query_cpu_dispatch_total`.
+
+The default admits `max(8, 2 * available_parallelism())` query drivers. Admission
+counts drivers waiting for I/O or a CPU worker, rather than compute threads alone.
+The fixed CPU pool limits simultaneous resident computation. The existing
+`BF_QUERY_CONCURRENCY` resource cap remains available: the proposed exact-one-
+permit-per-core rule lost throughput on four cores, and admission has latency and
+throughput tradeoffs. No new setting, public method, wire type, or format is added.
+
+The dispatcher-only gate orders baseline/candidate/candidate/baseline at each probe
+setting; the separate cache-retention candidate is measured below.
+Each table cell reports the median of four epochs for each independent process.
+All ordered top-ten rows, including distances, match the unchanged baseline in
+every epoch. Recall remains 0.9501738123 / 0.9610950174 at 48 / 64 probes.
+
+| Probes | Baseline q/s, two passes | Final q/s, two passes | Baseline / final instructions/query, two passes |
+|---:|---:|---:|---:|
+| 48 | 1,832 / 1,837 | 2,153 / 2,156 | 20.9632 / 20.9675 M; 20.9611 / 20.9668 M |
+| 64 | 1,585 / 1,599 | 1,859 / 1,861 | 24.2283 / 24.2384 M; 24.2286 / 24.2365 M |
+
+| Probes | Baseline p50 / p90, two passes (ms) | Final p50 / p90, two passes (ms) |
+|---:|---:|---:|
+| 48 | 7.83 / 11.70; 7.78 / 11.50 | 6.96 / 10.19; 7.02 / 10.32 |
+| 64 | 9.11 / 13.76; 9.00 / 13.36 | 8.09 / 11.73; 8.10 / 11.67 |
+
+Mean process-median throughput rises **17.4% / 16.8%**. The **1.30× warm gate is
+not met**, and this round establishes no win over Qdrant on the M4. The simpler
+positive change is retained under the brief's smaller-win allowance. Instructions
+are effectively unchanged. At 48 probes, context switches fall from 6.25–6.48 to
+5.09–5.10 per query, and migrations from 2.03–2.08 to 0.68–0.73. Cycles move only
+from 8.49–8.51 M to 8.42–8.47 M. The main gain is better delivery of CPU work,
+rather than a large reduction in executed instructions.
+
+### Isolated arms and kill results
+
+Each arm below was compared with unchanged X1 on the same store and CPU masks.
+These are screening results, rather than substitutes for the final paired table.
+
+| Arm | 48 / 64 probe q/s | Decision |
+|---|---:|---|
+| Typical unchanged X1 | 1,830–1,850 / 1,590–1,600 | Control |
+| Synchronous resident work on Tokio reactors | 445 / not retained | Reject; p90 rises to 39.47 ms at 48 probes |
+| Published immutable namespace snapshots | 1,863 / 1,545 | Reject; +1.9% / -3.3%, with negligible instruction savings |
+| Specialized resident CPU pool and projection, sixteen permits | 2,222 / 1,916 | Reject duplicate planner/projection logic; generic continuation is simpler |
+| Generic continuation, eight permits | 2,057 / 1,797 | Positive dispatch control |
+| Generic continuation, sixteen permits | 2,158 / 1,865 | Retain, subject to final gates |
+| CLOCK replacement for the sparse exact-vector cache | 980 / 816 | Reject; compiled-hit admission collapses |
+| Shared request ownership instead of the two request clones | 1,848 / 1,588 | Reject; approximately 0.004 M instructions saved, with no reliable throughput gain |
+| TCP_NODELAY on the API listener | 1,834 / 1,600 | Reject; within paired variation |
+
+The source audit finds three namespace mutex acquisitions, three namespace-state
+clones, and two query-request clones on the usual speculative warm strong path.
+Their existence does not establish a large cost: published snapshots and request
+sharing fail to produce a consistent gain. The HTTP route already serializes a
+typed response; it does not round-trip the entire response through a JSON value.
+Row attribute maps remain dynamic. The existing empty-state validation pass in
+`indexed::execute` also remains; safely splitting validation from evaluation
+would require preserving all multi-query and error semantics. These paths are
+unchanged; the specialized bypass was not retained.
+
+At four server cores, changing eight permits to four reduced throughput from
+994 / 879 to 936 / 813 q/s at 48 / 64 probes. At ten cores, changing eight to ten
+increased throughput from about 2,177 / 1,869 to 2,302 / 1,972, while slightly
+increasing p90. Sixteen permits on the eight-core unchanged server improve
+throughput to 1,970 / 1,711 but worsen p90 to 12.93 / 14.98 ms. Admission alone
+does not account for the dispatcher's latency improvement.
+
+A cancellation-safe coalescer assigned each strong caller a generation after the
+check already in flight, preserving the required arrival ordering. Its unit tests
+and concurrent acknowledged-write/read stress passed. File-backed warm throughput
+improved only about 2–3%. With sixteen clients, one cached row, and a controlled
+10 ms WAL HEAD delay, independent checks achieve 1,390 q/s and 12.04 ms p90;
+coalescing achieves 955 q/s and 23.38 ms. Yielding before the next generation
+does not repair that latency regression. The coalescer is removed. Single-writer
+storage mode alone does not prove that an engine owns the WAL head: another engine
+can share the storage, and read-only replicas still need checks. Safe skipping
+would require shared storage-level ownership information, outside this change.
+
+Four-query groups replayed from the real sixteen-client arrival order share
+11.44% / 14.31% of selected leaf-code bytes at 48 / 64 probes. Perfect elimination
+of repeated loads yields only 1.129× / 1.167× even if loading accounts for all
+query cost. Queue delay alone has p90 2.96 / 3.35 ms. This kills the load-reuse-only
+case before implementing a scheduler or kernel. It does not bound independent
+arithmetic improvements from a new batched kernel; no four-query scoring kernel
+is shipped or claimed to pass the 1.30× batch gate.
+
+### Request shapes, cold queries, and fixed cost
+
+A disposable 10K-row namespace adds scalar `category` and `label` attributes to
+the same 1,024-dimensional corpus vectors. All complete rows and distances match
+for top ten IDs, top ten projected attributes, top 100 projected attributes, and
+scalar ordering. Screening throughput increases from 3,776–4,020 to 4,192 q/s,
+3,715–3,799 to 3,995, 1,077–1,116 to 1,241, and 1,189–1,205 to 1,369,
+respectively. These are real indexed queries, including scoring and projection;
+the scalar-order case is not a zero-work wrapper benchmark. Recall against the
+full corpus is not meaningful for this smaller namespace.
+
+The final shape comparison uses 96 seeded cases, repeated three times per binary:
+80 successes and 16 expected errors. Warm final responses match for filters,
+eventual consistency, grouping, RRF, scalar ordering, vector/base64 projection,
+scalar attributes, offset, invalid limits, and unknown attributes. The Rust suite
+adds sixteen readers checking 4,096 strong reads against 128 acknowledged writes.
+
+The dispatcher-only cold gate alternates AB/BA on 30 queries per probe setting,
+starting a fresh
+server for every request. The standard local S3 facade adds 25 ms per backend read.
+It models fixed read latency, not real S3 tail behavior. All ordered rows and
+distances match.
+
+| Probes | Baseline p50 / p90 (ms) | Final p50 / p90 (ms) | Paired median change, 95% bootstrap interval (ms) |
+|---:|---:|---:|---:|
+| 48 | 204.52 / 249.48 | 201.99 / 212.66 | -0.20 [-3.79, +2.74] |
+| 64 | 205.91 / 263.88 | 205.69 / 215.45 | -1.33 [-3.28, +2.79] |
+
+Twenty thousand paired resamples detect no cold latency regression; this small
+sample does not rule out a small change. Mean backend reads are 134.93 / 128.00 at
+48 probes and 134.97 / 136.90 at 64, baseline / final; mean transferred bytes are
+126.81 / 125.14 MB and 147.86 / 147.74 MB. Asynchronous read timing makes these
+counts variable; read-count identity is not claimed. Cold queries retain the
+ordinary planner and the original blocking-pool dispatch.
+
+The fixed-cost control distinguishes a warm block cache from a completed compiled
+plan. On 10K rows, 512 distinct queries thrash X1's exact-vector cache, whose byte
+budget equals the much smaller code payload. The ordinary rerank remains visible
+in the instruction profile. Native scoring takes 2.8669 M user instructions and
+0.8383 M user cycles/query; HTTP takes approximately 6.89 M total instructions.
+That difference includes fallback scoring and cache work, so it is not a fixed
+HTTP tax. Every native ordered ID list matches HTTP, including the full NQ corpus.
+
+A repeated-first-vector control fits the sparse cache and isolates a genuinely
+compiled resident working set. Its counters cover 100% of runtime; user and
+kernel events are collected separately to avoid PMU multiplexing. Native scoring
+runs 100 epochs, and HTTP counters use twelve 512-request epochs after warming.
+All ordered IDs match. The repeated-vector fixture's full-corpus recall is not a
+quality measurement.
+
+| Repeated-vector path, 48 probes | User instructions/query | Kernel instructions/query | User / kernel cycles/query | q/s |
+|---|---:|---:|---:|---:|
+| Native scorer, eight workers | 2.3168 M | not counted | 0.6553 M / not counted | 31,620 |
+| X1 HTTP, sixteen clients | 3.0713 M | 0.0981 M | 1.2514 / 0.1651 M | 9,016 |
+| Dispatch-only HTTP, sixteen clients | 3.1035 M | 0.0959 M | 1.2320 / 0.1418 M | 9,876 |
+
+The native/HTTP instruction difference in this control is about 0.85–0.88 M,
+including attached-thread kernel work. It is not a universal 2.15 M constant.
+The native and server scorers also have different specializations, so subtracting
+their counters is not a strict phase decomposition. Neither this ARM IVF result
+nor the older full-NQ subtraction invalidates the separate M4 graph measurement.
+
+Instruction sampling uses a period of 500,003 user instructions, DWARF stacks,
+and zero lost samples. The following mutually exclusive function-family groups
+are estimates, not instrumented phase boundaries. Allocator leaves take priority;
+inlined/shared validation, projection, and synchronization can remain in the
+engine or unresolved groups. The standalone profile summarizer preserves these
+rules for reproduction.
+
+| Named function family | X1, 512 distinct vectors | X1, repeated vector | Dispatch-only, repeated vector |
+|---|---:|---:|---:|
+| JSON input | 6.12% | 13.31% | 13.08% |
+| Named validation helpers | 0.02% | 0.06% | 0.03% |
+| Other engine and planning | 2.09% | 3.91% | 2.44% |
+| Snapshot and consistency | 0.52% | 0.84% | 0.85% |
+| Hydration and projection | 1.34% | 1.83% | 1.07% |
+| JSON output | 0.24% | 0.57% | 0.52% |
+| Allocator | 1.91% | 1.09% | 1.02% |
+| CPU and runtime dispatch | 0.25% | 0.46% | 1.40% |
+| HTTP and async plumbing | 0.85% | 1.95% | 1.98% |
+| Cache and range reader | 8.95% | 3.81% | 2.54% |
+| Vector search | 73.17% | 70.19% | 73.23% |
+| Shared or unresolved | 4.53% | 1.98% | 1.83% |
+
+In the distinct-vector profile, the largest exclusive functions are `block_sums`
+(15.59%), `distance_unchecked` (15.39%), ordinary `rerank_recorded` (9.26%),
+`PlaneQuery::reset` (4.94%), JSON `parse_number` (4.85%), memcpy (4.52%), and
+`extend_f16` (4.46%). The cache/fallback path is the large difference. Float parsing
+alone costs approximately 0.33 M user instructions/query in this case: making it
+twice as fast would save roughly 0.16 M, about 2.4% of user instructions. A perfect
+parser cannot remove the remaining vector, cache, kernel, or scheduling costs.
+This is a CPU-cost estimate, not a measured throughput improvement.
+
+The retained cache fix reserves every exact-vector payload, descriptor, and cache
+entry when that full reservation plus code and metadata fits the existing decoded
+budget. It otherwise retains X1's code-sized sparse reservation. It does not fetch
+extra rows. A regression warms 32 distinct, nonzero queries on a small tier and
+requires every supported plan to remain compiled on the next pass; zero-vector
+and oversized-tie fallback correctness checks remain separate.
+
+The isolated policy comparison uses the same dispatcher and sixteen permits on
+both sides. With 512 distinct queries, the small namespace improves from
+**4,067 to 8,163 q/s (2.007×)**, p50 3.31→1.72 ms, p90 5.57→2.70 ms, instructions
+6.9217→3.7714 M/query (-45.5%), and cycles 3.7854→1.7911 M. All complete rows and
+distances match. The larger reservation stays inside the configured cache budget;
+it trades otherwise unused budget for retaining the observed exact working set.
+
+A clean final baseline/candidate/candidate/baseline gate, after the independent
+prepared-data transfer finished, measures the dispatcher and cache policy together:
+
+| Probes | X1 q/s, two passes | Final q/s, two passes | X1 / final instructions/query, two passes |
+|---:|---:|---:|---:|
+| 48 | 1,828 / 1,835 | 2,148 / 2,146 | 20.9615 / 20.8774 M; 20.9588 / 20.8757 M |
+| 64 | 1,580 / 1,587 | 1,889 / 1,882 | 24.2281 / 24.1134 M; 24.2297 / 24.1152 M |
+
+| Probes | X1 p50 / p90, two passes (ms) | Final p50 / p90, two passes (ms) |
+|---:|---:|---:|
+| 48 | 7.89 / 11.82; 7.87 / 11.67 | 6.94 / 10.25; 6.92 / 10.12 |
+| 64 | 9.16 / 13.42; 9.12 / 13.35 | 7.99 / 11.61; 7.95 / 11.67 |
+
+Final throughput increases **17.2% / 19.1%**, with every ordered row and distance
+identical and recall unchanged. The **1.30× gate still fails**. Full NQ's complete
+exact-vector reservation exceeds 4 GiB, so it keeps the sparse policy. The small
+instruction differences between separately linked binaries are not credited to
+the small-tier cache fix. A second 96-case shape comparison again gives 80 matching
+successes and 16 matching expected errors.
+
+The corrected varied-query resident control takes 3.6641 M user instructions and
+0.1046 M kernel instructions/query, versus 2.8669 M user instructions in the native
+scorer. User / kernel cycles are 1.6361 / 0.1652 M, versus 0.8383 M user cycles
+natively. All counters have 100% coverage, and native ordered IDs match. The
+profile run measures 7,954 q/s before sampling; sampling overhead is excluded from
+the throughput claim above. No sampled ordinary `rerank_recorded` work remains.
+
+| Corrected varied-query function family | User instruction samples |
+|---|---:|
+| Vector search | 75.82% |
+| JSON input | 11.14% |
+| Cache and range reader | 3.02% |
+| Other engine and planning | 2.11% |
+| HTTP and async plumbing | 1.55% |
+| CPU and runtime dispatch | 1.30% |
+| Hydration and projection | 1.10% |
+| Allocator | 0.86% |
+| Snapshot and consistency | 0.76% |
+| JSON output | 0.44% |
+| Named validation helpers | 0.04% |
+| Shared or unresolved | 1.85% |
+
+`parse_number` now represents 9.00% of user instructions, still approximately
+0.33 M/query. The roughly 0.90 M native/HTTP difference includes the wrapper,
+cache access, specialization differences, and attached-thread kernel work. This
+explains why a cache-missing small control overstates the fixed tax; it does not
+establish an index-independent constant. Both the repeated-vector and repaired
+varied-vector controls are useful alongside the full-corpus result.
+
+The final first 30-query cold sample has p50 204.76 / 202.32 ms and p90
+218.27 / 229.03 ms at 48 probes, baseline / candidate. At 64 probes, these are
+207.65 / 210.27 ms and 219.37 / 275.78 ms. Paired median changes are -1.51 ms
+[-4.55, +2.23] and +1.37 ms [-3.01, +4.67]. Paired p90-change intervals are wide:
+[-21.90, +71.92] / [-50.16, +70.80] ms. Because the point tail worsens despite
+stable medians, the cold check is expanded to 60 query pairs per probe setting.
+
+The isolated 60-pair confirmation completes after the scoped checks, with no
+concurrent build, test, transfer, or profiling load. All ordered rows and distances
+match. Median changes remain within uncertainty, and no cold regression is
+detected. The p90 interval at 64 probes remains broad; this sample does not prove
+a tight bound on cold tails.
+
+| Probes | Baseline p50 / p90 (ms) | Final p50 / p90 (ms) | Paired median change, 95% interval (ms) | Paired p90 change, 95% interval (ms) |
+|---:|---:|---:|---:|---:|
+| 48 | 204.76 / 251.38 | 203.64 / 212.51 | +0.34 [-2.80, +1.51] | -38.87 [-61.76, -4.15] |
+| 64 | 206.89 / 219.06 | 207.50 / 219.08 | +0.16 [-1.37, +2.78] | +0.02 [-41.14, +18.96] |
+
+A final attached-thread kernel instruction profile uses period 50,003, frame-pointer
+stacks, 10,395 samples, and zero lost samples. Rounded leaf-symbol families assign
+approximately 15.2% to network functions, 24.2% to scheduling and shared
+synchronization, 6.3% to filesystem/metadata functions, and 54.2% to shared or
+unresolved work. These estimates are normalized after rounding. The largest named
+leaves are `arch_local_irq_enable` (19.59%), `try_to_wake_up` (9.13%),
+`__arch_copy_to_user` (7.23%), `el0_svc` (6.32%), and `__sched_yield` (4.23%).
+This is CPU attribution within attached server threads, not an off-CPU wait
+breakdown or whole-host network/softirq accounting.
+
+### Reproduction and checks
+
+`crates/blowfish/benches/server_tax.py` imports the standard NQ HTTP adapter and
+request builder. It records full rows, per-request latency, arrivals, and per-epoch
+hardware counters. Its default run measures the complete query set; `--count`,
+`--namespace`, `--attrs`, and `--top-k` select the small controls. Use the same
+server CPU affinity, frozen store, cache settings, and binary build settings for
+both arms, and alternate AB/BA. Outputs must stay under `.scratch`.
+
+```sh
+uv run --project bench/nq python crates/blowfish/benches/server_tax.py \
+  --data "$DATA" --pid "$SERVER_PID" --out .scratch/q2/arm.json
+uv run --project bench/nq python crates/blowfish/benches/server_tax_verify.py \
+  --mode cold --store "$STORE" --data "$DATA" --baseline "$BASELINE" \
+  --candidate "$CANDIDATE" --out-dir .scratch/q2/cold
+cargo run --release -p bf-engine --example resident_ceiling -- \
+  "$STORE" small "$QUERIES_512_F32" 8 48 100 .scratch/q2/native.ids
+```
+
+The verification script also supports `--mode shapes`. For the fixed-cost control,
+use `--namespace small --count 512 --perf-events instructions:u,cycles:u`, repeat
+with kernel-only events, and use `--same-query` for the sparse-cache-fitting
+control. Record a warmed process with the appropriate Linux perf privileges:
+
+```sh
+sudo perf record -e instructions:u -c 500003 --call-graph dwarf,8192 \
+  -p "$SERVER_PID" -o .scratch/q2/profile.data
+sudo perf script -i .scratch/q2/profile.data > .scratch/q2/cache-final.stacks
+uv run --no-project python crates/blowfish/benches/server_tax_profile.py .scratch/q2
+```
+
+Save stacks as `baseline-x1.stacks`, `final.stacks`, or `cache-final.stacks`
+alongside matching counter files. The summarizer reports user-space attribution
+separately from kernel counters. The `server_tax_fixture`
+example creates the small namespace only under `.scratch`; `leaf_reuse` computes
+the code-byte reuse and queue-delay screening bound from recorded arrivals.
+`strong_head_latency_benchmark` is an explicitly ignored, reproducible 10 ms
+consistency-check control. The resident ceiling reports user-only instructions
+and cycles around the warmed query loop.
+
+Final formatting, scoped all-target clippy with warnings denied, and scoped tests
+pass on ARM: 210 passed, zero failures, and five explicit historical/controlled
+ignores. SHA-256 checks confirm that every changed Rust source file matches the
+checked source. Python syntax checks, undefined-name/import checks, full-corpus
+comparisons, seeded request-shape comparisons, and the isolated cold confirmation
+also pass. No full-workspace or M4 validation is claimed.
+
+The owned c7g.4xlarge, its root volume, its temporary key pair, and its security
+group are removed after measurements. No S3 objects or paid oracle namespaces are
+created. Scratch results are discarded after the retained numbers enter this
+record.
