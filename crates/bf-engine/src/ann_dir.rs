@@ -1005,21 +1005,23 @@ pub(crate) async fn search(
     _attribute: &str,
     members: Option<Vec<Option<Arc<Membership>>>>,
     layout: Layout,
-    real: Option<(&NamespaceState, &[bf_wal::SlabCover], &[usize])>,
+    real: Option<(
+        &NamespaceState,
+        &[bf_wal::SlabCover],
+        &crate::lineage::Placement,
+    )>,
     skip: &[bool],
     joint: Option<&Seat>,
 ) -> Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError> {
     // With slabs, `state` lists the slabs and `real` the segments that hold the documents: a
     // slab row is a global row number, mapped back by the covered segments' bases to a covered
-    // segment, and from there to its position among the live segments.
+    // segment, and from there (through lineage, if it was merged) to the live segment holding it.
+    // A row a merge dropped maps to nothing (the tier's mask leaves such rows out).
     let docs_state = real.map_or(state, |r| r.0);
-    let to_real = |i: usize, row: u32| -> (usize, u32) {
+    let to_real = |i: usize, row: u32| -> Option<(usize, u32)> {
         match real {
-            None => (i, row),
-            Some((_, covers, at)) => {
-                let p = covers.partition_point(|c| c.base <= row).saturating_sub(1);
-                (at[p], row - covers[p].base)
-            }
+            None => Some((i, row)),
+            Some((_, covers, at)) => at.real(covers, row),
         }
     };
     let skipped = |i: usize| skip.get(i).copied().unwrap_or(false);
@@ -1424,15 +1426,17 @@ pub(crate) async fn search(
             best.select_nth_unstable_by(keep, |a, b| cmp(a, b));
         }
         for (i, c) in best.into_iter().take(keep) {
-            let (i, row) = to_real(*i, c.row);
-            speculative.entry(i).or_default().insert(row);
+            if let Some((i, row)) = to_real(*i, c.row) {
+                speculative.entry(i).or_default().insert(row);
+            }
         }
     }
     // Exactly scanned segments already know their best rows.
     winners.sort_by(|a, b| a.0.total_cmp(&b.0));
     for (_, i, row) in winners.iter().take(k * 2) {
-        let (i, row) = to_real(*i, *row);
-        speculative.entry(i).or_default().insert(row);
+        if let Some((i, row)) = to_real(*i, *row) {
+            speculative.entry(i).or_default().insert(row);
+        }
     }
     let mut by_segment: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
     for (i, c) in pool {
@@ -1489,10 +1493,11 @@ pub(crate) async fn search(
     let winners: Vec<(f32, usize, u32)> = winners
         .into_iter()
         .map(|(d, i, row)| {
-            let (i, row) = to_real(i, row);
-            (d, i, row)
+            let (i, row) = to_real(i, row)
+                .ok_or_else(|| segment::index_error("tier row outside its lineage"))?;
+            Ok((d, i, row))
         })
-        .collect();
+        .collect::<Result<_, ApiError>>()?;
     let mut rows_by_segment: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
     for (_, i, row) in &winners {
         rows_by_segment.entry(*i).or_default().insert(*row);

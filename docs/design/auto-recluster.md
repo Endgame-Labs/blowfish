@@ -1,6 +1,6 @@
 # Automatic recluster
 
-Status: rounds R1 to R3 built (2026-11-23); R4 and R5 proposed. Implements SPEC decision 21 under decision 25: recluster is always on, with no off
+Status: rounds R1 to R3 built (2026-11-23), R4's lineage built (2026-11-24); R5 proposed. Implements SPEC decision 21 under decision 25: recluster is always on, with no off
 switch and no manual mode. `examples/recluster.rs` goes away once this ships.
 
 ## The problem, in numbers
@@ -35,9 +35,10 @@ Today recluster is a manual example, and it doesn't survive normal operation:
 
 ## Design
 
-### Layout: a base tier, at most one delta tier, and uncovered segments
+### Layout: a base tier, delta tiers, and uncovered segments
 
-`Manifest::ann_slabs` becomes `ann_tiers: attr -> [SlabSet]`, with at most two entries: a base and a delta. Each is
+`Manifest::ann_slabs` becomes `ann_tiers: attr -> [SlabSet]`: a base and a delta, plus, while a new base builds, a
+second delta over the rows written since it started (see "Deltas beside a base build"). Each is
 today's `SlabSet` (slabs, their covered segments with bases and live generations, and the paged directory). Rows
 in no tier are in **uncovered** segments, which keep their own ANN objects.
 
@@ -54,17 +55,41 @@ One query plan covers all three:
 
 ### Compaction and lineage
 
-Covered segments must be able to compact without invalidating a tier. When compaction merges covered segments, it
-records a **lineage entry** in the manifest for each source segment: the new segment's ID, the offset of the source
-segment's first surviving row in it, and the source's live bitmap at merge time (a small roaring object).
+Covered segments compact without invalidating a tier (round R4). When compaction merges covered segments, the
+manifest records a **lineage entry** for each covered source segment: the segments that hold its surviving rows
+now, and for each a small map object with two roaring bitmaps, the source rows placed there and the target rows
+they became.
 
+- Segments are in ID order, so compaction interleaves its sources' rows: an offset can't map them, but the two
+  bitmaps are aligned (the k-th row of one is the k-th of the other), so `rank` in one and `select` in the other
+  map a row either way.
 - A tier keeps addressing rows by its original global row numbers.
-- A winner maps back with one roaring `rank` (old row to new row) at hydrate time; only winners pay.
-- A delete after the merge sets the new segment's live generation, and the tier's mask maps it back with `select`.
-- Lineage entries are dropped when no tier refers to their source segments.
+- A winner maps to the segment holding it now at hydrate time; only winners pay.
+- A delete after the merge sets the target's live generation, and the tier's mask maps the target's live rows
+  back through the maps. The mask is built once per tier and set of live objects and maps (all immutable).
+- A merge of a merged segment composes its maps, so a tier row is always one hop from where it lives.
+- A merge never mixes coverage classes (the tiers covering a segment's rows, directly or through lineage): base
+  rows merge with base rows, delta rows with delta rows, and uncovered segments with each other. Every segment is
+  fully covered by its class's tiers or not covered at all, so a delta build reads whole segments, and the search
+  beside the tiers skips whole segments.
+- Lineage entries are dropped when no tier covers their source segments (a new base covers the targets itself).
+- Segments a running or waiting build covers are still left alone, so its install check stays simple.
 
-Until lineage ships (round R4), compaction skips covered segments, and a build waits for pending merges (see the
-triggers below).
+`Manifest.lineage` is a format-4 field: the bucket and manifest fences went to 4, and v0.1.15 fails closed on an
+upgraded bucket.
+
+### Deltas beside a base build
+
+A base build takes minutes (seven on NQ), and under steady writes the rows written meanwhile used to stay outside
+the tiers until it finished. Now a delta builds beside it (round AR3):
+- It covers the segments outside the base and outside the building base's segments, against the current base's
+  cells. It installs as an extra tier: the base, the delta from before, and this one.
+- A tier being installed replaces the tiers holding rows of the segments it covers (directly or through lineage),
+  and keeps the rest. So the new base replaces the old base and the old delta and keeps the delta built beside it,
+  and the next ordinary delta (over every row outside the base) replaces that one. A delta whose rows a newer base
+  holds is discarded (`superseded`).
+- A delta no longer needs to have been built against the installed base: queries never read the coarse cells, so
+  they only shape how well the delta clusters.
 
 ### When it runs
 
@@ -96,6 +121,8 @@ The indexer evaluates this after each publication, from manifest numbers only, s
 7. **Order:** a merge first, then a delta, then a masked-rows rebuild. (A masked rebuild of NQ took 10 minutes
    under 1,000 upserts a second, and with it ahead of the delta, the rows outside the tiers stayed above 20% while
    it ran.)
+8. **Beside a base build:** while a new base builds, only a delta over the rows outside it is considered, by the
+   delta thresholds of step 3 (see "Deltas beside a base build").
 
 What the policy costs, simulated for a namespace growing steadily in 200,000-row segments (first base at 1M rows):
 
@@ -110,8 +137,9 @@ of a fresh recluster at any time, and the build work happens in the background.
 
 ### How it runs: background, bounded, and yielding
 
-- **One job per process, run by the namespace's indexer** (the lease holder). It uses a dedicated build pool of half
-  the cores (at least one), so queries keep the rest.
+- **One base job and one delta job per process, run by the namespace's indexer** (the lease holder). They use a
+  dedicated build pool of half the cores (at least one), so queries keep the rest. A delta may start beside a base
+  build, never the reverse; beside one, it sizes its slabs from half the memory.
 - **Memory:**
   - The job reserves from the engine's memory budget. `max_slab_rows` is the memory available after the block
     cache, the decoded cache, the unindexed limit, and any in-flight segment build, divided by 12,000 bytes a row,
@@ -146,7 +174,7 @@ of a fresh recluster at any time, and the build work happens in the background.
 3. **Publish through the normal indexer cycle.** When the slabs and directory are uploaded, the next index cycle on
    this node does the following under its own claim:
    - reads the latest manifest;
-   - checks that every segment in `C` is still live (or reachable by lineage);
+   - checks that every segment in `C` is still live (compaction leaves a build's segments alone);
    - installs the tier with `C`'s recorded live generations (deletes since the snapshot become the usual mask);
    - retires the tiers it replaces;
    - publishes with `publish_fenced`.
@@ -164,8 +192,8 @@ layout until the new one is published.
 - **Manifest:**
   - `ann_tiers` replaces `ann_slabs`. Each tier gains its coarse cell centers (32 x 1,024 x f32, 128 KB, as an
     object reference) and a format version.
-  - `lineage: [ { source, target, offset, live_key } ]` is added.
-  - The manifest's `format_version` becomes 2 (see the fence in `simplify.md`).
+  - `lineage: [ { source, parts: [ { target, rows, map } ] } ]` is added (format 4).
+  - The manifest's `format_version` became 3 with `ann_tiers`, and 4 with `lineage`.
 - **`ns/<ns>/indexer/build-*.json`** build records (small, create-only).
 - Slab objects and the paged directory are unchanged by this doc. `graph-index.md` and `disk-footprint.md` change
   them, and both rely on this job to rewrite old ones.

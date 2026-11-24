@@ -97,7 +97,7 @@ async fn background_refresh_is_delayed_shared_and_permanently_fails_closed() {
     let scoped = store.scoped("projects/test");
     // Arm the background timer. Clones and scoped views do not start extra refreshers.
     tokio::task::yield_now().await;
-    let marker = Path::from("_system/format/4.json");
+    let marker = Path::from(format!("_system/format/{}.json", BUCKET_FORMAT_VERSION + 1));
     backend.put(&marker, "{}".into()).await.unwrap();
     tokio::time::advance(Duration::from_secs(59)).await;
     tokio::task::yield_now().await;
@@ -110,13 +110,13 @@ async fn background_refresh_is_delayed_shared_and_permanently_fails_closed() {
     tokio::task::yield_now().await;
     assert!(matches!(
         scoped.cached_bucket_format(),
-        Err(Error::BucketFormat { required: 4, .. })
+        Err(Error::BucketFormat { required, .. }) if required == BUCKET_FORMAT_VERSION + 1
     ));
     backend.delete(&marker).await.unwrap();
     // Even an explicit successful re-list cannot lower the process's observed generation.
     assert!(matches!(
         store.check_bucket_format().await,
-        Err(Error::BucketFormat { required: 4, .. })
+        Err(Error::BucketFormat { required, .. }) if required == BUCKET_FORMAT_VERSION + 1
     ));
     assert!(scoped.put("after-refresh", "blocked").await.is_err());
     assert!(store.delete("projects/test/before-refresh").await.is_err());

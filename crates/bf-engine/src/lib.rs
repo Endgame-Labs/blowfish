@@ -10,6 +10,7 @@ mod indexed;
 mod indexer;
 #[cfg(test)]
 mod ingest_benchmark;
+mod lineage;
 mod pattern;
 mod plan;
 mod read_cache;
@@ -116,6 +117,8 @@ pub(crate) struct NamespaceState {
     pub ann_dirs: BTreeMap<String, bf_wal::SegmentFile>,
     /// Recluster tiers by vector attribute (see `bf_wal::Manifest::ann_tiers`).
     pub ann_tiers: Arc<BTreeMap<String, Vec<bf_wal::SlabSet>>>,
+    /// Where merged tier-covered segments' rows went (see `bf_wal::Manifest::lineage`).
+    pub lineage: Arc<Vec<bf_wal::Lineage>>,
     /// When the checkpoint's indexer last flushed a bulk-load-sized tail (see
     /// `bf_wal::Manifest::bulk_load_at`).
     pub bulk_load_at: Option<DateTime<Utc>>,
@@ -147,6 +150,7 @@ impl Default for NamespaceState {
             text_stats: None,
             ann_dirs: BTreeMap::new(),
             ann_tiers: Arc::default(),
+            lineage: Arc::default(),
             bulk_load_at: None,
             scores: BTreeMap::new(),
             corpus: Arc::default(),
@@ -185,6 +189,7 @@ impl NamespaceState {
             text_stats: self.text_stats.clone(),
             ann_dirs: self.ann_dirs.clone(),
             ann_tiers: self.ann_tiers.clone(),
+            lineage: self.lineage.clone(),
             bulk_load_at: self.bulk_load_at,
             scores: BTreeMap::new(),
             corpus: self.corpus.clone(),
@@ -314,6 +319,7 @@ impl NamespaceState {
         self.text_stats = manifest.text_stats.clone().map(Arc::new);
         self.ann_dirs = manifest.ann_dirs.clone();
         self.ann_tiers = manifest.ann_tiers.clone().into();
+        self.lineage = manifest.lineage.clone().into();
         self.bulk_load_at = manifest.bulk_load_at;
         self.stats = manifest.stats.clone().into();
         self.checkpoint_refreshed = Instant::now();
@@ -1551,6 +1557,7 @@ mod tail_tests {
             text_stats: None,
             ann_dirs: Default::default(),
             ann_tiers: Default::default(),
+            lineage: Default::default(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],

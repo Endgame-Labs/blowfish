@@ -181,3 +181,34 @@ segments, at the same bytes.
 | D3 | zstd text columns in `docs.bfc` version 2 (one format bump together with D2 if both are ready). Drop the Bloom filter from `ids.bfi`. | D2 |
 | D4 | Slabs only: filtered ANN on slabs, retire covered segments' ANN objects. 10M filtered cold run. | Auto-recluster R1 and R4 (tiers and lineage), the fence out one release |
 | D5 | In-region inventory and benchmark run at 10M, then 100M with Kyle's go-ahead (AWS cost). | D4 |
+
+### D4 after round AR3: what is left
+
+Round AR3 built R4's lineage: compaction now merges covered segments and records where their rows went. It did
+not retire the covered segments' ANN objects. On NQ (2.68M rows, 768 dims in f16, everything covered by a base),
+those objects total 6.0 GB, about 2,240 bytes per covered row, in line with the estimate above. Retiring them
+makes the tier the only copy of those vectors, so every path that reads a covered segment's ANN object has to read
+through the tier first:
+
+- **A vector locator.** Given a segment and its rows, return their packed vectors: map each row to the tier's
+  global row (the cover's base, or back through the lineage map), then to a slab and the slab's local row (slab row
+  lists are ascending global rows; keep them resident, 4 bytes a row). Every item below is built on it.
+- **Projection and exact search** (`read_ann_packed`, `indexed.rs`) read through the locator.
+- **Filtered ANN** on the tiers: shift each segment's filter bitmap into global rows (the live-row masks already
+  do this through `tier_mask`), and probe the tiers under it. Today a filtered query falls back to the segments'
+  own indexes.
+- **Recluster input** (`recluster_with_spill`) and **compaction** (`merge_packed`) copy vectors through the
+  locator. A base rebuild then reads its predecessor's slabs, so the predecessor stays until the new base installs.
+  It already does.
+- **The trigger** (`auto_recluster::decide`), the **upgrade passes** (`reindex`, `segment_upgrade`),
+  **statistics**, **planning**, and **snapshot warm-up** stop requiring `annv2` on every segment.
+- **Branches and copies** pin segments, not tiers. They have to pin and copy the tiers covering a segment whose
+  ANN object is gone, or a copy would lose those vectors.
+- **Dropping a tier** (stale tiers, schema rebuilds) has to rewrite its segments' ANN objects first, through the
+  locator. Otherwise the vectors are gone.
+- **Retirement** itself: an index pass drops `annv2:` from fully covered segments in one fenced publication, and
+  GC deletes the objects after the retention window. The crash points are the publication (before or after its
+  write) and GC. In each, a restart must answer from the tier and GC must keep every object the manifest names.
+
+Every bullet is a path where a missed case loses vectors, not just speed, so D4 needs a round of its own. Lineage
+and the fence (format 4) are in place for it.

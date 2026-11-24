@@ -4,6 +4,19 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Compaction through recluster tiers, and bucket format 4** (`docs/benchmarks.md`, "Round AR3";
+  `docs/design/auto-recluster.md`, R4). Compaction now merges segments that a tier covers instead of skipping
+  them. It records where each merged segment's surviving rows went (lineage), so the tiers keep answering
+  without a rebuild, and a later merge folds the record forward. A delta can now build beside a base rebuild
+  and survive the base's install. The manifest gains `lineage`, so the manifest and bucket formats move to 4,
+  upgraded automatically; v0.1.15 refuses an upgraded bucket. On NQ, compaction took 51 segments to 33 with
+  both tier keys unchanged, recall@10 0.9521 before and after, and instructions per query flat (23.17M to
+  23.09M on the least loaded pair). Ten minutes at about 850 upserts a second left no stale tier. `kill -9`
+  at the first lineage map and at the first lineage manifest both restarted cleanly from the tiers (recall
+  0.955), and GC removed only orphaned maps. Retiring covered segments' ANN objects (D4, about 6 GB on NQ)
+  is planned in `docs/design/disk-footprint.md`, not built. Formatting, full-workspace clippy, and all Rust
+  tests pass.
+
 - **Apple M4 NQ at v0.1.15** (`docs/benchmarks.md`, "Apple M4 at v0.1.15"). I reran the tagged release,
   Qdrant 1.20.0, and LanceDB 0.41.0 one at a time on the same 10-core Mac. Blowfish gives 1,801–1,827 q/s
   at 64 probes, recall@10 0.9611, and 1.3–1.4 / 1.6 / 1.9–2.0 ms p50 / p90 / p99; at 48 probes,

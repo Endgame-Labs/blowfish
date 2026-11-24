@@ -142,6 +142,7 @@ impl OpenHint {
         text: Option<&bf_wal::SegmentFile>,
         dirs: &BTreeMap<String, bf_wal::SegmentFile>,
         tiers: &BTreeMap<String, Vec<bf_wal::SlabSet>>,
+        lineage: &[bf_wal::Lineage],
         prefetched: &BTreeMap<String, crate::ann_dir::Prefetched>,
         schema: &Schema,
     ) {
@@ -179,11 +180,10 @@ impl OpenHint {
                     .as_ref()
                     .filter(|(a, _, _)| a == attribute)
                     .and_then(|_| tiers.get(attribute))
-                    .filter(|t| crate::ann::tiers_usable(segments, t));
-                let covers_all = tiered.is_some_and(|t| {
-                    segments
-                        .iter()
-                        .all(|s| t.iter().any(|set| set.covers(&s.id)))
+                    .filter(|t| crate::ann::tiers_usable(segments, lineage, t));
+                let covers_all = tiered.is_some_and(|_| {
+                    let covered = crate::lineage::covered(segments, tiers, lineage);
+                    segments.iter().all(|s| covered.contains(&s.id))
                 });
                 for set in tiered.into_iter().flatten() {
                     let Some((_, vector, k)) = self.scan.as_ref() else {
@@ -387,6 +387,14 @@ fn same_checkpoint(state: &NamespaceState, m: &bf_wal::Manifest) -> bool {
             .ann_dirs
             .iter()
             .all(|(k, f)| m.ann_dirs.get(k).is_some_and(|g| g.key == f.key))
+        && state.lineage.len() == m.lineage.len()
+        && state.lineage.iter().zip(&m.lineage).all(|(a, b)| {
+            a.source == b.source
+                && a.parts
+                    .iter()
+                    .map(|p| &p.map.key)
+                    .eq(b.parts.iter().map(|p| &p.map.key))
+        })
         && state.ann_tiers.len() == m.ann_tiers.len()
         && state.ann_tiers.iter().all(|(k, f)| {
             m.ann_tiers.get(k).is_some_and(|g| {
@@ -550,6 +558,7 @@ pub(crate) async fn catch_up_hinted(
                             text_stats: m.text_stats.map(std::sync::Arc::new),
                             ann_dirs: m.ann_dirs,
                             ann_tiers: m.ann_tiers.into(),
+                            lineage: m.lineage.into(),
                             bulk_load_at: m.bulk_load_at,
                             stats: m.stats.into(),
                             ..Default::default()
@@ -577,6 +586,7 @@ pub(crate) async fn catch_up_hinted(
             let (segments, text) = (state.segments.clone(), state.text_stats.clone());
             let dirs = state.ann_dirs.clone();
             let slabs = state.ann_tiers.clone();
+            let lineage = state.lineage.clone();
             let schema = state.schema.clone();
             if hint.splits_text(&dirs) {
                 // The text half keeps warming behind the query: its reads are single-flighted
@@ -599,6 +609,7 @@ pub(crate) async fn catch_up_hinted(
                         text.as_deref(),
                         &dirs,
                         &slabs,
+                        &[],
                         &none,
                         &schema,
                     )
@@ -619,6 +630,7 @@ pub(crate) async fn catch_up_hinted(
                     text.as_deref(),
                     &dirs,
                     &slabs,
+                    &lineage,
                     &prefetched,
                     &schema
                 )

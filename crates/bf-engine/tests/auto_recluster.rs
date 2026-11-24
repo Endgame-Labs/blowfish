@@ -26,8 +26,27 @@ struct Faults {
     /// PUTs whose key contains this never return, and how many have started.
     hang: Mutex<Option<String>>,
     hung: std::sync::atomic::AtomicUsize,
+    /// The next PUT whose key contains this waits until the gate is opened (once).
+    gate: Mutex<Option<(String, Arc<tokio::sync::Notify>)>>,
+    gated: std::sync::atomic::AtomicUsize,
 }
 impl Faults {
+    /// Hold the next PUT matching `pattern`; notifying the returned handle lets it through.
+    fn gate(&self, pattern: &str) -> Arc<tokio::sync::Notify> {
+        let open = Arc::new(tokio::sync::Notify::new());
+        *self.gate.lock().unwrap() = Some((pattern.to_string(), open.clone()));
+        open
+    }
+    /// Wait until the gate holds a PUT.
+    async fn gated(&self) {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while self.gated.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a PUT is held");
+    }
     fn hang(&self, pattern: Option<&str>) {
         *self.hang.lock().unwrap() = pattern.map(str::to_string);
     }
@@ -92,6 +111,21 @@ impl ObjectStore for Faults {
         if hangs {
             self.hung.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             std::future::pending::<()>().await;
+        }
+        let held = {
+            let mut gate = self.gate.lock().unwrap();
+            if gate
+                .as_ref()
+                .is_some_and(|(p, _)| path.as_ref().contains(p.as_str()))
+            {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, open)) = held {
+            self.gated.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            open.notified().await;
         }
         match self.check(path) {
             Some(false) => failure(),
@@ -405,6 +439,83 @@ async fn writes_after_a_base_get_a_delta_on_its_cells_and_then_merge_into_a_new_
     }
     assert_eq!(nearest(&engine, vector(150 + 50_000)).await, json!(150));
     assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delta_builds_beside_a_base_rebuild_and_the_base_keeps_it() {
+    let (faults, store, engine) = setup().await;
+    let scratch = tempfile::tempdir().unwrap();
+    engine
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    write_rows(&engine, 6000..6400, 0).await;
+    engine
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    let before = tiers(&store).await;
+    assert_eq!(before.len(), 2);
+
+    // Half the base outside it: a merge into a new base, held at its first slab upload.
+    write_rows(&engine, 6400..9000, 0).await;
+    let open = faults.gate("/slabs/");
+    let base = tokio::spawn({
+        let (engine, opts) = (engine.clone(), options(scratch.path()));
+        async move { engine.recluster("t", &opts).await }
+    });
+    faults.gated().await;
+    // Rows written meanwhile get a delta beside it, which installs at once.
+    write_rows(&engine, 9000..9300, 0).await;
+    write_rows(&engine, 150..160, 70_000).await;
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        engine.recluster("t", &options(scratch.path())),
+    )
+    .await
+    .expect("the delta does not wait for the base")
+    .unwrap();
+    assert_eq!(report.rows, 310);
+    let during = tiers(&store).await;
+    assert_eq!(during.len(), 3);
+    assert_eq!(during[0].dir.key, before[0].dir.key);
+    assert_eq!(during[1].dir.key, before[1].dir.key);
+    for q in [17usize, 6100, 6500, 9000, 9299] {
+        assert_eq!(top(&engine, q).await, json!(q));
+    }
+    assert_eq!(nearest(&engine, vector(155 + 70_000)).await, json!(155));
+
+    // The base installs over the rows it was built from, and keeps the delta built beside it.
+    open.notify_one();
+    let report = tokio::time::timeout(Duration::from_secs(120), base)
+        .await
+        .expect("the base finishes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.rows, 9000);
+    let after = tiers(&store).await;
+    assert_eq!(after.len(), 2);
+    assert_ne!(after[0].dir.key, before[0].dir.key);
+    assert_eq!(after[1].dir.key, during[2].dir.key);
+    engine.collect_garbage("t").await.unwrap();
+    let fresh = Engine::new(store.clone());
+    for e in [&engine, &fresh] {
+        for q in [17usize, 6100, 6500, 8999, 9000, 9299] {
+            assert_eq!(top(e, q).await, json!(q));
+        }
+        assert_eq!(nearest(e, vector(155 + 70_000)).await, json!(155));
+        assert_ne!(nearest(e, vector(155)).await, json!(155));
+    }
+    // The next delta replaces the one built beside the base.
+    write_rows(&engine, 9300..9500, 0).await;
+    engine
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    let next = tiers(&store).await;
+    assert_eq!(next.len(), 2);
+    assert_eq!(next[0].dir.key, after[0].dir.key);
+    assert_eq!(next[1].rows(), 510);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

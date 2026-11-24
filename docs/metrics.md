@@ -33,6 +33,8 @@ by namespace, object key, token, or raw URL.
 | `blowfish_recluster_rows_total` | Counter | None | Rows written into installed recluster tiers |
 | `blowfish_recluster_deferred_total` | Counter | `reason` | Builds the trigger wanted but held back: `bulk_load`, `compaction`, `memory`, or `disk` |
 | `blowfish_recluster_discarded_total` | Counter | `reason` | Built tiers dropped before installation: `coverage`, `timeout`, or `superseded` |
+| `blowfish_recluster_tiers_stale_total` | Counter | None | Installed tiers retired because a segment they cover is gone with no lineage (a schema rebuild or a namespace deletion; compaction never causes one) |
+| `blowfish_lineage_merges_total` | Counter | None | Compactions that merged tier-covered segments and recorded where their rows went |
 | `blowfish_alloc_bytes` | Gauge | `kind` | jemalloc memory accounting refreshed on each `/metrics` scrape: `allocated`, `active`, `resident`, or `retained` |
 | `blowfish_cache_hits_total` | Counter | `tier` | Cache block hits by `memory` or `disk` tier |
 | `blowfish_cache_misses_total` | Counter | None | Cache block misses |
