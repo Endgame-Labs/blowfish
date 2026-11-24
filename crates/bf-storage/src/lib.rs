@@ -4,6 +4,7 @@ mod diagnostics;
 mod disk;
 mod format;
 mod hedge;
+mod mapped;
 pub use diagnostics::{BackendMeasurement, BackendStats};
 pub use format::BUCKET_FORMAT_VERSION;
 mod observed;
@@ -149,7 +150,11 @@ impl Storage {
     pub fn cache_limits(&self) -> (u64, Option<std::path::PathBuf>) {
         let config = &self.0.cache.config;
         (
-            config.memory_bytes,
+            if self.0.cache.mapped.get().is_some() {
+                0
+            } else {
+                config.memory_bytes
+            },
             config.disk_dir.clone().filter(|_| config.disk_bytes > 0),
         )
     }
@@ -242,6 +247,12 @@ impl Storage {
             cache,
         )
         .await?;
+        if cfg!(unix) && url.scheme() == "file" {
+            let root = url
+                .to_file_path()
+                .map_err(|_| Error::Config("invalid file URL"))?;
+            let _ = store.0.cache.mapped.set(mapped::Mapped::new(root)?);
+        }
         if url.scheme() == "s3" {
             let fixed = std::env::var("BF_WARM_CONNECTIONS")
                 .ok()
@@ -724,7 +735,12 @@ impl Storage {
     pub async fn delete(&self, key: &str) -> Result<(), Error> {
         self.writable()?;
         match self.0.backend.delete(&self.path(key)).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                if let Some(mapped) = self.0.cache.mapped.get() {
+                    mapped.remove(&self.path(key));
+                }
+                Ok(())
+            }
             Err(e) => Err(e.into()),
         }
     }

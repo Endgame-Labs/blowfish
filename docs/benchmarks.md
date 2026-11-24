@@ -7494,3 +7494,172 @@ their tagged key pairs and security groups were deleted, and their EBS roots wer
 Cleanup deleted 5,239 current objects totaling 409.8 GB from the owned temporary prefix;
 zero current objects and zero multipart uploads were verified. Existing prefixes were
 read-only. Local run artifacts were removed after retaining these measurements.
+
+## Round MEM2: fast local reads under a memory limit
+
+The final candidate passes the NQ memory gates after merging Q2 and RR2 through
+`a649aa5`: 3.59× baseline throughput at 2 GiB, 1.16× at 4 GiB, 1.37× at 8 GiB,
+and 1.32× at 12 GiB, with identical ordered IDs and distances. This section measures
+IVF; the G3 graph prototype is outside this round's scope.
+
+### What changed
+
+On Unix, immutable `file://` range readers map the original files and return exact
+slices, removing the heap block copy in front of the OS page cache. Small reads and
+explicitly sparse vector reads use a random-access mapping; ordinary reads containing
+a range of at least 64 KiB use a normal mapping with read-ahead. Both views share the
+same physical file pages. Sparse hints remain random even when their requested block
+size equals the configured main block size. Published files must remain immutable.
+Deleting a key invalidates both cached views; already-returned bytes remain valid.
+
+The cache retains at most 16 GiB of weighted virtual-file references and budgets 512
+cached descriptors, with 60-second idle expiry. These are reference budgets, rather
+than resident-page reservations. Caller-held bytes, including higher-level cache
+entries, can keep an unlinked inode alive until dropped. Mapped diagnostics describe
+logical returned ranges, not physical page faults. Query statistics conservatively
+count mapped bytes as misses because OS residency is unknown. Full mutable operations
+and S3 reads keep their ordinary backends.
+
+The effective heap block budget is zero for mapped sources. IVF's streaming seed-and-scan
+plan is disabled at zero retention: otherwise completed seed buffers can be discarded
+before scan readers request them again. The decoded-cache default changes from
+`limit / 8` to `limit / 4`, retaining the 512 MiB floor, 4 GiB ceiling, and existing
+override. At 2/4/8/12 GiB, its capacities are 0.5/1/2/3 GiB. X1 already reserves codes
+and a bounded row-exact vector pool together; this lets the NQ tier fit at 8 and 12 GiB.
+The small-budget regression now runs before live masks bypass compiled admission and
+checks that the same rejection marker survives repeated queries.
+
+### Final Graviton budget sweep
+
+One dedicated c7g.4xlarge, 16 vCPUs, 32 GiB RAM, and gp3 storage ran the two merged
+release builds serially. These warm local-store rates have no hard cgroup cap. Each arm
+checks all 3,452 queries, warms 1,000 queries, times 1,000 serial queries, and runs two
+2,000-query throughput passes at 16 clients. Tokio/Rayon have 12 threads, query/search
+admission is 64/12, and Q2's query workers follow the 16 available CPUs. Disk cache is
+disabled. Main blocks are 1 MiB; sparse blocks are 16 KiB. The decoded budget is fixed
+at 512 MiB here, isolating the storage policy. Numbers are mean q/s across the two passes.
+
+| Raw block budget | Merged baseline | Final mapped views |
+|---|---:|---:|
+| None | 204 | 2,765 |
+| 256 MiB | 380 | 2,819 |
+| 1 GiB | 1,047 | 2,855 |
+| 2 GiB | 2,193 | 2,791 |
+| 4 GiB | 2,582 | 2,812 |
+
+No tested mapped budget is slower than raw zero; these settings use the same effective
+mapped policy. Their means vary by about 3%. At decoded 2 GiB, the final candidate
+reaches 3,345 q/s with raw zero and 3,404 q/s with raw 4 GiB, 1.32× the final baseline's
+best 4 GiB rate. Its Graviton serial p50 is 3.18–3.19 ms, versus about 2.2 ms for mapped
+views at decoded 512 MiB: compiled search trades serial latency for throughput here.
+
+The initial post-X1 isolation baseline (`ab4172d`) gave 233/403/1,068/2,081/2,407 q/s
+at raw zero/256 MiB/1/2/4 GiB with 16 KiB sparse blocks. At 2 KiB sparse blocks, it gave
+200/231/409/2,140/2,236 q/s. The severe graph-specific cache cliff was not reproduced
+on IVF, but smaller sparse blocks were worse at small budgets. Increasing only that
+baseline's decoded budget to 2 GiB gave about 3,200 q/s. A separate 1.5 GiB decoded
+control, the old default under a 12 GiB limit, gave 2,426 q/s and no compiled queries:
+its general decoded pool is only half the total, so the NQ reservation still did not fit.
+
+### Matched M4 memory limits
+
+The same 2,681,468 NQ f16 cosine vectors, 1,024 dimensions, and 3,452 exact-truth queries
+are used throughout. The immutable IVF index was rebuilt with 32 recluster cells, 200
+rows per leaf, and at most 250,000 rows per slab; its recall differs slightly from MEM1's
+index. Inputs have the MEM1 SHA-256 hashes. The query snapshot excludes checkpointed WAL
+history and manifest-retired objects, retaining every active object. Its full 294-file,
+12,127,019,472-byte hash matches before and after the blowfish sweep.
+
+Apple M4's ten cores are shared by server and clients. The disposable arm64 Linux VM
+uses run-local Lima 2.3.0 with uncached VZ disks, guest ext4 data, no host data bind mount,
+and 3/5/9/13 GiB guest RAM for 2/4/8/12 GiB server caps. Cgroup v2 includes allocations
+and file cache, with swap disabled. The VM restarts between budgets, guest caches are
+synced and dropped before every server, and previously cached backing-file inodes are
+replaced with APFS clones while stopped. Query/search admission is 8/8, with ten runtime
+and Rayon threads. Baseline uses the MEM1 cache profile: raw `limit - 1 GiB`, decoded
+512 MiB, and disk zero. Candidate uses the new decoded default and mapped file pages.
+
+Each table row has two fresh-process repeats: full external quality, 1,000 warm-up queries,
+1,000 serial latency queries, and 2,000 pre-encoded queries at each of 1, 4, and 16 clients.
+Within each budget, the order is baseline/candidate/candidate/baseline. Recall@10 is
+0.950261 for every blowfish row, and every ordered ID and distance matches the baseline.
+Peak RSS and charged memory are maxima across both repeats. RSS can count alias mappings;
+cgroup charged memory counts their physical pages once. Small accounting overshoots round
+to the limit. Throughput is the 16-client mean and range.
+
+| Engine | Limit GiB | Peak RSS / charged GiB | Recall@10 | p50 / p90 / p99 ms | q/s, mean (range) |
+|---|---:|---|---:|---|---|
+| blowfish baseline, 48 probes | 2 | 1.59 / 2.00 | 0.950261 | 3.1 / 4.9–5.0 / 9.2–9.3 | 622 (619–625) |
+| blowfish MEM2, 48 probes | 2 | 1.93 / 1.57 | 0.950261 | 1.5–1.6 / 1.8 / 2.0–2.1 | 2,235 (2,210–2,260) |
+| blowfish baseline, 48 probes | 4 | 3.45 / 4.00 | 0.950261 | 1.7 / 2.0 / 2.5–2.6 | 1,987 (1,978–1,995) |
+| blowfish MEM2, 48 probes | 4 | 1.96 / 1.60 | 0.950261 | 1.5 / 1.7 / 1.9–2.0 | 2,305 (2,298–2,312) |
+| blowfish baseline, 48 probes | 8 | 3.47 / 6.36 | 0.950261 | 1.7 / 2.0–2.1 / 2.5–2.6 | 1,974 (1,958–1,990) |
+| blowfish MEM2, 48 probes | 8 | 2.79 / 2.44 | 0.950261 | 1.5 / 1.6 / 1.8 | 2,702 (2,688–2,715) |
+| blowfish baseline, 48 probes | 12 | 3.47 / 6.36 | 0.950261 | 1.7 / 2.0 / 2.5 | 1,959 (1,931–1,988) |
+| blowfish MEM2, 48 probes | 12 | 2.80 / 2.44 | 0.950261 | 1.5 / 1.6 / 1.8 | 2,592 (2,516–2,668) |
+
+All 16 blowfish cgroups have zero OOM events and zero swap. Benchmark servers are
+terminated after measurements; exit 137 after Docker's stop deadline is not an OOM
+(the OOM flag and cgroup counters are checked separately). Across these runs, host
+counters record 106 16-KiB swap-ins (1.66 MiB) and no swap-outs; those counters include
+desktop applications. The kernel logs of the measured runs are clean.
+
+Qdrant 1.20.0 was rebuilt on the same NQ inputs: f16 vectors on disk, HNSW in RAM,
+`m=16`, `ef_construct=100`, and query `ef=64`. It completed all 2,681,468 vectors
+with two physical segments, despite a target of one. These are comparison rows at
+slightly lower recall, not an equal-recall win for blowfish.
+
+| Engine | Limit GiB | Peak RSS / charged GiB | Recall@10 | p50 / p90 / p99 ms | q/s, mean (range) |
+|---|---:|---|---:|---|---|
+| Qdrant, vectors on disk, ef 64 | 8 | 4.81 / 4.89 | 0.943569 | 0.5 / 0.7 / 0.8 | 6,023 (5,996–6,050) |
+| Qdrant, vectors on disk, ef 64 | 12 | 4.81 / 4.89 | 0.943569 | 0.5 / 0.7 / 0.8 | 6,011 (5,972–6,051) |
+
+Each Qdrant row uses the same quality, warm-up, latency, and throughput protocol,
+with two fresh processes and uncached-runtime query VMs. Its full stored-file manifest
+matches before and after all four repeats: 41 files and 5,878,957,996 bytes. All repeats
+have identical ordered results, zero OOM events, zero server swap, and clean kernel logs.
+Qdrant remains faster once its working set fits; MEM2 improves blowfish's plateau but
+does not close that gap.
+
+An uncached-runtime bulk-loading attempt stalled and was discarded. Construction
+instead used the stock cached VZ runtime, ten GiB guest RAM, and an uncapped server;
+the loader and integrity helpers had separate caps. After construction, both backing
+files were synced, stopped, and cloned to fresh inodes before switching back to the
+uncached runtime for every measured query. No loading or construction time is included
+in throughput. The final blowfish store also matches its full before/after manifest:
+294 files and 12,127,019,472 bytes.
+
+### Cold checks and rejected controls
+
+Final merged disk-cold ABBA empties all engine caches and Linux page cache before every
+query on Graviton, raw 1 GiB, and decoded 512 MiB. Four ten-query passes give 20 samples
+per arm: pooled baseline p50/p90 1,067.7/1,512.1 ms, final candidate 331.2/598.8 ms.
+Every returned ID and distance matches. Large reads need bulk I/O: an earlier all-random
+mapping improved small-budget warm performance but regressed this disk-cold test to
+about 1.3 s p50, so it is not the final policy.
+
+A process-warm S3 ABBA uses a read-only facade delayed 25 ms per request and clears all
+application caches before each query. At raw zero, four 100-query passes give 200 samples per arm: pooled baseline p50/p90 176.0/198.6 ms, candidate 170.7/195.4 ms, with identical results. Shorter 20-query ABBA checks at raw 256 MiB and 4 GiB give p50 174.8/178.1 ms and 175.9/175.4 ms for baseline/candidate; their p90 values are 226.5/209.8 ms and 221.7/207.2 ms. Positive-budget S3 uses the same read policy in both builds. The facade models dependent
+request latency, not production S3 bandwidth, tails, or throttling.
+
+Rejected measurements were retained as controls, rather than shipped:
+
+- Unadvised mappings passed native warm tests but failed the 2 GiB M4 gate: 343 q/s and
+  p50/p90 9.7/23.9 ms, versus baseline 630 q/s and 2.9/4.8 ms. Sparse read-ahead was
+  the cliff. Random sparse views fix it; normal bulk views avoid serial cold-page faults.
+- Globally shrinking main blocks to 16 KiB reduced initial IVF throughput to 122 q/s
+  without raw cache, 215 q/s at 256 MiB, and 760 q/s at 1 GiB. It is not retained.
+- Amortized flight-table cleanup did not give a consistent gain. Additional ghost-list,
+  storage row-cache, and protected-LRU prototypes were not performance-qualified and
+  are not retained. X1's existing row-exact cache remains the compiled vector pool.
+- `posix_fadvise(DONTNEED)` after actual disk-block promotion, under a 2 GiB Graviton
+  cgroup with raw 256 MiB, decoded 512 MiB, and disk 6 GiB, improved a first pair from
+  45.1 to 78.8 q/s but regressed serial p50/p90 from 21.7/39.1 to 150.0/362.8 ms.
+  Its 1,000-query quality prefix matched. Remaining arms were killed. Remote S3's
+  disk-cache policy remains unchanged.
+
+Two discarded staging attempts and one comparator-loading attempt hit guest-kernel or
+runtime failures during bulk I/O, before comparator measurements. Preparation retries
+are excluded. Utilities use no bridge/NAT, payloads and binaries are hash-checked, and
+all measured VMs use the uncached runtime. Rust formatting, storage/engine all-target
+clippy with warnings denied, and both crates' full tests pass on the merged source.

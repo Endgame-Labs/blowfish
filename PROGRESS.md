@@ -4,6 +4,15 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Memory-capped servers 1.2-3.6x faster on warm vector queries** (round MEM2; `docs/benchmarks.md`, "Round MEM2").
+  Immutable local objects are now memory-mapped and share the operating system's page cache instead of being
+  copied into the heap, through two views of the same pages: normal read-ahead for contiguous reads of 64 KiB or
+  more, and random-access advice for small and sparse reads (plain read-ahead evicted hot pages at 2 GiB). The
+  decoded cache default rises from limit/8 to limit/4 (512 MiB to 4 GiB). On the Apple M4 with NQ at recall
+  0.950 and hard cgroup limits: 2 GiB 622 to 2,235 q/s, 4 GiB 1,987 to 2,305, 8 GiB 1,974 to 2,702, and 12 GiB
+  1,959 to 2,592, all results identical. Disk-cold p50 falls from 1,068 to 331 ms. Qdrant measured 6,023 q/s at
+  recall 0.944 in the same 8 GiB setup.
+
 - **Coarser leaves for large tiers, chosen automatically** (round C3; `docs/benchmarks.md`, "Round C3"). Recluster
   now uses 200-row leaves below 10M live vectors and 640-row leaves at or above, and the planner maps the probe
   count to the stored layout (64 becomes 70 on 640-row leaves), with no setting. At 10M, against a fresh 200-row

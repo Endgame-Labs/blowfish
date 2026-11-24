@@ -105,7 +105,7 @@ memory limit (host RAM, or the cgroup limit when lower):
 | Rows in a built or compacted segment | limit / 80,000, 25,000 to 200,000 | `BF_MAX_SEGMENT_ROWS` |
 | Rows accumulated before a bulk flush | the smaller of 100,000 and the segment cap | `BF_BULK_FLUSH_ROWS` |
 | Segment builds at once | 1 below 8 GiB, otherwise 2 | `BF_BUILD_CONCURRENCY` |
-| Decoded metadata cache | limit / 8, 512 MiB to 4 GiB | `BF_DECODED_CACHE_BYTES` |
+| Decoded metadata cache | limit / 4, 512 MiB to 4 GiB | `BF_DECODED_CACHE_BYTES` |
 
 The decoded cache budget covers all decoded data, in three parts: decoded segment metadata (two thirds), decoded ANN
 directory clusters (a quarter), and decoded document column blocks (a twelfth). Together they stay within
