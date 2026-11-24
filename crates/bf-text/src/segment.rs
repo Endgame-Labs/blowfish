@@ -2077,9 +2077,17 @@ impl SegmentReader {
             batch_size = usize::MAX;
             if prefetch {
                 let mut wanted = Vec::new();
-                for &(window, _) in &batch {
-                    for (t, term) in terms.iter().enumerate() {
-                        for b in term.span(window) {
+                // A frame can intersect several windows. Sweep their union in
+                // row order, requesting each frame once, without sorting a much
+                // larger vector of duplicate term/frame pairs. Scoring retains
+                // the original descending-bound window order.
+                let mut windows: Vec<_> = batch.iter().map(|&(w, _)| w).collect();
+                windows.sort_unstable();
+                for (t, term) in terms.iter().enumerate() {
+                    let mut after = 0;
+                    for &window in &windows {
+                        let span = term.span(window);
+                        for b in span.start.max(after)..span.end {
                             let meta = &term.meta.blocks[b];
                             if term.postings[b].is_none()
                                 && allowed.is_none_or(|rows| {
@@ -2089,10 +2097,9 @@ impl SegmentReader {
                                 wanted.push((t, b));
                             }
                         }
+                        after = after.max(span.end);
                     }
                 }
-                wanted.sort_unstable();
-                wanted.dedup();
                 self.read_search_blocks(&mut terms, wanted, &saturation, &mut metrics)
                     .await?;
             }
@@ -2154,7 +2161,11 @@ impl SegmentReader {
                                 let Some(postings) = &term.postings[b] else {
                                     continue;
                                 };
-                                let lo = postings.partition_point(|&(row, _)| row < start);
+                                let lo = if term.meta.blocks[b].first < start {
+                                    postings.partition_point(|&(row, _)| row < start)
+                                } else {
+                                    0
+                                };
                                 for &(row, _) in
                                     postings[lo..].iter().take_while(|&&(row, _)| row < end)
                                 {
@@ -2194,8 +2205,20 @@ impl SegmentReader {
                         let Some(postings) = &term.postings[b] else {
                             continue;
                         };
-                        let lo = postings.partition_point(|&(row, _)| row < start);
-                        let hi = postings.partition_point(|&(row, _)| row < end);
+                        // The directory already proves either endpoint when the
+                        // frame begins or ends inside this window. Search only
+                        // the remaining boundary, within the retained suffix.
+                        let block = &term.meta.blocks[b];
+                        let lo = if block.first < start {
+                            postings.partition_point(|&(row, _)| row < start)
+                        } else {
+                            0
+                        };
+                        let hi = if block.last >= end {
+                            lo + postings[lo..].partition_point(|&(row, _)| row < end)
+                        } else {
+                            postings.len()
+                        };
                         let postings = &postings[lo..hi];
                         let mut add = |row: u32, tf| {
                             let i = (row - start) as usize;
