@@ -52,7 +52,7 @@ Phrase positions preserve gaps, repeated terms, and input element boundaries.
 Sequence queries reject prefix matching, and indexes without positions return
 `io::ErrorKind::Unsupported` for sequence queries.
 
-## Segment format (version 5)
+## Segment format (version 6)
 
 All integers are little-endian. The fixed 72-byte footer records the format,
 row count, tokenizer, normalization length, region offsets, and checksums.
@@ -69,7 +69,13 @@ padding | term directories and short postings`. The dictionary region is reserve
 before assigning absolute directory offsets, avoiding a circular dependency on
 FST size. Directories retain the version-4 layout:
 `DF (u32) | block count (u32) | 52-byte block records | crc32`. A bundle CRC
-protects the complete range. Phrase positions remain independent, and document
+protects the complete range. Phrase positions remain independent. Each position
+block starts with a one-byte flag: zero omits array element ordinals, and one
+includes them. Within each posting, unsigned LEB128 encodes position deltas and,
+when present, element deltas. Positions restart at zero on a new element, and
+both coordinates restart for each document. Sorted coordinates, token gaps,
+repeated positions, and array boundaries are preserved exactly. CRCs cover the
+encoded bytes. Document
 lengths are packed in blocks of 128 rows. Zero length denotes a missing field.
 
 `text_header` extracts the footer and bundle index for the manifest.
@@ -93,9 +99,11 @@ bounds share a separate 8 MiB allowance: term-window summaries reuse frame maxim
 refresh when newly decoded frames can tighten them. Scores still use the
 reference f32 addition order, including repetitions, prefixes, and ties.
 
-Versions 1 through 4 remain readable during upgrades. New writes always use
-version 5. The engine automatically rebuilds old indexes from immutable document
-columns, one field per fenced publication; there is no layout-selection setting.
+Versions 1 through 5 remain readable during upgrades. New writes always use
+version 6. `upgrade_segment` transcodes formats 4 and 5 directly, validating
+posting, position, length, and dictionary checksums. It does not retokenize
+documents. Formats 1 through 3 rebuild from immutable document columns through
+the existing background upgrade pass. There is no layout-selection setting.
 The manifest schema is unchanged. The writer repacks the intermediate builder
 output into one copy of each posting and directory. Long postings and phrase positions precede the dictionary bundles.
 

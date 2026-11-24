@@ -1,5 +1,7 @@
 #[path = "bundle.rs"]
 mod bundle;
+#[path = "positions.rs"]
+mod positions;
 use crate::scoring::{Saturation, TermWeight};
 use crate::{CorpusStats, FtsParams, Query, Token, Tokenizer};
 use async_trait::async_trait;
@@ -14,6 +16,9 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::io::{self, ErrorKind};
 use std::ops::Range;
 use std::sync::Arc;
+
+/// Bundled dictionaries with lossless per-document position and element deltas.
+const VERSION_COMPRESSED: u32 = 6;
 
 const BLOCK: usize = 128;
 const FOOTER: usize = 72;
@@ -356,7 +361,7 @@ impl SegmentBuilder {
     /// Produce immutable dictionary-bundled bytes. Older segments remain readable
     /// during automatic upgrades. No other crate's serialization is embedded.
     pub fn finish(self) -> io::Result<Vec<u8>> {
-        bundle::bundle(self.finish_colocated()?)
+        bundle::bundle(self.finish_colocated_impl(true)?, true)
     }
 
     /// Produce format-4 bytes solely for migration tests and measurements.
@@ -365,7 +370,18 @@ impl SegmentBuilder {
         self.finish_colocated()
     }
 
+    #[cfg(any(test, feature = "legacy-fixtures"))]
     fn finish_colocated(self) -> io::Result<Vec<u8>> {
+        self.finish_colocated_impl(false)
+    }
+
+    /// Produce format-5 bytes solely for migration tests and measurements.
+    #[cfg(feature = "legacy-fixtures")]
+    pub fn finish_bundled_fixture(self) -> io::Result<Vec<u8>> {
+        bundle::legacy_bundle(self.finish_colocated()?)
+    }
+
+    fn finish_colocated_impl(self, compressed_positions: bool) -> io::Result<Vec<u8>> {
         let packer = BitPacker4x::new();
         // Phase 1: compress every term's blocks. `post` holds the blocks of all terms in order and
         // `pos` the phrase positions; block offsets are relative until phase 2 places them.
@@ -397,10 +413,14 @@ impl SegmentBuilder {
                 post.extend_from_slice(&compressed);
                 let positions_offset = pos.len() as u64;
                 if self.positions {
-                    for i in first..last {
-                        for &(element, position) in postings.of(i) {
-                            put32(&mut pos, element);
-                            put32(&mut pos, position);
+                    if compressed_positions {
+                        positions::encode((first..last).map(|i| postings.of(i)), &mut pos);
+                    } else {
+                        for i in first..last {
+                            for &(element, position) in postings.of(i) {
+                                put32(&mut pos, element);
+                                put32(&mut pos, position);
+                            }
                         }
                     }
                 }
@@ -774,14 +794,14 @@ impl TextHeader {
     /// Whether this header describes the current dictionary-bundled layout.
     /// Older layouts remain readable while the indexer upgrades them.
     pub fn is_current(&self) -> bool {
-        self.footer.get(8..12) == Some(VERSION_BUNDLED.to_le_bytes().as_slice())
+        self.footer.get(8..12) == Some(VERSION_COMPRESSED.to_le_bytes().as_slice())
     }
 }
 
-/// Upgrade colocated format-4 postings to format 5 without decoding or tokenizing documents.
+/// Upgrade format-4 or format-5 postings to format 6 without tokenizing documents.
 /// Current bytes are returned unchanged. Formats 1–3 return `None`, so callers can rebuild
 /// from their immutable document columns. The footer, lengths, and dictionary index are checked;
-/// format-4 conversion also checks posting and phrase payloads. Unknown formats are errors.
+/// conversion also checks posting and phrase payloads. Unknown formats are errors.
 pub fn upgrade_segment(bytes: Vec<u8>) -> io::Result<Option<Vec<u8>>> {
     let footer = checked_slice(&bytes, bytes.len().saturating_sub(FOOTER)..bytes.len())?;
     if footer.len() != FOOTER || &footer[..8] != MAGIC {
@@ -794,7 +814,7 @@ pub fn upgrade_segment(bytes: Vec<u8>) -> io::Result<Option<Vec<u8>>> {
     let version = u32::from_le_bytes(footer[8..12].try_into().unwrap());
     match version {
         VERSION | VERSION_LAZY | VERSION_CHUNKED => Ok(None),
-        VERSION_COLOCATED | VERSION_BUNDLED => {
+        VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED => {
             let _header = text_header(&bytes)?.ok_or_else(|| invalid("missing text header"))?;
             let lengths = u64::from_le_bytes(footer[32..40].try_into().unwrap()) as usize;
             let positions = u64::from_le_bytes(footer[40..48].try_into().unwrap()) as usize;
@@ -815,16 +835,16 @@ pub fn upgrade_segment(bytes: Vec<u8>) -> io::Result<Option<Vec<u8>>> {
                 checked_slice(&bytes, dictionary..bytes.len() - FOOTER)?,
                 u32::from_le_bytes(footer[64..68].try_into().unwrap()),
             )?;
-            if version == VERSION_BUNDLED {
+            if version == VERSION_COMPRESSED {
                 Ok(Some(bytes))
             } else {
-                bundle::bundle(bytes).map(Some)
+                bundle::bundle(bytes, false).map(Some)
             }
         }
         _ => Err(invalid("unknown text segment format")),
     }
 }
-/// The header of a finished version 4 or 5 segment (`None` for older versions).
+/// The header of a finished version 4, 5, or 6 segment (`None` for older versions).
 pub fn text_header(bytes: &[u8]) -> io::Result<Option<TextHeader>> {
     if bytes.len() < FOOTER {
         return Err(invalid("text segment has no footer"));
@@ -834,7 +854,10 @@ pub fn text_header(bytes: &[u8]) -> io::Result<Option<TextHeader>> {
     if c.take(8)? != MAGIC {
         return Err(invalid("unknown text segment format"));
     }
-    if !matches!(c.u32()?, VERSION_COLOCATED | VERSION_BUNDLED) {
+    if !matches!(
+        c.u32()?,
+        VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED
+    ) {
         return Ok(None);
     }
     let mut c = Cursor::new(&footer[32..]);
@@ -871,6 +894,7 @@ pub struct SegmentReader {
     /// Version 4: each term's record is followed by its blocks (`SMALL_BLOCKS` and fewer are read with it).
     colocated: bool,
     bundled: bool,
+    compressed_positions: bool,
     decoded: std::sync::Mutex<DecodedPostings>,
     saturation: std::sync::Mutex<Option<Arc<Saturation>>>,
 }
@@ -996,11 +1020,12 @@ impl SegmentReader {
             && version != VERSION_CHUNKED
             && version != VERSION_COLOCATED
             && version != VERSION_BUNDLED
+            && version != VERSION_COMPRESSED
         {
             return Err(invalid("unknown text segment format"));
         }
         let colocated = version >= VERSION_COLOCATED;
-        let bundled = version == VERSION_BUNDLED;
+        let bundled = version >= VERSION_BUNDLED;
         let chunked = version == VERSION_CHUNKED || colocated;
         let lazy = version == VERSION_LAZY || chunked;
         let flags = c.u32()?;
@@ -1108,6 +1133,7 @@ impl SegmentReader {
                 },
                 colocated,
                 bundled,
+                compressed_positions: version >= VERSION_COMPRESSED,
                 decoded: Default::default(),
                 saturation: Default::default(),
             });
@@ -1132,6 +1158,7 @@ impl SegmentReader {
                 postings_end: metadata_offset,
                 colocated: false,
                 bundled: false,
+                compressed_positions: false,
                 decoded: Default::default(),
                 saturation: Default::default(),
             });
@@ -1191,6 +1218,7 @@ impl SegmentReader {
             postings_end: lengths_offset,
             colocated: false,
             bundled: false,
+            compressed_positions: false,
             decoded: Default::default(),
             saturation: Default::default(),
         })
@@ -1358,7 +1386,7 @@ impl SegmentReader {
     }
     /// Open from a header kept elsewhere (the manifest), without reading the object: the footer
     /// and the dictionary's chunk index. Document lengths load on first use. Versions 4
-    /// and 5 have headers.
+    /// 5, and 6 have headers.
     pub fn open_with_header(source: Arc<dyn RangeRead>, header: &TextHeader) -> io::Result<Self> {
         let len = source.len();
         if header.footer.len() != FOOTER || len < FOOTER as u64 {
@@ -1370,7 +1398,10 @@ impl SegmentReader {
             return Err(invalid("unknown text segment format"));
         }
         let version = c.u32()?;
-        if !matches!(version, VERSION_COLOCATED | VERSION_BUNDLED) {
+        if !matches!(
+            version,
+            VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED
+        ) {
             return Err(invalid("unknown text segment format"));
         }
         let flags = c.u32()?;
@@ -1416,7 +1447,7 @@ impl SegmentReader {
             },
             terms: Terms::Lazy {
                 start: 0,
-                end: if version == VERSION_BUNDLED {
+                end: if version >= VERSION_BUNDLED {
                     lengths_offset
                 } else {
                     metadata_offset
@@ -1431,7 +1462,8 @@ impl SegmentReader {
             tokenizer,
             postings_end: lengths_offset,
             colocated: true,
-            bundled: version == VERSION_BUNDLED,
+            bundled: version >= VERSION_BUNDLED,
+            compressed_positions: version >= VERSION_COMPRESSED,
             decoded: Default::default(),
             saturation: Default::default(),
         })
@@ -2431,26 +2463,14 @@ impl SegmentReader {
             }))
             .await?;
             for (postings, raw) in results {
-                let mut c = Cursor::new(&raw);
+                let mut decoder = positions::Decoder::new(&raw, self.compressed_positions)?;
                 for (row, tf) in postings.iter().copied() {
-                    // Check the payload size before allocating for untrusted frequencies.
-                    if tf as u64 * 8 > (c.data.len() - c.at) as u64 {
-                        return Err(invalid("truncated positions"));
-                    }
-                    let mut positions = Vec::with_capacity(tf as usize);
-                    for _ in 0..tf {
-                        positions.push((c.u32()?, c.u32()?));
-                    }
-                    if !positions.windows(2).all(|p| p[0] <= p[1]) {
-                        return Err(invalid("unsorted positions"));
-                    }
+                    let positions = decoder.document(tf)?;
                     if candidates.contains(row) {
                         docs.insert(row, positions);
                     }
                 }
-                if c.at != c.data.len() {
-                    return Err(invalid("trailing positions"));
-                }
+                decoder.finish()?;
             }
             terms.insert((*term).to_owned(), docs);
         }

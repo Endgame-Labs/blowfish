@@ -1,4 +1,4 @@
-//! Dictionary bundles for text format 5. Long postings and phrase positions precede
+//! Dictionary bundles for text formats 5 and 6. Long postings and phrase positions precede
 //! bundles; short postings share their term's directory and dictionary read.
 use super::*;
 use fst::Streamer;
@@ -53,21 +53,41 @@ fn dictionary(terms: &[Term], base: u64) -> io::Result<(Vec<u8>, usize)> {
 
 /// Repack the builder's intermediate colocated bytes. Every posting and directory
 /// has exactly one final address; no old-format records or duplicate postings remain.
-pub(super) fn bundle(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+pub(super) fn bundle(bytes: Vec<u8>, compressed_positions: bool) -> io::Result<Vec<u8>> {
+    bundle_as(bytes, compressed_positions, true)
+}
+
+#[cfg(any(test, feature = "legacy-fixtures"))]
+pub(super) fn legacy_bundle(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+    bundle_as(bytes, false, false)
+}
+
+fn bundle_as(
+    bytes: Vec<u8>,
+    compressed_positions: bool,
+    output_compressed: bool,
+) -> io::Result<Vec<u8>> {
     let footer = checked_slice(&bytes, bytes.len().saturating_sub(FOOTER)..bytes.len())?;
     let header = text_header(&bytes)?.ok_or_else(|| invalid("text header missing"))?;
-    if footer[8..12] != VERSION_COLOCATED.to_le_bytes() {
-        return Err(invalid("expected colocated text builder output"));
+    let version = u32::from_le_bytes(footer[8..12].try_into().unwrap());
+    if !matches!(version, VERSION_COLOCATED | VERSION_BUNDLED) {
+        return Err(invalid("expected legacy text builder output"));
     }
     let lengths = u64::from_le_bytes(footer[32..40].try_into().unwrap()) as usize;
     let positions = u64::from_le_bytes(footer[40..48].try_into().unwrap()) as usize;
     let old_dictionary = u64::from_le_bytes(footer[48..56].try_into().unwrap()) as usize;
     let chunks_start = header.chunks.first().map_or(lengths, |c| c.1 as usize);
     let mut terms = Vec::new();
+    let mut position_data = Vec::new();
     for (_, offset, len, crc) in &header.chunks {
         let blob = checked_slice(&bytes, *offset as usize..*offset as usize + *len as usize)?;
         verify(blob, *crc)?;
-        let map = fst::Map::new(blob).map_err(|e| invalid(&e.to_string()))?;
+        let blob = Bytes::copy_from_slice(blob);
+        let map = if version == VERSION_BUNDLED {
+            SegmentReader::decode_bundle(&blob)?
+        } else {
+            fst::Map::new(blob).map_err(|e| invalid(&e.to_string()))?
+        };
         let mut stream = map.stream();
         while let Some((text, handle)) = stream.next() {
             let df = (handle & DF_MASK) as u32;
@@ -83,10 +103,10 @@ pub(super) fn bundle(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
             if df == 0 || c.u32()? != df || c.u32()? as usize != count {
                 return Err(invalid("invalid bundled term record"));
             }
-            let blocks = (0..count)
+            let mut blocks = (0..count)
                 .map(|_| BlockMeta::decode(&mut c))
                 .collect::<io::Result<Vec<_>>>()?;
-            for b in &blocks {
+            for b in &mut blocks {
                 let start = usize::try_from(b.positions)
                     .map_err(|_| invalid("position offset overflow"))?;
                 let end = start
@@ -95,7 +115,30 @@ pub(super) fn bundle(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
                 if start < positions || end > chunks_start {
                     return Err(invalid("phrase positions outside their region"));
                 }
-                verify(checked_slice(&bytes, start..end)?, b.positions_crc)?;
+                let raw = checked_slice(&bytes, start..end)?;
+                verify(raw, b.positions_crc)?;
+                let new_start = position_data.len();
+                if compressed_positions || !output_compressed {
+                    position_data.extend_from_slice(raw);
+                } else if !raw.is_empty() {
+                    let posting = checked_slice(
+                        &bytes,
+                        b.offset as usize..b.offset as usize + b.size as usize,
+                    )?;
+                    verify(posting, b.crc)?;
+                    let frequencies = frequencies(posting, b.count)?;
+                    let mut decoder = positions::Decoder::new(raw, false)?;
+                    let documents = frequencies
+                        .into_iter()
+                        .map(|tf| decoder.document(tf))
+                        .collect::<io::Result<Vec<_>>>()?;
+                    decoder.finish()?;
+                    positions::encode(documents.iter().map(Vec::as_slice), &mut position_data);
+                }
+                b.positions = new_start as u64;
+                b.positions_size = u32::try_from(position_data.len() - new_start)
+                    .map_err(|_| input("position block too large"))?;
+                b.positions_crc = crc32fast::hash(&position_data[new_start..]);
             }
             terms.push(Term {
                 text: text.to_vec(),
@@ -119,13 +162,10 @@ pub(super) fn bundle(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
         }
     }
     let positions_start = out.len() as u64;
-    out.extend_from_slice(checked_slice(&bytes, positions..chunks_start)?);
+    out.extend(position_data);
     for term in &mut terms {
         for b in &mut term.blocks {
-            b.positions = positions_start
-                + b.positions
-                    .checked_sub(positions as u64)
-                    .ok_or_else(|| invalid("invalid phrase position offset"))?;
+            b.positions += positions_start;
         }
     }
     let mut groups = Vec::new();
@@ -192,7 +232,14 @@ pub(super) fn bundle(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
     let index_crc = crc32fast::hash(&index);
     out.extend(index);
     let mut footer = footer.to_vec();
-    footer[8..12].copy_from_slice(&VERSION_BUNDLED.to_le_bytes());
+    footer[8..12].copy_from_slice(
+        &if output_compressed {
+            VERSION_COMPRESSED
+        } else {
+            VERSION_BUNDLED
+        }
+        .to_le_bytes(),
+    );
     footer[32..40].copy_from_slice(&lengths_offset.to_le_bytes());
     footer[40..48].copy_from_slice(&positions_start.to_le_bytes());
     footer[48..56].copy_from_slice(&dictionary_offset.to_le_bytes());
@@ -201,6 +248,28 @@ pub(super) fn bundle(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
     footer[68..].copy_from_slice(&crc.to_le_bytes());
     out.extend(footer);
     Ok(out)
+}
+
+fn frequencies(bytes: &[u8], count: u32) -> io::Result<Vec<u32>> {
+    if count == 0
+        || count as usize > BLOCK
+        || bytes.len() < 2
+        || bytes[0] > 32
+        || bytes[1] > 32
+        || bytes.len() != 2 + 16 * (bytes[0] as usize + bytes[1] as usize)
+    {
+        return Err(invalid("invalid packed posting size"));
+    }
+    let mut frequencies = [0; BLOCK];
+    BitPacker4x::new().decompress(
+        &bytes[2 + 16 * bytes[0] as usize..],
+        &mut frequencies,
+        bytes[1],
+    );
+    if frequencies[..count as usize].contains(&0) {
+        return Err(invalid("zero posting frequency"));
+    }
+    Ok(frequencies[..count as usize].to_vec())
 }
 
 #[cfg(test)]
@@ -295,6 +364,78 @@ mod tests {
         }
         for end in [0, 1, 71, bytes.len() - 1] {
             assert!(upgrade_segment(bytes[..end].to_vec()).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod compressed_tests {
+    use super::*;
+    use futures::executor::block_on;
+
+    #[test]
+    fn format_five_upgrade_is_identical_to_new_build_for_scalar_and_array_fields() {
+        for positions in [false, true] {
+            for arrays in [false, true] {
+                let build = || {
+                    let mut b = SegmentBuilder::new(positions);
+                    b.add_missing_document().unwrap();
+                    b.add_document(&[]).unwrap();
+                    for row in 0..5000 {
+                        let p = FtsParams::default();
+                        let tokens = if arrays {
+                            crate::tokenize_array(
+                                &["fish fish", "fish and water", &format!("term{}", row % 17)],
+                                &p,
+                            )
+                        } else {
+                            crate::tokenize(&format!("fish fish and water term{}", row % 17), &p)
+                        };
+                        b.add_document(&tokens).unwrap();
+                    }
+                    b
+                };
+                let old = legacy_bundle(build().finish_colocated().unwrap()).unwrap();
+                assert_eq!(
+                    u32::from_le_bytes(
+                        text_header(&old).unwrap().unwrap().footer[8..12]
+                            .try_into()
+                            .unwrap()
+                    ),
+                    5
+                );
+                let expected = build().finish().unwrap();
+                assert_eq!(upgrade_segment(old.clone()).unwrap().unwrap(), expected);
+                let a =
+                    block_on(SegmentReader::open(Arc::new(MemoryRangeRead::from(old)))).unwrap();
+                let h = text_header(&expected).unwrap().unwrap();
+                assert!(h.is_current());
+                let b =
+                    SegmentReader::open_with_header(Arc::new(MemoryRangeRead::from(expected)), &h)
+                        .unwrap();
+                let stats = block_on(a.stats()).unwrap();
+                for text in [
+                    "fish",
+                    "fish fish",
+                    "water term3",
+                    "fish water",
+                    "fish and water",
+                    "absent",
+                ] {
+                    let p = FtsParams::default();
+                    let q = Query::new(crate::tokenize(text, &p), false);
+                    assert_eq!(
+                        block_on(a.search_prefetched(&q, &stats, &p, 10, None)).unwrap(),
+                        block_on(b.search_prefetched(&q, &stats, &p, 10, None)).unwrap()
+                    );
+                    if positions {
+                        assert_eq!(
+                            block_on(a.contains_token_sequence(&q)).unwrap(),
+                            block_on(b.contains_token_sequence(&q)).unwrap()
+                        );
+                    }
+                }
+            }
         }
     }
 }
