@@ -1873,6 +1873,50 @@ mod tests {
     }
 
     #[test]
+    fn retired_vector_sources_still_trigger_masked_rebuilds_and_deltas() {
+        for through_lineage in [false, true] {
+            let mut segments: Vec<_> = (0..4).map(|i| segment(&format!("s{i}"), 100_000)).collect();
+            let tiers = std::collections::BTreeMap::from([(
+                "v".into(),
+                vec![tier(
+                    &[
+                        ("s0", 100_000),
+                        ("s1", 100_000),
+                        ("s2", 100_000),
+                        ("s3", 100_000),
+                    ],
+                    bf_wal::TIER_FORMAT_VERSION,
+                )],
+            )]);
+            for segment in &mut segments {
+                segment.files.remove("annv2:v");
+            }
+            let lineage = if through_lineage {
+                segments[0].id = "merged-s0".into();
+                serde_json::from_value(serde_json::json!([{
+                    "source":"s0", "parts":[{"target":"merged-s0", "rows":100_000,
+                        "map":{"key":"map-s0", "size":1, "metadata_len":0}}],
+                }]))
+                .unwrap()
+            } else {
+                Vec::new()
+            };
+            let (decision, numbers) =
+                decide(&segments, &tiers, &lineage, Some(320_000), false, false);
+            assert_eq!(decision, Decision::Build("v".into(), "masked"));
+            assert_eq!(numbers.unwrap().masked_rows, 80_000);
+            // New rows still own ANN objects and must trigger a delta beside the retired base.
+            segments.push(segment("new", 20_000));
+            let (decision, numbers) =
+                decide(&segments, &tiers, &lineage, Some(340_000), false, false);
+            assert_eq!(decision, Decision::Build("v".into(), "delta"));
+            let numbers = numbers.unwrap();
+            assert_eq!(numbers.uncovered_rows, 20_000);
+            assert_eq!(numbers.covered_rows, 400_000);
+        }
+    }
+
+    #[test]
     fn a_foreground_run_builds_a_delta_beside_a_base_unless_a_merge_is_due() {
         let mut segments: Vec<_> = (0..4).map(|i| segment(&format!("s{i}"), 100_000)).collect();
         let base = tier(
