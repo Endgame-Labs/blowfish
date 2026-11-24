@@ -4,6 +4,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-11-24
+
 ### Performance
 
 - **Cheaper filtered vector search:** Filtered ANN scans now use fixed-width table chunks and a bounded per-scan membership bitset (at most 8 bytes per scanned row; widely spaced IDs fall back to bitmap merging). On full NQ, CPU per query drops 20 to 40% across ID and hash filters at 1%, 10%, and 50% selectivity. The hardest case, a 1% hash filter, goes from 67 to 40 ms and uses 61% fewer instructions, and its 16-client throughput rises from 99 to 168 q/s. All 768 per-query comparisons return identical rows and distances. Unfiltered queries cost about 2% more CPU. See [docs/benchmarks/filtered-ann.md](docs/benchmarks/filtered-ann.md).
@@ -153,7 +155,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.19
 [0.1.18]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.18
 [0.1.17]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.17
 [0.1.16]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.16
