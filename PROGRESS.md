@@ -4,6 +4,16 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Fix: WAL payloads orphaned after a failed write group** (round WF1). When a group's slot commit failed,
+  the pipeline cancelled the later groups' uploads and deleted their payloads at once; a PUT already in flight
+  could land after the DELETE and stay forever. Cleanup now lets an abandoned upload finish before deleting its
+  payload, and GC reclaims expired payloads that no committed slot references, independent of checkpoint
+  progress (including after a restart and before the first manifest). Before deleting a payload in an empty
+  slot range, GC fills the gap with empty WAL entries, so a paused writer loses its conditional commit instead of
+  publishing a reference to deleted data. Acknowledged-write semantics are unchanged. A deterministic test forces
+  the PUT-after-DELETE ordering (20 of 20 failures before, none after), and the pipeline tests passed 200 runs in
+  a row under CPU contention (4% failure before).
+
 - **Text format 7: 1.69x smaller text indexes** (round B5; `docs/benchmarks.md`, "Round B5"). Partial posting
   blocks now store only their real rows (LEB128 row deltas and term frequencies) instead of padding to 128, and
   block directories use variable-width records with offsets derived from frame sizes. On 1M MS MARCO

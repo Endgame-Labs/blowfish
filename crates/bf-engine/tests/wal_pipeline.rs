@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use bf_engine::{Engine, EngineConfig};
 use bf_storage::Storage;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -23,11 +24,34 @@ use std::{
 /// slot's commit can be made to fail once.
 #[derive(Debug, Default)]
 struct Slow {
-    inner: object_store::memory::InMemory,
+    inner: Arc<object_store::memory::InMemory>,
     uploads: AtomicUsize,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
     fail_slot: AtomicU64,
+    late: Option<Arc<LateUpload>>,
+    commit_gate: Option<Arc<CommitGate>>,
+}
+
+#[derive(Debug, Default)]
+struct CommitGate {
+    entered: tokio::sync::Notify,
+    finish: tokio::sync::Notify,
+    attempts: AtomicUsize,
+}
+
+/// A remote PUT can outlive its canceled client future. On cancellation, force it to land
+/// after the first DELETE, reproducing the orphan without relying on scheduler timing.
+#[derive(Debug, Default)]
+struct LateUpload {
+    first_uploads: AtomicUsize,
+    first_upload_entered: tokio::sync::Notify,
+    finish_first_upload: tokio::sync::Notify,
+    upload_entered: tokio::sync::Notify,
+    finish_upload: tokio::sync::Notify,
+    deleted: tokio::sync::Notify,
+    cleanup_done: tokio::sync::Notify,
+    landed: tokio::sync::Notify,
 }
 impl fmt::Display for Slow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -44,12 +68,45 @@ impl ObjectStore for Slow {
     ) -> StoreResult<PutResult> {
         let name = path.as_ref();
         if name.contains("/wal-data/") {
+            if name.contains("/00000000000000000002-")
+                && let Some(late) = &self.late
+                && late.first_uploads.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                late.first_upload_entered.notify_one();
+                late.finish_first_upload.notified().await;
+            }
+            if name.contains("/00000000000000000003-")
+                && let Some(late) = &self.late
+            {
+                let (finish, canceled) = tokio::sync::oneshot::channel();
+                let (inner, path, remote_late) = (self.inner.clone(), path.clone(), late.clone());
+                let remote = tokio::spawn(async move {
+                    if canceled.await.is_err() {
+                        // A canceled request is still being processed by the remote store.
+                        remote_late.deleted.notified().await;
+                    }
+                    let result = inner.put_opts(&path, payload, opts).await;
+                    remote_late.landed.notify_one();
+                    result
+                });
+                late.upload_entered.notify_one();
+                late.finish_upload.notified().await;
+                let _ = finish.send(());
+                return remote.await.unwrap();
+            }
             let n = self.uploads.fetch_add(1, Ordering::SeqCst);
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(5 + 12 * (7 - (n % 8)) as u64)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
         } else if name.contains("/wal/") {
+            if name.ends_with("/00000000000000000002.wal")
+                && let Some(gate) = &self.commit_gate
+                && gate.attempts.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                gate.entered.notify_one();
+                gate.finish.notified().await;
+            }
             let seq: u64 = name
                 .rsplit('/')
                 .next()
@@ -84,7 +141,19 @@ impl ObjectStore for Slow {
         &self,
         paths: BoxStream<'static, StoreResult<Path>>,
     ) -> BoxStream<'static, StoreResult<Path>> {
-        self.inner.delete_stream(paths)
+        let late = self.late.clone();
+        self.inner
+            .delete_stream(paths)
+            .map(move |result| {
+                if let (Some(late), Ok(path)) = (&late, &result)
+                    && path.as_ref().contains("/wal-data/00000000000000000003-")
+                {
+                    late.deleted.notify_one();
+                    late.cleanup_done.notify_one();
+                }
+                result
+            })
+            .boxed()
     }
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
         self.inner.list(prefix)
@@ -180,6 +249,58 @@ async fn concurrent_groups_upload_together_and_commit_in_order() {
 }
 async fn engine_fresh(backend: &Arc<Slow>) -> (Engine, Storage) {
     engine(backend).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_upload_finishes_before_its_payload_is_deleted() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let late = Arc::new(LateUpload::default());
+        let backend = Arc::new(Slow {
+            late: Some(late.clone()),
+            ..Default::default()
+        });
+        let (engine, store) = engine(&backend).await;
+        async fn write(
+            engine: Engine,
+            id: u64,
+        ) -> Result<bf_types::WriteResponse, bf_types::ApiError> {
+            engine
+                .write(
+                    "late",
+                    serde_json::from_value(json!({
+                        "schema":{"pad":{"type":"string","filterable":false}},
+                        "upsert_rows":[row(id, json!({}))]
+                    }))
+                    .unwrap(),
+                )
+                .await
+        }
+        write(engine.clone(), 1).await.unwrap();
+        backend.fail_slot.store(2, Ordering::SeqCst);
+        let first = tokio::spawn(write(engine.clone(), 2));
+        late.first_upload_entered.notified().await;
+        let later = tokio::spawn(write(engine.clone(), 3));
+        late.upload_entered.notified().await;
+        late.finish_first_upload.notify_one();
+        assert!(first.await.unwrap().is_err());
+        assert!(later.await.unwrap().is_err());
+        late.finish_upload.notify_one();
+        late.landed.notified().await;
+        late.cleanup_done.notified().await;
+        assert_eq!(ids(&engine, "late").await, BTreeSet::from([1]));
+        assert_eq!(
+            payload_objects(&store, "late").await,
+            1,
+            "the abandoned remote PUT was deleted after landing"
+        );
+        assert_eq!(
+            ids(&engine_fresh(&backend).await.0, "late").await,
+            BTreeSet::from([1])
+        );
+        write(engine, 4).await.unwrap();
+    })
+    .await
+    .expect("the gated upload and cleanup completed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -386,9 +507,131 @@ fn wal_batch() -> Vec<bf_wal::WriteBatch> {
     vec![bf_wal::WriteBatch {
         upserts: vec![serde_json::from_value(json!({"id": 5, "pad": "y".repeat(70_000)})).unwrap()],
         deletes: vec![],
-        schema: Schema::new(),
+        schema: serde_json::from_value(json!({
+            "id":{"type":"uint"}, "pad":{"type":"string","filterable":false}
+        }))
+        .unwrap(),
         distance_metric: DistanceMetric::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }]
+}
+
+#[tokio::test]
+async fn restart_gc_reclaims_expired_orphans_without_checkpointing_live_payloads() {
+    let backend = Arc::new(Slow::default());
+    let (engine, store) = engine(&backend).await;
+    let wal = bf_wal::Wal::new(store.clone(), "restart").unwrap();
+    engine
+        .write(
+            "restart",
+            serde_json::from_value(json!({
+                "schema":{"pad":{"type":"string","filterable":false}},
+                "upsert_rows":[row(5, json!({}))]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let committed = wal.read(1).await.unwrap().unwrap();
+    // One abandoned attempt lost an occupied slot; another was staged ahead of an empty slot.
+    let lost = bf_wal::WalEntry::new(wal_batch());
+    wal.stage(1, &lost).await.unwrap();
+    let paused = bf_wal::WalEntry::new(wal_batch());
+    let staged = wal.stage(3, &paused).await.unwrap();
+    assert_eq!(payload_objects(&store, "restart").await, 3);
+    assert_eq!(
+        engine.collect_garbage("restart").await.unwrap(),
+        0,
+        "fresh payloads remain protected by retention"
+    );
+    drop(engine);
+    // No index manifest exists, and slot 2 has no payload (an inline flight may have crashed).
+    let restarted = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            retention: Duration::ZERO,
+            ..config()
+        },
+    );
+    assert_eq!(restarted.collect_garbage("restart").await.unwrap(), 2);
+    assert_eq!(payload_objects(&store, "restart").await, 1);
+    assert_eq!(
+        wal.read(1).await.unwrap().unwrap().write_id,
+        committed.write_id
+    );
+    assert_eq!(
+        slots(&store, "restart").await,
+        3,
+        "GC filled the gap with empty fences"
+    );
+    assert_eq!(
+        wal.commit(3, &paused, &staged).await.unwrap(),
+        bf_storage::CreateResult::Conflict,
+        "a paused writer cannot publish a payload that GC removed"
+    );
+    assert_eq!(restarted.collect_garbage("restart").await.unwrap(), 0);
+    assert_eq!(ids(&restarted, "restart").await, BTreeSet::from([5]));
+    assert_eq!(
+        ids(&engine_fresh(&backend).await.0, "restart").await,
+        BTreeSet::from([5])
+    );
+    // Recovery also removes losing payloads above an existing checkpoint, without reclaiming
+    // the winning, still-unindexed write in that same slot.
+    restarted.index_namespace("restart", true).await.unwrap();
+    wal.stage(4, &bf_wal::WalEntry::new(wal_batch()))
+        .await
+        .unwrap();
+    restarted
+        .write(
+            "restart",
+            serde_json::from_value(json!({
+                "schema":{"pad":{"type":"string","filterable":false}},
+                "upsert_rows":[row(6, json!({}))]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(restarted.collect_garbage("restart").await.unwrap() >= 1);
+    assert_eq!(payload_objects(&store, "restart").await, 1);
+    assert_eq!(
+        ids(&engine_fresh(&backend).await.0, "restart").await,
+        BTreeSet::from([5, 6])
+    );
+}
+
+#[tokio::test]
+async fn gc_preserves_a_payload_when_its_writer_wins_the_slot_fence() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let gate = Arc::new(CommitGate::default());
+        let backend = Arc::new(Slow {
+            commit_gate: Some(gate.clone()),
+            ..Default::default()
+        });
+        let (_, store) = engine(&backend).await;
+        let wal = bf_wal::Wal::new(store.clone(), "gc-race").unwrap();
+        wal.append(1, &bf_wal::WalEntry::new(vec![])).await.unwrap();
+        let entry = bf_wal::WalEntry::new(wal_batch());
+        let staged = wal.stage(2, &entry).await.unwrap();
+        let collecting = tokio::spawn({
+            let wal = wal.clone();
+            async move { wal.collect_orphan_payloads(chrono::Utc::now()).await }
+        });
+        gate.entered.notified().await;
+        assert_eq!(
+            wal.commit(2, &entry, &staged).await.unwrap(),
+            bf_storage::CreateResult::Created
+        );
+        gate.finish.notify_one();
+        assert_eq!(collecting.await.unwrap().unwrap(), 0);
+        assert_eq!(payload_objects(&store, "gc-race").await, 1);
+        assert_eq!(wal.read(2).await.unwrap().unwrap().write_id, entry.write_id);
+        assert_eq!(
+            ids(&engine_fresh(&backend).await.0, "gc-race").await,
+            BTreeSet::from([5])
+        );
+    })
+    .await
+    .expect("the writer and GC completed their slot race");
 }
