@@ -567,6 +567,23 @@ impl Jobs {
                 )
             }
         };
+        // Another builder may have installed a larger base while this one ran, or compaction
+        // may have moved only part of an overlapping delta outside a local base build. Retired
+        // segment ANN objects cannot supply rows a partial replacement would leave behind.
+        let covered: BTreeSet<&str> = pending
+            .set
+            .covered
+            .iter()
+            .map(|cover| cover.segment.as_str())
+            .collect();
+        if replaced.iter().any(|old| {
+            classes.iter().any(|(segment, class)| {
+                class.contains(&old.dir.key) && !covered.contains(segment.as_str())
+            })
+        }) {
+            discard(ns, &pending, "partial_coverage");
+            return None;
+        }
         // Objects the new tiers still use (a base built with its predecessor's cells) stay.
         let kept: BTreeSet<String> = installed.iter().flat_map(tier_keys).collect();
         for old in replaced
@@ -1300,6 +1317,106 @@ mod tests {
             "format": format
         }))
         .unwrap()
+    }
+
+    fn publication(segments: Vec<bf_wal::Segment>, tiers: Vec<SlabSet>) -> Manifest {
+        serde_json::from_value(serde_json::json!({
+            "format_version":bf_wal::MANIFEST_FORMAT_VERSION,
+            "schema":{"v":{"type":"[2]f16"}}, "id_type":"uint",
+            "distance_metric":"euclidean_squared", "created_at":chrono::Utc::now(),
+            "checkpoint_wal":1, "indexer_epoch":1, "segments":segments,
+            "ann_tiers":{"v":tiers},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn late_or_partial_tier_replacements_never_uncover_retired_vectors() {
+        for (kind, through_lineage) in [
+            (Kind::Base, false),
+            (Kind::Base, true),
+            (Kind::Delta, false),
+        ] {
+            let mut base = tier(&[("a", 10), ("b", 10)], bf_wal::TIER_FORMAT_VERSION);
+            base.dir.key = "current-base".into();
+            let mut tiers = vec![base];
+            let mut segments = vec![segment("a", 10), segment("b", 10)];
+            let pending_rows = if kind == Kind::Delta {
+                tiers[0] = tier(&[("a", 10)], bf_wal::TIER_FORMAT_VERSION);
+                tiers[0].dir.key = "current-base".into();
+                let mut delta = tier(&[("b", 10), ("c", 10)], bf_wal::TIER_FORMAT_VERSION);
+                delta.dir.key = "current-delta".into();
+                tiers.push(delta);
+                segments.push(segment("c", 10));
+                vec![("b", 10), ("d", 10)]
+            } else {
+                vec![("a", 10)]
+            };
+            for segment in &mut segments {
+                segment.files.remove("annv2:v");
+            }
+            if kind == Kind::Delta {
+                segments.push(segment("d", 10));
+            }
+            let mut manifest = publication(segments, tiers);
+            if through_lineage {
+                manifest.segments[1].id = "merged-b".into();
+                manifest.lineage = serde_json::from_value(serde_json::json!([{
+                    "source":"b", "parts":[{"target":"merged-b", "rows":10,
+                        "map":{"key":"map-b", "size":1, "metadata_len":0}}],
+                }]))
+                .unwrap();
+            }
+            let mut pending = tier(&pending_rows, bf_wal::TIER_FORMAT_VERSION);
+            pending.dir.key = "late-partial".into();
+            let target = Target {
+                kind,
+                segments: Vec::new(),
+                coarse: None,
+            };
+            let jobs = Jobs::default();
+            let outcome = jobs.stage("n", "v", pending, &target);
+            assert!(jobs.install("n", &mut manifest).is_none());
+            assert_eq!(*outcome.borrow(), Some(false));
+            assert!(manifest.retired.is_empty());
+            let covered =
+                crate::lineage::covered(&manifest.segments, &manifest.ann_tiers, &manifest.lineage);
+            assert!(
+                manifest
+                    .segments
+                    .iter()
+                    .all(|segment| segment.files.contains_key("annv2:v")
+                        || covered.contains(&segment.id))
+            );
+        }
+    }
+
+    #[test]
+    fn a_complete_base_replacement_can_leave_newly_ingested_segments_uncovered() {
+        let mut base = tier(&[("a", 10), ("b", 10)], bf_wal::TIER_FORMAT_VERSION);
+        base.dir.key = "current-base".into();
+        let mut segments = vec![segment("a", 10), segment("b", 10), segment("new", 10)];
+        for segment in &mut segments[..2] {
+            segment.files.remove("annv2:v");
+        }
+        let mut manifest = publication(segments, vec![base]);
+        let mut pending = tier(&[("a", 10), ("b", 10)], bf_wal::TIER_FORMAT_VERSION);
+        pending.dir.key = "complete-base".into();
+        let jobs = Jobs::default();
+        let outcome = jobs.stage(
+            "n",
+            "v",
+            pending,
+            &Target {
+                kind: Kind::Base,
+                segments: Vec::new(),
+                coarse: None,
+            },
+        );
+        jobs.install("n", &mut manifest).unwrap().published();
+        assert_eq!(*outcome.borrow(), Some(true));
+        assert_eq!(manifest.ann_tiers["v"][0].dir.key, "complete-base");
+        assert!(manifest.segments[2].files.contains_key("annv2:v"));
     }
 
     #[test]

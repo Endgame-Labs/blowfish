@@ -229,7 +229,7 @@ lists directly. A failed or ambiguous upload or publication leaves the preceding
 reachable. Retirement and directory rebuilding share the indexer's fenced publication. Segment
 directories list only segments that still own ANN objects.
 
-Two additional reader requirements emerged during implementation:
+Additional reader requirements emerged during implementation:
 
 - Parallel query workers select one segment for their work, but must retain the complete original
   snapshot as their vector source. Resolving a tier against that reduced segment list incorrectly makes
@@ -264,3 +264,9 @@ segments. GC protects every pinned slab, directory, row list, coarse-cell object
 Dropping a stale tier first rebuilds any surviving segment's ANN object through the original snapshot's
 locator. Replacing a base reads its predecessor while building, then publishes its replacement before
 retiring the predecessor's objects.
+
+Tier replacement also checks complete coverage before retiring any predecessor: every current segment
+that predecessor supplies, including lineage targets, must be covered by the replacement. A late,
+smaller base or a partially overlapping delta is discarded before publication. Otherwise it could
+uncover rows whose own ANN objects were already retired. Newly ingested segments outside the old
+tiers keep their own ANN objects and do not prevent a complete replacement from installing.
