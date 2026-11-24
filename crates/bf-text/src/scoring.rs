@@ -1,6 +1,7 @@
 use crate::{FtsParams, Token};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
 
 /// Namespace-wide statistics, including all segments and the unindexed WAL tail.
 ///
@@ -121,12 +122,12 @@ pub(crate) struct Saturation {
     values: Vec<f64>,
     /// Exact row-window maxima, independent of IDF and query frequency. They belong
     /// to this normalization table, so changed statistics cannot reuse them.
-    pub(crate) maxima: std::sync::Mutex<BoundCache>,
+    pub(crate) maxima: RwLock<BoundCache>,
 }
 
 #[derive(Default)]
 pub(crate) struct BoundCache {
-    pub(crate) frames: std::collections::HashMap<u64, Vec<(usize, f64)>>,
+    pub(crate) frames: std::collections::HashMap<u64, Arc<[(usize, f64)]>>,
     // Term maxima use -1 for windows without any posting. This keeps
     // prefix presence separate from a zero normalization value.
     terms: std::collections::HashMap<u64, TermBounds>,
@@ -134,27 +135,35 @@ pub(crate) struct BoundCache {
 }
 struct TermBounds {
     known_frames: usize,
-    maxima: Vec<f64>,
+    maxima: Arc<[f64]>,
 }
 impl BoundCache {
-    pub(crate) fn term(&self, offset: u64) -> Option<&[f64]> {
+    pub(crate) fn term(&self, offset: u64) -> Option<Arc<[f64]>> {
         self.terms
             .get(&offset)
             .filter(|term| term.known_frames == self.frames.len())
-            .map(|term| term.maxima.as_slice())
+            .map(|term| term.maxima.clone())
     }
 
-    pub(crate) fn remember_term(&mut self, offset: u64, windows: Vec<f64>) {
-        let charge = windows.capacity() * std::mem::size_of::<f64>() + 64;
-        let old_charge = self.terms.get(&offset).map_or(0, |term| {
-            term.maxima.capacity() * std::mem::size_of::<f64>() + 64
-        });
+    pub(crate) fn remember_term(&mut self, offset: u64, windows: Arc<[f64]>, known_frames: usize) {
+        if self
+            .terms
+            .get(&offset)
+            .is_some_and(|term| term.known_frames > known_frames)
+        {
+            return;
+        }
+        let charge = std::mem::size_of_val(windows.as_ref()) + 64;
+        let old_charge = self
+            .terms
+            .get(&offset)
+            .map_or(0, |term| std::mem::size_of_val(term.maxima.as_ref()) + 64);
         if self.bytes - old_charge + charge <= Saturation::MAX_BOUND_BYTES {
             self.bytes = self.bytes - old_charge + charge;
             self.terms.insert(
                 offset,
                 TermBounds {
-                    known_frames: self.frames.len(),
+                    known_frames,
                     maxima: windows,
                 },
             );
@@ -216,7 +225,7 @@ impl Saturation {
         window_rows: usize,
     ) {
         {
-            let maxima = self.maxima.lock().unwrap();
+            let maxima = self.maxima.read().unwrap();
             if maxima.bytes >= Self::MAX_BOUND_BYTES || maxima.frames.contains_key(&offset) {
                 return;
             }
@@ -236,7 +245,8 @@ impl Saturation {
         }
         // Include vector capacity, map capacity, and allocation overhead in admission.
         let charge = windows.capacity() * std::mem::size_of::<(usize, f64)>() + 64;
-        let mut maxima = self.maxima.lock().unwrap();
+        let windows = windows.into();
+        let mut maxima = self.maxima.write().unwrap();
         if maxima.bytes + charge <= Self::MAX_BOUND_BYTES && !maxima.frames.contains_key(&offset) {
             maxima.bytes += charge;
             maxima.frames.insert(offset, windows);
@@ -433,26 +443,56 @@ mod tests {
         let table = Saturation::new(&stats, &params);
         table.remember(10, &[(0, 1)], &[1; 256], 128);
         {
-            let mut maxima = table.maxima.lock().unwrap();
-            maxima.remember_term(10, vec![1.0, -1.0]);
-            assert_eq!(maxima.term(10), Some([1.0, -1.0].as_slice()));
+            let mut maxima = table.maxima.write().unwrap();
+            maxima.remember_term(10, vec![1.0, -1.0].into(), 1);
+            assert_eq!(maxima.term(10).as_deref(), Some([1.0, -1.0].as_slice()));
         }
         table.remember(20, &[(128, 1)], &[1; 256], 128);
-        let mut maxima = table.maxima.lock().unwrap();
+        let mut maxima = table.maxima.write().unwrap();
         assert!(
             maxima.term(10).is_none(),
             "a new frame tightens the summary"
         );
         let bytes = maxima.bytes;
-        maxima.remember_term(10, vec![1.0, 1.0]);
+        maxima.remember_term(10, vec![1.0, 1.0].into(), 2);
         assert_eq!(maxima.bytes, bytes, "replacement charges only one vector");
-        assert_eq!(maxima.term(10), Some([1.0, 1.0].as_slice()));
+        assert_eq!(maxima.term(10).as_deref(), Some([1.0, 1.0].as_slice()));
         for offset in 100..300 {
-            maxima.remember_term(offset, vec![1.0; 8192]);
+            maxima.remember_term(offset, vec![1.0; 8192].into(), 2);
         }
         assert!(maxima.bytes <= Saturation::MAX_BOUND_BYTES);
         assert!(maxima.terms.len() < 200);
-        assert_eq!(maxima.term(10), Some([1.0, 1.0].as_slice()));
+        assert_eq!(maxima.term(10).as_deref(), Some([1.0, 1.0].as_slice()));
+    }
+
+    #[test]
+    fn concurrent_bound_publication_preserves_the_observed_generation() {
+        let table = Saturation::new(
+            &CorpusStats {
+                total_docs: 256,
+                average_doc_length: 1.0,
+                ..Default::default()
+            },
+            &FtsParams::default(),
+        );
+        table.remember(10, &[(0, 1)], &[1; 256], 128);
+        let old_generation = table.maxima.read().unwrap().frames.len();
+        let old: Arc<[f64]> = vec![2.0, 2.0].into();
+        table.remember(20, &[(128, 1)], &[1; 256], 128);
+        {
+            let mut cache = table.maxima.write().unwrap();
+            cache.remember_term(10, old.clone(), old_generation);
+            assert!(cache.term(10).is_none(), "late publication must stay stale");
+            cache.remember_term(10, vec![1.0, 1.0].into(), 2);
+        }
+        let current = table.maxima.read().unwrap().term(10).unwrap();
+        // An owned snapshot holds no read guard. A delayed older computation
+        // cannot replace this newer summary or prevent another frame admission.
+        let mut cache = table.maxima.try_write().unwrap();
+        cache.remember_term(10, old.clone(), old_generation);
+        assert!(Arc::ptr_eq(&current, &cache.term(10).unwrap()));
+        assert_eq!(current.as_ref(), [1.0, 1.0]);
+        assert_eq!(old.as_ref(), [2.0, 2.0]);
     }
 
     #[test]
