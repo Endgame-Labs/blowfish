@@ -1,5 +1,7 @@
 //! Validated resident payloads and reusable synchronous query scratch.
+mod tier;
 use crate::{Bytes, Candidate, Directory, Index, RangeRead, Result, RotatedQuery, ScanScratch};
+pub use tier::{CompiledHits, CompiledTier, ValidatedVector, VectorRecorder};
 
 /// Immutable index payloads validated once on admission. Each arena owns exactly its bytes;
 /// slices do not pin unrelated cache blocks or the original object.
@@ -188,6 +190,8 @@ pub struct ResidentQueryScratch {
     uppers: Vec<f32>,
     decoded: Vec<f32>,
     hits: Vec<(u32, f32)>,
+    winners: Vec<(f32, usize, u32)>,
+    scanned: usize,
 }
 impl Default for ResidentQueryScratch {
     fn default() -> Self {
@@ -208,34 +212,22 @@ impl Default for ResidentQueryScratch {
             uppers: Vec::new(),
             decoded: Vec::new(),
             hits: Vec::new(),
+            winners: Vec::new(),
+            scanned: 0,
         }
     }
 }
 impl Directory {
-    /// Identical unfiltered, fully live slab-tier probe plan, bounded scans, and reranking on
-    /// the calling thread. The slabs share global row IDs. No I/O or runtime is used.
-    /// `nprobe` has the engine's square-root scaling, and `rerank_factor` caps exact work.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_resident<'a, R: RangeRead>(
+    fn resident_plan(
         &self,
-        indexes: &[ResidentIndex<R>],
         query: &[f32],
         nprobe: usize,
         rerank_factor: usize,
         k: usize,
-        scratch: &'a mut ResidentQueryScratch,
-    ) -> Result<&'a [(u32, f32)]> {
-        if indexes.len() != self.segments().len() || self.segments().iter().any(|s| s.flat) {
-            return Err(crate::Error::InvalidInput(
-                "resident search requires every non-flat slab".into(),
-            ));
-        }
+        scratch: &mut ResidentQueryScratch,
+    ) -> Result<usize> {
         self.prepare_resident(query, scratch)?;
         let s = scratch;
-        s.hits.clear();
-        if k == 0 {
-            return Ok(&s.hits);
-        }
         let entries = self.entries();
         let rows: usize = entries.iter().map(|e| e.rows as usize).sum();
         let probes =
@@ -268,7 +260,7 @@ impl Directory {
             s.order.sort_unstable();
             s.order.len()
         };
-        s.chosen.resize_with(indexes.len(), Vec::new);
+        s.chosen.resize_with(self.segments().len(), Vec::new);
         for group in &mut s.chosen {
             group.clear();
         }
@@ -287,15 +279,45 @@ impl Directory {
                 break;
             }
         }
+        s.scanned = picked_rows;
+        for group in &mut s.chosen {
+            group.sort_unstable();
+            for entry in group {
+                *entry = entries[*entry].cluster;
+            }
+        }
+        Ok(target)
+    }
+
+    /// Identical unfiltered, fully live slab-tier probe plan, bounded scans, and reranking on
+    /// the calling thread. The slabs share global row IDs. No I/O or runtime is used.
+    /// `nprobe` has the engine's square-root scaling, and `rerank_factor` caps exact work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_resident<'a, R: RangeRead>(
+        &self,
+        indexes: &[ResidentIndex<R>],
+        query: &[f32],
+        nprobe: usize,
+        rerank_factor: usize,
+        k: usize,
+        scratch: &'a mut ResidentQueryScratch,
+    ) -> Result<&'a [(u32, f32)]> {
+        if indexes.len() != self.segments().len() || self.segments().iter().any(|s| s.flat) {
+            return Err(crate::Error::InvalidInput(
+                "resident search requires every non-flat slab".into(),
+            ));
+        }
+        if k == 0 {
+            scratch.hits.clear();
+            return Ok(&scratch.hits);
+        }
+        let target = self.resident_plan(query, nprobe, rerank_factor, k, scratch)?;
+        let s = scratch;
+        s.hits.clear();
         s.candidates.clear();
         for (i, group) in s.chosen.iter_mut().enumerate() {
             if group.is_empty() {
                 continue;
-            }
-            // The server scans each slab in directory order, with its own running cutoff.
-            group.sort_unstable();
-            for entry in group.iter_mut() {
-                *entry = entries[*entry].cluster;
             }
             s.candidates.extend(
                 indexes[i]
@@ -304,23 +326,7 @@ impl Directory {
                     .map(|c| (i, *c)),
             );
         }
-        if s.candidates.len() > k {
-            s.uppers.clear();
-            s.uppers
-                .extend(s.candidates.iter().map(|(_, c)| c.distance + c.error));
-            s.uppers.select_nth_unstable_by(k - 1, f32::total_cmp);
-            let edge = s.uppers[k - 1];
-            s.candidates.retain(|(_, c)| c.distance - c.error <= edge);
-        }
-        if s.candidates.len() > target {
-            s.candidates.select_nth_unstable_by(target, |a, b| {
-                a.1.distance
-                    .total_cmp(&b.1.distance)
-                    .then(a.0.cmp(&b.0))
-                    .then(a.1.row.cmp(&b.1.row))
-            });
-            s.candidates.truncate(target);
-        }
+        prune(s, k, target);
         for (i, candidate) in &s.candidates {
             s.hits.push((
                 candidate.row,
@@ -331,6 +337,26 @@ impl Directory {
             .sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         s.hits.truncate(k);
         Ok(&s.hits)
+    }
+}
+
+fn prune(s: &mut ResidentQueryScratch, k: usize, target: usize) {
+    if s.candidates.len() > k {
+        s.uppers.clear();
+        s.uppers
+            .extend(s.candidates.iter().map(|(_, c)| c.distance + c.error));
+        s.uppers.select_nth_unstable_by(k - 1, f32::total_cmp);
+        let edge = s.uppers[k - 1];
+        s.candidates.retain(|(_, c)| c.distance - c.error <= edge);
+    }
+    if s.candidates.len() > target {
+        s.candidates.select_nth_unstable_by(target, |a, b| {
+            a.1.distance
+                .total_cmp(&b.1.distance)
+                .then(a.0.cmp(&b.0))
+                .then(a.1.row.cmp(&b.1.row))
+        });
+        s.candidates.truncate(target);
     }
 }
 

@@ -63,7 +63,7 @@ fn rows(offset: u32, n: usize, dims: usize) -> Vec<(u32, Vec<f32>)> {
 async fn compile(
     metric: Metric,
     dtype: VectorType,
-) -> (Directory, Vec<ResidentIndex>, Vec<Vec<Bytes>>) {
+) -> (Directory, Vec<ResidentIndex>, Vec<Vec<Bytes>>, Vec<Bytes>) {
     let mut sources = Vec::new();
     let mut blobs = Vec::new();
     for s in 0..3 {
@@ -107,14 +107,14 @@ async fn compile(
                 .unwrap(),
         );
     }
-    (dir, residents, code_blocks)
+    (dir, residents, code_blocks, blobs)
 }
 
 #[tokio::test]
 async fn identical_scans_distances_and_zero_allocations_after_warmup() {
     for metric in [Metric::CosineDistance, Metric::EuclideanSquared] {
         for dtype in [VectorType::F16, VectorType::F32] {
-            let (dir, residents, codes) = compile(metric, dtype).await;
+            let (dir, residents, codes, _) = compile(metric, dtype).await;
             let queries: Vec<_> = rows(19, 12, 64)
                 .into_iter()
                 .map(|(_, v)| v)
@@ -192,7 +192,7 @@ async fn identical_scans_distances_and_zero_allocations_after_warmup() {
 
 #[tokio::test]
 async fn resident_admission_rejects_corruption_and_shape_errors() {
-    let (dir, residents, _) = compile(Metric::CosineDistance, VectorType::F16).await;
+    let (dir, residents, _, _) = compile(Metric::CosineDistance, VectorType::F16).await;
     let mut scratch = ResidentQueryScratch::default();
     assert!(
         dir.search_resident(&residents, &[f32::NAN; 64], 48, 32, 10, &mut scratch)
@@ -269,4 +269,95 @@ async fn resident_admission_rejects_corruption_and_shape_errors() {
             )
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn compiled_tier_admits_incrementally_preserves_ties_and_never_reads_on_a_hit() {
+    use bf_vector::{CompiledTier, ValidatedVector, VectorRecorder};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+    #[derive(Default)]
+    struct Recorded(Mutex<HashMap<u32, ValidatedVector>>);
+    impl VectorRecorder for Recorded {
+        fn record(&self, v: ValidatedVector) {
+            self.0.lock().unwrap().insert(v.row(), v);
+        }
+    }
+    for metric in [Metric::CosineDistance, Metric::EuclideanSquared] {
+        let (dir, residents, codes, blobs) = compile(metric, VectorType::F16).await;
+        let dir = Arc::new(dir);
+        let tier = Arc::new(CompiledTier::new(dir.clone()).unwrap());
+        let mut scratch = ResidentQueryScratch::default();
+        let queries: Vec<_> = rows(31, 8, 64)
+            .into_iter()
+            .map(|(_, v)| v)
+            .chain([vec![0.; 64]])
+            .collect();
+        assert!(
+            tier.try_search(&queries[0], 48, 32, 10, |_| None, &mut scratch)
+                .unwrap()
+                .is_none()
+        );
+        let recorded = Recorded::default();
+        for (s, blob) in blobs.iter().enumerate() {
+            let mut partial = dir.partial_index(s, blob.clone()).unwrap();
+            for e in dir.segment_entries(s) {
+                let r = e.blob_range();
+                let decoded = partial
+                    .decode(&blob.slice(r.start as usize..r.end as usize))
+                    .unwrap();
+                partial.install_decoded(e.cluster, &decoded).unwrap();
+                // Concurrent admissions share one immutable slot, without losing earlier rows.
+                std::thread::scope(|scope| {
+                    for _ in 0..2 {
+                        let (tier, decoded, code) = (&tier, &decoded, &codes[s][e.cluster]);
+                        scope.spawn(move || tier.admit(s, e.cluster, decoded, code).unwrap());
+                    }
+                });
+            }
+            let index = partial.into_index();
+            index
+                .rerank_candidates_recorded(
+                    &queries[0],
+                    usize::MAX,
+                    index.locations(None),
+                    Some(&recorded),
+                )
+                .await
+                .unwrap();
+        }
+        let lookup = |row| recorded.0.lock().unwrap().get(&row).cloned();
+        // Missing exact rows cannot silently shrink the result set.
+        assert!(
+            tier.try_search(&queries[0], 48, 32, 10, |_| None, &mut scratch)
+                .unwrap()
+                .is_none()
+        );
+        let mut reference = ResidentQueryScratch::default();
+        for query in &queries {
+            let expected = dir
+                .search_resident(&residents, query, 48, 32, 10, &mut reference)
+                .unwrap();
+            let found = tier
+                .try_search(query, 48, 32, 10, lookup, &mut scratch)
+                .unwrap()
+                .unwrap();
+            assert!(found.scanned_rows > 0);
+            let mut got: Vec<_> = found.hits.iter().map(|(d, _, row)| (*row, *d)).collect();
+            got.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            got.truncate(10);
+            assert_eq!(got, expected);
+        }
+        COUNT.with(|count| count.set(Some(0)));
+        for query in &queries {
+            std::hint::black_box(
+                tier.try_search(query, 48, 32, 10, lookup, &mut scratch)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(COUNT.with(|count| count.replace(None).unwrap()), 0);
+    }
 }

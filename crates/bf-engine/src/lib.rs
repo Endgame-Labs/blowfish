@@ -32,6 +32,7 @@ mod reindex;
 mod text;
 mod text_keys;
 mod upgrade;
+mod warm_ann;
 mod write;
 
 use bf_storage::{CreateResult, Storage};
@@ -122,7 +123,7 @@ pub(crate) struct NamespaceState {
     /// When the checkpoint's indexer last flushed a bulk-load-sized tail (see
     /// `bf_wal::Manifest::bulk_load_at`).
     pub bulk_load_at: Option<DateTime<Utc>>,
-    pub scores: BTreeMap<String, BTreeMap<Id, f64>>,
+    pub scores: BTreeMap<Vec<u8>, BTreeMap<Id, f64>>,
     pub corpus: Arc<BTreeMap<String, bf_text::CorpusStats>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -815,6 +816,7 @@ impl Engine {
                 (state, response, execution, elapsed)
             };
         if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
+            && self.0.config.recall_sample_rate > 0.0
             && (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1_000_000.0
                 < self.0.config.recall_sample_rate
             && let Some(sampling) = self

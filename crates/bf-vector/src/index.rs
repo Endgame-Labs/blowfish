@@ -76,7 +76,7 @@ const VECTOR_MERGE_MAX: u64 = 2 << 20;
 /// Cheap to clone (shared), so a caller can keep decoded clusters across queries and install
 /// them into each query's partial index instead of decoding the blob again.
 #[derive(Clone)]
-pub struct DecodedCluster(Arc<format::ClusterData>);
+pub struct DecodedCluster(pub(crate) Arc<format::ClusterData>);
 impl DecodedCluster {
     /// Approximate resident bytes.
     pub fn resident_bytes(&self) -> u64 {
@@ -766,6 +766,30 @@ impl<R: RangeRead> Index<R> {
         keep: Option<usize>,
         scratch: &'a mut ScanScratch,
     ) -> Result<&'a [Candidate]> {
+        self.scan_with(
+            query,
+            clusters,
+            block,
+            |cid| &self.metadata.clusters[cid],
+            filter,
+            read_ms,
+            keep,
+            scratch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_with<'a, 'b, 'c>(
+        &self,
+        query: &RotatedQuery,
+        clusters: &[usize],
+        block: impl Fn(usize, usize) -> &'b [u8],
+        cluster: impl Fn(usize) -> &'c format::Cluster,
+        filter: Option<&RoaringBitmap>,
+        read_ms: u128,
+        keep: Option<usize>,
+        scratch: &'a mut ScanScratch,
+    ) -> Result<&'a [Candidate]> {
         // The `k` smallest upper bounds so far, as a max-heap; `cut` is its largest once full.
         scratch.uppers.clear();
         scratch.estimated.clear();
@@ -781,10 +805,7 @@ impl<R: RangeRead> Index<R> {
         let q_zero = query.zero;
         let q_rot = &query.rotated;
         let t_cpu = std::time::Instant::now();
-        let rows: usize = clusters
-            .iter()
-            .map(|c| self.metadata.clusters[*c].len())
-            .sum();
+        let rows: usize = clusters.iter().map(|c| cluster(*c).len()).sum();
         estimated.reserve(rows);
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
         let padded = self.rq.padded;
@@ -797,7 +818,7 @@ impl<R: RangeRead> Index<R> {
 
         for (position, cid) in clusters.iter().copied().enumerate() {
             let bytes = block(position, cid);
-            let c = &self.metadata.clusters[cid];
+            let c = cluster(cid);
             // A stub's (shared, empty) payload never records a check.
             let checked = c.data.as_deref().map(|d| &d.codes_checked);
             let n = c.len();
@@ -976,12 +997,25 @@ impl<R: RangeRead> Index<R> {
         k: usize,
         locations: Vec<(u32, u32)>,
     ) -> Result<Vec<(u32, f32)>> {
+        self.rerank_candidates_recorded(query, k, locations, None)
+            .await
+    }
+
+    /// [`Self::rerank_candidates`], recording validated immutable vector rows for a resident
+    /// tier. Only payloads already fetched by the ordinary rerank are recorded.
+    pub async fn rerank_candidates_recorded(
+        &self,
+        query: &[f32],
+        k: usize,
+        locations: Vec<(u32, u32)>,
+        recorder: Option<&dyn crate::VectorRecorder>,
+    ) -> Result<Vec<(u32, f32)>> {
         validate(query, self.dims())?;
         let locations = locations
             .into_iter()
             .map(|(c, i)| (c as usize, i as usize))
             .collect();
-        self.rerank(query, k, locations).await
+        self.rerank_recorded(query, k, locations, recorder).await
     }
 
     /// Every `(cluster, ordinal)` location whose row passes `filter`.
@@ -1143,7 +1177,17 @@ impl<R: RangeRead> Index<R> {
         &self,
         query: &[f32],
         k: usize,
+        locations: Vec<(usize, usize)>,
+    ) -> Result<Vec<(u32, f32)>> {
+        self.rerank_recorded(query, k, locations, None).await
+    }
+
+    async fn rerank_recorded(
+        &self,
+        query: &[f32],
+        k: usize,
         mut locations: Vec<(usize, usize)>,
+        recorder: Option<&dyn crate::VectorRecorder>,
     ) -> Result<Vec<(u32, f32)>> {
         locations.sort_unstable();
         locations.dedup();
@@ -1222,6 +1266,14 @@ impl<R: RangeRead> Index<R> {
                     None => c.rows.select(i as u32),
                 }
                 .ok_or_else(|| bad("invalid row ordinal"))?;
+                if let Some(recorder) = recorder {
+                    recorder.record(crate::ValidatedVector::new(
+                        row,
+                        self.dims(),
+                        self.vector_type(),
+                        vbytes,
+                    ));
+                }
                 result.push((row, self.metric().distance_unchecked(query, &decoded)));
             }
         }

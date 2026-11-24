@@ -10,7 +10,10 @@ mod format;
 mod index;
 mod reader;
 mod resident;
-pub use resident::{ResidentIndex, ResidentQueryScratch};
+pub use resident::{
+    CompiledHits, CompiledTier, ResidentIndex, ResidentQueryScratch, ValidatedVector,
+    VectorRecorder,
+};
 mod relayout;
 pub use bytes::Bytes;
 pub use cluster::{
