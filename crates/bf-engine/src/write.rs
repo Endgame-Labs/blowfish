@@ -72,7 +72,10 @@ pub(crate) fn prepare(
     if !current.exists && request.create_namespace == Some(false) {
         return Err(ApiError::new(404, "namespace was not found"));
     }
+    let stage = std::time::Instant::now();
     let mut state = current.clone();
+    crate::record_stage("prepare_clone", stage);
+    let stage = std::time::Instant::now();
     if let Some(metric) = request.distance_metric {
         if current.exists
             && current.metric != metric
@@ -160,6 +163,8 @@ pub(crate) fn prepare(
             "create_namespace requires the id type in schema",
         ));
     }
+    crate::record_stage("prepare_expand", stage);
+    let stage = std::time::Instant::now();
     let mut seen = BTreeSet::new();
     for row in upserts.iter_mut().chain(patches.iter_mut()) {
         let id = normalize_id(
@@ -246,6 +251,8 @@ pub(crate) fn prepare(
             }
         }
     }
+    crate::record_stage("prepare_schema", stage);
+    let stage = std::time::Instant::now();
     for row in &mut upserts {
         row.retain(|_, v| !v.is_null());
         normalize_document(row, &state.schema)?;
@@ -291,6 +298,8 @@ pub(crate) fn prepare(
     if let Some((_, f)) = &patch_by_filter {
         filter::validate(f, &state.schema, false)?;
     }
+    crate::record_stage("prepare_normalize", stage);
+    let stage = std::time::Instant::now();
     let mut response = WriteResponse::default();
     let mut upserted = vec![];
     let mut patched = vec![];
@@ -389,6 +398,8 @@ pub(crate) fn prepare(
         response.patched_ids = patched;
         response.deleted_ids = deleted;
     }
+    crate::record_stage("prepare_mutate", stage);
+    let stage = std::time::Instant::now();
     let now = Utc::now();
     let batch = WriteBatch {
         upserts: state
@@ -420,6 +431,7 @@ pub(crate) fn prepare(
         },
         updated_at: now,
     };
+    crate::record_stage("prepare_extract", stage);
     Ok((batch, response))
 }
 fn matching_ids(state: &NamespaceState, f: &Filter) -> Result<Vec<Id>, ApiError> {

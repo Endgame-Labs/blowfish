@@ -6,8 +6,10 @@ schema-first load, concurrency, advertised retry sleeps, and acknowledgment chec
 Keep BODIES, RUN, and other outputs under .scratch/. Each trace row is one
 logical request, including every attempt and retry sleep. Per-request timing
 starts after the body file read, as in the loader; total load time includes reads.
-The original loader summary is followed by the timing summary. Removing sleeps
-is an accounting estimate, not a prediction of a different admission policy.
+The original loader summary is followed by the timing summary. Use --stages with
+a fresh, auth-disabled disposable server to include individual engine and WAL
+stage timings. Stage intervals can overlap. Removing sleeps is an
+accounting estimate, not a prediction of a different admission policy.
 """
 
 import argparse
@@ -19,6 +21,7 @@ import re
 import threading
 import time
 from types import SimpleNamespace
+from urllib.request import urlopen
 
 
 class Recorder:
@@ -133,6 +136,51 @@ def summarize(records):
     }
 
 
+def stage_samples(text):
+    """Read only the engine and WAL stage summaries from Prometheus text."""
+    samples = {}
+    pattern = re.compile(r'^(blowfish_(?:commit|wal)_stage_seconds)(?:_(count|sum))?\{([^}]+)\} (\S+)$')
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        metric, kind, labels, value = match.groups()
+        labels = dict(re.findall(r'(\w+)="([^"\\]*)"', labels))
+        if "stage" not in labels:
+            continue
+        key = (metric, labels["stage"])
+        field = kind or {"0.5": "p50", "0.9": "p90"}.get(labels.get("quantile"))
+        if field:
+            samples.setdefault(key, {})[field] = float(value)
+    return samples
+
+
+def stage_summary(before, after):
+    """Report per-stage run means; fresh-process quantiles describe individual stages.
+
+    Concurrent stage times overlap, and their percentiles must not be added. A
+    process with previous samples cannot provide run-specific quantiles.
+    """
+    rows = {}
+    for (metric, stage), values in after.items():
+        old = before.get((metric, stage), {})
+        count = values.get("count", 0) - old.get("count", 0)
+        if count <= 0:
+            continue
+        row = {"samples": int(count),
+               "mean_ms": 1000 * (values["sum"] - old.get("sum", 0)) / count}
+        if not old.get("count", 0):
+            row.update({f"{q}_ms": 1000 * values[q] for q in ("p50", "p90") if q in values})
+        rows[f"{metric.removeprefix('blowfish_').removesuffix('_stage_seconds')}.{stage}"] = row
+    return rows
+
+
+def read_stages(host, port):
+    """Scrape an auth-disabled disposable benchmark server, outside the timed load."""
+    with urlopen(f"http://{host}:{port}/metrics", timeout=30) as response:
+        return stage_samples(response.read().decode())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bodies", type=Path)
@@ -141,6 +189,8 @@ def main():
     parser.add_argument("--port", type=int, default=18100)
     parser.add_argument("--namespace", default="w2")
     parser.add_argument("--clients", type=int, default=4)
+    parser.add_argument("--stages", action="store_true",
+                        help="include engine and WAL stage metrics from a fresh disposable server")
     args = parser.parse_args()
     source = Path(__file__).resolve().parents[2] / "bf-wal/benches/http_ingest.py"
     spec = importlib.util.spec_from_file_location("ingest", source)
@@ -151,8 +201,12 @@ def main():
         ingest.http = SimpleNamespace(client=SimpleNamespace(HTTPConnection=recorder.connection_type()))
         ingest.time = SimpleNamespace(monotonic=time.monotonic, sleep=recorder.sleep)
         try:
+            before = read_stages(args.host, args.port) if args.stages else {}
             ingest.load(args)
-            print(json.dumps(summarize(recorder.records)), flush=True)
+            summary = summarize(recorder.records)
+            if args.stages:
+                summary["stages"] = stage_summary(before, read_stages(args.host, args.port))
+            print(json.dumps(summary), flush=True)
         finally:
             recorder.close()
 

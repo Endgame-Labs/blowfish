@@ -1592,7 +1592,10 @@ async fn commit_worker(
             }
             pending.push(next);
         }
+        record_stage("batch", start);
+        let stage = Instant::now();
         let mut current = state.lock().await;
+        record_stage("state_lock", stage);
         if flights.is_empty() {
             // A state this node just committed or refreshed is current unless another writer
             // has since appended. The conditional create of the next WAL slot detects exactly
@@ -1637,7 +1640,9 @@ async fn commit_worker(
             };
             match write::prepare(&working, req, None) {
                 Ok((batch, result)) => {
+                    let stage = Instant::now();
                     working.apply(&batch, 0);
+                    record_stage("prepare_apply", stage);
                     batches.push(batch);
                     results.push(Ok(result));
                 }

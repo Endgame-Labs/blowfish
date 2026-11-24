@@ -25,6 +25,15 @@ class WriteAdmissionTests(unittest.TestCase):
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
+            def do_GET(self):
+                count = sum(value == 2 for value in seen.values())
+                data = (f'blowfish_wal_stage_seconds_sum{{stage="compress"}} {count / 10}\n'
+                        f'blowfish_wal_stage_seconds_count{{stage="compress"}} {count}\n').encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 first = body["upsert_columns"]["id"][0]
@@ -55,7 +64,7 @@ class WriteAdmissionTests(unittest.TestCase):
                 for first in range(3):
                     (run / f"{first:09}.json").write_text(json.dumps({"upsert_columns": {"id": [first]}}))
                 trace = run / "requests.jsonl"
-                args = [str(MODULE), str(run), "--trace", str(trace), "--port", str(server.server_port)]
+                args = [str(MODULE), str(run), "--trace", str(trace), "--port", str(server.server_port), "--stages"]
                 output = io.StringIO()
                 with patch.object(sys, "argv", args), redirect_stdout(output):
                     tracer.main()
@@ -64,6 +73,7 @@ class WriteAdmissionTests(unittest.TestCase):
                 self.assertEqual(seen, {0: 2, 1: 2, 2: 2})
                 self.assertEqual({r["id"] for r in records}, {0, 1, 2})
                 self.assertEqual(summary["retries"], 3)
+                self.assertEqual(summary["stages"]["wal.compress"], {"samples": 3, "mean_ms": 100})
                 for record in records:
                     self.assertEqual([a["status"] for a in record["attempts"]], [429, 200])
                     self.assertEqual(record["attempts"][0]["retry_after_ms"], "10")
@@ -74,6 +84,27 @@ class WriteAdmissionTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_stage_metrics_use_run_deltas_and_only_fresh_quantiles(self):
+        text = '\n'.join([
+            'blowfish_wal_stage_seconds{stage="compress",quantile="0.5"} 0.2',
+            'blowfish_wal_stage_seconds{quantile="0.9",stage="compress"} 0.4',
+            'blowfish_wal_stage_seconds_sum{stage="compress"} 0.6',
+            'blowfish_wal_stage_seconds_count{stage="compress"} 2',
+            'blowfish_commit_stage_seconds_sum{stage="prepare"} 0.1',
+            'blowfish_commit_stage_seconds_count{stage="prepare"} 1',
+            'unrelated_metric{stage="prepare"} 999',
+        ])
+        after = tracer.stage_samples(text)
+        fresh = tracer.stage_summary({}, after)
+        self.assertEqual(fresh["wal.compress"],
+                         {"samples": 2, "mean_ms": 300, "p50_ms": 200, "p90_ms": 400})
+        old = tracer.stage_samples(text.replace(' 0.6', ' 0.2').replace('} 2', '} 1'))
+        delta = tracer.stage_summary(old, after)
+        self.assertAlmostEqual(delta["wal.compress"]["mean_ms"], 400)
+        self.assertEqual(delta["wal.compress"]["samples"], 1)
+        self.assertNotIn("p90_ms", delta["wal.compress"])
+        self.assertNotIn("commit.prepare", delta)
 
     def test_rare_retries_do_not_set_p90(self):
         records = [{"total_ms": 100, "retry_sleep_ms": 0, "attempts": [{"http_ms": 100}]} for _ in range(97)]
