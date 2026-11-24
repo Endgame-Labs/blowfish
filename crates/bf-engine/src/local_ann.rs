@@ -4,6 +4,8 @@ use bf_storage::Storage;
 use bf_wal::{SegmentFile, SlabSet};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::CString,
@@ -30,17 +32,14 @@ const PIECE: u64 = 8 << 20;
 const RETRY: Duration = Duration::from_secs(60);
 
 struct StagedFile {
-    path: PathBuf,
+    file: File,
     len: u64,
     crc: Vec<u32>,
 }
 impl StagedFile {
-    fn read(&self, ranges: &[Range<u64>]) -> io::Result<Vec<Bytes>> {
-        let trace = crate::ann::trace_stages();
-        let started = Instant::now();
-        let (mut read_us, mut crc_us) = (0, 0);
-        let file = File::open(&self.path)?;
-        let mut blocks = BTreeMap::<u64, Bytes>::new();
+    /// Align before merging, so overlapping requests read and verify each block once.
+    fn aligned(&self, ranges: &[Range<u64>]) -> io::Result<Vec<Range<u64>>> {
+        let mut aligned = Vec::with_capacity(ranges.len());
         for r in ranges {
             if r.start > r.end || r.end > self.len {
                 return Err(io::ErrorKind::UnexpectedEof.into());
@@ -48,53 +47,101 @@ impl StagedFile {
             if r.is_empty() {
                 continue;
             }
-            for block in r.start / BLOCK as u64..=(r.end - 1) / BLOCK as u64 {
-                if blocks.contains_key(&block) {
-                    continue;
-                }
-                let start = block * BLOCK as u64;
-                let mut data = vec![0; (self.len - start).min(BLOCK as u64) as usize];
-                let at = Instant::now();
-                file.read_exact_at(&mut data, start)?;
-                if trace {
-                    read_us += at.elapsed().as_micros();
-                }
-                let at = Instant::now();
-                if self.crc.get(block as usize).copied() != Some(crc32fast::hash(&data)) {
+            let start = r.start / BLOCK as u64 * BLOCK as u64;
+            let end = ((r.end - 1) / BLOCK as u64 * BLOCK as u64)
+                .saturating_add(BLOCK as u64)
+                .min(self.len);
+            aligned.push(start..end);
+        }
+        aligned.sort_unstable_by_key(|r| r.start);
+        let mut merged: Vec<Range<u64>> = Vec::with_capacity(aligned.len());
+        for r in aligned {
+            if let Some(last) = merged.last_mut()
+                && r.start <= last.end
+            {
+                last.end = last.end.max(r.end);
+            } else {
+                merged.push(r);
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Submit every scattered extent before waiting for the first one. Advice is optional:
+    /// only the subsequent positional reads and checksum checks establish a cache hit.
+    fn advise(&self, ranges: &[Range<u64>]) {
+        #[cfg(target_os = "linux")]
+        for range in ranges {
+            let (Ok(start), Ok(len)) = (
+                libc::off_t::try_from(range.start),
+                libc::off_t::try_from(range.end - range.start),
+            ) else {
+                continue;
+            };
+            // SAFETY: this borrows a live descriptor, and supplies checked offsets. Failure
+            // merely leaves the ordinary read to submit its I/O below.
+            unsafe {
+                libc::posix_fadvise(self.file.as_raw_fd(), start, len, libc::POSIX_FADV_WILLNEED);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = ranges;
+    }
+
+    fn read(&self, ranges: &[Range<u64>]) -> io::Result<Vec<Bytes>> {
+        let trace = crate::ann::trace_stages();
+        let started = Instant::now();
+        let aligned = self.aligned(ranges)?;
+        self.advise(&aligned);
+        let (mut read_ns, mut crc_ns, mut blocks, mut bytes) = (0, 0, 0, 0);
+        let mut extents = BTreeMap::new();
+        for range in aligned {
+            let len = usize::try_from(range.end - range.start)
+                .map_err(|_| io::Error::other("staged range exceeds address space"))?;
+            let mut data = vec![0; len];
+            let at = trace.then(Instant::now);
+            self.file.read_exact_at(&mut data, range.start)?;
+            if let Some(at) = at {
+                read_ns += at.elapsed().as_nanos();
+            }
+            let at = trace.then(Instant::now);
+            for (n, block) in data.chunks(BLOCK).enumerate() {
+                let index = range.start / BLOCK as u64 + n as u64;
+                if self.crc.get(index as usize).copied() != Some(crc32fast::hash(block)) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "staged ANN checksum",
                     ));
                 }
-                if trace {
-                    crc_us += at.elapsed().as_micros();
-                }
-                blocks.insert(block, Bytes::from(data));
+                blocks += 1;
             }
+            if let Some(at) = at {
+                crc_ns += at.elapsed().as_nanos();
+            }
+            bytes += data.len();
+            extents.insert(range.start, Bytes::from(data));
         }
         let copied = Instant::now();
         let result = ranges
             .iter()
             .map(|r| {
-                let mut data = Vec::with_capacity((r.end - r.start) as usize);
-                let mut at = r.start;
-                while at < r.end {
-                    let block = at / BLOCK as u64;
-                    let offset = (at % BLOCK as u64) as usize;
-                    let bytes = &blocks[&block];
-                    let take = (bytes.len() - offset).min((r.end - at) as usize);
-                    data.extend_from_slice(&bytes[offset..offset + take]);
-                    at += take as u64;
+                if r.is_empty() {
+                    return Ok(Bytes::new());
                 }
-                Ok(Bytes::from(data))
+                let (&start, bytes) = extents
+                    .range(..=r.start)
+                    .next_back()
+                    .ok_or_else(|| io::Error::other("missing staged extent"))?;
+                // Each nonempty input is wholly contained by one merged extent.
+                Ok(bytes.slice((r.start - start) as usize..(r.end - start) as usize))
             })
             .collect();
         if trace {
             eprintln!(
-                "LOCAL_READ ranges={} blocks={} bytes={} read_us={read_us} crc_us={crc_us} copy_us={} total_us={} end_us={}",
+                "LOCAL_READ ranges={} blocks={blocks} bytes={bytes} read_us={} crc_us={} copy_us={} total_us={} end_us={}",
                 ranges.len(),
-                blocks.len(),
-                blocks.values().map(Bytes::len).sum::<usize>(),
+                read_ns / 1000,
+                crc_ns / 1000,
                 copied.elapsed().as_micros(),
                 started.elapsed().as_micros(),
                 std::time::SystemTime::now()
@@ -151,6 +198,7 @@ struct State {
 pub(crate) struct Manager {
     path: PathBuf,
     capacity: u64,
+    file_capacity: usize,
     state: Mutex<State>,
     _lock: File,
     stop: Arc<crate::stop::Stop>,
@@ -170,6 +218,21 @@ fn free_bytes(path: &Path) -> io::Result<u64> {
     // SAFETY: statvfs succeeded above.
     let stats = unsafe { stats.assume_init() };
     Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+fn file_capacity() -> io::Result<usize> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes to a valid, exclusively borrowed output structure.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Leave half the descriptors and a small margin for backend connections, write-behind
+    // cache files, and the runtime. Active-reader leases retain their file reservation too.
+    Ok((limit.rlim_cur / 2)
+        .saturating_sub(64)
+        .min(MAX_FILES as libc::rlim_t) as usize)
 }
 impl Manager {
     pub fn for_store(store: &Storage, stop: Arc<crate::stop::Stop>) -> Option<Arc<Self>> {
@@ -235,6 +298,7 @@ impl Manager {
         Ok(Arc::new(Self {
             path,
             capacity,
+            file_capacity: file_capacity()?,
             state: Mutex::default(),
             _lock: lock,
             stop,
@@ -242,7 +306,7 @@ impl Manager {
     }
     fn reserve(self: &Arc<Self>, bytes: u64, files: usize) -> Option<Lease> {
         if bytes > self.capacity
-            || files > MAX_FILES
+            || files > self.file_capacity
             || free_bytes(&self.path).ok()? < bytes.saturating_mul(2)
         {
             return None;
@@ -250,7 +314,7 @@ impl Manager {
         loop {
             let mut state = self.state.lock().expect("ANN staging lock");
             if state.used.saturating_add(bytes) <= self.capacity
-                && state.files_used.saturating_add(files) <= MAX_FILES
+                && state.files_used.saturating_add(files) <= self.file_capacity
                 && state.ready.len() < MAX_STAGES
             {
                 state.used += bytes;
@@ -509,9 +573,8 @@ impl Manager {
             tokio::task::yield_now().await;
         }
         file.sync_all().await?;
-        drop(file);
         Ok(StagedFile {
-            path: path.to_owned(),
+            file: file.into_std().await,
             len,
             crc,
         })
@@ -546,7 +609,7 @@ pub(crate) fn observe(store: &Storage, set: &SlabSet, dims: usize, leaves: u64, 
     // `key("")` includes the separator used for every storage-scoped cache key.
     manager.observe(store, &context.cache.key(""), set, dims, leaves);
 }
-pub(crate) fn covers(key: &str, ranges: &[Range<u64>]) -> bool {
+pub(crate) fn prefetch(key: &str, ranges: &[Range<u64>]) -> bool {
     let Some(context) = read_cache::staging_context() else {
         return false;
     };
@@ -559,10 +622,14 @@ pub(crate) fn covers(key: &str, ranges: &[Range<u64>]) -> bool {
     let Some(stage) = manager.file(&context.cache.key(key)) else {
         return false;
     };
-    stage
-        .files
-        .get(key)
-        .is_some_and(|f| ranges.iter().all(|r| r.start <= r.end && r.end <= f.len))
+    let Some(file) = stage.files.get(key) else {
+        return false;
+    };
+    let Ok(aligned) = file.aligned(ranges) else {
+        return false;
+    };
+    file.advise(&aligned);
+    true
 }
 pub(crate) fn read(key: &str, ranges: &[Range<u64>]) -> Option<Vec<Bytes>> {
     let context = read_cache::staging_context()?;
@@ -625,6 +692,68 @@ mod tests {
             .prefix("ann-staging-test-")
             .tempdir_in(parent)
             .unwrap()
+    }
+
+    #[test]
+    fn scattered_overlapping_ranges_share_an_open_file_without_a_shared_cursor() {
+        let work = scratch();
+        let temporary = tempfile::NamedTempFile::new_in(work.path()).unwrap();
+        let data: Vec<u8> = (0..BLOCK * 17 + 123)
+            .map(|i| (i * 37 % 251) as u8)
+            .collect();
+        temporary.as_file().write_all_at(&data, 0).unwrap();
+        let staged = StagedFile {
+            file: temporary.as_file().try_clone().unwrap(),
+            len: data.len() as u64,
+            crc: data.chunks(BLOCK).map(crc32fast::hash).collect(),
+        };
+        // The live descriptor, rather than a reopened pathname, owns the immutable bytes.
+        temporary.close().unwrap();
+        std::thread::scope(|threads| {
+            for salt in 0..8u64 {
+                let (staged, data) = (&staged, &data);
+                threads.spawn(move || {
+                    let mut seed = salt + 67;
+                    for _ in 0..40 {
+                        let mut ranges = vec![staged.len..staged.len, 0..37, 0..37];
+                        for _ in 0..12 {
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            let a = seed % (staged.len + 1);
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            let b = seed % (staged.len + 1);
+                            ranges.push(a.min(b)..a.max(b));
+                        }
+                        for (bytes, range) in staged.read(&ranges).unwrap().iter().zip(ranges) {
+                            assert_eq!(&bytes[..], &data[range.start as usize..range.end as usize]);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(
+            staged
+                .read(std::slice::from_ref(&Range { start: 1, end: 0 }))
+                .is_err()
+        );
+        assert!(
+            staged
+                .read(std::slice::from_ref(&(0..staged.len + 1)))
+                .is_err()
+        );
+        staged
+            .file
+            .write_all_at(&[data[BLOCK - 1] ^ 0xff], (BLOCK - 1) as u64)
+            .unwrap();
+        assert!(
+            staged.read(std::slice::from_ref(&(0..1))).is_err(),
+            "verify the entire checksum block, including unrequested bytes"
+        );
+        staged.file.set_len(BLOCK as u64).unwrap();
+        assert!(
+            staged
+                .read(std::slice::from_ref(&(BLOCK as u64..staged.len)))
+                .is_err()
+        );
     }
     fn vector(id: u32, salt: u32) -> Vec<f32> {
         (0..32)
@@ -746,12 +875,7 @@ mod tests {
                 )
                 .is_none()
         );
-        OpenOptions::new()
-            .write(true)
-            .open(&stage.files[key].path)
-            .unwrap()
-            .write_at(&[ann[0] ^ 0xff], 0)
-            .unwrap();
+        stage.files[key].file.write_at(&[ann[0] ^ 0xff], 0).unwrap();
         let mut cache = read_cache::DecodedCache::new(1 << 20, 1).scoped("left");
         cache.staging = Some(manager.clone());
         let context = read_cache::ReadContext::new(Arc::new(cache));
