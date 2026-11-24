@@ -4,6 +4,16 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Apple M4 memory budgets** (`docs/benchmarks.md`, "Memory budgets: blowfish and Qdrant on an Apple M4").
+  I compare v0.1.15 and Qdrant 1.20.0 under 2/4/8/12 GiB query limits, including file cache,
+  with server swap disabled and uncached VZ backing disks. At recall near 0.95, blowfish gives
+  710/1,799/1,805/1,795 q/s; Qdrant with vectors on disk gives 83/224/5,616/5,702 q/s. Mapping
+  its graph too gives 96/712/5,752/5,707 q/s at slightly lower recall. I include native cache
+  profiles, query peak RSS and cgroup memory, a 51.8 ms first query, and the historical build/query
+  memory distinction. All 77 records finish, quality repeats exactly, and store hashes pass before
+  and after. Formatting, full clippy, 324 Rust tests, and three harness regressions pass. No engine
+  code or README changes.
+
 - **Apple M4 NQ at v0.1.15** (`docs/benchmarks.md`, "Apple M4 at v0.1.15"). I reran the tagged release,
   Qdrant 1.20.0, and LanceDB 0.41.0 one at a time on the same 10-core Mac. Blowfish gives 1,801–1,827 q/s
   at 64 probes, recall@10 0.9611, and 1.3–1.4 / 1.6 / 1.9–2.0 ms p50 / p90 / p99; at 48 probes,

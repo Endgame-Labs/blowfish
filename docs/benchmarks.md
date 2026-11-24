@@ -4539,3 +4539,185 @@ Time to the final tier is longer: about 706 s from the first write here, against
 load ran; I have not isolated those effects from the other changes since Iteration 19. I would use the
 query improvement and the time to a final tier together when comparing releases. All of these numbers
 are warm, with local-disk storage on a shared Mac.
+
+## Memory budgets: blowfish and Qdrant on an Apple M4
+
+I find that **the ranking changes with available RAM**. With hard 2 and 4 GiB query budgets,
+blowfish at 48 probes (recall 0.9497) gives **710 and 1,799 q/s**, against Qdrant ef 64
+with vectors on disk (0.9492) at **83 and 224 q/s**. Mapping Qdrant's graph too improves it to
+**96 and 712 q/s**, at slightly lower recall, 0.9453. At 8 and 12 GiB, Qdrant's closest-recall
+mode reaches **5,616 and 5,702 q/s**, against blowfish's **1,805 and 1,795 q/s**: about 3.1 times
+faster. Blowfish benefits from a larger small cache, then plateaus; Qdrant recovers sharply once
+its roughly 5 GiB query working set fits. The old 14.73 decimal GB Qdrant maximum included
+index construction, rather than measuring query memory alone.
+
+### Workload and controls
+
+I use the same 10-core Apple M4 Mac mini, 16 GiB RAM, macOS 26.2, blowfish `v0.1.15`
+(`e49c509`, release profile, without `local-models`), and Qdrant 1.20.0 as the preceding section.
+The data is again 2,681,468 NQ passages, 3,452 queries, 1,024-dimensional f16 vectors, cosine distance,
+and id/vector only. I verify all four input SHA-256 hashes against that run:
+
+```text
+b1f1fb5d2d49dad476e3f0419ae3ea2975f907ddff94e447133e868ba31be185  corpus.f16
+841a621c983f0299d60873ee976990806f5d01e20116516f7bdc9842f4be2aaf  queries.npy
+fa470968ca6bf216a02ff0995881b07df055d06ca5a5780c7edb16769fb3c1b9  truth.npy
+60764fc0c70c0e35204c36905c40cb3299721ae97f15d235ada83af92f510e64  qrels.json
+```
+
+Every warm row has two fresh-process repeats. In **each repeat**, I first measure recall@10 against
+exact truth over all 3,452 queries at limit 10, then warm 1,000 queries and time 1,000 at one client.
+I run the same 2,000 pre-encoded HTTP queries at 1, 4, and 16 clients, in that order, and report 16-client
+throughput. Tables give the range of each latency percentile, and mean throughput with its range.
+All 10 cores are shared by server and clients, without CPU pinning. I run one engine at a time,
+wait for complete indexing, and remove its data before the next engine. Storage is local disk, rather
+than S3. Index creation is uncapped; these budgets apply to querying an existing index.
+
+Blowfish uses a fresh automatic tier covering all rows in 23 segments, 32 slabs, and 13,392 leaves.
+I keep that store fixed across its native profiles and Linux budgets. Its new layout differs from
+the preceding run, so I report quality again rather than reusing the previous recall.
+I disable the background exhaustive recall sampler
+(`BLOWFISH_RECALL_SAMPLE_RATE=0`) throughout this sweep: the external quality pass already checks every
+query in every repeat, and a periodic exhaustive job would fall inside only the longer, low-memory
+measurements. The engine source and query algorithm are unchanged. Its disk cache is disabled.
+Qdrant uses f16, HNSW m=16, ef_construct=100, optimizer target one segment, and
+max_segment_size=100,000,000. Both placements finish green with every vector indexed and two physical
+segments. I build each placement separately, so their measured recalls differ; I keep those values
+visible rather than treating ef as a quality guarantee.
+
+### Enforced query budgets
+
+I run both engines in Docker on an arm64 Linux guest, with Colima 0.10.3 and a run-local Lima 2.3.0
+built by `bench/nq/build_uncached_lima.sh`. Standard VZ backing files are host-cached: a guest cgroup
+alone can leave another copy of the dataset in the Mac's page cache. The helper switches VZ to
+`DiskImageCachingModeUncached`. Before the first boot, I APFS-clone and replace the stopped VM's root
+and data disk files to discard previously cached inodes. The installed Lima remains unchanged.
+
+Each fresh server gets `--memory=2g --memory-swap=2g`, or the corresponding 4, 8, or 12 GiB pair.
+I verify cgroup v2, active memory and swap controllers, and `memory.swap.max=0`; the server cannot swap
+inside its cgroup. The VM gets 10 vCPUs and one GiB above the engine limit: 3, 5, 9, or 13 GiB.
+The OS and client share that extra GiB; the client runs in a separate container outside the engine's
+cgroup. I use a Linux release build of the same blowfish tag and the `qdrant/qdrant:v1.20.0` image.
+Engine files live on a guest ext4 Docker volume, without host bind mounts. The virtual data disk
+is 26 GiB for Qdrant and expands to 36 GiB for blowfish's larger retained store. I restart the VM between
+budgets, and sync and drop the guest page cache before each fresh server, so earlier containers'
+pages cannot escape the next container's accounting.
+
+For blowfish, the block cache is 1, 3, 7, or 11 GiB, with a 512 MiB decoded cache in every case.
+These are cache capacities, rather than reservations; the cgroup also includes other allocations and
+file cache. Qdrant's first placement has vectors `on_disk=true` and HNSW `on_disk=false`; its second
+has both `on_disk=true`. I read process peak RSS from `/proc/1/status` (`VmHWM`), and total peak memory
+from cgroup `memory.peak`, including charged file cache and kernel memory. Each table cell shows the
+maximum across the two repeats, in GiB. Tiny cgroup overshoots at the page-accounting boundary round
+to the configured limit.
+
+I hash Qdrant's binary vector and graph files against their native reference before and after each
+VM sweep, and compare blowfish's entire store before and after its sweep. macOS swap stays enabled,
+and the existing desktop applications remain running. Across the 48 capped repeats,
+the system-wide counters record **30.8 MiB of swap-ins and zero swap-outs**, with at most 7.72 MiB
+swapped in during one repeat. These counters include desktop activity. The capped servers record
+no OOM events, and all 48 exit with status zero.
+The absolute rates below describe virtualized Linux on the M4; I compare both engines within this
+setup, and show native Mac calibration separately.
+
+At recall around 0.95:
+
+| Engine, setting | Limit GiB | Peak RSS / cgroup GiB | Recall@10 | p50 / p90 / p99 ms | q/s at 16, mean (range) |
+|---|---:|---|---:|---|---|
+| blowfish, 48 probes | 2 | 1.62 / 2.00 | 0.9497 | 3.1–3.2 / 4.9–5.1 / 9.0–10.2 | 710 (696–724) |
+| Qdrant, vectors on disk, ef 64 | 2 | 1.96 / 2.00 | 0.9492 | 25.2–26.9 / 34.2–38.1 / 43.1–56.3 | 83 (80–86) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 2 | 1.96 / 2.00 | 0.9453 | 22.7–23.1 / 30.7–31.3 / 40.1–41.8 | 96 (85–108) |
+| blowfish, 48 probes | 4 | 3.54 / 4.00 | 0.9497 | 1.8 / 2.1 / 2.6–2.7 | 1,799 (1,785–1,814) |
+| Qdrant, vectors on disk, ef 64 | 4 | 3.96 / 4.00 | 0.9492 | 4.8–5.6 / 17.2–18.4 / 23.0–24.0 | 224 (212–236) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 4 | 3.96 / 4.00 | 0.9453 | 4.0–4.2 / 14.0–14.2 / 18.4–19.5 | 712 (708–717) |
+| blowfish, 48 probes | 8 | 3.52 / 6.41 | 0.9497 | 1.8 / 2.1 / 2.5–2.7 | 1,805 (1,792–1,818) |
+| Qdrant, vectors on disk, ef 64 | 8 | 4.82 / 4.89 | 0.9492 | 0.6 / 0.7–0.9 / 0.8–1.2 | 5,616 (5,482–5,751) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 8 | 4.79 / 4.87 | 0.9453 | 0.6 / 0.7 / 0.8 | 5,752 (5,692–5,811) |
+| blowfish, 48 probes | 12 | 3.53 / 6.42 | 0.9497 | 1.8 / 2.1 / 2.6–2.7 | 1,795 (1,790–1,800) |
+| Qdrant, vectors on disk, ef 64 | 12 | 4.81 / 4.89 | 0.9492 | 0.6 / 0.7 / 0.8 | 5,702 (5,653–5,751) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 12 | 4.79 / 4.87 | 0.9453 | 0.6 / 0.7 / 0.8 | 5,707 (5,676–5,739) |
+
+At the requested higher search settings (their measured recalls differ):
+
+| Engine, setting | Limit GiB | Peak RSS / cgroup GiB | Recall@10 | p50 / p90 / p99 ms | q/s at 16, mean (range) |
+|---|---:|---|---:|---|---|
+| blowfish, 64 probes | 2 | 1.67 / 2.00 | 0.9602 | 3.3–3.4 / 5.2–5.4 / 9.8–10.8 | 581 (561–600) |
+| Qdrant, vectors on disk, ef 128 | 2 | 1.96 / 2.00 | 0.9707 | 48.8–51.2 / 60.5–63.6 / 71.6–77.9 | 44 (43–44) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 2 | 1.96 / 2.00 | 0.9680 | 44.7–45.1 / 55.1–56.0 / 65.7–67.5 | 56 (56) |
+| blowfish, 64 probes | 4 | 3.54 / 4.00 | 0.9602 | 1.9 / 2.3 / 2.8–2.9 | 1,554 (1,549–1,560) |
+| Qdrant, vectors on disk, ef 128 | 4 | 3.97 / 4.00 | 0.9707 | 8.1–8.6 / 27.2–27.5 / 36.9–38.7 | 131 (131–132) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 4 | 3.97 / 4.00 | 0.9680 | 7.3–7.4 / 21.2–21.6 / 27.4–28.2 | 169 (168–170) |
+| blowfish, 64 probes | 8 | 3.52 / 6.42 | 0.9602 | 1.9–2.0 / 2.3–2.4 / 2.7–2.9 | 1,519 (1,485–1,552) |
+| Qdrant, vectors on disk, ef 128 | 8 | 5.19 / 5.26 | 0.9707 | 0.8–0.9 / 1.1 / 1.2 | 3,998 (3,995–4,001) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 8 | 5.18 / 5.25 | 0.9680 | 0.8 / 1.1 / 1.2 | 4,152 (4,104–4,201) |
+| blowfish, 64 probes | 12 | 3.54 / 6.43 | 0.9602 | 1.9–2.0 / 2.3 / 2.8 | 1,553 (1,537–1,569) |
+| Qdrant, vectors on disk, ef 128 | 12 | 5.19 / 5.26 | 0.9707 | 0.8–0.9 / 1.1 / 1.2 | 4,034 (4,033–4,035) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 12 | 5.18 / 5.25 | 0.9680 | 0.8–0.9 / 1.1 / 1.2 | 4,077 (4,061–4,092) |
+
+At the 8 GiB limit, blowfish at 48 probes peaks at **3.52 GiB RSS but 6.41 GiB charged memory**,
+while vector-on-disk Qdrant ef 64 peaks at **4.82 GiB RSS and 4.89 GiB charged memory**.
+Blowfish has file cache outside its process mappings in addition to its application cache;
+Qdrant's memory-mapped file pages appear in RSS. Lower process RSS alone does not establish
+lower total query memory. The tables use total charged memory to expose that difference.
+
+### Native Mac calibration and a fresh-process pass
+
+These rows have no process memory cap. I vary blowfish's block-cache capacity through 1, 3, 7, and
+11 GiB with a 512 MiB decoded cache, and add its original 4 GiB block / 2 GiB decoded default.
+Peak RSS comes from `/usr/bin/time -l` around each fresh query process, including its quality,
+warm-up, latency, and throughput work. A larger configured cache only uses memory if the workload
+fills it; it cannot by itself establish a matched memory budget on macOS.
+
+| Engine, cache or placement | Peak RSS GiB | Recall@10 | p50 / p90 / p99 ms | q/s at 16, mean (range) |
+|---|---:|---:|---|---|
+| blowfish, block 1 / decoded 0.5 GiB, 64 probes | 1.57 | 0.9602 | 1.9 / 3.0–3.1 / 5.6–6.0 | 1,005 (980–1,030) |
+| blowfish, block 1 / decoded 0.5 GiB, 48 probes | 1.54 | 0.9497 | 1.7–1.8 / 2.6–2.9 / 4.8–5.5 | 1,159 (1,080–1,238) |
+| blowfish, block 3 / decoded 0.5 GiB, 64 probes | 3.21 | 0.9602 | 1.4 / 1.7–1.8 / 2.1–2.2 | 1,833 (1,823–1,842) |
+| blowfish, block 3 / decoded 0.5 GiB, 48 probes | 3.05 | 0.9497 | 1.3 / 1.5 / 1.9–2.0 | 2,129 (2,114–2,143) |
+| blowfish, block 7 / decoded 0.5 GiB, 64 probes | 3.10 | 0.9602 | 1.4 / 1.7 / 2.1 | 1,816 (1,783–1,849) |
+| blowfish, block 7 / decoded 0.5 GiB, 48 probes | 3.08 | 0.9497 | 1.3 / 1.5–1.6 / 1.9–2.0 | 2,145 (2,141–2,149) |
+| blowfish, block 11 / decoded 0.5 GiB, 64 probes | 3.07 | 0.9602 | 1.4 / 1.7–1.8 / 2.1–2.2 | 1,814 (1,794–1,834) |
+| blowfish, block 11 / decoded 0.5 GiB, 48 probes | 3.12 | 0.9497 | 1.3 / 1.6 / 1.9–2.0 | 2,138 (2,129–2,148) |
+| blowfish, block 4 / decoded 2 GiB (default), 64 probes | 3.16 | 0.9602 | 1.3 / 1.6 / 1.9–2.0 | 1,888 (1,886–1,890) |
+| blowfish, block 4 / decoded 2 GiB (default), 48 probes | 3.14 | 0.9497 | 1.2 / 1.5 / 1.8–1.9 | 2,165 (2,111–2,219) |
+| Qdrant, vectors on disk, ef 64 | 5.37 | 0.9492 | 0.4 / 0.6 / 0.6–0.7 | 6,063 (5,827–6,299) |
+| Qdrant, vectors on disk, ef 128 | 5.45 | 0.9707 | 0.7 / 0.9 / 1.0 | 4,855 (4,831–4,879) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 5.37 | 0.9453 | 0.4 / 0.6 / 0.7 | 7,535 (7,360–7,709) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 5.45 | 0.9680 | 0.7 / 0.8 / 0.9 | 5,500 (5,483–5,517) |
+
+At 48 probes, increasing the native block cache from 1 to 3 GiB raises mean throughput from
+**1,159 to 2,129 q/s**; 7 and 11 GiB give **2,145 and 2,138 q/s**. Their peak RSS remains near
+3.1 GiB. The original default gives 2,165 q/s. This workload stops benefiting materially from
+larger cache capacities once the hot data fits; the 7 and 11 GiB cache capacities do not
+cause equally large native allocations.
+
+For the separate default 64-probe pass, I start a fresh process with empty application caches,
+retain the OS file cache, and immediately time 1,000 queries without quality or warm-up first.
+The **first query takes 51.8 ms**; the entire pass has **2.3 / 3.9 / 7.7 ms** p50 / p90 / p99,
+2.8 ms mean, and **1.83 GiB** peak RSS. Later queries warm the application, so the pass percentiles
+are not 1,000 independently cold queries. This is process startup on local disk, rather than
+a cold-device or cold-S3 measurement.
+
+The historical all-RAM Qdrant ef 64 row remains **7,752 q/s** (7,481–8,023), recall **0.9497**,
+and **0.5 / 0.6 / 0.7 ms** p50 / p90 / p99. Its query RSS samples peaked at **5.49 GiB**
+(5.89 decimal GB); its **14.73 decimal GB** maximum included load and indexing. Those are different
+measurements. I reuse the row without rerunning it, and do not plot its build peak as query memory or
+compare its native rate directly with a capped Linux row.
+
+### Limits and reproduction
+
+The query sequence, cache history, and independent index builds matter. A complete quality pass
+precedes every warm repeat; these are neither random-query throughput estimates nor cold-read S3
+measurements. Latency uses 1,000 sequential queries, while throughput uses 2,000 with concurrency;
+a fast median can coexist with severe later cache churn. Two repeats show variability, rather than
+a confidence interval. A 4-to-8 GiB change brackets a transition; it does not locate the exact
+working-set threshold. The VM limit includes the server's charged page cache, but excludes the guest
+OS, client, VM overhead, and desktop applications. Host swap and virtualization remain limitations.
+
+`bench/nq/qdrant.py --vectors-on-disk` selects the first Qdrant placement; adding
+`--hnsw-on-disk` selects the second. `bench/nq/measure.py --parts quality,latency,throughput
+--clients 1,4,16` runs each warm repeat, with `NQ_QUALITY_K=10`, the selected engine, and its search
+setting. `--parts latency --first-pass` skips latency warm-up for the separate fresh-process pass.
+The harness now reports a failed or killed throughput worker, and reaps its peers. Its three
+regressions pass, along with formatting, full-workspace clippy, and all 324 Rust tests. The runtime
+helper is syntax-checked and exercised by the actual signed build, VM boots, and memory sweeps.
