@@ -455,6 +455,15 @@ impl Engine {
     async fn index_namespace_inner(&self, ns: &str, force: bool) -> Result<bool, ApiError> {
         let t0 = std::time::Instant::now();
         let handle = self.handle(ns).await?;
+        let bulk = |state: &NamespaceState| {
+            crate::auto_recluster::loading_with_backpressure(
+                state,
+                Utc::now(),
+                std::time::Instant::now(),
+                &handle.backpressure,
+                self.0.config.max_unindexed_bytes,
+            )
+        };
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
         // A built recluster tier waiting to be installed is work too, as are the segments a build
         // covers (compaction leaves them alone).
@@ -474,7 +483,7 @@ impl Engine {
                 && state.seq > 0
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
-                && tier(&state, &self.0.config, force, &protected).is_empty()
+                && tier(&state, &self.0.config, force, &protected, bulk(&state)).is_empty()
                 && !needs_text_upgrade(&state)
                 && !installing
             {
@@ -502,7 +511,7 @@ impl Engine {
                         })
                     })
             });
-            let will_compact = tier(&state, &self.0.config, force, &protected);
+            let will_compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
             let upgrade = needs_text_upgrade(&state) || installing;
             if state.seq == state.indexed_through
                 && will_compact.is_empty()
@@ -564,7 +573,7 @@ impl Engine {
             crate::text::hydrate(&self.0.store, &mut state).await?;
         }
         crate::ann::stage(t0, "idx hydrate");
-        let compact = tier(&state, &self.0.config, force, &protected);
+        let compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
         let upgrade = needs_text_upgrade(&state) || installing;
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
@@ -1263,9 +1272,10 @@ pub(crate) fn tier(
     config: &EngineConfig,
     force: bool,
     protected: &std::collections::BTreeSet<String>,
+    bulk: bool,
 ) -> Vec<String> {
     if !force
-        && state.shadowed.len() >= config.index_rows
+        && (bulk || state.shadowed.len() >= config.index_rows)
         && state.segments.len() < config.defer_compaction_segments
     {
         return vec![];
@@ -1477,6 +1487,68 @@ mod tests {
     }
 
     #[test]
+    fn compaction_waits_through_advertised_retries_but_honors_force_and_segment_cap() {
+        let config = EngineConfig {
+            max_segment_rows: 200_000,
+            defer_compaction_segments: 8,
+            ..Default::default()
+        };
+        let mut state = state_with(&[1000; 4]);
+        let now = Utc::now();
+        let clock = std::time::Instant::now();
+        state.updated_at = now - chrono::Duration::seconds(30);
+        state.bulk_load_at = Some(state.updated_at);
+        state.seq = 9;
+        state.indexed_through = 9;
+        let pressure = crate::auto_recluster::LoadBackpressure::default();
+        pressure.record(state.created_at, 20_001);
+        let active = |state: &NamespaceState, seconds| {
+            crate::auto_recluster::loading_with_backpressure(
+                state,
+                now + chrono::Duration::seconds(seconds),
+                clock + Duration::from_secs(seconds as u64),
+                &pressure,
+                u64::MAX,
+            )
+        };
+        // Indexing has caught up, but clients obeying Retry-After have not resumed yet.
+        assert!(active(&state, 10));
+        assert!(
+            tier(
+                &state,
+                &config,
+                false,
+                &Default::default(),
+                active(&state, 10)
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            tier(&state, &config, true, &Default::default(), true).len(),
+            4
+        );
+        assert!(!active(&state, 24));
+        assert_eq!(
+            tier(
+                &state,
+                &config,
+                false,
+                &Default::default(),
+                active(&state, 24)
+            )
+            .len(),
+            4
+        );
+        // The existing cap prevents a long load from growing the segment list without bound.
+        let capped = state_with(&[1000; 8]);
+        let protected = (0..4).map(|i| format!("s{i}")).collect();
+        assert_eq!(
+            tier(&capped, &config, false, &protected, true),
+            vec!["s4", "s5", "s6", "s7"]
+        );
+    }
+
+    #[test]
     fn compaction_merges_pairs_that_cannot_grow_to_a_full_group() {
         // The default cap is sized from host memory; pin it so the test doesn't depend on the machine.
         let config = EngineConfig {
@@ -1487,27 +1559,40 @@ mod tests {
         // first two merge instead of staying as four half-full segments forever.
         let state = state_with(&[100_000, 100_000, 100_000, 100_000]);
         assert_eq!(
-            tier(&state, &config, false, &Default::default()),
+            tier(&state, &config, false, &Default::default(), false),
             vec!["s0", "s1"]
         );
         // A lone segment, or segments already at the cap, stay as they are.
-        assert!(tier(&state_with(&[100_000]), &config, false, &Default::default()).is_empty());
+        assert!(
+            tier(
+                &state_with(&[100_000]),
+                &config,
+                false,
+                &Default::default(),
+                false
+            )
+            .is_empty()
+        );
         assert!(
             tier(
                 &state_with(&[190_000, 190_000]),
                 &config,
                 false,
-                &Default::default()
+                &Default::default(),
+                false,
             )
             .is_empty()
         );
         // Small segments still merge four at a time.
         let small = state_with(&[1000, 1100, 1200, 1300, 1400]);
-        assert_eq!(tier(&small, &config, false, &Default::default()).len(), 4);
+        assert_eq!(
+            tier(&small, &config, false, &Default::default(), false).len(),
+            4
+        );
         // Odd sizes in different tiers merge while their total fits under the cap.
         let odd = state_with(&[70_000, 90_000, 150_000]);
         assert_eq!(
-            tier(&odd, &config, false, &Default::default()),
+            tier(&odd, &config, false, &Default::default(), false),
             vec!["s0", "s1"]
         );
         // Small ones are left to their own tiers.
@@ -1516,7 +1601,8 @@ mod tests {
                 &state_with(&[300, 50_000]),
                 &config,
                 false,
-                &Default::default()
+                &Default::default(),
+                false,
             )
             .is_empty()
         );
@@ -1525,7 +1611,8 @@ mod tests {
                 &state_with(&[110_000, 150_000]),
                 &config,
                 false,
-                &Default::default()
+                &Default::default(),
+                false,
             )
             .is_empty()
         );

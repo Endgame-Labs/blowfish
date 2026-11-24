@@ -807,7 +807,8 @@ impl LoadBackpressure {
     }
 }
 
-fn loading_with_backpressure(
+/// Shared bulk-activity hint for compaction and reclustering, including advertised retries.
+pub(crate) fn loading_with_backpressure(
     state: &crate::NamespaceState,
     now: chrono::DateTime<chrono::Utc>,
     monotonic: Instant,
@@ -873,8 +874,6 @@ impl Engine {
             }
             // A merge the indexer would run now. While a long write tail defers compaction (as
             // under steady writes), waiting for it would leave the new rows outside the tiers.
-            let compacting =
-                !crate::indexer::tier(&state, &self.0.config, false, &protected).is_empty();
             let bulk = loading_with_backpressure(
                 &state,
                 chrono::Utc::now(),
@@ -882,6 +881,8 @@ impl Engine {
                 &handle.backpressure,
                 self.0.config.max_unindexed_bytes,
             );
+            let compacting =
+                !crate::indexer::tier(&state, &self.0.config, false, &protected, bulk).is_empty();
             let (decision, numbers) = match &building {
                 // Beside a base building here, only a delta over the rows outside it.
                 Some(building) => (
