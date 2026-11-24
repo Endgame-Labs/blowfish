@@ -15,9 +15,17 @@ fn scratch() -> tempfile::TempDir {
 
 // Invoked in a separate process under strace, so the test runner's unrelated writes cannot
 // satisfy the assertions. Markers are emitted only after Storage has acknowledged each write.
-#[tokio::test]
+#[test]
 #[ignore = "child of the syscall test"]
-async fn durability_child() {
+fn durability_child() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(durability_scenario());
+}
+async fn durability_scenario() {
     let root = std::env::var("BF_DURABILITY_ROOT").unwrap();
     let store = Storage::open(&StorageConfig {
         url: format!("file://{root}/new/store"),
@@ -35,6 +43,20 @@ async fn durability_child() {
         CreateResult::Created
     );
     println!("ACK:create");
+    if std::env::var_os("BF_FAIL_DIRECTORY").is_some() {
+        for n in 0..100 {
+            let key = format!("ns/a/wal/failed-{n}");
+            let id = Uuid::new_v4();
+            if store.create_with_id(&key, "visible", id).await.is_err() {
+                // Fail only after publication: the body is readable, but the directory
+                // barrier failed both in the backend and in ambiguous-result recovery.
+                assert_eq!(store.get(&key).await.unwrap(), "visible");
+                assert!(store.create_with_id(&key, "visible", id).await.is_err());
+                return;
+            }
+        }
+        panic!("directory fsync injection did not reach a publication");
+    }
     if std::env::var_os("BF_FAIL_RECOVERY").is_some() {
         // The parent injects EIO only when fsync targets the published file. The initial
         // staged-file fsync and directory publication succeeded, so the key remains visible.
@@ -274,6 +296,47 @@ fn a_visible_retry_cannot_hide_a_failed_sync() {
     let trace = fs::read_to_string(trace).unwrap();
     assert!(
         trace.matches("EIO (Input/output error) (INJECTED)").count() >= 2,
+        "{trace}"
+    );
+}
+
+#[test]
+fn a_failed_publication_directory_sync_is_not_acknowledged() {
+    if Command::new("strace").arg("--version").output().is_err() {
+        eprintln!("install strace to run the Linux durability fault checks");
+        return;
+    }
+    let run = scratch();
+    let trace = run.path().join("directory-fault-trace");
+    let result = Command::new("strace")
+        .args([
+            "-f",
+            "-qq",
+            "-yy",
+            "-e",
+            "trace=fsync",
+            "-e",
+            "inject=fsync:error=EIO:when=10+",
+        ])
+        .arg("-P")
+        .arg(run.path().join("new/store/ns/a/wal"))
+        .arg("-o")
+        .arg(&trace)
+        .arg(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "durability_child", "--nocapture"])
+        .env("BF_DURABILITY_ROOT", run.path())
+        .env("BF_FAIL_DIRECTORY", "1")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let trace = fs::read_to_string(trace).unwrap();
+    assert!(
+        trace.matches("EIO (Input/output error) (INJECTED)").count() >= 3,
         "{trace}"
     );
 }
