@@ -863,11 +863,6 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
         // Leaf clusters: sqrt(rows).
         let job = tokio::task::spawn_blocking(move || {
             let params = bf_vector::BuildParams {
-                // Small flushes of wide vectors must not turn into multi-megabyte exhaustive
-                // scans beside the namespace tier. Keep flat scans within 64 KiB, retaining
-                // the existing row threshold for narrow vectors.
-                flat_threshold: ((64usize << 10) / (dimensions * dtype.width()).max(1))
-                    .clamp(2, 2048),
                 clusters: Some(((packed.rows.len() as f64).sqrt().ceil() as usize).max(1)),
                 ..Default::default()
             };

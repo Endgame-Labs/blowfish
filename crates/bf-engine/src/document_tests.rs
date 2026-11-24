@@ -62,7 +62,7 @@ fn selected_column_decode_matches_full_values_and_rejects_malformed_skipped_valu
 }
 
 #[tokio::test]
-async fn small_wide_vector_flushes_are_indexed_and_preserve_top_k() {
+async fn small_wide_vector_flushes_remain_exact_and_preserve_top_k() {
     let store = Storage::open(&StorageConfig {
         url: "memory://".into(),
         ..Default::default()
@@ -107,8 +107,8 @@ async fn small_wide_vector_flushes_are_indexed_and_preserve_top_k() {
             .await
             .unwrap();
         assert!(
-            !index.is_flat(),
-            "a small high-dimensional flush must use codes, rather than fetching every vector on every query"
+            index.is_flat(),
+            "small flushes retain the established exact index plan"
         );
         segments.push(seg);
     }
