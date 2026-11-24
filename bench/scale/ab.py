@@ -41,32 +41,54 @@ def start_server(arm, append_log=False):
     config = env.pop("AB_CONFIG", str(CONFIG))  # an arm may read another bucket prefix (a different layout)
     ns = env.pop("AB_NS", NS)
     shutil.rmtree(WORK, ignore_errors=True); (WORK / "cache").mkdir(parents=True)
-    subprocess.run(["python3", str(HERE / "mkconfig.py"), config, str(WORK / "storage.json"), str(WORK / "cache"),
-                    "--memory-gib", os.environ.get("AB_MEM_GIB", "8"), "--read-only"], check=True)
+    subprocess.run(["uv", "run", "python", str(HERE / "mkconfig.py"), config, str(WORK / "storage.json"), str(WORK / "cache"),
+                    "--memory-gib", os.environ.get("AB_MEM_GIB", "8"), "--read-only"], check=True, timeout=60)
     # RAYON_NUM_THREADS is left to the server's default unless the environment (or the arm) sets it.
     e = dict(os.environ, MALLOC_ARENA_MAX="2", BF_TRACE_READS="1", **env)
     global CUR_NS
     CUR_NS = ns
     log = open(WORK / "server.log", "a" if append_log else "w")
-    proc = subprocess.Popen([binary, str(WORK / "storage.json"), f"127.0.0.1:{PORT}"], stdout=log, stderr=subprocess.STDOUT, env=e)
-    for _ in range(200):
-        try:
-            urllib.request.urlopen(URL + "/", timeout=1).read(); break
-        except Exception:
-            time.sleep(0.2)
-    time.sleep(float(os.environ.get("AB_SETTLE", "1.5")))  # let the connection warmer finish
+    try:
+        proc = subprocess.Popen([binary, str(WORK / "storage.json"), f"127.0.0.1:{PORT}"], stdout=log, stderr=subprocess.STDOUT, env=e)
+    finally:
+        log.close()
+    try:
+        for _ in range(200):
+            if proc.poll() is not None:
+                raise RuntimeError("benchmark server exited before readiness; inspect its scratch log")
+            try:
+                urllib.request.urlopen(URL + "/", timeout=1).read(); break
+            except Exception:
+                time.sleep(0.2)
+        else:
+            raise TimeoutError("benchmark server readiness timed out")
+        time.sleep(float(os.environ.get("AB_SETTLE", "1.5")))  # let the connection warmer finish
+    except BaseException:
+        stop_server(proc)
+        raise
     return proc
+
+
+def stop_server(proc):
+    """Stop only the benchmark child, with a bounded graceful-shutdown period."""
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
 
 
 def query_once(query):
     before = metrics()
     (WORK / "q.json").write_text(json.dumps([query]))
     res = subprocess.run(["uv", "run", str(ROOT / "crates/bf-engine/examples/scale_api.py"), str(WORK / "q.json"), URL, CUR_NS, "1"],
-                         capture_output=True, text=True, check=True)
+                         capture_output=True, text=True, check=True, timeout=660)
     row = json.loads(res.stdout.splitlines()[0])
     after = metrics()
     d = {k: after.get(k, 0) - before.get(k, 0) for k in after}
-    waves = subprocess.run([sys.executable, str(HERE / "waves.py"), str(WORK / "server.log")], capture_output=True, text=True).stdout
+    waves = subprocess.run([sys.executable, str(HERE / "waves.py"), str(WORK / "server.log")], capture_output=True, text=True, timeout=60).stdout
     m = re.search(r"(\d+) reads, ([\d.]+) MB, (\d+) waves", waves)
     return row, d, (int(m[1]), float(m[2]), int(m[3])) if m else (0, 0, 0)
 
@@ -77,7 +99,7 @@ def run_one(arm, query, qid):
     try:
         return query_once(query)
     finally:
-        proc.terminate(); proc.wait()
+        stop_server(proc)
 
 
 class CacheCold:
@@ -101,7 +123,7 @@ class CacheCold:
         return out
 
     def close(self):
-        self.proc.terminate(); self.proc.wait()
+        stop_server(self.proc)
 
 
 def main():
