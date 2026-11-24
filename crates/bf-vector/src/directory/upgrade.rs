@@ -135,6 +135,7 @@ pub fn partial_index<R: RangeRead>(
     let mut partial = dir.partial_index(segment, reader)?;
     partial.0.metadata_mut().flags =
         u32::from_le_bytes(header[44..48].try_into().unwrap()) | crate::format::FLAG_ROTATED;
+    partial.0.accept_legacy_blobs();
     Ok(partial)
 }
 
@@ -179,7 +180,9 @@ pub fn legacy_fragment(index_blob: &[u8], blocks_mode: bool) -> Result<(Vec<u8>,
     let mut placed: Vec<Option<(u64, usize, u64)>> = vec![None; m.clusters.len()];
     for &cid in &order {
         let c = &m.clusters[cid];
-        let blob = index.cluster_blob(cid);
+        // Released fragments (through v0.1.14) wrote blobs without the trailing checksum.
+        let mut blob = index.cluster_blob(cid);
+        blob.truncate(blob.len() - 4);
         let start = (resident_len + blobs.len()) as u64;
         let codes_len = if blocks_mode {
             c.codes.end - c.codes.start
