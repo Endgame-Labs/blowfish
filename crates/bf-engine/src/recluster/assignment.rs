@@ -172,8 +172,9 @@ impl<'a> Scorer<'a> {
                     && max_norm.is_finite()
                     && block.norms[r] >= 0.
                     && max_norm >= 0.
-                    && block.norms[r] <= f32::MAX / 4.
-                    && max_norm <= f32::MAX / 4.
+                    // Leave headroom for both dot accumulators and the final distance sum.
+                    && block.norms[r] <= f32::MAX / 16.
+                    && max_norm <= f32::MAX / 16.
                     && row.iter().all(|(d, _)| d.is_finite())
                 {
                     let minimum = row.iter().map(|(d, _)| *d).fold(f32::INFINITY, f32::min);
@@ -374,6 +375,69 @@ mod tests {
             assert_eq!(got, expected, "seed={seed}");
             let reduced = Scorer::with_bf16(&leaves, &norms, &groups, true);
             assert_eq!(reduced.nearest(&blocks), expected, "BF16 seed={seed}");
+        }
+    }
+    #[test]
+    fn near_overflow_distance_ranking_and_ties_match_the_reference() {
+        let dims = 128;
+        let scale = (f64::from(f32::MAX) / (4. * dims as f64)).sqrt() as f32;
+        let leaves: Vec<Vec<f32>> = (0..17)
+            .map(|c| {
+                (0..dims)
+                    .map(|d| {
+                        let x = if (c + d) % 3 == 0 {
+                            scale.next_down()
+                        } else {
+                            scale
+                        };
+                        -x
+                    })
+                    .collect()
+            })
+            .collect();
+        let norms: Vec<_> = leaves.iter().map(|v| norm2(v)).collect();
+        let groups = vec![(Vec::new(), vec![(0..9).collect(), (9..17).collect()])];
+        let rows: Vec<Vec<f32>> = (0..4)
+            .map(|r| {
+                (0..dims)
+                    .map(|d| {
+                        if (r + d) % 5 == 0 {
+                            scale.next_down()
+                        } else {
+                            scale
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let row_norms = rows.iter().map(|r| norm2(r)).collect();
+        let blocks = vec![Block {
+            positions: Vec::new(),
+            rows,
+            norms: row_norms,
+            wanted: vec![0, 1],
+        }];
+        let refs: Vec<_> = blocks[0].rows.iter().map(Vec::as_slice).collect();
+        let distances = super::super::block_distances(&refs, &blocks[0].norms, leaves.len(), |c| {
+            (&leaves[c], norms[c])
+        });
+        let expected: Vec<_> = distances
+            .into_iter()
+            .map(|row| {
+                let mut best = (f32::INFINITY, u32::MAX);
+                for (c, d) in row.into_iter().enumerate() {
+                    if d < best.0 || (d == best.0 && (c as u32) < best.1) {
+                        best = (d, c as u32);
+                    }
+                }
+                best.1
+            })
+            .collect();
+        for reduced in [false, true] {
+            assert_eq!(
+                Scorer::with_bf16(&leaves, &norms, &groups, reduced).nearest(&blocks),
+                expected
+            );
         }
     }
 }
