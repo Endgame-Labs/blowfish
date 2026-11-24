@@ -209,3 +209,64 @@ async fn slabs_answer_like_segments_and_keep_answering_beside_new_segments() {
             .all(|id| id.as_u64().unwrap() >= 3000)
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slab_winners_shadowed_by_tail_match_an_exhaustive_reference() {
+    let open = || async {
+        Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    };
+    let store = open().await;
+    let writer = engine(&store);
+    let reference = engine(&open().await);
+    let vector = |id: usize| {
+        let mut vector = vec![0.0f32; 64];
+        vector[0] = 1.0;
+        vector[1] = id as f32 / 100.0;
+        vector
+    };
+    let initial = json!({"distance_metric":"euclidean_squared",
+        "upsert_rows":(0..512).map(|id|json!({"id":id,"version":0,"vector":vector(id)})).collect::<Vec<_>>()});
+    write(&writer, initial.clone()).await;
+    write(&reference, initial).await;
+    writer.index_namespace("t", true).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    writer
+        .recluster(
+            "t",
+            &ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 4,
+                cluster_rows: 64,
+                max_slab_rows: 512,
+                scratch: scratch.path().into(),
+            },
+        )
+        .await
+        .unwrap();
+    for hidden in [1, 31, 96] {
+        let update = json!({"deletes":(0..hidden).filter(|id|id%2==0).collect::<Vec<_>>(),
+            "upsert_rows":(0..hidden).filter(|id|id%2==1)
+                .map(|id|json!({"id":id,"version":hidden,"vector":vector(1000+id)})).collect::<Vec<_>>()});
+        write(&writer, update.clone()).await;
+        write(&reference, update).await;
+        let request: QueryRequest = serde_json::from_value(json!({
+            "rank_by":["vector","ANN",vector(0)],"top_k":10,"include_attributes":["version"]
+        }))
+        .unwrap();
+        assert_eq!(
+            writer
+                .query("t", request.clone())
+                .await
+                .unwrap()
+                .result
+                .rows,
+            reference.query("t", request).await.unwrap().result.rows,
+            "{hidden} nearest slab rows shadowed by replacements and deletes"
+        );
+    }
+}

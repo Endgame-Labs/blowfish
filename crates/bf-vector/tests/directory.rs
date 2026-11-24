@@ -176,6 +176,16 @@ async fn ann_object_holds_blob_and_codes_together_and_scans_like_the_index() {
             &fragment[c.start as usize..c.end as usize],
         ));
     }
+    // Independent query views share only immutable ranges, never installed payloads.
+    let untouched = dir.partial_index(0, Bytes::from(fragment.clone())).unwrap();
+    assert_eq!(
+        untouched.index().cluster_count(),
+        partial.index().cluster_count()
+    );
+    for &cluster in &wanted {
+        assert!(partial.index().cluster_rows(cluster) > 0);
+        assert_eq!(untouched.index().cluster_rows(cluster), 0);
+    }
     let got = partial
         .index()
         .scan_blocks(&query, &wanted, codes.clone(), None)
@@ -188,6 +198,7 @@ async fn ann_object_holds_blob_and_codes_together_and_scans_like_the_index() {
     }
     // The bounded scan returns exactly the candidates that survive the error-bound test
     // (lower bound at most the k-th smallest upper bound) applied to the full scan.
+    let rotated = dir.rotate_query(&query).unwrap();
     for k in [1, 3, 10, 50] {
         let mut upper: Vec<f32> = got.iter().map(|c| c.distance + c.error).collect();
         upper.sort_by(f32::total_cmp);
@@ -202,10 +213,41 @@ async fn ann_object_holds_blob_and_codes_together_and_scans_like_the_index() {
             .scan_blocks_bounded(&query, &wanted, codes.clone(), None, k)
             .unwrap()
             .into_iter()
-            .filter(|c| c.distance - c.error <= threshold)
             .map(|c| (c.row, c.cluster, c.ordinal))
             .collect();
         assert_eq!(bounded, survivors, "k = {k}");
+
+        // Scans of separate leaf groups can share an already witnessed upper bound.
+        // Merging their survivors must equal bounding the complete scan once.
+        let mut merged = Vec::new();
+        let mut cutoff = f32::INFINITY;
+        for (group, blocks) in wanted.chunks(2).zip(codes.chunks(2)) {
+            merged.extend(
+                partial
+                    .index()
+                    .scan_blocks_bounded_rotated(&rotated, group, blocks.to_vec(), None, k, cutoff)
+                    .unwrap(),
+            );
+            if merged.len() >= k {
+                let mut upper: Vec<f32> = merged.iter().map(|c| c.distance + c.error).collect();
+                upper.select_nth_unstable_by(k - 1, f32::total_cmp);
+                cutoff = upper[k - 1];
+                merged.retain(|c| c.distance - c.error <= cutoff);
+            }
+        }
+        let merged: Vec<_> = merged
+            .iter()
+            .map(|c| (c.row, c.cluster, c.ordinal))
+            .collect();
+        assert_eq!(merged, survivors, "shared cut, k = {k}");
+    }
+    for invalid in [-1., f32::NAN] {
+        assert!(
+            partial
+                .index()
+                .scan_blocks_bounded_rotated(&rotated, &wanted, codes.clone(), None, 10, invalid)
+                .is_err()
+        );
     }
 }
 

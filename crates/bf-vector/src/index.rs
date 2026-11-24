@@ -122,14 +122,6 @@ impl Ord for OrdF32 {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct StubCluster {
-    pub codes: Range<u64>,
-    pub vectors: Range<u64>,
-    pub codes_crc: u32,
-    pub vectors_crc: u32,
-}
-
 /// A parsed immutable index. Metadata and centroids stay resident; codes and
 /// vectors are fetched through the reader for each search (usually cache-backed).
 pub struct Index<R: RangeRead> {
@@ -265,23 +257,12 @@ impl<R: RangeRead> Index<R> {
     pub(crate) fn stub(
         reader: R,
         shape: &crate::directory::Shape,
-        stubs: &[StubCluster],
+        stubs: Arc<Vec<format::Cluster>>,
         reference: Arc<Vec<f32>>,
     ) -> Result<Self> {
         let rq = RaBitQ::new(shape.dims, shape.seed)?;
-        // A query builds stubs for every cluster of each slab it probes and installs only the
-        // probed ones, so a stub holds no payload at all.
-        let clusters = stubs
-            .iter()
-            .map(|s| format::Cluster {
-                data: None,
-                parent: u32::MAX,
-                codes: s.codes.clone(),
-                vectors: s.vectors.clone(),
-                codes_crc: s.codes_crc,
-                vectors_crc: s.vectors_crc,
-            })
-            .collect();
+        // The directory owns all immutable ranges; this query installs only selected payloads.
+        let clusters = format::Clusters::partial(stubs);
         let metadata = Metadata {
             dims: shape.dims,
             count: 0,
@@ -646,8 +627,8 @@ impl<R: RangeRead> Index<R> {
         validate(query, self.dims())?;
         let t_read = std::time::Instant::now();
         let blocks = self.read_coalesced(clusters).await?;
-        let read_ms = t_read.elapsed().as_millis();
-        self.scan_blocks_timed(query, clusters, blocks, filter, read_ms, None)
+        let read_us = t_read.elapsed().as_micros();
+        self.scan_blocks_timed(query, clusters, blocks, filter, read_us, None)
     }
 
     /// Read the quantized-code blocks of `clusters` (merged into few requests), in input order.
@@ -694,6 +675,9 @@ impl<R: RangeRead> Index<R> {
 
     /// [`Self::scan_blocks_bounded`] with a query from [`Self::rotate_query`] or
     /// [`crate::Directory::rotate_query`] of the same vector space.
+    /// `upper_bound` is infinity, or the k-th smallest candidate upper bound already found
+    /// in another index for the same query, metric, and k. Candidates whose lower bounds
+    /// exceed it cannot win globally.
     pub fn scan_blocks_bounded_rotated(
         &self,
         query: &RotatedQuery,
@@ -701,13 +685,24 @@ impl<R: RangeRead> Index<R> {
         blocks: Vec<Bytes>,
         filter: Option<&RoaringBitmap>,
         k: usize,
+        upper_bound: f32,
     ) -> Result<Vec<Candidate>> {
         if query.rotated.len() != self.rq.padded || query.seed != self.metadata.seed {
             return Err(Error::InvalidInput(
                 "query rotated for another index".into(),
             ));
         }
-        self.scan_rotated(query, clusters, blocks, filter, 0, (k > 0).then_some(k))
+        if upper_bound.is_nan() || upper_bound < 0. {
+            return Err(Error::InvalidInput("invalid candidate upper bound".into()));
+        }
+        self.scan_rotated(
+            query,
+            clusters,
+            blocks,
+            filter,
+            0,
+            (k > 0).then_some((k, upper_bound)),
+        )
     }
 
     fn scan_blocks_timed(
@@ -716,11 +711,18 @@ impl<R: RangeRead> Index<R> {
         clusters: &[usize],
         blocks: Vec<Bytes>,
         filter: Option<&RoaringBitmap>,
-        read_ms: u128,
+        read_us: u128,
         keep: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let q = RotatedQuery::new(&self.rq, query, self.metric());
-        self.scan_rotated(&q, clusters, blocks, filter, read_ms, keep)
+        self.scan_rotated(
+            &q,
+            clusters,
+            blocks,
+            filter,
+            read_us,
+            keep.map(|k| (k, f32::INFINITY)),
+        )
     }
 
     fn scan_rotated(
@@ -729,12 +731,13 @@ impl<R: RangeRead> Index<R> {
         clusters: &[usize],
         blocks: Vec<Bytes>,
         filter: Option<&RoaringBitmap>,
-        read_ms: u128,
-        keep: Option<usize>,
+        read_us: u128,
+        keep: Option<(usize, f32)>,
     ) -> Result<Vec<Candidate>> {
+        let (keep, upper_bound) = keep.map_or((None, f32::INFINITY), |(k, bound)| (Some(k), bound));
         // The `k` smallest upper bounds so far, as a max-heap; `cut` is its largest once full.
         let mut uppers = std::collections::BinaryHeap::<OrdF32>::new();
-        let cut = std::cell::Cell::new(f32::INFINITY);
+        let cut = std::cell::Cell::new(upper_bound);
         let q_zero = query.zero;
         let q_rot = &query.rotated;
         let t_cpu = std::time::Instant::now();
@@ -797,7 +800,7 @@ impl<R: RangeRead> Index<R> {
                         uppers.push(OrdF32(upper));
                     }
                     if uppers.len() == k {
-                        cut.set(uppers.peek().map_or(f32::INFINITY, |u| u.0));
+                        cut.set(upper_bound.min(uppers.peek().map_or(f32::INFINITY, |u| u.0)));
                     }
                 }
                 estimated.push(Candidate {
@@ -882,12 +885,26 @@ impl<R: RangeRead> Index<R> {
                 }
             }
         }
+        if let Some(k) = keep
+            && k > 0
+            && estimated.len() > k
+        {
+            // Early clusters used a looser cut. Apply this index's final bound before
+            // returning candidates to the namespace-wide merge. Its k-th upper bound
+            // cannot be smaller than the global one, so every possible winner remains.
+            // Recompute after fine rescoring, which can change both distance and error.
+            let mut upper: Vec<f32> = estimated.iter().map(|c| c.distance + c.error).collect();
+            upper.select_nth_unstable_by(k - 1, f32::total_cmp);
+            let threshold = upper_bound.min(upper[k - 1]);
+            estimated.retain(|c| c.distance - c.error <= threshold);
+        }
         if trace_stages() {
             eprintln!(
-                "SCAN clusters={} read={}ms cpu={}ms rows={}",
+                "SCAN clusters={} read={}us cpu={}us scanned={} candidates={}",
                 clusters.len(),
-                read_ms,
-                t_cpu.elapsed().as_millis(),
+                read_us,
+                t_cpu.elapsed().as_micros(),
+                rows,
                 estimated.len()
             );
         }
@@ -1137,7 +1154,7 @@ impl<R: RangeRead> Index<R> {
         let nranges = ranges.len();
         let rbytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         let blocks = self.read_vectors(ranges).await?;
-        let read_ms = t_read.elapsed().as_millis();
+        let read_us = t_read.elapsed().as_micros();
         let t_cpu = std::time::Instant::now();
         let mut result = Vec::with_capacity(locations.len());
         let mut decoded = Vec::with_capacity(self.dims());
@@ -1180,12 +1197,12 @@ impl<R: RangeRead> Index<R> {
         }
         if trace_stages() {
             eprintln!(
-                "RERANK locations={} ranges={} bytes={} read={}ms cpu={}ms",
+                "RERANK locations={} ranges={} bytes={} read={}us cpu={}us",
                 locations.len(),
                 nranges,
                 rbytes,
-                read_ms,
-                t_cpu.elapsed().as_millis()
+                read_us,
+                t_cpu.elapsed().as_micros()
             );
         }
         sort_truncate(&mut result, k);
