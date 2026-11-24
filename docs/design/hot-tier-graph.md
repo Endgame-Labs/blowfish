@@ -139,10 +139,10 @@ CPU-to-I/O continuation. Each graph recall trial also runs the ordinary IVF plan
 request and snapshot, with the same admission, worker, and query concurrency. These paired CPU
 observations refine the pre-promotion IVF EWMA. Exhaustive scans can displace CPU caches even
 when they bypass application cache admission. Warm cost therefore comes from bounded blocks of
-eight recent sampled requests on one immutable snapshot and trial effort: graph plans run together,
+up to eight recent sampled requests on one immutable snapshot and trial effort: graph plans run together,
 then IVF plans run together, without exhaustive scans between those timed plans. The first cold
 query remains included in the average; there is no excluded identical-query warmup. Exact recall
-observations keep their original truth comparison. A per-graph queue retains at most 64 KiB of
+observations keep their original truth comparison. A per-graph queue retains at most 256 KiB of
 serialized requests under the metadata reservation, resets across snapshot or effort changes, and
 never retains truth responses or snapshots. Promotion requires a positive measured cost block;
 queries remain on IVF if a block cannot be collected. Only exhaustive truth work is throttled to one

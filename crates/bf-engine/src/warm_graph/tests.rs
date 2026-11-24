@@ -18,6 +18,20 @@ async fn query(e: &Engine, ns: &str, body: Value) -> Value {
     .unwrap()["rows"]
         .clone()
 }
+fn same_rows(left: Value, right: Value) {
+    assert_eq!(left, right);
+    for (a, b) in left
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(right.as_array().unwrap())
+    {
+        assert_eq!(
+            a["$dist"].as_f64().map(f64::to_bits),
+            b["$dist"].as_f64().map(f64::to_bits)
+        );
+    }
+}
 // Other unit tests create engines with large nominal cache budgets in this process. A real
 // optional graph may refuse that pressure. Wait for admission rather than assuming exclusivity.
 async fn admitted_entry(e: &Engine, set: &SlabSet) -> Entry {
@@ -171,13 +185,14 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     for body in [
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":100}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":1,"offset":30}),
         json!({"rank_by":["vector","ANN",vec![0.;16]],"top_k":10}),
         json!({"rank_by":["vector","kNN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
     ] {
         let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
-        assert_eq!(
+        same_rows(
             query(&e, "hot", body.clone()).await,
-            query(&control, "hot", body).await
+            query(&control, "hot", body).await,
         );
         assert_eq!(e.0.hot_graph.answers.load(Ordering::Relaxed), before);
     }
@@ -310,9 +325,9 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     .unwrap();
     e.index_namespace("hot", true).await.unwrap();
     control.drop_caches().await;
-    assert_eq!(
+    same_rows(
         query(&e, "hot", request(531)).await,
-        query(&control, "hot", request(531)).await
+        query(&control, "hot", request(531)).await,
     );
     assert!(
         e.0.hot_graph
@@ -557,4 +572,69 @@ fn background_workers_yield_to_normal_serving_threads() {
         policies.into_iter().all(|(nice, policy)| nice == 19
             && (policy == libc::SCHED_IDLE || policy == libc::SCHED_OTHER))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_metric_and_precision_keep_identical_ivf_answers() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.scratch")
+        .join(format!("g4-unsupported-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    for (metric, precision) in [("euclidean_squared", "f16"), ("cosine_distance", "f32")] {
+        let store = Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let config = EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.,
+            decoded_cache_bytes: 32 << 20,
+            ..Default::default()
+        };
+        let engine = Engine::with_config(store.clone(), config.clone());
+        let control = Engine::with_config(store, config);
+        let vectors = (0..200)
+            .map(|i| vec![1., i as f32 / 200., (i % 7) as f32 / 7., -0.5])
+            .collect::<Vec<_>>();
+        engine.write("hot", serde_json::from_value(json!({"distance_metric":metric,"schema":{"vector":{"type":format!("[4]{precision}"),"ann":true}},"upsert_rows":vectors.iter().enumerate().map(|(i,v)| json!({"id":i,"vector":v})).collect::<Vec<_>>()})).unwrap()).await.unwrap();
+        engine.index_namespace("hot", true).await.unwrap();
+        engine
+            .recluster(
+                "hot",
+                &ReclusterOptions {
+                    attribute: "vector".into(),
+                    cells: 2,
+                    cluster_rows: 16,
+                    max_slab_rows: 1000,
+                    scratch: root.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let (state, _) = engine
+            .snapshot("hot", &bf_types::Consistency::Strong)
+            .await
+            .unwrap();
+        let set = &state.ann_tiers["vector"][0];
+        assert!(
+            engine
+                .construct_hot_graph("hot", "vector", set, &HotCancellation::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for i in [0, 17, 113] {
+            let request = json!({"rank_by":["vector","ANN",vectors[i]],"top_k":10,"include_attributes":false});
+            same_rows(
+                query(&engine, "hot", request.clone()).await,
+                query(&control, "hot", request).await,
+            );
+        }
+        assert_eq!(engine.0.hot_graph.answers.load(Ordering::Relaxed), 0);
+        assert!(engine.shutdown(Duration::from_secs(5)).await);
+        assert!(control.shutdown(Duration::from_secs(5)).await);
+    }
 }
