@@ -184,6 +184,9 @@ segments, at the same bytes.
 
 ### D4 after round AR3: what is left
 
+Status (2026-11-24): the reader migration, fenced retirement, and crash tests are implemented below.
+NQ measurements and their limits are recorded in the Round D4 section of `docs/benchmarks.md`.
+
 Round AR3 built R4's lineage: compaction now merges covered segments and records where their rows went. It did
 not retire the covered segments' ANN objects. On NQ (2.68M rows, 1,024 dims in f16, everything covered by a base),
 those objects total 6.0 GB, about 2,240 bytes per covered row, in line with the estimate above. Retiring them
@@ -255,9 +258,13 @@ Snapshot warm-up and the planner share bounded cached predicate results for each
 segment live generation. The key includes its files, schema, and predicate; WAL shadows are
 removed afterward. This avoids repeatedly decoding high-cardinality ID-filter dictionaries,
 without reusing a mask across a flush, schema change, or compaction.
-Predicate bitmaps receive one forty-eighth of the existing decoded-cache budget, taken from
-the column-block portion. This keeps large ID dictionaries from evicting their own predicate
-results, and preserves the general LRU budget reserved by compiled warm tiers.
+Predicate bitmaps and decoded column blocks share one twelfth of the existing decoded-cache
+budget. Predicates protect up to one forty-eighth of the total, while columns borrow every byte
+not actually occupied by predicates. Predicate replacement or eviction immediately returns those
+bytes. Both classes use a byte-bounded CLOCK pool, with value destructors outside its lock; hot
+ANN cluster caches keep their existing independent shards. This avoids a fixed reservation
+refusing an ID column that otherwise fits whole, keeps large dictionaries from evicting their
+own predicate results, and preserves the general LRU budget reserved by compiled warm tiers.
 
 Branches and copies use version-2 pins containing covering tiers and vector lineage, as well as
 segments. GC protects every pinned slab, directory, row list, coarse-cell object, and lineage map.
