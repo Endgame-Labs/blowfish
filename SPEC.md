@@ -99,9 +99,14 @@ log entry in the same commit.
   half of it, or once deletes and updates mask a fifth of the tiers' rows. The base probes as it would alone, the
   delta `sqrt(its share)` of what it would alone, and the two share one rerank bound and one hydration. The bulk-load guard is kept
   in the manifest (`bulk_load_at`), and build records are deleted once their tier is installed or dropped.
-- **No row-level graph indexes** (HNSW, DiskANN, and similar over rows). The peak-jumping research ruled them out for a
-  cold, object-storage-first engine: their random hops each cost an object-store round trip. A graph over leaf centers,
-  held with the paged directory, is allowed (decision 26; `docs/design/graph-index.md`).
+- **No persisted row-level graph indexes** (HNSW, DiskANN, and similar over rows in the bucket). The peak-jumping research
+  ruled them out for a cold, object-storage-first engine: their random hops each cost an object-store round trip. A graph
+  over leaf centers, held with the paged directory, is allowed (decision 26; `docs/design/graph-index.md`).
+- **Automatic warm graphs** (round G4, decision 29): for hot, immutable cosine-f16 tiers, the engine builds an SQ8 Vamana
+  graph over rows in RAM, at idle priority, when measured heat pays for it, and serves unfiltered ANN from it only after
+  paired recall checks against IVF pick a serving effort. It is never written to the bucket and never causes an object
+  read during traversal; restart, eviction, or refusal falls back to IVF. There is no setting
+  (`docs/design/hot-tier-graph.md`).
 - **BM25** (round 13): window-pruned posting reads (exact, not approximate), the term record stored before its
   blocks (text segment format v4), and text headers in the manifest. Result quality is checked as overlap@10 against
   exact BM25 (k1 1.2, b 0.75).
@@ -265,3 +270,7 @@ S3 until the run is cleaned up.
 28. 2026-11-24: Stage each recluster tier's routing directory and codes on local disk automatically when a disk cache is
     configured (round C4): 10M cold p50 325 to 220 ms and 100M 715 to 400 ms at identical results, warm NQ +4-5%. Kyle
     gave release authority (2026-11-23) and asked that each changelog-worthy change ship as a release (2026-11-24).
+29. 2026-11-24: Allow RAM-only row graphs for warm tiers (round G4), under decision 27's mandate to change the design to
+    beat Qdrant. The bucket's IVF tiers stay authoritative; graphs are disposable accelerators built and promoted
+    automatically. On the M4 at matched recall, blowfish's self-built graph reached 8,133 vs. Qdrant's 8,183 q/s
+    (0.9575) and 8,558 vs. 8,907 q/s (0.9516), 2.4 to 2.8 times blowfish's IVF throughput, with 22% less memory.

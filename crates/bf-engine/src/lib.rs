@@ -361,6 +361,7 @@ struct Inner {
     read_cache: Arc<read_cache::DecodedCache>,
     queries: Arc<tokio::sync::Semaphore>,
     recall_sampler: Arc<RecallSampler>,
+    hot_graph: Arc<warm_graph::Cache>,
     config: EngineConfig,
     owner: uuid::Uuid,
     namespaces: Published<HashMap<String, Arc<Handle>>>,
@@ -492,6 +493,11 @@ impl Engine {
             ),
             queries: Arc::new(tokio::sync::Semaphore::new(config.query_concurrency.max(1))),
             recall_sampler: Arc::new(RecallSampler::new(config.recall_sample_interval)),
+            hot_graph: Arc::new(warm_graph::Cache::new(
+                config
+                    .decoded_cache_bytes
+                    .saturating_add(store.cache_limits().0),
+            )),
             store,
             config,
             owner: uuid::Uuid::new_v4(),
@@ -501,12 +507,14 @@ impl Engine {
         }));
         bf_alloc::adaptive_decay();
         auto_recluster::sweep_spills(&engine);
+        warm_graph::start(&engine);
         indexer::start(&engine);
         engine
     }
     /// Drop query caches and resident namespace state, retaining provisioned immutable ANN
     /// files. The next query has cold query caches on a provisioned node. For benchmarks only.
     pub async fn drop_caches(&self) {
+        self.0.hot_graph.clear();
         self.0.read_cache.clear();
         self.0.store.drop_caches();
         self.0.namespaces.lock().await.clear();
@@ -521,17 +529,20 @@ impl Engine {
             read_cache: Arc::new(self.0.read_cache.scoped(sub)),
             queries: self.0.queries.clone(),
             recall_sampler: self.0.recall_sampler.clone(),
+            hot_graph: Arc::new(self.0.hot_graph.scoped()),
             config: self.0.config.clone(),
             owner: uuid::Uuid::new_v4(),
             namespaces: Published::new(HashMap::new()),
             jobs: Default::default(),
             stop: self.0.stop.clone(),
         }));
+        warm_graph::start(&engine);
         indexer::start(&engine);
         engine
     }
     /// Signal this engine's background work to stop, without waiting (see [`Engine::shutdown`]).
     pub fn begin_shutdown(&self) {
+        self.0.hot_graph.clear();
         self.0.stop.begin();
     }
     /// Stop this engine's background work, and its scoped engines': indexing, compaction, GC,
@@ -676,6 +687,7 @@ impl Engine {
             .await?;
         }
         if !state.exists {
+            self.0.hot_graph.delete(ns);
             if cap.is_some()
                 && Wal::new(self.0.store.clone(), ns)
                     .map_err(log_error)?
@@ -878,8 +890,11 @@ impl Engine {
         let context = read_cache::ReadContext {
             stats: stats.clone(),
             backend: backend.clone(),
+            hot_graph: Some(warm_graph::Scope::new(self.0.hot_graph.clone(), ns)),
             ..read_cache::ReadContext::new(self.0.read_cache.clone())
         };
+        let graph_scope = context.hot_graph.clone();
+        let cpu_nanos = context.cpu_nanos.clone();
         let ann_rows = context.ann_rows.clone();
         let local_ann_bytes = context.local_ann_bytes.clone();
         let document_scan_rows = context.document_scan_rows.clone();
@@ -937,6 +952,16 @@ impl Engine {
                     .await?;
                 (state, response, execution, elapsed)
             };
+        if let Some(scope) = &graph_scope {
+            scope.record_cpu(cpu_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
+        }
+        warm_graph::Cache::observe(
+            self,
+            ns,
+            &state,
+            &request,
+            cpu_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        );
         if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
             && self.0.config.recall_sample_rate > 0.0
             && (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1_000_000.0
@@ -950,10 +975,11 @@ impl Engine {
             // The exhaustive search reads every vector: one segment at a time, so it holds one
             // core rather than all of them, and without filling the block caches, so it does not
             // evict what live queries reuse.
-            let mut config = self.0.config.clone();
-            config.search_concurrency = 1;
+            let config = self.0.config.clone();
+            let mut exact_config = config.clone();
+            exact_config.search_concurrency = 1;
             let sample = state.clone();
-            let ann = response.clone();
+            let trial = graph_scope.map(|s| s.trial());
             let cache = self.0.read_cache.clone();
             let queries = self.0.queries.clone();
             let stop = self.0.stop.clone();
@@ -963,19 +989,54 @@ impl Engine {
                 };
                 let runtime = tokio::runtime::Handle::current();
                 let context = read_cache::ReadContext {
-                    admit: false,
+                    hot_graph: trial.clone(),
                     ..read_cache::ReadContext::new(cache)
                 };
                 let _ = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     let _sampling = sampling;
+                    let exact_context = context.exhaustive();
+                    let ivf_context = context.ivf_reference();
                     runtime.block_on(read_cache::scope(context, async move {
-                        if let Some(Ok(exact)) = stop
-                            .run(indexed::execute(&store, &sample, &request, &config, true))
-                            .await
-                        {
-                            metrics::histogram!("blowfish_ann_recall")
-                                .record(indexed::recall(&ann, &exact));
+                        let ann = warm_graph::trial_plan(
+                            &store,
+                            &sample,
+                            &request,
+                            &config,
+                            read_cache::context().expect("sample read context"),
+                        )
+                        .await;
+                        let ann = ann.map(|(ann, _)| ann);
+                        let ivf = if ann.is_ok() && trial.as_ref().is_some_and(|s| s.used_graph()) {
+                            warm_graph::trial_plan(&store, &sample, &request, &config, ivf_context)
+                                .await
+                                .ok()
+                                .map(|(answer, _)| answer)
+                        } else {
+                            None
+                        };
+                        if let (Some(Ok(exact)), Ok(ann)) = (
+                            stop.run(read_cache::scope(
+                                exact_context,
+                                indexed::execute(&store, &sample, &request, &exact_config, true),
+                            ))
+                            .await,
+                            ann,
+                        ) {
+                            let recall = indexed::recall(&ann, &exact);
+                            if let (Some(scope), Some(ivf)) = (trial, ivf) {
+                                warm_graph::cost::measure(
+                                    &scope,
+                                    &store,
+                                    &sample,
+                                    &request,
+                                    &config,
+                                    read_cache::context().expect("sample read context"),
+                                )
+                                .await;
+                                scope.feedback(recall, indexed::recall(&ivf, &exact));
+                            }
+                            metrics::histogram!("blowfish_ann_recall").record(recall);
                         }
                     }));
                 })
@@ -1048,9 +1109,12 @@ impl Engine {
         let query = Box::pin(async move {
             let _permit = permit;
             let _in_flight = InFlight::enter();
-            read_cache::scope(
-                context,
-                indexed::execute(&store, &state, &request, &config, false),
+            warm_graph::measure_cpu(
+                context.cpu_nanos.clone(),
+                read_cache::scope(
+                    context,
+                    indexed::execute(&store, &state, &request, &config, false),
+                ),
             )
             .await
         });
@@ -1123,6 +1187,7 @@ impl Engine {
             .commits
             .submit(Operation::Delete(handle.backpressure.begin()))
             .await??;
+        self.0.hot_graph.delete(ns);
         Ok(())
     }
     /// Sorted, consistent namespace listing, using opaque base64 cursors.
@@ -1195,7 +1260,10 @@ impl Engine {
     pub async fn recall(&self, ns: &str, request: Value) -> Result<Value, ApiError> {
         let engine = self.clone();
         let ns = ns.to_owned();
-        let context = read_cache::ReadContext::new(self.0.read_cache.clone());
+        let context = read_cache::ReadContext {
+            hot_graph: Some(warm_graph::Scope::new(self.0.hot_graph.clone(), &ns).trial()),
+            ..read_cache::ReadContext::new(self.0.read_cache.clone())
+        };
         let permit = self
             .0
             .queries
@@ -1937,6 +2005,7 @@ mod recall_sampler_tests {
 
 #[cfg(test)]
 mod text_benchmark;
+mod warm_graph;
 
 #[cfg(test)]
 mod filtered_recall_tests;

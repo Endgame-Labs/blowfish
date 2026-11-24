@@ -1031,11 +1031,54 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
         if !matches!(rank, RankBy::Vector { .. }) {
             return Err(ApiError::bad("recall requires vector ranking"));
         }
-        let ann =
-            crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, false).await?;
-        let exact =
-            crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, true).await?;
-        recall_sum += crate::indexed::recall(&ann, &exact);
+        let context = crate::read_cache::context().expect("recall read context");
+        let scope = context.hot_graph.clone();
+        let (ann, _) = crate::warm_graph::trial_plan(
+            engine.storage(),
+            &state,
+            &q,
+            &engine.0.config,
+            context.clone(),
+        )
+        .await?;
+        let ivf = if scope.is_some_and(|s| s.used_graph()) {
+            crate::warm_graph::trial_plan(
+                engine.storage(),
+                &state,
+                &q,
+                &engine.0.config,
+                context.ivf_reference(),
+            )
+            .await
+            .ok()
+            .map(|(answer, _)| answer)
+        } else {
+            None
+        };
+        let exact_context = crate::read_cache::context()
+            .unwrap_or_else(|| crate::read_cache::ReadContext::new(engine.0.read_cache.clone()))
+            .exhaustive();
+        let exact = crate::read_cache::scope(
+            exact_context,
+            crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, true),
+        )
+        .await?;
+        let measured = crate::indexed::recall(&ann, &exact);
+        if let (Some(scope), Some(ivf)) =
+            (crate::read_cache::context().and_then(|c| c.hot_graph), ivf)
+        {
+            crate::warm_graph::cost::measure(
+                &scope,
+                engine.storage(),
+                &state,
+                &q,
+                &engine.0.config,
+                crate::read_cache::context().expect("recall read context"),
+            )
+            .await;
+            scope.feedback(measured, crate::indexed::recall(&ivf, &exact));
+        }
+        recall_sum += measured;
         ann_count += ann.result.rows.as_ref().map_or(0, Vec::len);
         let rows = exact.result.rows.expect("rank rows");
         count += rows.len();

@@ -10,6 +10,8 @@ repository.workspace = true
 legacy-fixtures = []
 
 [dependencies]
+parking_lot = "=0.12.5"
+libc = "=0.2.191"
 bytes = "=1.12.1"
 crc32fast = "=1.5.5"
 futures = "=0.3.34"
@@ -22,5 +24,6 @@ thiserror = "=2.0.21"
 
 [dev-dependencies]
 bf-vector = { path = ".", features = ["legacy-fixtures"] }
+hnsw_rs = "=0.3.5"
 proptest = "=1.12.0"
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread"] }

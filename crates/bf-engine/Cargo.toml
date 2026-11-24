@@ -41,6 +41,7 @@ tracing = "0.1.44"
 uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
+numkong = "=7.8.7"
 bf-text = { path = "../bf-text", features = ["legacy-fixtures"] }
 bf-vector = { path = "../bf-vector", features = ["legacy-fixtures"] }
 axum = "0.8.9"

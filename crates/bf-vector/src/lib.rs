@@ -61,3 +61,6 @@ pub enum Error {
 
 /// Result type used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Bounded-memory construction and navigation for disposable warm-tier graphs.
+pub mod warm_graph;

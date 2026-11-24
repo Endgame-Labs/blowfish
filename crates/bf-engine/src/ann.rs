@@ -224,131 +224,178 @@ pub(crate) fn tiers_usable(
         .all(|t| crate::lineage::reachable(segments, lineage, t))
 }
 
+type TierResult = Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError>;
+
 /// Unfiltered ANN over a recluster's tiers and the segments no tier covers, as one plan: each
 /// tier's slabs and the uncovered segments (through the namespace directory, with the covered
 /// segments left out of its probe plan) are searched at the same time, and their exactly
 /// reranked winners merged. `None` when some part cannot answer, so the caller falls back.
 #[allow(clippy::too_many_arguments)]
-async fn from_tiers(
-    store: &Storage,
-    state: &NamespaceState,
-    q: &QueryRequest,
-    attribute: &str,
-    vector: &[f32],
-    config: &EngineConfig,
+fn from_tiers<'a>(
+    store: &'a Storage,
+    state: &'a NamespaceState,
+    q: &'a QueryRequest,
+    attribute: &'a str,
+    vector: &'a [f32],
+    config: &'a EngineConfig,
     k: usize,
-    columns: &BTreeSet<String>,
-    tiers: &[bf_wal::SlabSet],
-) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    let mut covered = vec![false; state.segments.len()];
-    let mut positions = Vec::with_capacity(tiers.len());
-    for set in tiers {
-        let Some(at) = crate::lineage::place(store, &state.segments, &state.lineage, set).await?
-        else {
-            return Ok(None);
-        };
-        for i in at.positions() {
-            covered[i] = true;
+    columns: &'a BTreeSet<String>,
+    tiers: &'a [bf_wal::SlabSet],
+) -> futures::future::BoxFuture<'a, TierResult> {
+    // Keep the entire tier plan off caller stacks, including its graph-to-IVF retry.
+    async move {
+        let mut covered = vec![false; state.segments.len()];
+        let mut positions = Vec::with_capacity(tiers.len());
+        for set in tiers {
+            let Some(at) =
+                crate::lineage::place(store, &state.segments, &state.lineage, set).await?
+            else {
+                return Ok(None);
+            };
+            for i in at.positions() {
+                covered[i] = true;
+            }
+            positions.push(at);
         }
-        positions.push(at);
-    }
-    let uncovered = covered.iter().any(|c| !c);
-    // A base and its delta rank their leaves as one list.
-    let seats = if tiers.len() > 1 {
-        crate::ann_dir::Joint::seats(tiers.len())
-            .into_iter()
-            .map(Some)
-            .collect()
-    } else {
-        vec![None]
-    };
-    let parts = tiers
-        .iter()
-        .zip(&positions)
-        .zip(seats)
-        .map(|((set, at), seat)| {
+        let uncovered = covered.iter().any(|c| !c);
+        // A base and its delta rank their leaves as one list.
+        let graph_k = if state.shadowed.is_empty() {
+            k
+        } else {
+            k + (2 * k).max(20)
+        };
+        let mut graph_tiers = Vec::with_capacity(tiers.len());
+        for (set, at) in tiers.iter().zip(&positions) {
+            let enabled = if crate::warm_graph::available(state, attribute, set, vector, graph_k) {
+                let mask = tier_mask(store, state, set, at).await?;
+                crate::warm_graph::mask_eligible(state, attribute, set, mask.as_ref(), graph_k)
+            } else {
+                false
+            };
+            graph_tiers.push(enabled);
+        }
+        let accelerated = graph_tiers.iter().any(|enabled| *enabled);
+        let declined = std::sync::atomic::AtomicBool::new(false);
+        // Graph tiers and IVF tiers contribute independent top-k candidates. Unsupported graph
+        // shapes retain the ordinary joint IVF scan, including its candidate bounds.
+        let seats = if tiers.len() > 1 && !accelerated {
+            crate::ann_dir::Joint::seats(tiers.len())
+                .into_iter()
+                .map(Some)
+                .collect()
+        } else {
+            (0..tiers.len()).map(|_| None).collect::<Vec<_>>()
+        };
+        let parts = tiers
+            .iter()
+            .zip(&positions)
+            .zip(seats)
+            .zip(graph_tiers)
+            .map(|(((set, at), seat), expected)| {
+                let declined = &declined;
+                async move {
+                    from_slabs(
+                        store,
+                        state,
+                        attribute,
+                        vector,
+                        config,
+                        k,
+                        columns,
+                        set,
+                        at,
+                        None,
+                        seat.as_ref(),
+                        expected,
+                        declined,
+                    )
+                    .await
+                }
+                .boxed()
+            });
+        // Segments with no ANN object at all leave the whole query to the document scan.
+        if uncovered
+            && state
+                .segments
+                .iter()
+                .any(|s| crate::upgrade::files(s, attribute).is_none())
+        {
+            return Ok(None);
+        }
+        let rest = uncovered.then(|| {
+            let covered = &covered;
             async move {
-                from_slabs(
+                let file =
+                    crate::upgrade::directory_file(&state.ann_dirs, attribute).map(|(f, _)| f);
+                from_directory(
                     store,
                     state,
+                    q,
                     attribute,
                     vector,
                     config,
                     k,
                     columns,
-                    set,
-                    at,
-                    None,
-                    seat.as_ref(),
+                    file,
+                    Layout::Segments,
+                    covered,
                 )
                 .await
             }
             .boxed()
         });
-    // Segments with no ANN object at all leave the whole query to the document scan.
-    if uncovered
-        && state
-            .segments
-            .iter()
-            .any(|s| crate::upgrade::files(s, attribute).is_none())
-    {
-        return Ok(None);
-    }
-    let rest = uncovered.then(|| {
-        let covered = &covered;
-        async move {
-            let file = crate::upgrade::directory_file(&state.ann_dirs, attribute).map(|(f, _)| f);
-            from_directory(
-                store,
-                state,
-                q,
-                attribute,
-                vector,
-                config,
-                k,
-                columns,
-                file,
-                Layout::Segments,
-                covered,
-            )
-            .await
-        }
-        .boxed()
-    });
-    let found = futures::future::try_join_all(parts.chain(rest)).await?;
-    if crate::ann::trace_stages() {
-        eprintln!(
-            "TIERS tiers={} uncovered_segments={}",
-            tiers.len(),
-            covered.iter().filter(|c| !**c).count()
-        );
-    }
-    let mut ranked: Vec<(f64, Id, Document)> = Vec::new();
-    for part in found {
-        let Some((scores, mut docs)) = part else {
-            return Ok(None);
-        };
-        for (id, score) in scores {
-            if let Some(doc) = docs.remove(&id) {
-                ranked.push((score, id, doc));
+        let found = futures::future::try_join_all(parts.chain(rest)).await?;
+        if declined.load(std::sync::atomic::Ordering::Relaxed) {
+            // Admission, masks, or source availability can change after planning. Restore the
+            // complete joint IVF plan, including its shared probe bounds, for this query.
+            if let Some(mut context) = crate::read_cache::context() {
+                if let Some(scope) = context.hot_graph.take() {
+                    scope.abandon();
+                }
+                return crate::read_cache::scope(
+                    context,
+                    Box::pin(from_tiers(
+                        store, state, q, attribute, vector, config, k, columns, tiers,
+                    )),
+                )
+                .await;
             }
         }
-    }
-    #[cfg(test)]
-    TIER_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let mut scores = BTreeMap::new();
-    let mut docs = BTreeMap::new();
-    for (score, id, doc) in ranked {
-        if scores.len() == k {
-            break;
+        if crate::ann::trace_stages() {
+            eprintln!(
+                "TIERS tiers={} uncovered_segments={}",
+                tiers.len(),
+                covered.iter().filter(|c| !**c).count()
+            );
         }
-        if let std::collections::btree_map::Entry::Vacant(e) = scores.entry(id.clone()) {
-            e.insert(score);
-            docs.insert(id, doc);
+        let mut ranked: Vec<(f64, Id, Document)> = Vec::new();
+        for part in found {
+            let Some((scores, mut docs)) = part else {
+                return Ok(None);
+            };
+            for (id, score) in scores {
+                if let Some(doc) = docs.remove(&id) {
+                    ranked.push((score, id, doc));
+                }
+            }
         }
+        #[cfg(test)]
+        TIER_ANSWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut scores = BTreeMap::new();
+        let mut docs = BTreeMap::new();
+        for (score, id, doc) in ranked {
+            if scores.len() == k {
+                break;
+            }
+            if let std::collections::btree_map::Entry::Vacant(e) = scores.entry(id.clone()) {
+                e.insert(score);
+                docs.insert(id, doc);
+            }
+        }
+        Ok(Some((scores, docs)))
     }
-    Ok(Some((scores, docs)))
+    .boxed()
 }
 
 /// Live-row masks of recluster tiers whose covered segments changed since the build, by tier
@@ -477,54 +524,72 @@ async fn from_slabs(
     at: &crate::lineage::Placement,
     prefetched: Option<&crate::ann_dir::Prefetched>,
     seat: Option<&crate::ann_dir::Seat>,
+    graph_expected: bool,
+    declined: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    let Ok((dir, _)) =
-        crate::ann_dir::slab_directory(store, set, prefetched, vector, config, attribute).await
-    else {
-        return Ok(None);
-    };
-    let mut view = state.without_docs();
-    view.segments = set.slabs.clone().into();
-    if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
-        return Ok(None);
-    }
     let mask = tier_mask(store, state, set, at).await?;
-    if crate::ann::trace_stages() {
-        eprintln!(
-            "SLABS slabs={} masked={}",
-            view.segments.len(),
-            mask.is_some()
-        );
-    }
-    let warm = if mask.is_none() && seat.is_none() {
-        crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone())
-    } else {
-        None
-    };
-    let lives = vec![mask; view.segments.len()];
     let slack = if state.shadowed.is_empty() {
         0
     } else {
         (2 * k).max(20)
     };
-    let (mut scores, mut docs) = crate::ann_dir::search(
+    let accelerated = crate::warm_graph::search(
         store,
-        &view,
-        dir,
-        lives,
+        state,
+        attribute,
+        set,
+        at,
         vector,
-        config,
+        mask.clone(),
         k + slack,
         columns,
-        attribute,
-        None,
-        Layout::Slabs,
-        Some((state, &set.covered, at)),
-        &[],
-        seat,
-        warm,
     )
     .await?;
+    if graph_expected && accelerated.is_none() {
+        declined.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(None);
+    }
+    let (mut scores, mut docs) = match accelerated {
+        Some(found) => found,
+        None => {
+            let Ok((dir, _)) =
+                crate::ann_dir::slab_directory(store, set, prefetched, vector, config, attribute)
+                    .await
+            else {
+                return Ok(None);
+            };
+            let mut view = state.without_docs();
+            view.segments = set.slabs.clone().into();
+            if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
+                return Ok(None);
+            }
+            let warm_eligible = mask.is_none() && seat.is_none();
+            let lives = vec![mask; view.segments.len()];
+
+            let warm = warm_eligible
+                .then(|| crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone()))
+                .flatten();
+            crate::ann_dir::search(
+                store,
+                &view,
+                dir,
+                lives,
+                vector,
+                config,
+                k + slack,
+                columns,
+                attribute,
+                None,
+                Layout::Slabs,
+                Some((state, &set.covered, at)),
+                &[],
+                seat,
+                warm,
+            )
+            .await?
+        }
+    };
+
     if slack > 0 {
         let pooled = scores.len();
         scores.retain(|id, _| !state.shadowed.contains(id));

@@ -446,6 +446,8 @@ impl DecodedCache {
 #[derive(Clone)]
 pub(crate) struct ReadContext {
     pub cache: Arc<DecodedCache>,
+    pub(crate) hot_graph: Option<crate::warm_graph::Scope>,
+    pub(crate) cpu_nanos: Arc<std::sync::atomic::AtomicU64>,
     pub stats: Arc<CacheStats>,
     pub backend: Arc<bf_storage::BackendStats>,
     /// Whether segment reads in this context admit what they fetch into the block caches.
@@ -461,10 +463,28 @@ pub(crate) struct ReadContext {
     pub text_shadowed: Option<Arc<std::collections::BTreeMap<String, roaring::RoaringBitmap>>>,
 }
 impl ReadContext {
+    /// Exhaustive reference work reads through existing caches without admitting its scan.
+    /// It cannot select an approximate graph or contribute graph CPU measurements.
+    pub(crate) fn exhaustive(&self) -> Self {
+        Self {
+            admit: false,
+            hot_graph: None,
+            ..self.clone()
+        }
+    }
+    /// A normal ANN cost reference with the optional graph disabled, on the same snapshot.
+    pub(crate) fn ivf_reference(&self) -> Self {
+        Self {
+            hot_graph: None,
+            ..self.clone()
+        }
+    }
     /// A context with fresh statistics that admits its reads.
     pub fn new(cache: Arc<DecodedCache>) -> Self {
         Self {
             cache,
+            hot_graph: None,
+            cpu_nanos: Arc::default(),
             stats: Arc::default(),
             backend: Arc::default(),
             admit: true,
