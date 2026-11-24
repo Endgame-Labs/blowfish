@@ -400,3 +400,29 @@ A hot compiled ANN tier retains every validated exact vector when its full code,
 metadata, and vector reservation fits the decoded-cache budget. Larger tiers keep
 a bounded sparse vector cache. Admission only retains rows already read by normal
 queries; it never fetches the full tier eagerly.
+
+## Exact leaf assignment
+
+Large reclusters on CPUs with native ARM BF16 matrix instructions batch leaf scoring by candidate
+leaf group. The original four-row blocks, near-cell unions, group selection, and leaf-ID tie rules
+are retained. Each group is packed once, and up to 2,048 rows share its matrix work. The immutable
+coarse centers let both passes reuse each row's four nearest cells, stored in four bytes per row
+when there are at most 256 cells. Larger explicit cell layouts keep full-width routing.
+
+BF16 is only a temporary scoring representation. For original row `r` and center `c`, conversion
+errors with L2 norms `er` and `ec` change their dot product by at most
+`er * norm(c) + ec * norm(r) + er * ec`. The scorer adds conservative FP32 accumulation and distance
+arithmetic bounds. A candidate survives whenever its score interval could contain the original
+winner. Every survivor is recomputed with the original four-row FP32 dot kernel, original norm
+expression, and lowest-leaf-ID tie rule. Nonfinite scores and unsafe scales retain every candidate.
+Thus neither reduced precision nor matrix accumulation order can change the chosen leaf.
+
+The matrix path is selected automatically for at least 1,024 centers and 128 dimensions on native
+ARM BF16 hardware. Other processors and smaller layouts retain the direct kernel. Training,
+refinement sums, stored centers, query execution, and the persistent format use their existing
+representations. There is no new server setting.
+
+Ignored `recluster::experiment` tests capture a real engine spill, replay both passes, write every
+row's assignment, and compare complete centers and slab jobs. The same harness can prepare a
+flat f16 corpus for larger assignment-only checks. All experiment inputs and outputs must live
+beneath `.scratch/`; the `RR4_*` controls are compiled only into tests.

@@ -866,6 +866,39 @@ fn assign_leaves(
     let by_distance = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
     #[cfg(test)]
     let mut drift = experiment::Drift::new(present.len(), &leaves);
+    // Native BF16 matrix throughput amortizes packing for large center tables. Other CPUs
+    // and small layouts retain the existing four-row kernel.
+    let native = bf_vector::bf16_matrix_accelerated()
+        && leaves.len() >= 1024
+        && leaves.first().is_some_and(|l| l.len() >= 128);
+    #[cfg(test)]
+    let experiment = std::env::var_os("RR4_INPUT").is_some();
+    #[cfg(test)]
+    let batched = if experiment {
+        std::env::var_os("RR4_BATCHED").is_some()
+    } else {
+        native
+    };
+    #[cfg(not(test))]
+    let batched = native;
+    // Coarse centers never move during leaf refinement. Cache their four nearest IDs, with
+    // four bytes per row for the ordinary 32-cell layout. Larger explicit layouts retain
+    // the uncached path, so no index is narrowed to a byte.
+    let near_cells_cache = std::sync::OnceLock::<Vec<[u8; NEAR_CELLS]>>::new();
+    #[cfg(test)]
+    let cache_neighbors = batched
+        && coarse.len() <= 256
+        && (!experiment || std::env::var_os("RR4_CACHE_CELLS").is_some());
+    #[cfg(not(test))]
+    let cache_neighbors = batched && coarse.len() <= 256;
+    #[cfg(test)]
+    let batch_rows = std::env::var("RR4_BATCH_ROWS")
+        .ok()
+        .map(|s| s.parse::<usize>().unwrap())
+        .unwrap_or(2048);
+    #[cfg(not(test))]
+    let batch_rows: usize = 2048;
+    assert!(batch_rows > 0 && batch_rows.is_multiple_of(ASSIGN_BLOCK));
     let assign = |leaves: &[Vec<f32>],
                   #[cfg(test)] drift: Option<&experiment::Drift>|
      -> Option<Vec<u32>> {
@@ -898,32 +931,45 @@ fn assign_leaves(
         #[cfg(test)]
         let order_compared = std::sync::atomic::AtomicU64::new(0);
         // A row's nearest groups among its near cells, nearest first.
-        let near_groups = |v: &[f32]| -> Vec<(f32, usize)> {
-            let mut cells: Vec<(f32, usize)> = coarse
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (distance(v, c), i))
-                .collect();
-            if cells.len() > near {
-                cells.select_nth_unstable_by(near - 1, by_distance);
-                cells.truncate(near);
-            }
+        let near_groups = |v: &[f32], cached: Option<&[u8; NEAR_CELLS]>| {
             let mut found: Vec<(f32, usize)> = Vec::new();
-            for (_, cell) in cells {
+            let mut packed = [0u8; NEAR_CELLS];
+            let mut visit = |cell: usize| {
                 for (j, center) in groups[cell].0.iter().enumerate() {
                     found.push((distance(v, center), cell << 32 | j));
+                }
+            };
+            if let Some(cells) = cached {
+                for cell in &cells[..near] {
+                    visit(usize::from(*cell));
+                }
+            } else {
+                let mut cells: Vec<(f32, usize)> = coarse
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (distance(v, c), i))
+                    .collect();
+                if cells.len() > near {
+                    cells.select_nth_unstable_by(near - 1, by_distance);
+                    cells.truncate(near);
+                }
+                for (i, (_, cell)) in cells.into_iter().enumerate() {
+                    if cache_neighbors {
+                        packed[i] = cell as u8;
+                    }
+                    visit(cell);
                 }
             }
             #[cfg(test)]
             order_compared.fetch_add(
-                (coarse.len() + found.len()) as u64,
+                (if cached.is_some() { 0 } else { coarse.len() } + found.len()) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            if found.len() > probes {
+            if found.len() > probes && !cache_neighbors {
                 found.select_nth_unstable_by(probes - 1, by_distance);
                 found.truncate(probes);
             }
-            found
+            (found, packed)
         };
         // Leaves are far larger than the CPU caches (13,400 of 4 KB each on BEIR NQ), and rows in
         // ID order are scattered over them, so every comparison would miss. Rows are visited in
@@ -941,23 +987,41 @@ fn assign_leaves(
             .last()
             .map_or(0, |o| o + groups.last().map_or(0, |g| g.0.len()));
         let order_stage = Stage::new("assignment_order");
-        let nearest_group: Vec<u32> = present
-            .par_iter()
-            .map_init(Vec::new, |buf, g| {
-                if stopping() {
-                    return None;
-                }
-                let v = read_row(*g, buf);
-                Some(
-                    near_groups(&v)
-                        .into_iter()
-                        .min_by(by_distance)
-                        .map_or(0, |(_, key)| {
-                            (offsets[key >> 32] + (key & 0xFFFF_FFFF)) as u32
-                        }),
-                )
-            })
-            .collect::<Option<_>>()?;
+        let nearest = |v: &[f32], cached: Option<&[u8; NEAR_CELLS]>| {
+            let (found, packed) = near_groups(v, cached);
+            let group = found.into_iter().min_by(by_distance).map_or(0, |(_, key)| {
+                (offsets[key >> 32] + (key & 0xFFFF_FFFF)) as u32
+            });
+            (group, packed)
+        };
+        let nearest_group: Vec<u32> = if cache_neighbors {
+            let nearest_and_cells: Vec<_> = present
+                .par_iter()
+                .enumerate()
+                .map_init(Vec::new, |buf, (i, g)| {
+                    if stopping() {
+                        return None;
+                    }
+                    let v = read_row(*g, buf);
+                    Some(nearest(&v, near_cells_cache.get().map(|cells| &cells[i])))
+                })
+                .collect::<Option<_>>()?;
+            let (nearest_group, cells): (Vec<_>, Vec<_>) = nearest_and_cells.into_iter().unzip();
+            if near_cells_cache.get().is_none() {
+                let _ = near_cells_cache.set(cells);
+            }
+            nearest_group
+        } else {
+            present
+                .par_iter()
+                .map_init(Vec::new, |buf, g| {
+                    if stopping() {
+                        return None;
+                    }
+                    Some(nearest(&read_row(*g, buf), None).0)
+                })
+                .collect::<Option<_>>()?
+        };
         // A counting sort of row positions by nearest group.
         let mut starts = vec![0usize; group_count + 1];
         for g in &nearest_group {
@@ -996,7 +1060,15 @@ fn assign_leaves(
             let norms: Vec<f32> = rows.iter().map(|r| norm2(r)).collect();
             // The block's near cells, and each row's nearest groups among all of their groups.
             let mut cells: Vec<usize> = Vec::new();
-            for v in &refs {
+            for (r, v) in refs.iter().enumerate() {
+                if let Some(cached) = near_cells_cache.get() {
+                    cells.extend(
+                        cached[block[r] as usize][..near]
+                            .iter()
+                            .map(|c| usize::from(*c)),
+                    );
+                    continue;
+                }
                 let mut by_cell: Vec<(f32, usize)> = coarse
                     .iter()
                     .enumerate()
@@ -1051,12 +1123,17 @@ fn assign_leaves(
             })
         };
         #[cfg(test)]
-        let batched = std::env::var_os("RR4_BATCHED").is_some();
+        let reduced = if experiment {
+            std::env::var_os("RR4_BF16").is_some()
+        } else {
+            native
+        };
         #[cfg(not(test))]
-        let batched = false;
-        let scorer = batched.then(|| assignment::Scorer::new(leaves, &leaf_norms, &groups));
+        let reduced = native;
+        let scorer =
+            batched.then(|| assignment::Scorer::with_bf16(leaves, &leaf_norms, &groups, reduced));
         let ordered: Vec<u32> = order
-            .par_chunks(if batched { 128 } else { ASSIGN_BLOCK })
+            .par_chunks(if batched { batch_rows } else { ASSIGN_BLOCK })
             .map_init(Vec::new, |buf, batch| {
                 let blocks: Vec<_> = batch
                     .chunks(ASSIGN_BLOCK)
@@ -1113,10 +1190,24 @@ fn assign_leaves(
                 compared.load(std::sync::atomic::Ordering::Relaxed) as f64 / present.len() as f64;
             let ordering = order_compared.load(std::sync::atomic::Ordering::Relaxed) as f64
                 / present.len() as f64;
-            let total = main + ordering + coarse.len() as f64;
+            let total = main
+                + ordering
+                + if cache_neighbors {
+                    0.
+                } else {
+                    coarse.len() as f64
+                };
+            let (matrix, verification) = scorer.as_ref().map_or((0, 0), |s| s.counts());
+            let verification = verification as f64 / present.len() as f64;
+            let saved = if reduced {
+                matrix as f64 / present.len() as f64 * 2.
+            } else {
+                0.
+            };
+            let bytes = ((total + verification) * 4. - saved) * dims as f64;
             eprintln!(
-                "RR4 score_evals_per_row={main:.3} order_evals_per_row={ordering:.3} total_evals_per_row={total:.3} logical_center_bytes_per_row={:.0}",
-                total * dims as f64 * 4.
+                "RR4 score_evals_per_row={main:.3} order_evals_per_row={ordering:.3} total_evals_per_row={:.3} logical_center_bytes_per_row={bytes:.0}",
+                total + verification
             );
         }
         // `while_some` ends at the first block skipped for shutdown.
@@ -1131,6 +1222,8 @@ fn assign_leaves(
         for (i, l) in order.iter().zip(ordered) {
             leaf_of[*i as usize] = l;
         }
+        #[cfg(test)]
+        experiment::record_assignments(&leaf_of);
         Some(leaf_of)
     };
     let mut leaf_of = assign(

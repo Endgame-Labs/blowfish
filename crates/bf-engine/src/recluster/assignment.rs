@@ -11,25 +11,47 @@ pub(super) struct Block {
 }
 
 /// A group is packed once per assignment pass, then reused for every batch that visits it.
+enum Matrix {
+    Full(math::Centers),
+    Reduced(bf_vector::Bf16DotCenters),
+}
+
 pub(super) struct Scorer<'a> {
     leaves: &'a [Vec<f32>],
     norms: &'a [f32],
-    groups: BTreeMap<usize, (Vec<u32>, math::Centers)>,
+    groups: BTreeMap<usize, (Vec<u32>, Matrix)>,
+    reduced: bool,
     matrix_evals: std::sync::atomic::AtomicU64,
     exact_evals: std::sync::atomic::AtomicU64,
 }
 
 impl<'a> Scorer<'a> {
+    #[cfg(test)]
     pub fn new(leaves: &'a [Vec<f32>], norms: &'a [f32], groups: &[LeafGroups]) -> Self {
+        Self::with_bf16(leaves, norms, groups, false)
+    }
+
+    pub fn with_bf16(
+        leaves: &'a [Vec<f32>],
+        norms: &'a [f32],
+        groups: &[LeafGroups],
+        reduced: bool,
+    ) -> Self {
         let groups = groups
             .iter()
             .enumerate()
             .flat_map(|(cell, (_, groups))| {
                 groups.iter().enumerate().map(move |(g, ids)| {
-                    let packed = math::Centers::with_norms(
-                        ids.iter()
-                            .map(|l| (leaves[*l as usize].as_slice(), norms[*l as usize])),
-                    );
+                    let packed = if reduced {
+                        let refs: Vec<_> =
+                            ids.iter().map(|l| leaves[*l as usize].as_slice()).collect();
+                        Matrix::Reduced(bf_vector::Bf16DotCenters::new(&refs))
+                    } else {
+                        Matrix::Full(math::Centers::with_norms(
+                            ids.iter()
+                                .map(|l| (leaves[*l as usize].as_slice(), norms[*l as usize])),
+                        ))
+                    };
                     (cell << 32 | g, (ids.clone(), packed))
                 })
             })
@@ -38,6 +60,7 @@ impl<'a> Scorer<'a> {
             leaves,
             norms,
             groups,
+            reduced,
             matrix_evals: 0.into(),
             exact_evals: 0.into(),
         }
@@ -54,6 +77,13 @@ impl<'a> Scorer<'a> {
     pub fn nearest(&self, blocks: &[Block]) -> Vec<u32> {
         // Keep the original four-row blocks and their candidate unions intact. Only schedule
         // their matrix work together, so the same center block serves many nearby rows.
+        let rounded = self.reduced.then(|| {
+            let refs: Vec<_> = blocks
+                .iter()
+                .flat_map(|b| b.rows.iter().map(Vec::as_slice))
+                .collect();
+            bf_vector::Bf16DotRows::new(&refs)
+        });
         let mut visits: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (b, block) in blocks.iter().enumerate() {
             for key in &block.wanted {
@@ -63,17 +93,34 @@ impl<'a> Scorer<'a> {
         let mut scores = vec![Vec::<(f32, u32)>::new(); blocks.len() * 4];
         for (key, visiting) in visits {
             let (ids, packed) = &self.groups[&key];
-            let rows: Vec<_> = visiting
-                .iter()
-                .flat_map(|b| blocks[*b].rows.iter().map(Vec::as_slice))
-                .collect();
             let norms: Vec<_> = visiting
                 .iter()
                 .flat_map(|b| blocks[*b].norms.iter().copied())
                 .collect();
-            let distances = packed.distances(&rows, &norms);
+            let distances = match packed {
+                Matrix::Full(packed) => {
+                    let rows: Vec<_> = visiting
+                        .iter()
+                        .flat_map(|b| blocks[*b].rows.iter().map(Vec::as_slice))
+                        .collect();
+                    packed.distances(&rows, &norms)
+                }
+                Matrix::Reduced(packed) => {
+                    let selected: Vec<_> = visiting
+                        .iter()
+                        .flat_map(|b| (0..blocks[*b].rows.len()).map(move |r| b * 4 + r))
+                        .collect();
+                    let mut dots = packed.dots(rounded.as_ref().unwrap(), &selected);
+                    for (row, norm) in dots.chunks_exact_mut(ids.len()).zip(&norms) {
+                        for (dot, l) in row.iter_mut().zip(ids) {
+                            *dot = *norm + self.norms[*l as usize] - 2. * *dot;
+                        }
+                    }
+                    dots
+                }
+            };
             self.matrix_evals.fetch_add(
-                (rows.len() * ids.len()) as u64,
+                (norms.len() * ids.len()) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
             let mut at = 0;
@@ -105,6 +152,18 @@ impl<'a> Scorer<'a> {
                 .flat_map(|key| self.groups[key].0.iter())
                 .map(|l| self.norms[*l as usize])
                 .fold(0f32, f32::max);
+            let (max_center_norm, max_center_error) =
+                block
+                    .wanted
+                    .iter()
+                    .fold((0f64, 0f64), |(norm, error), key| {
+                        match &self.groups[key].1 {
+                            Matrix::Full(_) => (norm, error),
+                            Matrix::Reduced(p) => {
+                                (norm.max(p.max_norm_upper()), error.max(p.max_error_upper()))
+                            }
+                        }
+                    });
             let mut thresholds = [f64::INFINITY; 4];
             for r in 0..refs.len() {
                 let row = &scores[b * 4 + r];
@@ -118,9 +177,21 @@ impl<'a> Scorer<'a> {
                     && row.iter().all(|(d, _)| d.is_finite())
                 {
                     let minimum = row.iter().map(|(d, _)| *d).fold(f32::INFINITY, f32::min);
-                    let error = 4. * gamma * (f64::from(block.norms[r]) + f64::from(max_norm))
+                    let mut error = 4. * gamma * (f64::from(block.norms[r]) + f64::from(max_norm))
                         + (dims as f64 + 32.) * f64::from(f32::MIN_POSITIVE);
-                    thresholds[r] = f64::from(minimum) + 2. * error;
+                    if let Some(rounded) = &rounded {
+                        let row = b * 4 + r;
+                        // Cauchy-Schwarz bounds the change in a dot product by
+                        // ||delta_row|| ||center|| + ||row|| ||delta_center||
+                        // + ||delta_row|| ||delta_center||. Squared distances use twice it.
+                        error += 2.
+                            * (rounded.error_upper(row) * max_center_norm
+                                + rounded.norm_upper(row) * max_center_error
+                                + rounded.error_upper(row) * max_center_error);
+                    }
+                    if error.is_finite() {
+                        thresholds[r] = f64::from(minimum) + 2. * error;
+                    }
                 }
             }
             let mut best = [(f32::INFINITY, u32::MAX); 4];
@@ -225,6 +296,12 @@ mod tests {
                     expected,
                     "dims={dims} scale={scale}"
                 );
+                let reduced = Scorer::with_bf16(&leaves, &norms, &groups, true);
+                assert_eq!(
+                    reduced.nearest(&blocks),
+                    expected,
+                    "BF16 dims={dims} scale={scale}"
+                );
             }
         }
     }
@@ -295,6 +372,8 @@ mod tests {
                 }
             }
             assert_eq!(got, expected, "seed={seed}");
+            let reduced = Scorer::with_bf16(&leaves, &norms, &groups, true);
+            assert_eq!(reduced.nearest(&blocks), expected, "BF16 seed={seed}");
         }
     }
 }

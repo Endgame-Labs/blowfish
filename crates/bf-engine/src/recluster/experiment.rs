@@ -83,18 +83,12 @@ fn replay_leaf_assignment() {
     );
     let (present, coarse, cells, cluster_rows, max, offsets): Input =
         serde_json::from_slice(&std::fs::read(root.join("input.json")).unwrap()).unwrap();
-    let file = std::fs::File::open(root.join("vectors.f32")).unwrap();
+    let half = root.join("vectors.f16").exists();
+    let file =
+        std::fs::File::open(root.join(if half { "vectors.f16" } else { "vectors.f32" })).unwrap();
     let dims = coarse[0].len();
-    let read = |g: u32, buf: &mut Vec<u8>| {
-        buf.resize(dims * 4, 0);
-        file.read_exact_at(buf, u64::from(offsets[g as usize]) * (dims * 4) as u64)
-            .unwrap();
-        buf.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect()
-    };
+    let read =
+        |g: u32, buf: &mut Vec<u8>| read_flat_row(&file, offsets[g as usize], dims, half, buf);
     let threads = std::env::var("RR4_THREADS")
         .unwrap_or_else(|_| "4".into())
         .parse()
@@ -103,6 +97,10 @@ fn replay_leaf_assignment() {
         .num_threads(threads)
         .build()
         .unwrap();
+    println!(
+        "RR4 native_bf16_matrix={}",
+        bf_vector::bf16_matrix_accelerated()
+    );
     let start = std::time::Instant::now();
     let jobs = pool
         .install(|| {
@@ -218,7 +216,12 @@ impl Drift {
                     self.subset
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let upper = old.upper + self.drift[old.best as usize];
-                    let lower = (old.lower - self.max_drift).max(0.);
+                    let other_drift = candidates
+                        .iter()
+                        .filter(|l| **l != old.best)
+                        .map(|l| self.drift[*l as usize])
+                        .fold(0., f64::max);
+                    let lower = (old.lower - other_drift).max(0.);
                     if upper * upper + error < lower * lower - error {
                         assert_eq!(old.best, sorted[0].1, "drift bound changed winner");
                         self.skipped
@@ -257,4 +260,110 @@ pub(super) fn perf_control(enable: bool) {
         fifo.write_all(if enable { b"enable\n" } else { b"disable\n" })
             .unwrap();
     }
+}
+
+pub(super) fn record_assignments(leaf_of: &[u32]) {
+    static PASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(output) = std::env::var_os("RR4_OUTPUT") else {
+        return;
+    };
+    let output = PathBuf::from(output);
+    assert!(output.components().any(|c| c.as_os_str() == ".scratch"));
+    let pass = PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let bytes: Vec<_> = leaf_of.iter().flat_map(|l| l.to_le_bytes()).collect();
+    std::fs::write(output.with_extension(format!("pass{pass}.u32")), bytes).unwrap();
+}
+
+fn read_flat_row(
+    file: &std::fs::File,
+    row: u32,
+    dims: usize,
+    half: bool,
+    buf: &mut Vec<u8>,
+) -> Vec<f32> {
+    let width = dims * if half { 2 } else { 4 };
+    buf.resize(width, 0);
+    file.read_exact_at(buf, u64::from(row) * width as u64)
+        .unwrap();
+    if half {
+        let decoded: Vec<_> = buf
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::f16::from_bits(u16::from_le_bytes(*b)).to_f32())
+            .collect();
+        bf_vector::prepare_vector(&decoded, bf_vector::Metric::CosineDistance)
+    } else {
+        buf.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect()
+    }
+}
+
+#[test]
+#[ignore = "requires an owned raw f16 corpus in RR4_INPUT/vectors.f16 beneath .scratch"]
+fn prepare_flat_spill() {
+    let root = PathBuf::from(std::env::var_os("RR4_INPUT").expect("RR4_INPUT"));
+    assert!(root.components().any(|c| c.as_os_str() == ".scratch"));
+    assert!(!root.join("input.json").exists());
+    let file = std::fs::File::open(root.join("vectors.f16")).unwrap();
+    let dims = 1024;
+    let rows = file.metadata().unwrap().len() as usize / (dims * 2);
+    assert_eq!(file.metadata().unwrap().len() as usize, rows * dims * 2);
+    assert!(rows > 0 && rows < u32::MAX as usize);
+    let present: Vec<u32> = (0..rows as u32).collect();
+    let read = |g: u32, buf: &mut Vec<u8>| read_flat_row(&file, g, dims, true, buf);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let (coarse, cells) = pool.install(|| {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let picks: Vec<_> = (0..19_200.min(rows))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                present[state as usize % present.len()]
+            })
+            .collect();
+        let sample: Vec<_> = picks
+            .par_iter()
+            .map_init(Vec::new, |buf, g| read(*g, buf))
+            .collect();
+        let refs: Vec<_> = sample.iter().map(Vec::as_slice).collect();
+        let coarse = math::kmeans(&refs, 32.min(rows), 8, 7);
+        let packed = math::Centers::new(coarse.iter().map(Vec::as_slice));
+        let assignment: Vec<usize> = present
+            .par_chunks(128)
+            .flat_map_iter(|ids| {
+                let mut buf = Vec::new();
+                let rows: Vec<_> = ids.iter().map(|g| read(*g, &mut buf)).collect();
+                let refs: Vec<_> = rows.iter().map(Vec::as_slice).collect();
+                packed.nearest(&refs)
+            })
+            .collect();
+        let mut cells = vec![Vec::new(); coarse.len()];
+        for (g, c) in present.iter().zip(assignment) {
+            cells[c].push(*g);
+        }
+        (coarse, cells)
+    });
+    let cluster_rows = target_leaf_rows(rows as u64);
+    std::fs::write(
+        root.join("input.json"),
+        serde_json::to_vec(&(
+            &present,
+            coarse,
+            cells,
+            cluster_rows,
+            250_000usize,
+            &present,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    println!("RR4 flat fixture rows={rows} dims={dims} cluster_rows={cluster_rows}");
 }
