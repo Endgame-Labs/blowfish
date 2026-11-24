@@ -100,6 +100,79 @@ search, full-text search, and filter through the proxy; restart, wait for readin
 queries before deleting the test namespace. Check the object-store prefix directly as well.
 Namespace deletion can retain permanent WAL fences; do not remove these manually.
 
+## Upgrading to v0.1.16
+
+v0.1.16 raises the bucket format from generation 3 (v0.1.15) to generation 4.
+Stop every older writer, back up the entire deployment prefix, and start v0.1.16.
+Writable startup writes `_system/format/4.json`. From then on, v0.1.15 refuses
+both local and S3 storage with this exact startup error:
+
+```text
+Error: BucketFormat { required: 4, supported: 3 }
+```
+
+There is no in-place downgrade; restore the full backup to run the older binary.
+Read-only startup checks compatibility without advancing the format marker. Do
+not run old and new writers together during the upgrade.
+
+Everything else upgrades in the background while queries keep using indexes:
+
+- **Manifests.** The next publication writes format 4, adding row lineage so
+  compaction can merge segments covered by recluster tiers without rebuilding
+  those tiers.
+- **Text.** Format-4, format-5, and format-6 indexes repack directly into format 7,
+  combining compressed phrase positions with unpadded short posting lists. Query
+  results and phrase positions are preserved.
+- **ANN, documents, and tiers.** Current v0.1.15 `.bfa` objects, document-v2 objects,
+  and format-1 recluster tiers need no format upgrade. Older ANN and document
+  layouts continue upgrading automatically. Existing large tiers acquire the new
+  leaf population on their next normal recluster; startup does not rebuild them
+  to apply it.
+
+I tested independent v0.1.15 loads on local disk and S3, each with the first
+200,000 BEIR NQ passages, 1,024-dimensional f16 vectors, text, six segments, and
+one recluster tier of 32 slabs. The local tier covered all 200K rows; the S3 tier
+covered 135K, with the remaining 65K in indexed segments. Both binaries ran on
+the same 16-vCPU, 32-GB machine. Times below are seconds from v0.1.16 candidate process launch,
+including startup, under continuous four-client validation traffic:
+
+| Observed event | Local disk | S3 |
+| --- | ---: | ---: |
+| Generation-4 marker | 0.14 | 0.30 |
+| First format-4 manifest | 29.65 | 25.34 |
+| Every text object at format 7 | 30.24 | 27.11 |
+| Zero legacy counts verified by dry-run | 30.38 | 28.63 |
+
+`blowfish reindex --dry-run --storage-url STORAGE_URL NAMESPACE` reports legacy
+ANN and document counts, all zero in both runs. It does not count or force text
+upgrades. I separately checked every `fts:*` file's full-manifest text footer
+(version 7), manifest format 4, and current tier format 1 before declaring the
+upgrade complete. The existing ANN, document, and tier objects needed no upgrade.
+
+Every check ran the same 40 ANN queries against exact top-10 ground truth over
+that 200K-row corpus and 40 BM25 queries against that backend's v0.1.15 ordered
+results. Recall@10 stayed at 0.9725 on local disk and 0.9775 on S3 on every
+check; the independently built baseline indexes explain the difference. BM25
+matched 40/40 on every check. Across 35,520 local and 7,120 S3 candidate
+queries, there were zero errors and zero nonzero `exhaustive_search_count`
+responses. Restarting the older binary on both backends exited with status 1 and
+the error above.
+
+Stored bytes below use decimal MB. Live bytes sum unique file references in the
+latest full manifest; the entire prefix also includes the WAL, retained obsolete
+objects, manifests, and unpublished build objects.
+
+| Backend | Live referenced MB, before → after | Text MB, before → after | Entire prefix MB, before → after |
+| --- | ---: | ---: | ---: |
+| Local disk | 1,212.61 → 1,025.91 | 261.24 → 74.54 | 2,109.52 → 2,184.23 |
+| S3 | 1,068.16 → 881.14 | 261.78 → 74.76 | 1,982.02 → 2,056.95 |
+
+Text is about 3.50x smaller in these NQ upgrades. The entire prefix initially
+grows because old text objects remain until the retention window expires; these
+are pre-GC totals, not a claim of immediate bucket-space recovery. See the
+[upgrade measurement details](benchmarks.md#v0116-upgrade-validation).
+Background-job and shutdown behavior is described in the v0.1.15 section below.
+
 ## Upgrading to v0.1.15
 
 v0.1.15 raises the bucket format from generation 2 (v0.1.14) to generation 3. Follow the steps in Bucket
@@ -153,7 +226,7 @@ If rollback might be necessary, I recommend a consistent backup of the **entire 
 starting the new binary** (see Backups and recovery). Retaining the old executable alone is insufficient.
 Do not run old and new writers together during a format upgrade.
 
-The binary automatically accepts legacy format-1 and format-2 buckets and raises the deployment marker to format 3
+v0.1.15 automatically accepts legacy format-1 and format-2 buckets and raises the deployment marker to format 3
 at writable startup. Namespace manifests move to format 3 on publication. Format 2 renamed the checkpoint
 field while retaining its meaning; format 3 fences the single ANN object layout and document-v2 objects. Read-only startup checks compatibility without raising the marker.
 The append-only `_system/format/<version>.json` markers live at the deployment root, including for
@@ -229,7 +302,8 @@ blowfish reindex --storage-url s3://BUCKET/PREFIX NAMESPACE
 blowfish reindex --storage-url s3://BUCKET/PREFIX --all                 # every namespace in the bucket
 ```
 
-It prints progress, and I can run it beside a server that supports format 3. The report distinguishes
+It prints progress, and I can run it beside a server that supports the bucket’s current format (generation 4 for
+v0.1.16). The report distinguishes
 current single objects from legacy row-major, fast-scan, and other indexes. It also reports legacy
 document counts and bytes, converted document/ID pairs, and total ANN, document, and ID rewrite bytes.
 Directory and manifest writes are extra. `--dry-run` surveys document metadata without writing anything.
