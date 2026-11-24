@@ -209,7 +209,7 @@ pub(crate) struct Scope {
     cache: Arc<Cache>,
     namespace: String,
     trial: bool,
-    used: Arc<Mutex<Vec<Key>>>,
+    used: Arc<Mutex<Option<Vec<Key>>>>,
 }
 impl Scope {
     pub(crate) fn new(cache: Arc<Cache>, namespace: &str) -> Self {
@@ -217,18 +217,24 @@ impl Scope {
             cache,
             namespace: namespace.into(),
             trial: false,
-            used: Default::default(),
+            used: Arc::new(Mutex::new(Some(Vec::new()))),
         }
     }
     pub(crate) fn trial(&self) -> Self {
         Self {
             trial: true,
-            used: Default::default(),
+            used: Arc::new(Mutex::new(Some(Vec::new()))),
             ..self.clone()
         }
     }
+    /// A complete IVF retry must not calibrate any graph from its discarded partial plan.
+    pub(crate) fn abandon(&self) {
+        *self.used.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     pub(crate) fn record_cpu(&self, seconds: f64) {
-        let used = self.used.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(used) = self.used.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return;
+        };
         let entries = self.cache.entries.lock().unwrap_or_else(|e| e.into_inner());
         for key in used {
             if let Some(entry) = entries.get(&key).and_then(|h| h.ready.as_ref()) {
@@ -242,12 +248,13 @@ impl Scope {
         }
     }
     pub(crate) fn feedback(&self, recall: f64) {
-        let mut used = self
-            .used
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect::<Vec<_>>();
+        let mut used = {
+            let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(used) = used.as_mut() else {
+                return;
+            };
+            std::mem::take(used)
+        };
         used.sort();
         used.dedup();
         let mut entries = self.cache.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -811,6 +818,7 @@ pub(crate) fn available(
         .is_some_and(|e| {
             k > 0
                 && k <= RERANK
+                && e.graph.len() >= k
                 && vector.len() == e.graph.dims()
                 && vector.iter().any(|x| *x != 0.)
                 && (scope.trial
@@ -920,7 +928,11 @@ pub(crate) async fn search(
         }
         c.ef
     };
-    if k == 0 || k > RERANK || vector.len() != entry.graph.dims() || vector.iter().all(|x| *x == 0.)
+    if k == 0
+        || k > RERANK
+        || entry.graph.len() < k
+        || vector.len() != entry.graph.dims()
+        || vector.iter().all(|x| *x == 0.)
     {
         return Ok(None);
     }
@@ -942,11 +954,14 @@ pub(crate) async fn search(
             {
                 h.last = Instant::now();
             }
-            scope
+            if let Some(used) = scope
                 .used
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(key);
+                .as_mut()
+            {
+                used.push(key);
+            }
             scope.cache.answers.fetch_add(1, Ordering::Relaxed);
             Ok(Some(found))
         }

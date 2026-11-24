@@ -157,7 +157,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     e.write(
         "hot",
         serde_json::from_value::<WriteRequest>(
-            json!({"deletes":[17],"upsert_rows":[{"id":5000,"vector":vectors[17],"group":1}]}),
+            json!({"deletes":[17],"upsert_rows":(0..50).map(|i| json!({"id":5000+i,"vector":vectors[if i==0 {17} else {30+i}],"group":1})).collect::<Vec<_>>()}),
         )
         .unwrap(),
     )
@@ -178,6 +178,63 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         new_state.ann_tiers["vector"].len() > 1,
         "deltas stay independently searchable"
     );
+    // A successful delta-graph plan can be discarded when the base loses scratch admission.
+    // The returned IVF result must not feed either graph's recall or CPU calibration.
+    let (current, _) = e
+        .snapshot("hot", &bf_types::Consistency::Strong)
+        .await
+        .unwrap();
+    let delta_set = current.ann_tiers["vector"]
+        .iter()
+        .find(|s| s.dir.key != key.tier)
+        .unwrap();
+    let delta_key = Key::new("hot", &current, "vector", delta_set);
+    let delta = Arc::new(
+        e.construct_hot_graph("hot", "vector", delta_set, &HotCancellation::default())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(delta.graph.len(), 50);
+    let mut delta_heat = Heat::new(Instant::now());
+    delta_heat.rate = 100.;
+    delta_heat.ivf_seconds = 1.;
+    delta_heat.ready = Some(delta.clone());
+    e.0.hot_graph
+        .entries
+        .lock()
+        .unwrap()
+        .insert(delta_key.clone(), delta_heat);
+    let permit = held
+        .slots
+        .acquire_many(held.slots.available_permits() as u32)
+        .await
+        .unwrap();
+    let answered = e.0.hot_graph.answers.load(Ordering::Relaxed);
+    e.recall(
+        "hot",
+        json!({"num":1,"top_k":10,"rank_by":["vector","ANN",vectors[17]]}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        e.0.hot_graph.answers.load(Ordering::Relaxed) > answered,
+        "the delta must actually contribute before the complete IVF retry"
+    );
+    {
+        let calibration = delta.calibration.lock().unwrap();
+        assert!(
+            calibration.recalls.is_empty(),
+            "discarded plans cannot calibrate recall"
+        );
+        assert_eq!(
+            calibration.graph_seconds, 0.,
+            "discarded plans cannot calibrate CPU savings"
+        );
+    }
+    drop(permit);
+    e.0.hot_graph.entries.lock().unwrap().remove(&delta_key);
+    drop(delta);
     // Engine ownership includes the backend, even when namespaces have identical names.
     let other = Storage::open(&StorageConfig {
         url: "memory://".into(),

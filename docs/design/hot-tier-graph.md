@@ -143,7 +143,7 @@ Delta tiers and uncovered indexed segments retain their independent search plans
 participants contribute their own top-k candidates, avoiding a scan barrier that a graph participant
 cannot enter. Unsupported shapes and heavy masks retain the normal joint IVF plan. If a graph
 selected during planning later declines, the complete query retries with the ordinary joint IVF plan,
-restoring its shared probe bounds even after eviction, scratch admission loss, or insufficient candidates.
+restoring its shared probe bounds even after eviction, scratch admission loss, or insufficient candidates. Discarded partial graph plans contribute neither recall samples nor CPU savings to calibration.
 
 Above 10% masked source rows, evict the graph and use IVF. Also fall back when live candidates cannot
 supply the request. A new recluster directory starts a new identity and heat window; a build or ready

@@ -224,11 +224,12 @@ pub(crate) fn tiers_usable(
         .all(|t| crate::lineage::reachable(segments, lineage, t))
 }
 
+type TierResult = Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError>;
+
 /// Unfiltered ANN over a recluster's tiers and the segments no tier covers, as one plan: each
 /// tier's slabs and the uncovered segments (through the namespace directory, with the covered
 /// segments left out of its probe plan) are searched at the same time, and their exactly
 /// reranked winners merged. `None` when some part cannot answer, so the caller falls back.
-type TierResult = Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError>;
 #[allow(clippy::too_many_arguments)]
 fn from_tiers<'a>(
     store: &'a Storage,
@@ -348,7 +349,9 @@ fn from_tiers<'a>(
             // Admission, masks, or source availability can change after planning. Restore the
             // complete joint IVF plan, including its shared probe bounds, for this query.
             if let Some(mut context) = crate::read_cache::context() {
-                context.hot_graph = None;
+                if let Some(scope) = context.hot_graph.take() {
+                    scope.abandon();
+                }
                 return crate::read_cache::scope(
                     context,
                     Box::pin(from_tiers(
