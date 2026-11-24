@@ -773,6 +773,52 @@ fn loading(state: &crate::NamespaceState, now: chrono::DateTime<chrono::Utc>) ->
                 < LOAD_QUIET)
 }
 
+/// Local retry deadlines survive checkpoint refreshes, but belong to one namespace generation.
+/// They are scheduling hints only; manifests and acknowledged data never depend on them.
+#[derive(Default)]
+pub(crate) struct LoadBackpressure(
+    std::sync::Mutex<Option<(chrono::DateTime<chrono::Utc>, Instant)>>,
+);
+
+impl LoadBackpressure {
+    /// Include the whole-second Retry-After used by some SDKs, and allow a normal quiet period
+    /// after the advertised delay for the next request to arrive.
+    pub(crate) fn record(&self, generation: chrono::DateTime<chrono::Utc>, retry_ms: u64) {
+        self.record_at(generation, retry_ms, Instant::now());
+    }
+
+    fn record_at(&self, generation: chrono::DateTime<chrono::Utc>, retry_ms: u64, now: Instant) {
+        let delay = Duration::from_secs(retry_ms.div_ceil(1000)).saturating_add(LOAD_QUIET);
+        let Some(until) = now.checked_add(delay) else {
+            return;
+        };
+        let mut deadline = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let until = deadline
+            .filter(|(epoch, _)| *epoch == generation)
+            .map_or(until, |(_, old)| old.max(until));
+        *deadline = Some((generation, until));
+    }
+
+    fn active(&self, generation: chrono::DateTime<chrono::Utc>, now: Instant) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|(epoch, until)| epoch == generation && now < until)
+    }
+}
+
+fn loading_with_backpressure(
+    state: &crate::NamespaceState,
+    now: chrono::DateTime<chrono::Utc>,
+    monotonic: Instant,
+    pressure: &LoadBackpressure,
+    wal_limit: u64,
+) -> bool {
+    loading(state, now)
+        || (state.tail_bytes > 0 && state.tail_bytes >= wal_limit)
+        || pressure.active(state.created_at, monotonic)
+}
+
 /// Recover only unlocked process directories; live builds in other engines and processes stay.
 pub(crate) fn sweep_spills(engine: &Engine) {
     if let Err(error) = recluster::spill::sweep(&scratch_dir(engine)) {
@@ -829,7 +875,13 @@ impl Engine {
             // under steady writes), waiting for it would leave the new rows outside the tiers.
             let compacting =
                 !crate::indexer::tier(&state, &self.0.config, false, &protected).is_empty();
-            let bulk = loading(&state, chrono::Utc::now());
+            let bulk = loading_with_backpressure(
+                &state,
+                chrono::Utc::now(),
+                Instant::now(),
+                &handle.backpressure,
+                self.0.config.max_unindexed_bytes,
+            );
             let (decision, numbers) = match &building {
                 // Beside a base building here, only a delta over the rows outside it.
                 Some(building) => (
@@ -1210,6 +1262,119 @@ fn scopeguard(f: impl FnOnce()) -> impl Drop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_backpressure_keeps_an_indexed_load_active_past_the_quiet_window() {
+        let now = chrono::Utc::now();
+        let clock = Instant::now();
+        let mut state = crate::NamespaceState {
+            bulk_load_at: Some(now),
+            updated_at: now,
+            created_at: now,
+            seq: 9,
+            indexed_through: 9,
+            ..Default::default()
+        };
+        let pressure = LoadBackpressure::default();
+        pressure.record_at(now, 20_001, clock);
+        // An SDK using whole-second Retry-After waits 21 seconds, beyond the write-quiet window.
+        let retry_gap = chrono::Duration::seconds(10);
+        assert!(!loading(&state, now + retry_gap));
+        assert!(loading_with_backpressure(
+            &state,
+            now + retry_gap,
+            clock + Duration::from_secs(10),
+            &pressure,
+            u64::MAX,
+        ));
+        // A later, shorter 429 must not shorten the outstanding advertised delay.
+        pressure.record_at(now, 500, clock + Duration::from_secs(10));
+        assert!(pressure.active(now, clock + Duration::from_secs(22)));
+        assert!(!loading_with_backpressure(
+            &state,
+            now + chrono::Duration::seconds(23),
+            clock + Duration::from_secs(23),
+            &pressure,
+            u64::MAX,
+        ));
+        pressure.record_at(now, 30_000, clock + Duration::from_secs(20));
+        assert!(pressure.active(now, clock + Duration::from_secs(40)));
+        assert!(!pressure.active(now, clock + Duration::from_secs(52)));
+        // Recreating a namespace does not inherit the old generation's retry deadline.
+        state.created_at = now + chrono::Duration::seconds(1);
+        assert!(!loading_with_backpressure(
+            &state,
+            now + retry_gap,
+            clock + Duration::from_secs(10),
+            &pressure,
+            u64::MAX,
+        ));
+        // A backlog at the configured limit also delays builds without persisted bulk history.
+        state.bulk_load_at = None;
+        state.seq += 1;
+        state.tail_bytes = 100;
+        assert!(loading_with_backpressure(
+            &state,
+            now + retry_gap,
+            clock,
+            &pressure,
+            100
+        ));
+        state.tail_bytes = 99;
+        assert!(!loading_with_backpressure(
+            &state,
+            now + retry_gap,
+            clock,
+            &pressure,
+            100
+        ));
+    }
+
+    #[tokio::test]
+    async fn both_commit_paths_record_backpressure_independently_of_checkpoint_refresh() {
+        let store = bf_storage::Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store,
+            crate::EngineConfig {
+                indexing: false,
+                max_unindexed_bytes: 1,
+                ..Default::default()
+            },
+        );
+        for (ns, request) in [
+            ("pipeline", serde_json::json!({"upsert_rows":[{"id":2}]})),
+            (
+                "barrier",
+                serde_json::json!({"delete_by_filter":["id","Eq",1]}),
+            ),
+        ] {
+            engine
+                .write(
+                    ns,
+                    serde_json::from_value(serde_json::json!({"upsert_rows":[{"id":1}]})).unwrap(),
+                )
+                .await
+                .unwrap();
+            let error = engine
+                .write(ns, serde_json::from_value(request).unwrap())
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, 429);
+            let handle = engine.handle(ns).await.unwrap();
+            let generation = handle.state.lock().await.created_at;
+            assert!(handle.backpressure.active(generation, Instant::now()));
+            engine.index_namespace(ns, true).await.unwrap();
+            let state = handle.state.lock().await;
+            assert_eq!(state.seq, state.indexed_through);
+            assert_eq!(state.tail_bytes, 0);
+            assert!(handle.backpressure.active(generation, Instant::now()));
+        }
+    }
 
     #[test]
     fn a_bulk_load_finishes_after_a_short_quiet_period_and_an_indexed_tail() {

@@ -349,6 +349,7 @@ pub struct QueryDiagnostics {
 struct Handle {
     state: Arc<Mutex<NamespaceState>>,
     commits: GroupCommit<Operation, Result<WriteResponse, ApiError>>,
+    backpressure: Arc<auto_recluster::LoadBackpressure>,
 }
 struct Inner {
     store: Storage,
@@ -556,9 +557,11 @@ impl Engine {
         let (commits, receiver) = GroupCommit::channel(1024);
         let state = Arc::new(Mutex::new(NamespaceState::default()));
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
+        let backpressure = Arc::new(auto_recluster::LoadBackpressure::default());
         let handle = Arc::new(Handle {
             state: state.clone(),
             commits,
+            backpressure: backpressure.clone(),
         });
         handles.insert(ns.into(), handle.clone());
         let context = read_cache::ReadContext::new(self.0.read_cache.clone());
@@ -570,6 +573,7 @@ impl Engine {
                 receiver,
                 self.0.store.clone(),
                 self.0.config.clone(),
+                backpressure,
             ),
         ));
         Ok(handle)
@@ -1111,6 +1115,7 @@ async fn commit_sync(
     config: &EngineConfig,
     deleting: bool,
     pending: &[Op],
+    backpressure: &auto_recluster::LoadBackpressure,
 ) -> Result<Vec<Result<WriteResponse, ApiError>>, ApiError> {
     let mut current = state.lock().await;
     // A state this node just committed or refreshed is current unless another writer
@@ -1149,9 +1154,11 @@ async fn commit_sync(
             }
         }
         if current.tail_bytes >= config.max_unindexed_bytes {
+            let retry_ms = drain::retry_after_ms(current.tail_bytes);
+            backpressure.record(current.created_at, retry_ms);
             break Err(
                 ApiError::new(429, "unindexed WAL exceeds backpressure limit")
-                    .with_retry_after_ms(drain::retry_after_ms(current.tail_bytes)),
+                    .with_retry_after_ms(retry_ms),
             );
         }
         let stage = Instant::now();
@@ -1367,6 +1374,7 @@ async fn commit_worker(
     mut receiver: tokio::sync::mpsc::Receiver<Op>,
     store: Storage,
     config: EngineConfig,
+    backpressure: Arc<auto_recluster::LoadBackpressure>,
 ) {
     let depth = config.wal_pipeline.max(1);
     let mut backlog: VecDeque<Op> = VecDeque::new();
@@ -1412,7 +1420,16 @@ async fn commit_worker(
             }
             let deleting = matches!(first.request, Operation::Delete);
             let pending = vec![first];
-            let committed = commit_sync(&wal, &state, &store, &config, deleting, &pending).await;
+            let committed = commit_sync(
+                &wal,
+                &state,
+                &store,
+                &config,
+                deleting,
+                &pending,
+                &backpressure,
+            )
+            .await;
             reply_all(pending, committed, start);
             continue;
         }
@@ -1449,8 +1466,10 @@ async fn commit_worker(
             record_stage("catch_up", stage);
         }
         if current.tail_bytes >= config.max_unindexed_bytes {
+            let retry_ms = drain::retry_after_ms(current.tail_bytes);
+            backpressure.record(current.created_at, retry_ms);
             let e = ApiError::new(429, "unindexed WAL exceeds backpressure limit")
-                .with_retry_after_ms(drain::retry_after_ms(current.tail_bytes));
+                .with_retry_after_ms(retry_ms);
             drop(current);
             reply_all(pending, Err(e), start);
             continue;
