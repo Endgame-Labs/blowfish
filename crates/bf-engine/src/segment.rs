@@ -86,12 +86,23 @@ impl ObjectReader {
         {
             return Ok(bytes.slice((range.start - start) as usize..(range.end - start) as usize));
         }
+        if !self.bypass
+            && let Some(mut bytes) =
+                crate::local_ann::read(&self.file.key, std::slice::from_ref(&range))
+        {
+            return Ok(bytes.remove(0));
+        }
         self.range_reader()?
             .read_with_stats(range, &read_cache::stats())
             .await
             .map_err(io::Error::other)
     }
     pub async fn read_batch(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        if !self.bypass
+            && let Some(bytes) = crate::local_ann::read(&self.file.key, &ranges)
+        {
+            return Ok(bytes);
+        }
         self.range_reader()?
             .read_batch_with_stats(&ranges, &read_cache::stats())
             .await

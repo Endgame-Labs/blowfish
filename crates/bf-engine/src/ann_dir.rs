@@ -289,9 +289,14 @@ pub(crate) type Prefetched = (String, bytes::Bytes);
 
 /// Read the hint copy for `attr` (one GET, issued in parallel with the manifest read).
 pub(crate) async fn prefetch(store: &Storage, ns: &str, attr: &str) -> Option<Prefetched> {
-    let bytes = store.get(&hint_key(ns, attr)).await.ok()?;
+    let hint = hint_key(ns, attr);
+    if let Some(prefetched) = crate::local_ann::hint(&hint) {
+        return prefetched;
+    }
+    let bytes = store.get(&hint).await.ok()?;
     let klen = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
     let key = String::from_utf8(bytes.get(4..4 + klen)?.to_vec()).ok()?;
+    crate::local_ann::note_hint(&hint, Some(&key), (bytes.len() - 4 - klen) as u64);
     Some((key, bytes.slice(4 + klen..)))
 }
 
@@ -1325,6 +1330,9 @@ pub(crate) async fn search(
                 vec![(fragment, blobs), (index, codes)]
             };
             for (file, ranges) in reads {
+                if crate::local_ann::covers(&file.key, &ranges) {
+                    continue;
+                }
                 let reader = store
                     .range_reader_with_length(&file.key, file.size, true)
                     .map_err(segment::index_error)?;
@@ -1922,14 +1930,24 @@ pub(crate) async fn slab_directory(
     prefetched: Option<&Prefetched>,
     vector: &[f32],
     config: &EngineConfig,
+    attribute: &str,
 ) -> Result<(Arc<Directory>, bool), ApiError> {
     let Some(file) = set.pages.as_ref() else {
         let cached = read_cache::get::<Directory>(&set.dir.key, set.dir.metadata_len).is_some();
-        return Ok((load(store, &set.dir, prefetched).await?, cached));
+        let dir = load(store, &set.dir, prefetched).await?;
+        crate::local_ann::observe(
+            store,
+            set,
+            dir.dims(),
+            dir.entries().len() as u64,
+            attribute,
+        );
+        return Ok((dir, cached));
     };
     let t0 = std::time::Instant::now();
     let warm = read_cache::get::<PagedDirectory>(&file.key, file.metadata_len).is_some();
     let paged = load_paged(store, file, prefetched).await?;
+    crate::local_ann::observe(store, set, paged.dims(), paged.entry_count(), attribute);
     crate::ann::stage(t0, "directory header");
     paged_view(store, file, &paged, vector, config, warm).await
 }

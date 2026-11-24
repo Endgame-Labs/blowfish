@@ -38,6 +38,7 @@ pub(crate) struct DecodedCache {
     pub(crate) tail_vectors: crate::tail::VectorCache,
     /// Immutable WAL and shadow-row term counts, charged to this cache's total budget.
     pub(crate) text_terms: Arc<ClockCache<Arc<crate::text_tail::Analysis>, crate::text_tail::Key>>,
+    pub(crate) staging: Option<Arc<crate::local_ann::Manager>>,
 }
 /// foldhash, seeded per process (the keys are object keys and cluster numbers).
 type FastHash = foldhash::fast::RandomState;
@@ -189,7 +190,16 @@ impl DecodedCache {
                 text,
                 |value: &Arc<crate::text_tail::Analysis>| value.bytes(),
             )),
+            staging: None,
         }
+    }
+    pub(crate) fn with_store(
+        mut self,
+        store: &bf_storage::Storage,
+        stop: Arc<crate::stop::Stop>,
+    ) -> Self {
+        self.staging = crate::local_ann::Manager::for_store(store, stop);
+        self
     }
     /// A decoded column block (`key` is relative to this view, like every other key).
     pub fn column(&self, key: &str) -> Option<Arc<Vec<Option<serde_json::Value>>>> {
@@ -215,6 +225,7 @@ impl DecodedCache {
             // Document allocation identities are process-wide, independent of storage scope.
             tail_vectors: self.tail_vectors.clone(),
             text_terms: self.text_terms.clone(),
+            staging: self.staging.clone(),
         }
     }
     /// Forget every decoded entry (bench cold-cache runs).
@@ -311,6 +322,8 @@ pub(crate) struct ReadContext {
     pub admit: bool,
     pub ann_rows: Arc<std::sync::atomic::AtomicU64>,
     pub document_scan_rows: Arc<std::sync::atomic::AtomicU64>,
+    /// Logical bytes served by the engine's provisioned ANN files.
+    pub local_ann_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 impl ReadContext {
     /// A context with fresh statistics that admits its reads.
@@ -322,6 +335,7 @@ impl ReadContext {
             admit: true,
             ann_rows: Arc::default(),
             document_scan_rows: Arc::default(),
+            local_ann_bytes: Arc::default(),
         }
     }
 }
@@ -331,11 +345,22 @@ tokio::task_local! {
 pub(crate) fn context() -> Option<ReadContext> {
     CURRENT.try_with(Clone::clone).ok()
 }
+/// Skip context cloning when this storage view has no ANN staging manager.
+pub(crate) fn staging_context() -> Option<ReadContext> {
+    CURRENT
+        .try_with(|context| context.cache.staging.is_some().then(|| context.clone()))
+        .ok()
+        .flatten()
+}
 pub(crate) async fn scope<T>(context: ReadContext, future: impl Future<Output = T>) -> T {
     let backend = context.backend.clone();
     backend
         .scope("search", CURRENT.scope(context, future))
         .await
+}
+/// Let snapshot hints use the query cache without changing the caller's backend stage.
+pub(crate) async fn scope_hints<T>(context: ReadContext, future: impl Future<Output = T>) -> T {
+    CURRENT.scope(context, future).await
 }
 /// False inside a context whose reads must not fill the block caches.
 pub(crate) fn admitting() -> bool {

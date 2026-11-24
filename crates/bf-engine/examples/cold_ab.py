@@ -16,6 +16,9 @@ Each arm can set CONFIG to a private config for a copied layout with the same
 namespace name, and BF_ANN_NPROBE to match recall at a different probe budget.
 Both builds need blowfish_object_store_attempts_total for physical GET accounting.
 ANN row counts require BF_TRACE_STAGES output containing PLAN rows= records.
+For a single-tier automatic-staging candidate, pass --stage-arm NAME. The harness
+records its first query and provisioning cost, waits for publication, and evicts
+the staged files from the filesystem page cache before every measured query.
 Outputs, traces, and temporary storage configuration stay under --scratch. Cache
 files are removed on exit. Summarize the results, and remove the run directory
 when the experiment ends.
@@ -46,6 +49,12 @@ P.add_argument("--binary", required=True)
 P.add_argument("--config", type=Path, required=True)
 P.add_argument("--scratch", type=Path, required=True)
 P.add_argument("--port", type=int, default=8400)
+P.add_argument(
+    "--stage-arm",
+    action="append",
+    default=[],
+    help="single-tier staging arm to provision, then read with cold filesystem pages",
+)
 P.add_argument("--oracle", choices=["100k", "1m", "10m", "100m"], default="10m")
 P.add_argument(
     "--nq-data",
@@ -84,6 +93,8 @@ items = [
 arms = json.loads(a.arms)
 if not arms or any(not re.fullmatch(r"[A-Za-z0-9_-]+", name) for name in arms):
     P.error("arm names must contain only letters, numbers, hyphens, or underscores")
+if any(name not in arms for name in a.stage_arm) or (a.stage_arm and a.mode != "cachecold"):
+    P.error("stage arms must be named cachecold arms")
 if a.queries <= 0 or a.offset < 0 or a.offset + a.queries > len(items) or a.probes <= 0:
     P.error("select positive probes and a nonempty slice within the oracle workload")
 RUN.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -206,6 +217,40 @@ def server(name, index):
         shutil.rmtree(work / "cache", ignore_errors=True)
 
 
+def evict_staging(work):
+    """Evict only this run's durable staging files, without privileged global drops."""
+    files = [
+        p
+        for p in (work / "cache" / "ann-staging-v1").rglob("*")
+        if p.is_file() and p.name != ".lock"
+    ]
+    for path in files:
+        with path.open("rb") as stream:
+            os.fsync(stream.fileno())
+            os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    return {"files": len(files), "bytes": sum(p.stat().st_size for p in files)}
+
+
+def wait_staging(client, work, proc, first, start):
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError("staging server exited")
+        text = client.get("/metrics").text
+        if re.search(r'blowfish_ann_staging_total\{outcome="error"\} [1-9]', text):
+            raise RuntimeError("automatic staging failed; inspect server.log")
+        if re.search(r'blowfish_ann_staging_total\{outcome="ready"\} [1-9]', text):
+            provision = {
+                "first_query_ms": first["ms"],
+                "ready_after_ms": (time.perf_counter() - start) * 1000,
+                **evict_staging(work),
+            }
+            (work / "provision.json").write_text(json.dumps(provision, indent=2))
+            return
+        time.sleep(0.1)
+    raise RuntimeError("automatic staging timeout")
+
+
 def query(name, item, client, work, proc):
     before = stats(client)
     req = client.build_request(
@@ -256,7 +301,10 @@ try:
             for n, name in enumerate(arms):
                 servers[name] = stack.enter_context(server(name, n))
                 c, w, p = servers[name]
-                query(name, items[-1], c, w, p)
+                start = time.perf_counter()
+                first = query(name, items[-1], c, w, p)
+                if name in a.stage_arm:
+                    wait_staging(c, w, p, first, start)
             rows.clear()
             (RUN / "rows.jsonl").write_text("")
         for qi in range(a.offset, a.offset + a.queries):
@@ -270,6 +318,8 @@ try:
                 if a.mode == "cachecold":
                     c, w, p = servers[name]
                     c.post("/_bench/drop_caches").raise_for_status()
+                    if name in a.stage_arm:
+                        evict_staging(w)
                     (w / "server.log").write_text("")
                     query(name, items[qi], c, w, p)
                 else:
