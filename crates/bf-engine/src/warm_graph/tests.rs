@@ -121,38 +121,35 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         "uncalibrated graphs retain IVF"
     );
     assert_eq!(e.0.hot_graph.answers.load(Ordering::Relaxed), 0);
-    for i in [
-        17usize, 23, 59, 87, 111, 203, 531, 787, 997, 1511, 1901, 2243,
-    ]
-    .into_iter()
-    .cycle()
-    .take(2048)
-    {
-        // Keep this lifecycle test's payback positive independently of machine timing.
-        e.0.hot_graph
-            .entries
-            .lock()
-            .unwrap()
-            .get_mut(&key)
-            .unwrap()
-            .ivf_seconds = 1.;
-        e.recall(
-            "hot",
-            json!({"num":1,"top_k":10,"rank_by":["vector","ANN",vectors[i]]}),
-        )
-        .await
-        .unwrap();
-        if held.calibration.lock().unwrap().usable {
-            break;
-        }
-    }
-    assert!(
-        held.calibration.lock().unwrap().usable,
-        "exact recall sampling must calibrate and amortize the graph"
-    );
+    // Verify the real exact-sampling integration, then drive economics and quality with
+    // deterministic observations. Tiny fixtures need not have a profitable graph, and a
+    // lifecycle test must not depend on the scheduler or improvements to IVF recall.
+    e.recall(
+        "hot",
+        json!({"num":1,"top_k":10,"rank_by":["vector","ANN",vectors[17]]}),
+    )
+    .await
+    .unwrap();
+    assert!(held.searches.load(Ordering::Relaxed) > 0);
     assert!(
         e.0.hot_graph.entries.lock().unwrap()[&key].ivf_seconds < 1.,
         "recall must replace the synthetic initial baseline with paired IVF observations"
+    );
+    {
+        let mut calibration = held.calibration.lock().unwrap();
+        calibration.quality = effort::Effort::new();
+        calibration.build_seconds = 1.;
+    }
+    for _ in 0..128 {
+        let scope = Scope::new(e.0.hot_graph.clone(), "hot").trial();
+        *scope.used.lock().unwrap() = Some(vec![key.clone()]);
+        scope.record_cpu(0.001);
+        scope.record_ivf_cpu(0.01);
+        scope.feedback(1., 1.);
+    }
+    assert!(
+        held.calibration.lock().unwrap().usable,
+        "matched quality and positive measured payback must admit the graph"
     );
     // A graph selected during planning can lose its query scratch slot before execution.
     // The complete ordinary IVF plan must be restored rather than keeping independent seats.
@@ -246,10 +243,21 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         e.0.hot_graph.answers.load(Ordering::Relaxed) > answered,
         "the delta must actually contribute before the complete IVF retry"
     );
-    {
+    // Parallel tests can legitimately evict the optional base graph. In that case the
+    // delta and ordinary base IVF form a successful plan, so its feedback is valid.
+    let base_retained =
+        e.0.hot_graph
+            .entries
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|h| h.ready.as_ref())
+            .is_some_and(|base| Arc::ptr_eq(base, &held));
+    if base_retained {
         let calibration = delta.calibration.lock().unwrap();
-        assert!(
-            calibration.quality.len() == 0,
+        assert_eq!(
+            calibration.quality.len(),
+            0,
             "discarded plans cannot calibrate recall"
         );
         assert_eq!(
@@ -257,6 +265,19 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
             "discarded plans cannot calibrate CPU savings"
         );
     }
+    // Check the abandonment contract independently of optional global admission pressure.
+    let before_samples = delta.calibration.lock().unwrap().quality.len();
+    let scope = Scope::new(e.0.hot_graph.clone(), "hot").trial();
+    *scope.used.lock().unwrap() = Some(vec![delta_key.clone()]);
+    scope.abandon();
+    scope.record_cpu(1.);
+    scope.record_ivf_cpu(1.);
+    scope.feedback(0., 1.);
+    assert_eq!(
+        delta.calibration.lock().unwrap().quality.len(),
+        before_samples
+    );
+    assert_eq!(delta.calibration.lock().unwrap().graph_seconds, 0.);
     drop(permit);
     e.0.hot_graph.entries.lock().unwrap().remove(&delta_key);
     drop(delta);
@@ -501,5 +522,39 @@ async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan
         after_stats.cache_hit_ratio() > 0.,
         "ANN's sparse vector must remain cached after the larger exhaustive pass"
     );
+    // Eight truth observations produce one cost block. Its eight graph plans run
+    // together, while IVF cost plans and exact truth never select the graph.
+    assert_eq!(entry.calibration.lock().unwrap().trial_seconds, 0.);
+    for i in 1..8 {
+        e.recall(
+            "hot",
+            json!({"num":1,"top_k":10,"rank_by":["vector","ANN",vectors[171+i]]}),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(entry.searches.load(Ordering::Relaxed), 16);
+    assert_eq!(e.0.hot_graph.answers.load(Ordering::Relaxed), answered + 16);
+    assert!(entry.calibration.lock().unwrap().trial_seconds > 0.);
+    assert!(entry.pending_cost.lock().unwrap().queries.is_empty());
     e.shutdown(Duration::from_secs(3)).await;
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn background_workers_yield_to_normal_serving_threads() {
+    let policies = pool().broadcast(|_| {
+        // SAFETY: these calls inspect only the calling background worker.
+        unsafe {
+            (
+                libc::getpriority(libc::PRIO_PROCESS, 0),
+                libc::sched_getscheduler(0),
+            )
+        }
+    });
+    assert_eq!(policies.len(), 2);
+    assert!(
+        policies.into_iter().all(|(nice, policy)| nice == 19
+            && (policy == libc::SCHED_IDLE || policy == libc::SCHED_OTHER))
+    );
 }

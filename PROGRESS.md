@@ -4,6 +4,45 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Balanced warm slab scans (RR3, cherry-picked 91bca2d).** RR3 traced a warm p90 regression to task skew: each resident slab scan was one CPU task, and the query's largest task (64-82K rows at p90) set the tail while other workers idled. Fan-out resident non-exact scans now split into row-balanced batches (minimum 512 KiB of codes; target rows from queried rows, workers, and in-flight queries); streamed cold plans are unchanged. Largest task at p90 drops from 82,350 to 7,326 rows. BEIR NQ, main layouts (4- and 8-way loads), 200 paired samples: warm p90 -12.8 to -17.3%, real-S3 cold p90 -4.6 to -11.8%, cold medians -1 to -7% except 4/48 at +0.6% (paired bootstrap 95% CI -3.6 to +4.1%); 10,000-request throughput 854 -> 856 q/s (4 clients) and 1,477 -> 1,468 (16). All 3,452 ordered IDs identical. RR3's deterministic (canonical) assignment is not merged: its 4-client cold regression failed the cold gate.
+
+- **Filtered ANN recall planner (D4, merged from wt/d4-plan).** The segment-directory planner's fixed three-times probe cap lost neighbors on selective distributed filters. The probe budget now scales with inverse selectivity from the membership maps, plus a witness margin; `BF_FILTER_PROBE_CAP` is removed (one way per thing). BEIR NQ, 48 probes: hash 1% recall 0.936 -> 1.0, hash 10% 0.961 -> 0.989, ID 1%/10% stay 1.0, 50% unchanged. Matched-recall cost (main at 256 probes vs planner at 48): hash 1% CPU/query 46.4 -> 64.1 ms (+38%), hash 10% 42.8 -> 39.5 ms (recall 0.994 vs 0.989), ID 10% 9.6 -> 11.3 ms (+18%, both 1.0), 50% flat. A 40,000-vector regression test checks distributed filters against exhaustive truth. Next: cut the planner's extra work on ID-local filters, where it adds CPU without recall.
+
+- **BM25 under heavy writes another 1.65x faster** (round BW2; `docs/benchmarks.md`, "Round BW2"). Correcting
+  corpus statistics for indexed rows that the WAL tail replaced or deleted was the largest remaining stage. It
+  now reads indexed lengths and the exact masked postings of the query's own terms, and reuses the snapshot's
+  shadow bitmap when masking hits. On 1M MS MARCO with 1,000 text-changing upserts/s: p50/p90 49.0/70.0 to
+  29.7/40.8 ms (the shadow stage 22.4 to 6.3 ms p50), bit-identical on all 4,000 validation queries, write p90
+  +2.6%, idle BM25 unchanged. No format change.
+
+- **Warm queries stay compiled after compaction, and a core is kept for completions** (round Q3; `docs/benchmarks.md`,
+  "Round Q3"). After a compaction that fully covered a recluster tier's segments, the tier's live mask came back as
+  "everything" instead of none, which silently sent warm queries off the compiled fast path. Fixed, with a regression
+  test at both leaf sizes. The query CPU pool also uses `N - 1` workers on hosts with 8 or more CPUs. Paired on 8 CPUs
+  with 16 clients at 48/64 probes, identical results: after compaction +22%/+19% q/s and p90 -24%/-23%; freshly
+  published +3%/+2% q/s and p90 -8%/-11%. Cold queries are unchanged; the 4-CPU shape is flat within noise.
+
+- **Filtered queries 100x faster in throughput: immutable predicate results are cached** (from round D4). A filter's
+  result over an immutable segment was recomputed for every query, and snapshot warm-up and query planning
+  each did it separately. They now share one cached result keyed by the segment files, live generation, schema,
+  and filter, held in a protected share of the column cache (unused bytes stay available to columns); WAL
+  shadows are applied afterward. On full NQ with an ID-range filter at normal retention: warm p50 1,522 to
+  12 ms, and 16-client throughput 5 to 601 q/s, with identical results.
+
+- **Truthful index status in namespace metadata** (round MD1). Metadata always said `"index": {"status":
+  "up-to-date"}`, so a client polling for indexing to finish could be told it was done while the WAL tail still
+  held unindexed rows. It now reports `{"status": "updating", "unindexed_bytes": ..., "unindexed_rows": ...}`
+  from counts the snapshot already holds (no new I/O or format change), and `up-to-date` once the tail is
+  published. Metadata polling also refreshes the checkpoint while data is pending, so a reader sees another
+  node's index publication without a new write. The official Python SDK parses both states (`compat/`).
+
+- **BM25 under heavy writes 9.5x faster** (round BW1; `docs/benchmarks.md`, "Round BW1"). BM25 over an
+  unindexed write tail recomputed full-vocabulary statistics and re-tokenized tail rows on every query. Queries
+  now compute statistics for their own terms only and reuse cached per-row term counts from immutable tail
+  objects (a bounded CLOCK pool taking one eighth of the decoded-cache budget). On 1M MS MARCO with 1,000
+  text-changing upserts/s: p50 539 to 57 ms, p90 721 to 82 ms, with bit-identical results on 4,000 validation
+  queries across four million-row snapshots and every offered write acknowledged. Idle BM25 is unchanged.
+
 - **Memory-capped servers 1.2-3.6x faster on warm vector queries** (round MEM2; `docs/benchmarks.md`, "Round MEM2").
   Immutable local objects are now memory-mapped and share the operating system's page cache instead of being
   copied into the heap, through two views of the same pages: normal read-ahead for contiguous reads of 64 KiB or

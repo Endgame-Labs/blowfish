@@ -59,7 +59,7 @@ process's active build alone. It uses the disk-cache directory when available, a
 temporary directory otherwise. Measurement processes place temporary files in their owned run.
 
 One process-wide construction slot prevents competing graph builders. A dedicated Rayon pool has
-at most two workers, using Linux nice 5 or macOS utility QoS. CPU passes check cancellation at source-row, graph-point, and bounded-phase boundaries, and periodically check process memory headroom. Automatic recluster construction takes priority;
+at most two workers, using Linux idle scheduling with nice 19 (nice 19 alone when idle scheduling is denied), or macOS utility QoS. CPU passes check cancellation at source-row, graph-point, and bounded-phase boundaries, and periodically check process memory headroom. Automatic recluster construction takes priority;
 it also subtracts existing graph reservations when sizing its own work.
 
 Source decoding, local I/O, and construction all run on that pool. The blocking job retains the
@@ -137,7 +137,15 @@ CPU, with a conservative 10% allowance for source decoding. Graph query CPU is m
 ordinary query workers, charging each poll on its current thread and excluding I/O waits across
 CPU-to-I/O continuation. Each graph recall trial also runs the ordinary IVF plan for the same
 request and snapshot, with the same admission, worker, and query concurrency. These paired CPU
-observations refine the pre-promotion IVF EWMA; only exhaustive truth work is throttled to one
+observations refine the pre-promotion IVF EWMA. Exhaustive scans can displace CPU caches even
+when they bypass application cache admission. Warm cost therefore comes from bounded blocks of
+eight recent sampled requests on one immutable snapshot and trial effort: graph plans run together,
+then IVF plans run together, without exhaustive scans between those timed plans. The first cold
+query remains included in the average; there is no excluded identical-query warmup. Exact recall
+observations keep their original truth comparison. A per-graph queue retains at most 64 KiB of
+serialized requests under the metadata reservation, resets across snapshot or effort changes, and
+never retains truth responses or snapshots. Promotion requires a positive measured cost block;
+queries remain on IVF if a block cannot be collected. Only exhaustive truth work is throttled to one
 search worker. A calibrated graph that
 remains unprofitable for a full observation window is discarded. All thresholds are internal policy;
 there are no per-corpus ef constants or user-facing graph controls.

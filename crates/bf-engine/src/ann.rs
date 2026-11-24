@@ -400,8 +400,9 @@ fn from_tiers<'a>(
 
 /// Live-row masks of recluster tiers whose covered segments changed since the build, by tier
 /// directory and the changed segments' live objects.
+type TierMask = Option<Arc<RoaringBitmap>>;
 static TIER_MASKS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, Arc<RoaringBitmap>>>,
+    std::sync::Mutex<std::collections::HashMap<String, TierMask>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// The live rows of a tier as a mask over its global row numbers, or `None` when every row it
@@ -454,7 +455,7 @@ pub(crate) async fn tier_mask(
         .get(&key)
         .cloned()
     {
-        return Ok(Some(mask));
+        return Ok(mask);
     }
     let lives: Vec<usize> = lives.into_iter().collect();
     let loaded = futures::future::try_join_all(
@@ -489,14 +490,23 @@ pub(crate) async fn tier_mask(
             }
         }
     }
-    let mask = Arc::new(mask);
+    // A merge can move every row without deleting any. Preserve the mask-free plan in
+    // that case: a full bitmap otherwise disables the compiled tier and its resident scan.
+    // Cache the proof with the same immutable live objects and lineage maps as a real mask.
+    let full = set.covered.iter().all(|cover| {
+        cover
+            .base
+            .checked_add(cover.rows)
+            .is_some_and(|end| mask.contains_range(cover.base..end))
+    });
+    let mask = (!full).then(|| Arc::new(mask));
     let mut masks = TIER_MASKS.lock().unwrap_or_else(|e| e.into_inner());
     // A few tiers' current masks; older generations are dropped wholesale.
     if masks.len() >= 16 {
         masks.clear();
     }
     masks.insert(key, mask.clone());
-    Ok(Some(mask))
+    Ok(mask)
 }
 
 /// Unfiltered ANN from one tier's slabs: the same directory search, over slabs as pseudo

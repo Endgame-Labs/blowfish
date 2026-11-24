@@ -35,6 +35,7 @@ mod recluster;
 mod reindex;
 mod text;
 mod text_keys;
+mod text_tail;
 mod upgrade;
 mod warm_ann;
 mod write;
@@ -599,7 +600,7 @@ impl Engine {
         ns: &str,
         consistency: &Consistency,
     ) -> Result<(NamespaceState, bool), ApiError> {
-        self.snapshot_hinted(ns, consistency, None).await
+        self.snapshot_hinted(ns, consistency, None, false).await
     }
     /// A snapshot that, when it has to read a newer checkpoint, opens the files the query
     /// will need while the WAL tail is being read.
@@ -608,6 +609,7 @@ impl Engine {
         ns: &str,
         consistency: &Consistency,
         hint: Option<snapshot::OpenHint>,
+        refresh_pending_checkpoint: bool,
     ) -> Result<(NamespaceState, bool), ApiError> {
         let handle = self.handle(ns).await?;
         let mut state = handle.state.lock().await;
@@ -638,7 +640,10 @@ impl Engine {
         // Bound its age separately from WAL freshness, so repeated strong reads cannot
         // keep a reclaimed checkpoint alive indefinitely.
         let checkpoint_valid = state.seq > 0
-            && state.checkpoint_refreshed.elapsed() < self.0.config.retention.div_f64(2.0);
+            && state.checkpoint_refreshed.elapsed() < self.0.config.retention.div_f64(2.0)
+            // Metadata polling must see remote index publications even without a new write.
+            // Finished checkpoints retain the ordinary strong-read fast path.
+            && !(refresh_pending_checkpoint && (state.tail_bytes > 0 || !state.docs.is_empty()));
         let unchanged = if matches!(consistency, Consistency::Strong) && checkpoint_valid {
             let observed = (state.seq, state.manifest_seq);
             // Keep independent consistency requests off the namespace state lock.
@@ -818,7 +823,7 @@ impl Engine {
             let result = backend
                 .scope(
                     "snapshot",
-                    self.snapshot_hinted(ns, &request.consistency, Some(hint)),
+                    self.snapshot_hinted(ns, &request.consistency, Some(hint), false),
                 )
                 .await;
             (result, start.elapsed())
@@ -904,12 +909,7 @@ impl Engine {
                             read_cache::context().expect("sample read context"),
                         )
                         .await;
-                        let ann = ann.map(|(ann, seconds)| {
-                            if let Some(scope) = &trial {
-                                scope.record_cpu(seconds);
-                            }
-                            ann
-                        });
+                        let ann = ann.map(|(ann, _)| ann);
                         let ivf = if ann.is_ok() && trial.as_ref().is_some_and(|s| s.used_graph()) {
                             warm_graph::trial_plan(&store, &sample, &request, &config, ivf_context)
                                 .await
@@ -933,6 +933,15 @@ impl Engine {
                         ) {
                             let recall = indexed::recall(&ann, &exact);
                             if let (Some(scope), Some(ivf)) = (trial, ivf) {
+                                warm_graph::cost::measure(
+                                    &scope,
+                                    &store,
+                                    &sample,
+                                    &request,
+                                    &config,
+                                    read_cache::context().expect("sample read context"),
+                                )
+                                .await;
                                 scope.feedback(recall, indexed::recall(&ivf, &exact));
                             }
                             metrics::histogram!("blowfish_ann_recall").record(recall);
@@ -1032,11 +1041,19 @@ impl Engine {
         text::reference_stats(&mut full);
         query::execute(&full, &request)
     }
-    /// Namespace metadata, with fully expanded schema settings.
+    /// Namespace metadata, with fully expanded schema settings and current WAL indexing progress.
     pub async fn metadata(&self, ns: &str) -> Result<Value, ApiError> {
-        let (s, _) = self.snapshot(ns, &Consistency::Strong).await?;
+        let (s, _) = self
+            .snapshot_hinted(ns, &Consistency::Strong, None, true)
+            .await?;
         let totals = snapshot::statistics(&self.0.store, &s).await?;
         let mut metadata = json!({"schema":s.schema,"approx_logical_bytes":totals.logical_bytes,"approx_row_count":totals.rows,"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}});
+        // Every live tail row is searched exhaustively, including scalar-only namespaces.
+        // Deletes and schema-only writes leave bytes to checkpoint even with zero tail rows.
+        // Built segments (including small flat indexes) and recluster tiers are already indexed.
+        if s.tail_bytes > 0 || !s.docs.is_empty() {
+            metadata["index"] = json!({"status":"updating","unindexed_bytes":s.tail_bytes,"unindexed_rows":s.docs.len() as u64});
+        }
         if let Some(lineage) = branch::lineage(&self.0.store, ns, s.created_at).await? {
             metadata["branching"] = serde_json::to_value(lineage).expect("lineage serializes");
         }
@@ -1890,4 +1907,9 @@ mod recall_sampler_tests {
     }
 }
 
+#[cfg(test)]
+mod text_benchmark;
 mod warm_graph;
+
+#[cfg(test)]
+mod filtered_recall_tests;

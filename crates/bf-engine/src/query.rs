@@ -1033,7 +1033,7 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
         }
         let context = crate::read_cache::context().expect("recall read context");
         let scope = context.hot_graph.clone();
-        let (ann, seconds) = crate::warm_graph::trial_plan(
+        let (ann, _) = crate::warm_graph::trial_plan(
             engine.storage(),
             &state,
             &q,
@@ -1041,9 +1041,6 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
             context.clone(),
         )
         .await?;
-        if let Some(scope) = &scope {
-            scope.record_cpu(seconds);
-        }
         let ivf = if let Some(scope) = scope.filter(|s| s.used_graph()) {
             crate::warm_graph::trial_plan(
                 engine.storage(),
@@ -1073,6 +1070,15 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
         if let (Some(scope), Some(ivf)) =
             (crate::read_cache::context().and_then(|c| c.hot_graph), ivf)
         {
+            crate::warm_graph::cost::measure(
+                &scope,
+                engine.storage(),
+                &state,
+                &q,
+                &engine.0.config,
+                crate::read_cache::context().expect("recall read context"),
+            )
+            .await;
             scope.feedback(measured, crate::indexed::recall(&ivf, &exact));
         }
         recall_sum += measured;

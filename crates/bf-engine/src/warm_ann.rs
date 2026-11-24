@@ -195,48 +195,74 @@ mod tests {
         .await
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn compiled_queries_preserve_snapshots_masks_projections_and_cache_eviction() {
-        for cluster_rows in [60, 640] {
-            check_compiled_queries(cluster_rows).await;
-        }
-    }
-
-    async fn check_compiled_queries(cluster_rows: usize) {
-        let store = Storage::open(&StorageConfig {
-            url: "memory://".into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        let writer = engine(&store, 64 << 20);
-        for batch in 0..2 {
-            let docs: Vec<_> = (batch * 3000..(batch + 1) * 3000)
-                .map(|id| {
-                    json!({
-                        "id":format!("row-{:05}", 6000-id), "vector":vector(id), "tag":id % 4,
-                    })
-                })
-                .collect();
-            writer.write("compiled", serde_json::from_value::<WriteRequest>(json!({
-                "distance_metric":"cosine_distance", "schema":{"vector":{"type":"[32]f16"}}, "upsert_rows":docs,
-            })).unwrap()).await.unwrap();
-            writer.index_namespace("compiled", true).await.unwrap();
-        }
-        let scratch = tempfile::tempdir().unwrap();
-        writer
-            .recluster(
-                "compiled",
-                &ReclusterOptions {
-                    attribute: "vector".into(),
-                    cells: 1,
-                    cluster_rows,
-                    max_slab_rows: 10000,
-                    scratch: scratch.path().to_owned(),
-                },
-            )
+    // Keep the build future on the heap so the driver has room for compaction and queries.
+    fn fixture(
+        cluster_rows: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (Storage, Engine)>>> {
+        Box::pin(async move {
+            let store = Storage::open(&StorageConfig {
+                url: "memory://".into(),
+                ..Default::default()
+            })
             .await
             .unwrap();
+            let writer = engine(&store, 64 << 20);
+            for batch in 0..2 {
+                let docs: Vec<_> = (batch * 3000..(batch + 1) * 3000)
+                    .map(|id| {
+                        json!({
+                            "id":format!("row-{:05}", 6000-id), "vector":vector(id), "tag":id % 4,
+                        })
+                    })
+                    .collect();
+                writer.write("compiled", serde_json::from_value::<WriteRequest>(json!({
+                "distance_metric":"cosine_distance", "schema":{"vector":{"type":"[32]f16"}}, "upsert_rows":docs,
+            })).unwrap()).await.unwrap();
+                writer.index_namespace("compiled", true).await.unwrap();
+            }
+            let scratch = tempfile::tempdir().unwrap();
+            writer
+                .recluster(
+                    "compiled",
+                    &ReclusterOptions {
+                        attribute: "vector".into(),
+                        cells: 1,
+                        cluster_rows,
+                        max_slab_rows: 10000,
+                        scratch: scratch.path().to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+            (store, writer)
+        })
+    }
+
+    #[test]
+    fn compiled_queries_preserve_snapshots_masks_projections_and_cache_eviction() {
+        // The synthetic write, build, and compaction futures share one test driver. Keep
+        // their stack separate from the runtime workers, which retain their normal stacks.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        for cluster_rows in [60, 640] {
+                            compiled_case(cluster_rows).await;
+                        }
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn compiled_case(cluster_rows: usize) {
+        let (store, writer) = fixture(cluster_rows).await;
         let wal = bf_wal::Wal::new(store.clone(), "compiled").unwrap();
         let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
         let key = &manifest.ann_tiers["vector"][0].dir.key;
@@ -260,7 +286,8 @@ mod tests {
             compiled.hits.load(Ordering::Relaxed) > 0,
             "exercise the real compiled branch"
         );
-        let tiny = engine(&store, 128);
+        // Large enough for the rejection marker in the general pool, far too small for the tier.
+        let tiny = engine(&store, 256);
         for _ in 0..3 {
             assert_eq!(
                 query(&tiny, request(2111)).await,
@@ -312,6 +339,40 @@ mod tests {
             32,
             "a resident exact working set must not fall back after warming"
         );
+        // Pure compaction changes placement, but leaves every tier row live. Reuse the
+        // compiled generation through lineage, including after caching its full-mask proof.
+        let merger = Engine::with_config(
+            store.clone(),
+            EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.,
+                compaction_segments: 2,
+                max_segment_rows: 10_000,
+                ..Default::default()
+            },
+        );
+        assert!(
+            Box::pin(merger.index_namespace("compiled", true))
+                .await
+                .unwrap()
+        );
+        let (_, merged) = wal.latest_manifest().await.unwrap().unwrap();
+        assert!(!merged.lineage.is_empty());
+        assert_eq!(merged.ann_tiers["vector"][0].dir.key, *key);
+        warm.0.namespaces.lock().await.clear();
+        normal.0.namespaces.lock().await.clear();
+        let before_merge = compiled.hits.load(Ordering::Relaxed);
+        for id in [17, 2111, 5999, 17] {
+            assert_eq!(
+                query(&warm, request(id)).await,
+                query(&normal, request(id)).await
+            );
+        }
+        assert_eq!(
+            compiled.hits.load(Ordering::Relaxed) - before_merge,
+            4,
+            "full live masks must retain the compiled tier after compaction"
+        );
         // A concurrent reader cannot return an old speculative result over an unindexed write.
         writer.write("compiled", serde_json::from_value::<WriteRequest>(json!({
             "deletes":["row-05983"], "upsert_rows":[{"id":"new","vector":vector(17),"tag":1}],
@@ -352,3 +413,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "compiled_benchmark.rs"]
+mod benchmark;

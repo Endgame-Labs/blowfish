@@ -259,12 +259,11 @@ impl OpenHint {
             for seg in segments {
                 if by_dir && with_rest {
                     for f in &self.filters {
-                        // Populate the cache with the live mask and the filter's dictionary
-                        // blocks; the query recomputes the (cheap) bitmap from them.
+                        // Share the immutable live predicate with query planning; WAL shadows
+                        // are removed afterward, rather than entering the cache key.
                         tasks.push(
                             async move {
-                                let live = segment::live(store, seg).await?;
-                                segment::filter_rows(store, seg, f, schema, &live)
+                                segment::filter_live(store, seg, f, schema)
                                     .await
                                     .map(drop)
                             }
@@ -755,13 +754,24 @@ pub(crate) async fn allowed_with(
     f: Option<&Filter>,
     unshadow: bool,
 ) -> Result<RoaringBitmap, ApiError> {
-    let mut live = segment::live(store, seg).await?;
-    if unshadow && !state.shadowed.is_empty() {
-        live -= segment::lookup_many(store, seg, &state.shadowed).await?;
-    }
-    if let Some(f) = f {
+    let mut live = if let Some(f) = f {
         filter::validate(f, &state.schema, false)?;
-        live = segment::filter_rows(store, seg, f, &state.schema, &live).await?;
+        segment::filter_live(store, seg, f, &state.schema)
+            .await?
+            .as_ref()
+            .clone()
+    } else {
+        segment::live(store, seg).await?
+    };
+    if unshadow && !state.shadowed.is_empty() {
+        let prepared = crate::read_cache::context()
+            .and_then(|context| context.text_shadowed)
+            .and_then(|masks| masks.get(&seg.id).cloned());
+        if let Some(rows) = prepared {
+            live -= rows;
+        } else {
+            live -= segment::lookup_many(store, seg, &state.shadowed).await?;
+        }
     }
     Ok(live)
 }

@@ -19,7 +19,10 @@ const DWELL: Duration = Duration::from_secs(600);
 const IDLE: Duration = Duration::from_secs(1800);
 const RETRY: Duration = Duration::from_secs(1800);
 const RERANK: usize = 30;
+pub(crate) mod cost;
 mod effort;
+#[cfg(all(test, target_os = "macos"))]
+mod nav_probe;
 static RESERVED: AtomicU64 = AtomicU64::new(0);
 static FOREGROUND: AtomicU64 = AtomicU64::new(0);
 static CACHES: std::sync::LazyLock<Mutex<Vec<std::sync::Weak<Cache>>>> =
@@ -123,6 +126,7 @@ struct Entry {
     build_reservation_bytes: u64,
     phase_cpu: [AtomicU64; 3],
     searches: AtomicU64,
+    pending_cost: Mutex<cost::Pending>,
 }
 struct Heat {
     first: Instant,
@@ -310,8 +314,9 @@ impl Scope {
                     c.trial_seconds = 0.;
                 }
                 let saving = (h.ivf_seconds - c.graph_seconds).max(0.);
-                c.usable =
-                    c.quality.serving.is_some() && h.rate * 86400. * saving >= 2. * c.build_seconds;
+                c.usable = c.quality.serving.is_some()
+                    && c.graph_seconds > 0.
+                    && h.rate * 86400. * saving >= 2. * c.build_seconds;
                 let reject = update.exhausted
                     || (c.quality.settled() && c.quality.len() >= 128 && !c.usable);
                 drop(c);
@@ -621,9 +626,12 @@ fn pool() -> &'static rayon::ThreadPool {
             .thread_name(|n| format!("warm-graph-{n}"))
             .start_handler(|_| {
                 #[cfg(target_os = "linux")]
-                // SAFETY: Linux applies PRIO_PROCESS with pid zero to the calling worker thread.
+                // SAFETY: both calls affect only this worker on Linux. Idle scheduling yields
+                // to serving work; nice 19 remains a fallback when a sandbox denies it.
                 unsafe {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, 5);
+                    libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+                    let priority = libc::sched_param { sched_priority: 0 };
+                    libc::sched_setscheduler(0, libc::SCHED_IDLE, &priority);
                 }
                 #[cfg(target_os = "macos")]
                 // SAFETY: the QoS call changes only the calling worker's scheduling class.
@@ -820,6 +828,7 @@ impl Engine {
             build_reservation_bytes: estimate,
             phase_cpu: Default::default(),
             searches: AtomicU64::new(0),
+            pending_cost: Mutex::default(),
         }))
     }
 }
@@ -1021,6 +1030,8 @@ async fn search_entry(
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     entry.searches.fetch_add(1, Ordering::Relaxed);
     let navigation_started = thread_cpu();
+    #[cfg(all(test, target_os = "macos"))]
+    let counter_started = nav_probe::begin();
     let scratch = entry
         .scratch
         .lock()
@@ -1031,7 +1042,7 @@ async fn search_entry(
         entry,
         scratch: Some(scratch),
     };
-    let (hits, _) = entry
+    let (hits, evaluations) = entry
         .graph
         .candidates(
             vector,
@@ -1042,6 +1053,10 @@ async fn search_entry(
         )
         .map_err(segment::index_error)?;
     drop(loan);
+    #[cfg(all(test, target_os = "macos"))]
+    nav_probe::end(counter_started, evaluations, &hits);
+    #[cfg(not(all(test, target_os = "macos")))]
+    let _ = evaluations;
     entry.phase_cpu[0].fetch_add(
         ((thread_cpu() - navigation_started).max(0.) * 1e9) as u64,
         Ordering::Relaxed,

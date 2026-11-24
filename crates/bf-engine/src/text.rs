@@ -530,12 +530,20 @@ pub(crate) fn reference_stats(state: &mut NamespaceState) {
         .collect::<BTreeMap<_, _>>()
         .into();
 }
+/// Exact corpus statistics and the query's segment-local shadow masks. The masks
+/// belong to this snapshot, and can also exclude replaced rows during retrieval.
+#[derive(Clone, Default)]
+pub(crate) struct GlobalStats {
+    pub corpus: std::sync::Arc<BTreeMap<String, CorpusStats>>,
+    pub shadowed: Option<std::sync::Arc<BTreeMap<String, roaring::RoaringBitmap>>>,
+}
+
 /// Start at the checkpoint's live totals, subtract shadowed segment rows, and add the tail.
 pub(crate) async fn global_stats(
     store: &Storage,
     state: &NamespaceState,
     terms: &QueryTerms,
-) -> Result<std::sync::Arc<BTreeMap<String, CorpusStats>>, ApiError> {
+) -> Result<GlobalStats, ApiError> {
     let fields: BTreeSet<_> = state
         .schema
         .iter()
@@ -546,9 +554,10 @@ pub(crate) async fn global_stats(
         return Ok(Default::default());
     }
     if state.segments.iter().any(|seg| {
-        fields
-            .iter()
-            .any(|f| !segment::seg_text_matches(seg, &state.schema, f))
+        fields.iter().any(|f| {
+            !segment::seg_text_matches(seg, &state.schema, f)
+                || (!state.shadowed.is_empty() && !seg.files.contains_key(&format!("fts:{f}")))
+        })
     }) {
         let mut stats = NamespaceStats::default();
         for seg in &state.segments {
@@ -563,42 +572,214 @@ pub(crate) async fn global_stats(
         for doc in state.docs.values() {
             adjust(&mut stats, doc, &state.schema, true);
         }
-        return Ok(fields
+        return Ok(GlobalStats {
+            corpus: fields
+                .into_iter()
+                .map(|name| {
+                    let c = stats.text.get(&name).map(corpus).unwrap_or_default();
+                    (name, c)
+                })
+                .collect::<BTreeMap<_, _>>()
+                .into(),
+            shadowed: None,
+        });
+    }
+    if state.shadowed.is_empty() && state.docs.is_empty() {
+        return Ok(GlobalStats {
+            corpus: checkpoint_corpus_of(store, state, terms).await?,
+            shadowed: None,
+        });
+    }
+    let started = std::time::Instant::now();
+    let base = checkpoint_corpus_of(store, state, terms).await?;
+    // Keep exact integer lengths. Multiplying a rounded average by its document
+    // count can move the final normalization across an f64 rounding boundary.
+    let counts: BTreeMap<String, (u64, u64)> = match &state.text_stats {
+        Some(file) => match &file.stats_index {
+            Some(index) => index
+                .fields
+                .iter()
+                .map(|(name, field)| (name.clone(), (field.documents, field.total_length)))
+                .collect(),
+            None => load_index(store, file)
+                .await?
+                .fields
+                .iter()
+                .map(|(name, (docs, length, _))| (name.clone(), (*docs, *length)))
+                .collect(),
+        },
+        None => state
+            .stats
+            .text
+            .iter()
+            .map(|(name, field)| (name.clone(), (field.documents, field.total_length)))
+            .collect(),
+    };
+    let mut stats = NamespaceStats::default();
+    for name in &fields {
+        let (documents, total_length) = counts.get(name).copied().unwrap_or_default();
+        let document_frequencies = terms
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|term| {
+                base.get(name)?
+                    .document_frequencies
+                    .get(term)
+                    .map(|df| (term.clone(), *df))
+            })
+            .collect();
+        stats.text.insert(
+            name.clone(),
+            TextStats {
+                documents,
+                total_length,
+                document_frequencies,
+            },
+        );
+    }
+    crate::ann::stage(started, "bm25 checkpoint stats");
+    let analyzer = crate::text_tail::Analyzer::new(&state.schema);
+    let started = std::time::Instant::now();
+    let shadowed = if state.shadowed.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::new(
+            subtract_shadowed(store, state, &fields, terms, &mut stats).await?,
+        ))
+    };
+    crate::ann::stage(started, "bm25 shadow stats");
+    let started = std::time::Instant::now();
+    for doc in state.docs.values() {
+        adjust_summary(&mut stats, &analyzer.tail(doc), terms, true);
+    }
+    crate::ann::stage(started, "bm25 tail stats tokenization");
+    Ok(GlobalStats {
+        corpus: fields
             .into_iter()
             .map(|name| {
                 let c = stats.text.get(&name).map(corpus).unwrap_or_default();
                 (name, c)
             })
             .collect::<BTreeMap<_, _>>()
-            .into());
-    }
-    if state.shadowed.is_empty() && state.docs.is_empty() {
-        return checkpoint_corpus_of(store, state, terms).await;
-    }
-    let mut stats = full_stats(store, state).await?;
-    if !state.shadowed.is_empty() {
-        for seg in &state.segments {
-            let live = segment::live(store, seg).await?;
-            let shadowed = segment::lookup_many(store, seg, &state.shadowed).await? & live;
-            for doc in segment::projected_documents(store, seg, &shadowed, Some(&fields))
-                .await?
-                .values()
-            {
-                adjust(&mut stats, doc, &state.schema, false);
+            .into(),
+        shadowed,
+    })
+}
+
+/// Read lengths and intersect query-term postings, rather than hydrating and
+/// analyzing the text of every replaced row. Published deletion masks are applied
+/// first: a row already removed from the checkpoint must not be subtracted twice.
+async fn subtract_shadowed(
+    store: &Storage,
+    state: &NamespaceState,
+    fields: &BTreeSet<String>,
+    terms: &QueryTerms,
+    stats: &mut NamespaceStats,
+) -> Result<BTreeMap<String, roaring::RoaringBitmap>, ApiError> {
+    let removed = futures::future::try_join_all(state.segments.iter().map(|seg| async move {
+        let (rows, live) = tokio::try_join!(
+            segment::lookup_many(store, seg, &state.shadowed),
+            segment::live(store, seg),
+        )?;
+        let rows = rows & live;
+        let mut removed = BTreeMap::new();
+        if !rows.is_empty() {
+            for name in fields {
+                let file = seg
+                    .files
+                    .get(&format!("fts:{name}"))
+                    .ok_or_else(segment::corrupt)?;
+                let reader = segment::text_index(store, file).await?;
+                reader
+                    .ensure_lengths()
+                    .await
+                    .map_err(segment::index_error)?;
+                if reader.num_docs() != seg.row_count {
+                    return Err(segment::corrupt());
+                }
+                let mut field = TextStats::default();
+                for row in &rows {
+                    let length = reader.doc_lengths()[row as usize];
+                    // Zero is a missing/null field; present empty fields have
+                    // normalization length one, including stopword-only text.
+                    if length != 0 {
+                        field.documents += 1;
+                        field.total_length += u64::from(length);
+                    }
+                }
+                let wanted: Vec<_> = terms
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect();
+                let counts = reader
+                    .document_frequencies(&wanted, &rows)
+                    .await
+                    .map_err(segment::index_error)?;
+                field.document_frequencies = wanted
+                    .into_iter()
+                    .zip(counts)
+                    .filter(|(_, count)| *count != 0)
+                    .map(|(term, count)| (term.to_owned(), count))
+                    .collect();
+                removed.insert(name.clone(), field);
+            }
+        }
+        Ok::<_, ApiError>((seg.id.clone(), rows, removed))
+    }))
+    .await?;
+    let mut masks = BTreeMap::new();
+    for (segment, rows, removed) in removed {
+        masks.insert(segment, rows);
+        for (name, removed) in removed {
+            let field = stats.text.entry(name).or_default();
+            field.documents = field.documents.saturating_sub(removed.documents);
+            field.total_length = field.total_length.saturating_sub(removed.total_length);
+            for (term, removed) in removed.document_frequencies {
+                if let Some(count) = field.document_frequencies.get_mut(&term) {
+                    *count = count.saturating_sub(removed);
+                    if *count == 0 {
+                        field.document_frequencies.remove(&term);
+                    }
+                }
             }
         }
     }
-    for doc in state.docs.values() {
-        adjust(&mut stats, doc, &state.schema, true);
+    Ok(masks)
+}
+
+fn adjust_summary(
+    stats: &mut NamespaceStats,
+    summary: &crate::text_tail::Analysis,
+    terms: &QueryTerms,
+    add: bool,
+) {
+    for (name, document) in &summary.fields {
+        let field = stats.text.entry(name.clone()).or_default();
+        let length = u64::from(document.len().max(1));
+        if add {
+            field.documents += 1;
+            field.total_length += length;
+        } else {
+            field.documents = field.documents.saturating_sub(1);
+            field.total_length = field.total_length.saturating_sub(length);
+        }
+        for term in terms.get(name).into_iter().flatten() {
+            if document.frequency(term) == 0 {
+                continue;
+            }
+            if add {
+                *field.document_frequencies.entry(term.clone()).or_default() += 1;
+            } else if let Some(count) = field.document_frequencies.get_mut(term) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    field.document_frequencies.remove(term);
+                }
+            }
+        }
     }
-    Ok(fields
-        .into_iter()
-        .map(|name| {
-            let c = stats.text.get(&name).map(corpus).unwrap_or_default();
-            (name, c)
-        })
-        .collect::<BTreeMap<_, _>>()
-        .into())
 }
 
 #[cfg(test)]
@@ -635,9 +816,9 @@ mod tests {
         let second = global_stats(&store, &state, &QueryTerms::new())
             .await
             .unwrap();
-        assert!(std::sync::Arc::ptr_eq(&first, &second));
-        assert_eq!(first["text"].total_docs, 1);
-        assert_eq!(first["text"].document_frequencies["fox"], 1);
+        assert!(std::sync::Arc::ptr_eq(&first.corpus, &second.corpus));
+        assert_eq!(first.corpus["text"].total_docs, 1);
+        assert_eq!(first.corpus["text"].document_frequencies["fox"], 1);
     }
     #[tokio::test]
     async fn out_of_line_text_statistics_round_trip_and_restrict_to_query_terms() {
