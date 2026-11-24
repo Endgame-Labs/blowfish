@@ -12,7 +12,10 @@ Example: uv run crates/bf-engine/examples/cold_ab.py --config CONFIG.local \
     --binary CANDIDATE --arms '{"base":{"BINARY":"BASELINE"},"stream":{}}' \
     --scratch .scratch/cold-ab --label run-1 --queries 200
 
+Each arm can set CONFIG to a private config for a copied layout with the same
+namespace name, and BF_ANN_NPROBE to match recall at a different probe budget.
 Both builds need blowfish_object_store_attempts_total for physical GET accounting.
+ANN row counts require BF_TRACE_STAGES output containing PLAN rows= records.
 Outputs, traces, and temporary storage configuration stay under --scratch. Cache
 files are removed on exit. Summarize the results, and remove the run directory
 when the experiment ends.
@@ -83,13 +86,17 @@ def stats(client):
 
 @contextlib.contextmanager
 def server(name, index):
+    arm_env = dict(arms[name])
+    arm_config = json.loads(Path(arm_env.pop("CONFIG", a.config)).read_text())
+    if arm_config["namespace"] != config["namespace"]:
+        raise ValueError("paired arms must query the same namespace name")
     work = RUN / name
     work.mkdir(exist_ok=True)
     storage = {
-        "url": config["storage_url"],
-        "region": config.get("region"),
-        "endpoint": config.get("endpoint"),
-        "profile": config.get("profile"),
+        "url": arm_config["storage_url"],
+        "region": arm_config.get("region"),
+        "endpoint": arm_config.get("endpoint"),
+        "profile": arm_config.get("profile"),
         "read_only": True,
         "cache": {
             "memory_bytes": 8 * 2**30,
@@ -101,7 +108,6 @@ def server(name, index):
         },
     }
     (work / "storage.local").write_text(json.dumps(storage))
-    arm_env = dict(arms[name])
     binary = arm_env.pop("BINARY", a.binary)
     env = dict(
         os.environ,
@@ -160,7 +166,9 @@ def query(name, item, client, work, proc):
     after = stats(client)
     delta = {k: after.get(k, 0) - before.get(k, 0) for k in after}
     got = [r["id"] for r in res.get("rows", [])]
+    planned = re.findall(r"^PLAN rows=(\d+)$", (work / "server.log").read_text(), re.M)
     row = {
+        "ann_rows_scanned": sum(map(int, planned)) if planned else None,
         "arm": name,
         "q": item["query_id"],
         "ms": ms,
@@ -217,7 +225,9 @@ try:
             "p90": float(np.percentile([r["ms"] for r in part], 90)),
             **{
                 k: float(np.mean([r[k] for r in part]))
-                for k in ["recall", "gets", "completed_gets", "hedges", "bytes"]
+                for k in [
+                    "recall", "gets", "completed_gets", "hedges", "bytes", "ann_rows_scanned"
+                ]
                 if all(r.get(k) is not None for r in part)
             },
         }
