@@ -1205,6 +1205,9 @@ pub(crate) async fn search(
         context
             .ann_rows
             .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+        if crate::ann::trace_stages() {
+            eprintln!("PLAN rows={rows}");
+        }
     }
     crate::ann::stage(t0, "plan");
 

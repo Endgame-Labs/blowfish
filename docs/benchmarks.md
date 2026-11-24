@@ -6481,3 +6481,249 @@ crate gates are run before committing. A scheduling-sensitive cold-wave assertio
 under the parallel VM suite, then passed in isolation and in the serial default suite; no assertion was weakened.
 The feature-enabled suite also passes. Results were retained before removing experimental data,
 processes, staging objects, and cloud resources.
+
+## Round C2: cold routing hints and corpus-scaled leaves
+
+Tooling: `crates/bf-engine/examples/recluster_copy.rs` (an owned-copy upgrade and recluster example) and `cold_ab.py`.
+
+## Routing data in the first response: killed
+
+Owned in-region c7gd.2xlarge, 60 paired cache-cold queries, oracle indices 0–59,
+64 probes, alternating arm order, and the existing C1 HTTP harness. Each arm
+used 8 GiB payload memory, 512 MiB decoded metadata, 4,000-byte cache blocks,
+512-request concurrency, and eight Rayon threads. Only the paged-directory
+object bytes were supplied from a preloaded immutable local buffer at the
+`paged_view` read boundary in the ideal arm. Header retrieval, page decoding,
+page selection, assembly, cold flags, slab scans, reranks, and hydration remained
+unchanged. Every query dropped the ordinary caches, and the buffer was loaded
+outside the timed samples. The temporary hook is not in the commit.
+
+| Arm | p50 ms | p90 ms | Recall@10 | Mean physical GET attempts | Mean rows scanned |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 688.313 | 816.881 | 0.951667 | 2,208.917 | 809,325.017 |
+| Instant directory pages | 606.413 | 752.530 | 0.951667 | 1,796.233 | 809,325.017 |
+
+All 60 pairs returned identical ordered IDs and distances. The ideal arm saves
+81.9 ms at p50 (1.135x), but misses the required 550 ms cutoff by 56.4 ms.
+It removes approximately 413 GET attempts and 12.30 MB per query; the remaining
+roughly 1,796 GETs still dominate the opportunity. Per the brief, stop here:
+there is no real-header implementation or new on-disk format to review.
+
+### Corpus-scaled leaves: not qualified after confirmation
+
+Target 640 rows per leaf, close to `0.2 * sqrt(10,000,000) = 632.46`.
+The original 10M checkpoint contained legacy ANN objects, so the current
+recluster builder initially rejected it. The owned copy was automatically
+upgraded without retraining: 70 segment indexes, 32 slabs, and 70 document
+objects, in 1,048.414 s. The unchanged-center, upgraded control contained 531
+live objects and 55,798,359,779 bytes, copied in 50.911 s. The original copy had
+704 live objects and 82,530,563,146 bytes. Existing prefixes stayed read-only.
+
+The candidate rebuilt all 10M rows in 1,249.571 s: 15,611 clusters, 55 slabs,
+and a 3,303,367-byte directory. The candidate used 32 coarse cells and a
+250,000-row slab cap. The first complete, alternating cache-cold replay used
+all 200 oracle queries:
+
+| Arm | Probes | p50 ms | p90 ms | Recall@10 | Mean GET attempts | Mean planned rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original 200-row layout | 64 | 424.606 | 550.839 | 0.9615 | 660.590 | 245,659.015 |
+| Upgraded 200-row control | 64 | 453.871 | 607.047 | 0.9615 | 629.975 | 245,659.015 |
+| 640-row leaves | 64 | 313.577 | 466.450 | 0.9660 | 341.005 | 208,031.490 |
+| 640-row leaves | 80 | 291.833 | 414.793 | 0.9730 | 369.635 | 258,297.005 |
+| 640-row leaves | 96 | 311.282 | 445.323 | 0.9775 | 392.370 | 308,491.730 |
+
+The original and upgraded controls returned identical ordered IDs and distances
+for all 200 pairs. At 64 probes, the candidate is 1.354x faster than the original
+and 1.447x faster than the upgraded control, with better recall and 0.847x rows.
+It misses the GET gate: 1.937x fewer than the original, and 1.847x fewer than the
+upgraded control. This does not hit a kill criterion. A follow-up tested 48 and
+56 probes to spend the excess recall margin on fewer reads, using another 200
+alternating cache-cold queries:
+
+| Arm | Probes | p50 ms | p90 ms | Recall@10 | Mean GET attempts | Mean planned rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Upgraded control | 64 | 411.606 | 535.424 | 0.9615 | 629.675 | 245,659.015 |
+| 640-row leaves | 48 | 288.569 | 448.719 | 0.9560 | 300.510 | 157,424.260 |
+| 640-row leaves | 56 | 278.146 | 392.645 | 0.9620 | 312.360 | 183,033.660 |
+
+48 probes loses too much recall. 56 probes provisionally clears every gate:
+1.480x p50, 2.016x fewer GET attempts, 0.745x planned rows, and slightly better
+recall. Gates treat recall tolerance as loss of at most 0.001; this candidate
+also satisfies an absolute 0.001 tolerance.
+
+An independent confirmation removed the other candidate settings and replayed
+all 200 queries against both controls on the same instance:
+
+| Arm | Probes | p50 ms | p90 ms | Recall@10 | Mean GET attempts | Mean planned rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original 200-row layout | 64 | 387.348 | 459.114 | 0.9615 | 657.620 | 245,659.015 |
+| Upgraded 200-row control | 64 | 410.016 | 537.414 | 0.9615 | 625.705 | 245,659.015 |
+| 640-row leaves | 56 | 301.129 | 396.045 | 0.9620 | 325.635 | 183,033.660 |
+
+Against the original control, confirmation gives **1.286x p50**, below the
+required 1.30x, and **2.0195x fewer GET attempts**. Against the upgraded control,
+it gives **1.3616x p50**, but **1.9215x fewer GET attempts**, below the required
+2.0x. Quality and rows reproduce exactly: all 200 candidate ID/distance lists
+match between tuning and confirmation, and both controls match on all 200
+queries in each replay. Candidate recall is 1,924/2,000 exact neighbors versus
+1,923/2,000 for both controls. Planned rows are 0.745x the control.
+
+**Do not promote or publish the provisional pass as a reproducible win.**
+Neither prescribed hard-kill condition is hit: p50 gains exceed 1.2x, and
+matched recall needs fewer rows. This is promising but unqualified by the full
+acceptance gate. The existing leaf-size policy remains unchanged. Candidate
+GET attempts rose 4.25% between tuning and confirmation; mean issued hedges rose
+from 18.84 to 28.56, while results and planned rows stayed identical. The narrow
+GET margin is insufficient for promotion. Confirmation fetched 40.83 MB/query
+for the candidate, versus 62.02 MB for the original and 67.16 MB for the upgraded
+control. Across the four measured replays, physical GET attempts totaled
+1,289,325, excluding warmups and preparation.
+
+The candidate recomputes centers and assignments with the current builder,
+and its slab cap produces 55 slabs versus 32 in the preserved control. A fresh
+200-row build under identical options would isolate leaf size from historical
+builder changes and slab partitioning. The results compare rebuilt layouts.
+No 100M large-leaf rebuild or production-policy change was attempted. A later
+round would need more GET headroom and the same-builder control before changing
+the default. No edits in other crates are required by the retained tooling.
+
+### What was built and its interface
+
+- `crates/bf-engine/examples/cold_ab.py` accepts a per-arm `CONFIG` path in the
+  arms JSON, requires matching namespace names, and continues to force read-only
+  storage. Arms can override `BF_ANN_NPROBE`. Results and summaries include
+  `ann_rows_scanned`, obtained from trace records; builds without those records
+  report the field as unavailable.
+- `ann_dir` emits `PLAN rows=N` under the existing `BF_TRACE_STAGES` switch.
+  Query behavior and the wire API are unchanged.
+- `recluster_copy storage.json namespace cluster_rows scratch_dir [--upgrade-only]`
+  upgrades and rebuilds an owned benchmark copy. It restricts writes to simple
+  S3 `tmp/<owner>/...` prefixes, rejects traversal and URL escapes, requires a
+  `.scratch/` directory, and disables background indexing. `--upgrade-only`
+  prepares a lossless control before the candidate rebuild. It uses existing
+  `Engine::reindex` and `Engine::recluster` APIs, with 32 coarse cells and a
+  250,000-row slab cap. JSON output includes rows, slabs, clusters, directory
+  bytes, seconds, and the requested leaf size.
+
+### Validation
+
+All checks ran on a separate owned c7g.2xlarge, without measurement contention:
+`cargo fmt --check`, `cargo clippy -p bf-engine --all-targets -- -D warnings`,
+`cargo test -p bf-engine` (183 passed, four existing tests ignored), and
+`cargo test -p bf-engine --example recluster_copy` (one passed). The new guard
+test rejects existing scale prefixes, traversal, escapes, empty owners, and
+non-S3 URLs. The Python harness passed `--help` and an AST parse through `uv`.
+The checked diff contains no private settings, credentials, or hostnames.
+
+The checks host was terminated immediately after verification. The measured
+results and all gate decisions are recorded above before deleting scratch data.
+
+## Round B6: exact random-access completion, and bitmap score bands
+
+Both offline kill tests fail. B6 ships no production code, public API, dependency,
+query option, or text format. The failed prototypes are removed from the final
+source tree; implementation, tests, and reproduction notes remain in `eae8ece`
+and `83c6574` (`crates/bf-text/examples/b6`).
+
+### Corpus and paired protocol
+
+The first 1,000,000 passages from `msmarco_load.py`'s stream form five consecutive
+200,000-row, format-7 segments, built by `experiments::prepare_msmarco`. The workload
+is all 1,000 checked-in MS MARCO dev queries, with default BM25 parameters and
+limit 10. An independent `exact_bm25` run validates all 10,000 ordered hit IDs and
+f32 score bits. Every warm and measured candidate pass compares against those
+validated production results.
+
+All arms compile natively on one owned, on-demand c7g.2xlarge, use the same final
+release executable, and run pinned to CPU 3. Builds, indexing, and truth generation
+finish before counters start. Each invocation verifies truth, warms the complete
+workload, and counts the next pass using B5's perf control/ack FIFOs. Values below
+are medians of two complete invocations per arm. Counters measure instructions and
+cycles in user mode, without multiplexing. Two hardware-counter reads per query
+provide p90 cycles, and their cost is included in the outer counters.
+
+| Arm | M instructions/query | M cycles/query | p90 M cycles/query |
+| --- | ---: | ---: | ---: |
+| Existing reader | 18.230 | 11.485 | 28.102 |
+| Impact threshold algorithm, with forward TF completion | 16.658 | 16.780 | 44.483 |
+| Four scalar bitmap bands | 19.163 | 11.146 | 26.105 |
+| Eight scalar bitmap bands | 19.083 | 11.739 | 28.197 |
+| Four bands, direct bitmap intersections | 19.433 | 11.501 | 27.398 |
+| Eight bands, direct bitmap intersections | 20.402 | 12.061 | 28.745 |
+
+The final executable's SHA-256 is
+`f06618000d28167b2b0727d23644f9c63030e281756291059da0402afe5d54ef`.
+The paired baseline differs from B5's historical 20.581M instructions/query;
+comparisons use this executable's baseline. No improvement is inferred from a
+changed driver or release code generation.
+
+### Threshold algorithm with forward TF: rejected
+
+Query-term postings sort by exact saturation under the current namespace
+normalization, and form 128-row impact blocks. BitPacker4x packs their absolute
+row IDs. Each surfaced candidate is completed once from its document's forward
+TF slice, scored in canonical term order, and inserted into a heap shared across
+segments. Summing the remaining term maxima in canonical f32 order bounds
+untouched documents; strict termination retains score ties.
+
+The forward index stores row offsets and lexical term-ID deltas. A low bit folds
+in the common tf=1; other TFs use unsigned LEB128. Completion decodes the actual
+compressed bytes during queries. Saturation-sorted impact blocks and exact maxima
+are prepared outside counters, giving this warm experiment favorable conditions.
+Only workload terms need experimental impact lists; the forward index includes
+**every term in every document**.
+
+| Forward TF encoding | Bytes, including row offsets |
+| --- | ---: |
+| Lexical term-ID deltas, used for measured completion | 100,100,908 |
+| Frequency-ranked IDs, also including the ID mapping | 77,773,764 |
+
+Both measured encodings miss the 65 MB footprint gate. The corpus contains
+39.714 distinct terms/document, rather than the proposed roughly 35. The ranked
+alternative is a footprint diagnostic; its query completion is not measured.
+
+The algorithm reads 114.140 impact blocks/query, but completes **13,331.462
+candidates/query**, far above the proposal's 400–1,200. Reduced sorted access
+does not make completion cheap enough. Instructions exceed the 12.0M kill gate,
+mean cycles rise 1.46×, and p90 cycles rise **1.583×**, exceeding the 1.2× kill
+gate. Random access resolves the missing-contribution correctness problem, but
+the tested completion index fails both the CPU and footprint requirements.
+
+### Frequent-term bitmap bands: rejected
+
+The namespace's 32 most frequent terms receive four or eight disjoint bitmaps of
+upward-rounded saturation bounds. During normal window selection, the prototype
+combines those frequent-term row bounds with exact sparse partials and other dense
+terms' window maxima. Empty windows are removed before posting prefetch; surviving
+rows retain the original scorer, bounded decoded caches, and shared threshold.
+No query-truth floor is supplied.
+
+Eight scalar bands reduce posting reads from **663.770 to 495.275 blocks/query**
+(25.4%), and fully scored rows from **5,364.998 to 4,117.256/query**. Four bands
+read 509.794 blocks and score 4,163.172 rows/query. Bound evaluation costs more
+instructions than the saved posting/scoring work. Four bands improve p90 cycles,
+but still fail both absolute mean gates.
+
+A second implementation directly intersects the disjoint bitmap bands, pruning
+recursive intersections with suffix score bounds. It uses the sparse window
+maximum to avoid per-row bound accumulation. Those looser bounds leave
+654.372 blocks/query with four bands, and 642.218 with eight. Direct bitmap
+combination also fails: all bitmap variants exceed **15.9M instructions** and
+**8.34M cycles/query**. No bitmap layout or production hook ships.
+
+### Validation and limits
+
+Native ARM formatting, `cargo clippy -p bf-text --all-targets -- -D warnings`,
+and `cargo test -p bf-text` pass: **42 tests**, with eight corpus experiments
+ignored. The historical example adds its own checks: **16 pass**, with eight
+embedded corpus experiments ignored. New tests compare forward decoding and
+reference score bits, and exercise repeated terms, missing terms, ties, changed
+namespace averages, and both bitmap combinations. A 12K-row case forces frequent
+terms through the bitmap pruning path, and verifies that rows are actually pruned.
+Final bf-text checks pass again after removing the prototypes.
+
+This is an optimistic warm library experiment. Normalization-specific impact
+order, maxima, and bands are prepared outside counters; actual impact decoding,
+forward decoding, and query-bound evaluation are charged. There is no HTTP,
+engine, cold-I/O, SDK, M4, or real-S3 measurement. No format publication or update
+lifecycle is implemented. The existing BM25 CPU target remains open.
