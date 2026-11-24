@@ -94,12 +94,12 @@ On a 10-core Apple M4 Mac mini, I loaded the same 2.68M BEIR NQ passages (1,024-
 each engine, one engine at a time, on local disk. blowfish v0.1.15 ran with defaults and reclustered by itself.
 Latency is one client; throughput is 16 clients.
 
-| Engine, setting | Recall@10 | p50 / p99 | q/s at 16 clients | Peak RSS |
+| Engine, setting | Recall@10 | p50 / p99 | q/s at 16 clients | Peak RSS: build / queries |
 | --- | ---: | --- | ---: | ---: |
-| blowfish v0.1.15, 64 probes (default) | 0.961 | 1.4 / 2.0 ms | 1,814 | 2.7–3.3 GB |
-| blowfish v0.1.15, 48 probes | 0.951 | 1.2 / 1.8 ms | 2,101 | 2.7–3.3 GB |
-| Qdrant 1.20.0, HNSW `ef=64` | 0.950 | 0.5 / 0.7 ms | 7,752 | 14.7 GB |
-| LanceDB 0.41.0, IVF-PQ, 120 probes | 0.949 | 18.7 / 19.9 ms | 278 | 8.8 GB build, 0.6 GB query |
+| blowfish v0.1.15, 64 probes (default) | 0.961 | 1.4 / 2.0 ms | 1,814 | 2.7 / 2.7–3.3 GB |
+| blowfish v0.1.15, 48 probes | 0.951 | 1.2 / 1.8 ms | 2,101 | 2.7 / 2.7–3.3 GB |
+| Qdrant 1.20.0, HNSW `ef=64` | 0.950 | 0.5 / 0.7 ms | 7,752 | 14.7 / 5.9 GB |
+| LanceDB 0.41.0, IVF-PQ, 120 probes | 0.949 | 18.7 / 19.9 ms | 278 | 8.8 / 0.6 GB |
 
 Qdrant keeps its HNSW graph and vectors in RAM and is about 3.7 times faster at the same recall. blowfish
 scans one-bit codes and reads exact vectors through its object-storage cache, so the same layout serves
