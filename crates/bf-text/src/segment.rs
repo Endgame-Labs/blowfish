@@ -1385,7 +1385,7 @@ impl SegmentReader {
         Ok(())
     }
     /// Open from a header kept elsewhere (the manifest), without reading the object: the footer
-    /// and the dictionary's chunk index. Document lengths load on first use. Versions 4
+    /// and the dictionary's chunk index. Document lengths load on first use. Versions 4,
     /// 5, and 6 have headers.
     pub fn open_with_header(source: Arc<dyn RangeRead>, header: &TextHeader) -> io::Result<Self> {
         let len = source.len();
