@@ -2,6 +2,9 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
+mod batched;
+pub use batched::{Bf16DotCenters, Bf16DotRows, bf16_matrix_accelerated};
+
 mod cluster;
 mod directory;
 mod distance;

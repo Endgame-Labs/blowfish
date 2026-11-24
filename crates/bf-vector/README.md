@@ -157,3 +157,15 @@ row sets without allocating a dense map over the namespace. `Fragment::decode` r
 resident bytes for directory publication; `Index::open` also loads the leaf blobs for full-index
 operations such as recluster. Legacy `.bfv` objects are accepted as upgrade input, and no `.bff`
 or `.bfb` fragment writer remains.
+
+### Packed BF16 dots
+
+`Bf16DotRows` rounds a batch once and retains conservative L2 bounds on the original rows and their
+conversion errors. `Bf16DotCenters` packs centers once and scores selected rows with FP32
+accumulation through NumKong. `bf16_matrix_accelerated()` identifies native ARM BF16 hardware.
+These are temporary compute buffers, independent of the index format.
+
+The conversion bounds do not include dot-product accumulation error. A caller using these scores
+to prune exact search must also bound accumulation and distance arithmetic, verify every possible
+winner with its reference kernel, and reject nonfinite or unsafe intervals. The engine's recluster
+scorer implements that certification.

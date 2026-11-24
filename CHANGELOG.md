@@ -4,6 +4,11 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Performance
+
+- **Faster recluster, exactly:** Leaf assignment screens candidates with full-dimensional BF16 matrix scores and certified error bounds, then recomputes every possible winner with the original FP32 kernel, so assignments stay byte-identical. On ARM CPUs with native BF16 (selected automatically; other CPUs keep the original kernel), full NQ assignment drops from 176 s to 97 s and the time from the last write's acknowledgment to the full index drops from 255 s to 177 s (1.44x), at unchanged recall. A 10M assignment check went from 570 s to 349 s.
+
+
 ## [0.1.17] - 2026-11-24
 
 ### Changed
