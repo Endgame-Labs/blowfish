@@ -140,3 +140,14 @@ the same `Arc` explicitly to spawned tasks, and call `snapshot()` after completi
 Measurements include not-found requests, physical transferred bytes, and summed
 backend durations. Concurrent request durations overlap. Engine diagnostics use
 this API to distinguish consistency requests from uncached immutable reads.
+
+`RangeReader::read_batch_notifying` signals a supplied oneshot sender after its
+missing blocks have been reserved. Keep that read future alive while independent
+range readers consume the reserved flights: they retain batch coalescing, but
+can finish before an unrelated slow range. Input range order prioritizes newly
+reserved reads. `is_memory_resident` checks a logical range without I/O; its
+answer is advisory because eviction can race it.
+
+`blowfish_object_store_attempts_total{op}` counts read attempts when they start,
+including attempts later canceled by hedging or query cancellation. The existing
+request and byte counters count completed operations and transferred bodies.
