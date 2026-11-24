@@ -36,6 +36,8 @@ pub(crate) struct DecodedCache {
     columns: moka::sync::Cache<String, Arc<Vec<Option<serde_json::Value>>>>,
     /// Decoded resident WAL vectors; charged to the same total budget as immutable metadata.
     pub(crate) tail_vectors: crate::tail::VectorCache,
+    /// Immutable WAL and shadow-row term counts, charged to this cache's total budget.
+    pub(crate) text_terms: Arc<ClockCache<Arc<crate::text_tail::Analysis>, crate::text_tail::Key>>,
 }
 /// foldhash, seeded per process (the keys are object keys and cluster numbers).
 type FastHash = foldhash::fast::RandomState;
@@ -163,12 +165,12 @@ impl<V: Clone, K: Clone + std::hash::Hash + Eq> ClockCache<V, K> {
     }
 }
 impl DecodedCache {
-    /// `budget` bytes in all: half for the general LRU, a quarter for decoded clusters,
-    /// a sixth for resident WAL vectors, and a twelfth for decoded column blocks.
+    /// `budget` bytes in all: three eighths for the general LRU, a quarter for clusters,
+    /// a sixth for resident WAL vectors, an eighth for text counts, and a twelfth for columns.
     pub fn new(budget: u64, workers: usize) -> Self {
-        let (clusters, columns, vectors) = (budget / 4, budget / 12, budget / 6);
+        let (clusters, columns, vectors, text) = (budget / 4, budget / 12, budget / 6, budget / 8);
         Self {
-            budget: budget - clusters - columns - vectors,
+            budget: budget - clusters - columns - vectors - text,
             entries: Arc::new(Mutex::new(Entries::default())),
             scope: String::new(),
             workers: Arc::new(Semaphore::new(workers.max(1))),
@@ -183,6 +185,10 @@ impl DecodedCache {
                 })
                 .build(),
             tail_vectors: crate::tail::VectorCache::new(vectors),
+            text_terms: Arc::new(ClockCache::new(
+                text,
+                |value: &Arc<crate::text_tail::Analysis>| value.bytes(),
+            )),
         }
     }
     /// A decoded column block (`key` is relative to this view, like every other key).
@@ -208,6 +214,7 @@ impl DecodedCache {
             columns: self.columns.clone(),
             // Document allocation identities are process-wide, independent of storage scope.
             tail_vectors: self.tail_vectors.clone(),
+            text_terms: self.text_terms.clone(),
         }
     }
     /// Forget every decoded entry (bench cold-cache runs).
@@ -218,8 +225,9 @@ impl DecodedCache {
         self.clusters.clear();
         self.columns.invalidate_all();
         self.tail_vectors.clear();
+        self.text_terms.clear();
     }
-    fn key(&self, key: &str) -> String {
+    pub(crate) fn key(&self, key: &str) -> String {
         if self.scope.is_empty() {
             key.to_owned()
         } else {
@@ -425,7 +433,7 @@ mod tests {
     }
     #[test]
     fn byte_budget_lru_type_separation_and_pinned_users() {
-        let cache = DecodedCache::new(14, 1);
+        let cache = DecodedCache::new(24, 1);
         let pinned = Arc::new(1u64);
         cache.insert("a", 4, pinned.clone());
         cache.insert("b", 4, Arc::new(2u64));

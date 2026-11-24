@@ -575,22 +575,68 @@ pub(crate) async fn global_stats(
     if state.shadowed.is_empty() && state.docs.is_empty() {
         return checkpoint_corpus_of(store, state, terms).await;
     }
-    let mut stats = full_stats(store, state).await?;
-    if !state.shadowed.is_empty() {
-        for seg in &state.segments {
-            let live = segment::live(store, seg).await?;
-            let shadowed = segment::lookup_many(store, seg, &state.shadowed).await? & live;
-            for doc in segment::projected_documents(store, seg, &shadowed, Some(&fields))
+    let started = std::time::Instant::now();
+    let base = checkpoint_corpus_of(store, state, terms).await?;
+    // Keep exact integer lengths. Multiplying a rounded average by its document
+    // count can move the final normalization across an f64 rounding boundary.
+    let counts: BTreeMap<String, (u64, u64)> = match &state.text_stats {
+        Some(file) => match &file.stats_index {
+            Some(index) => index
+                .fields
+                .iter()
+                .map(|(name, field)| (name.clone(), (field.documents, field.total_length)))
+                .collect(),
+            None => load_index(store, file)
                 .await?
-                .values()
-            {
-                adjust(&mut stats, doc, &state.schema, false);
-            }
+                .fields
+                .iter()
+                .map(|(name, (docs, length, _))| (name.clone(), (*docs, *length)))
+                .collect(),
+        },
+        None => state
+            .stats
+            .text
+            .iter()
+            .map(|(name, field)| (name.clone(), (field.documents, field.total_length)))
+            .collect(),
+    };
+    let mut stats = NamespaceStats::default();
+    for name in &fields {
+        let (documents, total_length) = counts.get(name).copied().unwrap_or_default();
+        let document_frequencies = terms
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|term| {
+                base.get(name)?
+                    .document_frequencies
+                    .get(term)
+                    .map(|df| (term.clone(), *df))
+            })
+            .collect();
+        stats.text.insert(
+            name.clone(),
+            TextStats {
+                documents,
+                total_length,
+                document_frequencies,
+            },
+        );
+    }
+    crate::ann::stage(started, "bm25 checkpoint stats");
+    let analyzer = crate::text_tail::Analyzer::new(&state.schema);
+    let started = std::time::Instant::now();
+    if !state.shadowed.is_empty() {
+        for summary in analyzer.shadowed(store, state).await? {
+            adjust_summary(&mut stats, &summary, terms, false);
         }
     }
+    crate::ann::stage(started, "bm25 shadow stats");
+    let started = std::time::Instant::now();
     for doc in state.docs.values() {
-        adjust(&mut stats, doc, &state.schema, true);
+        adjust_summary(&mut stats, &analyzer.tail(doc), terms, true);
     }
+    crate::ann::stage(started, "bm25 tail stats tokenization");
     Ok(fields
         .into_iter()
         .map(|name| {
@@ -599,6 +645,38 @@ pub(crate) async fn global_stats(
         })
         .collect::<BTreeMap<_, _>>()
         .into())
+}
+
+fn adjust_summary(
+    stats: &mut NamespaceStats,
+    summary: &crate::text_tail::Analysis,
+    terms: &QueryTerms,
+    add: bool,
+) {
+    for (name, document) in &summary.fields {
+        let field = stats.text.entry(name.clone()).or_default();
+        let length = u64::from(document.len().max(1));
+        if add {
+            field.documents += 1;
+            field.total_length += length;
+        } else {
+            field.documents = field.documents.saturating_sub(1);
+            field.total_length = field.total_length.saturating_sub(length);
+        }
+        for term in terms.get(name).into_iter().flatten() {
+            if document.frequency(term) == 0 {
+                continue;
+            }
+            if add {
+                *field.document_frequencies.entry(term.clone()).or_default() += 1;
+            } else if let Some(count) = field.document_frequencies.get_mut(term) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    field.document_frequencies.remove(term);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
