@@ -4,6 +4,12 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Warm ANN profiling, round Q1.** `BF_TRACE_STAGES` now reports microsecond ANN and HTTP timings,
+  distinguishes scanned rows from accepted candidates, and separates rerank vector reads from scoring.
+  The HTTP response stays unchanged. Formatting, clippy for `bf-vector`, `bf-engine`, and `blowfish`
+  with all targets and warnings denied, and the three crates' test suites pass. The full NQ profile
+  and measured optimizations follow in the Round Q1 benchmark entry.
+
 - **Apple M4 NQ at v0.1.15** (`docs/benchmarks.md`, "Apple M4 at v0.1.15"). I reran the tagged release,
   Qdrant 1.20.0, and LanceDB 0.41.0 one at a time on the same 10-core Mac. Blowfish gives 1,801–1,827 q/s
   at 64 probes, recall@10 0.9611, and 1.3–1.4 / 1.6 / 1.9–2.0 ms p50 / p90 / p99; at 48 probes,

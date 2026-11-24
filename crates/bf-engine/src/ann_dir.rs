@@ -1247,7 +1247,7 @@ pub(crate) async fn search(
         let trace_t0 = t0;
         tasks.push(
             async move {
-                let task_start = trace_t0.elapsed().as_millis();
+                let task_start = trace_t0.elapsed().as_micros();
                 // The prefetch may have scanned this segment's clusters already (see
                 // `scan_memo_put`): that is exact only without a row mask.
                 if memo_hit && live.is_none() {
@@ -1308,7 +1308,7 @@ pub(crate) async fn search(
                     }
                 )?;
                 let (blobs, codes) = read;
-                let read_done = trace_t0.elapsed().as_millis();
+                let read_done = trace_t0.elapsed().as_micros();
                 let mut blobs = blobs.iter();
                 for (cluster, known) in wanted.iter().zip(decoded) {
                     let d = match known {
@@ -1335,7 +1335,7 @@ pub(crate) async fn search(
                     clusters: wanted.clone(),
                     exact,
                 };
-                let install_done = trace_t0.elapsed().as_millis();
+                let install_done = trace_t0.elapsed().as_micros();
                 let found = on_worker(async move {
                     if exact {
                         let hits = index
@@ -1359,7 +1359,7 @@ pub(crate) async fn search(
                     eprintln!(
                         "TASK seg={i} clusters={} start={task_start} read={read_done} install={install_done} scan={}",
                         probed.clusters.len(),
-                        trace_t0.elapsed().as_millis()
+                        trace_t0.elapsed().as_micros()
                     );
                 }
                 Ok::<_, ApiError>((probed, found))

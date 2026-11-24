@@ -646,8 +646,8 @@ impl<R: RangeRead> Index<R> {
         validate(query, self.dims())?;
         let t_read = std::time::Instant::now();
         let blocks = self.read_coalesced(clusters).await?;
-        let read_ms = t_read.elapsed().as_millis();
-        self.scan_blocks_timed(query, clusters, blocks, filter, read_ms, None)
+        let read_us = t_read.elapsed().as_micros();
+        self.scan_blocks_timed(query, clusters, blocks, filter, read_us, None)
     }
 
     /// Read the quantized-code blocks of `clusters` (merged into few requests), in input order.
@@ -716,11 +716,11 @@ impl<R: RangeRead> Index<R> {
         clusters: &[usize],
         blocks: Vec<Bytes>,
         filter: Option<&RoaringBitmap>,
-        read_ms: u128,
+        read_us: u128,
         keep: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let q = RotatedQuery::new(&self.rq, query, self.metric());
-        self.scan_rotated(&q, clusters, blocks, filter, read_ms, keep)
+        self.scan_rotated(&q, clusters, blocks, filter, read_us, keep)
     }
 
     fn scan_rotated(
@@ -729,7 +729,7 @@ impl<R: RangeRead> Index<R> {
         clusters: &[usize],
         blocks: Vec<Bytes>,
         filter: Option<&RoaringBitmap>,
-        read_ms: u128,
+        read_us: u128,
         keep: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         // The `k` smallest upper bounds so far, as a max-heap; `cut` is its largest once full.
@@ -884,10 +884,11 @@ impl<R: RangeRead> Index<R> {
         }
         if trace_stages() {
             eprintln!(
-                "SCAN clusters={} read={}ms cpu={}ms rows={}",
+                "SCAN clusters={} read={}us cpu={}us scanned={} candidates={}",
                 clusters.len(),
-                read_ms,
-                t_cpu.elapsed().as_millis(),
+                read_us,
+                t_cpu.elapsed().as_micros(),
+                rows,
                 estimated.len()
             );
         }
@@ -1137,7 +1138,7 @@ impl<R: RangeRead> Index<R> {
         let nranges = ranges.len();
         let rbytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         let blocks = self.read_vectors(ranges).await?;
-        let read_ms = t_read.elapsed().as_millis();
+        let read_us = t_read.elapsed().as_micros();
         let t_cpu = std::time::Instant::now();
         let mut result = Vec::with_capacity(locations.len());
         let mut decoded = Vec::with_capacity(self.dims());
@@ -1180,12 +1181,12 @@ impl<R: RangeRead> Index<R> {
         }
         if trace_stages() {
             eprintln!(
-                "RERANK locations={} ranges={} bytes={} read={}ms cpu={}ms",
+                "RERANK locations={} ranges={} bytes={} read={}us cpu={}us",
                 locations.len(),
                 nranges,
                 rbytes,
-                read_ms,
-                t_cpu.elapsed().as_millis()
+                read_us,
+                t_cpu.elapsed().as_micros()
             );
         }
         sort_truncate(&mut result, k);

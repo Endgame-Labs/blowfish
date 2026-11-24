@@ -202,7 +202,7 @@ pub(crate) fn trace_stages() -> bool {
 /// `BF_TRACE_STAGES=1` prints elapsed time at each ANN stage (diagnostics only).
 pub(crate) fn stage(t0: std::time::Instant, name: &str) {
     if trace_stages() {
-        eprintln!("STAGE {name} {} ms", t0.elapsed().as_millis());
+        eprintln!("STAGE {name} {} us", t0.elapsed().as_micros());
     }
 }
 

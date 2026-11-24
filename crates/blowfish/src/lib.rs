@@ -557,6 +557,10 @@ async fn write(
     }
     Ok(Json(response).into_response())
 }
+fn trace_query_stages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BF_TRACE_STAGES").is_some())
+}
 /// `Json<T>`, with the same rejections, that parses a valid body without
 /// `serde_path_to_error`'s per-value path tracking (several percent of a vector query's CPU).
 /// Only a body that fails to parse is parsed again through `Json`, for its error path.
@@ -583,9 +587,21 @@ where
                 .await
                 .map(|Json(v)| Self(v));
         }
+        let started = std::time::Instant::now();
         let bytes = axum::body::Bytes::from_request(req, state).await?;
+        let collected = started.elapsed();
         match serde_json::from_slice(&bytes) {
-            Ok(v) => Ok(Self(v)),
+            Ok(v) => {
+                if trace_query_stages() {
+                    eprintln!(
+                        "HTTP collect={}us decode={}us bytes={}",
+                        collected.as_micros(),
+                        (started.elapsed() - collected).as_micros(),
+                        bytes.len()
+                    );
+                }
+                Ok(Self(v))
+            }
             Err(_) => Json::<T>::from_bytes(&bytes).map(|Json(v)| Self(v)),
         }
     }
@@ -594,13 +610,18 @@ async fn query(
     Extension(s): Extension<AppState>,
     Path(ns): Path<String>,
     input: Result<FastJson<QueryRequest>, JsonRejection>,
-) -> Result<Json<QueryResponse>, HttpError> {
+) -> Result<Response, HttpError> {
     let request = body(input.map(|FastJson(v)| Json(v)))?;
     let response = s.engine.query(&ns, request.clone()).await?;
     record_query(&request);
     metrics::counter!("blowfish_query_rows_scanned_total")
         .increment(response.performance.exhaustive_search_count);
-    Ok(Json(response))
+    let started = std::time::Instant::now();
+    let response = Json(response).into_response();
+    if trace_query_stages() {
+        eprintln!("HTTP response={}us", started.elapsed().as_micros());
+    }
+    Ok(response)
 }
 fn record_query(request: &QueryRequest) {
     if let Some(queries) = &request.queries {
