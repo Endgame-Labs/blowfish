@@ -2628,3 +2628,7 @@ mod posting_cache_tests {
         assert_eq!(memo.order.len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "experiments.rs"]
+mod experiments;
