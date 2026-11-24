@@ -1,4 +1,6 @@
 //! Non-shipped control separating the compiled scorer from engine and HTTP scheduling.
+//! Linux CPU accounting covers the warmed process, including cache housekeeping, and
+//! reports user and system microseconds per query independently of PMU event counts.
 use super::WarmTier;
 use crate::{Engine, EngineConfig, read_cache};
 use bf_storage::{CacheConfig, Storage, StorageConfig};
@@ -13,6 +15,24 @@ mod counter {
     ));
 }
 use counter::Counter;
+
+/// Linux accounts CPU time separately from elapsed time and PMU user cycles.
+fn process_cpu_seconds() -> Option<(f64, f64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage initializes the complete rusage on success; only this
+        // process's accounting is requested, and the pointer is valid for that write.
+        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(result, 0, "process CPU accounting unavailable");
+        // SAFETY: the successful getrusage call initialized this value.
+        let usage = unsafe { usage.assume_init() };
+        let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.;
+        Some((seconds(usage.ru_utime), seconds(usage.ru_stime)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
 
 #[derive(Deserialize)]
 struct Profile {
@@ -109,10 +129,12 @@ async fn compiled_kernel_profile() -> Result<(), Box<dyn std::error::Error>> {
     .ok_or("compiled tier was not admitted")?;
     drop(engine);
     let barrier = std::sync::Barrier::new(profile.threads);
+    let cpu_started = std::sync::OnceLock::new();
     let results = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..profile.threads)
             .map(|thread| {
-                let (queries, warm, barrier, profile) = (&queries, &warm, &barrier, &profile);
+                let (queries, warm, barrier, profile, cpu_started) =
+                    (&queries, &warm, &barrier, &profile, &cpu_started);
                 scope.spawn(move || {
                     for query in queries {
                         std::hint::black_box(warm.search(query, profile.probes, 32, 10).unwrap());
@@ -139,6 +161,9 @@ async fn compiled_kernel_profile() -> Result<(), Box<dyn std::error::Error>> {
                         unsafe {
                             libc::raise(libc::SIGSTOP);
                         }
+                    }
+                    if barrier.wait().is_leader() {
+                        cpu_started.set(process_cpu_seconds()).unwrap();
                     }
                     barrier.wait();
                     let start = Instant::now();
@@ -178,6 +203,11 @@ async fn compiled_kernel_profile() -> Result<(), Box<dyn std::error::Error>> {
     let count: usize = results.iter().map(|r| r.0).sum();
     let misses: usize = results.iter().map(|r| r.1).sum();
     let seconds = results.iter().map(|r| r.2).fold(0., f64::max);
+    let cpu = cpu_started
+        .into_inner()
+        .flatten()
+        .zip(process_cpu_seconds())
+        .map(|(before, after)| (after.0 - before.0, after.1 - before.1));
     let mut events = std::collections::BTreeMap::<_, (u64, u64, u64)>::new();
     for (_, _, _, counters) in results {
         for (name, (value, enabled, running)) in counters {
@@ -192,7 +222,7 @@ async fn compiled_kernel_profile() -> Result<(), Box<dyn std::error::Error>> {
     }).collect();
     println!(
         "{}",
-        serde_json::json!({"compiled_queries":count,"misses":misses,"seconds":seconds,"qps":count as f64/seconds,"events":events})
+        serde_json::json!({"compiled_queries":count,"misses":misses,"seconds":seconds,"qps":count as f64/seconds,"cpu_user_us_per_query":cpu.map(|s|s.0*1e6/count as f64),"cpu_system_us_per_query":cpu.map(|s|s.1*1e6/count as f64),"events":events})
     );
     assert_eq!(
         misses, 0,
