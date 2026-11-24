@@ -12,6 +12,7 @@ experimental-hot-graph = ["dep:hnsw_rs"]
 legacy-fixtures = []
 
 [dependencies]
+libc = "=0.2.191"
 hnsw_rs = { version = "=0.3.5", optional = true }
 bytes = "=1.12.1"
 crc32fast = "=1.5.5"

@@ -407,6 +407,7 @@ dependencies = [
  "futures",
  "half",
  "hnsw_rs",
+ "libc",
  "numkong",
  "proptest",
  "rayon",
