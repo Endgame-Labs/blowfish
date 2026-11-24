@@ -4,6 +4,10 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
 
+mod cold_pack {
+    include!("cold_pack.rs");
+}
+
 const FORWARD_BLOCK: usize = 64;
 
 fn perf(command: &str) {
@@ -317,6 +321,10 @@ pub fn run() {
     let args: Vec<_> = std::env::args().collect();
     let root = Path::new(args.get(1).expect("fixture directory"));
     let mode = args.get(2).map_or("baseline", String::as_str);
+    if mode == "pack" {
+        cold_pack::pack(root);
+        return;
+    }
     let readers = open(root);
     let params = FtsParams::default();
     let stats: CorpusStats =
@@ -404,7 +412,11 @@ fn footprint(readers: &[SegmentReader]) {
         for handles in block_on(r.prefix_terms("")).unwrap().chunks(128) {
             let meta = block_on(r.load(handles.iter().copied())).unwrap();
             for t in meta.values() {
-                region_records += RECORD_HEADER + BLOCK_META * t.blocks.len() + 4;
+                region_records += if r.compact {
+                    compact::record_size(&t.blocks)
+                } else {
+                    RECORD_HEADER + BLOCK_META * t.blocks.len() + 4
+                };
                 // Two base offsets, record length, and checksum. All offsets and
                 // counts within a term follow from block sizes and document frequency.
                 new_records += 24;

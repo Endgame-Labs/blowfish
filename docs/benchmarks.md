@@ -5801,3 +5801,172 @@ A Spot c7g.2xlarge was reclaimed during an incomplete repeat. Incomplete counter
 are discarded; the final table comes entirely from the replacement on-demand
 host. No S3 objects are created, and both hosts and their temporary access
 resources are cleaned up at the end of the round.
+
+## Round B5: clustered block-max pruning, short posting tails, and cold fan-out
+
+B5 tests three separate hypotheses before changing the production layout. The
+short-list codec passes its serialized-byte gate; the clustered block-max
+prototype fails its CPU and block-count gates. Cold fan-out measurements and the
+final production checks are described below.
+
+### Corpus and paired CPU protocol
+
+The first 1,000,000 passages from the loader's MS MARCO stream form five consecutive
+200,000-row, format-6 text segments. The workload is the checked-in 1,000 dev
+queries. All counters use one owned, on-demand c7g.2xlarge, the release profile,
+and CPU 3. The baseline and BMP are in the same executable. Each invocation first
+computes reference results, warms its full workload, and then uses perf's control
+and acknowledgment FIFOs to count only the second pass. Builds, indexing, and
+other measurements finish before the counter passes.
+
+An independent `exact_bm25` pass verifies all 1,000 queries and 10,000 ordered
+hits, including every f32 score bit. The codec and BMP also compare against those
+validated production results. This is a text-library experiment, without HTTP,
+engine, or S3 work in its instruction counts.
+
+### Clustered block-max pruning: rejected
+
+Documents sort by their rarest term, second-rarest term, length, and original row,
+then form 64-document blocks. Term IDs follow lexical order. Each block records
+upward-rounded u8 saturation maxima per term. At query time, contributions scatter
+into block bounds in canonical f32 term order. Blocks sort by decreasing bound
+across all five segments, and scoring stops only when the next bound is strictly
+below the top-k floor. Original rows decide score ties.
+
+| Workload | Baseline M instructions/query | BMP M instructions/query | BMP evaluated blocks/query |
+| --- | ---: | ---: | ---: |
+| Original queries, top 10 | 20.581 | 45.786 | 990.773 |
+| First retained token only, top 10 | 3.431 | 6.474 | 10.905 |
+| Original queries, top 1,000 | 73.701 | 250.587 | 6,601.686 |
+
+The top-10 values are medians of two complete invocations per arm. The two edge
+cases each use one complete invocation per arm. Every workload preserves ordered
+rows and score bits, including the retained top-1,000 results.
+
+The main workload fails the ≤10.1M instruction and ≤45-block gates by wide
+margins. BMP executes 2.22× more instructions, scores 63,409 rows/query, and costs
+47.529M cycles/query versus 10.664M baseline. First-token queries still cost
+1.89× more instructions despite visiting few blocks. At top 1,000, BMP scores
+422,508 rows/query, versus 53,023 baseline, and costs 3.40× more instructions.
+
+These are deliberately favorable bounds on this proposal: the forward lists are
+already decoded, normalization bounds are rebuilt for the current corpus outside
+counters, and block ordering is global. The lexical sort does not cluster joint
+query relevance tightly enough. Estimated codec bytes are 255,174,577, including
+retained position payloads; that is not a serialized BMP format or a validated
+phrase-lookup directory. No BMP layout, row permutation, or query option ships.
+
+The experiment adapts BMP to BM25; the original paper evaluates learned sparse
+retrieval, so its speedups are not a BM25 prediction:
+https://www.antoniomallia.it/uploads/SIGIR24.pdf
+
+### Actual-length posting tails: format 7
+
+| Five-segment text footprint | Format 6 | Format 7 |
+| --- | ---: | ---: |
+| Total serialized bytes | 336,318,220 | 198,829,726 |
+| Posting payload bytes | 168,369,046 | 64,533,360 |
+| Term directory bytes | 82,327,828 | 48,686,905 |
+| Phrase payload bytes | 58,032,680 | 58,032,680 |
+
+Actual serialization saves 40.9%, or 1.69×, and passes the ≤258.7 MB gate.
+The initial 199,172,186-byte accounting estimate conservatively retained the
+original dictionary overhead and pre-transcode posting-size fields. Actual
+serialization saves another 330,575 directory bytes and 11,885 overhead bytes.
+
+Full 128-row blocks keep their existing SIMD bitpacking. Partial blocks store
+only their actual rows as unsigned LEB128 gaps and frequencies, with their first
+row in the directory. Variable-width block records retain independent posting
+and position CRCs. Per-term base addresses plus frame sizes determine offsets;
+document frequency determines block counts and the final block's row count.
+The footer, dictionary-bundle structure, independent phrase stream, and
+namespace-wide scoring arithmetic are unchanged.
+
+Migration validates every old posting and phrase frame. Corpus validation checks
+all 1,333,003 blocks, 56,676,270 phrase occurrences, document lengths, statistics,
+and score bits. Position payloads are byte-identical. Unit and property tests also
+cover arrays, missing fields, partial-block boundary values, corrupt metadata,
+truncation, overflow, duplicates, and trailing bytes. Format-4 and format-5
+migration tests continue to pass.
+
+New writes use format 7. Formats 4, 5, and 6 transcode directly without reading
+or tokenizing document columns. The existing `TextHeader::is_current` and fenced
+background upgrade path select the new layout; no manifest schema change or
+layout-selection option is added.
+
+### Production codec controls
+
+A separate HTTP-loaded checkpoint finishes compaction into five live segments.
+The ordinary background upgrader converts all five from format 6 to format 7 in
+4.08 seconds. Live text bytes fall from 336,384,495 to 198,814,582. Non-text segment
+fields, live masks, file references, namespace statistics, and the indexed WAL
+sequence stay identical. The engine's existing two upgrade integration tests pass.
+Sixty HTTP phrase queries also preserve complete ordered rows and score bits.
+
+A paired single build per arm parses, tokenizes, builds, and writes the same first
+million passages. Format 6 takes 34.222 seconds; format 7 takes 35.715 seconds
+(4.4% longer). Time inside `finish` rises from 4.478 to 6.186 seconds. The additional
+validation and repacking cost is charged. Both emitted versions and every file's
+size are checked. A stale-artifact build after switching source roots was discarded;
+the reported format-7 run follows a package clean and forced compilation.
+
+One final-binary warm pass per arm uses the original five format-6 files and their
+upgrades: 20.714M versus 20.665M instructions/query, and 10.605M versus 10.842M
+cycles/query. Both read the same 663.77 posting blocks and score the same 5,365
+rows/query. This is essentially flat warm CPU, not a BM25 speedup claim.
+
+### Cold facade protocol
+
+Cold tests use the first 60 dev queries, the same stopped five-segment checkpoint,
+and one fresh server process with an empty disk cache per query. Arm order
+alternates by query. Each server has two Rayon and two Tokio workers, 1 GiB of
+memory cache, 4 GiB of disk cache, 4,000-byte blocks, coalescing and fetch limits of
+512, and 128 warm connections. Each local S3 facade delays requests by 25 ms.
+The OS page cache is retained. This models dependent reads and local transfer;
+it is not an in-region S3 measurement. GET totals include both `get` and
+`get_range`; bytes include both operations too.
+
+| Production codec, 60 paired queries | Format 6 | Format 7 |
+| --- | ---: | ---: |
+| Facade p50 / p90, ms | 156.676 / 209.140 | 154.780 / 208.918 |
+| GETs/query | 109.83 | 109.82 |
+| MB/query | 3.442 | 3.037 |
+| Mean traced waves/query | 3.50 | 3.37 |
+
+Every response row is identical. The codec adds no cold read wave, reduces bytes,
+and leaves latency effectively unchanged. Current baselines differ from T1's
+historical six-segment checkpoint, so the table is the relevant paired control.
+
+### Cold term packing: rejected
+
+The offline packer stores corpus DF, per-segment block directories, and short
+postings in global lexical groups. Long postings and phrase data keep their old
+objects and offsets. The experimental statistics index locates each group directly
+from the manifest. This is a fresh-process, single-field checkpoint prototype,
+with no production publication or update lifecycle.
+
+A 128-term grouping expands the compressed manifest to 275,598 bytes, triggering
+the existing compact-reader-copy rule and an additional metadata wave. Grouping
+256 terms reduces it to 225,629 bytes, below that threshold. Both layouts reduce
+GETs, but the first prototype also mistakenly waited for packed term data before
+issuing independent document-length reads. The final candidate overlaps those
+length reads with term prefetch; the final gate uses this corrected version.
+
+| Corrected 256-term packing, 60 paired queries | Baseline | Packed |
+| --- | ---: | ---: |
+| Facade p50 / p90, ms | 159.653 / 217.248 | 153.009 / 201.016 |
+| GETs/query | 109.42 | 84.37 |
+| MB/query | 3.438 | 3.143 |
+
+Complete response rows match for all 60 queries. The 1.043× p50 improvement misses
+the ≤131 ms gate, even though p90, GETs, and bytes improve. Reducing requests does
+not remove the remaining posting-read/scoring work and dependent query stages.
+No cross-segment pack object, engine hook, or production format ships. The example
+retains the disposable packer, explicit temporary patch, and portable facade driver
+so the rejected experiment can be repeated without adding a supported query path.
+
+The format-7 codec is the only shipped change. The 1.3× BM25 CPU target and the
+cold-packing latency target remain open. All native bf-text checks, exhaustive
+truth, full corpus losslessness, automatic engine upgrades, and HTTP phrase checks
+pass. The two existing engine upgrade integration tests also pass. No full-workspace,
+SDK, M4, ANN, or real-S3 run is claimed.
