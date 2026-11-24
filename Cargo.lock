@@ -422,6 +422,7 @@ dependencies = [
  "bf-types",
  "chrono",
  "futures",
+ "half",
  "metrics",
  "serde",
  "serde_json",

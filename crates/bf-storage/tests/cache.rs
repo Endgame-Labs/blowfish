@@ -27,6 +27,9 @@ struct Counting {
     delay: AtomicBool,
     fail: AtomicBool,
     short: AtomicBool,
+    stall_last: AtomicBool,
+    last_started: tokio::sync::Notify,
+    resume_last: tokio::sync::Notify,
 }
 impl fmt::Display for Counting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -62,6 +65,12 @@ impl ObjectStore for Counting {
         }
         if let Some(object_store::GetRange::Bounded(range)) = &opts.range {
             self.ranges.lock().unwrap().push(range.clone());
+        }
+        if self.stall_last.load(Ordering::SeqCst)
+            && matches!(&opts.range, Some(object_store::GetRange::Bounded(r)) if r.start >= 512)
+        {
+            self.last_started.notify_one();
+            self.resume_last.notified().await;
         }
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
@@ -624,4 +633,76 @@ async fn gap_coalescing_merges_nearby_blocks_into_one_get() {
     // Block 9 is more than two blocks away from block 5: a second GET.
     reader.read(600..610).await.unwrap();
     assert_eq!(ranges(&backend).len(), 2);
+}
+
+#[tokio::test]
+async fn a_reserved_batch_coalesces_but_does_not_hold_ready_leaf_readers() {
+    let (store, backend, data) = setup(config()).await;
+    let reader = store.range_reader("object").await.unwrap();
+    backend.ranges.lock().unwrap().clear();
+    backend.stall_last.store(true, Ordering::SeqCst);
+    let (ready, reserved) = tokio::sync::oneshot::channel();
+    let bulk = reader.clone();
+    let task = tokio::spawn(async move {
+        bulk.read_batch_notifying(&[0..64, 64..128, 512..576], &CacheStats::default(), ready)
+            .await
+    });
+    reserved.await.unwrap();
+    backend.last_started.notified().await;
+    let bytes = tokio::time::timeout(Duration::from_secs(2), reader.read(0..128))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, data.slice(0..128));
+    assert!(
+        !task.is_finished(),
+        "one slow range must not hold an independent leaf"
+    );
+    let tail_reader = reader.clone();
+    let tail = tokio::spawn(async move { tail_reader.read(512..576).await });
+    // Poll the tail once so it owns a shared flight before canceling the planner.
+    tokio::task::yield_now().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    backend.resume_last.notify_one();
+    assert_eq!(tail.await.unwrap().unwrap(), data.slice(512..576));
+    let mut got = ranges(&backend);
+    got.sort_by_key(|r| r.start);
+    assert_eq!(got, vec![0..128, 512..576]);
+}
+
+#[tokio::test]
+async fn reserved_batches_dispatch_in_input_priority_order() {
+    let (store, backend, data) = setup(CacheConfig {
+        fetch_concurrency: 1,
+        ..config()
+    })
+    .await;
+    let reader = store.range_reader("object").await.unwrap();
+    backend.ranges.lock().unwrap().clear();
+    let (ready, reserved) = tokio::sync::oneshot::channel();
+    let result = reader
+        .read_batch_notifying(&[512..576, 0..64, 64..128], &CacheStats::default(), ready)
+        .await
+        .unwrap();
+    reserved.await.unwrap();
+    assert_eq!(
+        result,
+        vec![data.slice(512..576), data.slice(0..64), data.slice(64..128)]
+    );
+    assert_eq!(ranges(&backend), vec![512..576, 0..128]);
+}
+
+#[tokio::test]
+async fn memory_residency_is_advisory_and_per_range() {
+    let (store, backend, _) = setup(config()).await;
+    let reader = store.range_reader("object").await.unwrap();
+    backend.ranges.lock().unwrap().clear();
+    assert!(reader.is_memory_resident(0..0));
+    assert!(!reader.is_memory_resident(0..64));
+    assert!(!reader.is_memory_resident(1027..1028));
+    assert!(ranges(&backend).is_empty());
+    reader.read(0..64).await.unwrap();
+    assert!(reader.is_memory_resident(0..64));
+    assert!(!reader.is_memory_resident(0..65));
 }

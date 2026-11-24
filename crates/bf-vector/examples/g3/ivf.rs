@@ -106,7 +106,7 @@ impl Ivf {
             let blocks = cs.iter().map(|c| self.codes[i][*c].clone()).collect();
             pool.extend(
                 self.indexes[i]
-                    .scan_blocks_bounded_rotated(&rotated, cs, blocks, None, 10)
+                    .scan_blocks_bounded_rotated(&rotated, cs, blocks, None, 10, f32::INFINITY)
                     .unwrap(),
             );
         }

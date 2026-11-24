@@ -4964,3 +4964,895 @@ while sharing the two CPUs with other study work. The harness keeps the entire f
 its approximately 5.9 GiB query RSS is not a sparse-rerank-cache memory result. Eight-bit encoding
 of the corpus took 55.6 s, including writing the scratch codes. Full row-graph construction was
 moved to an isolated Graviton instance to avoid contention on the shared VM; its paired results follow.
+
+## Round Q1: warm vector query cost
+
+This round starts from `6dcde67` (v0.1.15). The unchanged-query profile uses `b899d0b`, which
+adds microsecond diagnostics without changing the wire response or query algorithm. The target is
+at least 1.5× warm throughput at recall@10 0.95 and 0.96, with no cold-S3 regression. **That gate
+is not met by the VM results below.** The M4 was reserved for another worker, and the coordinator directed this round to finish its VM gates;
+M4 throughput is unmeasured.
+
+### Dataset and measurement
+
+I loaded all 2,681,468 NQ passages as 1,024-dimensional f16 cosine vectors. The corpus, queries,
+truth, and qrels have the same four hashes as the v0.1.15 M4 run. The automatic tier contains
+32 slabs and 13,395 leaves. Preparation retries left 125,000 superseded source row versions and
+46 covered source segments; the slabs contain exactly 2,681,468 live rows, and no WAL tail is
+searched. This independently built layout differs from the M4 comparison, so its recall differs
+slightly too. Every binary comparison below uses the same unchanged store.
+
+The VM server and clients use CPUs 6–7, a nice-19 server, two Tokio workers, two Rayon workers,
+a 4 GiB raw block cache, no disk cache, no recall sampling, and read-only mode with indexing off.
+Clients send pre-encoded JSON float arrays over keep-alive connections, requesting the top 10 and
+only IDs. Hardware counters attach to the exact owned server PID after warming the measured
+queries. Instruction counts are user-space instructions. Other workers share the VM, so wall-clock
+q/s and stage timers cannot establish a throughput improvement. No production process is signaled.
+
+### The unchanged query
+
+Two alternating passes at each probe count, each with 1,000 warm-up and 1,000 measured queries
+at 16 clients:
+
+| Probes | Instructions/query, passes | Cycles/query, passes | Recall@10, first 1,000 |
+|---:|---:|---:|---:|
+| 48 | 13.1499 / 13.1318 M | 18.7558 / 18.2749 M | 0.9511 |
+| 64 | 15.1948 / 15.1868 M | 22.5791 / 20.2938 M | 0.9625 |
+
+All retained passes have cache-hit ratio 1.000 and exhaustive-search count zero. In 100 serial
+traced queries after 1,000 warm-ups, the mean scan visits 393 / 524 leaves, scans 82,820 / 110,114
+rows, emits 5,748 / 7,168 candidates, and exactly reranks 54.10 / 54.87 rows at 48 / 64 probes.
+
+| Stage | Median microseconds, 48 / 64 |
+|---|---:|
+| HTTP body collection / typed JSON decode | 6 / 8; 65 / 70 |
+| Snapshot/state access, overlapping search | 207 / 162 |
+| Center ranking, including rotation and dispatch | 437 / 514 |
+| Probe planning | 209 / 259 |
+| Per-slab task construction | 92 / 101 |
+| Cluster reads, install, and scan wall stage | 3,205 / 4,611 |
+| Sum of slab scan calls | 3,298 / 4,371 |
+| Global bounds, vector reads, rerank, and speculative hydration | 662 / 748 |
+| Sum of rerank cache-read calls / exact CPU calls | 191 / 196; 66 / 67 |
+| Final hydration / response JSON serialization | 36 / 37; 14 / 16 |
+| Search execution | 5,179 / 6,982 |
+
+These are scheduler-sensitive wall timers. Medians do not add, parallel call sums differ from
+elapsed stages, and snapshot checking overlaps search. Scan-call medians are about 40 ns per row;
+means rise to 61.5 / 50.6 ns with preemption. Keep-alive amortizes TCP accept across requests.
+
+A separate hot 64-probe `perf record` pass at 199 Hz has no reported lost samples, cache-hit
+ratio 1.000, and no tail. Approximate self-sample shares of all cycles: fast-scan kernel 12.3%;
+scan setup, bookkeeping, and candidate emission 5.6%; center ranking 6.1%; exact query-to-leaf-center
+distances 1.5%; JSON decoding 7.4%; allocator 4.9%; raw and decoded cache lookups 2.8%; kernel
+13.6%; and exact rerank symbols about 0.4%, small enough for sampling noise. About 7% of samples
+are unresolved libc addresses. They are not attributed to a particular copy routine.
+
+### Shared partial-index metadata
+
+A directory query previously allocated and initialized a complete cluster table for every slab,
+then installed a few selected payloads. Partial indexes now share immutable ranges and retain only
+their installed payloads. Ordinary fully opened indexes retain dense tables. Original cluster IDs,
+encoded objects, read ranges, and HTTP responses are preserved. The resident-byte estimate charges
+the shared table to the existing decoded-cache budget.
+
+| Probes | Baseline instructions/query, ABAB | Shared metadata instructions/query, ABAB | Saving |
+|---:|---:|---:|---:|
+| 48 | 13.1441 / 13.1374 M | 12.3756 / 12.3567 M | 5.9% |
+| 64 | 15.1982 / 15.1997 M | 14.3571 / 14.3725 M | 5.5% |
+
+All 4,000 top-10 ID lists match exactly. Peak RSS is roughly unchanged, or slightly lower; the
+shared VM does not establish a cycle or throughput improvement.
+
+Fresh-process cold queries use `bench/scale/local_s3.py`, 25 ms per request, the same store, and
+the production 1 MiB block size. Thirty queries per binary alternate ABBA at query granularity.
+At 64 probes, baseline p50/p90 is 482.90/637.16 ms; shared metadata is 475.65/588.48 ms. All IDs
+match. Mean requests are 101.93/102.13, bytes 139.10/139.53 MB, and idle-gap waves 3.067/3.133;
+speculative document-read scheduling accounts for small read-count differences. This does not
+model real S3 transfer throughput or tails, and 30 samples cannot establish p99 behavior. An earlier
+10-query comparison overlapped other owned query sweeps and is discarded for latency attribution.
+
+### Sharing candidate bounds between slabs
+
+After a slab scans, its k-th smallest candidate upper bound is a valid cut for the other slabs:
+the global k-th upper bound cannot be larger than one subset's. A per-query relaxed atomic passes
+that cut to slabs that have not scanned yet. Scan reads still start concurrently. Each scan also
+applies its final local bound after fine rescoring, removing candidates accepted under earlier,
+looser cuts before the global merge. The local filter alone saves only about 0.2%; passing the
+cut between slabs gives the useful additional saving. There is no new setting or stored format.
+
+The rotated bounded-scan Rust API gains an `upper_bound` argument, infinity until another slab has
+k witnesses. The engine is its only existing caller. Regression tests compare local and shared
+survivor sets against bounding a complete scan, reject invalid bounds, and check that independent
+partial indexes share no installed payloads.
+
+Combined shared metadata and candidate bounds, two ABAB rounds with 1,000 warm-up and 1,000
+measured queries at 16 clients:
+
+| Probes | Baseline instructions/query | Combined instructions/query | Saving | Baseline cycles/query | Combined cycles/query |
+|---:|---:|---:|---:|---:|---:|
+| 48 | 13.1336 / 13.1380 M | 11.4780 / 11.5023 M | 12.5% | 17.9741 / 19.2160 M | 16.7857 / 15.0430 M |
+| 64 | 15.1824 / 15.1967 M | 13.2610 / 13.2478 M | 12.7% | 21.9068 / 20.0412 M | 18.1330 / 17.1201 M |
+
+All 4,000 top-10 ID lists are identical, cache-hit ratio is 1.000, and no tail is searched. These
+instruction savings do not establish a proportional M4 throughput gain. The requested 1.5× gate
+remains unmet.
+
+In 100 traced queries at 16 clients, the combined path scans the same 82,820 / 110,114 rows
+at 48 / 64 probes, but returns 431 / 493 slab candidates instead of 5,748 / 7,168. Exact rerank
+remains 54.10 / 54.87 rows. The retained saving comes from shared metadata and candidate handling.
+
+A final fresh-process cold ABBA comparison uses 30 queries per binary at each probe count,
+the same default 1 MiB cache blocks, and the 25 ms local S3 facade:
+
+| Probes | Baseline p50/p90, ms | Combined p50/p90, ms | Baseline/combined requests | Baseline/combined MB | Baseline/combined waves |
+|---:|---:|---:|---:|---:|---:|
+| 48 | 388.70/544.00 | 382.19/523.55 | 94.07/94.10 | 114.50/114.57 | 3.100/3.100 |
+| 64 | 436.83/528.02 | 426.22/518.11 | 102.10/101.90 | 139.46/139.02 | 3.067/3.033 |
+
+All 60 cold top-10 ID lists match. No median or p90 cold regression is observed. Small request
+count differences come from speculative document reads; no scan-read dependency is added. The
+facade and sample-size limitations above still apply.
+
+### Recall and rejected experiments
+
+Full 3,452-query results against the exact top 10, four clients, after warming all queries.
+All 31,068 top-10 ID lists match between binaries. These full quality sweeps were not interleaved;
+the VM wall rates reflect changing shared load and **do not measure a speedup**.
+
+| Probes | Recall@10, both | Baseline instructions/query | Combined instructions/query | Baseline VM q/s | Combined VM q/s |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 0.932706 | 10.9547 M | 9.6623 M | 173.1 | 267.2 |
+| 40 | 0.942439 | 12.0532 M | 10.5922 M | 146.4 | 186.6 |
+| 48 | 0.949015 | 13.1146 M | 11.4877 M | 186.7 | 176.4 |
+| 52 | 0.951825 | 13.6584 M | 11.9327 M | 84.8 | 165.0 |
+| 56 | 0.954635 | 14.1542 M | 12.3858 M | 204.4 | 153.8 |
+| 64 | 0.959820 | 15.1649 M | 13.2692 M | 187.0 | 194.7 |
+| 68 | 0.962196 | 15.6785 M | 13.7019 M | 87.9 | 207.5 |
+| 80 | 0.966628 | 17.1395 M | 14.9867 M | 208.6 | 181.4 |
+| 96 | 0.971060 | 19.0511 M | 16.6872 M | 200.6 | 144.1 |
+
+I did not lower the default probe count. On this layout the measured qualifying points are 52
+and 68 probes; their baseline costs are 13.6584 and 15.6785 M instructions/query.
+
+- Caching owned code blocks beside decoded clusters saves 3.3–3.6% instructions, with identical
+  results, but adds roughly 0.4 GB RSS and has no stable cycle gain. It is set aside.
+- Ranking only eight nearby slabs at 64 probes costs 11.599 M instructions/query, but full recall
+  falls to 0.928158. It is rejected.
+- Rebuilding through the existing recluster API with 64-row leaves takes 1,324.49 seconds and
+  produces 32 slabs and 41,881 leaves. With shared metadata, 24/28/32/40 probes give recall
+  0.943279/0.949363/0.953998/0.960892 at 16.3465/17.1787/17.9653/19.5305 M instructions/query.
+  At 32 probes, 100 traced queries scan 59,187 rows across 819 leaves: fewer rows, but more than
+  twice as many leaf setups as default 48. Hot self samples attribute 13.4% to center ranking,
+  4.4% to exact query-to-leaf-center distances, 3.9% to probe selection, and about 4% to decoded
+  cluster lookups. The blocked scan still costs 14.5%. Finer leaves fail the complete-query gate.
+- Transposing resident center codes into 32-row lookup blocks changes center quantization slightly.
+  Default-layout recall becomes 0.949044/0.959994 at 48/64 probes, but costs rise to
+  13.6184/15.5983 M instructions/query, despite including the shared-metadata saving. Extra table
+  setup per slab outweighs the new kernel on this AVX-512 VM, so the prototype is rejected.
+
+Formatting, three-crate all-target clippy with warnings denied, and all three crates' tests pass:
+217 passed, six ignored, and zero failed across 44 suites. The final test run uses one test thread
+and two Tokio/Rayon workers. An earlier run overlapping compilation failed two 50 ms read-wave
+assertions; both pass unchanged in the serial run, consistent with scheduling sensitivity in the
+fixture. No assertions were relaxed. `bench/nq/profile.py` preserves the owned-process warm
+profiling procedure; see `bench/nq/README.md` for reproduction. All run artifacts are removed
+after recording these measurements.
+
+## Memory budgets: blowfish and Qdrant on an Apple M4
+
+I find that **the ranking changes with available RAM**. With hard 2 and 4 GiB query budgets,
+blowfish at 48 probes (recall 0.9497) gives **710 and 1,799 q/s**, against Qdrant ef 64
+with vectors on disk (0.9492) at **83 and 224 q/s**. Mapping Qdrant's graph too improves it to
+**96 and 712 q/s**, at slightly lower recall, 0.9453. At 8 and 12 GiB, Qdrant's closest-recall
+mode reaches **5,616 and 5,702 q/s**, against blowfish's **1,805 and 1,795 q/s**: about 3.1 times
+faster. Blowfish benefits from a larger small cache, then plateaus; Qdrant recovers sharply once
+its roughly 5 GiB query working set fits. The old 14.73 decimal GB Qdrant maximum included
+index construction, rather than measuring query memory alone.
+
+### Workload and controls
+
+I use the same 10-core Apple M4 Mac mini, 16 GiB RAM, macOS 26.2, blowfish `v0.1.15`
+(`e49c509`, release profile, without `local-models`), and Qdrant 1.20.0 as the preceding section.
+The data is again 2,681,468 NQ passages, 3,452 queries, 1,024-dimensional f16 vectors, cosine distance,
+and id/vector only. I verify all four input SHA-256 hashes against that run:
+
+```text
+b1f1fb5d2d49dad476e3f0419ae3ea2975f907ddff94e447133e868ba31be185  corpus.f16
+841a621c983f0299d60873ee976990806f5d01e20116516f7bdc9842f4be2aaf  queries.npy
+fa470968ca6bf216a02ff0995881b07df055d06ca5a5780c7edb16769fb3c1b9  truth.npy
+60764fc0c70c0e35204c36905c40cb3299721ae97f15d235ada83af92f510e64  qrels.json
+```
+
+Every warm row has two fresh-process repeats. In **each repeat**, I first measure recall@10 against
+exact truth over all 3,452 queries at limit 10, then warm 1,000 queries and time 1,000 at one client.
+I run the same 2,000 pre-encoded HTTP queries at 1, 4, and 16 clients, in that order, and report 16-client
+throughput. Tables give the range of each latency percentile, and mean throughput with its range.
+All 10 cores are shared by server and clients, without CPU pinning. I run one engine at a time,
+wait for complete indexing, and remove its data before the next engine. Storage is local disk, rather
+than S3. Index creation is uncapped; these budgets apply to querying an existing index.
+
+Blowfish uses a fresh automatic tier covering all rows in 23 segments, 32 slabs, and 13,392 leaves.
+I keep that store fixed across its native profiles and Linux budgets. Its new layout differs from
+the preceding run, so I report quality again rather than reusing the previous recall.
+I disable the background exhaustive recall sampler
+(`BLOWFISH_RECALL_SAMPLE_RATE=0`) throughout this sweep: the external quality pass already checks every
+query in every repeat, and a periodic exhaustive job would fall inside only the longer, low-memory
+measurements. The engine source and query algorithm are unchanged. Its disk cache is disabled.
+Qdrant uses f16, HNSW m=16, ef_construct=100, optimizer target one segment, and
+max_segment_size=100,000,000. Both placements finish green with every vector indexed and two physical
+segments. I build each placement separately, so their measured recalls differ; I keep those values
+visible rather than treating ef as a quality guarantee.
+
+### Enforced query budgets
+
+I run both engines in Docker on an arm64 Linux guest, with Colima 0.10.3 and a run-local Lima 2.3.0
+built by `bench/nq/build_uncached_lima.sh`. Standard VZ backing files are host-cached: a guest cgroup
+alone can leave another copy of the dataset in the Mac's page cache. The helper switches VZ to
+`DiskImageCachingModeUncached`. Before the first boot, I APFS-clone and replace the stopped VM's root
+and data disk files to discard previously cached inodes. The installed Lima remains unchanged.
+
+Each fresh server gets `--memory=2g --memory-swap=2g`, or the corresponding 4, 8, or 12 GiB pair.
+I verify cgroup v2, active memory and swap controllers, and `memory.swap.max=0`; the server cannot swap
+inside its cgroup. The VM gets 10 vCPUs and one GiB above the engine limit: 3, 5, 9, or 13 GiB.
+The OS and client share that extra GiB; the client runs in a separate container outside the engine's
+cgroup. I use a Linux release build of the same blowfish tag and the `qdrant/qdrant:v1.20.0` image.
+Engine files live on a guest ext4 Docker volume, without host bind mounts. The virtual data disk
+is 26 GiB for Qdrant and expands to 36 GiB for blowfish's larger retained store. I restart the VM between
+budgets, and sync and drop the guest page cache before each fresh server, so earlier containers'
+pages cannot escape the next container's accounting.
+
+For blowfish, the block cache is 1, 3, 7, or 11 GiB, with a 512 MiB decoded cache in every case.
+These are cache capacities, rather than reservations; the cgroup also includes other allocations and
+file cache. Qdrant's first placement has vectors `on_disk=true` and HNSW `on_disk=false`; its second
+has both `on_disk=true`. I read process peak RSS from `/proc/1/status` (`VmHWM`), and total peak memory
+from cgroup `memory.peak`, including charged file cache and kernel memory. Each table cell shows the
+maximum across the two repeats, in GiB. Tiny cgroup overshoots at the page-accounting boundary round
+to the configured limit.
+
+I hash Qdrant's binary vector and graph files against their native reference before and after each
+VM sweep, and compare blowfish's entire store before and after its sweep. macOS swap stays enabled,
+and the existing desktop applications remain running. Across the 48 capped repeats,
+the system-wide counters record **30.8 MiB of swap-ins and zero swap-outs**, with at most 7.72 MiB
+swapped in during one repeat. These counters include desktop activity. The capped servers record
+no OOM events, and all 48 exit with status zero.
+The absolute rates below describe virtualized Linux on the M4; I compare both engines within this
+setup, and show native Mac calibration separately.
+
+At recall around 0.95:
+
+| Engine, setting | Limit GiB | Peak RSS / cgroup GiB | Recall@10 | p50 / p90 / p99 ms | q/s at 16, mean (range) |
+|---|---:|---|---:|---|---|
+| blowfish, 48 probes | 2 | 1.62 / 2.00 | 0.9497 | 3.1–3.2 / 4.9–5.1 / 9.0–10.2 | 710 (696–724) |
+| Qdrant, vectors on disk, ef 64 | 2 | 1.96 / 2.00 | 0.9492 | 25.2–26.9 / 34.2–38.1 / 43.1–56.3 | 83 (80–86) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 2 | 1.96 / 2.00 | 0.9453 | 22.7–23.1 / 30.7–31.3 / 40.1–41.8 | 96 (85–108) |
+| blowfish, 48 probes | 4 | 3.54 / 4.00 | 0.9497 | 1.8 / 2.1 / 2.6–2.7 | 1,799 (1,785–1,814) |
+| Qdrant, vectors on disk, ef 64 | 4 | 3.96 / 4.00 | 0.9492 | 4.8–5.6 / 17.2–18.4 / 23.0–24.0 | 224 (212–236) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 4 | 3.96 / 4.00 | 0.9453 | 4.0–4.2 / 14.0–14.2 / 18.4–19.5 | 712 (708–717) |
+| blowfish, 48 probes | 8 | 3.52 / 6.41 | 0.9497 | 1.8 / 2.1 / 2.5–2.7 | 1,805 (1,792–1,818) |
+| Qdrant, vectors on disk, ef 64 | 8 | 4.82 / 4.89 | 0.9492 | 0.6 / 0.7–0.9 / 0.8–1.2 | 5,616 (5,482–5,751) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 8 | 4.79 / 4.87 | 0.9453 | 0.6 / 0.7 / 0.8 | 5,752 (5,692–5,811) |
+| blowfish, 48 probes | 12 | 3.53 / 6.42 | 0.9497 | 1.8 / 2.1 / 2.6–2.7 | 1,795 (1,790–1,800) |
+| Qdrant, vectors on disk, ef 64 | 12 | 4.81 / 4.89 | 0.9492 | 0.6 / 0.7 / 0.8 | 5,702 (5,653–5,751) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 12 | 4.79 / 4.87 | 0.9453 | 0.6 / 0.7 / 0.8 | 5,707 (5,676–5,739) |
+
+At the requested higher search settings (their measured recalls differ):
+
+| Engine, setting | Limit GiB | Peak RSS / cgroup GiB | Recall@10 | p50 / p90 / p99 ms | q/s at 16, mean (range) |
+|---|---:|---|---:|---|---|
+| blowfish, 64 probes | 2 | 1.67 / 2.00 | 0.9602 | 3.3–3.4 / 5.2–5.4 / 9.8–10.8 | 581 (561–600) |
+| Qdrant, vectors on disk, ef 128 | 2 | 1.96 / 2.00 | 0.9707 | 48.8–51.2 / 60.5–63.6 / 71.6–77.9 | 44 (43–44) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 2 | 1.96 / 2.00 | 0.9680 | 44.7–45.1 / 55.1–56.0 / 65.7–67.5 | 56 (56) |
+| blowfish, 64 probes | 4 | 3.54 / 4.00 | 0.9602 | 1.9 / 2.3 / 2.8–2.9 | 1,554 (1,549–1,560) |
+| Qdrant, vectors on disk, ef 128 | 4 | 3.97 / 4.00 | 0.9707 | 8.1–8.6 / 27.2–27.5 / 36.9–38.7 | 131 (131–132) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 4 | 3.97 / 4.00 | 0.9680 | 7.3–7.4 / 21.2–21.6 / 27.4–28.2 | 169 (168–170) |
+| blowfish, 64 probes | 8 | 3.52 / 6.42 | 0.9602 | 1.9–2.0 / 2.3–2.4 / 2.7–2.9 | 1,519 (1,485–1,552) |
+| Qdrant, vectors on disk, ef 128 | 8 | 5.19 / 5.26 | 0.9707 | 0.8–0.9 / 1.1 / 1.2 | 3,998 (3,995–4,001) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 8 | 5.18 / 5.25 | 0.9680 | 0.8 / 1.1 / 1.2 | 4,152 (4,104–4,201) |
+| blowfish, 64 probes | 12 | 3.54 / 6.43 | 0.9602 | 1.9–2.0 / 2.3 / 2.8 | 1,553 (1,537–1,569) |
+| Qdrant, vectors on disk, ef 128 | 12 | 5.19 / 5.26 | 0.9707 | 0.8–0.9 / 1.1 / 1.2 | 4,034 (4,033–4,035) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 12 | 5.18 / 5.25 | 0.9680 | 0.8–0.9 / 1.1 / 1.2 | 4,077 (4,061–4,092) |
+
+At the 8 GiB limit, blowfish at 48 probes peaks at **3.52 GiB RSS but 6.41 GiB charged memory**,
+while vector-on-disk Qdrant ef 64 peaks at **4.82 GiB RSS and 4.89 GiB charged memory**.
+Blowfish has file cache outside its process mappings in addition to its application cache;
+Qdrant's memory-mapped file pages appear in RSS. Lower process RSS alone does not establish
+lower total query memory. The tables use total charged memory to expose that difference.
+
+### Native Mac calibration and a fresh-process pass
+
+These rows have no process memory cap. I vary blowfish's block-cache capacity through 1, 3, 7, and
+11 GiB with a 512 MiB decoded cache, and add its original 4 GiB block / 2 GiB decoded default.
+Peak RSS comes from `/usr/bin/time -l` around each fresh query process, including its quality,
+warm-up, latency, and throughput work. A larger configured cache only uses memory if the workload
+fills it; it cannot by itself establish a matched memory budget on macOS.
+
+| Engine, cache or placement | Peak RSS GiB | Recall@10 | p50 / p90 / p99 ms | q/s at 16, mean (range) |
+|---|---:|---:|---|---|
+| blowfish, block 1 / decoded 0.5 GiB, 64 probes | 1.57 | 0.9602 | 1.9 / 3.0–3.1 / 5.6–6.0 | 1,005 (980–1,030) |
+| blowfish, block 1 / decoded 0.5 GiB, 48 probes | 1.54 | 0.9497 | 1.7–1.8 / 2.6–2.9 / 4.8–5.5 | 1,159 (1,080–1,238) |
+| blowfish, block 3 / decoded 0.5 GiB, 64 probes | 3.21 | 0.9602 | 1.4 / 1.7–1.8 / 2.1–2.2 | 1,833 (1,823–1,842) |
+| blowfish, block 3 / decoded 0.5 GiB, 48 probes | 3.05 | 0.9497 | 1.3 / 1.5 / 1.9–2.0 | 2,129 (2,114–2,143) |
+| blowfish, block 7 / decoded 0.5 GiB, 64 probes | 3.10 | 0.9602 | 1.4 / 1.7 / 2.1 | 1,816 (1,783–1,849) |
+| blowfish, block 7 / decoded 0.5 GiB, 48 probes | 3.08 | 0.9497 | 1.3 / 1.5–1.6 / 1.9–2.0 | 2,145 (2,141–2,149) |
+| blowfish, block 11 / decoded 0.5 GiB, 64 probes | 3.07 | 0.9602 | 1.4 / 1.7–1.8 / 2.1–2.2 | 1,814 (1,794–1,834) |
+| blowfish, block 11 / decoded 0.5 GiB, 48 probes | 3.12 | 0.9497 | 1.3 / 1.6 / 1.9–2.0 | 2,138 (2,129–2,148) |
+| blowfish, block 4 / decoded 2 GiB (default), 64 probes | 3.16 | 0.9602 | 1.3 / 1.6 / 1.9–2.0 | 1,888 (1,886–1,890) |
+| blowfish, block 4 / decoded 2 GiB (default), 48 probes | 3.14 | 0.9497 | 1.2 / 1.5 / 1.8–1.9 | 2,165 (2,111–2,219) |
+| Qdrant, vectors on disk, ef 64 | 5.37 | 0.9492 | 0.4 / 0.6 / 0.6–0.7 | 6,063 (5,827–6,299) |
+| Qdrant, vectors on disk, ef 128 | 5.45 | 0.9707 | 0.7 / 0.9 / 1.0 | 4,855 (4,831–4,879) |
+| Qdrant, vectors + HNSW on disk, ef 64 | 5.37 | 0.9453 | 0.4 / 0.6 / 0.7 | 7,535 (7,360–7,709) |
+| Qdrant, vectors + HNSW on disk, ef 128 | 5.45 | 0.9680 | 0.7 / 0.8 / 0.9 | 5,500 (5,483–5,517) |
+
+At 48 probes, increasing the native block cache from 1 to 3 GiB raises mean throughput from
+**1,159 to 2,129 q/s**; 7 and 11 GiB give **2,145 and 2,138 q/s**. Their peak RSS remains near
+3.1 GiB. The original default gives 2,165 q/s. This workload stops benefiting materially from
+larger cache capacities once the hot data fits; the 7 and 11 GiB cache capacities do not
+cause equally large native allocations.
+
+For the separate default 64-probe pass, I start a fresh process with empty application caches,
+retain the OS file cache, and immediately time 1,000 queries without quality or warm-up first.
+The **first query takes 51.8 ms**; the entire pass has **2.3 / 3.9 / 7.7 ms** p50 / p90 / p99,
+2.8 ms mean, and **1.83 GiB** peak RSS. Later queries warm the application, so the pass percentiles
+are not 1,000 independently cold queries. This is process startup on local disk, rather than
+a cold-device or cold-S3 measurement.
+
+The historical all-RAM Qdrant ef 64 row remains **7,752 q/s** (7,481–8,023), recall **0.9497**,
+and **0.5 / 0.6 / 0.7 ms** p50 / p90 / p99. Its query RSS samples peaked at **5.49 GiB**
+(5.89 decimal GB); its **14.73 decimal GB** maximum included load and indexing. Those are different
+measurements. I reuse the row without rerunning it, and do not plot its build peak as query memory or
+compare its native rate directly with a capped Linux row.
+
+### Limits and reproduction
+
+The query sequence, cache history, and independent index builds matter. A complete quality pass
+precedes every warm repeat; these are neither random-query throughput estimates nor cold-read S3
+measurements. Latency uses 1,000 sequential queries, while throughput uses 2,000 with concurrency;
+a fast median can coexist with severe later cache churn. Two repeats show variability, rather than
+a confidence interval. A 4-to-8 GiB change brackets a transition; it does not locate the exact
+working-set threshold. The VM limit includes the server's charged page cache, but excludes the guest
+OS, client, VM overhead, and desktop applications. Host swap and virtualization remain limitations.
+
+`bench/nq/qdrant.py --vectors-on-disk` selects the first Qdrant placement; adding
+`--hnsw-on-disk` selects the second. `bench/nq/measure.py --parts quality,latency,throughput
+--clients 1,4,16` runs each warm repeat, with `NQ_QUALITY_K=10`, the selected engine, and its search
+setting. `--parts latency --first-pass` skips latency warm-up for the separate fresh-process pass.
+The harness now reports a failed or killed throughput worker, and reaps its peers. Its three
+regressions pass, along with formatting, full-workspace clippy, and all 324 Rust tests. The runtime
+helper is syntax-checked and exercised by the actual signed build, VM boots, and memory sweeps.
+
+## Round T1: smaller phrase positions, and BM25 kill tests
+
+Text format 6 reduces live MS MARCO text indexes by 2.14×, with identical results.
+The 1.3× BM25 cost target remains open. The seed, document-order, and bound
+experiments did not pass their instruction gates, so their implementations stay
+out of the production path.
+
+I use the first 1,000,000 MS MARCO passages, the checked-in 1,000 dev queries,
+default BM25 parameters, and exhaustive truth from `bf-text/examples/exact_bm25.rs`.
+Measurements run on one disposable c7g.2xlarge (8 Graviton vCPUs, 16 GiB RAM).
+Both arms use the production release profile. The server has two Rayon and two
+Tokio workers, a 1 GiB memory cache, 4,000-byte blocks, 512-block coalescing,
+and fetch concurrency 512. Builds and loads finish before measured query passes.
+This is local disk and a fixed-delay S3 facade on EC2, with no real S3 latency claim.
+
+### Footprint and format
+
+The first kill test uses five consecutive 200,000-row text segments, with positions
+enabled. It inspects every block before selecting a codec.
+
+| Region | Format 5 bytes |
+| --- | ---: |
+| Phrase positions | 453,410,160 |
+| Packed postings | 168,369,046 |
+| Term records | 82,327,828 |
+| Packed lengths | 950,355 |
+| Dictionary bundles, padding, chunk index, and footers | 26,638,311 |
+| Total | 731,695,700 |
+
+Positions occupy 62.0% of the index. All 56,676,270 occurrences have element zero.
+Unsigned delta varints take 56,699,677 bytes; one scalar/array flag per block brings
+that to 58,032,680 bytes, 7.81× smaller than raw pairs. Total text bytes fall to
+336,318,220, a 2.18× reduction. A complete decode comparison checks every occurrence,
+not just phrases or samples.
+
+A separate HTTP-loaded namespace contains six compacted segments of 125,000,
+200,000, 165,000, 200,000, 200,000, and 110,000 rows. Its existing background upgrade
+moves all six text fields from format 5 to format 6. Live text bytes fall from
+743,516,484 to 348,199,345 (2.14×). The other live segment files are unchanged:
+documents 126,088,846 bytes, filters 52,991,262, ID filters 3,000,163, ID indexes
+6,889,704, and compact text keys 222. Retired files remain eligible for ordinary
+retention and GC; these figures count live references.
+
+Format 6 keeps the footer and 52-byte block-directory shape. Position blocks have
+a one-byte flag, followed by unsigned LEB128 position deltas. Array blocks also
+encode element deltas. Coordinates restart per document, and positions restart
+when the element changes. Gaps, repetitions, and array boundaries are lossless.
+BM25 does not read the position stream.
+
+Formats 4 and 5 transcode directly without retokenizing documents. The background
+upgrade recognizes `TextHeader::is_current`; manifest and bucket versions are
+unchanged. The current reader can serve older files while an upgrade runs. Unknown versions
+fail, new writes always use format 6, and there is no downgrade switch.
+
+The binary `ids.bfi` hypothesis is not implemented. On this integer-ID corpus,
+those files use 6.89 bytes/row rather than the estimated 35. Eliminating every ID-index
+byte would save less than 1% of format-5 live segment bytes, and ID-only BM25 already has
+222 bytes of stride-encoded text keys. A separate UUID/string-ID study is needed
+before changing the engine's ID format.
+
+### Build cost
+
+The Spot host was reclaimed after the query checks. I repeated the build gate on
+one replacement c7g.2xlarge, with both arms paired on that machine. Two A/B/A/B
+builds parse, tokenize, build, and write the same five 200,000-row segments.
+Separate binary hashes and every emitted segment footer are checked (5 before,
+6 after). An initial pass that reused Cargo artifacts after archive extraction
+was discarded; these runs follow a forced rebuild.
+
+| Build metric, median of two runs | Format 5 | Format 6 |
+| --- | ---: | ---: |
+| Parse, tokenize, build, and write | 34.124 s | 33.818 s |
+| Within `SegmentBuilder::finish` | 4.438 s | 4.370 s |
+
+Individual full-build times are 34.611 and 33.637 s before, versus 34.460 and
+33.176 s after. The codec passes the ≤1.05× build-time gate.
+
+### CPU hypotheses
+
+These kill tests call `bf-text` directly over immutable memory-backed segments.
+They search the five segments sequentially with the existing shared threshold,
+warm all 1,000 queries once, and count only the measured pass with perf's control
+FIFO. They exclude HTTP and engine work, and are not throughput comparisons with
+the earlier Apple M4 results. Counts are the median of two measured passes.
+
+| Variant | Million instructions/query | Reduction factor |
+| --- | ---: | ---: |
+| Baseline | 20.32 | 1.00× |
+| Exact kth score supplied free | 14.91 | 1.36× |
+| Best 64 rows per term, free seed scoring | 17.75 | 1.14× |
+| Best 64 rows per term per segment, free seed scoring | 15.92 | 1.28× |
+| Recursive document bisection prototype | 18.66 | 1.09× |
+| Experimental window-span cache | 19.60 | 1.04× |
+| Unlimited exact window bounds plus span cache | 18.61 | 1.09× |
+| Bisection, unlimited exact bounds, and span cache | 16.37 | 1.24× |
+
+The larger seed union contains 1,656 candidate rows/query on average. Its 1.28×
+ceiling already misses 1.3× before charging selection, scoring, or I/O, so no seed
+lists are written. The ideal floor clears 1.3× by too little to rescue these lists.
+
+The bisection prototype uses four log-odds refinement passes per balanced split,
+recursing to at most 128 rows and omitting unique or twice-occurring graph edges.
+Partitioning takes 2.38–2.44 seconds per 200,000-row segment. Its compressed text
+files grow from 336,318,220 to 342,407,182 bytes, and instructions fall only 9%.
+This prototype misses both the byte and instruction gates; it is not a general
+claim about other graph-partitioning implementations.
+
+Unlimited exact per-window maxima are a stronger bound than one joint `(tf, len)`
+pair per block. Even their combined ceiling misses 1.3×, so no bound metadata or
+row permutation is added to format 6. Persisting a single winning pair would also
+need to account for changed namespace average length, since that can change which
+posting wins.
+
+### Committed codec: HTTP checks
+
+The baseline production source is `b663eb2` (the test-only `c3eafdd` has identical
+production code). The codec is `3e49a4a`; corpus-backed kill and round-trip tests
+are in `5f13376`. Both binaries use Rust 1.100.0 and Clang 21.1.8 for native
+dependencies. Warm A/B/A/B passes start fresh servers, warm the full workload,
+and then measure 1,000 queries at each client count. Perf attaches only to the
+server during the measured pass. Cold A/B/A/B uses 60 queries and a fresh process
+per query, through the read-only facade with 25 ms/request. The OS page cache is
+retained. Tables give the median of each arm's two passes.
+
+| Metric | Format 5 | Format 6 |
+| --- | ---: | ---: |
+| Live text index bytes | 743,516,484 | 348,199,345 |
+| All live segment bytes | 932,486,681 | 537,169,542 |
+| Warm c1 p50 / p90 | 3.31 / 5.55 ms | 3.28 / 5.51 ms |
+| Warm c16 p50 / p90 | 26.47 / 52.14 ms | 25.41 / 48.54 ms |
+| Warm c16 queries/s | 499.3 | 517.3 |
+| Server instructions/query, c1 | 27.851 million | 27.811 million |
+| Server instructions/query, c16 | 27.037 million | 26.698 million |
+| Fresh-process facade p50 / p90 | 165.9 / 232.5 ms | 170.4 / 231.0 ms |
+| Cold reads/query | 113.78 | 113.86 |
+| Cold MB/query | 3.600 | 3.617 |
+| Cold waves/query | 3.15 | 3.15 |
+| Peak server RSS, median after c16 | 616.1 MiB | 616.4 MiB |
+| overlap@10, all 1,000 dev queries | 1.000 | 1.000 |
+
+BM25 cost is essentially unchanged. Cold p50 is 2.7% higher, p90 is 0.7% lower,
+and reads, bytes, and waves are essentially flat. Individual cold p50/p90 pairs
+are 161.2/237.7 and 170.6/227.4 ms before, versus 178.0/234.1 and 162.8/227.9 ms
+after. I do not claim a BM25 speedup from position compression.
+
+For phrase checks, I use the first four whitespace-delimited words of each of the
+first 60 passages, with `ContainsTokenSequence`, BM25 over the same words, and
+ID-only projection. This is a separate correctness and position-I/O workload,
+not a claim about the MS MARCO relevance distribution.
+
+| Cold phrase metric, 60 queries, A/B/A/B | Format 5 | Format 6 |
+| --- | ---: | ---: |
+| p50 / p90 | 363.2 / 560.2 ms | 355.1 / 540.8 ms |
+| Reads/query | 553.82 | 395.00 |
+| MB/query | 6.128 | 5.001 |
+
+Phrase p90 stays below the 5% regression gate; reads fall 28.7%, and bytes fall
+18.4%. These are whole-query numbers, including dictionaries, postings, and
+manifest reads. Fixed 4,000-byte cache blocks limit the benefit from the 7.81×
+smaller position payload.
+
+All **8,480 final HTTP responses** pass strict ordered-ID and f32 score-bit
+comparisons: 8,240 BM25 responses against exhaustive truth, and 240 phrase responses
+against one another. The complete 1,000-query offline result also matches the
+exhaustive IDs and score bits. Codec properties cover arbitrary u32 coordinates,
+arrays, scalar fields, repetitions, truncation, overflow, and noncanonical varints.
+Migration tests cover formats 4 and 5, missing and empty fields, long and short
+posting lists, header-only opens, and byte-identical fresh builds and upgrades.
+
+### Reproduction and limits
+
+Prepare the corpus with the same source and settings as
+`bench/scale/msmarco_load.py`. Keep corpus, binaries, stores, and output in an
+owned `.scratch/` directory, and remove it after preserving measurements. The
+ignored tests in `bf-text/src/experiments.rs` provide `prepare_msmarco`,
+`inspect_msmarco`, `upgrade_msmarco`, `lossless_msmarco`, `seeds_msmarco`,
+`reorder_msmarco`, and `query_msmarco`. They take `BF_TEXT_EXPERIMENT` as their
+scratch root, with `corpus.jsonl` and `workload.json`. Use the baseline revision's
+prepare test for format-5 input, and the current revision for transcoding and
+round-trip validation. The query test accepts `BF_TEXT_IDEAL_FLOOR`,
+`BF_TEXT_SEED_FLOOR`, and `BF_TEXT_PERFECT_BOUNDS` for the optimistic ceilings.
+Perf's enable/disable FIFO excludes preparation and warm-up from instruction counts.
+
+For the HTTP runs, use `bench/scale/bm25_local.py warm` with `--queries 1000
+--clients 1 16`, and `cold` with `--queries 60`, selecting each separately built
+binary and its corresponding immutable store. Supply `--namespace msmarco` and
+an owned `--profile-dir` under `.scratch/` when using perf. Repeat A/B/A/B, and
+compare every response to the exhaustive scorer using strict IDs and score bits.
+The published timings are not Apple M4 timings, in-region S3 latency, or a new
+comparison with hosted turbopuffer.
+
+## Round C1: overlapping cold ANN reads
+
+Measured on 2026-11-24, on one spot `c7gd.2xlarge` in AWS us-west-2, the bucket's region,
+using the preserved release-upgraded Wikipedia namespaces. Every server was
+read-only. No source objects, manifests, or layouts were changed.
+
+The control is commit `b663eb2`, with one instrumentation-only counter added to
+count backend read attempts when they start. Counting only completed operations
+misses requests canceled by hedging. Both arms use that counter; GET totals below
+include canceled attempts and missing-key GETs, and exclude HEADs.
+
+Each comparison alternates arm order for the same held-out query on the same
+instance. Cache-cold arms keep separate processes and connections, and clear
+memory, disk, decoded metadata, and namespace handles before each query. Fresh
+arms start a process and an empty application cache for every query, with the
+same 1.5-second connection-warmer settle in both arms. Operating-system caches
+are retained. Requests use strong consistency, 64 probes, `top_k=10`, and the
+existing exact-truth oracle workloads. Settings are eight Rayon threads, 4,000-byte
+blocks, 512-block coalescing, 512 concurrent fetches, an 8 GiB payload cache, and a
+512 MiB decoded cache. The toolchain is Rust 1.100.0 with GCC 14 on aarch64.
+
+A separate 200-request-per-size S3 check measured 4 KB GET p50 / p90 of
+**24.5 / 31.0 ms**, and 1 MB GETs of **30.8 / 37.9 ms**. S3 latency changed during
+the session; compare each candidate with its paired control, rather than comparing
+absolute candidate times across trials.
+
+### What changed
+
+The old snapshot prefetch awaited the entire scan, and reranking awaited the
+slowest slab. The replacement reserves coalesced reads before starting independent
+four-leaf scan batches, prioritizes nearby leaves, and starts a bounded prefetch
+of at most 80 vectors and 30 documents once 40% of the scan batches finish.
+The final probe set, error bound, rerank cap, distance calculation, and hydration
+remain the same. Every selected leaf is scanned; no time-based cutoff is enabled.
+
+Keeping coalescing was necessary: the first streaming prototype roughly doubled
+completed GETs. `RangeReader::read_batch_notifying` lets leaf consumers share the
+whole batch's reserved requests without waiting for an unrelated range to finish.
+A memory-residency check keeps resident queries on the per-slab path. Streaming
+applies to large, unfiltered slab searches without a shared cross-tier plan;
+These comparisons used a temporary `BF_ANN_STREAM_SCAN=0` override to restore the previous scheduling; it was removed at merge, so streaming is the only cold slab path and later comparisons use a baseline binary.
+
+### Rejected experiments
+
+| Paired trial | Control p50 / p90 ms | Candidate p50 / p90 ms | Result |
+| --- | ---: | ---: | --- |
+| 35 ms hedge seed and floor, 20 cache-cold queries | 503.9 / 599.3 | 488.3 / 631.6 | 1.03× p50 and worse p90; removed |
+| Streaming without reserved coalescing, 20 queries | 503.9 / 599.3 | 402.1 / 559.9 | Completed GETs rose from 562.5 to 1,154.4; removed |
+| Coalesced streaming, 30 speculative vectors and documents, 200 queries | 482.7 / 609.3 | 375.3 / 499.3 | 1.286× p50 misses 1.30×; not kept as the final setting |
+| Distant-half cutoff, 2% overfetch, and 35 ms hedging, 200 queries | 482.7 / 609.3 | 380.4 / 475.5 | Slower than streaming alone; removed |
+| 80 speculative vectors and documents, 50 queries | 501.4 / 713.5 | 365.1 / 479.6 | GET attempts rose 18.8%, above the 15% limit; removed |
+
+The cutoff waited for the nearest half and at least 95% of batches, then allowed
+`max(1.8 × median completion time, 80 ms)` before canceling distant stragglers.
+Its recall was 0.9630 against 0.9615, but it did not improve the latency target.
+An earlier handoff at 20% completion also missed the target in its 50-query screen.
+Co-probed leaf repacking was not attempted; this round makes no format change.
+
+The split speculation limits first passed a 200-query cache-cold run:
+581.6 / 720.0 ms became 443.7 / 582.1 ms, with recall 0.9615 on both arms and
+GET attempts 588.6 → 655.0 (+11.3%). A 50-query fresh-process run measured
+648.7 / 840.0 → 472.3 / 734.9 ms, with 11.8% more GETs. The final default build
+was then rebuilt and checked separately below.
+
+### Final default build
+
+Latency pairs are p50 / p90 in milliseconds. Cache-cold rows use all 200 oracle
+queries per arm, and fresh rows use the first 50. Recall below is over all 200
+cache-cold queries, against the existing independently computed exact top-10.
+The 100M paired harness, including both servers and the client, runs in a 10 GiB
+cgroup with swap disabled; payload-cache budgets remain 8 GiB per server.
+
+| Corpus and mode | Control p50 / p90 ms | Streaming p50 / p90 ms | Mean GET attempts, control → streaming |
+| --- | ---: | ---: | ---: |
+| 10M, cache-cold | 554.1 / 701.2 | 424.7 / 543.7 | 586.5 → 653.7 |
+| 10M, fresh process | 617.1 / 951.9 | 478.3 / 623.7 | 575.0 → 644.3 |
+| 100M, cache-cold | 1,027.9 / 1,165.7 | 715.1 / 907.0 | 2,211.5 → 2,247.5 |
+| 100M, fresh process | 1,116.6 / 1,418.1 | 807.1 / 1,062.4 | 2,181.5 → 2,233.6 |
+
+10M cache-cold p50 improves **1.3045×**, with p90 lower, recall unchanged at
+**0.9615**, and **11.5%** more GET attempts. The independent default-build rerun
+therefore meets the required 1.30× / 0.001 recall / 15% GET gate. Fresh-process
+GET growth is 12.1%, and its p90 also improves.
+
+At 100M, cache-cold p50 improves **1.4374×**, p90 is lower, recall remains
+**0.9540**, and GET growth is **1.6%**. This improves on the control, though it
+falls just short of the advisor's separate 1.45× aspiration for 100M.
+
+All **500 final query pairs** (200 cache-cold and 50 fresh at each size) returned
+identical IDs and distances. After timing, a fan-out/admission guard was added to
+preserve the existing per-slab policy for busy processes and cache-bypass reads.
+Its predicates are true in this single-query, cache-admitting configuration; the
+normal and forced-fallback paths both passed the final regression checks.
+
+### Reproduction
+
+`crates/bf-engine/examples/cold_ab.py` preserves the paired harness. Supply the
+private storage URL, namespace, region, and optional profile/endpoint in a local
+config file; the runner enforces read-only storage. For a comparison within the
+current binary:
+
+```sh
+source ~/.cargo/env
+CARGO_TARGET_DIR="$PWD/.scratch/c1/target" cargo build --release \
+  --manifest-path crates/bf-engine/examples/scale-server/Cargo.toml
+uv run crates/bf-engine/examples/cold_ab.py \
+  --config bench/scale/config.local \
+  --binary .scratch/c1/target/release/blowfish-scale-server \
+  --arms '{"control":{"BINARY":"BASELINE_BINARY"},"stream":{}}' \
+  --scratch .scratch/c1 --label cachecold --queries 200
+```
+
+Use `--mode fresh --queries 50` and a new label for fresh-process timing. Use
+`--oracle 100m` with a config pointing at the copied 100M namespace for the larger
+workload. The recorded control above used the original build with the attempt
+counter backported, rather than the environment override. Summarize results and
+remove the run directory afterward.
+
+### Validation, spend, and cleanup
+
+`cargo fmt --check`, `cargo clippy -p bf-engine -p bf-storage --all-targets -- -D warnings`,
+and `cargo test -p bf-engine -p bf-storage` passed on a separate Graviton checks
+host: **197 tests passed**, four existing tests remained ignored, and none failed.
+The 100K-row current-format regression also passed separately with
+`BF_FANOUT_QUERIES=0`, exercising the per-slab fallback. It covers cold/warm result
+equality, projection, and indexed deletes. Storage tests cover coalescing,
+dispatch priority, independent early completion, cancellation, and residency.
+The reusable Python harness passed an AST check and its `--help` invocation.
+
+| EC2 work | Instance type | Instance-hours | Estimated compute USD |
+| --- | --- | ---: | ---: |
+| Paired query measurements, spot | c7gd.2xlarge | 0.975 | 0.1163 |
+| Checks interrupted by Spot capacity reclamation | c7gd.2xlarge | 0.092 | 0.0103 |
+| Completed checks, on-demand | c7g.2xlarge | 0.394 | 0.1143 |
+| Total | | **1.461** | **0.2409** |
+
+Compute uses the observed regional Spot rates and the AWS on-demand price;
+EBS and S3 request charges are additional. No S3 data was added. All instances were
+terminated, and the temporary key pair and security group were deleted. Local run artifacts
+were removed after recording these results. Workspace and SDK compatibility
+checks remain the coordinator's merge checks.
+
+## Round I2: binary vectors in the WAL (2026-11-24)
+
+I test whether replacing the WAL's f32-base64 vectors with a binary section at the declared
+precision improves acknowledged ingest by at least 1.30×, preserves replayed values, and avoids a
+write-p90 increase. The starting source is `d79c6757`.
+
+### Method and kill test
+
+All measurements run on one disposable c7g.2xlarge Spot instance in us-west-2 (8 vCPU, 16 GiB RAM,
+swap off), against Amazon S3 in that region. The server uses CPUs 0–5, six Tokio workers, and six
+Rayon workers; the client uses CPUs 6–7. Both binaries use the same Rust release profile, with
+`CARGO_PROFILE_RELEASE_LTO=false` and `CARGO_PROFILE_RELEASE_DEBUG=1`.
+
+The input is the first 500,000 BEIR NQ rows: 1,024-dimensional f16 vectors, original titles, and
+original text. I prepare identical 1,000-row JSON request bodies once, outside timing. They carry
+f32-base64 vectors, as the official SDK does. Four clients write into a fresh namespace in a fresh
+S3 prefix for every arm. Timing includes the first schema-bearing write, request-body reads,
+backpressure retries, and the last durable acknowledgment. Write percentiles include retry delays.
+No query traffic runs during ingest.
+
+Both arms use a 512 MiB memory cache, no disk cache, a 100,000-row or 256 MiB indexing threshold,
+a 30-second indexing age, a 256 MiB bulk-flush threshold, and a 384 MiB unindexed-WAL limit. The
+WAL pipeline remains eight; background indexing, compaction, and automatic reclustering stay on.
+
+The initial profiled baseline takes 181.91 s (2,749 acknowledged rows/s), with write p50/p90
+669.5/1,378.9 ms and 44 backpressure retries. A 99 Hz `perf record` captures 36,696 samples with
+no lost samples. Vector-distance work in `l2_squared_f32` accounts for 28.98% of sampled cycles
+on Tokio workers; text posting construction accounts for 5.68%. The WAL staging stack accounts for
+9.64% inclusively, including 8.77% in `encode_payload`. The main JSON string-escaping sample accounts
+for 1.33%. Compression samples include both WAL payloads and segment blocks, so I do not attribute
+all compression time to the WAL. The profiled load is excluded from the paired timing
+comparison.
+
+### Codec experiment
+
+The disposable prototype replaces only the external WAL payload codec. It writes zstd-compressed
+JSON metadata followed by little-endian binary vector records. Dense f16 values occupy two bytes
+per dimension, and dense f32 values occupy four. Metadata borrows documents without cloning their
+large vector strings. Small inline commits keep their existing representation. Public `WalEntry`
+and `WriteBatch` values, HTTP bodies, acknowledgment durability, indexing, and query code stay the
+same.
+
+The prototype uses payload version 4 because versions 2 and 3 identify commit-slot encodings.
+It reads version-1 payloads automatically until checkpointing and normal GC remove them. There is
+one payload writer. Before timing, prototype tests pass for mixed old/new logs, conflicts, retries,
+pruning, malformed binary sections, missing/null fields, dense f16/f32 values, arrays, sparse vectors,
+multi-vectors, and every finite f16 bit pattern. Values that cannot round-trip through their declared precision stay in
+JSON instead of being silently rounded by the codec.
+
+I run unprofiled arms in candidate/baseline/baseline/candidate order:
+
+| Arm | Seconds | Acknowledged rows/s | Write p50 / p90 ms | Backpressure retries |
+| --- | ---: | ---: | ---: | ---: |
+| Candidate 1 | 169.55 | 2,949 | 393.3 / 812.6 | 56 |
+| Baseline 1 | 125.27 | 3,991 | 678.6 / 883.3 | 28 |
+| Baseline 2 | 125.41 | 3,987 | 687.8 / 926.4 | 28 |
+| Candidate 2 | 114.80 | 4,355 | 398.0 / 740.3 | 44 |
+
+The retained WAL payload objects shrink from 1,548,985,444 and 1,548,985,398 bytes in the
+baselines to 1,041,784,805 and 1,041,756,063 bytes in the candidates: about 3,098 versus 2,084 B/row,
+a 32.7% reduction. These are compressed object payload sizes, including the storage identity header;
+commit slots and segment objects are excluded.
+
+Fresh-process replay with the prototype reader checks baseline 1 and candidate 1 independently
+against the original input. Both reproduce every ID exactly once, all 512,000,000 vector coordinates
+bit-for-bit, and every title and text. They contain 321 and 338 WAL slots, respectively. The five
+prototype codec tests also pass; they are removed with the unadopted codec.
+
+**Rejected.** The baselines agree within 0.11%. The candidate ranges from 0.74× to 1.09× their
+throughput, and neither run reaches 1.30×. Write p90 improves, but acknowledged ingest does not
+meet the gate. Faster individual commits do not remove background indexing work or backpressure:
+the candidate receives 44–56 retry responses, compared with 28 in both baselines. The difference
+between uncompressed base64 size and binary size is not an ingest-speed prediction.
+
+I remove the experimental codec instead of adding a format or a setting for it. Production WAL
+payload version 1, commit slots, bucket fencing, and public APIs remain unchanged. No upgrade is
+needed. The retained HTTP driver and replay checker support future ingest experiments.
+
+### Reproduction and cleanup
+
+`crates/bf-wal/benches/http_ingest.py` prepares the fixed request bodies and measures acknowledged
+HTTP ingest. Run it with `uv run --with numpy python`, using `prepare BODIES --corpus CORPUS.npy
+--attrs ATTRS.jsonl`, then `load BODIES --clients 4` against each fresh server. The corpus is a
+little-endian f16 NumPy matrix; attributes are JSONL objects containing `title` and `text` in corpus
+row order. Put every input, body directory, store, and log below the run's `.scratch/` directory.
+
+`crates/bf-wal/examples/replay_check.rs` checks retained WAL payloads independently of the writer's
+resident state. Set `I2_URL` to the disposable S3 prefix, `I2_CORPUS` to that matrix, and `I2_ATTRS`
+to that JSONL file, then run `cargo run --release -p bf-wal --example replay_check`. The checker
+requires every source ID exactly once, compares all 1,024 f32 bit patterns with the original f16
+values expanded to f32, and compares every title and text. It fails on missing or duplicate rows.
+
+All disposable S3 prefixes are deleted and verified empty. The instance, key pair, and security
+group are removed. The instance ran for about 0.50 hours; the observed Spot price was $0.1074/hour,
+or about $0.05 in compute, excluding EBS and S3 requests. Local run inputs, logs, and source archives
+are removed after retaining these results. Final `cargo fmt --check`,
+`cargo clippy -p bf-wal --all-targets -- -D warnings`, and all 13 `cargo test -p bf-wal` tests pass.
+
+## Round B4: impact ordering, and dense BM25 scoring
+
+The tested impact-ordered TAAT path fails the CPU and cold-block gates. The
+row-aligned NEON scorer also fails the gate when combined with the existing
+reader's planner, caches, and posting reads. No production algorithm or text
+format changes ship from this round; text format 6 and automatic upgrades remain
+unchanged.
+
+The workload is T1's first 1,000,000 MS MARCO passages, five consecutive 200,000-row
+segments, and all 1,000 checked-in dev queries, with default BM25 parameters and
+limit 10. The offline example was `crates/bf-text/examples/impact_bm25.rs` (removed after the round; it is in commit 11a4738); its
+adjacent README documents preparation, counter control, and each variant.
+Final measurements use an owned on-demand c7g.2xlarge, pinned to one core, with
+one complete warm-up before each measured pass, on Rust 1.100.0. Perf's control
+FIFOs exclude preparation and warm-up. All arms use the release profile and sequential segments with a shared
+query threshold. These are paired ARM instruction/cycle measurements, with no
+HTTP, S3 latency, or Apple M4 throughput claim.
+
+| Offline variant | Million instructions/query | Million cycles/query |
+| --- | ---: | ---: |
+| Existing reader | 17.832 | 11.975 |
+| Impact TAAT | 127.684 | 111.551 |
+| Impact, free exact block maxima | 127.105 | 112.032 |
+| Dense, optimistic NEON | 13.653 | 7.291 |
+| Dense, optimistic cached scalar | 13.056 | 7.132 |
+| Dense, existing planner, NEON | 17.023 | 10.453 |
+| Dense, existing planner, cached scalar | 16.927 | 10.331 |
+
+Counts are medians of two measured passes per variant, except the free exact
+block-maxima diagnostic, which has one. The integrated NEON variant reduces
+instructions by **1.047×** and cycles by **1.146×**, missing both the 15.6M
+instruction limit and the 1.3× cycle gate. Cached scalar in the same planner is
+slightly cheaper, at **1.053×** fewer instructions and **1.159×** fewer cycles.
+The optimistic standalone NEON result passes its absolute instruction and cycle
+gates, but the scalar control is cheaper still; that result cannot be attributed
+to SIMD or substituted for the integrated gate.
+
+The final embedded reader's paired baseline differs from T1's historical 20.32M
+instructions/query. Compare variants inside this binary; embedding the reader,
+changing the offline driver, or changing release code generation is not a shipped
+production improvement. Both integrated variants also miss the absolute 15.6M gate.
+
+Resetting decoded postings and saturation/bound caches before each segment/query
+gives **3,928,538** required baseline posting blocks across the 1,000 queries.
+Impact order needs **6,863,734** (**1.747×** baseline), and free exact block maxima
+still need **6,815,551** (**1.735×**). Neither meets the ≤50% cold-block gate.
+These are logical payload-block counts, with no GET coalescing or latency claim.
+
+Repacking every long list, including terms outside the queries, adds **13,186,336**
+packed posting bytes to the **336,318,220**-byte format-6 text index: **3.921%**.
+This estimates the posting codec delta with the current bitpacking implementation;
+it does not include changes to dictionary reservation sizes or validate an emitted
+format-7 file. Footprint is not the reason this candidate is rejected.
+
+The impact prototype sorts long lists (df > 4,096 or more than 32 blocks) by
+build-time segment-normalized saturation, keeps rows sorted within each
+128-posting block, and leaves shorter lists in row order. Runtime suffix maxima
+of independent max-TF/min-length bounds remain conservative when namespace
+statistics change. A priority queue selects the next term block. Per-row term
+contributions preserve canonical f32 addition, and an indexed top-k heap tracks
+increasing lower scores.
+
+The proposed sum of remaining term bounds is only a bound on **untouched** rows.
+A touched row can retain a missing contribution, and a current winner needs its
+exact score before it can be returned. The prototype also checks unresolved
+partials and requires winners to have exact scores. An absent term can force
+exhaustion of its list to establish that missing contribution as zero. This
+experiment supplies no free candidate completion through a separate row index.
+The exact sorted-access implementation is rejected; this does not establish a
+ceiling for impact layouts with a separately charged candidate-completion index.
+
+The dense experiment transposes long query terms into row-aligned u32 frequencies.
+The NEON kernel uses two f64 lanes, keeps the reference arithmetic order, converts
+each term's contribution to f32, and adds terms in dictionary order. Sparse
+candidate windows retain the cached scalar scorer. The standalone planner gets
+unlimited exact window maxima and a fully prepared frequency cache. Its cached
+scalar control isolates the kernel from the planner/cache advantage.
+
+The integrated control retains the existing planner, bounded decoded cache,
+window-bound cache, posting reads, and shared threshold, changing only the final
+scoring loop to consult the prepared frequencies. Preparation of that additional
+frequency cache is free in this test. It does not model a persisted row-aligned
+representation or establish that all possible format-7 layouts fail. Its measured
+cost still misses the requested gate, so the optimistic standalone result is
+insufficient evidence to ship a format bump.
+
+The example tests compare randomized corpora with exhaustive scoring, covering
+missing terms, repeated query terms, changed namespace averages, and score ties.
+A native ARM test checks SIMD score bits against the existing scorer for zero
+frequencies, frequencies and lengths beyond the saturation cache, odd batch
+lengths, and multiple query frequencies. The full-corpus checks compare ordered
+IDs and f32 score bits, rather than overlap alone.
+
+The final crate gate passes: formatting, clippy for all bf-text targets, 39 library
+and integration tests, and 14 example tests. Seven historical corpus experiments
+remain ignored in each relevant test binary. The independent exhaustive utility
+checks all 1,000 queries and 10,000 ordered hits, with every f32 score bit equal;
+every prototype pass asserts against that validated baseline. No HTTP, SDK, or
+full-workspace validation is claimed for these example-only changes.
+
+A Spot c7g.2xlarge was reclaimed during an incomplete repeat. Incomplete counters
+are discarded; the final table comes entirely from the replacement on-demand
+host. No S3 objects are created, and both hosts and their temporary access
+resources are cleaned up at the end of the round.

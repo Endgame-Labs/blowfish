@@ -19,4 +19,5 @@ uuid = { version = "1.29.2", features = ["v4", "serde"] }
 zstd = "0.13.3"
 
 [dev-dependencies]
+half = "=2.7.1"
 tempfile = "3.27.0"
