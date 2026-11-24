@@ -243,7 +243,7 @@ impl Engine {
         let next_spill_row = std::sync::atomic::AtomicU32::new(0);
         let copy_stage = Stage::new("copy");
         let spill_write_nanos = std::sync::atomic::AtomicU64::new(0);
-        let copied: Vec<Vec<u32>> = futures::stream::iter(segments.into_iter().zip(bases).map(
+        let copied: Vec<_> = futures::stream::iter(segments.into_iter().zip(bases).map(
             |(seg, base): (Segment, u32)| {
                 let spill = spill.clone();
                 let ann_key = ann_key.clone();
@@ -252,6 +252,7 @@ impl Engine {
                 let next_spill_row = &next_spill_row;
                 async move {
                     job.pause().await;
+                    let ids = segment::ids(store, &seg).await?;
                     let index = segment_index(store, &seg, &ann_key).await?;
                     let live = if seg.live_generation == 0 {
                         None
@@ -287,7 +288,7 @@ impl Engine {
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     }
-                    Ok::<_, ApiError>(present)
+                    Ok::<_, ApiError>((base, ids, present))
                 }
             },
         ))
@@ -305,8 +306,22 @@ impl Engine {
                 .map(std::sync::atomic::AtomicU32::into_inner)
                 .collect(),
         );
-        let mut present: Vec<u32> = copied.into_iter().flatten().collect();
-        present.sort_unstable();
+        // Global row numbers describe the manifest, not the data: write concurrency changes
+        // segment boundaries and their order. Canonical document order makes both samples,
+        // four-row candidate unions, and refinement sums independent of those boundaries.
+        // Borrow IDs while sorting, so string IDs are not copied once per row.
+        let present: Vec<u32> = on_pool(move || {
+            let _ordering = Stage::new("document_order");
+            let mut ordered: Vec<_> = copied
+                .iter()
+                .flat_map(|(base, ids, rows)| {
+                    rows.iter().map(move |g| (&ids[(*g - base) as usize], *g))
+                })
+                .collect();
+            ordered.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
+            ordered.into_iter().map(|(_, g)| g).collect()
+        })
+        .await?;
         if present.is_empty() {
             return Err(ApiError::new(400, "no live rows to recluster"));
         }
@@ -690,7 +705,7 @@ fn pack_slabs(jobs: Vec<SlabJob>, max: usize) -> Vec<SlabJob> {
     out
 }
 
-/// One slab to build: its global rows (ascending), its leaf clusters' centers, and each row's
+/// One slab to build: its global rows, its leaf clusters' centers, and each row's
 /// cluster among them.
 struct SlabJob {
     rows: Vec<u32>,
@@ -1072,7 +1087,7 @@ fn assign_leaves(
         leaf_of = assign(&leaves)?;
         tracing::info!("recluster: refined at {:.0}s", t0.elapsed().as_secs_f64());
     }
-    // Each cell's leaves, with the rows that chose them, in ascending row order.
+    // Each cell's leaves, with the rows that chose them, in canonical document order.
     let cell_of: Vec<usize> = ranges
         .iter()
         .enumerate()

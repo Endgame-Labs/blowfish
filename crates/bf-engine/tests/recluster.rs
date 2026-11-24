@@ -34,6 +34,109 @@ async fn write(e: &Engine, body: Value) {
         .unwrap();
 }
 
+/// Compare membership by unique packed-vector fingerprints, rather than manifest-derived row
+/// numbers. Distance fingerprints also check trained centers, including empty leaves.
+async fn layout(batch: usize, strings: bool) -> (Vec<u8>, Vec<Vec<Vec<u8>>>, Vec<Vec<f32>>) {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let writer = engine(&store);
+    let doc_id = |i| {
+        if strings {
+            json!(format!("doc-{i:04}"))
+        } else {
+            json!(i)
+        }
+    };
+    // Interleave IDs, and reverse every batch: both segment membership and manifest order differ.
+    let order: Vec<_> = (0..1536).map(|i| (i * 7919) % 1536).collect();
+    for chunk in order.chunks(batch) {
+        write(
+            &writer,
+            json!({
+                "distance_metric":"euclidean_squared",
+                "schema":{"id":{"type":if strings {"string"} else {"uint"}},
+                    "vector":{"type":"[64]f16","ann":true}},
+                "upsert_rows":chunk.iter().rev().map(|&i|
+                    json!({"id":doc_id(i),"vector":vector(i)})).collect::<Vec<_>>()
+            }),
+        )
+        .await;
+        writer.index_namespace("t", true).await.unwrap();
+    }
+    // Live masks and a replacement must not make deleted versions participate in training.
+    write(
+        &writer,
+        json!({"deletes":[doc_id(10),doc_id(107)],
+        "upsert_rows":[{"id":doc_id(3),"vector":vector(2000)}]}),
+    )
+    .await;
+    writer.index_namespace("t", true).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    writer
+        .recluster(
+            "t",
+            &ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 4,
+                cluster_rows: 17,
+                max_slab_rows: 250,
+                scratch: scratch.path().into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    let (_, manifest) = Wal::new(store.clone(), "t")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap();
+    let tier = &manifest.ann_tiers["vector"][0];
+    let coarse = store
+        .get(&tier.coarse.as_ref().unwrap().key)
+        .await
+        .unwrap()
+        .to_vec();
+    let mut members = Vec::new();
+    let mut fingerprints = Vec::new();
+    for slab in &tier.slabs {
+        let file = &slab.files["annv2:vector"];
+        let index = bf_vector::Index::open(store.get(&file.key).await.unwrap())
+            .await
+            .unwrap();
+        fingerprints.push(index.center_distances(&vector(1777)).unwrap());
+        for c in 0..index.cluster_count() {
+            let (_, bytes) = index.read_cluster_rows(c).await.unwrap();
+            let mut rows: Vec<_> = bytes
+                .chunks_exact(index.vector_row_bytes())
+                .map(<[u8]>::to_vec)
+                .collect();
+            rows.sort_unstable();
+            members.push(rows);
+        }
+    }
+    (coarse, members, fingerprints)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clustering_is_independent_of_write_batches_and_segment_order() {
+    for strings in [false, true] {
+        let (coarse_a, members_a, centers_a) = layout(257, strings).await;
+        let (coarse_b, members_b, centers_b) = layout(113, strings).await;
+        assert_eq!(coarse_a, coarse_b, "coarse centers");
+        assert_eq!(centers_a, centers_b, "leaf-center distances");
+        assert_eq!(members_a.len(), members_b.len(), "leaf count");
+        for (leaf, (a, b)) in members_a.iter().zip(&members_b).enumerate() {
+            assert!(a == b, "membership of leaf {leaf}");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clustered_f16_rows_and_masked_holes_keep_their_global_ids() {
     let store = Storage::open(&StorageConfig {
