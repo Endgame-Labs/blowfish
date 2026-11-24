@@ -21,7 +21,7 @@ pub struct EngineConfig {
     pub index_rows: usize,
     /// Minimum logical WAL bytes before a background flush.
     pub index_bytes: u64,
-    /// Flush small tails after this age.
+    /// Flush small tails after this age, and estimate the rate of arriving writes within it.
     pub index_age: Duration,
     /// While writes are still arriving, keep accumulating the tail up to this many distinct
     /// rows (or `bulk_flush_age`) before building a segment, so a bulk load builds a few large
@@ -57,7 +57,8 @@ pub struct EngineConfig {
     pub wal_pipeline: usize,
     /// Eventual reads include at most this many logical WAL bytes.
     pub eventual_tail_bytes: u64,
-    /// Segments built concurrently when one flush or compaction yields several.
+    /// Segments built concurrently when one flush or compaction yields several. Up to two
+    /// overwritten-row statistics scans share this limit and the existing aggregate row bound.
     pub build_concurrency: usize,
     /// IVF leaf probes for ANN queries.
     pub ann_nprobe: usize,
@@ -115,7 +116,7 @@ impl Default for EngineConfig {
             indexing: true,
             index_rows: 1000,
             index_bytes: 8 * 1024 * 1024,
-            index_age: Duration::from_secs(5),
+            index_age: Duration::from_secs(2),
             bulk_flush_rows: default_max_segment_rows().min(100_000),
             bulk_flush_age: Duration::from_secs(60),
             bulk_flush_bytes: bulk_flush_bytes_for(default_max_unindexed_bytes()),
@@ -725,34 +726,16 @@ impl Engine {
             crate::ann::stage(t0, "idx pre-live");
             let mut covered = covered_segments(&manifest);
             covered.extend(protected.iter().cloned());
-            for mut seg in state.segments.iter().cloned() {
-                let live = segment::live(store, &seg).await?;
-                let keep = snapshot::allowed(store, &state, &seg, None).await?;
+            let (masks, removed) =
+                crate::statistics::removals(store, &state, self.0.config.build_concurrency).await?;
+            if external {
+                removed_stats = removed;
+            } else {
+                crate::statistics::merge(&mut manifest.stats, removed, false);
+            }
+            for (mut seg, (live, keep)) in state.segments.iter().cloned().zip(masks) {
                 let deleted = &live - &keep;
                 if !deleted.is_empty() {
-                    if external {
-                        crate::statistics::adjust(
-                            store,
-                            &seg,
-                            &deleted,
-                            &state.schema,
-                            &mut removed_stats,
-                            true,
-                            true,
-                        )
-                        .await?;
-                    } else {
-                        crate::statistics::adjust(
-                            store,
-                            &seg,
-                            &deleted,
-                            &state.schema,
-                            &mut manifest.stats,
-                            false,
-                            true,
-                        )
-                        .await?;
-                    }
                     retire(&mut manifest, seg.live.key.clone());
                     // A covered segment stays listed, with no live rows, while its tier does:
                     // the tier still holds its rows, and queries mask them out.

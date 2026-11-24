@@ -5,6 +5,7 @@ This script writes only beneath --out's caller-selected scratch directory.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import base64
 import http.client
 import json
@@ -19,9 +20,9 @@ import numpy as np
 import pyarrow.parquet as pq
 
 
-def connection(base):
+def connection(base, timeout=30):
     url = urlparse(base)
-    return http.client.HTTPConnection(url.hostname, url.port, timeout=30)
+    return http.client.HTTPConnection(url.hostname, url.port, timeout=timeout)
 
 
 def post(conn, path, body):
@@ -37,40 +38,64 @@ def writer(args, stop, ready, results):
     try:
         os.sched_setaffinity(0, {6, 7})
         vectors = np.load(args.data / "corpus.f16", mmap_mode="r")
-        attrs = pq.read_table(sorted((args.data / "raw/corpus").glob("*.parquet")), columns=["title", "text"])
+        attrs_path = args.data / "attrs.parquet"
+        attrs = pq.read_table(attrs_path if attrs_path.exists() else sorted((args.data / "raw/corpus").glob("*.parquet")), columns=["title", "text"])
+        title_values, text_values = attrs["title"], attrs["text"]
         rng = np.random.default_rng(17)
-        conn = connection(args.base_url)
         ack, rejected, requests, service = 0, 0, 0, []
-        ready.set()
-        start = time.monotonic()
-        batch = 0
-        while not stop.is_set() and time.monotonic() - start < args.seconds:
-            ids = rng.choice(len(vectors), args.rate, replace=False)
-            values = np.asarray(vectors[ids], dtype="<f4")
-            chosen = attrs.take(ids)
-            body = json.dumps({"upsert_columns": {
-                "id": ids.tolist(),
-                "vector": [base64.b64encode(v.tobytes()).decode() for v in values],
-                "title": [t + f" update {batch}" for t in chosen["title"].to_pylist()],
-                "text": chosen["text"].to_pylist(),
-            }}).encode()
-            sent = time.monotonic()
+        local = threading.local()
+
+        def send(body, count):
+            if not hasattr(local, "conn"):
+                local.conn = connection(args.base_url)
+            before = time.monotonic()
             try:
-                post(conn, f"/v2/namespaces/{args.namespace}", body)
-                ack += len(ids)
+                post(local.conn, f"/v2/namespaces/{args.namespace}", body)
+                return count, 0, time.monotonic() - before
             except RuntimeError as error:
                 if "HTTP 429" in str(error):
-                    rejected += len(ids)
-                else:
-                    raise
-            service.append(time.monotonic() - sent)
+                    return 0, count, time.monotonic() - before
+                raise
+
+        def collect(future):
+            nonlocal ack, rejected, requests
+            accepted, refused, duration = future.result(timeout=40)
+            ack += accepted
+            rejected += refused
             requests += 1
-            batch += 1
-            delay = start + batch - time.monotonic()
-            if delay > 0:
-                stop.wait(delay)
-        results.put({"acknowledged": ack, "rejected": rejected, "write_requests": requests,
-                     "elapsed_s": time.monotonic() - start, "write_p50_ms": float(np.percentile(service, 50) * 1000),
+            service.append(duration)
+
+        batch_size = args.batch or max(1, args.rate // 10)
+        ready.set()
+        start = time.monotonic()
+        batch, sent = 0, 0
+        pending = []
+        with ThreadPoolExecutor(4) as pool:
+            while not stop.is_set() and time.monotonic() - start < args.seconds and sent < args.rate * args.seconds:
+                if len(pending) >= 4:
+                    collect(pending.pop(0))
+                count = min(batch_size, args.rate * args.seconds - sent)
+                ids = rng.choice(len(vectors), count, replace=False)
+                values = np.asarray(vectors[ids], dtype="<f4")
+                chosen_title = [title_values[int(i)].as_py() for i in ids]
+                chosen_text = [text_values[int(i)].as_py() for i in ids]
+                body = json.dumps({"upsert_columns": {
+                    "id": ids.tolist(),
+                    "vector": [base64.b64encode(v.tobytes()).decode() for v in values],
+                    "title": [t + f" update {batch}" for t in chosen_title],
+                    "text": chosen_text,
+                }}).encode()
+                pending.append(pool.submit(send, body, count))
+                sent += count
+                batch += 1
+                delay = start + sent / args.rate - time.monotonic()
+                if delay > 0:
+                    stop.wait(delay)
+            for future in pending:
+                collect(future)
+        results.put({"acknowledged": ack, "rejected": rejected, "offered": sent, "batch_size": batch_size,
+                     "write_requests": requests, "elapsed_s": time.monotonic() - start,
+                     "write_p50_ms": float(np.percentile(service, 50) * 1000),
                      "write_p90_ms": float(np.percentile(service, 90) * 1000)})
     except BaseException as error:
         ready.set()
@@ -83,14 +108,15 @@ def main():
     p.add_argument("--base-url", required=True)
     p.add_argument("--namespace", default="nq")
     p.add_argument("--rate", type=int, default=1000)
+    p.add_argument("--batch", type=int, default=0, help="rows/request; default targets 10 requests/s")
     p.add_argument("--seconds", type=int, default=180)
     p.add_argument("--warmup", type=int, default=60)
     p.add_argument("--tag", required=True)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--server-pid", type=int)
     p.add_argument("--query-count", type=int, default=300)
-    p.add_argument("--ann-hz", type=float, default=10)
-    p.add_argument("--bm25-hz", type=float, default=1)
+    p.add_argument("--ann-hz", type=float, help="pace queries; omit for closed-loop, or use zero to disable")
+    p.add_argument("--bm25-hz", type=float, help="pace queries; omit for closed-loop, or use zero to disable")
     args = p.parse_args()
     os.sched_setaffinity(0, {6, 7})
     vectors = np.load(args.data / "queries.npy")[:args.query_count]
@@ -101,7 +127,7 @@ def main():
         "bm25": [json.dumps({"rank_by": ["text", "BM25", t], "top_k": 10, "include_attributes": ["id"]}).encode() for t in texts],
     }
     rates = {"ann": args.ann_hz, "bm25": args.bm25_hz}
-    bodies = {name: values for name, values in bodies.items() if rates[name] > 0}
+    bodies = {name: values for name, values in bodies.items() if rates[name] != 0}
     if not bodies:
         raise ValueError("at least one query rate must be positive")
     conn = connection(args.base_url)
@@ -125,7 +151,7 @@ def main():
     failures = []
 
     def sample(name, hz):
-        client = connection(args.base_url)
+        client = connection(args.base_url, timeout=120)
         index = 0
         try:
             while not stop.is_set() and time.monotonic() - start < args.seconds:
@@ -137,7 +163,7 @@ def main():
                 samples[name].append({"seconds": time.monotonic() - start, "ms": elapsed, "query": i,
                                       "recall10": overlap, "tail_rows": response["performance"]["exhaustive_search_count"]})
                 index += 1
-                delay = start + index / hz - time.monotonic()
+                delay = start + index / hz - time.monotonic() if hz else 0
                 if delay > 0:
                     stop.wait(delay)
         except BaseException as error:
@@ -162,7 +188,7 @@ def main():
     finally:
         stop.set()
         for thread in threads:
-            thread.join(35)
+            thread.join(125)
             if thread.is_alive():
                 raise RuntimeError("query sampler did not finish before its deadline")
         if child:
@@ -172,8 +198,11 @@ def main():
                 child.join(10)
     if failures:
         raise RuntimeError("; ".join(failures))
+    writer_result = results.get(timeout=5) if child else None
+    if writer_result and "error" in writer_result:
+        raise RuntimeError(writer_result["error"])
     record = {"tag": args.tag, "rate": args.rate, "seconds": args.seconds, "warmup": args.warmup,
-              "ann_hz": args.ann_hz, "bm25_hz": args.bm25_hz, "writer": results.get(timeout=5) if child else None, "max_rss_kib": max(rss, default=0), "samples": samples}
+              "ann_hz": args.ann_hz, "bm25_hz": args.bm25_hz, "writer": writer_result, "max_rss_kib": max(rss, default=0), "samples": samples}
     for name, rows in samples.items():
         measured = [row for row in rows if row["seconds"] >= args.warmup]
         record[name] = {"queries": len(measured), "p50_ms": float(np.percentile([r["ms"] for r in measured], 50)),
