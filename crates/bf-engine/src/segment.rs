@@ -1562,6 +1562,25 @@ pub(crate) fn merge_packed<D>(
     }
     Ok(out)
 }
+/// Cache a predicate over one immutable live generation, before applying WAL shadows. Snapshot
+/// prefetch and query planning share this result, rather than decoding and scanning a large
+/// value dictionary twice on every query. Schema and file keys also fence schema-only changes.
+pub(crate) async fn filter_live(
+    store: &Storage,
+    segment: &Segment,
+    f: &Filter,
+    schema: &Schema,
+) -> Result<Arc<RoaringBitmap>, ApiError> {
+    let key =
+        serde_json::to_string(&("filter-live-v1", segment, f, schema)).map_err(index_error)?;
+    if let Some(rows) = read_cache::predicate(&key) {
+        return Ok(rows);
+    }
+    let live = live(store, segment).await?;
+    let rows = filter_rows(store, segment, f, schema, &live).await?;
+    Ok(read_cache::insert_predicate(&key, rows))
+}
+
 /// Evaluate scalar, array, range, and boolean filters over sorted value dictionaries.
 pub(crate) fn filter_rows<'a>(
     store: &'a Storage,

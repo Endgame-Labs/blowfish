@@ -7864,3 +7864,772 @@ run directory. Historical rare-pair reproduction uses `BF_TEXT_EXPERIMENT`,
 Set `BF_TEXT_RARE_PAIR=1` for candidate passes, and select the combined-posting
 limit with `BF_TEXT_PAIR_LIMIT=16384` or `65536`; leave the first variable unset
 for baseline passes. These variables belong only to the historical experiment.
+
+## Round Q3: warm HTTP stalls
+
+The attribution baseline is main `ddbb7bb`, including Q2's CPU dispatcher and
+small-tier cache policy; the final integrated-main gate is recorded below. Measurements use one owned c7g.4xlarge, eight server CPUs, eight separate
+client CPUs, and sixteen keep-alive clients. NQ is downloaded from its public
+source, prepared with `bench/nq/prepare.py`, and loaded with `bench/nq/load.py`.
+Both arms use the same frozen automatic tier, build flags, cache budgets, query
+sequence, and host. Warm gates use the complete 3,452-query sequence at 48 and
+64 probes, with three warming epochs and four measured epochs per process.
+
+The resident ceiling can collect additional raw, user-only hardware events around
+only its warmed loop with `BF_BENCH_EVENTS=name:hex-config,...`. Its JSON includes
+counts per query and actual counter scheduling coverage. This is a benchmark-only
+control, rather than a server setting. For example, Neoverse V1 frontend and
+backend stall-cycle events are `stall_frontend:23` and `stall_backend:24`.
+`server_tax.py --query-repeats N` repeats the selected sequence to lengthen HTTP
+counter and cycle samples without replacing distinct vectors with one vector.
+Use separate small event groups to avoid multiplexing, and report kernel work
+separately from user work. Stalled-cycle counts are distinct from slot-based
+top-down percentages.
+
+A parser-only kill test compares Sonic 0.5.12 with the existing `serde_json`
+deserializer over every NQ request and eighteen numeric boundary cases. All NQ
+requests agree, but `1.0000000596046449` changes both a numeric filter value and
+the resulting ANN f32 component. A wholesale parser replacement is rejected:
+faster parsing must preserve the existing query bits and acceptance behavior.
+No parser dependency or production parser change is retained.
+
+### Pure compaction must preserve the resident plan
+
+A covered-segment compaction can move every row without deleting one. The old
+`tier_mask` returns `Some(full_bitmap)` in that case, despite its documented
+mask-free contract, and the bitmap disables the compiled tier. The fix checks
+coverage of every original row range and caches `None` under the existing
+immutable live-object and lineage-map key. Real deletions retain their masks.
+The regression case checks reuse of the compiled generation through compaction,
+repeated cached proofs, unindexed updates, indexed deletes, projections, and eviction.
+
+The new NQ tier has 32 slabs and 13,393 leaves. Its paired recall is
+0.9484067207 / 0.9590092700 at 48 / 64 probes. Its layout differs from Q2's;
+compare arms within this round. A copy of the first complete publication receives
+one ordinary covered-segment compaction, with no writes or tier rebuild. The
+native reference keeps the original publication's ID mapping and identical tier
+payloads. Every ordered row and distance in the following ABBA matches both the
+other arm and the first-publication reference.
+
+| Probes | Main q/s, two processes | Mask fix q/s, two processes | Main / fix p90, two processes (ms) |
+|---:|---:|---:|---|
+| 48 | 1,489 / 1,486 | 1,953 / 1,955 | 14.80 / 11.22; 14.83 / 11.16 |
+| 64 | 1,296 / 1,350 | 1,686 / 1,669 | 16.86 / 12.98; 16.21 / 13.05 |
+
+Mean process-median throughput rises **31.4% / 26.8%**. User instructions fall
+25.556→22.639 M / 29.331→26.110 M per query, while user cycles fall
+12.079→9.063 M / 13.774→10.708 M. Context switches fall
+9.53→5.17 / 8.88→5.43 per query. These counts have 100% scheduling coverage.
+An already unmasked first publication has no corresponding work reduction;
+its separate process controls vary by roughly 1–3%, and are not credited as a win.
+
+The first 40-pair cold check uses fresh processes and the standard 25 ms loopback
+S3 facade. Rows and distances agree. Paired median changes are +2.25 ms
+[-1.29, +3.85] / -2.09 ms [-3.87, +0.61]. The 48-probe p90 point worsens by
+42.97 ms, with a wide [-37.22, +60.12] ms interval, so this sample does **not**
+clear the cold-tail gate. A larger confirmation is required before the final result.
+
+### Match the scorer before attributing the HTTP difference
+
+The packed resident harness and the server use different scorer representations.
+The new ignored `warm_ann::benchmark::compiled_kernel_profile` control warms through
+ordinary engine queries, retains that exact `WarmTier` and sparse vector cache,
+and runs its scorer on eight OS threads. Timed loops exclude snapshots, hydration,
+HTTP, and worker dispatch. Both controls report user-only counters, with zero
+missing compiled payloads and 100% counter coverage.
+
+| Dataset, 48 probes | Packed native instructions / cycles (M/query) | Exact compiled scorer instructions / cycles (M/query) | Packed / compiled q/s |
+|---|---:|---:|---:|
+| 10K control | 3.348 / 1.073 | 3.377 / 1.310 | 18,682 / 15,191 |
+| Full NQ | 22.247 / 8.099 | 21.716 / 8.031 | 2,546 / 2,562 |
+
+The representation difference affects the small control, but does not explain the
+full-NQ HTTP gap. The full-NQ server takes about 22.64 M user instructions and
+9.3 M user cycles/query, at roughly 1,900–2,000 q/s. Fixing a presumed packed-array
+gap on full NQ would target the wrong cause.
+
+`BF_BENCH_COMPILED` points to a JSON control file under `.scratch`, with `store`,
+`namespace`, `queries` (headerless little-endian f32), `dims`, `probes`, `threads`,
+and `repeats`. Run the explicitly ignored test in release mode. Both scorer
+harnesses support `BF_BENCH_PROFILE_STOP`: after warming, the Unix process emits
+`NATIVE_PROFILE_READY`, stops itself, and resumes on `SIGCONT`. Attach a profiler
+before resuming to exclude startup and warming from function-cycle samples.
+With two raw events, the instruction counter is omitted and reported as `null`,
+so cycles plus the two events fit this host's three available PMU counters.
+
+Initial larger event groups multiplexed and were discarded. The corrected groups
+have 100% coverage. L3 refill events read zero on this host and are not interpreted
+as evidence of no L3 misses.
+
+Formatting, scoped all-target Clippy with warnings denied, and scoped tests pass:
+223 passed, zero failed, and six explicit ignores, including the new diagnostic.
+The large synthetic fixture uses a separate 8 MiB test-driver stack; runtime
+workers retain their normal stacks. No production API, wire type, format, or
+setting changes in the mask fix.
+
+### Stall attribution
+
+Corrected user-only PMU groups give the following counts per query. The small
+control uses 10,000 rows; full NQ uses all 2,681,468 rows. These compare the packed
+native control with the ordinary HTTP server at 48 probes, rather than claiming
+that subtracting the two isolates one function. Each raw group has 100% scheduling
+coverage. Frontend, backend, and memory stall events overlap and are not additive.
+
+| Event/query | Small native | Small HTTP | NQ native | NQ HTTP |
+|---|---:|---:|---:|---:|
+| Frontend stalled cycles | 18,905 | 255,946 | 80,153 | 433,319 |
+| Backend stalled cycles | 369,437 | 819,902 | 3,310,533 | 4,074,237 |
+| Memory stalled cycles | 37,857 | 323,704 | 814,382 | 1,203,757 |
+| L1D refills | 8,843 | 20,587 | 102,643 | 110,994 |
+| L2D refills | 1,326 | 15,709 | 16,376 | 37,016 |
+| L1I refills | 196 | 16,421 | 1,039 | 20,625 |
+| Data TLB walks | 160 | 1,436 | 6,974 | 9,543 |
+| Instruction TLB walks | 0.28 | 166 | 2.83 | 365 |
+| Branch mispredictions | 2,337 | 6,649 | 8,947 | 10,269 |
+| Frontend stalled slots | 1.562 M | 4.004 M | 10.660 M | 13.980 M |
+| Backend stalled slots | 3.370 M | 7.142 M | 30.107 M | 36.144 M |
+
+The excess is consistent with a wider instruction working set, instruction-TLB
+activity, and cache disruption around HTTP work and dispatch. It is particularly
+large for the short small-tier scorer. On full NQ, most cycles still belong to
+scoring. Warm-only function-cycle samples have zero lost samples. The exact
+compiled control spends 35.74% in `block_sums`, 19.24% in `PlaneQuery::dot`,
+7.60% in its scan, 6.55% in exact L2, 6.26% in `FastQuery::reset`, 5.55% in
+`PlaneQuery::reset`, and 3.78% in memcpy. Full-NQ HTTP spends respectively
+31.18%, 17.54%, 5.78%, 5.75%, 5.71%, 5.05%, and 3.82% there. Its number parser
+is 0.98%; the small HTTP parser is 4.61%. These are cycle shares, not instruction
+shares, and symbol inlining differs between binaries.
+
+Scheduler traces expose a second cost that user-cycle counts cannot capture.
+Cropped to the interval with active query workers, the 27,616-query NQ trace has
+95.32 aggregate CPU-seconds and 6.96 runnable-wait seconds on query workers;
+Tokio runtime workers add 7.35 CPU-seconds and **34.17 runnable-wait seconds**.
+There are 9,475 query-worker wakes, including 3,334 from another CPU, and 74,659
+runtime-worker wakes, including 42,379 from another CPU. Query/runtime threads
+migrate 3,326 / 19,857 times. The 24,576-query small trace has 5.12 / 5.20
+query/runtime runnable-wait seconds, and 4,127 / 6,053 migrations. These are
+aggregate scheduler measurements, not a sum of one query's critical-path stages;
+several threads can wait simultaneously.
+
+Pinning query workers to individual CPUs loses roughly 3–4% throughput and worsens
+p90. A one-thread Tokio screen has no consistent win. Deferring the slab-state
+clone until a compiled miss saves a little work, but its ABBA wins 2.1% at 48
+probes and loses 2.2% at 64 probes, so it is discarded. No affinity, reactor-thread
+setting, or clone-path change is retained.
+
+The expanded 80-pair cold confirmation for the mask fix follows the inconclusive
+40-pair sample above. At 48 / 64 probes, main p50 is 262.60 / 265.40 ms and the fix
+is 260.93 / 266.71 ms. Paired median changes are -0.82 ms [-2.80, +2.18] /
+-1.15 ms [-3.93, +1.41]. P90 improves 294.57→274.67 / 286.55→280.74 ms;
+paired p90 changes are -19.89 ms [-50.77, +3.61] / -5.81 ms [-43.69, +37.77].
+Rows and distances agree. This confirmation detects no cold regression; its broad
+p90 intervals still limit the precision of any claimed cold benefit.
+
+Applying Arm's Neoverse V1 `Topdown_L1` formulas (Telemetry Specification, issue 02,
+section 5.1) gives the approximate slot shares below. Backend slots are divided by
+eight times cycles; frontend slots also subtract the specified branch-mispredict
+correction. Retiring and bad speculation use the retired/speculated operation
+ratio. Events come from separate non-multiplexed passes over identical query
+sequences, so the four estimates need not sum to exactly 100% (observed totals
+99.1–100.4%). They are not the overlapping stalled-cycle ratios above.
+
+https://documentation-service.arm.com/static/66f715817243ed16264336b6
+
+| Dataset and path | Frontend bound | Backend bound | Retiring | Bad speculation |
+|---|---:|---:|---:|---:|
+| Small native | 17.3% | 39.1% | 40.3% | 3.3% |
+| Small HTTP | 23.8% | 44.9% | 27.2% | 4.5% |
+| NQ native | 16.0% | 46.4% | 34.9% | 1.7% |
+| NQ HTTP | 18.3% | 48.6% | 32.0% | 1.4% |
+
+### Leave scheduling capacity for completions
+
+For `N` available CPUs, the CPU pool uses `N - 1` workers when `N >= 8`, and `N`
+workers otherwise. The minimum remains one; query admission remains
+`max(8, 2 * N)`. Workers remain schedulable on every allowed CPU. This leaves some
+capacity for WAL-check completions and response delivery under sustained compute
+load, while preserving the existing worker count on small hosts.
+
+On the unmasked first publication, the initial four-epoch ABBA gains 2.1% q/s at
+48 probes but loses 1.2% at 64, with p90 improving 10.4% / 9.6%. The longer
+confirmation uses twelve measured full-query epochs per process:
+
+| Probes | Main / candidate q/s | Change | Main / candidate p90 (ms) | User cycles/query, main / candidate |
+|---:|---:|---:|---:|---:|
+| 48 | 1,894 / 1,994 | +5.3% | 11.52 / 10.08 | 9.325 / 8.976 M |
+| 64 | 1,682 / 1,696 | +0.8% | 13.00 / 11.65 | 10.603 / 10.661 M |
+
+The throughput gain at 64 probes is small relative to process variation. The
+repeatable result is the lower p90 at both probe counts. Instructions remain
+22.628→22.616 M / 26.110→26.098 M; this is a scheduling change, rather than less
+scoring work. Migrations fall 0.899→0.485 / 0.845→0.440 per query. Context switches
+are 5.017→4.954 / 5.397→5.154 per query. All counts have 100% scheduling coverage.
+
+With one covered-segment compaction, the combined mask and worker-pool candidate's
+four-epoch ABBA gives:
+
+| Probes | Main / candidate q/s | Change | Main / candidate p90 (ms) | User cycles/query, main / candidate |
+|---:|---:|---:|---:|---:|
+| 48 | 1,489 / 1,948 | +30.8% | 14.77 / 10.33 | 12.059 / 9.123 M |
+| 64 | 1,336 / 1,722 | +28.9% | 16.40 / 11.52 | 13.610 / 10.464 M |
+
+Every ordered row and distance matches the original reference. The separate
+96-case response-shape comparison passes: 80 successes and sixteen expected
+errors, including repeated requests against both binaries. Scoped checks pass
+again: 223 tests, zero failures, and six explicit ignores.
+
+### Wall-time stages
+
+A separate diagnostic build replaces per-request stderr output with aggregate
+histograms. The sample subtracts a metrics snapshot after warming from another
+after four measured epochs, giving exactly 2,048 small / 13,808 NQ samples for
+each stage. It uses the combined mask and seven-worker candidate at 48 probes.
+These are diagnostic timings, rather than additional throughput gate results.
+The earlier stderr trace slowed NQ to about 1,509 q/s and was discarded for
+quantitative wall attribution; aggregate instrumentation runs at about 1,934 q/s.
+
+| Mean stage (µs) | Small tier | NQ |
+|---|---:|---:|
+| Body collection | 10 | 6 |
+| JSON decode | 63 | 65 |
+| Search-state clone | 1.3 | 2.2 |
+| CPU-worker queue | 292 | 3,051 |
+| CPU-worker poll, including scoring and result assembly | 671 | 3,473 |
+| Worker completion to Tokio continuation | 191 | 544 |
+| Search execution, including dispatch | 1,160 | 7,077 |
+| Snapshot check, overlapping search | 862 | 766 |
+| Complete engine call | 1,561 | 7,499 |
+| Response encoding | 7.5 | 13.3 |
+| Client request to fully received response | 2,259 | 8,183 |
+
+Queue, poll, and continuation nearly sum to search execution. Snapshot time
+**overlaps** search and must not be added to it. The complete engine call includes
+other state-lock acquisition, context setup, and finalization. Another roughly
+0.6 ms remains outside the measured engine, parser, collector, and encoder stages:
+this includes routing, scheduling before the extractor runs, response delivery,
+and client transport. Connections are reused, so accept cost is amortized over
+an epoch; the body timer starts when the extractor is polled, rather than when
+bytes reach the socket. These are per-stage means over complete query cohorts,
+not a reconstruction of each request's unobserved network timeline.
+
+Snapshot cloning and encoding are small here. Memcpy's cycle share also includes
+scoring scratch and rerank work, so charging it all to query-vector copies would
+misidentify the cause. The fixed pool's queue and the Tokio continuation explain
+substantial wall time that is absent from an isolated scorer's user-cycle count.
+All additional timing hooks remain scratch-only experiment code.
+
+### Direct-response ceiling and bounded candidate
+
+The scratch-only numeric-ID ceiling loads one flat ID table before measurement,
+skips document hydration and generic result evaluation, and emits rows directly
+into a JSON byte buffer. Against the seven-worker candidate, its ABBA gains
+1.04% / 3.58% q/s at 48 / 64 probes, with p90 down 0.75% / 2.24% and instructions
+down about 1.1%. Every ordered row and distance matches.
+
+A bounded version learns numeric IDs from ordinary winner reads, allocates pages
+lazily, reserves their complete upper bound, and falls back for strings, unknown
+IDs, and `u64::MAX`. Its narrow, normally validated ID-only ANN shortcut preserves
+the existing response type and serializer. The corrected eight-epoch ABBA gains
+**2.37% / 1.58%** q/s, p90 improves 1.83% / 0.98%, and instructions fall
+0.49% / 0.40%. This misses the coordinator's two-probe 2% retention gate, so the
+cache, assembly shortcut, and candidate-only tests are discarded. The initial
+bounded screen did not match the benchmark's `["id"]` projection and is excluded
+from the decision. No new production ID table or response path is shipped.
+
+The long small control repeats 512 distinct queries 64 times per epoch. It gains
+0.69% q/s, improves p90 1.50%, and leaves user cycles effectively unchanged
+(1.988 M/query in both arms). The repeat-aware baseline verifier accepts either
+one original epoch or the complete repeated sequence, and still compares every
+ordered row and distance. Its first run exposed the old verifier's sequence-length
+mismatch; that failed measurement is discarded.
+
+A remaining miscellaneous cycle cost is Crossbeam epoch advancement. In the
+full-NQ HTTP sample, 1,456 of 2,095 samples whose leaf is `try_advance` have
+identifiable vector-cache lookup or housekeeping callers; 97 identify document
+columns. The exact compiled scorer has only 75 such samples in its comparable
+warm-only profile. Stack recovery is incomplete for some samples, and these are
+sample counts rather than a new percentage estimate. This points to sparse-vector
+cache maintenance as follow-up work; bypassing document hydration alone does not
+remove it.
+
+### Final gate on integrated main
+
+The attribution, prototypes, and initial gates above use task-start main
+`ddbb7bb`. The final gate rebuilds both arms against **`aba5c96`**, incorporating
+RR2, C3, MEM2, BW1, and MD1. The coordinator approved closing on this pinned
+comparison after the later predicate-cache change landed. That combination will
+receive its own coordinator gate. The original NQ publication and its ordinary
+compaction remain frozen; upgrading the code does not rebuild either tier.
+
+Both release binaries use the same toolchain and frame-pointer flags. Unpacking
+source with preserved old mtimes initially let Cargo reuse the baseline artifact;
+that was caught by comparing binary hashes before measurement. Cleaning the two
+release packages forced a distinct candidate build. The merged source passes
+formatting, scoped all-target Clippy with warnings denied, and scoped tests:
+**235 passed, zero failed, and eight explicit ignores**. The compiled-tier
+regression retains the upstream 60-row and 640-row cases and the rejection-marker
+coverage, alongside Q3's compaction and mutation cases.
+
+Final warm ABBA, sixteen clients, three warming epochs, and four measured epochs
+per process:
+
+| Publication | Probes | Main / Q3 q/s | Change | Main / Q3 p90 (ms) | User cycles/query, main / Q3 |
+|---|---:|---:|---:|---:|---:|
+| First complete tier | 48 | 2,016 / 2,077 | +3.0% | 10.78 / 9.87 | 8.723 / 8.548 M |
+| First complete tier | 64 | 1,731 / 1,770 | +2.3% | 12.61 / 11.29 | 10.340 / 10.170 M |
+| After pure compaction | 48 | 1,671 / 2,040 | +22.1% | 13.14 / 10.04 | 10.507 / 8.702 M |
+| After pure compaction | 64 | 1,467 / 1,745 | +19.0% | 15.00 / 11.51 | 12.184 / 10.347 M |
+
+All ordered rows and distances match both arms and the original publication
+reference. Recall remains 0.9484067207 / 0.9590092700. After compaction, user
+instructions fall 24.901→22.307 M / 28.571→25.749 M; context switches fall
+9.212→4.817 / 9.205→4.925, and migrations fall 1.079→0.424 / 1.012→0.358 per
+query. Counter scheduling coverage is 100%.
+
+The four-core confirmation uses four CPU workers in both arms. Its q/s changes
+are -0.96% / -2.09%, with p90 +0.37% / +2.10%. These small-host point differences
+remain an uncertainty; there is no claimed four-core gain. The earlier task-start
+four-core screen was -2.7% / -3.3%. The sixteen-core task-start control is flat /
++1.1% q/s, with p90 -2.2% / -3.6%; its clients share CPUs 8–15, so it is a topology
+control rather than the isolated-client gate. The worker rule preserves one and
+two workers on one- and two-CPU hosts. No M4, larger-host, or simultaneous-ingest
+performance claim is made.
+
+The final 96-case response-shape check again gives 80 successes, sixteen expected
+errors, and identical responses. Final cold confirmation uses eighty ABBA query
+pairs at each probe count, fresh processes, and the standard 25 ms S3 facade:
+
+| Probes | Main / Q3 p50 (ms) | Main / Q3 p90 (ms) | Paired median change, 95% CI (ms) | Paired p90 change, 95% CI (ms) |
+|---:|---:|---:|---:|---:|
+| 48 | 262.32 / 261.94 | 298.56 / 288.24 | -1.39 [-3.37, +1.47] | -10.32 [-49.60, +41.68] |
+| 64 | 266.36 / 265.83 | 301.98 / 280.50 | +0.01 [-2.44, +1.64] | -21.48 [-53.68, +12.98] |
+
+Rows and distances agree. This detects no cold regression; broad tail intervals
+limit any claim of a cold benefit. The preceding sixty-pair combined-candidate
+screen had higher p90 points (+11.88 / +19.90 ms), with intervals spanning zero;
+it is superseded by this confirmation, rather than treated as evidence of a win.
+
+A separate four-epoch counter control on the first publication collects user
+cycles, kernel cycles, and user instructions together, within the host's three
+available PMU counters. The native reference uses eight scorer threads; the HTTP
+candidate uses seven compute workers plus its runtime. Native kernel counting
+starts after the warmed-ready stop and ends when the timed result is emitted,
+excluding teardown of the multi-gigabyte resident arrays. The initial through-exit
+native kernel samples are discarded because teardown inflated them.
+
+| Dataset | Native user / kernel cycles (M/query) | Main HTTP user / kernel cycles | Q3 HTTP user / kernel cycles |
+|---|---:|---:|---:|
+| Small, 48 probes | 1.073 / 0.001 | 1.997 / 0.182 | 1.991 / 0.178 |
+| NQ, 48 probes | 8.213 / 0.008 | 8.700 / 0.232 | 8.430 / 0.193 |
+| NQ, 64 probes | 9.550 / 0.009 | 10.039 / 0.235 | 10.378 / 0.216 |
+
+The scorer is unchanged by Q3, so its native result is a common before/after
+reference. User instructions are 3.337 / 4.162 / 4.156 M for small native / main
+HTTP / Q3 HTTP; 22.216 / 22.300 / 22.285 M for NQ48; and
+25.813 / 25.786 / 25.756 M for NQ64. Counter coverage is 100% in both the internal
+native counters and the external kernel interval. The independent NQ64 user-cycle
+point varies by 3.4% in the opposite direction from the warm ABBA's 1.6% decrease;
+this is not evidence of a repeatable unmasked CPU-cycle win at that probe count.
+Use the paired warm gates above for throughput and latency conclusions. The small
+HTTP/native cycle difference remains substantial.
+
+## Round BW2: shadow statistics from indexed postings
+
+At 1,000 text-changing upserts/s, paired BM25 p50 falls **49.011 → 29.734 ms**
+(**1.65×**). All 4,000 frozen queries retain exact score bits, write-service p90
+increases 2.62%, every offered write is acknowledged, and idle latency holds.
+
+The first reproduction on the BW2 host gives **49.493/69.522 ms p50/p90** under
+1,000 text-changing upserts/s, with all 120,000 offered rows acknowledged. Shadow
+correction remains the largest component: **22.378/29.261 ms**, against
+14.379/18.592 ms for tail-statistics analysis, and 17.118/33.163 ms of summed
+segment scoring and hydration. Checkpoint-statistics lookup is 0.085/0.130 ms.
+These are the 90 measured requests in the first baseline run. Nested statistics
+and overlapping segment-worker durations are not additive. BW1's historical
+56.884 ms median is context; the comparisons below use fresh, paired BW2 runs.
+
+### Implementation
+
+The correction reads exact normalization lengths from each text index and counts
+query-term postings inside the bitmap of indexed rows replaced or deleted by the
+WAL. It first intersects that bitmap with the published live mask, preventing a
+second subtraction of rows already absent from checkpoint statistics. Length
+zero denotes a missing/null field; present empty fields, including text emptied
+by stopword removal, already have length one. No document-column read is needed
+to distinguish them.
+
+`SegmentReader::document_frequencies` counts exact terms in input order, including
+repetitions and absent terms. It reads intersecting posting blocks in batches,
+uses the smaller of the selected-row set and posting list within each block,
+and takes counts directly from metadata for full masks or gap-free blocks.
+Positions remain lazy. Existing posting and dictionary caches retain their
+existing limits.
+
+The same snapshot-local bitmap excludes shadowed hits during segment search.
+It travels through the query's read context to its search workers, and leaves
+scope with that query. It is never cached across snapshots. Idle queries retain
+the existing checkpoint-statistics path. WAL term summaries still use BW1's
+bounded cache; shadow-document summaries are removed. Commits perform no new
+analysis or index maintenance. No dependency, wire response, or persistent
+format changes.
+
+### Paired protocol
+
+One owned, on-demand c7g.4xlarge in us-west-2, Ubuntu 24.04 arm64, Rust 1.100.0,
+and Clang 19. Both timed release binaries use the same build settings. Server
+CPUs are 0–5, client CPUs are 6–7, the block cache is 2 GiB, and disk caching is
+disabled. Decoded-cache and indexing settings retain their defaults.
+
+The store contains the first million passages from the same MS MARCO stream
+as BW1. Its initial six segments contain 125,000, 200,000, 175,000, 200,000,
+200,000, and 100,000 rows. Loading drains the exhaustive tail to zero before
+copying the checkpoint. Each arm starts from an identical disposable copy.
+Every HTTP run prewarms all 1,000 queries, then runs for 120 seconds. Query
+percentiles exclude the first 30 seconds; write-service percentiles cover all
+1,200 requests in each write-loaded arm. The query and write seeds, text-changing
+100-row batches, strong consistency, top ten, and IDs-only projection are BW1's settings.
+Queries run at one Hz, and writes at 1,000 rows/s. Write-loaded arms run A/B/B/A;
+idle controls run separately in A/B/B/A order. Builds and independent reference
+generation finish before candidate timing. The first write-loaded pair enables
+stage traces; the second disables them.
+
+Baseline source is `aba5c96`; candidate source is `a8b9201`. Executable SHA-256:
+
+- Baseline: `d871681449ef2a48b6f15e8ac64ed87f4fca205b5c564a85b226b2866b59b983`.
+- Candidate: `31ef5e3eede0aebbf3462617b3ea74e8b2993cc0c1b0036ce57ce75620b8e102`.
+
+The million-row corpus JSONL SHA-256 is
+`c9d3f3493900d156cf1cfaf514a81a8cbea6e1f02a266bc8ce73165148ce42d6`;
+the checked-in workload SHA-256 is
+`3c8f1b03e4d8293ec9c45f53e8d1f94bfe4bd5cbb23d1e31623df655baf9f472`.
+
+### Stage confirmation
+
+The traced first pair contains the same 90 measured query IDs, in the same order.
+Per-request stage percentiles are:
+
+| Component | Baseline p50 / p90 ms | Candidate p50 / p90 ms |
+| --- | ---: | ---: |
+| Global statistics | 36.836 / 48.103 | 19.301 / 25.901 |
+| Checkpoint statistics, inside global statistics | 0.085 / 0.130 | 0.071 / 0.121 |
+| Shadow statistics, inside global statistics | 22.378 / 29.261 | 6.340 / 10.387 |
+| Tail-statistics analysis, inside global statistics | 14.379 / 18.592 | 13.077 / 16.846 |
+| Segment scoring and hydration, summed worker elapsed time | 17.118 / 33.163 | 11.097 / 24.749 |
+| Tail analysis or summary lookup for scoring | 1.272 / 2.256 | 1.181 / 2.073 |
+| Tail scoring | 3.372 / 6.544 | 2.332 / 5.027 |
+| Final merge | 0.022 / 0.024 | 0.021 / 0.023 |
+
+Shadow correction falls **71.7% at p50**. Reusing its bitmap also removes repeated
+ID lookups from segment search. Tail-statistics analysis is now the largest
+statistics component. The measured tail medians in this pair are 3,046.5 and
+2,945 rows. Nested and overlapping durations remain non-additive; these figures
+include the actual publication and cache behavior of each arm.
+
+### Exactness and checks
+
+BW1's serialized-snapshot checker passes all **4,000 queries**, including all
+**40,000 ordered IDs and f32 score bits**, against the independently compiled
+exhaustive `exact_bm25` executable. The four retained states cover the fully
+indexed million passages, 5,000 overwrites, overlapping updates plus deletes and
+nulls, and the next index publication. Old snapshots remain queryable after the
+later publication. Reference generation and checking take 155.57 seconds,
+outside all candidate timing.
+
+Formatting, scoped Clippy with warnings denied, and
+`cargo test -p bf-engine -p bf-text` pass: **252 tests, zero failures, and 15 expected ignored tests**.
+New coverage checks raw document presence against masked frequencies, sparse
+and dense masks, repeated and absent terms, missing and empty fields, lazy reads,
+packed tails, and text formats 4–7. An engine test removes the document-column
+files after computing its reference, clears storage caches, and verifies exact IDs-only BM25 with zero
+and positive decoded-cache budgets. Existing tests retain coverage of arrays,
+prefixes, filters, computed scores, changed analysis settings, and publications.
+The local and EC2 changed-source hashes match.
+
+The frozen checker uses the same `BW1_STORE` and `BW1_REFERENCE` variables as the
+previous round. Its independent reference executable SHA-256 is
+`b3b1bf4d1cb659bc5b35ba4017a723957dbfd7488543ddc98aebc7731f85bfad`.
+ARM test linking uses Clang 22, LLD 19, and LLVM 22 compiler builtins; both timed
+HTTP binaries use Clang 19's normal linker.
+
+### Write-loaded result
+
+All four arms execute the same **90 measured queries**. Their ordered query-index
+list has SHA-256
+`d7c5fdacd887c880c0e518841ac904d3a4b77dc83379b18122ce8e2f9143ed59`.
+
+| Arm | BM25 p50 / p90 ms | Write-service p50 / p90 ms | Tail median / maximum | Acknowledged / offered rows |
+| --- | ---: | ---: | ---: | ---: |
+| A1, baseline, traced | 49.493 / 69.522 | 1.241 / 1.796 | 3,046.5 / 5,686 | 120,000 / 120,000 |
+| B1, candidate, traced | 30.125 / 41.286 | 1.284 / 1.863 | 2,945 / 5,685 | 120,000 / 120,000 |
+| B2, candidate | 29.342 / 40.220 | 1.296 / 1.862 | 2,945.5 / 5,589 | 120,000 / 120,000 |
+| A2, baseline | 48.530 / 70.535 | 1.278 / 1.834 | 2,894.5 / 5,880 | 120,000 / 120,000 |
+
+Medians of the two run percentiles are **49.011/70.029 → 29.734/40.753 ms**:
+**1.65× faster p50, and 1.72× faster p90**. Both candidate repetitions beat
+44 ms p50. Median write-service p50/p90 changes from **1.260/1.815** to
+**1.290/1.862 ms**, increases of **2.43%/2.62%**, within the 5% p90 allowance.
+Every arm acknowledges every offered row, with zero rejections: **480,000 of
+480,000** in total. This establishes parity at the offered rate; maximum write
+capacity is not measured.
+
+### Idle control and reproduction
+
+All idle arms use the same query schedule, initial checkpoint, prewarm, and
+90-query measured slice as the write-loaded arms. Every query has zero exhaustive
+tail rows.
+
+| Arm | BM25 p50 / p90 ms |
+| --- | ---: |
+| A1, baseline | 2.501 / 4.441 |
+| B1, candidate | 2.451 / 4.344 |
+| B2, candidate | 2.377 / 4.139 |
+| A2, baseline | 2.496 / 4.171 |
+
+Median run percentiles are **2.498/4.306 → 2.414/4.242 ms**. Idle BM25 does not
+regress on this control. Together with the frozen exactness check, acknowledged
+writes, and write-service allowance, the paired runs pass all BW2 gates.
+
+Use BW1's reproduction command with the sources above, an owned scratch directory,
+`--bm25-hz 1`, `--seconds 120`, `--warmup 30`, and a fresh fully checkpointed store
+copy per arm. Use `--rate 1000` for write-loaded arms and `--rate 0` for idle.
+Both source builds, reference generation, and frozen checking must finish before
+timing. This round measures a warm local store; cold S3, broader ANN, small-memory,
+full-workspace, and official-SDK integration remain coordinator validation.
+
+The owned c7g.4xlarge ran for **0.93 hours**. Estimated cost is **about $0.56**,
+including compute at BW1's $0.58/hour rate and the 120 GiB gp3 root volume.
+The instance is terminated; its root volume, tagged key pair, and security group
+are confirmed absent. No S3 objects or prefixes were created. Owned scratch
+artifacts were removed after retaining these results.
+
+## Round RR3: deterministic reclustering and bounded resident scan tasks
+
+The production recommendation is the independent resident-scan query change `91bca2d`. Canonical
+construction and assignment experiments remain on the worker branch: canonical construction
+fails the cold gate, and the faster assignments fail their kill tests.
+
+The experimental canonical implementation orders base reclustering by document ID, rather than
+segment/global row order. Coarse sampling, leaf sampling, four-row candidate unions, refinement
+sums, slab packing, and leaf-block tours use that order. Source ID indices stay alive while the
+sort borrows IDs, avoiding string copies. Spill vectors remain in sequential physical order; the
+existing offset map translates canonical rows. Every base rebuild also retrains coarse cells:
+inheriting prefix-trained cells otherwise retains write-history dependence. Deltas still reuse
+their parent's cells, and older tiers remain readable. No persistent format, production setting,
+or dependency changes.
+
+The guarantee concerns equivalent base rebuilds with the same live IDs, vectors, metric,
+parameters, implementation, and hardware. Transient delta layouts, manifest global row numbers,
+membership encodings, and floating-point results across architectures need not be identical.
+C3's automatic target leaf size is inherited dynamically; NQ uses 200 rows.
+
+### Full-NQ construction and determinism
+
+The construction control is main `f089d97`, including C3 and MEM2, versus RR3 `faab445`. Both
+production binaries use Rust 1.100.0, Clang 19 C compilation, Clang 22 linking, ordinary thin
+LTO, and no native Rust CPU flags on the same owned c7gd.2xlarge: eight Graviton3 cores, 16 GiB
+RAM, and local NVMe. Public NQ is downloaded and prepared on the instance: 2,681,468 f16
+vectors, 1,024 dimensions, cosine, and all 3,452 exact-truth top-10 queries. I2 prepares 537
+bodies of up to 5,000 rows. Each arm starts with a fresh NVMe store and cleared OS cache. Raw,
+decoded, and disk cache budgets are 4 GiB, 1 GiB, and zero; global Rayon, Tokio, and recluster
+pools have four threads. Server and loader use nice 19. Builds, uploads, and queries never
+compete with timed construction. Readiness starts at the loader's last durable acknowledgment
+and ends at the full tier, polled every 250 ms.
+
+| Arm | Clients | I2 load, s | Ack to full tier, s | Leaf assignment, s | Source segments | Recall@10, 48 | Recall@10, 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Main | 4 | 175.719 | 253.463 | 175.798 | 54 | 0.951072 | 0.961732 |
+| Main | 8 | 162.797 | 250.639 | 177.581 | 89 | 0.951304 | 0.961356 |
+| Canonical | 4 | 158.399 | 241.256 | 171.939 | 42 | 0.952231 | 0.961993 |
+| Canonical | 8 | 181.629 | 252.545 | 177.257 | 103 | 0.952231 | 0.961993 |
+
+Sampled post-ack peak RSS is 2.441/1.965 GiB for main4/main8 and 2.256/2.424 GiB for
+canonical4/canonical8; this does not measure whole-load peak memory.
+
+Assignment sums both passes. Canonical sorting costs 0.114/0.104 seconds for four/eight clients.
+Both canonical tiers record a 2,681,468-row coarse-training population; their samples come from
+that complete canonical population. Their assignments match for every document, despite 42
+versus 103 source segments. Coarse bytes, all 13,390 stored rotated leaf centers, section
+centroids, counts, physical leaf-block tours, and ordered top-10 ID arrays for every query match
+exactly at both probe counts. Independent object parsing gives center/count SHA-256
+`1b9ad44ad73d669c8a02a756087d39fae917ea3032af57f07c83276e12818131` and block-tour SHA-256
+`d9a42981ced15b5eed0629f9dfca2e346005056736f177a55841a13789e15938`. The stored layout is
+equivalent; not every index byte is identical because row addresses and their membership
+encodings follow the manifest. These runs establish determinism and retained quality, but no
+assignment or readiness speedup.
+
+### Resident scan imbalance and an independent query change
+
+Canonical geometry initially raises warm p90 by about 5–11%, including at matched recall. A
+same-type on-demand replacement restores the frozen snapshots after Spot reclamation, prepares
+public NQ and truth again, and reproduces every endpoint hit count and canonical returned-ID
+fingerprint. All replacement-host comparisons are paired there; absolute latencies are not
+compared across hosts.
+
+The cause is task imbalance, rather than oversized leaves or greater total scan work. Main's
+four/eight-client leaves have median 190/191, p99 525/527, and maximum 828/1,012 rows; canonical
+has median 190, p99 527, and maximum 822. About 12.20%/12.43%/13.07% of rows are in leaves
+larger than 400. At matched recall, canonical p90 scanned rows is slightly lower. At fixed 48/64
+probes, however, the largest coarse-slab task's p90 is 70,017/82,350 rows, versus main4's
+51,961/64,258. At 64 probes, summed scan CPU p90 falls from 2,812 to 2,685 us, while the scan
+critical phase grows from 1,569 to 1,840 us. Launch delays are similar. These stage traces
+diagnose scheduling and are not latency gates.
+
+The independent query change partitions resident slab scans by selected rows divided by twice
+each query's share of the configured search concurrency, with a minimum estimated 512 KiB of
+codes per batch. The share divides available workers by active queries. A leaf remains atomic.
+Busy queries, exact segments, filtered/joint plans, and cold streamed scans keep their existing
+plans. Native local mappings are detected explicitly with `Storage::has_mapped_reads()` because
+mapped stores report a zero block-cache budget; other stores use the existing no-I/O sample of
+raw-cache residency. Uncached remote stores retain their previous behavior. Results, probes,
+centers, and assignments are unchanged. Final tracing confirms that the largest task's p90 falls
+to 5,576/7,326 rows at 48/64 probes. The regression uses one 100,000-row slab and repeated
+exactly representable vectors, checks all scanned rows, and compares tied IDs against both
+exhaustive search and known winners. It is independent of canonical clustering and can be
+applied separately.
+
+The final timing comparison uses main through `66bcca3`, including Q3/BW2, merged in `01917d8`.
+The control has the original scan planner; the candidate adds the resident batching change. Both
+read the frozen construction layouts above. A fresh fixed-probe warm-file ABBA uses 200 warm-up
+queries and the same first 100 timed queries per block, with 200 pooled samples per arm:
+
+| Built with clients | Probes | Main p50 / p90, ms | Canonical + batching p50 / p90, ms |
+|---:|---:|---:|---:|
+| 4 | 48 | 2.554 / 3.029 | 2.308 / 2.523 |
+| 4 | 64 | 2.791 / 3.272 | 2.480 / 2.699 |
+| 8 | 48 | 2.581 / 2.976 | 2.306 / 2.529 |
+| 8 | 64 | 2.826 / 3.245 | 2.467 / 2.693 |
+
+ The batching-only gate reads exactly the same main-built objects in both arms, changing only
+the scan planner. It uses the same warm/file and cache-cold/S3 ABBA protocol:
+
+| Built with clients | Probes | Mode | Original p50 / p90, ms | Batching p50 / p90, ms |
+|---:|---:|---|---:|---:|
+| 4 | 48 | Warm file | 2.528 / 2.970 | 2.229 / 2.567 |
+| 4 | 48 | Cold S3 | 230.302 / 338.575 | 231.697 / 299.907 |
+| 4 | 64 | Warm file | 2.744 / 3.277 | 2.404 / 2.708 |
+| 4 | 64 | Cold S3 | 232.306 / 303.747 | 225.155 / 289.663 |
+| 8 | 48 | Warm file | 2.529 / 2.929 | 2.238 / 2.466 |
+| 8 | 48 | Cold S3 | 261.801 / 375.999 | 244.488 / 331.815 |
+| 8 | 64 | Warm file | 2.790 / 3.201 | 2.432 / 2.793 |
+| 8 | 64 | Cold S3 | 258.856 / 346.075 | 255.964 / 328.664 |
+
+ Warm p90 improves 12.8–17.3%. Every cold p90 improves (4.6–11.8%); three cold medians improve,
+and four-client/48 increases 0.61%. Its 5,000-resample paired-query bootstrap median-delta
+interval is -3.62% to +4.07%, using seed 224. This resamples shared query IDs within the fixed
+blocks, so it does not capture independent time-block variability. The coordinator accepted the
+independent batching gate as cold parity within noise, rather than every raw percentile being
+lower. The streamed nonresident plan remains unchanged. Canonical geometry's separate cold
+regression is not excused by this result.
+
+ A supplementary throughput ABBA uses the same canonical4 geometry in both arms at 64 probes.
+Each block warms every one of its 1,000 preencoded query bodies, warms the parallel clients, and
+times 10,000 requests cycling those bodies. The table aggregates 20,000 timed requests per arm
+and concurrency:
+
+| Clients | Original queries/s | Batching queries/s | Change |
+|---:|---:|---:|---:|
+| 4 | 854.4 | 856.4 | +0.22% |
+| 16 | 1477.0 | 1468.2 | -0.60% |
+
+ Throughput is effectively unchanged. Before dividing the worker share by active queries,
+four-client throughput had fallen about 4.4%; the automatic sharing removes that overhead. An
+earlier short run with incomplete warm-up had an initial page-fault outlier and is excluded from
+this table. The 16-client path retains its existing busy-query plan.
+
+ The earlier complete matched-recall screen uses the `51e9407` reader for main geometry and the
+batching prototype for canonical geometry. Each integer bracket gets a separate ABBA with the
+same first 100 queries, 200 warm-up queries per warm block, and 200 timed samples per arm. Cold
+is real in-region S3 with application caches dropped before every request, rather than a local
+disk-cold test. There are no overlapping builds or uploads. At target main recall, canonical
+probes interpolate between 46/47 for main48 and 62/63/64 for main64: matched settings are
+46.514/63.438 for main4 and 46.743/62.714 for main8. Both arms' pooled p50/p90 values are
+interpolated using the same hit-derived weight.
+
+| Built with clients | Main probes | Mode | Main p50 / p90, ms | Canonical + batching p50 / p90, ms |
+|---:|---:|---|---:|---:|
+| 4 | 48 | Warm file | 2.426 / 2.819 | 2.217 / 2.468 |
+| 4 | 64 | Warm file | 2.664 / 3.180 | 2.411 / 2.637 |
+| 8 | 48 | Warm file | 2.499 / 2.848 | 2.241 / 2.461 |
+| 8 | 64 | Warm file | 2.733 / 3.117 | 2.400 / 2.640 |
+| 4 | 48 | Cold S3 | 229.388 / 301.483 | 241.651 / 318.876 |
+| 4 | 64 | Cold S3 | 222.043 / 282.581 | 226.554 / 296.081 |
+| 8 | 48 | Cold S3 | 249.261 / 327.304 | 239.851 / 321.494 |
+| 8 | 64 | Cold S3 | 237.616 / 312.806 | 221.386 / 292.945 |
+
+Warm p50 improves 8.6–12.2%, and p90 improves 12.5–17.1%, but the four-client cold arm
+regresses. This is not a strict cold no-regression pass for canonical reclustering. Canonical
+construction is therefore withheld from the production merge recommendation; its proof and
+implementation remain available on the worker branch. The exact final guard is separately
+checked on the newest merged main; the prototype's broader eligibility is not substituted for
+those final-binary checks. All 3,452 ordered ID arrays match the unchanged canonical reader at
+probes 46, 47, 48, 62, 63, and 64 for both source layouts. The final binary repeats the 48/64
+endpoint identity check.
+
+### Assignment kill tests and rejected ID hashing
+
+The worker branch retains faster-assignment candidates as test-only ignored helpers; no
+alternate production assignment or user setting ships. A graph walks leaf centers in physical
+spill order, then groups rows by their first-pass leaf for dense scoring after refinement.
+Follow-ups use global centroid neighbors, representative entry leaves, graph rebuilding, a
+four-center dot kernel, and sorted beam insertion. Projection recursively partitions each coarse
+cell with deterministic farthest-pair median planes until the requested target size.
+
+On a frozen NQ spill, the original leaf phase takes 195.006 seconds. The initial restricted
+R32/L8 graph takes 104.837 seconds of assignment and 132.003 seconds of leaf work, exceeding the
+90-second assignment kill. Projection takes 47.816 seconds of leaf work, but measured
+centroid-routing recall is 0.859936/0.887080 at 48/64 probes versus 0.954722/0.964195 for the
+control. These pre-quantization routing screens are not actual HTTP recall or formal bounds.
+
+The stronger global R32/L16 graph on the actual engine spill takes 87.004 + 6.531 = 93.535
+seconds of assignment and 5.054 seconds of graph building. Its leaf phase is 123.979 seconds
+versus the paired original's 196.040, but it still exceeds the kill. Supplementary R24/L4 and
+R32/L8 build-host screens trade quality for speed; their times are not compared across hosts.
+The prescribed global R32/L8 fallback gets an actual frozen-copy end-to-end check: all 3,452
+HTTP queries give 0.950261/0.960660 versus unchanged assignment's 0.952231/0.961993, losses of
+68/46 hits, or 0.001970/0.001333. Both exceed the 0.001 kill. That copied rebuild overlaps
+untimed staging, so its elapsed time is not a performance gate.
+
+A separate canonical fixed-document-ID hash order is also rejected. A fresh four-client NQ load
+on the replacement host takes 163.745 seconds, readiness 282.972 seconds, and leaf assignment
+201.616 seconds. Recall is 0.948146/0.960139 (32,730/33,144 hits), below the allowed old spread.
+The implementation retains direct ID order. No candidate establishes the 50-second assignment
+pass or 172-second readiness pass.
+
+### Validation and resource cleanup
+
+Small regressions cover numeric/string IDs, reversed/interleaved batches, deletions,
+replacements, centers, packed membership, readable prior tiers, and rebuilding inherited
+two-cell history into a fresh four-cell base. Delta reuse and old-coarse GC are covered.
+Full-corpus helpers prepare spill files, fingerprint layouts, and rebuild frozen stores.
+Formatting, strict release all-target Clippy, and the complete engine/vector release tests pass
+on the final merged source: 255 passed, zero failed, and 15 expensive or full-corpus helpers
+ignored. Full-corpus helpers were invoked explicitly for the recorded gates. The final local
+source hashes match the tested production source. After timing gates, the branch also merges
+main's filtered planner `0541703` in `da3b7a2`; final checks and full endpoint-ID identity
+across all four frozen stores cover that merge. The timing tables retain the actual `66bcca3`
+reader pair.
+
+All four owned instances are terminated, both Spot requests are closed, and the round's owned
+EBS volumes, key pair, security group, S3 objects, and multipart uploads are absent. Three older
+termination records expired from EC2's listing after their earlier termination confirmations;
+the final instance is confirmed terminated directly. All owned scratch artifacts are removed
+after the numbers and report are saved. The shared coordinator grant is retained.
+
+| Instance | Market | Hours | Observed rate, $/h | Estimated compute, $ |
+|---|---|---:|---:|---:|
+| c7gd.2xlarge | Spot | 2.819 | 0.1193 | 0.336 |
+| c7g.4xlarge | Spot | 1.401 | 0.2012 | 0.282 |
+| c7gd.2xlarge | On demand | 2.710 | 0.3629 | 0.983 |
+| c7g.4xlarge | On demand | 0.488 | 0.5800 | 0.283 |
+
+Total: 7.418 instance-hours and approximately $1.885 of compute, using observed Spot rates and
+verified on-demand prices. This excludes EBS, S3, and network charges. The measurement
+replacement is the same c7gd.2xlarge type as the reclaimed Spot host; both build hosts are
+c7g.4xlarge. No git commits were pushed by the worker.
+
+ Preparation failures are excluded: an accidental EBS-backed partial load, a Python helper
+import collision, an artificial delayed-S3 facade with connection stalls, and interrupted Spot
+work. An incorrect experimental residency guard was caught by its unchanged large scan tasks and
+was corrected before committing. Earlier pre-C3 measurements are not substituted for the
+construction gates, and the newest reader merge is not claimed as a new full-corpus construction
+run.

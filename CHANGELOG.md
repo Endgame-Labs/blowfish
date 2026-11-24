@@ -1,0 +1,133 @@
+# Changelog
+
+Notable changes per release, newest first. Dates are Pacific time (PT); details and benchmark methodology are in [docs/benchmarks.md](docs/benchmarks.md).
+
+## [Unreleased]
+
+### Upgrade notes
+
+- **Bucket and manifest format 4:** Compaction through recluster tiers adds `lineage` to the manifest, moving the manifest and bucket formats to 4. The format upgrades automatically, and v0.1.15 and older binaries refuse an upgraded bucket.
+- **Background text index upgrades (formats 6 and 7):** Existing format-4 and format-5 text indexes upgrade automatically in the background to format 6, and format-6 segments upgrade automatically in the background to format 7 (about 4 s for 1M rows).
+
+### Added
+
+- **Compaction through recluster tiers:** Compaction now merges segments covered by a recluster tier instead of skipping them, recording surviving row lineage so tiers keep answering without a rebuild, and delta tiers can now build beside a base rebuild and survive its install. On BEIR NQ (2.68M rows), compaction reduced 51 segments to 33 with both tier keys unchanged, recall@10 unchanged at 0.9521, and instructions per query flat (23.17M to 23.09M).
+- **Truthful index status in namespace metadata:** Namespace metadata now reports `{"status": "updating", "unindexed_bytes": ..., "unindexed_rows": ...}` while unindexed rows remain in the WAL tail and switches to `up-to-date` once published, instead of always reporting `up-to-date`. Polling metadata also refreshes the checkpoint while data is pending so a reader sees index publications from another node without a new write.
+
+### Changed
+
+- **Text index format 6 (compressed phrase positions):** Drops the element index for scalar string fields and delta-codes phrase positions losslessly. On 1M MS MARCO passages, text indexes shrink from 743.5 MB to 348.2 MB (2.14x smaller) and whole segments from 932.5 MB to 537.2 MB (1.74x smaller), with identical IDs and score bits across 8,480 HTTP responses and cold phrase queries reading 28.7% fewer objects and 18.4% fewer bytes (p90 560 to 541 ms).
+- **Text index format 7 (compact partial blocks and directories):** Partial posting blocks now store only their real rows (LEB128 row deltas and term frequencies) instead of padding to 128, and block directories use variable-width records with offsets derived from frame sizes. On 1M MS MARCO passages, text indexes shrink a further 1.69x from 336.3 MB to 198.8 MB (−40.9%), lossless across every posting and all 56.7M phrase occurrences with identical scores and ordered hits across 1,000 queries.
+- **Bulk-load scheduling across retries:** Bulk-load detection and deferred compaction now hold across each `429` response's advertised `Retry-After`, and the quiet period starts when queued writes complete rather than when batches are prepared. On full BEIR NQ with four clients, load time drops from 168 to 150 s and write p90 drops from 1,961 to 808 ms (2.4x lower); with eight clients, the first base covers all 2.68M rows instead of building a premature 730K-row base plus a merge, and the index is ready in 219 s instead of 266 s.
+- **Published benchmarks:** Added in-region AWS benchmarks for v0.1.14 (10M and 100M vector search, 1M MS MARCO BM25, and upgrade timings), Apple M4 BEIR NQ comparisons at v0.1.15 against Qdrant 1.20.0 and LanceDB 0.41.0, and matched 2–12 GiB memory-budget comparisons against Qdrant on an Apple M4.
+
+### Performance
+
+- **Balanced warm slab scans:** A warm vector query's resident slab scans now split into row-balanced CPU batches, sized by the workers and the queries already in flight, instead of one task per slab, so one crowded slab no longer sets the tail. On BEIR NQ (same index, identical ordered results on all 3,452 queries), warm p90 drops 12.8–17.3% at 48 and 64 probes, real-S3 cold p90 drops 4.6–11.8%, and throughput at 4 and 16 clients is unchanged.
+- **Warm queries stay on the compiled path after compaction:** A compaction that fully covered a recluster tier's segments made the tier look partially masked, which silently disabled compiled warm queries. On BEIR NQ (8 CPUs, 16 clients) after compaction, throughput rises 22% at 48 probes and 19% at 64 with p90 about 23% lower, and the query CPU pool now leaves one core for completions on hosts with 8 or more CPUs (p90 8-11% lower on freshly published tiers), with identical results.
+- **Cached immutable predicate results:** Filter results over immutable segments are now cached and shared between snapshot warm-up and query planning in a protected share of the column cache, with WAL shadows applied afterward. On full BEIR NQ with an ID-range filter at normal retention, warm p50 drops from 1,522 to 12 ms and 16-client throughput rises from 5 to 601 q/s with identical results.
+- **Memory-mapped local objects and larger decoded cache:** Immutable local objects are now memory-mapped into the OS page cache using sequential read-ahead for reads of 64 KiB or more and random-access advice for smaller sparse reads, and the decoded-cache default rises from `limit/8` to `limit/4` (512 MiB to 4 GiB). On BEIR NQ at recall@10 0.950 on an Apple M4 under hard cgroup memory limits, warm throughput rises from 622 to 2,235 q/s at 2 GiB, 1,987 to 2,305 q/s at 4 GiB, 1,974 to 2,702 q/s at 8 GiB, and 1,959 to 2,592 q/s at 12 GiB (1.2–3.6x), while disk-cold p50 drops from 1,068 to 331 ms (3.2x lower) with identical results.
+- **Compiled warm tiers and synchronous warm queries:** Resident recluster tiers now compile into a generation-scoped view with a sparse exact-vector cache and execute warm queries synchronously with reusable per-thread scratch, falling back to the normal planner on any miss. On BEIR NQ (16 clients, `c7g.2xlarge`), warm throughput increases by 31.2% at 48 probes and 27.6% at 64 probes with 10.1% fewer instructions per query, identical ordered top-10 results, and about 0.9 GB higher peak RSS within the cache budget.
+- **Dedicated CPU thread pool, core-derived admission, and full small-tier exact caches:** Warm query plans now run on a fixed pool of CPU threads with query admission sized to twice the available cores (floor of 8), and tiers whose exact vectors fit in the decoded-cache budget keep all of them instead of sizing from code bytes. On 8-core BEIR NQ, HTTP warm throughput rises from 1,832 to 2,148 q/s at 48 probes and 1,584 to 1,886 q/s at 64 probes (+17–19%, identical results); a 10K-row namespace rises from 4,067 to 8,163 q/s.
+- **Streaming cold slab scans and overlapped rerank:** Cold vector slab searches now reserve reads nearest leaf first, scan leaf batches as bytes arrive, and begin bounded rerank and document reads before the slowest scan read finishes. On in-region `c7gd.2xlarge` (cache-cold, paired), p50/p90 drops from 554/701 to 425/544 ms (1.30x; GET attempts +11.5%) at 10M vectors and from 1,028/1,166 to 715/907 ms (1.44x; GET attempts +1.6%) at 100M vectors, with unchanged recall@10 (0.9615 and 0.9540) and identical IDs and distances.
+- **Automatic 640-row leaves for 10M+ vector tiers:** Recluster now uses 640-row leaves at 10M live vectors or above (keeping 200-row leaves below 10M), maps probe counts to the stored layout (64 becomes 70 on 640-row leaves), and skips a redundant 5.35 MB segment-directory hint per cold query on upgraded tiers. At 10M vectors (matched recall@10 0.9690 vs. 0.9700 against a 200-row control), cold p50 drops from 378 to 325 ms (−13.9%), GETs drop from 621 to 355 (1.75x fewer), bytes per query drop from 58.4 to 47.6 MB, and the build is 23.6% faster.
+- **Shared partial-index metadata and candidate bounds:** Partial ANN indexes now share immutable cluster ranges, and completed slabs pass witnessed upper bounds to later scans to discard non-competitive candidates before merging. On warm BEIR NQ, this cuts instructions per query by 12.5% at 48 probes and 12.7% at 64 probes with identical top-10 ID lists across all 31,068 tested queries.
+- **Fast queries under steady writes:** Added a byte-bounded decoded WAL vector cache, bounded global top-k, and parallel exact scoring over wide tails, while preventing steady writes from triggering bulk-load mode and reusing unchanged full-text statistics. On BEIR NQ at 1,000 upserts/s, ANN p50/p90 drops from 156/451 to 15/28 ms (at 300 upserts/s, 160/280 to 29/41 ms); BM25 under 1,000 writes/s drops from 4.2/9.2 s to 1.7/2.1 s.
+- **BM25 under heavy writes:** BM25 queries over an unindexed WAL tail now compute statistics only for query terms, reuse cached per-row term counts from immutable tail objects in a bounded CLOCK pool (one-eighth of the decoded-cache budget), and correct for replaced or deleted indexed rows from the query terms' masked postings and stored lengths. On 1M MS MARCO at 1,000 text-changing upserts/s, p50/p90 drops from 539/721 ms to about 30/41 ms (18x faster p50) with bit-identical results across 4,000 validation queries.
+- **Selective BM25 posting-cache probes and reused normalization bounds:** BM25 readers now probe the posting cache selectively and reuse normalization bounds across scoring passes.
+- **Faster recluster readiness after bulk loads:** Active bulk loads now defer recluster until writes go quiet, prioritize the first base build ahead of remaining segment compaction, use a four-row SIMD dot-product kernel (NEON, AVX2, and AVX-512) with 128-row training batches, and manage per-build spill files with lock-guarded cleanup and startup sweeping. On BEIR NQ (`c7gd.2xlarge`, in-region S3), time from the last acknowledged write to a ready full tier drops from 756.7 to 257.5 s (2.94x sooner) and full build time drops from 426.4 to 255.0 s (1.67x); added the `blowfish_recluster_stage_seconds{stage}` metric.
+
+### Fixed
+
+- **Recall on selective filtered vector queries:** Filtered ANN queries no longer cap their probe count at three times the unfiltered count. The probe budget now grows with the filter's selectivity (counted from segment membership maps), plus a margin for one more surviving neighbor, and the `BF_FILTER_PROBE_CAP` setting is removed. On BEIR NQ at default probes, recall@10 for a filter matching 1% of rows by hash rises from 0.936 to 1.0, and for 10% from 0.961 to 0.989; 50% filters are unchanged. The extra recall costs search work: at 1% the CPU per query is 38% higher than raising the unfiltered probe count to reach the same recall, and an ID-range filter matching 10% uses 18% more CPU at unchanged recall.
+- **Orphaned WAL payloads after failed write groups:** When a write group's slot commit failed, cancelling later uploads and deleting their payloads immediately could let an in-flight `PUT` land after the `DELETE` and leave an orphan object behind. Cleanup now waits for an abandoned upload to finish before deleting its payload, and GC reclaims expired unreferenced payloads after filling empty slot ranges with empty WAL entries so a paused writer loses its conditional commit.
+
+## [0.1.15] - 2026-11-23
+
+### Upgrade notes
+
+- **Bucket and manifest format 3 (no in-place downgrade):** Stop all older writers and back up the full prefix before starting v0.1.15; writable startup writes `_system/format/3.json`, causing v0.1.14 and older binaries to refuse the bucket with `BucketFormat { required: 3, supported: 2 }`. ANN objects, old manual recluster slab sets (adopted as a tier without rebuilding), v2 documents, and older text indexes upgrade automatically in the background while queries stay indexed (`blowfish reindex --dry-run` reports remaining legacy counts).
+
+### Added
+
+- **Automatic, always-on recluster with base and delta tiers:** A background job now builds a reclustered base tier once a namespace reaches 100K rows across 2+ segments with an estimated gain of at least 1.25, maintains a delta tier on the base's coarse cells (merging into a new base at half the base size or rebuilding once updates or deletes mask one-fifth of rows), and runs one unified query plan across base, delta, and uncovered segments. On BEIR NQ (2.68M 1,024-dim `f16` rows), the automatic base build took 231 s at 791 MB RSS after a 269 s load, reaching 587 q/s at recall@10 0.962; with 5% of rows rewritten, instructions per query rose 11.3% (down from 36% with the earlier side search), and new `blowfish_recluster_*` metrics report progress.
+
+### Changed
+
+- **Single `.bfa` ANN object and vector-free, compressed `docs.bfc` v2:** Each segment and slab ANN index is now one range-read `.bfa` object (blobs, codes, and vectors), while `docs.bfc` v2 drops vector columns, compresses string columns with zstd, and drops the Bloom filter from `ids.bfi`. Storage footprint drops from 5,945 to 3,581 bytes/row (−40%) on BEIR NQ and from 5,406 to 2,887 bytes/row on the synthetic set, where cold float projection falls from 165.54 to 44.22 ms.
+- **Graceful shutdown for background jobs:** On `SIGTERM` or `SIGINT`, all background jobs (indexer, compaction, upgrades, recluster, GC, and recall sampler) stop within seconds with a shared 5 s budget for in-flight work instead of blocking shutdown for minutes during a recluster build. Measured shutdown on BEIR NQ is 0.1 s, and interrupted work resumes safely on restart.
+- **Recall sampler skips startup burst:** The background recall sampler now skips its first interval after startup and uses at most about 2% of the time thereafter, avoiding rereading about 5.5 GB on BEIR NQ right after every restart.
+
+### Performance
+
+- **Lower warm vector query overhead:** Added a typed `rank_by` reader, a batched center-ranking kernel, and single-pass query vector hashing. On warm BEIR NQ (16 clients, 6 vCPUs, 64 probes), instructions per query drop from 25.5M to 15.3M (−40%) at 574 q/s.
+- **Exact MaxScore BM25 pruning and concurrent hybrid queries:** Added exact MaxScore-style pruning with window maxima and shared score floors, and parallelized hybrid multi-query branches with shared cutoffs. On local 1M MS MARCO (2 CPUs), warm 1-client p50/p90 drops from 18.4/42.4 to 11.3/21.8 ms, 16-client throughput rises from 50.2 to 99.9 q/s (−73% instructions/query), and all 12,240 responses match exhaustive results; on 100K BEIR NQ hybrid queries, warm multi-query p50/p90 drops from 14.8/22.6 to 12.0/15.8 ms (RRF 12.3/18.8 to 10.5/14.0 ms; cold RRF 335/392 to 303/366 ms).
+- **Faster text index repacking and lower update memory:** Format-4 text indexes repack into format 5 without re-tokenizing in bounded batches (960K rows in 16 segments upgrade in 4.8 s instead of 62.7 s at 1.0 GB vs. 2.0 GB peak, byte-identical), and unconditional upserts no longer load old rows (on 681K BEIR NQ rows, update peak memory drops from 6.40 to 3.14 GiB and post-update RSS from 4.52 to 0.67 GiB).
+
+### Removed
+
+- **Manual recluster examples:** Removed `examples/recluster.rs` and `examples/repage.rs`, replaced by automatic background reclustering.
+
+## [0.1.14] - 2026-11-23
+
+### Upgrade notes
+
+- **Bucket and manifest format 2 (no in-place downgrade):** Stop all older processes and back up the entire deployment prefix before starting v0.1.14; writable startup writes `_system/format/2.json` and moves manifests to format 2 (renaming `indexed_through` to `checkpoint_wal`), which v0.1.13 and older binaries cannot read or write. Legacy row-major vector indexes and format 1–4 text indexes remain readable while upgrading automatically in the background (or immediately via `blowfish reindex`).
+
+### Added
+
+- **Automatic vector index upgrade and `blowfish reindex`:** Writable servers now rewrite legacy row-major per-segment `.bfv` indexes and recluster slabs into the fast-scan layout automatically one index at a time from stored quantized codes without retraining, and `blowfish reindex [NAMESPACE|--all] [--dry-run]` runs or inspects the upgrade on demand.
+- **Apple Silicon Docker images and fatal signal backtraces:** Docker images now build and smoke-test on `arm64` alongside `x86_64` (plus native macOS CI), and fatal signals (`SIGSEGV`, `SIGBUS`, `SIGILL`, and `SIGFPE`) print the signal, fault address, thread, and stack frames to stderr before exiting.
+
+### Changed
+
+- **Cross-cell recluster assignment:** Recluster now trains cells above 1,024 leaves two-level, assigns rows in 4-row blocks across their 4 nearest cells (12 nearest leaf groups), and runs one center-recompute and reassignment pass. On BEIR NQ at 64 probes, recall@10 reaches 0.961 at 32 cells (138 s build vs. 158 s per-cell at 0.955) and 0.961 at 8 cells (230 s vs. 216 s per-cell at 0.950), though 100M-shaped cells project to about 5 hours on 8 vCPUs compared to 1.7 hours previously.
+- **Auto-scaled probes for unreclustered multi-segment namespaces:** Default `ann_nprobe` now scales by `min(S^0.3, 4)` on unreclustered multi-segment namespaces (leaving explicit `ann_nprobe` values and reclustered slabs unchanged), raising default as-loaded BEIR NQ recall@10 from 0.907 to 0.956–0.960.
+- **Unified memory-limit detection:** Every memory-sized default, including the block cache, now uses the smaller of host RAM and the process's own cgroup `memory.max`, and macOS reads `hw.memsize` instead of assuming 4 GiB.
+
+### Performance
+
+- **Fast-scan vector index layout and 16-lane SIMD distance kernels:** New `.bfv` indexes transpose 1-bit RaBitQ codes into 32-row blocks with four precomputed `f32` factors scored via 4-bit lookup tables (`vpshufb` on AVX-512BW, `TBL` on NEON), and 16-lane AVX-512 distance kernels replace `numkong` `f32` distances (about 65 ns vs. 300–700 ns per 1,024-dim pair). Per-row scanning drops from 24 to 5 ns on x86-64 and from 26.5 to 5.4 ns on Apple M4, and older row-major indexes also gain AVX-512 and NEON popcount paths.
+- **Multi-client vector query throughput:** Paced the background recall sampler, switched rerank reads to 16 KiB sparse blocks, skipped the store-wide planning lock on cached batches, moved decoded clusters to a sharded CLOCK cache, hydrated only projected columns, capped slab fan-out under load, and enforced `BF_DECODED_CACHE_BYTES` across all three decoded caches. On BEIR NQ (2.68M passages, 6 vCPUs, 16 clients), throughput rose from 27.1 to 616 q/s reclustered (recall@10 0.954 to 0.961; 1-client warm p50 28.7 to 5.3 ms) and from 27.7 to 400 q/s as loaded (recall@10 0.907 to 0.956; 1-client warm p50 23.5 to 5.2 ms).
+- **Text index format 5 and BM25 latency:** Format-5 `.bft` indexes bundle FST dictionaries, term directories, and short posting lists, add compact `text_keys` row-to-ID maps fetched in the opening read wave, and precompute term weights and exact `f64` saturation tables with row-level pruning. On local 1M MS MARCO (2 CPUs, `overlap@10` 1.000), warm 1-client p50/p90 drops from 45.5/99.8 to 18.4/44.1 ms, fresh cold p50/p90 against a 25 ms/request local S3 facade drops from 457/670 to 255/353 ms, and mean cold reads per query drop from 189.0 to 117.2.
+
+### Fixed
+
+- **macOS file-descriptor exhaustion:** Startup now raises the soft open-file limit to the hard limit (256 to 61,440 on the test Mac), fixing `EMFILE` and `503` errors on ~100-segment `file://` namespaces.
+- **jemalloc arena decay crash:** Adaptive jemalloc decay now configures arenas individually instead of via `arena.4096.*`, fixing macOS `mallctl` support and an intermittent jemalloc 5.3 cold-start segfault.
+
+### Removed
+
+- **Legacy layout and tuning environment variables:** Removed `BF_RECLUSTER_GLOBAL`, `BF_RECLUSTER_GROUPS`, `BF_RECLUSTER_REFINE`, `BF_ANN_FASTSCAN`, `BF_ANN_DIRECTORY`, `BF_ANN_BLOCKS`, `BF_ANN_SLABS`, `BF_ANN_PAGED`, `BF_ANN_SCAN_MEMO`, `BF_ANN_SPECULATE`, `BF_READER_COPY`, `BF_ANN_SEGMENT_SPREAD`, `BF_IVF_CLUSTER_FACTOR`, and `BF_NO_AVX512`; setting them now has no effect.
+
+## [0.1.13] - 2026-11-19
+
+### Upgrade notes
+
+- **Additive on-disk changes and active `BF_*` variables:** New objects (`idfilter.bff`, paged slab directories, compact `manifest-latest` copies, and `Manifest::pruned_through`) are additive so existing namespaces open unchanged without re-ingestion; existing reclustered namespaces can add paged directories and compact manifest copies via `examples/repage.rs` and `examples/readercopy.rs`. Review deployment environments for leftover `BF_*` variables because `blowfish serve` now honors all of them.
+
+### Added
+
+- **100M-document scale on a single node:** blowfish now loads, reclusters, and queries 100M 1,024-dim `f16` documents on one `c7gd.2xlarge` (8 vCPU, 16 GB RAM, and local NVMe) against same-region AWS S3. Loading took 5.7 h (4,891 docs/s average, 6.8 GB peak RSS), recluster took 1.7 h (160 slabs, 499,920 clusters, 6.0 GB peak RSS), and 64-probe queries (recall@10 0.954) run at 1,243/1,370 ms fresh cold (1,201/1,391 ms cache-cold) and 99.7/162.8 ms warm (72.6/90.4 ms warm at 48 probes, recall@10 0.941).
+- **Official SDK retry headers:** Every `429` and `503` response now sends `Retry-After` and `retry-after-ms` (estimated from WAL backlog and drain rate, clamped to 0.5–30 s), and `x-should-retry` is set to `true` on `408`, `409`, `429`, `502`, `503`, and `504` and `false` on `500`, verified against the official Python and TypeScript SDKs.
+
+### Changed
+
+- **Memory-sized defaults and jemalloc with adaptive decay:** Linked jemalloc (`bf-alloc`) with adaptive dirty/muzzy page decay and derived segment row caps, flush thresholds, build concurrency, caches, and recluster slabs from host RAM or cgroup memory. Combined with a packed `f16` index builder, streamed text-statistics merges, flat BM25 postings, and cache-bypassing scans, a 4 GB `c7gd.large` (swap off) holds a 10M load and recluster at 2.3–2.9 GB peak RSS (down from 13–16 GB for ingest and 16.9 GB for recluster).
+- **`blowfish serve` honors all `BF_*` engine variables:** Server startup now initializes from `EngineConfig::from_env()` so all `BF_*` engine knobs take effect, with CLI flags and TOML settings retaining precedence.
+
+### Performance
+
+- **Flat ingest throughput at scale:** Per-segment ID Bloom filters (`idfilter.bff`), larger bulk flushes, deferred compaction up to 1,024 segments, parallel text-statistics merges, and concurrent ANN directory writes keep ingest flat as namespaces grow. On 10M rows, ingest throughput rises from 2,126 to 4,501 docs/s on `c7gd.xlarge` (4,704 to 2,222 s) and to 2,918 docs/s on `c7gd.large` (11,568 to 3,427 s).
+- **Paged slab directory and compact manifest copy:** Recluster now writes a tour-ordered paged slab directory for namespaces with at least 100,000 clusters (4.0 MB header at 100M; about 18 MB fetched per 64-probe cold query instead of 185.7 MB) alongside a compact `manifest-latest` copy (375 KB instead of 3.4 MB at 100M) and speculative scan reads. Cold 100M reads drop from about 327 MB to 159.9 MB per query, and 10M in-region vector cold p50/p90 reaches 680/907 ms fresh and 533/656 ms cache-cold (recall@10 0.953–0.956).
+- **Parallel slab scans for warm vector queries:** Probed slabs now run on separate runtime tasks with `as_chunks` bit-plane transposition. Warm p50/p90 drops from 163.0/195.3 to 99.7/162.8 ms at 100M (64 probes), from 119.6/138.0 to 72.6/90.4 ms at 100M (48 probes), and from 42.2/54.7 to 36.6/50.8 ms at 10M (48 probes).
+- **Faster cold BM25 queries:** Co-located term records, manifest text headers, window-pruned posting reads, concurrent segment reads, and the fixed-key manifest copy cut in-region 1M MS MARCO fresh cold p50/p90 from 453/569 ms in v0.1.12 to 380/526 ms fresh and 301/369 ms cache-cold (17.1/34.5 ms warm; `overlap@10` 1.000).
+
+### Fixed
+
+- **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
+
+[Unreleased]: https://github.com/dorkitude/blowfish/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/dorkitude/blowfish/releases/tag/v0.1.15
+[0.1.14]: https://github.com/dorkitude/blowfish/releases/tag/v0.1.14
+[0.1.13]: https://github.com/dorkitude/blowfish/releases/tag/v0.1.13

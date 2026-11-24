@@ -111,7 +111,7 @@ The decoded cache budget covers all decoded data, in three parts: decoded segmen
 directory clusters (a quarter), and decoded document column blocks (a twelfth). Together they stay within
 `BF_DECODED_CACHE_BYTES`.
 
-`blowfish serve` reads every `BF_*` engine variable above, plus `BF_INDEX_BYTES`, `BF_MAX_SEGMENT_BYTES`, `BF_BULK_FLUSH_AGE_MS`, `BF_WAL_PIPELINE`, `BF_RETENTION_SECS`, `BF_ANN_RERANK`, `BF_EXACT_FETCH`, and `BF_FILTER_PROBE_CAP`. CLI flags and TOML keys take precedence over them. `BF_BULK_FLUSH_BYTES` follows `max_unindexed_bytes` (three quarters of it) unless set explicitly.
+`blowfish serve` reads every `BF_*` engine variable above, plus `BF_INDEX_BYTES`, `BF_MAX_SEGMENT_BYTES`, `BF_BULK_FLUSH_AGE_MS`, `BF_WAL_PIPELINE`, `BF_RETENTION_SECS`, `BF_ANN_RERANK`, and `BF_EXACT_FETCH`. CLI flags and TOML keys take precedence over them. `BF_BULK_FLUSH_BYTES` follows `max_unindexed_bytes` (three quarters of it) unless set explicitly.
 
 Memory detection: every memory-sized default, the block cache included, reads one limit: the smaller of host RAM and the process's own cgroup (`/proc/self/cgroup` -> `/sys/fs/cgroup<path>/memory.max`, then `/sys/fs/cgroup/memory.max`). On macOS host RAM comes from `hw.memsize`. When nothing can be read it assumes 4 GiB.
 
@@ -223,6 +223,12 @@ from 0.906 to 0.958. Reclustering removes the cost: it gets the recall at the ba
 | Queries in flight up to which one query fans its slab work out over the thread pool (more run each query on its own thread) | half the CPUs | `BF_FANOUT_QUERIES` |
 | Least time between two sampled recall comparisons (the first waits this long after startup, and a comparison that took `t` delays the next by at least `50 × t`) | 60,000 ms | `BF_RECALL_SAMPLE_INTERVAL_MS` |
 | Cache block size for scattered small reads (rerank vectors) | 16,384 | `BF_SPARSE_BLOCK_BYTES` |
+
+Warm queries run on a fixed pool of query CPU workers: `N - 1` workers when the process has `N >= 8` CPUs, and `N` otherwise
+(at least one), so the async runtime keeps a core free to deliver completions and responses under sustained load. A warm
+plan gets one poll on this pool; a plan that has to wait for I/O continues on the I/O path. Cold snapshots use the I/O path.
+On 8 CPUs this cut warm NQ p90 by 8-11% with throughput 2-3% higher (`docs/benchmarks.md`, "Round Q3"). There is no
+setting for the pool size.
 
 On x86-64 the RaBitQ scan uses AVX-512 (`VPOPCNTQ`) when the CPU has it; on arm64 it uses NEON (`CNT` and pairwise adds).
 Both give bit-identical results to the portable path.

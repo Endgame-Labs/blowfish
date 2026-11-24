@@ -241,7 +241,9 @@ bytes, including decoded metadata hits, instead of guessing from namespace age.
 
 `query_concurrency` admits twice the available CPU count, with a minimum of eight;
 `search_concurrency` defaults to eight. Warm query plans receive one poll on a fixed
-CPU pool sized to the available cores. Plans that finish return through a oneshot;
+CPU pool with one fewer worker than available cores on hosts with at least eight
+cores, leaving capacity for I/O completions and response delivery. Smaller hosts
+use every available core. Plans that finish return through a oneshot;
 plans that yield retain their future and continue on the blocking I/O path. Cold
 snapshots use that original path directly. CPU work stays off Tokio reactor threads,
 and pending I/O cannot occupy the fixed CPU pool. `blowfish_query_cpu_dispatch_total`
