@@ -27,7 +27,10 @@ use bf_types::ApiError;
 use bf_wal::{Manifest, SlabSet, Wal};
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -761,10 +764,7 @@ fn scratch_dir(engine: &Engine) -> std::path::PathBuf {
 /// Recent load-rate flushes establish that writes are a bulk load. Its history survives restarts,
 /// while write recency and an unindexed tail distinguish an active load from a completed one.
 fn loading(state: &crate::NamespaceState, now: chrono::DateTime<chrono::Utc>) -> bool {
-    let recent = state
-        .bulk_load_at
-        .is_some_and(|at| now.signed_duration_since(at).to_std().unwrap_or_default() < BULK_WINDOW);
-    recent
+    recent_bulk(state, now)
         && (state.seq > state.indexed_through
             || now
                 .signed_duration_since(state.updated_at)
@@ -773,14 +773,44 @@ fn loading(state: &crate::NamespaceState, now: chrono::DateTime<chrono::Utc>) ->
                 < LOAD_QUIET)
 }
 
-/// Local retry deadlines survive checkpoint refreshes, but belong to one namespace generation.
-/// They are scheduling hints only; manifests and acknowledged data never depend on them.
+fn recent_bulk(state: &crate::NamespaceState, now: chrono::DateTime<chrono::Utc>) -> bool {
+    state
+        .bulk_load_at
+        .is_some_and(|at| now.signed_duration_since(at).to_std().unwrap_or_default() < BULK_WINDOW)
+}
+
+/// Local write activity survives checkpoint refreshes. Retry deadlines belong to one generation;
+/// queued operations own their activity until completion. These are scheduling hints only.
 #[derive(Default)]
-pub(crate) struct LoadBackpressure(
-    std::sync::Mutex<Option<(chrono::DateTime<chrono::Utc>, Instant)>>,
-);
+pub(crate) struct LoadBackpressure(std::sync::Mutex<WriteActivity>);
+
+#[derive(Default)]
+struct WriteActivity {
+    retry_until: Option<(chrono::DateTime<chrono::Utc>, Instant)>,
+    pending: usize,
+    quiet_until: Option<Instant>,
+}
+
+/// Owned by queued work, so caller cancellation cannot hide an outstanding commit.
+pub(crate) struct PendingWrite(Arc<LoadBackpressure>);
+
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        let mut activity = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+        activity.pending -= 1;
+        if activity.pending == 0 {
+            activity.quiet_until = Instant::now().checked_add(LOAD_QUIET);
+        }
+    }
+}
 
 impl LoadBackpressure {
+    /// Track work from submission through its final reply, including queued and staged writes.
+    pub(crate) fn begin(self: &Arc<Self>) -> PendingWrite {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).pending += 1;
+        PendingWrite(self.clone())
+    }
+
     /// Include the whole-second Retry-After used by some SDKs, and allow a normal quiet period
     /// after the advertised delay for the next request to arrive.
     pub(crate) fn record(&self, generation: chrono::DateTime<chrono::Utc>, retry_ms: u64) {
@@ -792,18 +822,25 @@ impl LoadBackpressure {
         let Some(until) = now.checked_add(delay) else {
             return;
         };
-        let mut deadline = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let until = deadline
+        let mut activity = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let until = activity
+            .retry_until
             .filter(|(epoch, _)| *epoch == generation)
             .map_or(until, |(_, old)| old.max(until));
-        *deadline = Some((generation, until));
+        activity.retry_until = Some((generation, until));
     }
 
     fn active(&self, generation: chrono::DateTime<chrono::Utc>, now: Instant) -> bool {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .retry_until
             .is_some_and(|(epoch, until)| epoch == generation && now < until)
+    }
+
+    fn writing(&self, now: Instant) -> bool {
+        let activity = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        activity.pending > 0 || activity.quiet_until.is_some_and(|until| now < until)
     }
 }
 
@@ -818,6 +855,7 @@ pub(crate) fn loading_with_backpressure(
     loading(state, now)
         || (state.tail_bytes > 0 && state.tail_bytes >= wal_limit)
         || pressure.active(state.created_at, monotonic)
+        || (recent_bulk(state, now) && pressure.writing(monotonic))
 }
 
 /// Recover only unlocked process directories; live builds in other engines and processes stay.
@@ -1263,6 +1301,47 @@ fn scopeguard(f: impl FnOnce()) -> impl Drop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_writes_survive_caller_cancellation_and_quiet_starts_at_completion() {
+        let activity = Arc::new(LoadBackpressure::default());
+        let (commits, mut receiver) = bf_wal::GroupCommit::<PendingWrite, ()>::channel(1);
+        let submitted = activity.clone();
+        let caller = tokio::spawn(async move { commits.submit(submitted.begin()).await });
+        let queued = receiver.recv().await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let now = chrono::Utc::now();
+        let clock = Instant::now();
+        let mut state = crate::NamespaceState {
+            bulk_load_at: Some(now),
+            updated_at: now - chrono::Duration::seconds(30),
+            seq: 9,
+            indexed_through: 9,
+            ..Default::default()
+        };
+        assert!(loading_with_backpressure(
+            &state,
+            now + chrono::Duration::seconds(10),
+            clock + Duration::from_secs(10),
+            &activity,
+            u64::MAX,
+        ));
+        // Ordinary steady writes do not acquire bulk semantics just by being queued.
+        state.bulk_load_at = None;
+        assert!(!loading_with_backpressure(
+            &state,
+            now,
+            clock,
+            &activity,
+            u64::MAX
+        ));
+        drop(queued);
+        let completed = Instant::now();
+        assert!(activity.writing(completed + Duration::from_secs(1)));
+        assert!(!activity.writing(completed + Duration::from_secs(3)));
+        assert!(!activity.active(state.created_at, completed));
+    }
 
     #[test]
     fn advertised_backpressure_keeps_an_indexed_load_active_past_the_quiet_window() {

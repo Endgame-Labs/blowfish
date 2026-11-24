@@ -462,8 +462,12 @@ impl RecallSampler {
 #[derive(Clone)]
 pub struct Engine(Arc<Inner>);
 enum Operation {
-    Write(Box<WriteRequest>, Option<Box<branch::Source>>),
-    Delete,
+    Write(
+        Box<WriteRequest>,
+        Option<Box<branch::Source>>,
+        auto_recluster::PendingWrite,
+    ),
+    Delete(auto_recluster::PendingWrite),
 }
 impl Engine {
     /// Use an already-probed store. No writable local state is required.
@@ -727,7 +731,11 @@ impl Engine {
         };
         let response = handle
             .commits
-            .submit(Operation::Write(Box::new(request), copy))
+            .submit(Operation::Write(
+                Box::new(request),
+                copy,
+                handle.backpressure.begin(),
+            ))
             .await??;
         if inherited_read_only {
             self.patch_metadata(ns, json!({"read_only":true})).await?;
@@ -986,7 +994,10 @@ impl Engine {
     /// Delete via a serialized tombstone. Its immutable slot fences stale writers.
     pub async fn delete_namespace(&self, ns: &str) -> Result<(), ApiError> {
         let handle = self.handle(ns).await?;
-        handle.commits.submit(Operation::Delete).await??;
+        handle
+            .commits
+            .submit(Operation::Delete(handle.backpressure.begin()))
+            .await??;
         Ok(())
     }
     /// Sorted, consistent namespace listing, using opaque base64 cursors.
@@ -1171,7 +1182,7 @@ async fn commit_sync(
         let mut batches = vec![];
         let mut results = vec![];
         for p in pending {
-            let Operation::Write(req, copy) = &p.request else {
+            let Operation::Write(req, copy, _activity) = &p.request else {
                 unreachable!()
             };
             match write::prepare(&working, req, copy.as_deref()) {
@@ -1191,7 +1202,7 @@ async fn commit_sync(
             break Ok(results);
         }
         let mut entry = WalEntry::new(batches);
-        if let Operation::Write(_, Some(source)) = &pending[0].request
+        if let Operation::Write(_, Some(source), _activity) = &pending[0].request
             && let Err(e) = branch::stage(store, wal, &mut entry, source).await
         {
             break Err(e);
@@ -1234,8 +1245,8 @@ struct Flight {
 /// that scan the whole namespace.
 fn is_barrier(op: &Operation) -> bool {
     match op {
-        Operation::Delete | Operation::Write(_, Some(_)) => true,
-        Operation::Write(req, None) => {
+        Operation::Delete(_activity) | Operation::Write(_, Some(_), _activity) => true,
+        Operation::Write(req, None, _activity) => {
             req.delete_by_filter.is_some() || req.patch_by_filter.is_some()
         }
     }
@@ -1418,7 +1429,7 @@ async fn commit_worker(
                 backlog.push_back(first);
                 continue;
             }
-            let deleting = matches!(first.request, Operation::Delete);
+            let deleting = matches!(first.request, Operation::Delete(_));
             let pending = vec![first];
             let committed = commit_sync(
                 &wal,
@@ -1489,7 +1500,7 @@ async fn commit_worker(
         let mut batches = vec![];
         let mut results = vec![];
         for p in &pending {
-            let Operation::Write(req, None) = &p.request else {
+            let Operation::Write(req, None, _activity) = &p.request else {
                 unreachable!("barriers never reach the pipeline")
             };
             match write::prepare(&working, req, None) {
