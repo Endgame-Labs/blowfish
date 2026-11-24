@@ -4,6 +4,27 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Two more exact-BM25 ideas measured and rejected** (round B6; `docs/benchmarks.md`, "Round B6"). Fagin's
+  threshold algorithm with a forward term-frequency index stays exact but costs 1.58x the p90 cycles and needs
+  78-100 MB of extra index on 1M passages; bitmap score bands cut posting reads 25% but add more bound work than
+  they save (19.1M vs 18.2M instructions per query). No code changes; the prototypes are in commit 83c6574.
+
+- **Cold-query layout study** (round C2; `docs/benchmarks.md`, "Round C2"). Two ideas tested on owned copies of
+  the 10M and 100M namespaces. Routing data in the first response was rejected: even with the directory pages
+  free, 100M cold p50 only falls from 688 to 606 ms. Leaves of 640 rows instead of 200, at 56 probes, cut 10M
+  cold p50 from 387 to 301 ms (1.29x), halve GETs (658 to 326), read 25% fewer rows, and keep recall (0.9620
+  vs 0.9615). That just misses the 1.30x gate, but it is better on every measure, so a follow-up round makes
+  leaf size automatic. Adds an owned-copy recluster example for layout comparisons.
+
+- **Row graphs for hot tiers: measured, not shipped yet** (round G3; `docs/benchmarks.md`, "Round G3", and
+  `docs/design/hot-tier-graph.md`). An HNSW graph over a hot tier's rows, with 8-bit codes and an exact f16
+  rerank of the top 30, searches NQ about 4.5x faster than IVF at equal recall in-process (EC2, 32 cores:
+  44,610 vs 9,992 q/s at recall 0.950), and 15,142 q/s at 0.950 on the Apple M4. Over HTTP on the M4 it
+  serves 5,472 q/s at 0.950 against Qdrant's 8,502: the remaining gap is per-query server overhead, which
+  round Q2 is working on. A bounded partition-and-stitch Vamana build fits in 0.89 GiB but takes 350 s on 32
+  cores. A graph over 32-row packets was rejected. The prototype stays out of main until it is automatic
+  (round G4); the design doc has the shipping sequence.
+
 - **Fix: WAL payloads orphaned after a failed write group** (round WF1). When a group's slot commit failed,
   the pipeline cancelled the later groups' uploads and deleted their payloads at once; a PUT already in flight
   could land after the DELETE and stay forever. Cleanup now lets an abandoned upload finish before deleting its
