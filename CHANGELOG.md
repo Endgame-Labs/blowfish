@@ -4,6 +4,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-11-24
+
 ### Added
 
 - **Automatic warm graphs:** When a cosine-f16 tier stays hot, blowfish builds an in-memory SQ8 Vamana graph for it in the background at idle priority, checks its recall against IVF on live traffic, and serves unfiltered vector queries from it once a serving effort passes. Nothing is written to the bucket; restarts, eviction, and refused builds fall back to IVF, and filtered, exact, and other-metric queries stay on IVF. On full BEIR NQ on an Apple M4, warm HTTP throughput rose from about 2,940 to 8,133 q/s at recall 0.9575 and from 3,502 to 8,558 q/s at 0.9516, within 0.6% and 3.9% of Qdrant at matched recall while using 22% less memory. Building the NQ graph reserves about 5.0 GB of RAM and 5.5 GB of temporary disk and slowed live queries by 1.6% on 8 Linux cores. There is no setting; see [docs/operations.md](docs/operations.md) and [docs/design/hot-tier-graph.md](docs/design/hot-tier-graph.md).
@@ -167,7 +169,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.21
 [0.1.20]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.20
 [0.1.19]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.19
 [0.1.18]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.18
