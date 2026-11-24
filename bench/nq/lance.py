@@ -90,7 +90,7 @@ def measure(a):
                 search(v, 10)
                 t.append((time.perf_counter() - s) * 1000)
             p = lambda x: round(float(np.percentile(t, x)), 1)
-            res["latency_ms"] = {"p50": p(50), "p95": p(95), "p99": p(99), "mean": round(float(np.mean(t)), 1)}
+            res["latency_ms"] = {"p50": p(50), "p90": p(90), "p95": p(95), "p99": p(99), "mean": round(float(np.mean(t)), 1)}
             res["qps"] = {}
             for n in (1, 4, 16):
                 work = [q[:2000][k::n] for k in range(n)]
