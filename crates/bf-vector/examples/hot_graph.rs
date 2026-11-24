@@ -11,8 +11,6 @@ mod graph;
 mod ivf;
 #[path = "g3/measure.rs"]
 mod measure;
-#[path = "g3/packet.rs"]
-mod packet;
 // Include the production transform without adding a library API for an experiment.
 #[path = "g3/quant.rs"]
 mod quant;
@@ -77,57 +75,6 @@ fn main() -> AnyResult<()> {
             t.elapsed().as_secs_f64(),
             data::rss_kib()
         );
-    } else if args[1] == "packet-build" {
-        let t = Instant::now();
-        let ivf = ivf::Ivf::load(Path::new(&args[3]))?;
-        let size = args.get(5).map(|s| s.parse()).transpose()?.unwrap_or(32);
-        let packets = packet::Packets::build(&v, &ivf, size);
-        drop(ivf);
-        eprintln!(
-            "packets_build count={} seconds={:.3} rss_kib={}",
-            packets.len(),
-            t.elapsed().as_secs_f64(),
-            data::rss_kib()
-        );
-        packets.write(Path::new(&format!("{}.packets{size}", args[3])))?;
-        let g = Graph::build(packets.centers(), 16, 100);
-        g.write(Path::new(&format!("{}.graph{size}", args[3])))?;
-    } else if args[1] == "packet-search" {
-        let packets = packet::Packets::read(Path::new(&format!("{}.packets32", args[3])))?;
-        let g = Graph::read(Path::new(&format!("{}.graph32", args[3])))?;
-        let queries = Matrix::load(&dir.join("queries.npy"), "<f4", 4, usize::MAX)?.floats();
-        let truth = Matrix::load(&dir.join("truth.npy"), "<i4", 4, usize::MAX)?.truth();
-        let ef = args.get(5).map(|s| s.parse()).transpose()?.unwrap_or(64);
-        let repeats = args.get(6).map(|s| s.parse()).transpose()?.unwrap_or(1);
-        let rerank = args.get(7).map(|s| s.parse()).transpose()?.unwrap_or(80);
-        let region = measure::Region::begin();
-        let results = measure::parallel(
-            queries.len() * repeats,
-            || packet::PacketSearch::new(packets.len()),
-            |s, i| {
-                let q = data::normalized(&queries[i % queries.len()]);
-                let (h, p, r) = packets.search(&g, &v, &q, ef, rerank, s);
-                (
-                    h.iter()
-                        .filter(|h| truth[i % truth.len()].contains(&h.id))
-                        .count(),
-                    p,
-                    r,
-                )
-            },
-        );
-        let seconds = region.end();
-        let n = results.len() as f64;
-        println!(
-            "variant=packet32 ef={ef} rerank={rerank} queries={} recall={:.6} packets={:.1} rows={:.1} seconds={seconds:.4} qps={:.2} threads={} rss_kib={}",
-            results.len(),
-            results.iter().map(|x| x.0).sum::<usize>() as f64 / (10. * n),
-            results.iter().map(|x| x.1).sum::<usize>() as f64 / n,
-            results.iter().map(|x| x.2).sum::<usize>() as f64 / n,
-            n / seconds,
-            rayon::current_num_threads(),
-            data::rss_kib()
-        );
     } else if args[1] == "ivf" {
         let index = ivf::Ivf::load(Path::new(&args[3]))?;
         let queries = Matrix::load(&dir.join("queries.npy"), "<f4", 4, usize::MAX)?.floats();
@@ -160,7 +107,7 @@ fn main() -> AnyResult<()> {
             rayon::current_num_threads(),
             data::rss_kib()
         );
-    } else if matches!(args[1].as_str(), "search" | "search8" | "search8-seeds") {
+    } else if matches!(args[1].as_str(), "search" | "search8") {
         let g = Graph::read(Path::new(&args[3]))?;
         if g.levels.len() != v.len() {
             return Err("graph/corpus mismatch".into());
@@ -190,28 +137,7 @@ fn main() -> AnyResult<()> {
                 let q = data::normalized(&queries[i % queries.len()]);
                 let (mut hits, count) = if let Some(c) = &codes {
                     let (q8, scale) = c.prepare(&q);
-                    let (mut h, n) = if args[1] == "search8-seeds" {
-                        let upper = g.levels[g.entry as usize]
-                            .get(1)
-                            .expect("stitched medoid layer");
-                        let mut seeds = upper
-                            .iter()
-                            .copied()
-                            .chain(std::iter::once(g.entry))
-                            .map(|id| graph::Hit {
-                                id,
-                                distance: c.score(&q8, scale, id),
-                            })
-                            .collect::<Vec<_>>();
-                        let scored = seeds.len();
-                        seeds.sort_unstable();
-                        seeds.truncate(4);
-                        let (hits, count) =
-                            g.search_seeded(ef, s, &seeds, |id| c.score(&q8, scale, id));
-                        (hits, count + scored - seeds.len())
-                    } else {
-                        g.search(ef, s, |id| c.score(&q8, scale, id))
-                    };
+                    let (mut h, n) = g.search(ef, s, |id| c.score(&q8, scale, id));
                     h.truncate(rerank);
                     for x in &mut h {
                         x.distance = v.rerank(&q, x.id);

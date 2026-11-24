@@ -6690,3 +6690,25 @@ crate gates are run before committing. A scheduling-sensitive cold-wave assertio
 under the parallel VM suite, then passed in isolation and in the serial default suite; no assertion was weakened.
 The feature-enabled suite also passes. Results were retained before removing experimental data,
 processes, staging objects, and cloud resources.
+
+## Round G4: automatic warm graph
+
+G4 replaces explicit prototype promotion with an engine-owned automatic accelerator, with no feature
+flag, graph import, or graph setting. The bucket's IVF format and query fallback remain authoritative.
+The implementation and internal policy are described in `docs/design/hot-tier-graph.md`. Release
+performance gates are still in progress; the G3 imported-graph numbers above are historical results.
+
+### Construction I/O kill test
+
+The first bounded candidate was stopped before graph construction. On an otherwise idle 8-core
+Graviton3 instance, two-worker construction spent **13m55.7s** producing and repartitioning its source
+spool, with **68.51 user CPU seconds**, **14.14 system CPU seconds**, and **108.1 MiB peak RSS**. At
+13m40s, `/proc` reported **24.83 GB physical reads**, **20.82 GB logical reads**, and **7.44 million
+read syscalls**. Only the 5.49 GB source spool existed; no graph or recall result was produced.
+
+The failure was small random reads, rather than vector scoring: repeated row reads in projection
+order, combined with aggressive release of the spool's page cache, kept the CPU mostly idle. A low
+RSS is insufficient evidence for an economical builder. The replacement uses a fixed-size source
+block cache inside the existing construction reservation, and releases its anonymous mapping before
+loading the resident graph. It remains subject to the full construction, foreground, recall, and
+charged-memory gates.

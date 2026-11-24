@@ -295,6 +295,8 @@ impl DecodedCache {
 #[derive(Clone)]
 pub(crate) struct ReadContext {
     pub cache: Arc<DecodedCache>,
+    pub(crate) hot_graph: Option<crate::warm_graph::Scope>,
+    pub(crate) cpu_nanos: Arc<std::sync::atomic::AtomicU64>,
     pub stats: Arc<CacheStats>,
     pub backend: Arc<bf_storage::BackendStats>,
     /// Whether segment reads in this context admit what they fetch into the block caches.
@@ -309,6 +311,8 @@ impl ReadContext {
     pub fn new(cache: Arc<DecodedCache>) -> Self {
         Self {
             cache,
+            hot_graph: None,
+            cpu_nanos: Arc::default(),
             stats: Arc::default(),
             backend: Arc::default(),
             admit: true,

@@ -15,13 +15,19 @@ if '.scratch' not in output.resolve().parts:
     raise SystemExit('output must be under .scratch/')
 output.mkdir(parents=True, exist_ok=False)
 raw = (store / 'ns/nq/manifest-latest').read_bytes()
-zstd = ctypes.CDLL('libzstd.so.1')
-zstd.ZSTD_decompress.restype = ctypes.c_size_t
-out = ctypes.create_string_buffer(100_000_000)
-size = zstd.ZSTD_decompress(out, len(out), raw[8:], len(raw) - 8)
-if size > len(out):
-    raise SystemExit('manifest decompression failed')
-manifest = json.loads(out.raw[:size])
+if raw.startswith(b'BFPUT001'):
+    raw = raw[24:]
+raw = raw[8:]  # The compact reader copy prefixes the manifest generation.
+if raw.startswith(b'{'):
+    manifest = json.loads(raw)
+else:
+    zstd = ctypes.CDLL('libzstd.so.1')
+    zstd.ZSTD_decompress.restype = ctypes.c_size_t
+    out = ctypes.create_string_buffer(100_000_000)
+    size = zstd.ZSTD_decompress(out, len(out), raw, len(raw))
+    if size > len(out):
+        raise SystemExit('manifest decompression failed')
+    manifest = json.loads(out.raw[:size])
 tiers = manifest['ann_tiers']['vector']
 if len(tiers) != 1:
     raise SystemExit('expected one complete base tier')

@@ -1054,22 +1054,6 @@ impl<R: RangeRead> Index<R> {
         out
     }
 
-    /// G3 experiment: map immutable tier rows to their exact-rerank locations without vector I/O.
-    #[cfg(feature = "experimental-hot-graph")]
-    pub fn hot_graph_locations(&self) -> Vec<(u32, u32, u32)> {
-        self.metadata
-            .clusters
-            .iter()
-            .enumerate()
-            .flat_map(|(cluster, c)| {
-                c.rows
-                    .iter()
-                    .enumerate()
-                    .map(move |(ordinal, row)| (row, cluster as u32, ordinal as u32))
-            })
-            .collect()
-    }
-
     /// Approximate resident bytes of the decoded metadata (centers, row sets, checksums).
     pub fn resident_bytes(&self) -> u64 {
         let m = &self.metadata;

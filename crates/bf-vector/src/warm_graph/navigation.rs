@@ -94,7 +94,36 @@ impl Scratch {
                     }
                 }
             }
+            // The threshold can only improve. Pending nodes already outside the beam can
+            // never be expanded, so release them before stale heap entries grow with N.
+            if self.frontier.len() > ef * 2 {
+                let worst = *self.nearest.peek().unwrap();
+                self.frontier.retain(|hit| hit.0 <= worst);
+            }
         }
         (self.nearest.clone().into_sorted_vec(), evaluations)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn long_improving_walk_bounds_stale_frontier_and_survives_generation_wrap() {
+        let n = 4096;
+        let ef = 32;
+        let links = (0..n)
+            .map(|i| std::array::from_fn(|j| (i + j + 1).min(n - 1) as u32))
+            .collect::<Vec<_>>();
+        let degrees = vec![34; n];
+        let mut scratch = Scratch::new(n);
+        for _ in 0..260 {
+            let (hits, _) = scratch.search(&links, &degrees, 0, ef, |id| (n - id as usize) as f32);
+            assert_eq!(
+                hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+                (n - ef..n).rev().map(|id| id as u32).collect::<Vec<_>>()
+            );
+            assert!(scratch.frontier.capacity() <= ef * 4);
+        }
     }
 }

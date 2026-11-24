@@ -355,6 +355,7 @@ struct Inner {
     read_cache: Arc<read_cache::DecodedCache>,
     queries: Arc<tokio::sync::Semaphore>,
     recall_sampler: Arc<RecallSampler>,
+    hot_graph: Arc<warm_graph::Cache>,
     config: EngineConfig,
     owner: uuid::Uuid,
     namespaces: Mutex<HashMap<String, Arc<Handle>>>,
@@ -478,6 +479,11 @@ impl Engine {
             )),
             queries: Arc::new(tokio::sync::Semaphore::new(config.query_concurrency.max(1))),
             recall_sampler: Arc::new(RecallSampler::new(config.recall_sample_interval)),
+            hot_graph: Arc::new(warm_graph::Cache::new(
+                config
+                    .decoded_cache_bytes
+                    .saturating_add(store.cache_limits().0),
+            )),
             store,
             config,
             owner: uuid::Uuid::new_v4(),
@@ -487,12 +493,14 @@ impl Engine {
         }));
         bf_alloc::adaptive_decay();
         auto_recluster::sweep_spills(&engine);
+        warm_graph::start(&engine);
         indexer::start(&engine);
         engine
     }
     /// Drop every cache the engine and its store hold, including resident namespace state, so
     /// the next query is cache-cold on a warm process. For benchmarks only.
     pub async fn drop_caches(&self) {
+        self.0.hot_graph.clear();
         self.0.read_cache.clear();
         self.0.store.drop_caches();
         self.0.namespaces.lock().await.clear();
@@ -507,17 +515,20 @@ impl Engine {
             read_cache: Arc::new(self.0.read_cache.scoped(sub)),
             queries: self.0.queries.clone(),
             recall_sampler: self.0.recall_sampler.clone(),
+            hot_graph: Arc::new(self.0.hot_graph.scoped()),
             config: self.0.config.clone(),
             owner: uuid::Uuid::new_v4(),
             namespaces: Mutex::new(HashMap::new()),
             jobs: Default::default(),
             stop: self.0.stop.clone(),
         }));
+        warm_graph::start(&engine);
         indexer::start(&engine);
         engine
     }
     /// Signal this engine's background work to stop, without waiting (see [`Engine::shutdown`]).
     pub fn begin_shutdown(&self) {
+        self.0.hot_graph.clear();
         self.0.stop.begin();
     }
     /// Stop this engine's background work, and its scoped engines': indexing, compaction, GC,
@@ -652,6 +663,7 @@ impl Engine {
             .await?;
         }
         if !state.exists {
+            self.0.hot_graph.delete(ns);
             if cap.is_some()
                 && Wal::new(self.0.store.clone(), ns)
                     .map_err(log_error)?
@@ -764,8 +776,11 @@ impl Engine {
         let context = read_cache::ReadContext {
             stats: stats.clone(),
             backend: backend.clone(),
+            hot_graph: Some(warm_graph::Scope::new(self.0.hot_graph.clone(), ns)),
             ..read_cache::ReadContext::new(self.0.read_cache.clone())
         };
+        let graph_scope = context.hot_graph.clone();
+        let cpu_nanos = context.cpu_nanos.clone();
         let ann_rows = context.ann_rows.clone();
         let document_scan_rows = context.document_scan_rows.clone();
         let cached = if matches!(request.consistency, Consistency::Strong) {
@@ -819,6 +834,17 @@ impl Engine {
                 let (response, execution) = self.search_snapshot(&state, &request, context).await?;
                 (state, response, execution, elapsed)
             };
+        if let Some(scope) = &graph_scope {
+            scope.record_cpu(cpu_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
+        }
+        warm_graph::Cache::observe(
+            self,
+            ns,
+            &state,
+            &request,
+            cpu_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+            stats.temperature() == "hot",
+        );
         if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
             && self.0.config.recall_sample_rate > 0.0
             && (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1_000_000.0
@@ -835,7 +861,7 @@ impl Engine {
             let mut config = self.0.config.clone();
             config.search_concurrency = 1;
             let sample = state.clone();
-            let ann = response.clone();
+            let trial = graph_scope.map(|s| s.trial());
             let cache = self.0.read_cache.clone();
             let queries = self.0.queries.clone();
             let stop = self.0.stop.clone();
@@ -846,18 +872,28 @@ impl Engine {
                 let runtime = tokio::runtime::Handle::current();
                 let context = read_cache::ReadContext {
                     admit: false,
+                    hot_graph: trial.clone(),
                     ..read_cache::ReadContext::new(cache)
                 };
                 let _ = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     let _sampling = sampling;
                     runtime.block_on(read_cache::scope(context, async move {
-                        if let Some(Ok(exact)) = stop
-                            .run(indexed::execute(&store, &sample, &request, &config, true))
-                            .await
-                        {
-                            metrics::histogram!("blowfish_ann_recall")
-                                .record(indexed::recall(&ann, &exact));
+                        let cpu = warm_graph::thread_cpu();
+                        let ann = indexed::execute(&store, &sample, &request, &config, false).await;
+                        if let Some(scope) = &trial {
+                            scope.record_cpu((warm_graph::thread_cpu() - cpu).max(0.));
+                        }
+                        if let (Some(Ok(exact)), Ok(ann)) = (
+                            stop.run(indexed::execute(&store, &sample, &request, &config, true))
+                                .await,
+                            ann,
+                        ) {
+                            let recall = indexed::recall(&ann, &exact);
+                            if let Some(scope) = trial {
+                                scope.feedback(recall);
+                            }
+                            metrics::histogram!("blowfish_ann_recall").record(recall);
                         }
                     }));
                 })
@@ -924,10 +960,15 @@ impl Engine {
         let response = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _in_flight = InFlight::enter();
-            runtime.block_on(read_cache::scope(
+            let cpu = context.cpu_nanos.clone();
+            let started_cpu = warm_graph::thread_cpu();
+            let result = runtime.block_on(read_cache::scope(
                 context,
                 indexed::execute(&store, &state, &request, &config, false),
-            ))
+            ));
+            let elapsed = (warm_graph::thread_cpu() - started_cpu).max(0.);
+            cpu.fetch_add((elapsed * 1e9) as u64, std::sync::atomic::Ordering::Relaxed);
+            result
         })
         .await
         .map_err(segment::index_error)??;
@@ -983,6 +1024,7 @@ impl Engine {
     pub async fn delete_namespace(&self, ns: &str) -> Result<(), ApiError> {
         let handle = self.handle(ns).await?;
         handle.commits.submit(Operation::Delete).await??;
+        self.0.hot_graph.delete(ns);
         Ok(())
     }
     /// Sorted, consistent namespace listing, using opaque base64 cursors.
@@ -1055,7 +1097,11 @@ impl Engine {
     pub async fn recall(&self, ns: &str, request: Value) -> Result<Value, ApiError> {
         let engine = self.clone();
         let ns = ns.to_owned();
-        let context = read_cache::ReadContext::new(self.0.read_cache.clone());
+        let context = read_cache::ReadContext {
+            admit: false,
+            hot_graph: Some(warm_graph::Scope::new(self.0.hot_graph.clone(), &ns).trial()),
+            ..read_cache::ReadContext::new(self.0.read_cache.clone())
+        };
         let permit = self
             .0
             .queries
@@ -1780,6 +1826,4 @@ mod recall_sampler_tests {
     }
 }
 
-/// Explicitly experimental, disposable warm-tier accelerator.
-#[cfg(feature = "experimental-hot-graph")]
-pub mod hot_graph;
+mod warm_graph;

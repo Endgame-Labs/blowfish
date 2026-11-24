@@ -1,5 +1,7 @@
 use super::{
-    HotGraph, check, quant, vamana,
+    HotGraph, check, quant,
+    source::Rows,
+    vamana,
     vectors::{Matrix, Vectors},
 };
 use crate::{Error, Result};
@@ -116,9 +118,13 @@ impl HotGraphBuilder {
         }
         drop(sorted);
         let cap = (384 * 1024 * 1024 / (self.dims * 5 + 1024)).clamp(256, 65536);
+        discard(&self.source)?;
+        let source = Rows::new(&self.source, self.dims, self.count)?;
         let mut parts = Vec::new();
         for (_, ids) in std::mem::take(&mut self.groups) {
-            split(&self.source, self.dims, ids, cap / 2, &mut parts, cancelled)?;
+            // Compute source means without loading their vectors. Boundary overlap must
+            // connect coarse slabs before size-capped subdivision.
+            split(&source, self.dims, ids, usize::MAX, &mut parts, cancelled)?;
         }
         // Boundary overlap is geometric, rather than a row-count quota. A second subdivision
         // below enforces the memory cap even when every row belongs to the same boundary.
@@ -131,7 +137,10 @@ impl HotGraphBuilder {
         let mut overlaps = Vec::new();
         for (id, &p) in primary.iter().enumerate() {
             check(cancelled)?;
-            let row = read_row(&self.source, self.dims, id as u32)?;
+            if id.is_multiple_of(8192) {
+                discard(&self.source)?;
+            }
+            let row = read_row(&source, self.dims, id as u32)?;
             let mut best = (usize::MAX, f32::INFINITY);
             let mut second = best;
             for (i, part) in parts.iter().enumerate() {
@@ -156,14 +165,7 @@ impl HotGraphBuilder {
         drop(primary);
         let mut bounded = Vec::new();
         for part in parts {
-            split(
-                &self.source,
-                self.dims,
-                part.ids,
-                cap,
-                &mut bounded,
-                cancelled,
-            )?;
+            split(&source, self.dims, part.ids, cap, &mut bounded, cancelled)?;
         }
         let adjacency = OpenOptions::new()
             .read(true)
@@ -188,8 +190,7 @@ impl HotGraphBuilder {
             let mut packed = vec![0; part.ids.len() * self.dims * 2];
             for (&id, out) in part.ids.iter().zip(packed.chunks_exact_mut(self.dims * 2)) {
                 check(cancelled)?;
-                self.source
-                    .read_exact_at(out, id as u64 * self.dims as u64 * 2)?;
+                source.copy(id, out)?;
             }
             let vectors = Vectors::from_matrix(Matrix {
                 rows: part.ids.len(),
@@ -236,7 +237,7 @@ impl HotGraphBuilder {
                     for &p in &neighbors {
                         let row = match local.get(&p) {
                             Some(&i) => vectors.row(i).to_vec(),
-                            None => read_row(&self.source, self.dims, p)?,
+                            None => read_row(&source, self.dims, p)?,
                         };
                         rows.insert(p, row);
                     }
@@ -273,6 +274,7 @@ impl HotGraphBuilder {
             return Err(Error::InvalidInput("missing primary graph row".into()));
         }
         drop(present);
+        drop(source);
         entries.sort_unstable();
         entries.dedup();
         let mut links = Vec::with_capacity(self.count);
@@ -329,15 +331,8 @@ impl HotGraphBuilder {
         })
     }
 }
-fn read_row(file: &File, dims: usize, id: u32) -> Result<Vec<f16>> {
-    let mut bytes = vec![0; dims * 2];
-    file.read_exact_at(&mut bytes, id as u64 * dims as u64 * 2)?;
-    Ok(bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| f16::from_le_bytes(*b))
-        .collect())
+fn read_row(file: &Rows<'_>, _dims: usize, id: u32) -> Result<Vec<f16>> {
+    file.row(id)
 }
 fn cosine(a: &[f16], b: &[f16]) -> f32 {
     use numkong::Dot;
@@ -351,7 +346,7 @@ fn cosine(a: &[f16], b: &[f16]) -> f32 {
     .max(0.)
 }
 fn split(
-    file: &File,
+    file: &Rows<'_>,
     dims: usize,
     ids: Vec<u32>,
     cap: usize,
@@ -469,8 +464,9 @@ mod tests {
         }
         drop(f);
         let f = File::open(root.join("rows")).unwrap();
+        let source = Rows::new(&f, 2, 101).unwrap();
         let mut parts = Vec::new();
-        split(&f, 2, (0..101).collect(), 8, &mut parts, &|| false).unwrap();
+        split(&source, 2, (0..101).collect(), 8, &mut parts, &|| false).unwrap();
         assert!(parts.iter().all(|p| !p.ids.is_empty() && p.ids.len() <= 8));
         let mut ids = parts.into_iter().flat_map(|p| p.ids).collect::<Vec<_>>();
         ids.sort_unstable();

@@ -138,16 +138,3 @@ impl Ivf {
         (hits, rows, count)
     }
 }
-impl Ivf {
-    pub fn leaves(&self) -> Vec<Vec<u32>> {
-        self.indexes
-            .iter()
-            .flat_map(|index| {
-                (0..index.cluster_count()).map(|c| {
-                    let (ids, _) = block_on(index.read_cluster_rows(c)).unwrap();
-                    ids.into_iter().map(|id| self.rowmap[id as usize]).collect()
-                })
-            })
-            .collect()
-    }
-}

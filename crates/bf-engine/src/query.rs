@@ -1031,11 +1031,19 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
         if !matches!(rank, RankBy::Vector { .. }) {
             return Err(ApiError::bad("recall requires vector ranking"));
         }
+        let cpu = crate::warm_graph::thread_cpu();
         let ann =
             crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, false).await?;
+        if let Some(scope) = crate::read_cache::context().and_then(|c| c.hot_graph) {
+            scope.record_cpu((crate::warm_graph::thread_cpu() - cpu).max(0.));
+        }
         let exact =
             crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, true).await?;
-        recall_sum += crate::indexed::recall(&ann, &exact);
+        let measured = crate::indexed::recall(&ann, &exact);
+        if let Some(scope) = crate::read_cache::context().and_then(|c| c.hot_graph) {
+            scope.feedback(measured);
+        }
+        recall_sum += measured;
         ann_count += ann.result.rows.as_ref().map_or(0, Vec::len);
         let rows = exact.result.rows.expect("rank rows");
         count += rows.len();

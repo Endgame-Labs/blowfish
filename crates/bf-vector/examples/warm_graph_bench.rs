@@ -3,7 +3,12 @@
 #[allow(dead_code)]
 #[path = "g3/data.rs"]
 mod data;
+#[allow(dead_code)]
+#[path = "g3/measure.rs"]
+mod measure;
 use bf_vector::{Bytes, Index, RangeRead, warm_graph::HotGraphBuilder};
+use numkong::Dot;
+use rayon::prelude::*;
 use std::{
     fs::File,
     io::{self, Read},
@@ -60,6 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sum();
     let dims = open(&files[0])?.dims();
     let start = Instant::now();
+    let cpu_before = usage().0;
     let mut builder = HotGraphBuilder::new(Path::new(&args[3]), dims, count)?;
     for (partition, file) in files.iter().enumerate() {
         let index = open(file)?;
@@ -71,12 +77,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let graph = pool.install(|| builder.finish(&|| false))?;
     println!(
-        "built rows={} workers={} seconds={:.3} resident_bytes={} rss_kib={}",
+        "built rows={} workers={} seconds={:.3} cpu_seconds={:.3} resident_bytes={} rss_kib={} peak_rss_kib={}",
         graph.len(),
         workers,
         start.elapsed().as_secs_f64(),
+        usage().0 - cpu_before,
         graph.resident_bytes(),
-        data::rss_kib()
+        data::rss_kib(),
+        usage().1
     );
     let data = Path::new(&args[2]);
     let queries = data::Matrix::load(&data.join("queries.npy"), "<f4", 4, usize::MAX)?.floats();
@@ -89,36 +97,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         2 | 3 => 12 + u32::from_le_bytes(prefix[8..12].try_into()?) as u64,
         _ => return Err("unsupported NPY".into()),
     };
-    let mut scratch = graph.scratch();
+    // Load exact values directly into one f16 allocation after recording the build phase.
+    // This gives the same resident rerank boundary as the monolithic reference, without a
+    // second full-corpus packed buffer hiding in the measured construction footprint.
+    let mut values = vec![half::f16::ZERO; count * dims];
+    // SAFETY: f16 admits every bit pattern, its allocation is writable, and the byte length
+    // exactly spans the allocation. This harness accepts the little-endian NQ encoding.
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), values.len() * 2)
+    };
+    corpus.read_exact_at(bytes, offset)?;
+    let inv_norms = values
+        .par_chunks_exact(dims)
+        .map(|v| {
+            // SAFETY: both transparent wrappers have identical IEEE binary16 layout and alignment.
+            let v =
+                unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<numkong::f16>(), v.len()) };
+            1. / numkong::f16::dot(v, v).unwrap().sqrt()
+        })
+        .collect();
+    let exact = data::Vectors {
+        dims,
+        values,
+        inv_norms,
+    };
     for ef in [32, 48, 64, 96, 128, 160, 192, 256, 384, 512] {
-        let start = Instant::now();
-        let mut found = 0;
-        let mut evaluations = 0;
-        for (q, t) in queries.iter().zip(&truth) {
-            let (ids, work) = graph.candidates(q, ef, 30, None, &mut scratch)?;
-            evaluations += work;
-            let mut hits = Vec::new();
-            for id in ids {
-                let mut b = vec![0; dims * 2];
-                corpus.read_exact_at(&mut b, offset + id as u64 * dims as u64 * 2)?;
-                let v = b
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| half::f16::from_le_bytes(*b).to_f32())
+        let region = measure::Region::begin();
+        let results = measure::parallel(
+            queries.len(),
+            || graph.scratch(),
+            |scratch, i| {
+                let (ids, work) = graph
+                    .candidates(&queries[i], ef, 30, None, scratch)
+                    .unwrap();
+                let q = data::normalized(&queries[i]);
+                let mut hits = ids
+                    .into_iter()
+                    .map(|id| (id, exact.rerank(&q, id)))
                     .collect::<Vec<_>>();
-                hits.push((id, bf_vector::Metric::CosineDistance.distance(q, &v)?));
-            }
-            hits.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
-            found += hits.iter().take(10).filter(|h| t.contains(&h.0)).count();
-        }
+                hits.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+                (
+                    hits.iter()
+                        .take(10)
+                        .filter(|h| truth[i].contains(&h.0))
+                        .count(),
+                    work,
+                )
+            },
+        );
+        let elapsed = region.end();
+        let found: usize = results.iter().map(|r| r.0).sum();
+        let evaluations: usize = results.iter().map(|r| r.1).sum();
         println!(
-            "ef={ef} recall={:.6} scores={:.1} qps={:.1} seconds={:.3}",
+            "ef={ef} recall={:.6} scores={:.1} qps={:.1} seconds={elapsed:.3} threads={}",
             found as f64 / (queries.len() * 10) as f64,
             evaluations as f64 / queries.len() as f64,
-            queries.len() as f64 / start.elapsed().as_secs_f64(),
-            start.elapsed().as_secs_f64()
+            queries.len() as f64 / elapsed,
+            rayon::current_num_threads()
         );
     }
     Ok(())
+}
+
+fn usage() -> (f64, u64) {
+    let mut out = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage writes the complete output on success, and the pointer is valid.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, out.as_mut_ptr()) } != 0 {
+        return (0., 0);
+    }
+    // SAFETY: the call succeeded and initialized this rusage.
+    let out = unsafe { out.assume_init() };
+    let cpu = out.ru_utime.tv_sec as f64
+        + out.ru_utime.tv_usec as f64 / 1e6
+        + out.ru_stime.tv_sec as f64
+        + out.ru_stime.tv_usec as f64 / 1e6;
+    #[cfg(target_os = "macos")]
+    let peak = out.ru_maxrss as u64 / 1024;
+    #[cfg(not(target_os = "macos"))]
+    let peak = out.ru_maxrss as u64;
+    (cpu, peak)
 }

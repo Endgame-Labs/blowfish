@@ -730,6 +730,11 @@ pub(crate) async fn building_prefixes(
     Ok(out)
 }
 
+/// Whether another automatic tier builder currently owns process CPU and memory.
+pub(crate) fn building() -> bool {
+    BASE_RUNNING.load(Ordering::Acquire) || DELTA_RUNNING.load(Ordering::Acquire)
+}
+
 /// Memory a slab build may use: the budget after the block cache, the decoded cache, the
 /// unindexed limit, and a segment build if one is running, as rows of a slab; `None` below the floor.
 fn slab_rows(engine: &Engine, beside: bool) -> Option<usize> {
@@ -744,6 +749,7 @@ fn slab_rows(engine: &Engine, beside: bool) -> Option<usize> {
         .saturating_sub(cache)
         .saturating_sub(config.decoded_cache_bytes)
         .saturating_sub(config.max_unindexed_bytes)
+        .saturating_sub(crate::warm_graph::reserved_bytes())
         .saturating_sub(in_flight);
     let available = if beside { available / 2 } else { available };
     let rows = (available / SLAB_ROW_BYTES) as usize;

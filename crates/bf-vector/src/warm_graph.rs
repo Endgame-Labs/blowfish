@@ -5,6 +5,7 @@
 mod builder;
 mod navigation;
 mod quant;
+mod source;
 mod vamana;
 mod vectors;
 use crate::{Error, Result, RoaringBitmap, rabitq};
@@ -92,15 +93,13 @@ impl HotGraph {
         }
         let q = vectors::normalized(query);
         let (code, scale) = self.codes.prepare(&q);
-        let entry = *self
+        let entry = self
             .entries
             .iter()
-            .min_by(|a, b| {
-                self.codes
-                    .score(&code, scale, **a)
-                    .total_cmp(&self.codes.score(&code, scale, **b))
-            })
-            .unwrap();
+            .map(|&id| (id, self.codes.score(&code, scale, id)))
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+            .unwrap()
+            .0;
         let (mut hits, evaluations) = scratch.0.search(
             &self.links,
             &self.degrees,
@@ -199,6 +198,24 @@ mod tests {
             .unwrap();
         // SQ8 navigation supplies candidates; exact storage rerank chooses the winner.
         assert!(hits.contains(&(1000 + 51 * 3)));
+        let direction = (0..dims)
+            .map(|i| if i % 2 == 0 { 1. } else { -1. })
+            .collect::<Vec<_>>();
+        let expected = graph
+            .candidates(&direction, n, 30, None, &mut scratch)
+            .unwrap()
+            .0;
+        for scale in [f32::MAX, f32::from_bits(1)] {
+            let query = direction.iter().map(|x| x * scale).collect::<Vec<_>>();
+            assert_eq!(
+                graph
+                    .candidates(&query, n, 30, None, &mut scratch)
+                    .unwrap()
+                    .0,
+                expected
+            );
+        }
+
         assert!(graph.resident_bytes() < HotGraph::reservation(n, dims, 2).unwrap());
     }
     #[test]

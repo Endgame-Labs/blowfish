@@ -5,10 +5,6 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-# G3 query-path experiment; not enabled in production builds.
-experimental-hot-graph = ["bf-vector/experimental-hot-graph"]
-
 [dependencies]
 zstd = "=0.13.5"
 fst = "=0.4.7"
@@ -52,11 +48,3 @@ bf-models = { path = "../bf-models" }
 async-trait = "=0.1.92"
 object_store = "=0.14.2"
 tempfile = "3.27.0"
-
-[[example]]
-name = "hot_graph_server"
-required-features = ["experimental-hot-graph"]
-
-[[example]]
-name = "prepare_hot_graph_nq"
-required-features = ["experimental-hot-graph"]

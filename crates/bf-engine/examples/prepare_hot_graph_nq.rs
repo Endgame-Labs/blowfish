@@ -25,11 +25,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         EngineConfig {
             indexing: false,
             recall_sample_rate: 0.,
+            retention: std::time::Duration::from_secs(5),
             ..EngineConfig::from_env()
         },
     );
     let start = Instant::now();
-    if std::env::var_os("G3_RECLUSTER_ONLY").is_none() {
+    {
         let matrix = data::Matrix::load(
             &Path::new(&args[2]).join("corpus.f16"),
             "<f2",
@@ -89,6 +90,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         report.rows,
         start.elapsed().as_secs_f64()
     );
+    engine.collect_garbage(&args[3]).await?;
     engine.shutdown(std::time::Duration::from_secs(5)).await;
     Ok(())
 }

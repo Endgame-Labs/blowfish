@@ -254,14 +254,23 @@ async fn from_tiers(
     }
     let uncovered = covered.iter().any(|c| !c);
     // A base and its delta rank their leaves as one list.
-    #[cfg(feature = "experimental-hot-graph")]
-    let accelerated = tiers
-        .iter()
-        .any(|s| crate::hot_graph::available(&s.dir.key));
-    #[cfg(not(feature = "experimental-hot-graph"))]
-    let accelerated = false;
-    // Independent top-k unions are complete. The prototype bypasses joint scan barriers when
-    // any part is a graph; delta tiers and uncovered segments retain the ordinary planner.
+    let graph_k = if state.shadowed.is_empty() {
+        k
+    } else {
+        k + (2 * k).max(20)
+    };
+    let mut accelerated = false;
+    for (set, at) in tiers.iter().zip(&positions) {
+        if crate::warm_graph::available(state, attribute, set, vector, graph_k) {
+            let mask = tier_mask(store, state, set, at).await?;
+            if crate::warm_graph::mask_eligible(state, attribute, set, mask.as_ref(), graph_k) {
+                accelerated = true;
+                break;
+            }
+        }
+    }
+    // Graph tiers and IVF tiers contribute independent top-k candidates. Unsupported graph
+    // shapes retain the ordinary joint IVF scan, including its candidate bounds.
     let seats = if tiers.len() > 1 && !accelerated {
         crate::ann_dir::Joint::seats(tiers.len())
             .into_iter()
@@ -476,41 +485,40 @@ async fn from_slabs(
     prefetched: Option<&crate::ann_dir::Prefetched>,
     seat: Option<&crate::ann_dir::Seat>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    let Ok((dir, _)) = crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
-    else {
-        return Ok(None);
-    };
-    let mut view = state.without_docs();
-    view.segments = set.slabs.clone().into();
-    if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
-        return Ok(None);
-    }
     let mask = tier_mask(store, state, set, at).await?;
-    if crate::ann::trace_stages() {
-        eprintln!(
-            "SLABS slabs={} masked={}",
-            view.segments.len(),
-            mask.is_some()
-        );
-    }
-    #[cfg(feature = "experimental-hot-graph")]
-    let hot_mask = mask.clone();
-    let warm_eligible = mask.is_none() && seat.is_none();
-    let lives = vec![mask; view.segments.len()];
     let slack = if state.shadowed.is_empty() {
         0
     } else {
         (2 * k).max(20)
     };
-    #[cfg(feature = "experimental-hot-graph")]
-    let accelerated =
-        crate::hot_graph::search(store, state, set, at, vector, hot_mask, k + slack, columns)
-            .await?;
-    #[cfg(not(feature = "experimental-hot-graph"))]
-    let accelerated = None;
+    let accelerated = crate::warm_graph::search(
+        store,
+        state,
+        attribute,
+        set,
+        at,
+        vector,
+        mask.clone(),
+        k + slack,
+        columns,
+    )
+    .await?;
     let (mut scores, mut docs) = match accelerated {
         Some(found) => found,
         None => {
+            let Ok((dir, _)) =
+                crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
+            else {
+                return Ok(None);
+            };
+            let mut view = state.without_docs();
+            view.segments = set.slabs.clone().into();
+            if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
+                return Ok(None);
+            }
+            let warm_eligible = mask.is_none() && seat.is_none();
+            let lives = vec![mask; view.segments.len()];
+
             let warm = warm_eligible
                 .then(|| crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone()))
                 .flatten();

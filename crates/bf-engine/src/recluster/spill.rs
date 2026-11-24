@@ -61,6 +61,11 @@ pub(crate) fn sweep(root: &Path) -> io::Result<()> {
 }
 
 impl Spill {
+    /// The exclusively owned directory, for additional disposable construction files.
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     pub(crate) fn create(root: &Path, bytes: u64) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         let root_file = root_lock(root)?;
