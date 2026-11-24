@@ -3,6 +3,7 @@ use crate::{EngineConfig, NamespaceState, filter, query, segment, snapshot};
 use bf_storage::Storage;
 use bf_types::*;
 use futures::{FutureExt, StreamExt, TryStreamExt};
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use std::{
     cmp::Ordering,
@@ -208,12 +209,9 @@ impl Ord for HitKey {
 /// Offer one exact score without cloning the ID of a noncompetitive row.
 fn offer(heap: &mut BinaryHeap<HitKey>, id: &Id, score: f64, descending: bool, k: usize) {
     let competitive = heap.len() < k
-        || heap.peek().is_some_and(|worst| {
-            let cmp = score.total_cmp(&worst.score);
-            (if descending { cmp.reverse() } else { cmp })
-                .then(id.cmp(&worst.id))
-                .is_lt()
-        });
+        || heap
+            .peek()
+            .is_some_and(|worst| improves(id, score, descending, worst));
     if competitive {
         if heap.len() == k {
             heap.pop();
@@ -224,6 +222,12 @@ fn offer(heap: &mut BinaryHeap<HitKey>, id: &Id, score: f64, descending: bool, k
             descending,
         });
     }
+}
+fn improves(id: &Id, score: f64, descending: bool, worst: &HitKey) -> bool {
+    let cmp = score.total_cmp(&worst.score);
+    (if descending { cmp.reverse() } else { cmp })
+        .then(id.cmp(&worst.id))
+        .is_lt()
 }
 /// Keep only the globally competitive candidates while merging segment-local top-k lists.
 fn trim_candidates(state: &mut NamespaceState, q: &QueryRequest) {
@@ -560,23 +564,66 @@ fn merge_tail(
             offer(&mut heap, id, *score, false, k);
         }
     }
-    for (id, doc) in &state.docs {
-        if q.filters
-            .as_ref()
-            .map(|f| filter::matches(f, Some(doc), None, &state.schema))
-            .transpose()?
-            .unwrap_or(true)
-            && let Some(v) = doc.get(attribute)
-        {
-            let values = match &context {
-                Some(context) => context.cache.tail_vectors.get(doc, &attribute_key, admit)?,
-                None => crate::tail::Values::Transient(decode_vector(v)?),
-            };
-            let distance = query::distance(values.as_ref(), vector, state.metric);
-            if all {
-                scores.insert(id.clone(), distance);
-            } else {
-                offer(&mut heap, id, distance, false, k);
+    let score = |doc: &std::sync::Arc<Document>,
+                 key: &std::sync::Arc<str>|
+     -> Result<Option<f64>, ApiError> {
+        doc.get(attribute)
+            .map(|v| {
+                let values = match &context {
+                    Some(context) => context.cache.tail_vectors.get(doc, key, admit)?,
+                    None => crate::tail::Values::Transient(decode_vector(v)?),
+                };
+                Ok(query::distance(values.as_ref(), vector, state.metric))
+            })
+            .transpose()
+    };
+    if !all
+        && q.filters.is_none()
+        && state.docs.len() >= 2048
+        && vector.len() >= 64
+        && crate::fan_out()
+        && rayon::current_num_threads() > 1
+    {
+        let rows: Vec<_> = state.docs.iter().collect();
+        let bound = heap.peek().filter(|_| heap.len() == k);
+        // Each chunk retains its best k rows with the evaluator's identical total order.
+        // A discarded row has k better rows in its own chunk, so it cannot win globally.
+        // The initial indexed bound can only improve as tail candidates are merged.
+        let chunks: Result<Vec<_>, ApiError> = rows
+            .par_chunks(512)
+            .map(|rows| {
+                // Separate key allocations avoid a contended Arc counter on cache lookups.
+                let key = std::sync::Arc::<str>::from(attribute);
+                let mut local = BinaryHeap::new();
+                for (id, doc) in rows {
+                    if let Some(distance) = score(doc, &key)?
+                        && bound.is_none_or(|worst| improves(id, distance, false, worst))
+                    {
+                        offer(&mut local, id, distance, false, k);
+                    }
+                }
+                Ok(local)
+            })
+            .collect();
+        for chunk in chunks? {
+            for hit in chunk {
+                offer(&mut heap, &hit.id, hit.score, false, k);
+            }
+        }
+    } else {
+        for (id, doc) in &state.docs {
+            if q.filters
+                .as_ref()
+                .map(|f| filter::matches(f, Some(doc), None, &state.schema))
+                .transpose()?
+                .unwrap_or(true)
+                && let Some(distance) = score(doc, &attribute_key)?
+            {
+                if all {
+                    scores.insert(id.clone(), distance);
+                } else {
+                    offer(&mut heap, id, distance, false, k);
+                }
             }
         }
     }

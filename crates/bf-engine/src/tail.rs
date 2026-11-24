@@ -225,61 +225,63 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_tail_queries_equal_the_same_snapshot_reference() {
         use crate::*;
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
             for metric in [DistanceMetric::CosineDistance, DistanceMetric::EuclideanSquared] {
-                for dtype in ["[17]f32", "[17]f16"] {
-                    let store = Storage::open(&bf_storage::StorageConfig { url:"memory://".into(), ..Default::default() }).await.unwrap();
-                    let config = EngineConfig { indexing:false, recall_sample_rate:0.0, lease_duration:std::time::Duration::ZERO, ..Default::default() };
-                    let engine = Engine::with_config(store.clone(), config.clone());
-                    let row = |id: u64, step: u64| json!({"id":id,"group":id%4,"version":step,
-                        "vector":(0..17).map(|d| match d { 0=>1.0, 1=>(id as f32+1.0+step as f32/97.0)/16.0, _=>d as f32*0.001 }).collect::<Vec<_>>()});
-                    engine.write("tail", serde_json::from_value(json!({"schema":{"vector":{"type":dtype}},"distance_metric":metric,
-                        "upsert_rows":(0..192).map(|id|row(id,0)).collect::<Vec<_>>() })).unwrap()).await.unwrap();
-                    engine.index_namespace("tail",true).await.unwrap();
-                    let writer = engine.clone();
-                    let (ready,mut steps) = tokio::sync::mpsc::channel(1);
-                    let proceed = Arc::new(tokio::sync::Notify::new());
-                    let next = proceed.clone();
-                    let task = tokio::spawn(async move {
-                        for step in 1..=32 {
-                            writer.write("tail",serde_json::from_value(json!({
-                                "upsert_rows":(0..8).map(|i|row((step*11+i)%128, step)).collect::<Vec<_>>(),
-                                "deletes":[128+step%32],
-                                "patch_rows":[{"id":160+step%32,"version":step+100}]
-                            })).unwrap()).await.unwrap();
-                            if step%5==0 { writer.index_namespace("tail",true).await.unwrap(); }
-                            ready.send(step).await.unwrap();
-                            next.notified().await;
-                        }
-                    });
-                    let context = read_cache::ReadContext::new(engine.0.read_cache.clone());
-                    read_cache::scope(context, async {
-                        for round in 0..32 {
-                            steps.recv().await.expect("writer committed this consistency point");
-                            let (state, _) = engine.snapshot("tail", &Consistency::Strong).await.unwrap();
-                            // The next write/index publication runs while both evaluators use
-                            // this captured consistency point. No timing assumptions are needed.
-                            proceed.notify_one();
-                            let full = snapshot::materialize(&store, &state).await.unwrap();
-                            let vector: Vec<f32> = (0..17).map(|d| if d==0 {1.0}else{0.0}).collect();
-                            let request: QueryRequest = serde_json::from_value(json!({
-                                "rank_by":["vector","ANN",vector],"top_k":9,"offset":3,
-                                "include_attributes":["version","group","vector"],
-                                "filters":match round%3 {0=>json!(["group","In",[0,2]]),1=>json!(["id","Gte",0]),_=>serde_json::Value::Null}
-                            })).unwrap();
-                            let got = indexed::execute(&store,&state,&request,&config,true).await.unwrap().result.rows.unwrap();
-                            let expected = query::execute(&full,&request).unwrap().result.rows.unwrap();
-                            assert_eq!(got.iter().map(|d|&d["id"]).collect::<Vec<_>>(),expected.iter().map(|d|&d["id"]).collect::<Vec<_>>(),"{dtype}, {metric:?}, seq={}",state.seq);
-                            for (mut actual,mut reference) in got.into_iter().zip(expected) {
-                                let a=actual.remove("$dist").unwrap().as_f64().unwrap();
-                                let b=reference.remove("$dist").unwrap().as_f64().unwrap();
-                                assert!((a-b).abs()<=1e-5*b.abs().max(1.0));
-                                assert_eq!(actual,reference);
+                for (dimensions, count, updates, rounds) in [(17, 192, 8, 32), (65, 4096, 2304, 8)] {
+                    for dtype in [format!("[{dimensions}]f32"), format!("[{dimensions}]f16")] {
+                        let store = Storage::open(&bf_storage::StorageConfig { url:"memory://".into(), ..Default::default() }).await.unwrap();
+                        let config = EngineConfig { indexing:false, recall_sample_rate:0.0, lease_duration:std::time::Duration::ZERO, ..Default::default() };
+                        let engine = Engine::with_config(store.clone(), config.clone());
+                        let row = move |id: u64, step: u64| json!({"id":id,"group":id%4,"version":step,
+                            "vector":(0..dimensions).map(|d| match d { 0=>1.0, 1=>((id%17) as f32+1.0+step as f32/97.0)/16.0, _=>d as f32*0.001 }).collect::<Vec<_>>()});
+                        engine.write("tail", serde_json::from_value(json!({"schema":{"vector":{"type":dtype}},"distance_metric":metric,
+                            "upsert_rows":(0..count).map(|id|row(id,0)).collect::<Vec<_>>() })).unwrap()).await.unwrap();
+                        engine.index_namespace("tail",true).await.unwrap();
+                        let writer = engine.clone();
+                        let (ready,mut steps) = tokio::sync::mpsc::channel(1);
+                        let proceed = Arc::new(tokio::sync::Notify::new());
+                        let next = proceed.clone();
+                        let task = tokio::spawn(async move {
+                            for step in 1..=rounds {
+                                writer.write("tail",serde_json::from_value(json!({
+                                    "upsert_rows":(0..updates).map(|i|row((step*11+i)%(count-64), step)).collect::<Vec<_>>(),
+                                    "deletes":[count-64+step%32],
+                                    "patch_rows":[{"id":count-32+step%32,"version":step+100}]
+                                })).unwrap()).await.unwrap();
+                                if step%5==0 { writer.index_namespace("tail",true).await.unwrap(); }
+                                ready.send(step).await.unwrap();
+                                next.notified().await;
                             }
-                            tokio::task::yield_now().await;
-                        }
-                    }).await;
-                    task.await.unwrap();
+                        });
+                        let context = read_cache::ReadContext::new(engine.0.read_cache.clone());
+                        read_cache::scope(context, async {
+                            for round in 0..rounds {
+                                steps.recv().await.expect("writer committed this consistency point");
+                                let (state, _) = engine.snapshot("tail", &Consistency::Strong).await.unwrap();
+                                // The next write/index publication runs while both evaluators use
+                                // this captured consistency point. No timing assumptions are needed.
+                                proceed.notify_one();
+                                let full = snapshot::materialize(&store, &state).await.unwrap();
+                                let vector: Vec<f32> = (0..dimensions).map(|d| if d==0 {1.0}else{0.0}).collect();
+                                let request: QueryRequest = serde_json::from_value(json!({
+                                    "rank_by":["vector","ANN",vector],"top_k":9,"offset":3,
+                                    "include_attributes":["version","group","vector"],
+                                    "filters":match round%3 {0=>json!(["group","In",[0,2]]),1=>json!(["id","Gte",0]),_=>serde_json::Value::Null}
+                                })).unwrap();
+                                let got = indexed::execute(&store,&state,&request,&config,true).await.unwrap().result.rows.unwrap();
+                                let expected = query::execute(&full,&request).unwrap().result.rows.unwrap();
+                                assert_eq!(got.iter().map(|d|&d["id"]).collect::<Vec<_>>(),expected.iter().map(|d|&d["id"]).collect::<Vec<_>>(),"{dtype}, {metric:?}, seq={}",state.seq);
+                                for (mut actual,mut reference) in got.into_iter().zip(expected) {
+                                    let a=actual.remove("$dist").unwrap().as_f64().unwrap();
+                                    let b=reference.remove("$dist").unwrap().as_f64().unwrap();
+                                    assert!((a-b).abs()<=1e-5*b.abs().max(1.0));
+                                    assert_eq!(actual,reference);
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        }).await;
+                        task.await.unwrap();
+                    }
                 }
             }
         }).await.expect("concurrent tail regression timed out");
