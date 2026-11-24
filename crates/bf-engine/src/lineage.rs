@@ -256,6 +256,8 @@ pub(crate) async fn record(
         }
     }
     let mut retired = Vec::new();
+    // Parts of composed entries whose targets this merge left alone: they stay as they are.
+    let mut kept: BTreeMap<String, Vec<LineagePart>> = BTreeMap::new();
     for entry in &manifest.lineage {
         let through: Vec<&LineagePart> = entry
             .parts
@@ -265,6 +267,15 @@ pub(crate) async fn record(
         if through.is_empty() {
             continue;
         }
+        kept.insert(
+            entry.source.clone(),
+            entry
+                .parts
+                .iter()
+                .filter(|p| !by_source.contains_key(p.target.as_str()))
+                .cloned()
+                .collect(),
+        );
         let mut pairs = Vec::new();
         for part in through {
             let map = load(store, part).await?;
@@ -294,7 +305,7 @@ pub(crate) async fn record(
             map.from.insert(source_row);
             map.to.insert(row);
         }
-        let mut parts = Vec::with_capacity(maps.len());
+        let mut parts = kept.remove(&source).unwrap_or_default();
         for (b, map) in maps {
             let target = &outputs[b].id;
             let rows = map.from.len() as u32;
@@ -379,5 +390,82 @@ mod tests {
             map.pairs().collect::<Vec<_>>(),
             [(1, 0), (4, 2), (5, 7), (9, 8)]
         );
+    }
+
+    fn segment(id: &str, rows: u32) -> Segment {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "wal_start": 0, "wal_end": 0, "row_count": rows, "files": {},
+            "live": {"key": "", "size": 0, "metadata_len": 0}, "live_generation": 0
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_merge_of_one_target_keeps_the_parts_in_the_others() {
+        let store = Storage::from_backend(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            object_store::path::Path::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut manifest = Manifest {
+            format_version: bf_wal::MANIFEST_FORMAT_VERSION,
+            schema: Default::default(),
+            distance_metric: Default::default(),
+            id_type: bf_types::AttributeType::Scalar(bf_types::ScalarType::Uint),
+            created_at: Default::default(),
+            indexed_through: 0,
+            indexer_epoch: 0,
+            deleted: false,
+            segments: vec![],
+            stats: Default::default(),
+            text_stats: None,
+            ann_dirs: Default::default(),
+            ann_tiers: Default::default(),
+            lineage: Default::default(),
+            updated_at: None,
+            retired: vec![],
+            checkpoints: vec![],
+            pruned_through: 0,
+            bulk_load_at: None,
+            root: false,
+        };
+        // Source `s` (4 rows) was merged into `t1` (rows 0 and 2 there) and `t2` (rows 1 and 3).
+        let mut parts = Vec::new();
+        for (target, from, to) in [("t1", [0u32, 2], [1u32, 3]), ("t2", [1, 3], [0, 1])] {
+            let map = Map {
+                from: from.into_iter().collect(),
+                to: to.into_iter().collect(),
+            };
+            let file = segment::put_value(&store, format!("m-{target}"), &map)
+                .await
+                .unwrap();
+            parts.push(LineagePart {
+                target: target.into(),
+                rows: 2,
+                map: file,
+            });
+        }
+        manifest.lineage.push(Lineage {
+            source: "s".into(),
+            parts,
+        });
+        // Now `t1` (4 rows) merges alone into `u`, at positions 4 to 7.
+        let merged = [Merged {
+            segment: "t1".into(),
+            rows: (0..4).map(|r| (r, r + 4)).collect(),
+        }];
+        record(&store, "n", &mut manifest, &merged, &[segment("u", 8)])
+            .await
+            .unwrap();
+        assert_eq!(manifest.lineage.len(), 1);
+        let parts = &manifest.lineage[0].parts;
+        let targets: Vec<&str> = parts.iter().map(|p| p.target.as_str()).collect();
+        assert_eq!(targets, ["t2", "u"]);
+        assert_eq!(parts[0].map.key, "m-t2");
+        let map = load(&store, &parts[1]).await.unwrap();
+        assert_eq!(map.pairs().collect::<Vec<_>>(), [(0, 5), (2, 7)]);
     }
 }
