@@ -33,6 +33,9 @@ async fn mapped_ranges_share_pages_and_keep_unlinked_bytes_alive() {
     assert_eq!(got, vec![data.slice(3..10), data.slice(0..4), Bytes::new()]);
     assert_eq!(stats.snapshot().missed_bytes, 11);
     let retained = got[0].clone();
+    let sparse = reader.clone().sparse(512);
+    let retained_sparse = sparse.read(3..10).await.unwrap();
+    assert_eq!(retained_sparse, retained);
     store.drop_caches();
     assert_eq!(retained, data.slice(3..10));
     store.delete(key).await.unwrap();
@@ -50,6 +53,8 @@ async fn mapped_ranges_share_pages_and_keep_unlinked_bytes_alive() {
         fresh
     );
     assert_eq!(retained, data.slice(3..10));
+    assert_eq!(retained_sparse, data.slice(3..10));
+    assert_eq!(sparse.read(0..fresh.len() as u64).await.unwrap(), fresh);
     assert!(reader.read(0..1000).await.is_err());
 }
 
@@ -107,4 +112,27 @@ async fn sequential_truncation_is_reported_before_accessing_a_cached_mapping() {
         reader.read(0..1).await.unwrap_err(),
         Error::Config(_)
     ));
+}
+
+#[tokio::test]
+async fn bulk_and_sparse_views_invalidate_together_without_invalidating_held_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path()).await;
+    let first = Bytes::from(vec![b'a'; 128 << 10]);
+    store.create("both-views", first.clone()).await.unwrap();
+    let reader = store.range_reader("both-views").await.unwrap();
+    // Even a sparse hint as large as the block size must keep the random-access view.
+    let sparse = reader.clone().sparse(1 << 20);
+    let bulk_bytes = reader.read(0..first.len() as u64).await.unwrap();
+    let sparse_bytes = sparse.read(0..first.len() as u64).await.unwrap();
+    assert_eq!(bulk_bytes, first);
+    assert_eq!(sparse_bytes, first);
+    store.delete("both-views").await.unwrap();
+    let second = Bytes::from(vec![b'b'; first.len()]);
+    store.create("both-views", second.clone()).await.unwrap();
+    assert_eq!(reader.read(0..second.len() as u64).await.unwrap(), second);
+    assert_eq!(sparse.read(0..second.len() as u64).await.unwrap(), second);
+    store.drop_caches();
+    assert_eq!(bulk_bytes, first);
+    assert_eq!(sparse_bytes, first);
 }

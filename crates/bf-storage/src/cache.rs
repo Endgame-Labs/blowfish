@@ -388,6 +388,8 @@ pub struct RangeReader {
     admit: bool,
     /// Small-block size for sparse reads (see [`RangeReader::sparse`]), or 0.
     small: u32,
+    /// Scattered access, independent of the block size used by non-mapped backends.
+    random: bool,
 }
 impl RangeReader {
     /// A reader that still uses cached blocks but admits none of its own: for one-pass scans
@@ -402,6 +404,7 @@ impl RangeReader {
     /// gigabyte: a miss then fetches and caches 16 KB instead of 1 MB. Small blocks are cached
     /// apart from full ones, so use it only for reads that are sparse in their object.
     pub fn sparse(mut self, block_size: usize) -> Self {
+        self.random = true;
         let full = self.storage.0.cache.config.block_size;
         let size = block_size.max(512).next_power_of_two();
         self.small = if size >= full { 0 } else { size as u32 };
@@ -500,6 +503,7 @@ impl RangeReader {
                 self.layout.offset,
                 ranges,
                 self.admit,
+                self.random,
             );
             if let Some(ready) = ready.take() {
                 let _ = ready.send(());
@@ -803,6 +807,7 @@ impl Storage {
             layout,
             admit: true,
             small: 0,
+            random: false,
         })
     }
     /// Open an immutable object without HEAD or header probing. The caller supplies the
@@ -823,6 +828,7 @@ impl Storage {
             layout: Layout { len, offset },
             admit: true,
             small: 0,
+            random: false,
         })
     }
     /// Cached whole-object read for immutable objects, sharing the range cache and single-flight.

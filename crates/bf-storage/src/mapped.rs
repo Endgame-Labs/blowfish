@@ -18,7 +18,7 @@ struct Mapping {
 /// Bounds descriptors and virtual address retention; resident pages remain reclaimable by the OS.
 pub(crate) struct Mapped {
     backend: LocalFileSystem,
-    files: Cache<String, Arc<Mapping>>,
+    files: Cache<(String, bool), Arc<Mapping>>,
 }
 impl Mapped {
     pub(crate) fn new(root: PathBuf) -> Result<Arc<Self>, Error> {
@@ -27,7 +27,7 @@ impl Mapped {
             files: Cache::builder()
                 .max_capacity(16 * 1024)
                 // At least 32 MiB of virtual-budget charge also caps descriptors at 512.
-                .weigher(|_: &String, value: &Arc<Mapping>| {
+                .weigher(|_: &(String, bool), value: &Arc<Mapping>| {
                     value
                         .bytes
                         .len()
@@ -49,7 +49,7 @@ impl Mapped {
         });
         Ok(value)
     }
-    fn open(&self, path: &Path) -> Result<Arc<Mapping>, Error> {
+    fn open(&self, path: &Path, random: bool) -> Result<Arc<Mapping>, Error> {
         let file = File::open(self.backend.path_to_filesystem(path)?).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Error::NotFound
@@ -63,7 +63,13 @@ impl Mapped {
             // SAFETY: RangeReader's contract requires immutable objects. Blowfish publishes
             // files atomically and never truncates published objects. Unlinking during GC is
             // safe: the mapping owns its original inode until all returned Bytes are dropped.
-            Bytes::from_owner(unsafe { memmap2::MmapOptions::new().map(&file)? })
+            let mapping = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            #[cfg(unix)]
+            if random {
+                // Sparse faults must not fill small budgets with unrequested vector neighbors.
+                let _ = mapping.advise(memmap2::Advice::Random);
+            }
+            Bytes::from_owner(mapping)
         };
         Ok(Arc::new(Mapping { file, bytes }))
     }
@@ -74,6 +80,7 @@ impl Mapped {
         offset: u64,
         ranges: &[Range<u64>],
         admit: bool,
+        random: bool,
     ) -> Result<Vec<Bytes>, Error> {
         if ranges.iter().all(Range::is_empty) {
             return Ok(ranges.iter().map(|_| Bytes::new()).collect());
@@ -82,15 +89,18 @@ impl Mapped {
         metrics::counter!("blowfish_object_store_attempts_total", "op" => "mapped_read")
             .increment(1);
         let result = (|| {
-            let key = path.to_string();
+            // Large directory and ID reads need bulk I/O on a cold disk; small reads and
+            // sparse vector batches must not trigger read-ahead. Both views share OS pages.
+            let random = random || ranges.iter().all(|r| r.end - r.start < 64 << 10);
+            let key = (path.to_string(), random);
             let mapping = if admit {
                 self.files
-                    .try_get_with(key, || self.open(path))
+                    .try_get_with(key, || self.open(path, random))
                     .map_err(Error::from_shared)?
             } else {
                 match self.files.get(&key) {
                     Some(value) => value,
-                    None => self.open(path)?,
+                    None => self.open(path, random)?,
                 }
             };
             // Report an ordinary short-object error before accessing a file truncated outside
@@ -126,7 +136,9 @@ impl Mapped {
         result
     }
     pub(crate) fn remove(&self, path: &Path) {
-        self.files.invalidate(&path.to_string());
+        for random in [false, true] {
+            self.files.invalidate(&(path.to_string(), random));
+        }
         self.files.run_pending_tasks();
     }
     pub(crate) fn clear(&self) {
