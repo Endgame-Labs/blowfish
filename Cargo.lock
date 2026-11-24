@@ -310,6 +310,7 @@ dependencies = [
  "libc",
  "metrics",
  "moka",
+ "numkong",
  "object_store",
  "rayon",
  "regex",

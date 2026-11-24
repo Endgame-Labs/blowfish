@@ -6,10 +6,13 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+# Disposable warm-index prototype; the production query path does not enable this.
+experimental-hot-graph = ["dep:hnsw_rs"]
 # Test-only: `downgrade_layout`, which writes the row-major layout an older release used.
 legacy-fixtures = []
 
 [dependencies]
+hnsw_rs = { version = "=0.3.5", optional = true }
 bytes = "=1.12.1"
 crc32fast = "=1.5.5"
 futures = "=0.3.34"

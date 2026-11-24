@@ -62,3 +62,37 @@ claim follows from this harness. Hardware counters and wall time are architectur
 
 Copy retained results into `docs/benchmarks.md`, and remove the entire `.scratch/g3` run directory when
 finished, including input copies, the exported IVF fixture, all graph files, all codes, and all logs.
+
+
+## Feature-gated query-path prototype
+
+`cargo build --release -p bf-engine --features experimental-hot-graph --example hot_graph_server
+--example prepare_hot_graph_nq` builds disposable examples over the real engine. The fixture builder
+accepts a storage JSON path, NQ data directory, namespace, and scratch directory. The loopback server
+accepts storage JSON, namespace, readiness marker, port, ef, rerank, and construction budget in GiB.
+An ef of zero serves ordinary IVF. Promotion is explicit only in this experiment; the proposed shipped
+lifecycle is automatic, as described in `docs/design/hot-tier-graph.md`.
+
+The graph prototype normally builds from immutable tier objects and releases its f16 construction
+vectors. Exact candidates use the existing sparse range cache. `G3_RETAIN_EXACT=1` selects the larger,
+fully resident comparison. `G3_NQ_GRAPH_IMPORT=SCRATCH_DIR` instead imports the existing private graph
+and code encodings built over corpus/document IDs 0..N, maps those IDs into a fresh NQ fixture, and
+opens its source-index metadata. Only use that trusted import with the identical NQ corpus. It is a
+query-cost experiment, with no S3 sidecar, manifest change, or bounded-build claim.
+
+`http_measure.py` measures all-query recall at top-10, warms all queries, and times repeated pre-encoded
+HTTP requests with persistent connections. On Linux, pin both servers to CPUs 0-23 and use eight client
+processes with eight threads on CPUs 24-31. It attaches query-only perf counters to the server, rather
+than counting Python work. On macOS, use `G3_CLIENT_PROCESSES=16 G3_CLIENT_THREADS=1`; client and server
+share the host, and perf is omitted. Run with `uv run --python 3.12 --no-project --with numpy python`.
+Save outputs under `.scratch/`, and repeat throughput measurements.
+
+`qdrant_load.py` uses the official `qdrant-client==1.20.0` uploader and official Qdrant 1.20.0 release
+binaries for the paired fixture: cosine, f16 in RAM, M=16, construction ef=100, one target segment, and
+no payloads. It permits an indexed segment plus an empty write segment; inspect telemetry to confirm
+all rows are indexed before measurement. The caller owns its server, directory, and cleanup.
+
+`stitch_plan EXPORTED_IVF_DIRECTORY` is a cheap prerequisite probe for the proposed stitched-slab
+builder. It computes normalized empirical slab means, then the fraction of rows near their two closest
+means at several distance-ratio thresholds. It reads a cluster at a time, checks existing CRCs, and
+reports overlap without building a graph. It is not a Vamana implementation or a stitched-recall test.

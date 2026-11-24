@@ -50,3 +50,7 @@ pub enum Error {
 
 /// Result type used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Disposable warm-tier row graph prototype, excluded from default builds.
+#[cfg(feature = "experimental-hot-graph")]
+pub mod hot_graph;

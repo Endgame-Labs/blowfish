@@ -1766,3 +1766,7 @@ mod recall_sampler_tests {
         assert!(sampler.start(Duration::ZERO).is_some());
     }
 }
+
+/// Explicitly experimental, disposable warm-tier accelerator.
+#[cfg(feature = "experimental-hot-graph")]
+pub mod hot_graph;

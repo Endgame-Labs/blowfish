@@ -253,13 +253,21 @@ async fn from_tiers(
     }
     let uncovered = covered.iter().any(|c| !c);
     // A base and its delta rank their leaves as one list.
-    let seats = if tiers.len() > 1 {
+    #[cfg(feature = "experimental-hot-graph")]
+    let accelerated = tiers
+        .iter()
+        .any(|s| crate::hot_graph::available(&s.dir.key));
+    #[cfg(not(feature = "experimental-hot-graph"))]
+    let accelerated = false;
+    // Independent top-k unions are complete. The prototype bypasses joint scan barriers when
+    // any part is a graph; delta tiers and uncovered segments retain the ordinary planner.
+    let seats = if tiers.len() > 1 && !accelerated {
         crate::ann_dir::Joint::seats(tiers.len())
             .into_iter()
             .map(Some)
             .collect()
     } else {
-        vec![None]
+        (0..tiers.len()).map(|_| None).collect::<Vec<_>>()
     };
     let parts = tiers
         .iter()
@@ -484,29 +492,42 @@ async fn from_slabs(
             mask.is_some()
         );
     }
+    #[cfg(feature = "experimental-hot-graph")]
+    let hot_mask = mask.clone();
     let lives = vec![mask; view.segments.len()];
     let slack = if state.shadowed.is_empty() {
         0
     } else {
         (2 * k).max(20)
     };
-    let (mut scores, mut docs) = crate::ann_dir::search(
-        store,
-        &view,
-        dir,
-        lives,
-        vector,
-        config,
-        k + slack,
-        columns,
-        attribute,
-        None,
-        Layout::Slabs,
-        Some((state, &set.covered, at)),
-        &[],
-        seat,
-    )
-    .await?;
+    #[cfg(feature = "experimental-hot-graph")]
+    let accelerated =
+        crate::hot_graph::search(store, state, set, at, vector, hot_mask, k + slack, columns)
+            .await?;
+    #[cfg(not(feature = "experimental-hot-graph"))]
+    let accelerated = None;
+    let (mut scores, mut docs) = match accelerated {
+        Some(found) => found,
+        None => {
+            crate::ann_dir::search(
+                store,
+                &view,
+                dir,
+                lives,
+                vector,
+                config,
+                k + slack,
+                columns,
+                attribute,
+                None,
+                Layout::Slabs,
+                Some((state, &set.covered, at)),
+                &[],
+                seat,
+            )
+            .await?
+        }
+    };
     if slack > 0 {
         let pooled = scores.len();
         scores.retain(|id, _| !state.shadowed.contains(id));
