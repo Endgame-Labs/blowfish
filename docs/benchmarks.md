@@ -8232,3 +8232,172 @@ point varies by 3.4% in the opposite direction from the warm ABBA's 1.6% decreas
 this is not evidence of a repeatable unmasked CPU-cycle win at that probe count.
 Use the paired warm gates above for throughput and latency conclusions. The small
 HTTP/native cycle difference remains substantial.
+
+## Round BW2: shadow statistics from indexed postings
+
+At 1,000 text-changing upserts/s, paired BM25 p50 falls **49.011 → 29.734 ms**
+(**1.65×**). All 4,000 frozen queries retain exact score bits, write-service p90
+increases 2.62%, every offered write is acknowledged, and idle latency holds.
+
+The first reproduction on the BW2 host gives **49.493/69.522 ms p50/p90** under
+1,000 text-changing upserts/s, with all 120,000 offered rows acknowledged. Shadow
+correction remains the largest component: **22.378/29.261 ms**, against
+14.379/18.592 ms for tail-statistics analysis, and 17.118/33.163 ms of summed
+segment scoring and hydration. Checkpoint-statistics lookup is 0.085/0.130 ms.
+These are the 90 measured requests in the first baseline run. Nested statistics
+and overlapping segment-worker durations are not additive. BW1's historical
+56.884 ms median is context; the comparisons below use fresh, paired BW2 runs.
+
+### Implementation
+
+The correction reads exact normalization lengths from each text index and counts
+query-term postings inside the bitmap of indexed rows replaced or deleted by the
+WAL. It first intersects that bitmap with the published live mask, preventing a
+second subtraction of rows already absent from checkpoint statistics. Length
+zero denotes a missing/null field; present empty fields, including text emptied
+by stopword removal, already have length one. No document-column read is needed
+to distinguish them.
+
+`SegmentReader::document_frequencies` counts exact terms in input order, including
+repetitions and absent terms. It reads intersecting posting blocks in batches,
+uses the smaller of the selected-row set and posting list within each block,
+and takes counts directly from metadata for full masks or gap-free blocks.
+Positions remain lazy. Existing posting and dictionary caches retain their
+existing limits.
+
+The same snapshot-local bitmap excludes shadowed hits during segment search.
+It travels through the query's read context to its search workers, and leaves
+scope with that query. It is never cached across snapshots. Idle queries retain
+the existing checkpoint-statistics path. WAL term summaries still use BW1's
+bounded cache; shadow-document summaries are removed. Commits perform no new
+analysis or index maintenance. No dependency, wire response, or persistent
+format changes.
+
+### Paired protocol
+
+One owned, on-demand c7g.4xlarge in us-west-2, Ubuntu 24.04 arm64, Rust 1.100.0,
+and Clang 19. Both timed release binaries use the same build settings. Server
+CPUs are 0–5, client CPUs are 6–7, the block cache is 2 GiB, and disk caching is
+disabled. Decoded-cache and indexing settings retain their defaults.
+
+The store contains the first million passages from the same MS MARCO stream
+as BW1. Its initial six segments contain 125,000, 200,000, 175,000, 200,000,
+200,000, and 100,000 rows. Loading drains the exhaustive tail to zero before
+copying the checkpoint. Each arm starts from an identical disposable copy.
+Every HTTP run prewarms all 1,000 queries, then runs for 120 seconds. Query
+percentiles exclude the first 30 seconds; write-service percentiles cover all
+1,200 requests in each write-loaded arm. The query and write seeds, text-changing
+100-row batches, strong consistency, top ten, and IDs-only projection are BW1's settings.
+Queries run at one Hz, and writes at 1,000 rows/s. Write-loaded arms run A/B/B/A;
+idle controls run separately in A/B/B/A order. Builds and independent reference
+generation finish before candidate timing. The first write-loaded pair enables
+stage traces; the second disables them.
+
+Baseline source is `aba5c96`; candidate source is `a8b9201`. Executable SHA-256:
+
+- Baseline: `d871681449ef2a48b6f15e8ac64ed87f4fca205b5c564a85b226b2866b59b983`.
+- Candidate: `31ef5e3eede0aebbf3462617b3ea74e8b2993cc0c1b0036ce57ce75620b8e102`.
+
+The million-row corpus JSONL SHA-256 is
+`c9d3f3493900d156cf1cfaf514a81a8cbea6e1f02a266bc8ce73165148ce42d6`;
+the checked-in workload SHA-256 is
+`3c8f1b03e4d8293ec9c45f53e8d1f94bfe4bd5cbb23d1e31623df655baf9f472`.
+
+### Stage confirmation
+
+The traced first pair contains the same 90 measured query IDs, in the same order.
+Per-request stage percentiles are:
+
+| Component | Baseline p50 / p90 ms | Candidate p50 / p90 ms |
+| --- | ---: | ---: |
+| Global statistics | 36.836 / 48.103 | 19.301 / 25.901 |
+| Checkpoint statistics, inside global statistics | 0.085 / 0.130 | 0.071 / 0.121 |
+| Shadow statistics, inside global statistics | 22.378 / 29.261 | 6.340 / 10.387 |
+| Tail-statistics analysis, inside global statistics | 14.379 / 18.592 | 13.077 / 16.846 |
+| Segment scoring and hydration, summed worker elapsed time | 17.118 / 33.163 | 11.097 / 24.749 |
+| Tail analysis or summary lookup for scoring | 1.272 / 2.256 | 1.181 / 2.073 |
+| Tail scoring | 3.372 / 6.544 | 2.332 / 5.027 |
+| Final merge | 0.022 / 0.024 | 0.021 / 0.023 |
+
+Shadow correction falls **71.7% at p50**. Reusing its bitmap also removes repeated
+ID lookups from segment search. Tail-statistics analysis is now the largest
+statistics component. The measured tail medians in this pair are 3,046.5 and
+2,945 rows. Nested and overlapping durations remain non-additive; these figures
+include the actual publication and cache behavior of each arm.
+
+### Exactness and checks
+
+BW1's serialized-snapshot checker passes all **4,000 queries**, including all
+**40,000 ordered IDs and f32 score bits**, against the independently compiled
+exhaustive `exact_bm25` executable. The four retained states cover the fully
+indexed million passages, 5,000 overwrites, overlapping updates plus deletes and
+nulls, and the next index publication. Old snapshots remain queryable after the
+later publication. Reference generation and checking take 155.57 seconds,
+outside all candidate timing.
+
+Formatting, scoped Clippy with warnings denied, and
+`cargo test -p bf-engine -p bf-text` pass: **252 tests, zero failures, and 15 expected ignored tests**.
+New coverage checks raw document presence against masked frequencies, sparse
+and dense masks, repeated and absent terms, missing and empty fields, lazy reads,
+packed tails, and text formats 4–7. An engine test removes the document-column
+files after computing its reference, clears storage caches, and verifies exact IDs-only BM25 with zero
+and positive decoded-cache budgets. Existing tests retain coverage of arrays,
+prefixes, filters, computed scores, changed analysis settings, and publications.
+The local and EC2 changed-source hashes match.
+
+The frozen checker uses the same `BW1_STORE` and `BW1_REFERENCE` variables as the
+previous round. Its independent reference executable SHA-256 is
+`b3b1bf4d1cb659bc5b35ba4017a723957dbfd7488543ddc98aebc7731f85bfad`.
+ARM test linking uses Clang 22, LLD 19, and LLVM 22 compiler builtins; both timed
+HTTP binaries use Clang 19's normal linker.
+
+### Write-loaded result
+
+All four arms execute the same **90 measured queries**. Their ordered query-index
+list has SHA-256
+`d7c5fdacd887c880c0e518841ac904d3a4b77dc83379b18122ce8e2f9143ed59`.
+
+| Arm | BM25 p50 / p90 ms | Write-service p50 / p90 ms | Tail median / maximum | Acknowledged / offered rows |
+| --- | ---: | ---: | ---: | ---: |
+| A1, baseline, traced | 49.493 / 69.522 | 1.241 / 1.796 | 3,046.5 / 5,686 | 120,000 / 120,000 |
+| B1, candidate, traced | 30.125 / 41.286 | 1.284 / 1.863 | 2,945 / 5,685 | 120,000 / 120,000 |
+| B2, candidate | 29.342 / 40.220 | 1.296 / 1.862 | 2,945.5 / 5,589 | 120,000 / 120,000 |
+| A2, baseline | 48.530 / 70.535 | 1.278 / 1.834 | 2,894.5 / 5,880 | 120,000 / 120,000 |
+
+Medians of the two run percentiles are **49.011/70.029 → 29.734/40.753 ms**:
+**1.65× faster p50, and 1.72× faster p90**. Both candidate repetitions beat
+44 ms p50. Median write-service p50/p90 changes from **1.260/1.815** to
+**1.290/1.862 ms**, increases of **2.43%/2.62%**, within the 5% p90 allowance.
+Every arm acknowledges every offered row, with zero rejections: **480,000 of
+480,000** in total. This establishes parity at the offered rate; maximum write
+capacity is not measured.
+
+### Idle control and reproduction
+
+All idle arms use the same query schedule, initial checkpoint, prewarm, and
+90-query measured slice as the write-loaded arms. Every query has zero exhaustive
+tail rows.
+
+| Arm | BM25 p50 / p90 ms |
+| --- | ---: |
+| A1, baseline | 2.501 / 4.441 |
+| B1, candidate | 2.451 / 4.344 |
+| B2, candidate | 2.377 / 4.139 |
+| A2, baseline | 2.496 / 4.171 |
+
+Median run percentiles are **2.498/4.306 → 2.414/4.242 ms**. Idle BM25 does not
+regress on this control. Together with the frozen exactness check, acknowledged
+writes, and write-service allowance, the paired runs pass all BW2 gates.
+
+Use BW1's reproduction command with the sources above, an owned scratch directory,
+`--bm25-hz 1`, `--seconds 120`, `--warmup 30`, and a fresh fully checkpointed store
+copy per arm. Use `--rate 1000` for write-loaded arms and `--rate 0` for idle.
+Both source builds, reference generation, and frozen checking must finish before
+timing. This round measures a warm local store; cold S3, broader ANN, small-memory,
+full-workspace, and official-SDK integration remain coordinator validation.
+
+The owned c7g.4xlarge ran for **0.93 hours**. Estimated cost is **about $0.56**,
+including compute at BW1's $0.58/hour rate and the 120 GiB gp3 root volume.
+The instance is terminated; its root volume, tagged key pair, and security group
+are confirmed absent. No S3 objects or prefixes were created. Owned scratch
+artifacts were removed after retaining these results.
