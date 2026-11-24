@@ -1,4 +1,5 @@
 //! Immutable segment indexes with a WAL overlay and an exhaustive reference evaluator.
+pub use query_worker::on_query_reactor;
 mod ann;
 mod ann_dir;
 mod auto_recluster;
@@ -30,8 +31,10 @@ pub use recluster::{ReclusterOptions, ReclusterReport};
 pub use reindex::{LayoutCounts, ReindexOptions, ReindexReport};
 mod metadata;
 mod models;
+mod published;
 mod query;
 mod query_worker;
+use published::Published;
 mod recluster;
 mod reindex;
 mod text;
@@ -51,7 +54,6 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tokio::sync::Mutex;
 
 /// One unindexed WAL entry resident in a namespace's tail.
 #[derive(Clone)]
@@ -350,7 +352,7 @@ pub struct QueryDiagnostics {
     pub document_scan_rows: u64,
 }
 struct Handle {
-    state: Arc<Mutex<NamespaceState>>,
+    state: Arc<Published<NamespaceState>>,
     commits: GroupCommit<Operation, Result<WriteResponse, ApiError>>,
     backpressure: Arc<auto_recluster::LoadBackpressure>,
 }
@@ -361,7 +363,7 @@ struct Inner {
     recall_sampler: Arc<RecallSampler>,
     config: EngineConfig,
     owner: uuid::Uuid,
-    namespaces: Mutex<HashMap<String, Arc<Handle>>>,
+    namespaces: Published<HashMap<String, Arc<Handle>>>,
     /// The automatic recluster's builds and the tiers waiting to be installed.
     jobs: auto_recluster::Jobs,
     /// Shutdown of background work, shared with scoped engines.
@@ -493,7 +495,7 @@ impl Engine {
             store,
             config,
             owner: uuid::Uuid::new_v4(),
-            namespaces: Mutex::new(HashMap::new()),
+            namespaces: Published::new(HashMap::new()),
             jobs: Default::default(),
             stop,
         }));
@@ -521,7 +523,7 @@ impl Engine {
             recall_sampler: self.0.recall_sampler.clone(),
             config: self.0.config.clone(),
             owner: uuid::Uuid::new_v4(),
-            namespaces: Mutex::new(HashMap::new()),
+            namespaces: Published::new(HashMap::new()),
             jobs: Default::default(),
             stop: self.0.stop.clone(),
         }));
@@ -561,12 +563,15 @@ impl Engine {
     }
     async fn handle(&self, ns: &str) -> Result<Arc<Handle>, ApiError> {
         validate_namespace(ns)?;
+        if let Some(handle) = self.0.namespaces.load().get(ns) {
+            return Ok(handle.clone());
+        }
         let mut handles = self.0.namespaces.lock().await;
         if let Some(handle) = handles.get(ns) {
             return Ok(handle.clone());
         }
         let (commits, receiver) = GroupCommit::channel(1024);
-        let state = Arc::new(Mutex::new(NamespaceState::default()));
+        let state = Arc::new(Published::new(NamespaceState::default()));
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
         let backpressure = Arc::new(auto_recluster::LoadBackpressure::default());
         let handle = Arc::new(Handle {
@@ -576,7 +581,7 @@ impl Engine {
         });
         handles.insert(ns.into(), handle.clone());
         let context = read_cache::ReadContext::new(self.0.read_cache.clone());
-        tokio::spawn(read_cache::scope(
+        query_worker::shared_runtime().spawn(read_cache::scope(
             context,
             commit_worker(
                 wal,
@@ -688,6 +693,56 @@ impl Engine {
         }
         Ok((state.clone(), warm))
     }
+    async fn query_snapshot(
+        &self,
+        ns: &str,
+        consistency: &Consistency,
+        hint: snapshot::OpenHint,
+        backend: &Arc<bf_storage::BackendStats>,
+    ) -> Result<(Arc<NamespaceState>, bool), ApiError> {
+        if matches!(consistency, Consistency::Strong) {
+            let handle = self.handle(ns).await?;
+            let state = handle.state.load();
+            if state.exists
+                && state.seq > 0
+                && state.checkpoint_refreshed.elapsed() < self.0.config.retention.div_f64(2.0)
+            {
+                let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
+                match self.0.store.head(&wal.key(state.seq + 1)).await {
+                    Err(bf_storage::Error::NotFound) => {
+                        let current = handle.state.load();
+                        if current.seq == state.seq
+                            && current.manifest_seq == state.manifest_seq
+                            && current.checkpoint_refreshed.elapsed()
+                                < self.0.config.retention.div_f64(2.0)
+                        {
+                            return Ok((current, true));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(storage_error(error)),
+                }
+            }
+        }
+        if query_worker::is_reactor() {
+            let (engine, ns, consistency) = (self.clone(), ns.to_owned(), consistency.clone());
+            let backend = backend.clone();
+            return query_worker::run_io(query_worker::shared_runtime(), async move {
+                backend
+                    .scope(
+                        "snapshot",
+                        engine.snapshot_hinted(&ns, &consistency, Some(hint), false),
+                    )
+                    .await
+                    .map(|(state, warm)| (Arc::new(state), warm))
+            })
+            .await?;
+        }
+        self.snapshot_hinted(ns, consistency, Some(hint), false)
+            .await
+            .map(|(state, warm)| (Arc::new(state), warm))
+    }
+
     /// Atomically validate, group, and durably commit all operations in one request.
     pub async fn write(
         &self,
@@ -771,6 +826,42 @@ impl Engine {
         ns: &str,
         request: QueryRequest,
     ) -> Result<(QueryResponse, QueryDiagnostics), ApiError> {
+        if query_worker::is_reactor() {
+            let resident = self.0.config.models.is_none()
+                && self.0.namespaces.load().get(ns).is_some_and(|handle| {
+                    let state = handle.state.load();
+                    state.exists
+                        && state.seq > 0
+                        && state.checkpoint_refreshed.elapsed()
+                            < self.0.config.retention.div_f64(2.0)
+                        && warm_ann::inline_plan(
+                            &self.0.read_cache,
+                            &state,
+                            &request,
+                            &self.0.config,
+                        )
+                });
+            if !resident {
+                let start = Instant::now();
+                let (engine, ns) = (self.clone(), ns.to_owned());
+                let result = query_worker::run_io(
+                    query_worker::shared_runtime(),
+                    Box::pin(async move { engine.query_configured(&ns, request).await }),
+                )
+                .await?;
+                return result.map(|(mut response, diagnostics)| {
+                    response.performance.server_total_ms = start.elapsed().as_millis() as u64;
+                    (response, diagnostics)
+                });
+            }
+        }
+        self.query_configured(ns, request).await
+    }
+    async fn query_configured(
+        &self,
+        ns: &str,
+        request: QueryRequest,
+    ) -> Result<(QueryResponse, QueryDiagnostics), ApiError> {
         match self.0.config.models.clone() {
             Some(models) => self.query_with_models(models, ns, request).await,
             None => self.query_inner(ns, request).await,
@@ -794,11 +885,11 @@ impl Engine {
         let document_scan_rows = context.document_scan_rows.clone();
         let cached = if matches!(request.consistency, Consistency::Strong) {
             let handle = self.handle(ns).await?;
-            let state = handle.state.lock().await;
+            let state = handle.state.load();
             (state.exists
                 && state.seq > 0
                 && state.checkpoint_refreshed.elapsed() < self.0.config.retention.div_f64(2.0))
-            .then(|| state.clone())
+            .then_some(state)
         } else {
             None
         };
@@ -814,7 +905,7 @@ impl Engine {
             let result = backend
                 .scope(
                     "snapshot",
-                    self.snapshot_hinted(ns, &request.consistency, Some(hint), false),
+                    self.query_snapshot(ns, &request.consistency, hint, &backend),
                 )
                 .await;
             (result, start.elapsed())
@@ -866,7 +957,7 @@ impl Engine {
             let cache = self.0.read_cache.clone();
             let queries = self.0.queries.clone();
             let stop = self.0.stop.clone();
-            tokio::spawn(async move {
+            query_worker::shared_runtime().spawn(async move {
                 let Ok(permit) = queries.acquire_owned().await else {
                     return;
                 };
@@ -929,7 +1020,7 @@ impl Engine {
     }
     async fn search_snapshot(
         &self,
-        state: &NamespaceState,
+        state: &Arc<NamespaceState>,
         request: &QueryRequest,
         context: read_cache::ReadContext,
         warm: bool,
@@ -938,6 +1029,8 @@ impl Engine {
         let store = self.0.store.clone();
         let config = self.0.config.clone();
         let t_clone = Instant::now();
+        let inline = query_worker::is_reactor()
+            && warm_ann::inline_plan(&self.0.read_cache, state, request, &config);
         let state = state.clone();
         if crate::ann::trace_stages() {
             eprintln!("CLONE {}us", t_clone.elapsed().as_micros());
@@ -962,7 +1055,7 @@ impl Engine {
             .await
         });
         let response = if warm {
-            query_worker::run(query).await??
+            query_worker::run(query, inline).await??
         } else {
             metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "cold").increment(1);
             query_worker::run_io(tokio::runtime::Handle::current(), query).await??
@@ -1153,7 +1246,7 @@ async fn catch_up(wal: &Wal, state: &mut NamespaceState, store: &Storage) -> Res
 /// Deletes, copies, and filter writes use it, after the pipeline has drained.
 async fn commit_sync(
     wal: &Wal,
-    state: &Mutex<NamespaceState>,
+    state: &Published<NamespaceState>,
     store: &Storage,
     config: &EngineConfig,
     deleting: bool,
@@ -1291,7 +1384,7 @@ fn is_barrier(op: &Operation) -> bool {
 /// own slot commits, and slots commit strictly in order.
 async fn commit_front(
     wal: &Wal,
-    state: &Mutex<NamespaceState>,
+    state: &Published<NamespaceState>,
     store: &Storage,
     flights: &mut VecDeque<Flight>,
     staged: Result<Result<bf_wal::Staged, bf_wal::Error>, tokio::task::JoinError>,
@@ -1407,7 +1500,7 @@ async fn commit_front(
 /// Commit every flight, oldest first.
 async fn drain(
     wal: &Wal,
-    state: &Mutex<NamespaceState>,
+    state: &Published<NamespaceState>,
     store: &Storage,
     flights: &mut VecDeque<Flight>,
     backlog: &mut VecDeque<Op>,
@@ -1420,7 +1513,7 @@ async fn drain(
 
 async fn commit_worker(
     wal: Wal,
-    state: Arc<Mutex<NamespaceState>>,
+    state: Arc<Published<NamespaceState>>,
     mut receiver: tokio::sync::mpsc::Receiver<Op>,
     store: Storage,
     config: EngineConfig,

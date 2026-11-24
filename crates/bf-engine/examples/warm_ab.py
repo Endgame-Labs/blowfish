@@ -173,11 +173,17 @@ def main():
     parser.add_argument("--arms", type=Path, required=True)
     parser.add_argument("--namespace", default="nq")
     parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--warm-epochs", type=int, default=2)
+    parser.add_argument("--population", type=int, default=2_681_468)
+    parser.add_argument(
+        "--identical-results", action="store_true",
+        help="require identical ordered rows and distances across all arms",
+    )
     parser.add_argument("--server-cpus", default="0-7")
     parser.add_argument("--client-cpus", default="8-15")
     args = parser.parse_args()
-    if args.epochs < 1:
-        parser.error("epochs must be positive")
+    if args.epochs < 1 or args.warm_epochs < 1 or args.population < 1:
+        parser.error("epochs, warm epochs, and population must be positive")
     if ".scratch" not in args.scratch.resolve().parts or args.scratch.exists():
         parser.error("scratch must be a new directory under .scratch/")
     args.scratch.mkdir(parents=True)
@@ -199,26 +205,34 @@ def main():
     ]
     arms = json.loads(args.arms.read_text())
     results = []
-    expected_ids = {}
+    expected_rows = {}
+    reference = None
     order = list(arms) + list(reversed(arms))
     for run, name in enumerate(order):
         directory = args.scratch / str(run)
         directory.mkdir()
         with server(arms[name], directory, cpus(args.server_cpus)) as (client, process):
-            # Warm every query twice; the second epoch can use the compiled tier.
-            for _ in range(2):
+            # Warm complete varied-query epochs; later epochs can use the compiled tier.
+            for _ in range(args.warm_epochs):
                 epoch(bodies, args.namespace, cpus(args.client_cpus))
             for repeat in range(args.epochs):
                 compiled_before = compiled_queries(client)
                 rows = epoch(bodies, args.namespace, cpus(args.client_cpus))
                 compiled = compiled_queries(client) - compiled_before
                 decoded = [json.loads(row[3]) for row in rows]
+                result_rows = [result["rows"] for result in decoded]
                 ids = [[int(row["id"]) for row in result["rows"]] for result in decoded]
-                if name in expected_ids and ids != expected_ids[name]:
+                if name in expected_rows and result_rows != expected_rows[name]:
                     raise RuntimeError(
-                        f"ordered IDs changed between warm runs of {name}"
+                        f"ordered rows or distances changed between warm runs of {name}"
                     )
-                expected_ids[name] = ids
+                expected_rows[name] = result_rows
+                if args.identical_results:
+                    if reference is None:
+                        reference = result_rows
+                        (args.scratch / "reference.json").write_text(json.dumps(reference))
+                    elif result_rows != reference:
+                        raise RuntimeError(f"ordered rows or distances differ in arm {name}")
                 cache = float(
                     np.mean([r["performance"]["cache_hit_ratio"] for r in decoded])
                 )
@@ -226,11 +240,12 @@ def main():
                 population = {
                     r["performance"]["approx_namespace_size"] for r in decoded
                 }
-                if cache != 1.0 or tail != {0} or population != {2_681_468}:
+                if cache != 1.0 or tail != {0} or population != {args.population}:
                     raise RuntimeError(
-                        f"not a fully warm NQ tier: cache={cache}, tail={tail}, population={population}"
+                        f"not a fully warm tier: cache={cache}, tail={tail}, population={population}"
                     )
                 seconds = (max(r[2] for r in rows) - min(r[1] for r in rows)) / 1e9
+                latency = [(row[2] - row[1]) / 1e6 for row in rows]
                 status = Path(f"/proc/{process.pid}/status").read_text()
                 peak = (
                     int(
@@ -249,6 +264,8 @@ def main():
                     "probes": arms[name]["probes"],
                     "queries": len(rows),
                     "qps": len(rows) / seconds,
+                    "p50_ms": float(np.percentile(latency, 50)),
+                    "p90_ms": float(np.percentile(latency, 90)),
                     "peak_rss_bytes": peak,
                     "recall": float(
                         np.mean(
@@ -260,7 +277,7 @@ def main():
                     ),
                     "cache_hit_ratio": cache,
                     "tail_rows": 0,
-                    "namespace_rows": 2_681_468,
+                    "namespace_rows": args.population,
                     "compiled_queries": compiled,
                 }
                 (directory / f"{repeat}.ids.json").write_text(json.dumps(ids))

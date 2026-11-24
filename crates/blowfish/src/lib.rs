@@ -2,6 +2,7 @@
 mod admin;
 mod legacy;
 mod operations;
+pub mod reactors;
 
 use axum::{
     Extension, Json, Router,

@@ -8,6 +8,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **New home and license holder:** The repository moved from `dorkitude/blowfish` to [`endgame-labs/blowfish`](https://github.com/endgame-labs/blowfish); old URLs, clones, and remotes redirect. The MIT license's copyright holder is now Endgame Labs, Inc.
 
+### Performance
+
+- **Per-core query serving:** Warm queries on compiled tiers now run on per-core reactors instead of a shared pool, while cold, nonresident, and background work stays on shared I/O. On full NQ at 16 clients, throughput rises 2% on 4 cores, 5 to 6% on 8 cores (p90 8.0 to 6.9 ms), and 21% on 16 cores (3,709 to 4,486 q/s), with identical ordered results. Cold S3 latency is unchanged within noise. See [docs/benchmarks.md](docs/benchmarks.md).
+
 ## [0.1.16] - 2026-11-24
 
 ### Upgrade notes

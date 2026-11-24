@@ -377,7 +377,7 @@ impl DecodedCache {
             format!("{}\0{key}", self.scope)
         }
     }
-    fn get<T: Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
+    pub(crate) fn get<T: Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
         let key = self.key(key);
         let mut entries = self.entries.lock().expect("decoded cache lock");
         entries.clock += 1;

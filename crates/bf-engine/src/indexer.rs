@@ -244,7 +244,8 @@ pub(crate) fn start(engine: &Engine) {
     let stop = engine.0.stop.clone();
     // Shutdown drops the loop at its next await, mid-pass if need be: a pass publishes only
     // through a fenced manifest write, so a dropped one leaves orphans for GC, as a crash does.
-    tokio::spawn(async move { stop.clone().run(index_loop(weak, interval, stop)).await });
+    crate::query_worker::shared_runtime()
+        .spawn(async move { stop.clone().run(index_loop(weak, interval, stop)).await });
 }
 async fn index_loop(
     weak: std::sync::Weak<crate::Inner>,

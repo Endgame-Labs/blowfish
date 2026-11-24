@@ -25,12 +25,72 @@ struct Seen(AtomicU8);
 thread_local! {
     static SCRATCH: RefCell<ResidentQueryScratch> = RefCell::new(ResidentQueryScratch::default());
 }
+/// Only a bounded, unfiltered, already compiled ANN tier may spend CPU on an HTTP reactor.
+/// The normal planner still proves masks, coverage, and exact-vector residency; a miss yields
+/// its existing future to shared I/O, and unsupported plans retain the fixed worker pool.
+pub(crate) fn inline_plan(
+    cache: &read_cache::DecodedCache,
+    state: &crate::NamespaceState,
+    request: &bf_types::QueryRequest,
+    config: &crate::EngineConfig,
+) -> bool {
+    let Some(bf_types::RankBy::Vector {
+        attribute,
+        exact: false,
+        vector,
+        ..
+    }) = &request.rank_by
+    else {
+        return false;
+    };
+    if vector.len() > 1024
+        || config.ann_nprobe > 64
+        || config.ann_rerank_factor > 32
+        || request.compute_attributes.is_some()
+        || request.limit.is_some()
+        || request.filters.is_some()
+        || request.queries.is_some()
+        || request.aggregate_by.is_some()
+        || request.group_by.is_some()
+        || request.rerank_by.is_some()
+        || request.total().unwrap_or(10).saturating_add(request.offset) > 10
+        || state.tail_bytes != 0
+        || !state.docs.is_empty()
+        || state
+            .segments
+            .iter()
+            .any(|segment| segment.live_generation != 0)
+    {
+        return false;
+    }
+    let Some(tiers) = state.ann_tiers.get(attribute) else {
+        return false;
+    };
+    tiers.len() == 1
+        && cache
+            .get::<WarmTier>(&tiers[0].dir.key)
+            .is_some_and(|warm| {
+                warm.ready.load(Ordering::Acquire)
+                    && warm.rows as u64
+                        == state
+                            .segments
+                            .iter()
+                            .map(|segment| u64::from(segment.row_count))
+                            .sum::<u64>()
+            })
+}
+
 impl WarmTier {
     /// A first query uses only the normal cold path. A second query can reserve a compiled
     /// view if its complete code working set and exact-vector cache fit the decoded budget.
     pub fn for_tier(key: &str, directory: Arc<Directory>) -> Option<Arc<Self>> {
         if let Some(warm) = read_cache::get::<Self>(key, 0) {
             return Some(warm);
+        }
+        // Eligibility can race eviction. Rebuilding metadata for a large tier belongs
+        // to shared I/O; a reactor miss reaches the planner's existing yield instead.
+        if crate::query_worker::is_reactor() {
+            return None;
         }
         if read_cache::capacity() == 0 {
             return None;
@@ -195,6 +255,35 @@ mod tests {
         .await
     }
 
+    async fn reactor_miss_never_rebuilds(key: String, directory: Arc<Directory>) {
+        let cache = Arc::new(read_cache::DecodedCache::new(64 << 20, 2));
+        let context = read_cache::ReadContext::new(cache.clone());
+        let shared = tokio::runtime::Handle::current();
+        let (reactor_key, reactor_directory) = (key.clone(), directory.clone());
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(crate::on_query_reactor(
+                    shared,
+                    read_cache::scope(context, async move {
+                        // Model eviction of the large tier while its small admission marker stays.
+                        read_cache::insert_once(&reactor_key, 64, Seen(AtomicU8::new(1))).unwrap();
+                        assert!(WarmTier::for_tier(&reactor_key, reactor_directory).is_none());
+                        assert!(read_cache::get::<WarmTier>(&reactor_key, 0).is_none());
+                    }),
+                ));
+        })
+        .await
+        .unwrap();
+        read_cache::scope(read_cache::ReadContext::new(cache), async move {
+            // The shared path can still rebuild that same admissible generation.
+            assert!(WarmTier::for_tier(&key, directory).is_some());
+        })
+        .await;
+    }
+
     // Keep the build future on the heap so the driver has room for compaction and queries.
     fn fixture(
         cluster_rows: usize,
@@ -282,10 +371,48 @@ mod tests {
             }
         }
         let compiled = current(&warm, key).await.expect("hot tier admitted");
+        let state = warm.handle("compiled").await.unwrap().state.load();
+        let mut eligible: QueryRequest = serde_json::from_value(request(17)).unwrap();
+        assert!(inline_plan(
+            &warm.0.read_cache,
+            &state,
+            &eligible,
+            &warm.0.config
+        ));
+        eligible.top_k = Some(11);
+        assert!(!inline_plan(
+            &warm.0.read_cache,
+            &state,
+            &eligible,
+            &warm.0.config
+        ));
+        eligible.top_k = Some(10);
+        let mut expensive = warm.0.config.clone();
+        expensive.ann_nprobe = 65;
+        assert!(!inline_plan(
+            &warm.0.read_cache,
+            &state,
+            &eligible,
+            &expensive
+        ));
+        eligible.filters = Some(serde_json::from_value(json!(["tag", "Eq", 0])).unwrap());
+        assert!(!inline_plan(
+            &warm.0.read_cache,
+            &state,
+            &eligible,
+            &warm.0.config
+        ));
         assert!(
             compiled.hits.load(Ordering::Relaxed) > 0,
             "exercise the real compiled branch"
         );
+        reactor_miss_never_rebuilds(
+            key.clone(),
+            crate::ann_dir::load(&store, &manifest.ann_tiers["vector"][0].dir, None)
+                .await
+                .unwrap(),
+        )
+        .await;
         // Large enough for the rejection marker in the general pool, far too small for the tier.
         let tiny = engine(&store, 256);
         for _ in 0..3 {
