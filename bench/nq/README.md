@@ -84,3 +84,23 @@ blowfish with `load.py --vectors-only`, which writes id and vector only, as Qdra
 
 macOS has no `taskset`, so run with `--cpus ""`: the server and the clients share every core. Measure peak RSS with
 `/usr/bin/time -l`. Run one engine at a time, and delete its data before starting the next.
+
+## Memory placement and first-pass latency
+
+`qdrant.py --vectors-on-disk` creates memory-mapped f16 vectors while leaving HNSW in RAM. Add
+`--hnsw-on-disk` to memory-map the graph too. Both switches default to false, preserving the RAM baseline.
+The loader prints the observed physical segment count after indexing; the optimizer's one-segment target
+does not guarantee that count.
+
+For latency immediately after a fresh blowfish process starts with empty application caches, run
+`measure.py DATA --tag first-pass --parts latency --first-pass`. This skips the warm-up and records
+`latency_ms.first_query` alongside the first pass's percentiles. Later queries in that pass progressively
+warm the caches. The OS page cache is retained unless the runner explicitly clears it; these are not
+independently cold queries. The option rejects other measurement parts, which could warm the process first.
+
+Cache capacity and process RSS are not total-memory limits. For a constrained comparison, put both engines
+under the same cgroup `memory.max`, disable swap with `--memory-swap` equal to Docker's `--memory`, and
+record `memory.peak`, process RSS, and `memory.events`. Keep engine data on the guest filesystem when using
+a Linux VM, and clear the guest page cache between fresh containers so prior containers' cached pages
+do not escape the next container's accounting. Report VM measurements separately from native macOS,
+and disclose host caching of the VM's backing disk: a guest cgroup limit does not cap that host cache.
