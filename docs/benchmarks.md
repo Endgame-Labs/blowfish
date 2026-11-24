@@ -8378,4 +8378,236 @@ throughput gate and is not approved for main. An index-only ID-band/local-filter
 pointing into the existing exact vector payload, is the next design round. Lowering probes to
 recover throughput is not an acceptable substitute: the earlier pilot lost neighbors.
 
-Additional filter selectivity controls and the final integrated-reader confirmation follow below.
+### Additional scalar-filter scope and CPU controls
+
+The follow-up pair uses main `d37a323` and D4 `6a0010b`, including Q3 and the independent
+predicate cache, with identical harnesses. Both arms use read-only storage, one-hour retention,
+a 3 GiB block cache, no disk cache, and 4,108,168,192 decoded bytes. The separate full NQ
+fixture adds a uint `bucket` attribute: one SplitMix64 step on the document ID, modulo 10,000.
+ID-prefix and distributed bucket predicates each select approximately 1%, 10%, and 50%.
+The pre-upgrade copy matches all 1,198 relative object keys and sizes, totaling 12,236,016,365
+bytes. After retirement and GC, the candidate totals 6,259,483,896 bytes: 5,976,532,469 fewer
+bytes (48.8%). These numbers describe this additional scalar-bearing fixture, rather than the
+original IDs-and-vectors fixture above.
+
+Each predicate uses 64 distinct query vectors and exhaustive filtered truth computed from the
+stored f16 vectors. Two 48-probe passes reverse arm and predicate order; each includes four
+cache-cold queries, 64 serial warm queries, and 64 queries at concurrency 16. The four-sample
+cold percentile and short concurrent throughput are noisy; use the long CPU controls below for
+the selective-filter conclusion. Separate 64-probe quality passes cover all 64 vectors.
+
+| Predicate | Matching rows | Arm | Cold p50 / p90 (ms; four samples) | Warm p50 / p90 (ms) | 16-client q/s | Recall@10, 48 / 64 |
+|---|---:|---|---|---|---:|---|
+| id-1 | 26,815 | baseline | 1784.23–2159.32 / 2137.38–2518.05 | 9.31–12.40 / 14.87–14.94 | 184.50–1010.26 | 1.000000 / 1.0 |
+| id-1 | 26,815 | candidate | 2180.47–2420.16 / 2318.44–3373.89 | 14.06–14.22 / 15.04–15.21 | 107.50–107.56 | 1.000000 / 1.0 |
+| id-10 | 268,147 | baseline | 1834.72–2046.15 / 2288.59–2542.87 | 9.46–12.44 / 17.30–19.66 | 768.13–798.36 | 1.000000 / 1.0 |
+| id-10 | 268,147 | candidate | 2247.79–2322.96 / 2435.99–2599.06 | 9.52–11.43 / 11.18–13.77 | 232.70–233.51 | 1.000000 / 1.0 |
+| id-50 | 1,340,734 | baseline | 2326.74–2608.64 / 2635.11–2646.20 | 11.19–13.21 / 13.70–15.73 | 543.08–545.25 | 0.960938 / 0.9671875 |
+| id-50 | 1,340,734 | candidate | 2623.91–2714.92 / 2759.13–3233.73 | 10.29–14.19 / 13.51–20.84 | 761.67–763.90 | 0.965625 / 0.975 |
+| bucket-1 | 26,735 | baseline | 1067.38–1150.04 / 1071.93–1981.17 | 7.95–9.08 / 9.07–12.35 | 460.85–473.28 | 0.935937 / 0.965625 |
+| bucket-1 | 26,735 | candidate | 1226.65–1464.85 / 1319.91–1469.18 | 14.69–14.85 / 15.97–16.19 | 105.45–105.67 | 1.000000 / 1.0 |
+| bucket-10 | 266,924 | baseline | 1256.30–1284.77 / 1292.18–1386.42 | 8.80–8.89 / 10.68–10.69 | 504.64–509.21 | 0.960938 / 0.9671875 |
+| bucket-10 | 266,924 | candidate | 1446.49–1531.17 / 1557.49–1638.80 | 8.73–9.56 / 10.16–11.08 | 218.24–220.55 | 1.000000 / 1.0 |
+| bucket-50 | 1,339,910 | baseline | 1508.04–1601.60 / 1610.59–1614.58 | 9.81–9.95 / 11.16–12.73 | 470.55–480.12 | 0.945312 / 0.95625 |
+| bucket-50 | 1,339,910 | candidate | 1338.21–1404.85 / 1367.48–2149.90 | 10.00–10.79 / 11.85–14.33 | 622.76–750.93 | 0.964063 / 0.9734375 |
+
+All same-arm rows repeat exactly. The original ID-prefix fixture retains identical results, but
+the broader scalar fixture does not: at 48 probes, ordered row objects match across arms for
+64/64 queries at ID 1% and 10%, 44/64 at ID 50%, and 41/64, 47/64, and 42/64 for bucket
+1%, 10%, and 50%, respectively. Tier geometry and the uncapped selectivity budget improve
+aggregate recall on distributed predicates. Those unequal-recall q/s values are not an
+iso-recall comparison. They still establish that the cached 1% and 10% throughput regression
+is broader than ID-local predicates; 50% predicates improve.
+
+For longer controls, cycle those 64 vectors through 2,000 prewarm requests, 1,000 serial
+requests, and 2,000 concurrent requests. Enable `perf stat` only after prewarm and count
+instructions, cycles, and task-clock over all 3,000 measured requests:
+
+| Predicate | Arm | 16-client q/s | Instructions/query (M) | CPU/query (ms) | Concurrent planned rows/query | Concurrent execution (ms) |
+|---|---|---:|---:|---:|---:|---:|
+| ID 10% | main | 806.65 | 58.05 | 9.58 | 217,823 | 17.11 |
+| ID 10% | D4 | 231.33 | 168.15 | 33.25 | 1,145,653 | 67.55 |
+| Bucket 10% | main | 519.72 | 81.37 | 16.48 | 294,836 | 29.74 |
+| Bucket 10% | D4 | 221.13 | 172.48 | 34.81 | 1,150,964 | 71.25 |
+
+Each concurrent phase performs 2,000 snapshot HEADs and no search backend reads. Mean
+snapshot HEAD latency is 10.93/11.04 ms for main/D4 on ID 10%, and 10.27/10.96 ms on
+bucket 10%. The selective-filter gap therefore includes additional local query CPU and
+candidate work, unlike the earlier unfiltered checkpoint-noise control. ID 10% has identical
+recall; bucket 10% also buys higher recall. Format 5 remains held.
+
+Fixture preparation is excluded from timing. An attempted retirement with a pending WAL and
+a one-byte segment cap created tiny orphan objects; the harness now rejects that state.
+A separate `flush` action checkpoints the overlay without compaction before `index` retires
+already flushed segments. GC removed the failed preparation's objects before the successful
+copy. S3 copying uses `--copy-props none`, because the measurement role does not grant
+GetObjectTagging. These preparation failures are not query observations.
+
+## Round BW2: shadow statistics from indexed postings
+
+At 1,000 text-changing upserts/s, paired BM25 p50 falls **49.011 → 29.734 ms**
+(**1.65×**). All 4,000 frozen queries retain exact score bits, write-service p90
+increases 2.62%, every offered write is acknowledged, and idle latency holds.
+
+The first reproduction on the BW2 host gives **49.493/69.522 ms p50/p90** under
+1,000 text-changing upserts/s, with all 120,000 offered rows acknowledged. Shadow
+correction remains the largest component: **22.378/29.261 ms**, against
+14.379/18.592 ms for tail-statistics analysis, and 17.118/33.163 ms of summed
+segment scoring and hydration. Checkpoint-statistics lookup is 0.085/0.130 ms.
+These are the 90 measured requests in the first baseline run. Nested statistics
+and overlapping segment-worker durations are not additive. BW1's historical
+56.884 ms median is context; the comparisons below use fresh, paired BW2 runs.
+
+### Implementation
+
+The correction reads exact normalization lengths from each text index and counts
+query-term postings inside the bitmap of indexed rows replaced or deleted by the
+WAL. It first intersects that bitmap with the published live mask, preventing a
+second subtraction of rows already absent from checkpoint statistics. Length
+zero denotes a missing/null field; present empty fields, including text emptied
+by stopword removal, already have length one. No document-column read is needed
+to distinguish them.
+
+`SegmentReader::document_frequencies` counts exact terms in input order, including
+repetitions and absent terms. It reads intersecting posting blocks in batches,
+uses the smaller of the selected-row set and posting list within each block,
+and takes counts directly from metadata for full masks or gap-free blocks.
+Positions remain lazy. Existing posting and dictionary caches retain their
+existing limits.
+
+The same snapshot-local bitmap excludes shadowed hits during segment search.
+It travels through the query's read context to its search workers, and leaves
+scope with that query. It is never cached across snapshots. Idle queries retain
+the existing checkpoint-statistics path. WAL term summaries still use BW1's
+bounded cache; shadow-document summaries are removed. Commits perform no new
+analysis or index maintenance. No dependency, wire response, or persistent
+format changes.
+
+### Paired protocol
+
+One owned, on-demand c7g.4xlarge in us-west-2, Ubuntu 24.04 arm64, Rust 1.100.0,
+and Clang 19. Both timed release binaries use the same build settings. Server
+CPUs are 0–5, client CPUs are 6–7, the block cache is 2 GiB, and disk caching is
+disabled. Decoded-cache and indexing settings retain their defaults.
+
+The store contains the first million passages from the same MS MARCO stream
+as BW1. Its initial six segments contain 125,000, 200,000, 175,000, 200,000,
+200,000, and 100,000 rows. Loading drains the exhaustive tail to zero before
+copying the checkpoint. Each arm starts from an identical disposable copy.
+Every HTTP run prewarms all 1,000 queries, then runs for 120 seconds. Query
+percentiles exclude the first 30 seconds; write-service percentiles cover all
+1,200 requests in each write-loaded arm. The query and write seeds, text-changing
+100-row batches, strong consistency, top ten, and IDs-only projection are BW1's settings.
+Queries run at one Hz, and writes at 1,000 rows/s. Write-loaded arms run A/B/B/A;
+idle controls run separately in A/B/B/A order. Builds and independent reference
+generation finish before candidate timing. The first write-loaded pair enables
+stage traces; the second disables them.
+
+Baseline source is `aba5c96`; candidate source is `a8b9201`. Executable SHA-256:
+
+- Baseline: `d871681449ef2a48b6f15e8ac64ed87f4fca205b5c564a85b226b2866b59b983`.
+- Candidate: `31ef5e3eede0aebbf3462617b3ea74e8b2993cc0c1b0036ce57ce75620b8e102`.
+
+The million-row corpus JSONL SHA-256 is
+`c9d3f3493900d156cf1cfaf514a81a8cbea6e1f02a266bc8ce73165148ce42d6`;
+the checked-in workload SHA-256 is
+`3c8f1b03e4d8293ec9c45f53e8d1f94bfe4bd5cbb23d1e31623df655baf9f472`.
+
+### Stage confirmation
+
+The traced first pair contains the same 90 measured query IDs, in the same order.
+Per-request stage percentiles are:
+
+| Component | Baseline p50 / p90 ms | Candidate p50 / p90 ms |
+| --- | ---: | ---: |
+| Global statistics | 36.836 / 48.103 | 19.301 / 25.901 |
+| Checkpoint statistics, inside global statistics | 0.085 / 0.130 | 0.071 / 0.121 |
+| Shadow statistics, inside global statistics | 22.378 / 29.261 | 6.340 / 10.387 |
+| Tail-statistics analysis, inside global statistics | 14.379 / 18.592 | 13.077 / 16.846 |
+| Segment scoring and hydration, summed worker elapsed time | 17.118 / 33.163 | 11.097 / 24.749 |
+| Tail analysis or summary lookup for scoring | 1.272 / 2.256 | 1.181 / 2.073 |
+| Tail scoring | 3.372 / 6.544 | 2.332 / 5.027 |
+| Final merge | 0.022 / 0.024 | 0.021 / 0.023 |
+
+Shadow correction falls **71.7% at p50**. Reusing its bitmap also removes repeated
+ID lookups from segment search. Tail-statistics analysis is now the largest
+statistics component. The measured tail medians in this pair are 3,046.5 and
+2,945 rows. Nested and overlapping durations remain non-additive; these figures
+include the actual publication and cache behavior of each arm.
+
+### Exactness and checks
+
+BW1's serialized-snapshot checker passes all **4,000 queries**, including all
+**40,000 ordered IDs and f32 score bits**, against the independently compiled
+exhaustive `exact_bm25` executable. The four retained states cover the fully
+indexed million passages, 5,000 overwrites, overlapping updates plus deletes and
+nulls, and the next index publication. Old snapshots remain queryable after the
+later publication. Reference generation and checking take 155.57 seconds,
+outside all candidate timing.
+
+Formatting, scoped Clippy with warnings denied, and
+`cargo test -p bf-engine -p bf-text` pass: **252 tests, zero failures, and 15 expected ignored tests**.
+New coverage checks raw document presence against masked frequencies, sparse
+and dense masks, repeated and absent terms, missing and empty fields, lazy reads,
+packed tails, and text formats 4–7. An engine test removes the document-column
+files after computing its reference, clears storage caches, and verifies exact IDs-only BM25 with zero
+and positive decoded-cache budgets. Existing tests retain coverage of arrays,
+prefixes, filters, computed scores, changed analysis settings, and publications.
+The local and EC2 changed-source hashes match.
+
+The frozen checker uses the same `BW1_STORE` and `BW1_REFERENCE` variables as the
+previous round. Its independent reference executable SHA-256 is
+`b3b1bf4d1cb659bc5b35ba4017a723957dbfd7488543ddc98aebc7731f85bfad`.
+ARM test linking uses Clang 22, LLD 19, and LLVM 22 compiler builtins; both timed
+HTTP binaries use Clang 19's normal linker.
+
+### Write-loaded result
+
+All four arms execute the same **90 measured queries**. Their ordered query-index
+list has SHA-256
+`d7c5fdacd887c880c0e518841ac904d3a4b77dc83379b18122ce8e2f9143ed59`.
+
+| Arm | BM25 p50 / p90 ms | Write-service p50 / p90 ms | Tail median / maximum | Acknowledged / offered rows |
+| --- | ---: | ---: | ---: | ---: |
+| A1, baseline, traced | 49.493 / 69.522 | 1.241 / 1.796 | 3,046.5 / 5,686 | 120,000 / 120,000 |
+| B1, candidate, traced | 30.125 / 41.286 | 1.284 / 1.863 | 2,945 / 5,685 | 120,000 / 120,000 |
+| B2, candidate | 29.342 / 40.220 | 1.296 / 1.862 | 2,945.5 / 5,589 | 120,000 / 120,000 |
+| A2, baseline | 48.530 / 70.535 | 1.278 / 1.834 | 2,894.5 / 5,880 | 120,000 / 120,000 |
+
+Medians of the two run percentiles are **49.011/70.029 → 29.734/40.753 ms**:
+**1.65× faster p50, and 1.72× faster p90**. Both candidate repetitions beat
+44 ms p50. Median write-service p50/p90 changes from **1.260/1.815** to
+**1.290/1.862 ms**, increases of **2.43%/2.62%**, within the 5% p90 allowance.
+Every arm acknowledges every offered row, with zero rejections: **480,000 of
+480,000** in total. This establishes parity at the offered rate; maximum write
+capacity is not measured.
+
+### Idle control and reproduction
+
+All idle arms use the same query schedule, initial checkpoint, prewarm, and
+90-query measured slice as the write-loaded arms. Every query has zero exhaustive
+tail rows.
+
+| Arm | BM25 p50 / p90 ms |
+| --- | ---: |
+| A1, baseline | 2.501 / 4.441 |
+| B1, candidate | 2.451 / 4.344 |
+| B2, candidate | 2.377 / 4.139 |
+| A2, baseline | 2.496 / 4.171 |
+
+Median run percentiles are **2.498/4.306 → 2.414/4.242 ms**. Idle BM25 does not
+regress on this control. Together with the frozen exactness check, acknowledged
+writes, and write-service allowance, the paired runs pass all BW2 gates.
+
+Use BW1's reproduction command with the sources above, an owned scratch directory,
+`--bm25-hz 1`, `--seconds 120`, `--warmup 30`, and a fresh fully checkpointed store
+copy per arm. Use `--rate 1000` for write-loaded arms and `--rate 0` for idle.
+Both source builds, reference generation, and frozen checking must finish before
+timing. This round measures a warm local store; cold S3, broader ANN, small-memory,
+full-workspace, and official-SDK integration remain coordinator validation.
+
+The owned c7g.4xlarge ran for **0.93 hours**. Estimated cost is **about $0.56**,
+including compute at BW1's $0.58/hour rate and the 120 GiB gp3 root volume.
+The instance is terminated; its root volume, tagged key pair, and security group
+are confirmed absent. No S3 objects or prefixes were created. Owned scratch
+artifacts were removed after retaining these results.

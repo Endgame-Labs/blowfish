@@ -769,7 +769,14 @@ pub(crate) async fn allowed_with(
         segment::live(store, seg).await?
     };
     if unshadow && !state.shadowed.is_empty() {
-        live -= segment::lookup_many(store, seg, &state.shadowed).await?;
+        let prepared = crate::read_cache::context()
+            .and_then(|context| context.text_shadowed)
+            .and_then(|masks| masks.get(&seg.id).cloned());
+        if let Some(rows) = prepared {
+            live -= rows;
+        } else {
+            live -= segment::lookup_many(store, seg, &state.shadowed).await?;
+        }
     }
     Ok(live)
 }

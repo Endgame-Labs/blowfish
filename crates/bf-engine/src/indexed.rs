@@ -159,16 +159,24 @@ pub(crate) async fn execute(
                         .await
                     } else {
                         let mut prepared = state.clone();
-                        prepared.corpus = statistics.await?;
-                        prepare(
+                        let stats = statistics.await?;
+                        prepared.corpus = stats.corpus;
+                        let work = prepare(
                             store,
                             &prepared,
                             q,
                             config,
                             force_exact,
                             request.queries.is_none(),
-                        )
-                        .await
+                        );
+                        if stats.shadowed.is_some()
+                            && let Some(mut context) = crate::read_cache::context()
+                        {
+                            context.text_shadowed = stats.shadowed;
+                            crate::read_cache::scope(context, work).await
+                        } else {
+                            work.await
+                        }
                     }
                 }
             }),
@@ -183,7 +191,7 @@ pub(crate) async fn execute(
         }
     }
     if !clauses.is_empty() {
-        candidates.corpus = statistics.await?;
+        candidates.corpus = statistics.await?.corpus;
     }
     let started = std::time::Instant::now();
     let result = query::execute(&candidates, request);

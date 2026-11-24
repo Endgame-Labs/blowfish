@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **BM25 under heavy writes another 1.65x faster** (round BW2; `docs/benchmarks.md`, "Round BW2"). Correcting
+  corpus statistics for indexed rows that the WAL tail replaced or deleted was the largest remaining stage. It
+  now reads indexed lengths and the exact masked postings of the query's own terms, and reuses the snapshot's
+  shadow bitmap when masking hits. On 1M MS MARCO with 1,000 text-changing upserts/s: p50/p90 49.0/70.0 to
+  29.7/40.8 ms (the shadow stage 22.4 to 6.3 ms p50), bit-identical on all 4,000 validation queries, write p90
+  +2.6%, idle BM25 unchanged. No format change.
+
 - **Warm queries stay compiled after compaction, and a core is kept for completions** (round Q3; `docs/benchmarks.md`,
   "Round Q3"). After a compaction that fully covered a recluster tier's segments, the tier's live mask came back as
   "everything" instead of none, which silently sent warm queries off the compiled fast path. Fixed, with a regression
