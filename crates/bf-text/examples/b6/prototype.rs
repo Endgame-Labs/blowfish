@@ -300,6 +300,7 @@ impl Ta {
 pub(super) struct Bands {
     pub(super) terms: BTreeMap<u64, Vec<Vec<u64>>>,
     pub(super) ceilings: Vec<f64>,
+    pub(super) bitwise: bool,
     pub(super) skipped_rows: AtomicUsize,
     pub(super) skipped_windows: AtomicUsize,
 }
@@ -342,6 +343,7 @@ impl Bands {
         Self {
             terms,
             ceilings,
+            bitwise: false,
             skipped_rows: AtomicUsize::new(0),
             skipped_windows: AtomicUsize::new(0),
         }
@@ -504,11 +506,15 @@ pub fn run() {
     if mode == "footprint" {
         return;
     }
-    let bands: Vec<_> = if mode.starts_with("bands") {
-        let count = if mode == "bands4" { 4 } else { 8 };
+    let bands: Vec<_> = if mode.starts_with("bands") || mode.starts_with("bitbands") {
+        let count = if mode.ends_with("4") { 4 } else { 8 };
         readers
             .iter()
-            .map(|r| Bands::build(r, &stats, &params, count))
+            .map(|r| {
+                let mut b = Bands::build(r, &stats, &params, count);
+                b.bitwise = mode.starts_with("bitbands");
+                b
+            })
             .collect()
     } else {
         Vec::new()
@@ -649,8 +655,9 @@ mod tests {
                 .flat_map(|q| q.exact_terms().into_keys().map(str::to_owned))
                 .collect();
             let mut ta = Ta::build(&reader, &stats, &params, &wanted);
-            for count in [4, 8] {
-                let bands = Bands::build(&reader, &stats, &params, count);
+            for (count, bitwise) in [(4, false), (8, false), (4, true), (8, true)] {
+                let mut bands = Bands::build(&reader, &stats, &params, count);
+                bands.bitwise = bitwise;
                 for query in &queries {
                     let mut expected: Vec<_> = documents
                         .iter()
@@ -687,6 +694,41 @@ mod tests {
                     assert!(bands.skipped_rows.load(AtomicOrdering::Relaxed) > 0);
                 }
             }
+        }
+    }
+}
+
+pub(super) type BandChoices = [(f64, [u64; 2]); 9];
+#[allow(clippy::too_many_arguments)]
+pub(super) fn combine_bands(
+    choices: &[BandChoices],
+    suffix: &[f64],
+    count: usize,
+    score: f64,
+    mask: [u64; 2],
+    target: f64,
+    out: &mut [u64; 2],
+) {
+    if score + suffix[0] < target {
+        return;
+    }
+    if score >= target || choices.is_empty() {
+        out[0] |= mask[0];
+        out[1] |= mask[1];
+        return;
+    }
+    for &(value, bits) in &choices[0][..=count] {
+        let next = [mask[0] & bits[0], mask[1] & bits[1]];
+        if next != [0; 2] {
+            combine_bands(
+                &choices[1..],
+                &suffix[1..],
+                count,
+                score + value,
+                next,
+                target,
+                out,
+            );
         }
     }
 }

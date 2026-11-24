@@ -13,7 +13,7 @@ Keep all fixtures and outputs in an owned `.scratch/` directory, and remove them
 when the run finishes.
 
 Build `cargo build --release -p bf-text --example b6`. Run
-`b6 FIXTURES baseline|ta|bands4|bands8|footprint`. Every measured mode first
+`b6 FIXTURES baseline|ta|bands4|bands8|bitbands4|bitbands8|footprint`. Every measured mode first
 checks the production reader against exhaustive truth, warms one full workload,
 and measures the next pass. Ordered rows and every f32 score bit must agree.
 The workload uses consecutive passage IDs, checked against exhaustive truth.
@@ -31,7 +31,10 @@ Bitmap modes build four or eight disjoint upward-rounded saturation bands for
 the namespace's 32 most frequent terms. During window selection, they combine
 frequent-term row bounds with other dense-term window bounds and exact sparse
 partials. Empty windows are removed before posting prefetch; surviving rows keep
-the normal scorer. There is no query-truth seed floor. Normalization-specific
+the normal scorer. `bitbands4` and `bitbands8` combine the disjoint
+band masks directly, pruning recursive intersections with suffix score bounds.
+Those modes use the window maximum of sparse partials, a looser bound that
+avoids per-row bound accumulation. There is no query-truth seed floor. Normalization-specific
 impact order, maxima, and bands are prepared outside counters, so this is an
 optimistic warm-cache experiment, without lifecycle or cold-I/O claims.
 

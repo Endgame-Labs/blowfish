@@ -245,6 +245,18 @@ impl SegmentReader {
             .enumerate()
             .filter_map(|(t, handle)| bands.terms.get(handle).map(|b| (t, b)))
             .collect();
+        let band_scores: Vec<Vec<f64>> = band_terms
+            .iter()
+            .map(|(t, _)| {
+                bands
+                    .ceilings
+                    .iter()
+                    .map(|&s| f64::from(terms[*t].weight.score_saturation(s)))
+                    .collect()
+            })
+            .collect();
+        let mut choices = vec![[(0.0, [0u64; 2]); 9]; band_terms.len()];
+        let mut suffix = vec![0.0; band_terms.len() + 1];
         let mut band_masks = vec![[u64::MAX; 2]; windows];
         let mut band_rows = 0usize;
         let mut band_windows = 0usize;
@@ -289,26 +301,65 @@ impl SegmentReader {
                             other += term.bound(window, &saturation);
                         }
                     }
-                    let mut upper = [other; BLOCK];
-                    for &(t, term_bands) in &band_terms {
-                        let term = &terms[t];
-                        for (b, bitmap) in term_bands.iter().enumerate() {
-                            let score = f64::from(term.weight.score_saturation(bands.ceilings[b]));
-                            for lane in 0..2 {
-                                let mut mask = bitmap[window * 2 + lane];
-                                while mask != 0 {
-                                    let bit = mask.trailing_zeros() as usize;
-                                    upper[lane * 64 + bit] += score;
-                                    mask &= mask - 1;
+                    let mut masks = [0u64; 2];
+                    if bands.bitwise {
+                        let count = bands.ceilings.len();
+                        for (bt, &(_, term_bands)) in band_terms.iter().enumerate() {
+                            let mut absent = [u64::MAX; 2];
+                            let mut maximum = 0.0f64;
+                            for b in 0..count {
+                                let mask =
+                                    [term_bands[b][window * 2], term_bands[b][window * 2 + 1]];
+                                choices[bt][b] = (band_scores[bt][b], mask);
+                                absent[0] &= !mask[0];
+                                absent[1] &= !mask[1];
+                                if mask != [0; 2] {
+                                    maximum = maximum.max(band_scores[bt][b]);
+                                }
+                            }
+                            choices[bt][count] = (0.0, absent);
+                            suffix[bt] = maximum;
+                        }
+                        for t in (0..band_terms.len()).rev() {
+                            suffix[t] += suffix[t + 1];
+                        }
+                        let sparse = row_bounds
+                            .get(start as usize..end as usize)
+                            .map_or(0.0, |r| r.iter().copied().fold(0.0, f32::max));
+                        // Division is rounded downward conservatively; the existing
+                        // margin is larger than its one-ulp uncertainty.
+                        let target =
+                            floor / margin - other - f64::from(sparse) - floor * f64::EPSILON * 8.0;
+                        experiment::combine_bands(
+                            &choices,
+                            &suffix,
+                            count,
+                            0.0,
+                            [u64::MAX; 2],
+                            target,
+                            &mut masks,
+                        );
+                    } else {
+                        let mut upper = [other; BLOCK];
+                        for (bt, &(_, term_bands)) in band_terms.iter().enumerate() {
+                            for (b, bitmap) in term_bands.iter().enumerate() {
+                                let score = band_scores[bt][b];
+                                for lane in 0..2 {
+                                    let mut mask = bitmap[window * 2 + lane];
+                                    while mask != 0 {
+                                        let bit = mask.trailing_zeros() as usize;
+                                        upper[lane * 64 + bit] += score;
+                                        mask &= mask - 1;
+                                    }
                                 }
                             }
                         }
-                    }
-                    let mut masks = [0u64; 2];
-                    for (i, &upper) in upper.iter().enumerate().take((end - start) as usize) {
-                        let sparse = row_bounds.get(start as usize + i).copied().unwrap_or(0.0);
-                        if (upper + f64::from(sparse)) * margin >= floor {
-                            masks[i / 64] |= 1 << (i % 64);
+
+                        for (i, &upper) in upper.iter().enumerate().take((end - start) as usize) {
+                            let sparse = row_bounds.get(start as usize + i).copied().unwrap_or(0.0);
+                            if (upper + f64::from(sparse)) * margin >= floor {
+                                masks[i / 64] |= 1 << (i % 64);
+                            }
                         }
                     }
                     band_rows += (end - start) as usize
