@@ -1,5 +1,5 @@
 //! Reproduce filtered ANN recall, stage profiles, and warm CPU measurements on a frozen NQ fixture.
-//! Usage: filtered_bench STORAGE_JSON MODE OUTPUT [WORKLOAD_JSON] [QUERY_INDEX].
+//! Usage: filtered_bench STORAGE_JSON MODE OUTPUT [WORKLOAD_JSON].
 //! Modes: flush, recluster, quality, profile (prewarm, then trace), and warm.
 //! Warm cycles the supplied queries through 2,000 prewarm, 1,000 serial, and 2,000 16-client calls.
 //! perf stat FIFO control excludes startup and prewarm (BF_FILTER_BENCH_PERF_CONTROL and _ACK).
@@ -67,8 +67,8 @@ impl Diagnostics {
 // perf stat --delay=-1 --control=fifo:CONTROL,ACK can exclude startup and warm-up.
 // An acknowledgement ensures counters change before crossing the phase boundary.
 fn counters(command: &str) -> Result<(), Box<dyn Error>> {
-    if let Ok(path) = std::env::var("BF_filtered ANN_PERF_CONTROL") {
-        let ack = std::env::var("BF_filtered ANN_PERF_ACK")?;
+    if let Ok(path) = std::env::var("BF_FILTER_BENCH_PERF_CONTROL") {
+        let ack = std::env::var("BF_FILTER_BENCH_PERF_ACK")?;
         let mut control = std::fs::OpenOptions::new().write(true).open(path)?;
         let mut ack = std::io::BufReader::new(std::fs::File::open(ack)?);
         writeln!(control, "{command}")?;

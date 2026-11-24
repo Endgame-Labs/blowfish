@@ -905,11 +905,10 @@ impl<R: RangeRead> Index<R> {
                 let scan_cut = if cosine && q_zero { &open } else { &cut };
                 selected.clear();
                 if let Some(filter) = sparse_filter {
-                    selected.extend(
-                        ids.iter()
-                            .enumerate()
-                            .filter_map(|(ordinal, row)| filter.contains(*row).then_some(ordinal)),
-                    );
+                    // Merge the sorted row sets once. Testing every cluster row against
+                    // the sparse mask repeats a binary search for mostly excluded rows.
+                    let allowed = &c.rows & filter;
+                    selected.extend(allowed.iter().map(|row| (c.rows.rank(row) - 1) as usize));
                 }
                 if sparse_filter.is_some() && selected.len().saturating_mul(16) <= n {
                     skipped_codes += n - selected.len();
