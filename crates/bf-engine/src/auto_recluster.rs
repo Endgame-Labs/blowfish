@@ -241,7 +241,9 @@ pub(crate) fn decide(
         if bulk && why != "upgrade" {
             return (Decision::Wait("bulk_load"), Some(l));
         }
-        if compacting {
+        // The first tier protects its sources before yielding. Lineage lets those sources
+        // compact after installation, so rebuilding their segment indexes first only delays it.
+        if compacting && tiered.is_some() {
             return (Decision::Wait("compaction"), Some(l));
         }
         return (Decision::Build(attr, why), Some(l));
@@ -818,7 +820,7 @@ impl Engine {
             return;
         };
         let protected = self.0.jobs.protected(ns);
-        let (generation, decision, numbers) = {
+        let (generation, decision, numbers, preparing) = {
             let state = handle.state.lock().await;
             if !state.exists || state.manifest_seq == 0 || state.root_only {
                 return;
@@ -850,7 +852,12 @@ impl Engine {
                     compacting,
                 ),
             };
-            (state.manifest_seq, decision, numbers)
+            let preparing = if matches!(&decision, Decision::Build(_, "base")) {
+                state.segments.iter().map(|s| s.id.clone()).collect()
+            } else {
+                BTreeSet::new()
+            };
+            (state.manifest_seq, decision, numbers, preparing)
         };
         if !self.0.jobs.evaluate(ns, generation) {
             return;
@@ -880,8 +887,26 @@ impl Engine {
             return;
         }
         let (engine, ns) = (self.clone(), ns.to_string());
+        // A first base starts ahead of remaining compaction. Protect its snapshot before
+        // spawning, including the manifest and lease reads that precede start_job.
+        let preparing = if preparing.is_empty() {
+            None
+        } else {
+            engine
+                .0
+                .jobs
+                .lock()
+                .building
+                .insert((ns.clone(), kind), preparing);
+            let (inner, key) = (engine.0.clone(), (ns.clone(), kind));
+            Some(scopeguard(move || {
+                inner.jobs.lock().building.remove(&key);
+            }))
+        };
         tokio::spawn(async move {
             let _running = Running(vec![kind]);
+            // Drop preparation before releasing the build slot, on every exit.
+            let _preparing = preparing;
             tracing::info!(
                 namespace = ns.as_str(),
                 attribute = attr.as_str(),
@@ -1059,15 +1084,24 @@ impl Engine {
         };
         let body = serde_json::to_vec(&record).map_err(crate::segment::index_error)?;
         let store = self.0.store.clone();
-        store
-            .create(&record_key(ns, &id, 0), body.clone())
-            .await
-            .map_err(storage_error)?;
+        // Protection precedes the first await: the next index pass must not start a merge
+        // while the initial build record is being written. Job's drop also clears it when
+        // that write fails, hangs and is cancelled, or is interrupted by shutdown.
+        let mut job = Job {
+            id,
+            slab_prefix,
+            record: None,
+            jobs: Some((self.0.clone(), ns.to_string(), kind)),
+        };
         self.0.jobs.lock().building.insert(
             (ns.to_string(), kind),
             segments.iter().map(|s| s.id.clone()).collect(),
         );
-        let (key_ns, key_id) = (ns.to_string(), id.clone());
+        store
+            .create(&record_key(ns, &job.id, 0), body.clone())
+            .await
+            .map_err(storage_error)?;
+        let (key_ns, key_id) = (ns.to_string(), job.id.clone());
         let refresh = tokio::spawn(async move {
             let mut n = 0u64;
             loop {
@@ -1081,12 +1115,8 @@ impl Engine {
                 }
             }
         });
-        Ok(Job {
-            id,
-            slab_prefix,
-            record: Some(refresh),
-            jobs: Some((self.0.clone(), ns.to_string(), kind)),
-        })
+        job.record = Some(refresh);
+        Ok(job)
     }
 
     /// The foreground form of the job (see [`Engine::recluster`]).
@@ -1320,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn a_loaded_namespace_gets_a_base_once_compaction_and_the_load_settle() {
+    fn a_loaded_namespace_gets_its_first_base_ahead_of_remaining_compaction() {
         let none = Default::default();
         let loaded: Vec<_> = (0..25)
             .map(|i| segment(&format!("s{i}"), 100_000))
@@ -1332,7 +1362,7 @@ mod tests {
         assert!((gain - 2.6 * 316.0 / 200.0).abs() < 0.2, "{gain}");
         assert_eq!(
             decide(&loaded, &none, &[], None, false, true).0,
-            Decision::Wait("compaction")
+            Decision::Build("v".into(), "base")
         );
         // No base yet: an active load still waits, rather than building throwaway tiers.
         assert_eq!(

@@ -583,6 +583,45 @@ async fn a_delta_whose_rows_are_all_deleted_leaves_the_joint_plan_to_the_base() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_protects_its_sources_before_its_first_record_and_releases_them_on_cancel() {
+    let (faults, store, _) = setup().await;
+    // The fixture has three segments; make two sufficient for a merge so that this
+    // exercises protection rather than the normal four-segment compaction threshold.
+    let engine = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            retention: Duration::ZERO,
+            compaction_segments: 2,
+            ..Default::default()
+        },
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let wal = bf_wal::Wal::new(store.clone(), "t").unwrap();
+    let (_, before) = wal.latest_manifest().await.unwrap().unwrap();
+    let source_ids =
+        |m: &bf_wal::Manifest| m.segments.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+    let _open = faults.gate("/indexer/build-");
+    let build = tokio::spawn({
+        let (engine, opts) = (engine.clone(), options(scratch.path()));
+        async move { engine.recluster("t", &opts).await }
+    });
+    faults.gated().await;
+    engine.index_namespace("t", true).await.unwrap();
+    let (_, protected) = wal.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(source_ids(&protected), source_ids(&before));
+    build.abort();
+    assert!(build.await.unwrap_err().is_cancelled());
+    // Cancellation releases source protection even before any spill or slab exists.
+    engine.index_namespace("t", true).await.unwrap();
+    let (_, compacted) = wal.latest_manifest().await.unwrap().unwrap();
+    assert!(compacted.segments.len() < before.segments.len());
+    assert_eq!(top(&engine, 1234).await, json!(1234));
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_a_build_removes_its_spill() {
     let (faults, _, engine) = setup().await;
     let scratch = tempfile::tempdir().unwrap();
