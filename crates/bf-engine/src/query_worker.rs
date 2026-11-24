@@ -9,6 +9,31 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+thread_local! {
+    static IO_RUNTIME: std::cell::RefCell<Option<tokio::runtime::Handle>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run an independent single-thread HTTP reactor, retaining a shared runtime for I/O
+/// continuations. The future must occupy this thread for its entire lifetime.
+pub async fn on_query_reactor<F: Future>(runtime: tokio::runtime::Handle, future: F) -> F::Output {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            IO_RUNTIME.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    );
+    IO_RUNTIME.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(runtime);
+    });
+    let _reset = Reset;
+    future.await
+}
+
 enum Work<F: Future> {
     Ready(F::Output),
     Yielded(Pin<Box<F>>),
@@ -23,6 +48,18 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    if let Some(runtime) = IO_RUNTIME.with(|slot| slot.borrow().clone()) {
+        let mut future = Box::pin(future);
+        let work = catch_unwind(AssertUnwindSafe(|| {
+            let mut context = Context::from_waker(futures::task::noop_waker_ref());
+            future.as_mut().poll(&mut context)
+        }));
+        return match work {
+            Ok(Poll::Ready(value)) => Ok(value),
+            Ok(Poll::Pending) => run_io(runtime, future).await,
+            Err(_) => Err(ApiError::new(500, "query worker panicked")),
+        };
+    }
     static WORKERS: OnceLock<rayon::ThreadPool> = OnceLock::new();
     let pool = WORKERS.get_or_init(|| {
         let cpus = std::thread::available_parallelism().map_or(1, usize::from);
@@ -81,6 +118,9 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    let runtime = IO_RUNTIME
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or(runtime);
     tokio::task::spawn_blocking(move || runtime.block_on(future))
         .await
         .map_err(crate::segment::index_error)
@@ -94,6 +134,64 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     tokio::task_local! { static VALUE: usize; }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_reactor_polls_inline_and_preserves_a_yielded_plan() {
+        let io = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(on_query_reactor(io, async {
+                    let thread = std::thread::current().id();
+                    assert_eq!(
+                        run(async move { std::thread::current().id() })
+                            .await
+                            .unwrap(),
+                        thread
+                    );
+                    let polls = Arc::new(AtomicUsize::new(0));
+                    let seen = polls.clone();
+                    let result = run(VALUE.scope(
+                        29,
+                        std::future::poll_fn(move |_| {
+                            assert_eq!(VALUE.get(), 29);
+                            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                                assert_eq!(std::thread::current().id(), thread);
+                                Poll::Pending
+                            } else {
+                                assert_ne!(std::thread::current().id(), thread);
+                                Poll::Ready(42)
+                            }
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+                    assert_eq!(result, 42);
+                    assert_eq!(polls.load(Ordering::SeqCst), 2);
+                    assert_eq!(
+                        run(async { panic!("reactor panic") })
+                            .await
+                            .unwrap_err()
+                            .status,
+                        500
+                    );
+                    assert_eq!(run(async { 7 }).await.unwrap(), 7);
+                    assert_eq!(
+                        run(async {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            8
+                        })
+                        .await
+                        .unwrap(),
+                        8
+                    );
+                }));
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ready_work_uses_a_cpu_worker_and_keeps_its_task_local_context() {

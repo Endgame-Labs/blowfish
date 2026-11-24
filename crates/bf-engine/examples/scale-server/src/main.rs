@@ -54,6 +54,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }),
     );
-    axum::serve(tokio::net::TcpListener::bind(address).await?, app).await?;
+    blowfish::reactors::serve(tokio::net::TcpListener::bind(address).await?, app, std::future::pending()).await?;
     Ok(())
 }

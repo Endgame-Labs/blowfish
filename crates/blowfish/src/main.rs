@@ -508,7 +508,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // flight and the jobs share one grace period; whatever is left after it is dropped, which is
     // crash-safe (an interrupted build's record stays, and GC reclaims its objects later).
     let signalled = std::sync::Arc::new(tokio::sync::Notify::new());
-    let server = axum::serve(listener, app).with_graceful_shutdown({
+    let server = blowfish::reactors::serve(listener, app, {
         let (signalled, engine) = (signalled.clone(), engine.clone());
         async move {
             shutdown().await;
