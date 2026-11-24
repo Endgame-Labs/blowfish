@@ -262,6 +262,10 @@ try:
         for qi in range(a.offset, a.offset + a.queries):
             names = list(arms)
             names = names[qi % len(names) :] + names[: qi % len(names)]
+            # Reverse alternate complete rotations for multi-arm runs, so every pair
+            # appears in each order equally often. Two arms retain strict AB/BA order.
+            if len(names) > 2 and (qi // len(names)) % 2:
+                names.reverse()
             for name in names:
                 if a.mode == "cachecold":
                     c, w, p = servers[name]

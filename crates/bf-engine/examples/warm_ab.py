@@ -8,7 +8,7 @@ Usage: uv run crates/bf-engine/examples/warm_ab.py --data DATA --scratch .scratc
     --arms ARMS.json --server-cpus 0-7 --client-cpus 8-15
 ARMS.json maps names to binary, storage (StorageConfig JSON path), and probes.
 Run two independent processes per arm in forward/reverse order. Every process warms
-all queries twice before two measured epochs. Compare measured recall, never an
+all queries twice before two measured epochs by default. Compare measured recall, never an
 interpolated estimate. Storage is always read-only. Delete scratch after recording results.
 """
 
@@ -172,9 +172,12 @@ def main():
     parser.add_argument("--scratch", type=Path, required=True)
     parser.add_argument("--arms", type=Path, required=True)
     parser.add_argument("--namespace", default="nq")
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--server-cpus", default="0-7")
     parser.add_argument("--client-cpus", default="8-15")
     args = parser.parse_args()
+    if args.epochs < 1:
+        parser.error("epochs must be positive")
     if ".scratch" not in args.scratch.resolve().parts or args.scratch.exists():
         parser.error("scratch must be a new directory under .scratch/")
     args.scratch.mkdir(parents=True)
@@ -205,7 +208,7 @@ def main():
             # Warm every query twice; the second epoch can use the compiled tier.
             for _ in range(2):
                 epoch(bodies, args.namespace, cpus(args.client_cpus))
-            for repeat in range(2):
+            for repeat in range(args.epochs):
                 compiled_before = compiled_queries(client)
                 rows = epoch(bodies, args.namespace, cpus(args.client_cpus))
                 compiled = compiled_queries(client) - compiled_before
