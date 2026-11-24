@@ -361,7 +361,6 @@ impl Cache {
         state: &NamespaceState,
         q: &QueryRequest,
         seconds: f64,
-        hot: bool,
     ) {
         trim();
         let cache = &engine.0.hot_graph;
@@ -376,8 +375,7 @@ impl Cache {
         else {
             return;
         };
-        if !hot
-            || q.filters.is_some()
+        if q.filters.is_some()
             || q.total().unwrap_or(10) == 0
             || q.total().unwrap_or(10).saturating_add(q.offset) > RERANK
             || vector.iter().all(|x| *x == 0.)
@@ -715,6 +713,7 @@ impl Engine {
         let worker_running = self.0.stop.track();
         let mut built = tokio::task::spawn_blocking(move || {
             pool().install(|| {
+                let _busy = bf_alloc::busy();
                 let source_started = thread_cpu();
                 let source = read_source(&engine, &source_set, &source_attribute, spill.directory(), dims, count, &c);
                 let Source { builder, sources, mut locations } = runtime.block_on(async {
@@ -1053,6 +1052,24 @@ async fn search_entry(
     }
     Ok(Some((scores, documents)))
 }
+/// Charge each poll on its current thread, including Q2's resumed I/O continuation.
+/// Async waiting and migration between worker threads do not become query CPU time.
+pub(crate) fn measure_cpu<F: std::future::Future>(
+    cpu: Arc<AtomicU64>,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    // Pin the large query plan on the heap before constructing the small poll wrapper. Keeping
+    // both the input and a pin! local in an async fn doubles its debug-build stack footprint.
+    let mut future = Box::pin(future);
+    std::future::poll_fn(move |cx| {
+        let started = thread_cpu();
+        let result = future.as_mut().poll(cx);
+        let elapsed = (thread_cpu() - started).max(0.);
+        cpu.fetch_add((elapsed * 1e9) as u64, Ordering::Relaxed);
+        result
+    })
+}
+
 pub(crate) fn thread_cpu() -> f64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -1121,7 +1138,7 @@ impl Engine {
             .unwrap_or_else(|e| e.into_inner());
         let graphs=entries.iter().filter(|(k,_)|k.namespace==namespace).map(|(k,h)|{
             let calibration=h.ready.as_ref().map(|e|{let c=e.calibration.lock().unwrap_or_else(|e|e.into_inner());serde_json::json!({"ef":c.ef,"usable":c.usable,"samples":c.recalls.len(),"build_cpu_seconds":e.measured_cpu_seconds,"build_wall_seconds":e.build_wall_seconds,"build_reservation_bytes":e.build_reservation_bytes,"reserved_bytes":e._reservation.0,"promotion_cpu_cost_seconds":c.build_seconds,"graph_cpu_seconds":c.graph_seconds,"resident_bytes":e.graph.resident_bytes()})});
-            serde_json::json!({"attribute":k.attribute,"building":h.building.is_some(),"calibration":calibration})
+            serde_json::json!({"attribute":k.attribute,"building":h.building.is_some(),"calibration":calibration,"heat_seconds":h.first.elapsed().as_secs_f64(),"query_rate":h.rate,"ivf_cpu_seconds":h.ivf_seconds,"retry_seconds":h.retry.saturating_duration_since(Instant::now()).as_secs_f64()})
         }).collect::<Vec<_>>();
         serde_json::json!({"graphs":graphs,"answered":self.0.hot_graph.answers.load(Ordering::Relaxed),"process_reserved_bytes":RESERVED.load(Ordering::Relaxed)})
     }

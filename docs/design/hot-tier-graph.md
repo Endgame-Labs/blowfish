@@ -106,8 +106,8 @@ cache effects. The target-host memory gate must validate the complete working se
 
 ## Heat, recall, and effort
 
-A first or cold query stays on IVF. Promotion requires ten minutes of sustained eligible hot queries;
-a gap longer than a minute resets that dwell. A 15-minute decaying rate and measured foreground
+A fresh process starts on IVF. Promotion requires ten minutes of sustained eligible queries,
+including requests with payload-cache misses; a gap longer than a minute resets that dwell. A 15-minute decaying rate and measured foreground
 worker CPU estimate the namespace's future savings. Initial scheduling uses a conservative construction
 estimate of one CPU millisecond per source row. It is only a scheduling estimate.
 
@@ -121,7 +121,8 @@ ceiling is discarded.
 Foreground selection additionally requires predicted CPU savings over the next 24 hours to cover
 at least twice measured construction CPU. The builder records its worker CPU and source-transform
 CPU, with a conservative 10% allowance for source decoding. Graph query CPU is measured on the
-ordinary query worker. The pre-promotion IVF EWMA supplies the comparison. A calibrated graph that
+ordinary query workers, charging each poll on its current thread and excluding I/O waits across
+CPU-to-I/O continuation. The pre-promotion IVF EWMA supplies the comparison. A calibrated graph that
 remains unprofitable for a full observation window is discarded. All thresholds are internal policy;
 there are no per-corpus ef constants or user-facing graph controls.
 
@@ -140,8 +141,9 @@ masks. WAL shadowing and tail upserts or deletes use the ordinary engine union a
 
 Delta tiers and uncovered indexed segments retain their independent search plans. Graph and IVF
 participants contribute their own top-k candidates, avoiding a scan barrier that a graph participant
-cannot enter. If every graph declines because of an unsupported shape or heavy masking, the normal
-joint IVF plan remains intact.
+cannot enter. Unsupported shapes and heavy masks retain the normal joint IVF plan. If a graph
+selected during planning later declines, the complete query retries with the ordinary joint IVF plan,
+restoring its shared probe bounds even after eviction, scratch admission loss, or insufficient candidates.
 
 Above 10% masked source rows, evict the graph and use IVF. Also fall back when live candidates cannot
 supply the request. A new recluster directory starts a new identity and heat window; a build or ready

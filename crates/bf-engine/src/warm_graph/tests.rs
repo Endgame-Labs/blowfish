@@ -124,6 +124,20 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         held.calibration.lock().unwrap().usable,
         "exact recall sampling must calibrate and amortize the graph"
     );
+    // A graph selected during planning can lose its query scratch slot before execution.
+    // The complete ordinary IVF plan must be restored rather than keeping independent seats.
+    let permit = held
+        .slots
+        .acquire_many(held.slots.available_permits() as u32)
+        .await
+        .unwrap();
+    let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
+    assert_eq!(
+        query(&e, "hot", request(17)).await,
+        query(&control, "hot", request(17)).await
+    );
+    assert_eq!(e.0.hot_graph.answers.load(Ordering::Relaxed), before);
+    drop(permit);
     let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
     assert_eq!(query(&e, "hot", request(17)).await[0]["id"], 17);
     assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
@@ -249,4 +263,29 @@ fn cancelled_entries_are_dropped_on_namespace_generation_replacement() {
     cache.prune("a", &state, Instant::now());
     assert!(cancel.cancelled());
     assert!(cache.entries.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migrated_query_polls_charge_cpu_without_charging_io_waits() {
+    let cpu = Arc::new(AtomicU64::new(0));
+    let start = Instant::now();
+    let name = crate::query_worker::run(measure_cpu(cpu.clone(), async {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        std::thread::current()
+            .name()
+            .unwrap_or_default()
+            .to_string()
+    }))
+    .await
+    .unwrap();
+    assert!(
+        !name.starts_with("bf-query-"),
+        "a yielded plan must continue on the I/O worker"
+    );
+    let charged = Duration::from_nanos(cpu.load(Ordering::Relaxed));
+    assert!(charged > Duration::ZERO);
+    assert!(
+        charged < start.elapsed() / 2,
+        "timer waits are not foreground CPU"
+    );
 }
