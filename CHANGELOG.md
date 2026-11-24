@@ -4,6 +4,11 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Added
+
+- **Profile-guided build recipe:** `scripts/pgo-build.sh` builds a profile-guided blowfish binary trained on a mixed workload (warm vector, filtered, BM25, writes, and cold queries) from public NQ data. On full NQ at 8 cores, warm HTTP vector search rises 5.4% (2,339 to 2,464 q/s), filtered search 105%, BM25 16%, and writes 4%, with identical results; instruction-cache refills drop 30%. Official release builds do not use it yet. See [docs/pgo.md](docs/pgo.md).
+
+
 ## [0.1.19] - 2026-11-24
 
 ### Performance
