@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Filtered ANN recall planner (D4, merged from wt/d4-plan).** The segment-directory planner's fixed three-times probe cap lost neighbors on selective distributed filters. The probe budget now scales with inverse selectivity from the membership maps, plus a witness margin; `BF_FILTER_PROBE_CAP` is removed (one way per thing). BEIR NQ, 48 probes: hash 1% recall 0.936 -> 1.0, hash 10% 0.961 -> 0.989, ID 1%/10% stay 1.0, 50% unchanged. Matched-recall cost (main at 256 probes vs planner at 48): hash 1% CPU/query 46.4 -> 64.1 ms (+38%), hash 10% 42.8 -> 39.5 ms (recall 0.994 vs 0.989), ID 10% 9.6 -> 11.3 ms (+18%, both 1.0), 50% flat. A 40,000-vector regression test checks distributed filters against exhaustive truth. Next: cut the planner's extra work on ID-local filters, where it adds CPU without recall.
+
 - **BM25 under heavy writes another 1.65x faster** (round BW2; `docs/benchmarks.md`, "Round BW2"). Correcting
   corpus statistics for indexed rows that the WAL tail replaced or deleted was the largest remaining stage. It
   now reads indexed lengths and the exact masked postings of the query's own terms, and reuses the snapshot's
