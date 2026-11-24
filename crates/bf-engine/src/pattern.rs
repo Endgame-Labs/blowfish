@@ -260,7 +260,15 @@ pub(crate) async fn segment_scores(
         let bf_types::RankBy::Filter(f) = clause else {
             unreachable!()
         };
-        let rows = crate::segment::filter_rows(store, seg, f, &out.schema, allowed).await?;
+        let rows = crate::segment::filter_rows_from(
+            store,
+            Some((&*out).into()),
+            seg,
+            f,
+            &out.schema,
+            allowed,
+        )
+        .await?;
         if rank == Some(clause) {
             direct = Some(rows.clone());
         }

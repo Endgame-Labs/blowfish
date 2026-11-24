@@ -205,16 +205,28 @@ pub(crate) fn decide(
     bulk: bool,
     compacting: bool,
 ) -> (Decision, Option<Layout>) {
-    // Vector attributes every segment has a current ANN object for (an older layout is upgraded
-    // first, by `reindex`).
+    // Covered segments may have retired their own index; their current tier is the source.
+    let source = crate::vector_locator::Source {
+        segments,
+        tiers,
+        lineage,
+    };
     let attrs: BTreeSet<String> = segments
         .iter()
-        .flat_map(|s| s.files.keys())
-        .filter_map(|k| k.strip_prefix("annv2:").map(str::to_string))
+        .flat_map(|s| s.schema.iter())
+        .filter(|(_, c)| crate::segment::dense_type(c).is_some())
+        .map(|(a, _)| a.clone())
+        .chain(
+            segments
+                .iter()
+                .flat_map(|s| s.files.keys())
+                .filter_map(|k| k.strip_prefix("annv2:").map(str::to_string)),
+        )
+        .chain(tiers.keys().cloned())
         .filter(|a| {
             segments
                 .iter()
-                .all(|s| s.files.contains_key(&format!("annv2:{a}")))
+                .all(|s| s.files.contains_key(&format!("annv2:{a}")) || source.covers(s, a))
         })
         .collect();
     for attr in attrs {
@@ -282,16 +294,20 @@ fn decide_beside(
     compacting: bool,
 ) -> Decision {
     let classes = crate::lineage::classes(segments, tiers, lineage);
+    let source = crate::vector_locator::Source {
+        segments,
+        tiers,
+        lineage,
+    };
     for (attr, sets) in tiers {
         let Some(base) = sets.first().filter(|b| b.coarse.is_some()) else {
             continue;
         };
         let key = format!("annv2:{attr}");
         let (mut outside, mut beside) = (0u64, 0u64);
-        for s in segments
-            .iter()
-            .filter(|s| s.files.contains_key(&key) && !building.contains(&s.id))
-        {
+        for s in segments.iter().filter(|s| {
+            (s.files.contains_key(&key) || source.covers(s, attr)) && !building.contains(&s.id)
+        }) {
             match classes.get(&s.id) {
                 Some(class) if class.contains(&base.dir.key) => {}
                 Some(class) if !class.is_empty() => beside += u64::from(s.row_count),
@@ -369,7 +385,8 @@ fn target(manifest: &Manifest, attr: &str, kind: Kind, building: &BTreeSet<Strin
                     .segments
                     .iter()
                     .filter(|s| {
-                        s.files.contains_key(&key)
+                        (s.files.contains_key(&key)
+                            || crate::vector_locator::Source::from(manifest).covers(s, attr))
                             && !in_base.contains(&s.id)
                             && !building.contains(&s.id)
                     })

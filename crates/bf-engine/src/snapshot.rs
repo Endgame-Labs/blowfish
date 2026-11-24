@@ -121,7 +121,6 @@ impl OpenHint {
                 vector,
                 ..
             }) = &request.rank_by
-            && request.filters.is_none()
             && request.limit.as_ref().and_then(Limit::per).is_none()
         {
             hint.scan = Some((
@@ -167,10 +166,12 @@ impl OpenHint {
             let queries = &queries;
             let mut tasks = vec![];
             // A directory replaces opening every segment's ANN metadata, ids, and docs footer.
-            let by_dir = self
-                .ann
-                .iter()
-                .all(|a| crate::upgrade::directory_file(dirs, a).is_some());
+            let by_dir = self.ann.iter().all(|a| {
+                crate::upgrade::directory_file(dirs, a).is_some()
+                    || tiers
+                        .get(a)
+                        .is_some_and(|t| crate::ann::tiers_usable(segments, lineage, t))
+            });
             for attribute in self.ann.iter().filter(|_| with_rest) {
                 // A lone unfiltered ANN query reads the block-layout directory when there is one.
                 // A recluster's tiers take the scan of the rows they cover; the block-layout
@@ -203,7 +204,7 @@ impl OpenHint {
                             .await?;
                             // Everything this query touches is already in memory: the scan's
                             // reads would only copy cached bytes, and the query itself reads them.
-                            if warm {
+                            if warm || !self.filters.is_empty() {
                                 return Ok(());
                             }
                             crate::ann_dir::prefetch_scan(
@@ -681,7 +682,8 @@ pub(crate) async fn allowed_with(
     }
     if let Some(f) = f {
         filter::validate(f, &state.schema, false)?;
-        live = segment::filter_rows(store, seg, f, &state.schema, &live).await?;
+        live = segment::filter_rows_from(store, Some(state.into()), seg, f, &state.schema, &live)
+            .await?;
     }
     Ok(live)
 }
@@ -692,8 +694,9 @@ pub(crate) async fn materialize(
     let mut full = state.clone();
     for seg in &state.segments {
         let live = allowed(store, state, seg, None).await?;
-        full.docs
-            .extend(crate::shared(segment::documents(store, seg, &live).await?));
+        full.docs.extend(crate::shared(
+            segment::documents_from(store, Some((state).into()), seg, &live).await?,
+        ));
     }
     // Schema drops apply immediately even while older segment columns remain on disk.
     for doc in full.docs.values_mut() {
@@ -814,8 +817,9 @@ pub(crate) async fn for_writes(
         for seg in &state.segments {
             let live = segment::live(store, seg).await?;
             let rows = segment::lookup_many(store, seg, &hydrate).await? & live;
-            full.docs
-                .extend(crate::shared(segment::documents(store, seg, &rows).await?));
+            full.docs.extend(crate::shared(
+                segment::documents_from(store, Some((state).into()), seg, &rows).await?,
+            ));
         }
     }
     // Groups that are staged but not yet committed come first in the log: a write must see their
@@ -841,7 +845,15 @@ pub(crate) async fn statistics(
         for seg in &state.segments {
             let rows = segment::lookup_many(store, seg, &state.shadowed).await?
                 & segment::live(store, seg).await?;
-            let old = crate::statistics::rows(store, seg, &rows, &state.schema, false).await?;
+            let old = crate::statistics::rows(
+                store,
+                Some(state.into()),
+                seg,
+                &rows,
+                &state.schema,
+                false,
+            )
+            .await?;
             stats.rows = stats.rows.saturating_sub(old.rows);
             stats.logical_bytes = stats.logical_bytes.saturating_sub(old.logical_bytes);
         }

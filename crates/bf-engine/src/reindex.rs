@@ -310,7 +310,7 @@ impl Engine {
             if !segment::upgrade::needs_upgrade(store, seg).await? {
                 continue;
             }
-            let converted = convert_documents(store, ns, seg).await?;
+            let converted = convert_documents(store, ns, seg, Some((&latest).into())).await?;
             let bytes = converted.bytes;
             report.bytes_written += bytes;
             // One segment per publication bounds memory and makes interrupted upgrades resumable.
@@ -601,8 +601,9 @@ async fn convert_documents(
     store: &bf_storage::Storage,
     ns: &str,
     seg: &Segment,
+    source: Option<crate::vector_locator::Source<'_>>,
 ) -> Result<Converted, ApiError> {
-    let new = segment::upgrade::rewrite(store, ns, seg).await?;
+    let new = segment::upgrade::rewrite(store, ns, seg, source).await?;
     let bytes = new.iter().map(|(_, f)| f.size).sum();
     Ok(Converted {
         id: seg.id.clone(),

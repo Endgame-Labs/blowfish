@@ -40,6 +40,7 @@ pub(crate) async fn removals(
                         let mut removed = NamespaceStats::default();
                         adjust_bounded(
                             &store,
+                            Some((&*base).into()),
                             &seg,
                             &deleted,
                             &base.schema,
@@ -114,16 +115,21 @@ pub(crate) fn merge(into: &mut NamespaceStats, from: NamespaceStats, add: bool) 
 
 pub(crate) async fn rows(
     store: &Storage,
+    source: Option<crate::vector_locator::Source<'_>>,
     seg: &Segment,
     rows: &RoaringBitmap,
     schema: &Schema,
     with_text: bool,
 ) -> Result<NamespaceStats, ApiError> {
     let mut stats = NamespaceStats::default();
-    adjust(store, seg, rows, schema, &mut stats, true, with_text).await?;
+    adjust_bounded(
+        store, source, seg, rows, schema, &mut stats, true, with_text, SCAN_ROWS,
+    )
+    .await?;
     Ok(stats)
 }
 
+#[cfg(test)]
 pub(crate) async fn adjust(
     store: &Storage,
     seg: &Segment,
@@ -133,12 +139,16 @@ pub(crate) async fn adjust(
     add: bool,
     with_text: bool,
 ) -> Result<(), ApiError> {
-    adjust_bounded(store, seg, rows, schema, stats, add, with_text, SCAN_ROWS).await
+    adjust_bounded(
+        store, None, seg, rows, schema, stats, add, with_text, SCAN_ROWS,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn adjust_bounded(
     store: &Storage,
+    source: Option<crate::vector_locator::Source<'_>>,
     seg: &Segment,
     rows: &RoaringBitmap,
     schema: &Schema,
@@ -181,7 +191,9 @@ async fn adjust_bounded(
         if chunk.is_empty() {
             break;
         }
-        let docs = segment::projected_rows_with(store, seg, &chunk, Some(&columns), true).await?;
+        let docs =
+            segment::projected_rows_with_from(store, source, seg, &chunk, Some(&columns), true)
+                .await?;
         for doc in docs.values() {
             if with_text {
                 text::adjust(stats, doc, schema, add);
@@ -341,7 +353,9 @@ mod tests {
                     expected.rows += 1;
                     expected.logical_bytes += serde_json::to_vec(doc).unwrap().len() as u64;
                 }
-                let actual = rows(&store, seg, &selected, &schema, true).await.unwrap();
+                let actual = rows(&store, None, seg, &selected, &schema, true)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     serde_json::to_value(&actual).unwrap(),
                     serde_json::to_value(&expected).unwrap()
@@ -362,7 +376,9 @@ mod tests {
                 assert!(subtracted.text.values().all(|f| f.documents == 0
                     && f.total_length == 0
                     && f.document_frequencies.is_empty()));
-                let without_text = rows(&store, seg, &selected, &schema, false).await.unwrap();
+                let without_text = rows(&store, None, seg, &selected, &schema, false)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     (without_text.rows, without_text.logical_bytes),
                     (expected.rows, expected.logical_bytes)

@@ -30,6 +30,10 @@ struct Pin {
     segments: Vec<Segment>,
     stats: NamespaceStats,
     #[serde(default)]
+    ann_tiers: std::collections::BTreeMap<String, Vec<bf_wal::SlabSet>>,
+    #[serde(default)]
+    vector_lineage: Vec<bf_wal::Lineage>,
+    #[serde(default)]
     lineage: Option<Lineage>,
 }
 #[derive(Serialize, Deserialize)]
@@ -46,11 +50,15 @@ fn commit_key(wal: &Wal, id: Uuid) -> String {
 }
 fn install(state: &mut NamespaceState, pin: &Pin) {
     state.segments = pin.segments.clone().into();
+    state.ann_tiers = pin.ann_tiers.clone().into();
+    state.lineage = pin.vector_lineage.clone().into();
     state.stats = std::sync::Arc::new(pin.stats.clone());
     state.corpus = crate::text::checkpoint_corpus(&pin.stats);
 }
 pub(crate) fn install_source(state: &mut NamespaceState, source: &Source) {
     state.segments = source.state.segments.clone();
+    state.ann_tiers = source.state.ann_tiers.clone();
+    state.lineage = source.state.lineage.clone();
     state.stats = source.state.stats.clone();
     state.corpus = source.state.corpus.clone();
 }
@@ -68,11 +76,13 @@ impl Engine {
             // source's out-of-line text object.
             crate::text::hydrate(&self.0.store, &mut state).await?;
             let pin = Pin {
-                format_version: 1,
+                format_version: 2,
                 source_namespace: source.into(),
                 created_at: Utc::now(),
                 segments: state.segments.to_vec(),
                 stats: (*state.stats).clone(),
+                ann_tiers: (*state.ann_tiers).clone(),
+                vector_lineage: (*state.lineage).clone(),
                 lineage: if is_branch {
                     Some(Lineage {
                         parent: source.into(),
@@ -167,7 +177,7 @@ pub(crate) async fn replay(
             serde_json::from_slice(&store.get(&descriptor.pin).await.map_err(storage_error)?)
                 .map_err(crate::segment::index_error)?;
         if descriptor.format_version != 1
-            || pin.format_version != 1
+            || !(1..=2).contains(&pin.format_version)
             || entry.tombstone
             || entry.batches.len() != 1
         {
@@ -194,9 +204,20 @@ pub(crate) async fn protected(store: &Storage) -> Result<BTreeSet<String>, ApiEr
         let pin: Pin =
             serde_json::from_slice(&store.get(&object.key).await.map_err(storage_error)?)
                 .map_err(crate::segment::index_error)?;
-        if pin.format_version != 1 {
+        if !(1..=2).contains(&pin.format_version) {
             return Err(ApiError::new(500, "unsupported segment pin"));
         }
+        protected.extend(
+            pin.ann_tiers
+                .values()
+                .flatten()
+                .flat_map(crate::auto_recluster::tier_keys),
+        );
+        protected.extend(
+            pin.vector_lineage
+                .iter()
+                .flat_map(|l| l.parts.iter().map(|p| p.map.key.clone())),
+        );
         for segment in pin.segments {
             protected.extend(
                 segment

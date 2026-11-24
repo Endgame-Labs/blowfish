@@ -343,8 +343,14 @@ async fn scan<'q>(
             while rows.peek().is_some_and(|row| *row / 256 == block) {
                 selected.insert(rows.next().expect("peeked row"));
             }
-            for (id, mut doc) in
-                segment::projected_documents(store, seg, &selected, Some(&columns)).await?
+            for (id, mut doc) in segment::projected_documents_from(
+                store,
+                Some(state.into()),
+                seg,
+                &selected,
+                Some(&columns),
+            )
+            .await?
             {
                 doc.retain(|name, _| state.schema.contains_key(name));
                 scan.row(id, doc)?;

@@ -121,12 +121,28 @@ pub(crate) fn explain(
         for seg in &state.segments {
             let used: Vec<_> = needed
                 .iter()
-                .filter(|file| seg.files.contains_key(*file))
-                .cloned()
+                .filter(|file| {
+                    seg.files.contains_key(*file)
+                        || file.strip_prefix("annv2:").is_some_and(|a| {
+                            crate::vector_locator::Source::from(state).covers(seg, a)
+                        })
+                })
+                .map(|file| {
+                    if seg.files.contains_key(file) {
+                        file.clone()
+                    } else {
+                        format!("covering tier ({file})")
+                    }
+                })
                 .collect();
             let fallback: Vec<_> = needed
                 .iter()
-                .filter(|file| !seg.files.contains_key(*file))
+                .filter(|file| {
+                    !seg.files.contains_key(*file)
+                        && !file.strip_prefix("annv2:").is_some_and(|a| {
+                            crate::vector_locator::Source::from(state).covers(seg, a)
+                        })
+                })
                 .cloned()
                 .collect();
             let _ = writeln!(

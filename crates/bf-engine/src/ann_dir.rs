@@ -561,12 +561,13 @@ pub(crate) async fn prefetch_scan(
 pub(crate) async fn live_masks(
     store: &Storage,
     state: &NamespaceState,
+    source: &NamespaceState,
     filter: Option<&Filter>,
 ) -> Result<Vec<Option<Arc<RoaringBitmap>>>, ApiError> {
     futures::future::try_join_all(state.segments.iter().map(|seg| async move {
         if let Some(f) = filter {
             return Ok(Some(Arc::new(
-                crate::snapshot::allowed_with(store, state, seg, Some(f), false).await?,
+                crate::snapshot::allowed_with(store, source, seg, Some(f), false).await?,
             )));
         }
         if seg.live_generation == 0 {
@@ -1026,6 +1027,7 @@ pub(crate) async fn search(
     )>,
     skip: &[bool],
     joint: Option<&Seat>,
+    source: &NamespaceState,
 ) -> Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError> {
     // With slabs, `state` lists the slabs and `real` the segments that hold the documents: a
     // slab row is a global row number, mapped back by the covered segments' bases to a covered
@@ -1112,7 +1114,14 @@ pub(crate) async fn search(
     // Segments whose few allowed rows are fetched and ranked exactly, without codes or blobs.
     let mut exact_rows = BTreeSet::new();
     if matching > 0 {
-        if filtered && matching <= config.exact_fetch_rows.max(target) {
+        if filtered
+            && matching <= config.exact_fetch_rows.max(target)
+            && dir
+                .segments()
+                .iter()
+                .enumerate()
+                .all(|(i, s)| s.flat || skipped(i) || members.get(i).is_some_and(Option::is_some))
+        {
             for (i, seg) in dir.segments().iter().enumerate() {
                 if !seg.flat && !skipped(i) && live_rows(i) > 0 {
                     exact_rows.insert(i);
@@ -1537,17 +1546,24 @@ pub(crate) async fn search(
                     });
                 }
                 for (i, rows) in rows {
-                    let (store, segment, columns, context) = (
+                    let (store, segment, columns, context, source) = (
                         store.clone(),
                         docs_state.segments[i].clone(),
                         columns.clone(),
                         context.clone(),
+                        source.without_docs(),
                     );
                     early.spawn(async move {
                         let work = async move {
-                            let _ =
-                                segment::projected_rows(&store, &segment, &rows, Some(&columns))
-                                    .await;
+                            let _ = segment::projected_rows_with_from(
+                                &store,
+                                Some((&source).into()),
+                                &segment,
+                                &rows,
+                                Some(&columns),
+                                false,
+                            )
+                            .await;
                         };
                         match context {
                             Some(context) => read_cache::scope(context, work).await,
@@ -1650,7 +1666,15 @@ pub(crate) async fn search(
     });
     let rerank_limit = reranks.len().max(limit);
     let prefetch = futures::future::join_all(speculative.iter().map(|(&i, rows)| async move {
-        let _ = segment::projected_rows(store, &docs_state.segments[i], rows, Some(columns)).await;
+        let _ = segment::projected_rows_with_from(
+            store,
+            Some(source.into()),
+            &docs_state.segments[i],
+            rows,
+            Some(columns),
+            false,
+        )
+        .await;
     }));
     let (reranked, _) = tokio::join!(
         futures::stream::iter(reranks)
@@ -1698,8 +1722,15 @@ pub(crate) async fn search(
         futures::future::try_join_all(rows_by_segment.iter().map(|(&i, rows)| async move {
             Ok::<_, ApiError>((
                 i,
-                segment::projected_rows(store, &docs_state.segments[i], rows, Some(columns))
-                    .await?,
+                segment::projected_rows_with_from(
+                    store,
+                    Some(source.into()),
+                    &docs_state.segments[i],
+                    rows,
+                    Some(columns),
+                    false,
+                )
+                .await?,
             ))
         }))
         .await?

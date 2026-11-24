@@ -293,7 +293,7 @@ async fn vectors_are_absent_from_documents_and_projection_is_byte_identical_to_v
         let merged_rows = (0..merged.row_count).collect();
         let actual = documents(&store, &merged, &merged_rows).await.unwrap();
         assert_eq!(actual, documents(&store, &legacy, &rows).await.unwrap());
-        let rewritten = upgrade::rewrite(&store, "t", &legacy).await.unwrap();
+        let rewritten = upgrade::rewrite(&store, "t", &legacy, None).await.unwrap();
         for (role, file) in rewritten {
             legacy.files.insert(role, file);
         }
@@ -429,5 +429,5 @@ async fn document_upgrade_rejects_corrupt_source_blocks() {
     .await
     .unwrap();
     segment.files.insert("docs".into(), file);
-    assert!(upgrade::rewrite(&store, "t", &segment).await.is_err());
+    assert!(upgrade::rewrite(&store, "t", &segment, None).await.is_err());
 }

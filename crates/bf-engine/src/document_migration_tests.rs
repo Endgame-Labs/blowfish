@@ -96,7 +96,7 @@ async fn mixed_document_checkpoints_keep_indexes_and_wire_bytes() {
     for stage in 0..2 {
         let (_, snapshot) = wal.latest_manifest().await.unwrap().unwrap();
         let seg = &snapshot.segments[stage];
-        let converted = convert_documents(&store, "t", seg).await.unwrap();
+        let converted = convert_documents(&store, "t", seg, None).await.unwrap();
         let mut report = ReindexReport::default();
         engine
             .publish_batch(&wal, "t", Batch::Documents(vec![converted]), &mut report)
@@ -133,10 +133,10 @@ async fn stale_document_conversion_cannot_replace_a_compaction_or_another_upgrad
     segment::upgrade::make_legacy(&store, &mut m.segments[0])
         .await
         .unwrap();
-    let first = convert_documents(&store, "t", &m.segments[0])
+    let first = convert_documents(&store, "t", &m.segments[0], None)
         .await
         .unwrap();
-    let second = convert_documents(&store, "t", &m.segments[0])
+    let second = convert_documents(&store, "t", &m.segments[0], None)
         .await
         .unwrap();
     assert_eq!(apply_documents(&mut m, &[first]).0, 1);

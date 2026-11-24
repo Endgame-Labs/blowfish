@@ -553,9 +553,15 @@ pub(crate) async fn global_stats(
         let mut stats = NamespaceStats::default();
         for seg in &state.segments {
             let live = crate::snapshot::allowed(store, state, seg, None).await?;
-            for doc in segment::projected_documents(store, seg, &live, Some(&fields))
-                .await?
-                .values()
+            for doc in segment::projected_documents_from(
+                store,
+                Some(state.into()),
+                seg,
+                &live,
+                Some(&fields),
+            )
+            .await?
+            .values()
             {
                 adjust(&mut stats, doc, &state.schema, true);
             }
@@ -580,9 +586,15 @@ pub(crate) async fn global_stats(
         for seg in &state.segments {
             let live = segment::live(store, seg).await?;
             let shadowed = segment::lookup_many(store, seg, &state.shadowed).await? & live;
-            for doc in segment::projected_documents(store, seg, &shadowed, Some(&fields))
-                .await?
-                .values()
+            for doc in segment::projected_documents_from(
+                store,
+                Some(state.into()),
+                seg,
+                &shadowed,
+                Some(&fields),
+            )
+            .await?
+            .values()
             {
                 adjust(&mut stats, doc, &state.schema, false);
             }

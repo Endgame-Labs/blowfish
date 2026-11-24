@@ -72,15 +72,29 @@ async fn layouts(store: &Storage) -> (Vec<CodeLayout>, Vec<CodeLayout>) {
 }
 /// Rewrite every vector index (segments and slabs) in the older layout, as an older release
 /// left them, and drop the directories that listed the replaced objects.
-async fn downgrade(store: &Storage) {
+async fn downgrade(store: &Storage, retired_sources: Option<&[bf_wal::Segment]>) {
     let wal = Wal::new(store.clone(), "t").unwrap();
     let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
     let mut slabs = m.ann_tiers.get("vector").map(|t| t[0].slabs.clone());
     let mut segments = std::mem::take(&mut m.segments);
     for seg in segments.iter_mut().chain(slabs.iter_mut().flatten()) {
-        let old = seg.files["annv2:vector"].clone();
+        // A pre-D4 fixture has its own segment indexes as well as slabs. Their objects still
+        // exist inside retention, so reattach those recorded sources before downgrading.
+        let old = seg
+            .files
+            .get("annv2:vector")
+            .or_else(|| {
+                retired_sources
+                    .into_iter()
+                    .flatten()
+                    .find(|s| s.id == seg.id)
+                    .and_then(|s| s.files.get("annv2:vector"))
+            })
+            .expect("fixture ANN source")
+            .clone();
         let blob = store.get(&old.key).await.unwrap();
         let Some(blob) = bf_vector::downgrade_layout(&blob).unwrap() else {
+            seg.files.insert("annv2:vector".into(), old);
             continue;
         };
 
@@ -103,7 +117,7 @@ async fn downgrade(store: &Storage) {
             ("annfrag:vector", "bff", false),
             ("annfrag2:vector", "bfb", true),
         ] {
-            if !blocks && seg.files.is_empty() {
+            if !blocks && !seg.files.contains_key("docs") {
                 continue;
             }
             let (fragment, resident) = bf_vector::Fragment::legacy_fragment(&blob, blocks).unwrap();
@@ -166,7 +180,7 @@ async fn reindex_upgrades_and_survives_concurrent_writes() {
     build(&store, &writer).await;
     let queries = [5usize, 1234, 4321, 8000];
     let before = answers(&store, &queries).await;
-    downgrade(&store).await;
+    downgrade(&store, None).await;
     assert_eq!(layouts(&store).await.0, vec![CodeLayout::RowMajor; 3]);
     assert_eq!(answers(&store, &queries).await, before, "older files read");
 
@@ -216,6 +230,14 @@ async fn reindex_upgrades_and_survives_concurrent_writes() {
     assert_eq!(answers(&store, &queries).await, before, "answers unchanged");
 
     // Slabs.
+    let pre_d4_segments = Wal::new(store.clone(), "t")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .segments;
     writer
         .recluster(
             "t",
@@ -230,7 +252,7 @@ async fn reindex_upgrades_and_survives_concurrent_writes() {
         .await
         .unwrap();
     let slab_before = answers(&store, &queries).await;
-    downgrade(&store).await;
+    downgrade(&store, Some(&pre_d4_segments)).await;
     let (seg, slabs) = layouts(&store).await;
     assert!(!slabs.is_empty() && slabs.iter().all(|l| *l == CodeLayout::RowMajor));
     assert!(seg.contains(&CodeLayout::RowMajor));
@@ -250,7 +272,7 @@ async fn the_background_indexer_upgrades_old_indexes() {
     build(&store, &writer).await;
     let queries = [5usize, 4321];
     let before = answers(&store, &queries).await;
-    downgrade(&store).await;
+    downgrade(&store, None).await;
     assert_eq!(layouts(&store).await.0, vec![CodeLayout::RowMajor; 3]);
     // A server with indexing on finds the namespace and upgrades it unasked.
     // Reproduce a legacy checkpoint: writable startup has already raised the root marker,

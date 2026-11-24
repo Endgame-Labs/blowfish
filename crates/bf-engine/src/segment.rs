@@ -1101,15 +1101,25 @@ pub(crate) async fn lookup_many(
     }
     Ok(rows)
 }
+#[cfg(test)]
 pub(crate) async fn documents(
     store: &Storage,
     segment: &Segment,
     rows: &RoaringBitmap,
 ) -> Result<BTreeMap<Id, Document>, ApiError> {
-    projected_documents(store, segment, rows, None).await
+    documents_from(store, None, segment, rows).await
 }
-pub(crate) async fn projected_documents(
+pub(crate) async fn documents_from(
     store: &Storage,
+    source: Option<crate::vector_locator::Source<'_>>,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+) -> Result<BTreeMap<Id, Document>, ApiError> {
+    projected_documents_from(store, source, segment, rows, None).await
+}
+pub(crate) async fn projected_documents_from(
+    store: &Storage,
+    source: Option<crate::vector_locator::Source<'_>>,
     segment: &Segment,
     rows: &RoaringBitmap,
     columns: Option<&std::collections::BTreeSet<String>>,
@@ -1131,7 +1141,7 @@ pub(crate) async fn projected_documents(
             })
             .collect();
     }
-    let rows_docs = projected_rows(store, segment, rows, columns).await?;
+    let rows_docs = projected_rows_with_from(store, source, segment, rows, columns, false).await?;
     rows_docs
         .into_values()
         .map(|doc| {
@@ -1141,6 +1151,7 @@ pub(crate) async fn projected_documents(
         })
         .collect()
 }
+#[cfg(test)]
 pub(crate) async fn projected_rows(
     store: &Storage,
     segment: &Segment,
@@ -1149,9 +1160,19 @@ pub(crate) async fn projected_rows(
 ) -> Result<BTreeMap<u32, Document>, ApiError> {
     projected_rows_with(store, segment, rows, columns, false).await
 }
-/// [`projected_rows`], optionally reading through the block caches without filling them.
+/// Project selected rows, optionally reading through the block caches without filling them.
 pub(crate) async fn projected_rows_with(
     store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    columns: Option<&std::collections::BTreeSet<String>>,
+    bypass: bool,
+) -> Result<BTreeMap<u32, Document>, ApiError> {
+    projected_rows_with_from(store, None, segment, rows, columns, bypass).await
+}
+pub(crate) async fn projected_rows_with_from(
+    store: &Storage,
+    source: Option<crate::vector_locator::Source<'_>>,
     segment: &Segment,
     rows: &RoaringBitmap,
     columns: Option<&std::collections::BTreeSet<String>>,
@@ -1285,7 +1306,7 @@ pub(crate) async fn projected_rows_with(
         if columns.is_some_and(|c| !c.contains(name)) {
             continue;
         }
-        let (present, packed) = read_ann_packed(store, segment, rows, name, bypass).await?;
+        let (present, packed) = read_ann_packed(store, source, segment, rows, name, bypass).await?;
         let dtype = if i8 {
             bf_vector::VectorType::I8
         } else if f16 {
@@ -1330,8 +1351,18 @@ pub(crate) async fn projected_rows_with(
 pub(crate) type SegmentVectors = BTreeMap<String, PackedPart>;
 /// The IDs of a segment's present vectors, in row order, and their packed bytes.
 pub(crate) type PackedPart = (Vec<Id>, Vec<u8>);
+#[cfg(test)]
 pub(crate) async fn compaction_rows(
     store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    strip: &std::collections::BTreeSet<String>,
+) -> Result<(BTreeMap<Id, Document>, SegmentVectors), ApiError> {
+    compaction_rows_from(store, None, segment, rows, strip).await
+}
+pub(crate) async fn compaction_rows_from(
+    store: &Storage,
+    source: Option<crate::vector_locator::Source<'_>>,
     segment: &Segment,
     rows: &RoaringBitmap,
     strip: &std::collections::BTreeSet<String>,
@@ -1345,7 +1376,7 @@ pub(crate) async fn compaction_rows(
         .filter(|name| !strip.contains(*name))
         .cloned()
         .collect();
-    let docs = projected_rows_with(store, segment, rows, Some(&columns), true).await?;
+    let docs = projected_rows_with_from(store, source, segment, rows, Some(&columns), true).await?;
     let docs: BTreeMap<Id, Document> = docs
         .into_values()
         .map(|doc| {
@@ -1360,7 +1391,7 @@ pub(crate) async fn compaction_rows(
         if !segment.schema.contains_key(name) {
             continue;
         }
-        let (present, data) = read_packed(store, segment, rows, name).await?;
+        let (present, data) = read_packed_from(store, source, segment, rows, name).await?;
         let ids: Vec<Id> = present
             .iter()
             .map(|row| ids.get(*row as usize).cloned().ok_or_else(corrupt))
@@ -1371,13 +1402,23 @@ pub(crate) async fn compaction_rows(
 }
 /// The stored-precision bytes of one vector column for the requested rows: which of them have a
 /// vector (ascending), and those vectors back to back. Reads block by block, bypassing the caches.
+#[cfg(test)]
 pub(crate) async fn read_packed(
     store: &Storage,
     segment: &Segment,
     rows: &RoaringBitmap,
     attribute: &str,
 ) -> Result<(Vec<u32>, Vec<u8>), ApiError> {
-    read_ann_packed(store, segment, rows, attribute, true).await
+    read_packed_from(store, None, segment, rows, attribute).await
+}
+pub(crate) async fn read_packed_from(
+    store: &Storage,
+    source: Option<crate::vector_locator::Source<'_>>,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    attribute: &str,
+) -> Result<(Vec<u32>, Vec<u8>), ApiError> {
+    read_ann_packed(store, source, segment, rows, attribute, true).await
 }
 
 /// Resident ANN metadata for projection and vector-width accounting. No vector payload is read.
@@ -1418,11 +1459,15 @@ pub(crate) async fn projection_directory(
 
 async fn read_ann_packed(
     store: &Storage,
+    source: Option<crate::vector_locator::Source<'_>>,
     segment: &Segment,
     rows: &RoaringBitmap,
     attribute: &str,
     bypass: bool,
 ) -> Result<(Vec<u32>, Vec<u8>), ApiError> {
+    if let Some(source) = source.filter(|s| s.covers(segment, attribute)) {
+        return source.read(store, segment, rows, attribute, bypass).await;
+    }
     let Some(file) = segment.files.get(&format!("annv2:{attribute}")) else {
         if let Some(file) = segment.files.get(&format!("ann:{attribute}")) {
             let reader = ObjectReader::new(store, file);
@@ -1436,22 +1481,37 @@ async fn read_ann_packed(
                 .map_err(index_error)?;
             return index.read_packed_rows(rows).await.map_err(index_error);
         }
-        // While D1 is pending, the document-v1 column remains a safe source at every
-        // checkpoint. It disappears only after the current ANN object is published.
+        let docs_file = segment.files.get("docs").ok_or_else(corrupt)?;
+        let docs = directory(&ObjectReader::new(store, docs_file)).await?;
+        if docs.vectors.contains_key(attribute) {
+            return Err(index_error(
+                "segment vector has no ANN source or reachable covering tier",
+            ));
+        }
+        // Document-v1 columns remain the source only while their ANN upgrade is pending.
         return upgrade::read_packed(store, segment, rows, attribute).await;
     };
+    read_ann_file(store, segment, file, rows, attribute, bypass).await
+}
+
+/// Read packed rows of a current ANN object; slab rows use global IDs and need no schema.
+pub(crate) async fn read_ann_file(
+    store: &Storage,
+    segment: &Segment,
+    file: &SegmentFile,
+    rows: &RoaringBitmap,
+    attribute: &str,
+    bypass: bool,
+) -> Result<(Vec<u32>, Vec<u8>), ApiError> {
     let mut reader = ObjectReader::new(store, file);
     if bypass {
         reader = reader.bypass_cache();
     }
     let dir = projection_directory(store, segment, file, bypass).await?;
-    let (dims, dtype) = segment
-        .schema
-        .get(attribute)
-        .and_then(dense_type)
-        .ok_or_else(corrupt)?;
     let mut partial = dir.partial_index(0, reader.clone()).map_err(index_error)?;
-    if dir.dims() != dims || partial.index().vector_type() != dtype {
+    if let Some((dims, dtype)) = segment.schema.get(attribute).and_then(dense_type)
+        && (dir.dims() != dims || partial.index().vector_type() != dtype)
+    {
         return Err(corrupt());
     }
     let membership =
@@ -1560,23 +1620,36 @@ pub(crate) fn filter_rows<'a>(
     live: &'a RoaringBitmap,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoaringBitmap, ApiError>> + Send + 'a>>
 {
+    filter_rows_from(store, None, segment, f, schema, live)
+}
+pub(crate) fn filter_rows_from<'a>(
+    store: &'a Storage,
+    source: Option<crate::vector_locator::Source<'a>>,
+    segment: &'a Segment,
+    f: &'a Filter,
+    schema: &'a Schema,
+    live: &'a RoaringBitmap,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoaringBitmap, ApiError>> + Send + 'a>>
+{
     Box::pin(async move {
         match f {
             Filter::And(fs) => {
                 let mut out = live.clone();
                 for f in fs {
-                    out &= filter_rows(store, segment, f, schema, &out).await?;
+                    out &= filter_rows_from(store, source, segment, f, schema, &out).await?;
                 }
                 Ok(out)
             }
             Filter::Or(fs) => {
                 let mut out = RoaringBitmap::new();
                 for f in fs {
-                    out |= filter_rows(store, segment, f, schema, live).await?;
+                    out |= filter_rows_from(store, source, segment, f, schema, live).await?;
                 }
                 Ok(out)
             }
-            Filter::Not(f) => Ok(live - filter_rows(store, segment, f, schema, live).await?),
+            Filter::Not(f) => {
+                Ok(live - filter_rows_from(store, source, segment, f, schema, live).await?)
+            }
             Filter::Compare {
                 attribute,
                 op,
@@ -1623,8 +1696,14 @@ pub(crate) fn filter_rows<'a>(
                         get_value(store, file).await?;
                     let candidates = index.candidates(f, live)?;
                     let columns = std::collections::BTreeSet::from([attribute.clone()]);
-                    let docs =
-                        projected_documents(store, segment, &candidates, Some(&columns)).await?;
+                    let docs = projected_documents_from(
+                        store,
+                        source,
+                        segment,
+                        &candidates,
+                        Some(&columns),
+                    )
+                    .await?;
                     let ids = ids(store, segment).await?;
                     let mut out = RoaringBitmap::new();
                     for row in &candidates {
@@ -1648,7 +1727,9 @@ pub(crate) fn filter_rows<'a>(
                 let dir = directory(&reader).await?;
                 let Some(col) = dir.columns.get(attribute) else {
                     let columns = std::collections::BTreeSet::from([attribute.clone()]);
-                    let docs = projected_documents(store, segment, live, Some(&columns)).await?;
+                    let docs =
+                        projected_documents_from(store, source, segment, live, Some(&columns))
+                            .await?;
                     let ids = ids(store, segment).await?;
                     let mut out = RoaringBitmap::new();
                     for row in live {

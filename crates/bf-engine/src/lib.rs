@@ -35,6 +35,7 @@ mod reindex;
 mod text;
 mod text_keys;
 mod upgrade;
+mod vector_locator;
 mod write;
 
 use bf_storage::{CreateResult, Storage};

@@ -7,10 +7,10 @@ use uuid::Uuid;
 
 /// Current WAL encoding: one version byte followed by zstd-compressed JSON.
 pub const FORMAT_VERSION: u8 = 1;
-/// Current manifest generation. Formats 1 to 3 are accepted only for automatic upgrade (format 3
-/// replaced format 2's single `ann_slabs` layout with `ann_tiers`; format 4 added `lineage`, and
-/// segments a tier covers no longer need an ANN object of their own).
-pub const MANIFEST_FORMAT_VERSION: u8 = 4;
+/// Current manifest generation. Formats 1 to 4 are accepted only for automatic upgrade (format 3
+/// replaced format 2's single `ann_slabs` layout with `ann_tiers`; format 4 added `lineage`;
+/// format 5 lets covered segments retire their ANN objects, and pins covering tiers in copies).
+pub const MANIFEST_FORMAT_VERSION: u8 = 5;
 /// Current format of a tier's slabs and directory. A tier written in an older one is rebuilt by
 /// the automatic recluster.
 pub const TIER_FORMAT_VERSION: u32 = 1;

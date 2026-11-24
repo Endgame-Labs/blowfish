@@ -141,15 +141,16 @@ impl Engine {
         let store = &self.0.store;
         let attr = opts.attribute.as_str();
         let wal = Wal::new(store.clone(), ns).map_err(log_error)?;
-        let (ann_key, frag_key) = (format!("annv2:{attr}"), format!("annv2:{attr}"));
+        let ann_key = format!("annv2:{attr}");
+        let source = crate::vector_locator::Source::from(manifest);
         if segments.is_empty()
             || segments
                 .iter()
-                .any(|s| !s.files.contains_key(&ann_key) || !s.files.contains_key(&frag_key))
+                .any(|s| !s.files.contains_key(&ann_key) && !source.covers(s, attr))
         {
             return Err(ApiError::new(
                 400,
-                "every segment needs an ANN index and a block fragment",
+                "every segment needs a current ANN source",
             ));
         }
 
@@ -168,7 +169,20 @@ impl Engine {
         if total >= u64::from(u32::MAX) {
             return Err(ApiError::new(400, "too many rows for one recluster"));
         }
-        let first = segment_index(store, &segments[0], &ann_key).await?;
+        let first_segment = segments
+            .iter()
+            .find(|s| s.files.contains_key(&ann_key))
+            .or_else(|| {
+                manifest
+                    .ann_tiers
+                    .get(attr)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|t| &t.slabs)
+                    .find(|s| s.files.contains_key(&ann_key))
+            })
+            .ok_or_else(segment::corrupt)?;
+        let first = segment_index(store, first_segment, &ann_key).await?;
         let (dims, width) = (first.dims(), first.vector_row_bytes());
         let (dtype, metric) = (
             first.vector_type(),
@@ -193,6 +207,7 @@ impl Engine {
         let result = self
             .recluster_with_spill(
                 target,
+                manifest,
                 &wal,
                 opts,
                 covered,
@@ -212,6 +227,7 @@ impl Engine {
     async fn recluster_with_spill(
         &self,
         target: &Target,
+        manifest: &bf_wal::Manifest,
         wal: &Wal,
         opts: &ReclusterOptions,
         covered: Vec<SlabCover>,
@@ -225,6 +241,7 @@ impl Engine {
         let (attr, ns) = (opts.attribute.as_str(), wal.namespace().to_string());
         let ann_key = format!("annv2:{attr}");
         let segments = target.segments.clone();
+        let source = crate::vector_locator::Source::from(manifest);
         let bases: Vec<u32> = covered.iter().map(|c| c.base).collect();
         let copied: Vec<Vec<u32>> = futures::stream::iter(segments.into_iter().zip(bases).map(
             |(seg, base): (Segment, u32)| {
@@ -232,6 +249,30 @@ impl Engine {
                 let ann_key = ann_key.clone();
                 async move {
                     job.pause().await;
+                    if source.covers(&seg, attr) {
+                        let live = segment::live(store, &seg).await?;
+                        let mut it = live.iter();
+                        let mut present = Vec::with_capacity(live.len() as usize);
+                        loop {
+                            let selected =
+                                it.by_ref().take(4096).collect::<bf_vector::RoaringBitmap>();
+                            if selected.is_empty() {
+                                break;
+                            }
+                            let (rows, bytes) =
+                                source.read(store, &seg, &selected, attr, true).await?;
+                            for (row, raw) in rows.into_iter().zip(bytes.chunks_exact(width)) {
+                                spill
+                                    .write_all_at(
+                                        raw,
+                                        (u64::from(base) + u64::from(row)) * width as u64,
+                                    )
+                                    .map_err(segment::index_error)?;
+                                present.push(base + row);
+                            }
+                        }
+                        return Ok::<_, ApiError>(present);
+                    }
                     let index = segment_index(store, &seg, &ann_key).await?;
                     let live = if seg.live_generation == 0 {
                         None
@@ -411,6 +452,7 @@ impl Engine {
             clusters += k;
             let spill = spill.clone();
             let rows_n = rows.len() as u32;
+            let global_rows = rows.clone();
             // Between slabs, let a queued flush or compaction run first.
             job.pause().await;
             let blob = on_pool(move || -> Result<(Vec<u8>, u64), ApiError> {
@@ -459,7 +501,14 @@ impl Engine {
                 )
                 .await?;
                 let mut files = std::collections::BTreeMap::new();
+                let row_file = crate::vector_locator::write_rows(
+                    &store2,
+                    format!("{prefix}/vector-rows.bfr"),
+                    &global_rows,
+                )
+                .await?;
                 files.insert(format!("annv2:{attr2}"), ann);
+                files.insert("vector_rows".into(), row_file);
                 uploads2.lock().await.push(Segment {
                     id: id2,
                     wal_start: 0,

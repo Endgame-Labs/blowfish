@@ -34,10 +34,9 @@ pub(crate) async fn search(
             state.docs.len()
         );
     }
-    // A recluster's tiers answer unfiltered queries for the rows they cover, and the namespace
+    // A recluster's tiers answer vector queries for the rows they cover, and the namespace
     // directory for the rest (segments written since).
-    if q.filters.is_none()
-        && let Some(tiers) = state.ann_tiers.get(attribute)
+    if let Some(tiers) = state.ann_tiers.get(attribute)
         && let Some(found) = from_tiers(
             store, state, q, attribute, vector, config, k, columns, tiers,
         )
@@ -65,6 +64,7 @@ pub(crate) async fn search(
             Some(file),
             Layout::Segments,
             &[],
+            state,
         )
         .await?
     {
@@ -87,6 +87,7 @@ pub(crate) async fn search(
             None,
             Layout::Segments,
             &[],
+            state,
         )
         .await;
     }
@@ -108,6 +109,7 @@ async fn from_directory(
     file: Option<&bf_wal::SegmentFile>,
     layout: Layout,
     skip: &[bool],
+    source: &NamespaceState,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     // Filtered queries compute each segment's allowed rows (live rows that pass the filter)
     // alongside the directory, and read each segment's row-to-cluster map, so the
@@ -116,11 +118,18 @@ async fn from_directory(
     let (dir, lives) = tokio::join!(
         async {
             match file {
-                Some(f) => crate::ann_dir::load(store, f, None).await,
+                Some(f) => {
+                    let dir = crate::ann_dir::load(store, f, None).await?;
+                    if crate::ann_dir::covers(&dir, &state.segments, attribute, layout) {
+                        Ok(dir)
+                    } else {
+                        crate::upgrade::directory(store, &state.segments, attribute).await
+                    }
+                }
                 None => crate::upgrade::directory(store, &state.segments, attribute).await,
             }
         },
-        crate::ann_dir::live_masks(store, state, q.filters.as_ref())
+        crate::ann_dir::live_masks(store, state, source, q.filters.as_ref())
     );
     // Upgrade readers normalize older directories before the current planner uses them.
     if crate::ann::trace_stages() {
@@ -176,6 +185,7 @@ async fn from_directory(
                 None,
                 skip,
                 None,
+                source,
             )
             .await?;
             if slack > 0 {
@@ -223,7 +233,7 @@ pub(crate) fn tiers_usable(
         .all(|t| crate::lineage::reachable(segments, lineage, t))
 }
 
-/// Unfiltered ANN over a recluster's tiers and the segments no tier covers, as one plan: each
+/// ANN over a recluster's tiers and the segments no tier covers, as one plan: each
 /// tier's slabs and the uncovered segments (through the namespace directory, with the covered
 /// segments left out of its probe plan) are searched at the same time, and their exactly
 /// reranked winners merged. `None` when some part cannot answer, so the caller falls back.
@@ -279,6 +289,7 @@ async fn from_tiers(
                     at,
                     None,
                     seat.as_ref(),
+                    q.filters.as_ref(),
                 )
                 .await
             }
@@ -289,17 +300,27 @@ async fn from_tiers(
         && state
             .segments
             .iter()
-            .any(|s| crate::upgrade::files(s, attribute).is_none())
+            .enumerate()
+            .any(|(i, s)| !covered[i] && crate::upgrade::files(s, attribute).is_none())
     {
         return Ok(None);
     }
     let rest = uncovered.then(|| {
         let covered = &covered;
         async move {
+            let mut rest_state = state.without_docs();
+            rest_state.segments = state
+                .segments
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !covered[*i])
+                .map(|(_, s)| s.clone())
+                .collect::<Vec<_>>()
+                .into();
             let file = crate::upgrade::directory_file(&state.ann_dirs, attribute).map(|(f, _)| f);
             from_directory(
                 store,
-                state,
+                &rest_state,
                 q,
                 attribute,
                 vector,
@@ -308,7 +329,8 @@ async fn from_tiers(
                 columns,
                 file,
                 Layout::Segments,
-                covered,
+                &[],
+                state,
             )
             .await
         }
@@ -451,7 +473,7 @@ pub(crate) async fn tier_mask(
     Ok(Some(mask))
 }
 
-/// Unfiltered ANN from one tier's slabs: the same directory search, over slabs as pseudo
+/// Masked or unfiltered ANN from one tier's slabs: the same directory search, over slabs as pseudo
 /// segments, with winners mapped back to the segments holding them now (`at`) for hydration.
 #[allow(clippy::too_many_arguments)]
 async fn from_slabs(
@@ -466,6 +488,7 @@ async fn from_slabs(
     at: &crate::lineage::Placement,
     prefetched: Option<&crate::ann_dir::Prefetched>,
     seat: Option<&crate::ann_dir::Seat>,
+    filter: Option<&Filter>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     let Ok((dir, _)) = crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
     else {
@@ -476,7 +499,10 @@ async fn from_slabs(
     if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
         return Ok(None);
     }
-    let mask = tier_mask(store, state, set, at).await?;
+    let mask = match filter {
+        Some(filter) => Some(filtered_mask(store, state, set, at, filter).await?),
+        None => tier_mask(store, state, set, at).await?,
+    };
     if crate::ann::trace_stages() {
         eprintln!(
             "SLABS slabs={} masked={}",
@@ -484,7 +510,23 @@ async fn from_slabs(
             mask.is_some()
         );
     }
-    let lives = vec![mask; view.segments.len()];
+    let lives = if filter.is_some() {
+        futures::future::try_join_all(set.slabs.iter().map(|slab| {
+            let mask = &mask;
+            async move {
+                let rows = crate::vector_locator::rows(store, slab, set, attribute).await?;
+                let allowed = rows
+                    .iter()
+                    .copied()
+                    .filter(|r| mask.as_ref().is_none_or(|m| m.contains(*r)))
+                    .collect();
+                Ok::<_, ApiError>(Some(Arc::new(allowed)))
+            }
+        }))
+        .await?
+    } else {
+        vec![mask; view.segments.len()]
+    };
     let slack = if state.shadowed.is_empty() {
         0
     } else {
@@ -500,11 +542,12 @@ async fn from_slabs(
         k + slack,
         columns,
         attribute,
-        None,
+        filter.map(|_| vec![None; view.segments.len()]),
         Layout::Slabs,
         Some((state, &set.covered, at)),
         &[],
         seat,
+        state,
     )
     .await?;
     if slack > 0 {
@@ -517,4 +560,47 @@ async fn from_slabs(
         return Ok(None);
     }
     Ok(Some((scores, docs)))
+}
+
+/// Shift exact per-segment filter results back through lineage into the tier's global rows.
+/// This includes live masks and tail shadows, so a slab scan cannot return an older version.
+async fn filtered_mask(
+    store: &Storage,
+    state: &NamespaceState,
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+    filter: &Filter,
+) -> Result<Arc<RoaringBitmap>, ApiError> {
+    use crate::lineage::Place;
+    let positions: BTreeSet<_> = at.positions().collect();
+    let loaded = futures::future::try_join_all(
+        positions
+            .iter()
+            .map(|&i| crate::snapshot::allowed(store, state, &state.segments[i], Some(filter))),
+    )
+    .await?;
+    let allowed: BTreeMap<_, _> = positions.into_iter().zip(loaded).collect();
+    let mut mask = RoaringBitmap::new();
+    for (c, place) in set.covered.iter().zip(&at.places) {
+        match place {
+            Place::Here(i) => {
+                mask.extend(
+                    allowed[i]
+                        .iter()
+                        .filter(|r| *r < c.rows)
+                        .map(|r| c.base + r),
+                );
+            }
+            Place::Moved(parts) => {
+                for (i, map) in parts {
+                    mask.extend(
+                        map.pairs()
+                            .filter(|(_, to)| allowed[i].contains(*to))
+                            .map(|(from, _)| c.base + from),
+                    );
+                }
+            }
+        }
+    }
+    Ok(Arc::new(mask))
 }

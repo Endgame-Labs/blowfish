@@ -185,7 +185,7 @@ segments, at the same bytes.
 ### D4 after round AR3: what is left
 
 Round AR3 built R4's lineage: compaction now merges covered segments and records where their rows went. It did
-not retire the covered segments' ANN objects. On NQ (2.68M rows, 768 dims in f16, everything covered by a base),
+not retire the covered segments' ANN objects. On NQ (2.68M rows, 1,024 dims in f16, everything covered by a base),
 those objects total 6.0 GB, about 2,240 bytes per covered row, in line with the estimate above. Retiring them
 makes the tier the only copy of those vectors, so every path that reads a covered segment's ANN object has to read
 through the tier first:
@@ -212,3 +212,38 @@ through the tier first:
 
 Every bullet is a path where a missed case loses vectors, not just speed, so D4 needs a round of its own. Lineage
 and the fence (format 4) are in place for it.
+
+### D4 publication and reader invariants
+
+D4 uses manifest and bucket format 5. Format-4 manifests remain readable and upgrade automatically; a
+format-4 binary must reject the format-5 bucket marker before reading, writing, or collecting garbage.
+ANN objects keep their existing encoding and global slab row IDs. A slab's file map adds `vector_rows`,
+a sorted list of little-endian u32 global rows, followed by a CRC32. Its resident list costs four bytes
+per vector row. Binary search identifies the slab and row ordinal; the existing ANN index resolves the
+row's cluster and packed vector range. No second vector payload is introduced.
+
+The index publication first makes row lists durable for any existing tiers, then drops fully covered
+segments' `annv2:` references, and records their objects for normal retention and GC. Older tiers need a
+one-time scan to recover their row lists through the existing ANN reader. New tier builds write the
+lists directly. A failed or ambiguous upload or publication leaves the preceding complete source
+reachable. Retirement and directory rebuilding share the indexer's fenced publication. Segment
+directories list only segments that still own ANN objects.
+
+Two additional reader requirements emerged during implementation:
+
+- Parallel query workers select one segment for their work, but must retain the complete original
+  snapshot as their vector source. Resolving a tier against that reduced segment list incorrectly makes
+  its other covers unreachable. Exact and scalar workers, and ANN plans over uncovered segments, pass the original source explicitly.
+- A row-list file is slab metadata, so legacy upgrade fixtures and readers must identify slabs by their
+  document role, rather than by an otherwise empty file map.
+
+Filtered tier queries shift exact per-segment filter results back through lineage into global rows,
+then intersect them with each slab's resident row list. Their probe plan uses those matching counts
+and the filtered probe cap. Sparse global slab IDs have no dense row-to-cluster map, so they use the
+existing masked code scan, rather than the dense segment map's direct exact-fetch shortcut.
+
+Branches and copies use version-2 pins containing covering tiers and vector lineage, as well as
+segments. GC protects every pinned slab, directory, row list, coarse-cell object, and lineage map.
+Dropping a stale tier first rebuilds any surviving segment's ANN object through the original snapshot's
+locator. Replacing a base reads its predecessor while building, then publishes its replacement before
+retiring the predecessor's objects.

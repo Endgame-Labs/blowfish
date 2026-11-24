@@ -342,7 +342,12 @@ pub(crate) fn covered_segments(manifest: &Manifest) -> std::collections::BTreeSe
 /// A recluster tier holds rows of the segments it covers: once a covered segment is gone with no
 /// lineage to where its rows went (a schema rebuild, or deletion of the namespace), it can never
 /// answer again, so retire it. Lineage no remaining tier refers to is dropped too.
-pub(crate) fn retire_stale_tiers(manifest: &mut Manifest) {
+pub(crate) async fn retire_stale_tiers(
+    store: &bf_storage::Storage,
+    ns: &str,
+    manifest: &mut Manifest,
+    source: crate::vector_locator::Source<'_>,
+) -> Result<(), ApiError> {
     let mut stale = Vec::new();
     for (attr, tiers) in &manifest.ann_tiers {
         for (n, set) in tiers.iter().enumerate() {
@@ -354,6 +359,31 @@ pub(crate) fn retire_stale_tiers(manifest: &mut Manifest) {
         if stale.iter().any(|(a, n)| a == attr && *n == 0) {
             stale.retain(|(a, _)| a != attr);
             stale.extend((0..tiers.len()).map(|n| (attr.clone(), n)));
+        }
+    }
+    // Materialize surviving vectors before dropping their last tier. Read from the original
+    // publication snapshot, where all covers and lineage are still resolvable.
+    for (attr, _) in &stale {
+        for seg in &mut manifest.segments {
+            if !seg.files.contains_key(&format!("annv2:{attr}")) && source.covers(seg, attr) {
+                let file = crate::vector_locator::restore(
+                    store,
+                    ns,
+                    source,
+                    seg,
+                    attr,
+                    manifest.distance_metric,
+                )
+                .await?;
+                seg.files.insert(format!("annv2:{attr}"), file);
+            } else if crate::upgrade::files(seg, attr).is_none()
+                && seg.schema.get(attr).and_then(segment::dense_type).is_some()
+                && !segment::upgrade::needs_upgrade(store, seg).await?
+            {
+                return Err(segment::index_error(
+                    "cannot drop a tier while a surviving segment has no resolvable vector source",
+                ));
+            }
         }
     }
     for (attr, n) in stale.into_iter().rev() {
@@ -371,6 +401,7 @@ pub(crate) fn retire_stale_tiers(manifest: &mut Manifest) {
         retire_slabs(manifest, &set);
     }
     crate::lineage::prune(manifest);
+    Ok(())
 }
 pub(crate) fn retire_slabs(manifest: &mut Manifest, set: &bf_wal::SlabSet) {
     // Objects another remaining tier still uses (a delta's base, or cells shared) stay.
@@ -503,7 +534,9 @@ impl Engine {
                     })
             });
             let will_compact = tier(&state, &self.0.config, force, &protected);
-            let upgrade = needs_text_upgrade(&state) || installing;
+            let upgrade = needs_text_upgrade(&state)
+                || installing
+                || crate::vector_locator::needs_retirement(&state);
             if state.seq == state.indexed_through
                 && will_compact.is_empty()
                 && !will_rebuild
@@ -565,7 +598,9 @@ impl Engine {
         }
         crate::ann::stage(t0, "idx hydrate");
         let compact = tier(&state, &self.0.config, force, &protected);
-        let upgrade = needs_text_upgrade(&state) || installing;
+        let upgrade = needs_text_upgrade(&state)
+            || installing
+            || crate::vector_locator::needs_retirement(&state);
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
         }
@@ -652,6 +687,8 @@ impl Engine {
         crate::ann::stage(t0, "idx claim");
         let store = &self.0.store;
         manifest.stats = (*state.stats).clone();
+        manifest.ann_tiers = (*state.ann_tiers).clone();
+        manifest.lineage = (*state.lineage).clone();
         // The previous text statistics object is replaced by this publication.
         let previous_text = manifest.text_stats.take();
         // With `external` statistics, changes accumulate here and merge into the object at the end.
@@ -674,7 +711,8 @@ impl Engine {
             manifest.stats = NamespaceStats::default();
             for seg in &state.segments {
                 let live = snapshot::allowed(store, &state, seg, None).await?;
-                let mut docs = segment::documents(store, seg, &live).await?;
+                let mut docs =
+                    segment::documents_from(store, Some((&state).into()), seg, &live).await?;
                 for doc in docs.values_mut() {
                     doc.retain(|name, _| state.schema.contains_key(name));
                 }
@@ -776,8 +814,14 @@ impl Engine {
                                 segment::ids(store, &seg).await?,
                             ));
                         }
-                        let (docs, vectors) =
-                            segment::compaction_rows(store, &seg, &live, &strip).await?;
+                        let (docs, vectors) = segment::compaction_rows_from(
+                            store,
+                            Some((&state).into()),
+                            &seg,
+                            &live,
+                            &strip,
+                        )
+                        .await?;
                         compact_docs.extend(crate::shared(docs));
                         for (name, part) in vectors {
                             compact_vectors.entry(name).or_default().push(part);
@@ -932,47 +976,13 @@ impl Engine {
         };
         manifest.deleted = false;
         manifest.segments = segments;
-        retire_stale_tiers(&mut manifest);
+        retire_stale_tiers(store, ns, &mut manifest, (&state).into()).await?;
         // Rewrite bounded batches under this publication's epoch claim. A failed or fenced
         // pass leaves only unreferenced objects for GC; it never deletes uncertain uploads.
         let old = crate::text_upgrade::upgrade(store, ns, &mut manifest.segments).await?;
         for key in old {
             retire(&mut manifest, key);
         }
-        // Rebuild each vector attribute's ANN directories only when their segment list changed.
-        let attributes: std::collections::BTreeSet<String> = manifest
-            .segments
-            .iter()
-            .flat_map(|s| s.files.keys())
-            .filter_map(|k| k.strip_prefix("annv2:").map(str::to_string))
-            .collect();
-        let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
-        for attr in attributes {
-            // The two layouts are independent objects: write them at the same time.
-            let layouts = [crate::ann_dir::Layout::Segments];
-            let built = futures::future::try_join_all(layouts.iter().map(|layout| {
-                crate::ann_dir::build(
-                    store,
-                    ns,
-                    &manifest.segments,
-                    &attr,
-                    *layout,
-                    previous_dirs.get(&layout.dir_key(&attr)),
-                )
-            }))
-            .await?;
-            for (layout, file) in layouts.iter().zip(built) {
-                if let Some(file) = file {
-                    manifest.ann_dirs.insert(layout.dir_key(&attr), file);
-                }
-            }
-        }
-        for old in previous_dirs.values() {
-            if !manifest.ann_dirs.values().any(|f| f.key == old.key) {
-                retire(&mut manifest, old.key.clone());
-            }
-        }
-        crate::ann::stage(t0, "idx dirs");
         manifest.schema = state.schema.clone();
         manifest.distance_metric = state.metric;
         manifest.id_type = state.schema["id"].data_type.clone().expect("id schema");
@@ -1030,6 +1040,47 @@ impl Engine {
             // A new base covers the merged segments' targets itself: their lineage goes.
             crate::lineage::prune(&mut manifest);
         }
+        crate::vector_locator::retire_covered(store, &mut manifest).await?;
+        // Rebuild each vector attribute's ANN directories only when their segment list changed.
+        let attributes: std::collections::BTreeSet<String> = manifest
+            .segments
+            .iter()
+            .flat_map(|s| s.files.keys())
+            .filter_map(|k| k.strip_prefix("annv2:").map(str::to_string))
+            .collect();
+        let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
+        for attr in attributes {
+            let segment_sources: Vec<_> = manifest
+                .segments
+                .iter()
+                .filter(|s| s.files.contains_key(&format!("annv2:{attr}")))
+                .cloned()
+                .collect();
+            let layouts = [crate::ann_dir::Layout::Segments];
+            let built = futures::future::try_join_all(layouts.iter().map(|layout| {
+                crate::ann_dir::build(
+                    store,
+                    ns,
+                    &segment_sources,
+                    &attr,
+                    *layout,
+                    previous_dirs.get(&layout.dir_key(&attr)),
+                )
+            }))
+            .await?;
+            for (layout, file) in layouts.iter().zip(built) {
+                if let Some(file) = file {
+                    manifest.ann_dirs.insert(layout.dir_key(&attr), file);
+                }
+            }
+        }
+        for old in previous_dirs.values() {
+            if !manifest.ann_dirs.values().any(|f| f.key == old.key) {
+                retire(&mut manifest, old.key.clone());
+            }
+        }
+        crate::ann::stage(t0, "idx dirs");
+
         let generation = match wal
             .publish_fenced(claim, manifest.indexer_epoch, &manifest)
             .await

@@ -4847,7 +4847,7 @@ Neither original prefix nor the production process on this VM was modified.
 
 ## Round AR3: compaction through the tiers (lineage), and deltas beside a base build (2026-11-24)
 
-NQ (2,681,468 rows, 768 dims in f16, cosine) on one shared 8-CPU VM: server on CPUs 0 to 5, clients on 4 and 5, local
+NQ (2,681,468 rows, 1,024 dims in f16, cosine) on one shared 8-CPU VM: server on CPUs 0 to 5, clients on 4 and 5, local
 file store. Other workers were running benchmarks at the same time (load average 10 to 15), so latencies are noisy.
 The gate uses instruction counts (`perf stat -e instructions:u` on the server over 2,000 one-client queries, after
 2,000 warm-up queries).
@@ -5598,3 +5598,37 @@ EBS and S3 request charges are additional. No S3 data was added. All instances w
 terminated, and the temporary key pair and security group were deleted. Local run artifacts
 were removed after recording these results. Workspace and SDK compatibility
 checks remain the coordinator's merge checks.
+
+## Round D4: one stored vector copy in covered namespaces (2026-11-24)
+
+I loaded all 2,681,468 NQ passages as 1,024-dimensional f16 cosine vectors, with IDs and vectors only,
+through the HTTP API on `origin/main` at `293251c`. The paired runs use one owned c7gd.2xlarge in
+us-west-2, with S3 in the same region. The baseline's final base has 38 slabs, with about 200 rows per
+leaf. I copied that namespace's objects to a separate candidate prefix before upgrading it. Query
+runs use the engine directly, strong consistency, a 3 GiB memory block cache, and no disk cache.
+
+The retirement pass keeps the snapshot's segment layout fixed. Compaction and lineage are tested
+separately. Format-4 tiers gain their row lists automatically, then the indexer removes covered
+segments' ANN references in its fenced publication. With retention set to zero for this measurement,
+GC removes the redundant objects:
+
+| Namespace objects, decimal GB | Before | After |
+|---|---:|---:|
+| Segment ANN objects | 5.942 | 0.000 |
+| Tier ANN objects | 5.982 | 5.982 |
+| Slab row lists | 0.000 | 0.011 |
+| Other namespace objects | 0.211 | 0.209 |
+| Total | 12.135 | 6.201 |
+
+The exact reduction is 5,933,965,463 bytes, or 48.9%. All 18 segment ANN objects disappear, and all
+38 tier ANN objects keep their original keys and bytes. The 38 row-list objects total 10,726,936
+bytes, including their checksums and storage headers; their resident u32 lists use 10,725,872 bytes.
+The automatic upgrade takes 54.0 seconds, and the following GC takes 0.8 seconds. The format-4
+executable rejects the upgraded prefix with `BucketFormat { required: 5, supported: 4 }`.
+
+Use separate `CARGO_TARGET_DIR` directories when building the two source archives: sharing one can
+reuse an executable from the other archive. The measurement harness records its compiled manifest
+and bucket versions, and verifies that the older executable refuses the candidate before timing it.
+The harness is `crates/bf-engine/examples/d4.rs`; the data loader is `bench/nq/load.py --vectors-only`.
+
+Paired latency, throughput, and recall measurements are in progress.

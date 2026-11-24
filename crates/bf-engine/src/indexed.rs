@@ -310,6 +310,7 @@ async fn prepare(
         let mut out = prepare_one(
             store,
             state,
+            state,
             q,
             config,
             force_exact,
@@ -320,6 +321,7 @@ async fn prepare(
         trim_candidates(&mut out, q);
         return Ok(out);
     };
+    let sources = std::sync::Arc::new(state.without_docs());
     let mut base = state.without_docs();
     base.segments.clear();
     let base = std::sync::Arc::new(base);
@@ -329,6 +331,7 @@ async fn prepare(
         let config = config.clone();
         let q = q.clone();
         let base = base.clone();
+        let sources = sources.clone();
         let threshold = threshold.clone();
         async move {
             let permit = context
@@ -348,6 +351,7 @@ async fn prepare(
                     prepare_one(
                         &store,
                         &state,
+                        &sources,
                         &q,
                         &config,
                         force_exact,
@@ -375,6 +379,7 @@ async fn prepare(
     let part = prepare_one(
         store,
         &tail,
+        state,
         q,
         config,
         force_exact,
@@ -440,9 +445,11 @@ fn projection_columns(
     }
     columns
 }
+#[allow(clippy::too_many_arguments)]
 async fn prepare_one(
     store: &Storage,
     state: &NamespaceState,
+    source: &NamespaceState,
     q: &QueryRequest,
     config: &EngineConfig,
     force_exact: bool,
@@ -458,10 +465,10 @@ async fn prepare_one(
         },
     ) = &q.rank_by
     else {
-        return prepare_scalar(store, state, q, threshold).await;
+        return prepare_scalar(store, state, source, q, threshold).await;
     };
     if state.metric == DistanceMetric::CosineDistance && vector.iter().all(|x| *x == 0.0) {
-        return snapshot::materialize(store, state).await;
+        return snapshot::materialize(store, source).await;
     }
     // Diversification can need arbitrarily deep candidates from each segment.
     let all = q.limit.as_ref().and_then(Limit::per).is_some();
@@ -472,7 +479,7 @@ async fn prepare_one(
     for seg in &state.segments {
         let file = seg.files.get(&format!("annv2:{attribute}"));
         let (allowed, index, ids) = tokio::try_join!(
-            snapshot::allowed(store, state, seg, q.filters.as_ref()),
+            snapshot::allowed(store, source, seg, q.filters.as_ref()),
             async {
                 match file {
                     Some(file) => segment::vector_index(store, file).await.map(Some),
@@ -484,6 +491,72 @@ async fn prepare_one(
         if allowed.is_empty() {
             continue;
         }
+        if index.is_none() && crate::vector_locator::Source::from(source).covers(seg, attribute) {
+            let (dims, dtype) = seg
+                .schema
+                .get(attribute)
+                .and_then(segment::dense_type)
+                .ok_or_else(segment::corrupt)?;
+            let width = dims * dtype.width();
+            let mut remaining = allowed.iter();
+            let mut hits = Vec::new();
+            loop {
+                let selected: RoaringBitmap = remaining.by_ref().take(4096).collect();
+                if selected.is_empty() {
+                    break;
+                }
+                let (rows, bytes) = segment::read_packed_from(
+                    store,
+                    Some(source.into()),
+                    seg,
+                    &selected,
+                    attribute,
+                )
+                .await?;
+                if let Some(context) = crate::read_cache::context() {
+                    context
+                        .ann_rows
+                        .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                for (row, raw) in rows.into_iter().zip(bytes.chunks_exact(width)) {
+                    let stored: Vec<f32> = match dtype {
+                        bf_vector::VectorType::I8 => raw.iter().map(|x| *x as i8 as f32).collect(),
+                        bf_vector::VectorType::F16 => raw
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|x| half::f16::from_le_bytes(*x).to_f32())
+                            .collect(),
+                        bf_vector::VectorType::F32 => raw
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|x| f32::from_le_bytes(*x))
+                            .collect(),
+                    };
+                    hits.push((row, query::distance(&stored, vector, state.metric)));
+                }
+            }
+            hits.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            if !all {
+                hits.truncate(k);
+            }
+            let rows = hits.iter().map(|(r, _)| *r).collect();
+            for (row, score) in hits {
+                scores.insert(ids[row as usize].clone(), score);
+            }
+            out.docs.extend(crate::shared(
+                segment::projected_documents_from(
+                    store,
+                    Some(source.into()),
+                    seg,
+                    &rows,
+                    Some(&columns),
+                )
+                .await?,
+            ));
+            continue;
+        }
         let Some(index) = index else {
             // Version-one document-only segments remain readable during rollout.
             if let Some(context) = crate::read_cache::context() {
@@ -491,7 +564,7 @@ async fn prepare_one(
                     .document_scan_rows
                     .fetch_add(allowed.len(), std::sync::atomic::Ordering::Relaxed);
             }
-            let docs = segment::documents(store, seg, &allowed).await?;
+            let docs = segment::documents_from(store, Some(source.into()), seg, &allowed).await?;
             for (id, mut doc) in docs {
                 doc.retain(|name, _| state.schema.contains_key(name));
                 if let Some(v) = doc.get(attribute) {
@@ -526,7 +599,14 @@ async fn prepare_one(
             scores.insert(ids[row as usize].clone(), score as f64);
         }
         out.docs.extend(crate::shared(
-            segment::projected_documents(store, seg, &rows, Some(&columns)).await?,
+            segment::projected_documents_from(
+                store,
+                Some(source.into()),
+                seg,
+                &rows,
+                Some(&columns),
+            )
+            .await?,
         ));
     }
     let scores = merge_tail(state, q, attribute, vector, all, scores, &mut out)?;
@@ -699,6 +779,7 @@ pub(crate) fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) 
 async fn prepare_segment(
     store: &Storage,
     state: &NamespaceState,
+    source: &NamespaceState,
     q: &QueryRequest,
     seg: &bf_wal::Segment,
     clauses: &[&RankBy],
@@ -735,7 +816,7 @@ async fn prepare_segment(
     let use_keys =
         columns.is_empty() && !all && !clauses.is_empty() && crate::text_keys::inline(seg);
     let (allowed, indexes, whole_ids, keys) = tokio::try_join!(
-        snapshot::allowed(store, state, seg, q.filters.as_ref()),
+        snapshot::allowed(store, source, seg, q.filters.as_ref()),
         open_text,
         async {
             if clauses.is_empty() || big_ids || use_keys {
@@ -801,7 +882,14 @@ async fn prepare_segment(
             .map_err(segment::index_error)?
         } else {
             let columns = BTreeSet::from([attribute.clone()]);
-            let docs = segment::projected_documents(store, seg, &allowed, Some(&columns)).await?;
+            let docs = segment::projected_documents_from(
+                store,
+                Some(source.into()),
+                seg,
+                &allowed,
+                Some(&columns),
+            )
+            .await?;
             let mut hits = vec![];
             for row in &allowed {
                 let value = docs[&ids.as_ref().expect("text IDs")[row as usize]]
@@ -849,11 +937,26 @@ async fn prepare_segment(
             }
         }
         out.docs.extend(crate::shared(
-            segment::projected_documents(store, seg, &selected, Some(columns)).await?,
+            segment::projected_documents_from(
+                store,
+                Some(source.into()),
+                seg,
+                &selected,
+                Some(columns),
+            )
+            .await?,
         ));
         return Ok(out);
     }
-    let rows = segment::projected_rows(store, seg, &selected, Some(columns)).await?;
+    let rows = segment::projected_rows_with_from(
+        store,
+        Some(source.into()),
+        seg,
+        &selected,
+        Some(columns),
+        false,
+    )
+    .await?;
     let mut row_ids = BTreeMap::new();
     let mut docs = BTreeMap::new();
     for (row, doc) in rows {
@@ -876,6 +979,7 @@ async fn prepare_segment(
 async fn prepare_scalar(
     store: &Storage,
     state: &NamespaceState,
+    source: &NamespaceState,
     q: &QueryRequest,
     threshold: Option<&bf_text::SearchThreshold>,
 ) -> Result<NamespaceState, ApiError> {
@@ -916,6 +1020,7 @@ async fn prepare_scalar(
         prepare_segment(
             store,
             state,
+            source,
             q,
             seg,
             &clauses,

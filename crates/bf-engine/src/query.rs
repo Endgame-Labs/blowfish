@@ -998,7 +998,7 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
             let live = crate::snapshot::allowed(engine.storage(), &state, seg, None).await?;
             let rows = live.iter().take(num - samples.len()).collect();
             samples.extend(
-                crate::segment::documents(engine.storage(), seg, &rows)
+                crate::segment::documents_from(engine.storage(), Some((&state).into()), seg, &rows)
                     .await?
                     .into_values()
                     .map(std::sync::Arc::new),

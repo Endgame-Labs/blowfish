@@ -64,6 +64,7 @@ pub(crate) async fn rewrite(
     store: &Storage,
     ns: &str,
     segment: &Segment,
+    source: Option<crate::vector_locator::Source<'_>>,
 ) -> Result<Vec<(String, SegmentFile)>, ApiError> {
     let file = segment.files.get("docs").ok_or_else(corrupt)?;
     let reader = ObjectReader::new(store, file).bypass_cache();
@@ -72,7 +73,9 @@ pub(crate) async fn rewrite(
     let mut body = Vec::new();
     for (name, column) in &old.columns {
         if let Some((dims, f16)) = column.vector {
-            if !segment.files.contains_key(&format!("annv2:{name}")) {
+            if !segment.files.contains_key(&format!("annv2:{name}"))
+                && !source.is_some_and(|s| s.covers(segment, name))
+            {
                 return Err(index_error(
                     "document upgrade requires the current ANN object",
                 ));

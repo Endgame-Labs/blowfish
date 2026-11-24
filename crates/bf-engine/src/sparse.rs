@@ -109,7 +109,9 @@ pub(crate) async fn segment_scores(
                 scores.insert(ids[row as usize].clone(), score as f64);
             }
         } else {
-            let docs = segment::documents(store, seg, allowed).await?;
+            let fields = std::collections::BTreeSet::from([attribute.clone()]);
+            let docs =
+                segment::projected_documents_from(store, None, seg, allowed, Some(&fields)).await?;
             for (id, doc) in docs {
                 scores.insert(id, dot(doc.get(attribute), vector) as f64);
             }
