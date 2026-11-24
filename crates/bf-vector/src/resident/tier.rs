@@ -1,5 +1,5 @@
 //! Incrementally admitted code rows and validated sparse exact-vector rows.
-use super::{ResidentQueryScratch, decode, prune};
+use super::{ResidentPopulation, ResidentQueryScratch, decode, prune};
 use crate::{Bytes, DecodedCluster, Directory, Index, Result, VectorType, format};
 use std::sync::{Arc, OnceLock};
 
@@ -62,6 +62,7 @@ pub struct CompiledHits<'a> {
 pub struct CompiledTier {
     directory: Arc<Directory>,
     slabs: Vec<Slab>,
+    population: ResidentPopulation,
 }
 impl CompiledTier {
     /// Maximum resident bytes for code payloads and metadata, before constructing a view.
@@ -71,6 +72,7 @@ impl CompiledTier {
         let rows: u64 = directory.entries().iter().map(|e| u64::from(e.rows)).sum();
         Self::code_bytes(directory)
             + directory.resident_bytes()
+            + directory.entries().len() as u64 * std::mem::size_of::<usize>() as u64
             + rows * 16
             + leaves as u64 * (directory.dims().next_power_of_two() as u64 * 4 + 512)
             + directory.segments().len() as u64 * directory.dims().next_power_of_two() as u64 * 32
@@ -107,7 +109,12 @@ impl CompiledTier {
                 rows,
             });
         }
-        Ok(Self { directory, slabs })
+        let population = ResidentPopulation::new(&directory);
+        Ok(Self {
+            directory,
+            slabs,
+            population,
+        })
     }
     /// Admit a decoded leaf and its immutable code bytes. Racing admissions converge on one
     /// validated payload. The source block is copied so it cannot pin unrelated cache data.
@@ -176,9 +183,14 @@ impl CompiledTier {
                 scanned_rows: 0,
             }));
         }
-        let target = self
-            .directory
-            .resident_plan(query, nprobe, rerank_factor, k, scratch)?;
+        let target = self.directory.resident_plan(
+            query,
+            nprobe,
+            rerank_factor,
+            k,
+            Some(&self.population),
+            scratch,
+        )?;
         let s = scratch;
         if s.chosen.iter().enumerate().any(|(i, cs)| {
             cs.iter()

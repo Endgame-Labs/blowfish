@@ -150,6 +150,7 @@ mod tests {
                 indexing: false,
                 recall_sample_rate: 0.,
                 decoded_cache_bytes,
+                ann_nprobe: 8,
                 ..Default::default()
             },
         )
@@ -176,6 +177,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn compiled_queries_preserve_snapshots_masks_projections_and_cache_eviction() {
+        for cluster_rows in [60, 640] {
+            check_compiled_queries(cluster_rows).await;
+        }
+    }
+
+    async fn check_compiled_queries(cluster_rows: usize) {
         let store = Storage::open(&StorageConfig {
             url: "memory://".into(),
             ..Default::default()
@@ -203,7 +210,7 @@ mod tests {
                 &ReclusterOptions {
                     attribute: "vector".into(),
                     cells: 1,
-                    cluster_rows: 60,
+                    cluster_rows,
                     max_slab_rows: 10000,
                     scratch: scratch.path().to_owned(),
                 },

@@ -143,7 +143,7 @@ pub(crate) struct Layout {
 
 /// The trigger's numbers for `attr` (see the design's gain estimate). For uncovered segments a
 /// default query probes `min(S^0.3, 4)` times the clusters, each holding about `sqrt(rows)` of a
-/// segment's rows; after a rebuild it probes leaves of `CLUSTER_ROWS`.
+/// segment's rows; after a rebuild it probes leaves sized from the tier's population.
 pub(crate) fn layout(
     segments: &[bf_wal::Segment],
     lineage: &[bf_wal::Lineage],
@@ -189,7 +189,7 @@ pub(crate) fn layout(
     });
     let spread = (sum * sum / squares).max(1.0).powf(0.3).min(4.0);
     let per_cluster = sum / roots.max(1.0);
-    let leaf = recluster::CLUSTER_ROWS as f64;
+    let leaf = recluster::target_leaf_rows(rows) as f64;
     // Rows scanned per probe now (tiers' leaves, plus the uncovered part's coarser clusters), over
     // rows scanned per probe after.
     let tier_part = if tiers.is_empty() { 0.0 } else { leaf };
@@ -987,7 +987,7 @@ impl Engine {
         let opts = recluster::ReclusterOptions {
             attribute: attr.to_string(),
             cells: recluster::CELLS,
-            cluster_rows: recluster::CLUSTER_ROWS,
+            cluster_rows: 0,
             max_slab_rows,
             scratch,
         };

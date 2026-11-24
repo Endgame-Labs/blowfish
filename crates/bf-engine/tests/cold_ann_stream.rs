@@ -68,7 +68,7 @@ async fn cold_batches_preserve_warm_results_projection_and_live_masks() {
             &ReclusterOptions {
                 attribute: "vector".into(),
                 cells: 4,
-                cluster_rows: 128,
+                cluster_rows: 0,
                 max_slab_rows: 30_000,
                 scratch: scratch.path().join("build"),
             },
@@ -76,6 +76,7 @@ async fn cold_batches_preserve_warm_results_projection_and_live_masks() {
         .await
         .unwrap();
     assert_eq!(built.rows, 100_000);
+    assert_eq!(built.cluster_rows, 200);
     for id in [0, 107, 1007, 49_001, 99_999] {
         engine.drop_caches().await;
         let request = json!({
