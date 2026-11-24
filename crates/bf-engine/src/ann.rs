@@ -176,6 +176,7 @@ async fn from_directory(
                 None,
                 skip,
                 None,
+                None,
             )
             .await?;
             if slack > 0 {
@@ -484,6 +485,11 @@ async fn from_slabs(
             mask.is_some()
         );
     }
+    let warm = if mask.is_none() && seat.is_none() {
+        crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone())
+    } else {
+        None
+    };
     let lives = vec![mask; view.segments.len()];
     let slack = if state.shadowed.is_empty() {
         0
@@ -505,6 +511,7 @@ async fn from_slabs(
         Some((state, &set.covered, at)),
         &[],
         seat,
+        warm,
     )
     .await?;
     if slack > 0 {

@@ -4,6 +4,17 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Compiled warm tiers** (round X1; `docs/benchmarks.md`, "Round X1"). Once a recluster tier is resident, the
+  engine compiles a generation-scoped view of it (codes, factors, leaf metadata, and a sparse cache of exact
+  vectors charged to the decoded-cache budget) and runs warm queries on it synchronously, with reusable
+  per-thread scratch and no I/O; any miss falls back to the normal planner. Paired on a c7g.2xlarge, all 3,452
+  NQ queries at 16 clients, on top of the cold-streaming and shared-bound work: +31.2% q/s at 48 probes and
+  +27.6% at 64, with 10.1% fewer instructions per query, recall 0.9517 / 0.9618, and every ordered top 10
+  identical. Cold queries are unchanged (120 paired cold queries, identical results, no detectable shift). Peak
+  RSS is about 0.9 GB higher, within the cache budget. A resident ceiling harness
+  (`crates/bf-engine/examples/resident_ceiling.rs`) shows the server still reaches about 58% of the same scan
+  run in-process; that gap is the next round's target.
+
 - **BM25: impact-ordered postings and SIMD scoring, tested and rejected** (round B4; `docs/benchmarks.md`,
   "Round B4"). On 1,000 MS MARCO queries (c7g.2xlarge, paired), exact term-at-a-time scoring over
   impact-ordered blocks cost 127.7M instructions per query against 17.8M for the current reader, because
