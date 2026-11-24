@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Filtered queries 100x faster in throughput: immutable predicate results are cached** (from round D4). A filter's
+  result over an immutable segment was recomputed for every query, and snapshot warm-up and query planning
+  each did it separately. They now share one cached result keyed by the segment files, live generation, schema,
+  and filter, held in a protected share of the column cache (unused bytes stay available to columns); WAL
+  shadows are applied afterward. On full NQ with an ID-range filter at normal retention: warm p50 1,522 to
+  12 ms, and 16-client throughput 5 to 601 q/s, with identical results.
+
 - **Truthful index status in namespace metadata** (round MD1). Metadata always said `"index": {"status":
   "up-to-date"}`, so a client polling for indexing to finish could be told it was done while the WAL tail still
   held unindexed rows. It now reports `{"status": "updating", "unindexed_bytes": ..., "unindexed_rows": ...}`
