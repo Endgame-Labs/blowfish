@@ -1218,7 +1218,11 @@ pub(crate) async fn search(
         );
     }
     let vector_key = vector_hash(&vector);
+    // A completed slab supplies a valid global cut to slabs that have not scanned yet.
+    // Read planning stays concurrent; busy warm queries scan on their own thread.
+    let scan_upper = Arc::new(std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()));
     for (&i, cs) in &chosen {
+        let scan_upper = scan_upper.clone();
         let (dir, vector, rotated) = (dir.clone(), vector.clone(), rotated.clone());
         let exact = exact_segments.contains(&i);
         let flat = dir.segments()[i].flat;
@@ -1249,7 +1253,7 @@ pub(crate) async fn search(
         let trace_t0 = t0;
         tasks.push(
             async move {
-                let task_start = trace_t0.elapsed().as_millis();
+                let task_start = trace_t0.elapsed().as_micros();
                 // The prefetch may have scanned this segment's clusters already (see
                 // `scan_memo_put`): that is exact only without a row mask.
                 if memo_hit && live.is_none() {
@@ -1310,7 +1314,7 @@ pub(crate) async fn search(
                     }
                 )?;
                 let (blobs, codes) = read;
-                let read_done = trace_t0.elapsed().as_millis();
+                let read_done = trace_t0.elapsed().as_micros();
                 let mut blobs = blobs.iter();
                 for (cluster, known) in wanted.iter().zip(decoded) {
                     let d = match known {
@@ -1337,7 +1341,7 @@ pub(crate) async fn search(
                     clusters: wanted.clone(),
                     exact,
                 };
-                let install_done = trace_t0.elapsed().as_millis();
+                let install_done = trace_t0.elapsed().as_micros();
                 let found = on_worker(async move {
                     if exact {
                         let hits = index
@@ -1352,8 +1356,22 @@ pub(crate) async fn search(
                     // The rerank below keeps only candidates whose lower bound is within the
                     // k-th smallest upper bound, so the scan drops the rest as it goes.
                     let found = index
-                        .scan_blocks_bounded_rotated(&rotated, &wanted, codes, live.as_deref(), k)
+                        .scan_blocks_bounded_rotated(
+                            &rotated,
+                            &wanted,
+                            codes,
+                            live.as_deref(),
+                            k,
+                            f32::from_bits(scan_upper.load(std::sync::atomic::Ordering::Relaxed)),
+                        )
                         .map_err(segment::index_error)?;
+                    if k > 0 && found.len() >= k {
+                        let mut upper: Vec<f32> = found.iter().map(|c| c.distance + c.error).collect();
+                        upper.select_nth_unstable_by(k - 1, f32::total_cmp);
+                        // Distances and errors are non-negative, so their float bits have
+                        // the same order as the values. Every published cut has k witnesses.
+                        scan_upper.fetch_min(upper[k - 1].to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    }
                     Ok((Vec::new(), found))
                 })
                 .await?;
@@ -1361,7 +1379,7 @@ pub(crate) async fn search(
                     eprintln!(
                         "TASK seg={i} clusters={} start={task_start} read={read_done} install={install_done} scan={}",
                         probed.clusters.len(),
-                        trace_t0.elapsed().as_millis()
+                        trace_t0.elapsed().as_micros()
                     );
                 }
                 Ok::<_, ApiError>((probed, found))

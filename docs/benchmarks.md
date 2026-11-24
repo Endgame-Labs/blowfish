@@ -4908,3 +4908,178 @@ before and after the manifest write and a merge of a merged segment.
 
 Not done in this round. The covered segments' ANN objects total 6.0 GB on NQ (about 2,240 bytes per covered row),
 which is what D4 would save. `disk-footprint.md` lists what retiring them needs.
+
+
+## Round Q1: warm vector query cost
+
+This round starts from `6dcde67` (v0.1.15). The unchanged-query profile uses `b899d0b`, which
+adds microsecond diagnostics without changing the wire response or query algorithm. The target is
+at least 1.5× warm throughput at recall@10 0.95 and 0.96, with no cold-S3 regression. **That gate
+is not met by the VM results below.** The M4 was reserved for another worker, and the coordinator directed this round to finish its VM gates;
+M4 throughput is unmeasured.
+
+### Dataset and measurement
+
+I loaded all 2,681,468 NQ passages as 1,024-dimensional f16 cosine vectors. The corpus, queries,
+truth, and qrels have the same four hashes as the v0.1.15 M4 run. The automatic tier contains
+32 slabs and 13,395 leaves. Preparation retries left 125,000 superseded source row versions and
+46 covered source segments; the slabs contain exactly 2,681,468 live rows, and no WAL tail is
+searched. This independently built layout differs from the M4 comparison, so its recall differs
+slightly too. Every binary comparison below uses the same unchanged store.
+
+The VM server and clients use CPUs 6–7, a nice-19 server, two Tokio workers, two Rayon workers,
+a 4 GiB raw block cache, no disk cache, no recall sampling, and read-only mode with indexing off.
+Clients send pre-encoded JSON float arrays over keep-alive connections, requesting the top 10 and
+only IDs. Hardware counters attach to the exact owned server PID after warming the measured
+queries. Instruction counts are user-space instructions. Other workers share the VM, so wall-clock
+q/s and stage timers cannot establish a throughput improvement. No production process is signaled.
+
+### The unchanged query
+
+Two alternating passes at each probe count, each with 1,000 warm-up and 1,000 measured queries
+at 16 clients:
+
+| Probes | Instructions/query, passes | Cycles/query, passes | Recall@10, first 1,000 |
+|---:|---:|---:|---:|
+| 48 | 13.1499 / 13.1318 M | 18.7558 / 18.2749 M | 0.9511 |
+| 64 | 15.1948 / 15.1868 M | 22.5791 / 20.2938 M | 0.9625 |
+
+All retained passes have cache-hit ratio 1.000 and exhaustive-search count zero. In 100 serial
+traced queries after 1,000 warm-ups, the mean scan visits 393 / 524 leaves, scans 82,820 / 110,114
+rows, emits 5,748 / 7,168 candidates, and exactly reranks 54.10 / 54.87 rows at 48 / 64 probes.
+
+| Stage | Median microseconds, 48 / 64 |
+|---|---:|
+| HTTP body collection / typed JSON decode | 6 / 8; 65 / 70 |
+| Snapshot/state access, overlapping search | 207 / 162 |
+| Center ranking, including rotation and dispatch | 437 / 514 |
+| Probe planning | 209 / 259 |
+| Per-slab task construction | 92 / 101 |
+| Cluster reads, install, and scan wall stage | 3,205 / 4,611 |
+| Sum of slab scan calls | 3,298 / 4,371 |
+| Global bounds, vector reads, rerank, and speculative hydration | 662 / 748 |
+| Sum of rerank cache-read calls / exact CPU calls | 191 / 196; 66 / 67 |
+| Final hydration / response JSON serialization | 36 / 37; 14 / 16 |
+| Search execution | 5,179 / 6,982 |
+
+These are scheduler-sensitive wall timers. Medians do not add, parallel call sums differ from
+elapsed stages, and snapshot checking overlaps search. Scan-call medians are about 40 ns per row;
+means rise to 61.5 / 50.6 ns with preemption. Keep-alive amortizes TCP accept across requests.
+
+A separate hot 64-probe `perf record` pass at 199 Hz has no reported lost samples, cache-hit
+ratio 1.000, and no tail. Approximate self-sample shares of all cycles: fast-scan kernel 12.3%;
+scan setup, bookkeeping, and candidate emission 5.6%; center ranking 6.1%; exact query-to-leaf-center
+distances 1.5%; JSON decoding 7.4%; allocator 4.9%; raw and decoded cache lookups 2.8%; kernel
+13.6%; and exact rerank symbols about 0.4%, small enough for sampling noise. About 7% of samples
+are unresolved libc addresses. They are not attributed to a particular copy routine.
+
+### Shared partial-index metadata
+
+A directory query previously allocated and initialized a complete cluster table for every slab,
+then installed a few selected payloads. Partial indexes now share immutable ranges and retain only
+their installed payloads. Ordinary fully opened indexes retain dense tables. Original cluster IDs,
+encoded objects, read ranges, and HTTP responses are preserved. The resident-byte estimate charges
+the shared table to the existing decoded-cache budget.
+
+| Probes | Baseline instructions/query, ABAB | Shared metadata instructions/query, ABAB | Saving |
+|---:|---:|---:|---:|
+| 48 | 13.1441 / 13.1374 M | 12.3756 / 12.3567 M | 5.9% |
+| 64 | 15.1982 / 15.1997 M | 14.3571 / 14.3725 M | 5.5% |
+
+All 4,000 top-10 ID lists match exactly. Peak RSS is roughly unchanged, or slightly lower; the
+shared VM does not establish a cycle or throughput improvement.
+
+Fresh-process cold queries use `bench/scale/local_s3.py`, 25 ms per request, the same store, and
+the production 1 MiB block size. Thirty queries per binary alternate ABBA at query granularity.
+At 64 probes, baseline p50/p90 is 482.90/637.16 ms; shared metadata is 475.65/588.48 ms. All IDs
+match. Mean requests are 101.93/102.13, bytes 139.10/139.53 MB, and idle-gap waves 3.067/3.133;
+speculative document-read scheduling accounts for small read-count differences. This does not
+model real S3 transfer throughput or tails, and 30 samples cannot establish p99 behavior. An earlier
+10-query comparison overlapped other owned query sweeps and is discarded for latency attribution.
+
+### Sharing candidate bounds between slabs
+
+After a slab scans, its k-th smallest candidate upper bound is a valid cut for the other slabs:
+the global k-th upper bound cannot be larger than one subset's. A per-query relaxed atomic passes
+that cut to slabs that have not scanned yet. Scan reads still start concurrently. Each scan also
+applies its final local bound after fine rescoring, removing candidates accepted under earlier,
+looser cuts before the global merge. The local filter alone saves only about 0.2%; passing the
+cut between slabs gives the useful additional saving. There is no new setting or stored format.
+
+The rotated bounded-scan Rust API gains an `upper_bound` argument, infinity until another slab has
+k witnesses. The engine is its only existing caller. Regression tests compare local and shared
+survivor sets against bounding a complete scan, reject invalid bounds, and check that independent
+partial indexes share no installed payloads.
+
+Combined shared metadata and candidate bounds, two ABAB rounds with 1,000 warm-up and 1,000
+measured queries at 16 clients:
+
+| Probes | Baseline instructions/query | Combined instructions/query | Saving | Baseline cycles/query | Combined cycles/query |
+|---:|---:|---:|---:|---:|---:|
+| 48 | 13.1336 / 13.1380 M | 11.4780 / 11.5023 M | 12.5% | 17.9741 / 19.2160 M | 16.7857 / 15.0430 M |
+| 64 | 15.1824 / 15.1967 M | 13.2610 / 13.2478 M | 12.7% | 21.9068 / 20.0412 M | 18.1330 / 17.1201 M |
+
+All 4,000 top-10 ID lists are identical, cache-hit ratio is 1.000, and no tail is searched. These
+instruction savings do not establish a proportional M4 throughput gain. The requested 1.5× gate
+remains unmet.
+
+In 100 traced queries at 16 clients, the combined path scans the same 82,820 / 110,114 rows
+at 48 / 64 probes, but returns 431 / 493 slab candidates instead of 5,748 / 7,168. Exact rerank
+remains 54.10 / 54.87 rows. The retained saving comes from shared metadata and candidate handling.
+
+A final fresh-process cold ABBA comparison uses 30 queries per binary at each probe count,
+the same default 1 MiB cache blocks, and the 25 ms local S3 facade:
+
+| Probes | Baseline p50/p90, ms | Combined p50/p90, ms | Baseline/combined requests | Baseline/combined MB | Baseline/combined waves |
+|---:|---:|---:|---:|---:|---:|
+| 48 | 388.70/544.00 | 382.19/523.55 | 94.07/94.10 | 114.50/114.57 | 3.100/3.100 |
+| 64 | 436.83/528.02 | 426.22/518.11 | 102.10/101.90 | 139.46/139.02 | 3.067/3.033 |
+
+All 60 cold top-10 ID lists match. No median or p90 cold regression is observed. Small request
+count differences come from speculative document reads; no scan-read dependency is added. The
+facade and sample-size limitations above still apply.
+
+### Recall and rejected experiments
+
+Full 3,452-query results against the exact top 10, four clients, after warming all queries.
+All 31,068 top-10 ID lists match between binaries. These full quality sweeps were not interleaved;
+the VM wall rates reflect changing shared load and **do not measure a speedup**.
+
+| Probes | Recall@10, both | Baseline instructions/query | Combined instructions/query | Baseline VM q/s | Combined VM q/s |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 0.932706 | 10.9547 M | 9.6623 M | 173.1 | 267.2 |
+| 40 | 0.942439 | 12.0532 M | 10.5922 M | 146.4 | 186.6 |
+| 48 | 0.949015 | 13.1146 M | 11.4877 M | 186.7 | 176.4 |
+| 52 | 0.951825 | 13.6584 M | 11.9327 M | 84.8 | 165.0 |
+| 56 | 0.954635 | 14.1542 M | 12.3858 M | 204.4 | 153.8 |
+| 64 | 0.959820 | 15.1649 M | 13.2692 M | 187.0 | 194.7 |
+| 68 | 0.962196 | 15.6785 M | 13.7019 M | 87.9 | 207.5 |
+| 80 | 0.966628 | 17.1395 M | 14.9867 M | 208.6 | 181.4 |
+| 96 | 0.971060 | 19.0511 M | 16.6872 M | 200.6 | 144.1 |
+
+I did not lower the default probe count. On this layout the measured qualifying points are 52
+and 68 probes; their baseline costs are 13.6584 and 15.6785 M instructions/query.
+
+- Caching owned code blocks beside decoded clusters saves 3.3–3.6% instructions, with identical
+  results, but adds roughly 0.4 GB RSS and has no stable cycle gain. It is set aside.
+- Ranking only eight nearby slabs at 64 probes costs 11.599 M instructions/query, but full recall
+  falls to 0.928158. It is rejected.
+- Rebuilding through the existing recluster API with 64-row leaves takes 1,324.49 seconds and
+  produces 32 slabs and 41,881 leaves. With shared metadata, 24/28/32/40 probes give recall
+  0.943279/0.949363/0.953998/0.960892 at 16.3465/17.1787/17.9653/19.5305 M instructions/query.
+  At 32 probes, 100 traced queries scan 59,187 rows across 819 leaves: fewer rows, but more than
+  twice as many leaf setups as default 48. Hot self samples attribute 13.4% to center ranking,
+  4.4% to exact query-to-leaf-center distances, 3.9% to probe selection, and about 4% to decoded
+  cluster lookups. The blocked scan still costs 14.5%. Finer leaves fail the complete-query gate.
+- Transposing resident center codes into 32-row lookup blocks changes center quantization slightly.
+  Default-layout recall becomes 0.949044/0.959994 at 48/64 probes, but costs rise to
+  13.6184/15.5983 M instructions/query, despite including the shared-metadata saving. Extra table
+  setup per slab outweighs the new kernel on this AVX-512 VM, so the prototype is rejected.
+
+Formatting, three-crate all-target clippy with warnings denied, and all three crates' tests pass:
+217 passed, six ignored, and zero failed across 44 suites. The final test run uses one test thread
+and two Tokio/Rayon workers. An earlier run overlapping compilation failed two 50 ms read-wave
+assertions; both pass unchanged in the serial run, consistent with scheduling sensitivity in the
+fixture. No assertions were relaxed. `bench/nq/profile.py` preserves the owned-process warm
+profiling procedure; see `bench/nq/README.md` for reproduction. All run artifacts are removed
+after recording these measurements.

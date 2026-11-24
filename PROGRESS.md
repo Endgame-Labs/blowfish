@@ -17,6 +17,33 @@ Newest first. Each entry says what works now and how it was checked.
   is planned in `docs/design/disk-footprint.md`, not built. Formatting, full-workspace clippy, and all Rust
   tests pass.
 
+- **NQ profiling harness, round Q1.** `bench/nq/profile.py` owns its read-only server and profiler,
+  records exact recall, result IDs, cache statistics, microsecond traces, and hardware counters,
+  and cleans up its child processes. The benchmark write-up preserves the full before/after
+  curve, cold comparisons, rejected experiments, and throughput limits. The harness was used
+  for the final ABAB, full-quality, and trace runs; all Rust checks remain passing.
+
+- **Shared ANN candidate bounds, round Q1.** Completed slabs pass a witnessed upper bound to later
+  scans, and scans discard candidates accepted under earlier, looser bounds before merging. Combined
+  with shared metadata, warm NQ uses 12.5% fewer VM instructions at 48 probes and 12.7% fewer at 64.
+  All 31,068 top-10 ID lists match across the full probe curve. Cold 25 ms S3-facade p50/p90 is
+  382/524 versus 389/544 ms at 48 probes and 426/518 versus 437/528 ms at 64. Formatting,
+  three-crate all-target clippy, and all 217 tests pass (six ignored). The 1.5× throughput gate
+  remains unmet; M4 throughput is unmeasured. Details are in `docs/benchmarks.md`, "Round Q1".
+
+- **Shared ANN query metadata, round Q1.** Partial indexes share immutable cluster ranges and
+  retain only installed payloads, preserving cluster IDs and encoded objects. On warm NQ,
+  alternating VM passes use 5.9% fewer instructions at 48 probes and 5.5% fewer at 64, with
+  all 4,000 top-10 lists identical. Fresh-process 25 ms S3-facade comparisons show similar
+  median latency; no M4 throughput improvement is claimed. Independent-view regression tests,
+  formatting, three-crate clippy, and the crate test suites validate the change.
+
+- **Warm ANN profiling, round Q1.** `BF_TRACE_STAGES` now reports microsecond ANN and HTTP timings,
+  distinguishes scanned rows from accepted candidates, and separates rerank vector reads from scoring.
+  The HTTP response stays unchanged. Formatting, clippy for `bf-vector`, `bf-engine`, and `blowfish`
+  with all targets and warnings denied, and the three crates' test suites pass. The full NQ profile
+  and measured optimizations follow in the Round Q1 benchmark entry.
+
 - **Apple M4 NQ at v0.1.15** (`docs/benchmarks.md`, "Apple M4 at v0.1.15"). I reran the tagged release,
   Qdrant 1.20.0, and LanceDB 0.41.0 one at a time on the same 10-core Mac. Blowfish gives 1,801–1,827 q/s
   at 64 probes, recall@10 0.9611, and 1.3–1.4 / 1.6 / 1.9–2.0 ms p50 / p90 / p99; at 48 probes,
