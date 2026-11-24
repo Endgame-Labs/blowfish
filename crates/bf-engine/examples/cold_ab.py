@@ -1,0 +1,228 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx==0.28.1", "numpy==2.5.4"]
+# ///
+"""Alternate paired cold ANN queries against two read-only server builds.
+
+Run from a worktree with uv. Supply a private config.local with storage_url,
+region, namespace, and optional endpoint/profile. The oracle selects the existing
+exact-truth workload; it does not change the storage prefix or namespace.
+
+Example: uv run crates/bf-engine/examples/cold_ab.py --config CONFIG.local \
+    --binary CANDIDATE --arms '{"base":{"BINARY":"BASELINE"},"stream":{}}' \
+    --scratch .scratch/cold-ab --label run-1 --queries 200
+
+Both builds need blowfish_object_store_attempts_total for physical GET accounting.
+Outputs, traces, and temporary storage configuration stay under --scratch. Cache
+files are removed on exit. Summarize the results, and remove the run directory
+when the experiment ends.
+"""
+
+import argparse, contextlib, json, os, re, shutil, signal, subprocess, time
+from pathlib import Path
+import httpx
+import numpy as np
+
+P = argparse.ArgumentParser(description=__doc__)
+P.add_argument("--arms", required=True, help="JSON arm name -> environment")
+P.add_argument("--mode", choices=["fresh", "cachecold"], default="cachecold")
+P.add_argument("--queries", type=int, default=50)
+P.add_argument("--offset", type=int, default=0)
+P.add_argument("--probes", type=int, default=64)
+P.add_argument("--label", required=True)
+P.add_argument("--binary", required=True)
+P.add_argument("--config", type=Path, required=True)
+P.add_argument("--scratch", type=Path, required=True)
+P.add_argument("--port", type=int, default=8400)
+P.add_argument("--oracle", choices=["100k", "1m", "10m", "100m"], default="10m")
+a = P.parse_args()
+signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(143)))
+ROOT = Path(__file__).resolve().parents[3]
+RUN = (a.scratch / a.label).resolve()
+if ".scratch" not in RUN.parts or not RUN.is_relative_to(a.scratch.resolve()):
+    P.error("scratch and label must resolve inside this run under .scratch/")
+if RUN.exists() and any(RUN.iterdir()):
+    P.error("run directory must be empty; choose a new label")
+config = json.loads(a.config.read_text())
+truth = np.load(ROOT / f"bench/scale/data/oracle-{a.oracle}.npz")
+items = [
+    {
+        "query_id": i,
+        "truth": truth["ann_ids"][i].tolist(),
+        "request": {
+            "rank_by": ["vector", "ANN", truth["vector"][i].astype("f4").tolist()],
+            "top_k": 10,
+            "consistency": {"level": "strong"},
+        },
+    }
+    for i in range(len(truth["vector"]))
+]
+arms = json.loads(a.arms)
+if not arms or any(not re.fullmatch(r"[A-Za-z0-9_-]+", name) for name in arms):
+    P.error("arm names must contain only letters, numbers, hyphens, or underscores")
+if a.queries <= 0 or a.offset < 0 or a.offset + a.queries > len(items) or a.probes <= 0:
+    P.error("select positive probes and a nonempty slice within the oracle workload")
+RUN.mkdir(parents=True, exist_ok=True, mode=0o700)
+rows = []
+
+
+def stats(client):
+    text = client.get("/metrics").text
+    out = {}
+    for line in text.splitlines():
+        m = re.match(
+            r"blowfish_object_store_(requests|bytes|hedges|attempts)_total\{(.*)\} (\S+)",
+            line,
+        )
+        if m:
+            op = re.search(r'(?:op|outcome)="([^"]+)"', m[2])[1]
+            key = m[1] + "_" + op
+            out[key] = out.get(key, 0) + float(m[3])
+    return out
+
+
+@contextlib.contextmanager
+def server(name, index):
+    work = RUN / name
+    work.mkdir(exist_ok=True)
+    storage = {
+        "url": config["storage_url"],
+        "region": config.get("region"),
+        "endpoint": config.get("endpoint"),
+        "profile": config.get("profile"),
+        "read_only": True,
+        "cache": {
+            "memory_bytes": 8 * 2**30,
+            "disk_bytes": 48 * 2**30,
+            "disk_dir": str(work / "cache"),
+            "block_size": 4000,
+            "max_coalesce_blocks": 512,
+            "fetch_concurrency": 512,
+        },
+    }
+    (work / "storage.local").write_text(json.dumps(storage))
+    arm_env = dict(arms[name])
+    binary = arm_env.pop("BINARY", a.binary)
+    env = dict(
+        os.environ,
+        RAYON_NUM_THREADS="8",
+        BF_DECODED_CACHE_BYTES=str(512 * 2**20),
+        BF_ANN_NPROBE=str(a.probes),
+        BF_TRACE_READS="1",
+        BF_TRACE_STAGES="1",
+    )
+    env.update(arm_env)
+    port = a.port + index
+    log = (work / "server.log").open("a")
+    proc = subprocess.Popen(
+        [str(ROOT / binary), str(work / "storage.local"), f"127.0.0.1:{port}"],
+        env=env,
+        stdout=log,
+        stderr=log,
+    )
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=300) as client:
+            for _ in range(300):
+                if proc.poll() is not None:
+                    raise RuntimeError(f"{name} server exited, see log")
+                try:
+                    client.get("/").raise_for_status()
+                    break
+                except httpx.HTTPError:
+                    time.sleep(0.1)
+            else:
+                raise RuntimeError("server readiness timeout")
+            time.sleep(1.5)
+            if proc.poll() is not None:
+                raise RuntimeError(f"{name} server exited before sampling; see log")
+            yield client, work, proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        log.close()
+        shutil.rmtree(work / "cache", ignore_errors=True)
+
+
+def query(name, item, client, work, proc):
+    before = stats(client)
+    req = client.build_request(
+        "POST", f"/v2/namespaces/{config['namespace']}/query", json=item["request"]
+    )
+    start = time.perf_counter()
+    res = client.send(req)
+    ms = (time.perf_counter() - start) * 1000
+    res.raise_for_status()
+    res = res.json()
+    after = stats(client)
+    delta = {k: after.get(k, 0) - before.get(k, 0) for k in after}
+    got = [r["id"] for r in res.get("rows", [])]
+    row = {
+        "arm": name,
+        "q": item["query_id"],
+        "ms": ms,
+        "recall": len(set(map(int, got)) & set(item["truth"])) / 10,
+        "ids": got,
+        "distances": [r.get("$dist") for r in res.get("rows", [])],
+        "gets": sum(delta.get("attempts_" + op, 0) for op in ["get", "get_range"])
+        if any(k.startswith("attempts_") for k in after)
+        else None,
+        "completed_gets": sum(
+            delta.get("requests_" + op, 0) for op in ["get", "get_range"]
+        ),
+        "hedges": delta.get("hedges_issued", 0),
+        "bytes": sum(delta.get("bytes_" + op, 0) for op in ["get", "get_range"]),
+    }
+    rows.append(row)
+    with (RUN / "rows.jsonl").open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    print(
+        json.dumps({k: v for k, v in row.items() if k not in ["ids", "distances"]}),
+        flush=True,
+    )
+    return row
+
+
+try:
+    with contextlib.ExitStack() as stack:
+        servers = {}
+        if a.mode == "cachecold":
+            for n, name in enumerate(arms):
+                servers[name] = stack.enter_context(server(name, n))
+                c, w, p = servers[name]
+                query(name, items[-1], c, w, p)
+            rows.clear()
+            (RUN / "rows.jsonl").write_text("")
+        for qi in range(a.offset, a.offset + a.queries):
+            names = list(arms)
+            names = names[qi % len(names) :] + names[: qi % len(names)]
+            for name in names:
+                if a.mode == "cachecold":
+                    c, w, p = servers[name]
+                    c.post("/_bench/drop_caches").raise_for_status()
+                    (w / "server.log").write_text("")
+                    query(name, items[qi], c, w, p)
+                else:
+                    with server(name, list(arms).index(name)) as (c, w, p):
+                        query(name, items[qi], c, w, p)
+    summary = {}
+    for name in arms:
+        part = [r for r in rows if r["arm"] == name]
+        summary[name] = {
+            "n": len(part),
+            "p50": float(np.percentile([r["ms"] for r in part], 50)),
+            "p90": float(np.percentile([r["ms"] for r in part], 90)),
+            **{
+                k: float(np.mean([r[k] for r in part]))
+                for k in ["recall", "gets", "completed_gets", "hedges", "bytes"]
+                if all(r.get(k) is not None for r in part)
+            },
+        }
+    (RUN / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2), flush=True)
+finally:
+    for name in arms:
+        shutil.rmtree(RUN / name / "cache", ignore_errors=True)

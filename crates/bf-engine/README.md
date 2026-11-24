@@ -382,3 +382,9 @@ than every `index_interval`. Local writes and eligible compaction bypass this id
 wait, and `index_namespace(..., true)` always refreshes the backend. Strong query
 checks also refresh the known WAL state, avoiding redundant idle indexer requests
 while the namespace is actively queried.
+
+Large cold, unfiltered slab ANN queries reserve coalesced scan reads, scan small
+batches as they arrive, and overlap a bounded vector and document prefetch with
+the remaining scan. The probe set and final rerank bound are unchanged. Resident
+queries, filtered queries, busy processes, cache-bypass reads, and searches sharing
+a plan across tiers keep the per-slab path. `BF_ANN_STREAM_SCAN=0` disables streaming for paired comparisons.

@@ -4908,3 +4908,145 @@ before and after the manifest write and a merge of a merged segment.
 
 Not done in this round. The covered segments' ANN objects total 6.0 GB on NQ (about 2,240 bytes per covered row),
 which is what D4 would save. `disk-footprint.md` lists what retiring them needs.
+
+## Round C1: overlapping cold ANN reads
+
+Measured on 2026-11-24, on one spot `c7gd.2xlarge` in AWS us-west-2, the bucket's region,
+using the preserved release-upgraded Wikipedia namespaces. Every server was
+read-only. No source objects, manifests, or layouts were changed.
+
+The control is commit `b663eb2`, with one instrumentation-only counter added to
+count backend read attempts when they start. Counting only completed operations
+misses requests canceled by hedging. Both arms use that counter; GET totals below
+include canceled attempts and missing-key GETs, and exclude HEADs.
+
+Each comparison alternates arm order for the same held-out query on the same
+instance. Cache-cold arms keep separate processes and connections, and clear
+memory, disk, decoded metadata, and namespace handles before each query. Fresh
+arms start a process and an empty application cache for every query, with the
+same 1.5-second connection-warmer settle in both arms. Operating-system caches
+are retained. Requests use strong consistency, 64 probes, `top_k=10`, and the
+existing exact-truth oracle workloads. Settings are eight Rayon threads, 4,000-byte
+blocks, 512-block coalescing, 512 concurrent fetches, an 8 GiB payload cache, and a
+512 MiB decoded cache. The toolchain is Rust 1.100.0 with GCC 14 on aarch64.
+
+A separate 200-request-per-size S3 check measured 4 KB GET p50 / p90 of
+**24.5 / 31.0 ms**, and 1 MB GETs of **30.8 / 37.9 ms**. S3 latency changed during
+the session; compare each candidate with its paired control, rather than comparing
+absolute candidate times across trials.
+
+### What changed
+
+The old snapshot prefetch awaited the entire scan, and reranking awaited the
+slowest slab. The replacement reserves coalesced reads before starting independent
+four-leaf scan batches, prioritizes nearby leaves, and starts a bounded prefetch
+of at most 80 vectors and 30 documents once 40% of the scan batches finish.
+The final probe set, error bound, rerank cap, distance calculation, and hydration
+remain the same. Every selected leaf is scanned; no time-based cutoff is enabled.
+
+Keeping coalescing was necessary: the first streaming prototype roughly doubled
+completed GETs. `RangeReader::read_batch_notifying` lets leaf consumers share the
+whole batch's reserved requests without waiting for an unrelated range to finish.
+A memory-residency check keeps resident queries on the per-slab path. Streaming
+applies to large, unfiltered slab searches without a shared cross-tier plan;
+`BF_ANN_STREAM_SCAN=0` restores the previous scheduling for comparisons.
+
+### Rejected experiments
+
+| Paired trial | Control p50 / p90 ms | Candidate p50 / p90 ms | Result |
+| --- | ---: | ---: | --- |
+| 35 ms hedge seed and floor, 20 cache-cold queries | 503.9 / 599.3 | 488.3 / 631.6 | 1.03× p50 and worse p90; removed |
+| Streaming without reserved coalescing, 20 queries | 503.9 / 599.3 | 402.1 / 559.9 | Completed GETs rose from 562.5 to 1,154.4; removed |
+| Coalesced streaming, 30 speculative vectors and documents, 200 queries | 482.7 / 609.3 | 375.3 / 499.3 | 1.286× p50 misses 1.30×; not kept as the final setting |
+| Distant-half cutoff, 2% overfetch, and 35 ms hedging, 200 queries | 482.7 / 609.3 | 380.4 / 475.5 | Slower than streaming alone; removed |
+| 80 speculative vectors and documents, 50 queries | 501.4 / 713.5 | 365.1 / 479.6 | GET attempts rose 18.8%, above the 15% limit; removed |
+
+The cutoff waited for the nearest half and at least 95% of batches, then allowed
+`max(1.8 × median completion time, 80 ms)` before canceling distant stragglers.
+Its recall was 0.9630 against 0.9615, but it did not improve the latency target.
+An earlier handoff at 20% completion also missed the target in its 50-query screen.
+Co-probed leaf repacking was not attempted; this round makes no format change.
+
+The split speculation limits first passed a 200-query cache-cold run:
+581.6 / 720.0 ms became 443.7 / 582.1 ms, with recall 0.9615 on both arms and
+GET attempts 588.6 → 655.0 (+11.3%). A 50-query fresh-process run measured
+648.7 / 840.0 → 472.3 / 734.9 ms, with 11.8% more GETs. The final default build
+was then rebuilt and checked separately below.
+
+### Final default build
+
+Latency pairs are p50 / p90 in milliseconds. Cache-cold rows use all 200 oracle
+queries per arm, and fresh rows use the first 50. Recall below is over all 200
+cache-cold queries, against the existing independently computed exact top-10.
+The 100M paired harness, including both servers and the client, runs in a 10 GiB
+cgroup with swap disabled; payload-cache budgets remain 8 GiB per server.
+
+| Corpus and mode | Control p50 / p90 ms | Streaming p50 / p90 ms | Mean GET attempts, control → streaming |
+| --- | ---: | ---: | ---: |
+| 10M, cache-cold | 554.1 / 701.2 | 424.7 / 543.7 | 586.5 → 653.7 |
+| 10M, fresh process | 617.1 / 951.9 | 478.3 / 623.7 | 575.0 → 644.3 |
+| 100M, cache-cold | 1,027.9 / 1,165.7 | 715.1 / 907.0 | 2,211.5 → 2,247.5 |
+| 100M, fresh process | 1,116.6 / 1,418.1 | 807.1 / 1,062.4 | 2,181.5 → 2,233.6 |
+
+10M cache-cold p50 improves **1.3045×**, with p90 lower, recall unchanged at
+**0.9615**, and **11.5%** more GET attempts. The independent default-build rerun
+therefore meets the required 1.30× / 0.001 recall / 15% GET gate. Fresh-process
+GET growth is 12.1%, and its p90 also improves.
+
+At 100M, cache-cold p50 improves **1.4374×**, p90 is lower, recall remains
+**0.9540**, and GET growth is **1.6%**. This improves on the control, though it
+falls just short of the advisor's separate 1.45× aspiration for 100M.
+
+All **500 final query pairs** (200 cache-cold and 50 fresh at each size) returned
+identical IDs and distances. After timing, a fan-out/admission guard was added to
+preserve the existing per-slab policy for busy processes and cache-bypass reads.
+Its predicates are true in this single-query, cache-admitting configuration; the
+normal and forced-fallback paths both passed the final regression checks.
+
+### Reproduction
+
+`crates/bf-engine/examples/cold_ab.py` preserves the paired harness. Supply the
+private storage URL, namespace, region, and optional profile/endpoint in a local
+config file; the runner enforces read-only storage. For a comparison within the
+current binary:
+
+```sh
+source ~/.cargo/env
+CARGO_TARGET_DIR="$PWD/.scratch/c1/target" cargo build --release \
+  --manifest-path crates/bf-engine/examples/scale-server/Cargo.toml
+uv run crates/bf-engine/examples/cold_ab.py \
+  --config bench/scale/config.local \
+  --binary .scratch/c1/target/release/blowfish-scale-server \
+  --arms '{"control":{"BF_ANN_STREAM_SCAN":"0"},"stream":{}}' \
+  --scratch .scratch/c1 --label cachecold --queries 200
+```
+
+Use `--mode fresh --queries 50` and a new label for fresh-process timing. Use
+`--oracle 100m` with a config pointing at the copied 100M namespace for the larger
+workload. The recorded control above used the original build with the attempt
+counter backported, rather than the environment override. Summarize results and
+remove the run directory afterward.
+
+### Validation, spend, and cleanup
+
+`cargo fmt --check`, `cargo clippy -p bf-engine -p bf-storage --all-targets -- -D warnings`,
+and `cargo test -p bf-engine -p bf-storage` passed on a separate Graviton checks
+host: **197 tests passed**, four existing tests remained ignored, and none failed.
+The 100K-row current-format regression also passed separately with
+`BF_FANOUT_QUERIES=0`, exercising the per-slab fallback. It covers cold/warm result
+equality, projection, and indexed deletes. Storage tests cover coalescing,
+dispatch priority, independent early completion, cancellation, and residency.
+The reusable Python harness passed an AST check and its `--help` invocation.
+
+| EC2 work | Instance type | Instance-hours | Estimated compute USD |
+| --- | --- | ---: | ---: |
+| Paired query measurements, spot | c7gd.2xlarge | 0.975 | 0.1163 |
+| Checks interrupted by Spot capacity reclamation | c7gd.2xlarge | 0.092 | 0.0103 |
+| Completed checks, on-demand | c7g.2xlarge | 0.394 | 0.1143 |
+| Total | | **1.461** | **0.2409** |
+
+Compute uses the observed regional Spot rates and the AWS on-demand price;
+EBS and S3 request charges are additional. No S3 data was added. All instances were
+terminated, and the temporary key pair and security group were deleted. Local run artifacts
+were removed after recording these results. Workspace and SDK compatibility
+checks remain the coordinator's merge checks.
