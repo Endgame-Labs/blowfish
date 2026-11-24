@@ -4,6 +4,14 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Shared ANN candidate bounds, round Q1.** Completed slabs pass a witnessed upper bound to later
+  scans, and scans discard candidates accepted under earlier, looser bounds before merging. Combined
+  with shared metadata, warm NQ uses 12.5% fewer VM instructions at 48 probes and 12.7% fewer at 64.
+  All 31,068 top-10 ID lists match across the full probe curve. Cold 25 ms S3-facade p50/p90 is
+  382/524 versus 389/544 ms at 48 probes and 426/518 versus 437/528 ms at 64. Formatting,
+  three-crate all-target clippy, and all 217 tests pass (six ignored). The 1.5× throughput gate
+  remains unmet; M4 throughput is unmeasured. Details are in `docs/benchmarks.md`, "Round Q1".
+
 - **Shared ANN query metadata, round Q1.** Partial indexes share immutable cluster ranges and
   retain only installed payloads, preserving cluster IDs and encoded objects. On warm NQ,
   alternating VM passes use 5.9% fewer instructions at 48 probes and 5.5% fewer at 64, with

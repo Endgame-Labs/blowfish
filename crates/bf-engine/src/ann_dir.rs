@@ -1216,7 +1216,11 @@ pub(crate) async fn search(
         );
     }
     let vector_key = vector_hash(&vector);
+    // A completed slab supplies a valid global cut to slabs that have not scanned yet.
+    // Read planning stays concurrent; busy warm queries scan on their own thread.
+    let scan_upper = Arc::new(std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()));
     for (&i, cs) in &chosen {
+        let scan_upper = scan_upper.clone();
         let (dir, vector, rotated) = (dir.clone(), vector.clone(), rotated.clone());
         let exact = exact_segments.contains(&i);
         let flat = dir.segments()[i].flat;
@@ -1350,8 +1354,22 @@ pub(crate) async fn search(
                     // The rerank below keeps only candidates whose lower bound is within the
                     // k-th smallest upper bound, so the scan drops the rest as it goes.
                     let found = index
-                        .scan_blocks_bounded_rotated(&rotated, &wanted, codes, live.as_deref(), k)
+                        .scan_blocks_bounded_rotated(
+                            &rotated,
+                            &wanted,
+                            codes,
+                            live.as_deref(),
+                            k,
+                            f32::from_bits(scan_upper.load(std::sync::atomic::Ordering::Relaxed)),
+                        )
                         .map_err(segment::index_error)?;
+                    if k > 0 && found.len() >= k {
+                        let mut upper: Vec<f32> = found.iter().map(|c| c.distance + c.error).collect();
+                        upper.select_nth_unstable_by(k - 1, f32::total_cmp);
+                        // Distances and errors are non-negative, so their float bits have
+                        // the same order as the values. Every published cut has k witnesses.
+                        scan_upper.fetch_min(upper[k - 1].to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    }
                     Ok((Vec::new(), found))
                 })
                 .await?;

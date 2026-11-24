@@ -675,6 +675,9 @@ impl<R: RangeRead> Index<R> {
 
     /// [`Self::scan_blocks_bounded`] with a query from [`Self::rotate_query`] or
     /// [`crate::Directory::rotate_query`] of the same vector space.
+    /// `upper_bound` is infinity, or the k-th smallest candidate upper bound already found
+    /// in another index for the same query, metric, and k. Candidates whose lower bounds
+    /// exceed it cannot win globally.
     pub fn scan_blocks_bounded_rotated(
         &self,
         query: &RotatedQuery,
@@ -682,13 +685,24 @@ impl<R: RangeRead> Index<R> {
         blocks: Vec<Bytes>,
         filter: Option<&RoaringBitmap>,
         k: usize,
+        upper_bound: f32,
     ) -> Result<Vec<Candidate>> {
         if query.rotated.len() != self.rq.padded || query.seed != self.metadata.seed {
             return Err(Error::InvalidInput(
                 "query rotated for another index".into(),
             ));
         }
-        self.scan_rotated(query, clusters, blocks, filter, 0, (k > 0).then_some(k))
+        if upper_bound.is_nan() || upper_bound < 0. {
+            return Err(Error::InvalidInput("invalid candidate upper bound".into()));
+        }
+        self.scan_rotated(
+            query,
+            clusters,
+            blocks,
+            filter,
+            0,
+            (k > 0).then_some((k, upper_bound)),
+        )
     }
 
     fn scan_blocks_timed(
@@ -701,7 +715,14 @@ impl<R: RangeRead> Index<R> {
         keep: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         let q = RotatedQuery::new(&self.rq, query, self.metric());
-        self.scan_rotated(&q, clusters, blocks, filter, read_us, keep)
+        self.scan_rotated(
+            &q,
+            clusters,
+            blocks,
+            filter,
+            read_us,
+            keep.map(|k| (k, f32::INFINITY)),
+        )
     }
 
     fn scan_rotated(
@@ -711,11 +732,12 @@ impl<R: RangeRead> Index<R> {
         blocks: Vec<Bytes>,
         filter: Option<&RoaringBitmap>,
         read_us: u128,
-        keep: Option<usize>,
+        keep: Option<(usize, f32)>,
     ) -> Result<Vec<Candidate>> {
+        let (keep, upper_bound) = keep.map_or((None, f32::INFINITY), |(k, bound)| (Some(k), bound));
         // The `k` smallest upper bounds so far, as a max-heap; `cut` is its largest once full.
         let mut uppers = std::collections::BinaryHeap::<OrdF32>::new();
-        let cut = std::cell::Cell::new(f32::INFINITY);
+        let cut = std::cell::Cell::new(upper_bound);
         let q_zero = query.zero;
         let q_rot = &query.rotated;
         let t_cpu = std::time::Instant::now();
@@ -778,7 +800,7 @@ impl<R: RangeRead> Index<R> {
                         uppers.push(OrdF32(upper));
                     }
                     if uppers.len() == k {
-                        cut.set(uppers.peek().map_or(f32::INFINITY, |u| u.0));
+                        cut.set(upper_bound.min(uppers.peek().map_or(f32::INFINITY, |u| u.0)));
                     }
                 }
                 estimated.push(Candidate {
@@ -862,6 +884,19 @@ impl<R: RangeRead> Index<R> {
                     (c.distance, c.error) = fq.rescore(&bytes, n, qc2, cosine, c.ordinal as usize);
                 }
             }
+        }
+        if let Some(k) = keep
+            && k > 0
+            && estimated.len() > k
+        {
+            // Early clusters used a looser cut. Apply this index's final bound before
+            // returning candidates to the namespace-wide merge. Its k-th upper bound
+            // cannot be smaller than the global one, so every possible winner remains.
+            // Recompute after fine rescoring, which can change both distance and error.
+            let mut upper: Vec<f32> = estimated.iter().map(|c| c.distance + c.error).collect();
+            upper.select_nth_unstable_by(k - 1, f32::total_cmp);
+            let threshold = upper_bound.min(upper[k - 1]);
+            estimated.retain(|c| c.distance - c.error <= threshold);
         }
         if trace_stages() {
             eprintln!(
