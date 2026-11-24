@@ -524,7 +524,7 @@ async fn from_slabs(
             .sum::<usize>();
         let mut tuning = config.clone();
         tuning.ann_nprobe = (tuning.ann_nprobe as f64
-            * crate::ann_dir::filtered_tier_scale(rows, matching, k))
+            * crate::ann_dir::filtered_probe_scale(rows, matching, k))
         .ceil() as usize;
         Some(tuning)
     } else {

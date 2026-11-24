@@ -8385,8 +8385,16 @@ predicate cache, with identical harnesses. Both arms use read-only storage, one-
 a 3 GiB block cache, no disk cache, and 4,108,168,192 decoded bytes. The separate full NQ
 fixture adds a uint `bucket` attribute: one SplitMix64 step on the document ID, modulo 10,000.
 ID-prefix and distributed bucket predicates each select approximately 1%, 10%, and 50%.
+The predicates are `id < ceil(2,681,468 * fraction)` and `bucket < 10,000 * fraction`,
+using the first 64 query vectors. For exact reproduction, compute the bucket with wrapping u64
+arithmetic: `x = id + 0x9e3779b97f4a7c15`, then
+`x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9`, then
+`x = (x ^ (x >> 27)) * 0x94d049bb133111eb`, then
+`bucket = (x ^ (x >> 31)) % 10000`.
 The pre-upgrade copy matches all 1,198 relative object keys and sizes, totaling 12,236,016,365
-bytes. After retirement and GC, the candidate totals 6,259,483,896 bytes: 5,976,532,469 fewer
+bytes. This fixture has 65 segment ANN objects and 39 tier ANN objects, compared with
+18 and 38 in the original vectors-only fixture. After retirement and GC, the candidate totals
+6,259,483,896 bytes: 5,976,532,469 fewer
 bytes (48.8%). These numbers describe this additional scalar-bearing fixture, rather than the
 original IDs-and-vectors fixture above.
 
@@ -8415,7 +8423,10 @@ All same-arm rows repeat exactly. The original ID-prefix fixture retains identic
 the broader scalar fixture does not: at 48 probes, ordered row objects match across arms for
 64/64 queries at ID 1% and 10%, 44/64 at ID 50%, and 41/64, 47/64, and 42/64 for bucket
 1%, 10%, and 50%, respectively. Tier geometry and the uncapped selectivity budget improve
-aggregate recall on distributed predicates. Those unequal-recall q/s values are not an
+aggregate recall on distributed predicates. Higher means do not guarantee every query improves:
+at ID 50%, eight of 64 queries lose up to three true neighbors at both probe settings; at
+bucket 50%, six queries at 48 probes and seven at 64 lose up to two. Thus the broader fixture
+also fails a universal identical-results gate. Those unequal-recall q/s values are not an
 iso-recall comparison. They still establish that the cached 1% and 10% throughput regression
 is broader than ID-local predicates; 50% predicates improve.
 
@@ -8442,6 +8453,112 @@ A separate `flush` action checkpoints the overlay without compaction before `ind
 already flushed segments. GC removed the failed preparation's objects before the successful
 copy. S3 copying uses `--copy-props none`, because the measurement role does not grant
 GetObjectTagging. These preparation failures are not query observations.
+
+### Integrated unfiltered confirmation and fresh-process queries
+
+The frozen integrated pair is main `d37a323` and D4 `6a0010b`, using the same read-only,
+one-hour-retention cache configuration as the scalar follow-up. Two short runs per arm
+reverse order at each probe setting. Each clears engine and storage caches before 20 cold
+queries, prewarms 64, times 64 serial warm queries, and measures 64 requests at concurrency
+16. Separate full-corpus passes verify all 3,452 ordered row objects, including distances,
+are identical at both 48 and 64 probes. Exact top-ten recall remains 0.9497682503 and
+0.9599652375. The 100-column truth file is sliced to its first ten neighbors for this metric.
+
+Fresh-process first-query samples run each of the first 20 query vectors in a new process
+and engine, with arm order alternating by query index, at both probe counts: 80 processes.
+The reported interval times the first query, excluding process launch and engine construction.
+Every first-query output matches its full quality pass. These samples complement the
+cache-cleared, connection-pool-retaining cold results; they are distinct protocols.
+
+| Probes | Arm | Cold p50 / p90 (ms) | Warm p50 / p90 (ms) | 16-client q/s | Fresh-process first-query p50 / p90 (ms) |
+|---:|---|---|---|---:|---|
+| 48 | baseline | 289.82–386.50 / 412.48–505.35 | 11.17–24.61 / 12.83–48.66 | 646.22–1048.94 | 444.50 / 843.83 |
+| 48 | candidate | 243.29–346.65 / 364.90–402.65 | 7.86–8.34 / 10.27–15.79 | 860.23–890.90 | 360.70 / 531.35 |
+| 64 | baseline | 274.76–288.05 / 381.45–437.48 | 9.31–11.74 / 11.45–18.43 | 613.60–904.35 | 367.94 / 847.06 |
+| 64 | candidate | 299.59–374.73 / 399.19–443.66 | 11.19–11.24 / 14.51–15.57 | 729.14–998.70 | 325.24 / 706.78 |
+
+The short warm ranges overlap, and the first-query samples show no regression. They do not
+establish a repeatable throughput speedup: request counts are small, and S3 latency varies.
+Three longer 48-probe controls use 2,000 distinct prewarm queries, 1,000 serial queries,
+and 2,000 concurrent queries, with counters covering all 3,000 measured requests. `baseline`
+is the main executable on unretired objects; `reader` is the D4 executable on those same
+unretired objects; `retired` is D4 on the retired copy. All 1,000 saved rows match the full
+quality pass, with 100% event-counter coverage.
+
+| Control | 16-client q/s | Warm p50 / p90 (ms) | Instructions/query (M) | CPU/query (ms) | Concurrent planned rows/query | Concurrent execution (ms) |
+|---|---:|---|---:|---:|---:|---:|
+| baseline | 771.19 | 10.72 / 22.11 | 23.20 | 3.73 | 83,562 | 3.45 |
+| reader | 1437.41 | 9.42 / 12.52 | 23.23 | 3.69 | 83,562 | 3.55 |
+| retired | 1154.47 | 10.57 / 13.88 | 23.27 | 3.73 | 83,562 | 3.52 |
+
+All three concurrent phases perform 2,000 snapshot HEADs and zero search backend reads.
+Mean snapshot latency is 13.55, 10.18, and 11.63 ms, respectively. Search instructions and
+CPU are essentially unchanged across the reader and storage-layout controls; the single-run
+throughput spread includes snapshot latency and scheduling effects. These controls support
+unfiltered parity and do not change the failed selective-filter gate. The later standalone
+planner merge is documented separately below; it is not retroactively part of these frozen
+binaries. Final D4 source validation includes subsequent main changes, including BW2.
+
+### Independent filtered probe planner, with calibrated recall
+
+The standalone planner branch `wt/d4-plan`, final commit `a74815d` on `d63fe89`, starts from
+main `8997a1d`. It keeps main's segment directories, ANN objects, and dense memberships;
+it changes no format or tier reader. The automatic budget uses full inverse selectivity plus
+one surviving witness and one standard deviation of its trial count. Available membership
+counts size the budget; sparse index formats retain their existing fallback. The production
+`filtered_probe_cap` field and `BF_FILTER_PROBE_CAP` environment variable are removed.
+The old three-times cap survives only as a fixed private test helper, demonstrating lost
+neighbors. A 40,000-vector f16 test also checks exhaustive neighbors and retained format-4
+segment objects. Required native checks pass, with 213 tests and eight ignored experiments.
+
+For each of the six scalar predicates, keep the planner at explicit 48 probes and find the
+first tested main probe value whose aggregate recall meets or exceeds it. Test the grid
+48, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512, 768, and 1,024, stopping at the first
+passing value. This calibrates on the same 64 vectors; it is neither a held-out validation nor
+a claim that the chosen integer is minimal. For bucket 1%, main recall progresses through
+0.9359375, 0.965625, 0.975, 0.9796875, 0.9859375, 0.990625, 0.99375, and 1.0.
+For bucket 10%, it progresses through 0.9609375, 0.9671875, 0.971875, 0.9796875,
+0.9828125, 0.984375, 0.9875, and 0.99375. The main bucket-10 reference therefore has
+slightly higher recall than the planner. Other aggregate recall pairs match; ordered output
+objects match for 64/64 paired queries except bucket 10%, at 61/64.
+
+Both isolated release builds use one identical metadata-recording harness and the same
+unretired, read-only NQ objects, format 4, with the scalar follow-up cache budgets and retention.
+After 2,000 prewarm queries, count 1,000 serial and 2,000 concurrent queries, cycling the
+64 distinct vectors. Performance counters cover exactly these 3,000 requests at 100%
+coverage. No build, data copy, truth computation, or other query workload overlaps timing.
+Arm order alternates between predicates. These are single long pairs, not confidence intervals.
+
+| Predicate | Main/planner probes | Main/planner recall@10 | Main/planner q/s | Main/planner instructions/query (M) | Main/planner CPU/query (ms) |
+|---|---|---|---|---|---|
+| id-1 | 48 / 48 | 1.000000 / 1.000000 | 1361.48 / 1131.91 | 22.99 / 23.06 | 4.90 / 4.93 |
+| bucket-1 | 256 / 48 | 1.000000 / 1.000000 | 167.59 / 118.66 | 242.07 / 344.16 | 46.36 / 64.08 |
+| id-10 | 48 / 48 | 1.000000 / 1.000000 | 844.65 / 688.78 | 57.88 / 67.63 | 9.60 / 11.33 |
+| bucket-10 | 256 / 48 | 0.993750 / 0.989062 | 180.93 / 149.27 | 221.23 / 203.47 | 42.80 / 39.51 |
+| id-50 | 64 / 48 | 0.967187 / 0.967187 | 511.28 / 513.51 | 122.14 / 122.12 | 15.86 / 15.78 |
+| bucket-50 | 64 / 48 | 0.956250 / 0.956250 | 435.40 / 454.86 | 130.87 / 130.65 | 18.67 / 18.71 |
+
+The conservative budget costs more local CPU on some selective filters: bucket 1% uses
+42.2% more instructions and 38.2% more CPU at equal recall 1.0; ID 10% uses about 18.0%
+more CPU. ID 1% has effectively unchanged CPU despite its single-pair throughput variation.
+At 50%, CPU is essentially unchanged. Bucket 10% uses 7.7% less CPU than the main-256
+reference, with slightly lower recall, so that pair is not an exact quality tie. The change
+improves default filtered recall and removes an arbitrary cap; it is not a universal speedup.
+Against main at the original 48 probes, the standalone planner loses no true neighbors on any
+of the six 64-query samples. It improves four ID-50 queries, 23 bucket-1 queries, 15 bucket-10
+queries, and six bucket-50 queries; ID 1% and 10% are unchanged. This is a sample result,
+rather than a guarantee of monotonic recall on every possible ANN query. The planner remains
+independent of the held vector-retirement format.
+
+### Resources and cleanup
+
+The owned c7gd.2xlarge ran for 9.19 hours. Estimated compute cost is $3.34 at
+$0.3629/hour; EBS and S3 charges are additional. The instance is terminated, and its root
+volume, tagged key pair, and tagged security group are confirmed absent. All four owned
+measurement prefixes list zero current objects after 4,284 deletes. No delete returns a
+version ID or delete marker; version enumeration is not permitted by the measurement role.
+The owned data, build outputs, logs, and nested worktrees are removed after retaining these
+numbers, while the supplied EC2 instructions and uncommitted worker report remain.
 
 ## Round BW2: shadow statistics from indexed postings
 

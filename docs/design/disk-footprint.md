@@ -189,8 +189,9 @@ D4 branch. Format 5 is held from main because cached selective-filter throughput
 the standalone predicate cache, including distributed hash predicates at 1% and 10%. That cache landed independently without a format change. The next
 round is an index-only ID-band/local-filter directory into the existing vector payload, preserving
 filter locality while storing exact vectors once. Long controls confirm additional local query CPU,
-rather than snapshot latency alone. Broader predicates can improve, so the replacement needs a
-selectivity-aware planner and measurements at matched recall. NQ measurements and their limits are recorded in
+rather than snapshot latency alone. Some broad-filter queries also lose neighbors across the new
+geometry despite higher aggregate recall, so a universal identical-results gate fails too. The
+replacement needs a selectivity-aware planner and measurements at matched recall. NQ measurements and their limits are recorded in
 the Round D4 section of `docs/benchmarks.md`.
 
 Round AR3 built R4's lineage: compaction now merges covered segments and records where their rows went. It did

@@ -643,26 +643,10 @@ struct Totals {
     /// [`independent_spread`] of the layout.
     spread: f64,
 }
-impl Totals {
-    /// Preserve the unfiltered candidate coverage after a tier's rows are thinned by a filter.
-    /// Segment indexes retain their historical probe cap; a capped tier probe lost recall when
-    /// matching rows were spread across the global clustering instead of a few whole segments.
-    fn thinning(&self, config: &EngineConfig) -> f64 {
-        let thin = self.ann_rows as f64 / self.matching.max(1) as f64;
-        if self.filtered && self.layout == Layout::Slabs {
-            filtered_tier_scale(self.ann_rows, self.matching, self.k)
-        } else if self.filtered {
-            thin.min(config.filtered_probe_cap.max(1) as f64)
-        } else {
-            thin
-        }
-    }
-}
-
 /// Inverse selectivity, with one additional surviving witness and one standard deviation of
 /// the trials needed to find `k + 1` survivors under independent thinning. The margin depends
 /// on both selectivity and k; correlated real filters still need measured recall validation.
-pub(crate) fn filtered_tier_scale(rows: usize, matching: usize, k: usize) -> f64 {
+pub(crate) fn filtered_probe_scale(rows: usize, matching: usize, k: usize) -> f64 {
     if matching >= rows {
         return 1.0;
     }
@@ -785,10 +769,12 @@ fn pick_clusters(
     let Totals {
         layout,
         ann_rows,
+        matching,
         clusters,
         target,
+        k,
+        filtered,
         spread,
-        ..
     } = *t;
     // Each candidate as one integer key, ordered as (distance by `f32::total_cmp`, entry): the
     // partition and sort below compare integers.
@@ -800,9 +786,20 @@ fn pick_clusters(
         .filter(|(n, e)| !flat[e.segment] && e.rows > 0 && in_cluster(*n) > 0.0)
         .map(|(n, _)| (u64::from(total_order_key(distances[n])) << 32) | n as u64)
         .collect();
-    // Filtered tier probes compensate for the full selectivity, bounded by the cluster count.
-    // The matching-candidate target below also keeps sparse masks from exhausting a short probe.
-    let thin = t.thinning(config);
+    // Preserve candidate coverage under selective filters, including survivor variance.
+    // Selectivity changes the plan automatically; there is no lower-recall configuration.
+    let thin = if filtered {
+        filtered_probe_scale(ann_rows, matching, k)
+    } else {
+        ann_rows as f64 / matching.max(1) as f64
+    };
+    // Reproduce the removed cap only in the private regression test.
+    #[cfg(test)]
+    let thin = if filtered && config.legacy_three_filter_test {
+        (ann_rows as f64 / matching.max(1) as f64).min(3.0)
+    } else {
+        thin
+    };
     let probes = probe_count(config, ann_rows, clusters, thin * spread, layout);
     // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
     // only in the unlikely case the walk runs past them.
@@ -1125,24 +1122,6 @@ pub(crate) async fn search(
     // Rows in clusters of ANN (non-flat) segments, per segment and in all.
     let (seg_rows, seg_clusters): (Vec<usize>, Vec<usize>) =
         dir.segment_totals().into_iter().unzip();
-    let mut ann_rows = 0usize;
-    let mut matching = 0usize;
-    let mut clusters = 0usize;
-    // Expected allowed rows per cluster of each segment: the segment's allowed fraction.
-    let mut fraction = vec![1.0f64; dir.segments().len()];
-    for (i, seg) in dir.segments().iter().enumerate() {
-        if skipped(i) {
-            fraction[i] = 0.0;
-        } else if !seg.flat {
-            ann_rows += seg_rows[i];
-            matching += live_rows(i).min(seg_rows[i]);
-            clusters += seg_clusters[i];
-            fraction[i] = live_rows(i).min(seg_rows[i]) as f64 / seg_rows[i].max(1) as f64;
-        }
-    }
-    let target = k.saturating_mul(config.ann_rerank_factor).min(matching);
-    // The most candidates reranked (a delta beside its base reranks fewer: see `Seat::pick`).
-    let mut rerank_cap = target;
     // Filtered: allowed rows in each cluster, exactly, from the row-to-cluster maps.
     let counts: Vec<Vec<u32>> = if filtered {
         dir.segments()
@@ -1158,6 +1137,33 @@ pub(crate) async fn search(
     } else {
         Vec::new()
     };
+    let mut ann_rows = 0usize;
+    let mut matching = 0usize;
+    let mut clusters = 0usize;
+    // Expected allowed rows per cluster of each segment: the segment's allowed fraction.
+    let mut fraction = vec![1.0f64; dir.segments().len()];
+    for (i, seg) in dir.segments().iter().enumerate() {
+        if skipped(i) {
+            fraction[i] = 0.0;
+        } else if !seg.flat {
+            ann_rows += seg_rows[i];
+            // Dictionary masks also contain rows whose vector is null. Count actual
+            // vector members, rather than treating those rows as surviving witnesses.
+            let selected = counts
+                .get(i)
+                .filter(|counts| !counts.is_empty())
+                .map_or_else(
+                    || live_rows(i).min(seg_rows[i]),
+                    |counts| counts.iter().map(|n| *n as usize).sum(),
+                );
+            matching += selected;
+            clusters += seg_clusters[i];
+            fraction[i] = selected as f64 / seg_rows[i].max(1) as f64;
+        }
+    }
+    let target = k.saturating_mul(config.ann_rerank_factor).min(matching);
+    // The most candidates reranked (a delta beside its base reranks fewer: see `Seat::pick`).
+    let mut rerank_cap = target;
     let in_cluster = |n: usize| -> f64 {
         let e = &entries[n];
         match counts.get(e.segment).filter(|c| !c.is_empty()) {
@@ -2198,7 +2204,7 @@ pub(crate) async fn speculate_slab_scan(
 
 #[cfg(test)]
 mod spread_tests {
-    use super::{Layout, MAX_SPREAD, Totals, filtered_tier_scale, independent_spread, probe_count};
+    use super::{Layout, MAX_SPREAD, filtered_probe_scale, independent_spread, probe_count};
     use crate::EngineConfig;
 
     #[test]
@@ -2207,7 +2213,7 @@ mod spread_tests {
             let p = matching as f64 / 1_000_000.0;
             for k in [1, 10, 100] {
                 let trials =
-                    (filtered_tier_scale(1_000_000, matching, k) * k as f64).ceil() as usize;
+                    (filtered_probe_scale(1_000_000, matching, k) * k as f64).ceil() as usize;
                 // Exact binomial probability of fewer than k survivors, independently of
                 // the planner's waiting-time approximation. A mean-only budget fails this.
                 let mut term = (1.0 - p).powi(trials as i32);
@@ -2219,37 +2225,24 @@ mod spread_tests {
                 assert!(failure < 0.2, "p={p}, k={k}, failure={failure}");
             }
         }
-        assert_eq!(filtered_tier_scale(100, 100, 10), 1.0);
+        assert_eq!(filtered_probe_scale(100, 100, 10), 1.0);
     }
 
     #[test]
-    fn filtered_tier_budget_preserves_expected_candidate_coverage() {
+    fn selective_probes_preserve_candidate_coverage_for_both_layouts() {
         let config = EngineConfig::default();
-        let unfiltered = probe_count(&config, 1_000_000, 10_000, 1.0, Layout::Slabs);
-        for matching in [1, 10, 1000, 10_000, 100_000, 500_000, 1_000_000] {
-            let totals = Totals {
-                ann_rows: 1_000_000,
-                matching,
-                clusters: 10_000,
-                target: 320.min(matching),
-                k: 10,
-                filtered: true,
-                layout: Layout::Slabs,
-                spread: 1.0,
-            };
-            let probes = probe_count(
-                &config,
-                totals.ann_rows,
-                totals.clusters,
-                totals.thinning(&config),
-                totals.layout,
-            );
-            assert!(probes == totals.clusters || probes * matching >= unfiltered * totals.ann_rows);
-            let segments = Totals {
-                layout: Layout::Segments,
-                ..totals
-            };
-            assert!(segments.thinning(&config) <= config.filtered_probe_cap as f64);
+        for layout in [Layout::Segments, Layout::Slabs] {
+            let unfiltered = probe_count(&config, 1_000_000, 10_000, 1.0, layout);
+            for matching in [1, 10, 1000, 10_000, 100_000, 500_000, 1_000_000] {
+                let probes = probe_count(
+                    &config,
+                    1_000_000,
+                    10_000,
+                    filtered_probe_scale(1_000_000, matching, 10),
+                    layout,
+                );
+                assert!(probes == 10_000 || probes * matching >= unfiltered * 1_000_000);
+            }
         }
     }
 
