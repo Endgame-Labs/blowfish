@@ -140,7 +140,9 @@ where
     let runtime = IO_RUNTIME
         .with(|slot| slot.borrow().clone())
         .unwrap_or(runtime);
-    tokio::task::spawn_blocking(move || runtime.block_on(future))
+    let worker_runtime = runtime.clone();
+    runtime
+        .spawn_blocking(move || worker_runtime.block_on(future))
         .await
         .map_err(crate::segment::index_error)
 }
@@ -166,6 +168,7 @@ mod tests {
         let io = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             tokio::runtime::Builder::new_current_thread()
+                .thread_name("reactor-blocking")
                 .enable_all()
                 .build()
                 .unwrap()
@@ -212,6 +215,7 @@ mod tests {
                                 Poll::Pending
                             } else {
                                 assert_ne!(std::thread::current().id(), thread);
+                                assert_ne!(std::thread::current().name(), Some("reactor-blocking"));
                                 Poll::Ready(42)
                             }
                         }),

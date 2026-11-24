@@ -172,6 +172,8 @@ def server(name, index):
     )
     env.update(arm_env)
     port = a.port + index
+    # Fresh processes reuse an arm directory; traces must describe only this process.
+    (work / "server.log").write_text("")
     log = (work / "server.log").open("a")
     proc = subprocess.Popen(
         [str(ROOT / binary), str(work / "storage.local"), f"127.0.0.1:{port}"],

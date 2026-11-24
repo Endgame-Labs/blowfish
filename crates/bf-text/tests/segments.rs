@@ -95,6 +95,209 @@ fn empty_and_single_row_roundtrip() {
 }
 
 #[test]
+fn masked_document_frequencies_count_rows_and_preserve_input_order() {
+    let docs: Vec<_> = (0..5137)
+        .map(|row| {
+            if row % 17 == 0 {
+                None
+            } else if row % 19 == 0 {
+                Some(Vec::new())
+            } else {
+                let mut tokens = vec![Token::new("common", 0), Token::new("common", 1)];
+                if row % 97 == 0 {
+                    tokens.push(Token::new("rare", 2));
+                }
+                if row % 7 == 0 {
+                    tokens.push(Token::new("prefix", 3));
+                }
+                Some(tokens)
+            }
+        })
+        .collect();
+    let mut builder = SegmentBuilder::new(true);
+    for doc in &docs {
+        if let Some(tokens) = doc {
+            builder.add_document(tokens).unwrap();
+        } else {
+            builder.add_missing_document().unwrap();
+        }
+    }
+    let bytes = builder.finish().unwrap();
+    let terms = [
+        "common", "rare", "common", "pre", "prefix", "absent", "Common",
+    ];
+    for divisor in [1, 2, 7, 97, 5137] {
+        let rows: RoaringBitmap = (0..docs.len() as u32)
+            .filter(|row| row % divisor == 0)
+            .collect();
+        let expected: Vec<_> = terms
+            .iter()
+            .map(|term| {
+                rows.iter()
+                    .filter(|row| {
+                        docs[*row as usize]
+                            .as_ref()
+                            .is_some_and(|tokens| tokens.iter().any(|t| &t.text == term))
+                    })
+                    .count() as u64
+            })
+            .collect();
+        // A cold pass and a cached pass cover both posting sources. Header opens
+        // also check lazy lengths and packed tails crossing block boundaries.
+        let header = bf_text::text_header(&bytes).unwrap().unwrap();
+        let reader = SegmentReader::open_with_header(
+            Arc::new(MemoryRangeRead::from(bytes.clone())),
+            &header,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                block_on(reader.document_frequencies(&terms, &rows)).unwrap(),
+                expected,
+                "divisor={divisor}"
+            );
+        }
+    }
+}
+
+#[test]
+fn masked_frequencies_skip_empty_masks_and_gap_free_payloads() {
+    let docs: Vec<_> = (0..16_385)
+        .map(|row| {
+            let mut tokens = vec![Token::new("common", 0)];
+            if row % 257 == 0 {
+                tokens.push(Token::new("rare", 1));
+            }
+            tokens
+        })
+        .collect();
+    let bytes = build(&docs, true, Tokenizer::WordV4);
+    let header = bf_text::text_header(&bytes).unwrap().unwrap();
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let reader = SegmentReader::open_with_header(
+        Arc::new(Recording {
+            bytes: bytes.into(),
+            reads: reads.clone(),
+        }),
+        &header,
+    )
+    .unwrap();
+    assert_eq!(
+        block_on(reader.document_frequencies(&["common"], &RoaringBitmap::new())).unwrap(),
+        [0]
+    );
+    assert!(
+        block_on(reader.document_frequencies(&[], &[7].into_iter().collect()))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        block_on(reader.document_frequencies(&["common"], &[16_385].into_iter().collect()))
+            .is_err()
+    );
+    assert!(reads.lock().unwrap().is_empty());
+    let all: RoaringBitmap = (0..16_385).collect();
+    assert_eq!(
+        block_on(reader.document_frequencies(&["common", "rare"], &all)).unwrap(),
+        [16_385, 64]
+    );
+    // Dictionary counts need neither lengths nor decoded postings.
+    assert!(reader.doc_lengths().is_empty());
+    let sparse = [7, 257, 258, 16_384].into_iter().collect();
+    assert_eq!(
+        block_on(reader.document_frequencies(&["common"], &sparse)).unwrap(),
+        [4]
+    );
+    assert!(
+        reader.doc_lengths().is_empty(),
+        "gap-free blocks need no payload decode"
+    );
+    reads.lock().unwrap().clear();
+    assert_eq!(
+        block_on(reader.document_frequencies(&["common"], &sparse)).unwrap(),
+        [4]
+    );
+    assert!(reads.lock().unwrap().is_empty());
+    assert_eq!(
+        block_on(reader.document_frequencies(&["rare"], &sparse)).unwrap(),
+        [1]
+    );
+    assert_eq!(reader.doc_lengths().len(), docs.len());
+}
+
+#[test]
+#[cfg(feature = "legacy-fixtures")]
+fn masked_frequencies_read_legacy_layouts_with_empty_and_missing_fields() {
+    for version in 4..=6 {
+        let mut builder = SegmentBuilder::new(true);
+        for row in 0..1027 {
+            if row % 17 == 0 {
+                builder.add_missing_document().unwrap();
+            } else if row % 19 == 0 {
+                builder.add_document(&[]).unwrap();
+            } else {
+                let mut tokens = vec![Token::new("common", 0), Token::new("common", 1)];
+                if row % 7 == 0 {
+                    tokens.push(Token::new("rare", 2));
+                }
+                builder.add_document(&tokens).unwrap();
+            }
+        }
+        let bytes = match version {
+            4 => builder.finish_colocated_fixture(),
+            5 => builder.finish_bundled_fixture(),
+            6 => builder.finish_compressed_fixture(),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        let reader = open(bytes);
+        for divisor in [1, 2, 127] {
+            let rows: RoaringBitmap = (0..1027).filter(|row| row % divisor == 0).collect();
+            let common = rows
+                .iter()
+                .filter(|row| row % 17 != 0 && row % 19 != 0)
+                .count() as u64;
+            let rare = rows
+                .iter()
+                .filter(|row| row % 17 != 0 && row % 19 != 0 && row % 7 == 0)
+                .count() as u64;
+            assert_eq!(
+                block_on(
+                    reader.document_frequencies(&["rare", "common", "absent", "common"], &rows)
+                )
+                .unwrap(),
+                [rare, common, 0, common],
+                "version={version} divisor={divisor}"
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+    #[test]
+    fn masked_frequencies_match_document_presence(
+        raw in prop::collection::vec(prop::option::of(prop::collection::vec(0u8..8, 0..16)), 0..600),
+        divisor in 1u32..15, offset in 0u32..15,
+    ) {
+        let mut builder = SegmentBuilder::new(false);
+        for doc in &raw {
+            if let Some(words) = doc {
+                builder.add_document(&words.iter().enumerate().map(|(i, word)|Token::new(format!("term{word}"), i as u32)).collect::<Vec<_>>()).unwrap();
+            } else {
+                builder.add_missing_document().unwrap();
+            }
+        }
+        let reader = open(builder.finish().unwrap());
+        let rows: RoaringBitmap = (0..raw.len() as u32).filter(|row| (row + offset) % divisor == 0).collect();
+        let terms: Vec<_> = (0..10).map(|word|format!("term{word}")).collect();
+        let wanted: Vec<_> = terms.iter().map(String::as_str).collect();
+        let expected: Vec<_> = (0..10u8).map(|word| rows.iter().filter(|row|raw[*row as usize].as_ref().is_some_and(|words|words.contains(&word))).count() as u64).collect();
+        prop_assert_eq!(block_on(reader.document_frequencies(&wanted, &rows)).unwrap(), expected);
+    }
+}
+
+#[test]
 fn arrays_stopword_gaps_repetitions_and_boolean_subwords() {
     let p = FtsParams::default();
     let docs = vec![
