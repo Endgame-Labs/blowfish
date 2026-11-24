@@ -20,8 +20,9 @@ fn vector(id: usize) -> Vec<f32> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_batches_preserve_warm_results_projection_and_live_masks() {
+    let backend = Arc::new(InMemory::new());
     let store = Storage::from_backend_with_cache(
-        Arc::new(InMemory::new()),
+        backend.clone(),
         Path::default(),
         false,
         false,
@@ -68,7 +69,7 @@ async fn cold_batches_preserve_warm_results_projection_and_live_masks() {
             &ReclusterOptions {
                 attribute: "vector".into(),
                 cells: 4,
-                cluster_rows: 128,
+                cluster_rows: 0,
                 max_slab_rows: 30_000,
                 scratch: scratch.path().join("build"),
             },
@@ -76,6 +77,32 @@ async fn cold_batches_preserve_warm_results_projection_and_live_masks() {
         .await
         .unwrap();
     assert_eq!(built.rows, 100_000);
+    assert_eq!(built.cluster_rows, 200);
+    let uncached_store = Storage::from_backend_with_cache(
+        backend,
+        Path::default(),
+        true,
+        false,
+        CacheConfig {
+            memory_bytes: 0,
+            block_size: 1024,
+            max_coalesce_blocks: 256,
+            fetch_concurrency: 32,
+            hedge_budget: 0.0,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let uncached = Engine::with_config(
+        uncached_store,
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            decoded_cache_bytes: 16 << 20,
+            ..Default::default()
+        },
+    );
     for id in [0, 107, 1007, 49_001, 99_999] {
         engine.drop_caches().await;
         let request = json!({
@@ -87,10 +114,18 @@ async fn cold_batches_preserve_warm_results_projection_and_live_masks() {
             .await
             .unwrap();
         let warm = engine
-            .query("stream", serde_json::from_value(request).unwrap())
+            .query("stream", serde_json::from_value(request.clone()).unwrap())
             .await
             .unwrap();
         assert_eq!(cold.result.rows, warm.result.rows);
+        // A zero-capacity reader cannot retain speculative seed reads. Its per-slab path
+        // must return the same IDs, distances, and projections as the cached streaming path.
+        uncached.drop_caches().await;
+        let no_cache = uncached
+            .query("stream", serde_json::from_value(request).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(cold.result.rows, no_cache.result.rows);
         let rows = cold.result.rows.unwrap();
         assert_eq!(rows[0]["id"], json!(id));
         for row in rows {

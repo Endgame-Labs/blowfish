@@ -181,6 +181,7 @@ struct Planning {
 
 pub(crate) struct RangeCache {
     pub(crate) config: CacheConfig,
+    pub(crate) mapped: std::sync::OnceLock<Arc<crate::mapped::Mapped>>,
     memory: Cache<BlockKey, Bytes>,
     disk: Option<Arc<Mutex<Disk>>>,
     layouts: Cache<String, Layout>,
@@ -200,6 +201,9 @@ struct Spills {
 impl RangeCache {
     /// Empty the memory and disk tiers and the object-length cache (bench cold-cache runs).
     pub(crate) fn drop_all(&self) {
+        if let Some(mapped) = self.mapped.get() {
+            mapped.clear();
+        }
         self.memory.invalidate_all();
         self.memory.run_pending_tasks();
         self.layouts.invalidate_all();
@@ -257,6 +261,7 @@ impl RangeCache {
                     .unwrap_or(config.hedge_budget),
             ),
             spills: Arc::default(),
+            mapped: std::sync::OnceLock::new(),
             config,
             memory,
             disk,
@@ -383,6 +388,8 @@ pub struct RangeReader {
     admit: bool,
     /// Small-block size for sparse reads (see [`RangeReader::sparse`]), or 0.
     small: u32,
+    /// Scattered access, independent of the block size used by non-mapped backends.
+    random: bool,
 }
 impl RangeReader {
     /// A reader that still uses cached blocks but admits none of its own: for one-pass scans
@@ -397,6 +404,7 @@ impl RangeReader {
     /// gigabyte: a miss then fetches and caches 16 KB instead of 1 MB. Small blocks are cached
     /// apart from full ones, so use it only for reads that are sparse in their object.
     pub fn sparse(mut self, block_size: usize) -> Self {
+        self.random = true;
         let full = self.storage.0.cache.config.block_size;
         let size = block_size.max(512).next_power_of_two();
         self.small = if size >= full { 0 } else { size as u32 };
@@ -477,6 +485,31 @@ impl RangeReader {
         stats: &CacheStats,
         mut ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<Vec<Bytes>, Error> {
+        if let Some(mapped) = self.storage.0.cache.mapped.get() {
+            for range in ranges {
+                if range.start > range.end || range.end > self.len() {
+                    return Err(Error::Config("invalid object range"));
+                }
+            }
+            let bytes = ranges.iter().map(|range| range.end - range.start).sum();
+            stats.record_many(
+                Tier::Miss,
+                bytes,
+                ranges.iter().filter(|range| !range.is_empty()).count() as u64,
+            );
+            let result = mapped.read(
+                &self.storage.path(&self.key),
+                self.len() + self.layout.offset,
+                self.layout.offset,
+                ranges,
+                self.admit,
+                self.random,
+            );
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
+            return result;
+        }
         let prioritized = ready.is_some();
         let mut priorities = BTreeMap::new();
         let cache = &self.storage.0.cache;
@@ -774,6 +807,7 @@ impl Storage {
             layout,
             admit: true,
             small: 0,
+            random: false,
         })
     }
     /// Open an immutable object without HEAD or header probing. The caller supplies the
@@ -794,6 +828,7 @@ impl Storage {
             layout: Layout { len, offset },
             admit: true,
             small: 0,
+            random: false,
         })
     }
     /// Cached whole-object read for immutable objects, sharing the range cache and single-flight.

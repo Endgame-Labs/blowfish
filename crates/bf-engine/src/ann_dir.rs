@@ -404,13 +404,13 @@ pub(crate) async fn prefetch_scan(
         &distances,
         &in_cluster,
         &Totals {
+            layout,
             ann_rows,
             matching,
             clusters,
             target,
             k,
             filtered: false,
-            slabs: layout == Layout::Slabs,
             spread: layout_spread(config, dir, layout, &seg_rows, &|_| false),
         },
         config,
@@ -633,13 +633,13 @@ fn likely_segments(dir: &Directory, picked: &[usize]) -> BTreeSet<usize> {
 
 /// Row and cluster totals the probe plan is sized from.
 struct Totals {
+    layout: Layout,
     ann_rows: usize,
     matching: usize,
     clusters: usize,
     target: usize,
     k: usize,
     filtered: bool,
-    slabs: bool,
     /// [`independent_spread`] of the layout.
     spread: f64,
 }
@@ -649,7 +649,7 @@ impl Totals {
     /// matching rows were spread across the global clustering instead of a few whole segments.
     fn thinning(&self, config: &EngineConfig) -> f64 {
         let thin = self.ann_rows as f64 / self.matching.max(1) as f64;
-        if self.filtered && self.slabs {
+        if self.filtered && self.layout == Layout::Slabs {
             filtered_tier_scale(self.ann_rows, self.matching, self.k)
         } else if self.filtered {
             thin.min(config.filtered_probe_cap.max(1) as f64)
@@ -718,9 +718,19 @@ fn tier_share(dir: &Directory, seg_rows: &[usize], skipped: &dyn Fn(usize) -> bo
 
 /// Clusters a query probes: `ann_nprobe` per square root of the rows' worth of clusters, more
 /// when `thin` (total rows over matching rows) says the clusters are sparse.
-fn probe_count(config: &EngineConfig, ann_rows: usize, clusters: usize, thin: f64) -> usize {
-    let scale = (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0);
-    ((config.ann_nprobe as f64 * scale * thin).ceil() as usize).min(clusters)
+fn probe_count(
+    config: &EngineConfig,
+    ann_rows: usize,
+    clusters: usize,
+    thin: f64,
+    layout: Layout,
+) -> usize {
+    let budget = if layout == Layout::Slabs {
+        bf_vector::tier_probe_budget(config.ann_nprobe, ann_rows, clusters)
+    } else {
+        config.ann_nprobe as f64 * (clusters as f64 / (ann_rows as f64).sqrt()).max(1.0)
+    };
+    ((budget * thin).ceil() as usize).min(clusters)
 }
 
 /// How many more clusters to probe because the segments were clustered independently.
@@ -773,6 +783,7 @@ fn pick_clusters(
     config: &EngineConfig,
 ) -> Vec<usize> {
     let Totals {
+        layout,
         ann_rows,
         clusters,
         target,
@@ -792,7 +803,7 @@ fn pick_clusters(
     // Filtered tier probes compensate for the full selectivity, bounded by the cluster count.
     // The matching-candidate target below also keeps sparse masks from exhausting a short probe.
     let thin = t.thinning(config);
-    let probes = probe_count(config, ann_rows, clusters, thin * spread);
+    let probes = probe_count(config, ann_rows, clusters, thin * spread, layout);
     // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
     // only in the unlikely case the walk runs past them.
     let mut sorted = if order.len() > probes.saturating_mul(8).max(256) {
@@ -1176,13 +1187,13 @@ pub(crate) async fn search(
             }
         } else {
             let totals = Totals {
+                layout,
                 ann_rows,
                 matching,
                 clusters,
                 target,
                 k,
                 filtered,
-                slabs: layout == Layout::Slabs,
                 spread: layout_spread(config, dir.as_ref(), layout, &seg_rows, &skipped)
                     * tier_share(dir.as_ref(), &seg_rows, &skipped),
             };
@@ -1299,7 +1310,10 @@ pub(crate) async fn search(
     let scan_upper = Arc::new(std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()));
     // Sample a selected code range per slab. This costs no I/O, and keeps resident
     // workloads on the existing per-slab scan rather than creating many small tasks.
-    let streaming = stream_scan(&dir, layout)
+    // Streaming seeds the raw cache before its scan readers start. With no retention budget,
+    // completed seed reads are discarded, and fast backends fetch them again for the scans.
+    let streaming = store.cache_limits().0 > 0
+        && stream_scan(&dir, layout)
         && !filtered
         && joint.is_none()
         && chosen.iter().any(|(&i, cs)| {
@@ -2000,8 +2014,9 @@ async fn paged_view(
 ) -> Result<(Arc<Directory>, bool), ApiError> {
     let t0 = std::time::Instant::now();
     let (rows, clusters) = paged.totals();
-    let want = (probe_count(config, rows as usize, clusters as usize, 1.0) as f64 * page_margin())
-        .ceil() as usize;
+    let want = (probe_count(config, rows as usize, clusters as usize, 1.0, Layout::Slabs) as f64
+        * page_margin())
+    .ceil() as usize;
     let kappa = page_kappa();
     let cells = {
         let (paged, vector) = (paged.clone(), vector.to_vec());
@@ -2183,7 +2198,7 @@ pub(crate) async fn speculate_slab_scan(
 
 #[cfg(test)]
 mod spread_tests {
-    use super::{MAX_SPREAD, Totals, filtered_tier_scale, independent_spread, probe_count};
+    use super::{Layout, MAX_SPREAD, Totals, filtered_tier_scale, independent_spread, probe_count};
     use crate::EngineConfig;
 
     #[test]
@@ -2210,7 +2225,7 @@ mod spread_tests {
     #[test]
     fn filtered_tier_budget_preserves_expected_candidate_coverage() {
         let config = EngineConfig::default();
-        let unfiltered = probe_count(&config, 1_000_000, 10_000, 1.0);
+        let unfiltered = probe_count(&config, 1_000_000, 10_000, 1.0, Layout::Slabs);
         for matching in [1, 10, 1000, 10_000, 100_000, 500_000, 1_000_000] {
             let totals = Totals {
                 ann_rows: 1_000_000,
@@ -2219,7 +2234,7 @@ mod spread_tests {
                 target: 320.min(matching),
                 k: 10,
                 filtered: true,
-                slabs: true,
+                layout: Layout::Slabs,
                 spread: 1.0,
             };
             let probes = probe_count(
@@ -2227,10 +2242,11 @@ mod spread_tests {
                 totals.ann_rows,
                 totals.clusters,
                 totals.thinning(&config),
+                totals.layout,
             );
             assert!(probes == totals.clusters || probes * matching >= unfiltered * totals.ann_rows);
             let segments = Totals {
-                slabs: false,
+                layout: Layout::Segments,
                 ..totals
             };
             assert!(segments.thinning(&config) <= config.filtered_probe_cap as f64);

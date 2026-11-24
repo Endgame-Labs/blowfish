@@ -444,6 +444,100 @@ async fn cold_open_reads_the_directory_hint_alongside_the_manifest() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slab_hint_skips_the_upgraded_segment_directory_and_missing_slabs_fall_back() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable.clone(), config());
+    let vector = |id: usize| -> Vec<f32> {
+        (0..32)
+            .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+            .collect()
+    };
+    let docs: Vec<_> = (0..3000)
+        .map(|id| json!({"id":id,"vector":vector(id)}))
+        .collect();
+    writer
+        .write(
+            "slab-hints",
+            serde_json::from_value(json!({
+                "distance_metric":"cosine_distance", "upsert_rows":docs,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    writer.index_namespace("slab-hints", true).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    writer
+        .recluster(
+            "slab-hints",
+            &bf_engine::ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 1,
+                cluster_rows: 200,
+                max_slab_rows: 10_000,
+                scratch: scratch.path().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let segment_hint = "ann-dir-latest-616e6e76323a766563746f72.bin";
+    let slab_hint = "ns/slab-hints/segments/ann-dir-latest-616e6e333a766563746f72.bin";
+    // Both hints exist, as they do after a lossless upgrade. Delaying reads makes an
+    // eager segment-hint request observable even when it would later be canceled.
+    assert!(
+        writable
+            .get(&format!("ns/slab-hints/segments/{segment_hint}"))
+            .await
+            .is_ok()
+    );
+    let request = json!({"rank_by":["vector","ANN",vector(17)],"top_k":10});
+    backend.paths.lock().unwrap().clear();
+    backend.delay.store(true, Ordering::SeqCst);
+    let reader = Engine::with_config(store(backend.clone()).await, config());
+    let with_slab = reader
+        .query(
+            "slab-hints",
+            serde_json::from_value(request.clone()).unwrap(),
+        )
+        .await
+        .unwrap()
+        .result
+        .rows;
+    assert!(
+        !backend
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.contains(segment_hint))
+    );
+    // An absent hint remains advisory: the reader can fetch the ordinary directory,
+    // and still return exactly the same tier results.
+    writable.delete(slab_hint).await.unwrap();
+    backend.paths.lock().unwrap().clear();
+    let reader = Engine::with_config(store(backend.clone()).await, config());
+    let without_slab = reader
+        .query("slab-hints", serde_json::from_value(request).unwrap())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    assert_eq!(with_slab, without_slab);
+    assert!(
+        backend
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.contains(segment_hint))
+    );
+    backend.delay.store(false, Ordering::SeqCst);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_wal_write_discards_speculative_results() {
     let backend = Arc::new(Counting::default());
     let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
