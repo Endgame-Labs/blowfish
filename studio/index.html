@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>blowfish: self-hosted search with the turbopuffer API</title>
+  <meta name="description" content="An open-source, self-hostable search engine in a single Rust binary that speaks the turbopuffer API. Vector search, BM25, hybrid queries, and filters stored straight in your S3-compatible bucket.">
+  <meta property="og:title" content="blowfish: self-hosted search with the turbopuffer API">
+  <meta property="og:description" content="Open-source vector, BM25, and hybrid search on object storage that speaks the turbopuffer API. One Rust binary, MIT licensed, and happy to swim in your own bucket.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="blowfish: self-hosted search with the turbopuffer API">
+  <meta name="twitter:description" content="Open-source vector, BM25, and hybrid search on object storage that speaks the turbopuffer API. One Rust binary, MIT licensed, and happy to swim in your own bucket.">
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <!-- Subtle animated ocean bubbles backdrop (disabled under prefers-reduced-motion) -->
+  <div class="ocean-bubbles" aria-hidden="true">
+    <span class="bubble" style="--x: 6%;  --size: 12px; --dur: 22s; --delay: -4s;  --sway: 6s;  --drift: 12px; --alpha: 0.34;"></span>
+    <span class="bubble" style="--x: 14%; --size: 20px; --dur: 28s; --delay: -15s; --sway: 8s;  --drift: 16px; --alpha: 0.28;"></span>
+    <span class="bubble" style="--x: 23%; --size: 9px;  --dur: 19s; --delay: -9s;  --sway: 5s;  --drift: 10px; --alpha: 0.38;"></span>
+    <span class="bubble" style="--x: 34%; --size: 16px; --dur: 25s; --delay: -2s;  --sway: 7s;  --drift: 14px; --alpha: 0.25;"></span>
+    <span class="bubble" style="--x: 45%; --size: 8px;  --dur: 18s; --delay: -12s; --sway: 5s;  --drift: 9px;  --alpha: 0.32;"></span>
+    <span class="bubble" style="--x: 56%; --size: 22px; --dur: 30s; --delay: -6s;  --sway: 9s;  --drift: 18px; --alpha: 0.22;"></span>
+    <span class="bubble" style="--x: 66%; --size: 11px; --dur: 21s; --delay: -17s; --sway: 6s;  --drift: 11px; --alpha: 0.36;"></span>
+    <span class="bubble" style="--x: 76%; --size: 17px; --dur: 26s; --delay: -8s;  --sway: 7s;  --drift: 15px; --alpha: 0.28;"></span>
+    <span class="bubble" style="--x: 84%; --size: 10px; --dur: 20s; --delay: -14s; --sway: 5s;  --drift: 10px; --alpha: 0.36;"></span>
+    <span class="bubble" style="--x: 92%; --size: 18px; --dur: 27s; --delay: -3s;  --sway: 8s;  --drift: 14px; --alpha: 0.26;"></span>
+    <span class="bubble" style="--x: 29%; --size: 7px;  --dur: 17s; --delay: -11s; --sway: 4s;  --drift: 8px;  --alpha: 0.34;"></span>
+    <span class="bubble" style="--x: 71%; --size: 13px; --dur: 24s; --delay: -19s; --sway: 6s;  --drift: 12px; --alpha: 0.30;"></span>
+  </div>
+
+  <!-- "Fork me on GitHub" corner ribbon -->
+  <div class="fork-ribbon-wrap">
+    <a class="fork-ribbon" href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer" aria-label="Fork blowfish on GitHub">
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+        <path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm6.25 7.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM8.5 7.75a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0ZM5 5.372v5.256a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0Zm8.5-2.122a2.25 2.25 0 1 1-4.5 0 2.25 2.25 0 0 1 4.5 0Zm-1.5 0a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Zm.75 2.25v2.25a2.25 2.25 0 0 1-2.25 2.25H6.5v1.5h4a3.75 3.75 0 0 0 3.75-3.75V5.5h-1.5ZM5 12.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Z"/>
+      </svg>
+      Fork me on GitHub
+    </a>
+  </div>
+
+  <!-- Sticky Navigation -->
+  <header class="site-header">
+    <div class="container nav-inner">
+      <a class="brand" href="#top" aria-label="blowfish home">
+        <img class="brand-icon" src="./blowfish-mark.svg" alt="" width="34" height="34">
+        <span>blowfish</span>
+        <span class="version-pill">v0.1.13</span>
+      </a>
+
+      <nav class="nav-links" aria-label="Primary navigation">
+        <a href="#turbopuffer">I love turbopuffer</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#features">Features</a>
+        <a href="#numbers">Numbers</a>
+        <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle color theme">
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" hidden aria-hidden="true">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+          </svg>
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/>
+          </svg>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- Hero -->
+    <section class="hero" id="top">
+      <div class="container hero-grid">
+        <div class="hero-copy">
+          <a class="release-badge" href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">
+            <span class="release-tag">v0.1.13</span>
+            <span>Open source · MIT · Pre-1.0</span>
+          </a>
+
+          <h1 class="hero-title">
+            Self-hosted search that swims with the <span class="hero-title-accent">turbopuffer API</span>.
+          </h1>
+
+          <p class="hero-pitch">
+            An open-source vector, BM25, and hybrid search engine in a <strong>single Rust binary</strong> — backed by your own S3-compatible bucket or a local folder, and friendly with every official turbopuffer SDK.
+          </p>
+
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 2.4l2.92 5.92 6.53.95-4.72 4.6 1.11 6.51L12 17.3l-5.84 3.08 1.11-6.51-4.72-4.6 6.53-.95L12 2.4Z"/>
+              </svg>
+              Star on GitHub
+            </a>
+            <a class="btn btn-secondary" href="#quickstart">
+              Get started
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 12h14M13 5l7 7-7 7"/>
+              </svg>
+            </a>
+          </div>
+
+          <div class="sdk-strip" aria-label="Compatible official turbopuffer SDKs">
+            <span class="sdk-strip-label">Official SDKs work unchanged:</span>
+            <span class="sdk-pill">Python</span>
+            <span class="sdk-pill">TypeScript</span>
+            <span class="sdk-pill">Go</span>
+            <span class="sdk-pill">Java</span>
+            <span class="sdk-pill">Ruby</span>
+            <span class="sdk-pill">Rust</span>
+          </div>
+        </div>
+
+        <!-- Hero Visual Showcase -->
+        <div class="hero-visual">
+          <div class="glass-card mascot-stage">
+            <div class="mascot-wrap">
+              <img src="./blowfish-mark.svg" alt="Illustrated smiling blowfish mascot with ocean teal scales, warm coral fins, and rising bubbles" width="196" height="196">
+            </div>
+
+            <div class="endpoint-preview">
+              <div class="endpoint-bar">
+                <span class="endpoint-title">One base URL away</span>
+                <div class="mode-switch" role="group" aria-label="Preview endpoint configuration">
+                  <button class="mode-btn" type="button" data-endpoint-mode="blowfish" aria-pressed="true">blowfish</button>
+                  <button class="mode-btn" type="button" data-endpoint-mode="turbopuffer" aria-pressed="false">turbopuffer</button>
+                </div>
+              </div>
+              <pre class="endpoint-code"><code id="endpoint-preview-code"><span class="tok-k">import</span> turbopuffer
+tpuf <span class="tok-p">=</span> turbopuffer.<span class="tok-f">Turbopuffer</span>(
+  api_key<span class="tok-p">=</span><span class="tok-s">"dev"</span>,
+  base_url<span class="tok-p">=</span><span class="tok-s">"http://127.0.0.1:8000"</span>,
+)</code></pre>
+              <p class="endpoint-caption">
+                <span class="endpoint-dot" aria-hidden="true"></span>
+                <span id="endpoint-preview-caption">Local dev, CI, on-prem, or your own S3 bucket — same official SDK.</span>
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Prominent & Sincere "I love turbopuffer" Section -->
+    <section class="section" id="turbopuffer">
+      <div class="container">
+        <div class="love-panel">
+          <div class="love-top">
+            <div class="love-heading-group">
+              <div class="love-kicker">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35Z"/>
+                </svg>
+                Same ocean, friendly neighbors
+              </div>
+              <h2 class="section-title">I love turbopuffer.</h2>
+              <p class="section-lead">
+                Truly — I use <a href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer</a> on lots of projects, large and small, and I happily recommend it for production. blowfish isn't here to compete with it; it's a friendly reef companion for the moments when you need to self-host or stay local.
+              </p>
+            </div>
+
+            <a class="love-link" href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">
+              Visit turbopuffer.com
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M7 17 17 7M7 7h10v10"/>
+              </svg>
+            </a>
+          </div>
+
+          <div class="usecases-grid">
+            <article class="usecase-card">
+              <div class="usecase-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="3" width="20" height="14" rx="2"/>
+                  <path d="M8 21h8M12 17v4"/>
+                </svg>
+              </div>
+              <div>
+                <h3>Local development &amp; CI</h3>
+                <p>Spin up search in Docker or on your laptop for fast tests and offline hacking — no account, API key, or network calls required.</p>
+              </div>
+            </article>
+
+            <article class="usecase-card">
+              <div class="usecase-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/>
+                </svg>
+              </div>
+              <div>
+                <h3>Inside your firewall</h3>
+                <p>Run on-prem, inside a locked-down VPC, or completely air-gapped while keeping the clean API your developers already enjoy.</p>
+              </div>
+            </article>
+
+            <article class="usecase-card">
+              <div class="usecase-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <ellipse cx="12" cy="5" rx="9" ry="3"/>
+                  <path d="M3 5v14a9 3 0 0 0 18 0V5"/>
+                  <path d="M3 12a9 3 0 0 0 18 0"/>
+                </svg>
+              </div>
+              <div>
+                <h3>Self-hosting on your own bucket</h3>
+                <p>Keep every byte inside your own S3-compatible bucket for strict data residency, compliance, or pure weekend tinkering.</p>
+              </div>
+            </article>
+
+            <article class="usecase-card">
+              <div class="usecase-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/>
+                </svg>
+              </div>
+              <div>
+                <h3>Learn how object-storage search works</h3>
+                <p>Curious what happens under the waves when a search engine lives on S3? Crack open the Rust source and read right through it.</p>
+              </div>
+            </article>
+          </div>
+
+          <div class="love-footer-note">
+            <span>Because the APIs match, moving between blowfish and <a href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer</a> is just changing <code>base_url</code>.</span>
+            <span>Swim local today, ship managed whenever you like.</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Quickstart -->
+    <section class="section" id="quickstart">
+      <div class="container">
+        <div class="section-header">
+          <div class="eyebrow">
+            <span class="eyebrow-dot" aria-hidden="true"></span>
+            Quickstart
+          </div>
+          <h2 class="section-title">Dive in with two tiny steps.</h2>
+          <p class="section-lead">
+            Boot blowfish locally, point the official turbopuffer SDK at <code>http://127.0.0.1:8000</code>, and run your first vector query.
+          </p>
+        </div>
+
+        <div class="quickstart-stack">
+          <!-- Step 1 -->
+          <div class="code-card">
+            <div class="code-card-head">
+              <div class="code-step">
+                <span class="step-num">1</span>
+                <span class="step-title">Start blowfish locally</span>
+                <span class="step-lang">bash</span>
+              </div>
+              <button class="copy-btn" type="button" data-copy-target="code-step-1" aria-label="Copy bash commands">
+                <svg class="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="9" y="9" width="13" height="13" rx="2"/>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                </svg>
+                <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" hidden aria-hidden="true">
+                  <path d="M20 6 9 17l-5-5"/>
+                </svg>
+                <span class="copy-label">Copy</span>
+              </button>
+            </div>
+            <pre class="code-block"><code id="code-step-1">git clone https://github.com/endgame-labs/blowfish.git &amp;&amp; cd blowfish
+docker compose up --build --wait blowfish   <span class="tok-c"># serves on 127.0.0.1:8000, auth off for local dev</span></code></pre>
+          </div>
+
+          <!-- Step 2 -->
+          <div class="code-card">
+            <div class="code-card-head">
+              <div class="code-step">
+                <span class="step-num">2</span>
+                <span class="step-title">Query it with the official turbopuffer SDK</span>
+                <span class="step-lang">python</span>
+              </div>
+              <button class="copy-btn" type="button" data-copy-target="code-step-2" aria-label="Copy Python snippet">
+                <svg class="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="9" y="9" width="13" height="13" rx="2"/>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                </svg>
+                <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" hidden aria-hidden="true">
+                  <path d="M20 6 9 17l-5-5"/>
+                </svg>
+                <span class="copy-label">Copy</span>
+              </button>
+            </div>
+            <pre class="code-block"><code id="code-step-2"><span class="tok-c"># pip install turbopuffer</span>
+<span class="tok-k">import</span> os
+os.environ.<span class="tok-f">pop</span>(<span class="tok-s">"TURBOPUFFER_REGION"</span>, <span class="tok-k">None</span>)  <span class="tok-c"># a region only applies to turbopuffer's own URLs</span>
+<span class="tok-k">import</span> turbopuffer
+tpuf <span class="tok-p">=</span> turbopuffer.<span class="tok-f">Turbopuffer</span>(api_key<span class="tok-p">=</span><span class="tok-s">"dev"</span>, base_url<span class="tok-p">=</span><span class="tok-s">"http://127.0.0.1:8000"</span>)
+ns <span class="tok-p">=</span> tpuf.<span class="tok-f">namespace</span>(<span class="tok-s">"hello"</span>)
+ns.<span class="tok-f">write</span>(upsert_rows<span class="tok-p">=</span>[{<span class="tok-s">"id"</span>: <span class="tok-n">1</span>, <span class="tok-s">"vector"</span>: [<span class="tok-n">0.1</span>, <span class="tok-n">0.2</span>], <span class="tok-s">"text"</span>: <span class="tok-s">"hello, blowfish"</span>}], distance_metric<span class="tok-p">=</span><span class="tok-s">"cosine_distance"</span>)
+<span class="tok-f">print</span>(ns.<span class="tok-f">query</span>(rank_by<span class="tok-p">=</span>(<span class="tok-s">"vector"</span>, <span class="tok-s">"ANN"</span>, [<span class="tok-n">0.1</span>, <span class="tok-n">0.2</span>]), top_k<span class="tok-p">=</span><span class="tok-n">1</span>).rows)</code></pre>
+          </div>
+        </div>
+
+        <div class="quickstart-notes">
+          <span>Works with the official <strong>Python, TypeScript, Go, Java, Ruby, and Rust</strong> SDKs — no fork or wrapper needed.</span>
+          <span class="pre1-badge">
+            <span class="pre1-pill">Pre-1.0</span>
+            <span>Honest heads-up: blowfish is at v0.1.13, so the storage format may still change.</span>
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Features -->
+    <section class="section" id="features">
+      <div class="container">
+        <div class="section-header">
+          <div class="eyebrow">
+            <span class="eyebrow-dot" aria-hidden="true"></span>
+            What's inside the shell
+          </div>
+          <h2 class="section-title">Small fish, surprisingly roomy architecture.</h2>
+          <p class="section-lead">
+            Everything you need for vector, full-text, and hybrid search — without standing up a sprawling cluster of stateful boxes.
+          </p>
+        </div>
+
+        <div class="features-grid">
+          <article class="glass-card glass-card-interactive feature-card">
+            <div class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 22v-5M9 8V2M15 8V2M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>
+              </svg>
+            </div>
+            <h3>SDK-compatible out of the box</h3>
+            <p>Speaks the turbopuffer API directly. The official Python, TypeScript, Go, Java, Ruby, and Rust SDKs work unchanged — just point the base URL at blowfish.</p>
+          </article>
+
+          <article class="glass-card glass-card-interactive feature-card">
+            <div class="feature-icon sky" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
+                <path d="M12 12v9M8 17l4 4 4-4"/>
+              </svg>
+            </div>
+            <h3>Your bucket is the database</h3>
+            <p>Stores everything in any S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, or SeaweedFS) or a local directory. No other database. Servers are stateless caches — run more copies to scale out.</p>
+          </article>
+
+          <article class="glass-card glass-card-interactive feature-card">
+            <div class="feature-icon coral" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"/>
+                <path d="m21 21-4.3-4.3M11 8v6M8 11h6"/>
+              </svg>
+            </div>
+            <h3>Vector, BM25, hybrid, and filters</h3>
+            <p>Run ANN vector search, exact BM25 full-text search, hybrid rankings, and structured metadata filters in a single unified query engine.</p>
+          </article>
+
+          <article class="glass-card glass-card-interactive feature-card">
+            <div class="feature-icon sky" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 3v18h18"/>
+                <path d="m19 9-5 5-4-4-3 3"/>
+              </svg>
+            </div>
+            <h3>Scales to 100M on one machine</h3>
+            <p>Comfortably serves 100M documents from a single server with S3 backing, and a 10M-document workload fits neatly on a 4 GB machine.</p>
+          </article>
+
+          <article class="glass-card glass-card-interactive feature-card">
+            <div class="feature-icon coral" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="m21 16-9 5-9-5V8l9-5 9 5v8Z"/>
+                <path d="M3.27 6.96 12 12.01l8.73-5.05M12 22.08V12"/>
+              </svg>
+            </div>
+            <h3>Single Rust binary</h3>
+            <p>Compiled into one fast, self-contained Rust executable. Easy to drop into Docker, CI pipelines, laptops, or air-gapped servers with zero extra services.</p>
+          </article>
+
+          <article class="glass-card glass-card-interactive feature-card">
+            <div class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3a9 9 0 1 0 9 9"/>
+                <path d="M12 7v5l3 3M16 3h5v5"/>
+              </svg>
+            </div>
+            <h3>MIT licensed &amp; readable</h3>
+            <p>Permissively open source under the MIT license. Browse the code, learn how object-storage search ticks, file an issue, or fork it for your own adventures.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- The Numbers -->
+    <section class="section" id="numbers">
+      <div class="container">
+        <div class="section-header">
+          <div class="eyebrow">
+            <span class="eyebrow-dot" aria-hidden="true"></span>
+            Real-world numbers
+          </div>
+          <h2 class="section-title">Fast enough to be genuinely useful.</h2>
+          <p class="section-lead">
+            Not a race against anyone — just honest measurements so you know what a single node can comfortably pull from object storage.
+          </p>
+        </div>
+
+        <div class="spec-pill" role="note" aria-label="Measurement setup">
+          <span><strong>Setup:</strong> one c7gd.2xlarge (8 vCPU, 16 GB)</span>
+          <span aria-hidden="true">·</span>
+          <span>Same AWS region as the S3 bucket</span>
+          <span aria-hidden="true">·</span>
+          <span>1,024-dim embeddings</span>
+        </div>
+
+        <div class="numbers-grid">
+          <!-- 100M Documents -->
+          <article class="glass-card metric-card metric-card-featured">
+            <div>
+              <div class="metric-head">
+                <h3 class="metric-scale">100M documents</h3>
+                <span class="metric-kind">Vector ANN</span>
+              </div>
+              <div class="metric-hero-stat">
+                <span class="metric-big">~0.1 s</span>
+                <span class="metric-big-label">warm (99.7 ms p50)</span>
+              </div>
+              <p class="metric-sub">About 1.2 s fully cold with empty caches and everything pulled from S3.</p>
+            </div>
+
+            <div class="latency-bars" aria-label="100M documents latency comparison">
+              <div class="bar-row">
+                <div class="bar-meta">
+                  <span class="bar-label">Warm (p50)</span>
+                  <span class="bar-val">99.7 ms</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 10%;"></div>
+                </div>
+              </div>
+              <div class="bar-row">
+                <div class="bar-meta">
+                  <span class="bar-label">Fully cold (from S3)</span>
+                  <span class="bar-val">~1.2 s</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill cold" style="width: 100%;"></div>
+                </div>
+              </div>
+            </div>
+
+            <ul class="metric-facts">
+              <li><span>Quality (recall@10)</span><strong>0.954</strong></li>
+              <li><span>Load throughput</span><strong>4,891 docs/s</strong></li>
+            </ul>
+          </article>
+
+          <!-- 10M Documents -->
+          <article class="glass-card metric-card">
+            <div>
+              <div class="metric-head">
+                <h3 class="metric-scale">10M documents</h3>
+                <span class="metric-kind">Vector ANN</span>
+              </div>
+              <div class="metric-hero-stat">
+                <span class="metric-big">36.6 ms</span>
+                <span class="metric-big-label">warm p50</span>
+              </div>
+              <p class="metric-sub">Snappy warm queries, 533 ms cache-cold, and light enough for a 4 GB box.</p>
+            </div>
+
+            <div class="latency-bars" aria-label="10M documents latency comparison">
+              <div class="bar-row">
+                <div class="bar-meta">
+                  <span class="bar-label">Warm (p50)</span>
+                  <span class="bar-val">36.6 ms</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 7%;"></div>
+                </div>
+              </div>
+              <div class="bar-row">
+                <div class="bar-meta">
+                  <span class="bar-label">Cache-cold (p50)</span>
+                  <span class="bar-val">533 ms</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill cold" style="width: 45%;"></div>
+                </div>
+              </div>
+            </div>
+
+            <ul class="metric-facts">
+              <li><span>Quality (recall@10)</span><strong>0.953</strong></li>
+              <li><span>Memory footprint</span><strong>Fits on 4 GB</strong></li>
+            </ul>
+          </article>
+
+          <!-- BM25 on 1M Passages -->
+          <article class="glass-card metric-card">
+            <div>
+              <div class="metric-head">
+                <h3 class="metric-scale">1M passages</h3>
+                <span class="metric-kind">BM25 Full-Text</span>
+              </div>
+              <div class="metric-hero-stat">
+                <span class="metric-big">301 ms</span>
+                <span class="metric-big-label">cache-cold p50</span>
+              </div>
+              <p class="metric-sub">Full-text search pulled straight from object storage with exact BM25 scoring.</p>
+            </div>
+
+            <div class="latency-bars" aria-label="BM25 latency and exactness">
+              <div class="bar-row">
+                <div class="bar-meta">
+                  <span class="bar-label">Cache-cold (p50)</span>
+                  <span class="bar-val">301 ms</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill cold" style="width: 26%;"></div>
+                </div>
+              </div>
+              <div class="bar-row">
+                <div class="bar-meta">
+                  <span class="bar-label">Exact BM25 match (overlap@10)</span>
+                  <span class="bar-val">1.000</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 100%;"></div>
+                </div>
+              </div>
+            </div>
+
+            <ul class="metric-facts">
+              <li><span>Overlap@10 vs exact BM25</span><strong>1.000</strong></li>
+              <li><span>Storage backend</span><strong>Object storage</strong></li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- Closing CTA Band -->
+    <section class="section">
+      <div class="container">
+        <div class="glass-card cta-band">
+          <div class="cta-copy">
+            <h2>Ready to take blowfish for a swim?</h2>
+            <p>Star the repo, peek at the Rust source, or grab release v0.1.13 and run it against your favorite bucket.</p>
+          </div>
+          <div class="cta-actions">
+            <a class="btn btn-primary" href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 2.4l2.92 5.92 6.53.95-4.72 4.6 1.11 6.51L12 17.3l-5.84 3.08 1.11-6.51-4.72-4.6 6.53-.95L12 2.4Z"/>
+              </svg>
+              Star on GitHub
+            </a>
+            <a class="btn btn-secondary" href="https://github.com/endgame-labs/blowfish#readme" target="_blank" rel="noopener noreferrer">
+              Read the docs
+            </a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-top">
+        <div class="footer-brand">
+          <img src="./blowfish-mark.svg" alt="" width="28" height="28">
+          <span>blowfish</span>
+          <span class="version-pill">MIT License</span>
+        </div>
+
+        <nav class="footer-links" aria-label="Footer links">
+          <a href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <a href="https://github.com/endgame-labs/blowfish#readme" target="_blank" rel="noopener noreferrer">Docs</a>
+          <a href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">v0.1.13</a>
+          <a href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer</a>
+        </nav>
+      </div>
+
+      <div class="footer-bottom">
+        <p><a href="https://github.com/endgame-labs/blowfish/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License © 2026 Endgame Labs, Inc.</a> · Not affiliated with turbopuffer.</p>
+        <p class="footer-love">Made with love by someone who loves turbopuffer.</p>
+      </div>
+    </div>
+  </footer>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>

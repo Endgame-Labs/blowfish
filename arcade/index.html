@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>blowfish: self-hosted search with the turbopuffer API</title>
+  <meta name="description" content="Open-source, self-hosted vector, BM25 full-text, and hybrid search in a single Rust binary that speaks the turbopuffer API — using your own S3-compatible bucket as the database.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="blowfish: self-hosted search with the turbopuffer API">
+  <meta property="og:description" content="Open-source, self-hosted vector, BM25 full-text, and hybrid search in a single Rust binary that speaks the turbopuffer API. Your bucket is the database.">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="blowfish: self-hosted search with the turbopuffer API">
+  <meta name="twitter:description" content="Open-source, self-hosted vector, BM25 full-text, and hybrid search in a single Rust binary that speaks the turbopuffer API.">
+  <meta name="color-scheme" content="dark light">
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Press+Start+2P&family=Silkscreen:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <!-- Crisp 8-bit pixel SVG sprite library -->
+  <svg class="sprite-sheet" aria-hidden="true" focusable="false">
+    <symbol id="fish-calm" viewBox="0 0 24 24" shape-rendering="crispEdges">
+      <path fill="#101830" d="M11 4h3v1h-3zM10 5h1v1h-1zM14 5h1v1h-1zM9 6h2v1h-2zM13 6h3v1h-3zM8 7h1v1h-1zM15 7h2v1h-2zM2 8h2v1h-2zM7 8h1v1h-1zM17 8h1v1h-1zM1 9h1v1h-1zM4 9h3v1h-3zM18 9h1v1h-1zM1 10h1v1h-1zM5 10h1v1h-1zM18 10h1v1h-1zM2 11h1v1h-1zM5 11h1v1h-1zM15 11h2v1h-2zM18 11h2v1h-2zM2 12h1v1h-1zM5 12h1v1h-1zM15 12h2v1h-2zM19 12h1v1h-1zM1 13h1v1h-1zM5 13h1v1h-1zM18 13h1v1h-1zM20 13h1v1h-1zM1 14h1v1h-1zM4 14h3v1h-3zM18 14h2v1h-2zM2 15h2v1h-2zM7 15h1v1h-1zM18 15h1v1h-1zM8 16h1v1h-1zM17 16h1v1h-1zM9 17h8v1h-8z"/>
+      <path fill="#36ecff" d="M11 5h3v1h-3zM2 9h2v1h-2zM2 10h1v1h-1zM4 10h1v1h-1zM4 11h1v1h-1zM4 12h1v1h-1zM9 12h2v1h-2zM2 13h1v1h-1zM4 13h1v1h-1zM8 13h2v1h-2zM2 14h2v1h-2z"/>
+      <path fill="#0d9ec9" d="M11 6h2v1h-2zM3 10h1v1h-1zM3 11h1v1h-1zM3 12h1v1h-1zM3 13h1v1h-1zM10 13h2v1h-2zM9 14h3v1h-3z"/>
+      <path fill="#fff27a" d="M9 7h2v1h-2zM13 7h2v1h-2zM8 8h1v1h-1zM16 8h1v1h-1z"/>
+      <path fill="#ffbe2e" d="M11 7h2v1h-2zM9 8h2v1h-2zM12 8h4v1h-4zM7 9h11v1h-11zM6 10h4v1h-4zM11 10h3v1h-3zM17 10h1v1h-1zM6 11h8v1h-8zM17 11h1v1h-1zM6 12h3v1h-3zM11 12h3v1h-3zM18 12h1v1h-1zM6 13h2v1h-2zM12 13h4v1h-4zM17 14h1v1h-1z"/>
+      <path fill="#e38014" d="M11 8h1v1h-1zM10 10h1v1h-1z"/>
+      <path fill="#ffffff" d="M14 10h3v1h-3zM14 11h1v1h-1zM14 12h1v1h-1z"/>
+      <path fill="#ff4f82" d="M17 12h1v1h-1zM16 13h2v1h-2z"/>
+      <path fill="#ff6b57" d="M19 13h1v1h-1z"/>
+      <path fill="#fff6cf" d="M7 14h2v1h-2zM12 14h5v1h-5zM8 15h10v1h-10z"/>
+      <path fill="#efd07a" d="M9 16h8v1h-8z"/>
+    </symbol>
+    <symbol id="fish-puffed" viewBox="0 0 24 24" shape-rendering="crispEdges">
+      <path fill="#101830" d="M11 0h2v1h-2zM10 1h1v1h-1zM13 1h1v1h-1zM4 2h2v1h-2zM10 2h1v1h-1zM13 2h1v1h-1zM18 2h2v1h-2zM3 3h1v1h-1zM6 3h1v1h-1zM9 3h6v1h-6zM17 3h1v1h-1zM20 3h1v1h-1zM3 4h1v1h-1zM6 4h3v1h-3zM15 4h3v1h-3zM20 4h1v1h-1zM4 5h3v1h-3zM17 5h3v1h-3zM4 6h2v1h-2zM18 6h2v1h-2zM2 7h3v1h-3zM19 7h3v1h-3zM1 8h1v1h-1zM4 8h1v1h-1zM9 8h1v1h-1zM16 8h1v1h-1zM19 8h1v1h-1zM22 8h1v1h-1zM1 9h1v1h-1zM4 9h1v1h-1zM8 9h2v1h-2zM15 9h2v1h-2zM19 9h1v1h-1zM22 9h1v1h-1zM2 10h3v1h-3zM9 10h1v1h-1zM16 10h1v1h-1zM19 10h3v1h-3zM1 11h1v1h-1zM4 11h1v1h-1zM11 11h2v1h-2zM19 11h1v1h-1zM22 11h1v1h-1zM0 12h1v1h-1zM4 12h1v1h-1zM10 12h1v1h-1zM12 12h2v1h-2zM19 12h1v1h-1zM23 12h1v1h-1zM1 13h1v1h-1zM4 13h1v1h-1zM11 13h2v1h-2zM19 13h1v1h-1zM22 13h1v1h-1zM2 14h3v1h-3zM19 14h3v1h-3zM1 15h1v1h-1zM4 15h1v1h-1zM19 15h1v1h-1zM22 15h1v1h-1zM1 16h1v1h-1zM4 16h1v1h-1zM19 16h1v1h-1zM22 16h1v1h-1zM2 17h3v1h-3zM19 17h3v1h-3zM4 18h2v1h-2zM18 18h2v1h-2zM3 19h1v1h-1zM6 19h3v1h-3zM15 19h3v1h-3zM20 19h1v1h-1zM3 20h1v1h-1zM6 20h1v1h-1zM9 20h6v1h-6zM17 20h1v1h-1zM20 20h1v1h-1zM4 21h2v1h-2zM10 21h1v1h-1zM13 21h1v1h-1zM18 21h2v1h-2zM10 22h1v1h-1zM13 22h1v1h-1zM11 23h2v1h-2z"/>
+      <path fill="#ffe596" d="M11 1h2v1h-2zM11 2h2v1h-2zM4 3h2v1h-2zM18 3h2v1h-2zM4 4h2v1h-2zM18 4h2v1h-2zM2 8h2v1h-2zM20 8h2v1h-2zM2 9h2v1h-2zM20 9h2v1h-2zM2 15h2v1h-2zM20 15h2v1h-2zM2 16h2v1h-2zM20 16h2v1h-2zM4 19h2v1h-2zM18 19h2v1h-2zM4 20h2v1h-2zM18 20h2v1h-2zM11 21h2v1h-2zM11 22h2v1h-2z"/>
+      <path fill="#fff27a" d="M9 4h2v1h-2zM13 4h2v1h-2zM7 5h2v1h-2zM15 5h2v1h-2zM6 6h1v1h-1zM17 6h1v1h-1z"/>
+      <path fill="#ffbe2e" d="M11 4h2v1h-2zM9 5h6v1h-6zM7 6h2v1h-2zM10 6h4v1h-4zM15 6h2v1h-2zM5 7h14v1h-14zM5 8h2v1h-2zM10 8h4v1h-4zM17 8h2v1h-2zM5 9h2v1h-2zM10 9h4v1h-4zM17 9h2v1h-2zM5 10h2v1h-2zM10 10h4v1h-4zM17 10h2v1h-2zM7 11h4v1h-4zM13 11h4v1h-4zM7 12h3v1h-3zM14 12h3v1h-3zM7 13h4v1h-4zM13 13h4v1h-4z"/>
+      <path fill="#e38014" d="M9 6h1v1h-1zM14 6h1v1h-1z"/>
+      <path fill="#ffffff" d="M7 8h2v1h-2zM14 8h2v1h-2zM7 9h1v1h-1zM14 9h1v1h-1zM7 10h2v1h-2zM14 10h2v1h-2z"/>
+      <path fill="#36ecff" d="M2 11h2v1h-2zM20 11h2v1h-2zM1 12h1v1h-1zM22 12h1v1h-1zM2 13h2v1h-2zM20 13h2v1h-2z"/>
+      <path fill="#ff4f82" d="M5 11h2v1h-2zM17 11h2v1h-2zM5 12h2v1h-2zM17 12h2v1h-2z"/>
+      <path fill="#0d9ec9" d="M2 12h2v1h-2zM20 12h2v1h-2z"/>
+      <path fill="#ff6b57" d="M11 12h1v1h-1z"/>
+      <path fill="#fff6cf" d="M5 13h2v1h-2zM17 13h2v1h-2zM5 14h14v1h-14zM5 15h14v1h-14zM5 16h2v1h-2zM17 16h2v1h-2zM5 17h2v1h-2zM17 17h2v1h-2z"/>
+      <path fill="#efd07a" d="M7 16h10v1h-10zM7 17h10v1h-10zM6 18h12v1h-12zM9 19h6v1h-6z"/>
+    </symbol>
+    <symbol id="px-coin" viewBox="0 0 12 12" shape-rendering="crispEdges">
+      <path fill="#101830" d="M4 0h4v1h-4zM2 1h2v1h-2zM8 1h2v1h-2zM1 2h1v1h-1zM10 2h1v1h-1zM1 3h1v1h-1zM5 3h2v1h-2zM10 3h1v1h-1zM0 4h1v1h-1zM4 4h4v1h-4zM11 4h1v1h-1zM0 5h1v1h-1zM4 5h1v1h-1zM7 5h1v1h-1zM11 5h1v1h-1zM0 6h1v1h-1zM4 6h1v1h-1zM7 6h1v1h-1zM11 6h1v1h-1zM0 7h1v1h-1zM4 7h4v1h-4zM11 7h1v1h-1zM1 8h1v1h-1zM5 8h2v1h-2zM10 8h1v1h-1zM1 9h1v1h-1zM10 9h1v1h-1zM2 10h2v1h-2zM8 10h2v1h-2zM4 11h4v1h-4z"/>
+      <path fill="#fff27a" d="M4 1h4v1h-4zM2 2h2v1h-2zM2 3h1v1h-1zM4 3h1v1h-1zM1 4h1v1h-1zM3 4h1v1h-1zM1 5h1v1h-1zM3 5h1v1h-1zM5 5h2v1h-2zM1 6h1v1h-1zM3 6h1v1h-1zM5 6h2v1h-2zM1 7h1v1h-1zM3 7h1v1h-1zM2 8h1v1h-1zM4 8h1v1h-1z"/>
+      <path fill="#ffbe2e" d="M4 2h6v1h-6zM3 3h1v1h-1zM7 3h2v1h-2zM2 4h1v1h-1zM8 4h2v1h-2zM2 5h1v1h-1zM8 5h2v1h-2zM2 6h1v1h-1zM8 6h2v1h-2zM2 7h1v1h-1zM8 7h2v1h-2zM3 8h1v1h-1zM7 8h2v1h-2zM2 9h5v1h-5z"/>
+      <path fill="#e38014" d="M9 3h1v1h-1zM10 4h1v1h-1zM10 5h1v1h-1zM10 6h1v1h-1zM10 7h1v1h-1zM9 8h1v1h-1zM7 9h3v1h-3zM4 10h4v1h-4z"/>
+    </symbol>
+    <symbol id="px-heart" viewBox="0 0 12 12" shape-rendering="crispEdges">
+      <path fill="#101830" d="M2 1h3v1h-3zM7 1h3v1h-3zM1 2h1v1h-1zM5 2h2v1h-2zM10 2h1v1h-1zM0 3h1v1h-1zM11 3h1v1h-1zM0 4h1v1h-1zM11 4h1v1h-1zM0 5h1v1h-1zM11 5h1v1h-1zM1 6h1v1h-1zM10 6h1v1h-1zM2 7h1v1h-1zM9 7h1v1h-1zM3 8h1v1h-1zM8 8h1v1h-1zM4 9h1v1h-1zM7 9h1v1h-1zM5 10h2v1h-2z"/>
+      <path fill="#ff3868" d="M2 2h3v1h-3zM7 2h3v1h-3zM1 3h1v1h-1zM4 3h7v1h-7zM1 4h1v1h-1zM3 4h8v1h-8zM1 5h10v1h-10zM2 6h8v1h-8zM3 7h6v1h-6zM4 8h4v1h-4zM5 9h2v1h-2z"/>
+      <path fill="#ff9ebb" d="M2 3h2v1h-2zM2 4h1v1h-1z"/>
+    </symbol>
+    <symbol id="px-sdk" viewBox="0 0 16 16" shape-rendering="crispEdges">
+      <path fill="#101830" d="M2 1h12v1h-12zM1 2h1v1h-1zM14 2h1v1h-1zM1 3h1v1h-1zM14 3h1v1h-1zM1 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM14 5h1v1h-1zM1 6h1v1h-1zM14 6h1v1h-1zM1 7h1v1h-1zM14 7h1v1h-1zM1 8h1v1h-1zM14 8h1v1h-1zM1 9h1v1h-1zM14 9h1v1h-1zM1 10h1v1h-1zM14 10h1v1h-1zM2 11h3v1h-3zM11 11h3v1h-3zM4 12h1v1h-1zM6 12h1v1h-1zM8 12h1v1h-1zM10 12h1v1h-1zM12 12h1v1h-1zM4 13h1v1h-1zM6 13h1v1h-1zM8 13h1v1h-1zM10 13h1v1h-1zM12 13h1v1h-1zM4 14h9v1h-9z"/>
+      <path fill="#5c8dff" d="M2 2h12v1h-12zM2 3h2v1h-2zM12 3h2v1h-2zM2 4h2v1h-2zM12 4h2v1h-2zM2 5h2v1h-2zM12 5h2v1h-2zM2 6h2v1h-2zM12 6h2v1h-2zM2 7h2v1h-2zM12 7h2v1h-2z"/>
+      <path fill="#d8e4ff" d="M4 3h8v1h-8zM4 7h8v1h-8z"/>
+      <path fill="#36ecff" d="M4 4h8v1h-8zM4 5h1v1h-1zM7 5h5v1h-5zM4 6h8v1h-8z"/>
+      <path fill="#ffffff" d="M5 5h2v1h-2z"/>
+      <path fill="#2b4ec4" d="M2 8h12v1h-12zM2 9h4v1h-4zM10 9h4v1h-4zM2 10h12v1h-12z"/>
+      <path fill="#ffbe2e" d="M6 9h4v1h-4zM5 11h6v1h-6zM5 12h1v1h-1zM7 12h1v1h-1zM9 12h1v1h-1zM11 12h1v1h-1zM5 13h1v1h-1zM7 13h1v1h-1zM9 13h1v1h-1zM11 13h1v1h-1z"/>
+    </symbol>
+    <symbol id="px-bucket" viewBox="0 0 16 16" shape-rendering="crispEdges">
+      <path fill="#101830" d="M6 0h4v1h-4zM4 1h2v1h-2zM10 1h2v1h-2zM3 2h1v1h-1zM5 2h1v1h-1zM10 2h1v1h-1zM12 2h1v1h-1zM2 3h12v1h-12zM1 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM14 5h1v1h-1zM2 6h1v1h-1zM13 6h1v1h-1zM2 7h1v1h-1zM13 7h1v1h-1zM2 8h1v1h-1zM13 8h1v1h-1zM2 9h1v1h-1zM13 9h1v1h-1zM3 10h1v1h-1zM12 10h1v1h-1zM3 11h1v1h-1zM12 11h1v1h-1zM3 12h1v1h-1zM12 12h1v1h-1zM4 13h8v1h-8z"/>
+      <path fill="#7e93bd" d="M6 1h4v1h-4zM4 2h1v1h-1zM11 2h1v1h-1z"/>
+      <path fill="#d8e4ff" d="M2 4h12v1h-12z"/>
+      <path fill="#36ecff" d="M2 5h2v1h-2zM12 5h2v1h-2zM3 6h10v1h-10zM3 7h2v1h-2zM11 7h2v1h-2z"/>
+      <path fill="#ffffff" d="M4 5h8v1h-8z"/>
+      <path fill="#ffbe2e" d="M5 7h6v1h-6zM5 8h6v1h-6zM5 9h2v1h-2zM9 9h2v1h-2zM5 10h6v1h-6z"/>
+      <path fill="#0d9ec9" d="M3 8h2v1h-2zM11 8h2v1h-2zM3 9h2v1h-2zM11 9h2v1h-2zM4 10h1v1h-1zM11 10h1v1h-1zM4 11h8v1h-8z"/>
+      <path fill="#fff27a" d="M7 9h2v1h-2z"/>
+      <path fill="#2b4ec4" d="M4 12h8v1h-8z"/>
+    </symbol>
+    <symbol id="px-search" viewBox="0 0 16 16" shape-rendering="crispEdges">
+      <path fill="#fff27a" d="M13 0h1v1h-1zM12 1h3v1h-3zM13 2h1v1h-1z"/>
+      <path fill="#101830" d="M4 1h5v1h-5zM2 2h2v1h-2zM9 2h2v1h-2zM1 3h1v1h-1zM11 3h1v1h-1zM1 4h1v1h-1zM11 4h1v1h-1zM0 5h1v1h-1zM12 5h1v1h-1zM0 6h1v1h-1zM12 6h1v1h-1zM0 7h1v1h-1zM12 7h1v1h-1zM1 8h1v1h-1zM12 8h1v1h-1zM1 9h1v1h-1zM11 9h2v1h-2zM2 10h2v1h-2zM9 10h2v1h-2zM13 10h1v1h-1zM4 11h5v1h-5zM10 11h1v1h-1zM14 11h1v1h-1zM11 12h1v1h-1zM15 12h1v1h-1zM12 13h1v1h-1zM15 13h1v1h-1zM13 14h2v1h-2z"/>
+      <path fill="#36ecff" d="M4 2h5v1h-5zM2 3h2v1h-2zM6 3h5v1h-5zM2 4h1v1h-1zM5 4h4v1h-4zM10 4h1v1h-1zM1 5h2v1h-2zM4 5h4v1h-4zM11 5h1v1h-1zM1 6h7v1h-7zM11 6h1v1h-1zM1 7h8v1h-8zM10 7h2v1h-2zM2 8h9v1h-9zM2 9h9v1h-9zM4 10h5v1h-5z"/>
+      <path fill="#ffffff" d="M4 3h2v1h-2zM3 4h2v1h-2zM3 5h1v1h-1z"/>
+      <path fill="#ffbe2e" d="M9 4h1v1h-1zM8 5h3v1h-3zM8 6h3v1h-3zM9 7h1v1h-1zM11 8h1v1h-1zM11 10h2v1h-2zM11 11h3v1h-3zM12 12h3v1h-3zM13 13h2v1h-2z"/>
+    </symbol>
+    <symbol id="px-scale" viewBox="0 0 16 16" shape-rendering="crispEdges">
+      <path fill="#101830" d="M7 0h2v1h-2zM6 1h1v1h-1zM9 1h1v1h-1zM5 2h1v1h-1zM10 2h1v1h-1zM5 3h1v1h-1zM10 3h1v1h-1zM1 4h4v1h-4zM11 4h4v1h-4zM0 5h1v1h-1zM15 5h1v1h-1zM1 6h2v1h-2zM13 6h2v1h-2zM3 7h1v1h-1zM12 7h1v1h-1zM3 8h1v1h-1zM12 8h1v1h-1zM2 9h1v1h-1zM7 9h2v1h-2zM13 9h1v1h-1zM2 10h1v1h-1zM5 10h2v1h-2zM9 10h2v1h-2zM13 10h1v1h-1zM2 11h3v1h-3zM11 11h3v1h-3zM1 12h1v1h-1zM14 12h1v1h-1zM1 13h1v1h-1zM14 13h1v1h-1zM2 14h12v1h-12z"/>
+      <path fill="#fff27a" d="M7 1h2v1h-2zM6 2h2v1h-2zM6 3h2v1h-2zM5 4h1v1h-1zM1 5h4v1h-4zM3 6h2v1h-2z"/>
+      <path fill="#ffbe2e" d="M8 2h2v1h-2zM8 3h2v1h-2zM6 4h5v1h-5zM5 5h7v1h-7zM5 6h6v1h-6zM4 7h6v1h-6zM4 8h5v1h-5zM3 9h4v1h-4zM3 10h2v1h-2z"/>
+      <path fill="#e38014" d="M12 5h3v1h-3zM11 6h2v1h-2zM10 7h2v1h-2zM9 8h3v1h-3zM9 9h4v1h-4zM11 10h2v1h-2z"/>
+      <path fill="#36ecff" d="M2 12h12v1h-12z"/>
+      <path fill="#0d9ec9" d="M2 13h4v1h-4zM10 13h4v1h-4z"/>
+      <path fill="#39ff9c" d="M6 13h4v1h-4z"/>
+    </symbol>
+    <symbol id="px-binary" viewBox="0 0 16 16" shape-rendering="crispEdges">
+      <path fill="#101830" d="M6 0h4v1h-4zM6 1h1v1h-1zM9 1h1v1h-1zM2 2h2v1h-2zM5 2h1v1h-1zM10 2h1v1h-1zM12 2h2v1h-2zM1 3h1v1h-1zM4 3h2v1h-2zM10 3h2v1h-2zM14 3h1v1h-1zM2 4h1v1h-1zM13 4h1v1h-1zM3 5h1v1h-1zM6 5h4v1h-4zM12 5h1v1h-1zM1 6h3v1h-3zM5 6h1v1h-1zM10 6h1v1h-1zM12 6h3v1h-3zM0 7h1v1h-1zM5 7h1v1h-1zM10 7h1v1h-1zM15 7h1v1h-1zM0 8h1v1h-1zM5 8h1v1h-1zM10 8h1v1h-1zM15 8h1v1h-1zM1 9h3v1h-3zM6 9h4v1h-4zM12 9h3v1h-3zM3 10h1v1h-1zM12 10h1v1h-1zM2 11h1v1h-1zM13 11h1v1h-1zM1 12h1v1h-1zM4 12h2v1h-2zM10 12h2v1h-2zM14 12h1v1h-1zM2 13h2v1h-2zM5 13h1v1h-1zM10 13h1v1h-1zM12 13h2v1h-2zM6 14h1v1h-1zM10 14h1v1h-1zM6 15h4v1h-4z"/>
+      <path fill="#ffbe2e" d="M7 1h2v1h-2zM6 2h4v1h-4zM2 3h2v1h-2zM7 3h2v1h-2zM12 3h2v1h-2zM3 4h3v1h-3zM7 4h2v1h-2zM10 4h3v1h-3zM4 5h2v1h-2zM10 5h2v1h-2zM4 6h1v1h-1zM11 6h1v1h-1zM1 7h4v1h-4zM11 7h4v1h-4zM5 9h1v1h-1zM10 9h1v1h-1zM6 10h1v1h-1zM9 10h1v1h-1zM6 11h1v1h-1zM9 11h1v1h-1zM7 12h2v1h-2z"/>
+      <path fill="#fff27a" d="M6 3h1v1h-1zM6 4h1v1h-1z"/>
+      <path fill="#e38014" d="M9 3h1v1h-1zM9 4h1v1h-1zM1 8h4v1h-4zM11 8h4v1h-4zM4 9h1v1h-1zM11 9h1v1h-1zM4 10h2v1h-2zM7 10h2v1h-2zM10 10h2v1h-2zM3 11h3v1h-3zM7 11h2v1h-2zM10 11h3v1h-3zM2 12h2v1h-2zM6 12h1v1h-1zM9 12h1v1h-1zM12 12h2v1h-2zM6 13h4v1h-4zM7 14h3v1h-3z"/>
+      <path fill="#36ecff" d="M6 6h4v1h-4zM6 7h1v1h-1zM9 7h1v1h-1zM6 8h4v1h-4z"/>
+      <path fill="#ffffff" d="M7 7h2v1h-2z"/>
+    </symbol>
+    <symbol id="px-mit" viewBox="0 0 16 16" shape-rendering="crispEdges">
+      <path fill="#101830" d="M3 1h10v1h-10zM2 2h1v1h-1zM13 2h1v1h-1zM1 3h1v1h-1zM12 3h1v1h-1zM14 3h1v1h-1zM1 4h1v1h-1zM12 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM12 5h2v1h-2zM1 6h1v1h-1zM4 6h3v1h-3zM9 6h3v1h-3zM13 6h1v1h-1zM1 7h1v1h-1zM13 7h1v1h-1zM1 8h1v1h-1zM4 8h6v1h-6zM13 8h1v1h-1zM1 9h1v1h-1zM13 9h1v1h-1zM1 10h1v1h-1zM4 10h4v1h-4zM13 10h1v1h-1zM1 11h1v1h-1zM13 11h1v1h-1zM1 12h1v1h-1zM13 12h1v1h-1zM2 13h12v1h-12z"/>
+      <path fill="#fff6cf" d="M3 2h10v1h-10zM2 3h2v1h-2zM13 3h1v1h-1zM2 4h2v1h-2zM13 4h1v1h-1zM2 5h10v1h-10zM2 6h2v1h-2zM7 6h2v1h-2zM12 6h1v1h-1zM2 7h11v1h-11zM2 8h2v1h-2zM10 8h3v1h-3zM2 9h11v1h-11zM2 10h2v1h-2zM8 10h5v1h-5zM2 11h2v1h-2zM2 12h11v1h-11z"/>
+      <path fill="#39ff9c" d="M4 3h8v1h-8zM4 4h1v1h-1zM11 4h1v1h-1z"/>
+      <path fill="#14a862" d="M5 4h6v1h-6z"/>
+      <path fill="#efd07a" d="M4 11h9v1h-9z"/>
+    </symbol>
+  </svg>
+
+  <!-- Subtle CRT scanlines & vignette layer (disabled under reduced-motion or light mode grid) -->
+  <div class="crt-overlay" aria-hidden="true"></div>
+
+  <!-- Pixel ocean ambient bubble & coin layer -->
+  <div class="ocean-backdrop" aria-hidden="true">
+    <div class="ocean-rays"></div>
+    <div class="bubble-lane" id="bubble-lane">
+      <span class="px-bubble b1"></span>
+      <span class="px-bubble b2"></span>
+      <span class="px-bubble b3"></span>
+      <span class="px-bubble b4"></span>
+      <span class="px-bubble b5"></span>
+      <span class="px-bubble b6"></span>
+      <span class="px-bubble b7"></span>
+      <span class="px-bubble b8"></span>
+    </div>
+  </div>
+
+  <!-- Required: "Fork me on GitHub" corner ribbon -->
+  <a class="github-ribbon" href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">
+    <span>Fork me on GitHub</span>
+  </a>
+
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <!-- Arcade HUD Header -->
+  <header class="arcade-hud">
+    <div class="hud-inner">
+      <a class="hud-brand" href="#top" aria-label="blowfish home">
+        <svg class="hud-fish" viewBox="0 0 24 24" width="28" height="28" aria-hidden="true">
+          <use href="#fish-calm"></use>
+        </svg>
+        <span class="hud-title">BLOWFISH</span>
+      </a>
+
+      <div class="hud-score" aria-live="polite" title="Puff the blowfish or copy code to rack up points!">
+        <svg class="coin-spin" viewBox="0 0 12 12" width="16" height="16" aria-hidden="true">
+          <use href="#px-coin"></use>
+        </svg>
+        <span class="hud-label">SCORE</span>
+        <span class="hud-digits" id="arcade-score">000100</span>
+      </div>
+
+      <nav class="hud-nav" aria-label="Primary">
+        <a href="#turbopuffer">Co-op</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#features">Power-Ups</a>
+        <a href="#numbers">Stats</a>
+        <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle day and night ocean palette" title="Switch Day / Night arcade palette">
+          <span class="theme-toggle-text" id="theme-toggle-text">CRT</span>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- HERO STAGE -->
+    <section class="hero" id="top">
+      <div class="container hero-grid">
+        <div class="hero-stage-card">
+          <div class="stage-bar">
+            <span class="stage-tag">STAGE 1-1 // OBJECT STORAGE OCEAN</span>
+            <a class="release-pill" href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">
+              v0.1.13 · PRE-1.0
+            </a>
+          </div>
+
+          <div class="hero-content">
+            <div class="mascot-wrap">
+              <button
+                type="button"
+                class="puffer-stage"
+                id="puffer-stage"
+                aria-label="Interactive pixel pufferfish: hover or press to puff up"
+                aria-pressed="false"
+              >
+                <span class="puffer-glow" aria-hidden="true"></span>
+                <span class="puffer-float" id="puffer-float" aria-hidden="true">PUFF! +100</span>
+                <span class="puffer-burst" id="puffer-burst" aria-hidden="true"></span>
+                <svg class="puffer-svg sprite-calm" viewBox="0 0 24 24" role="img" aria-hidden="true">
+                  <use href="#fish-calm"></use>
+                </svg>
+                <svg class="puffer-svg sprite-puffed" viewBox="0 0 24 24" role="img" aria-hidden="true">
+                  <use href="#fish-puffed"></use>
+                </svg>
+              </button>
+              <p class="mascot-hint" id="mascot-hint">
+                <span class="blink-dot" aria-hidden="true">▶</span> HOVER OR TAP TO PUFF!
+              </p>
+            </div>
+
+            <div class="hero-copy">
+              <p class="eyebrow">
+                <svg class="coin-spin inline-coin" viewBox="0 0 12 12" width="14" height="14" aria-hidden="true">
+                  <use href="#px-coin"></use>
+                </svg>
+                SINGLE RUST BINARY · MIT LICENSED
+              </p>
+              <h1 class="arcade-logo">BLOWFISH</h1>
+              <p class="hero-pitch">
+                Open-source, self-hosted vector, BM25 full-text, and hybrid search that speaks the
+                <strong>turbopuffer API</strong> — straight from your own object storage bucket.
+              </p>
+
+              <div class="hero-actions">
+                <a class="btn btn-gold" href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">
+                  <svg class="btn-icon coin-spin" viewBox="0 0 12 12" width="16" height="16" aria-hidden="true">
+                    <use href="#px-coin"></use>
+                  </svg>
+                  <span>Star on GitHub</span>
+                </a>
+                <a class="btn btn-cyan" href="#quickstart">
+                  <span class="btn-arrow" aria-hidden="true">▶</span>
+                  <span>Get started</span>
+                </a>
+              </div>
+
+              <div class="hero-pills" aria-label="Highlights">
+                <span class="px-pill">S3 · R2 · MinIO · SeaweedFS · Local</span>
+                <span class="px-pill">Official SDKs Unchanged</span>
+                <span class="px-pill">Stateless Cache Nodes</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- I LOVE TURBOPUFFER SECTION (PROMINENT & SINCERE) -->
+    <section class="section" id="turbopuffer" aria-labelledby="turbopuffer-heading">
+      <div class="container">
+        <div class="coop-panel">
+          <div class="coop-header">
+            <div class="coop-badge">
+              <svg class="heart-beat" viewBox="0 0 12 12" width="18" height="18" aria-hidden="true">
+                <use href="#px-heart"></use>
+              </svg>
+              <span>2P CO-OP MODE</span>
+            </div>
+            <h2 id="turbopuffer-heading">I love turbopuffer.</h2>
+            <p class="coop-lead">
+              Let me say it loud and clear: I love
+              <a href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer</a>,
+              I use it on many projects, large and small, and I genuinely recommend it for production.
+              <strong>blowfish</strong> isn't here to pick a fight — it's your friendly pixel sidekick for the times you need to swim in your own waters.
+            </p>
+          </div>
+
+          <div class="quest-grid">
+            <article class="quest-card">
+              <span class="quest-num">01</span>
+              <h3>Local dev &amp; CI</h3>
+              <p>Spin up real vector, BM25, and hybrid search on your laptop or in CI — zero accounts, zero API keys, and zero network calls.</p>
+            </article>
+            <article class="quest-card">
+              <span class="quest-num">02</span>
+              <h3>Inside your firewall</h3>
+              <p>Run comfortably on-prem, inside private VPCs, or in fully air-gapped environments where data cannot leave your reef.</p>
+            </article>
+            <article class="quest-card">
+              <span class="quest-num">03</span>
+              <h3>Your own bucket</h3>
+              <p>Self-host straight on AWS S3, Cloudflare R2, MinIO, SeaweedFS, or local disk for data residency, budgets, or weekend tinkering.</p>
+            </article>
+            <article class="quest-card">
+              <span class="quest-num">04</span>
+              <h3>Read the code</h3>
+              <p>Curious how a search engine built on object storage works under the hood? Pop open the Rust source and explore every pixel.</p>
+            </article>
+          </div>
+
+          <div class="warp-bar">
+            <div class="warp-node">
+              <span class="warp-kicker">PRODUCTION CLOUD</span>
+              <a class="warp-name" href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer.com</a>
+            </div>
+            <div class="warp-bridge" aria-hidden="true">
+              <span class="warp-arrows">◀═══ SWAP <code>base_url</code> ═══▶</span>
+            </div>
+            <div class="warp-node">
+              <span class="warp-kicker">SELF-HOSTED / LOCAL</span>
+              <span class="warp-name">blowfish</span>
+            </div>
+          </div>
+          <p class="warp-caption">
+            Because the APIs match, moving between <a href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer</a> and blowfish is literally a one-line <code>base_url</code> change.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- QUICKSTART SECTION -->
+    <section class="section" id="quickstart" aria-labelledby="quickstart-heading">
+      <div class="container">
+        <div class="section-head">
+          <p class="section-kicker">PRESS START</p>
+          <h2 id="quickstart-heading">Quickstart in two moves</h2>
+          <p class="section-sub">
+            Boot blowfish locally with Docker Compose, then talk to it using the official turbopuffer SDK unchanged.
+          </p>
+        </div>
+
+        <div class="terminal-stack">
+          <!-- Step 1: Shell -->
+          <div class="arcade-terminal">
+            <div class="terminal-bar">
+              <div class="terminal-title">
+                <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                <span>STEP 01 · BOOT BLOWFISH (BASH)</span>
+              </div>
+              <button type="button" class="copy-btn" data-copy-target="code-bash" aria-label="Copy shell quickstart commands">
+                <span class="copy-label">COPY</span>
+              </button>
+            </div>
+            <pre class="code-block"><code id="code-bash">git clone https://github.com/endgame-labs/blowfish.git &amp;&amp; cd blowfish
+docker compose up --build --wait blowfish   # serves on 127.0.0.1:8000, auth off for local dev</code></pre>
+          </div>
+
+          <!-- Step 2: Python -->
+          <div class="arcade-terminal">
+            <div class="terminal-bar">
+              <div class="terminal-title">
+                <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                <span>STEP 02 · QUERY WITH OFFICIAL SDK (PYTHON)</span>
+              </div>
+              <button type="button" class="copy-btn" data-copy-target="code-python" aria-label="Copy Python quickstart code">
+                <span class="copy-label">COPY</span>
+              </button>
+            </div>
+            <pre class="code-block"><code id="code-python"># pip install turbopuffer
+import os
+os.environ.pop("TURBOPUFFER_REGION", None)  # a region only applies to turbopuffer's own URLs
+import turbopuffer
+tpuf = turbopuffer.Turbopuffer(api_key="dev", base_url="http://127.0.0.1:8000")
+ns = tpuf.namespace("hello")
+ns.write(upsert_rows=[{"id": 1, "vector": [0.1, 0.2], "text": "hello, blowfish"}], distance_metric="cosine_distance")
+print(ns.query(rank_by=("vector", "ANN", [0.1, 0.2]), top_k=1).rows)</code></pre>
+          </div>
+        </div>
+
+        <p class="sdk-note">
+          Prefer another language? The official turbopuffer SDKs for
+          <strong>Python, TypeScript, Go, Java, Ruby, and Rust</strong> all work unchanged — just point <code>base_url</code> at blowfish!
+        </p>
+      </div>
+    </section>
+
+    <!-- FEATURE HIGHLIGHTS (6 POWER-UPS) -->
+    <section class="section" id="features" aria-labelledby="features-heading">
+      <div class="container">
+        <div class="section-head">
+          <p class="section-kicker">POWER-UP SELECT</p>
+          <h2 id="features-heading">Everything in one cozy shell</h2>
+          <p class="section-sub">
+            No sprawling cluster to wrangle — just a spiky little Rust binary sitting happily in front of object storage.
+          </p>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature-card">
+            <div class="feature-icon-box" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="44" height="44"><use href="#px-sdk"></use></svg>
+            </div>
+            <h3>SDK-compatible</h3>
+            <p>Speaks the turbopuffer API natively. Drop in the official Python, TypeScript, Go, Java, Ruby, or Rust SDK without changing your query code.</p>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-icon-box" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="44" height="44"><use href="#px-bucket"></use></svg>
+            </div>
+            <h3>Your bucket is the database</h3>
+            <p>Stores everything in AWS S3, Cloudflare R2, MinIO, SeaweedFS, or a local directory. No other database — servers are stateless caches, so run more copies to scale out.</p>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-icon-box" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="44" height="44"><use href="#px-search"></use></svg>
+            </div>
+            <h3>Vector, BM25, hybrid, and filters</h3>
+            <p>Approximate nearest-neighbor (ANN) vector search, exact BM25 full-text search, hybrid ranking, and attribute filters all ship in the same engine.</p>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-icon-box" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="44" height="44"><use href="#px-scale"></use></svg>
+            </div>
+            <h3>Scales to 100M on one machine</h3>
+            <p>Queries pull what they need straight from object storage and warm up local cache. Even a 10M-document load fits comfortably on a 4 GB machine.</p>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-icon-box" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="44" height="44"><use href="#px-binary"></use></svg>
+            </div>
+            <h3>Single Rust binary</h3>
+            <p>One compiled Rust binary with zero sidecar databases, brokers, or coordination services to babysit at 3 a.m.</p>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-icon-box" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="44" height="44"><use href="#px-mit"></use></svg>
+            </div>
+            <h3>MIT licensed · Pre-1.0</h3>
+            <p>Free and open-source under the MIT license. It's still happily pre-1.0 (<a href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">v0.1.13</a>), so the on-bucket storage format may still change as things mature.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- BENCHMARK NUMBERS SECTION -->
+    <section class="section" id="numbers" aria-labelledby="numbers-heading">
+      <div class="container">
+        <div class="section-head">
+          <p class="section-kicker">ARCADE STATS BOARD</p>
+          <h2 id="numbers-heading">Fast enough to be genuinely useful</h2>
+          <p class="section-sub">
+            Not a race against anyone — just real measurements so you know what to expect when you drop blowfish onto your own bucket.
+          </p>
+        </div>
+
+        <div class="rig-banner">
+          <span class="rig-label">TEST CABINET</span>
+          <span class="rig-spec">Same AWS region as the bucket · 1× <code>c7gd.2xlarge</code> (8 vCPU, 16 GB) · 1,024-dim embeddings</span>
+        </div>
+
+        <div class="stats-grid">
+          <!-- 100M Documents -->
+          <article class="stat-card stat-card-gold">
+            <div class="stat-top">
+              <span class="stat-stage">BIG REEF</span>
+              <h3>100M documents</h3>
+            </div>
+            <dl class="stat-list">
+              <div class="stat-row">
+                <dt>Fully cold vector search <span>(empty caches, pulled from S3)</span></dt>
+                <dd class="stat-val">~1.2 s</dd>
+              </div>
+              <div class="stat-row">
+                <dt>Warm vector search <span>(99.7 ms p50)</span></dt>
+                <dd class="stat-val val-cyan">~0.1 s</dd>
+              </div>
+              <div class="stat-row">
+                <dt>recall@10</dt>
+                <dd class="stat-val val-green">0.954</dd>
+              </div>
+              <div class="stat-row">
+                <dt>Ingest rate</dt>
+                <dd class="stat-val">4,891 docs/s</dd>
+              </div>
+            </dl>
+            <div class="pixel-meter" aria-label="recall at 10 is 0.954">
+              <span class="meter-label">RECALL@10</span>
+              <div class="meter-track" aria-hidden="true">
+                <span class="meter-fill" style="width: 95.4%"></span>
+              </div>
+            </div>
+          </article>
+
+          <!-- 10M Documents -->
+          <article class="stat-card stat-card-cyan">
+            <div class="stat-top">
+              <span class="stat-stage">COZY LAGOON</span>
+              <h3>10M documents</h3>
+            </div>
+            <dl class="stat-list">
+              <div class="stat-row">
+                <dt>Cache-cold vector search <span>(p50)</span></dt>
+                <dd class="stat-val">533 ms</dd>
+              </div>
+              <div class="stat-row">
+                <dt>Warm vector search <span>(p50)</span></dt>
+                <dd class="stat-val val-cyan">36.6 ms</dd>
+              </div>
+              <div class="stat-row">
+                <dt>recall@10</dt>
+                <dd class="stat-val val-green">0.953</dd>
+              </div>
+              <div class="stat-row">
+                <dt>Memory footprint</dt>
+                <dd class="stat-val val-gold">Fits on 4 GB</dd>
+              </div>
+            </dl>
+            <div class="pixel-meter" aria-label="recall at 10 is 0.953">
+              <span class="meter-label">RECALL@10</span>
+              <div class="meter-track" aria-hidden="true">
+                <span class="meter-fill" style="width: 95.3%"></span>
+              </div>
+            </div>
+          </article>
+
+          <!-- BM25 1M Passages -->
+          <article class="stat-card stat-card-coral">
+            <div class="stat-top">
+              <span class="stat-stage">FULL-TEXT</span>
+              <h3>BM25 on 1M passages</h3>
+            </div>
+            <dl class="stat-list">
+              <div class="stat-row">
+                <dt>Cache-cold BM25 <span>(p50)</span></dt>
+                <dd class="stat-val">301 ms</dd>
+              </div>
+              <div class="stat-row">
+                <dt>Exact BM25 match <span>(overlap@10)</span></dt>
+                <dd class="stat-val val-green">1.000</dd>
+              </div>
+            </dl>
+            <p class="stat-note">
+              Results match exact BM25 scoring — no fuzzy compromises on keyword search.
+            </p>
+            <div class="pixel-meter" aria-label="overlap at 10 is 1.000">
+              <span class="meter-label">OVERLAP@10</span>
+              <div class="meter-track" aria-hidden="true">
+                <span class="meter-fill meter-fill-full" style="width: 100%"></span>
+              </div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 8-bit Pixel Ocean Floor Scenery -->
+  <div class="ocean-floor" aria-hidden="true">
+    <svg class="floor-svg" viewBox="0 0 320 44" preserveAspectRatio="xMidYMax slice" shape-rendering="crispEdges">
+      <!-- Distant pixel reef silhouette -->
+      <path class="floor-reef-far" d="M0 32h320v12H0zM14 26h18v6H14zM18 22h10v4H18zM86 27h24v5H86zM92 23h12v4H92zM210 25h26v7h-26zM216 21h14v4h-14zM282 28h22v4h-22z"/>
+      <!-- Swaying pixel kelp stalks -->
+      <g class="kelp kelp-a">
+        <path fill="#14a862" d="M36 16h3v6h-3zM34 22h3v6h-3zM36 28h3v8h-3zM248 14h3v6h-3zM246 20h3v6h-3zM248 26h3v10h-3z"/>
+        <path fill="#39ff9c" d="M37 16h1v5h-1zM35 22h1v5h-1zM249 14h1v5h-1zM247 20h1v5h-1z"/>
+      </g>
+      <g class="kelp kelp-b">
+        <path fill="#14a862" d="M44 20h3v5h-3zM46 25h3v5h-3zM44 30h3v6h-3zM258 18h3v6h-3zM260 24h3v6h-3zM258 30h3v6h-3z"/>
+        <path fill="#39ff9c" d="M45 20h1v4h-1zM259 18h1v5h-1z"/>
+      </g>
+      <!-- Pixel coral bushes -->
+      <path fill="#ff4f82" d="M118 26h2v8h-2zM114 28h4v2h-4zM114 24h2v4h-2zM120 29h4v2h-4zM122 25h2v4h-2zM294 25h2v9h-2zM290 27h4v2h-4zM290 24h2v3h-2zM296 28h4v2h-4zM298 24h2v4h-2z"/>
+      <path fill="#ff9ebb" d="M114 24h1v2h-1zM118 26h1v3h-1zM122 25h1v2h-1zM294 25h1v3h-1z"/>
+      <!-- Little pixel treasure chest on the ocean floor -->
+      <g transform="translate(152,23)">
+        <path fill="#101830" d="M1 0h14v1H1zM0 1h1v10H0zM15 1h1v10h-1zM1 11h14v1H1zM1 5h14v1H1z"/>
+        <path fill="#b85d19" d="M1 1h14v4H1zM1 6h14v5H1z"/>
+        <path fill="#e38014" d="M2 2h12v2H2zM2 7h12v2H2z"/>
+        <path fill="#ffbe2e" d="M1 1h2v10H1zM13 1h2v10h-2zM6 4h4v3H6z"/>
+        <path fill="#fff27a" d="M7 5h2v1H7z"/>
+      </g>
+      <!-- Sandy pixel sea floor -->
+      <path class="floor-sand-top" d="M0 34h48v2H0zM48 33h56v3H48zM104 34h76v2h-76zM180 33h64v3h-64zM244 34h76v2h-76z"/>
+      <path class="floor-sand-main" d="M0 36h320v8H0z"/>
+      <path class="floor-sand-speck" d="M16 38h4v2h-4zM64 39h6v2h-6zM126 37h4v2h-4zM198 39h8v2h-8zM272 38h5v2h-5z"/>
+    </svg>
+  </div>
+
+  <!-- FOOTER -->
+  <footer class="arcade-footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <svg viewBox="0 0 24 24" width="32" height="32" aria-hidden="true">
+          <use href="#fish-puffed"></use>
+        </svg>
+        <div>
+          <p class="footer-title">BLOWFISH</p>
+          <p class="footer-license"><a href="https://github.com/endgame-labs/blowfish/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License © 2026 Endgame Labs, Inc.</a></p>
+        </div>
+      </div>
+
+      <nav class="footer-links" aria-label="Footer">
+        <a href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href="https://github.com/endgame-labs/blowfish#readme" target="_blank" rel="noopener noreferrer">Docs</a>
+        <a href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">v0.1.13</a>
+        <a href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer</a>
+      </nav>
+
+      <div class="footer-meta">
+        <p>blowfish is an independent project · Not affiliated with turbopuffer.</p>
+        <p class="footer-love">
+          Made with
+          <svg class="inline-heart" viewBox="0 0 12 12" width="14" height="14" aria-label="love" role="img">
+            <use href="#px-heart"></use>
+          </svg>
+          by someone who loves turbopuffer.
+        </p>
+      </div>
+    </div>
+  </footer>
+
+  <script src="./script.js"></script>
+</body>
+</html>

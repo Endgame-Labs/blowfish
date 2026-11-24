@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>blowfish: self-hosted search with the turbopuffer API</title>
+  <meta name="description" content="An open-source, self-hostable search engine in a single Rust binary that speaks the turbopuffer API. Vector, BM25, hybrid search, and filters right from your own bucket.">
+  <meta property="og:title" content="blowfish: self-hosted search with the turbopuffer API">
+  <meta property="og:description" content="Open-source, self-hostable vector, BM25, and hybrid search in a single Rust binary. Speaks the turbopuffer API and stores everything in your S3-compatible bucket or a local directory.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://github.com/endgame-labs/blowfish">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="blowfish: self-hosted search with the turbopuffer API">
+  <meta name="twitter:description" content="Open-source, self-hostable vector, BM25, and hybrid search in a single Rust binary that speaks the turbopuffer API.">
+  <meta name="theme-color" content="#FFD60A">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=JetBrains+Mono:wght@500;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <!-- Neo-brutalist "Fork me on GitHub" corner ribbon -->
+  <div class="fork-ribbon-wrap" aria-hidden="false">
+    <a class="fork-ribbon" href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">
+      Fork me on GitHub ↗
+    </a>
+  </div>
+
+  <!-- Top Navigation -->
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="#top" aria-label="blowfish home">
+        <svg class="brand-icon" viewBox="0 0 64 64" width="36" height="36" aria-hidden="true">
+          <rect x="3" y="3" width="58" height="58" rx="12" fill="#00E5CC" stroke="#111111" stroke-width="4"/>
+          <polygon points="32,7 27,15 37,15" fill="#FF5E5B" stroke="#111111" stroke-width="2.5" stroke-linejoin="round"/>
+          <polygon points="32,57 27,49 37,49" fill="#FF5E5B" stroke="#111111" stroke-width="2.5" stroke-linejoin="round"/>
+          <polygon points="8,32 16,27 16,37" fill="#FF5E5B" stroke="#111111" stroke-width="2.5" stroke-linejoin="round"/>
+          <polygon points="56,32 48,27 48,37" fill="#FF5E5B" stroke="#111111" stroke-width="2.5" stroke-linejoin="round"/>
+          <circle cx="32" cy="32" r="18" fill="#FFD60A" stroke="#111111" stroke-width="3.5"/>
+          <circle cx="25" cy="28" r="4" fill="#FFFFFF" stroke="#111111" stroke-width="2.5"/>
+          <circle cx="39" cy="28" r="4" fill="#FFFFFF" stroke="#111111" stroke-width="2.5"/>
+          <circle cx="26" cy="28" r="1.8" fill="#111111"/>
+          <circle cx="40" cy="28" r="1.8" fill="#111111"/>
+          <ellipse cx="32" cy="36" rx="3.2" ry="2.6" fill="#FF5E5B" stroke="#111111" stroke-width="2.2"/>
+        </svg>
+        <span class="brand-name">blowfish</span>
+      </a>
+
+      <nav class="site-nav" aria-label="Primary">
+        <a href="#love-turbopuffer">Why</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#features">Features</a>
+        <a href="#numbers">Numbers</a>
+        <a class="nav-release" href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">v0.1.13</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- HERO -->
+    <section class="hero" id="top">
+      <div class="container hero-grid">
+        <div class="hero-copy">
+          <div class="hero-badges">
+            <span class="pill pill-aqua">MIT LICENSE</span>
+            <span class="pill pill-yellow">SINGLE RUST BINARY</span>
+            <a class="pill pill-coral" href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">v0.1.13 · PRE-1.0</a>
+          </div>
+
+          <div class="mascot-row">
+            <button class="mascot-btn" id="mascot-btn" type="button" aria-label="Click the pufferfish mascot for a fun message">
+              <svg class="mascot-svg" viewBox="0 0 120 120" width="84" height="84" aria-hidden="true">
+                <!-- Bubbles -->
+                <circle class="bubble b1" cx="102" cy="20" r="5" fill="#00E5CC" stroke="#111111" stroke-width="3"/>
+                <circle class="bubble b2" cx="110" cy="34" r="3.5" fill="#FFFFFF" stroke="#111111" stroke-width="2.5"/>
+                <!-- Tail fin -->
+                <polygon points="10,60 28,46 28,74" fill="#00E5CC" stroke="#111111" stroke-width="4" stroke-linejoin="round"/>
+                <!-- Spikes -->
+                <g class="spikes" fill="#FF5E5B" stroke="#111111" stroke-width="3.5" stroke-linejoin="round">
+                  <polygon points="62,10 53,26 71,26"/>
+                  <polygon points="62,110 53,94 71,94"/>
+                  <polygon points="108,60 92,51 92,69"/>
+                  <polygon points="32,24 44,30 34,42"/>
+                  <polygon points="92,24 80,30 90,42"/>
+                  <polygon points="32,96 44,90 34,78"/>
+                  <polygon points="92,96 80,90 90,78"/>
+                </g>
+                <!-- Body -->
+                <circle cx="62" cy="60" r="36" fill="#FFD60A" stroke="#111111" stroke-width="4.5"/>
+                <!-- Belly patch -->
+                <path d="M36 74 C44 90, 80 90, 88 74 C76 80, 48 80, 36 74 Z" fill="#FFFDF5" stroke="#111111" stroke-width="3.5" stroke-linejoin="round"/>
+                <!-- Side fin -->
+                <path d="M40 60 C30 56, 28 68, 38 70" fill="#00E5CC" stroke="#111111" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+                <!-- Eyes -->
+                <circle cx="54" cy="52" r="8.5" fill="#FFFFFF" stroke="#111111" stroke-width="3.5"/>
+                <circle cx="76" cy="52" r="8.5" fill="#FFFFFF" stroke="#111111" stroke-width="3.5"/>
+                <circle cx="56" cy="52" r="3.5" fill="#111111"/>
+                <circle cx="78" cy="52" r="3.5" fill="#111111"/>
+                <circle cx="57.5" cy="50" r="1.4" fill="#FFFFFF"/>
+                <circle cx="79.5" cy="50" r="1.4" fill="#FFFFFF"/>
+                <!-- Rosy cheeks -->
+                <ellipse cx="43" cy="62" rx="4.5" ry="2.8" fill="#FF5E5B" opacity="0.85"/>
+                <ellipse cx="87" cy="62" rx="4.5" ry="2.8" fill="#FF5E5B" opacity="0.85"/>
+                <!-- Happy O mouth -->
+                <ellipse cx="66" cy="66" rx="5.5" ry="4.5" fill="#FF5E5B" stroke="#111111" stroke-width="3"/>
+              </svg>
+            </button>
+            <div class="speech-bubble" id="mascot-bubble" role="status" aria-live="polite">
+              <span>Point <code>base_url</code> here and splash in!</span>
+            </div>
+          </div>
+
+          <h1 class="hero-title">
+            Self-hosted search with the <span class="marker-yellow">turbopuffer API</span>.
+          </h1>
+
+          <p class="hero-pitch">
+            Open-source vector, BM25, hybrid search, and filters in a single Rust binary—using any S3-compatible bucket or a local directory as your database.
+          </p>
+
+          <div class="hero-actions">
+            <a class="btn btn-coral btn-lg" href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">
+              <span class="btn-icon" aria-hidden="true">★</span>
+              Star on GitHub
+            </a>
+            <a class="btn btn-aqua btn-lg" href="#quickstart">
+              Get started
+              <span class="btn-icon" aria-hidden="true">↓</span>
+            </a>
+          </div>
+
+          <p class="hero-footnote">
+            Official turbopuffer SDKs (<strong>Python</strong>, <strong>TypeScript</strong>, <strong>Go</strong>, <strong>Java</strong>, <strong>Ruby</strong>, and <strong>Rust</strong>) work unchanged.
+            <span class="pre-10-note">Pre-1.0 heads-up: the storage format may still change.</span>
+          </p>
+        </div>
+
+        <!-- BLINKING-CURSOR TERMINAL HERO -->
+        <div class="hero-terminal-col">
+          <div class="terminal-window" aria-label="Interactive quickstart terminal preview">
+            <div class="terminal-chrome">
+              <div class="terminal-squares" aria-hidden="true">
+                <span class="sq sq-coral"></span>
+                <span class="sq sq-yellow"></span>
+                <span class="sq sq-aqua"></span>
+              </div>
+              <div class="terminal-title">blowfish@reef:~/quickstart</div>
+              <button class="terminal-replay" id="replay-terminal" type="button" title="Replay typing animation">
+                ↻ Replay
+              </button>
+            </div>
+            <div class="terminal-body" id="hero-terminal-body">
+              <pre class="terminal-output" id="hero-terminal-output" aria-live="off"><span class="t-prompt">$</span> <span class="t-cmd">git clone https://github.com/endgame-labs/blowfish.git &amp;&amp; cd blowfish</span>
+<span class="t-prompt">$</span> <span class="t-cmd">docker compose up --build --wait blowfish</span>
+<span class="t-ok">✔</span> <span class="t-aqua">blowfish v0.1.13</span> <span class="t-dim">serving on</span> <span class="t-yellow">http://127.0.0.1:8000</span> <span class="t-dim">(auth off)</span>
+<span class="t-prompt">$</span> <span class="t-cmd">python3 hello.py</span>
+<span class="t-dim"># point the official turbopuffer SDK at blowfish</span>
+<span class="t-kw">tpuf</span> = turbopuffer.Turbopuffer(api_key=<span class="t-str">"dev"</span>, base_url=<span class="t-yellow">"http://127.0.0.1:8000"</span>)
+<span class="t-kw">ns</span> = tpuf.namespace(<span class="t-str">"hello"</span>)
+<span class="t-kw">ns</span>.write(upsert_rows=[{<span class="t-str">"id"</span>: 1, <span class="t-str">"vector"</span>: [0.1, 0.2], <span class="t-str">"text"</span>: <span class="t-str">"hello, blowfish"</span>}], ...)
+<span class="t-coral">→ [Row(id=1, $dist=0.0, text='hello, blowfish')]</span>
+<span class="t-prompt">$</span> <span class="cursor" aria-hidden="true">█</span></pre>
+            </div>
+            <div class="terminal-footer">
+              <span class="term-stat">STATUS: <strong>READY TO PUFF</strong></span>
+              <a class="term-jump" href="#quickstart">Copy full snippets ↓</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAPE / STICKER BAR -->
+    <div class="ticker-strip" aria-label="Key capabilities">
+      <div class="container ticker-items">
+        <span>★ SPEAKS THE TURBOPUFFER API</span>
+        <span class="sep" aria-hidden="true">◆</span>
+        <span>YOUR BUCKET IS THE DATABASE</span>
+        <span class="sep" aria-hidden="true">◆</span>
+        <span>S3 · R2 · MINIO · SEAWEEDFS · LOCAL DIR</span>
+        <span class="sep" aria-hidden="true">◆</span>
+        <span>VECTOR + BM25 + HYBRID + FILTERS</span>
+      </div>
+    </div>
+
+    <!-- I LOVE TURBOPUFFER SECTION -->
+    <section class="section" id="love-turbopuffer">
+      <div class="container">
+        <div class="love-card">
+          <div class="love-header">
+            <span class="pill pill-ink">FRIENDLY REEF NOTE ♥</span>
+            <h2 class="section-title love-title">I love turbopuffer. Seriously.</h2>
+            <p class="love-lead">
+              Let me say it plainly and happily: I love <a href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer</a>, I use it on many projects, large and small, and I recommend it for production.
+              <strong>blowfish</strong> exists for the times you want something else—without rewriting a single line of application code.
+            </p>
+          </div>
+
+          <div class="love-grid">
+            <article class="mini-card mini-card-white">
+              <span class="mini-num">01</span>
+              <h3>Local dev &amp; CI</h3>
+              <p>Run real vector and BM25 queries on your laptop or in CI without an account, API credentials, or network calls.</p>
+            </article>
+
+            <article class="mini-card mini-card-aqua">
+              <span class="mini-num">02</span>
+              <h3>Inside your firewall</h3>
+              <p>Deploy on-prem, inside private VPCs, or in fully air-gapped environments where data cannot leave your perimeter.</p>
+            </article>
+
+            <article class="mini-card mini-card-coral">
+              <span class="mini-num">03</span>
+              <h3>Self-host on your own bucket</h3>
+              <p>Keep full control over your own object storage for data residency, compliance, or joyful weekend tinkering.</p>
+            </article>
+
+            <article class="mini-card mini-card-white">
+              <span class="mini-num">04</span>
+              <h3>Learn how it works</h3>
+              <p>Curious how a search engine on object storage actually ticks? Pop open the MIT-licensed Rust repo and read the code.</p>
+            </article>
+          </div>
+
+          <div class="love-bridge">
+            <div class="bridge-copy">
+              <p class="bridge-headline">Moving between blowfish and turbopuffer is a single <code>base_url</code> change.</p>
+              <div class="bridge-swap" aria-label="Base URL swap between local blowfish and turbopuffer">
+                <span class="swap-chip swap-local">http://127.0.0.1:8000</span>
+                <span class="swap-arrow" aria-hidden="true">⇄</span>
+                <span class="swap-chip swap-cloud">turbopuffer.com</span>
+              </div>
+            </div>
+            <a class="btn btn-ink" href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">
+              Check out turbopuffer ↗
+            </a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- QUICKSTART SECTION -->
+    <section class="section" id="quickstart">
+      <div class="container">
+        <div class="section-head">
+          <span class="pill pill-aqua">QUICKSTART</span>
+          <h2 class="section-title">Dive in with two snippets.</h2>
+          <p class="section-sub">Start blowfish locally with Docker Compose, then talk to it using the official turbopuffer SDK.</p>
+        </div>
+
+        <div class="quickstart-stack">
+          <!-- Code Block 1: Bash -->
+          <div class="code-card">
+            <div class="code-header code-header-coral">
+              <div class="code-meta">
+                <span class="step-tag">STEP 01</span>
+                <span class="code-label">Start blowfish locally (bash)</span>
+              </div>
+              <button class="copy-btn" type="button" data-copy-target="code-bash" aria-label="Copy bash quickstart commands">
+                <span class="copy-label">Copy</span>
+              </button>
+            </div>
+            <pre class="code-block"><code id="code-bash" class="language-bash"><span class="t-aqua">git</span> clone https://github.com/endgame-labs/blowfish.git <span class="t-coral">&amp;&amp;</span> <span class="t-aqua">cd</span> blowfish
+<span class="t-aqua">docker</span> compose up --build --wait blowfish   <span class="t-dim"># serves on 127.0.0.1:8000, auth off for local dev</span></code></pre>
+          </div>
+
+          <!-- Code Block 2: Python -->
+          <div class="code-card">
+            <div class="code-header code-header-yellow">
+              <div class="code-meta">
+                <span class="step-tag">STEP 02</span>
+                <span class="code-label">Write &amp; query with the official SDK (python)</span>
+              </div>
+              <button class="copy-btn" type="button" data-copy-target="code-python" aria-label="Copy Python quickstart code">
+                <span class="copy-label">Copy</span>
+              </button>
+            </div>
+            <pre class="code-block"><code id="code-python" class="language-python"><span class="t-dim"># pip install turbopuffer</span>
+<span class="t-coral">import</span> os
+os.environ.pop(<span class="t-yellow">"TURBOPUFFER_REGION"</span>, <span class="t-aqua">None</span>)  <span class="t-dim"># a region only applies to turbopuffer's own URLs</span>
+<span class="t-coral">import</span> turbopuffer
+tpuf = turbopuffer.Turbopuffer(api_key=<span class="t-yellow">"dev"</span>, base_url=<span class="t-yellow">"http://127.0.0.1:8000"</span>)
+ns = tpuf.namespace(<span class="t-yellow">"hello"</span>)
+ns.write(upsert_rows=[{<span class="t-yellow">"id"</span>: <span class="t-aqua">1</span>, <span class="t-yellow">"vector"</span>: [<span class="t-aqua">0.1</span>, <span class="t-aqua">0.2</span>], <span class="t-yellow">"text"</span>: <span class="t-yellow">"hello, blowfish"</span>}], distance_metric=<span class="t-yellow">"cosine_distance"</span>)
+<span class="t-aqua">print</span>(ns.query(rank_by=(<span class="t-yellow">"vector"</span>, <span class="t-yellow">"ANN"</span>, [<span class="t-aqua">0.1</span>, <span class="t-aqua">0.2</span>]), top_k=<span class="t-aqua">1</span>).rows)</code></pre>
+          </div>
+        </div>
+
+        <div class="sdk-bar">
+          <span class="sdk-bar-label">Official turbopuffer SDKs that work unchanged:</span>
+          <div class="sdk-pills">
+            <span class="sdk-pill">Python</span>
+            <span class="sdk-pill">TypeScript</span>
+            <span class="sdk-pill">Go</span>
+            <span class="sdk-pill">Java</span>
+            <span class="sdk-pill">Ruby</span>
+            <span class="sdk-pill">Rust</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FEATURES SECTION -->
+    <section class="section" id="features">
+      <div class="container">
+        <div class="section-head">
+          <span class="pill pill-coral">FEATURES</span>
+          <h2 class="section-title">Small binary. Big ocean energy.</h2>
+          <p class="section-sub">Everything you need for fast vector and full-text search—without hauling around a second database.</p>
+        </div>
+
+        <div class="features-grid">
+          <article class="feature-card">
+            <div class="feature-top feature-top-yellow">
+              <span class="feature-icon" aria-hidden="true">{ }</span>
+              <h3>SDK-compatible</h3>
+            </div>
+            <div class="feature-body">
+              <p>Speaks the <strong>turbopuffer API</strong> natively. Keep the official Python, TypeScript, Go, Java, Ruby, and Rust SDKs unchanged—just point <code>base_url</code> at blowfish.</p>
+            </div>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-top feature-top-aqua">
+              <span class="feature-icon" aria-hidden="true">⬡</span>
+              <h3>Your bucket is the database</h3>
+            </div>
+            <div class="feature-body">
+              <p>Stores everything in any S3-compatible bucket (<strong>AWS S3</strong>, <strong>Cloudflare R2</strong>, <strong>MinIO</strong>, and <strong>SeaweedFS</strong>) or a local directory. No other database. Servers are stateless caches; run more copies to scale out.</p>
+            </div>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-top feature-top-coral">
+              <span class="feature-icon" aria-hidden="true">⌕</span>
+              <h3>Vector, BM25, hybrid, and filters</h3>
+            </div>
+            <div class="feature-body">
+              <p>Approximate nearest neighbor (ANN) vector search, exact BM25 full-text search, hybrid queries, and structured filters—all built into one cohesive engine.</p>
+            </div>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-top feature-top-aqua">
+              <span class="feature-icon" aria-hidden="true">▲</span>
+              <h3>Scales to 100M on one machine</h3>
+            </div>
+            <div class="feature-body">
+              <p>Handles 100M documents comfortably on a single AWS node, and a 10M-document load fits on a <strong>4 GB machine</strong>.</p>
+            </div>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-top feature-top-coral">
+              <span class="feature-icon" aria-hidden="true">⚙</span>
+              <h3>Single Rust binary</h3>
+            </div>
+            <div class="feature-body">
+              <p>One self-contained Rust executable. No separate metadata store, no coordinator cluster, and no dependency soup to wrestle with.</p>
+            </div>
+          </article>
+
+          <article class="feature-card">
+            <div class="feature-top feature-top-yellow">
+              <span class="feature-icon" aria-hidden="true">♥</span>
+              <h3>MIT licensed &amp; honest</h3>
+            </div>
+            <div class="feature-body">
+              <p>Open-source under the permissive <strong>MIT license</strong>. Light heads-up: blowfish is pre-1.0 (<a href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">v0.1.13</a>), so the storage format may still change.</p>
+            </div>
+          </article>
+        </div>
+
+        <!-- Architecture Diagram -->
+        <div class="arch-card" aria-label="Architecture overview: Official SDK talks to stateless blowfish server backed by your object storage bucket">
+          <div class="arch-step arch-aqua">
+            <span class="arch-tag">YOUR APP</span>
+            <strong>Official turbopuffer SDK</strong>
+            <span class="arch-detail">Python · TS · Go · Java · Ruby · Rust</span>
+          </div>
+          <div class="arch-arrow" aria-hidden="true">
+            <span class="arch-arrow-label">base_url</span>
+            <span class="arch-arrow-glyph">━━▶</span>
+          </div>
+          <div class="arch-step arch-yellow">
+            <span class="arch-tag">STATELESS CACHE</span>
+            <strong>blowfish binary</strong>
+            <span class="arch-detail">Run more copies to scale out</span>
+          </div>
+          <div class="arch-arrow" aria-hidden="true">
+            <span class="arch-arrow-label">S3 / Local</span>
+            <span class="arch-arrow-glyph">━━▶</span>
+          </div>
+          <div class="arch-step arch-coral">
+            <span class="arch-tag">THE DATABASE</span>
+            <strong>Your Bucket</strong>
+            <span class="arch-detail">S3 · R2 · MinIO · SeaweedFS · Local dir</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- THE NUMBERS SECTION -->
+    <section class="section" id="numbers">
+      <div class="container">
+        <div class="section-head">
+          <span class="pill pill-yellow">THE NUMBERS</span>
+          <h2 class="section-title">Fast enough to be genuinely useful.</h2>
+          <p class="section-sub">Not a race against anyone—just real measurements so you know what to expect when you self-host.</p>
+        </div>
+
+        <div class="rig-banner">
+          <span class="rig-label">TEST SETUP</span>
+          <span class="rig-text">Measured in the same AWS region as the bucket · one <strong>c7gd.2xlarge</strong> (8 vCPU, 16 GB) · <strong>1,024-dim</strong> embeddings</span>
+        </div>
+
+        <div class="numbers-grid">
+          <!-- 100M -->
+          <article class="stat-card">
+            <div class="stat-banner stat-banner-coral">
+              <span class="stat-kicker">SCALE</span>
+              <h3>100M documents</h3>
+            </div>
+            <div class="stat-body">
+              <div class="stat-hero">
+                <span class="stat-big">~0.1 s</span>
+                <span class="stat-unit">warm (99.7 ms p50)</span>
+              </div>
+              <dl class="stat-list">
+                <div class="stat-row">
+                  <dt>Fully cold vector search</dt>
+                  <dd>~1.2 s</dd>
+                </div>
+                <div class="stat-row stat-row-note">
+                  <dt>Cold cache detail</dt>
+                  <dd>Empty caches, everything pulled from S3</dd>
+                </div>
+                <div class="stat-row">
+                  <dt>recall@10</dt>
+                  <dd>0.954</dd>
+                </div>
+                <div class="stat-row">
+                  <dt>Load rate</dt>
+                  <dd>4,891 docs/s</dd>
+                </div>
+              </dl>
+            </div>
+          </article>
+
+          <!-- 10M -->
+          <article class="stat-card">
+            <div class="stat-banner stat-banner-aqua">
+              <span class="stat-kicker">SWEET SPOT</span>
+              <h3>10M documents</h3>
+            </div>
+            <div class="stat-body">
+              <div class="stat-hero">
+                <span class="stat-big">36.6 ms</span>
+                <span class="stat-unit">p50 warm</span>
+              </div>
+              <dl class="stat-list">
+                <div class="stat-row">
+                  <dt>Cache-cold</dt>
+                  <dd>533 ms p50</dd>
+                </div>
+                <div class="stat-row">
+                  <dt>recall@10</dt>
+                  <dd>0.953</dd>
+                </div>
+                <div class="stat-row stat-row-highlight">
+                  <dt>Footprint</dt>
+                  <dd>Fits on a 4 GB machine</dd>
+                </div>
+              </dl>
+            </div>
+          </article>
+
+          <!-- BM25 1M -->
+          <article class="stat-card">
+            <div class="stat-banner stat-banner-yellow">
+              <span class="stat-kicker">FULL-TEXT</span>
+              <h3>BM25 on 1M passages</h3>
+            </div>
+            <div class="stat-body">
+              <div class="stat-hero">
+                <span class="stat-big">301 ms</span>
+                <span class="stat-unit">p50 cache-cold</span>
+              </div>
+              <dl class="stat-list">
+                <div class="stat-row">
+                  <dt>Accuracy</dt>
+                  <dd>overlap@10 1.000</dd>
+                </div>
+                <div class="stat-row stat-row-note">
+                  <dt>Ranking match</dt>
+                  <dd>Results match exact BM25</dd>
+                </div>
+              </dl>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- FINAL CTA -->
+    <section class="section section-cta">
+      <div class="container">
+        <div class="cta-slab">
+          <div>
+            <h2>Ready to take blowfish for a swim?</h2>
+            <p>MIT licensed, single Rust binary, and one <code>base_url</code> away from your existing turbopuffer code.</p>
+          </div>
+          <div class="cta-buttons">
+            <a class="btn btn-yellow btn-lg" href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">★ Star on GitHub</a>
+            <a class="btn btn-white btn-lg" href="https://github.com/endgame-labs/blowfish#readme" target="_blank" rel="noopener noreferrer">Read the docs ↗</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- FOOTER -->
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div class="footer-top">
+        <div class="footer-brand">
+          <strong>blowfish</strong>
+          <span class="pill pill-yellow">MIT LICENSE</span>
+          <a class="pill pill-aqua" href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">v0.1.13 · pre-1.0</a>
+        </div>
+
+        <nav class="footer-links" aria-label="Footer">
+          <a href="https://github.com/endgame-labs/blowfish" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <a href="https://github.com/endgame-labs/blowfish#readme" target="_blank" rel="noopener noreferrer">Docs</a>
+          <a href="https://github.com/endgame-labs/blowfish/releases/tag/v0.1.13" target="_blank" rel="noopener noreferrer">Latest release (v0.1.13)</a>
+          <a href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer.com</a>
+        </nav>
+      </div>
+
+      <div class="footer-bottom">
+        <p class="footer-love">Made with love by someone who loves <a href="https://turbopuffer.com" target="_blank" rel="noopener noreferrer">turbopuffer</a>.</p>
+        <p class="footer-disclaimer"><a href="https://github.com/endgame-labs/blowfish/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License © 2026 Endgame Labs, Inc.</a> · Not affiliated with turbopuffer.</p>
+      </div>
+    </div>
+  </footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="blowfish icon">
+  <!-- Jagged crimson comic starburst backing -->
+  <polygon
+    points="32,2 40,12 54,6 52,20 63,28 53,38 59,52 45,51 39,62 28,53 15,60 16,46 3,41 12,30 4,17 18,17 22,4"
+    fill="#e5001a"
+    stroke="#0a0a0a"
+    stroke-width="2.5"
+    stroke-linejoin="miter"
+  />
+  <!-- Puffed blowfish silhouette -->
+  <g transform="rotate(-6 32 32)">
+    <!-- Tail fin -->
+    <polygon points="48,29 60,20 56,32 60,44 48,36" fill="#0a0a0a" stroke="#ffffff" stroke-width="2" stroke-linejoin="miter" />
+    <!-- Top & bottom spikes -->
+    <polygon
+      points="29,12 33,18 39,14 40,21 47,21 44,28 50,33 44,39 46,46 38,45 34,52 29,46 22,51 21,44 13,44 17,37 11,31 17,26 14,19 22,20 24,13"
+      fill="#0a0a0a"
+      stroke="#ffffff"
+      stroke-width="2.2"
+      stroke-linejoin="miter"
+    />
+    <!-- White comic belly highlight -->
+    <path d="M18,35 C22,44 37,45 43,36 C37,39 24,38 18,35 Z" fill="#ffffff" />
+    <!-- Expressive comic eyes -->
+    <circle cx="24" cy="28" r="4.5" fill="#ffffff" stroke="#0a0a0a" stroke-width="1.5" />
+    <circle cx="23.2" cy="28" r="2.1" fill="#0a0a0a" />
+    <circle cx="22.4" cy="27" r="0.8" fill="#ffffff" />
+    <circle cx="34" cy="27" r="4" fill="#ffffff" stroke="#0a0a0a" stroke-width="1.5" />
+    <circle cx="33.2" cy="27" r="1.9" fill="#0a0a0a" />
+    <circle cx="32.5" cy="26.2" r="0.7" fill="#ffffff" />
+    <!-- Cheeky O-shaped puffer mouth -->
+    <circle cx="17.5" cy="34" r="2.7" fill="#e5001a" stroke="#ffffff" stroke-width="1.4" />
+  </g>
+</svg>

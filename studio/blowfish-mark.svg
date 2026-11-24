@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" role="img" aria-label="blowfish illustrated pufferfish mark">
+  <defs>
+    <!-- Ambient halo -->
+    <radialGradient id="bf-halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#2dd4bf" stop-opacity="0.28"/>
+      <stop offset="58%" stop-color="#38bdf8" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Body ocean-teal gradient -->
+    <linearGradient id="bf-body" x1="20%" y1="12%" x2="82%" y2="88%">
+      <stop offset="0%" stop-color="#5eead4"/>
+      <stop offset="44%" stop-color="#14b8a6"/>
+      <stop offset="100%" stop-color="#0369a1"/>
+    </linearGradient>
+
+    <!-- Warm belly gradient -->
+    <linearGradient id="bf-belly" x1="35%" y1="0%" x2="65%" y2="100%">
+      <stop offset="0%" stop-color="#fffbeb"/>
+      <stop offset="65%" stop-color="#fde68a"/>
+      <stop offset="100%" stop-color="#fdba74"/>
+    </linearGradient>
+
+    <!-- Fin gradient -->
+    <linearGradient id="bf-fin" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7dd3fc"/>
+      <stop offset="55%" stop-color="#2dd4bf"/>
+      <stop offset="100%" stop-color="#0e7490"/>
+    </linearGradient>
+
+    <!-- Coral warm accent -->
+    <linearGradient id="bf-coral" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fdba74"/>
+      <stop offset="100%" stop-color="#fb7185"/>
+    </linearGradient>
+
+    <!-- Spine gradient -->
+    <linearGradient id="bf-spine" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#99f6e4"/>
+      <stop offset="100%" stop-color="#0284c7"/>
+    </linearGradient>
+
+    <!-- Glassy crown sheen -->
+    <linearGradient id="bf-sheen" x1="20%" y1="0%" x2="60%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.52"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Bubble gradient -->
+    <radialGradient id="bf-bubble" cx="32%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.85"/>
+      <stop offset="45%" stop-color="#bae6fd" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.16"/>
+    </radialGradient>
+
+    <!-- Clip for belly & spots inside body -->
+    <clipPath id="bf-body-clip">
+      <ellipse cx="122" cy="126" rx="64" ry="57"/>
+    </clipPath>
+
+    <!-- Soft drop shadow -->
+    <filter id="bf-shadow" x="-15%" y="-15%" width="130%" height="135%">
+      <feDropShadow dx="0" dy="8" stdDeviation="7" flood-color="#041527" flood-opacity="0.32"/>
+    </filter>
+  </defs>
+
+  <!-- Subtle bioluminescent halo -->
+  <circle cx="122" cy="126" r="102" fill="url(#bf-halo)"/>
+
+  <g filter="url(#bf-shadow)">
+    <!-- Tail fin -->
+    <path d="M62 126 C44 106, 26 92, 22 98 C18 104, 30 118, 35 126 C30 134, 18 148, 22 154 C26 160, 44 146, 62 126 Z" fill="url(#bf-fin)"/>
+    <path d="M58 126 C44 114, 32 106, 28 108" stroke="#e0f2fe" stroke-opacity="0.45" stroke-width="2" stroke-linecap="round" fill="none"/>
+    <path d="M58 126 C44 138, 32 146, 28 144" stroke="#e0f2fe" stroke-opacity="0.35" stroke-width="2" stroke-linecap="round" fill="none"/>
+
+    <!-- Dorsal fin -->
+    <path d="M104 71 C106 54, 122 47, 134 55 C139 58, 137 68, 132 72 Z" fill="url(#bf-coral)"/>
+
+    <!-- Playful rounded puffer spines around perimeter -->
+    <g fill="url(#bf-spine)">
+      <!-- Top-left -->
+      <path d="M77 83 L66 72 C64 70, 68 65, 72 67 L85 75 Z"/>
+      <!-- Top -->
+      <path d="M94 72 L89 58 C88 55, 94 53, 96 56 L104 69 Z"/>
+      <!-- Top-right -->
+      <path d="M148 73 L158 61 C160 58, 165 62, 163 65 L156 79 Z"/>
+      <!-- Upper-right -->
+      <path d="M168 88 L181 80 C184 78, 187 84, 184 87 L174 96 Z"/>
+      <!-- Lower-right -->
+      <path d="M168 164 L180 172 C183 174, 179 179, 176 177 L162 170 Z"/>
+      <!-- Bottom-right -->
+      <path d="M142 180 L148 193 C149 196, 143 198, 141 195 L133 182 Z"/>
+      <!-- Bottom -->
+      <path d="M114 182 L113 196 C113 199, 107 199, 107 195 L106 181 Z"/>
+      <!-- Bottom-left -->
+      <path d="M86 172 L75 182 C72 184, 68 179, 71 176 L80 166 Z"/>
+    </g>
+
+    <!-- Main plump body -->
+    <ellipse cx="122" cy="126" rx="64" ry="57" fill="url(#bf-body)"/>
+
+    <!-- Clipped interior details -->
+    <g clip-path="url(#bf-body-clip)">
+      <!-- Warm creamy belly -->
+      <path d="M54 134 C76 149, 106 154, 138 148 C162 143, 180 135, 192 128 L192 192 L54 192 Z" fill="url(#bf-belly)"/>
+
+      <!-- Subtle belly transition wave -->
+      <path d="M54 134 C76 149, 106 154, 138 148 C162 143, 180 135, 192 128" stroke="#ffffff" stroke-opacity="0.35" stroke-width="2.5" fill="none"/>
+
+      <!-- Soft dorsal spots -->
+      <circle cx="96" cy="95" r="7.5" fill="#99f6e4" fill-opacity="0.32"/>
+      <circle cx="116" cy="86" r="5.5" fill="#99f6e4" fill-opacity="0.28"/>
+      <circle cx="80" cy="108" r="4.5" fill="#99f6e4" fill-opacity="0.25"/>
+      <circle cx="136" cy="88" r="4" fill="#99f6e4" fill-opacity="0.22"/>
+
+      <!-- Glossy top sheen -->
+      <ellipse cx="112" cy="87" rx="40" ry="16" transform="rotate(-10 112 87)" fill="url(#bf-sheen)"/>
+
+      <!-- Warm coral blush cheek -->
+      <ellipse cx="160" cy="134" rx="11" ry="6.5" fill="#fb7185" fill-opacity="0.34"/>
+    </g>
+
+    <!-- Crisp subtle rim stroke on body -->
+    <ellipse cx="122" cy="126" rx="64" ry="57" fill="none" stroke="#e0f2fe" stroke-opacity="0.24" stroke-width="1.5"/>
+
+    <!-- Side pectoral fin -->
+    <path d="M107 132 C93 128, 79 134, 79 144 C79 152, 92 155, 106 147 C111 144, 112 135, 107 132 Z" fill="url(#bf-coral)" stroke="#fff7ed" stroke-opacity="0.35" stroke-width="1.2"/>
+    <path d="M103 139 C95 140, 88 142, 85 144" stroke="#fff7ed" stroke-opacity="0.5" stroke-width="1.5" stroke-linecap="round" fill="none"/>
+
+    <!-- Expressive glossy eye -->
+    <circle cx="151" cy="112" r="14.5" fill="#ffffff"/>
+    <circle cx="153.5" cy="112" r="8.8" fill="#071a2f"/>
+    <!-- Eye specular highlights -->
+    <circle cx="156.5" cy="108.5" r="3.4" fill="#ffffff"/>
+    <circle cx="149.8" cy="115.5" r="1.4" fill="#7dd3fc"/>
+
+    <!-- Friendly little puffer smile -->
+    <path d="M174 126 C177 128, 180 128, 183 125.5" stroke="#082032" stroke-width="2.6" stroke-linecap="round" fill="none"/>
+    <ellipse cx="183.5" cy="126" rx="4.2" ry="3.4" fill="#fb7185" fill-opacity="0.88" stroke="#082032" stroke-width="1.8"/>
+  </g>
+
+  <!-- Three glassy bubbles rising playfully -->
+  <g>
+    <circle cx="201" cy="96" r="8.5" fill="url(#bf-bubble)" stroke="#bae6fd" stroke-opacity="0.65" stroke-width="1.2"/>
+    <path d="M197 92.5 A4.5 4.5 0 0 1 202 90.5" stroke="#ffffff" stroke-opacity="0.9" stroke-width="1.6" stroke-linecap="round" fill="none"/>
+
+    <circle cx="212" cy="70" r="6" fill="url(#bf-bubble)" stroke="#bae6fd" stroke-opacity="0.6" stroke-width="1.1"/>
+    <circle cx="210" cy="68" r="1.4" fill="#ffffff" fill-opacity="0.9"/>
+
+    <circle cx="195" cy="56" r="4" fill="url(#bf-bubble)" stroke="#bae6fd" stroke-opacity="0.55" stroke-width="1"/>
+  </g>
+</svg>

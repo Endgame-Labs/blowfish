@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Subtle paper circle badge -->
+  <circle cx="32" cy="32" r="30" fill="#faf5ea" stroke="#242938" stroke-width="3" stroke-dasharray="1 0"/>
+  <!-- Little spikes -->
+  <path d="M32 6 L34.5 12.5 L29.5 12.5 Z
+           M49 12 L46 18 L42 14.5 Z
+           M57 26 L51 29 L51.5 23.5 Z
+           M55 43 L49.5 41 L52 36.5 Z
+           M43 55 L40 49.5 L44.5 48.5 Z
+           M21 54 L24 49 L19.5 47.5 Z
+           M12 43 L17.5 40.5 L15 36 Z
+           M13 15 L18 19 L14 21.5 Z"
+        fill="#f6c94c" stroke="#242938" stroke-width="2.2" stroke-linejoin="round"/>
+  <!-- Tail fin -->
+  <path d="M13 31 C7 24, 6 26, 8 32 C6 38, 7 40, 14 35 Z"
+        fill="#e55d4a" stroke="#242938" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- Slightly off-register riso fill for puffer body -->
+  <ellipse cx="34.5" cy="33.5" rx="19" ry="17.5" fill="#f6c94c"/>
+  <!-- Cream belly wash -->
+  <path d="M20 39 C26 48, 42 48, 49 38 C43 43, 27 44, 20 39 Z" fill="#fff8e1"/>
+  <!-- Hand-drawn body outline -->
+  <path d="M15 32 C15 21, 24 14, 34 14.5 C44.5 15, 52.5 22, 52 32.5 C51.5 43.5, 43 50, 33 49.5 C22.5 49, 15 42.5, 15 32 Z"
+        stroke="#242938" stroke-width="2.8" stroke-linecap="round"/>
+  <!-- Cheek blush -->
+  <ellipse cx="44" cy="36" rx="3.4" ry="2.2" fill="#e55d4a" opacity="0.65"/>
+  <!-- Eye -->
+  <circle cx="40.5" cy="28" r="3.4" fill="#242938"/>
+  <circle cx="41.7" cy="26.8" r="1.1" fill="#fffdf8"/>
+  <!-- Happy little mouth -->
+  <path d="M47 33.5 C48.5 34.5, 48.5 36.5, 46.5 37" stroke="#242938" stroke-width="2.2" stroke-linecap="round"/>
+  <!-- Tiny side fin -->
+  <path d="M27 34 C23 32, 22 38, 28 38.5" fill="#1f8a7a" stroke="#242938" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
