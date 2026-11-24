@@ -87,6 +87,11 @@ impl WarmTier {
         if let Some(warm) = read_cache::get::<Self>(key, 0) {
             return Some(warm);
         }
+        // Eligibility can race eviction. Rebuilding metadata for a large tier belongs
+        // to shared I/O; a reactor miss reaches the planner's existing yield instead.
+        if crate::query_worker::is_reactor() {
+            return None;
+        }
         if read_cache::capacity() == 0 {
             return None;
         }
@@ -250,6 +255,35 @@ mod tests {
         .await
     }
 
+    async fn reactor_miss_never_rebuilds(key: String, directory: Arc<Directory>) {
+        let cache = Arc::new(read_cache::DecodedCache::new(64 << 20, 2));
+        let context = read_cache::ReadContext::new(cache.clone());
+        let shared = tokio::runtime::Handle::current();
+        let (reactor_key, reactor_directory) = (key.clone(), directory.clone());
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(crate::on_query_reactor(
+                    shared,
+                    read_cache::scope(context, async move {
+                        // Model eviction of the large tier while its small admission marker stays.
+                        read_cache::insert_once(&reactor_key, 64, Seen(AtomicU8::new(1))).unwrap();
+                        assert!(WarmTier::for_tier(&reactor_key, reactor_directory).is_none());
+                        assert!(read_cache::get::<WarmTier>(&reactor_key, 0).is_none());
+                    }),
+                ));
+        })
+        .await
+        .unwrap();
+        read_cache::scope(read_cache::ReadContext::new(cache), async move {
+            // The shared path can still rebuild that same admissible generation.
+            assert!(WarmTier::for_tier(&key, directory).is_some());
+        })
+        .await;
+    }
+
     // Keep the build future on the heap so the driver has room for compaction and queries.
     fn fixture(
         cluster_rows: usize,
@@ -372,6 +406,13 @@ mod tests {
             compiled.hits.load(Ordering::Relaxed) > 0,
             "exercise the real compiled branch"
         );
+        reactor_miss_never_rebuilds(
+            key.clone(),
+            crate::ann_dir::load(&store, &manifest.ann_tiers["vector"][0].dir, None)
+                .await
+                .unwrap(),
+        )
+        .await;
         // Large enough for the rejection marker in the general pool, far too small for the tier.
         let tiny = engine(&store, 256);
         for _ in 0..3 {

@@ -6,6 +6,7 @@
 
 mod analysis;
 mod scoring;
+mod scratch;
 
 pub use analysis::{
     FtsParams, Language, Token, Tokenizer, matches_all_tokens, matches_any_token,

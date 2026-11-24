@@ -172,7 +172,7 @@ fn query_msmarco() {
                     // An intentionally unlimited, perfect bound is a ceiling on
                     // the possible benefit of compact joint block metadata.
                     sat.maxima
-                        .lock()
+                        .write()
                         .unwrap()
                         .frames
                         .insert(b.offset, maxima.into_iter().collect());
