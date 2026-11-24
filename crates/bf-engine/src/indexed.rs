@@ -83,6 +83,15 @@ pub(crate) async fn execute(
             billing: Default::default(),
         });
     }
+    // Computed BM25 scores can use terms absent from the retrieval rank.
+    let projected_ranks: Vec<_> = request
+        .queries
+        .as_deref()
+        .unwrap_or(std::slice::from_ref(request))
+        .iter()
+        .flat_map(|q| q.compute_attributes.iter().flat_map(|attrs| attrs.values()))
+        .filter_map(|value| RankBy::parse(value.clone()).ok())
+        .collect();
     let mut clauses = vec![];
     for q in request
         .queries
@@ -92,6 +101,9 @@ pub(crate) async fn execute(
         if let Some(rank) = &q.rank_by {
             text_clauses(rank, &mut clauses);
         }
+    }
+    for rank in &projected_ranks {
+        text_clauses(rank, &mut clauses);
     }
     let mut terms = crate::text::QueryTerms::new();
     if !clauses.is_empty() {
@@ -110,7 +122,15 @@ pub(crate) async fn execute(
     }
     // Only text subqueries wait for corpus statistics. In a cold RRF request,
     // ANN can start its directory and scan reads while those chunks arrive.
-    let statistics = crate::text::global_stats(store, state, &terms).shared();
+    let statistics = async {
+        let started = std::time::Instant::now();
+        let result = crate::text::global_stats(store, state, &terms).await;
+        if !clauses.is_empty() {
+            crate::ann::stage(started, "bm25 global stats");
+        }
+        result
+    }
+    .shared();
     let mut candidates = result_state(state);
     // Subqueries (for example the ANN and BM25 halves of a hybrid query) read independent
     // files, so they run concurrently. Results merge in request order.
@@ -165,7 +185,12 @@ pub(crate) async fn execute(
     if !clauses.is_empty() {
         candidates.corpus = statistics.await?;
     }
-    query::execute(&candidates, request)
+    let started = std::time::Instant::now();
+    let result = query::execute(&candidates, request);
+    if !clauses.is_empty() {
+        crate::ann::stage(started, "bm25 merge");
+    }
+    result
 }
 /// Candidate assembly needs only the evaluator's inputs. Copying the resident documents,
 /// shadow set, and replay history here only to clear them multiplies tail work per query.
@@ -910,6 +935,7 @@ async fn prepare_scalar(
     for clause in &clauses {
         out.scores.entry(rank_key(clause)).or_default();
     }
+    let segment_started = std::time::Instant::now();
     let parts = futures::future::try_join_all(state.segments.iter().map(|seg| {
         prepare_segment(
             store,
@@ -931,18 +957,14 @@ async fn prepare_scalar(
             out.scores.entry(rank).or_default().extend(scores);
         }
     }
-    for (id, doc) in &state.docs {
-        if !q
-            .filters
-            .as_ref()
-            .map(|f| filter::matches(f, Some(doc), None, &state.schema))
-            .transpose()?
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        let mut positive = false;
-        for clause in &clauses {
+    crate::ann::stage(segment_started, "bm25 segments+hydrate");
+    let tail_started = std::time::Instant::now();
+    let mut token_time = std::time::Duration::ZERO;
+    let mut score_time = std::time::Duration::ZERO;
+    let analyzer = crate::text_tail::Analyzer::new(&state.schema);
+    let prepared_queries: Vec<_> = clauses
+        .iter()
+        .map(|clause| {
             let RankBy::Bm25 {
                 attribute,
                 query,
@@ -954,27 +976,73 @@ async fn prepare_scalar(
             let cfg = state.schema[attribute]
                 .text_config()
                 .expect("validated FTS");
-            let query = bf_text::Query::new(
-                crate::text::tokens(query, &cfg),
-                crate::text::prefix(params.as_ref()),
-            );
-            let fallback = bf_text::CorpusStats::default();
-            let stats = state.corpus.get(attribute).unwrap_or(&fallback);
-            let score = bf_text::score_document(
-                &crate::text::tokens(doc.get(attribute).unwrap_or(&serde_json::Value::Null), &cfg),
-                &query,
-                stats,
-                &cfg,
-            ) as f64;
+            (
+                attribute,
+                rank_key(clause),
+                bf_text::Query::new(
+                    crate::text::tokens(query, &cfg),
+                    crate::text::prefix(params.as_ref()),
+                ),
+                cfg,
+            )
+        })
+        .collect();
+    let fallback = bf_text::CorpusStats::default();
+    let scorers: Vec<_> = prepared_queries
+        .iter()
+        .map(|(attribute, key, query, cfg)| {
+            (
+                attribute,
+                key,
+                bf_text::PreparedQuery::new(
+                    query,
+                    state.corpus.get(*attribute).unwrap_or(&fallback),
+                    cfg,
+                ),
+            )
+        })
+        .collect();
+    for (id, doc) in &state.docs {
+        if !q
+            .filters
+            .as_ref()
+            .map(|f| filter::matches(f, Some(doc), None, &state.schema))
+            .transpose()?
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let before = crate::ann::trace_stages().then(std::time::Instant::now);
+        let summary = (!scorers.is_empty()).then(|| analyzer.tail(doc));
+        if let Some(before) = before {
+            token_time += before.elapsed();
+        }
+        let before = crate::ann::trace_stages().then(std::time::Instant::now);
+        let mut positive = false;
+        for (attribute, key, scorer) in &scorers {
+            let score = summary
+                .as_ref()
+                .expect("text clause")
+                .fields
+                .get(**attribute)
+                .map_or(0.0, |terms| scorer.score(terms)) as f64;
             out.scores
-                .entry(rank_key(clause))
+                .entry((*key).clone())
                 .or_default()
                 .insert(id.clone(), score);
             positive |= score > 0.0;
         }
+        if let Some(before) = before {
+            score_time += before.elapsed();
+        }
         if all || positive {
             out.docs.insert(id.clone(), doc.clone());
         }
+    }
+    crate::ann::stage(tail_started, "bm25 tail total");
+    if crate::ann::trace_stages() {
+        eprintln!("STAGE bm25 tail tokenization {} us", token_time.as_micros());
+        eprintln!("STAGE bm25 tail scoring {} us", score_time.as_micros());
     }
     crate::sparse::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out);
     crate::pattern::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out)?;
