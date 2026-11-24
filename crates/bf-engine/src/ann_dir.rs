@@ -1263,7 +1263,10 @@ pub(crate) async fn search(
     let scan_upper = Arc::new(std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()));
     // Sample a selected code range per slab. This costs no I/O, and keeps resident
     // workloads on the existing per-slab scan rather than creating many small tasks.
-    let streaming = stream_scan(&dir, layout)
+    // Streaming seeds the raw cache before its scan readers start. With no retention budget,
+    // completed seed reads are discarded, and fast backends fetch them again for the scans.
+    let streaming = store.cache_limits().0 > 0
+        && stream_scan(&dir, layout)
         && !filtered
         && joint.is_none()
         && chosen.iter().any(|(&i, cs)| {

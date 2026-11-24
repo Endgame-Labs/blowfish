@@ -181,6 +181,7 @@ struct Planning {
 
 pub(crate) struct RangeCache {
     pub(crate) config: CacheConfig,
+    pub(crate) mapped: std::sync::OnceLock<Arc<crate::mapped::Mapped>>,
     memory: Cache<BlockKey, Bytes>,
     disk: Option<Arc<Mutex<Disk>>>,
     layouts: Cache<String, Layout>,
@@ -200,6 +201,9 @@ struct Spills {
 impl RangeCache {
     /// Empty the memory and disk tiers and the object-length cache (bench cold-cache runs).
     pub(crate) fn drop_all(&self) {
+        if let Some(mapped) = self.mapped.get() {
+            mapped.clear();
+        }
         self.memory.invalidate_all();
         self.memory.run_pending_tasks();
         self.layouts.invalidate_all();
@@ -257,6 +261,7 @@ impl RangeCache {
                     .unwrap_or(config.hedge_budget),
             ),
             spills: Arc::default(),
+            mapped: std::sync::OnceLock::new(),
             config,
             memory,
             disk,
@@ -477,6 +482,30 @@ impl RangeReader {
         stats: &CacheStats,
         mut ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<Vec<Bytes>, Error> {
+        if let Some(mapped) = self.storage.0.cache.mapped.get() {
+            for range in ranges {
+                if range.start > range.end || range.end > self.len() {
+                    return Err(Error::Config("invalid object range"));
+                }
+            }
+            let bytes = ranges.iter().map(|range| range.end - range.start).sum();
+            stats.record_many(
+                Tier::Miss,
+                bytes,
+                ranges.iter().filter(|range| !range.is_empty()).count() as u64,
+            );
+            let result = mapped.read(
+                &self.storage.path(&self.key),
+                self.len() + self.layout.offset,
+                self.layout.offset,
+                ranges,
+                self.admit,
+            );
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
+            return result;
+        }
         let prioritized = ready.is_some();
         let mut priorities = BTreeMap::new();
         let cache = &self.storage.0.cache;
