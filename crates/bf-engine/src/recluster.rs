@@ -868,6 +868,18 @@ fn assign_leaves(
     let assign = |leaves: &[Vec<f32>], _previous: Option<&[u32]>| -> Option<Vec<u32>> {
         #[cfg(test)]
         if let Some(graph) = &graph {
+            let refined = if _previous.is_some() {
+                let started = std::time::Instant::now();
+                let refined = graph::Graph::build(leaves, &members);
+                println!(
+                    "RR3 refined graph build seconds={:.3}",
+                    started.elapsed().as_secs_f64()
+                );
+                Some(refined)
+            } else {
+                None
+            };
+            let graph = refined.as_ref().unwrap_or(graph);
             let started = std::time::Instant::now();
             let visit_order = if _previous.is_none() {
                 offline::visit_order(present)

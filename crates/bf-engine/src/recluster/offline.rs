@@ -1,6 +1,59 @@
 //! Full-corpus offline prerequisite; enabled explicitly, and never run in ordinary test suites.
 use super::*;
 
+#[tokio::test]
+#[ignore = "requires an owned full-NQ source store and a new RR3_COPY under .scratch"]
+async fn full_nq_recluster_copy() {
+    let source = std::path::PathBuf::from(std::env::var_os("RR3_STORE").expect("RR3_STORE"));
+    let output = std::path::PathBuf::from(std::env::var_os("RR3_COPY").expect("RR3_COPY"));
+    assert!(output.components().any(|c| c.as_os_str() == ".scratch"));
+    assert!(!output.exists(), "the benchmark copy must be new");
+    assert!(
+        std::process::Command::new("cp")
+            .args(["-a", "--reflink=always"])
+            .arg(&source)
+            .arg(&output)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let store = bf_storage::Storage::open(&bf_storage::StorageConfig {
+        url: format!("file://{}", output.display()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let engine = Engine::with_config(
+        store,
+        crate::EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.,
+            decoded_cache_bytes: 1 << 30,
+            ..Default::default()
+        },
+    );
+    let scratch = output.join(".scratch");
+    let report = engine
+        .recluster(
+            "nq",
+            &ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 32,
+                cluster_rows: CLUSTER_ROWS,
+                max_slab_rows: 250_000,
+                scratch: scratch.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.rows, 2_681_468);
+    assert_eq!(std::fs::read_dir(scratch).unwrap().count(), 0);
+    println!(
+        "RR3 copied tier rows={} leaves={} seconds={:.3}",
+        report.rows, report.clusters, report.seconds
+    );
+}
+
 pub(super) fn visit_order(present: &[u32]) -> Option<Vec<usize>> {
     let root = std::path::PathBuf::from(std::env::var_os("RR3_SPILL")?);
     let offsets = spill_offsets(&root);

@@ -2,8 +2,8 @@
 use super::{Stage, math};
 use rayon::prelude::*;
 
-const DEGREE: usize = 24;
-const BEAM: usize = 4;
+const DEGREE: usize = 32;
+const BEAM: usize = 8;
 
 fn compare(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
     a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
@@ -152,9 +152,12 @@ impl Graph {
             if beam.len() < BEAM
                 || compare(&(d, i), &(beam.last().unwrap().0, beam.last().unwrap().1)).is_lt()
             {
-                beam.push((d, i, false));
-                beam.sort_unstable_by(|a, b| compare(&(a.0, a.1), &(b.0, b.1)));
-                beam.truncate(BEAM);
+                let at =
+                    beam.partition_point(|entry| compare(&(entry.0, entry.1), &(d, i)).is_lt());
+                beam.insert(at, (d, i, false));
+                if beam.len() > BEAM {
+                    beam.pop();
+                }
             }
         }
         while let Some(next) = beam.iter().position(|(_, _, expanded)| !expanded) {
