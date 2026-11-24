@@ -61,8 +61,7 @@ pub(crate) async fn execute(
     force_exact: bool,
 ) -> Result<QueryResponse, ApiError> {
     // Validate the complete request before touching index files, preserving M1 errors.
-    let mut empty = state.clone();
-    empty.docs.clear();
+    let empty = result_state(state);
     query::execute(&empty, request)?;
     if crate::streaming::supports(request) {
         return crate::streaming::execute(store, state, request).await;
@@ -116,8 +115,7 @@ pub(crate) async fn execute(
     // Only text subqueries wait for corpus statistics. In a cold RRF request,
     // ANN can start its directory and scan reads while those chunks arrive.
     let statistics = crate::text::global_stats(store, state, &terms).shared();
-    let mut candidates = state.clone();
-    candidates.docs.clear();
+    let mut candidates = result_state(state);
     // Subqueries (for example the ANN and BM25 halves of a hybrid query) read independent
     // files, so they run concurrently. Results merge in request order.
     let parts = futures::future::try_join_all(
@@ -173,6 +171,17 @@ pub(crate) async fn execute(
     }
     query::execute(&candidates, request)
 }
+/// Candidate assembly needs only the evaluator's inputs. Copying the resident documents,
+/// shadow set, and replay history here only to clear them multiplies tail work per query.
+fn result_state(state: &NamespaceState) -> NamespaceState {
+    NamespaceState {
+        schema: state.schema.clone(),
+        metric: state.metric,
+        segments: state.segments.clone(),
+        corpus: state.corpus.clone(),
+        ..Default::default()
+    }
+}
 #[derive(Clone)]
 struct HitKey {
     score: f64,
@@ -196,6 +205,26 @@ impl Ord for HitKey {
         (if self.descending { cmp.reverse() } else { cmp }).then(self.id.cmp(&other.id))
     }
 }
+/// Offer one exact score without cloning the ID of a noncompetitive row.
+fn offer(heap: &mut BinaryHeap<HitKey>, id: &Id, score: f64, descending: bool, k: usize) {
+    let competitive = heap.len() < k
+        || heap.peek().is_some_and(|worst| {
+            let cmp = score.total_cmp(&worst.score);
+            (if descending { cmp.reverse() } else { cmp })
+                .then(id.cmp(&worst.id))
+                .is_lt()
+        });
+    if competitive {
+        if heap.len() == k {
+            heap.pop();
+        }
+        heap.push(HitKey {
+            score,
+            id: id.clone(),
+            descending,
+        });
+    }
+}
 /// Keep only the globally competitive candidates while merging segment-local top-k lists.
 fn trim_candidates(state: &mut NamespaceState, q: &QueryRequest) {
     if q.limit.as_ref().and_then(Limit::per).is_some() {
@@ -210,17 +239,13 @@ fn trim_candidates(state: &mut NamespaceState, q: &QueryRequest) {
     let k = q.total().unwrap_or(10) + q.offset;
     let mut heap = BinaryHeap::new();
     for (id, score) in scores {
-        let hit = HitKey {
-            id: id.clone(),
-            score: *score,
-            descending: matches!(rank, RankBy::Bm25 { .. }),
-        };
-        if heap.len() < k {
-            heap.push(hit);
-        } else if heap.peek().is_some_and(|worst| hit < *worst) {
-            heap.pop();
-            heap.push(hit);
-        }
+        offer(
+            &mut heap,
+            id,
+            *score,
+            matches!(rank, RankBy::Bm25 { .. }),
+            k,
+        );
     }
     let keep: BTreeSet<_> = heap.into_iter().map(|hit| hit.id).collect();
     state.docs.retain(|id, _| keep.contains(id));
@@ -268,21 +293,10 @@ async fn prepare(
         if let Some((scores, docs)) =
             crate::ann::search(store, state, q, attribute, vector, config, k, &columns).await?
         {
-            let mut tail = state.clone();
-            tail.segments.clear();
-            let mut out = prepare_one(
-                store,
-                &tail,
-                q,
-                config,
-                force_exact,
-                narrow_columns,
-                threshold.as_deref(),
-            )
-            .await?;
-            out.docs.extend(crate::shared(docs));
-            out.scores.entry(rank_key(rank)).or_default().extend(scores);
-            trim_candidates(&mut out, q);
+            let mut out = result_state(state);
+            out.docs = crate::shared(docs);
+            let scores = merge_tail(state, q, attribute, vector, false, scores, &mut out)?;
+            out.scores.insert(rank_key(rank), scores);
             return Ok(out);
         }
     }
@@ -302,8 +316,7 @@ async fn prepare(
         trim_candidates(&mut out, q);
         return Ok(out);
     };
-    let mut base = state.clone();
-    base.docs.clear();
+    let mut base = state.without_docs();
     base.segments.clear();
     let base = std::sync::Arc::new(base);
     let parts = futures::stream::iter(state.segments.iter().cloned().map(|segment| {
@@ -449,8 +462,7 @@ async fn prepare_one(
     // Diversification can need arbitrarily deep candidates from each segment.
     let all = q.limit.as_ref().and_then(Limit::per).is_some();
     let k = q.total().unwrap_or(10) + q.offset;
-    let mut out = state.clone();
-    out.docs.clear();
+    let mut out = result_state(state);
     let mut scores = BTreeMap::new();
     let columns = projection_columns(state, q, narrow_columns);
     for seg in &state.segments {
@@ -513,6 +525,41 @@ async fn prepare_one(
             segment::projected_documents(store, seg, &rows, Some(&columns)).await?,
         ));
     }
+    let scores = merge_tail(state, q, attribute, vector, all, scores, &mut out)?;
+    out.scores.insert(rank_key(rank), scores);
+    Ok(out)
+}
+
+/// Every live tail vector is scored with the reference kernel. The heap retains the best
+/// `k + offset` from the union with indexed hits, using the same ID tie-break as the evaluator.
+/// Dropped rows therefore cannot change top-k. Diversified limits retain every candidate.
+#[allow(clippy::too_many_arguments)]
+fn merge_tail(
+    state: &NamespaceState,
+    q: &QueryRequest,
+    attribute: &str,
+    vector: &[f32],
+    all: bool,
+    mut scores: BTreeMap<Id, f64>,
+    out: &mut NamespaceState,
+) -> Result<BTreeMap<Id, f64>, ApiError> {
+    let start = std::time::Instant::now();
+    let context = crate::read_cache::context();
+    let attribute_key: std::sync::Arc<str> = attribute.into();
+    let admit = context.as_ref().is_some_and(|context| {
+        context.admit
+            && context
+                .cache
+                .tail_vectors
+                .fits(state.docs.len(), vector.len(), attribute.len())
+    });
+    let k = q.total().unwrap_or(10) + q.offset;
+    let mut heap = BinaryHeap::new();
+    if !all {
+        for (id, score) in &scores {
+            offer(&mut heap, id, *score, false, k);
+        }
+    }
     for (id, doc) in &state.docs {
         if q.filters
             .as_ref()
@@ -521,15 +568,29 @@ async fn prepare_one(
             .unwrap_or(true)
             && let Some(v) = doc.get(attribute)
         {
-            scores.insert(
-                id.clone(),
-                query::distance(&decode_vector(v)?, vector, state.metric),
-            );
+            let values = match &context {
+                Some(context) => context.cache.tail_vectors.get(doc, &attribute_key, admit)?,
+                None => crate::tail::Values::Transient(decode_vector(v)?),
+            };
+            let distance = query::distance(values.as_ref(), vector, state.metric);
+            if all {
+                scores.insert(id.clone(), distance);
+            } else {
+                offer(&mut heap, id, distance, false, k);
+            }
+        }
+    }
+    if !all {
+        scores = heap.into_iter().map(|hit| (hit.id, hit.score)).collect();
+    }
+    out.docs.retain(|id, _| scores.contains_key(id));
+    for id in scores.keys() {
+        if let Some(doc) = state.docs.get(id) {
             out.docs.insert(id.clone(), doc.clone());
         }
     }
-    out.scores.insert(rank_key(rank), scores);
-    Ok(out)
+    crate::ann::stage(start, "tail score+merge");
+    Ok(scores)
 }
 
 pub(crate) fn recall(ann: &QueryResponse, exact: &QueryResponse) -> f64 {
@@ -778,8 +839,7 @@ async fn prepare_scalar(
     let plain_text = matches!(q.rank_by, Some(RankBy::Bm25 { .. }));
     let k = q.total().unwrap_or(10000) + q.offset;
     let all = !plain_text || q.limit.as_ref().and_then(Limit::per).is_some();
-    let mut out = state.clone();
-    out.docs.clear();
+    let mut out = result_state(state);
     let mut columns: BTreeSet<_> = state
         .schema
         .iter()

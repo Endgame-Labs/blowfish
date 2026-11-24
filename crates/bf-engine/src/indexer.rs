@@ -1207,10 +1207,12 @@ impl Engine {
 /// A flush of a tail written at least this fast is a bulk load's (NQ loads at about 10,000 rows a
 /// second; the continuous-write test writes 1,000).
 const BULK_LOAD_ROWS_PER_SEC: f64 = 2_000.0;
-/// True while a bulk load is still writing and its tail is under the bulk-flush limits: wait
-/// for more rows rather than building a small segment now.
+/// Give arriving writes one normal flush-age window to establish their rate, then accumulate
+/// only bulk loads. A steady stream below the bulk rate must not leave a minute of exact scans.
 fn bulk_wait(state: &NamespaceState, config: &EngineConfig, tail_age: Duration) -> bool {
     config.index_age >= Duration::from_secs(1)
+        && (tail_age < config.index_age
+            || state.docs.len() as f64 / tail_age.as_secs_f64().max(1.0) >= BULK_LOAD_ROWS_PER_SEC)
         && state.shadowed.len() < config.bulk_flush_rows
         && tail_age < config.bulk_flush_age
         && state.tail_bytes < config.bulk_flush_bytes.min(config.max_unindexed_bytes)
@@ -1394,6 +1396,39 @@ async fn build_segments<D: std::borrow::Borrow<bf_types::Document> + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steady_writes_flush_at_normal_age_but_bulk_loads_keep_accumulating() {
+        let config = EngineConfig {
+            bulk_flush_rows: 100_000,
+            bulk_flush_bytes: 1_000_000_000,
+            ..Default::default()
+        };
+        for rate in [100, 300, 1000, 3000] {
+            let mut state = NamespaceState {
+                updated_at: Utc::now(),
+                ..Default::default()
+            };
+            for id in 0..rate * 6 {
+                state
+                    .docs
+                    .insert(bf_types::Id::Uint(id), std::sync::Arc::default());
+                state.shadowed.insert(bf_types::Id::Uint(id));
+            }
+            assert_eq!(
+                bulk_wait(&state, &config, Duration::from_secs(6)),
+                rate >= 2000,
+                "rate={rate}"
+            );
+            assert!(bulk_wait(&state, &config, Duration::from_secs(1)));
+            assert!(!bulk_wait(&state, &config, config.bulk_flush_age));
+            state.updated_at = Utc::now() - chrono::Duration::seconds(2);
+            assert!(!bulk_wait(&state, &config, Duration::from_secs(6)));
+            state.updated_at = Utc::now();
+            state.tail_bytes = config.bulk_flush_bytes;
+            assert!(!bulk_wait(&state, &config, Duration::from_secs(6)));
+        }
+    }
 
     fn state_with(rows: &[u32]) -> NamespaceState {
         let mut state = NamespaceState::default();
