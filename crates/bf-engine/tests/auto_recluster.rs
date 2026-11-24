@@ -420,7 +420,7 @@ async fn writes_after_a_base_get_a_delta_on_its_cells_and_then_merge_into_a_new_
         assert_eq!(top(&fresh, q).await, json!(q));
     }
 
-    // Half the base outside it: a merge into one new base, on the same cells.
+    // Half the base outside it: a merge into one new base, with cells trained on all live rows.
     write_rows(&engine, 6600..9000, 0).await;
     let report = engine
         .recluster("t", &options(scratch.path()))
@@ -430,10 +430,15 @@ async fn writes_after_a_base_get_a_delta_on_its_cells_and_then_merge_into_a_new_
     let merged = tiers(&store).await;
     assert_eq!(merged.len(), 1);
     assert_ne!(merged[0].dir.key, base[0].dir.key);
-    assert_eq!(merged[0].coarse.as_ref().map(|f| &f.key), Some(&cells.key));
-    assert_eq!(merged[0].coarse_rows, 6000);
+    assert_ne!(merged[0].coarse.as_ref().map(|f| &f.key), Some(&cells.key));
+    assert_eq!(merged[0].coarse_rows, 9000);
+    let new_cells = merged[0].coarse.as_ref().unwrap();
     engine.collect_garbage("t").await.unwrap();
-    assert!(store.get(&cells.key).await.is_ok());
+    assert!(store.get(&new_cells.key).await.is_ok());
+    assert!(matches!(
+        store.get(&cells.key).await,
+        Err(bf_storage::Error::NotFound)
+    ));
     for q in [17usize, 6500, 8999] {
         assert_eq!(top(&engine, q).await, json!(q));
     }

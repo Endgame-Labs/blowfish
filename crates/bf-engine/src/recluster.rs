@@ -366,17 +366,17 @@ impl Engine {
                 bf_vector::prepare_vector(&first.decode_stored(buf), metric)
             }
         };
-        let reused = match &target.coarse {
-            Some((file, rows)) => {
-                Some((read_coarse(store, file, dims).await?, file.clone(), *rows))
-            }
-            None => None,
+        // Deltas use their base's partition. A base rebuild trains from its own canonical rows:
+        // inherited cells may have been trained by older code or over a different prefix.
+        let reused = match (&target.coarse, target.kind) {
+            (Some((file, _)), Kind::Delta) => Some(read_coarse(store, file, dims).await?),
+            _ => None,
         };
         let cells = opts.cells.max(1).min(present.len());
         let (assignment, cell_rows, coarse) = {
             let (present, read_row) = (present.clone(), read_row.clone());
             let cells_n = cells;
-            let known = reused.as_ref().map(|(centers, _, _)| centers.clone());
+            let known = reused;
             let stop = self.0.stop.clone();
             on_pool(move || {
                 let centers = known.unwrap_or_else(|| {
@@ -433,11 +433,10 @@ impl Engine {
             .await?
             .ok_or_else(shutting_down)?
         };
-        // A base keeps its cells for the deltas built against it and for its merge.
-        let coarse_file = match (target.kind, reused) {
-            (Kind::Delta, _) => None,
-            (Kind::Base, Some((_, file, rows))) => Some((file, rows)),
-            (Kind::Base, None) => {
+        // A base keeps its canonical cells for the deltas built against it.
+        let coarse_file = match target.kind {
+            Kind::Delta => None,
+            Kind::Base => {
                 let mut bytes = Vec::with_capacity(coarse.len() * dims * 4);
                 for x in coarse.iter().flatten() {
                     bytes.extend_from_slice(&x.to_le_bytes());

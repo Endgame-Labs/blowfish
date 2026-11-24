@@ -46,9 +46,6 @@ const DELTA_GROWTH: f64 = 0.25;
 /// the tiers are rebuilt once deletes and updates mask this share of their rows.
 const MERGE_SHARE: f64 = 0.5;
 const MASKED_SHARE: f64 = 0.2;
-/// A merge retrains the coarse cells once the rows have grown this many times past the rows
-/// they were trained over.
-const COARSE_GROWTH: u64 = 4;
 /// A namespace whose indexer flushed a bulk-load-sized tail this recently is still loading.
 const BULK_WINDOW: Duration = Duration::from_secs(300);
 /// A bulk load has settled once writes have paused this long and its tail is indexed. This is
@@ -342,7 +339,7 @@ fn forced_kind(
 }
 
 /// What a build reads and makes: its kind, the segments whose rows it covers (in manifest order),
-/// and the coarse cells it reuses.
+/// and, for a delta, the base's coarse cells it reuses.
 pub(crate) struct Target {
     pub kind: Kind,
     pub segments: Vec<bf_wal::Segment>,
@@ -360,11 +357,6 @@ fn target(manifest: &Manifest, attr: &str, kind: Kind, building: &BTreeSet<Strin
     let base = tiers
         .first()
         .filter(|b| b.format == bf_wal::TIER_FORMAT_VERSION);
-    let all: u64 = manifest
-        .segments
-        .iter()
-        .map(|s| u64::from(s.row_count))
-        .sum();
     match (kind, base) {
         (Kind::Delta, Some(base)) if base.coarse.is_some() => {
             // Rows the base holds, in segments it covers or merged ones' targets.
@@ -393,9 +385,8 @@ fn target(manifest: &Manifest, attr: &str, kind: Kind, building: &BTreeSet<Strin
         _ => Target {
             kind: Kind::Base,
             segments: manifest.segments.clone(),
-            coarse: base
-                .and_then(|b| b.coarse.clone().map(|f| (f, b.coarse_rows)))
-                .filter(|(_, rows)| all <= rows.saturating_mul(COARSE_GROWTH)),
+            // A base is canonical for its live rows, regardless of its inherited layout.
+            coarse: None,
         },
     }
 }

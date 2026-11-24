@@ -36,7 +36,11 @@ async fn write(e: &Engine, body: Value) {
 
 /// Compare membership by unique packed-vector fingerprints, rather than manifest-derived row
 /// numbers. Distance fingerprints also check trained centers, including empty leaves.
-async fn layout(batch: usize, strings: bool) -> (Vec<u8>, Vec<Vec<Vec<u8>>>, Vec<Vec<f32>>) {
+async fn layout(
+    batch: usize,
+    strings: bool,
+    prior: bool,
+) -> (Vec<u8>, Vec<Vec<Vec<u8>>>, Vec<Vec<f32>>) {
     let store = Storage::open(&StorageConfig {
         url: "memory://".into(),
         ..Default::default()
@@ -76,6 +80,23 @@ async fn layout(batch: usize, strings: bool) -> (Vec<u8>, Vec<Vec<Vec<u8>>>, Vec
     .await;
     writer.index_namespace("t", true).await.unwrap();
     let scratch = tempfile::tempdir().unwrap();
+    if prior {
+        writer
+            .recluster(
+                "t",
+                &ReclusterOptions {
+                    attribute: "vector".into(),
+                    cells: 2,
+                    cluster_rows: 17,
+                    max_slab_rows: 250,
+                    scratch: scratch.path().into(),
+                },
+            )
+            .await
+            .unwrap();
+        // The inherited tier remains readable until its replacement is installed.
+        assert_eq!(ids(&writer, 5).await[0], doc_id(5));
+    }
     writer
         .recluster(
             "t",
@@ -126,13 +147,20 @@ async fn layout(batch: usize, strings: bool) -> (Vec<u8>, Vec<Vec<Vec<u8>>>, Vec
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clustering_is_independent_of_write_batches_and_segment_order() {
     for strings in [false, true] {
-        let (coarse_a, members_a, centers_a) = layout(257, strings).await;
-        let (coarse_b, members_b, centers_b) = layout(113, strings).await;
+        let (coarse_a, members_a, centers_a) = layout(257, strings, false).await;
+        let (coarse_b, members_b, centers_b) = layout(113, strings, false).await;
         assert_eq!(coarse_a, coarse_b, "coarse centers");
         assert_eq!(centers_a, centers_b, "leaf-center distances");
         assert_eq!(members_a.len(), members_b.len(), "leaf count");
         for (leaf, (a, b)) in members_a.iter().zip(&members_b).enumerate() {
             assert!(a == b, "membership of leaf {leaf}");
+        }
+        let (coarse_c, members_c, centers_c) = layout(113, strings, true).await;
+        assert_eq!(coarse_a, coarse_c, "inherited coarse cells were retrained");
+        assert_eq!(centers_a, centers_c, "rebuilt leaf-center distances");
+        assert_eq!(members_a.len(), members_c.len(), "rebuilt leaf count");
+        for (leaf, (a, c)) in members_a.iter().zip(&members_c).enumerate() {
+            assert!(a == c, "rebuilt membership of leaf {leaf}");
         }
     }
 }
