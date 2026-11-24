@@ -35,7 +35,7 @@ uv run python -I load.py $D --base-url http://127.0.0.1:18100 --namespace nq
   - **quality:** all 3,452 queries at `top_k` 100 (four at a time): recall@10 against the exact top 10, and F1@10,
     nDCG@10, and recall@100 against the qrels (smaller k are prefixes of the top 100);
   - **latency:** one warm-up pass over the first 1,000 queries, then the same 1,000 at concurrency 1 (`top_k` 10),
-    client-timed over one keep-alive connection: p50, p95, and p99;
+    client-timed over one keep-alive connection: p50, p90, p95, and p99;
   - **throughput:** the first 2,000 queries (`top_k` 10) with bodies encoded before the clock starts, at 1, 4, and
     16 clients. Each client is a separate process with one keep-alive connection and takes every Nth query. The rate
     is 2,000 over the wall time from a common start to the last response.

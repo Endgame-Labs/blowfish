@@ -6,7 +6,7 @@ Usage:
 - quality: all 3,452 test queries at top_k 100 (concurrency 4). Recall@10 against the exact top 10 (`truth.npy`),
   and F1@10, nDCG@10, and recall@100 against the qrels. Smaller k are prefixes of the top 100.
 - latency: one warm-up pass over the first 1,000 queries, then the same 1,000 at concurrency 1 (top_k 10),
-  timed by the client over a keep-alive HTTP connection: p50, p95, and p99.
+  timed by the client over a keep-alive HTTP connection: p50, p90, p95, and p99.
 - throughput: the first 2,000 queries (top_k 10), request bodies encoded before the clock starts, at 1, 4, and 16
   clients. Each client is a separate process with one keep-alive connection and takes every Nth query; the rate is
   2,000 over the wall time from a common start to the last response.
@@ -117,7 +117,7 @@ def latency(a, q):
         c.query(b)
         t.append((time.perf_counter() - s) * 1000)
     p = lambda x: round(float(np.percentile(t, x)), 1)
-    return {"p50": p(50), "p95": p(95), "p99": p(99), "mean": round(float(np.mean(t)), 1), "max": round(max(t), 1)}
+    return {"p50": p(50), "p90": p(90), "p95": p(95), "p99": p(99), "mean": round(float(np.mean(t)), 1), "max": round(max(t), 1)}
 
 
 def worker(base, ns, bodies, cpus, start, out):
