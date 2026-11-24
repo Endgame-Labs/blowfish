@@ -4,6 +4,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-11-24
+
 ### Changed
 
 - **New home and license holder:** The repository moved from `dorkitude/blowfish` to [`endgame-labs/blowfish`](https://github.com/endgame-labs/blowfish); old URLs, clones, and remotes redirect. The MIT license's copyright holder is now Endgame Labs, Inc.
@@ -140,7 +142,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.17
 [0.1.16]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.16
 [0.1.15]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.15
 [0.1.14]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.14
