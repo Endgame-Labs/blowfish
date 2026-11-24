@@ -602,8 +602,12 @@ fn cluster_counts(
     let matching = counts.iter().map(|n| *n as usize).sum();
     // Charge the pinned predicate even if its protected-cache entry is evicted. Both key
     // copies and the value's containers are included in this conservative reservation.
-    let bytes =
-        (counts.capacity() * 4 + allowed.serialized_size() * 2 + key.len() * 2 + 256) as u64;
+    let stats = allowed.statistics();
+    let predicate_bytes = stats.n_bytes_array_containers
+        + stats.n_bytes_bitset_containers
+        + stats.n_bytes_run_containers
+        + u64::from(stats.n_containers) * 64;
+    let bytes = (counts.capacity() * 4 + key.len() * 2 + 256) as u64 + predicate_bytes;
     read_cache::insert(
         &key,
         bytes,

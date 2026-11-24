@@ -178,7 +178,10 @@ entry pins and charges its predicate, preventing pointer reuse and keeping evict
 generations are fenced by the existing predicate cache; WAL-shadowed winners are still removed after hydration.
 
 Sparse masks use row-indexed coarse code scoring when the allowed share is at most one sixteenth, both across the scan and
-within a leaf. It reads only selected ordinals from the existing transposed code blocks, with the same integer table sums,
+within a leaf. One scratch membership bitmap per scan avoids repeatedly merging each leaf with the same predicate; its
+length is capped at one u64 word per scanned row, with normal scratch-capacity reuse; widely spaced external row IDs retain
+the bitmap intersection.
+It reads only selected ordinals from the existing transposed code blocks, with the same integer table sums,
 coarse scores, error bounds, zero handling, and fine rescoring. Entire code blocks still receive checksum and factor
 validation before use. Dense and unfiltered scans keep their block kernel. Neither the bucket format nor the HTTP API
 changes, and there is no new setting.

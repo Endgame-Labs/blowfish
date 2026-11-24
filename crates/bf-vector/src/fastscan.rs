@@ -615,13 +615,21 @@ impl FastQuery {
                 f32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
             };
             let (sq, signed_k1, k2, cb) = (factor(0), factor(1), factor(2), factor(3));
-            let block = &bytes[16 * rows + ordinal / BLOCK * (padded / 8 * BLOCK)..];
+            let width = padded / 8 * BLOCK;
+            let block = &bytes[16 * rows + ordinal / BLOCK * width..][..width];
             let j = ordinal % BLOCK;
             let mut sum = 0u32;
-            for t in 0..padded / 8 {
-                let byte = block[t * BLOCK + j];
-                sum += u32::from(self.coarse.lut[(2 * t) * 16 + (byte & 15) as usize])
-                    + u32::from(self.coarse.lut[(2 * t + 1) * 16 + (byte >> 4) as usize]);
+            // Fixed-width chunks expose the nibble bounds once, instead of checking
+            // offsets into the entire table and code buffer for every lookup.
+            for (code, table) in block
+                .as_chunks::<BLOCK>()
+                .0
+                .iter()
+                .zip(self.coarse.lut.as_chunks::<32>().0)
+            {
+                let byte = code[j];
+                sum += u32::from(table[(byte & 15) as usize])
+                    + u32::from(table[16 + (byte >> 4) as usize]);
             }
             let k = signed_k1.abs();
             let zero = signed_k1.is_sign_negative();
