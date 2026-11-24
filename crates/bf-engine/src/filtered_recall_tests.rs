@@ -102,7 +102,7 @@ async fn selective_distributed_masks_preserve_recall_and_format_four() {
         store.clone(),
         EngineConfig {
             legacy_three_filter_test: true,
-            ..config
+            ..config.clone()
         },
     );
     let mut selective = (0usize, 0usize, 0usize);
@@ -141,6 +141,53 @@ async fn selective_distributed_masks_preserve_recall_and_format_four() {
         selective.1,
         selective.2
     );
+    // Compare true-neighbor sets per query, rather than allowing gains on one query to
+    // hide losses on another. The frozen planner has exactly current main's probe rule.
+    for probes in [48, 64] {
+        let candidate = Engine::with_config(
+            store.clone(),
+            EngineConfig {
+                ann_nprobe: probes,
+                ..config.clone()
+            },
+        );
+        let baseline = Engine::with_config(
+            store.clone(),
+            EngineConfig {
+                ann_nprobe: probes,
+                baseline_filter_test: true,
+                ..config.clone()
+            },
+        );
+        for attribute in ["id", "bucket"] {
+            for percent in [1, 10, 50] {
+                for i in 0..8 {
+                    let limit = if attribute == "id" {
+                        400 * percent
+                    } else {
+                        percent
+                    };
+                    let body = json!({"rank_by":["vector","ANN",vector(137+i*4999)],
+                        "filters":[attribute,"Lt",limit],"top_k":5,"include_attributes":false});
+                    let mut exact = body.clone();
+                    exact["rank_by"][1] = json!("kNN");
+                    let truth = query(&candidate, exact).await;
+                    let before = query(&baseline, body.clone()).await;
+                    let after = query(&candidate, body).await;
+                    for row in before
+                        .iter()
+                        .filter(|row| truth.iter().any(|t| t["id"] == row["id"]))
+                    {
+                        assert!(
+                            after.iter().any(|a| a["id"] == row["id"]),
+                            "probes={probes}, attribute={attribute}, percent={percent}, query={i}, missing={}",
+                            row["id"]
+                        );
+                    }
+                }
+            }
+        }
+    }
     assert!(
         query(
             &engine,

@@ -75,6 +75,9 @@ pub struct EngineConfig {
     /// Fixed legacy behavior used only by the internal recall regression test.
     #[cfg(test)]
     pub(crate) legacy_three_filter_test: bool,
+    /// Frozen inverse-selectivity planner, used only by per-query recall comparisons.
+    #[cfg(test)]
+    pub(crate) baseline_filter_test: bool,
     /// Fraction of ANN requests checked against exhaustive ground truth.
     pub recall_sample_rate: f64,
     /// Least time between two sampled recall comparisons (and only one runs at a time).
@@ -145,6 +148,8 @@ impl Default for EngineConfig {
             exact_fetch_rows: 8192,
             #[cfg(test)]
             legacy_three_filter_test: false,
+            #[cfg(test)]
+            baseline_filter_test: false,
             recall_sample_rate: 0.01,
             recall_sample_interval: Duration::from_secs(60),
             models: None,

@@ -164,6 +164,25 @@ A filtered ANN query now takes the same path as an unfiltered one:
    There is no fixed cap: a cap of three times the unfiltered count lost neighbors on selective filters.
 3. Winners are hydrated by segment row (`projected_rows`), so no ID index is read.
 
+The filtered planner also recognizes a cluster-local mask when leaves with any allowed member hold less than half of the
+source rows. It walks those leaves in center-distance order and can stop after their **actual allowed counts** cover two
+unfiltered probe populations, including the existing witness margin and at least the rerank budget. The original scaled
+probe plan remains a ceiling on this extra walk. Distributed and broad masks retain its geometric floor. A literal
+rerank-sized survivor pool lost true neighbors, even with the unfiltered minimum; exact counts alone do not prove that the
+probed centers cover the nearest filtered vectors.
+
+Immutable predicates share their `Arc` with the filtered planner. Derived membership counts are cached by that predicate's
+identity and immutable fragment key, within the existing decoded budget and namespace storage scope. Each cached count
+entry pins and charges its predicate, preventing pointer reuse and keeping evicted predicates accounted for. Schema and live
+generations are fenced by the existing predicate cache; WAL-shadowed winners are still removed after hydration.
+
+Sparse masks use row-indexed coarse code scoring when the allowed share is at most one sixteenth, both across the scan and
+within a leaf. It reads only selected ordinals from the existing transposed code blocks, with the same integer table sums,
+coarse scores, error bounds, zero handling, and fine rescoring. Entire code blocks still receive checksum and factor
+validation before use. Dense and unfiltered scans keep their block kernel. Neither the bucket format nor the HTTP API
+changes, and there is no new setting.
+
+
 Old fragments and directories (no map) make the directory unusable for the namespace until compaction rewrites them:
 queries use the per-segment path, as for segments without fragments. A directory in an unknown format is ignored, not an
 error. The unindexed-tail fall-back (any tail upsert disables the directory path) is unchanged and is the next fix.
