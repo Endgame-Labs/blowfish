@@ -122,12 +122,17 @@ Foreground selection additionally requires predicted CPU savings over the next 2
 at least twice measured construction CPU. The builder records its worker CPU and source-transform
 CPU, with a conservative 10% allowance for source decoding. Graph query CPU is measured on the
 ordinary query workers, charging each poll on its current thread and excluding I/O waits across
-CPU-to-I/O continuation. The pre-promotion IVF EWMA supplies the comparison. A calibrated graph that
+CPU-to-I/O continuation. Each graph recall trial also runs the ordinary IVF plan for the same
+request and snapshot, with the same admission, worker, and query concurrency. These paired CPU
+observations refine the pre-promotion IVF EWMA; only exhaustive truth work is throttled to one
+search worker. A calibrated graph that
 remains unprofitable for a full observation window is discarded. All thresholds are internal policy;
 there are no per-corpus ef constants or user-facing graph controls.
 
-Both automatic and explicit exhaustive recall comparisons bypass cache admission, so calibration
-does not fill foreground caches with a one-pass full-corpus scan. Existing recall pacing still limits
+Both automatic and explicit recall trials use ordinary cache admission for ANN, so measured
+query cost reflects the serving path. Their exhaustive reference pass separately bypasses cache
+admission and graph selection. Calibration therefore cannot fill foreground caches with a
+one-pass full-corpus scan, or mistake repeated uncached sparse mapping opens for serving cost. Existing recall pacing still limits
 expensive background comparisons. Read-only diagnostics report construction wall time, measured CPU,
 reservation, retained capacity, current effort, calibration samples, and successful graph plans.
 

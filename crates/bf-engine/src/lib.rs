@@ -873,8 +873,9 @@ impl Engine {
             // The exhaustive search reads every vector: one segment at a time, so it holds one
             // core rather than all of them, and without filling the block caches, so it does not
             // evict what live queries reuse.
-            let mut config = self.0.config.clone();
-            config.search_concurrency = 1;
+            let config = self.0.config.clone();
+            let mut exact_config = config.clone();
+            exact_config.search_concurrency = 1;
             let sample = state.clone();
             let trial = graph_scope.map(|s| s.trial());
             let cache = self.0.read_cache.clone();
@@ -886,22 +887,39 @@ impl Engine {
                 };
                 let runtime = tokio::runtime::Handle::current();
                 let context = read_cache::ReadContext {
-                    admit: false,
                     hot_graph: trial.clone(),
                     ..read_cache::ReadContext::new(cache)
                 };
                 let _ = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     let _sampling = sampling;
+                    let exact_context = context.exhaustive();
+                    let ivf_context = context.ivf_reference();
                     runtime.block_on(read_cache::scope(context, async move {
                         let cpu = warm_graph::thread_cpu();
                         let ann = indexed::execute(&store, &sample, &request, &config, false).await;
                         if let Some(scope) = &trial {
                             scope.record_cpu((warm_graph::thread_cpu() - cpu).max(0.));
                         }
+                        if ann.is_ok() && trial.as_ref().is_some_and(|s| s.used_graph()) {
+                            let cpu = warm_graph::thread_cpu();
+                            if read_cache::scope(
+                                ivf_context,
+                                indexed::execute(&store, &sample, &request, &config, false),
+                            )
+                            .await
+                            .is_ok()
+                                && let Some(scope) = &trial
+                            {
+                                scope.record_ivf_cpu((warm_graph::thread_cpu() - cpu).max(0.));
+                            }
+                        }
                         if let (Some(Ok(exact)), Ok(ann)) = (
-                            stop.run(indexed::execute(&store, &sample, &request, &config, true))
-                                .await,
+                            stop.run(read_cache::scope(
+                                exact_context,
+                                indexed::execute(&store, &sample, &request, &exact_config, true),
+                            ))
+                            .await,
                             ann,
                         ) {
                             let recall = indexed::recall(&ann, &exact);
@@ -1121,7 +1139,6 @@ impl Engine {
         let engine = self.clone();
         let ns = ns.to_owned();
         let context = read_cache::ReadContext {
-            admit: false,
             hot_graph: Some(warm_graph::Scope::new(self.0.hot_graph.clone(), &ns).trial()),
             ..read_cache::ReadContext::new(self.0.read_cache.clone())
         };

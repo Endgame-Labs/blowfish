@@ -307,6 +307,22 @@ pub(crate) struct ReadContext {
     pub document_scan_rows: Arc<std::sync::atomic::AtomicU64>,
 }
 impl ReadContext {
+    /// Exhaustive reference work reads through existing caches without admitting its scan.
+    /// It cannot select an approximate graph or contribute graph CPU measurements.
+    pub(crate) fn exhaustive(&self) -> Self {
+        Self {
+            admit: false,
+            hot_graph: None,
+            ..self.clone()
+        }
+    }
+    /// A normal ANN cost reference with the optional graph disabled, on the same snapshot.
+    pub(crate) fn ivf_reference(&self) -> Self {
+        Self {
+            hot_graph: None,
+            ..self.clone()
+        }
+    }
     /// A context with fresh statistics that admits its reads.
     pub fn new(cache: Arc<DecodedCache>) -> Self {
         Self {

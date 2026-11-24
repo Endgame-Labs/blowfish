@@ -1037,8 +1037,31 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
         if let Some(scope) = crate::read_cache::context().and_then(|c| c.hot_graph) {
             scope.record_cpu((crate::warm_graph::thread_cpu() - cpu).max(0.));
         }
-        let exact =
-            crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, true).await?;
+        if let Some(scope) = crate::read_cache::context().and_then(|c| c.hot_graph)
+            && scope.used_graph()
+        {
+            let context = crate::read_cache::context()
+                .expect("recall read context")
+                .ivf_reference();
+            let cpu = crate::warm_graph::thread_cpu();
+            if crate::read_cache::scope(
+                context,
+                crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, false),
+            )
+            .await
+            .is_ok()
+            {
+                scope.record_ivf_cpu((crate::warm_graph::thread_cpu() - cpu).max(0.));
+            }
+        }
+        let exact_context = crate::read_cache::context()
+            .unwrap_or_else(|| crate::read_cache::ReadContext::new(engine.0.read_cache.clone()))
+            .exhaustive();
+        let exact = crate::read_cache::scope(
+            exact_context,
+            crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, true),
+        )
+        .await?;
         let measured = crate::indexed::recall(&ann, &exact);
         if let Some(scope) = crate::read_cache::context().and_then(|c| c.hot_graph) {
             scope.feedback(measured);

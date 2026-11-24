@@ -142,6 +142,10 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         held.calibration.lock().unwrap().usable,
         "exact recall sampling must calibrate and amortize the graph"
     );
+    assert!(
+        e.0.hot_graph.entries.lock().unwrap()[&key].ivf_seconds < 1.,
+        "recall must replace the synthetic initial baseline with paired IVF observations"
+    );
     // A graph selected during planning can lose its query scratch slot before execution.
     // The complete ordinary IVF plan must be restored rather than keeping independent seats.
     let permit = held
@@ -358,4 +362,128 @@ async fn migrated_query_polls_charge_cpu_without_charging_io_waits() {
         charged < start.elapsed() / 2,
         "timer waits are not foreground CPU"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.scratch")
+        .join(format!("g4-recall-cache-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        cache: CacheConfig {
+            block_size: 16 << 10,
+            // The graph and paired IVF working sets fit; the separate truth objects do not.
+            memory_bytes: 4 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let e = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.,
+            decoded_cache_bytes: 64 << 20,
+            ..Default::default()
+        },
+    );
+    let mut seed = 19u64;
+    let vectors = (0..20_000)
+        .map(|_| {
+            (0..64)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 40) as f32 / 16777216. * 2. - 1.
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    e.write("hot", serde_json::from_value(json!({
+        "distance_metric":"cosine_distance",
+        "schema":{"vector":{"type":"[64]f16","ann":true}},
+        "upsert_rows":vectors.iter().enumerate().map(|(id,v)| json!({"id":id,"vector":v})).collect::<Vec<_>>()
+    })).unwrap()).await.unwrap();
+    e.index_namespace("hot", true).await.unwrap();
+    e.recluster(
+        "hot",
+        &ReclusterOptions {
+            attribute: "vector".into(),
+            cells: 2,
+            cluster_rows: 64,
+            max_slab_rows: 20_000,
+            scratch: root.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let (state, _) = e
+        .snapshot("hot", &bf_types::Consistency::Strong)
+        .await
+        .unwrap();
+    let set = &state.ann_tiers["vector"][0];
+    let key = Key::new("hot", &state, "vector", set);
+    let entry = Arc::new(admitted_entry(&e, set).await);
+    let mut heat = Heat::new(Instant::now());
+    heat.rate = 100.;
+    heat.ivf_seconds = 1.;
+    heat.ready = Some(entry.clone());
+    e.0.hot_graph.entries.lock().unwrap().insert(key, heat);
+    store.drop_caches();
+    e.0.read_cache.clear();
+    let vector = &vectors[171];
+    let (hits, _) = entry
+        .graph
+        .candidates(vector, 64, 30, None, &mut entry.graph.scratch())
+        .unwrap();
+    let at = entry
+        .locations
+        .binary_search_by_key(&hits[0], |p| p.0)
+        .unwrap();
+    let [slab, cluster, ordinal] = entry.locations[at].1;
+    let probe = || {
+        let mut context = crate::read_cache::ReadContext::new(e.0.read_cache.clone());
+        context.admit = false;
+        context
+    };
+    let before = probe();
+    let before_stats = before.stats.clone();
+    crate::read_cache::scope(
+        before,
+        entry.sources[slab as usize].rerank_candidates(vector, 1, vec![(cluster, ordinal)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(before_stats.cache_hit_ratio(), 0.);
+    let answered = e.0.hot_graph.answers.load(Ordering::Relaxed);
+    e.recall(
+        "hot",
+        json!({"num":1,"top_k":10,"rank_by":["vector","ANN",vector]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        e.0.hot_graph.answers.load(Ordering::Relaxed),
+        answered + 1,
+        "the IVF cost reference and exhaustive truth must not use the graph"
+    );
+    let after = probe();
+    let after_stats = after.stats.clone();
+    crate::read_cache::scope(
+        after,
+        entry.sources[slab as usize].rerank_candidates(vector, 1, vec![(cluster, ordinal)]),
+    )
+    .await
+    .unwrap();
+    assert!(
+        after_stats.cache_hit_ratio() > 0.,
+        "ANN's sparse vector must remain cached after the larger exhaustive pass"
+    );
+    e.shutdown(Duration::from_secs(3)).await;
 }

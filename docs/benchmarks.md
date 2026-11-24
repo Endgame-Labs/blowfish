@@ -7880,6 +7880,72 @@ flag, graph import, or graph setting. The bucket's IVF format and query fallback
 The implementation and internal policy are described in `docs/design/hot-tier-graph.md`. Release
 performance gates are still in progress; the G3 imported-graph numbers above are historical results.
 
+### Production bounded global constructor
+
+The final constructor streams rotated SQ8, constructs one whole-tier R32/L64 graph with fixed
+64-slot transient adjacency, and releases the code spool and construction arrays on publication.
+It retains no f16 source. On the same eight-core Graviton3 host, with two nice-5 construction
+workers, the full 2,681,468-row NQ build completed in **1,259.333 s wall** and **2,366.307 CPU s**.
+Constructor high-water RSS was **3,823,692 KiB (3.65 GiB)**, below its **4,913,880,315-byte** vector
+construction/publication reservation. The installed graph retains **3,134,636,096 bytes**.
+
+That is **6.38 times less wall time** and **4.05 times less CPU** than the first bounded candidate.
+The completed SQ8 spool is **2,756,549,104 bytes**. Its pages are released while loading codes.
+The later **8.12 GiB** benchmark peak includes a full f16 corpus loaded only after recording the
+constructor's high-water mark; it is not construction memory or a server cache requirement.
+
+All-query resident diagnostics use eight query threads, exact f16 rerank30 with the original f32
+query, and top-k 10. These are short, single-pass core timings, separate from the HTTP gate.
+
+| ef | Recall@10 | Mean distance evaluations | Queries/s |
+|---:|---:|---:|---:|
+| 64 | 0.943250 | 1,530.3 | 17,020 |
+| 96 | 0.958488 | 2,049.8 | 12,996 |
+| 128 | 0.965411 | 2,549.2 | 10,631 |
+| 160 | 0.969206 | 3,035.7 | 9,065 |
+| 192 | 0.972480 | 3,514.2 | 7,914 |
+| 256 | 0.977202 | 4,444.8 | 6,312 |
+
+At **0.965411** recall and **2,549.2** evaluations, the bounded global graph exceeds the monolithic
+HNSW reference's **0.962022** recall with **2,650.2** evaluations. The production sweep brackets
+0.95 rather than sampling that point directly; the preceding global SQ8 control measured
+0.953476 at 1,797.8 evaluations. Runtime effort remains automatic, not an ef option.
+
+For comparison, the requested monolithic HNSW control using SQ8 construction distances took
+**551.377 s** with eight workers, and **10,950,896 KiB (10.44 GiB)** peak RSS. Its external process
+used **4,378.33 CPU s**, including source loading and graph output. Replacing resident f16 with
+SQ8 saves about 2.75 GB, but its graph/index/allocator state still exceeds the warm reservation.
+It measured **0.949044 at 2,022.4 evaluations**, and **0.961645 at 2,667.5**. This is a rejected
+constructor baseline, not an alternate shipped path.
+
+### Final automatic admission, interference, and cold checks
+
+The M4 admitted the global constructor after ten minutes of ordinary sustained queries, with a
+**4,976,832,491-byte** construction reservation. Foreground queries stayed on IVF while it built.
+The measured before/during pair returned identical **0.9608343** all-query recall, at
+**2,927.391/2,782.443 HTTP queries/s**, a **4.95%** reduction in one pair. Each timed region contains
+110,464 requests over 16 persistent clients. No Qdrant load or compilation overlapped this pass.
+The first M4 global build completed in **1,011.630 s wall** and **1,850.608 CPU s**, with a
+**5,314,810,608-byte** peak physical footprint including foreground caches. It retained a
+**4,188,240,040-byte** reservation after publication. Calibration then rejected the graph as
+unprofitable: trials applied nonadmission to ANN as well as the exhaustive reference, reopening
+uncached sparse views instead of measuring normal serving cache behavior. The corrected path
+admits ANN reads and separately bypasses admission for truth. It also pairs each graph trial
+with an ordinary IVF reference on the same request, snapshot, cache policy, worker, and query
+concurrency. The serving load remains active during calibration. Its final promotion and Qdrant
+comparisons remain pending. IVF answered queries throughout the rejected calibration.
+
+A final short S3 cold ABBA compares baseline `f089d97` with runtime implementation `ff2fa2c`, on
+the same eight pinned Graviton3 cores. All 32 answers have identical rows and distance bits.
+Mean latencies for A1/B1/B2/A2 are **337.99/200.50/216.25/194.15 ms**; combined baseline/candidate
+medians are **220.49/194.70 ms**. This short gate finds no aggregate cold regression. Strong order
+and network variation prevents a speedup claim.
+
+Each host's paired comparison uses one fixed truth file. Query arrays match byte-for-byte across
+EC2 and M4. The independently prepared truth files differ in two top-10 memberships among 34,520
+neighbors, a maximum recall difference of 0.000058, consistent with borderline floating-point
+ordering. The M4 blowfish and Qdrant gates share the identical truth file.
+
 ### Construction I/O kill test
 
 The first bounded candidate was stopped before graph construction. On an otherwise idle 8-core

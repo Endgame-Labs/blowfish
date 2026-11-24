@@ -247,6 +247,34 @@ impl Scope {
             }
         }
     }
+    pub(crate) fn used_graph(&self) -> bool {
+        self.used
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|used| !used.is_empty())
+    }
+    /// Pair the trial with ordinary IVF under the same admission, snapshot, and worker conditions.
+    pub(crate) fn record_ivf_cpu(&self, seconds: f64) {
+        if !seconds.is_finite() || seconds <= 0. {
+            return;
+        }
+        let Some(mut used) = self.used.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return;
+        };
+        used.sort();
+        used.dedup();
+        let mut entries = self.cache.entries.lock().unwrap_or_else(|e| e.into_inner());
+        for key in used {
+            if let Some(heat) = entries.get_mut(&key) {
+                heat.ivf_seconds = if heat.ivf_seconds == 0. {
+                    seconds
+                } else {
+                    heat.ivf_seconds * 0.8 + seconds * 0.2
+                };
+            }
+        }
+    }
     pub(crate) fn feedback(&self, recall: f64) {
         let mut used = {
             let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
