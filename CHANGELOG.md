@@ -38,6 +38,7 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ### Fixed
 
+- **Recall on selective filtered vector queries:** Filtered ANN queries no longer cap their probe count at three times the unfiltered count. The probe budget now grows with the filter's selectivity (counted from segment membership maps), plus a margin for one more surviving neighbor, and the `BF_FILTER_PROBE_CAP` setting is removed. On BEIR NQ at default probes, recall@10 for a filter matching 1% of rows by hash rises from 0.936 to 1.0, and for 10% from 0.961 to 0.989; 50% filters are unchanged. The extra recall costs search work: at 1% the CPU per query is 38% higher than raising the unfiltered probe count to reach the same recall, and an ID-range filter matching 10% uses 18% more CPU at unchanged recall.
 - **Orphaned WAL payloads after failed write groups:** When a write group's slot commit failed, cancelling later uploads and deleting their payloads immediately could let an in-flight `PUT` land after the `DELETE` and leave an orphan object behind. Cleanup now waits for an abandoned upload to finish before deleting its payload, and GC reclaims expired unreferenced payloads after filling empty slot ranges with empty WAL entries so a paused writer loses its conditional commit.
 
 ## [0.1.15] - 2026-11-23

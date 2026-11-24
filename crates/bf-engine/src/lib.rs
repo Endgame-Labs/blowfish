@@ -1836,3 +1836,6 @@ mod recall_sampler_tests {
 
 #[cfg(test)]
 mod text_benchmark;
+
+#[cfg(test)]
+mod filtered_recall_tests;
