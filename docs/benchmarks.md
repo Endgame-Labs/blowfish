@@ -4,12 +4,14 @@
 
 Chronological lab notebook (iterations 0 through 18, plus 100M runs). For the concise summary and reproduction guide, see [`benchmarks/README.md`](benchmarks/README.md); for estimated infrastructure and benchmark costs, see [`cost-estimates.md`](cost-estimates.md).
 
-Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, strong consistency, 1,024-dim `f16` Cohere Wikipedia embeddings; current `main`, beyond `v0.1.12`):
+Latest in-region AWS S3 numbers (archived `v0.1.14`, strong consistency,
+1,024-dimensional `f16` Cohere Wikipedia embeddings; see [v0.1.14 in-region](#v0114-in-region)
+for upgrade timings, full comparison tables, memory limits, and cost):
 
-- **10M vector (48 probes, recall@10 `0.953–0.956`):** `533 / 656 ms` cache-cold (`533–600 / 650–750 ms` across runs), `680 / 907 ms` fresh process (`680–690 / 907–966 ms` across runs), and `36.6 / 50.8 ms` warm ([Iteration 18](#iteration-18-100m-warm-ann-under-150-ms-and-a-small-cold-manifest-read)). turbopuffer published (768-dim): `874 / 1,214 ms` cold, `14 / 17 ms` warm.
-- **100M vector (64 probes, recall@10 `0.954`; 48 probes `0.941–0.950`):** `1,201 / 1,391 ms` cache-cold (`1,164–1,201 / 1,348–1,391 ms`), `1,243 / 1,370 ms` fresh process (`1,228–1,243 / 1,370–1,411 ms`), and `99.7 / 162.8 ms` warm (`72.6 / 90.4 ms` warm at 48 probes); about `160 MB` read per cold query; load `5.7 h` at `4,891 docs/s`, `recluster` `1.7 h` into 160 slabs ([100M load and recluster](#100m-wikipedia-embeddings-in-region-and-over-the-internet), [Iteration 17](#iteration-17-100m-cold-and-warm-ann), and [Iteration 18](#iteration-18-100m-warm-ann-under-150-ms-and-a-small-cold-manifest-read)). turbopuffer publishes no 100M number.
-- **1M BM25 (MS MARCO, `overlap@10` `1.000` vs. exact BM25):** `380 / 526 ms` fresh process and `301 / 369 ms` cache-cold ([Iteration 13](#iteration-13-bm25-1m) and [Iteration 14 in-region check](#bm25-cold-at-1m-ms-marco-round-13-code-c7gd2xlarge-in-region-50-queries-abpy)). turbopuffer published: `316 / 381 ms` cold, `13 / 18 ms` warm.
-- **Memory and ingest:** a 4 GB `c7gd.large` (swap off) holds a 10M load plus `recluster` at `2.3–2.9 GB` peak RSS (`769 / 973 ms` fresh, `623 / 740 ms` cache-cold; [Iteration 15](#iteration-15-memory-10m-load-and-recluster-on-a-c7gdlarge) and [Iteration 18 memory check](#memory-check-10m-load-and-recluster-4-gib-cgroup-swap-off-2-cpus)). Ingest holds flat at about `4,500 docs/s` to 10M on `c7gd.xlarge` ([Iteration 16](#iteration-16-ingest-throughput-that-stays-flat-as-the-namespace-grows)).
+- **10M vector, 48 probes, recall@10 `0.9525`:** 625.5 / 924.3 ms fresh, 454.3 / 533.6 ms cache-cold, and 18.2 / 25.7 ms warm; 216.1 queries/s at 16 clients. At 64 probes, warm is 20.3 / 30.7 ms at recall `0.9615`. Published turbopuffer (768-dimensional): 874 / 1,214 ms cold and 14 / 17 ms warm.
+- **100M vector, 64 probes, recall@10 `0.9540`:** 1,251.6 / 1,429.1 ms fresh, 1,149.3 / 1,341.7 ms cache-cold, and 150.0 / 228.5 ms warm under a 10 GiB cgroup. The 8 GiB payload-cache warm prewarm OOMed; reported 100M warm arms use 7 GiB, and are slower than prior documented results. A separate 12 GiB diagnostic is recorded below. Published turbopuffer has no 100M result.
+- **1M BM25, MS MARCO, exact overlap@10 `1.0000`:** 249.4 / 449.1 ms fresh, 206.5 / 261.2 ms cache-cold, and 11.2 / 14.2 ms warm. Published turbopuffer: 316 / 381 ms cold and 13 / 18 ms warm.
+- **Actual 4 GB query check, c7gd.large, 48 probes:** 670.4 / 833.3 ms fresh and 536.3 / 637.1 ms cache-cold, swap off. This rerun measured queries; historical 10M ingest and recluster validations remain [Iteration 15](#iteration-15-memory-10m-load-and-recluster-on-a-c7gdlarge), [Iteration 16](#iteration-16-ingest-throughput-that-stays-flat-as-the-namespace-grows), and [Iteration 18](#memory-check-10m-load-and-recluster-4-gib-cgroup-swap-off-2-cpus).
 - **One machine, BEIR NQ (2.68M x 1,024 f16, local disk; [Iteration 19](#iteration-19-beir-natural-questions-on-one-machine)):**
   reclustered at 64 probes, recall@10 `0.955`, warm `8.3 / 18.1 ms` p50 / p99, and `444 q/s` at 16 clients on 6 pinned
   vCPUs (was `28.7 / 732 ms` and `27 q/s`). As loaded at default settings, recall@10 is `0.960` (was `0.907`). On an
@@ -3362,3 +3364,306 @@ its temporary server logs and child processes on exit. Its warm output labels c1
 with `clients`; use each group separately when comparing timings. The exhaustive scorer takes
 the original corpus JSONL on stdin and the checked-in workload as its argument. Delete the
 corpus, stores, results, and other run artifacts after recording the measurements.
+
+## v0.1.14 in-region
+
+Rerun begun on 2026-11-23, using only the archived `v0.1.14` release
+(`e6fbc8fcd806fdf16efc75dd6b82a14fa145835b`) for Rust sources and binaries.
+Copying, upgrades, GC, all required query measurements, and AWS cleanup are complete.
+This run measures existing data after the release's automatic format upgrades,
+without retraining, reclustering, or changing segment and slab geometry.
+
+### Checkpoint copy and upgrade method
+
+The original deployment prefixes remain untouched. A server-side S3 copy selected
+the latest full manifest, its reader copy, referenced live files, matching ANN
+hints, and deployment format markers. Retired segments and checkpointed WAL were
+excluded; no namespace had an uncheckpointed WAL tail. Source stability was
+checked again after each copy. This is a quiescent benchmark checkpoint copy;
+production backup guidance remains in `operations.md`.
+
+The destination preserves deployment-relative keys under `v014/scale` and
+`v014/big`. All writable opens and upgrades use those copies.
+
+| Namespace | Copied objects | Copied bytes | Copy wall seconds | Segments / slabs |
+| --- | ---: | ---: | ---: | ---: |
+| Wikipedia 10M | 632 | 81,713,485,245 | 73.540 | 70 / 32 |
+| MS MARCO 1M | 27 | 1,133,003,880 | 3.101 | 5 / 0 |
+| Wikipedia 100M | 16,414 | 838,308,354,467 | 783.738 | 1,787 / 160 |
+| Total | 17,073 | 921,154,843,592 | | |
+
+The release-tag `blowfish reindex` CLI converted vector indexes first. A writable
+release-tag benchmark server then upgraded text indexes and backfilled text ID
+maps. The copied text indexes were format 3 at 10M and MS MARCO, and format 4
+at 100M; all reached format 5. Upgrades used a 10 GiB cgroup, no swap, a 1 GiB
+storage cache, a 512 MiB
+decoded-cache budget, six Rayon threads, one builder, and a segment-row cap of
+one to prevent compaction. One-day retention preserved rewrite inventory before
+normal garbage collection. Neither original deployment prefix was opened by a
+writable process.
+
+| Namespace | Vector wall seconds | Vector peak RSS bytes | Index/fragment bytes written | Converted segment indexes / slabs |
+| --- | ---: | ---: | ---: | ---: |
+| Wikipedia 10M | 385.710 | 3,368,763,392 | 48,153,920,416 | 69 / 32 |
+| MS MARCO 1M | 0.501, no-op | Not sampled meaningfully | 0 | 0 / 0 |
+| Wikipedia 100M | 9,379.929 | 5,494,411,264 | 483,798,730,044 | 1,761 / 160 |
+
+One 10M segment and 26 100M segments have flat indexes that do not require the
+fast-scan conversion. The 100M CLI completed 364 publications, with no superseded
+work. External wall time includes CLI startup and final reporting; the CLI's
+internal vector times were 385.2 seconds and 9,378.8 seconds, respectively.
+
+The shared writable server completed the five MS MARCO text fields and ID maps
+after 96.327 seconds and the 70 Wikipedia 10M fields and maps after 742.119
+seconds. Corresponding whole-process RSS high-water bounds were 1,899,151,360
+and 2,720,260,096 bytes. These elapsed times begin at the same server start;
+work alternated between namespaces, and RSS is a shared-process bound. New
+stored objects totaled 734,155,049 bytes for MS MARCO and 57,806,052,764 bytes
+for 10M. This inventory counts keys absent from the initial copy at their final
+stored size; the CLI byte column counts index and fragment output only.
+
+The first spot instance was terminated by AWS for lack of capacity after 6.69
+hours, with all vector conversions and 782 of 1,787 text fields durably committed.
+A sequential on-demand replacement reuses byte-identical release binaries.
+The copied namespace retained all 100M rows, segments, and slabs. No query
+measurements had run before the interruption. Text timings below identify
+the interruption and include its downtime.
+
+The 100M text phase completed at 03:48 UTC on 2026-11-24: about **11 h 33 m**
+end to end, including the spot interruption and recovery, or **11 h 24 m** of
+estimated active episodes. The resumed episode took **7 h 59 m 38 s**. The origin of
+the interrupted episode is reconstructed from paired clock samples, with a
+combined timing uncertainty of about 45 seconds. Maximum observed whole-process
+RSS across both text writers was **2,808,823,808 bytes**. All 1,787 fields reached
+text format 5, all ID maps were present, and all 100M rows, 1,787 segments, and
+160 slabs were preserved.
+
+The 100M upgrade created **21,360 new stored objects totaling 840,226,569,560
+bytes**. By suffix, this includes 181,075,547,430 bytes of JSON metadata,
+67,850,049,052 bytes of directory files, 107,501,991,227 bytes of text indexes,
+and the rewritten vector indexes and fragments. This inventory counts keys absent
+from the initial copy, including lease records and newly introduced fixed keys,
+once at their final stored size. It measures additional stored objects rather
+than cumulative PUT traffic. Inventory includes the portable
+24-byte object headers; the CLI's vector byte counter measures logical payloads.
+Repeated writes of fixed-key hints and reader copies are outside this new-key
+inventory. One extra text-index object from the interrupted attempt was left
+unreferenced and subsequently reclaimed.
+
+Before GC, the full 100M manifest was **97,125,315 bytes of JSON**, or
+**46,542,105 encoded bytes**, versus the original 11,291,307 bytes of JSON. The
+indexer publishes a field conversion and its ID map separately, each with a
+fenced claim and commit. At this geometry, those steps require at least 7,148
+full manifest-slot writes. Repeated manifest work is a plausible contributor to
+migration time; its CPU share was not profiled. The 100M source also has 25.5
+times as many segments as the 10M source, so these upgrade times are not a
+constant-geometry scaling comparison.
+
+Normal release-tag GC then reclaimed **705,945,354,747 bytes** from the copied
+roots, taking 22.5 seconds for the shared scale root and 78.4 seconds for the
+100M root. No unreferenced reclaimable objects remained in the scanned data,
+slab, legacy-payload, and lease prefixes. Retirement records for objects omitted
+from the checkpoint copy can remain in the manifest ledger. Permanent manifest
+history is retained. The resulting copy has **27,202 current objects totaling
+1,113,976,881,229 bytes**, approximately **$23.86/month** at the checked S3
+Standard rate of $0.023/GiB-month. This is an estimate for current listed
+objects; IAM denies independent bucket-versioning and object-version inventory
+reads, while newly written object HEAD responses contain no version ID.
+
+| Namespace | New keys before GC | New-key bytes before GC | Current objects after GC | Current bytes after GC |
+| --- | ---: | ---: | ---: | ---: |
+| Wikipedia 10M | 965 | 57,806,052,764 | 1,061 | 82,945,842,525 |
+| MS MARCO 1M | 43 | 734,155,049 | 57 | 1,148,811,811 |
+| Wikipedia 100M | 21,360 | 840,226,569,560 | 26,082 | 1,029,882,226,805 |
+
+Namespace rows exclude two deployment format markers totaling 88 bytes.
+
+### Measurement method and initial network floor
+
+The main host is an actual `c7gd.2xlarge` in the S3 bucket's region. Queries use
+strong consistency, `top_k=10`, 4,000-byte cache blocks, 512-block coalescing,
+512 concurrent fetches, an 8 GiB storage-cache budget for cold arms and 10M warm arms, a 512 MiB
+decoded-cache budget, eight Rayon threads, and the existing ANN oracle workloads. Eight threads
+match the full-host default used by the latest iteration-18 comparison; the
+earlier in-region briefs forced six. The 100M server
+is constrained to a 10 GiB cgroup with swap disabled. No maintenance runs during
+query measurements.
+
+The first 100M warm prewarm at the historical 8 GiB payload-cache setting was
+OOM-killed under the 10 GiB cgroup. At the kill, the server alone had
+10,605,543,424 bytes of anonymous RSS; the cgroup also included the Python client.
+A payload-cache budget is not a whole-process RSS cap. The 100M warm reruns use
+**7 GiB of payload cache under the same 10 GiB limit**, with all other query
+settings preserved. These warm results therefore include a cache-budget change
+relative to the historical comparison. The cold arms retain the 8 GiB setting.
+No timing or recall result is reported for the failed prewarm.
+
+Each cold arm uses 50 distinct queries. Fresh mode starts a new read-only server
+and empty application disk cache for every query. Cache-cold mode drops memory,
+disk, decoded metadata, and namespace caches on a warm process before each
+query. Operating-system caches are not explicitly flushed. Warm c1 runs use
+1,000 requests after a complete workload prewarm, and recall uses all 200 ANN
+oracle queries. The 10M throughput runs use 16 clients and 1,000 timed requests
+after prewarming. Warm throughput excludes prewarming; fresh-run wall time also
+includes process lifecycle and is not reported as query throughput.
+
+BM25 uses the existing 1,000-query MS MARCO workload. Independent exact top-10
+answers were generated with the release-tag `bf-text` exhaustive scorer over the
+first million source documents, taking 111.879 seconds; all queries had nonempty
+answer sets. Overlap is the strict ID intersection divided by ten.
+
+| 4 KB S3 GET, 200 requests | p50 ms | p90 ms |
+| --- | ---: | ---: |
+| Prior in-region run | 24.5 | 30.5 |
+| v0.1.14 run, before upgrades | 25.0 | 31.2 |
+| v0.1.14 replacement, before resumed upgrades | 25.9 | 32.4 |
+
+All main-host query measurements use the replacement. Its 1 MB GET floor was
+36.5 / 58.2 ms, versus 107.3 / 127.9 ms on the first host; the similar 4 KB
+floor does not imply identical transfer behavior. The older documented in-region
+1 MB floor was 30.2 / 36.1 ms. Separate-session comparisons include S3 and host
+variance as well as release differences.
+
+Historical comparisons use the documented v0.1.13-era results, with their
+actual provenance retained. There is no v0.1.13-era 10M 64-probe result in this
+notebook; the older 64-probe table is v0.1.12. The historical MS MARCO warm result
+is round 11. These are separate-session comparisons, not an interleaved A/B.
+Published turbopuffer 10M results use 768-dimensional vectors, whereas these
+Wikipedia vectors have 1,024 dimensions at `f16` precision. The published 10M
+recall@10 is 0.943; this run reports its own recall over the full 200-query oracle.
+
+
+### Query results
+
+Latency pairs are p50 / p90 in milliseconds. Historical ANN results are the
+v0.1.13-era iteration-18 measurements. BM25 cold comes from the round-14
+in-region check, BM25 warm is round 11, and the prior actual-4-GB result is
+iteration 15. Their original provenance is preserved above and in the earlier
+sections; these are not newly rerun v0.1.13 controls.
+
+### 10M vector
+
+| Probes and mode | turbopuffer published p50 / p90 ms | v0.1.13-era documented p50 / p90 ms | v0.1.14 p50 / p90 ms |
+| --- | ---: | ---: | ---: |
+| 48, fresh process | 874 / 1,214 | 680 / 907 | 625.5 / 924.3 |
+| 48, cache-cold | 874 / 1,214 | 533 / 656 | 454.3 / 533.6 |
+| 48, warm c1 | 14 / 17 | 36.6 / 50.8 | 18.2 / 25.7 |
+| 64, fresh process | 874 / 1,214 | Not reported | 561.3 / 734.2 |
+| 64, cache-cold | 874 / 1,214 | Not reported | 477.6 / 533.1 |
+| 64, warm c1 | 14 / 17 | Not reported | 20.3 / 30.7 |
+
+| Probes | Prior recall@10 | v0.1.14 recall@10 (200 queries) | v0.1.14 warm c1 queries/s |
+| --- | ---: | ---: | ---: |
+| 48 | 0.953 (rounded) | 0.9525 | 51.60 |
+| 64 | Not reported | 0.9615 | 42.54 |
+
+### 100M vector
+
+v0.1.14 cold rows use 8 GiB of payload cache; warm rows use 7 GiB after the
+8 GiB prewarm failed. All required rows use the 10 GiB cgroup.
+
+| Probes and mode | turbopuffer published p50 / p90 ms | v0.1.13-era documented p50 / p90 ms | v0.1.14 p50 / p90 ms |
+| --- | ---: | ---: | ---: |
+| 48, fresh process | Not published | 1,058 / 1,253 | 1,163.8 / 1,435.5 |
+| 48, cache-cold | Not published | 1,128 / 1,341 | 1,034.9 / 1,201.2 |
+| 48, warm c1 | Not published | 72.6 / 90.4 | 112.1 / 164.6 |
+| 64, fresh process | Not published | 1,243 / 1,370 | 1,251.6 / 1,429.1 |
+| 64, cache-cold | Not published | 1,201 / 1,391 | 1,149.3 / 1,341.7 |
+| 64, warm c1 | Not published | 99.7 / 162.8 | 150.0 / 228.5 |
+
+| Probes | Prior recall@10 | v0.1.14 recall@10 (200 queries) | v0.1.14 warm c1 queries/s |
+| --- | ---: | ---: | ---: |
+| 48 | 0.9410 | 0.9410 | 8.29 |
+| 64 | 0.9540 | 0.9540 | 6.14 |
+
+### 10M throughput at 16 clients
+
+| Probes | turbopuffer published | Prior in-region | v0.1.14 queries/s | v0.1.14 p50 / p90 ms |
+| --- | --- | --- | ---: | ---: |
+| 48 | Not published | Not reported | 216.14 | 72.3 / 86.9 |
+| 64 | Not published | Not reported | 171.97 | 91.0 / 106.7 |
+
+### MS MARCO BM25 1M
+
+| Mode | turbopuffer published p50 / p90 ms | v0.1.13-era documented p50 / p90 ms | v0.1.14 p50 / p90 ms |
+| --- | ---: | ---: | ---: |
+| fresh process | 316 / 381 | 380 / 526 | 249.4 / 449.1 |
+| cache-cold | 316 / 381 | 301 / 369 | 206.5 / 261.2 |
+| warm c1 | 13 / 18 | 17.1 / 34.5 (round 11) | 11.2 / 14.2 |
+
+Overlap@10 versus exact: 1.0000
+
+### 10M on an actual 4 GB c7gd.large
+
+| Probes and mode | turbopuffer published p50 / p90 ms | Prior 4 GB in-region p50 / p90 ms | v0.1.14 p50 / p90 ms |
+| --- | ---: | ---: | ---: |
+| 48, fresh process | 874 / 1,214 | 769 / 973 | 670.4 / 833.3 |
+| 48, cache-cold | 874 / 1,214 | 623 / 740 | 536.3 / 637.1 |
+| 64, fresh process | 874 / 1,214 | Not reported | 649.0 / 750.9 |
+| 64, cache-cold | 874 / 1,214 | Not reported | 568.0 / 709.3 |
+
+The actual `c7gd.large` check used two Rayon threads, a 1 GiB payload cache,
+a 256 MiB decoded-cache budget, a 3.5 GiB cgroup, and no swap. Hardware exposed
+3,897,240 KiB of RAM. Separate 200-query checks gave recall@10
+`0.9525` at 48 probes and `0.9615` at 64 probes.
+The maximum sampled server high-water RSS across its six arms was
+1,860,599,808 bytes.
+The old small-host comparison used 47 slabs; this preserved source has 32.
+This rerun validates queries on 4 GB, not a new ingest or recluster run.
+
+### Separate memory diagnostic, outside the required 10 GiB profile
+
+After the required runs, one bounded 100M 48-probe warm control restored the
+8 GiB payload cache under a **12 GiB cgroup**, with the same 200-query prewarm,
+1,000 timed requests, decoded cache, and eight Rayon threads. It measured
+**44.8 / 56.9 ms**, 21.52 queries/s, recall@10 `0.9410`,
+and 11,246,977,024 bytes of server high-water RSS. It is separate from
+the required 10 GiB results and does not establish that the 8 GiB cache fits
+that limit: its measured server RSS alone exceeds 10 GiB. Restoring cache
+capacity and memory headroom materially changed warm latency in this session.
+This control helps distinguish the memory constraint from a release comparison;
+a profiler would still be needed to attribute CPU and allocation costs.
+
+### Interpretation, spend, and cleanup
+
+At 10M and 48 probes, warm latency fell from the documented 36.6 / 50.8 ms to
+18.2 / 25.7 ms, with full-set recall `0.9525`, versus the documented rounded
+value of `0.953`.
+Cold improvements vary by mode; 10M fresh p90 and 100M fresh latency did not
+improve in this session. At 100M, the historical 8 GiB warm profile could not
+complete under this run's 10 GiB cgroup, and the 7 GiB fallback was slower than
+the documented prior warm results. The distinct memory diagnostic above should
+not replace those constrained results. BM25 cache-cold and warm improved, with
+exact overlap maintained. Separate-session variance and cache-budget differences
+prevent attributing every change to the release alone.
+
+| Run cost component | Estimated USD |
+| --- | ---: |
+| EC2 compute, all three sequential instances | 4.011 |
+| Root EBS and public IPv4 time | 0.131 |
+| Copied storage, peak-listed-size time bound | 0.852 |
+| S3 request reserve, included once in this estimate | 5.000 |
+| Egress reserve | 1.000 |
+| Total including reserves | **10.994** |
+
+Instance time was 6.690 hours on the interrupted
+spot `c7gd.2xlarge`, 8.797 hours on its on-demand
+replacement, and 0.191 hours on `c7gd.large`.
+Checked on-demand rates were $0.3629/hour and $0.0907/hour, respectively;
+the spot rate was about $0.12/hour. The storage bound applies the observed
+peak of 1,819,922,235,976 bytes over the entire 15.732-hour
+run. These are estimates, not a reconciled AWS invoice: S3 multipart request
+amplification and exact billed request counts were not independently available.
+The final estimate expands the egress reserve to $1.00 to cover binary,
+manifest, and checkpoint-hint transfers whose exact bill was not reconciled.
+The conservative projection, including that larger allowance, stayed below $16,
+the $35 stop threshold, and the $40 approved budget. The retained copy's
+approximately $23.86/month is future storage, separate from this run estimate.
+
+EC2 describe calls confirmed all owned instances terminated, with no active
+`Project=blowfish` instances or remaining tagged volumes. The owned key pair and
+security group were deleted; the interrupted spot request is closed. No incomplete
+uploads remain under `v014/`. Its retained count and bytes match the post-GC
+inventory above. Final read-only checkpoint checks matched all three originals,
+including selected live-object sizes and ETags and deployment format markers.
+Neither original prefix nor the production process on this VM was modified.
