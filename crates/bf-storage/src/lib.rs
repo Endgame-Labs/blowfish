@@ -158,6 +158,11 @@ impl Storage {
             config.disk_dir.clone().filter(|_| config.disk_bytes > 0),
         )
     }
+    /// Whether immutable local reads use native memory mappings, independently of the block
+    /// cache's budget (which [`Storage::cache_limits`] reports as zero for mapped stores).
+    pub fn has_mapped_reads(&self) -> bool {
+        self.0.cache.mapped.get().is_some()
+    }
     /// Empty this store's block caches. For benchmarks that need a cache-cold, process-warm
     /// state; no public route calls it.
     pub fn drop_caches(&self) {
