@@ -260,7 +260,8 @@ mod tests {
             compiled.hits.load(Ordering::Relaxed) > 0,
             "exercise the real compiled branch"
         );
-        let tiny = engine(&store, 128);
+        // Large enough for the rejection marker in the general pool, far too small for the tier.
+        let tiny = engine(&store, 256);
         for _ in 0..3 {
             assert_eq!(
                 query(&tiny, request(2111)).await,

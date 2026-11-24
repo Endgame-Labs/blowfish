@@ -1,4 +1,4 @@
-"""NQ queries during paced upserts; run with uv and timeout, with clients on CPUs 6 and 7.
+"""NQ or MS MARCO queries during paced upserts; run with uv and timeout, with clients on CPUs 6 and 7.
 
 The server owns a disposable local store. Use identical store copies and ABAB arm order.
 This script writes only beneath --out's caller-selected scratch directory.
@@ -17,7 +17,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import numpy as np
-import pyarrow.parquet as pq
+
+
+def pin(args):
+    os.sched_setaffinity(0, {int(cpu) for cpu in args.cpus.split(",")})
 
 
 def connection(base, timeout=30):
@@ -36,11 +39,17 @@ def post(conn, path, body):
 
 def writer(args, stop, ready, results):
     try:
-        os.sched_setaffinity(0, {6, 7})
-        vectors = np.load(args.data / "corpus.f16", mmap_mode="r")
-        attrs_path = args.data / "attrs.parquet"
-        attrs = pq.read_table(attrs_path if attrs_path.exists() else sorted((args.data / "raw/corpus").glob("*.parquet")), columns=["title", "text"])
-        title_values, text_values = attrs["title"], attrs["text"]
+        pin(args)
+        if args.corpus:
+            with args.corpus.open() as source:
+                documents = [json.loads(line) for line in source]
+            vectors = None
+        else:
+            import pyarrow.parquet as pq
+            vectors = np.load(args.data / "corpus.f16", mmap_mode="r")
+            attrs_path = args.data / "attrs.parquet"
+            attrs = pq.read_table(attrs_path if attrs_path.exists() else sorted((args.data / "raw/corpus").glob("*.parquet")), columns=["title", "text"])
+            title_values, text_values = attrs["title"], attrs["text"]
         rng = np.random.default_rng(17)
         ack, rejected, requests, service = 0, 0, 0, []
         local = threading.local()
@@ -75,16 +84,24 @@ def writer(args, stop, ready, results):
                 if len(pending) >= 4:
                     collect(pending.pop(0))
                 count = min(batch_size, args.rate * args.seconds - sent)
-                ids = rng.choice(len(vectors), count, replace=False)
-                values = np.asarray(vectors[ids], dtype="<f4")
-                chosen_title = [title_values[int(i)].as_py() for i in ids]
-                chosen_text = [text_values[int(i)].as_py() for i in ids]
-                body = json.dumps({"upsert_columns": {
-                    "id": ids.tolist(),
-                    "vector": [base64.b64encode(v.tobytes()).decode() for v in values],
-                    "title": [t + f" update {batch}" for t in chosen_title],
-                    "text": chosen_text,
-                }}).encode()
+                if args.corpus:
+                    ids = rng.choice(len(documents), count, replace=False)
+                    body = json.dumps({"upsert_rows": [
+                        {"id": documents[int(i)]["id"],
+                         "text": documents[int(i)]["text"] + f" update {batch}"}
+                        for i in ids
+                    ]}).encode()
+                else:
+                    ids = rng.choice(len(vectors), count, replace=False)
+                    values = np.asarray(vectors[ids], dtype="<f4")
+                    chosen_title = [title_values[int(i)].as_py() for i in ids]
+                    chosen_text = [text_values[int(i)].as_py() for i in ids]
+                    body = json.dumps({"upsert_columns": {
+                        "id": ids.tolist(),
+                        "vector": [base64.b64encode(v.tobytes()).decode() for v in values],
+                        "title": [t + f" update {batch}" for t in chosen_title],
+                        "text": chosen_text,
+                    }}).encode()
                 pending.append(pool.submit(send, body, count))
                 sent += count
                 batch += 1
@@ -104,7 +121,10 @@ def writer(args, stop, ready, results):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("data", type=Path)
+    p.add_argument("data", type=Path, nargs="?")
+    p.add_argument("--corpus", type=Path, help="MS MARCO JSONL with numeric id and text")
+    p.add_argument("--workload", type=Path, help="MS MARCO query request JSON")
+    p.add_argument("--cpus", default="6,7", help="client CPU affinity")
     p.add_argument("--base-url", required=True)
     p.add_argument("--namespace", default="nq")
     p.add_argument("--rate", type=int, default=1000)
@@ -119,14 +139,25 @@ def main():
     p.add_argument("--ann-hz", type=float, help="pace queries; omit for closed-loop, or use zero to disable")
     p.add_argument("--bm25-hz", type=float, help="pace queries; omit for closed-loop, or use zero to disable")
     args = p.parse_args()
-    os.sched_setaffinity(0, {6, 7})
-    vectors = np.load(args.data / "queries.npy")[:args.query_count]
-    truth = np.load(args.data / "truth.npy")[:args.query_count, :10]
-    texts = pq.read_table(args.data / "raw/queries/test.parquet", columns=["text"])["text"].to_pylist()[:args.query_count]
-    bodies = {
-        "ann": [json.dumps({"rank_by": ["vector", "ANN", v.tolist()], "top_k": 10, "include_attributes": ["id"]}).encode() for v in vectors],
-        "bm25": [json.dumps({"rank_by": ["text", "BM25", t], "top_k": 10, "include_attributes": ["id"]}).encode() for t in texts],
-    }
+    pin(args)
+    if args.workload:
+        if not args.corpus:
+            p.error("--workload requires --corpus")
+        workload = json.loads(args.workload.read_text())[:args.query_count]
+        bodies = {"bm25": [json.dumps({**item["request"], "include_attributes": ["id"]}).encode()
+                            for item in workload]}
+        args.ann_hz = 0
+    else:
+        if args.data is None:
+            p.error("provide NQ data, or --corpus and --workload")
+        import pyarrow.parquet as pq
+        vectors = np.load(args.data / "queries.npy")[:args.query_count]
+        truth = np.load(args.data / "truth.npy")[:args.query_count, :10]
+        texts = pq.read_table(args.data / "raw/queries/test.parquet", columns=["text"])["text"].to_pylist()[:args.query_count]
+        bodies = {
+            "ann": [json.dumps({"rank_by": ["vector", "ANN", v.tolist()], "top_k": 10, "include_attributes": ["id"]}).encode() for v in vectors],
+            "bm25": [json.dumps({"rank_by": ["text", "BM25", t], "top_k": 10, "include_attributes": ["id"]}).encode() for t in texts],
+        }
     rates = {"ann": args.ann_hz, "bm25": args.bm25_hz}
     bodies = {name: values for name, values in bodies.items() if rates[name] != 0}
     if not bodies:
@@ -135,7 +166,7 @@ def main():
     # Open both plans before writes; the timed window begins after the writer is ready.
     for name in bodies:
         for _ in range(4 if name == "ann" else 1):
-            for body in bodies[name] if name == "ann" else bodies[name][:30]:
+            for body in bodies[name] if name == "ann" else bodies[name] if args.workload else bodies[name][:30]:
                 post(conn, f"/v2/namespaces/{args.namespace}/query", body)
     context = mp.get_context("spawn")
     stop, ready, results = context.Event(), context.Event(), context.Queue()
@@ -156,9 +187,12 @@ def main():
     def sample(name, hz):
         client = connection(args.base_url, timeout=120)
         index = 0
+        # A slow baseline and a fast candidate see the same seeded order. Pacing
+        # the query stream also lets their timed windows cover identical queries.
+        order = np.random.default_rng(29).permutation(len(bodies[name])) if args.workload else np.arange(len(bodies[name]))
         try:
             while not stop.is_set() and time.monotonic() - start < args.seconds:
-                i = index % len(vectors)
+                i = int(order[index % len(order)])
                 before = time.monotonic()
                 response = post(client, f"/v2/namespaces/{args.namespace}/query", bodies[name][i])
                 elapsed = (time.monotonic() - before) * 1000
