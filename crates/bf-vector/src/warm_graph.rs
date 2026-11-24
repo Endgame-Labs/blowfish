@@ -128,15 +128,17 @@ mod tests {
     use super::*;
     use half::f16;
     fn root() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.scratch")
             .join(format!(
-                "g4-vector-{}-{}",
+                "g4-vector-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ))
     }
     struct Cleanup(std::path::PathBuf);

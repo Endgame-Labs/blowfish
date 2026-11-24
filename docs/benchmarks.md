@@ -8848,7 +8848,7 @@ run.
 G4 replaces explicit prototype promotion with an engine-owned automatic accelerator, with no feature
 flag, graph import, or graph setting. The bucket's IVF format and query fallback remain authoritative.
 The implementation and internal policy are described in `docs/design/hot-tier-graph.md`. Release
-performance gates are still in progress; the G3 imported-graph numbers above are historical results.
+performance measurements follow; the G3 imported-graph numbers above are historical results.
 
 ### Production bounded global constructor
 
@@ -8888,65 +8888,161 @@ SQ8 saves about 2.75 GB, but its graph/index/allocator state still exceeds the w
 It measured **0.949044 at 2,022.4 evaluations**, and **0.961645 at 2,667.5**. This is a rejected
 constructor baseline, not an alternate shipped path.
 
-### Final automatic admission, interference, and cold checks
+### Automatic admission and M4 HTTP qualification
 
-The M4 admitted the global constructor after ten minutes of ordinary sustained queries, with a
-**4,976,832,491-byte** construction reservation. Foreground queries stayed on IVF while it built.
-The measured before/during pair returned identical **0.9608343** all-query recall, at
-**2,927.391/2,782.443 HTTP queries/s**, a **4.95%** reduction in one pair. Each timed region contains
-110,464 requests over 16 persistent clients. No Qdrant load or compilation overlapped this pass.
-The first M4 global build completed in **1,011.630 s wall** and **1,850.608 CPU s**, with a
-**5,314,810,608-byte** peak physical footprint including foreground caches. It retained a
-**4,188,240,040-byte** reservation after publication. Calibration then rejected the graph as
-unprofitable. Trials applied nonadmission to ANN as well as the exhaustive reference, exposing
-a cache-policy mismatch and repeated uncached sparse views. The corrected path
-admits ANN reads and separately bypasses admission for truth. It also pairs each graph trial
-with an ordinary IVF reference on the same request, snapshot, cache policy, worker, and query
-concurrency. The serving load remains active during calibration. Its final promotion and Qdrant
-comparisons remain pending. IVF answered queries throughout the rejected calibration.
+Both M4 quality profiles use the identical `c515dd8` server binary. Each starts a fresh process on
+IVF, accumulates ten minutes of ordinary sustained query heat, and constructs its own graph on the
+M4. No graph is imported, and no graph policy is overridden. The profiles use the existing IVF probe
+budgets of 64 and 48; graph effort follows paired measured IVF quality. Actual all-query recall,
+rather than the nominal 0.96 and 0.95 profile names, determines the Qdrant comparison.
 
-The corrected run measured **2,826.481 HTTP queries/s** during CPU construction, again at
-**0.9608343** recall over 110,464 timed requests. Its earlier **2,870.523 queries/s** sample overlapped
-early source collection, so it is not a clean prebuild control. A separate fresh-process IVF control
-will avoid that phase ambiguity. The configured 4 GiB raw cache is bypassed by MEM2 local mappings;
-the enabled foreground charge is 4 GiB decoded cache. Together with the construction reservation
-and 20% physical headroom, the policy envelope is **12,707,773,623 bytes** on a 16 GiB machine.
-Mapped clean object pages remain reclaimable, and physical footprint is reported separately.
+Qdrant 1.20 uses cosine, resident f16 vectors, M=16, construction ef=100, and a complete green index
+covering all 2,681,468 rows. Qdrant is indexed once, and stopped before each blowfish heat and build
+phase. It is restarted from that fixture only after automatic graph promotion. An earlier attempt
+left Qdrant indexing beside an idle blowfish process, compressing blowfish RSS from about 4 GB to
+18 MB; that attempt is excluded from serving comparisons.
 
-That paired-cache run completed construction in **1,052.541 s wall** and **1,867.857 CPU s**, with
-**5,319,676,560 bytes** peak whole-process physical footprint. It also rejected promotion: later
-trials measured roughly **3.3–4.0 ms** graph CPU versus **1.8–1.9 ms** paired IVF, with sampled
-effort reaching 165. It supplies no promoted serving or Qdrant result. Further validation dispatches
-both ANN and IVF trials through the ordinary Q2 query-worker path, leaving exhaustive truth on its
-separate blocking worker, and records navigation, exact-rerank, and hydration CPU separately.
-The CPU-payback threshold is unchanged. A replay through IVF and the exact evaluator then exposed
-sample difficulty and excess effort in that rejected sequence:
+The HTTP protocol follows G3: 16 persistent client processes, one connection each, all 3,452 quality
+queries, and 110,464 timed requests per region. Qdrant query ef is matched to blowfish's measured
+recall within 0.0005. Three paired timing repetitions alternate BF/Q, Q/BF, and BF/Q. Status before
+and after each blowfish region must show validated graph use for every request and unchanged
+serving effort. No compilation, index construction, or heat client overlaps these timed comparisons.
+Ordinary 800-query/s heat runs during admission, construction, and calibration, and is paused for foreground
+capacity measurements and the paired comparisons.
 
-| Trial ef | Samples | Graph recall | Paired IVF recall |
-|---:|---:|---:|---:|
-| 64 | 8 | 0.800000 | 0.950000 |
-| 96 | 19 | 0.952632 | 0.973684 |
-| 108 | 8 | 0.950000 | 0.975000 |
-| 122 | 12 | 0.916667 | 0.933333 |
-| 165 | 32 | 0.993750 | 0.971875 |
+The default 64-probe IVF profile promoted at **automatic graph ef100** after trials at 64 and 80.
+Serving effort remained 100 while a cheaper ef90 trial was pending. All-query graph recall is
+**0.957473928**, exactly matching Qdrant at ef75. It is **0.003360371 below** the profile's all-query
+IVF recall of 0.960834299: the sampled controller's accepted point is not a literal 0.960000 gate.
+These measurements report the actual point, with no benchmark effort override.
 
-The revised controller targets IVF's measured quality on each identical sample, collects enough
-paired observations, and explores effort in both directions with a query-level confidence interval.
-A validated serving effort stays available while cheaper trials run. Seeded noisy-stream tests
-exercise convergence from both lower and higher initial efforts. The fixed nominal graph target is
-removed; two ordinary IVF probe profiles can now use the identical server binary, with graph effort
-chosen automatically against each profile's measured quality. Final serving comparisons remain pending.
+| Existing IVF profile | Automatic graph ef | Qdrant ef | BF recall@10 | Qdrant recall@10 | Median BF queries/s | Median Qdrant queries/s |
+|---|---:|---:|---:|---:|---:|---:|
+| 64 probes, nominal 0.96 | 100 | 75 | 0.9574739 | 0.9574739 | 8,133.461 | 8,183.248 |
+| 48 probes, nominal 0.95 | 80 | 63 | 0.9515643 | 0.9511877 | 8,558.044 | 8,907.079 |
 
-A final short S3 cold ABBA compares baseline `f089d97` with runtime implementation `126a5d2`, on
-the same eight pinned Graviton3 cores. All 32 answers have identical rows and distance bits.
-Mean latencies for A1/B1/B2/A2 are **388.87/239.79/245.70/232.27 ms**; combined baseline/candidate
-medians are **255.53/239.99 ms**. This short gate finds no aggregate cold regression. Strong order
-and network variation prevents a speedup claim.
+Default-profile BF repetitions are **8,133.461 / 8,075.650 / 8,172.993 queries/s**; Qdrant's are
+**8,163.299 / 8,224.563 / 8,183.248**. The ratio of medians puts BF **0.61% lower**. This is near
+parity, not a Qdrant throughput win or a statistical confidence interval. Every BF region has
+exactly 117,368 graph answers including its quality and warmup passes, unchanged validated ef100,
+and 110,464 timed requests. Median server instructions/query are **3.567M BF / 2.039M Qdrant**.
+Timed BF RSS is **4.443–4.448 GB**, versus Qdrant's **5.676–5.678 GB**.
+
+| Self-built M4 profile | Construction wall s | Construction CPU s | Whole-process peak RSS bytes | Peak physical footprint bytes |
+|---|---:|---:|---:|---:|
+| 64 probes | 1,027.330 | 1,889.763 | 6,432,276,480 | 5,310,059,416 |
+| 48 probes | 979.811 | 1,808.196 | 7,140,720,640 | 5,308,257,176 |
+
+Both processes reported zero swaps. Their peak RSS and physical footprint are below the combined
+policy envelope; physical footprint and reclaimable mapped pages differ.
+
+The lower profile promoted at **automatic ef80** after rejecting ef64. Its all-query recall is
+**0.951564311**, versus the profile's IVF baseline of **0.950637312**. Qdrant ef63 measures
+**0.951187717**, a gap of **0.000376593**, within the matching tolerance. BF repetitions are
+**8,582.132 / 8,540.076 / 8,558.044 queries/s**; Qdrant's are **8,859.519 / 8,998.395 / 8,907.079**.
+The ratio of medians puts BF **3.92% lower**. Every BF region again records exactly 117,368 graph
+answers, validated unchanged serving effort, and 110,464 timed requests. Median instructions/query
+are **3.349M BF / 1.921M Qdrant**. Timed RSS is **4.439–4.441 GB BF / 5.646–5.648 GB Qdrant**.
+The clean prebuild lower-profile IVF baseline is **3,501.557 queries/s**, with 110,464 timed requests.
+Neither profile establishes a Qdrant throughput win. Both demonstrate server-built automatic
+acceleration, with actual quality points reported rather than forced benchmark effort.
+
+Construction reserves **4,976,832,491 bytes** before reading source rows. The enabled foreground
+charge is the 4 GiB decoded cache: MEM2 local mappings bypass the configured 4 GiB raw cache.
+Construction, enabled caches, and 20% physical headroom give a **12,707,773,623-byte** envelope on
+this 16 GiB machine. The published graph retains a **4,188,240,040-byte** reservation. Mapped clean
+object pages remain reclaimable; process physical footprint is reported separately.
+
+A final-source attempt refused construction with only 4.1 GiB of free disk after test artifacts grew.
+It kept answering on IVF, with no graph allocation or query failure. Obsolete owned release artifacts
+were removed, free space returned to 13 GiB, and qualification restarted normally. Measurement
+launchers now check at least 8 GiB free before starting; no retry or admission state was forced.
+
+### Foreground interference and eight-core construction
+
+The clean final `c515dd8` M4 pair measured **2,940.218/2,820.782 HTTP queries/s** before/during
+CPU construction, a **4.06%** reduction in one pair, with identical **0.9608343** recall. Each
+region contains 110,464 requests over 16 persistent clients. Construction remains unpublished
+throughout this measurement, so every foreground query uses IVF. Prebuild server instructions
+were **26.130M per query**; during-build task counters include background construction work.
+
+An earlier clean `dd7ecde` M4 pair measured **2,915.210/2,827.604 HTTP queries/s** before/during
+construction, a **3.01%** reduction, with identical **0.9608343** recall over 110,464 timed requests
+per region. Its automatic build completed in **1,067.002 s wall** and **1,958.434 CPU s**, with a
+**5,309,600,856-byte** peak whole-process physical footprint. That diagnostic's three matched-recall
+pairs gave median **7,883.643 BF queries/s** at **0.9578216** recall versus **7,594.576 Qdrant
+queries/s** at **0.9574739**, a **3.81%** difference. It predates final heat and warm-reference
+bookkeeping fixes, so it is a diagnostic, not the final-source qualification.
+
+On an eight-core, 16 GiB S3-backed serving fixture, nice-5 construction measured
+**1,911.895/1,475.951 queries/s** before/during (**22.8%** lower), at identical **0.9608343** recall.
+It completed in **1,813.514 s wall** and **2,576.881 CPU s**. Whole-cgroup charged peak was
+**9,501,671,424 bytes**. That interference result motivated Linux idle scheduling with nice 19.
+
+The final idle-priority gate measured **1,845.066/1,815.448 queries/s** before/during CPU
+construction, a **1.61%** reduction, with identical **0.9608343** recall over 55,232 timed queries
+per arm. Both construction workers were verified at `SCHED_IDLE` and nice 19. Both arms used the
+same eight server cores, 64 clients, 16 GiB cgroup cap, disabled swap, 2 GiB raw cache, and 4 GiB
+decoded cache. Between the capacity measurements, ordinary foreground heat is paced at 450
+queries/s; that client is paused during each timed region. The build completed in **1,884.474 s wall**
+and **2,549.995 CPU s**. Whole-cgroup charged peak was **9,028,444,160 bytes**, and process high-water RSS was **8,776,416 KiB**, below
+the **14,855,257,271-byte** combined construction, enabled foreground cache, and headroom envelope.
+The retained graph reservation was **4,164,346,940 bytes**. This gate uses `d0bd886`: constructor,
+reservation, and scheduling code are unchanged by the later post-build calibration and heat fixes.
+The earlier nice-5 comparison predates the final main merge, so the difference between runs cannot
+be attributed solely to scheduler priority.
+
+### Cold and correctness checks
+
+A final short S3 cold ABBA compares baseline `f089d97` with runtime implementation `d0bd886` on
+the same eight pinned Graviton3 cores. Every arm starts a fresh engine and drops caches before
+each of eight distinct queries. All 32 answers have identical rows and distance bits. Mean
+latencies for A1/B1/B2/A2 are **440.03/308.07/300.80/332.80 ms**; combined baseline/candidate
+medians are **393.76/289.89 ms**. This short gate finds no aggregate cold regression. Strong order
+and network variation prevents a speedup claim. Later fixes affect graph heat or post-build
+calibration, rather than the cold IVF search path.
+
+Scoped final-source tests cover cancellation and spill cleanup, bounded construction and search
+storage, backend and namespace identity, generation cancellation, recluster invalidation, WAL
+updates and deletes, masks, unsupported-shape answer and distance-bit equality, complete joint IVF
+retry, discarded-plan feedback, cache admission, and active-snapshot reservation lifetime. The
+final macOS source passed 271 scoped tests, including doctests, plus all-target Clippy with warnings
+denied. The preceding Linux `dd7ecde` source passed the same 271 scoped tests; the final generic
+heat and CPU-bookkeeping fixes were validated on macOS. Manual ignored benchmarks are excluded
+from passing-test totals.
 
 Each host's paired comparison uses one fixed truth file. Query arrays match byte-for-byte across
 EC2 and M4. The independently prepared truth files differ in two top-10 memberships among 34,520
 neighbors, a maximum recall difference of 0.000058, consistent with borderline floating-point
 ordering. The M4 blowfish and Qdrant gates share the identical truth file.
+
+### Calibration controls and rejected measurements
+
+Initial full builds took **1,011.630 s wall / 1,850.608 CPU s** and **1,052.541 s wall /
+1,867.857 CPU s** on the M4, with whole-process peak physical footprints of **5,314,810,608** and
+**5,319,676,560 bytes**. Both rejected promotion, and supply no matched serving result. They
+exposed ANN trial nonadmission, truth-interleaved CPU costs, and effort ratcheting against a fixed
+nominal target. Production ANN trials now use ordinary cache admission, and pair graph and IVF
+quality on identical query-level samples. At least 32 paired observations support confidence
+decisions, 128 an uncertain measured match, and at most 512 a rolling window. A validated serving
+effort stays available while cheaper trials run. Seeded noisy-stream tests converge from both
+higher and lower efforts.
+
+A same-object M4 control uses 552 identical queries, four repetitions, and matching row hits and
+distance-evaluation counts. Native/trial navigation costs **0.280/0.291 ms** CPU; evicting 128 MiB
+from CPU caches before every query changes those to **0.308/0.307 ms**. With an 800-query/s
+foreground load, costs are **0.341/0.348 ms**; raising trial QoS gives **0.347 ms**, so production
+QoS remains unchanged. These controls find no consistent extra serving-path navigation work.
+They do not isolate the complete memory-latency effects of full-corpus truth scans or compression.
+
+Warm CPU economics use bounded blocks of up to eight recent sampled requests on the same snapshot
+and effort. Graph plans run together, then ordinary IVF plans, without exhaustive scans between
+timed plans. The first cold query stays in the average. Exact recall observations retain their
+original truth comparisons. The queue holds at most 256 KiB under the metadata allowance, flushes
+useful smaller blocks at byte boundaries, and resets across snapshot or effort changes. It retains
+neither snapshots nor truth responses. Both CPU estimates come from these blocks; individual
+truth-interleaved IVF timings cannot overwrite the warm reference. Only completed foreground
+queries update heat, and admission and status apply elapsed decay between arrivals.
 
 ### Construction I/O kill test
 
@@ -8958,10 +9054,10 @@ read syscalls**. Only the 5.49 GB source spool existed; no graph or recall resul
 
 The failure was small random reads, rather than vector scoring: repeated row reads in projection
 order, combined with aggressive release of the spool's page cache, kept the CPU mostly idle. A low
-RSS is insufficient evidence for an economical builder. The replacement uses a fixed-size source
-block cache inside the existing construction reservation, and releases its anonymous mapping before
-loading the resident graph. It remains subject to the full construction, foreground, recall, and
-charged-memory gates.
+RSS is insufficient evidence for an economical builder. An intermediate replacement added a
+fixed-size source block cache inside the construction reservation, releasing its mapping before
+loading the graph. Its completed measurements follow. The final whole-tier SQ8 constructor above
+replaces that source cache and partition construction entirely.
 
 
 ### First bounded candidate: construction and evaluation cost
@@ -8990,8 +9086,8 @@ algorithm curve, not an HTTP or automatic-promotion result.
 
 This is a material evaluation-cost regression against G3's monolithic graph. In particular,
 subdividing overlapping coarse partitions into disjoint capped children can lose some of the
-coarse overlap's connectivity; this is a suspected cause, pending the overlap control. A two-nearest-partition overlap control and a same-host monolithic
-reference are being measured before drawing a shipping performance conclusion.
+coarse overlap's connectivity; this remains a suspected cause. The completed overlap control and
+same-host monolithic reference below reject this constructor.
 
 The same host's monolithic HNSW reference (M=16, construction ef=100) took **712.230 s** for
 construction with eight workers, and approximately **13.0 GiB** peak RSS. The external process
@@ -9041,7 +9137,7 @@ This passes the evaluation-budget kill test against the monolithic HNSW referenc
 retained the full f16 input and peaked at **9.30 GiB**; it is not a bounded-memory measurement.
 Its 32-thread query timings are not comparable with the eight-thread reference. The replacement
 production constructor streams SQ8, uses fixed-capacity compactly locked adjacency, retains no
-f16 source, and must pass the complete bounded, two-worker, and M4 gates.
+f16 source, and supplies the bounded, two-worker measurements above.
 
 The two-nearest-partition control finished in **1,002.007 s** with 32 offline workers: 119 capped
 parts, at most 61,844 rows each, and 5,369,868 visits. It reached **0.949942 at 3,040.0 evaluations**,
@@ -9081,8 +9177,7 @@ measurement only. Its initial charged-memory peak was **6,704,111,616 bytes**; t
 last observed peak was **12,251,926,528 bytes**, within the **14,620,135,068-byte** combined cache, graph,
 and headroom policy envelope and the **17,179,869,184-byte** cgroup cap. Total charged server memory
 must not be described as constructor workspace. AWS reclaimed this Spot host during construction,
-so it supplies no completed-build, final-memory, or calibrated serving result. The native M4 run
-continues independently.
+so it supplies no completed-build, final-memory, or calibrated serving result. The subsequent native M4 and global-constructor measurements are recorded above.
 
 ### Short S3 cold ABBA
 
