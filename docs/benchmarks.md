@@ -5801,3 +5801,133 @@ A Spot c7g.2xlarge was reclaimed during an incomplete repeat. Incomplete counter
 are discarded; the final table comes entirely from the replacement on-demand
 host. No S3 objects are created, and both hosts and their temporary access
 resources are cleaned up at the end of the round.
+
+## Round RR1: recluster readiness and spill ownership (2026-11-24)
+
+NQ's full tier became ready **257.5 seconds after the last load acknowledgment**, versus **756.7 seconds**
+before RR1: **2.94 times sooner**. There were no intermediate recluster builds during loading. The final build
+fell from **426.4 to 255.0 seconds**, or **1.67 times faster**, with equal or better measured recall.
+The requested **2 times faster full build was not achieved**; leaf assignment remains the largest cost.
+
+### Matched setup
+
+These numbers isolate RR1 through `5a34b2d` against `b663eb2`, before integrating later main changes. The baseline
+has only spill cleanup and the same stage timers added; its trigger, training, and assignment algorithms are
+unchanged. Both use native release builds with the repository's thin LTO profile, four codegen units, no native
+Rust CPU flags, and Clang 19 for C dependencies.
+
+One dedicated Graviton3 `c7gd.2xlarge`: eight cores, 16 GiB RAM, local NVMe, and a fresh local file store per arm.
+The server and HTTP loader share CPUs 0 to 7, at nice 19, with no competing compilation or benchmark. The default
+recluster pool has four threads. Both servers have a 4 GiB payload cache, no disk cache, and automatic recall
+sampling disabled. No S3 bucket or paid oracle is used.
+
+The corpus is the NQ vectors used by the Mac and Q1 runs: 2,681,468 rows, 1,024 dimensions in f16, cosine, and
+3,452 queries with exact ground truth. `bench/nq/load.py --vectors-only` sends 5,000-row HTTP batches with four
+requests in flight. A sampler sends at most one serial top-10 ANN request a second, with only IDs returned,
+using a fixed sequence of query vectors and a persistent connection. Every 20 seconds, a separate diagnostic
+compares one query against exact search on the same live snapshot. These sparse load-time recall samples do
+not replace the full quality gate below. Expected 404 responses before the first write creates the namespace
+are excluded from query samples.
+
+The last acknowledgment is approximated by the loader's final status write. Readiness is the full-row-count
+tier installation in the server log, polled every 250 ms and checked against namespace metadata. Latencies
+cover requests started during the load, including time spent competing with ingest and the exact diagnostics.
+This is one paired run, with independently generated segment IDs and layouts; it does not give confidence
+intervals or establish Mac performance.
+
+### Load and readiness
+
+| Measurement | Before | RR1 |
+|---|---:|---:|
+| HTTP load, seconds | 190.5 | 176.5 |
+| Intermediate builds started during the load | 5 | 0 |
+| Last acknowledgment to full-build start, seconds | 330.3 | 2.5 |
+| Full build, seconds | 426.4 | 255.0 |
+| Last acknowledgment to full-tier installation, seconds | 756.7 | 257.5 |
+| Query p50 during load, ms | 563.8 | 408.7 |
+| Query p90 during load, ms | 1,623.9 | 1,589.2 |
+| Successful timed queries during load | 160 | 153 |
+| Query errors | 0 | 0 |
+| Snapshot-exact recall samples | 8, all 1.0 | 7, all 1.0 |
+| Server CPU through readiness, seconds | 3,377.6 | 1,813.3 |
+
+The baseline installed intermediate tiers over 160K, 75K, 440K, 410K, and 950K rows. Four installed during the
+load, and the fifth shortly afterward. Together they rebuilt 2.035M rows before the final 2.681M-row build.
+Its doubling exception starts work during a load, but its five-minute history can still hold the final build
+once uncovered rows fall just below covered rows.
+
+RR1 uses that history only to recognize bulk ingestion. A classified load holds first bases, merges, and deltas
+while writes arrived in the last two seconds or the tail is unindexed. It retries after two seconds, without
+requiring another publication. The first base then takes priority over remaining compaction, protecting its
+sources before its background task can yield. After installation, format-4 lineage lets those segments compact.
+Queries continue searching uncovered segments and any existing tiers throughout the load. There is no setting
+that selects the previous behavior.
+
+### Full-build profile
+
+Times below are seconds, summed over the final full build's stage events. Uploads overlap the next slab's CPU
+work. Spill service times sum work across concurrent readers or writers and are already inside their parent
+stages; they must not be added to build wall time. "Upload" here means publication to the local object store,
+not a network or S3 upload measurement.
+
+| Stage | Before | RR1 |
+|---|---:|---:|
+| Copy source vectors to spill | 20.193 | 13.557 |
+| Spill write service time, inside copy | 17.835 | 11.277 |
+| Coarse k-means | 1.211 | 1.156 |
+| Coarse assignment | 6.788 | 6.456 |
+| Leaf k-means | 116.099 | 21.948 |
+| Leaf assignment, both passes | 253.871 | 183.309 |
+| Center refinement | 2.560 | 2.547 |
+| Read slab vectors from spill | 3.649 | 3.861 |
+| RaBitQ encoding and ANN serialization | 21.172 | 21.359 |
+| Upload, overlapping | 2.249 | 2.437 |
+| Random spill read service time, inside earlier stages | 31.039 | 39.129 |
+| Directory construction | 0.033 | 0.016 |
+
+Lloyd training and coarse assignment use bounded batches of 128 rows against packed centers. Seeds, samples,
+iteration counts, near-cell counts, group probes, and the refinement pass stay unchanged. Center accumulation
+stays in input order in f64. Leaf assignment keeps direct four-row dot products, with independent FMA chains
+on NEON, AVX2, and AVX-512. Whole source clusters are written contiguously to the spill; a four-byte address
+per global row preserves identity without scattering one small write per vector. This changes only temporary
+spill layout, with no persistent format change.
+
+Larger assignment blocks were counterproductive: a 16-row experiment compared 1,549 centers per row, versus
+812 with four rows, and its first assignment took 144.2 seconds, versus 91.2. It was stopped and discarded.
+Packing selected leaf centers into matrices was also slower in a separate prototype. Batched near-group
+selection completed a full build in 250.5 seconds, only 1.8% below the selected implementation in a separate
+layout, and was not retained. These controls explain why the final path uses matrix batches for training and
+direct four-row scoring for leaves; they do not demonstrate the missing 2 times build gain.
+
+### Recall and memory
+
+Separate read-only servers run the full 3,452-query quality gate, top 10, with explicit probes:
+
+| Probes | Before recall@10 | RR1 recall@10 | Difference |
+|---|---:|---:|---:|
+| 48 | 0.9494 | 0.9501 | +0.0007 |
+| 64 | 0.9602 | 0.9603 | +0.0001 |
+
+Both are within 0.002 of the baseline. RSS is sampled every 250 ms; the process high-water mark is read from
+`VmHWM`. GB below are decimal. The build-only sample uses current `VmRSS` between full-build start and install,
+so an earlier ingest or exact-diagnostic peak is not mistaken for build memory.
+
+| Server memory measurement | Before | RR1 |
+|---|---:|---:|
+| Sampled full-build peak RSS, GB | 6.884 | 6.964 |
+| Process high-water RSS over load, diagnostics, and build, GB | 9.543 | 9.817 |
+
+The full-build sampled peak rose 1.2%, with the same cache and slab budgets. This 16 GiB-host profile includes
+a configured 4 GiB cache and exact diagnostics, so it is not a matched comparison with the historical Mac's
+approximately 2.7 GB load/build peak. No full-precision corpus or corpus-sized distance matrix is materialized.
+
+### Spill recovery
+
+Each build holds an exclusive ownership lock in its own process-named directory. A drop guard unlinks its
+spill on success, failure, cancellation, shutdown, or panic unwinding, even while a blocking worker has an open
+descriptor. Startup and new builds recover only unlocked abandoned directories. A lock on the root directory
+serializes creation and sweeping, including the interval before the ownership file exists.
+
+Tests cover cancellation, stopped engines, panic unwinding, and a separate live process surviving a sweep,
+followed by recovery after that process is killed. Legacy loose spills have no ownership lock and are left
+alone; remove those only after the old processes using their directory have stopped.
