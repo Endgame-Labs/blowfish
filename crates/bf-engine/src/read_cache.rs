@@ -249,7 +249,9 @@ impl PredicateColumns {
             .lookup(key)
     }
     fn insert_column(&self, key: String, value: Column) {
+        // The hash map and clock ring each own a key string.
         let bytes = (key.len() as u64)
+            .saturating_mul(2)
             .saturating_add(64)
             .saturating_add((value.len() as u64).saturating_mul(48));
         let mut entries = self.entries.lock().expect("column cache lock");
@@ -267,6 +269,7 @@ impl PredicateColumns {
     }
     fn insert_predicate(&self, key: String, value: Predicate) {
         let bytes = (key.len() as u64)
+            .saturating_mul(2)
             .saturating_add(128)
             .saturating_add((value.serialized_size() as u64).saturating_mul(2));
         let mut entries = self.entries.lock().expect("column cache lock");
@@ -548,6 +551,16 @@ mod tests {
         let entries = pool.entries.lock().unwrap();
         assert_eq!(entries.columns.cap, pool.budget);
         assert_eq!(entries.columns.bytes + entries.predicates.bytes, 0);
+    }
+
+    #[test]
+    fn both_clock_and_hash_map_key_copies_are_charged_before_admission() {
+        let pool = PredicateColumns::new(4096, 1024);
+        let key = "key".repeat(200);
+        pool.insert_predicate(key.clone(), Arc::new((0..1).collect()));
+        assert!(pool.predicate(&key).is_none());
+        pool.insert_column(key.clone(), Arc::new(vec![None; 64]));
+        assert!(pool.column(&key).is_none());
     }
 
     #[test]

@@ -492,19 +492,7 @@ async fn from_slabs(
     filter: Option<&Filter>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     let allowed = if let Some(filter) = filter {
-        let mask = filtered_mask(store, state, set, at, filter).await?;
-        Some(
-            futures::future::try_join_all(set.slabs.iter().map(|slab| {
-                let mask = &mask;
-                async move {
-                    let rows = crate::vector_locator::rows(store, slab, set, attribute).await?;
-                    let allowed: RoaringBitmap =
-                        rows.iter().copied().filter(|r| mask.contains(*r)).collect();
-                    Ok::<_, ApiError>(Some(Arc::new(allowed)))
-                }
-            }))
-            .await?,
-        )
+        Some(filtered_slab_masks(store, state, set, at, filter, attribute).await?)
     } else {
         None
     };
@@ -602,6 +590,117 @@ async fn from_slabs(
     Ok(Some((scores, docs)))
 }
 
+// Derived masks describe only immutable indexed rows. Branches can share tiers while having
+// equal WAL/manifest sequence numbers, so use their actual file, live, schema, and lineage
+// identities. Tail shadows bypass the derived cache; segment predicates remain reusable.
+fn slab_filter_generation(
+    state: &NamespaceState,
+    set: &bf_wal::SlabSet,
+    filter: &Filter,
+    attribute: &str,
+) -> Result<Option<String>, ApiError> {
+    if !state.shadowed.is_empty() {
+        return Ok(None);
+    }
+    let segments: Vec<_> = state
+        .segments
+        .iter()
+        .map(|s| {
+            let files: Vec<_> = s
+                .files
+                .iter()
+                .map(|(role, file)| (role, &file.key))
+                .collect();
+            (&s.id, &s.live.key, &s.schema, files)
+        })
+        .collect();
+    let lineage: Vec<_> = state
+        .lineage
+        .iter()
+        .map(|l| {
+            let parts: Vec<_> = l
+                .parts
+                .iter()
+                .map(|p| (&p.target, p.rows, &p.map.key))
+                .collect();
+            (&l.source, parts)
+        })
+        .collect();
+    serde_json::to_string(&(
+        1u8,
+        attribute,
+        &set.dir.key,
+        &set.covered,
+        filter,
+        &state.schema,
+        segments,
+        lineage,
+    ))
+    .map(Some)
+    .map_err(segment::index_error)
+}
+
+/// Filtered slab membership, cached in the byte-bounded predicate pool. Cold row lists and
+/// predicates are independent reads, so open them together; warm queries reuse the intersections.
+async fn filtered_slab_masks(
+    store: &Storage,
+    state: &NamespaceState,
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+    filter: &Filter,
+    attribute: &str,
+) -> Result<Vec<Option<Arc<RoaringBitmap>>>, ApiError> {
+    let keys = slab_filter_generation(state, set, filter, attribute)?
+        .map(|generation| {
+            set.slabs
+                .iter()
+                .map(|slab| {
+                    let identity = serde_json::to_string(&(
+                        &slab.id,
+                        slab.row_count,
+                        slab.files.get(&format!("annv2:{attribute}")),
+                        slab.files.get("vector_rows"),
+                    ))
+                    .map_err(segment::index_error)?;
+                    // Both components are complete serialized values, with unambiguous boundaries.
+                    Ok::<_, ApiError>(format!("slab-filter:[{generation},{identity}]"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let mut allowed: Vec<_> = set
+        .slabs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            keys.as_ref()
+                .and_then(|keys| crate::read_cache::predicate(&keys[i]))
+        })
+        .collect();
+    let missing: Vec<_> = allowed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, mask)| mask.is_none().then_some(i))
+        .collect();
+    if missing.is_empty() {
+        return Ok(allowed);
+    }
+    let lists = futures::future::try_join_all(
+        missing
+            .iter()
+            .map(|&i| crate::vector_locator::rows(store, &set.slabs[i], set, attribute)),
+    );
+    let (mask, lists) = tokio::try_join!(filtered_mask(store, state, set, at, filter), lists)?;
+    for (&i, rows) in missing.iter().zip(lists) {
+        let selected: RoaringBitmap = rows.iter().copied().filter(|r| mask.contains(*r)).collect();
+        allowed[i] = Some(match &keys {
+            Some(keys) => crate::read_cache::insert_predicate(&keys[i], selected),
+            None => Arc::new(selected),
+        });
+    }
+    Ok(allowed)
+}
+
 /// Shift exact per-segment filter results back through lineage into the tier's global rows.
 /// This includes live masks and tail shadows, so a slab scan cannot return an older version.
 async fn filtered_mask(
@@ -643,4 +742,119 @@ async fn filtered_mask(
         }
     }
     Ok(Arc::new(mask))
+}
+
+#[cfg(test)]
+mod slab_mask_tests {
+    use super::*;
+    use crate::{Engine, ReclusterOptions, read_cache};
+    use serde_json::json;
+    use std::{path::Path, time::Duration};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filtered_slab_masks_reuse_immutable_rows_and_bypass_shadows_and_new_live_files() {
+        let store = Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store.clone(),
+            EngineConfig {
+                indexing: false,
+                retention: Duration::ZERO,
+                recall_sample_rate: 0.0,
+                compaction_segments: 100,
+                ..Default::default()
+            },
+        );
+        for batch in 0..3 {
+            let rows: Vec<_> = (batch * 600..(batch + 1) * 600)
+                .map(|id| json!({"id":id,"group":id%5,"vector":[(id as f32).sin(),0.5,0.25,1.0]}))
+                .collect();
+            engine.write("masks", serde_json::from_value(json!({
+                "distance_metric":"euclidean_squared", "schema":{"vector":{"type":"[4]f16"}},
+                "upsert_rows":rows,
+            })).unwrap()).await.unwrap();
+            engine.index_namespace("masks", true).await.unwrap();
+        }
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/d4-cache-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let scratch = tempfile::tempdir_in(base).unwrap();
+        engine
+            .recluster(
+                "masks",
+                &ReclusterOptions {
+                    attribute: "vector".into(),
+                    cells: 2,
+                    cluster_rows: 30,
+                    max_slab_rows: 600,
+                    scratch: scratch.path().into(),
+                },
+            )
+            .await
+            .unwrap();
+        engine.collect_garbage("masks").await.unwrap();
+        let (state, _) = engine
+            .snapshot("masks", &Consistency::Strong)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .segments
+                .iter()
+                .all(|s| !s.files.contains_key("annv2:vector"))
+        );
+        let set = &state.ann_tiers["vector"][0];
+        let at = crate::lineage::place(&store, &state.segments, &state.lineage, set)
+            .await
+            .unwrap()
+            .unwrap();
+        let filter: Filter = serde_json::from_value(json!(["group", "Eq", 3])).unwrap();
+        let context = read_cache::ReadContext::new(engine.0.read_cache.clone());
+        read_cache::scope(context, async {
+            let first = filtered_slab_masks(&store, &state, set, &at, &filter, "vector")
+                .await
+                .unwrap();
+            let second = filtered_slab_masks(&store, &state, set, &at, &filter, "vector")
+                .await
+                .unwrap();
+            assert!(
+                first
+                    .iter()
+                    .zip(&second)
+                    .all(|(a, b)| Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()))
+            );
+            let union = |masks: &[Option<Arc<RoaringBitmap>>]| -> RoaringBitmap {
+                masks
+                    .iter()
+                    .flatten()
+                    .flat_map(|mask| mask.iter())
+                    .collect()
+            };
+            assert_eq!(union(&first).len(), 360);
+            let mut shadowed = state.clone();
+            shadowed.shadowed.insert(Id::Uint(3));
+            let third = filtered_slab_masks(&store, &shadowed, set, &at, &filter, "vector")
+                .await
+                .unwrap();
+            assert_eq!(
+                union(&third).len(),
+                359,
+                "a branch or WAL shadow must bypass the cached tier mask"
+            );
+            // A different immutable live generation must miss, rather than reuse a valid old mask.
+            let mut changed = state.clone();
+            let mut segments = state.segments.to_vec();
+            segments[0].live.key = "missing-new-live-generation".into();
+            changed.segments = segments.into();
+            assert!(
+                filtered_slab_masks(&store, &changed, set, &at, &filter, "vector")
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+    }
 }

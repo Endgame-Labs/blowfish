@@ -255,7 +255,11 @@ fixed probe multiplier; correlated filters still require measured recall checks.
 keeps every vector row uses the unfiltered budget. Sparse global slab IDs have no dense row-to-cluster map, so they use the
 existing masked code scan, rather than the dense segment map's direct exact-fetch shortcut.
 Snapshot warm-up and the planner share bounded cached predicate results for each immutable
-segment live generation. The key includes its files, schema, and predicate; WAL shadows are
+segment live generation. Filtered tier scans also cache each slab's derived allowed bitmap in
+that protected pool, so a warm query does not intersect every vector row again. Their keys include
+the tier, current file and live identities, schemas, coverage, and lineage; numeric WAL or manifest
+sequences alone are insufficient because branches can share tiers. Tail shadows bypass these
+derived masks. Cold row-list reads overlap predicate evaluation. The key includes its files, schema, and predicate; WAL shadows are
 removed afterward. This avoids repeatedly decoding high-cardinality ID-filter dictionaries,
 without reusing a mask across a flush, schema change, or compaction.
 Predicate bitmaps and decoded column blocks share one twelfth of the existing decoded-cache
