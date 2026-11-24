@@ -89,6 +89,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let store = Storage::open(&config).await?;
     let mut tuning = EngineConfig::from_env();
+    // The engine's positive-threshold parser ignores zero; this benchmark also needs an
+    // explicit zero-retention query profile, independently of maintenance and immediate GC.
+    if let Ok(seconds) = std::env::var("BF_RETENTION_SECS") {
+        tuning.retention = Duration::from_secs(seconds.parse()?);
+    }
     tuning.indexing = false;
     if matches!(args[1].as_str(), "index" | "recluster" | "gc") {
         tuning.retention = Duration::ZERO;
