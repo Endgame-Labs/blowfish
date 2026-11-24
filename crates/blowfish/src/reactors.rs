@@ -1,10 +1,41 @@
 //! Independent HTTP reactors with round-robin connection ownership.
-use axum::{Router, serve::Listener};
+use axum::{
+    Router,
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    serve::Listener,
+};
 use std::{future::Future, io, net::SocketAddr};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, watch},
 };
+
+async fn dispatch(
+    State(runtime): State<tokio::runtime::Handle>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if request.method() == axum::http::Method::POST
+        && (path.starts_with("/v1/namespaces/") || path.starts_with("/v2/namespaces/"))
+        && path.ends_with("/query")
+    {
+        return next.run(request).await;
+    }
+    // Writes, administration, and maintenance never execute CPU work on a query reactor.
+    // Dropping the connection cancels its request driver while durable commit workers retain
+    // their existing cancellation semantics.
+    let mut work = tokio::task::JoinSet::new();
+    work.spawn_on(next.run(request), &runtime);
+    match work.join_next().await {
+        Some(Ok(response)) => response,
+        _ => {
+            crate::HttpError(bf_types::ApiError::new(500, "request worker stopped")).into_response()
+        }
+    }
+}
 
 struct Connections {
     incoming: mpsc::Receiver<(std::net::TcpStream, SocketAddr)>,
@@ -50,6 +81,7 @@ async fn serve_count(
 ) -> io::Result<()> {
     let address = listener.local_addr()?;
     let io_runtime = tokio::runtime::Handle::current();
+    let app = app.layer(middleware::from_fn_with_state(io_runtime.clone(), dispatch));
     let (stop, stopped) = watch::channel(false);
     let mut senders = Vec::with_capacity(count);
     let mut completions = tokio::task::JoinSet::new();
@@ -108,29 +140,44 @@ async fn serve_count(
     };
     let _ = stop.send(true);
     drop(senders);
+    accepted?;
     while let Some(result) = completions.join_next().await {
         result.map_err(io::Error::other)??;
     }
-    accepted
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::get;
+    use axum::routing::{get, post};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connections_have_distinct_reactors_and_shutdown_drains() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
-            "/",
-            get(|| async {
+            "/v2/namespaces/test/query",
+            post(|| async {
                 assert_eq!(
                     tokio::runtime::Handle::current().runtime_flavor(),
                     tokio::runtime::RuntimeFlavor::CurrentThread
                 );
                 std::thread::current().name().unwrap().to_owned()
+            }),
+        );
+        async fn panicking() -> &'static str {
+            panic!("test request panic");
+        }
+        let app = app.route("/panic", get(panicking));
+        let app = app.route(
+            "/write",
+            get(|| async {
+                assert_eq!(
+                    tokio::runtime::Handle::current().runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                );
+                "shared"
             }),
         );
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -147,7 +194,7 @@ mod tests {
         for client in &clients {
             names.push(
                 client
-                    .get(format!("http://{address}/"))
+                    .post(format!("http://{address}/v2/namespaces/test/query"))
                     .send()
                     .await
                     .unwrap()
@@ -160,7 +207,7 @@ mod tests {
         for (client, expected) in clients.iter().zip(names) {
             assert_eq!(
                 client
-                    .get(format!("http://{address}/"))
+                    .post(format!("http://{address}/v2/namespaces/test/query"))
                     .send()
                     .await
                     .unwrap()
@@ -170,6 +217,31 @@ mod tests {
                 expected
             );
         }
+        assert_eq!(
+            clients[0]
+                .get(format!("http://{address}/write"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "shared"
+        );
+        let failed = clients[0]
+            .get(format!("http://{address}/panic"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(failed.headers()["x-should-retry"], "false");
+        assert_eq!(
+            failed.json::<serde_json::Value>().await.unwrap()["status"],
+            "error"
+        );
         stop.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), serving)
             .await

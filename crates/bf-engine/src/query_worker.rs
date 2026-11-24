@@ -34,6 +34,17 @@ pub async fn on_query_reactor<F: Future>(runtime: tokio::runtime::Handle, future
     future.await
 }
 
+/// Background work belongs to the shared runtime, including work created by a first query.
+pub(crate) fn shared_runtime() -> tokio::runtime::Handle {
+    IO_RUNTIME
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(tokio::runtime::Handle::current)
+}
+
+pub(crate) fn is_reactor() -> bool {
+    IO_RUNTIME.with(|slot| slot.borrow().is_some())
+}
+
 enum Work<F: Future> {
     Ready(F::Output),
     Yielded(Pin<Box<F>>),
@@ -43,20 +54,28 @@ enum Work<F: Future> {
 /// A resident plan completes on its CPU worker without entering `block_on`. A yielded plan
 /// keeps its partially polled future, including I/O and locks, rather than executing twice.
 /// Its blocking-pool continuation cannot exhaust the fixed CPU workers while waiting for I/O.
-pub(crate) async fn run<F>(future: F) -> Result<F::Output, ApiError>
+pub(crate) async fn run<F>(future: F, inline: bool) -> Result<F::Output, ApiError>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    if let Some(runtime) = IO_RUNTIME.with(|slot| slot.borrow().clone()) {
+    if inline && let Some(runtime) = IO_RUNTIME.with(|slot| slot.borrow().clone()) {
         let mut future = Box::pin(future);
         let work = catch_unwind(AssertUnwindSafe(|| {
             let mut context = Context::from_waker(futures::task::noop_waker_ref());
             future.as_mut().poll(&mut context)
         }));
         return match work {
-            Ok(Poll::Ready(value)) => Ok(value),
-            Ok(Poll::Pending) => run_io(runtime, future).await,
+            Ok(Poll::Ready(value)) => {
+                metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "inline")
+                    .increment(1);
+                Ok(value)
+            }
+            Ok(Poll::Pending) => {
+                metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "inline_yielded")
+                    .increment(1);
+                run_io(runtime, future).await
+            }
             Err(_) => Err(ApiError::new(500, "query worker panicked")),
         };
     }
@@ -72,7 +91,7 @@ where
             .build()
             .expect("query worker pool")
     });
-    let runtime = tokio::runtime::Handle::current();
+    let runtime = shared_runtime();
     let worker_runtime = runtime.clone();
     let (send, receive) = oneshot::channel();
     pool.spawn_fifo(move || {
@@ -134,6 +153,13 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     tokio::task_local! { static VALUE: usize; }
+    async fn run<F>(future: F) -> Result<F::Output, ApiError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        super::run(future, true).await
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn independent_reactor_polls_inline_and_preserves_a_yielded_plan() {
@@ -145,6 +171,30 @@ mod tests {
                 .unwrap()
                 .block_on(on_query_reactor(io, async {
                     let thread = std::thread::current().id();
+                    assert_eq!(
+                        shared_runtime()
+                            .spawn(async { tokio::runtime::Handle::current().runtime_flavor() })
+                            .await
+                            .unwrap(),
+                        tokio::runtime::RuntimeFlavor::MultiThread
+                    );
+                    assert!(
+                        super::run(
+                            async {
+                                assert_eq!(
+                                    tokio::runtime::Handle::current().runtime_flavor(),
+                                    tokio::runtime::RuntimeFlavor::MultiThread
+                                );
+                                std::thread::current()
+                                    .name()
+                                    .unwrap()
+                                    .starts_with("bf-query-")
+                            },
+                            false
+                        )
+                        .await
+                        .unwrap()
+                    );
                     assert_eq!(
                         run(async move { std::thread::current().id() })
                             .await
@@ -191,6 +241,89 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_reactor_refresh_keeps_backend_accounting_and_a_writable_handle() {
+        use crate::{Engine, EngineConfig};
+        use bf_storage::{Storage, StorageConfig};
+        use serde_json::json;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&StorageConfig {
+            url: format!("file://{}", directory.path().display()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let config = EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.,
+            ..Default::default()
+        };
+        let writer = Engine::with_config(storage.clone(), config.clone());
+        writer
+            .write(
+                "reactor",
+                serde_json::from_value(json!({
+                    "distance_metric":"cosine_distance", "upsert_rows":[{"id":1,"vector":[1.,0.]}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let reader = Engine::with_config(storage, config);
+        let io = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(on_query_reactor(io, async move {
+                    let (response, diagnostics) = reader
+                        .query_with_diagnostics(
+                            "reactor",
+                            serde_json::from_value(json!({
+                                "rank_by":["vector","ANN",[1.,0.]], "top_k":1
+                            }))
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.result.rows.as_ref().unwrap()[0]["id"], json!(1));
+                    assert!(
+                        diagnostics
+                            .backend
+                            .iter()
+                            .any(|measurement| measurement.stage == "snapshot"
+                                && measurement.requests > 0)
+                    );
+                    reader
+                        .write(
+                            "reactor",
+                            serde_json::from_value(json!({
+                                "upsert_rows":[{"id":2,"vector":[0.,1.]}]
+                            }))
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let response = reader
+                        .query(
+                            "reactor",
+                            serde_json::from_value(json!({
+                                "rank_by":["id","asc"], "top_k":10
+                            }))
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.result.rows.as_ref().unwrap().len(), 2);
+                    assert!(reader.shutdown(std::time::Duration::from_secs(5)).await);
+                }));
+        })
+        .await
+        .unwrap();
+        assert!(writer.shutdown(std::time::Duration::from_secs(5)).await);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

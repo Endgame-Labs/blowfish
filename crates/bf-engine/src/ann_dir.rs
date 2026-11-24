@@ -1080,6 +1080,12 @@ pub(crate) async fn search(
         }
         return hydrate(store, state, real, columns, k, winners, t0).await;
     }
+    // A missing compiled code or exact row can still find all its bytes in a lower cache.
+    // Yield before the general planner spends CPU: the reactor's saved future continues on
+    // shared I/O, rather than running an unexpectedly expensive fallback on this connection.
+    if crate::query_worker::is_reactor() {
+        tokio::task::yield_now().await;
+    }
     let vector: Arc<[f32]> = vector.into();
     let width = dir.vector_row_bytes();
     // One rotation serves the ranking and every segment's scan (they share one vector space).

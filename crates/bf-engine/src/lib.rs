@@ -576,7 +576,7 @@ impl Engine {
         });
         handles.insert(ns.into(), handle.clone());
         let context = read_cache::ReadContext::new(self.0.read_cache.clone());
-        tokio::spawn(read_cache::scope(
+        query_worker::shared_runtime().spawn(read_cache::scope(
             context,
             commit_worker(
                 wal,
@@ -693,6 +693,7 @@ impl Engine {
         ns: &str,
         consistency: &Consistency,
         hint: snapshot::OpenHint,
+        backend: &Arc<bf_storage::BackendStats>,
     ) -> Result<(Arc<NamespaceState>, bool), ApiError> {
         if matches!(consistency, Consistency::Strong) {
             let handle = self.handle(ns).await?;
@@ -717,6 +718,20 @@ impl Engine {
                     Err(error) => return Err(storage_error(error)),
                 }
             }
+        }
+        if query_worker::is_reactor() {
+            let (engine, ns, consistency) = (self.clone(), ns.to_owned(), consistency.clone());
+            let backend = backend.clone();
+            return query_worker::run_io(query_worker::shared_runtime(), async move {
+                backend
+                    .scope(
+                        "snapshot",
+                        engine.snapshot_hinted(&ns, &consistency, Some(hint), false),
+                    )
+                    .await
+                    .map(|(state, warm)| (Arc::new(state), warm))
+            })
+            .await?;
         }
         self.snapshot_hinted(ns, consistency, Some(hint), false)
             .await
@@ -806,6 +821,42 @@ impl Engine {
         ns: &str,
         request: QueryRequest,
     ) -> Result<(QueryResponse, QueryDiagnostics), ApiError> {
+        if query_worker::is_reactor() {
+            let resident = self.0.config.models.is_none()
+                && self.0.namespaces.load().get(ns).is_some_and(|handle| {
+                    let state = handle.state.load();
+                    state.exists
+                        && state.seq > 0
+                        && state.checkpoint_refreshed.elapsed()
+                            < self.0.config.retention.div_f64(2.0)
+                        && warm_ann::inline_plan(
+                            &self.0.read_cache,
+                            &state,
+                            &request,
+                            &self.0.config,
+                        )
+                });
+            if !resident {
+                let start = Instant::now();
+                let (engine, ns) = (self.clone(), ns.to_owned());
+                let result = query_worker::run_io(
+                    query_worker::shared_runtime(),
+                    Box::pin(async move { engine.query_configured(&ns, request).await }),
+                )
+                .await?;
+                return result.map(|(mut response, diagnostics)| {
+                    response.performance.server_total_ms = start.elapsed().as_millis() as u64;
+                    (response, diagnostics)
+                });
+            }
+        }
+        self.query_configured(ns, request).await
+    }
+    async fn query_configured(
+        &self,
+        ns: &str,
+        request: QueryRequest,
+    ) -> Result<(QueryResponse, QueryDiagnostics), ApiError> {
         match self.0.config.models.clone() {
             Some(models) => self.query_with_models(models, ns, request).await,
             None => self.query_inner(ns, request).await,
@@ -848,7 +899,7 @@ impl Engine {
             let result = backend
                 .scope(
                     "snapshot",
-                    self.query_snapshot(ns, &request.consistency, hint),
+                    self.query_snapshot(ns, &request.consistency, hint, &backend),
                 )
                 .await;
             (result, start.elapsed())
@@ -900,7 +951,7 @@ impl Engine {
             let cache = self.0.read_cache.clone();
             let queries = self.0.queries.clone();
             let stop = self.0.stop.clone();
-            tokio::spawn(async move {
+            query_worker::shared_runtime().spawn(async move {
                 let Ok(permit) = queries.acquire_owned().await else {
                     return;
                 };
@@ -970,6 +1021,8 @@ impl Engine {
         let store = self.0.store.clone();
         let config = self.0.config.clone();
         let t_clone = Instant::now();
+        let inline = query_worker::is_reactor()
+            && warm_ann::inline_plan(&self.0.read_cache, state, request, &config);
         let state = state.clone();
         if crate::ann::trace_stages() {
             eprintln!("CLONE {}us", t_clone.elapsed().as_micros());
@@ -994,7 +1047,7 @@ impl Engine {
             .await
         });
         let response = if warm {
-            query_worker::run(query).await??
+            query_worker::run(query, inline).await??
         } else {
             metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "cold").increment(1);
             query_worker::run_io(tokio::runtime::Handle::current(), query).await??

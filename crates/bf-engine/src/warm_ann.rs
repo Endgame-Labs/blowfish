@@ -25,6 +25,61 @@ struct Seen(AtomicU8);
 thread_local! {
     static SCRATCH: RefCell<ResidentQueryScratch> = RefCell::new(ResidentQueryScratch::default());
 }
+/// Only a bounded, unfiltered, already compiled ANN tier may spend CPU on an HTTP reactor.
+/// The normal planner still proves masks, coverage, and exact-vector residency; a miss yields
+/// its existing future to shared I/O, and unsupported plans retain the fixed worker pool.
+pub(crate) fn inline_plan(
+    cache: &read_cache::DecodedCache,
+    state: &crate::NamespaceState,
+    request: &bf_types::QueryRequest,
+    config: &crate::EngineConfig,
+) -> bool {
+    let Some(bf_types::RankBy::Vector {
+        attribute,
+        exact: false,
+        vector,
+        ..
+    }) = &request.rank_by
+    else {
+        return false;
+    };
+    if vector.len() > 1024
+        || config.ann_nprobe > 64
+        || config.ann_rerank_factor > 32
+        || request.compute_attributes.is_some()
+        || request.limit.is_some()
+        || request.filters.is_some()
+        || request.queries.is_some()
+        || request.aggregate_by.is_some()
+        || request.group_by.is_some()
+        || request.rerank_by.is_some()
+        || request.total().unwrap_or(10).saturating_add(request.offset) > 10
+        || state.tail_bytes != 0
+        || !state.docs.is_empty()
+        || state
+            .segments
+            .iter()
+            .any(|segment| segment.live_generation != 0)
+    {
+        return false;
+    }
+    let Some(tiers) = state.ann_tiers.get(attribute) else {
+        return false;
+    };
+    tiers.len() == 1
+        && cache
+            .get::<WarmTier>(&tiers[0].dir.key)
+            .is_some_and(|warm| {
+                warm.ready.load(Ordering::Acquire)
+                    && warm.rows as u64
+                        == state
+                            .segments
+                            .iter()
+                            .map(|segment| u64::from(segment.row_count))
+                            .sum::<u64>()
+            })
+}
+
 impl WarmTier {
     /// A first query uses only the normal cold path. A second query can reserve a compiled
     /// view if its complete code working set and exact-vector cache fit the decoded budget.
@@ -282,6 +337,37 @@ mod tests {
             }
         }
         let compiled = current(&warm, key).await.expect("hot tier admitted");
+        let state = warm.handle("compiled").await.unwrap().state.load();
+        let mut eligible: QueryRequest = serde_json::from_value(request(17)).unwrap();
+        assert!(inline_plan(
+            &warm.0.read_cache,
+            &state,
+            &eligible,
+            &warm.0.config
+        ));
+        eligible.top_k = Some(11);
+        assert!(!inline_plan(
+            &warm.0.read_cache,
+            &state,
+            &eligible,
+            &warm.0.config
+        ));
+        eligible.top_k = Some(10);
+        let mut expensive = warm.0.config.clone();
+        expensive.ann_nprobe = 65;
+        assert!(!inline_plan(
+            &warm.0.read_cache,
+            &state,
+            &eligible,
+            &expensive
+        ));
+        eligible.filters = Some(serde_json::from_value(json!(["tag", "Eq", 0])).unwrap());
+        assert!(!inline_plan(
+            &warm.0.read_cache,
+            &state,
+            &eligible,
+            &warm.0.config
+        ));
         assert!(
             compiled.hits.load(Ordering::Relaxed) > 0,
             "exercise the real compiled branch"
