@@ -158,8 +158,10 @@ A filtered ANN query now takes the same path as an unfiltered one:
    segment's existing filter file), and each segment's membership map. No segment index or ID index is opened.
 2. Exact allowed rows per cluster come from the map. If at most `exact_fetch_rows` (8,192) rows are allowed, their
    vectors are fetched directly (`PartialIndex::exact_at`, merged ranges) and ranked exactly: no blobs, no codes.
-   Otherwise the nearest clusters (probe count up to `filtered_probe_cap` = 3 times the unfiltered count, until the
-   allowed candidates reach the rerank budget) are scanned by code with the allowed rows as the filter, then reranked.
+   Otherwise the nearest clusters are scanned by code with the allowed rows as the filter, then reranked. The probe
+   budget grows with inverse selectivity (the share of rows the filter allows, counted from the membership maps), plus
+   a margin for one more surviving witness and one standard deviation of the trials needed to find `k + 1` survivors.
+   There is no fixed cap: a cap of three times the unfiltered count lost neighbors on selective filters.
 3. Winners are hydrated by segment row (`projected_rows`), so no ID index is read.
 
 Old fragments and directories (no map) make the directory unusable for the namespace until compaction rewrites them:

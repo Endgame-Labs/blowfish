@@ -111,7 +111,7 @@ The decoded cache budget covers all decoded data, in three parts: decoded segmen
 directory clusters (a quarter), and decoded document column blocks (a twelfth). Together they stay within
 `BF_DECODED_CACHE_BYTES`.
 
-`blowfish serve` reads every `BF_*` engine variable above, plus `BF_INDEX_BYTES`, `BF_MAX_SEGMENT_BYTES`, `BF_BULK_FLUSH_AGE_MS`, `BF_WAL_PIPELINE`, `BF_RETENTION_SECS`, `BF_ANN_RERANK`, `BF_EXACT_FETCH`, and `BF_FILTER_PROBE_CAP`. CLI flags and TOML keys take precedence over them. `BF_BULK_FLUSH_BYTES` follows `max_unindexed_bytes` (three quarters of it) unless set explicitly.
+`blowfish serve` reads every `BF_*` engine variable above, plus `BF_INDEX_BYTES`, `BF_MAX_SEGMENT_BYTES`, `BF_BULK_FLUSH_AGE_MS`, `BF_WAL_PIPELINE`, `BF_RETENTION_SECS`, `BF_ANN_RERANK`, and `BF_EXACT_FETCH`. CLI flags and TOML keys take precedence over them. `BF_BULK_FLUSH_BYTES` follows `max_unindexed_bytes` (three quarters of it) unless set explicitly.
 
 Memory detection: every memory-sized default, the block cache included, reads one limit: the smaller of host RAM and the process's own cgroup (`/proc/self/cgroup` -> `/sys/fs/cgroup<path>/memory.max`, then `/sys/fs/cgroup/memory.max`). On macOS host RAM comes from `hw.memsize`. When nothing can be read it assumes 4 GiB.
 
