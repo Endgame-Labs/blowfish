@@ -4,10 +4,11 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-11-24
+
 ### Performance
 
 - **Faster recluster, exactly:** Leaf assignment screens candidates with full-dimensional BF16 matrix scores and certified error bounds, then recomputes every possible winner with the original FP32 kernel, so assignments stay byte-identical. On ARM CPUs with native BF16 (selected automatically; other CPUs keep the original kernel), full NQ assignment drops from 176 s to 97 s and the time from the last write's acknowledgment to the full index drops from 255 s to 177 s (1.44x), at unchanged recall. A 10M assignment check went from 570 s to 349 s.
-
 
 ## [0.1.17] - 2026-11-24
 
@@ -147,7 +148,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.18
 [0.1.17]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.17
 [0.1.16]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.16
 [0.1.15]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.15
