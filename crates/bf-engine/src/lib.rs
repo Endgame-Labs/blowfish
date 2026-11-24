@@ -35,6 +35,7 @@ mod recluster;
 mod reindex;
 mod text;
 mod text_keys;
+mod text_tail;
 mod upgrade;
 mod vector_locator;
 mod warm_ann;
@@ -1821,3 +1822,6 @@ mod recall_sampler_tests {
         assert!(sampler.start(Duration::ZERO).is_some());
     }
 }
+
+#[cfg(test)]
+mod text_benchmark;

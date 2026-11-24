@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **BM25 under heavy writes 9.5x faster** (round BW1; `docs/benchmarks.md`, "Round BW1"). BM25 over an
+  unindexed write tail recomputed full-vocabulary statistics and re-tokenized tail rows on every query. Queries
+  now compute statistics for their own terms only and reuse cached per-row term counts from immutable tail
+  objects (a bounded CLOCK pool taking one eighth of the decoded-cache budget). On 1M MS MARCO with 1,000
+  text-changing upserts/s: p50 539 to 57 ms, p90 721 to 82 ms, with bit-identical results on 4,000 validation
+  queries across four million-row snapshots and every offered write acknowledged. Idle BM25 is unchanged.
+
 - **Memory-capped servers 1.2-3.6x faster on warm vector queries** (round MEM2; `docs/benchmarks.md`, "Round MEM2").
   Immutable local objects are now memory-mapped and share the operating system's page cache instead of being
   copied into the heap, through two views of the same pages: normal read-ahead for contiguous reads of 64 KiB or

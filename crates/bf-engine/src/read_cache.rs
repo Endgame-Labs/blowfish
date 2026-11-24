@@ -33,10 +33,11 @@ pub(crate) struct DecodedCache {
     /// many (the general LRU's eviction scans every entry).
     clusters: ClusterCache,
     /// Decoded document column blocks (256 rows each), for hydrating results.
-    /// Columns borrow unused predicate capacity; immutable predicates keep protected space.
     columns: Arc<PredicateColumns>,
     /// Decoded resident WAL vectors; charged to the same total budget as immutable metadata.
     pub(crate) tail_vectors: crate::tail::VectorCache,
+    /// Immutable WAL and shadow-row term counts, charged to this cache's total budget.
+    pub(crate) text_terms: Arc<ClockCache<Arc<crate::text_tail::Analysis>, crate::text_tail::Key>>,
 }
 /// foldhash, seeded per process (the keys are object keys and cluster numbers).
 type FastHash = foldhash::fast::RandomState;
@@ -294,13 +295,13 @@ impl PredicateColumns {
     }
 }
 impl DecodedCache {
-    /// Half for the general LRU, a quarter for clusters, a sixth for WAL vectors, and a
-    /// twelfth shared by columns and predicates. Predicates protect up to a quarter of that
-    /// pool; columns borrow its unused bytes. X1's general reservation stays unchanged.
+    /// `budget` bytes in all: three eighths for the general LRU, a quarter for clusters,
+    /// a sixth for resident WAL vectors, an eighth for text counts, and a twelfth shared by columns and predicates.
+    /// Predicates protect up to a quarter of that pool; columns borrow unused bytes.
     pub fn new(budget: u64, workers: usize) -> Self {
-        let (clusters, columns, vectors) = (budget / 4, budget / 12, budget / 6);
+        let (clusters, columns, vectors, text) = (budget / 4, budget / 12, budget / 6, budget / 8);
         Self {
-            budget: budget - clusters - columns - vectors,
+            budget: budget - clusters - columns - vectors - text,
             entries: Arc::new(Mutex::new(Entries::default())),
             scope: String::new(),
             workers: Arc::new(Semaphore::new(workers.max(1))),
@@ -310,6 +311,10 @@ impl DecodedCache {
             )),
             columns: Arc::new(PredicateColumns::new(columns, budget / 48)),
             tail_vectors: crate::tail::VectorCache::new(vectors),
+            text_terms: Arc::new(ClockCache::new(
+                text,
+                |value: &Arc<crate::text_tail::Analysis>| value.bytes(),
+            )),
         }
     }
     /// A decoded column block (`key` is relative to this view, like every other key).
@@ -341,6 +346,7 @@ impl DecodedCache {
             columns: self.columns.clone(),
             // Document allocation identities are process-wide, independent of storage scope.
             tail_vectors: self.tail_vectors.clone(),
+            text_terms: self.text_terms.clone(),
         }
     }
     /// Forget every decoded entry (bench cold-cache runs).
@@ -351,8 +357,9 @@ impl DecodedCache {
         self.clusters.clear();
         self.columns.clear();
         self.tail_vectors.clear();
+        self.text_terms.clear();
     }
-    fn key(&self, key: &str) -> String {
+    pub(crate) fn key(&self, key: &str) -> String {
         if self.scope.is_empty() {
             key.to_owned()
         } else {
@@ -483,6 +490,20 @@ pub(crate) fn insert<T: Any + Send + Sync>(key: &str, bytes: u64, value: T) -> A
     value
 }
 
+/// The current query's general decoded-cache budget (zero outside a query context).
+pub(crate) fn capacity() -> u64 {
+    context().map_or(0, |c| c.cache.budget)
+}
+/// Reserve a complete resident view atomically. Concurrent cold queries share one winner,
+/// and the rejected candidate is dropped after releasing the cache lock.
+pub(crate) fn insert_once<T: Any + Send + Sync>(key: &str, bytes: u64, value: T) -> Option<Arc<T>> {
+    let context = context()?;
+    if bytes > context.cache.budget || context.cache.budget == 0 {
+        return None;
+    }
+    Some(context.cache.install(key, bytes, Arc::new(value), true))
+}
+
 /// A generation-fenced predicate, isolated from large dictionary admission in the general LRU.
 pub(crate) fn predicate(key: &str) -> Option<Arc<bf_vector::RoaringBitmap>> {
     let context = context()?;
@@ -503,109 +524,9 @@ pub(crate) fn insert_predicate(
     value
 }
 
-/// The current query's general decoded-cache budget (zero outside a query context).
-pub(crate) fn capacity() -> u64 {
-    context().map_or(0, |c| c.cache.budget)
-}
-/// Reserve a complete resident view atomically. Concurrent cold queries share one winner,
-/// and the rejected candidate is dropped after releasing the cache lock.
-pub(crate) fn insert_once<T: Any + Send + Sync>(key: &str, bytes: u64, value: T) -> Option<Arc<T>> {
-    let context = context()?;
-    if bytes > context.cache.budget || context.cache.budget == 0 {
-        return None;
-    }
-    Some(context.cache.install(key, bytes, Arc::new(value), true))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn columns_borrow_unused_predicate_bytes_and_return_them_under_pressure() {
-        let pool = PredicateColumns::new(16_384, 4096);
-        let column = Arc::new(vec![None; 100]);
-        for i in 0..3 {
-            pool.insert_column(format!("column-{i}"), column.clone());
-        }
-        // All three fit the shared pool, although they exceed its old fixed column portion.
-        assert!((0..3).all(|i| pool.column(&format!("column-{i}")).is_some()));
-        let predicate: Predicate = Arc::new((0..100).map(|i| i * 65_537).collect());
-        pool.insert_predicate("predicate".into(), predicate.clone());
-        assert_eq!(pool.predicate("predicate"), Some(predicate));
-        {
-            let entries = pool.entries.lock().unwrap();
-            assert_eq!(entries.columns.map.len(), 2);
-            assert!(entries.columns.bytes + entries.predicates.bytes <= pool.budget);
-        }
-        // Replacing a large predicate with a small one immediately returns its unused bytes.
-        pool.insert_predicate("predicate".into(), Arc::new((1..5).collect()));
-        pool.insert_column("new-column".into(), column.clone());
-        assert_eq!(pool.entries.lock().unwrap().columns.map.len(), 3);
-        pool.insert_predicate(
-            "oversized".into(),
-            Arc::new((0..1000).map(|i| i * 65_537).collect()),
-        );
-        assert!(pool.predicate("oversized").is_none());
-        assert_eq!(pool.entries.lock().unwrap().columns.map.len(), 3);
-        pool.clear();
-        let entries = pool.entries.lock().unwrap();
-        assert_eq!(entries.columns.cap, pool.budget);
-        assert_eq!(entries.columns.bytes + entries.predicates.bytes, 0);
-    }
-
-    #[test]
-    fn both_clock_and_hash_map_key_copies_are_charged_before_admission() {
-        let pool = PredicateColumns::new(4096, 1024);
-        let key = "key".repeat(200);
-        pool.insert_predicate(key.clone(), Arc::new((0..1).collect()));
-        assert!(pool.predicate(&key).is_none());
-        pool.insert_column(key.clone(), Arc::new(vec![None; 64]));
-        assert!(pool.column(&key).is_none());
-    }
-
-    #[test]
-    fn concurrent_predicate_and_column_admission_obeys_the_shared_byte_limit() {
-        let pool = Arc::new(PredicateColumns::new(65_536, 16_384));
-        std::thread::scope(|scope| {
-            for thread in 0..8 {
-                let pool = pool.clone();
-                scope.spawn(move || {
-                    for i in 0..100 {
-                        let key = format!("{thread}-{i}");
-                        pool.insert_column(key.clone(), Arc::new(vec![None; 100]));
-                        pool.insert_predicate(key.clone(), Arc::new((0..100).collect()));
-                        let _ = (pool.column(&key), pool.predicate(&key));
-                        let entries = pool.entries.lock().unwrap();
-                        assert!(entries.columns.bytes + entries.predicates.bytes <= pool.budget);
-                        assert!(entries.predicates.bytes <= pool.protected);
-                    }
-                });
-            }
-        });
-    }
-
-    #[test]
-    fn predicate_budget_survives_dictionary_churn_and_obeys_scope_and_clear() {
-        let cache = DecodedCache::new(48 * 64 * 1024, 1);
-        let rows = Arc::new((0..100).collect::<bf_vector::RoaringBitmap>());
-        cache.insert_predicate("generation", rows.clone());
-        for i in 0..4 {
-            cache.insert(&format!("dictionary-{i}"), cache.budget, Arc::new(i));
-        }
-        assert_eq!(cache.predicate("generation").unwrap(), rows);
-        let other = cache.scoped("other");
-        assert!(other.predicate("generation").is_none());
-        other.insert_predicate("generation", Arc::new((200..300).collect()));
-        assert_ne!(other.predicate("generation").unwrap(), rows);
-        let oversized = Arc::new((0..10_000).map(|r| r * 65_537).collect());
-        cache.insert_predicate("oversized", oversized);
-        assert!(cache.predicate("oversized").is_none());
-        assert!(cache.columns.entries.lock().unwrap().predicates.bytes <= cache.columns.protected);
-        cache.clear();
-        assert!(cache.predicate("generation").is_none());
-        assert!(other.predicate("generation").is_none());
-        assert_eq!(rows.len(), 100);
-    }
     #[test]
     fn atomic_resident_admission_shares_one_bounded_generation() {
         let cache = Arc::new(DecodedCache::new(192, 1));
@@ -664,7 +585,7 @@ mod tests {
     }
     #[test]
     fn byte_budget_lru_type_separation_and_pinned_users() {
-        let cache = DecodedCache::new(14, 1);
+        let cache = DecodedCache::new(24, 1);
         let pinned = Arc::new(1u64);
         cache.insert("a", 4, pinned.clone());
         cache.insert("b", 4, Arc::new(2u64));
@@ -761,5 +682,96 @@ mod tests {
         writer.join().unwrap();
         reader.join().unwrap();
         assert!(matches!(observed, Ok(Some(9))));
+    }
+}
+
+#[cfg(test)]
+mod predicate_tests {
+    use super::*;
+    #[test]
+    fn columns_borrow_unused_predicate_bytes_and_return_them_under_pressure() {
+        let pool = PredicateColumns::new(16_384, 4096);
+        let column = Arc::new(vec![None; 100]);
+        for i in 0..3 {
+            pool.insert_column(format!("column-{i}"), column.clone());
+        }
+        // All three fit the shared pool, although they exceed its old fixed column portion.
+        assert!((0..3).all(|i| pool.column(&format!("column-{i}")).is_some()));
+        let predicate: Predicate = Arc::new((0..100).map(|i| i * 65_537).collect());
+        pool.insert_predicate("predicate".into(), predicate.clone());
+        assert_eq!(pool.predicate("predicate"), Some(predicate));
+        {
+            let entries = pool.entries.lock().unwrap();
+            assert_eq!(entries.columns.map.len(), 2);
+            assert!(entries.columns.bytes + entries.predicates.bytes <= pool.budget);
+        }
+        // Replacing a large predicate with a small one immediately returns its unused bytes.
+        pool.insert_predicate("predicate".into(), Arc::new((1..5).collect()));
+        pool.insert_column("new-column".into(), column.clone());
+        assert_eq!(pool.entries.lock().unwrap().columns.map.len(), 3);
+        pool.insert_predicate(
+            "oversized".into(),
+            Arc::new((0..1000).map(|i| i * 65_537).collect()),
+        );
+        assert!(pool.predicate("oversized").is_none());
+        assert_eq!(pool.entries.lock().unwrap().columns.map.len(), 3);
+        pool.clear();
+        let entries = pool.entries.lock().unwrap();
+        assert_eq!(entries.columns.cap, pool.budget);
+        assert_eq!(entries.columns.bytes + entries.predicates.bytes, 0);
+    }
+
+    #[test]
+    fn both_clock_and_hash_map_key_copies_are_charged_before_admission() {
+        let pool = PredicateColumns::new(4096, 1024);
+        let key = "key".repeat(200);
+        pool.insert_predicate(key.clone(), Arc::new((0..1).collect()));
+        assert!(pool.predicate(&key).is_none());
+        pool.insert_column(key.clone(), Arc::new(vec![None; 64]));
+        assert!(pool.column(&key).is_none());
+    }
+
+    #[test]
+    fn concurrent_predicate_and_column_admission_obeys_the_shared_byte_limit() {
+        let pool = Arc::new(PredicateColumns::new(65_536, 16_384));
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let pool = pool.clone();
+                scope.spawn(move || {
+                    for i in 0..100 {
+                        let key = format!("{thread}-{i}");
+                        pool.insert_column(key.clone(), Arc::new(vec![None; 100]));
+                        pool.insert_predicate(key.clone(), Arc::new((0..100).collect()));
+                        let _ = (pool.column(&key), pool.predicate(&key));
+                        let entries = pool.entries.lock().unwrap();
+                        assert!(entries.columns.bytes + entries.predicates.bytes <= pool.budget);
+                        assert!(entries.predicates.bytes <= pool.protected);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn predicate_budget_survives_dictionary_churn_and_obeys_scope_and_clear() {
+        let cache = DecodedCache::new(48 * 64 * 1024, 1);
+        let rows = Arc::new((0..100).collect::<bf_vector::RoaringBitmap>());
+        cache.insert_predicate("generation", rows.clone());
+        for i in 0..4 {
+            cache.insert(&format!("dictionary-{i}"), cache.budget, Arc::new(i));
+        }
+        assert_eq!(cache.predicate("generation").unwrap(), rows);
+        let other = cache.scoped("other");
+        assert!(other.predicate("generation").is_none());
+        other.insert_predicate("generation", Arc::new((200..300).collect()));
+        assert_ne!(other.predicate("generation").unwrap(), rows);
+        let oversized = Arc::new((0..10_000).map(|r| r * 65_537).collect());
+        cache.insert_predicate("oversized", oversized);
+        assert!(cache.predicate("oversized").is_none());
+        assert!(cache.columns.entries.lock().unwrap().predicates.bytes <= cache.columns.protected);
+        cache.clear();
+        assert!(cache.predicate("generation").is_none());
+        assert!(other.predicate("generation").is_none());
+        assert_eq!(rows.len(), 100);
     }
 }
