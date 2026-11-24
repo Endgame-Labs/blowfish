@@ -224,6 +224,12 @@ from 0.906 to 0.958. Reclustering removes the cost: it gets the recall at the ba
 | Least time between two sampled recall comparisons (the first waits this long after startup, and a comparison that took `t` delays the next by at least `50 × t`) | 60,000 ms | `BF_RECALL_SAMPLE_INTERVAL_MS` |
 | Cache block size for scattered small reads (rerank vectors) | 16,384 | `BF_SPARSE_BLOCK_BYTES` |
 
+Warm queries run on a fixed pool of query CPU workers: `N - 1` workers when the process has `N >= 8` CPUs, and `N` otherwise
+(at least one), so the async runtime keeps a core free to deliver completions and responses under sustained load. A warm
+plan gets one poll on this pool; a plan that has to wait for I/O continues on the I/O path. Cold snapshots use the I/O path.
+On 8 CPUs this cut warm NQ p90 by 8-11% with throughput 2-3% higher (`docs/benchmarks.md`, "Round Q3"). There is no
+setting for the pool size.
+
 On x86-64 the RaBitQ scan uses AVX-512 (`VPOPCNTQ`) when the CPU has it; on arm64 it uses NEON (`CNT` and pairwise adds).
 Both give bit-identical results to the portable path.
 
