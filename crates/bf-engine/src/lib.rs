@@ -1708,8 +1708,8 @@ mod tail_tests {
 
 #[cfg(test)]
 mod recall_sampler_tests {
-    use super::RecallSampler;
-    use std::time::Duration;
+    use super::{RECALL_SAMPLE_DUTY, RecallSampler};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn one_comparison_at_a_time_and_one_per_interval() {
@@ -1746,13 +1746,16 @@ mod recall_sampler_tests {
                 .start(Duration::ZERO)
                 .is_none()
         );
-        // A comparison that took 20 ms holds off the next for about a second, past the interval.
+        // A comparison that took about 20 ms holds off the next for 50 times as long, past the
+        // interval. Sleeps can overrun on a busy machine, so wait out a measured upper bound.
         let sampler = RecallSampler::new(Duration::ZERO);
+        let before = Instant::now();
         let sampling = sampler.start(Duration::ZERO).expect("starts");
         std::thread::sleep(Duration::from_millis(20));
         drop(sampling);
+        let hold_off = before.elapsed() * RECALL_SAMPLE_DUTY;
         assert!(sampler.start(Duration::ZERO).is_none());
-        std::thread::sleep(Duration::from_millis(1100));
+        std::thread::sleep(hold_off + Duration::from_millis(50));
         assert!(sampler.start(Duration::ZERO).is_some());
     }
 }
