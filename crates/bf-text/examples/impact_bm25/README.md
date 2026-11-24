@@ -68,6 +68,9 @@ in the queries, using the existing bitpacking width calculation. Directly
 persisted format-7 files, dictionary-size changes, and phrase migrations are not
 implemented by this experiment.
 
+The preparation log counts reordered long lists; dense modes report zero because
+they retain row order.
+
 The dense cache is deliberately optimistic: every long query term gets a full
 row-aligned array before measurement. Both dense modes share it, so the scalar
 comparison isolates the scoring kernel. The standalone planner also gets exact
