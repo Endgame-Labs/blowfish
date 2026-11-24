@@ -5265,3 +5265,101 @@ setting. `--parts latency --first-pass` skips latency warm-up for the separate f
 The harness now reports a failed or killed throughput worker, and reaps its peers. Its three
 regressions pass, along with formatting, full-workspace clippy, and all 324 Rust tests. The runtime
 helper is syntax-checked and exercised by the actual signed build, VM boots, and memory sweeps.
+
+## Round I2: binary vectors in the WAL (2026-11-24)
+
+I test whether replacing the WAL's f32-base64 vectors with a binary section at the declared
+precision improves acknowledged ingest by at least 1.30×, preserves replayed values, and avoids a
+write-p90 increase. The starting source is `d79c6757`.
+
+### Method and kill test
+
+All measurements run on one disposable c7g.2xlarge Spot instance in us-west-2 (8 vCPU, 16 GiB RAM,
+swap off), against Amazon S3 in that region. The server uses CPUs 0–5, six Tokio workers, and six
+Rayon workers; the client uses CPUs 6–7. Both binaries use the same Rust release profile, with
+`CARGO_PROFILE_RELEASE_LTO=false` and `CARGO_PROFILE_RELEASE_DEBUG=1`.
+
+The input is the first 500,000 BEIR NQ rows: 1,024-dimensional f16 vectors, original titles, and
+original text. I prepare identical 1,000-row JSON request bodies once, outside timing. They carry
+f32-base64 vectors, as the official SDK does. Four clients write into a fresh namespace in a fresh
+S3 prefix for every arm. Timing includes the first schema-bearing write, request-body reads,
+backpressure retries, and the last durable acknowledgment. Write percentiles include retry delays.
+No query traffic runs during ingest.
+
+Both arms use a 512 MiB memory cache, no disk cache, a 100,000-row or 256 MiB indexing threshold,
+a 30-second indexing age, a 256 MiB bulk-flush threshold, and a 384 MiB unindexed-WAL limit. The
+WAL pipeline remains eight; background indexing, compaction, and automatic reclustering stay on.
+
+The initial profiled baseline takes 181.91 s (2,749 acknowledged rows/s), with write p50/p90
+669.5/1,378.9 ms and 44 backpressure retries. A 99 Hz `perf record` captures 36,696 samples with
+no lost samples. Vector-distance work in `l2_squared_f32` accounts for 28.98% of sampled cycles
+on Tokio workers; text posting construction accounts for 5.68%. The WAL staging stack accounts for
+9.64% inclusively, including 8.77% in `encode_payload`. The main JSON string-escaping sample accounts
+for 1.33%. Compression samples include both WAL payloads and segment blocks, so I do not attribute
+all compression time to the WAL. The profiled load is excluded from the paired timing
+comparison.
+
+### Codec experiment
+
+The disposable prototype replaces only the external WAL payload codec. It writes zstd-compressed
+JSON metadata followed by little-endian binary vector records. Dense f16 values occupy two bytes
+per dimension, and dense f32 values occupy four. Metadata borrows documents without cloning their
+large vector strings. Small inline commits keep their existing representation. Public `WalEntry`
+and `WriteBatch` values, HTTP bodies, acknowledgment durability, indexing, and query code stay the
+same.
+
+The prototype uses payload version 4 because versions 2 and 3 identify commit-slot encodings.
+It reads version-1 payloads automatically until checkpointing and normal GC remove them. There is
+one payload writer. Before timing, prototype tests pass for mixed old/new logs, conflicts, retries,
+pruning, malformed binary sections, missing/null fields, dense f16/f32 values, arrays, sparse vectors,
+multi-vectors, and every finite f16 bit pattern. Values that cannot round-trip through their declared precision stay in
+JSON instead of being silently rounded by the codec.
+
+I run unprofiled arms in candidate/baseline/baseline/candidate order:
+
+| Arm | Seconds | Acknowledged rows/s | Write p50 / p90 ms | Backpressure retries |
+| --- | ---: | ---: | ---: | ---: |
+| Candidate 1 | 169.55 | 2,949 | 393.3 / 812.6 | 56 |
+| Baseline 1 | 125.27 | 3,991 | 678.6 / 883.3 | 28 |
+| Baseline 2 | 125.41 | 3,987 | 687.8 / 926.4 | 28 |
+| Candidate 2 | 114.80 | 4,355 | 398.0 / 740.3 | 44 |
+
+The retained WAL payload objects shrink from 1,548,985,444 and 1,548,985,398 bytes in the
+baselines to 1,041,784,805 and 1,041,756,063 bytes in the candidates: about 3,098 versus 2,084 B/row,
+a 32.7% reduction. These are compressed object payload sizes, including the storage identity header;
+commit slots and segment objects are excluded.
+
+Fresh-process replay with the prototype reader checks baseline 1 and candidate 1 independently
+against the original input. Both reproduce every ID exactly once, all 512,000,000 vector coordinates
+bit-for-bit, and every title and text. They contain 321 and 338 WAL slots, respectively. The five
+prototype codec tests also pass; they are removed with the unadopted codec.
+
+**Rejected.** The baselines agree within 0.11%. The candidate ranges from 0.74× to 1.09× their
+throughput, and neither run reaches 1.30×. Write p90 improves, but acknowledged ingest does not
+meet the gate. Faster individual commits do not remove background indexing work or backpressure:
+the candidate receives 44–56 retry responses, compared with 28 in both baselines. The difference
+between uncompressed base64 size and binary size is not an ingest-speed prediction.
+
+I remove the experimental codec instead of adding a format or a setting for it. Production WAL
+payload version 1, commit slots, bucket fencing, and public APIs remain unchanged. No upgrade is
+needed. The retained HTTP driver and replay checker support future ingest experiments.
+
+### Reproduction and cleanup
+
+`crates/bf-wal/benches/http_ingest.py` prepares the fixed request bodies and measures acknowledged
+HTTP ingest. Run it with `uv run --with numpy python`, using `prepare BODIES --corpus CORPUS.npy
+--attrs ATTRS.jsonl`, then `load BODIES --clients 4` against each fresh server. The corpus is a
+little-endian f16 NumPy matrix; attributes are JSONL objects containing `title` and `text` in corpus
+row order. Put every input, body directory, store, and log below the run's `.scratch/` directory.
+
+`crates/bf-wal/examples/replay_check.rs` checks retained WAL payloads independently of the writer's
+resident state. Set `I2_URL` to the disposable S3 prefix, `I2_CORPUS` to that matrix, and `I2_ATTRS`
+to that JSONL file, then run `cargo run --release -p bf-wal --example replay_check`. The checker
+requires every source ID exactly once, compares all 1,024 f32 bit patterns with the original f16
+values expanded to f32, and compares every title and text. It fails on missing or duplicate rows.
+
+All disposable S3 prefixes are deleted and verified empty. The instance, key pair, and security
+group are removed. The instance ran for about 0.50 hours; the observed Spot price was $0.1074/hour,
+or about $0.05 in compute, excluding EBS and S3 requests. Local run inputs, logs, and source archives
+are removed after retaining these results. Final `cargo fmt --check`,
+`cargo clippy -p bf-wal --all-targets -- -D warnings`, and all 13 `cargo test -p bf-wal` tests pass.
