@@ -30,6 +30,9 @@ use rayon::prelude::*;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
+mod assignment;
+#[cfg(test)]
+mod experiment;
 mod math;
 pub(crate) mod spill;
 
@@ -38,10 +41,22 @@ pub(crate) mod spill;
 struct Stage(&'static str, std::time::Instant);
 impl Stage {
     fn new(name: &'static str) -> Self {
+        #[cfg(test)]
+        if name == "leaf_assignment" {
+            experiment::perf_control(true);
+        }
         Self(name, std::time::Instant::now())
     }
     fn record(name: &'static str, elapsed: std::time::Duration) {
+        #[cfg(test)]
+        if name == "leaf_assignment" {
+            experiment::perf_control(false);
+        }
         let seconds = elapsed.as_secs_f64();
+        #[cfg(test)]
+        if std::env::var_os("RR4_INPUT").is_some() {
+            eprintln!("RR4 stage={name} seconds={seconds:.6}");
+        }
         metrics::histogram!("blowfish_recluster_stage_seconds", "stage" => name).record(seconds);
         tracing::info!(stage = name, seconds, "recluster: stage finished");
     }
@@ -772,6 +787,8 @@ fn assign_leaves(
     max: usize,
     stopping: &(dyn Fn() -> bool + Sync),
 ) -> Option<Vec<SlabJob>> {
+    #[cfg(test)]
+    experiment::capture(present, read_row, coarse, &cell_rows, cluster_rows, max);
     let distance = bf_vector::squared_distance;
     let t0 = std::time::Instant::now();
     let training = Stage::new("leaf_kmeans");
@@ -847,7 +864,11 @@ fn assign_leaves(
     let near = NEAR_CELLS.min(coarse.len()).max(1);
     let probes = GROUP_PROBES;
     let by_distance = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
-    let assign = |leaves: &[Vec<f32>]| -> Option<Vec<u32>> {
+    #[cfg(test)]
+    let mut drift = experiment::Drift::new(present.len(), &leaves);
+    let assign = |leaves: &[Vec<f32>],
+                  #[cfg(test)] drift: Option<&experiment::Drift>|
+     -> Option<Vec<u32>> {
         let _assignment = Stage::new("leaf_assignment");
         // Each cell's leaves under about sqrt(leaves) group centers (the means of their leaves),
         // so a row compares against the groups of its near cells and the leaves of its nearest
@@ -874,6 +895,8 @@ fn assign_leaves(
                 (centers, cell_groups.clone())
             })
             .collect();
+        #[cfg(test)]
+        let order_compared = std::sync::atomic::AtomicU64::new(0);
         // A row's nearest groups among its near cells, nearest first.
         let near_groups = |v: &[f32]| -> Vec<(f32, usize)> {
             let mut cells: Vec<(f32, usize)> = coarse
@@ -891,6 +914,11 @@ fn assign_leaves(
                     found.push((distance(v, center), cell << 32 | j));
                 }
             }
+            #[cfg(test)]
+            order_compared.fetch_add(
+                (coarse.len() + found.len()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if found.len() > probes {
                 found.select_nth_unstable_by(probes - 1, by_distance);
                 found.truncate(probes);
@@ -912,6 +940,7 @@ fn assign_leaves(
         let group_count = offsets
             .last()
             .map_or(0, |o| o + groups.last().map_or(0, |g| g.0.len()));
+        let order_stage = Stage::new("assignment_order");
         let nearest_group: Vec<u32> = present
             .par_iter()
             .map_init(Vec::new, |buf, g| {
@@ -944,6 +973,8 @@ fn assign_leaves(
         }
         drop(nearest_group);
         drop(starts);
+        drop(order_stage);
+        let score_stage = Stage::new("assignment_score");
         // Rows in blocks of neighbors in that order: a block compares with the union of its rows'
         // nearest groups (nearly the same groups for neighbors), four rows per pass over each
         // center, as dot products against precomputed squared norms.
@@ -953,87 +984,141 @@ fn assign_leaves(
             .map(|(centers, _)| centers.iter().map(|c| norm2(c)).collect())
             .collect();
         let compared = std::sync::atomic::AtomicU64::new(0);
-        let ordered: Vec<u32> = order
-            .par_chunks(ASSIGN_BLOCK)
-            .map_init(Vec::new, |buf, block| {
-                if stopping() {
-                    return None;
-                }
-                let rows: Vec<Vec<f32>> = block
+        let route = |buf: &mut Vec<u8>, block: &[u32]| {
+            if stopping() {
+                return None;
+            }
+            let rows: Vec<Vec<f32>> = block
+                .iter()
+                .map(|i| read_row(present[*i as usize], buf))
+                .collect();
+            let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+            let norms: Vec<f32> = rows.iter().map(|r| norm2(r)).collect();
+            // The block's near cells, and each row's nearest groups among all of their groups.
+            let mut cells: Vec<usize> = Vec::new();
+            for v in &refs {
+                let mut by_cell: Vec<(f32, usize)> = coarse
                     .iter()
-                    .map(|i| read_row(present[*i as usize], buf))
+                    .enumerate()
+                    .map(|(i, c)| (distance(v, c), i))
                     .collect();
-                let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
-                let norms: Vec<f32> = rows.iter().map(|r| norm2(r)).collect();
-                // The block's near cells, and each row's nearest groups among all of their groups.
-                let mut cells: Vec<usize> = Vec::new();
-                for v in &refs {
-                    let mut by_cell: Vec<(f32, usize)> = coarse
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| (distance(v, c), i))
-                        .collect();
-                    if by_cell.len() > near {
-                        by_cell.select_nth_unstable_by(near - 1, by_distance);
-                        by_cell.truncate(near);
-                    }
-                    cells.extend(by_cell.into_iter().map(|(_, c)| c));
+                if by_cell.len() > near {
+                    by_cell.select_nth_unstable_by(near - 1, by_distance);
+                    by_cell.truncate(near);
                 }
-                cells.sort_unstable();
-                cells.dedup();
-                let keys: Vec<usize> = cells
-                    .iter()
-                    .flat_map(|&cell| (0..groups[cell].0.len()).map(move |j| cell << 32 | j))
-                    .collect();
-                let group_d = block_distances(&refs, &norms, keys.len(), |n| {
-                    let key = keys[n];
-                    (
-                        groups[key >> 32].0[key & 0xFFFF_FFFF].as_slice(),
-                        group_norms[key >> 32][key & 0xFFFF_FFFF],
-                    )
-                });
-                let mut wanted: Vec<usize> = Vec::new();
-                for d in &group_d {
-                    let mut found: Vec<(f32, usize)> =
-                        d.iter().enumerate().map(|(n, d)| (*d, keys[n])).collect();
-                    if found.len() > probes {
-                        found.select_nth_unstable_by(probes - 1, by_distance);
-                        found.truncate(probes);
-                    }
-                    wanted.extend(found.into_iter().map(|(_, key)| key));
-                }
-                wanted.sort_unstable();
-                wanted.dedup();
-                let candidates: Vec<u32> = wanted
-                    .iter()
-                    .flat_map(|key| groups[key >> 32].1[key & 0xFFFF_FFFF].iter().copied())
-                    .collect();
-                compared.fetch_add(
-                    ((keys.len() + candidates.len()) * refs.len()) as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                let leaf_d = block_distances(&refs, &norms, candidates.len(), |n| {
-                    let l = candidates[n] as usize;
-                    (leaves[l].as_slice(), leaf_norms[l])
-                });
-                Some(
-                    leaf_d
-                        .iter()
-                        .map(|d| {
-                            let mut best = (f32::INFINITY, u32::MAX);
-                            for (d, &l) in d.iter().zip(&candidates) {
-                                if *d < best.0 || (*d == best.0 && l < best.1) {
-                                    best = (*d, l);
-                                }
-                            }
-                            best.1
-                        })
-                        .collect::<Vec<u32>>(),
+                cells.extend(by_cell.into_iter().map(|(_, c)| c));
+            }
+            cells.sort_unstable();
+            cells.dedup();
+            let keys: Vec<usize> = cells
+                .iter()
+                .flat_map(|&cell| (0..groups[cell].0.len()).map(move |j| cell << 32 | j))
+                .collect();
+            let group_d = block_distances(&refs, &norms, keys.len(), |n| {
+                let key = keys[n];
+                (
+                    groups[key >> 32].0[key & 0xFFFF_FFFF].as_slice(),
+                    group_norms[key >> 32][key & 0xFFFF_FFFF],
                 )
+            });
+            let mut wanted: Vec<usize> = Vec::new();
+            for d in &group_d {
+                let mut found: Vec<(f32, usize)> =
+                    d.iter().enumerate().map(|(n, d)| (*d, keys[n])).collect();
+                if found.len() > probes {
+                    found.select_nth_unstable_by(probes - 1, by_distance);
+                    found.truncate(probes);
+                }
+                wanted.extend(found.into_iter().map(|(_, key)| key));
+            }
+            wanted.sort_unstable();
+            wanted.dedup();
+            compared.fetch_add(
+                ((keys.len()
+                    + wanted
+                        .iter()
+                        .map(|key| groups[key >> 32].1[key & 0xFFFF_FFFF].len())
+                        .sum::<usize>())
+                    * refs.len()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Some(assignment::Block {
+                rows,
+                norms,
+                wanted,
+                #[cfg(test)]
+                positions: block.to_vec(),
+            })
+        };
+        #[cfg(test)]
+        let batched = std::env::var_os("RR4_BATCHED").is_some();
+        #[cfg(not(test))]
+        let batched = false;
+        let scorer = batched.then(|| assignment::Scorer::new(leaves, &leaf_norms, &groups));
+        let ordered: Vec<u32> = order
+            .par_chunks(if batched { 128 } else { ASSIGN_BLOCK })
+            .map_init(Vec::new, |buf, batch| {
+                let blocks: Vec<_> = batch
+                    .chunks(ASSIGN_BLOCK)
+                    .map(|block| route(buf, block))
+                    .collect::<Option<_>>()?;
+                if batched {
+                    return Some(scorer.as_ref().unwrap().nearest(&blocks));
+                }
+                let mut out = Vec::new();
+                for block in blocks {
+                    let refs: Vec<_> = block.rows.iter().map(Vec::as_slice).collect();
+                    let candidates: Vec<u32> = block
+                        .wanted
+                        .iter()
+                        .flat_map(|key| groups[key >> 32].1[key & 0xFFFF_FFFF].iter().copied())
+                        .collect();
+                    let ds = block_distances(&refs, &block.norms, candidates.len(), |n| {
+                        let l = candidates[n] as usize;
+                        (leaves[l].as_slice(), leaf_norms[l])
+                    });
+                    #[cfg(test)]
+                    if let Some(drift) = drift {
+                        drift.observe(
+                            &block.positions,
+                            &block.wanted,
+                            &block.norms,
+                            &candidates,
+                            &ds,
+                        );
+                    }
+                    for row in ds {
+                        let mut best = (f32::INFINITY, u32::MAX);
+                        for (d, &l) in row.iter().zip(&candidates) {
+                            if *d < best.0 || (*d == best.0 && l < best.1) {
+                                best = (*d, l);
+                            }
+                        }
+                        out.push(best.1);
+                    }
+                }
+                Some(out)
             })
             .while_some()
             .flatten_iter()
             .collect();
+        drop(score_stage);
+        #[cfg(test)]
+        if let Some(scorer) = &scorer {
+            eprintln!("RR4 matrix_and_verification_evals={:?}", scorer.counts());
+        }
+        #[cfg(test)]
+        if std::env::var_os("RR4_INPUT").is_some() {
+            let main =
+                compared.load(std::sync::atomic::Ordering::Relaxed) as f64 / present.len() as f64;
+            let ordering = order_compared.load(std::sync::atomic::Ordering::Relaxed) as f64
+                / present.len() as f64;
+            let total = main + ordering + coarse.len() as f64;
+            eprintln!(
+                "RR4 score_evals_per_row={main:.3} order_evals_per_row={ordering:.3} total_evals_per_row={total:.3} logical_center_bytes_per_row={:.0}",
+                total * dims as f64 * 4.
+            );
+        }
         // `while_some` ends at the first block skipped for shutdown.
         if stopping() {
             return None;
@@ -1048,7 +1133,11 @@ fn assign_leaves(
         }
         Some(leaf_of)
     };
-    let mut leaf_of = assign(&leaves)?;
+    let mut leaf_of = assign(
+        &leaves,
+        #[cfg(test)]
+        drift.as_ref(),
+    )?;
     tracing::info!(
         "recluster: rows assigned at {:.0}s",
         t0.elapsed().as_secs_f64()
@@ -1080,9 +1169,17 @@ fn assign_leaves(
                     .collect()
             })
             .collect();
+        #[cfg(test)]
+        if let Some(drift) = &mut drift {
+            drift.advance(&centers);
+        }
         leaves = centers;
         drop(refinement);
-        leaf_of = assign(&leaves)?;
+        leaf_of = assign(
+            &leaves,
+            #[cfg(test)]
+            drift.as_ref(),
+        )?;
         tracing::info!("recluster: refined at {:.0}s", t0.elapsed().as_secs_f64());
     }
     // Each cell's leaves, with the rows that chose them, in ascending row order.
