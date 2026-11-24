@@ -131,18 +131,21 @@ pub(crate) struct Layout {
 /// segment's rows; after a rebuild it probes leaves of `CLUSTER_ROWS`.
 pub(crate) fn layout(
     segments: &[bf_wal::Segment],
+    lineage: &[bf_wal::Lineage],
     tiers: Option<&Vec<SlabSet>>,
     attr: &str,
 ) -> Layout {
     let tiers = tiers.map(Vec::as_slice).unwrap_or_default();
-    let covered: BTreeSet<&str> = tiers
-        .iter()
-        .flat_map(|t| t.covered.iter().map(|c| c.segment.as_str()))
-        .collect();
+    // Segments whose rows the tiers hold, themselves or merged into them.
+    let covered = crate::lineage::covered(
+        segments,
+        &std::collections::BTreeMap::from([(attr.to_string(), tiers.to_vec())]),
+        lineage,
+    );
     let key = format!("annv2:{attr}");
     let uncovered: Vec<u64> = segments
         .iter()
-        .filter(|s| s.files.contains_key(&key) && !covered.contains(s.id.as_str()))
+        .filter(|s| s.files.contains_key(&key) && !covered.contains(&s.id))
         .map(|s| u64::from(s.row_count))
         .filter(|n| *n > 0)
         .collect();
@@ -185,6 +188,7 @@ pub(crate) fn layout(
 pub(crate) fn decide(
     segments: &[bf_wal::Segment],
     tiers: &std::collections::BTreeMap<String, Vec<SlabSet>>,
+    lineage: &[bf_wal::Lineage],
     live_rows: Option<u64>,
     bulk: bool,
     compacting: bool,
@@ -203,7 +207,7 @@ pub(crate) fn decide(
         .collect();
     for attr in attrs {
         let tiered = tiers.get(&attr).filter(|t| !t.is_empty());
-        let mut l = layout(segments, tiered, &attr);
+        let mut l = layout(segments, lineage, tiered, &attr);
         if let Some(live) = live_rows {
             l.masked_rows = l
                 .covered_rows
@@ -258,11 +262,16 @@ fn next_tier(l: &Layout) -> Option<&'static str> {
 
 /// The tier a foreground run builds whatever the thresholds say: a base when there is none or a
 /// merge is due, else a delta when rows are outside the tiers, else a new base.
-fn forced_kind(segments: &[bf_wal::Segment], tiers: Option<&Vec<SlabSet>>, attr: &str) -> Kind {
+fn forced_kind(
+    segments: &[bf_wal::Segment],
+    lineage: &[bf_wal::Lineage],
+    tiers: Option<&Vec<SlabSet>>,
+    attr: &str,
+) -> Kind {
     let Some(tiers) = tiers.filter(|t| !t.is_empty()) else {
         return Kind::Base;
     };
-    let l = layout(segments, Some(tiers), attr);
+    let l = layout(segments, lineage, Some(tiers), attr);
     if l.gain.is_infinite() || l.uncovered_rows == 0 || next_tier(&l) == Some("merge") {
         Kind::Base
     } else {
@@ -296,14 +305,19 @@ fn target(manifest: &Manifest, attr: &str, kind: Kind) -> Target {
         .sum();
     match (kind, base) {
         (Kind::Delta, Some(base)) if base.coarse.is_some() => {
-            let in_base: BTreeSet<&str> = base.covered.iter().map(|c| c.segment.as_str()).collect();
+            // Rows the base holds, in segments it covers or merged ones' targets.
+            let in_base = crate::lineage::covered(
+                &manifest.segments,
+                &std::collections::BTreeMap::from([(attr.to_string(), vec![base.clone()])]),
+                &manifest.lineage,
+            );
             let key = format!("annv2:{attr}");
             Target {
                 kind,
                 segments: manifest
                     .segments
                     .iter()
-                    .filter(|s| s.files.contains_key(&key) && !in_base.contains(s.id.as_str()))
+                    .filter(|s| s.files.contains_key(&key) && !in_base.contains(&s.id))
                     .cloned()
                     .collect(),
                 coarse: base.coarse.clone().map(|f| (f, base.coarse_rows)),
@@ -697,6 +711,7 @@ impl Engine {
             let (decision, numbers) = decide(
                 &state.segments,
                 &state.ann_tiers,
+                &state.lineage,
                 Some(state.stats.rows),
                 bulk,
                 compacting,
@@ -936,6 +951,7 @@ impl Engine {
         let _running = Running;
         let kind = forced_kind(
             &manifest.segments,
+            &manifest.lineage,
             manifest.ann_tiers.get(&opts.attribute),
             &opts.attribute,
         );
@@ -1031,12 +1047,12 @@ mod tests {
         let none = Default::default();
         let small = [segment("a", 30_000), segment("b", 30_000)];
         assert_eq!(
-            decide(&small, &none, None, false, false).0,
+            decide(&small, &none, &[], None, false, false).0,
             Decision::Nothing
         );
         let single = [segment("a", 500_000)];
         assert_eq!(
-            decide(&single, &none, None, false, false).0,
+            decide(&single, &none, &[], None, false, false).0,
             Decision::Nothing
         );
     }
@@ -1047,18 +1063,18 @@ mod tests {
         let loaded: Vec<_> = (0..25)
             .map(|i| segment(&format!("s{i}"), 100_000))
             .collect();
-        let (decision, numbers) = decide(&loaded, &none, None, false, false);
+        let (decision, numbers) = decide(&loaded, &none, &[], None, false, false);
         assert_eq!(decision, Decision::Build("v".into(), "base"));
         // 25 segments of 100K: 25^0.3 more probes of about 316-row clusters, against 200-row leaves.
         let gain = numbers.unwrap().gain;
         assert!((gain - 2.6 * 316.0 / 200.0).abs() < 0.2, "{gain}");
         assert_eq!(
-            decide(&loaded, &none, None, false, true).0,
+            decide(&loaded, &none, &[], None, false, true).0,
             Decision::Wait("compaction")
         );
         // No base yet, so uncovered rows exceed covered ones: a load does not hold the first one.
         assert_eq!(
-            decide(&loaded, &none, None, true, false).0,
+            decide(&loaded, &none, &[], None, true, false).0,
             Decision::Build("v".into(), "base")
         );
     }
@@ -1076,23 +1092,23 @@ mod tests {
         let mut tiers = std::collections::BTreeMap::new();
         tiers.insert("v".to_string(), vec![base.clone()]);
         assert_eq!(
-            decide(&segments, &tiers, None, false, false).0,
+            decide(&segments, &tiers, &[], None, false, false).0,
             Decision::Nothing
         );
         // 2.5% of the base outside it: not yet.
         segments.push(segment("n0", 10_000));
-        let (decision, numbers) = decide(&segments, &tiers, None, false, false);
+        let (decision, numbers) = decide(&segments, &tiers, &[], None, false, false);
         assert_eq!(decision, Decision::Nothing);
         assert_eq!(numbers, None);
         // 5%: a delta.
         segments.push(segment("n1", 10_000));
         assert_eq!(
-            decide(&segments, &tiers, None, false, false).0,
+            decide(&segments, &tiers, &[], None, false, false).0,
             Decision::Build("v".into(), "delta")
         );
         // While a load runs, it waits until the load outgrows what is covered.
         assert_eq!(
-            decide(&segments, &tiers, None, true, false).0,
+            decide(&segments, &tiers, &[], None, true, false).0,
             Decision::Wait("bulk_load")
         );
         // With a 20K delta installed, the next one waits for 4% of the base again (the delta's
@@ -1102,12 +1118,12 @@ mod tests {
             vec![base.clone(), tier(&[("n0", 10_000), ("n1", 10_000)], 1)],
         );
         assert_eq!(
-            decide(&segments, &tiers, None, false, false).0,
+            decide(&segments, &tiers, &[], None, false, false).0,
             Decision::Nothing
         );
         segments.push(segment("n2", 16_000));
         assert_eq!(
-            decide(&segments, &tiers, None, false, false).0,
+            decide(&segments, &tiers, &[], None, false, false).0,
             Decision::Build("v".into(), "delta")
         );
         // A large delta is rebuilt only once a quarter of it is outside.
@@ -1119,11 +1135,11 @@ mod tests {
         segments.extend([segment("n0", 100_000), segment("n1", 60_000)]);
         segments.push(segment("n2", 30_000));
         assert_eq!(
-            decide(&segments, &tiers, None, false, false).0,
+            decide(&segments, &tiers, &[], None, false, false).0,
             Decision::Nothing
         );
         segments.push(segment("n3", 10_000));
-        let (decision, numbers) = decide(&segments, &tiers, None, false, false);
+        let (decision, numbers) = decide(&segments, &tiers, &[], None, false, false);
         assert_eq!(decision, Decision::Build("v".into(), "merge"));
         let numbers = numbers.unwrap();
         assert_eq!(
@@ -1138,7 +1154,7 @@ mod tests {
         tiers.insert("v".to_string(), vec![tier(&covered, 0)]);
         segments.truncate(4);
         assert_eq!(
-            decide(&segments, &tiers, None, true, false).0,
+            decide(&segments, &tiers, &[], None, true, false).0,
             Decision::Build("v".into(), "upgrade")
         );
     }
@@ -1159,7 +1175,7 @@ mod tests {
                 1,
             )],
         );
-        let at = |live| decide(&segments, &tiers, Some(live), false, false);
+        let at = |live| decide(&segments, &tiers, &[], Some(live), false, false);
         assert_eq!(at(400_000).0, Decision::Nothing);
         assert_eq!(at(330_000).0, Decision::Nothing);
         let (decision, numbers) = at(320_000);
@@ -1168,13 +1184,13 @@ mod tests {
         // Rows outside the tier are live rows the tier does not mask.
         let mut more = segments.clone();
         more.push(segment("n", 10_000));
-        let (decision, numbers) = decide(&more, &tiers, Some(340_000), false, false);
+        let (decision, numbers) = decide(&more, &tiers, &[], Some(340_000), false, false);
         assert_eq!(decision, Decision::Nothing);
         assert_eq!(numbers, None);
         // With both due, the delta goes first (steady updates mask the base as fast as they
         // write rows outside it).
         more.push(segment("m", 10_000));
-        let (decision, numbers) = decide(&more, &tiers, Some(330_000), false, false);
+        let (decision, numbers) = decide(&more, &tiers, &[], Some(330_000), false, false);
         assert_eq!(decision, Decision::Build("v".into(), "delta"));
         assert_eq!(numbers.unwrap().masked_rows, 90_000);
     }
@@ -1191,13 +1207,13 @@ mod tests {
             ],
             1,
         );
-        assert_eq!(forced_kind(&segments, None, "v"), Kind::Base);
+        assert_eq!(forced_kind(&segments, &[], None, "v"), Kind::Base);
         let tiers = vec![base];
-        assert_eq!(forced_kind(&segments, Some(&tiers), "v"), Kind::Base);
+        assert_eq!(forced_kind(&segments, &[], Some(&tiers), "v"), Kind::Base);
         segments.push(segment("n", 1_000));
-        assert_eq!(forced_kind(&segments, Some(&tiers), "v"), Kind::Delta);
+        assert_eq!(forced_kind(&segments, &[], Some(&tiers), "v"), Kind::Delta);
         segments.push(segment("m", 300_000));
-        assert_eq!(forced_kind(&segments, Some(&tiers), "v"), Kind::Base);
+        assert_eq!(forced_kind(&segments, &[], Some(&tiers), "v"), Kind::Base);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -7,9 +7,10 @@ use uuid::Uuid;
 
 /// Current WAL encoding: one version byte followed by zstd-compressed JSON.
 pub const FORMAT_VERSION: u8 = 1;
-/// Current manifest generation. Formats 1 and 2 are accepted only for automatic upgrade (format 3
-/// replaced format 2's single `ann_slabs` layout with `ann_tiers`).
-pub const MANIFEST_FORMAT_VERSION: u8 = 3;
+/// Current manifest generation. Formats 1 to 3 are accepted only for automatic upgrade (format 3
+/// replaced format 2's single `ann_slabs` layout with `ann_tiers`; format 4 added `lineage`, and
+/// segments a tier covers no longer need an ANN object of their own).
+pub const MANIFEST_FORMAT_VERSION: u8 = 4;
 /// Current format of a tier's slabs and directory. A tier written in an older one is rebuilt by
 /// the automatic recluster.
 pub const TIER_FORMAT_VERSION: u32 = 1;
@@ -188,6 +189,10 @@ pub struct Manifest {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub ann_tiers: std::collections::BTreeMap<String, Vec<SlabSet>>,
+    /// Where the rows of tier-covered segments that compaction merged went: one entry per covered
+    /// segment that is gone, while some tier still covers it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage: Vec<Lineage>,
     /// Last indexed write timestamp; absent on legacy schema-only manifests.
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
@@ -272,6 +277,31 @@ impl SlabSet {
     pub fn covers(&self, segment: &str) -> bool {
         self.covered.iter().any(|c| c.segment == segment)
     }
+}
+/// Where a tier-covered segment's rows went when compaction merged it away. A tier keeps
+/// addressing them by its own global row numbers; each part maps the source's surviving rows to
+/// rows of one segment that holds them now. Rows in no part were deleted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lineage {
+    /// The covered segment (no longer in `segments`).
+    pub source: String,
+    /// The segments holding its surviving rows, in ID order. Empty when none survive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<LineagePart>,
+}
+/// One target of a [`Lineage`] entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LineagePart {
+    /// The segment that holds the rows now.
+    pub target: String,
+    /// Rows mapped (the map object's size).
+    pub rows: u32,
+    /// Two roaring bitmaps of equal length: the source rows placed in `target`, and the target
+    /// rows they became. The k-th smallest of one is the k-th smallest of the other (both segments
+    /// are in ID order), so `rank` and `select` map a row either way.
+    pub map: SegmentFile,
 }
 /// One covered segment's span of global row numbers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1151,6 +1181,7 @@ mod manifest_codec_tests {
             text_stats: None,
             ann_dirs: Default::default(),
             ann_tiers: Default::default(),
+            lineage: Default::default(),
             updated_at: None,
             bulk_load_at: None,
             retired: vec![],
@@ -1228,7 +1259,7 @@ mod manifest_codec_tests {
         assert_eq!(tiers[0].format, 1);
         let written: serde_json::Value =
             serde_json::from_slice(&encode_manifest(&old).unwrap()).unwrap();
-        assert_eq!(written["format_version"], 3);
+        assert_eq!(written["format_version"], MANIFEST_FORMAT_VERSION);
         assert!(written.get("ann_slabs").is_none());
         assert_eq!(written["ann_tiers"]["vector"][0]["covered"][0]["rows"], 5);
         let again = decode_manifest(&serde_json::to_vec(&written).unwrap()).unwrap();

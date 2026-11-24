@@ -1,6 +1,7 @@
 //! Epoch-fenced index publication, tiered compaction, and grace-period reclamation.
 use crate::{Engine, NamespaceState, catch_up, log_error, segment, snapshot, storage_error};
 use bf_types::ApiError;
+use bf_vector::RoaringBitmap;
 use bf_wal::{IndexerLease, Manifest, NamespaceStats, RetiredObject, Wal};
 use chrono::Utc;
 use std::{collections::BTreeMap, time::Duration};
@@ -332,32 +333,19 @@ async fn index_loop(
         }
     }
 }
-/// Segments some recluster tier covers. Compaction leaves them alone (a tier addresses their rows
-/// by position), and a flush keeps them listed even once every row is deleted.
+/// Segments holding rows some recluster tier covers, directly or through lineage. A flush keeps
+/// them listed even once every row is deleted.
 pub(crate) fn covered_segments(manifest: &Manifest) -> std::collections::BTreeSet<String> {
-    manifest
-        .ann_tiers
-        .values()
-        .flatten()
-        .flat_map(|set| set.covered.iter().map(|c| c.segment.clone()))
-        .collect()
+    crate::lineage::covered(&manifest.segments, &manifest.ann_tiers, &manifest.lineage)
 }
-/// A recluster tier holds rows of the segments it covers: once a covered segment is gone (a
-/// schema rebuild, or deletion of the namespace), it can never answer again, so retire it.
+/// A recluster tier holds rows of the segments it covers: once a covered segment is gone with no
+/// lineage to where its rows went (a schema rebuild, or deletion of the namespace), it can never
+/// answer again, so retire it. Lineage no remaining tier refers to is dropped too.
 pub(crate) fn retire_stale_tiers(manifest: &mut Manifest) {
-    let live: BTreeMap<&str, u32> = manifest
-        .segments
-        .iter()
-        .map(|s| (s.id.as_str(), s.row_count))
-        .collect();
     let mut stale = Vec::new();
     for (attr, tiers) in &manifest.ann_tiers {
         for (n, set) in tiers.iter().enumerate() {
-            if !set
-                .covered
-                .iter()
-                .all(|c| live.get(c.segment.as_str()) == Some(&c.rows))
-            {
+            if !crate::lineage::reachable(&manifest.segments, &manifest.lineage, set) {
                 stale.push((attr.clone(), n));
             }
         }
@@ -370,11 +358,18 @@ pub(crate) fn retire_stale_tiers(manifest: &mut Manifest) {
     for (attr, n) in stale.into_iter().rev() {
         let tiers = manifest.ann_tiers.get_mut(&attr).expect("listed above");
         let set = tiers.remove(n);
+        tracing::warn!(
+            attribute = attr.as_str(),
+            tier = n,
+            "recluster: tier retired, its covered segments are gone"
+        );
+        metrics::counter!("blowfish_recluster_tiers_stale_total").increment(1);
         if tiers.is_empty() {
             manifest.ann_tiers.remove(&attr);
         }
         retire_slabs(manifest, &set);
     }
+    crate::lineage::prune(manifest);
 }
 pub(crate) fn retire_slabs(manifest: &mut Manifest, set: &bf_wal::SlabSet) {
     // Objects another remaining tier still uses (a delta's base, or cells shared) stay.
@@ -607,6 +602,7 @@ impl Engine {
             text_stats: None,
             ann_dirs: Default::default(),
             ann_tiers: Default::default(),
+            lineage: Default::default(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
@@ -781,11 +777,22 @@ impl Engine {
             let mut compact_vectors: BTreeMap<String, Vec<segment::PackedPart>> = BTreeMap::new();
             let mut start = u64::MAX;
             let mut end = 0;
+            // Merged segments whose rows a tier covers: their surviving rows and IDs, for lineage.
+            let lineage_sources = covered_segments(&manifest);
+            let mut tracked: Vec<(String, RoaringBitmap, std::sync::Arc<segment::IdIndex>)> =
+                Vec::new();
             if !compact.is_empty() {
                 let mut remaining = vec![];
                 for seg in segments {
                     if compact.contains(&seg.id) {
                         let live = segment::live(store, &seg).await?;
+                        if lineage_sources.contains(&seg.id) {
+                            tracked.push((
+                                seg.id.clone(),
+                                live.clone(),
+                                segment::ids(store, &seg).await?,
+                            ));
+                        }
                         let (docs, vectors) =
                             segment::compaction_rows(store, &seg, &live, &strip).await?;
                         compact_docs.extend(crate::shared(docs));
@@ -840,6 +847,29 @@ impl Engine {
             };
             let compact_packed =
                 segment::merge_packed(&state.schema, &compact_docs, compact_vectors)?;
+            let merged_lineage: Vec<crate::lineage::Merged> = if tracked.is_empty() {
+                Vec::new()
+            } else {
+                let order: Vec<&bf_types::Id> = compact_docs.keys().collect();
+                tracked
+                    .iter()
+                    .map(|(id, live, ids)| {
+                        let rows = live
+                            .iter()
+                            .map(|row| {
+                                let id = ids.get(row as usize).ok_or_else(segment::corrupt)?;
+                                let at =
+                                    order.binary_search(&id).map_err(|_| segment::corrupt())?;
+                                Ok((row, at as u32))
+                            })
+                            .collect::<Result<Vec<_>, ApiError>>()?;
+                        Ok(crate::lineage::Merged {
+                            segment: id.clone(),
+                            rows,
+                        })
+                    })
+                    .collect::<Result<_, ApiError>>()?
+            };
             let compacted = async {
                 if compact_docs.is_empty() {
                     Ok(vec![])
@@ -909,6 +939,10 @@ impl Engine {
                 }
             }
             merged_text = merged;
+            if !tracked.is_empty() {
+                crate::lineage::record(store, ns, &mut manifest, &merged_lineage, &compacted)
+                    .await?;
+            }
             segments.extend(flushed);
             segments.extend(compacted);
             segments
@@ -1009,6 +1043,10 @@ impl Engine {
         }
         // A finished recluster tier joins this publication if its segments are still here.
         let installed = self.0.jobs.install(ns, &mut manifest);
+        if installed.is_some() {
+            // A new base covers the merged segments' targets itself: their lineage goes.
+            crate::lineage::prune(&mut manifest);
+        }
         let generation = match wal
             .publish_fenced(claim, manifest.indexer_epoch, &manifest)
             .await
@@ -1078,6 +1116,7 @@ impl Engine {
             {
                 retire_slabs(&mut manifest, &set);
             }
+            crate::lineage::prune(&mut manifest);
             manifest.deleted = true;
             manifest.indexed_through = checkpoint.seq;
         }
@@ -1102,6 +1141,7 @@ impl Engine {
                 &crate::ann_dir::paged_hint_name(attr),
             ));
         }
+        protected.extend(crate::lineage::keys(&manifest).cloned());
         // Objects of recluster builds still running (their records are fresh).
         let building = crate::auto_recluster::building_prefixes(&self.0.store, ns).await?;
         for seg in &manifest.segments {
@@ -1229,32 +1269,40 @@ fn needs_text_upgrade(state: &NamespaceState) -> bool {
     })
 }
 
-/// The segments to merge next, if any. Segments a recluster tier covers are never merged (a tier
-/// addresses their rows by position), nor are those in `protected` (a build covering them is
-/// running or waiting to be installed).
+/// The segments to merge next, if any. Segments in `protected` (a recluster build covering them is
+/// running or waiting to be installed) are left alone. A merge never mixes coverage classes (the
+/// tiers covering a segment's rows): a tier-covered segment merges only with segments covered by
+/// the same tiers, and lineage records where its rows went (see `lineage.rs`).
 pub(crate) fn tier(
     state: &NamespaceState,
     config: &EngineConfig,
     force: bool,
     protected: &std::collections::BTreeSet<String>,
 ) -> Vec<String> {
-    let covered: std::collections::BTreeSet<&str> = state
-        .ann_tiers
-        .values()
-        .flatten()
-        .flat_map(|set| set.covered.iter().map(|c| c.segment.as_str()))
-        .collect();
-    let candidates: Vec<&bf_wal::Segment> = state
-        .segments
-        .iter()
-        .filter(|s| !covered.contains(s.id.as_str()) && !protected.contains(&s.id))
-        .collect();
     if !force
         && state.shadowed.len() >= config.index_rows
         && state.segments.len() < config.defer_compaction_segments
     {
         return vec![];
     }
+    let classes = crate::lineage::classes(&state.segments, &state.ann_tiers, &state.lineage);
+    let mut by_class: BTreeMap<Vec<&str>, Vec<&bf_wal::Segment>> = BTreeMap::new();
+    for seg in state.segments.iter().filter(|s| !protected.contains(&s.id)) {
+        let class = classes
+            .get(&seg.id)
+            .map(|c| c.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        by_class.entry(class).or_default().push(seg);
+    }
+    by_class
+        .into_values()
+        .map(|candidates| pick(&candidates, config))
+        .find(|ids| !ids.is_empty())
+        .unwrap_or_default()
+}
+
+/// The merge [`tier`] picks among `candidates` (all of one coverage class).
+fn pick(candidates: &[&bf_wal::Segment], config: &EngineConfig) -> Vec<String> {
     let count = config.compaction_segments.max(2);
     let mut tiers: BTreeMap<u32, (Vec<String>, u64, u64)> = BTreeMap::new();
     for seg in candidates.iter().copied() {

@@ -206,40 +206,21 @@ pub(crate) fn stage(t0: std::time::Instant, name: &str) {
     }
 }
 
-/// Where each of a tier's covered segments is among `segments`, or `None` when one is gone. A
-/// covered segment stays listed while its tier does (compaction skips it, and one whose rows were
-/// all deleted is kept with no live rows), and a publication that removes one anyway retires the
-/// tier, so `None` is only seen in a moment between the two.
-pub(crate) fn tier_positions(
-    segments: &[bf_wal::Segment],
-    set: &bf_wal::SlabSet,
-) -> Option<Vec<usize>> {
-    // Segments keep their relative order across publications, so one forward walk finds them.
-    let mut at = Vec::with_capacity(set.covered.len());
-    let mut j = 0;
-    for c in &set.covered {
-        let found = segments[j..]
-            .iter()
-            .position(|s| s.id == c.segment)
-            .map(|p| p + j)
-            .or_else(|| segments.iter().position(|s| s.id == c.segment))?;
-        if segments[found].row_count != c.rows {
-            return None;
-        }
-        at.push(found);
-        j = found + 1;
-    }
-    Some(at)
-}
-
 /// Queries the tiers answered (tests check the plan is used).
 #[cfg(test)]
 pub(crate) static TIER_ANSWERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Whether every tier of `tiers` can answer for its covered segments (see [`tier_positions`]).
-pub(crate) fn tiers_usable(segments: &[bf_wal::Segment], tiers: &[bf_wal::SlabSet]) -> bool {
-    tiers.iter().all(|t| tier_positions(segments, t).is_some())
+/// Whether every tier of `tiers` can answer for its covered segments: each is live, or merged
+/// into live segments by lineage (see `lineage::reachable`).
+pub(crate) fn tiers_usable(
+    segments: &[bf_wal::Segment],
+    lineage: &[bf_wal::Lineage],
+    tiers: &[bf_wal::SlabSet],
+) -> bool {
+    tiers
+        .iter()
+        .all(|t| crate::lineage::reachable(segments, lineage, t))
 }
 
 /// Unfiltered ANN over a recluster's tiers and the segments no tier covers, as one plan: each
@@ -261,11 +242,12 @@ async fn from_tiers(
     let mut covered = vec![false; state.segments.len()];
     let mut positions = Vec::with_capacity(tiers.len());
     for set in tiers {
-        let Some(at) = tier_positions(&state.segments, set) else {
+        let Some(at) = crate::lineage::place(store, &state.segments, &state.lineage, set).await?
+        else {
             return Ok(None);
         };
-        for i in &at {
-            covered[*i] = true;
+        for i in at.positions() {
+            covered[i] = true;
         }
         positions.push(at);
     }
@@ -374,9 +356,103 @@ static TIER_MASKS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Arc<RoaringBitmap>>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// The live rows of a tier as a mask over its global row numbers, or `None` when every row it
+/// holds is still live: rows deleted since the slabs were built, and rows dropped by a merge, are
+/// left out. Built once per tier and set of live objects and lineage maps (all immutable).
+pub(crate) async fn tier_mask(
+    store: &Storage,
+    state: &NamespaceState,
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+) -> Result<Option<Arc<RoaringBitmap>>, ApiError> {
+    use crate::lineage::Place;
+    // Covered segments still here whose rows were deleted since the build, and merged ones (whose
+    // targets' live rows decide).
+    let mut changed: Vec<usize> = Vec::new();
+    for (p, place) in at.places.iter().enumerate() {
+        match place {
+            Place::Here(i) => {
+                if state.segments[*i].live_generation != set.covered[p].live_generation {
+                    changed.push(p);
+                }
+            }
+            Place::Moved(_) => changed.push(p),
+        }
+    }
+    if changed.is_empty() {
+        return Ok(None);
+    }
+    let mut key = set.dir.key.clone();
+    let mut lives: BTreeSet<usize> = BTreeSet::new();
+    for p in &changed {
+        match &at.places[*p] {
+            Place::Here(i) => {
+                lives.insert(*i);
+            }
+            Place::Moved(parts) => lives.extend(parts.iter().map(|(i, _)| *i)),
+        }
+    }
+    for i in &lives {
+        key.push('|');
+        key.push_str(&state.segments[*i].live.key);
+    }
+    for map in &at.maps {
+        key.push('|');
+        key.push_str(map);
+    }
+    if let Some(mask) = TIER_MASKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Ok(Some(mask));
+    }
+    let lives: Vec<usize> = lives.into_iter().collect();
+    let loaded = futures::future::try_join_all(
+        lives
+            .iter()
+            .map(|i| segment::live(store, &state.segments[*i])),
+    )
+    .await?;
+    let live_of = |i: usize| &loaded[lives.binary_search(&i).expect("loaded above")];
+    let mut mask = RoaringBitmap::new();
+    for (p, c) in set.covered.iter().enumerate() {
+        if !changed.contains(&p) {
+            // Unchanged segments stay fully live.
+            mask.insert_range(c.base..c.base + c.rows);
+            continue;
+        }
+        match &at.places[p] {
+            Place::Here(i) => {
+                for r in live_of(*i) {
+                    mask.insert(c.base + r);
+                }
+            }
+            Place::Moved(parts) => {
+                for (i, map) in parts {
+                    let live = live_of(*i);
+                    for (from, to) in map.pairs() {
+                        if live.contains(to) {
+                            mask.insert(c.base + from);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mask = Arc::new(mask);
+    let mut masks = TIER_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+    // A few tiers' current masks; older generations are dropped wholesale.
+    if masks.len() >= 16 {
+        masks.clear();
+    }
+    masks.insert(key, mask.clone());
+    Ok(Some(mask))
+}
+
 /// Unfiltered ANN from one tier's slabs: the same directory search, over slabs as pseudo
-/// segments, with winners mapped back to their segments (at `at` among the live segments) for
-/// hydration.
+/// segments, with winners mapped back to the segments holding them now (`at`) for hydration.
 #[allow(clippy::too_many_arguments)]
 async fn from_slabs(
     store: &Storage,
@@ -387,7 +463,7 @@ async fn from_slabs(
     k: usize,
     columns: &BTreeSet<String>,
     set: &bf_wal::SlabSet,
-    at: &[usize],
+    at: &crate::lineage::Placement,
     prefetched: Option<&crate::ann_dir::Prefetched>,
     seat: Option<&crate::ann_dir::Seat>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
@@ -400,62 +476,7 @@ async fn from_slabs(
     if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
         return Ok(None);
     }
-    // Rows deleted since the slabs were built: a mask over global row numbers.
-    let changed: Vec<usize> = (0..set.covered.len())
-        .filter(|p| state.segments[at[*p]].live_generation != set.covered[*p].live_generation)
-        .collect();
-    // The mask depends only on the tier and the changed segments' live objects, which are
-    // immutable: build it once, not on every query.
-    let mask_key = (!changed.is_empty()).then(|| {
-        let mut key = set.dir.key.clone();
-        for p in &changed {
-            key.push('|');
-            key.push_str(&state.segments[at[*p]].live.key);
-        }
-        key
-    });
-    let cached = mask_key.as_ref().and_then(|key| {
-        TIER_MASKS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .cloned()
-    });
-    let mask = if changed.is_empty() {
-        None
-    } else if cached.is_some() {
-        cached
-    } else {
-        let mut mask = RoaringBitmap::new();
-        let loaded = futures::future::try_join_all(
-            changed
-                .iter()
-                .map(|p| segment::live(store, &state.segments[at[*p]])),
-        )
-        .await?;
-        for (n, p) in changed.iter().enumerate() {
-            let c = &set.covered[*p];
-            for r in &loaded[n] {
-                mask.insert(c.base + r);
-            }
-        }
-        // Unchanged segments stay fully live.
-        for (p, c) in set.covered.iter().enumerate() {
-            if !changed.contains(&p) {
-                mask.insert_range(c.base..c.base + c.rows);
-            }
-        }
-        let mask = Arc::new(mask);
-        if let Some(key) = mask_key {
-            let mut masks = TIER_MASKS.lock().unwrap_or_else(|e| e.into_inner());
-            // A few tiers' current masks; older generations are dropped wholesale.
-            if masks.len() >= 16 {
-                masks.clear();
-            }
-            masks.insert(key, mask.clone());
-        }
-        Some(mask)
-    };
+    let mask = tier_mask(store, state, set, at).await?;
     if crate::ann::trace_stages() {
         eprintln!(
             "SLABS slabs={} masked={}",

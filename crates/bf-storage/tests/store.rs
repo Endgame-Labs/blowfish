@@ -108,7 +108,13 @@ async fn s3_contract() {
     .unwrap();
     assert_eq!(store.mode(), StorageMode::Conditional);
     exercise(store.clone()).await;
-    store.delete("_system/format/3.json").await.unwrap();
+    store
+        .delete(&format!(
+            "_system/format/{}.json",
+            bf_storage::BUCKET_FORMAT_VERSION
+        ))
+        .await
+        .unwrap();
     assert!(store.list("").await.unwrap().is_empty());
 }
 

@@ -69,6 +69,7 @@ async fn steady_state_publication_request_count() {
         text_stats: None,
         ann_dirs: Default::default(),
         ann_tiers: Default::default(),
+        lineage: Default::default(),
         updated_at: None,
         retired: vec![],
         checkpoints: vec![],
