@@ -1,11 +1,12 @@
 //! Paired D4 object-store measurements. All configuration and output paths are supplied by the caller.
 //! Usage: d4 STORAGE_JSON MODE OUTPUT [WORKLOAD_JSON] [QUERY_INDEX].
 //! Modes: index, recluster, gc, measure, short (64 queries), first (one fresh-process query),
-//! and quality (result rows without timing phases).
+//! warm (2,000-query prewarm, then serial and concurrent queries), and quality (rows only).
 use bf_engine::{Engine, EngineConfig, ReclusterOptions};
 use bf_storage::{Storage, StorageConfig};
 use bf_types::QueryRequest;
 use serde_json::json;
+use std::io::{BufRead, Write};
 use std::{
     error::Error,
     path::PathBuf,
@@ -17,10 +18,30 @@ fn percentiles(mut times: Vec<f64>) -> serde_json::Value {
     let nth = |fraction: f64| times[((times.len() - 1) as f64 * fraction).round() as usize];
     json!({"queries":times.len(),"p50_ms":nth(0.5),"p90_ms":nth(0.9),"qps":times.len() as f64/(times.iter().sum::<f64>()/1000.0)})
 }
+// perf stat --delay=-1 --control=fifo:CONTROL,ACK can exclude startup and warm-up.
+// An acknowledgement ensures counters change before crossing the phase boundary.
+fn counters(command: &str) -> Result<(), Box<dyn Error>> {
+    if let Ok(path) = std::env::var("BF_D4_PERF_CONTROL") {
+        let ack = std::env::var("BF_D4_PERF_ACK")?;
+        let mut control = std::fs::OpenOptions::new().write(true).open(path)?;
+        let mut ack = std::io::BufReader::new(std::fs::File::open(ack)?);
+        writeln!(control, "{command}")?;
+        control.flush()?;
+        let mut line = String::new();
+        if ack.read_line(&mut line)? == 0 {
+            return Err("perf control closed before acknowledging the phase".into());
+        }
+    }
+    Ok(())
+}
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let config: StorageConfig = serde_json::from_slice(&std::fs::read(&args[0])?)?;
+    let mut config: StorageConfig = serde_json::from_slice(&std::fs::read(&args[0])?)?;
+    if !matches!(args[1].as_str(), "index" | "recluster" | "gc") {
+        // Reader controls must never advance the baseline bucket marker.
+        config.read_only = true;
+    }
     let store = Storage::open(&config).await?;
     let mut tuning = EngineConfig::from_env();
     tuning.indexing = false;
@@ -37,7 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let decoded = tuning.decoded_cache_bytes;
     let engine = Engine::with_config(store.clone(), tuning);
     let mut result = json!({
-        "mode":args[1], "nprobe":nprobe, "retention_secs":retention,
+        "mode":args[1], "nprobe":nprobe, "storage_read_only":config.read_only, "retention_secs":retention,
         "decoded_cache_bytes":decoded, "block_cache_bytes":config.cache.memory_bytes,
         "disk_cache_bytes":config.cache.disk_bytes,
         "manifest_format":bf_wal::MANIFEST_FORMAT_VERSION,
@@ -91,6 +112,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let answer = engine.query("nq", requests[i].clone()).await?;
             result["first_ms"] = json!(start.elapsed().as_secs_f64() * 1000.0);
             result["rows"] = json!(answer.result.rows);
+        }
+        "warm" => {
+            let mut requests: Vec<QueryRequest> =
+                serde_json::from_slice(&std::fs::read(&args[3])?)?;
+            requests.truncate(2000);
+            if requests.is_empty() {
+                return Err("empty workload".into());
+            }
+            for q in &requests {
+                engine.query("nq", q.clone()).await?;
+            }
+            counters("enable")?;
+            let mut times = Vec::new();
+            let mut rows = Vec::new();
+            for q in requests.iter().take(1000) {
+                let start = Instant::now();
+                let reply = engine.query("nq", q.clone()).await?;
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+                rows.push(reply.result.rows);
+            }
+            result["warm"] = percentiles(times);
+            result["rows"] = json!(rows);
+            let start = Instant::now();
+            let mut tasks = tokio::task::JoinSet::new();
+            for client in 0..16 {
+                let (engine, requests) = (engine.clone(), requests.clone());
+                tasks.spawn(async move {
+                    for q in requests.into_iter().skip(client).step_by(16) {
+                        engine.query("nq", q).await?;
+                    }
+                    Ok::<_, bf_types::ApiError>(())
+                });
+            }
+            while let Some(done) = tasks.join_next().await {
+                done??;
+            }
+            result["qps16"] = json!(requests.len() as f64 / start.elapsed().as_secs_f64());
+            counters("disable")?;
+            result["counted_queries"] = json!(requests.len().min(1000) + requests.len());
         }
         "measure" | "short" => {
             let mut requests: Vec<QueryRequest> =
