@@ -4,6 +4,27 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Filtered queries 100x faster in throughput: immutable predicate results are cached** (from round D4). A filter's
+  result over an immutable segment was recomputed for every query, and snapshot warm-up and query planning
+  each did it separately. They now share one cached result keyed by the segment files, live generation, schema,
+  and filter, held in a protected share of the column cache (unused bytes stay available to columns); WAL
+  shadows are applied afterward. On full NQ with an ID-range filter at normal retention: warm p50 1,522 to
+  12 ms, and 16-client throughput 5 to 601 q/s, with identical results.
+
+- **Truthful index status in namespace metadata** (round MD1). Metadata always said `"index": {"status":
+  "up-to-date"}`, so a client polling for indexing to finish could be told it was done while the WAL tail still
+  held unindexed rows. It now reports `{"status": "updating", "unindexed_bytes": ..., "unindexed_rows": ...}`
+  from counts the snapshot already holds (no new I/O or format change), and `up-to-date` once the tail is
+  published. Metadata polling also refreshes the checkpoint while data is pending, so a reader sees another
+  node's index publication without a new write. The official Python SDK parses both states (`compat/`).
+
+- **BM25 under heavy writes 9.5x faster** (round BW1; `docs/benchmarks.md`, "Round BW1"). BM25 over an
+  unindexed write tail recomputed full-vocabulary statistics and re-tokenized tail rows on every query. Queries
+  now compute statistics for their own terms only and reuse cached per-row term counts from immutable tail
+  objects (a bounded CLOCK pool taking one eighth of the decoded-cache budget). On 1M MS MARCO with 1,000
+  text-changing upserts/s: p50 539 to 57 ms, p90 721 to 82 ms, with bit-identical results on 4,000 validation
+  queries across four million-row snapshots and every offered write acknowledged. Idle BM25 is unchanged.
+
 - **Memory-capped servers 1.2-3.6x faster on warm vector queries** (round MEM2; `docs/benchmarks.md`, "Round MEM2").
   Immutable local objects are now memory-mapped and share the operating system's page cache instead of being
   copied into the heap, through two views of the same pages: normal read-ahead for contiguous reads of 64 KiB or

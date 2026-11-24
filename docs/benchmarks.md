@@ -7663,3 +7663,204 @@ runtime failures during bulk I/O, before comparator measurements. Preparation re
 are excluded. Utilities use no bridge/NAT, payloads and binaries are hash-checked, and
 all measured VMs use the uncached runtime. Rust formatting, storage/engine all-target
 clippy with warnings denied, and both crates' full tests pass on the merged source.
+
+## Round BW1: exact BM25 during steady writes
+
+The measured cause is query-time reconstruction of full-vocabulary checkpoint
+statistics, followed by repeated analysis of shadowed and unindexed documents.
+BW1 reuses immutable document term counts and fetches checkpoint frequencies only
+for query terms. Commits perform no additional tokenization or index maintenance.
+
+### Protocol
+
+One owned, on-demand c7g.4xlarge in us-west-2, Ubuntu 24.04 arm64, Rust 1.100.0,
+and Clang 19. The server runs on CPUs 0–5, and clients run on CPUs 6–7. Every
+arm starts from an identical local-store copy of the first 1,000,000 passages in
+`msmarco_load.py`'s stream. The block cache is 2 GiB; decoded-cache and indexing
+settings retain their defaults. No S3 latency is measured.
+
+The workload is `bench/scale/data/bm25-msmarco.json`, strong consistency, top ten,
+and IDs only. W1's `steady_writes.py` now accepts this text-only workload and
+corpus. Seed 17 selects random 100-row upsert batches at 1,000 rows/s. Each write
+uses the original passage plus a batch-specific suffix, changing BM25 statistics.
+Seed 29 permutes query order. Paired runs pace queries at one per second, use
+120-second windows with 30 seconds of warm-up, and run in A/B/B/A order. These
+runs compare the same query schedule, without letting the faster binary cover a
+different part of the workload. Closed-loop runs separately measure a saturated
+single client. Builds and independent reference generation finish before timing.
+
+A load must drain its WAL tail before making the store copies. In this run,
+metadata reported `index.status = "up-to-date"` while 375,000 load rows remained
+unindexed. The drain gate is a query's `performance.exhaustive_search_count = 0`;
+`["id", "asc"]`, with limit one, checks it without BM25 analysis. The frozen
+snapshot checker also explicitly checkpoints the initial load.
+
+### Initial measurement and cause
+
+The initial closed-loop idle result is **2.615/5.127 ms p50/p90**, versus
+**517.969/703.266 ms** at 1,000 upserts/s. All 120,000 offered rows are
+acknowledged, with zero rejections. The measured tail median/maximum is
+2,797/5,683 rows. This is well outside the stop condition of twice idle latency.
+The idle HTTP warm-up has already drained the initial load tail.
+
+### Implementation
+
+- `bf-text::DocumentTerms` retains exact lengths and term frequencies without
+  positions. `PreparedQuery` prepares query weights once and accumulates f32
+  contributions in the reference scorer's lexical order, including repeated
+  terms and prefix matches.
+- Engine queries fetch only needed checkpoint frequencies, including terms in
+  computed BM25 projections. Counts and total lengths remain integers through
+  subtraction and addition; reconstructing a length from a rounded average
+  would introduce an avoidable score-bit risk.
+- Immutable WAL summaries use document allocation identities, weak references,
+  and complete analysis configurations. Shadow summaries use scoped immutable
+  document-object keys, row ordinals, and configurations. Only cache misses
+  hydrate and analyze shadow rows.
+- A sharded CLOCK pool receives one eighth of the existing decoded-cache budget,
+  taken from the general metadata pool. Total configured cache capacity does
+  not increase. Eviction remains bounded under sustained replacement; commits
+  maintain no new index or statistics structure.
+
+### Paired result
+
+All four arms execute the **same 90 measured query IDs, in the same order**.
+The first A/B pair enables stage traces; the second B/A pair disables them.
+
+| Arm | Queries | BM25 p50 ms | BM25 p90 ms | Tail median / maximum |
+| --- | ---: | ---: | ---: | ---: |
+| A1, existing reader | 90 | 541.867 | 723.110 | 2,995.5 / 6,278 |
+| B1, cached counts | 90 | 57.228 | 84.534 | 3,095.5 / 6,877 |
+| B2, cached counts | 90 | 56.540 | 80.202 | 3,194 / 6,677 |
+| A2, existing reader | 90 | 536.329 | 718.113 | 2,994.5 / 6,378 |
+
+The medians of the run percentiles are **539.098/720.611 → 56.884/82.368 ms**:
+**9.48× faster p50, and 8.75× faster p90**. Both candidate runs pass the
+100/180 ms latency gates, despite slightly larger measured tails.
+
+Each arm acknowledges all 120,000 offered rows, with zero rejections, sustaining
+1,000 upserts/s. Median write-service p50/p90 changes from 1.841/2.462 to
+1.896/2.550 ms, increases of 3.0%/3.6%. Observed acknowledged throughput has
+zero regression at the offered rate. Maximum ingest capacity remains unmeasured.
+
+Separate closed-loop candidate runs give **2.691/5.074 ms idle**, and
+**21.839/43.294 ms under writes**, with 3,612 measured queries in the latter
+90-second measured window, about 40.1 queries/s from one client. Its tail
+median/maximum is 2,000/6,976 rows. All **720,000 offered measurement rows** across
+the initial, paired, and closed-loop write runs are acknowledged. The paired table
+is the controlled speedup comparison; the closed-loop observations use different
+query arrival rates and sample counts.
+
+The HTTP baseline is `a649aa5` plus opt-in stage timing; candidate production code
+is `238373b`. Their executable SHA-256 values are respectively
+`22deabc60c7d220f54c330f400292e1921c5d99174c3f4e7cb29af7af2767418` and
+`26d64844fff5cd0e2314e856b607cd202cc0dd33ae4c20a15bfaefc9f02f25ce`.
+
+### Per-query work breakdown
+
+`BF_TRACE_STAGES` groups observations by completed HTTP query. Each column below
+covers 120 tail-bearing requests from A1 or B1, including warm-up.
+
+| Component | Before p50 / p90 ms | After p50 / p90 ms |
+| --- | ---: | ---: |
+| Global statistics, including the first analysis pass | 487.354 / 633.502 | 41.606 / 60.044 |
+| Checkpoint statistics, inside global statistics | 235.638 / 250.263 | 0.092 / 1.833 |
+| Shadow-row statistics, inside global statistics | 115.732 / 197.213 | 25.166 / 39.248 |
+| Tail statistics analysis, inside global statistics | 96.200 / 173.060 | 14.326 / 20.535 |
+| Tail analysis or summary lookup for scoring | 10.269 / 18.333 | 1.448 / 2.779 |
+| Tail scoring | 16.468 / 30.053 | 3.007 / 7.177 |
+| Segment scoring and hydration, summed worker elapsed time | 16.227 / 34.982 | 15.920 / 34.582 |
+| Final result merge | 0.030 / 0.034 | 0.028 / 0.032 |
+
+The global-statistics rows overlap by definition. Segment worker durations can
+also overlap. These are per-request work observations; percentiles do not sum to
+wall latency, and include discarded speculative work when present. The full
+vocabulary decode disappears from queries; fresh shadow and tail analysis remains
+on first use. A mutable WAL inverted index is unnecessary to pass this round's
+gates. The remaining tail scan is exact and proportional to the bounded tail.
+
+### Exactness and checks
+
+The opt-in engine test `text_benchmark::bm25_serialized_msmarco_snapshots` captures
+four states: the fully indexed million passages, 5,000 overwrites, overlapping
+replacements plus 300 deletes and null fields, and the next index publication.
+Every state remains alive while later publications complete. Its serialized live
+text corpus feeds the independent `exact_bm25` executable, with null fields
+excluded from field statistics. Independent reference passes run concurrently,
+outside every timed measurement.
+
+All **4,000 query results match**, including **40,000 ordered IDs and their f32
+score bits**, with zero differences. The two tail-bearing states have 5,000 and 4,800 live tail documents;
+the second has 5,100 shadowed IDs. Unit coverage also exercises cache eviction,
+zero budgets, immutable replacement and copy-on-write identities, changed analysis
+settings, scalar and array fields, missing and empty values, repeated and prefix
+terms, filters, multi-field scores, computed BM25 projections, and publication.
+
+Formatting, scoped Clippy with warnings denied, and both complete crate suites
+pass. No bucket format, wire response, dependency, or write-path change ships.
+The cache pool redistribution can affect metadata residency; ANN, cold-S3, 4 GiB,
+full-workspace, and official-SDK integration measurements remain coordinator work.
+
+### Rare-term-pair side experiment: rejected
+
+The offline fixture is B6's five consecutive 200,000-row format-7 segments over
+the same first million passages, all 1,000 MS MARCO queries, default parameters,
+and top ten. An independent exhaustive pass validates all 10,000 ordered IDs and
+score bits before counters run. Every warm and counted pass checks those results.
+
+For each query, the prototype intersects the two least-frequent term postings,
+fully scores matches in canonical term order, and keeps ten hits in a bounded
+heap. Query weights are prepared once. It skips the normal reader only when the
+tenth score strictly exceeds both missing-term score bounds. Bounds sum the
+actual per-term maximum contributions in lexical order with upward rounding;
+those resident maxima and all query-term posting lists are prepared outside
+counters, making this an optimistic warm test. Failed certificates pay for the
+ordinary reader, including all fallback work.
+
+One native release executable runs pinned to CPU 3. Perf control/ack FIFOs exclude
+fixture loading, truth generation, and complete workload warm-up. Counters cover
+cycles and instructions in user mode, without multiplexing. A/B/B/A medians use
+two counted passes per main arm; the wider gate has one diagnostic pass.
+
+| Arm | M instructions/query | M cycles/query | Attempts / certificates per 1,000 queries |
+| --- | ---: | ---: | ---: |
+| Existing reader | 20.622 | 12.855 | 0 / 0 |
+| Rare pair, at most 16,384 combined postings | 20.806 | 13.059 | 871 / 12 |
+| Rare pair, at most 65,536 combined postings | 20.888 | 13.102 | 999 / 13 |
+
+The main candidate fully scores 23,522 intersections across the workload; the
+wider gate scores 35,114. Only 1.2–1.3% of queries certify. Mean cycles increase
+about 1.6% at the selective gate and miss the **8.83M cycles/query** requirement.
+This executable's paired baseline differs from B6's historical 11.485M; no gain
+is inferred from that difference. All counted results remain exact.
+
+The failed prototype is removed from the final tree. Its complete implementation
+and corpus checks remain in `45f50da`, following the initial driver in `781f311`.
+No rare-pair production hook, query option, index, or format ships.
+
+### Reproduction
+
+Use an owned run directory under `.scratch/`, a disposable fully indexed local
+store copy per arm, and a trap that deletes the run directory when finished. The
+MS MARCO corpus input is JSONL with numeric `id` and string `text`. With the server
+pinned to CPUs 0–5, the matched client command is:
+
+```sh
+uv run --with numpy crates/bf-engine/bench/steady_writes.py \
+  --corpus "$BW1_RUN/corpus.jsonl" \
+  --workload bench/scale/data/bm25-msmarco.json \
+  --namespace msmarco --base-url http://127.0.0.1:8300 \
+  --query-count 1000 --rate 1000 --batch 100 --bm25-hz 1 \
+  --seconds 120 --warmup 30 --tag paired-a1 --out "$BW1_RUN/results.jsonl"
+```
+
+Omit `--bm25-hz` for closed-loop requests, and use `--rate 0` for idle. For the
+frozen checker, build `bf-text`'s `exact_bm25` example, copy it beneath the owned
+scratch directory, and set `BW1_REFERENCE` and `BW1_STORE` to its absolute path and
+a disposable local-store copy. Run the ignored engine test in release mode. It
+writes reference JSON next to the disposable store; remove that output with the
+run directory. Historical rare-pair reproduction uses `BF_TEXT_EXPERIMENT`,
+`BF_TEXT_PERF_CONTROL`, and `BF_TEXT_PERF_ACK` with the driver in `45f50da`.
+Set `BF_TEXT_RARE_PAIR=1` for candidate passes, and select the combined-posting
+limit with `BF_TEXT_PAIR_LIMIT=16384` or `65536`; leave the first variable unset
+for baseline passes. These variables belong only to the historical experiment.
