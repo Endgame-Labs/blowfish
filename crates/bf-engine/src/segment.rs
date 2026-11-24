@@ -302,6 +302,66 @@ fn decode_column(data: &[u8], col: &Column, b: &Block) -> Result<Vec<Option<Valu
         decode(data)
     }
 }
+/// Maintenance scans need only a few rows of each compressed JSON block. Skip the other
+/// values while parsing, rather than allocating hundreds of strings for each requested row.
+fn decode_selected_column(
+    data: &[u8],
+    col: &Column,
+    b: &Block,
+    first: u32,
+    count: usize,
+    rows: &RoaringBitmap,
+) -> Result<Vec<(u32, Value)>, ApiError> {
+    struct Selected<'a> {
+        first: u32,
+        count: usize,
+        rows: &'a RoaringBitmap,
+    }
+    impl<'de> serde::de::Visitor<'de> for Selected<'_> {
+        type Value = Vec<(u32, Value)>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a document column with {} values", self.count)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut found = Vec::new();
+            for i in 0..self.count {
+                if self.rows.contains(self.first + i as u32) {
+                    let value = seq
+                        .next_element::<Option<Value>>()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                    if let Some(value) = value {
+                        found.push((self.first + i as u32, value));
+                    }
+                } else if seq.next_element::<serde::de::IgnoredAny>()?.is_none() {
+                    return Err(serde::de::Error::invalid_length(i, &self));
+                }
+            }
+            if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::invalid_length(self.count + 1, &self));
+            }
+            Ok(found)
+        }
+    }
+    let unpacked;
+    let data = if col.compressed {
+        let length = b.uncompressed_length.ok_or_else(corrupt)?;
+        unpacked = zstd::bulk::decompress(data, length).map_err(index_error)?;
+        if unpacked.len() != length {
+            return Err(corrupt());
+        }
+        unpacked.as_slice()
+    } else {
+        data
+    };
+    let mut decoder = serde_json::Deserializer::from_slice(data);
+    let found = serde::Deserializer::deserialize_seq(&mut decoder, Selected { first, count, rows })
+        .map_err(index_error)?;
+    decoder.end().map_err(index_error)?;
+    Ok(found)
+}
 fn finish(body: Vec<u8>, directory: &Directory) -> Result<(Vec<u8>, u64), ApiError> {
     finish_version(body, directory, 1)
 }
@@ -1137,7 +1197,9 @@ pub(crate) async fn projected_rows_with(
                 let missing: Vec<usize> = (0..indices.len())
                     .filter(|n| decoded[*n].is_none())
                     .collect();
-                for batch in missing.chunks(64) {
+                // Two bounded maintenance scans retain at most the previous 64-block batch
+                // in aggregate. Query hydration retains its whole-block decoded cache.
+                for batch in missing.chunks(if bypass { 32 } else { 64 }) {
                     let descriptors = batch
                         .iter()
                         .map(|n| col.blocks.get(indices[*n]).ok_or_else(corrupt))
@@ -1160,6 +1222,17 @@ pub(crate) async fn projected_rows_with(
                         let last = first
                             .saturating_add(BLOCK_ROWS as u32)
                             .min(segment.row_count);
+                        if bypass && col.vector.is_none() {
+                            found.extend(decode_selected_column(
+                                &data,
+                                col,
+                                b,
+                                first,
+                                (last - first) as usize,
+                                rows,
+                            )?);
+                            continue;
+                        }
                         let values: Vec<Option<Value>> = if let Some((dims, f16)) = col.vector {
                             upgrade::decode_vectors(
                                 &data,
@@ -1180,6 +1253,9 @@ pub(crate) async fn projected_rows_with(
                         }
                         decoded[n] = Some(values);
                     }
+                }
+                if bypass && col.vector.is_none() {
+                    return Ok((name, found));
                 }
                 for (&i, values) in indices.iter().zip(&decoded) {
                     let values = values.as_ref().ok_or_else(corrupt)?;

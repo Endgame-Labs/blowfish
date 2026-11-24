@@ -97,6 +97,7 @@ impl ObjectStore for Observed {
         } else {
             "get"
         };
+        metrics::counter!("blowfish_object_store_attempts_total", "op" => op).increment(1);
         let head = opts.head;
         let range_dbg = match &opts.range {
             Some(object_store::GetRange::Bounded(r)) => Some((r.start, r.end)),

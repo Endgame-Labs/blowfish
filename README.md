@@ -107,6 +107,26 @@ Qdrant keeps its HNSW graph and vectors in RAM and is about 3.7 times faster at 
 scans one-bit codes and reads exact vectors through its object-storage cache, so the same layout serves
 cold from S3. Details: [Apple M4 at v0.1.15](docs/benchmarks.md#apple-m4-at-v0115-blowfish-qdrant-and-lancedb).
 
+#### Under a memory limit
+
+To test whether Qdrant's lead depends on RAM, I ran the same 2.68M BEIR NQ workload (1,024-dim `f16`,
+16 clients) on the same Mac inside a Linux VM with a cgroup cap on RAM plus page cache, swap off, and an
+uncached VM disk. Engines ran one at a time, with two fresh processes per row:
+
+| Engine | Recall@10 | 2 GiB | 4 GiB | 8 GiB | 12 GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| blowfish v0.1.15, 48 probes | 0.950 | 710 q/s | 1,799 | 1,805 | 1,795 |
+| Qdrant 1.20.0, `ef=64`, vectors on disk | 0.949 | 83 | 224 | 5,616 | 5,702 |
+| Qdrant 1.20.0, `ef=64`, vectors and HNSW on disk | 0.945 | 96 | 712 | 5,752 | 5,707 |
+
+The ranking flips with available RAM: with 2 or 4 GiB, blowfish is 2.5 to 8.5 times faster; with 8 GiB
+or more, Qdrant is about 3.1 times faster. At 2 GiB, p50 latency is 3.1–3.2 ms for blowfish vs.
+22.7–26.9 ms for Qdrant; at 4 GiB, it is 1.8 ms vs. 4.0–5.6 ms. blowfish uses about 3.5 GB RSS and does
+not get faster beyond about 4 GiB (natively on macOS, 1/3/7/11 GiB of block cache gave
+1,159/2,129/2,145/2,138 q/s). Qdrant needs roughly 5 GB to hold its graph and vectors; below that, it
+reads from disk on each hop. Details:
+[Matched memory limits](docs/benchmarks.md#memory-budgets-blowfish-and-qdrant-on-an-apple-m4).
+
 ### My own measurements of hosted services (10M)
 
 I also measured turbopuffer and Amazon S3 Vectors on the same 10M 1,024-dim `f16` Wikipedia dataset. Because caches cannot be forced cold externally on either hosted service, their idle-gap latency is not directly comparable to blowfish's cold numbers:

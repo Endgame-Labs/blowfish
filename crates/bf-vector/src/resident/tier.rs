@@ -187,27 +187,32 @@ impl CompiledTier {
             return Ok(None);
         }
         s.candidates.clear();
+        let mut upper_bound = f32::INFINITY;
         for (i, group) in s.chosen.iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
             let slab = &self.slabs[i];
             let leaf = |cid: usize| slab.leaves[cid].get().expect("checked admitted leaf");
-            s.candidates.extend(
-                slab.index
-                    .scan_with(
-                        &s.rotated,
-                        group,
-                        |_, cid| &leaf(cid).codes,
-                        |cid| &leaf(cid).cluster,
-                        None,
-                        0,
-                        Some(k),
-                        &mut s.scan,
-                    )?
-                    .iter()
-                    .map(|c| (i, *c)),
-            );
+            let found = slab.index.scan_with(
+                &s.rotated,
+                group,
+                |_, cid| &leaf(cid).codes,
+                |cid| &leaf(cid).cluster,
+                None,
+                0,
+                Some((k, upper_bound)),
+                &mut s.scan,
+            )?;
+            // Publish only bounds supported by k witnesses from this query. Scans run
+            // sequentially here, so a local value shares the cut without an atomic.
+            if found.len() >= k {
+                s.uppers.clear();
+                s.uppers.extend(found.iter().map(|c| c.distance + c.error));
+                s.uppers.select_nth_unstable_by(k - 1, f32::total_cmp);
+                upper_bound = upper_bound.min(s.uppers[k - 1]);
+            }
+            s.candidates.extend(found.iter().map(|c| (i, *c)));
         }
         prune(s, k, target);
         for (i, candidate) in &s.candidates {

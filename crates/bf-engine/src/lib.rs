@@ -20,6 +20,9 @@ mod sparse;
 mod statistics;
 mod stop;
 mod streaming;
+mod tail;
+#[cfg(test)]
+mod tail_benchmark;
 mod text_upgrade;
 pub use indexer::EngineConfig;
 pub use recluster::{ReclusterOptions, ReclusterReport};
@@ -878,10 +881,10 @@ impl Engine {
         };
         if crate::ann::trace_stages() {
             eprintln!(
-                "QUERY snapshot={}ms exec={}ms total={}ms",
-                snapshot_elapsed.as_millis(),
-                execution_elapsed.as_millis(),
-                start.elapsed().as_millis()
+                "QUERY snapshot={}us exec={}us total={}us",
+                snapshot_elapsed.as_micros(),
+                execution_elapsed.as_micros(),
+                start.elapsed().as_micros()
             );
         }
         let diagnostics = QueryDiagnostics {
@@ -906,7 +909,7 @@ impl Engine {
         let t_clone = Instant::now();
         let state = state.clone();
         if crate::ann::trace_stages() {
-            eprintln!("CLONE {}ms", t_clone.elapsed().as_millis());
+            eprintln!("CLONE {}us", t_clone.elapsed().as_micros());
         }
         let request = request.clone();
         let runtime = tokio::runtime::Handle::current();

@@ -137,7 +137,7 @@ impl<R: RangeRead> ResidentIndex<R> {
             |_, cid| &self.codes[cid],
             filter,
             0,
-            (k > 0).then_some(k),
+            (k > 0).then_some((k, f32::INFINITY)),
             scratch,
         )
     }

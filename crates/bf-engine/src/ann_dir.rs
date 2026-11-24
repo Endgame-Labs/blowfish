@@ -360,6 +360,11 @@ pub(crate) async fn prefetch_scan(
     k: usize,
     config: &EngineConfig,
 ) -> Result<(), ApiError> {
+    // Let the query consume arriving scan batches instead of waiting for the whole
+    // speculative scan here, ahead of query execution.
+    if stream_scan(dir, layout) {
+        return Ok(());
+    }
     if segments.iter().any(|s| s.live_generation != 0) || !covers(dir, segments, attribute, layout)
     {
         return Ok(());
@@ -986,6 +991,14 @@ type Real<'a> = (
     &'a [bf_wal::SlabCover],
     &'a crate::lineage::Placement,
 );
+/// Streaming pays for itself on large cold slab searches; small and resident searches keep
+/// the per-slab path.
+fn stream_scan(dir: &Directory, layout: Layout) -> bool {
+    crate::fan_out()
+        && read_cache::admitting()
+        && layout == Layout::Slabs
+        && dir.segments().iter().map(|s| s.rows).sum::<usize>() >= 100_000
+}
 
 struct Probed {
     segment: usize,
@@ -1244,7 +1257,89 @@ pub(crate) async fn search(
         );
     }
     let vector_key = vector_hash(&vector);
+    // A completed slab (or streamed batch) with k witnesses supplies a valid global cut to scans
+    // that have not run yet. Read planning stays concurrent; busy warm queries scan on their own
+    // thread.
+    let scan_upper = Arc::new(std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()));
+    // Sample a selected code range per slab. This costs no I/O, and keeps resident
+    // workloads on the existing per-slab scan rather than creating many small tasks.
+    let streaming = stream_scan(&dir, layout)
+        && !filtered
+        && joint.is_none()
+        && chosen.iter().any(|(&i, cs)| {
+            let seg = &dir.segments()[i];
+            let Some(file) = state.segments[i].files.values().find(|f| f.key == seg.key) else {
+                return true;
+            };
+            let Ok(reader) = store.range_reader_with_length(&file.key, file.size, true) else {
+                return true;
+            };
+            cs.first()
+                .is_some_and(|&n| !reader.is_memory_resident(entries[n].codes_range()))
+        });
+    let mut bulk = tokio::task::JoinSet::new();
+    if streaming {
+        let mut order: Vec<_> = chosen
+            .iter()
+            .filter(|(i, _)| !exact_segments.contains(i))
+            .collect();
+        order.sort_unstable_by(|a, b| distances[a.1[0]].total_cmp(&distances[b.1[0]]));
+        let mut reservations = Vec::new();
+        for (&i, cs) in order {
+            let seg = &dir.segments()[i];
+            let files = &state.segments[i].files;
+            let index = files
+                .values()
+                .find(|f| f.key == seg.key)
+                .ok_or_else(|| segment::index_error("segment lost its ANN index"))?;
+            let fragment = files
+                .values()
+                .find(|f| f.key == seg.fragment)
+                .ok_or_else(|| segment::index_error("segment lost its ANN fragment"))?;
+            let mut blobs: Vec<_> = cs.iter().map(|&n| entries[n].blob_range()).collect();
+            let codes: Vec<_> = cs.iter().map(|&n| entries[n].codes_range()).collect();
+            let reads = if seg.codes_in_fragment {
+                blobs.extend(codes);
+                vec![(fragment, blobs)]
+            } else {
+                vec![(fragment, blobs), (index, codes)]
+            };
+            for (file, ranges) in reads {
+                let reader = store
+                    .range_reader_with_length(&file.key, file.size, true)
+                    .map_err(segment::index_error)?;
+                let stats = read_cache::stats();
+                let (ready, reserved) = tokio::sync::oneshot::channel();
+                reservations.push(reserved);
+                bulk.spawn(async move {
+                    let _ = reader.read_batch_notifying(&ranges, &stats, ready).await;
+                });
+            }
+        }
+        for ready in reservations {
+            let _ = ready.await;
+        }
+    }
+    let mut batches = Vec::new();
     for (&i, cs) in &chosen {
+        if streaming && !exact_segments.contains(&i) {
+            let mut ranked = cs.clone();
+            ranked.sort_unstable_by(|&a, &b| distances[a].total_cmp(&distances[b]));
+            for chunk in ranked.chunks(4) {
+                batches.push((i, chunk.to_vec()));
+            }
+        } else {
+            batches.push((i, cs.clone()));
+        }
+    }
+    if streaming {
+        batches.sort_unstable_by(|a, b| {
+            let nearest = |ns: &[usize]| ns.first().map_or(f32::INFINITY, |&n| distances[n]);
+            nearest(&a.1).total_cmp(&nearest(&b.1))
+        });
+    }
+    for (i, cs) in batches {
+        let scan_upper = scan_upper.clone();
         let (dir, vector, rotated) = (dir.clone(), vector.clone(), rotated.clone());
         let exact = exact_segments.contains(&i);
         let flat = dir.segments()[i].flat;
@@ -1276,7 +1371,7 @@ pub(crate) async fn search(
         let warm = warm.clone();
         tasks.push(
             async move {
-                let task_start = trace_t0.elapsed().as_millis();
+                let task_start = trace_t0.elapsed().as_micros();
                 // The prefetch may have scanned this segment's clusters already (see
                 // `scan_memo_put`): that is exact only without a row mask.
                 if memo_hit && live.is_none() {
@@ -1337,7 +1432,7 @@ pub(crate) async fn search(
                     }
                 )?;
                 let (blobs, codes) = read;
-                let read_done = trace_t0.elapsed().as_millis();
+                let read_done = trace_t0.elapsed().as_micros();
                 let mut blobs = blobs.iter();
                 for (position, (cluster, known)) in wanted.iter().zip(decoded).enumerate() {
                     let d = match known {
@@ -1369,7 +1464,7 @@ pub(crate) async fn search(
                     clusters: wanted.clone(),
                     exact,
                 };
-                let install_done = trace_t0.elapsed().as_millis();
+                let install_done = trace_t0.elapsed().as_micros();
                 let found = on_worker(async move {
                     if exact {
                         let hits = index
@@ -1384,8 +1479,22 @@ pub(crate) async fn search(
                     // The rerank below keeps only candidates whose lower bound is within the
                     // k-th smallest upper bound, so the scan drops the rest as it goes.
                     let found = index
-                        .scan_blocks_bounded_rotated(&rotated, &wanted, codes, live.as_deref(), k)
+                        .scan_blocks_bounded_rotated(
+                            &rotated,
+                            &wanted,
+                            codes,
+                            live.as_deref(),
+                            k,
+                            f32::from_bits(scan_upper.load(std::sync::atomic::Ordering::Relaxed)),
+                        )
                         .map_err(segment::index_error)?;
+                    if k > 0 && found.len() >= k {
+                        let mut upper: Vec<f32> = found.iter().map(|c| c.distance + c.error).collect();
+                        upper.select_nth_unstable_by(k - 1, f32::total_cmp);
+                        // Distances and errors are non-negative, so their float bits have
+                        // the same order as the values. Every published cut has k witnesses.
+                        scan_upper.fetch_min(upper[k - 1].to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    }
                     Ok((Vec::new(), found))
                 })
                 .await?;
@@ -1393,7 +1502,7 @@ pub(crate) async fn search(
                     eprintln!(
                         "TASK seg={i} clusters={} start={task_start} read={read_done} install={install_done} scan={}",
                         probed.clusters.len(),
-                        trace_t0.elapsed().as_millis()
+                        trace_t0.elapsed().as_micros()
                     );
                 }
                 Ok::<_, ApiError>((probed, found))
@@ -1407,21 +1516,101 @@ pub(crate) async fn search(
     // other on a single thread.
     crate::ann::stage(t0, "tasks built");
     let limit = config.search_concurrency.max(1) * 2;
-    let results: Vec<(Probed, Found)> = run_parallel(tasks).await?;
+    let mut early = tokio::task::JoinSet::new();
+    let results: Vec<(Probed, Found)> = if streaming {
+        let context = read_cache::context();
+        let mut scans = tokio::task::JoinSet::new();
+        let count = tasks.len();
+        for task in tasks {
+            let context = context.clone();
+            scans.spawn(async move {
+                match context {
+                    Some(context) => read_cache::scope(context, task).await,
+                    None => task.await,
+                }
+            });
+        }
+        let mut results: Vec<(Probed, Found)> = Vec::new();
+        let mut launched = false;
+        while let Some(result) = scans.join_next().await {
+            results.push(result.map_err(segment::index_error)??);
+            if !launched && results.len() * 5 >= count * 2 && !scans.is_empty() {
+                launched = true;
+                let mut leading: Vec<_> = results
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(n, (_, (_, found)))| found.iter().map(move |c| (n, c)))
+                    .collect();
+                leading.sort_unstable_by(|a, b| a.1.distance.total_cmp(&b.1.distance));
+                leading.truncate(k.saturating_mul(8).min(80));
+                let mut locations: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
+                let mut rows: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
+                let docs_limit = k.saturating_mul(3).min(30);
+                for (rank, (n, c)) in leading.into_iter().enumerate() {
+                    locations.entry(n).or_default().push((c.cluster, c.ordinal));
+                    if rank < docs_limit
+                        && let Some((i, row)) = to_real(results[n].0.segment, c.row)
+                    {
+                        rows.entry(i).or_default().insert(row);
+                    }
+                }
+                for (n, locations) in locations {
+                    let (index, vector, context) =
+                        (results[n].0.index.clone(), vector.clone(), context.clone());
+                    early.spawn(async move {
+                        let work = async move {
+                            let _ = index.rerank_candidates(&vector, k, locations).await;
+                        };
+                        match context {
+                            Some(context) => read_cache::scope(context, work).await,
+                            None => work.await,
+                        }
+                    });
+                }
+                for (i, rows) in rows {
+                    let (store, segment, columns, context) = (
+                        store.clone(),
+                        docs_state.segments[i].clone(),
+                        columns.clone(),
+                        context.clone(),
+                    );
+                    early.spawn(async move {
+                        let work = async move {
+                            let _ =
+                                segment::projected_rows(&store, &segment, &rows, Some(&columns))
+                                    .await;
+                        };
+                        match context {
+                            Some(context) => read_cache::scope(context, work).await,
+                            None => work.await,
+                        }
+                    });
+                }
+                crate::ann::stage(t0, "early rerank");
+            }
+        }
+        // These reads only populate the immutable cache. Keep them alive through the final
+        // rerank so its misses share any requests still in flight.
+        results
+    } else {
+        run_parallel(tasks).await?
+    };
     crate::ann::stage(t0, "scan");
     let mut winners: Vec<(f32, usize, u32)> = Vec::new(); // (exact distance, segment, row)
     let mut pool: Vec<(usize, Candidate)> = Vec::new();
     let mut indexes: BTreeMap<usize, Arc<Index<Reader>>> = BTreeMap::new();
-    for (probed, (exact_hits, found)) in results {
+    let mut sources = Vec::new();
+    for (n, (probed, (exact_hits, found))) in results.into_iter().enumerate() {
         let _ = (&probed.clusters, probed.exact);
         winners.extend(exact_hits.into_iter().map(|(d, r)| (d, probed.segment, r)));
-        pool.extend(found.into_iter().map(|c| (probed.segment, c)));
-        indexes.insert(probed.segment, probed.index);
+        pool.extend(found.into_iter().map(|c| (n, c)));
+        sources.push(probed.segment);
+        indexes.insert(n, probed.index);
     }
     let cmp = |a: &(usize, Candidate), b: &(usize, Candidate)| {
         a.1.distance
             .total_cmp(&b.1.distance)
-            .then(a.0.cmp(&b.0))
+            .then(sources[a.0].cmp(&sources[b.0]))
             .then(a.1.row.cmp(&b.1.row))
     };
     // Error-bounded reranking: only candidates whose lower bound can still beat the k-th best
@@ -1458,7 +1647,7 @@ pub(crate) async fn search(
             best.select_nth_unstable_by(keep, |a, b| cmp(a, b));
         }
         for (i, c) in best.into_iter().take(keep) {
-            if let Some((i, row)) = to_real(*i, c.row) {
+            if let Some((i, row)) = to_real(sources[*i], c.row) {
                 speculative.entry(i).or_default().insert(row);
             }
         }
@@ -1481,6 +1670,7 @@ pub(crate) async fn search(
     // one of the few permits through the read latency, and the segments would queue for them.
     let reranks = by_segment.into_iter().map(|(i, locations)| {
         let (index, vector, warm) = (indexes[&i].clone(), vector.clone(), warm.clone());
+        let i = sources[i];
         async move {
             let hits = index
                 .rerank_candidates_recorded(

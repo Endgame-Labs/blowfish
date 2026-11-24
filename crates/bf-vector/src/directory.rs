@@ -27,7 +27,7 @@ use crate::{
     Metric, RaBitQ, RangeRead, Result, VectorType,
     cluster::prepare,
     format::{Parser, bad, check_crc},
-    index::{Index, StubCluster},
+    index::Index,
 };
 
 pub(crate) const ANN_MAGIC: &[u8; 8] = b"BFANN002";
@@ -119,30 +119,36 @@ struct Section {
     /// Quantized codes live in the fragment, after each cluster's blob.
     codes_in_fragment: bool,
     /// Every cluster's ranges, by cluster ID, for [`Directory::partial_index`] (built once).
-    stubs: std::sync::OnceLock<Vec<StubCluster>>,
+    stubs: std::sync::OnceLock<Arc<Vec<crate::format::Cluster>>>,
 }
 impl Section {
-    fn stubs(&self) -> &[StubCluster] {
-        self.stubs.get_or_init(|| {
-            let mut stubs = vec![
-                StubCluster {
-                    codes: 0..0,
-                    vectors: 0..0,
-                    codes_crc: 0,
-                    vectors_crc: 0,
-                };
-                self.clusters
-            ];
-            for e in &self.entries {
-                stubs[e.cluster] = StubCluster {
-                    codes: e.codes.clone(),
-                    vectors: e.vectors.clone(),
-                    codes_crc: e.codes_crc,
-                    vectors_crc: e.vectors_crc,
-                };
-            }
-            stubs
-        })
+    fn stubs(&self) -> Arc<Vec<crate::format::Cluster>> {
+        self.stubs
+            .get_or_init(|| {
+                let mut stubs = vec![
+                    crate::format::Cluster {
+                        data: None,
+                        parent: u32::MAX,
+                        codes: 0..0,
+                        vectors: 0..0,
+                        codes_crc: 0,
+                        vectors_crc: 0,
+                    };
+                    self.clusters
+                ];
+                for e in &self.entries {
+                    stubs[e.cluster] = crate::format::Cluster {
+                        data: None,
+                        parent: u32::MAX,
+                        codes: e.codes.clone(),
+                        vectors: e.vectors.clone(),
+                        codes_crc: e.codes_crc,
+                        vectors_crc: e.vectors_crc,
+                    };
+                }
+                Arc::new(stubs)
+            })
+            .clone()
     }
 }
 
@@ -747,7 +753,11 @@ impl Directory {
         let bits: usize = self
             .sections
             .iter()
-            .map(|s| s.bits.len() + s.centroid.len() * 4)
+            .map(|s| {
+                s.bits.len()
+                    + s.centroid.len() * 4
+                    + s.clusters * std::mem::size_of::<crate::format::Cluster>()
+            })
             .sum();
         (bits
             + self.entries.len() * 2 * std::mem::size_of::<DirEntry>()

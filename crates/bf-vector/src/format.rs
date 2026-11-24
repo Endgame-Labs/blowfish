@@ -45,7 +45,7 @@ pub(crate) fn mean_center<'a>(centers: impl Iterator<Item = &'a [f32]>, padded: 
 /// A leaf cluster's decoded payload description: center, rows, and checksums. Shared (one
 /// reference count) by every index holding the cluster, including the per-query partial
 /// indexes that install a cached decoded directory cluster (see [`crate::DecodedCluster`]).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ClusterData {
     pub center: Vec<f32>,
     pub rows: RoaringBitmap,
@@ -65,6 +65,7 @@ impl ClusterData {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Cluster {
     /// `None` for a stub (a directory cluster not installed): reads see an empty payload.
     pub data: Option<Arc<ClusterData>>,
@@ -73,6 +74,131 @@ pub(crate) struct Cluster {
     pub vectors: Range<u64>,
     pub codes_crc: u32,
     pub vectors_crc: u32,
+}
+
+/// A normal index owns its complete table. A query's partial index shares immutable ranges
+/// and owns only the few payloads it installs. Cluster IDs never change between the views.
+pub(crate) enum Clusters {
+    Dense(Vec<Cluster>),
+    Partial {
+        base: Arc<Vec<Cluster>>,
+        installed: Vec<(usize, Cluster)>,
+    },
+}
+impl From<Vec<Cluster>> for Clusters {
+    fn from(value: Vec<Cluster>) -> Self {
+        Self::Dense(value)
+    }
+}
+impl Clusters {
+    pub fn partial(base: Arc<Vec<Cluster>>) -> Self {
+        Self::Partial {
+            base,
+            installed: Vec::new(),
+        }
+    }
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Dense(rows) => rows.len(),
+            Self::Partial { base, .. } => base.len(),
+        }
+    }
+    pub fn get(&self, index: usize) -> Option<&Cluster> {
+        match self {
+            Self::Dense(rows) => rows.get(index),
+            Self::Partial { base, installed } => {
+                match installed.binary_search_by_key(&index, |(id, _)| *id) {
+                    Ok(at) => Some(&installed[at].1),
+                    Err(_) => base.get(index),
+                }
+            }
+        }
+    }
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Cluster> {
+        // A fully opened index should keep contiguous iteration and lookup. Partial queries
+        // normally install only a few percent of these slots.
+        if matches!(self, Self::Partial { base, installed } if installed.len() >= base.len().div_ceil(2))
+        {
+            self.make_dense();
+        }
+        match self {
+            Self::Dense(rows) => rows.get_mut(index),
+            Self::Partial { base, installed } => {
+                if index >= base.len() {
+                    return None;
+                }
+                let at = match installed.binary_search_by_key(&index, |(id, _)| *id) {
+                    Ok(at) => at,
+                    Err(at) => {
+                        installed.insert(at, (index, base[index].clone()));
+                        at
+                    }
+                };
+                Some(&mut installed[at].1)
+            }
+        }
+    }
+    pub fn iter(&self) -> ClusterIter<'_> {
+        ClusterIter {
+            table: self,
+            indices: 0..self.len(),
+        }
+    }
+    fn make_dense(&mut self) {
+        if let Self::Partial { base, installed } = self {
+            let mut rows = base.as_ref().clone();
+            for (i, row) in installed.drain(..) {
+                rows[i] = row;
+            }
+            *self = Self::Dense(rows);
+        }
+    }
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Cluster> {
+        self.make_dense();
+        match self {
+            Self::Dense(rows) => rows.iter_mut(),
+            Self::Partial { .. } => unreachable!(),
+        }
+    }
+}
+impl std::ops::Index<usize> for Clusters {
+    type Output = Cluster;
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("cluster index")
+    }
+}
+pub(crate) struct ClusterIter<'a> {
+    table: &'a Clusters,
+    indices: std::ops::Range<usize>,
+}
+impl<'a> Iterator for ClusterIter<'a> {
+    type Item = &'a Cluster;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.indices.next().map(|i| &self.table[i])
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
+    }
+}
+impl DoubleEndedIterator for ClusterIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.indices.next_back().map(|i| &self.table[i])
+    }
+}
+impl ExactSizeIterator for ClusterIter<'_> {}
+impl<'a> IntoIterator for &'a Clusters {
+    type Item = &'a Cluster;
+    type IntoIter = ClusterIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl<'a> IntoIterator for &'a mut Clusters {
+    type Item = &'a mut Cluster;
+    type IntoIter = std::slice::IterMut<'a, Cluster>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
 }
 static EMPTY_CLUSTER: std::sync::LazyLock<ClusterData> = std::sync::LazyLock::new(Default::default);
 impl std::ops::Deref for Cluster {
@@ -91,7 +217,7 @@ pub(crate) struct Metadata {
     pub flat: bool,
     pub flags: u32,
     pub parents: Vec<Vec<f32>>,
-    pub clusters: Vec<Cluster>,
+    pub clusters: Clusters,
 }
 
 struct Block {
@@ -215,7 +341,7 @@ pub(crate) fn build_blob(
         flat,
         flags: FLAG_ROTATED | FLAG_COMPACT | if fastscan { FLAG_FASTSCAN } else { 0 },
         parents: parents.iter().map(|p| rotated_center(&rq, p)).collect(),
-        clusters,
+        clusters: clusters.into(),
     };
     let meta_len = encode_metadata(&metadata)?.len() as u64;
     // All codes first (probed clusters sit close together, so reads coalesce), then all vectors.
@@ -500,7 +626,7 @@ pub(crate) fn decode_metadata(bytes: &[u8], crc: u32, payload_end: u64) -> Resul
         flat,
         flags,
         parents,
-        clusters,
+        clusters: clusters.into(),
     })
 }
 

@@ -4,6 +4,34 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Cold vector queries stream their slab scans** (round C1; `docs/benchmarks.md`, "Round C1"). On a cold
+  slab search, scan reads are reserved nearest leaf first and each batch of leaves is scanned as its bytes
+  land, and bounded rerank and document reads start before the slowest scan read returns. In-region
+  (c7gd.2xlarge, cache-cold, paired): 10M p50/p90 554/701 to 425/544 ms (1.30x) with GET attempts +11.5%;
+  100M 1,028/1,166 to 715/907 ms (1.44x) with GET attempts +1.6%. Recall@10 unchanged (0.9615 and 0.9540),
+  and all 500 final pairs returned identical IDs and distances. Calibrated hedging and a straggler cutoff
+  were tried and removed. No format change; small and resident searches keep the per-slab path.
+
+- **Fast queries under steady writes** (round W1; `docs/benchmarks.md`, worker harness
+  `crates/bf-engine/bench/steady_writes.py`). Queries over the unindexed WAL tail decoded every resident
+  vector from base64 on each query. A byte-bounded cache of decoded tail vectors (inside the existing decoded
+  cache budget), a bounded global top-k, and parallel exact scoring of wide tails fix that, with identical
+  results. Steady writes are no longer mistaken for a bulk load, removal-statistics scans are bounded,
+  maintenance reads decode only the fields they need, and unchanged full-text statistics are reused. On NQ at
+  1,000 upserts a second (quiet VM), ANN query p50/p90 went from 156/451 ms to 15/28 ms, with recall@10
+  0.9511 vs 0.9517 over 300 matched queries (no detected shift); at 300/s, 160/280 to 29/41 ms under load.
+  BM25 under 1,000 writes/s: 4.2/9.2 s to 1.7/2.1 s. All 3.79M writes across 40 runs were acknowledged.
+  Indexing defaults (five-second flush age, 2,048-row flat threshold, ANN overfetch) are unchanged.
+
+- **Text format 6: compressed phrase positions** (`docs/benchmarks.md`, "Round T1"). Phrase positions were
+  stored as two raw `u32`s per token occurrence, 62% of the text index. Format 6 drops the element index for
+  scalar string fields and delta-codes positions, losslessly. On 1M MS MARCO, text indexes go from 743.5 MB to
+  348.2 MB (2.14x smaller) and whole segments from 932.5 MB to 537.2 MB (1.74x). Formats 4 and 5 upgrade
+  automatically through the background upgrade pass. All 8,480 HTTP responses match exact IDs and score
+  bits; cold phrase queries read 28.7% fewer objects and 18.4% fewer bytes (p90 560 to 541 ms); segment
+  build time is unchanged. BM25 seed lists, document reordering by graph bisection, and exact per-window
+  bounds were measured and rejected (1.09x to 1.28x).
+
 - **Compaction through recluster tiers, and bucket format 4** (`docs/benchmarks.md`, "Round AR3";
   `docs/design/auto-recluster.md`, R4). Compaction now merges segments that a tier covers instead of skipping
   them. It records where each merged segment's surviving rows went (lineage), so the tiers keep answering
@@ -16,6 +44,43 @@ Newest first. Each entry says what works now and how it was checked.
   0.955), and GC removed only orphaned maps. Retiring covered segments' ANN objects (D4, about 6 GB on NQ)
   is planned in `docs/design/disk-footprint.md`, not built. Formatting, full-workspace clippy, and all Rust
   tests pass.
+
+- **NQ profiling harness, round Q1.** `bench/nq/profile.py` owns its read-only server and profiler,
+  records exact recall, result IDs, cache statistics, microsecond traces, and hardware counters,
+  and cleans up its child processes. The benchmark write-up preserves the full before/after
+  curve, cold comparisons, rejected experiments, and throughput limits. The harness was used
+  for the final ABAB, full-quality, and trace runs; all Rust checks remain passing.
+
+- **Shared ANN candidate bounds, round Q1.** Completed slabs pass a witnessed upper bound to later
+  scans, and scans discard candidates accepted under earlier, looser bounds before merging. Combined
+  with shared metadata, warm NQ uses 12.5% fewer VM instructions at 48 probes and 12.7% fewer at 64.
+  All 31,068 top-10 ID lists match across the full probe curve. Cold 25 ms S3-facade p50/p90 is
+  382/524 versus 389/544 ms at 48 probes and 426/518 versus 437/528 ms at 64. Formatting,
+  three-crate all-target clippy, and all 217 tests pass (six ignored). The 1.5× throughput gate
+  remains unmet; M4 throughput is unmeasured. Details are in `docs/benchmarks.md`, "Round Q1".
+
+- **Shared ANN query metadata, round Q1.** Partial indexes share immutable cluster ranges and
+  retain only installed payloads, preserving cluster IDs and encoded objects. On warm NQ,
+  alternating VM passes use 5.9% fewer instructions at 48 probes and 5.5% fewer at 64, with
+  all 4,000 top-10 lists identical. Fresh-process 25 ms S3-facade comparisons show similar
+  median latency; no M4 throughput improvement is claimed. Independent-view regression tests,
+  formatting, three-crate clippy, and the crate test suites validate the change.
+
+- **Warm ANN profiling, round Q1.** `BF_TRACE_STAGES` now reports microsecond ANN and HTTP timings,
+  distinguishes scanned rows from accepted candidates, and separates rerank vector reads from scoring.
+  The HTTP response stays unchanged. Formatting, clippy for `bf-vector`, `bf-engine`, and `blowfish`
+  with all targets and warnings denied, and the three crates' test suites pass. The full NQ profile
+  and measured optimizations follow in the Round Q1 benchmark entry.
+
+- **Apple M4 memory budgets** (`docs/benchmarks.md`, "Memory budgets: blowfish and Qdrant on an Apple M4").
+  I compare v0.1.15 and Qdrant 1.20.0 under 2/4/8/12 GiB query limits, including file cache,
+  with server swap disabled and uncached VZ backing disks. At recall near 0.95, blowfish gives
+  710/1,799/1,805/1,795 q/s; Qdrant with vectors on disk gives 83/224/5,616/5,702 q/s. Mapping
+  its graph too gives 96/712/5,752/5,707 q/s at slightly lower recall. I include native cache
+  profiles, query peak RSS and cgroup memory, a 51.8 ms first query, and the historical build/query
+  memory distinction. All 77 records finish, quality repeats exactly, and store hashes pass before
+  and after. Formatting, full clippy, 324 Rust tests, and three harness regressions pass. No engine
+  code or README changes.
 
 - **Apple M4 NQ at v0.1.15** (`docs/benchmarks.md`, "Apple M4 at v0.1.15"). I reran the tagged release,
   Qdrant 1.20.0, and LanceDB 0.41.0 one at a time on the same 10-core Mac. Blowfish gives 1,801–1,827 q/s

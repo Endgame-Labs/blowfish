@@ -34,6 +34,8 @@ pub(crate) struct DecodedCache {
     clusters: ClusterCache,
     /// Decoded document column blocks (256 rows each), for hydrating results.
     columns: moka::sync::Cache<String, Arc<Vec<Option<serde_json::Value>>>>,
+    /// Decoded resident WAL vectors; charged to the same total budget as immutable metadata.
+    pub(crate) tail_vectors: crate::tail::VectorCache,
 }
 /// foldhash, seeded per process (the keys are object keys and cluster numbers).
 type FastHash = foldhash::fast::RandomState;
@@ -44,17 +46,17 @@ pub(crate) type ClusterCache = Arc<ClockCache<bf_vector::DecodedCluster>>;
 /// A byte-bounded cache of small, many, immutable values for hot paths: sharded mutexes over
 /// hash maps with CLOCK (second-chance) eviction. A lookup is one uncontended lock, a hash
 /// probe, and a clone; moka's per-read bookkeeping cost several times that under load.
-pub(crate) struct ClockCache<V> {
-    shards: Vec<Mutex<ClockShard<V>>>,
+pub(crate) struct ClockCache<V, K = ClusterKey> {
+    shards: Vec<Mutex<ClockShard<V, K>>>,
     weigh: fn(&V) -> u64,
 }
-struct ClockShard<V> {
-    map: HashMap<ClusterKey, (V, u64, bool), FastHash>,
-    ring: std::collections::VecDeque<(Arc<str>, u32)>,
+struct ClockShard<V, K> {
+    map: HashMap<K, (V, u64, bool), FastHash>,
+    ring: std::collections::VecDeque<K>,
     bytes: u64,
     cap: u64,
 }
-impl<V: Clone> ClockCache<V> {
+impl<V: Clone, K: Clone + std::hash::Hash + Eq> ClockCache<V, K> {
     const SHARDS: usize = 64;
     pub fn new(capacity: u64, weigh: fn(&V) -> u64) -> Self {
         let cap = capacity / Self::SHARDS as u64;
@@ -72,7 +74,7 @@ impl<V: Clone> ClockCache<V> {
             weigh,
         }
     }
-    fn shard(&self, key: &(Arc<str>, u32)) -> &Mutex<ClockShard<V>> {
+    fn shard(&self, key: &K) -> &Mutex<ClockShard<V, K>> {
         use std::hash::BuildHasher;
         // foldhash, seeded per process: SipHash on each of a warm query's hundreds of cluster
         // lookups cost about 2% of CPU.
@@ -80,18 +82,42 @@ impl<V: Clone> ClockCache<V> {
         let h = SEED.get_or_init(Default::default).hash_one(key);
         &self.shards[h as usize % Self::SHARDS]
     }
-    pub fn get(&self, key: &(Arc<str>, u32)) -> Option<V> {
+    pub fn get(&self, key: &K) -> Option<V> {
         let mut shard = self.shard(key).lock().expect("clock cache lock");
         let (value, _, hot) = shard.map.get_mut(key)?;
         *hot = true;
         Some(value.clone())
     }
-    pub fn insert(&self, key: (Arc<str>, u32), value: V) {
+    pub fn insert(&self, key: K, value: V) {
+        let mut shard = self.shard(&key).lock().expect("clock cache lock");
+        let retired = self.insert_locked(&mut shard, key, value);
+        drop(shard);
+        drop(retired);
+    }
+    /// Initialize a missing immutable value once, under its shard lock. Initializers must
+    /// be short, and must not call this cache recursively. Retired values drop after unlock.
+    pub fn get_or_try_insert<E>(
+        &self,
+        key: K,
+        init: impl FnOnce() -> Result<V, E>,
+    ) -> Result<V, E> {
+        let mut shard = self.shard(&key).lock().expect("clock cache lock");
+        if let Some((value, _, hot)) = shard.map.get_mut(&key) {
+            *hot = true;
+            return Ok(value.clone());
+        }
+        let value = init()?;
+        let retired = self.insert_locked(&mut shard, key, value.clone());
+        drop(shard);
+        drop(retired);
+        Ok(value)
+    }
+    fn insert_locked(&self, shard: &mut ClockShard<V, K>, key: K, value: V) -> Vec<V> {
         let bytes = (self.weigh)(&value);
         let mut retired = Vec::new();
-        let mut shard = self.shard(&key).lock().expect("clock cache lock");
         if bytes > shard.cap {
-            return;
+            retired.push(value);
+            return retired;
         }
         if let Some((old, b, _)) = shard.map.insert(key.clone(), (value, bytes, false)) {
             shard.bytes -= b;
@@ -118,8 +144,7 @@ impl<V: Clone> ClockCache<V> {
                 None => {}
             }
         }
-        drop(shard);
-        drop(retired);
+        retired
     }
     pub fn clear(&self) {
         for shard in &self.shards {
@@ -129,14 +154,21 @@ impl<V: Clone> ClockCache<V> {
             shard.bytes = 0;
         }
     }
+    #[cfg(test)]
+    pub fn resident_bytes(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().expect("clock cache lock").bytes)
+            .sum()
+    }
 }
 impl DecodedCache {
-    /// `budget` bytes in all: two thirds for the general LRU, a quarter for decoded clusters, and
-    /// a twelfth for decoded column blocks.
+    /// `budget` bytes in all: half for the general LRU, a quarter for decoded clusters,
+    /// a sixth for resident WAL vectors, and a twelfth for decoded column blocks.
     pub fn new(budget: u64, workers: usize) -> Self {
-        let (clusters, columns) = (budget / 4, budget / 12);
+        let (clusters, columns, vectors) = (budget / 4, budget / 12, budget / 6);
         Self {
-            budget: budget - clusters - columns,
+            budget: budget - clusters - columns - vectors,
             entries: Arc::new(Mutex::new(Entries::default())),
             scope: String::new(),
             workers: Arc::new(Semaphore::new(workers.max(1))),
@@ -150,6 +182,7 @@ impl DecodedCache {
                     (k.len() + 64 + v.len() * 48).min(u32::MAX as usize) as u32
                 })
                 .build(),
+            tail_vectors: crate::tail::VectorCache::new(vectors),
         }
     }
     /// A decoded column block (`key` is relative to this view, like every other key).
@@ -173,6 +206,8 @@ impl DecodedCache {
             workers: self.workers.clone(),
             clusters: self.clusters.clone(),
             columns: self.columns.clone(),
+            // Document allocation identities are process-wide, independent of storage scope.
+            tail_vectors: self.tail_vectors.clone(),
         }
     }
     /// Forget every decoded entry (bench cold-cache runs).
@@ -182,6 +217,7 @@ impl DecodedCache {
         e.bytes = 0;
         self.clusters.clear();
         self.columns.invalidate_all();
+        self.tail_vectors.clear();
     }
     fn key(&self, key: &str) -> String {
         if self.scope.is_empty() {
@@ -359,8 +395,37 @@ mod tests {
     }
 
     #[test]
+    fn clock_initializes_once_across_threads_and_retries_errors() {
+        let cache = Arc::new(ClockCache::<u64, u64>::new(64 * 1024, |_| 8));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            threads.push(std::thread::spawn(move || {
+                assert_eq!(
+                    cache.get_or_try_insert(42, || {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok::<_, ()>(7)
+                    }),
+                    Ok(7)
+                );
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            cache.get_or_try_insert(43, || Err::<u64, _>("retry")),
+            Err("retry")
+        );
+        assert_eq!(cache.get(&43), None);
+        assert_eq!(cache.get_or_try_insert(43, || Ok::<_, ()>(9)), Ok(9));
+    }
+    #[test]
     fn byte_budget_lru_type_separation_and_pinned_users() {
-        let cache = DecodedCache::new(10, 1);
+        let cache = DecodedCache::new(14, 1);
         let pinned = Arc::new(1u64);
         cache.insert("a", 4, pinned.clone());
         cache.insert("b", 4, Arc::new(2u64));

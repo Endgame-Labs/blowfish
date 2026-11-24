@@ -135,6 +135,7 @@ async fn identical_scans_distances_and_zero_allocations_after_warmup() {
                             clusters.iter().map(|&c| codes[s][c].clone()).collect(),
                             None,
                             10,
+                            f32::INFINITY,
                         )
                         .unwrap();
                     let warm = resident
@@ -336,19 +337,29 @@ async fn compiled_tier_admits_incrementally_preserves_ties_and_never_reads_on_a_
                 .is_none()
         );
         let mut reference = ResidentQueryScratch::default();
+        // Different probe and k shapes exercise a published cut, sparse witness sets,
+        // and ties. The resident reference scans each slab with an independent bound.
+        for (probes, k) in [(1, 1), (3, 64), (48, 10), (64, 10)] {
+            for query in &queries {
+                let expected = dir
+                    .search_resident(&residents, query, probes, 32, k, &mut reference)
+                    .unwrap();
+                let found = tier
+                    .try_search(query, probes, 32, k, lookup, &mut scratch)
+                    .unwrap()
+                    .unwrap();
+                assert!(found.scanned_rows > 0);
+                let mut got: Vec<_> = found.hits.iter().map(|(d, _, row)| (*row, *d)).collect();
+                got.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+                got.truncate(k);
+                assert_eq!(got, expected, "probes={probes}, k={k}");
+            }
+        }
+        // Restore the allocation check's working shape after varying k.
         for query in &queries {
-            let expected = dir
-                .search_resident(&residents, query, 48, 32, 10, &mut reference)
-                .unwrap();
-            let found = tier
-                .try_search(query, 48, 32, 10, lookup, &mut scratch)
+            tier.try_search(query, 48, 32, 10, lookup, &mut scratch)
                 .unwrap()
                 .unwrap();
-            assert!(found.scanned_rows > 0);
-            let mut got: Vec<_> = found.hits.iter().map(|(d, _, row)| (*row, *d)).collect();
-            got.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
-            got.truncate(10);
-            assert_eq!(got, expected);
         }
         COUNT.with(|count| count.set(Some(0)));
         for query in &queries {
