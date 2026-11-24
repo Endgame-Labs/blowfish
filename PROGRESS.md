@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **BM25: impact-ordered postings and SIMD scoring, tested and rejected** (round B4; `docs/benchmarks.md`,
+  "Round B4"). On 1,000 MS MARCO queries (c7g.2xlarge, paired), exact term-at-a-time scoring over
+  impact-ordered blocks cost 127.7M instructions per query against 17.8M for the current reader, because
+  exactness still has to complete every touched candidate's partial score. Dense NEON scoring in the real reader
+  saved only 4.7% instructions, and plain cached scalar code did as well. Text format 6 and the reader are
+  unchanged; the BM25 cost target stays open.
+
 - **Binary WAL vectors: tested and rejected** (round I2; `docs/benchmarks.md`, "Round I2"). Writing vectors
   to the WAL as binary at their declared precision, instead of JSON, reached at best 1.09x acknowledged rows/s
   on paired 500K-row NQ loads (in-region S3, c7g.2xlarge), and the other candidate run was slower than the

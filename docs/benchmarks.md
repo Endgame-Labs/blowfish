@@ -5696,3 +5696,108 @@ group are removed. The instance ran for about 0.50 hours; the observed Spot pric
 or about $0.05 in compute, excluding EBS and S3 requests. Local run inputs, logs, and source archives
 are removed after retaining these results. Final `cargo fmt --check`,
 `cargo clippy -p bf-wal --all-targets -- -D warnings`, and all 13 `cargo test -p bf-wal` tests pass.
+
+## Round B4: impact ordering, and dense BM25 scoring
+
+The tested impact-ordered TAAT path fails the CPU and cold-block gates. The
+row-aligned NEON scorer also fails the gate when combined with the existing
+reader's planner, caches, and posting reads. No production algorithm or text
+format changes ship from this round; text format 6 and automatic upgrades remain
+unchanged.
+
+The workload is T1's first 1,000,000 MS MARCO passages, five consecutive 200,000-row
+segments, and all 1,000 checked-in dev queries, with default BM25 parameters and
+limit 10. The offline example was `crates/bf-text/examples/impact_bm25.rs` (removed after the round; it is in commit 11a4738); its
+adjacent README documents preparation, counter control, and each variant.
+Final measurements use an owned on-demand c7g.2xlarge, pinned to one core, with
+one complete warm-up before each measured pass, on Rust 1.100.0. Perf's control
+FIFOs exclude preparation and warm-up. All arms use the release profile and sequential segments with a shared
+query threshold. These are paired ARM instruction/cycle measurements, with no
+HTTP, S3 latency, or Apple M4 throughput claim.
+
+| Offline variant | Million instructions/query | Million cycles/query |
+| --- | ---: | ---: |
+| Existing reader | 17.832 | 11.975 |
+| Impact TAAT | 127.684 | 111.551 |
+| Impact, free exact block maxima | 127.105 | 112.032 |
+| Dense, optimistic NEON | 13.653 | 7.291 |
+| Dense, optimistic cached scalar | 13.056 | 7.132 |
+| Dense, existing planner, NEON | 17.023 | 10.453 |
+| Dense, existing planner, cached scalar | 16.927 | 10.331 |
+
+Counts are medians of two measured passes per variant, except the free exact
+block-maxima diagnostic, which has one. The integrated NEON variant reduces
+instructions by **1.047×** and cycles by **1.146×**, missing both the 15.6M
+instruction limit and the 1.3× cycle gate. Cached scalar in the same planner is
+slightly cheaper, at **1.053×** fewer instructions and **1.159×** fewer cycles.
+The optimistic standalone NEON result passes its absolute instruction and cycle
+gates, but the scalar control is cheaper still; that result cannot be attributed
+to SIMD or substituted for the integrated gate.
+
+The final embedded reader's paired baseline differs from T1's historical 20.32M
+instructions/query. Compare variants inside this binary; embedding the reader,
+changing the offline driver, or changing release code generation is not a shipped
+production improvement. Both integrated variants also miss the absolute 15.6M gate.
+
+Resetting decoded postings and saturation/bound caches before each segment/query
+gives **3,928,538** required baseline posting blocks across the 1,000 queries.
+Impact order needs **6,863,734** (**1.747×** baseline), and free exact block maxima
+still need **6,815,551** (**1.735×**). Neither meets the ≤50% cold-block gate.
+These are logical payload-block counts, with no GET coalescing or latency claim.
+
+Repacking every long list, including terms outside the queries, adds **13,186,336**
+packed posting bytes to the **336,318,220**-byte format-6 text index: **3.921%**.
+This estimates the posting codec delta with the current bitpacking implementation;
+it does not include changes to dictionary reservation sizes or validate an emitted
+format-7 file. Footprint is not the reason this candidate is rejected.
+
+The impact prototype sorts long lists (df > 4,096 or more than 32 blocks) by
+build-time segment-normalized saturation, keeps rows sorted within each
+128-posting block, and leaves shorter lists in row order. Runtime suffix maxima
+of independent max-TF/min-length bounds remain conservative when namespace
+statistics change. A priority queue selects the next term block. Per-row term
+contributions preserve canonical f32 addition, and an indexed top-k heap tracks
+increasing lower scores.
+
+The proposed sum of remaining term bounds is only a bound on **untouched** rows.
+A touched row can retain a missing contribution, and a current winner needs its
+exact score before it can be returned. The prototype also checks unresolved
+partials and requires winners to have exact scores. An absent term can force
+exhaustion of its list to establish that missing contribution as zero. This
+experiment supplies no free candidate completion through a separate row index.
+The exact sorted-access implementation is rejected; this does not establish a
+ceiling for impact layouts with a separately charged candidate-completion index.
+
+The dense experiment transposes long query terms into row-aligned u32 frequencies.
+The NEON kernel uses two f64 lanes, keeps the reference arithmetic order, converts
+each term's contribution to f32, and adds terms in dictionary order. Sparse
+candidate windows retain the cached scalar scorer. The standalone planner gets
+unlimited exact window maxima and a fully prepared frequency cache. Its cached
+scalar control isolates the kernel from the planner/cache advantage.
+
+The integrated control retains the existing planner, bounded decoded cache,
+window-bound cache, posting reads, and shared threshold, changing only the final
+scoring loop to consult the prepared frequencies. Preparation of that additional
+frequency cache is free in this test. It does not model a persisted row-aligned
+representation or establish that all possible format-7 layouts fail. Its measured
+cost still misses the requested gate, so the optimistic standalone result is
+insufficient evidence to ship a format bump.
+
+The example tests compare randomized corpora with exhaustive scoring, covering
+missing terms, repeated query terms, changed namespace averages, and score ties.
+A native ARM test checks SIMD score bits against the existing scorer for zero
+frequencies, frequencies and lengths beyond the saturation cache, odd batch
+lengths, and multiple query frequencies. The full-corpus checks compare ordered
+IDs and f32 score bits, rather than overlap alone.
+
+The final crate gate passes: formatting, clippy for all bf-text targets, 39 library
+and integration tests, and 14 example tests. Seven historical corpus experiments
+remain ignored in each relevant test binary. The independent exhaustive utility
+checks all 1,000 queries and 10,000 ordered hits, with every f32 score bit equal;
+every prototype pass asserts against that validated baseline. No HTTP, SDK, or
+full-workspace validation is claimed for these example-only changes.
+
+A Spot c7g.2xlarge was reclaimed during an incomplete repeat. Incomplete counters
+are discarded; the final table comes entirely from the replacement on-demand
+host. No S3 objects are created, and both hosts and their temporary access
+resources are cleaned up at the end of the round.
