@@ -108,7 +108,10 @@ cache effects. The target-host memory gate must validate the complete working se
 ## Heat, recall, and effort
 
 A fresh process starts on IVF. Promotion requires ten minutes of sustained eligible queries,
-including requests with payload-cache misses; a gap longer than a minute resets that dwell. A 15-minute decaying rate and measured foreground
+including requests with payload-cache misses; a gap longer than a minute resets that dwell.
+Only the completed foreground query updates its heat timestamp; graph searches and recall trials
+must not retime it before the arrival-rate observation. Admission, eviction, and read-only status
+also apply elapsed decay when evaluating a rate between arrivals. A 15-minute decaying rate and measured foreground
 worker CPU estimate the namespace's future savings. Initial scheduling estimates one CPU millisecond per source row. This is a scheduling estimate,
 not a construction-time guarantee; installation uses measured construction cost.
 
@@ -144,7 +147,9 @@ then IVF plans run together, without exhaustive scans between those timed plans.
 query remains included in the average; there is no excluded identical-query warmup. Exact recall
 observations keep their original truth comparison. A per-graph queue retains at most 256 KiB of
 serialized requests under the metadata reservation, resets across snapshot or effort changes, and
-never retains truth responses or snapshots. Promotion requires a positive measured cost block;
+never retains truth responses or snapshots. Individual scan-interleaved IVF timings do not update
+the warm reference estimate; both trial CPU estimates come from the same block method. Promotion
+requires a positive measured cost block;
 queries remain on IVF if a block cannot be collected. Only exhaustive truth work is throttled to one
 search worker. A calibrated graph that
 remains unprofitable for a full observation window is discarded. All thresholds are internal policy;

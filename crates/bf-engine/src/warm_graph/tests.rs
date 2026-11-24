@@ -138,6 +138,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     // Verify the real exact-sampling integration, then drive economics and quality with
     // deterministic observations. Tiny fixtures need not have a profitable graph, and a
     // lifecycle test must not depend on the scheduler or improvements to IVF recall.
+    let last_foreground = e.0.hot_graph.entries.lock().unwrap()[&key].last;
     e.recall(
         "hot",
         json!({"num":1,"top_k":10,"rank_by":["vector","ANN",vectors[17]]}),
@@ -145,9 +146,27 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     .await
     .unwrap();
     assert!(held.searches.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        e.0.hot_graph.entries.lock().unwrap()[&key].last,
+        last_foreground,
+        "recall graph searches must not retime foreground heat observations"
+    );
+    assert_eq!(
+        e.0.hot_graph.entries.lock().unwrap()[&key].ivf_seconds,
+        1.,
+        "an individual scan-interleaved trial must not replace the warm IVF baseline"
+    );
+    for i in 1..8 {
+        e.recall(
+            "hot",
+            json!({"num":1,"top_k":10,"rank_by":["vector","ANN",vectors[17+i]]}),
+        )
+        .await
+        .unwrap();
+    }
     assert!(
         e.0.hot_graph.entries.lock().unwrap()[&key].ivf_seconds < 1.,
-        "recall must replace the synthetic initial baseline with paired IVF observations"
+        "the paired warm block must replace the initial IVF baseline"
     );
     {
         let mut calibration = held.calibration.lock().unwrap();
@@ -362,6 +381,24 @@ fn sustained_heat_resets_after_a_gap_and_decays() {
     heat.observe(now + Duration::from_secs(1601), 0.002);
     assert_eq!(heat.first, heat.last);
     assert!(heat.rate < old / 2.);
+    let mut busy = Heat::new(now);
+    busy.rate = 800.;
+    assert!(busy.rate_at(now + Duration::from_secs(60)) < 750.);
+    assert_eq!(
+        busy.rate, 800.,
+        "read-only heat evaluation must not invent arrivals"
+    );
+    busy.observe(now + Duration::from_secs(60), 0.001);
+    assert!(
+        busy.rate < 750.,
+        "a real gap must decay an already warm rate"
+    );
+    busy.observe(now + Duration::from_secs(59), 0.001);
+    assert_eq!(
+        busy.last,
+        now + Duration::from_secs(60),
+        "late lock acquisition must not move the heat clock backwards"
+    );
 }
 #[test]
 fn cancelled_entries_are_dropped_on_namespace_generation_replacement() {
@@ -519,6 +556,18 @@ async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan
         "the IVF cost reference and exhaustive truth must not use the graph"
     );
     assert_eq!(entry.searches.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        e.0.hot_graph
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .ivf_seconds,
+        1.,
+        "single cold IVF observations cannot skew promotion economics"
+    );
     assert!(
         entry
             .phase_cpu

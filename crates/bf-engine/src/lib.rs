@@ -914,12 +914,7 @@ impl Engine {
                             warm_graph::trial_plan(&store, &sample, &request, &config, ivf_context)
                                 .await
                                 .ok()
-                                .map(|(answer, seconds)| {
-                                    if let Some(scope) = &trial {
-                                        scope.record_ivf_cpu(seconds);
-                                    }
-                                    answer
-                                })
+                                .map(|(answer, _)| answer)
                         } else {
                             None
                         };

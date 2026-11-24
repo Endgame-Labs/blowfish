@@ -149,12 +149,17 @@ impl Heat {
             ready: None,
         }
     }
+    fn rate_at(&self, now: Instant) -> f64 {
+        self.rate * (-now.saturating_duration_since(self.last).as_secs_f64() / 900.).exp()
+    }
     fn observe(&mut self, now: Instant, seconds: f64) {
+        // Concurrent completions can reach the cache lock out of timestamp order.
+        let now = now.max(self.last);
         let dt = now.duration_since(self.last).as_secs_f64();
         if dt > 60. {
             self.first = now;
         }
-        self.rate = self.rate * (-dt / 900.).exp() + 1. / 900.;
+        self.rate = self.rate_at(now) + 1. / 900.;
         self.ivf_seconds = if self.ivf_seconds == 0. {
             seconds
         } else {
@@ -316,7 +321,7 @@ impl Scope {
                 let saving = (h.ivf_seconds - c.graph_seconds).max(0.);
                 c.usable = c.quality.serving.is_some()
                     && c.graph_seconds > 0.
-                    && h.rate * 86400. * saving >= 2. * c.build_seconds;
+                    && h.rate_at(Instant::now()) * 86400. * saving >= 2. * c.build_seconds;
                 let reject = update.exhausted
                     || (c.quality.settled() && c.quality.len() >= 128 && !c.usable);
                 drop(c);
@@ -727,7 +732,7 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&key)
-                .map_or(0., |h| h.rate * h.ivf_seconds * 0.5);
+                .map_or(0., |h| h.rate_at(Instant::now()) * h.ivf_seconds * 0.5);
             make_room(estimate, benefit / estimate.max(1) as f64);
             reserved = Reservation::new(estimate, cap.saturating_sub(foreground));
         }
@@ -988,15 +993,6 @@ pub(crate) async fn search(
     let result = search_entry(store, state, set, at, vector, mask, k, columns, &entry, ef).await;
     match result {
         Ok(Some(found)) => {
-            if let Some(h) = scope
-                .cache
-                .entries
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&key)
-            {
-                h.last = Instant::now();
-            }
             if let Some(used) = scope
                 .used
                 .lock()
@@ -1256,7 +1252,7 @@ impl Engine {
             .unwrap_or_else(|e| e.into_inner());
         let graphs=entries.iter().filter(|(k,_)|k.namespace==namespace).map(|(k,h)|{
             let calibration=h.ready.as_ref().map(|e|{let c=e.calibration.lock().unwrap_or_else(|e|e.into_inner());serde_json::json!({"ef":c.quality.serving.unwrap_or(c.quality.trial),"trial_ef":c.quality.trial,"usable":c.usable,"samples":c.quality.len(),"paired_quality":c.quality.statistics(),"trial_cpu_seconds":c.trial_seconds,"build_cpu_seconds":e.measured_cpu_seconds,"build_wall_seconds":e.build_wall_seconds,"build_reservation_bytes":e.build_reservation_bytes,"reserved_bytes":e._reservation.0,"promotion_cpu_cost_seconds":c.build_seconds,"graph_cpu_seconds":c.graph_seconds,"resident_bytes":e.graph.resident_bytes(),"phase_searches":e.searches.load(Ordering::Relaxed),"phase_cpu_seconds":e.phase_cpu.iter().map(|v|v.load(Ordering::Relaxed) as f64/1e9).collect::<Vec<_>>()})});
-            serde_json::json!({"attribute":k.attribute,"building":h.building.is_some(),"calibration":calibration,"heat_seconds":h.first.elapsed().as_secs_f64(),"query_rate":h.rate,"ivf_cpu_seconds":h.ivf_seconds,"retry_seconds":h.retry.saturating_duration_since(Instant::now()).as_secs_f64()})
+            serde_json::json!({"attribute":k.attribute,"building":h.building.is_some(),"calibration":calibration,"heat_seconds":h.first.elapsed().as_secs_f64(),"query_rate":h.rate_at(Instant::now()),"ivf_cpu_seconds":h.ivf_seconds,"retry_seconds":h.retry.saturating_duration_since(Instant::now()).as_secs_f64()})
         }).collect::<Vec<_>>();
         serde_json::json!({"graphs":graphs,"answered":self.0.hot_graph.answers.load(Ordering::Relaxed),"process_reserved_bytes":RESERVED.load(Ordering::Relaxed)})
     }
@@ -1338,7 +1334,7 @@ fn trim() {
         for (key, heat) in entries.iter() {
             let benefit = heat.ready.as_ref().map_or(0., |entry| {
                 let c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
-                heat.rate * (heat.ivf_seconds - c.graph_seconds).max(0.)
+                heat.rate_at(Instant::now()) * (heat.ivf_seconds - c.graph_seconds).max(0.)
                     / entry._reservation.0.max(1) as f64
             });
             choices.push((benefit, key.clone(), cache.clone()));
@@ -1397,7 +1393,7 @@ fn make_room(bytes: u64, benefit_per_byte: f64) {
                 } else {
                     (h.ivf_seconds - c.graph_seconds).max(0.)
                 };
-                let old = h.rate * saving / e._reservation.0.max(1) as f64;
+                let old = h.rate_at(Instant::now()) * saving / e._reservation.0.max(1) as f64;
                 if benefit_per_byte > old * 2. {
                     choices.push((old, key.clone(), cache.clone()));
                 }

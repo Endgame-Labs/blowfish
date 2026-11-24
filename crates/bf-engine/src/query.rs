@@ -1041,7 +1041,7 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
             context.clone(),
         )
         .await?;
-        let ivf = if let Some(scope) = scope.filter(|s| s.used_graph()) {
+        let ivf = if scope.is_some_and(|s| s.used_graph()) {
             crate::warm_graph::trial_plan(
                 engine.storage(),
                 &state,
@@ -1051,10 +1051,7 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
             )
             .await
             .ok()
-            .map(|(answer, seconds)| {
-                scope.record_ivf_cpu(seconds);
-                answer
-            })
+            .map(|(answer, _)| answer)
         } else {
             None
         };
