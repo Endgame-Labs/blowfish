@@ -84,6 +84,16 @@ def normalize(value, depth=0, require_metrics=True):
         # Index-derived estimates can lag writes; retain presence and validate
         # the integer contract while allowing exact counts from blowfish.
         value = {k: 0 if k.startswith("approx_") else v for k, v in value.items()}
+        if "index" in value and "approx_row_count" in value:
+            index = value["index"]
+            if not isinstance(index, dict) or index.get("status") not in ("up-to-date", "updating"):
+                raise ValueError("metadata.index must have a recognized status")
+            if index["status"] == "updating":
+                for key in ("unindexed_bytes", "unindexed_rows"):
+                    if type(index.get(key)) is not int or index[key] < 0:
+                        raise ValueError(f"metadata.index.{key} must be a non-negative integer")
+            # Indexing is asynchronous; validate both states before comparing fixtures.
+            value["index"] = {"status": "up-to-date"}
         return {k: normalize(v, depth + 1) for k, v in value.items() if k not in {"performance", "billing", "created_at", "updated_at", "last_write_at", "last_included_write_at", "trace_id", "request_id"}}
     return value
 

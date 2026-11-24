@@ -4,6 +4,46 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Truthful index status in namespace metadata** (round MD1). Metadata always said `"index": {"status":
+  "up-to-date"}`, so a client polling for indexing to finish could be told it was done while the WAL tail still
+  held unindexed rows. It now reports `{"status": "updating", "unindexed_bytes": ..., "unindexed_rows": ...}`
+  from counts the snapshot already holds (no new I/O or format change), and `up-to-date` once the tail is
+  published. Metadata polling also refreshes the checkpoint while data is pending, so a reader sees another
+  node's index publication without a new write. The official Python SDK parses both states (`compat/`).
+
+- **BM25 under heavy writes 9.5x faster** (round BW1; `docs/benchmarks.md`, "Round BW1"). BM25 over an
+  unindexed write tail recomputed full-vocabulary statistics and re-tokenized tail rows on every query. Queries
+  now compute statistics for their own terms only and reuse cached per-row term counts from immutable tail
+  objects (a bounded CLOCK pool taking one eighth of the decoded-cache budget). On 1M MS MARCO with 1,000
+  text-changing upserts/s: p50 539 to 57 ms, p90 721 to 82 ms, with bit-identical results on 4,000 validation
+  queries across four million-row snapshots and every offered write acknowledged. Idle BM25 is unchanged.
+
+- **Memory-capped servers 1.2-3.6x faster on warm vector queries** (round MEM2; `docs/benchmarks.md`, "Round MEM2").
+  Immutable local objects are now memory-mapped and share the operating system's page cache instead of being
+  copied into the heap, through two views of the same pages: normal read-ahead for contiguous reads of 64 KiB or
+  more, and random-access advice for small and sparse reads (plain read-ahead evicted hot pages at 2 GiB). The
+  decoded cache default rises from limit/8 to limit/4 (512 MiB to 4 GiB). On the Apple M4 with NQ at recall
+  0.950 and hard cgroup limits: 2 GiB 622 to 2,235 q/s, 4 GiB 1,987 to 2,305, 8 GiB 1,974 to 2,702, and 12 GiB
+  1,959 to 2,592, all results identical. Disk-cold p50 falls from 1,068 to 331 ms. Qdrant measured 6,023 q/s at
+  recall 0.944 in the same 8 GiB setup.
+
+- **Coarser leaves for large tiers, chosen automatically** (round C3; `docs/benchmarks.md`, "Round C3"). Recluster
+  now uses 200-row leaves below 10M live vectors and 640-row leaves at or above, and the planner maps the probe
+  count to the stored layout (64 becomes 70 on 640-row leaves), with no setting. At 10M, against a fresh 200-row
+  control at matched recall (0.9690 vs 0.9700), cold p50 falls from 378 to 325 ms (-13.9%), GETs from 621 to 355,
+  and bytes from 58.4 to 47.6 MB per query; the build is 23.6% faster with lower peak memory. NQ keeps 200-row
+  leaves and its warm speed (+0.9-1.4%). Existing tiers change on their next normal recluster. Upgraded tiers no
+  longer download a redundant 5.35 MB segment-directory hint per cold query.
+
+- **Bulk loads no longer start reclustering early** (round RR2; `docs/benchmarks.md`, "Round RR2"). Load detection
+  now holds through each 429's advertised Retry-After, compaction stays deferred across those retries, and the
+  quiet period starts when queued writes actually complete instead of when their batch was prepared. On full NQ
+  with four clients the load takes 150 s instead of 168, with write p90 808 ms instead of 1,961. With eight
+  clients, the first base covers all 2.68M rows instead of a premature 730K-row base plus a merge, and the
+  index is ready in 219 s instead of 266. Single-assignment recluster (64, 96, and 112 samples per leaf) and
+  coarse pre-partitioned ingest were measured and rejected. Recall across five loads of the unchanged algorithm
+  varies by up to 0.0017, so layout-deterministic sampling is a follow-up.
+
 - **Warm vector queries 17-19% faster over HTTP** (round Q2; `docs/benchmarks.md`, "Round Q2"). Warm query
   plans now run on a fixed pool of CPU workers (polled once there, handed back to the I/O path on a cache miss),
   and the engine admits twice the available CPUs in queries at once, with a floor of 8. On NQ at 8 cores:

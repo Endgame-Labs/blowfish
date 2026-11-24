@@ -413,6 +413,26 @@ fn same_checkpoint(state: &NamespaceState, m: &bf_wal::Manifest) -> bool {
             })
         })
 }
+/// Wait until the current manifest proves that `attr` has no slab tier. A missing hint can
+/// independently release the segment fallback, so a manifest listing a tier waits here.
+async fn without_tier(
+    layouts: &mut tokio::sync::watch::Receiver<Option<BTreeSet<String>>>,
+    attr: &str,
+) {
+    loop {
+        let tiered = layouts.borrow().as_ref().map(|attrs| attrs.contains(attr));
+        match tiered {
+            Some(false) => return,
+            Some(true) => std::future::pending::<()>().await,
+            None => {
+                if layouts.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn catch_up_hinted(
     wal: &Wal,
     state: &mut NamespaceState,
@@ -439,84 +459,144 @@ pub(crate) async fn catch_up_hinted(
         } else {
             (bf_wal::ManifestView::Full, state.manifest_seq)
         };
-        let (manifest, prefetched) = tokio::join!(wal.manifest_view_after(known, view), async {
+        // The notice exists only for a cold unfiltered open; warm queries allocate nothing here.
+        let (layouts_tx, layouts_rx) =
+            if state.ann_dirs.is_empty() && hint.is_some_and(|hint| hint.scan.is_some()) {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+        let manifest_read = async {
+            let result = wal.manifest_view_after(known, view).await;
+            if let Some(tx) = &layouts_tx {
+                let tiers = result
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map_or(&*state.ann_tiers, |(_, m)| &m.ann_tiers);
+                let attrs: BTreeSet<String> = tiers
+                    .iter()
+                    .filter(|(_, tiers)| !tiers.is_empty())
+                    .map(|(attr, _)| attr.clone())
+                    .collect();
+                let _ = tx.send(Some(attrs));
+            }
+            result
+        };
+        let (manifest, prefetched) = tokio::join!(manifest_read, async {
             let mut found = BTreeMap::new();
             if let Some(hint) = hint.filter(|_| state.ann_dirs.is_empty()) {
-                let reads = hint.ann.iter().map(|a| async move {
-                    // A lone unfiltered ANN query wants the block-layout directory: try its hint
-                    // first, and the plain one when the namespace has none.
-                    let mut got = Vec::new();
-                    if hint.scan.is_some() {
-                        // The recluster's paged slab directory, its flat slab directory, and
-                        // the block directory are fetched together: which one answers is decided
-                        // once the manifest is read. They are tried in that order, and the
-                        // slower ones are dropped as soon as an earlier one is found, so a big
-                        // flat directory is not downloaded in full for nothing.
-                        let names = [
-                            crate::ann_dir::paged_hint_name(a),
-                            crate::ann_dir::Layout::Slabs.dir_key(a),
-                            crate::ann_dir::Layout::Segments.dir_key(a),
-                        ];
-                        let mut pending: Vec<futures::future::BoxFuture<'_, _>> = names
-                            .iter()
-                            .enumerate()
-                            .map(|(i, n)| {
+                let reads = hint.ann.iter().map(|a| {
+                    let mut layouts = layouts_rx.clone();
+                    async move {
+                        // A lone unfiltered ANN query wants the block-layout directory: try its hint
+                        // first, and the plain one when the namespace has none.
+                        let mut got = Vec::new();
+                        if hint.scan.is_some() {
+                            let mut layouts =
+                                layouts.take().expect("cold unfiltered layout notice");
+                            // Race the paged and flat slab hints, in that priority order. A
+                            // lossless upgrade also writes a segment-directory hint; downloading
+                            // it here wastes megabytes when a tier answers the query. Fetch that
+                            // fallback when both slab hints are absent, or as soon as the
+                            // manifest proves there is no tier (preserving untiered read waves).
+                            // Filtered queries still prefetch the segment hint directly.
+                            let names = [
+                                crate::ann_dir::paged_hint_name(a),
+                                crate::ann_dir::Layout::Slabs.dir_key(a),
+                            ];
+                            let mut pending: Vec<futures::future::BoxFuture<'_, _>> = names
+                                .iter()
+                                .enumerate()
+                                .map(|(i, n)| {
+                                    async move {
+                                        (
+                                            i,
+                                            crate::ann_dir::prefetch(store, wal.namespace(), n)
+                                                .await,
+                                        )
+                                    }
+                                    .boxed()
+                                })
+                                .collect();
+                            let (force, forced) = tokio::sync::oneshot::channel();
+                            let mut force = Some(force);
+                            pending.push(
                                 async move {
-                                    (i, crate::ann_dir::prefetch(store, wal.namespace(), n).await)
-                                }
-                                .boxed()
-                            })
-                            .collect();
-                        let mut results: [Option<Option<crate::ann_dir::Prefetched>>; 3] =
-                            Default::default();
-                        'priority: for want in 0..3 {
-                            while results[want].is_none() {
-                                let ((i, r), _, rest) = futures::future::select_all(pending).await;
-                                pending = rest;
-                                results[i] = Some(r);
-                            }
-                            if results[want].as_ref().is_some_and(Option::is_some) {
-                                break 'priority;
-                            }
-                        }
-                        drop(pending);
-                        // Readers look a hint up by the directory's own name.
-                        let reader_names = [
-                            crate::ann_dir::Layout::Slabs.dir_key(a),
-                            crate::ann_dir::Layout::Slabs.dir_key(a),
-                            crate::ann_dir::Layout::Segments.dir_key(a),
-                        ];
-                        let first = results
-                            .into_iter()
-                            .zip(reader_names)
-                            .find_map(|(r, name)| r.flatten().map(|p| (name, p)));
-                        if let Some((name, p)) = first {
-                            // A paged slab directory's header says what the scan will read:
-                            // start those reads now, while the manifest is still in flight.
-                            if let Some((attribute, vector, k)) =
-                                hint.scan.as_ref().filter(|(s, _, _)| s == a)
-                            {
-                                let (store, context, config) =
-                                    (store.clone(), hint.context.clone(), hint.config.clone());
-                                let (attribute, vector, k, p) =
-                                    (attribute.clone(), vector.clone(), *k, p.clone());
-                                tokio::spawn(crate::read_cache::scope(context, async move {
-                                    crate::ann_dir::speculate_slab_scan(
-                                        &store, p, &attribute, &vector, k, &config,
+                                    tokio::select! {
+                                        _ = forced => {},
+                                        _ = without_tier(&mut layouts, a) => {},
+                                    }
+                                    (
+                                        2,
+                                        crate::ann_dir::prefetch(
+                                            store,
+                                            wal.namespace(),
+                                            &crate::ann_dir::Layout::Segments.dir_key(a),
+                                        )
+                                        .await,
                                     )
-                                    .await
-                                }));
+                                }
+                                .boxed(),
+                            );
+                            let mut results: [Option<Option<crate::ann_dir::Prefetched>>; 3] =
+                                Default::default();
+                            'priority: for want in 0..3 {
+                                if want == 2
+                                    && let Some(force) = force.take()
+                                {
+                                    let _ = force.send(());
+                                }
+                                while results[want].is_none() {
+                                    let ((i, r), _, rest) =
+                                        futures::future::select_all(pending).await;
+                                    pending = rest;
+                                    results[i] = Some(r);
+                                }
+                                if results[want].as_ref().is_some_and(Option::is_some) {
+                                    break 'priority;
+                                }
                             }
-                            got.push((name, p));
-                            return got;
+                            drop(pending);
+                            // Readers look a hint up by the directory's own name.
+                            let reader_names = [
+                                crate::ann_dir::Layout::Slabs.dir_key(a),
+                                crate::ann_dir::Layout::Slabs.dir_key(a),
+                                crate::ann_dir::Layout::Segments.dir_key(a),
+                            ];
+                            let first = results
+                                .into_iter()
+                                .zip(reader_names)
+                                .find_map(|(r, name)| r.flatten().map(|p| (name, p)));
+                            if let Some((name, p)) = first {
+                                // A paged slab directory's header says what the scan will read:
+                                // start those reads now, while the manifest is still in flight.
+                                if let Some((attribute, vector, k)) =
+                                    hint.scan.as_ref().filter(|(s, _, _)| s == a)
+                                {
+                                    let (store, context, config) =
+                                        (store.clone(), hint.context.clone(), hint.config.clone());
+                                    let (attribute, vector, k, p) =
+                                        (attribute.clone(), vector.clone(), *k, p.clone());
+                                    tokio::spawn(crate::read_cache::scope(context, async move {
+                                        crate::ann_dir::speculate_slab_scan(
+                                            &store, p, &attribute, &vector, k, &config,
+                                        )
+                                        .await
+                                    }));
+                                }
+                                got.push((name, p));
+                                return got;
+                            }
                         }
+                        got.extend(
+                            crate::ann_dir::prefetch(store, wal.namespace(), &format!("annv2:{a}"))
+                                .await
+                                .map(|p| (format!("annv2:{a}"), p)),
+                        );
+                        got
                     }
-                    got.extend(
-                        crate::ann_dir::prefetch(store, wal.namespace(), &format!("annv2:{a}"))
-                            .await
-                            .map(|p| (format!("annv2:{a}"), p)),
-                    );
-                    got
                 });
                 found.extend(futures::future::join_all(reads).await.into_iter().flatten());
             }
@@ -712,7 +792,7 @@ pub(crate) async fn for_writes(
     let mut wanted = BTreeSet::new();
     let mut hydrate = BTreeSet::new();
     for p in pending {
-        let Operation::Write(req, _) = &p.request else {
+        let Operation::Write(req, _, _activity) = &p.request else {
             continue;
         };
         if req.delete_by_filter.is_some() || req.patch_by_filter.is_some() {

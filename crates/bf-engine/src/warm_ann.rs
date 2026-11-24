@@ -170,21 +170,22 @@ mod tests {
                 indexing: false,
                 recall_sample_rate: 0.,
                 decoded_cache_bytes,
+                ann_nprobe: 8,
                 ..Default::default()
             },
         )
     }
     async fn query(engine: &Engine, body: Value) -> Vec<Document> {
-        engine
-            .query(
-                "compiled",
-                serde_json::from_value::<QueryRequest>(body).unwrap(),
-            )
-            .await
-            .unwrap()
-            .result
-            .rows
-            .unwrap()
+        // Keep the combined residency and eviction fixture's debug future off the test stack.
+        Box::pin(engine.query(
+            "compiled",
+            serde_json::from_value::<QueryRequest>(body).unwrap(),
+        ))
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap()
     }
     async fn current(engine: &Engine, key: &str) -> Option<Arc<WarmTier>> {
         read_cache::scope(
@@ -195,8 +196,10 @@ mod tests {
     }
 
     // Keep the build future on the heap so the driver has room for compaction and queries.
-    fn fixture() -> std::pin::Pin<Box<dyn std::future::Future<Output = (Storage, Engine)>>> {
-        Box::pin(async {
+    fn fixture(
+        cluster_rows: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (Storage, Engine)>>> {
+        Box::pin(async move {
             let store = Storage::open(&StorageConfig {
                 url: "memory://".into(),
                 ..Default::default()
@@ -224,7 +227,7 @@ mod tests {
                     &ReclusterOptions {
                         attribute: "vector".into(),
                         cells: 1,
-                        cluster_rows: 60,
+                        cluster_rows,
                         max_slab_rows: 10000,
                         scratch: scratch.path().to_owned(),
                     },
@@ -247,15 +250,19 @@ mod tests {
                     .enable_all()
                     .build()
                     .unwrap()
-                    .block_on(compiled_case());
+                    .block_on(async {
+                        for cluster_rows in [60, 640] {
+                            compiled_case(cluster_rows).await;
+                        }
+                    });
             })
             .unwrap()
             .join()
             .unwrap();
     }
 
-    async fn compiled_case() {
-        let (store, writer) = fixture().await;
+    async fn compiled_case(cluster_rows: usize) {
+        let (store, writer) = fixture(cluster_rows).await;
         let wal = bf_wal::Wal::new(store.clone(), "compiled").unwrap();
         let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
         let key = &manifest.ann_tiers["vector"][0].dir.key;
@@ -279,6 +286,38 @@ mod tests {
             compiled.hits.load(Ordering::Relaxed) > 0,
             "exercise the real compiled branch"
         );
+        // Large enough for the rejection marker in the general pool, far too small for the tier.
+        let tiny = engine(&store, 256);
+        for _ in 0..3 {
+            assert_eq!(
+                query(&tiny, request(2111)).await,
+                query(&normal, request(2111)).await
+            );
+        }
+        assert!(
+            current(&tiny, key).await.is_none(),
+            "oversized tiers are never retained"
+        );
+        let rejected = read_cache::scope(
+            read_cache::ReadContext::new(tiny.0.read_cache.clone()),
+            async { read_cache::get::<Seen>(key, 0).expect("rejection marker retained") },
+        )
+        .await;
+        assert_eq!(rejected.0.load(Ordering::Relaxed), 2);
+        for _ in 0..8 {
+            assert_eq!(
+                query(&tiny, request(2111)).await,
+                query(&normal, request(2111)).await
+            );
+            let marker = read_cache::scope(
+                read_cache::ReadContext::new(tiny.0.read_cache.clone()),
+                async { read_cache::get::<Seen>(key, 0).expect("rejection marker retained") },
+            )
+            .await;
+            assert!(Arc::ptr_eq(&rejected, &marker));
+            assert_eq!(marker.0.load(Ordering::Relaxed), 2);
+            assert!(current(&tiny, key).await.is_none());
+        }
         // A varied small working set must stay compiled when all exact rows fit. A
         // code-sized vector cache loses these rows between queries, despite ample budget.
         // Keep zero-vector/all-tie queries in the correctness checks above: their
@@ -371,17 +410,6 @@ mod tests {
         assert_eq!(
             query(&warm, request(17)).await,
             query(&normal, request(17)).await
-        );
-        let tiny = engine(&store, 128);
-        for _ in 0..3 {
-            assert_eq!(
-                query(&tiny, request(2111)).await,
-                query(&normal, request(2111)).await
-            );
-        }
-        assert!(
-            current(&tiny, key).await.is_none(),
-            "oversized tiers are never retained"
         );
     }
 }

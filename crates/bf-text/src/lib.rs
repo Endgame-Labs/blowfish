@@ -11,7 +11,7 @@ pub use analysis::{
     FtsParams, Language, Token, Tokenizer, matches_all_tokens, matches_any_token,
     matches_token_sequence, tokenize, tokenize_array, tokenize_spans,
 };
-pub use scoring::{CorpusStats, Query, score_document};
+pub use scoring::{CorpusStats, DocumentTerms, PreparedQuery, Query, score_document};
 mod segment;
 pub use segment::{
     MemoryRangeRead, RangeRead, SearchHit, SearchMetrics, SearchThreshold, SegmentBuilder,

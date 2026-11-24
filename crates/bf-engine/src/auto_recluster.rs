@@ -27,7 +27,10 @@ use bf_types::ApiError;
 use bf_wal::{Manifest, SlabSet, Wal};
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -143,7 +146,7 @@ pub(crate) struct Layout {
 
 /// The trigger's numbers for `attr` (see the design's gain estimate). For uncovered segments a
 /// default query probes `min(S^0.3, 4)` times the clusters, each holding about `sqrt(rows)` of a
-/// segment's rows; after a rebuild it probes leaves of `CLUSTER_ROWS`.
+/// segment's rows; after a rebuild it probes leaves sized from the tier's population.
 pub(crate) fn layout(
     segments: &[bf_wal::Segment],
     lineage: &[bf_wal::Lineage],
@@ -189,7 +192,7 @@ pub(crate) fn layout(
     });
     let spread = (sum * sum / squares).max(1.0).powf(0.3).min(4.0);
     let per_cluster = sum / roots.max(1.0);
-    let leaf = recluster::CLUSTER_ROWS as f64;
+    let leaf = recluster::target_leaf_rows(rows) as f64;
     // Rows scanned per probe now (tiers' leaves, plus the uncovered part's coarser clusters), over
     // rows scanned per probe after.
     let tier_part = if tiers.is_empty() { 0.0 } else { leaf };
@@ -761,16 +764,98 @@ fn scratch_dir(engine: &Engine) -> std::path::PathBuf {
 /// Recent load-rate flushes establish that writes are a bulk load. Its history survives restarts,
 /// while write recency and an unindexed tail distinguish an active load from a completed one.
 fn loading(state: &crate::NamespaceState, now: chrono::DateTime<chrono::Utc>) -> bool {
-    let recent = state
-        .bulk_load_at
-        .is_some_and(|at| now.signed_duration_since(at).to_std().unwrap_or_default() < BULK_WINDOW);
-    recent
+    recent_bulk(state, now)
         && (state.seq > state.indexed_through
             || now
                 .signed_duration_since(state.updated_at)
                 .to_std()
                 .unwrap_or_default()
                 < LOAD_QUIET)
+}
+
+fn recent_bulk(state: &crate::NamespaceState, now: chrono::DateTime<chrono::Utc>) -> bool {
+    state
+        .bulk_load_at
+        .is_some_and(|at| now.signed_duration_since(at).to_std().unwrap_or_default() < BULK_WINDOW)
+}
+
+/// Local write activity survives checkpoint refreshes. Retry deadlines belong to one generation;
+/// queued operations own their activity until completion. These are scheduling hints only.
+#[derive(Default)]
+pub(crate) struct LoadBackpressure(std::sync::Mutex<WriteActivity>);
+
+#[derive(Default)]
+struct WriteActivity {
+    retry_until: Option<(chrono::DateTime<chrono::Utc>, Instant)>,
+    pending: usize,
+    quiet_until: Option<Instant>,
+}
+
+/// Owned by queued work, so caller cancellation cannot hide an outstanding commit.
+pub(crate) struct PendingWrite(Arc<LoadBackpressure>);
+
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        let mut activity = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+        activity.pending -= 1;
+        if activity.pending == 0 {
+            activity.quiet_until = Instant::now().checked_add(LOAD_QUIET);
+        }
+    }
+}
+
+impl LoadBackpressure {
+    /// Track work from submission through its final reply, including queued and staged writes.
+    pub(crate) fn begin(self: &Arc<Self>) -> PendingWrite {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).pending += 1;
+        PendingWrite(self.clone())
+    }
+
+    /// Include the whole-second Retry-After used by some SDKs, and allow a normal quiet period
+    /// after the advertised delay for the next request to arrive.
+    pub(crate) fn record(&self, generation: chrono::DateTime<chrono::Utc>, retry_ms: u64) {
+        self.record_at(generation, retry_ms, Instant::now());
+    }
+
+    fn record_at(&self, generation: chrono::DateTime<chrono::Utc>, retry_ms: u64, now: Instant) {
+        let delay = Duration::from_secs(retry_ms.div_ceil(1000)).saturating_add(LOAD_QUIET);
+        let Some(until) = now.checked_add(delay) else {
+            return;
+        };
+        let mut activity = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let until = activity
+            .retry_until
+            .filter(|(epoch, _)| *epoch == generation)
+            .map_or(until, |(_, old)| old.max(until));
+        activity.retry_until = Some((generation, until));
+    }
+
+    fn active(&self, generation: chrono::DateTime<chrono::Utc>, now: Instant) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retry_until
+            .is_some_and(|(epoch, until)| epoch == generation && now < until)
+    }
+
+    fn writing(&self, now: Instant) -> bool {
+        let activity = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        activity.pending > 0 || activity.quiet_until.is_some_and(|until| now < until)
+    }
+}
+
+/// Shared bulk-activity hint for compaction and reclustering, including advertised retries.
+pub(crate) fn loading_with_backpressure(
+    state: &crate::NamespaceState,
+    now: chrono::DateTime<chrono::Utc>,
+    monotonic: Instant,
+    pressure: &LoadBackpressure,
+    wal_limit: u64,
+) -> bool {
+    loading(state, now)
+        || (state.tail_bytes > 0 && state.tail_bytes >= wal_limit)
+        || pressure.active(state.created_at, monotonic)
+        || (recent_bulk(state, now) && pressure.writing(monotonic))
 }
 
 /// Recover only unlocked process directories; live builds in other engines and processes stay.
@@ -827,9 +912,15 @@ impl Engine {
             }
             // A merge the indexer would run now. While a long write tail defers compaction (as
             // under steady writes), waiting for it would leave the new rows outside the tiers.
+            let bulk = loading_with_backpressure(
+                &state,
+                chrono::Utc::now(),
+                Instant::now(),
+                &handle.backpressure,
+                self.0.config.max_unindexed_bytes,
+            );
             let compacting =
-                !crate::indexer::tier(&state, &self.0.config, false, &protected).is_empty();
-            let bulk = loading(&state, chrono::Utc::now());
+                !crate::indexer::tier(&state, &self.0.config, false, &protected, bulk).is_empty();
             let (decision, numbers) = match &building {
                 // Beside a base building here, only a delta over the rows outside it.
                 Some(building) => (
@@ -987,7 +1078,7 @@ impl Engine {
         let opts = recluster::ReclusterOptions {
             attribute: attr.to_string(),
             cells: recluster::CELLS,
-            cluster_rows: recluster::CLUSTER_ROWS,
+            cluster_rows: 0,
             max_slab_rows,
             scratch,
         };
@@ -1210,6 +1301,160 @@ fn scopeguard(f: impl FnOnce()) -> impl Drop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_writes_survive_caller_cancellation_and_quiet_starts_at_completion() {
+        let activity = Arc::new(LoadBackpressure::default());
+        let (commits, mut receiver) = bf_wal::GroupCommit::<PendingWrite, ()>::channel(1);
+        let submitted = activity.clone();
+        let caller = tokio::spawn(async move { commits.submit(submitted.begin()).await });
+        let queued = receiver.recv().await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let now = chrono::Utc::now();
+        let clock = Instant::now();
+        let mut state = crate::NamespaceState {
+            bulk_load_at: Some(now),
+            updated_at: now - chrono::Duration::seconds(30),
+            seq: 9,
+            indexed_through: 9,
+            ..Default::default()
+        };
+        assert!(loading_with_backpressure(
+            &state,
+            now + chrono::Duration::seconds(10),
+            clock + Duration::from_secs(10),
+            &activity,
+            u64::MAX,
+        ));
+        // Ordinary steady writes do not acquire bulk semantics just by being queued.
+        state.bulk_load_at = None;
+        assert!(!loading_with_backpressure(
+            &state,
+            now,
+            clock,
+            &activity,
+            u64::MAX
+        ));
+        drop(queued);
+        let completed = Instant::now();
+        assert!(activity.writing(completed + Duration::from_secs(1)));
+        assert!(!activity.writing(completed + Duration::from_secs(3)));
+        assert!(!activity.active(state.created_at, completed));
+    }
+
+    #[test]
+    fn advertised_backpressure_keeps_an_indexed_load_active_past_the_quiet_window() {
+        let now = chrono::Utc::now();
+        let clock = Instant::now();
+        let mut state = crate::NamespaceState {
+            bulk_load_at: Some(now),
+            updated_at: now,
+            created_at: now,
+            seq: 9,
+            indexed_through: 9,
+            ..Default::default()
+        };
+        let pressure = LoadBackpressure::default();
+        pressure.record_at(now, 20_001, clock);
+        // An SDK using whole-second Retry-After waits 21 seconds, beyond the write-quiet window.
+        let retry_gap = chrono::Duration::seconds(10);
+        assert!(!loading(&state, now + retry_gap));
+        assert!(loading_with_backpressure(
+            &state,
+            now + retry_gap,
+            clock + Duration::from_secs(10),
+            &pressure,
+            u64::MAX,
+        ));
+        // A later, shorter 429 must not shorten the outstanding advertised delay.
+        pressure.record_at(now, 500, clock + Duration::from_secs(10));
+        assert!(pressure.active(now, clock + Duration::from_secs(22)));
+        assert!(!loading_with_backpressure(
+            &state,
+            now + chrono::Duration::seconds(23),
+            clock + Duration::from_secs(23),
+            &pressure,
+            u64::MAX,
+        ));
+        pressure.record_at(now, 30_000, clock + Duration::from_secs(20));
+        assert!(pressure.active(now, clock + Duration::from_secs(40)));
+        assert!(!pressure.active(now, clock + Duration::from_secs(52)));
+        // Recreating a namespace does not inherit the old generation's retry deadline.
+        state.created_at = now + chrono::Duration::seconds(1);
+        assert!(!loading_with_backpressure(
+            &state,
+            now + retry_gap,
+            clock + Duration::from_secs(10),
+            &pressure,
+            u64::MAX,
+        ));
+        // A backlog at the configured limit also delays builds without persisted bulk history.
+        state.bulk_load_at = None;
+        state.seq += 1;
+        state.tail_bytes = 100;
+        assert!(loading_with_backpressure(
+            &state,
+            now + retry_gap,
+            clock,
+            &pressure,
+            100
+        ));
+        state.tail_bytes = 99;
+        assert!(!loading_with_backpressure(
+            &state,
+            now + retry_gap,
+            clock,
+            &pressure,
+            100
+        ));
+    }
+
+    #[tokio::test]
+    async fn both_commit_paths_record_backpressure_independently_of_checkpoint_refresh() {
+        let store = bf_storage::Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store,
+            crate::EngineConfig {
+                indexing: false,
+                max_unindexed_bytes: 1,
+                ..Default::default()
+            },
+        );
+        for (ns, request) in [
+            ("pipeline", serde_json::json!({"upsert_rows":[{"id":2}]})),
+            (
+                "barrier",
+                serde_json::json!({"delete_by_filter":["id","Eq",1]}),
+            ),
+        ] {
+            engine
+                .write(
+                    ns,
+                    serde_json::from_value(serde_json::json!({"upsert_rows":[{"id":1}]})).unwrap(),
+                )
+                .await
+                .unwrap();
+            let error = engine
+                .write(ns, serde_json::from_value(request).unwrap())
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, 429);
+            let handle = engine.handle(ns).await.unwrap();
+            let generation = handle.state.lock().await.created_at;
+            assert!(handle.backpressure.active(generation, Instant::now()));
+            engine.index_namespace(ns, true).await.unwrap();
+            let state = handle.state.lock().await;
+            assert_eq!(state.seq, state.indexed_through);
+            assert_eq!(state.tail_bytes, 0);
+            assert!(handle.backpressure.active(generation, Instant::now()));
+        }
+    }
 
     #[test]
     fn a_bulk_load_finishes_after_a_short_quiet_period_and_an_indexed_tail() {

@@ -217,6 +217,26 @@ impl Default for ResidentQueryScratch {
         }
     }
 }
+/// The immutable part of a compiled tier's plan. Cache both the row total and the eligible
+/// entry positions, so a warm query does not walk the strided metadata twice to recover them.
+struct ResidentPopulation {
+    rows: usize,
+    entries: Vec<usize>,
+}
+impl ResidentPopulation {
+    fn new(directory: &Directory) -> Self {
+        let mut entries = Vec::with_capacity(directory.entries().len());
+        let mut rows = 0;
+        for (i, entry) in directory.entries().iter().enumerate() {
+            rows += entry.rows as usize;
+            if entry.rows > 0 {
+                entries.push(i);
+            }
+        }
+        Self { rows, entries }
+    }
+}
+
 impl Directory {
     fn resident_plan(
         &self,
@@ -224,33 +244,41 @@ impl Directory {
         nprobe: usize,
         rerank_factor: usize,
         k: usize,
+        population: Option<&ResidentPopulation>,
         scratch: &mut ResidentQueryScratch,
     ) -> Result<usize> {
         self.prepare_resident(query, scratch)?;
         let s = scratch;
         let entries = self.entries();
-        let rows: usize = entries.iter().map(|e| e.rows as usize).sum();
-        let probes =
-            ((nprobe as f64 * (entries.len() as f64 / (rows as f64).sqrt()).max(1.)).ceil()
-                as usize)
-                .min(entries.len());
+        let rows = population.map_or_else(
+            || entries.iter().map(|entry| entry.rows as usize).sum(),
+            |p| p.rows,
+        );
+        let probes = (crate::tier_probe_budget(nprobe, rows, entries.len()).ceil() as usize)
+            .min(entries.len());
         let target = k.saturating_mul(rerank_factor).min(rows);
         s.order.clear();
-        s.order.extend(
-            entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.rows > 0)
-                .map(|(i, _)| {
-                    let bits = s.distances[i].to_bits();
-                    let key = if bits >> 31 == 1 {
-                        !bits
-                    } else {
-                        bits | 1 << 31
-                    };
-                    (u64::from(key) << 32) | i as u64
-                }),
-        );
+        let distances = &s.distances;
+        let key = |i: usize| {
+            let bits = distances[i].to_bits();
+            let key = if bits >> 31 == 1 {
+                !bits
+            } else {
+                bits | 1 << 31
+            };
+            (u64::from(key) << 32) | i as u64
+        };
+        if let Some(population) = population {
+            s.order.extend(population.entries.iter().copied().map(key));
+        } else {
+            s.order.extend(
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.rows > 0)
+                    .map(|(i, _)| key(i)),
+            );
+        }
         let mut sorted = if s.order.len() > probes.saturating_mul(8).max(256) {
             let head = probes * 2 + 64;
             s.order.select_nth_unstable(head);
@@ -311,7 +339,7 @@ impl Directory {
             scratch.hits.clear();
             return Ok(&scratch.hits);
         }
-        let target = self.resident_plan(query, nprobe, rerank_factor, k, scratch)?;
+        let target = self.resident_plan(query, nprobe, rerank_factor, k, None, scratch)?;
         let s = scratch;
         s.hits.clear();
         s.candidates.clear();

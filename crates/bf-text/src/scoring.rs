@@ -332,6 +332,92 @@ pub fn score_document(
     score
 }
 
+/// Position-free term counts for an immutable document. Reuse these across
+/// queries when only BM25 scores and corpus deltas are needed.
+#[derive(Clone, Debug, Default)]
+pub struct DocumentTerms {
+    length: u32,
+    frequencies: BTreeMap<String, u32>,
+}
+impl DocumentTerms {
+    /// Analyze already-tokenized input once, retaining exact term frequencies.
+    pub fn new(tokens: &[Token]) -> Self {
+        let mut frequencies = BTreeMap::new();
+        for token in tokens {
+            *frequencies.entry(token.text.clone()).or_default() += 1;
+        }
+        Self {
+            length: tokens.len() as u32,
+            frequencies,
+        }
+    }
+    /// Retained token count, before the corpus's minimum-one normalization.
+    pub fn len(&self) -> u32 {
+        self.length
+    }
+    /// Whether the document has no retained tokens.
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+    /// Number of occurrences of an exact term.
+    pub fn frequency(&self, term: &str) -> u32 {
+        self.frequencies.get(term).copied().unwrap_or(0)
+    }
+    /// Conservative allocation charge, including sparsely populated tree nodes.
+    pub fn resident_bytes(&self) -> u64 {
+        (std::mem::size_of::<Self>()
+            + (self.frequencies.len() / 5 + 1) * 512
+            + self.frequencies.keys().map(String::capacity).sum::<usize>()) as u64
+    }
+}
+
+/// Query weights prepared once for scoring many immutable document summaries.
+/// Contributions accumulate in the reference scorer's lexical f32 order.
+pub struct PreparedQuery<'a> {
+    terms: Vec<(&'a str, TermWeight)>,
+    prefix: Option<&'a str>,
+}
+impl<'a> PreparedQuery<'a> {
+    /// Prepare exact weights for this query, corpus snapshot, and configuration.
+    pub fn new(query: &'a Query, stats: &CorpusStats, params: &FtsParams) -> Self {
+        Self {
+            terms: query
+                .exact_terms()
+                .into_iter()
+                .map(|(term, qf)| {
+                    (
+                        term,
+                        TermWeight::new(
+                            qf,
+                            *stats.document_frequencies.get(term).unwrap_or(&0),
+                            stats,
+                            params,
+                        ),
+                    )
+                })
+                .collect(),
+            prefix: query.prefix(),
+        }
+    }
+    /// Score cached counts with bit-identical arithmetic to [`score_document`].
+    pub fn score(&self, document: &DocumentTerms) -> f32 {
+        let mut score = 0.0;
+        for (term, weight) in &self.terms {
+            score += weight.score(document.frequency(term), document.length);
+        }
+        if let Some(prefix) = self.prefix
+            && document
+                .frequencies
+                .range(prefix.to_owned()..)
+                .next()
+                .is_some_and(|(term, _)| term.starts_with(prefix))
+        {
+            score += 1.0;
+        }
+        score
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +492,64 @@ mod tests {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+    use crate::{tokenize, tokenize_array};
+    #[test]
+    fn prepared_counts_preserve_reference_bits_for_queries_and_parameters() {
+        for k1 in [0.1, 1.2, 3.0] {
+            for b in [0.0, 0.75, 1.0] {
+                for k3 in [0.1, 8.0, 100.0] {
+                    let params = FtsParams {
+                        k1,
+                        b,
+                        k3,
+                        ..Default::default()
+                    };
+                    let documents: Vec<_> = [
+                        "",
+                        "a",
+                        "a a z",
+                        "red foxes fox",
+                        "prefix prefixed prelude",
+                        "é 東京",
+                    ]
+                    .map(|s| tokenize(s, &params))
+                    .into_iter()
+                    .chain([tokenize_array(&["a red", "a fox", ""], &params)])
+                    .collect();
+                    let stats = CorpusStats::from_documents(&documents);
+                    for raw in [
+                        "",
+                        "a",
+                        "a a z",
+                        "red fox missing",
+                        "pre",
+                        "prefix pre",
+                        "é 東京",
+                    ] {
+                        for prefix in [false, true] {
+                            let query = Query::new(tokenize(raw, &params), prefix);
+                            let scorer = PreparedQuery::new(&query, &stats, &params);
+                            for tokens in &documents {
+                                let terms = DocumentTerms::new(tokens);
+                                assert_eq!(terms.len(), tokens.len() as u32);
+                                assert_eq!(terms.is_empty(), tokens.is_empty());
+                                assert_eq!(
+                                    scorer.score(&terms).to_bits(),
+                                    score_document(tokens, &query, &stats, &params).to_bits(),
+                                    "{raw} prefix={prefix}"
+                                );
                             }
                         }
                     }

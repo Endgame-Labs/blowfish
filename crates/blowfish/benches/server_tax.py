@@ -165,9 +165,10 @@ def run(a):
                     perf.wait()
         ids = [r[3] for r in rows]
         if a.baseline:
-            assert ids == json.loads(a.baseline.read_text()), (
-                "ordered ID/distance mismatch"
-            )
+            expected = json.loads(a.baseline.read_text())
+            if a.query_repeats != 1 and len(expected) == len(queries):
+                expected *= a.query_repeats
+            assert ids == expected, "ordered ID/distance mismatch"
         a.out.with_suffix(".ids").write_text(json.dumps(ids))
         ms = [(r[2] - r[1]) / 1e6 for r in rows]
         recall = np.mean(
@@ -179,6 +180,7 @@ def run(a):
         record = dict(
             queries=len(rows),
             qps=len(rows) / elapsed,
+            mean=float(np.mean(ms)),
             p50=float(np.percentile(ms, 50)),
             p90=float(np.percentile(ms, 90)),
             recall=float(recall),
