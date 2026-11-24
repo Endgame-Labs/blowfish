@@ -84,3 +84,31 @@ blowfish with `load.py --vectors-only`, which writes id and vector only, as Qdra
 
 macOS has no `taskset`, so run with `--cpus ""`: the server and the clients share every core. Measure peak RSS with
 `/usr/bin/time -l`. Run one engine at a time, and delete its data before starting the next.
+
+## Warm query profiling (Linux)
+
+`profile.py` starts its own read-only server, warms the query IDs before attaching perf, records
+exact top-10 recall and cache statistics, and stops only its child processes. It writes the JSON
+summary, result IDs, server log, and optional perf output under `.scratch/`. Use a perf executable
+that matches the VM's kernel; some distributions' `/usr/bin/perf` wrapper cannot find it.
+
+From the repository root:
+
+```sh
+source ~/.cargo/env
+R="$PWD/.scratch/nq-profile"
+mkdir -p "$R"
+timeout 600 uv run --project bench/nq python bench/nq/profile.py \
+  --binary target/release/blowfish --store .scratch/nq-run/store \
+  --data .scratch/nq-data --out "$R/p64.json" --probes 64 \
+  --quality --warm 3452 --clients 4 --perf stat --perf-path /path/to/perf
+```
+
+The default is CPUs 6–7, two Tokio/Rayon workers, a 4 GiB raw cache, no disk cache, and no recall
+sampling. `--perf record` collects 199 Hz DWARF call stacks. `--trace --clients 1 --count 100`
+records serial `BF_TRACE_STAGES` diagnostics; omit `--quality` for that shorter pass. Repeat the
+same measured IDs during warm-up, and check cache-hit ratio and exhaustive-search count before
+attributing CPU cost. Alternate two frozen binaries ABAB against the same immutable store, compare
+the `.ids` files, and divide perf totals by the measured query count. Wall time on a shared VM
+cannot establish throughput; use `measure.py` on an otherwise idle machine for that. Record the
+numbers worth keeping, and delete the profiling directory when done.

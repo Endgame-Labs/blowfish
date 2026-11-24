@@ -4,6 +4,12 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **NQ profiling harness, round Q1.** `bench/nq/profile.py` owns its read-only server and profiler,
+  records exact recall, result IDs, cache statistics, microsecond traces, and hardware counters,
+  and cleans up its child processes. The benchmark write-up preserves the full before/after
+  curve, cold comparisons, rejected experiments, and throughput limits. The harness was used
+  for the final ABAB, full-quality, and trace runs; all Rust checks remain passing.
+
 - **Shared ANN candidate bounds, round Q1.** Completed slabs pass a witnessed upper bound to later
   scans, and scans discard candidates accepted under earlier, looser bounds before merging. Combined
   with shared metadata, warm NQ uses 12.5% fewer VM instructions at 48 probes and 12.7% fewer at 64.
