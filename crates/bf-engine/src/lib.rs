@@ -507,6 +507,9 @@ impl Engine {
     /// Drop query caches and resident namespace state, retaining provisioned immutable ANN
     /// files. The next query has cold query caches on a provisioned node. For benchmarks only.
     pub async fn drop_caches(&self) {
+        // A completed query can still have disposable block writes in flight. Drain them
+        // before clearing, so they cannot repopulate a supposedly cold benchmark cache.
+        self.0.store.flush_cache().await;
         self.0.read_cache.clear();
         self.0.store.drop_caches();
         self.0.namespaces.lock().await.clear();

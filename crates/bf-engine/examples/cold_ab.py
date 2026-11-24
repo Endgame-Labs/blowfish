@@ -118,7 +118,7 @@ def stats(client):
 
 def trace_summary(log):
     """Completed read waves and bytes by object kind, separate from attempted GETs."""
-    reads, kinds, stages, timeline, local, slots, stage_times = [], {}, {}, [], [], [], []
+    reads, kinds, stages, timeline, local, slots, stage_times, lookups = [], {}, {}, [], [], [], [], []
     for line in log.splitlines():
         if line.startswith("TRACE_READ "):
             _, path, _, _, size, end, elapsed = line.split()
@@ -154,6 +154,10 @@ def trace_summary(log):
             slots.append(
                 {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", line)}
             )
+        elif line.startswith("TRACE_CACHE "):
+            lookups.append(
+                {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", line)}
+            )
         elif line.startswith("STAGE_TIME "):
             name, end_us = line[11:].rsplit(" ", 1)
             stage_times.append({"stage": name, "end_us": int(end_us)})
@@ -173,6 +177,7 @@ def trace_summary(log):
         "local_reads": local,
         "fetch_slots": slots,
         "stage_timeline": stage_times,
+        "cache_lookups": lookups,
     }
 
 
@@ -332,6 +337,7 @@ def query(name, item, client, work, proc):
                     "local_reads",
                     "fetch_slots",
                     "stage_timeline",
+                    "cache_lookups",
                 ]
             }
         ),
