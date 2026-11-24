@@ -4,9 +4,16 @@
 //! QUERIES_F32 is a headerless little-endian f32 array of the directory's dimension.
 //! On Linux, BF_BENCH_EVENTS=name:hex-config,... adds raw, user-only PMU counters
 //! around only the warmed loop. Each result includes its actual scheduling coverage.
+//! With two or more raw events, the instruction counter is omitted (reported as null)
+//! to leave room on hosts with only three available PMU counters.
+//! BF_BENCH_PROFILE_STOP stops the warmed process on Unix. Attach a profiler, then send
+//! SIGCONT to sample only steady queries; the READY marker goes to stderr.
+#[path = "support/counter.rs"]
+mod counter;
 use bf_storage::{Storage, StorageConfig};
 use bf_vector::{Bytes, Directory, ResidentIndex, ResidentQueryScratch};
 use bf_wal::Wal;
+use counter::Counter;
 use std::{
     error::Error,
     fs::File,
@@ -148,7 +155,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap();
                 }
                 let mut ids = vec![Vec::with_capacity(10); queries.len()];
-                let counter = Counter::open(1).expect("instructions counter unavailable");
                 let cycles = Counter::open(0).expect("cycle counter unavailable");
                 let extra: Vec<_> = std::env::var("BF_BENCH_EVENTS")
                     .unwrap_or_default()
@@ -164,9 +170,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                         )
                     })
                     .collect();
+                let counter = (extra.len() <= 1)
+                    .then(|| Counter::open(1).expect("instructions counter unavailable"));
+                if std::env::var_os("BF_BENCH_PROFILE_STOP").is_some() && barrier.wait().is_leader()
+                {
+                    eprintln!("NATIVE_PROFILE_READY {}", std::process::id());
+                    #[cfg(unix)]
+                    // SAFETY: stop only this benchmark process, after every worker has warmed.
+                    unsafe {
+                        libc::raise(libc::SIGSTOP);
+                    }
+                    #[cfg(not(unix))]
+                    panic!("profile stop requires Unix");
+                }
                 barrier.wait();
                 let tick = Instant::now();
-                counter.start();
+                if let Some(counter) = &counter {
+                    counter.start();
+                }
                 cycles.start();
                 for (_, event) in &extra {
                     event.start();
@@ -188,12 +209,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .map(|(name, event)| (name, event.stop()))
                     .collect();
                 let cycles = cycles.stop();
-                let instructions = counter.stop();
+                let instructions = counter.map(Counter::stop);
                 extra.push(("cycles".to_owned(), cycles));
-                extra.push(("instructions".to_owned(), instructions));
+                if let Some(instructions) = instructions {
+                    extra.push(("instructions".to_owned(), instructions));
+                }
                 (
                     count,
-                    instructions.0,
+                    instructions.map(|counter| counter.0),
                     tick.elapsed().as_secs_f64(),
                     ids,
                     cycles.0,
@@ -207,7 +230,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .collect::<Vec<_>>()
     });
     let count: usize = results.iter().map(|r| r.0).sum();
-    let instructions: u64 = results.iter().map(|r| r.1).sum();
+    let instructions: Option<u64> = results.iter().map(|r| r.1).sum();
     let cycles: u64 = results.iter().map(|r| r.4).sum();
     let seconds = results.iter().map(|r| r.2).fold(0., f64::max);
     let mut events = std::collections::BTreeMap::<String, (u64, u64, u64)>::new();
@@ -239,7 +262,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "{}",
-        serde_json::json!({"queries":count, "threads":threads, "probes":probes, "seconds":seconds, "qps":count as f64/seconds, "instructions_per_query":instructions as f64/count as f64, "cycles_per_query":cycles as f64/count as f64, "events":events, "resident_bytes":resident_bytes, "startup_and_warm_seconds":all_started.elapsed().as_secs_f64()-seconds, "peak_rss_bytes":rss("VmHWM:"), "rss_bytes":rss("VmRSS:")})
+        serde_json::json!({"queries":count, "threads":threads, "probes":probes, "seconds":seconds, "qps":count as f64/seconds, "instructions_per_query":instructions.map(|n| n as f64/count as f64), "cycles_per_query":cycles as f64/count as f64, "events":events, "resident_bytes":resident_bytes, "startup_and_warm_seconds":all_started.elapsed().as_secs_f64()-seconds, "peak_rss_bytes":rss("VmHWM:"), "rss_bytes":rss("VmRSS:")})
     );
     Ok(())
 }
@@ -254,68 +277,4 @@ fn rss(field: &str) -> Option<u64> {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(|kb| kb * 1024)
         })
-}
-
-#[cfg(target_os = "linux")]
-struct Counter(File);
-#[cfg(target_os = "linux")]
-impl Counter {
-    fn open(event: u64) -> std::io::Result<Self> {
-        Self::with_type(0, event)
-    }
-    fn raw(event: u64) -> std::io::Result<Self> {
-        Self::with_type(4, event)
-    }
-    fn with_type(kind: u64, event: u64) -> std::io::Result<Self> {
-        use std::os::fd::FromRawFd;
-        // perf_event_attr v0 (64 bytes): hardware event, user space only, disabled.
-        let mut attr = [0u64; 8];
-        attr[0] = (64u64 << 32) | kind;
-        attr[1] = event;
-        attr[4] = 3; // PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING.
-        attr[5] = 1 | (1 << 5) | (1 << 6);
-        // SAFETY: valid attr pointer, this thread, no CPU affinity, and no group.
-        let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: perf_event_open returned a new owned file descriptor.
-        Ok(Self(unsafe { File::from_raw_fd(fd as i32) }))
-    }
-    fn start(&self) {
-        use std::os::fd::AsRawFd;
-        // SAFETY: these perf ioctls take no pointer argument.
-        unsafe {
-            libc::ioctl(self.0.as_raw_fd(), 0x2403, 0);
-            libc::ioctl(self.0.as_raw_fd(), 0x2400, 0);
-        }
-    }
-    fn stop(mut self) -> (u64, u64, u64) {
-        use std::os::fd::AsRawFd;
-        // SAFETY: PERF_EVENT_IOC_DISABLE takes no pointer argument.
-        unsafe {
-            libc::ioctl(self.0.as_raw_fd(), 0x2401, 0);
-        }
-        let mut bytes = [0; 24];
-        self.0.read_exact(&mut bytes).unwrap();
-        let words: [u64; 3] = std::array::from_fn(|i| {
-            u64::from_ne_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap())
-        });
-        (words[0], words[1], words[2])
-    }
-}
-#[cfg(not(target_os = "linux"))]
-struct Counter;
-#[cfg(not(target_os = "linux"))]
-impl Counter {
-    fn raw(_event: u64) -> std::io::Result<Self> {
-        Err(std::io::Error::other("hardware counts require Linux perf"))
-    }
-    fn open(_event: u64) -> std::io::Result<Self> {
-        Err(std::io::Error::other("hardware counts require Linux perf"))
-    }
-    fn start(&self) {}
-    fn stop(self) -> (u64, u64, u64) {
-        (0, 0, 0)
-    }
 }

@@ -59,9 +59,6 @@ def run(a):
             np.repeat(queries[:1], len(queries), axis=0),
             np.repeat(truth[:1], len(truth), axis=0),
         )
-    if a.query_repeats != 1:
-        queries = np.tile(queries, (a.query_repeats, 1))
-        truth = np.tile(truth, (a.query_repeats, 1))
     bodies = [nq.body(v, a.top_k) for v in queries]
     if a.order:
         bodies = [
@@ -81,6 +78,9 @@ def run(a):
             return json.dumps(body).encode()
 
         bodies = [project(raw) for raw in bodies]
+    if a.query_repeats != 1:
+        bodies *= a.query_repeats
+        truth = np.tile(truth, (a.query_repeats, 1))
     local = threading.local()
 
     def query(item):

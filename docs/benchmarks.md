@@ -7104,3 +7104,77 @@ requests agree, but `1.0000000596046449` changes both a numeric filter value and
 the resulting ANN f32 component. A wholesale parser replacement is rejected:
 faster parsing must preserve the existing query bits and acceptance behavior.
 No parser dependency or production parser change is retained.
+
+### Pure compaction must preserve the resident plan
+
+A covered-segment compaction can move every row without deleting one. The old
+`tier_mask` returns `Some(full_bitmap)` in that case, despite its documented
+mask-free contract, and the bitmap disables the compiled tier. The fix checks
+coverage of every original row range and caches `None` under the existing
+immutable live-object and lineage-map key. Real deletions retain their masks.
+The regression case checks reuse of the compiled generation through compaction,
+repeated cached proofs, unindexed updates, indexed deletes, projections, and eviction.
+
+The new NQ tier has 32 slabs and 13,393 leaves. Its paired recall is
+0.9484067207 / 0.9590092700 at 48 / 64 probes. Its layout differs from Q2's;
+compare arms within this round. A copy of the first complete publication receives
+one ordinary covered-segment compaction, with no writes or tier rebuild. The
+native reference keeps the original publication's ID mapping and identical tier
+payloads. Every ordered row and distance in the following ABBA matches both the
+other arm and the first-publication reference.
+
+| Probes | Main q/s, two processes | Mask fix q/s, two processes | Main / fix p90, two processes (ms) |
+|---:|---:|---:|---|
+| 48 | 1,489 / 1,486 | 1,953 / 1,955 | 14.80 / 11.22; 14.83 / 11.16 |
+| 64 | 1,296 / 1,350 | 1,686 / 1,669 | 16.86 / 12.98; 16.21 / 13.05 |
+
+Mean process-median throughput rises **31.4% / 26.8%**. User instructions fall
+25.556→22.639 M / 29.331→26.110 M per query, while user cycles fall
+12.079→9.063 M / 13.774→10.708 M. Context switches fall
+9.53→5.17 / 8.88→5.43 per query. These counts have 100% scheduling coverage.
+An already unmasked first publication has no corresponding work reduction;
+its separate process controls vary by roughly 1–3%, and are not credited as a win.
+
+The first 40-pair cold check uses fresh processes and the standard 25 ms loopback
+S3 facade. Rows and distances agree. Paired median changes are +2.25 ms
+[-1.29, +3.85] / -2.09 ms [-3.87, +0.61]. The 48-probe p90 point worsens by
+42.97 ms, with a wide [-37.22, +60.12] ms interval, so this sample does **not**
+clear the cold-tail gate. A larger confirmation is required before the final result.
+
+### Match the scorer before attributing the HTTP difference
+
+The packed resident harness and the server use different scorer representations.
+The new ignored `warm_ann::benchmark::compiled_kernel_profile` control warms through
+ordinary engine queries, retains that exact `WarmTier` and sparse vector cache,
+and runs its scorer on eight OS threads. Timed loops exclude snapshots, hydration,
+HTTP, and worker dispatch. Both controls report user-only counters, with zero
+missing compiled payloads and 100% counter coverage.
+
+| Dataset, 48 probes | Packed native instructions / cycles (M/query) | Exact compiled scorer instructions / cycles (M/query) | Packed / compiled q/s |
+|---|---:|---:|---:|
+| 10K control | 3.348 / 1.073 | 3.377 / 1.310 | 18,682 / 15,191 |
+| Full NQ | 22.247 / 8.099 | 21.716 / 8.031 | 2,546 / 2,562 |
+
+The representation difference affects the small control, but does not explain the
+full-NQ HTTP gap. The full-NQ server takes about 22.64 M user instructions and
+9.3 M user cycles/query, at roughly 1,900–2,000 q/s. Fixing a presumed packed-array
+gap on full NQ would target the wrong cause.
+
+`BF_BENCH_COMPILED` points to a JSON control file under `.scratch`, with `store`,
+`namespace`, `queries` (headerless little-endian f32), `dims`, `probes`, `threads`,
+and `repeats`. Run the explicitly ignored test in release mode. Both scorer
+harnesses support `BF_BENCH_PROFILE_STOP`: after warming, the Unix process emits
+`NATIVE_PROFILE_READY`, stops itself, and resumes on `SIGCONT`. Attach a profiler
+before resuming to exclude startup and warming from function-cycle samples.
+With two raw events, the instruction counter is omitted and reported as `null`,
+so cycles plus the two events fit this host's three available PMU counters.
+
+Initial larger event groups multiplexed and were discarded. The corrected groups
+have 100% coverage. L3 refill events read zero on this host and are not interpreted
+as evidence of no L3 misses.
+
+Formatting, scoped all-target Clippy with warnings denied, and scoped tests pass:
+223 passed, zero failed, and six explicit ignores, including the new diagnostic.
+The large synthetic fixture uses a separate 8 MiB test-driver stack; runtime
+workers retain their normal stacks. No production API, wire type, format, or
+setting changes in the mask fix.
