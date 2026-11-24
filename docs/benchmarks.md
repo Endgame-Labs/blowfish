@@ -7928,17 +7928,49 @@ The measured before/during pair returned identical **0.9608343** all-query recal
 The first M4 global build completed in **1,011.630 s wall** and **1,850.608 CPU s**, with a
 **5,314,810,608-byte** peak physical footprint including foreground caches. It retained a
 **4,188,240,040-byte** reservation after publication. Calibration then rejected the graph as
-unprofitable: trials applied nonadmission to ANN as well as the exhaustive reference, reopening
-uncached sparse views instead of measuring normal serving cache behavior. The corrected path
+unprofitable. Trials applied nonadmission to ANN as well as the exhaustive reference, exposing
+a cache-policy mismatch and repeated uncached sparse views. The corrected path
 admits ANN reads and separately bypasses admission for truth. It also pairs each graph trial
 with an ordinary IVF reference on the same request, snapshot, cache policy, worker, and query
 concurrency. The serving load remains active during calibration. Its final promotion and Qdrant
 comparisons remain pending. IVF answered queries throughout the rejected calibration.
 
-A final short S3 cold ABBA compares baseline `f089d97` with runtime implementation `ff2fa2c`, on
+The corrected run measured **2,826.481 HTTP queries/s** during CPU construction, again at
+**0.9608343** recall over 110,464 timed requests. Its earlier **2,870.523 queries/s** sample overlapped
+early source collection, so it is not a clean prebuild control. A separate fresh-process IVF control
+will avoid that phase ambiguity. The configured 4 GiB raw cache is bypassed by MEM2 local mappings;
+the enabled foreground charge is 4 GiB decoded cache. Together with the construction reservation
+and 20% physical headroom, the policy envelope is **12,707,773,623 bytes** on a 16 GiB machine.
+Mapped clean object pages remain reclaimable, and physical footprint is reported separately.
+
+That paired-cache run completed construction in **1,052.541 s wall** and **1,867.857 CPU s**, with
+**5,319,676,560 bytes** peak whole-process physical footprint. It also rejected promotion: later
+trials measured roughly **3.3–4.0 ms** graph CPU versus **1.8–1.9 ms** paired IVF, with sampled
+effort reaching 165. It supplies no promoted serving or Qdrant result. Further validation dispatches
+both ANN and IVF trials through the ordinary Q2 query-worker path, leaving exhaustive truth on its
+separate blocking worker, and records navigation, exact-rerank, and hydration CPU separately.
+The CPU-payback threshold is unchanged. A replay through IVF and the exact evaluator then exposed
+sample difficulty and excess effort in that rejected sequence:
+
+| Trial ef | Samples | Graph recall | Paired IVF recall |
+|---:|---:|---:|---:|
+| 64 | 8 | 0.800000 | 0.950000 |
+| 96 | 19 | 0.952632 | 0.973684 |
+| 108 | 8 | 0.950000 | 0.975000 |
+| 122 | 12 | 0.916667 | 0.933333 |
+| 165 | 32 | 0.993750 | 0.971875 |
+
+The revised controller targets IVF's measured quality on each identical sample, collects enough
+paired observations, and explores effort in both directions with a query-level confidence interval.
+A validated serving effort stays available while cheaper trials run. Seeded noisy-stream tests
+exercise convergence from both lower and higher initial efforts. The fixed nominal graph target is
+removed; two ordinary IVF probe profiles can now use the identical server binary, with graph effort
+chosen automatically against each profile's measured quality. Final serving comparisons remain pending.
+
+A final short S3 cold ABBA compares baseline `f089d97` with runtime implementation `126a5d2`, on
 the same eight pinned Graviton3 cores. All 32 answers have identical rows and distance bits.
-Mean latencies for A1/B1/B2/A2 are **337.99/200.50/216.25/194.15 ms**; combined baseline/candidate
-medians are **220.49/194.70 ms**. This short gate finds no aggregate cold regression. Strong order
+Mean latencies for A1/B1/B2/A2 are **388.87/239.79/245.70/232.27 ms**; combined baseline/candidate
+medians are **255.53/239.99 ms**. This short gate finds no aggregate cold regression. Strong order
 and network variation prevents a speedup claim.
 
 Each host's paired comparison uses one fixed truth file. Query arrays match byte-for-byte across

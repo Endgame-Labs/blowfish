@@ -126,8 +126,16 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     ]
     .into_iter()
     .cycle()
-    .take(40)
+    .take(2048)
     {
+        // Keep this lifecycle test's payback positive independently of machine timing.
+        e.0.hot_graph
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .ivf_seconds = 1.;
         e.recall(
             "hot",
             json!({"num":1,"top_k":10,"rank_by":["vector","ANN",vectors[i]]}),
@@ -241,7 +249,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     {
         let calibration = delta.calibration.lock().unwrap();
         assert!(
-            calibration.recalls.is_empty(),
+            calibration.quality.len() == 0,
             "discarded plans cannot calibrate recall"
         );
         assert_eq!(
@@ -389,6 +397,7 @@ async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan
             indexing: false,
             recall_sample_rate: 0.,
             decoded_cache_bytes: 64 << 20,
+            query_concurrency: 1,
             ..Default::default()
         },
     );
@@ -472,6 +481,13 @@ async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan
         e.0.hot_graph.answers.load(Ordering::Relaxed),
         answered + 1,
         "the IVF cost reference and exhaustive truth must not use the graph"
+    );
+    assert_eq!(entry.searches.load(Ordering::Relaxed), 1);
+    assert!(
+        entry
+            .phase_cpu
+            .iter()
+            .all(|v| v.load(Ordering::Relaxed) > 0)
     );
     let after = probe();
     let after_stats = after.stats.clone();

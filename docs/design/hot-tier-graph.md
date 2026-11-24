@@ -79,9 +79,10 @@ metric, precision, dimensions, rotation, and graph implementation are fixed by t
 and current process. No graph survives a binary restart or crosses a backend.
 
 Admission reserves before source reads. The conservative estimate includes padded SQ8, compact
-links, row maps, source-index metadata, exact-rerank locations, partition construction and load peaks,
+links, row maps, source-index metadata, exact-rerank locations, global construction and publication peaks,
 allocator allowance, per-query visited bytes, and bounded heaps. A process-wide counter accounts for
-active graphs and builders, while a separate charge accounts for configured foreground caches.
+active graphs and builders, while a separate charge accounts for enabled foreground caches. Local mapped storage disables the ordinary
+raw-byte cache, so its configured raw-byte budget is not charged a second time.
 Admission leaves 20% of the machine or cgroup limit as headroom. A charged-memory or host-available
 check can refuse a build even when the reservation arithmetic would fit.
 
@@ -113,10 +114,22 @@ not a construction-time guarantee; installation uses measured construction cost.
 
 A finished graph initially serves recall trials, while foreground queries retain IVF. The existing
 paced exact-recall sampler, or the ordinary recall endpoint, compares those trials against exhaustive
-results. Query effort starts at twice the graph degree, not an NQ benchmark setting. The controller
-uses at least eight observations, keeps a rolling window of up to 32, and increases ef when mean
-recall is below 0.96. Its internal ceiling is 4,096. A graph that still cannot meet the target at the
-ceiling is discarded.
+results. Query effort starts at twice the graph degree, not an NQ benchmark setting. Each trial
+also evaluates ordinary IVF on the same request and exact reference. The controller targets that
+measured IVF quality, with no nominal per-corpus recall constant. It collects at least 32 paired
+query observations, using an approximate 95% interval over query-level recall differences; common
+query difficulty and correlated neighbors are not treated as independent successes. A variance
+floor prevents an all-equal early window from claiming zero uncertainty.
+
+Confident inferiority increases trial effort; confident excess quality explores lower effort.
+Otherwise, at least 128 observations and a nonnegative measured quality difference can validate a
+candidate. An uncertain deficit collects up to 512 observations before increasing. A bracket of
+failed and validated efforts narrows to within 12.5%, while a validated serving effort remains
+available during cheaper trials. Sustained excess quality revisits old lower bounds, so an unlucky
+early window cannot permanently ratchet effort. The internal ceiling is 4,096; a graph unable to
+match IVF there is discarded. Read-only status distinguishes serving effort, trial effort, paired
+quality, and uncertainty. Existing sampler pacing bounds production comparison cost; an ordinary
+explicit recall request can contribute the same paired observations.
 
 Foreground selection additionally requires predicted CPU savings over the next 24 hours to cover
 at least twice measured construction CPU. The builder records its worker CPU and source-transform
@@ -129,12 +142,16 @@ search worker. A calibrated graph that
 remains unprofitable for a full observation window is discarded. All thresholds are internal policy;
 there are no per-corpus ef constants or user-facing graph controls.
 
-Both automatic and explicit recall trials use ordinary cache admission for ANN, so measured
+Both automatic and explicit recall trials dispatch ANN and its IVF reference through the same
+query-worker path as ordinary warm queries, with CPU charged per poll across I/O continuations.
+Exhaustive truth remains on its separately paced blocking worker. Trials use ordinary cache admission for ANN, so measured
 query cost reflects the serving path. Their exhaustive reference pass separately bypasses cache
 admission and graph selection. Calibration therefore cannot fill foreground caches with a
 one-pass full-corpus scan, or mistake repeated uncached sparse mapping opens for serving cost. Existing recall pacing still limits
 expensive background comparisons. Read-only diagnostics report construction wall time, measured CPU,
 reservation, retained capacity, current effort, calibration samples, and successful graph plans.
+Cumulative navigation, exact-rerank, and hydration CPU counters distinguish search cost from storage
+and result assembly without exposing graph controls.
 
 ## Writes, masks, and tier changes
 

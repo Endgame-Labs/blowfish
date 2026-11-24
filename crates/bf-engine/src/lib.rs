@@ -896,24 +896,33 @@ impl Engine {
                     let exact_context = context.exhaustive();
                     let ivf_context = context.ivf_reference();
                     runtime.block_on(read_cache::scope(context, async move {
-                        let cpu = warm_graph::thread_cpu();
-                        let ann = indexed::execute(&store, &sample, &request, &config, false).await;
-                        if let Some(scope) = &trial {
-                            scope.record_cpu((warm_graph::thread_cpu() - cpu).max(0.));
-                        }
-                        if ann.is_ok() && trial.as_ref().is_some_and(|s| s.used_graph()) {
-                            let cpu = warm_graph::thread_cpu();
-                            if read_cache::scope(
-                                ivf_context,
-                                indexed::execute(&store, &sample, &request, &config, false),
-                            )
-                            .await
-                            .is_ok()
-                                && let Some(scope) = &trial
-                            {
-                                scope.record_ivf_cpu((warm_graph::thread_cpu() - cpu).max(0.));
+                        let ann = warm_graph::trial_plan(
+                            &store,
+                            &sample,
+                            &request,
+                            &config,
+                            read_cache::context().expect("sample read context"),
+                        )
+                        .await;
+                        let ann = ann.map(|(ann, seconds)| {
+                            if let Some(scope) = &trial {
+                                scope.record_cpu(seconds);
                             }
-                        }
+                            ann
+                        });
+                        let ivf = if ann.is_ok() && trial.as_ref().is_some_and(|s| s.used_graph()) {
+                            warm_graph::trial_plan(&store, &sample, &request, &config, ivf_context)
+                                .await
+                                .ok()
+                                .map(|(answer, seconds)| {
+                                    if let Some(scope) = &trial {
+                                        scope.record_ivf_cpu(seconds);
+                                    }
+                                    answer
+                                })
+                        } else {
+                            None
+                        };
                         if let (Some(Ok(exact)), Ok(ann)) = (
                             stop.run(read_cache::scope(
                                 exact_context,
@@ -923,8 +932,8 @@ impl Engine {
                             ann,
                         ) {
                             let recall = indexed::recall(&ann, &exact);
-                            if let Some(scope) = trial {
-                                scope.feedback(recall);
+                            if let (Some(scope), Some(ivf)) = (trial, ivf) {
+                                scope.feedback(recall, indexed::recall(&ivf, &exact));
                             }
                             metrics::histogram!("blowfish_ann_recall").record(recall);
                         }

@@ -1031,29 +1031,36 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
         if !matches!(rank, RankBy::Vector { .. }) {
             return Err(ApiError::bad("recall requires vector ranking"));
         }
-        let cpu = crate::warm_graph::thread_cpu();
-        let ann =
-            crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, false).await?;
-        if let Some(scope) = crate::read_cache::context().and_then(|c| c.hot_graph) {
-            scope.record_cpu((crate::warm_graph::thread_cpu() - cpu).max(0.));
+        let context = crate::read_cache::context().expect("recall read context");
+        let scope = context.hot_graph.clone();
+        let (ann, seconds) = crate::warm_graph::trial_plan(
+            engine.storage(),
+            &state,
+            &q,
+            &engine.0.config,
+            context.clone(),
+        )
+        .await?;
+        if let Some(scope) = &scope {
+            scope.record_cpu(seconds);
         }
-        if let Some(scope) = crate::read_cache::context().and_then(|c| c.hot_graph)
-            && scope.used_graph()
-        {
-            let context = crate::read_cache::context()
-                .expect("recall read context")
-                .ivf_reference();
-            let cpu = crate::warm_graph::thread_cpu();
-            if crate::read_cache::scope(
-                context,
-                crate::indexed::execute(engine.storage(), &state, &q, &engine.0.config, false),
+        let ivf = if let Some(scope) = scope.filter(|s| s.used_graph()) {
+            crate::warm_graph::trial_plan(
+                engine.storage(),
+                &state,
+                &q,
+                &engine.0.config,
+                context.ivf_reference(),
             )
             .await
-            .is_ok()
-            {
-                scope.record_ivf_cpu((crate::warm_graph::thread_cpu() - cpu).max(0.));
-            }
-        }
+            .ok()
+            .map(|(answer, seconds)| {
+                scope.record_ivf_cpu(seconds);
+                answer
+            })
+        } else {
+            None
+        };
         let exact_context = crate::read_cache::context()
             .unwrap_or_else(|| crate::read_cache::ReadContext::new(engine.0.read_cache.clone()))
             .exhaustive();
@@ -1063,8 +1070,10 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
         )
         .await?;
         let measured = crate::indexed::recall(&ann, &exact);
-        if let Some(scope) = crate::read_cache::context().and_then(|c| c.hot_graph) {
-            scope.feedback(measured);
+        if let (Some(scope), Some(ivf)) =
+            (crate::read_cache::context().and_then(|c| c.hot_graph), ivf)
+        {
+            scope.feedback(measured, crate::indexed::recall(&ivf, &exact));
         }
         recall_sum += measured;
         ann_count += ann.result.rows.as_ref().map_or(0, Vec::len);

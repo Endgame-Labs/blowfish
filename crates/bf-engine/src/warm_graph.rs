@@ -19,7 +19,7 @@ const DWELL: Duration = Duration::from_secs(600);
 const IDLE: Duration = Duration::from_secs(1800);
 const RETRY: Duration = Duration::from_secs(1800);
 const RERANK: usize = 30;
-const TARGET: f64 = 0.96;
+mod effort;
 static RESERVED: AtomicU64 = AtomicU64::new(0);
 static FOREGROUND: AtomicU64 = AtomicU64::new(0);
 static CACHES: std::sync::LazyLock<Mutex<Vec<std::sync::Weak<Cache>>>> =
@@ -102,8 +102,8 @@ impl Drop for BuildSlot {
     }
 }
 struct Calibration {
-    ef: usize,
-    recalls: std::collections::VecDeque<f64>,
+    quality: effort::Effort,
+    trial_seconds: f64,
     usable: bool,
     graph_seconds: f64,
     build_seconds: f64,
@@ -121,6 +121,8 @@ struct Entry {
     build_wall_seconds: f64,
     measured_cpu_seconds: f64,
     build_reservation_bytes: u64,
+    phase_cpu: [AtomicU64; 3],
+    searches: AtomicU64,
 }
 struct Heat {
     first: Instant,
@@ -239,10 +241,15 @@ impl Scope {
         for key in used {
             if let Some(entry) = entries.get(&key).and_then(|h| h.ready.as_ref()) {
                 let mut c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
-                c.graph_seconds = if c.graph_seconds == 0. {
+                let measured = if self.trial {
+                    &mut c.trial_seconds
+                } else {
+                    &mut c.graph_seconds
+                };
+                *measured = if *measured == 0. {
                     seconds
                 } else {
-                    c.graph_seconds * 0.8 + seconds * 0.2
+                    *measured * 0.8 + seconds * 0.2
                 };
             }
         }
@@ -275,7 +282,7 @@ impl Scope {
             }
         }
     }
-    pub(crate) fn feedback(&self, recall: f64) {
+    pub(crate) fn feedback(&self, recall: f64, reference: f64) {
         let mut used = {
             let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
             let Some(used) = used.as_mut() else {
@@ -292,31 +299,21 @@ impl Scope {
                 && let Some(entry) = h.ready.as_ref()
             {
                 let mut c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
-                if !recall.is_finite() {
+                if !recall.is_finite() || !reference.is_finite() {
                     continue;
                 }
-                c.recalls.push_back(recall.clamp(0., 1.));
-                if c.recalls.len() > 32 {
-                    c.recalls.pop_front();
+                let update = c.quality.observe(recall, reference);
+                if update.accepted {
+                    c.graph_seconds = c.trial_seconds;
                 }
-                if c.recalls.len() < 8 {
-                    continue;
+                if update.changed {
+                    c.trial_seconds = 0.;
                 }
-                let measured = c.recalls.iter().sum::<f64>() / c.recalls.len() as f64;
-                let reject = if measured < TARGET {
-                    c.usable = false;
-                    let exhausted = c.ef == 4096;
-                    c.ef =
-                        ((c.ef as f64 * (1. + (TARGET - measured) * 8.).clamp(1.125, 1.5)).ceil()
-                            as usize)
-                            .min(4096);
-                    c.recalls.clear();
-                    exhausted
-                } else {
-                    let saving = (h.ivf_seconds - c.graph_seconds).max(0.);
-                    c.usable = h.rate * 86400. * saving >= 2. * c.build_seconds;
-                    !c.usable && c.recalls.len() >= 32
-                };
+                let saving = (h.ivf_seconds - c.graph_seconds).max(0.);
+                c.usable =
+                    c.quality.serving.is_some() && h.rate * 86400. * saving >= 2. * c.build_seconds;
+                let reject = update.exhausted
+                    || (c.quality.settled() && c.quality.len() >= 128 && !c.usable);
                 drop(c);
                 if reject {
                     retired.push(h.ready.take());
@@ -809,8 +806,8 @@ impl Engine {
             mask_live: Mutex::new(None),
             slots: tokio::sync::Semaphore::new(workers),
             calibration: Mutex::new(Calibration {
-                ef: 64,
-                recalls: Default::default(),
+                quality: effort::Effort::new(),
+                trial_seconds: 0.,
                 usable: false,
                 graph_seconds: 0.,
                 // Include a conservative allowance for source metadata and CRC decoding.
@@ -821,6 +818,8 @@ impl Engine {
             build_wall_seconds: start.elapsed().as_secs_f64(),
             measured_cpu_seconds: built.build_cpu + built.source_cpu,
             build_reservation_bytes: estimate,
+            phase_cpu: Default::default(),
+            searches: AtomicU64::new(0),
         }))
     }
 }
@@ -957,7 +956,11 @@ pub(crate) async fn search(
         if !scope.trial && !c.usable {
             return Ok(None);
         }
-        c.ef
+        if scope.trial {
+            c.quality.trial
+        } else {
+            c.quality.serving.unwrap_or(c.quality.trial)
+        }
     };
     if k == 0
         || k > RERANK
@@ -1016,6 +1019,8 @@ async fn search_entry(
     entry: &Entry,
     ef: usize,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+    entry.searches.fetch_add(1, Ordering::Relaxed);
+    let navigation_started = thread_cpu();
     let scratch = entry
         .scratch
         .lock()
@@ -1037,6 +1042,10 @@ async fn search_entry(
         )
         .map_err(segment::index_error)?;
     drop(loan);
+    entry.phase_cpu[0].fetch_add(
+        ((thread_cpu() - navigation_started).max(0.) * 1e9) as u64,
+        Ordering::Relaxed,
+    );
     let mut by_source: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
     for row in hits {
         let p = entry
@@ -1049,17 +1058,19 @@ async fn search_entry(
             .or_default()
             .push((cluster, ordinal));
     }
-    let mut exact =
+    let mut exact = measure_phase(
+        &entry.phase_cpu[1],
         futures::future::try_join_all(by_source.into_iter().map(|(slab, locations)| async move {
             entry.sources[slab]
                 .rerank_candidates(vector, k, locations)
                 .await
                 .map_err(segment::index_error)
-        }))
-        .await?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+        })),
+    )
+    .await?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     exact.truncate(k);
     if exact.len() < k {
@@ -1080,8 +1091,11 @@ async fn search_entry(
     let mut scores = BTreeMap::new();
     let mut documents = BTreeMap::new();
     for (i, rows) in by_segment {
-        for (row, doc) in
-            segment::projected_rows(store, &state.segments[i], &rows, Some(columns)).await?
+        for (row, doc) in measure_phase(
+            &entry.phase_cpu[2],
+            segment::projected_rows(store, &state.segments[i], &rows, Some(columns)),
+        )
+        .await?
         {
             let id: Id =
                 serde_json::from_value(doc.get("id").ok_or_else(segment::corrupt)?.clone())
@@ -1097,6 +1111,49 @@ async fn search_entry(
         return Ok(None);
     }
     Ok(Some((scores, documents)))
+}
+/// Run a calibration ANN plan through the same CPU dispatch as an ordinary warm query.
+/// Exhaustive truth retains its separate blocking worker and nonadmitting context.
+pub(crate) async fn trial_plan(
+    store: &Storage,
+    state: &NamespaceState,
+    request: &QueryRequest,
+    config: &crate::EngineConfig,
+    mut context: read_cache::ReadContext,
+) -> Result<(bf_types::QueryResponse, f64), ApiError> {
+    let store = store.clone();
+    let state = state.clone();
+    let request = request.clone();
+    let config = config.clone();
+    context.cpu_nanos = Arc::new(AtomicU64::new(0));
+    let cpu = context.cpu_nanos.clone();
+    let query = Box::pin(async move {
+        measure_cpu(
+            context.cpu_nanos.clone(),
+            read_cache::scope(
+                context,
+                crate::indexed::execute(&store, &state, &request, &config, false),
+            ),
+        )
+        .await
+    });
+    let answer = crate::query_worker::run(query).await??;
+    Ok((answer, cpu.load(Ordering::Relaxed) as f64 / 1e9))
+}
+fn measure_phase<F: std::future::Future>(
+    cpu: &AtomicU64,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let mut future = Box::pin(future);
+    std::future::poll_fn(move |cx| {
+        let started = thread_cpu();
+        let result = future.as_mut().poll(cx);
+        cpu.fetch_add(
+            ((thread_cpu() - started).max(0.) * 1e9) as u64,
+            Ordering::Relaxed,
+        );
+        result
+    })
 }
 /// Charge each poll on its current thread, including Q2's resumed I/O continuation.
 /// Async waiting and migration between worker threads do not become query CPU time.
@@ -1183,7 +1240,7 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let graphs=entries.iter().filter(|(k,_)|k.namespace==namespace).map(|(k,h)|{
-            let calibration=h.ready.as_ref().map(|e|{let c=e.calibration.lock().unwrap_or_else(|e|e.into_inner());serde_json::json!({"ef":c.ef,"usable":c.usable,"samples":c.recalls.len(),"build_cpu_seconds":e.measured_cpu_seconds,"build_wall_seconds":e.build_wall_seconds,"build_reservation_bytes":e.build_reservation_bytes,"reserved_bytes":e._reservation.0,"promotion_cpu_cost_seconds":c.build_seconds,"graph_cpu_seconds":c.graph_seconds,"resident_bytes":e.graph.resident_bytes()})});
+            let calibration=h.ready.as_ref().map(|e|{let c=e.calibration.lock().unwrap_or_else(|e|e.into_inner());serde_json::json!({"ef":c.quality.serving.unwrap_or(c.quality.trial),"trial_ef":c.quality.trial,"usable":c.usable,"samples":c.quality.len(),"paired_quality":c.quality.statistics(),"trial_cpu_seconds":c.trial_seconds,"build_cpu_seconds":e.measured_cpu_seconds,"build_wall_seconds":e.build_wall_seconds,"build_reservation_bytes":e.build_reservation_bytes,"reserved_bytes":e._reservation.0,"promotion_cpu_cost_seconds":c.build_seconds,"graph_cpu_seconds":c.graph_seconds,"resident_bytes":e.graph.resident_bytes(),"phase_searches":e.searches.load(Ordering::Relaxed),"phase_cpu_seconds":e.phase_cpu.iter().map(|v|v.load(Ordering::Relaxed) as f64/1e9).collect::<Vec<_>>()})});
             serde_json::json!({"attribute":k.attribute,"building":h.building.is_some(),"calibration":calibration,"heat_seconds":h.first.elapsed().as_secs_f64(),"query_rate":h.rate,"ivf_cpu_seconds":h.ivf_seconds,"retry_seconds":h.retry.saturating_duration_since(Instant::now()).as_secs_f64()})
         }).collect::<Vec<_>>();
         serde_json::json!({"graphs":graphs,"answered":self.0.hot_graph.answers.load(Ordering::Relaxed),"process_reserved_bytes":RESERVED.load(Ordering::Relaxed)})
