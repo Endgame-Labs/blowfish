@@ -5,8 +5,9 @@ import path, explicit promotion API, or query-budget setting. The bucket's IVF i
 source of truth. See `docs/design/hot-tier-graph.md` for admission, calibration, and eviction.
 
 `warm_graph_bench EXPORTED_IVF NQ_DATA SCRATCH_DIRECTORY [build_workers=2]` exercises the production
-bounded builder. It streams source clusters, subdivides oversized spatial partitions, constructs
-two-pass R32/L64 Vamana graphs, stitches boundary rows, streams rotated SQ8, and loads compact links.
+bounded builder. It streams rotated SQ8 from source clusters, constructs one whole-tier R32/L64
+Vamana graph with fixed-capacity adjacency, and publishes compact links. It retains no f16 corpus
+or source cache during construction.
 After construction it measures all 3,452 NQ queries against exact cosine top-10 truth. Exact rerank
 reads local corpus rows; this offline q/s is distinct from HTTP throughput and sparse-cache behavior.
 The builder removes its own spill directory on success, cancellation, or error. The caller owns and

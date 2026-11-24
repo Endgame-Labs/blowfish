@@ -67,12 +67,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let cpu_before = usage().0;
     let mut builder = HotGraphBuilder::new(Path::new(&args[3]), dims, count)?;
-    for (partition, file) in files.iter().enumerate() {
+    for file in &files {
         let index = open(file)?;
         for c in 0..index.cluster_count() {
             let (ids, bytes) = futures::executor::block_on(index.read_cluster_rows(c))?;
             let ids = ids.iter().map(|r| map[*r as usize]).collect::<Vec<_>>();
-            builder.append(partition, &ids, &bytes)?;
+            builder.append(&ids, &bytes, &|| false)?;
         }
     }
     let graph = pool.install(|| builder.finish(&|| false))?;

@@ -7894,3 +7894,134 @@ RSS is insufficient evidence for an economical builder. The replacement uses a f
 block cache inside the existing construction reservation, and releases its anonymous mapping before
 loading the resident graph. It remains subject to the full construction, foreground, recall, and
 charged-memory gates.
+
+
+### First bounded candidate: construction and evaluation cost
+
+The fixed source cache completed the full 2,681,468-row, 1,024-dimensional NQ build on an
+8-core Graviton3 host with **two construction workers**. Construction took **8,039.831 s wall**
+and **9,595.764 s CPU**. The completed graph retains **3,134,636,604 bytes**; constructor RSS at
+publication was approximately **3.02 GiB**. The construction source cache is released before
+loading that graph. The later resident exact-rerank benchmark loads another full f16 corpus,
+so its **8.16 GiB** process peak must not be reported as the bounded constructor's footprint.
+
+The following uses all 3,452 queries, top-k 10, a 30-row exact f16 rerank pool, and eight query
+threads. Source loading and construction are outside the query region. It is an in-process
+algorithm curve, not an HTTP or automatic-promotion result.
+
+| ef | Recall@10 | Mean distance evaluations | Queries/s |
+|---:|---:|---:|---:|
+| 64 | 0.898523 | 1,557.8 | 18,278 |
+| 96 | 0.921727 | 2,085.7 | 14,062 |
+| 128 | 0.935284 | 2,591.2 | 11,338 |
+| 160 | 0.943685 | 3,082.1 | 9,556 |
+| 192 | 0.948320 | 3,558.8 | 8,375 |
+| 256 | 0.955649 | 4,486.3 | 6,666 |
+| 384 | 0.965643 | 6,266.2 | 4,731 |
+| 512 | 0.970742 | 7,967.8 | 3,708 |
+
+This is a material evaluation-cost regression against G3's monolithic graph. In particular,
+subdividing overlapping coarse partitions into disjoint capped children can lose some of the
+coarse overlap's connectivity; this is a suspected cause, pending the overlap control. A two-nearest-partition overlap control and a same-host monolithic
+reference are being measured before drawing a shipping performance conclusion.
+
+The same host's monolithic HNSW reference (M=16, construction ef=100) took **712.230 s** for
+construction with eight workers, and approximately **13.0 GiB** peak RSS. The external process
+spent **5,654.52 CPU seconds** including source loading and graph output. Separate SQ8 encoding
+took **15.355 s**, excluding its source reload. That memory requirement prevents using this
+constructor inside the automatic warm reservation.
+
+At exactly **0.948320** mean recall, the HNSW reference uses **1,788.5 evaluations** and achieves
+**13,803 queries/s**, versus the bounded candidate's **3,558.8** and **8,375**. At ef104, HNSW
+reaches **0.951101** recall with **1,900.6 evaluations** and **13,063 queries/s**. These single-pass
+resident curves establish the evaluation gap; they do not establish an HTTP throughput ratio.
+
+### Rejected leaf-seeded NN-Descent control
+
+An optimistic resident control seeded each approximately 200-row IVF leaf against itself and its
+three nearest leaf centroids, retained the nearest 32 SQ8 neighbors using GEMM, ran two NN-Descent
+joins with sampled forward and reverse new/old neighbors, and applied alpha-1.2 RNG pruning to 32
+links plus the connectivity ring. It used the same SQ8 navigation and a 30-row stored-f16 rerank pool. This early control also
+rounded the query to f16 for reranking; this limits precise threshold comparisons. The large observed quality gap rejects this control;
+production reranking retains the original f32 query.
+
+On eight pinned Graviton3 cores, input loading took **2.754 s**, and SQ8/leaf-center preparation took
+**4.462 s**. The remaining graph algorithm took **34.423 s**: center routing **1.514 s**, GEMM seeding
+**17.625 s**, joins **4.894/3.258 s**, and final pruning **7.023 s**. Its full resident input was
+intentionally unbounded, with **10.38 GiB** total process peak; this does not pass the workspace gate.
+
+It fails the quality kill test: recall **0.372538 at 2,094.8 evaluations**, **0.487543 at 3,497.0**,
+and **0.608951 at 5,807.6**. Reject this implementation despite its construction time. These numbers
+are not a claim about every possible NN-Descent seeding or refinement scheme.
+
+### Whole-tier SQ8 construction control
+
+A global SQ8 Vamana control, with R32/L64, two passes, 2R transient reverse-neighbor capacity,
+and final pruning to R after each pass, took **130.984 s** on 32 offline Graviton3 cores. This
+includes SQ8 preparation after loading the input. Its rerank keeps the original f32 query and
+stored f16 rows. Unlike the partition controls, it sees the entire corpus during construction.
+
+| ef | Recall@10 | Mean distance evaluations |
+|---:|---:|---:|
+| 64 | 0.943975 | 1,536.3 |
+| 80 | 0.953476 | 1,797.8 |
+| 96 | 0.959589 | 2,053.9 |
+| 104 | 0.961645 | 2,179.3 |
+| 128 | 0.967034 | 2,552.8 |
+
+This passes the evaluation-budget kill test against the monolithic HNSW reference. The control
+retained the full f16 input and peaked at **9.30 GiB**; it is not a bounded-memory measurement.
+Its 32-thread query timings are not comparable with the eight-thread reference. The replacement
+production constructor streams SQ8, uses fixed-capacity compactly locked adjacency, retains no
+f16 source, and must pass the complete bounded, two-worker, and M4 gates.
+
+The two-nearest-partition control finished in **1,002.007 s** with 32 offline workers: 119 capped
+parts, at most 61,844 rows each, and 5,369,868 visits. It reached **0.949942 at 3,040.0 evaluations**,
+and **0.963036 at 4,413.2**. It improves the original bounded curve, but retains a material gap.
+A partition-only 2R-slack control was stopped after 16 parts and 84.846 algorithm seconds to
+prioritize the global SQ8 candidate; it supplies no full-build or recall result.
+
+### First bounded candidate: automatic admission and interference
+
+These two serving runs used the earlier partition constructor. They establish automatic admission
+and initial interference evidence, rather than the revised global constructor's final gate.
+
+Both serving runs began with ordinary sustained queries, admitted construction automatically after
+the ten-minute heat dwell, and retained IVF while construction was in progress. Neither imported a
+graph. The dedicated construction pool has two workers.
+
+The M4 server includes Q2 and MEM2, uses the default internal recall target of 0.96, a 4 GiB raw
+cache budget, and the default 4 GiB decoded budget. The fixture is an ordinary local object store.
+Its construction reservation is **4,755,117,628 bytes**. The same G3 HTTP protocol uses 16 persistent
+client processes, one connection each, all 3,452 quality queries, and 110,464 timed requests.
+
+| M4 phase | Recall@10 | HTTP queries/s |
+|---|---:|---:|
+| IVF before construction | 0.9608343 | 3,001.809 |
+| IVF during construction | 0.9608343 | 2,933.095 |
+
+That single pair shows a **2.29%** foreground reduction; it does not establish a confidence interval.
+During the measured construction pass, physical footprint was **3,819,159,552 bytes**, with a peak
+of **3,877,523,128 bytes** so far. That M4 build was stopped after about 38 minutes of construction to test the successful
+global SQ8 replacement. It supplies no completed-build or calibrated serving result. Final memory,
+calibration, and Qdrant gates use the revised constructor.
+
+A separate Linux S3 serving run, restricted to eight CPUs and a 16 GiB cgroup, measured **1,401.919**
+HTTP queries/s before construction and **1,393.713** during it, a **0.59%** difference in one pair.
+This run predates MEM2, uses 6 GiB of combined foreground cache budgets, and is an interference
+measurement only. Its initial charged-memory peak was **6,704,111,616 bytes**; the construction
+last observed peak was **12,251,926,528 bytes**, within the **14,620,135,068-byte** combined cache, graph,
+and headroom policy envelope and the **17,179,869,184-byte** cgroup cap. Total charged server memory
+must not be described as constructor workspace. AWS reclaimed this Spot host during construction,
+so it supplies no completed-build, final-memory, or calibrated serving result. The native M4 run
+continues independently.
+
+### Short S3 cold ABBA
+
+A short cold comparison on eight pinned cores of the same Graviton3 instance used baseline
+`f089d97` and candidate `1310d17`. Each run started a fresh engine, and dropped its caches before
+each of eight distinct queries. No graph was present. Mean latencies for A1/B1/B2/A2 were
+**368.95/200.36/163.61/232.02 ms**; combined baseline/candidate medians were **261.54/176.95 ms**.
+All 32 answers returned identical rows and distance bits. Backend request counts vary even between
+the two baseline runs because of concurrent speculative IVF reads. Large ordering and network
+variation prevents a speedup claim; this short gate found no cold latency regression.

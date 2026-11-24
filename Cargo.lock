@@ -410,6 +410,7 @@ dependencies = [
  "hnsw_rs",
  "libc",
  "numkong",
+ "parking_lot",
  "proptest",
  "rayon",
  "roaring",

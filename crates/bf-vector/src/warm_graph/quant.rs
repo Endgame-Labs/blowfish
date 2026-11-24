@@ -1,13 +1,12 @@
 //! Symmetric eight-bit scalar codes after the production signed Hadamard rotation.
-use super::{rabitq::RaBitQ, vectors::Vectors};
+use super::rabitq::RaBitQ;
 use numkong::Dot;
-use rayon::prelude::*;
 pub struct Codes {
     pub dims: usize,
     pub values: Vec<i8>,
     pub scales: Vec<f32>,
 }
-fn encode(row: &[f64]) -> (Vec<i8>, f32) {
+pub(super) fn encode(row: &[f64]) -> (Vec<i8>, f32) {
     let scale = row.iter().map(|x| x.abs()).fold(0f64, f64::max) / 127.;
     let scale = scale.max(f64::MIN_POSITIVE);
     (
@@ -18,24 +17,17 @@ fn encode(row: &[f64]) -> (Vec<i8>, f32) {
     )
 }
 impl Codes {
-    pub fn build(v: &Vectors) -> Self {
-        let rq = RaBitQ::new(v.dims, 42).unwrap();
-        let dims = v.dims.next_power_of_two();
-        let mut values = vec![0i8; v.len() * dims];
-        let scales = values
-            .par_chunks_mut(dims)
-            .enumerate()
-            .map(|(id, out)| {
-                let (code, scale) = encode(&rq.rotate(&v.normalized(id as u32)));
-                out.copy_from_slice(&code);
-                scale
-            })
-            .collect();
-        Self {
-            dims,
-            values,
-            scales,
-        }
+    pub fn between(&self, a: u32, b: u32) -> f32 {
+        let a = a as usize;
+        let b = b as usize;
+        (1. - i8::dot(
+            &self.values[a * self.dims..(a + 1) * self.dims],
+            &self.values[b * self.dims..(b + 1) * self.dims],
+        )
+        .unwrap() as f32
+            * self.scales[a]
+            * self.scales[b])
+            .max(0.)
     }
     pub fn prepare(&self, q: &[f32]) -> (Vec<i8>, f32) {
         encode(&RaBitQ::new(q.len(), 42).unwrap().rotate(q))

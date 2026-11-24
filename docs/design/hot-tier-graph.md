@@ -25,41 +25,41 @@ No second document store or alternate wire response is introduced.
 ## Bounded construction
 
 `bf_vector::warm_graph::HotGraphBuilder` accepts clusters of little-endian f16 vectors and their
-original tier row numbers. Dense node IDs follow source slab and IVF-leaf order. This keeps the
-navigation codes of nearby source rows together without changing their tier coordinates.
+original tier row numbers. Dense node IDs follow source slab and IVF-leaf order. It builds one
+whole-tier graph over resident SQ8, eliminating both partition boundaries and random f16 stitching.
+The initial partition-and-stitch implementation and its rejected controls are measured in Round G4.
 
-1. Stream validated rows into a uniquely owned local spill. Construction reads bypass foreground
-   range admission, and source metadata opens run outside decoded-cache admission. Source readers
-   retained for exact rerank can use normal foreground caches after installation.
-2. Compute normalized empirical means of the original spatial slabs, one row at a time. Assign
-   each row to its source slab, and optionally its nearest other slab when the two nearest center
-   distances differ by at most a factor of 1.07. There is at most one extra copy per row.
-3. Subdivide these overlapping partitions with median projection splits before loading vectors.
-   The row cap is dimension-dependent, at most 65,536, with a 384 MiB partition allowance. A median
-   split always progresses, including for identical, collinear, or severely skewed rows. Compute
-   boundary membership before subdivision: using the smaller child means instead can spend overlap
-   inside one coarse slab and lose the intended cross-slab connections.
-4. Build one capped partition at a time using two-pass Vamana, R=32, L=64, and pruning alpha 1 then
-   1.2. Reciprocal edges are robust-pruned. Boundary copies merge into the global graph with another
-   robust prune against original f16 distances. Encode rotated SQ8 per partition, and stream global
-   codes and adjacency to spill files.
-5. Load fixed-width compact links, degree bytes, SQ8, and the explicit node-to-tier-row map. Two
-   additional ring links guarantee connectivity even for degenerate partitions. Partition medoids
-   provide resident entry points. Construction f16 vectors and all owned spill files are released.
+1. Validate each row, normalize it, apply the fixed signed Hadamard rotation, and stream SQ8 plus
+   its scale into a uniquely owned local spill. Accumulate a normalized empirical mean. Original
+   f16 rows are released after each bounded source cluster; no f16 corpus or source cache is kept.
+2. Reserve the whole construction before reading source data. Load compact SQ8 and scales from the
+   flushed spool, releasing consumed file pages. Refuse the optional graph if it cannot fit.
+3. Choose the code nearest the normalized empirical mean as a resident entry. A zero mean uses
+   the first valid normalized row. Build two-pass Vamana with final degree 32, L=64, and pruning
+   alpha 1 then 1.2, using only SQ8 construction distances.
+4. Each construction row owns a fixed-capacity 64-neighbor array under a compact lock. Reverse
+   additions prune on overflow, and each pass prunes every row back to 32. Searches copy a bounded
+   array before releasing its lock. The constructor frontier periodically removes stale nodes
+   outside the monotonically improving beam threshold.
+5. Convert construction adjacency into fixed-width immutable links, append two connectivity-ring
+   edges, and retain the original tier-row map. Release all construction adjacency and owned spool
+   files. Only ordinary queries read original f16 rows, for exact reranking of the top 30.
 
-The source, code, and adjacency files are disposable implementation details, not persisted index
-formats. Repeated source reads use a 64 KiB block cache with CLOCK eviction, capped at the smaller
-of the reserved SQ8 payload and 2 GiB. Anonymous mapping ownership makes its physical pages directly
-releasable before resident graph loading, avoiding allocator retention of a second working set. Linux flushes and releases consumed spill pages with `posix_fadvise`; macOS uses uncached
-spill descriptors. Streaming center and projection passes also release consumed pages. Dropping a
-builder cleans its unique directory on success, refusal, error, or cancellation. The engine wraps
-it in the existing process-owned spill lock, so startup recovery can reclaim a crashed build while
-leaving another process's active build alone. It uses the disk-cache directory when available, and
-the standard temporary directory otherwise; a disk-cache setting is not required. Measurement
-processes direct temporary files into their owned run directory.
+There are no spatial partitions to overflow or subdivide in this constructor. Oversized tiers are
+refused by the process reservation and continue on IVF. Reservation accounts separately for the
+source, construction, publication, and retained-query peaks, including simultaneous old adjacency
+and new compact links, two construction scratch sets, query scratch, and allocator allowance. Fixed
+neighbor arrays and compact locks avoid a hidden per-node allocator or operating-system lock budget.
+
+The SQ8 spool is a disposable implementation detail, not a persisted index format. Linux releases
+consumed clean spool pages with `posix_fadvise`; macOS uses uncached descriptors. Dropping a builder
+cleans its unique directory on success, refusal, error, or cancellation. The engine uses the existing
+process-owned spill lock, so startup recovery can reclaim a crashed build while leaving another
+process's active build alone. It uses the disk-cache directory when available, and the standard
+temporary directory otherwise. Measurement processes place temporary files in their owned run.
 
 One process-wide construction slot prevents competing graph builders. A dedicated Rayon pool has
-at most two workers, using Linux nice 5 or macOS utility QoS. CPU passes check cancellation at row and bounded-partition boundaries, and periodically check process memory headroom. Automatic recluster construction takes priority;
+at most two workers, using Linux nice 5 or macOS utility QoS. CPU passes check cancellation at source-row, graph-point, and bounded-phase boundaries, and periodically check process memory headroom. Automatic recluster construction takes priority;
 it also subtracts existing graph reservations when sizing its own work.
 
 Source decoding, local I/O, and construction all run on that pool. The blocking job retains the
@@ -108,8 +108,8 @@ cache effects. The target-host memory gate must validate the complete working se
 
 A fresh process starts on IVF. Promotion requires ten minutes of sustained eligible queries,
 including requests with payload-cache misses; a gap longer than a minute resets that dwell. A 15-minute decaying rate and measured foreground
-worker CPU estimate the namespace's future savings. Initial scheduling uses a conservative construction
-estimate of one CPU millisecond per source row. It is only a scheduling estimate.
+worker CPU estimate the namespace's future savings. Initial scheduling estimates one CPU millisecond per source row. This is a scheduling estimate,
+not a construction-time guarantee; installation uses measured construction cost.
 
 A finished graph initially serves recall trials, while foreground queries retain IVF. The existing
 paced exact-recall sampler, or the ordinary recall endpoint, compares those trials against exhaustive
@@ -153,7 +153,7 @@ delete or replacement is observed through normal snapshot refresh or the running
 ## Validation and measurement tools
 
 Vector tests cover source validation, cancellation, spill cleanup, original row coordinates, live
-masks, bounded subdivision of duplicate vectors, compact navigation, bounded frontier capacity, and
+masks, fixed construction adjacency, mid-build cancellation, compact navigation, bounded frontier capacity, and
 visitation wraparound. Engine tests exercise exact-recall calibration, WAL updates and deletes,
 indexed masks, delta tiers, backend isolation, generation cancellation, unsupported-shape equality,
 and active-snapshot reservation lifetime.

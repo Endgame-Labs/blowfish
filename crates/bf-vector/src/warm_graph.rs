@@ -1,11 +1,11 @@
 //! Disposable, bounded-memory row graphs for warm immutable cosine-f16 tiers.
 //!
-//! Source rows and partial adjacency spill to caller-owned local storage. Nothing here defines
-//! a bucket format. Construction uses the caller's CPU pool and checks cancellation between rows.
+//! Quantized source codes spill to caller-owned local storage. Construction retains global SQ8
+//! and fixed-capacity adjacency, without a full f16 corpus or spatial partitions. Nothing here
+//! defines a bucket format. The caller supplies a pool with at most two construction workers.
 mod builder;
 mod navigation;
 mod quant;
-mod source;
 mod vamana;
 mod vectors;
 use crate::{Error, Result, RoaringBitmap, rabitq};
@@ -61,13 +61,7 @@ impl HotGraph {
         if rows == 0 || rows > u32::MAX as usize || dims == 0 || dims > 4096 {
             return None;
         }
-        let resident =
-            (rows as u64).checked_mul((dims.next_power_of_two() + 160 + workers) as u64)?;
-        // Includes the capped partition's packed input, decoded f16, codes, links, and heaps.
-        resident
-            .checked_add(512 << 20)?
-            .checked_mul(5)
-            .map(|n| n / 4)
+        vamana::reservation(rows as u64, dims.next_power_of_two() as u64, workers as u64)
     }
     /// Number of source rows still eligible in the supplied tier mask.
     pub fn live_count(&self, mask: &RoaringBitmap) -> usize {
@@ -174,7 +168,7 @@ mod tests {
                 .flatten()
                 .flat_map(|x| f16::from_f32(*x).to_le_bytes())
                 .collect::<Vec<_>>();
-            b.append(part, &ids, &packed).unwrap();
+            b.append(&ids, &packed, &|| false).unwrap();
         }
         let graph = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
@@ -223,12 +217,12 @@ mod tests {
         let root = root();
         let _cleanup = Cleanup(root.clone());
         let mut b = HotGraphBuilder::new(&root, 2, 1).unwrap();
-        assert!(b.append(0, &[1], &[0; 4]).is_err());
+        assert!(b.append(&[1], &[0; 4], &|| false).is_err());
         let p = [f16::ONE, f16::ZERO]
             .into_iter()
             .flat_map(|x| x.to_le_bytes())
             .collect::<Vec<_>>();
-        b.append(0, &[1], &p).unwrap();
+        b.append(&[1], &p, &|| false).unwrap();
         let cancel = HotCancellation::default();
         cancel.cancel();
         assert!(b.finish(&|| cancel.cancelled()).is_err());

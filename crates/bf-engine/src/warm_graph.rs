@@ -419,7 +419,7 @@ impl Cache {
                 {
                     None
                 } else {
-                    // Initial scheduling is conservative. Installation and calibration use the
+                    // Initial scheduling is an estimate. Installation and calibration use the
                     // actual measured construction cost and namespace query costs below.
                     let forecast = h.rate * 86400. * h.ivf_seconds * 0.5;
                     let estimate = set.rows() as f64 * 0.001;
@@ -561,7 +561,9 @@ async fn read_source(
                     .map(|(ordinal, &row)| (row, [slab_id as u32, cluster as u32, ordinal as u32])),
             );
             builder
-                .append(slab_id, &ids, &packed)
+                .append(&ids, &packed, &|| {
+                    cancel.cancelled() || engine.0.stop.stopping()
+                })
                 .map_err(segment::index_error)?;
         }
         let context = read_cache::ReadContext {
@@ -665,8 +667,9 @@ impl Engine {
             return Ok(None);
         };
         let Some(estimate) = HotGraph::reservation(count, dims, workers)
-            .and_then(|n| n.checked_add(metadata.saturating_mul(2)))
-            .and_then(|n| n.checked_add(count as u64 * 16))
+            .and_then(|n| n.checked_add(metadata.saturating_mul(3)))
+            .and_then(|n| n.checked_add(count as u64 * 20))
+            .and_then(|n| n.checked_add(1 << 20))
         else {
             return Ok(None);
         };
@@ -702,7 +705,7 @@ impl Engine {
         let root = scratch_dir(self);
         std::fs::create_dir_all(&root).map_err(segment::index_error)?;
         let spill_bytes = (count as u64)
-            .saturating_mul((dims * 2 + dims.next_power_of_two() + 136) as u64)
+            .saturating_mul((dims.next_power_of_two() + 4) as u64)
             .saturating_mul(2);
         if !disk_available(&root, spill_bytes) {
             return Ok(None);

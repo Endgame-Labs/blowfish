@@ -10,6 +10,7 @@ repository.workspace = true
 legacy-fixtures = []
 
 [dependencies]
+parking_lot = "=0.12.5"
 libc = "=0.2.191"
 bytes = "=1.12.1"
 crc32fast = "=1.5.5"

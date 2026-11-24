@@ -18,6 +18,29 @@ async fn query(e: &Engine, ns: &str, body: Value) -> Value {
     .unwrap()["rows"]
         .clone()
 }
+// Other unit tests create engines with large nominal cache budgets in this process. A real
+// optional graph may refuse that pressure. Wait for admission rather than assuming exclusivity.
+async fn admitted_entry(e: &Engine, set: &SlabSet) -> Entry {
+    let started = Instant::now();
+    loop {
+        let result = e
+            .construct_hot_graph("hot", "vector", set, &HotCancellation::default())
+            .await;
+        match result {
+            Ok(Some(entry)) => return entry,
+            result => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(120),
+                    "test graph was never admitted; last result was an error: {}",
+                    result.is_err()
+                );
+                let answer = query(e, "hot", json!({"rank_by":["id","asc"],"top_k":1})).await;
+                assert_eq!(answer.as_array().unwrap().len(), 1);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -79,12 +102,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     let key = Key::new("hot", &state, "vector", set);
     // The private constructor exercises exactly the automatic source/build path, without
     // making a test spend ten minutes generating heat.
-    let cancel = HotCancellation::default();
-    let entry = e
-        .construct_hot_graph("hot", "vector", set, &cancel)
-        .await
-        .unwrap()
-        .unwrap();
+    let entry = admitted_entry(&e, set).await;
     assert_eq!(entry.graph.len(), 2500);
     let held = Arc::new(entry);
     let mut heat = Heat::new(Instant::now());
@@ -189,12 +207,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         .find(|s| s.dir.key != key.tier)
         .unwrap();
     let delta_key = Key::new("hot", &current, "vector", delta_set);
-    let delta = Arc::new(
-        e.construct_hot_graph("hot", "vector", delta_set, &HotCancellation::default())
-            .await
-            .unwrap()
-            .unwrap(),
-    );
+    let delta = Arc::new(admitted_entry(&e, delta_set).await);
     assert_eq!(delta.graph.len(), 50);
     let mut delta_heat = Heat::new(Instant::now());
     delta_heat.rate = 100.;
