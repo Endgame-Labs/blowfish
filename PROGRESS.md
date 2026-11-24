@@ -4,6 +4,15 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Bulk loads no longer start reclustering early** (round RR2; `docs/benchmarks.md`, "Round RR2"). Load detection
+  now holds through each 429's advertised Retry-After, compaction stays deferred across those retries, and the
+  quiet period starts when queued writes actually complete instead of when their batch was prepared. On full NQ
+  with four clients the load takes 150 s instead of 168, with write p90 808 ms instead of 1,961. With eight
+  clients, the first base covers all 2.68M rows instead of a premature 730K-row base plus a merge, and the
+  index is ready in 219 s instead of 266. Single-assignment recluster (64, 96, and 112 samples per leaf) and
+  coarse pre-partitioned ingest were measured and rejected. Recall across five loads of the unchanged algorithm
+  varies by up to 0.0017, so layout-deterministic sampling is a follow-up.
+
 - **Warm vector queries 17-19% faster over HTTP** (round Q2; `docs/benchmarks.md`, "Round Q2"). Warm query
   plans now run on a fixed pool of CPU workers (polled once there, handed back to the I/O path on a cache miss),
   and the engine admits twice the available CPUs in queries at once, with a floor of 8. On NQ at 8 cores:

@@ -7076,3 +7076,181 @@ The owned c7g.4xlarge, its root volume, its temporary key pair, and its security
 group are removed after measurements. No S3 objects or paid oracle namespaces are
 created. Scratch results are discarded after the retained numbers enter this
 record.
+
+## Round RR2: recluster scheduling under bulk loads
+
+## Retained changes
+
+- `d208436`: remember each namespace generation's advertised backpressure retry deadline on its
+  handle. Both pipelined writes and barrier writes record 429s. Deadlines use a monotonic clock,
+  include whole-second Retry-After rounding and the ordinary two-second quiet allowance, and only
+  extend when another 429 arrives. Reclustering waits for outstanding retry deadlines or a WAL at
+  its configured backpressure limit. Checkpoint refreshes preserve the hint; namespace recreation
+  does not inherit it.
+- `00e63f6`: compaction and reclustering use the same activity predicate. Compaction stays deferred
+  across retry pauses, including when the tail has been fully indexed. Forced compaction, protected
+  sources, and the existing segment-count cap retain their behavior.
+- `2aa772a`: track queued write and delete operations through their final reply, including staged
+  WAL work. The activity token belongs to the operation, so caller cancellation does not release
+  it prematurely. The ordinary quiet interval starts at actual operation completion. This extra
+  signal applies only to recently classified bulk namespaces, preserving ordinary steady-write
+  behavior. A private operation pattern in snapshot hydration was updated for the token.
+
+The first single-assignment trial exposed an incomplete base over 1,830,000 rows while clients were
+still loading. A traced repeat received four 15.9–16.4-second retry delays. With the correction, the
+first base covered all 2,681,468 rows. A fixed five-second debounce would not have covered those waits.
+The preliminary incomplete trial is excluded from comparisons.
+
+The eight-client control exposed a second cause without any 429s: a first base over only 730,000
+rows. Namespace `updated_at` is captured during write preparation, before WAL serialization, upload,
+and commit. Its p50/p90 write latency was 2.49/4.30 seconds, so a two-second test of that timestamp
+was not a truthful quiet interval. Queued activity and completion-based quiet fix this without changing
+wire timestamps. The final eight-client repeat starts one first base over all 2,681,468 rows.
+
+Public APIs and persistent formats are unchanged. The retry hint and the extra private tier-selection
+argument are internal to bf-engine. There are no dependency or bf-vector changes.
+
+### Paired measurements
+
+One owned Spot c7gd.2xlarge: eight Graviton3 cores, 16 GiB RAM, and local NVMe. Native Rust 1.100.0,
+Clang 19 C compilation, and Clang 22 linking with compiler-rt; no native Rust CPU flags. All compilation
+and tests ran on the instance, with no compilation competing with timed loads or builds.
+
+Full NQ: 2,681,468 f16 vectors, 1,024 dimensions, cosine, and all 3,452 quality queries at top_k 10.
+The supplied prepared data was copied read-only. I2 prepares 5,000-row request bodies once, and timing
+includes body reads, writes, and durable acknowledgments. Every run uses a fresh local store, a 4 GiB
+payload cache, no disk cache, and cleared OS page caches before loading. Global Rayon, Tokio, and the
+recluster pool each use four threads on the eight-core host. Server and loader use nice 19.
+
+No foreground queries compete with timed ingest or building. Quality sweeps run afterward in separate
+server processes. Absolute times and RSS therefore differ from RR1's query-interleaved run; the paired
+comparisons here are the evidence. Readiness is sampled every 250 ms after the loader's final return.
+A scratch I2 copy adds retry timestamps without changing request bodies or retry behavior.
+
+| Arm | Clients | I2 load, s | Final acknowledgment to full tier, s | Full build, s | Recall@10, 48 | Recall@10, 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| Original main | 4 | 168.062 | 222.688 | 217.715 | 0.951130 | 0.961298 |
+| Single assignment, 64 samples | 4 | 161.030 | 161.525 | 156.579 | 0.949276 | 0.959994 |
+| Single assignment, 96 samples | 4 | 156.464 | 187.868 | 179.203 | 0.949594 | 0.959762 |
+| Single assignment, 112 samples | 4 | 168.576 | 200.556 | 194.251 | 0.948667 | 0.958575 |
+| Retry/compaction fixes, A (pre-final) | 4 | 161.360 | 224.119 | 218.596 | 0.950521 | 0.961530 |
+| Retry/compaction fixes, B (pre-final) | 8 | 184.099 | 265.828 | 215.392 | 0.951072 | 0.961559 |
+| All three fixes, A | 4 | 149.575 | 231.872 | 225.384 | 0.950116 | 0.960747 |
+| All three fixes, B | 8 | 169.756 | 219.450 | 214.197 | 0.949594 | 0.959907 |
+
+The acceptance gate is a loss of at most 0.001 against the paired original main at **both** probe counts,
+plus readiness ≤198 seconds. The 64-sample arm loses 0.001854 / 0.001304; 96 loses 0.001535 at both;
+112 loses 0.002462 / 0.002723 and also misses time. None ships. Historical RR1 thresholds alone would
+have accepted the 64-sample arm. Later unchanged-algorithm controls also expose variation at this
+scale, so these strict gate failures are conservative rejections, not proof that every observed loss
+is caused by single assignment. No sampling change is shipped.
+
+| Arm | Leaf training, s | Leaf assignment total, s | Post-acknowledgment RSS peak, GB | Whole-process HWM, GB |
+|---|---:|---:|---:|---:|
+| Original main | 21.354 | 153.911 (two passes) | 1.395 | 2.296 |
+| 64 samples | 38.111 | 75.471 | 1.944 | 4.131 |
+| 96 samples | 62.375 | 73.140 | 3.321 | 3.554 |
+| 112 samples | 72.734 | 78.015 | 2.295 | 4.201 |
+| Retry/compaction fixes, A | 20.878 | 153.677 (two passes) | 0.919 | 4.191 |
+| All three fixes, A | 21.800 | 158.638 (two passes) | 2.286 | 4.079 |
+| All three fixes, B | 20.595 | 149.164 (two passes) | 1.563 | 2.667 |
+
+RSS sampling includes the last indexer drain between acknowledgment and build start. Different
+asynchronous flush and compaction layouts affect peak memory; these are not isolated training-RSS deltas.
+
+The pre-final retry/compaction-only four-client load has ten 15–17-second retries, versus zero in
+the original main control.
+It improves acknowledged throughput from 15,955 to 16,618 rows/s (1.042x), with write p90 1,960.7 to
+1,277.5 ms. This is one end-to-end pair, not a confidence interval. Post-acknowledgment readiness is
+essentially unchanged and misses 198 seconds. The first base uses 30 source segments, versus the
+original control's more fragmented layout, and covers the full corpus.
+
+The final four-client load improves acknowledged throughput from 15,955 to 17,927 rows/s (1.124x),
+and write p90 from 1,960.7 to 807.5 ms, with twelve 15–17-second retries. Its first base covers the full
+corpus over 24 segments. Readiness is 231.872 seconds versus original main's 222.688 seconds; this
+round does **not** claim a readiness speedup for the four-client profile or meet 198 seconds.
+
+At eight clients, actual queued-write tracking removes the 730K intermediate base and its later merge.
+Within that same eight-client profile, load improves 184.099 to 169.756 seconds, and full-tier readiness
+265.828 to 219.450 seconds. Both runs have zero 429s. The final run's only first build covers the full
+corpus over 100 segments. The pre-final row's 215.392-second build is its final merge, excluding the
+75.294-second intermediate base; its readiness includes that scheduling penalty.
+
+The four- and eight-client runs within each phase use **identical binaries and unchanged clustering**.
+Eight clients deliberately change batching/retry behavior for spread testing; eight-versus-four-client
+throughput is not a claimed compaction effect. These are individual end-to-end measurements, not
+confidence intervals.
+
+#### Control recall spread
+
+- The pre-final unchanged-algorithm pair differs by 0.0005504 / 0.0000290 (19 / 1 neighbor hits).
+- The final unchanged-algorithm pair differs by 0.0005214 / 0.0008401 (18 / 29 hits).
+- Across original main and all four unchanged-algorithm scheduler controls, the range is
+  0.0015353 / 0.0016512 (53 / 57 hits).
+- Excluding the pre-final eight-client run that trained coarse cells on a 730K prefix, the four
+  full-corpus-first-base controls still span 0.0015353 / 0.0016222 (53 / 56 hits).
+
+This confirms that fresh-load layout variability reaches or exceeds the 0.001 gate even when clustering
+code is unchanged. In particular, final four-client recall at 48 probes loses 35 hits against original
+main: 0.0010139, narrowly outside the strict gate. Final eight-client losses are 0.0015353 / 0.0013905.
+These are reported rather than labelled passes. A reliable sub-0.001 algorithm comparison needs stable
+input ordering/sampling or a frozen-layout paired control; the current one-run gate is too close to
+its observed end-to-end variation. The 198-second performance target remains unmet independently.
+
+### Other kill results
+
+1. **Exact group-outer strips:** preserving RR1 assignments requires preserving the four-row unions.
+   Removing union bloat changes the actual search space. A pass-one runner-up/top-16 bound also does
+   not cover centers newly admitted by refined group routing. The prototype retains those semantics,
+   uses SGEMM as a conservative rejection filter, and recomputes possible winners with the original
+   four-row dot arithmetic. A 4,096-row kernel control takes 0.2024 s with direct dots versus 0.2270 s
+   with strips (0.892x); 32,768 rows take 1.8612 versus 2.1191 s (0.878x), allowing 4,096 gathered rows
+   per matrix call. Both return identical assignments. Shapes are 1,024 dimensions, 13,400 leaves,
+   640 groups, and 40-group unions. These are synthetic kernel controls, not full-NQ leaf-stage
+   measurements. This implementation fails its prerequisite; it does not prove a ceiling for every
+   possible group-outer implementation. The prototype is discarded.
+2. **Free coarse routing:** 32 zero centers and free balanced assignments remove all segment training
+   and distance assignment while retaining cluster-level encoding parallelism. Full-NQ I2 load is
+   146.417 s, 18,314 rows/s, zero retries, and 1,954.4 ms write p90: only 1.148x original main, below
+   1.3x. The final build is stopped after the failed ingest prerequisite; full-tier time and quality
+   are not measured for this arm. Adaptive batching means this is an experimental optimistic arm,
+   not a mathematical bound across every batching policy. No coarse-routing change ships.
+3. **Ingest-time staging:** RR1's copy and coarse stages sum to 21.169 s, not the advisor's assumed
+   70 s. Current paired main spends 11.436 + 0.167 + 3.614 = 15.217 s. Perfectly hiding all three
+   leaves 207.471 s readiness, still above 198 s, before reconciliation or ingest overhead. This
+   rejects staging alone by its critical-path bound; combinations with other changes remain open.
+4. **Explicit ARM L2:** 0.1549 s existing versus 0.1437 s explicit NEON (1.078x). The existing lane
+   loop already compiles efficiently on ARM. This isolated gain does not justify another kernel;
+   the prototype is discarded.
+
+### Validation and limitations
+
+Native commands before each commit:
+
+```sh
+cargo fmt --all
+cargo clippy --locked -p bf-engine -p bf-vector --all-targets -- -D warnings
+cargo test --locked -p bf-engine -p bf-vector -- --test-threads=2
+```
+
+All pass: the final run has **225 passed, zero failed, and seven ignored**, including doctests.
+Regressions cover a fully indexed ten-second retry gap against a 21-second advertised wait,
+expiry, shorter and longer subsequent retries, namespace recreation, the exact WAL threshold, real
+429s from both commit paths, checkpoint refresh, compaction expiry, forced compaction, the segment cap,
+protected sources, queued work after caller cancellation, actual completion-based quiet, and ordinary
+steady-write classification. Full-workspace and official-SDK compatibility gates remain coordinator work.
+
+Retry deadlines are node-local scheduling hints. Persisted bulk history and WAL checks provide the
+existing restart/cross-node fallback; these deadlines themselves are not propagated across nodes or
+restarts. They do not affect durable write ordering or manifest fencing.
+
+Independent loads produce different flush layouts and segment-derived global row ordering. Coarse
+sampling, leaf sampling, and four-row candidate unions depend on that ordering. A hash of **document
+IDs**, rather than the segment-derived global row number, is the useful stable key. Coarse sampling
+alone would not make the whole build layout-invariant: leaf samples and within-group block order also
+need attention. No sampling change ships. Reading stable IDs and preserving bounded memory/I/O need
+measurement before such a change.
+
+The coordinator should update PROGRESS.md, benchmark/design documentation, and run workspace plus
+both-mode SDK compatibility checks before merging. No additional crate change is required for the three
+scheduling fixes. Cross-node persistence of retry hints would require broader metadata work.
