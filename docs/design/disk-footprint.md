@@ -239,12 +239,22 @@ Two additional reader requirements emerged during implementation:
 
 Filtered tier queries shift exact per-segment filter results back through lineage into global rows,
 then intersect them with each slab's resident row list. Their probe plan uses those matching counts
-and the filtered probe cap. Sparse global slab IDs have no dense row-to-cluster map, so they use the
+and the full filter selectivity. The historical segment probe cap under-probed a tier when matches
+were spread throughout its global clustering; a tier now preserves the expected unfiltered
+candidate coverage, bounded by the number of clusters. Paged directory selection uses the same
+selectivity-adjusted budget, computed from actual matching vector rows. The budget adds a margin
+of one surviving witness, plus one standard deviation of the trials needed for `top_k + 1`
+survivors under independent thinning. This depends on selectivity and `top_k`, rather than a
+fixed probe multiplier; correlated filters still require measured recall checks. A filter that
+keeps every vector row uses the unfiltered budget. Sparse global slab IDs have no dense row-to-cluster map, so they use the
 existing masked code scan, rather than the dense segment map's direct exact-fetch shortcut.
 Snapshot warm-up and the planner share bounded cached predicate results for each immutable
 segment live generation. The key includes its files, schema, and predicate; WAL shadows are
 removed afterward. This avoids repeatedly decoding high-cardinality ID-filter dictionaries,
 without reusing a mask across a flush, schema change, or compaction.
+Predicate bitmaps receive one forty-eighth of the existing decoded-cache budget, taken from
+the column-block portion. This keeps large ID dictionaries from evicting their own predicate
+results, and preserves the general LRU budget reserved by compiled warm tiers.
 
 Branches and copies use version-2 pins containing covering tiers and vector lineage, as well as
 segments. GC protects every pinned slab, directory, row list, coarse-cell object, and lineage map.

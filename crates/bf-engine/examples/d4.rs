@@ -1,6 +1,7 @@
 //! Paired D4 object-store measurements. All configuration and output paths are supplied by the caller.
 //! Usage: d4 STORAGE_JSON MODE OUTPUT [WORKLOAD_JSON] [QUERY_INDEX].
-//! Modes: index, recluster, gc, measure, short (64 queries), and first (one fresh-process query).
+//! Modes: index, recluster, gc, measure, short (64 queries), first (one fresh-process query),
+//! and quality (result rows without timing phases).
 use bf_engine::{Engine, EngineConfig, ReclusterOptions};
 use bf_storage::{Storage, StorageConfig};
 use bf_types::QueryRequest;
@@ -64,6 +65,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         "gc" => {
             result["deleted"] = json!(engine.collect_garbage("nq").await?);
+        }
+        "quality" => {
+            let requests: Vec<QueryRequest> = serde_json::from_slice(&std::fs::read(&args[3])?)?;
+            let mut rows = Vec::new();
+            for request in requests {
+                rows.push(engine.query("nq", request).await?.result.rows);
+            }
+            result["rows"] = json!(rows);
         }
         "first" => {
             let requests: Vec<QueryRequest> = serde_json::from_slice(&std::fs::read(&args[3])?)?;

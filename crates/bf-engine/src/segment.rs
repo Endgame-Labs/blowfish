@@ -1623,15 +1623,12 @@ pub(crate) async fn filter_live_from(
 ) -> Result<Arc<RoaringBitmap>, ApiError> {
     let key =
         serde_json::to_string(&("filter-live-v1", segment, f, schema)).map_err(index_error)?;
-    if let Some(rows) = read_cache::get(&key, 0) {
+    if let Some(rows) = read_cache::predicate(&key) {
         return Ok(rows);
     }
     let live = live(store, segment).await?;
     let rows = filter_rows_from(store, source, segment, f, schema, &live).await?;
-    // Roaring containers can reserve more than their serialized form. Charge a conservative
-    // multiple, plus the key and Arc, to the existing bounded decoded metadata cache.
-    let bytes = rows.serialized_size() as u64 * 2 + key.len() as u64 + 128;
-    Ok(read_cache::insert(&key, bytes, rows))
+    Ok(read_cache::insert_predicate(&key, rows))
 }
 
 /// Evaluate scalar, array, range, and boolean filters over sorted value dictionaries.

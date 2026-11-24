@@ -408,7 +408,9 @@ pub(crate) async fn prefetch_scan(
             matching,
             clusters,
             target,
+            k,
             filtered: false,
+            slabs: layout == Layout::Slabs,
             spread: layout_spread(config, dir, layout, &seg_rows, &|_| false),
         },
         config,
@@ -635,9 +637,38 @@ struct Totals {
     matching: usize,
     clusters: usize,
     target: usize,
+    k: usize,
     filtered: bool,
+    slabs: bool,
     /// [`independent_spread`] of the layout.
     spread: f64,
+}
+impl Totals {
+    /// Preserve the unfiltered candidate coverage after a tier's rows are thinned by a filter.
+    /// Segment indexes retain their historical probe cap; a capped tier probe lost recall when
+    /// matching rows were spread across the global clustering instead of a few whole segments.
+    fn thinning(&self, config: &EngineConfig) -> f64 {
+        let thin = self.ann_rows as f64 / self.matching.max(1) as f64;
+        if self.filtered && self.slabs {
+            filtered_tier_scale(self.ann_rows, self.matching, self.k)
+        } else if self.filtered {
+            thin.min(config.filtered_probe_cap.max(1) as f64)
+        } else {
+            thin
+        }
+    }
+}
+
+/// Inverse selectivity, with one additional surviving witness and one standard deviation of
+/// the trials needed to find `k + 1` survivors under independent thinning. The margin depends
+/// on both selectivity and k; correlated real filters still need measured recall validation.
+pub(crate) fn filtered_tier_scale(rows: usize, matching: usize, k: usize) -> f64 {
+    if matching >= rows {
+        return 1.0;
+    }
+    let p = matching.max(1) as f64 / rows.max(1) as f64;
+    let witnesses = k.saturating_add(1).max(1) as f64;
+    (witnesses + (witnesses * (1.0 - p)).sqrt()) / (p * k.max(1) as f64)
 }
 
 /// [`independent_spread`] over a directory's searched ANN segments; 1 for slabs (one clustering).
@@ -743,11 +774,10 @@ fn pick_clusters(
 ) -> Vec<usize> {
     let Totals {
         ann_rows,
-        matching,
         clusters,
         target,
-        filtered,
         spread,
+        ..
     } = *t;
     // Each candidate as one integer key, ordered as (distance by `f32::total_cmp`, entry): the
     // partition and sort below compare integers.
@@ -759,17 +789,9 @@ fn pick_clusters(
         .filter(|(n, e)| !flat[e.segment] && e.rows > 0 && in_cluster(*n) > 0.0)
         .map(|(n, _)| (u64::from(total_order_key(distances[n])) << 32) | n as u64)
         .collect();
-    // Deleted rows and filtered-out rows thin the probed clusters, so probe more (a filter at
-    // most `filtered_probe_cap` times) and keep probing until the allowed candidates reach
-    // `target`.
-    let thin = {
-        let thin = ann_rows as f64 / matching.max(1) as f64;
-        if filtered {
-            thin.min(config.filtered_probe_cap.max(1) as f64)
-        } else {
-            thin
-        }
-    };
+    // Filtered tier probes compensate for the full selectivity, bounded by the cluster count.
+    // The matching-candidate target below also keeps sparse masks from exhausting a short probe.
+    let thin = t.thinning(config);
     let probes = probe_count(config, ann_rows, clusters, thin * spread);
     // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
     // only in the unlikely case the walk runs past them.
@@ -1158,7 +1180,9 @@ pub(crate) async fn search(
                 matching,
                 clusters,
                 target,
+                k,
                 filtered,
+                slabs: layout == Layout::Slabs,
                 spread: layout_spread(config, dir.as_ref(), layout, &seg_rows, &skipped)
                     * tier_share(dir.as_ref(), &seg_rows, &skipped),
             };
@@ -2156,8 +2180,59 @@ pub(crate) async fn speculate_slab_scan(
 
 #[cfg(test)]
 mod spread_tests {
-    use super::{MAX_SPREAD, independent_spread};
+    use super::{MAX_SPREAD, Totals, filtered_tier_scale, independent_spread, probe_count};
     use crate::EngineConfig;
+
+    #[test]
+    fn filtered_margin_covers_survivor_variance_under_independent_thinning() {
+        for matching in [10_000, 100_000, 500_000, 900_000] {
+            let p = matching as f64 / 1_000_000.0;
+            for k in [1, 10, 100] {
+                let trials =
+                    (filtered_tier_scale(1_000_000, matching, k) * k as f64).ceil() as usize;
+                // Exact binomial probability of fewer than k survivors, independently of
+                // the planner's waiting-time approximation. A mean-only budget fails this.
+                let mut term = (1.0 - p).powi(trials as i32);
+                let mut failure = term;
+                for j in 0..k - 1 {
+                    term *= (trials - j) as f64 / (j + 1) as f64 * p / (1.0 - p);
+                    failure += term;
+                }
+                assert!(failure < 0.2, "p={p}, k={k}, failure={failure}");
+            }
+        }
+        assert_eq!(filtered_tier_scale(100, 100, 10), 1.0);
+    }
+
+    #[test]
+    fn filtered_tier_budget_preserves_expected_candidate_coverage() {
+        let config = EngineConfig::default();
+        let unfiltered = probe_count(&config, 1_000_000, 10_000, 1.0);
+        for matching in [1, 10, 1000, 10_000, 100_000, 500_000, 1_000_000] {
+            let totals = Totals {
+                ann_rows: 1_000_000,
+                matching,
+                clusters: 10_000,
+                target: 320.min(matching),
+                k: 10,
+                filtered: true,
+                slabs: true,
+                spread: 1.0,
+            };
+            let probes = probe_count(
+                &config,
+                totals.ann_rows,
+                totals.clusters,
+                totals.thinning(&config),
+            );
+            assert!(probes == totals.clusters || probes * matching >= unfiltered * totals.ann_rows);
+            let segments = Totals {
+                slabs: false,
+                ..totals
+            };
+            assert!(segments.thinning(&config) <= config.filtered_probe_cap as f64);
+        }
+    }
 
     #[test]
     fn spread_counts_effective_equal_segments() {

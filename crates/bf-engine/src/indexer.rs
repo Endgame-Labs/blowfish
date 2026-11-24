@@ -72,9 +72,10 @@ pub struct EngineConfig {
     /// A filtered ANN query with at most this many allowed rows fetches and ranks exactly
     /// those rows' vectors instead of scanning quantized codes.
     pub exact_fetch_rows: usize,
-    /// A filtered ANN query that scans codes probes up to this many times as many clusters as
+    /// A filtered ANN query over segment indexes probes up to this many times as many clusters as
     /// an unfiltered one, in proportion to how few rows the filter leaves (recall on filtered
-    /// sets needs a deeper probe than the allowed fraction alone suggests).
+    /// sets needs a deeper probe than the allowed fraction alone suggests). Recluster tiers
+    /// compensate for the full filter selectivity to preserve their unfiltered candidate coverage.
     pub filtered_probe_cap: usize,
     /// Fraction of ANN requests checked against exhaustive ground truth.
     pub recall_sample_rate: f64,

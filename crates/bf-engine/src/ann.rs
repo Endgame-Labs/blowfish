@@ -491,7 +491,55 @@ async fn from_slabs(
     seat: Option<&crate::ann_dir::Seat>,
     filter: Option<&Filter>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    let Ok((dir, _)) = crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
+    let allowed = if let Some(filter) = filter {
+        let mask = filtered_mask(store, state, set, at, filter).await?;
+        Some(
+            futures::future::try_join_all(set.slabs.iter().map(|slab| {
+                let mask = &mask;
+                async move {
+                    let rows = crate::vector_locator::rows(store, slab, set, attribute).await?;
+                    let allowed: RoaringBitmap =
+                        rows.iter().copied().filter(|r| mask.contains(*r)).collect();
+                    Ok::<_, ApiError>(Some(Arc::new(allowed)))
+                }
+            }))
+            .await?,
+        )
+    } else {
+        None
+    };
+    // A paged directory must expose enough leaves for the selectivity-adjusted probe, too.
+    // Size it from actual vector rows, including nullable columns and compaction lineage.
+    let directory_config = if let Some(allowed) = &allowed {
+        let matching = allowed
+            .iter()
+            .flatten()
+            .map(|rows| rows.len() as usize)
+            .sum::<usize>();
+        if matching == 0 {
+            return Ok(Some((BTreeMap::new(), BTreeMap::new())));
+        }
+        let rows = set
+            .slabs
+            .iter()
+            .map(|slab| slab.row_count as usize)
+            .sum::<usize>();
+        let mut tuning = config.clone();
+        tuning.ann_nprobe = (tuning.ann_nprobe as f64
+            * crate::ann_dir::filtered_tier_scale(rows, matching, k))
+        .ceil() as usize;
+        Some(tuning)
+    } else {
+        None
+    };
+    let Ok((dir, _)) = crate::ann_dir::slab_directory(
+        store,
+        set,
+        prefetched,
+        vector,
+        directory_config.as_ref().unwrap_or(config),
+    )
+    .await
     else {
         return Ok(None);
     };
@@ -500,39 +548,24 @@ async fn from_slabs(
     if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
         return Ok(None);
     }
-    let mask = match filter {
-        Some(filter) => Some(filtered_mask(store, state, set, at, filter).await?),
-        None => tier_mask(store, state, set, at).await?,
+    let mask = if filter.is_none() {
+        tier_mask(store, state, set, at).await?
+    } else {
+        None
     };
     if crate::ann::trace_stages() {
         eprintln!(
             "SLABS slabs={} masked={}",
             view.segments.len(),
-            mask.is_some()
+            allowed.is_some() || mask.is_some()
         );
     }
-    let warm = if mask.is_none() && seat.is_none() {
+    let warm = if allowed.is_none() && mask.is_none() && seat.is_none() {
         crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone())
     } else {
         None
     };
-    let lives = if filter.is_some() {
-        futures::future::try_join_all(set.slabs.iter().map(|slab| {
-            let mask = &mask;
-            async move {
-                let rows = crate::vector_locator::rows(store, slab, set, attribute).await?;
-                let allowed = rows
-                    .iter()
-                    .copied()
-                    .filter(|r| mask.as_ref().is_none_or(|m| m.contains(*r)))
-                    .collect();
-                Ok::<_, ApiError>(Some(Arc::new(allowed)))
-            }
-        }))
-        .await?
-    } else {
-        vec![mask; view.segments.len()]
-    };
+    let lives = allowed.unwrap_or_else(|| vec![mask; view.segments.len()]);
     let slack = if state.shadowed.is_empty() {
         0
     } else {

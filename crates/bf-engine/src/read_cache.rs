@@ -34,6 +34,9 @@ pub(crate) struct DecodedCache {
     clusters: ClusterCache,
     /// Decoded document column blocks (256 rows each), for hydrating results.
     columns: moka::sync::Cache<String, Arc<Vec<Option<serde_json::Value>>>>,
+    /// Immutable filter results have their own small budget. Large ID dictionaries can churn
+    /// through the general LRU without evicting the predicates computed from them.
+    predicates: moka::sync::Cache<String, Arc<bf_vector::RoaringBitmap>>,
     /// Decoded resident WAL vectors; charged to the same total budget as immutable metadata.
     pub(crate) tail_vectors: crate::tail::VectorCache,
 }
@@ -164,11 +167,13 @@ impl<V: Clone, K: Clone + std::hash::Hash + Eq> ClockCache<V, K> {
 }
 impl DecodedCache {
     /// `budget` bytes in all: half for the general LRU, a quarter for decoded clusters,
-    /// a sixth for resident WAL vectors, and a twelfth for decoded column blocks.
+    /// a sixth for resident WAL vectors, a sixteenth for decoded column blocks, and a
+    /// forty-eighth for predicate bitmaps. The general LRU's half stays available to warm tiers.
     pub fn new(budget: u64, workers: usize) -> Self {
-        let (clusters, columns, vectors) = (budget / 4, budget / 12, budget / 6);
+        let predicates = budget / 48;
+        let (clusters, columns, vectors) = (budget / 4, budget / 12 - predicates, budget / 6);
         Self {
-            budget: budget - clusters - columns - vectors,
+            budget: budget - clusters - columns - vectors - predicates,
             entries: Arc::new(Mutex::new(Entries::default())),
             scope: String::new(),
             workers: Arc::new(Semaphore::new(workers.max(1))),
@@ -182,6 +187,14 @@ impl DecodedCache {
                     (k.len() + 64 + v.len() * 48).min(u32::MAX as usize) as u32
                 })
                 .build(),
+            predicates: moka::sync::Cache::builder()
+                .max_capacity(predicates)
+                .weigher(|k: &String, v: &Arc<bf_vector::RoaringBitmap>| {
+                    // Roaring containers can reserve more than their serialized form.
+                    (k.len() as u64 + 128 + v.serialized_size() as u64 * 2).min(u64::from(u32::MAX))
+                        as u32
+                })
+                .build(),
             tail_vectors: crate::tail::VectorCache::new(vectors),
         }
     }
@@ -192,6 +205,12 @@ impl DecodedCache {
     /// Keep a decoded column block.
     pub fn insert_column(&self, key: &str, value: Arc<Vec<Option<serde_json::Value>>>) {
         self.columns.insert(self.key(key), value);
+    }
+    fn predicate(&self, key: &str) -> Option<Arc<bf_vector::RoaringBitmap>> {
+        self.predicates.get(&self.key(key))
+    }
+    fn insert_predicate(&self, key: &str, value: Arc<bf_vector::RoaringBitmap>) {
+        self.predicates.insert(self.key(key), value);
     }
     /// Decoded clusters of the ANN object `object` (keys are scoped like every other entry).
     pub fn clusters(&self, object: &str) -> (ClusterCache, Arc<str>) {
@@ -206,6 +225,7 @@ impl DecodedCache {
             workers: self.workers.clone(),
             clusters: self.clusters.clone(),
             columns: self.columns.clone(),
+            predicates: self.predicates.clone(),
             // Document allocation identities are process-wide, independent of storage scope.
             tail_vectors: self.tail_vectors.clone(),
         }
@@ -217,6 +237,7 @@ impl DecodedCache {
         e.bytes = 0;
         self.clusters.clear();
         self.columns.invalidate_all();
+        self.predicates.invalidate_all();
         self.tail_vectors.clear();
     }
     fn key(&self, key: &str) -> String {
@@ -350,6 +371,26 @@ pub(crate) fn insert<T: Any + Send + Sync>(key: &str, bytes: u64, value: T) -> A
     value
 }
 
+/// A generation-fenced predicate, isolated from large dictionary admission in the general LRU.
+pub(crate) fn predicate(key: &str) -> Option<Arc<bf_vector::RoaringBitmap>> {
+    let context = context()?;
+    let value = context.cache.predicate(key)?;
+    context
+        .stats
+        .record_memory_hit(value.serialized_size() as u64);
+    Some(value)
+}
+pub(crate) fn insert_predicate(
+    key: &str,
+    value: bf_vector::RoaringBitmap,
+) -> Arc<bf_vector::RoaringBitmap> {
+    let value = Arc::new(value);
+    if let Some(context) = context() {
+        context.cache.insert_predicate(key, value.clone());
+    }
+    value
+}
+
 /// The current query's general decoded-cache budget (zero outside a query context).
 pub(crate) fn capacity() -> u64 {
     context().map_or(0, |c| c.cache.budget)
@@ -367,6 +408,31 @@ pub(crate) fn insert_once<T: Any + Send + Sync>(key: &str, bytes: u64, value: T)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn predicate_budget_survives_dictionary_churn_and_obeys_scope_and_clear() {
+        let cache = DecodedCache::new(48 * 64 * 1024, 1);
+        let rows = Arc::new((0..100).collect::<bf_vector::RoaringBitmap>());
+        cache.insert_predicate("generation", rows.clone());
+        for i in 0..4 {
+            cache.insert(&format!("dictionary-{i}"), cache.budget, Arc::new(i));
+        }
+        assert_eq!(cache.predicate("generation").unwrap(), rows);
+        let other = cache.scoped("other");
+        assert!(other.predicate("generation").is_none());
+        other.insert_predicate("generation", Arc::new((200..300).collect()));
+        assert_ne!(other.predicate("generation").unwrap(), rows);
+        let oversized = Arc::new((0..10_000).map(|r| r * 65_537).collect());
+        cache.insert_predicate("oversized", oversized);
+        cache.predicates.run_pending_tasks();
+        assert!(cache.predicate("oversized").is_none());
+        assert!(
+            cache.predicates.weighted_size() <= cache.predicates.policy().max_capacity().unwrap()
+        );
+        cache.clear();
+        assert!(cache.predicate("generation").is_none());
+        assert!(other.predicate("generation").is_none());
+        assert_eq!(rows.len(), 100);
+    }
     #[test]
     fn atomic_resident_admission_shares_one_bounded_generation() {
         let cache = Arc::new(DecodedCache::new(192, 1));
