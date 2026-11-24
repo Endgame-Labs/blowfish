@@ -209,7 +209,7 @@ Newest first. Each entry says what works now and how it was checked.
     (243 passed, 4 ignored). Compat passed 121/121 in both normal and forced-indexing modes, alongside
     SDK retry checks and the TypeScript smoke suite. Idle indexing still performs no object-store I/O.
 
-- **Automatic upgrade of old vector indexes** (`docs/operations.md`, "Upgrading to v0.1.14"). Indexes in the older
+- **Automatic upgrade of old vector indexes** (`docs/operations.md`, "Bucket format 3: what the upgrade does"). Indexes in the older
   row-major layout only became fast-scan when compaction or `recluster` rewrote them, so a read-only namespace stayed
   on the old layout. The background indexer now rewrites each per-segment index and each `recluster` slab in the
   fast-scan layout by itself, from the stored codes (no retraining), one index at a time. It writes new objects, then
