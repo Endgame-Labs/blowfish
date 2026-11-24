@@ -21,6 +21,14 @@ nq = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nq)
 
 
+def process_cpu_seconds(pid):
+    """Whole-process Linux user and system CPU, including all server threads."""
+    # The command in parentheses may contain spaces or parentheses of its own.
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    ticks = os.sysconf("SC_CLK_TCK")
+    return int(fields[11]) / ticks, int(fields[12]) / ticks
+
+
 def worker(k, bodies, barrier, out, namespace):
     client = nq.Client("http://127.0.0.1:18100", namespace)
     try:
@@ -112,7 +120,7 @@ def run(a):
         try:
             for process in processes:
                 process.start()
-            if a.pid:
+            if a.pid and not a.no_perf:
                 perf = subprocess.Popen(
                     [
                         "sudo",
@@ -130,6 +138,7 @@ def run(a):
                     stderr=subprocess.DEVNULL,
                 )
                 time.sleep(0.15)
+            cpu_before = process_cpu_seconds(a.pid) if a.pid else None
             start = time.perf_counter_ns()
             barrier.wait(timeout=120)
             rows, received = [], 0
@@ -146,6 +155,7 @@ def run(a):
                 received += 1
             rows.sort()
             elapsed = (max(r[2] for r in rows) - min(r[1] for r in rows)) / 1e9
+            cpu_after = process_cpu_seconds(a.pid) if a.pid else None
         finally:
             for process in processes:
                 if process.is_alive():
@@ -186,6 +196,11 @@ def run(a):
             recall=float(recall),
             rep=rep,
         )
+        if cpu_before is not None:
+            record.update(
+                cpu_user_us_per_query=(cpu_after[0] - cpu_before[0]) * 1e6 / len(rows),
+                cpu_system_us_per_query=(cpu_after[1] - cpu_before[1]) * 1e6 / len(rows),
+            )
         result.append(record)
         print(json.dumps(record), flush=True)
         a.out.write_text(json.dumps(result, indent=2))
@@ -221,6 +236,10 @@ if __name__ == "__main__":
         "--perf-events", default="instructions,cycles,context-switches,cpu-migrations"
     )
     p.add_argument("--pid", type=int)
+    p.add_argument(
+        "--no-perf", action="store_true",
+        help="record process CPU from --pid without attaching PMU counters",
+    )
     p.add_argument("--repeats", type=int, default=4)
     p.add_argument("--cold", action="store_true")
     args = p.parse_args()
