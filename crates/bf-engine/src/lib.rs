@@ -1257,7 +1257,14 @@ async fn commit_front(
     };
     let mut retry = false;
     let failure = match staged {
-        Err(e) => Some(e),
+        Err(e) => {
+            // A failed stage can have an ambiguous PUT outcome. Its task has finished, so
+            // attempt cleanup even though it could not return a Staged value.
+            let _ = wal
+                .discard(front.seq, &front.entry, &bf_wal::Staged::maybe_uploaded())
+                .await;
+            Some(e)
+        }
         Ok(staged) => {
             let mut current = state.lock().await;
             if current.seq + 1 != front.seq {
@@ -1321,25 +1328,25 @@ async fn commit_front(
     }
     let mut failed = vec![front];
     failed.extend(flights.drain(..));
-    // Later flights never reached their slots: stop their uploads and remove their payloads.
-    for (i, f) in failed.iter_mut().enumerate() {
+    for (i, f) in failed.into_iter().enumerate().rev() {
         if i > 0 {
-            f.upload.abort();
-            let (wal, seq, entry) = (wal.clone(), f.seq, f.entry.clone());
+            // Later flights never reached their slots. Let each upload finish before deleting:
+            // aborting its task does not stop a running poll or a remote PUT, which could land
+            // after the delete. Cleanup owns the handle, independently of the failed writers.
+            let (wal, seq, entry, upload) = (wal.clone(), f.seq, f.entry, f.upload);
             tokio::spawn(async move {
+                let _ = upload.await;
                 let staged = bf_wal::Staged::maybe_uploaded();
-                let _ = wal.discard(seq, &entry, &staged).await;
+                if let Err(error) = wal.discard(seq, &entry, &staged).await {
+                    tracing::warn!(%error, seq, "abandoned WAL payload cleanup deferred to GC");
+                }
             });
         }
-    }
-    if retry {
-        for f in failed.into_iter().rev() {
+        if retry {
             for p in f.pending.into_iter().rev() {
                 backlog.push_front(p);
             }
-        }
-    } else {
-        for f in failed {
+        } else {
             for p in f.pending {
                 let _ = p.reply.send(Err(error.clone()));
             }

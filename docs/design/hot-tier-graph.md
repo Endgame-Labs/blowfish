@@ -1,6 +1,6 @@
 # Disposable row graphs for hot recluster tiers (Round G3)
 
-Status: measured query-path experiment behind `experimental-hot-graph`. The current implementation
+Status: measured query-path experiment (commit 285ea88, not on main; round G4 is turning it into an automatic default path). The current implementation
 fails the end-to-end Qdrant gate. This is a proposal for SPEC 27's hot tier, reopening decision 26
 only for an expendable RAM accelerator. The bucket's IVF representation, manifest, recovery path,
 and cold query plan stay authoritative. No stored format or default server behavior changes.
