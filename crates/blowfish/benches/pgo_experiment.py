@@ -373,7 +373,15 @@ def write_batches(binary, args, label, count=4096):
                 "vector": {"type": "[1024]f16"},
                 "text": {"type": "string", "full_text_search": True},
             }
-            request("writes", {"schema": schema, "upsert_rows": rows[:16]}, suffix="")
+            request(
+                "writes",
+                {
+                    "schema": schema,
+                    "distance_metric": "cosine_distance",
+                    "upsert_rows": rows[:16],
+                },
+                suffix="",
+            )
             start = time.perf_counter()
             outputs = []
             for i in range(16, count, 16):

@@ -25,7 +25,8 @@ if [[ ! -x $profdata ]]; then
   exit 2
 fi
 # Use identical flags and an explicit target to avoid instrumenting build scripts.
-flags=${RUSTFLAGS-}
+# Shared counters otherwise lose updates when training on several server threads.
+flags="${RUSTFLAGS-} -Cllvm-args=-instrprof-atomic-counter-update-all"
 export CARGO_TARGET_DIR="$run/target"
 RUSTFLAGS="$flags -Cprofile-generate=$run/raw" \
   cargo build --locked --release --target "$target" -p blowfish --bin blowfish
