@@ -82,9 +82,11 @@ The new scorer uses **73% fewer server instructions** at one client and **74% fe
 with `overlap@10` **1.000**. Across two A/B repeats, warm p50/p90 ranges are **9.9–12.7 / 19.1–24.4 ms**;
 16-client throughput is **91–109 queries/s**, against **47–53** before. Peak server RSS rises about
 58 MiB. A fresh-process local S3 facade with 25 ms per request measures a median **251/366 ms**, against
-**258/372 ms** before. This is a local round-trip model; the **18 ms warm p90 target remains open**,
-and I have not confirmed this revision in-region.
-Details and reproduction: [BM25 measurements](docs/benchmarks.md#bm25-round-2-exact-maxscore-and-hybrid-concurrency).
+**258/372 ms** before. This is a local round-trip model, and I have not confirmed this revision in-region.
+On a 10-core Apple M4, the same store and queries measure warm p50/p90 **1.47/3.00 ms** and
+**520 queries/s** at 16 clients, so the two shared VM CPUs, not the scorer, set the VM's p90.
+Details and reproduction: [BM25 measurements](docs/benchmarks.md#bm25-round-2-exact-maxscore-and-hybrid-concurrency)
+and [BM25 round 3](docs/benchmarks.md#bm25-round-3-fewer-posting-probes-and-a-mac-baseline).
 
 ### My own measurements of hosted services (10M)
 
