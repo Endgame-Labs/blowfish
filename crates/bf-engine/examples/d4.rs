@@ -2,12 +2,13 @@
 //! Usage: d4 STORAGE_JSON MODE OUTPUT [WORKLOAD_JSON] [QUERY_INDEX].
 //! Modes: index, recluster, gc, measure, short (64 queries), first (one fresh-process query),
 //! warm (2,000-query prewarm, then serial and concurrent queries), and quality (rows only).
-use bf_engine::{Engine, EngineConfig, ReclusterOptions};
+use bf_engine::{Engine, EngineConfig, QueryDiagnostics, ReclusterOptions};
 use bf_storage::{Storage, StorageConfig};
 use bf_types::QueryRequest;
 use serde_json::json;
 use std::io::{BufRead, Write};
 use std::{
+    collections::BTreeMap,
     error::Error,
     path::PathBuf,
     time::{Duration, Instant},
@@ -17,6 +18,50 @@ fn percentiles(mut times: Vec<f64>) -> serde_json::Value {
     times.sort_by(f64::total_cmp);
     let nth = |fraction: f64| times[((times.len() - 1) as f64 * fraction).round() as usize];
     json!({"queries":times.len(),"p50_ms":nth(0.5),"p90_ms":nth(0.9),"qps":times.len() as f64/(times.iter().sum::<f64>()/1000.0)})
+}
+#[derive(Default)]
+struct Diagnostics {
+    snapshot: Duration,
+    execution: Duration,
+    backend: BTreeMap<String, (u64, u64, Duration)>,
+    ann_rows: u64,
+}
+impl Diagnostics {
+    fn add(&mut self, d: QueryDiagnostics) {
+        self.snapshot += d.snapshot_elapsed;
+        self.execution += d.execution_elapsed;
+        self.ann_rows += d.ann_rows_scanned;
+        for b in d.backend {
+            let total = self
+                .backend
+                .entry(format!("{}:{}", b.stage, b.operation))
+                .or_default();
+            total.0 += b.requests;
+            total.1 += b.bytes;
+            total.2 += b.elapsed;
+        }
+    }
+    fn merge(&mut self, other: Self) {
+        self.snapshot += other.snapshot;
+        self.execution += other.execution;
+        self.ann_rows += other.ann_rows;
+        for (key, (requests, bytes, elapsed)) in other.backend {
+            let total = self.backend.entry(key).or_default();
+            total.0 += requests;
+            total.1 += bytes;
+            total.2 += elapsed;
+        }
+    }
+    fn json(self, queries: usize) -> serde_json::Value {
+        json!({
+            "snapshot_mean_ms":self.snapshot.as_secs_f64()*1000.0/queries as f64,
+            "execution_mean_ms":self.execution.as_secs_f64()*1000.0/queries as f64,
+            "ann_rows_per_query":self.ann_rows as f64/queries as f64,
+            "backend":self.backend.into_iter().map(|(key,(requests,bytes,elapsed))|
+                json!({"stage_operation":key,"requests":requests,"bytes":bytes,
+                    "elapsed_ms":elapsed.as_secs_f64()*1000.0})).collect::<Vec<_>>(),
+        })
+    }
 }
 // perf stat --delay=-1 --control=fifo:CONTROL,ACK can exclude startup and warm-up.
 // An acknowledgement ensures counters change before crossing the phase boundary.
@@ -126,12 +171,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             counters("enable")?;
             let mut times = Vec::new();
             let mut rows = Vec::new();
+            let mut diagnostics = Diagnostics::default();
             for q in requests.iter().take(1000) {
                 let start = Instant::now();
-                let reply = engine.query("nq", q.clone()).await?;
+                let (reply, d) = engine.query_with_diagnostics("nq", q.clone()).await?;
+                diagnostics.add(d);
                 times.push(start.elapsed().as_secs_f64() * 1000.0);
                 rows.push(reply.result.rows);
             }
+            result["warm_diagnostics"] = diagnostics.json(times.len());
             result["warm"] = percentiles(times);
             result["rows"] = json!(rows);
             let start = Instant::now();
@@ -139,17 +187,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             for client in 0..16 {
                 let (engine, requests) = (engine.clone(), requests.clone());
                 tasks.spawn(async move {
+                    let mut diagnostics = Diagnostics::default();
                     for q in requests.into_iter().skip(client).step_by(16) {
-                        engine.query("nq", q).await?;
+                        let (_, d) = engine.query_with_diagnostics("nq", q).await?;
+                        diagnostics.add(d);
                     }
-                    Ok::<_, bf_types::ApiError>(())
+                    Ok::<_, bf_types::ApiError>(diagnostics)
                 });
             }
+            let mut diagnostics = Diagnostics::default();
             while let Some(done) = tasks.join_next().await {
-                done??;
+                diagnostics.merge(done??);
             }
             result["qps16"] = json!(requests.len() as f64 / start.elapsed().as_secs_f64());
             counters("disable")?;
+            result["concurrent_diagnostics"] = diagnostics.json(requests.len());
             result["counted_queries"] = json!(requests.len().min(1000) + requests.len());
         }
         "measure" | "short" => {
