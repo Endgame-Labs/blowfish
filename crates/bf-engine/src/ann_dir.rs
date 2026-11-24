@@ -1781,13 +1781,23 @@ pub(crate) async fn search(
         }
     });
     let rerank_limit = reranks.len().max(limit);
-    let prefetch = futures::future::join_all(speculative.iter().map(|(&i, rows)| async move {
-        let _ = segment::projected_rows(store, &docs_state.segments[i], rows, Some(columns)).await;
-    }));
+    let prefetch = async {
+        futures::future::join_all(speculative.iter().map(|(&i, rows)| async move {
+            let _ =
+                segment::projected_rows(store, &docs_state.segments[i], rows, Some(columns)).await;
+        }))
+        .await;
+        crate::ann::stage(t0, "speculative docs");
+    };
     let (reranked, _) = tokio::join!(
-        futures::stream::iter(reranks)
-            .buffer_unordered(rerank_limit)
-            .try_collect::<Vec<Vec<(f32, usize, u32)>>>(),
+        async {
+            let hits = futures::stream::iter(reranks)
+                .buffer_unordered(rerank_limit)
+                .try_collect::<Vec<Vec<(f32, usize, u32)>>>()
+                .await;
+            crate::ann::stage(t0, "rerank vectors");
+            hits
+        },
         prefetch
     );
     winners.extend(reranked?.into_iter().flatten());

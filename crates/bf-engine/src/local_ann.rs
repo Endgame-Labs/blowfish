@@ -36,6 +36,9 @@ struct StagedFile {
 }
 impl StagedFile {
     fn read(&self, ranges: &[Range<u64>]) -> io::Result<Vec<Bytes>> {
+        let trace = crate::ann::trace_stages();
+        let started = Instant::now();
+        let (mut read_us, mut crc_us) = (0, 0);
         let file = File::open(&self.path)?;
         let mut blocks = BTreeMap::<u64, Bytes>::new();
         for r in ranges {
@@ -51,17 +54,26 @@ impl StagedFile {
                 }
                 let start = block * BLOCK as u64;
                 let mut data = vec![0; (self.len - start).min(BLOCK as u64) as usize];
+                let at = Instant::now();
                 file.read_exact_at(&mut data, start)?;
+                if trace {
+                    read_us += at.elapsed().as_micros();
+                }
+                let at = Instant::now();
                 if self.crc.get(block as usize).copied() != Some(crc32fast::hash(&data)) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "staged ANN checksum",
                     ));
                 }
+                if trace {
+                    crc_us += at.elapsed().as_micros();
+                }
                 blocks.insert(block, Bytes::from(data));
             }
         }
-        ranges
+        let copied = Instant::now();
+        let result = ranges
             .iter()
             .map(|r| {
                 let mut data = Vec::with_capacity((r.end - r.start) as usize);
@@ -76,7 +88,21 @@ impl StagedFile {
                 }
                 Ok(Bytes::from(data))
             })
-            .collect()
+            .collect();
+        if trace {
+            eprintln!(
+                "LOCAL_READ ranges={} blocks={} bytes={} read_us={read_us} crc_us={crc_us} copy_us={} total_us={} end_us={}",
+                ranges.len(),
+                blocks.len(),
+                blocks.values().map(Bytes::len).sum::<usize>(),
+                copied.elapsed().as_micros(),
+                started.elapsed().as_micros(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros())
+            );
+        }
+        result
     }
 }
 

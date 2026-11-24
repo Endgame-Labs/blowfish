@@ -194,7 +194,7 @@ impl ObjectStore for Observed {
 }
 
 /// `BF_TRACE_READS=1` prints one line per backend read (diagnostics only).
-fn trace_reads() -> bool {
+pub(crate) fn trace_reads() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BF_TRACE_READS").is_some())
 }

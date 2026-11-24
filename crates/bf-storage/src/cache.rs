@@ -600,11 +600,21 @@ impl RangeReader {
                 let last = *indices.last().unwrap();
                 let group = async move {
                     let cache = &reader.storage.0.cache;
+                    let queued = std::time::Instant::now();
                     let _permit = cache
                         .fetches
                         .acquire()
                         .await
                         .expect("cache semaphore stays open");
+                    if crate::observed::trace_reads() {
+                        eprintln!(
+                            "TRACE_SLOT wait_us={} end_us={}",
+                            queued.elapsed().as_micros(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_micros())
+                        );
+                    }
                     let from = first * size;
                     let to = (last * size).saturating_add(size).min(reader.len());
                     let bytes = cache

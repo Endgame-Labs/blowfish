@@ -118,7 +118,7 @@ def stats(client):
 
 def trace_summary(log):
     """Completed read waves and bytes by object kind, separate from attempted GETs."""
-    reads, kinds, stages = [], {}, {}
+    reads, kinds, stages, timeline, local, slots, stage_times = [], {}, {}, [], [], [], []
     for line in log.splitlines():
         if line.startswith("TRACE_READ "):
             _, path, _, _, size, end, elapsed = line.split()
@@ -137,6 +137,26 @@ def trace_summary(log):
                 else "other"
             )
             kinds[kind] = kinds.get(kind, 0) + int(size)
+            timeline.append(
+                {
+                    "kind": kind,
+                    "object": path,
+                    "bytes": int(size),
+                    "start_us": (int(end) - int(elapsed)) * 1000,
+                    "end_us": int(end) * 1000,
+                }
+            )
+        elif line.startswith("LOCAL_READ "):
+            local.append(
+                {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", line)}
+            )
+        elif line.startswith("TRACE_SLOT "):
+            slots.append(
+                {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", line)}
+            )
+        elif line.startswith("STAGE_TIME "):
+            name, end_us = line[11:].rsplit(" ", 1)
+            stage_times.append({"stage": name, "end_us": int(end_us)})
         elif line.startswith("STAGE "):
             name, micros, _ = line[6:].rsplit(" ", 2)
             stages[name] = stages.get(name, 0) + int(micros)
@@ -145,7 +165,15 @@ def trace_summary(log):
         if active_until is None or start >= active_until:
             waves += 1
         active_until = max(active_until or end, end)
-    return {"read_waves": waves, "read_bytes_by_kind": kinds, "stage_us": stages}
+    return {
+        "read_waves": waves,
+        "read_bytes_by_kind": kinds,
+        "stage_us": stages,
+        "read_timeline": timeline,
+        "local_reads": local,
+        "fetch_slots": slots,
+        "stage_timeline": stage_times,
+    }
 
 
 @contextlib.contextmanager
@@ -258,6 +286,7 @@ def query(name, item, client, work, proc):
     req = client.build_request(
         "POST", f"/v2/namespaces/{config['namespace']}/query", json=item["request"]
     )
+    request_start_us = time.time_ns() // 1000
     start = time.perf_counter()
     res = client.send(req)
     ms = (time.perf_counter() - start) * 1000
@@ -273,6 +302,7 @@ def query(name, item, client, work, proc):
         "arm": name,
         "q": item["query_id"],
         "ms": ms,
+        "request_start_us": request_start_us,
         "recall": len(set(map(int, got)) & set(item["truth"])) / 10,
         "ids": got,
         "distances": [r.get("$dist") for r in res.get("rows", [])],
@@ -290,7 +320,21 @@ def query(name, item, client, work, proc):
     with (RUN / "rows.jsonl").open("a") as f:
         f.write(json.dumps(row) + "\n")
     print(
-        json.dumps({k: v for k, v in row.items() if k not in ["ids", "distances"]}),
+        json.dumps(
+            {
+                k: v
+                for k, v in row.items()
+                if k
+                not in [
+                    "ids",
+                    "distances",
+                    "read_timeline",
+                    "local_reads",
+                    "fetch_slots",
+                    "stage_timeline",
+                ]
+            }
+        ),
         flush=True,
     )
     return row
