@@ -151,43 +151,51 @@ async fn from_directory(
             None
         };
         if q.filters.is_none() || members.is_some() {
-            // Unindexed upserts and deletes shadow rows of the segments by ID. Rather than
-            // opening every ID index to find the shadowed rows, ask for a few extra
-            // winners and drop the shadowed ones afterwards. If the shadowed rows eat into
-            // the results so that fewer than k remain while the pool was full, use the
-            // document scan instead.
-            let slack = if state.shadowed.is_empty() {
-                0
-            } else {
-                (2 * k).max(20)
-            };
-            let (mut scores, mut docs) = crate::ann_dir::search(
-                store,
-                state,
-                dir,
-                lives,
-                vector,
-                config,
-                k + slack,
-                columns,
-                attribute,
-                members,
-                layout,
-                None,
-                skip,
-                None,
-            )
-            .await?;
-            if slack > 0 {
-                let pooled = scores.len();
-                scores.retain(|id, _| !state.shadowed.contains(id));
-                docs.retain(|id, _| !state.shadowed.contains(id));
-                if scores.len() >= k || pooled < k + slack {
-                    return Ok(Some((scores, docs)));
-                }
-            } else {
-                return Ok(Some((scores, docs)));
-            }
+            return unshadowed(&state.shadowed, k, |count| {
+                crate::ann_dir::search(
+                    store,
+                    state,
+                    dir.clone(),
+                    lives.clone(),
+                    vector,
+                    config,
+                    count,
+                    columns,
+                    attribute,
+                    members.clone(),
+                    layout,
+                    None,
+                    skip,
+                    None,
+                )
+            })
+            .await;
+        }
+    }
+    Ok(None)
+}
+
+/// Check WAL shadows on returned IDs without opening every source ID index. Most small
+/// WAL overlays do not shadow any ANN winners: requesting k first avoids multiplying the exact
+/// rerank pool merely because writes are pending. Retry with the existing overfetch bound
+/// only when a winner was shadowed, and retain the full scan if that bound is insufficient.
+async fn unshadowed<F, Fut>(
+    shadowed: &BTreeSet<Id>,
+    k: usize,
+    mut search: F,
+) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut:
+        std::future::Future<Output = Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError>>,
+{
+    for count in [k, k.saturating_add(k.saturating_mul(2).max(20))] {
+        let (mut scores, mut docs) = search(count).await?;
+        let pooled = scores.len();
+        scores.retain(|id, _| !shadowed.contains(id));
+        docs.retain(|id, _| !shadowed.contains(id));
+        if scores.len() >= k || pooled < count {
+            return Ok(Some((scores, docs)));
         }
     }
     Ok(None)
@@ -464,36 +472,25 @@ async fn from_slabs(
         );
     }
     let lives = vec![mask; view.segments.len()];
-    let slack = if state.shadowed.is_empty() {
-        0
-    } else {
-        (2 * k).max(20)
-    };
-    let (mut scores, mut docs) = crate::ann_dir::search(
-        store,
-        &view,
-        dir,
-        lives,
-        vector,
-        config,
-        k + slack,
-        columns,
-        attribute,
-        None,
-        Layout::Slabs,
-        Some((state, &set.covered, at)),
-        &[],
-        seat,
-    )
-    .await?;
-    if slack > 0 {
-        let pooled = scores.len();
-        scores.retain(|id, _| !state.shadowed.contains(id));
-        docs.retain(|id, _| !state.shadowed.contains(id));
-        if scores.len() >= k || pooled < k + slack {
-            return Ok(Some((scores, docs)));
-        }
-        return Ok(None);
-    }
-    Ok(Some((scores, docs)))
+    unshadowed(&state.shadowed, k, |count| {
+        crate::ann_dir::search(
+            store,
+            &view,
+            dir.clone(),
+            lives.clone(),
+            vector,
+            config,
+            count,
+            columns,
+            attribute,
+            None,
+            Layout::Slabs,
+            Some((state, &set.covered, at)),
+            &[],
+            // A retry has its own larger bound; the first search completed this seat's
+            // exchanges with the other tiers already.
+            if count == k { seat } else { None },
+        )
+    })
+    .await
 }

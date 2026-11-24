@@ -114,6 +114,7 @@ def main():
     p.add_argument("--tag", required=True)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--server-pid", type=int)
+    p.add_argument("--ready-marker", type=Path, help="write after prewarming and writer readiness, for attaching perf")
     p.add_argument("--query-count", type=int, default=300)
     p.add_argument("--ann-hz", type=float, help="pace queries; omit for closed-loop, or use zero to disable")
     p.add_argument("--bm25-hz", type=float, help="pace queries; omit for closed-loop, or use zero to disable")
@@ -148,6 +149,8 @@ def main():
     samples = {name: [] for name in bodies}
     rss = []
     start = time.monotonic()
+    if args.ready_marker:
+        args.ready_marker.write_text(str(start))
     failures = []
 
     def sample(name, hz):

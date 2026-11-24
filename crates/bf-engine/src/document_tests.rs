@@ -134,25 +134,53 @@ async fn small_wide_vector_flushes_are_indexed_and_preserve_top_k() {
     state.ann_dirs.insert("annv2:vector".into(), directory);
     let request: bf_types::QueryRequest =
         serde_json::from_value(json!({"rank_by":["vector","ANN",vector],"top_k":10})).unwrap();
-    let actual = crate::indexed::execute(
-        &store,
-        &state,
-        &request,
-        &crate::EngineConfig::default(),
-        false,
-    )
-    .await
-    .unwrap()
-    .result
-    .rows
-    .unwrap();
-    state.docs = crate::shared(docs);
-    let expected = crate::query::execute(&state, &request)
+    for hidden in [0, 1, 31, 96] {
+        state.docs.clear();
+        state.shadowed.clear();
+        let mut reference = docs.clone();
+        for id in 0..hidden {
+            state.shadowed.insert(Id::Uint(id));
+            if id % 2 == 0 {
+                reference.remove(&Id::Uint(id));
+            } else {
+                let mut replacement = reference[&Id::Uint(id)].clone();
+                let mut vector = vec![0.0; 1024];
+                vector[0] = 1.0;
+                vector[1] = 100.0 + id as f32;
+                replacement.insert(
+                    "vector".into(),
+                    json!(bf_types::encode_vector(&vector, false)),
+                );
+                reference.insert(Id::Uint(id), replacement.clone());
+                state
+                    .docs
+                    .insert(Id::Uint(id), std::sync::Arc::new(replacement));
+            }
+        }
+        let actual = crate::indexed::execute(
+            &store,
+            &state,
+            &request,
+            &crate::EngineConfig::default(),
+            false,
+        )
+        .await
         .unwrap()
         .result
         .rows
         .unwrap();
-    assert_eq!(actual, expected);
+        let mut exhaustive = state.clone();
+        exhaustive.docs = crate::shared(reference);
+        let expected = crate::query::execute(&exhaustive, &request)
+            .unwrap()
+            .result
+            .rows
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "{hidden} nearest indexed rows shadowed by replacements and deletes"
+        );
+    }
 }
 
 pub(super) fn input(n: u32) -> (Schema, BTreeMap<Id, Document>) {

@@ -265,7 +265,7 @@ mod tests {
                             let request: QueryRequest = serde_json::from_value(json!({
                                 "rank_by":["vector","ANN",vector],"top_k":9,"offset":3,
                                 "include_attributes":["version","group","vector"],
-                                "filters":if round%2==0 {json!(["group","In",[0,2]])}else{json!(["id","Gte",0])}
+                                "filters":match round%3 {0=>json!(["group","In",[0,2]]),1=>json!(["id","Gte",0]),_=>serde_json::Value::Null}
                             })).unwrap();
                             let got = indexed::execute(&store,&state,&request,&config,true).await.unwrap().result.rows.unwrap();
                             let expected = query::execute(&full,&request).unwrap().result.rows.unwrap();
