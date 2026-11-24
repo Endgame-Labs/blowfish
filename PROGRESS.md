@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Shared ANN query metadata, round Q1.** Partial indexes share immutable cluster ranges and
+  retain only installed payloads, preserving cluster IDs and encoded objects. On warm NQ,
+  alternating VM passes use 5.9% fewer instructions at 48 probes and 5.5% fewer at 64, with
+  all 4,000 top-10 lists identical. Fresh-process 25 ms S3-facade comparisons show similar
+  median latency; no M4 throughput improvement is claimed. Independent-view regression tests,
+  formatting, three-crate clippy, and the crate test suites validate the change.
+
 - **Warm ANN profiling, round Q1.** `BF_TRACE_STAGES` now reports microsecond ANN and HTTP timings,
   distinguishes scanned rows from accepted candidates, and separates rerank vector reads from scoring.
   The HTTP response stays unchanged. Formatting, clippy for `bf-vector`, `bf-engine`, and `blowfish`

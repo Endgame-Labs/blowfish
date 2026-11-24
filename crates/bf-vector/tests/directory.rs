@@ -176,6 +176,16 @@ async fn ann_object_holds_blob_and_codes_together_and_scans_like_the_index() {
             &fragment[c.start as usize..c.end as usize],
         ));
     }
+    // Independent query views share only immutable ranges, never installed payloads.
+    let untouched = dir.partial_index(0, Bytes::from(fragment.clone())).unwrap();
+    assert_eq!(
+        untouched.index().cluster_count(),
+        partial.index().cluster_count()
+    );
+    for &cluster in &wanted {
+        assert!(partial.index().cluster_rows(cluster) > 0);
+        assert_eq!(untouched.index().cluster_rows(cluster), 0);
+    }
     let got = partial
         .index()
         .scan_blocks(&query, &wanted, codes.clone(), None)

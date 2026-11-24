@@ -122,14 +122,6 @@ impl Ord for OrdF32 {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct StubCluster {
-    pub codes: Range<u64>,
-    pub vectors: Range<u64>,
-    pub codes_crc: u32,
-    pub vectors_crc: u32,
-}
-
 /// A parsed immutable index. Metadata and centroids stay resident; codes and
 /// vectors are fetched through the reader for each search (usually cache-backed).
 pub struct Index<R: RangeRead> {
@@ -265,23 +257,12 @@ impl<R: RangeRead> Index<R> {
     pub(crate) fn stub(
         reader: R,
         shape: &crate::directory::Shape,
-        stubs: &[StubCluster],
+        stubs: Arc<Vec<format::Cluster>>,
         reference: Arc<Vec<f32>>,
     ) -> Result<Self> {
         let rq = RaBitQ::new(shape.dims, shape.seed)?;
-        // A query builds stubs for every cluster of each slab it probes and installs only the
-        // probed ones, so a stub holds no payload at all.
-        let clusters = stubs
-            .iter()
-            .map(|s| format::Cluster {
-                data: None,
-                parent: u32::MAX,
-                codes: s.codes.clone(),
-                vectors: s.vectors.clone(),
-                codes_crc: s.codes_crc,
-                vectors_crc: s.vectors_crc,
-            })
-            .collect();
+        // The directory owns all immutable ranges; this query installs only selected payloads.
+        let clusters = format::Clusters::partial(stubs);
         let metadata = Metadata {
             dims: shape.dims,
             count: 0,
