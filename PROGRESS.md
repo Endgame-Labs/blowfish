@@ -2,6 +2,17 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-24
+
+- **Apple M4 NQ at v0.1.15** (`docs/benchmarks.md`, "Apple M4 at v0.1.15"). I reran the tagged release,
+  Qdrant 1.20.0, and LanceDB 0.41.0 one at a time on the same 10-core Mac. Blowfish gives 1,801–1,827 q/s
+  at 64 probes, recall@10 0.9611, and 1.3–1.4 / 1.6 / 1.9–2.0 ms p50 / p90 / p99; at 48 probes,
+  2,075–2,128 q/s at recall 0.9512. Qdrant ef 64 gives 7,481–8,023 q/s at 0.9497, and LanceDB 120 probes
+  276–279 q/s at 0.9489. HTTP load takes 89.9 s, and the final automatic tier takes 580.9 s to build,
+  installing about 706 s after the first write; load/build peak RSS is 2.73 GB. The write-up includes
+  repeated passes, limits, intermediate builds, memory, and comparison caveats. Both harnesses now report
+  p90. Formatting, full-workspace clippy, and all 324 Rust tests pass; no engine code or root README changes.
+
 ## 2026-11-23
 
 - **Automatic recluster, round R3** (`docs/benchmarks.md`, "Automatic recluster, round R3"). Rows written after

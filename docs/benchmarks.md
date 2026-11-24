@@ -13,7 +13,8 @@ Latest in-region AWS S3 numbers (`c7gd.2xlarge`, same region as the bucket, stro
 - **One machine, BEIR NQ (2.68M x 1,024 f16, local disk; [Iteration 19](#iteration-19-beir-natural-questions-on-one-machine)):**
   reclustered at 64 probes, recall@10 `0.955`, warm `8.3 / 18.1 ms` p50 / p99, and `444 q/s` at 16 clients on 6 pinned
   vCPUs (was `28.7 / 732 ms` and `27 q/s`). As loaded at default settings, recall@10 is `0.960` (was `0.907`). On an
-  Apple M4: `2.8 / 4.1 ms` and `870 q/s`.
+  [Apple M4 at v0.1.15](#apple-m4-at-v0115-blowfish-qdrant-and-lancedb): `1.3–1.4 / 1.9–2.0 ms` and
+  `1,814 q/s` at 64 probes (recall@10 `0.961`).
   [Iteration 20](#iteration-20-fewer-cycles-per-row-and-better-placed-rows-beir-nq-one-machine): `573 q/s` at recall@10
   `0.954` reclustered (54 probes, against main's `395 q/s` at `0.955` in the same interleaved run), `0.960` at the
   default 64 probes, and `387 q/s` as loaded (main `269`).
@@ -4453,3 +4454,88 @@ I load the first 1,000,000 MS MARCO passages on a 10-core Apple M4 Mac mini (16 
 - Posting-slice searches, candidate generation, and scoring still dominate long, common-word queries, and some M4 c1 tail medians rise slightly (query 672: `16.13` to `16.83 ms`; 182: `10.52` to `10.87 ms`), though 769 drops from `5.84` to `5.41 ms`.
 - The 200-query VM pass is not comparable to round 2's 1,000-query mean, and candidate c1 counts vary (`27.509` vs. `25.606` million) with segment-floor ordering under contention.
 - Other applications stayed open on the unpinned Mac, and the fixed 25 ms/request S3 facade makes no in-region cold claim.
+
+## Apple M4 at v0.1.15: blowfish, Qdrant, and LanceDB
+
+I reran the vectors-only NQ comparison on a 10-core Apple M4 Mac mini with 16 GiB of RAM and macOS 26.2.
+I built blowfish from tag `v0.1.15` (`e49c509`), in the native release profile, without `local-models`.
+I used Qdrant 1.20.0's official macOS arm64 binary and LanceDB 0.41.0, the same versions as the
+[Iteration 19 Mac run](#on-a-mac-blowfish-qdrant-and-lancedb-apple-m4).
+
+I kept that run's limits: all 10 cores shared by engine and clients, no CPU pinning, no process memory cap,
+and a 4 GiB blowfish block cache with its disk cache disabled. macOS swap stayed enabled, and the desktop's
+background applications remained running. I ran one engine at a time, on local disk, and deleted its data
+before starting the next.
+
+The workload is the same 2,681,468 NQ passages, 3,452 queries, and 1,024-dimensional Cohere embed-english-v3
+vectors stored as f16, with cosine distance. Every engine gets id and vector only. I use `bench/nq/` and
+measure recall@10 against its brute-force exact truth at limit 10 for all three engines. Warm latency is
+1,000 queries at one client after one 1,000-query warm-up pass. Throughput is the first 2,000 queries, with
+pre-encoded HTTP request bodies for blowfish and Qdrant, at 1, 4, and 16 clients. LanceDB runs in-process
+with client threads. I added p90 output to both measurement scripts.
+
+### Query results
+
+| Engine, setting | Recall@10 | p50 / p90 / p99 ms, 1 client | q/s at 16, mean (range) |
+|---|---:|---|---|
+| blowfish v0.1.15, 64 probes (default) | 0.9611 | 1.3–1.4 / 1.6 / 1.9–2.0 | 1,814 (1,801–1,827) |
+| blowfish v0.1.15, 48 probes | 0.9512 | 1.2 / 1.4 / 1.7–1.8 | 2,101 (2,075–2,128) |
+| Qdrant 1.20.0, hnsw_ef 64 | 0.9497 | 0.5 / 0.6 / 0.7 | 7,752 (7,481–8,023) |
+| Qdrant 1.20.0, hnsw_ef 128 | 0.9696 | 0.7 / 0.9 / 1.0 | 5,451 (5,444–5,459) |
+| LanceDB 0.41.0, 80 probes, refine 10 | 0.9249 | 13.0–13.2 / 13.3–13.5 / 13.9–14.5 | 393 (390–396) |
+| LanceDB 0.41.0, 120 probes, refine 10 | 0.9489 | 18.6–18.7 / 19.0–19.1 / 19.8–19.9 | 278 (276–279) |
+
+I measured blowfish in 64, 48, 64, and 48 probe order, restarting the process and warming it each time.
+At 64 probes, the two 16-client passes gave 1,827.0 and 1,801.1 q/s; at 48, 2,074.6 and 2,127.9 q/s.
+I also repeated both Qdrant settings and both LanceDB settings. The table gives the range of each latency
+percentile across two passes and the mean throughput, with its range. I ran quality in the first blowfish
+and Qdrant pair, and in both LanceDB passes; LanceDB's recall repeated exactly. Iteration 19 scored blowfish
+at limit 100; Qdrant and LanceDB were scored at limit 10 then too.
+
+Qdrant uses HNSW m=16, ef_construct=100, and f16 vectors in RAM. I kept the optimizer target of one segment
+and max_segment_size=100,000,000. When I measured, it reported green status, all 2,681,468 vectors indexed,
+an empty update queue, and **two physical segments**. LanceDB uses IVF-PQ with 1,600 partitions,
+128 sub-vectors, and refine factor 10, at 80 and 120 probes. Its newly built index has lower recall than
+Iteration 19's, so I report this run's measured quality alongside its speed.
+
+At recall around 0.95, blowfish at 48 probes serves about **7.6 times** LanceDB's throughput at 120 probes
+(2,101 against 278 q/s), and about **27%** of Qdrant's at ef 64 (7,752 q/s). The default 64 probes gives
+higher recall, 0.9611, at about 1,814 q/s. The algorithms and client paths differ: LanceDB pays no HTTP or
+JSON cost, and Qdrant uses HNSW over RAM-resident vectors.
+
+### Load, automatic recluster, and memory
+
+I loaded blowfish through the HTTP API with `load.py --vectors-only`: 5,000-row batches, four requests
+in flight, and default indexing, compaction, and automatic recluster settings. I waited for the tier
+covering all rows to be installed and indexing to become idle before measuring queries.
+
+The HTTP load took **89.9 s** (29,822 rows/s). The automatic job installed a 225,000-row tier in 11.1 s,
+then a 545,000-row tier in 105.9 s, starting both during ingest. The bulk-load guard permits another build
+when uncovered rows exceed covered rows, so these intermediate tiers are part of the default behavior.
+The final build covered all 2,681,468 rows in 19 segments, with 32 slabs and 13,392 leaves, and took
+**580.9 s**. It started about 35 s after the last write and installed about 616 s after it; from the first
+write to the final tier was about **706 s**. Vector copying took 191 s of that final build. These times
+overlap, so I do not add the intermediate builds to the load time.
+
+| Engine | Load or write | Index or recluster | Peak RSS, decimal GB |
+|---|---|---|---|
+| blowfish | 89.9 s | 11.1 s and 105.9 s intermediate builds; 580.9 s final build | 2.73 load/build; 2.69–3.34 queries |
+| Qdrant | 343 s | 270 s | 14.73 across load, index, and queries |
+| LanceDB | 18 s | 56 s | 8.82 build; 0.60–0.61 queries |
+
+I measured process maxima with `/usr/bin/time -l`. One-second RSS samples during blowfish's final full-corpus
+build peaked at 1.54 GB; its whole load/build process peaked at 2.73 GB. Qdrant's process maximum includes
+indexing, while its query RSS samples peaked at 5.89 GB. Qdrant's indexing time includes the harness's
+30-second readiness polling. The old blowfish quality pass requested more results and could fill more
+cache, so the RSS difference from Iteration 19 is not a controlled memory comparison.
+
+Against the historical M4 run, default-probe throughput rises from 870 to about **1,814 q/s**, with recall
+rising from 0.952 to 0.961. The 1-client p50 falls from 2.8 to 1.3–1.4 ms, and p99 from 4.1 to 1.9–2.0 ms.
+At 48 probes I now measure recall 0.951 rather than 0.940. I rebuilt the indexes, so this comparison
+includes layout and build differences.
+
+Time to the final tier is longer: about 706 s from the first write here, against the old 139 s load plus
+334 s manual recluster. The automatic job uses half the cores and made intermediate tiers while this
+load ran; I have not isolated those effects from the other changes since Iteration 19. I would use the
+query improvement and the time to a final tier together when comparing releases. All of these numbers
+are warm, with local-disk storage on a shared Mac.
