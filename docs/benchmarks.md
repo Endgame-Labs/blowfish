@@ -6735,6 +6735,10 @@ through the HTTP API on `origin/main` at `293251c`. The paired runs use one owne
 us-west-2, with S3 in the same region. The baseline's final base has 38 slabs, with about 200 rows per
 leaf. I copied that namespace's objects to a separate candidate prefix before upgrading it. Query
 runs use the engine directly, strong consistency, a 3 GiB memory block cache, and no disk cache.
+The original matrix sets retention to zero, matching its immediate-GC setup. A separate short
+comparison of the final integrated branch uses the normal one-hour retention, which also exercises
+warm searches that overlap checkpoint refresh. The harness records the resolved retention and
+cache budgets; set `BF_RETENTION_SECS=0` to reproduce the original matrix's query configuration.
 
 The retirement pass keeps the snapshot's segment layout fixed. Compaction and lineage are tested
 separately. Format-4 tiers gain their row lists automatically, then the indexer removes covered

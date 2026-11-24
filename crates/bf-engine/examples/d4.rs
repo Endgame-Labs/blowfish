@@ -24,15 +24,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let store = Storage::open(&config).await?;
     let mut tuning = EngineConfig::from_env();
     tuning.indexing = false;
-    tuning.retention = Duration::ZERO;
+    if matches!(args[1].as_str(), "index" | "recluster" | "gc") {
+        tuning.retention = Duration::ZERO;
+    }
     tuning.recall_sample_rate = 0.0;
     if args[1] == "index" {
         // Isolate the retirement publication from compaction in the paired snapshot.
         tuning.max_segment_bytes = 1;
     }
     let nprobe = tuning.ann_nprobe;
+    let retention = tuning.retention.as_secs_f64();
+    let decoded = tuning.decoded_cache_bytes;
     let engine = Engine::with_config(store.clone(), tuning);
-    let mut result = json!({"mode":args[1],"nprobe":nprobe,"manifest_format":bf_wal::MANIFEST_FORMAT_VERSION,"bucket_format":bf_storage::BUCKET_FORMAT_VERSION});
+    let mut result = json!({
+        "mode":args[1], "nprobe":nprobe, "retention_secs":retention,
+        "decoded_cache_bytes":decoded, "block_cache_bytes":config.cache.memory_bytes,
+        "disk_cache_bytes":config.cache.disk_bytes,
+        "manifest_format":bf_wal::MANIFEST_FORMAT_VERSION,
+        "bucket_format":bf_storage::BUCKET_FORMAT_VERSION,
+    });
     let t0 = Instant::now();
     match args[1].as_str() {
         "index" => {
