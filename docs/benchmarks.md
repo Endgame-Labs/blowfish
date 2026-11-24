@@ -4451,8 +4451,8 @@ the write tail flushed by v0.1.15.
 | 4 | 30.31M | 38.58M | 0.9521 |
 
 On the least-contended runs (1 and 2), after is 0.5% below before. Runs 3 and 4 ran with the VM at load average 15:
-counts rose on both sides, because idle runtime threads spin more under contention. Recall is identical, query for
-query in aggregate. A read-only server in front of an unindexed 46,681-row write tail spent 3.2G instructions and 344
+counts rose on both sides, because idle runtime threads spin more under contention. Recall is identical in every run. A
+read-only server in front of an unindexed 46,681-row write tail spent 3.2G instructions and 344
 ms p50 per query, nearly all decoding and scoring the tail's base64 vectors. That is the WAL tail path, not lineage.
 
 ### Continuous writes
