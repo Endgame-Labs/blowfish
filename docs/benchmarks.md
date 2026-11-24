@@ -4908,3 +4908,59 @@ before and after the manifest write and a merge of a merged segment.
 
 Not done in this round. The covered segments' ANN objects total 6.0 GB on NQ (about 2,240 bytes per covered row),
 which is what D4 would save. `disk-footprint.md` lists what retiring them needs.
+
+
+## Round G3: disposable graphs for hot tiers
+
+Status: kill tests in progress. These are offline experiments; production queries, manifests,
+S3 layouts, and cold-path behavior are unchanged. The harness is
+`crates/bf-vector/examples/hot_graph.rs`, with reproducible commands in `examples/g3/README.md`.
+
+### Shared-VM baseline and packet kill test
+
+BEIR NQ, 2,681,468 x 1,024 f16 vectors, cosine, top 10, and all 3,452 test queries. Recall is
+against exact cosine top 10. These runs used two query threads on two x86-64 vCPUs of an AMD
+EPYC 9354P. Other experiments shared the machine, so wall-clock q/s is not retained as throughput
+evidence. Perf counters cover only the resident query region, including normalization, query setup,
+traversal, scan, exact rerank, and recall accounting. Loading, construction, and encoding are excluded.
+
+The IVF fixture copies the current 32-slab, 13,395-leaf base tier. Its 2,806,468 ordinal slots include
+superseded covered rows; only 2,681,468 rows are indexed. Mapping tier ordinals through covered
+segments' ID lists is necessary before comparing with corpus truth. The baseline uses the production
+directory ranking, scaled probe count, resident code scan, per-slab top-10 bounds, global top-10 upper
+bound, 320-row rerank cap, and direct exact scoring over the same f16 corpus as the graphs. It excludes
+HTTP, hydration, cache lookups, and read planning. The strict qualifying baseline points are 50 probes
+at 0.95 and 66 at 0.96; the requested 48/64 points fall just short of those thresholds in this harness.
+
+The packet variant greedily forms spatial packets of up to 32 rows within existing IVF leaves,
+then builds an exact-center HNSW using `hnsw_rs 0.3.5` (MIT OR Apache-2.0), M=16, base degree up to
+32, and construction ef=100. Its 90,316 packets are navigated by minimum residual one-bit fast-scan
+row score, using the production transform and scorer. It keeps the best 80 reached rows for exact
+f16 rerank. A query caches each packet score, so upper/base-layer revisits do not scan it twice.
+Row counts are logical corpus rows; the SIMD kernel also processes padded lanes.
+
+| Variant | Probes / ef | Recall@10 | Unique packets / query | Rows scored / query | M instructions / query |
+|---|---:|---:|---:|---:|---:|
+| ivf | 48 | 0.949015 | — | 83,135 | 9.160 |
+| ivf | 50 | 0.950637 | — | 86,668 | 9.350 |
+| ivf | 64 | 0.959820 | — | 110,402 | 10.717 |
+| ivf | 66 | 0.961095 | — | 113,745 | 10.891 |
+| packet32 | 64 | 0.838934 | 737.2 | 22,377 | 4.416 |
+| packet32 | 256 | 0.926043 | 2019.9 | 61,122 | 8.988 |
+| packet32 | 480 | 0.951912 | 3335.7 | 100,764 | 13.721 |
+| packet32 | 512 | 0.953882 | 3515.0 | 106,159 | 14.365 |
+| packet32 | 640 | 0.960718 | 4212.5 | 127,145 | 16.891 |
+| packet32 | 1024 | 0.973001 | 6168.6 | 185,937 | 24.008 |
+| packet32 | 2048 | 0.985429 | 10819.2 | 325,454 | 41.137 |
+
+**Kill the packet variant.** At the qualifying 0.95 and 0.96 points (ef=480 and 640), it needs
+47% and 55% more instructions than the qualifying IVF baselines, rather than at least 50% fewer.
+It also scores more rows at both thresholds. The predicted walk of 300–500 packets at 0.96 does not
+materialize: the measured 0.960718 point visits 4,213 packets and scores 127,145 rows. This result
+rejects this packet topology and scorer, without claiming that all possible packet graphs fail.
+
+Packet preparation, including loading the IVF fixture, took 142 s, and its center HNSW took 127 s,
+while sharing the two CPUs with other study work. The harness keeps the entire f16 corpus resident;
+its approximately 5.9 GiB query RSS is not a sparse-rerank-cache memory result. Eight-bit encoding
+of the corpus took 55.6 s, including writing the scratch codes. Full row-graph construction was
+moved to an isolated Graviton instance to avoid contention on the shared VM; its paired results follow.

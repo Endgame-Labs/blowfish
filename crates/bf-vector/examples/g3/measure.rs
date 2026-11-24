@@ -33,7 +33,7 @@ impl Region {
             control.flush().unwrap();
             let mut line = String::new();
             ack.read_line(&mut line).unwrap();
-            assert!(line.starts_with("ack"));
+            assert!(line.trim_start_matches('\0').starts_with("ack"));
         }
     }
     pub fn end(mut self) -> f64 {

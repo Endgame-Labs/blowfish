@@ -21,7 +21,7 @@ try:
     for fifo in (control, ack):
         os.mkfifo(fifo)
     env = dict(os.environ, RAYON_NUM_THREADS=threads, G3_PERF_CTL=str(control), G3_PERF_ACK=str(ack))
-    command = ['nice', '-n', '19', 'taskset', '-c', cpus, 'perf', 'stat', '-D', '-1',
+    command = ['nice', '-n', '19', 'taskset', '-c', cpus, os.environ.get('G3_PERF_BIN', 'perf'), 'stat', '-D', '-1',
                '--control', f'fifo:{control},{ack}', '-e', 'instructions,cycles', '-x', ',',
                '-o', str(stem) + '.perf', binary, *args]
     with Path(str(stem) + '.log').open('w') as log:

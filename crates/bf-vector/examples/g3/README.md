@@ -51,6 +51,7 @@ limit is only for construction smoke tests; NQ recall requires the complete corp
 `packet-build` uses its ef-position argument for packet size (16 or 32); `packet-search` currently
 loads the 32-row fixture. Sixteen-row packets pad the SIMD block to 32 rows, just as production does.
 
+`G3_PERF_BIN` may select a working perf executable when the default command is a kernel-version wrapper.
 `measure.py` starts perf counters disabled and enables them only around the resident query loop.
 Instruction counts include normalization, rotation, visited and heap work, scoring, rerank, and recall
 accounting. Corpus loading, graph building, code encoding, and fixture parsing are excluded. Run all

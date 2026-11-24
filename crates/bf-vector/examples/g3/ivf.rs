@@ -69,6 +69,11 @@ impl Ivf {
             .iter()
             .map(|b| u32::from_le_bytes(*b))
             .collect();
+        eprintln!(
+            "ivf rows={rows} leaves={} slabs={}",
+            dir.entries().len(),
+            indexes.len()
+        );
         Ok(Self {
             dir,
             indexes,
