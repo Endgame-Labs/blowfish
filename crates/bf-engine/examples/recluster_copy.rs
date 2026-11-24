@@ -1,6 +1,6 @@
 //! Rebuild a private benchmark copy with an explicit target leaf size.
 //!
-//! Usage: recluster_copy storage.json namespace cluster_rows scratch_dir [--upgrade-only]
+//! Usage: recluster_copy storage.json namespace cluster_rows|auto scratch_dir [--upgrade-only]
 //! The storage URL must use an owned `tmp/` prefix, and the scratch directory must
 //! be under `.scratch/`. Copy a quiescent checkpoint first, and delete the owned
 //! prefix after measurement. Existing scale prefixes are never writable here.
@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !(args.len() == 4 || (args.len() == 5 && args[4] == "--upgrade-only")) {
         return Err(
-            "expected storage.json namespace cluster_rows scratch_dir [--upgrade-only]".into(),
+            "expected storage.json namespace cluster_rows|auto scratch_dir [--upgrade-only]".into(),
         );
     }
     let config: StorageConfig = serde_json::from_slice(&std::fs::read(&args[0])?)?;
@@ -31,10 +31,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if !scratch.components().any(|c| c.as_os_str() == ".scratch") {
         return Err("scratch directory must be beneath .scratch/".into());
     }
-    let cluster_rows: usize = args[2].parse()?;
-    if cluster_rows == 0 {
-        return Err("cluster_rows must be positive".into());
-    }
+    let cluster_rows = match args[2].as_str() {
+        "auto" => 0,
+        value => {
+            let rows: usize = value.parse()?;
+            if rows == 0 {
+                return Err("cluster_rows must be positive, or auto".into());
+            }
+            rows
+        }
+    };
     let engine = Engine::with_config(
         Storage::open(&config).await?,
         EngineConfig {
@@ -73,7 +79,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         serde_json::json!({
             "rows":report.rows, "slabs":report.slabs, "clusters":report.clusters,
             "directory_bytes":report.directory_bytes, "seconds":report.seconds,
-            "cluster_rows":cluster_rows,
+            "cluster_rows":report.cluster_rows,
         })
     );
     Ok(())

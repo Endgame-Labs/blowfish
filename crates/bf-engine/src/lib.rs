@@ -972,7 +972,9 @@ impl Engine {
             .acquire_owned()
             .await
             .map_err(segment::index_error)?;
-        let query = async move {
+        // The full indexed plan is large. Keep the dispatch alternatives pointer-sized so a
+        // saved I/O continuation does not multiply its stack footprint in the caller's future.
+        let query = Box::pin(async move {
             let _permit = permit;
             let _in_flight = InFlight::enter();
             warm_graph::measure_cpu(
@@ -983,7 +985,7 @@ impl Engine {
                 ),
             )
             .await
-        };
+        });
         let response = if warm {
             query_worker::run(query).await??
         } else {

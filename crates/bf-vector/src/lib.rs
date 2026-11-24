@@ -8,7 +8,9 @@ mod distance;
 mod fastscan;
 mod format;
 mod index;
+mod policy;
 mod reader;
+pub use policy::tier_probe_budget;
 mod resident;
 pub use resident::{
     CompiledHits, CompiledTier, ResidentIndex, ResidentQueryScratch, ValidatedVector,
