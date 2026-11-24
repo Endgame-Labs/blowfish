@@ -164,10 +164,11 @@ A filtered ANN query now takes the same path as an unfiltered one:
    There is no fixed cap: a cap of three times the unfiltered count lost neighbors on selective filters.
 3. Winners are hydrated by segment row (`projected_rows`), so no ID index is read.
 
-The filtered planner also recognizes a cluster-local mask when leaves with any allowed member hold less than half of the
-source rows. It walks those leaves in center-distance order and can stop after their **actual allowed counts** cover two
-unfiltered probe populations, including the existing witness margin and at least the rerank budget. The original scaled
-probe plan remains a ceiling on this extra walk. Distributed and broad masks retain its geometric floor. A literal
+The filtered planner walks nonempty leaves in center-distance order and can stop after their **actual allowed counts**
+cover two unfiltered probe populations, including the existing witness margin and at least the rerank budget. It multiplies
+this coverage goal by the square root of source rows over rows in wholly excluded leaves. The benefit fades smoothly as
+fewer source rows are excluded; with none, the original plan is retained. The original scaled probe plan remains a ceiling
+on this walk. A literal
 rerank-sized survivor pool lost true neighbors, even with the unfiltered minimum; exact counts alone do not prove that the
 probed centers cover the nearest filtered vectors.
 

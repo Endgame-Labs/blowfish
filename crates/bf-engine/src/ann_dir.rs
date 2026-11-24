@@ -838,9 +838,9 @@ fn pick_clusters(
     };
     let probes = probe_count(config, ann_rows, clusters, thin * spread, layout);
     let base_probes = probe_count(config, ann_rows, clusters, spread, layout);
-    // An early stop is reserved for cluster-local masks: most source rows lie in leaves
-    // with no allowed member. Distributed and broad masks retain the existing geometric
-    // floor; replacing it with a rerank-sized witness pool lost true neighbors.
+    // Empty leaves expose the filter's concentration without assuming independent row
+    // thinning. Increase the coverage goal smoothly as less source data is excluded;
+    // with no wholly excluded leaves, retain the original geometric plan.
     let eligible_rows: u64 = if filtered {
         order
             .iter()
@@ -849,12 +849,16 @@ fn pick_clusters(
     } else {
         0
     };
-    let coverage = if filtered && eligible_rows.saturating_mul(2) < ann_rows as u64 {
+    let excluded_rows = (ann_rows as u64).saturating_sub(eligible_rows);
+    let coverage = if filtered && excluded_rows > 0 {
         // Exact membership counts determine when this population has actually been
         // covered. Keep two unfiltered probe populations, with the existing witness margin;
         // a smaller population regressed localized NQ queries despite filling rerank.
         let witnesses = thin * matching as f64 / ann_rows.max(1) as f64;
-        (2.0 * base_probes as f64 * ann_rows as f64 / clusters.max(1) as f64 * witnesses)
+        let concentration = (ann_rows as f64 / excluded_rows as f64).sqrt();
+        (2.0 * base_probes as f64 * ann_rows as f64 / clusters.max(1) as f64
+            * witnesses
+            * concentration)
             .ceil()
             .max(target as f64)
             .min(matching as f64)
@@ -1177,7 +1181,15 @@ pub(crate) async fn search(
     // One rotation serves the ranking and every segment's scan (they share one vector space).
     let rotated = Arc::new(dir.rotate_query(&vector).map_err(segment::index_error)?);
     let distances = {
-        let (dir, rotated, skip) = (dir.clone(), rotated.clone(), skip.to_vec());
+        let (dir, rotated, mut skip) = (dir.clone(), rotated.clone(), skip.to_vec());
+        if filtered {
+            // An empty predicate cannot contribute a candidate. Avoid even ranking that
+            // segment's center codes; nonempty segments keep identical distances.
+            skip.resize(lives.len(), false);
+            for (i, mask) in lives.iter().enumerate() {
+                skip[i] |= mask.as_ref().is_some_and(|rows| rows.is_empty());
+            }
+        }
         on_worker(async move {
             // Segments a recluster tier answers for are not ranked at all.
             dir.center_distances_rotated_except(&rotated, crate::fan_out(), &skip)
@@ -2289,17 +2301,26 @@ mod spread_tests {
             .build(&rows)
             .unwrap();
         let (ann, length) = Fragment::build_ann(&blob).unwrap();
-        let fragment = Fragment::decode(&ann[..length as usize]).unwrap();
-        let bytes = Directory::build(&[("segment".into(), "ann".into(), "ann".into(), fragment)])
-            .unwrap()
-            .unwrap();
+        let sources: Vec<_> = (0..10)
+            .map(|i| {
+                (
+                    format!("segment-{i}"),
+                    format!("ann-{i}"),
+                    format!("ann-{i}"),
+                    Fragment::decode(&ann[..length as usize]).unwrap(),
+                )
+            })
+            .collect();
+        let bytes = Directory::build(&sources).unwrap().unwrap();
         let directory = Directory::decode(&bytes).unwrap();
-        assert_eq!(directory.entries().len(), 10);
+        assert_eq!(directory.entries().len(), 100);
         assert!(directory.entries().iter().all(|e| e.rows == 100));
-        let distances: Vec<_> = (0..10).map(|i| (10 - i) as f32).collect();
+        let distances: Vec<_> = (0..100).map(|i| (100 - i) as f32).collect();
         let config = EngineConfig {
             ann_nprobe: 1,
             ann_nprobe_explicit: true,
+            ann_rerank_factor: 1,
+            exact_fetch_rows: 0,
             ..Default::default()
         };
         let baseline = EngineConfig {
@@ -2308,29 +2329,41 @@ mod spread_tests {
         };
         let totals = super::Totals {
             layout: Layout::Segments,
-            ann_rows: 1000,
-            matching: 400,
-            clusters: 10,
+            ann_rows: 10000,
+            matching: 2000,
+            clusters: 100,
             target: 10,
             k: 10,
             filtered: true,
             spread: 1.,
         };
-        let local = |n| if n < 4 { 100. } else { 0. };
+        let local = |n| if n < 20 { 100. } else { 0. };
         assert_eq!(
             super::pick_clusters(&directory, &distances, &local, &totals, &config),
-            vec![3, 2, 1]
+            vec![19, 18, 17, 16]
         );
         assert_eq!(
             super::pick_clusters(&directory, &distances, &local, &totals, &baseline),
-            vec![3, 2, 1, 0]
+            vec![19, 18, 17, 16, 15, 14, 13]
         );
         // The same allowed cardinality spread across all leaves retains main's probe floor.
-        let distributed = |_| 40.;
+        let distributed = |_| 20.;
         assert_eq!(
             super::pick_clusters(&directory, &distances, &distributed, &totals, &config),
             super::pick_clusters(&directory, &distances, &distributed, &totals, &baseline)
         );
+        // Nearby broad masks share main's geometry without a hard 50% boundary.
+        for allowed_clusters in [49, 50, 51] {
+            let broad = |n| if n < allowed_clusters { 100. } else { 0. };
+            let broad_totals = super::Totals {
+                matching: allowed_clusters * 100,
+                ..totals
+            };
+            assert_eq!(
+                super::pick_clusters(&directory, &distances, &broad, &broad_totals, &config),
+                super::pick_clusters(&directory, &distances, &broad, &broad_totals, &baseline)
+            );
+        }
     }
 
     #[test]
