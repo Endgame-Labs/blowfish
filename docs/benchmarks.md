@@ -4421,3 +4421,35 @@ The harness terminates its exact server and profiler PIDs, and removes temporary
 I remove input copies, disposable stores, profiles, and build snapshots after preserving these
 numbers. The facade models fixed dependent round trips and local transfer; I have not measured
 this revision against an in-region S3 bucket or hosted turbopuffer.
+
+## BM25 round 3: fewer posting probes, and a Mac baseline
+
+I load the first 1,000,000 MS MARCO passages on a 10-core Apple M4 Mac mini (16 GiB RAM, macOS 26.2) into one immutable format-5 store of six segments (200,000, 200,000, 5,000, 200,000, 200,000, and 195,000 rows) and run the 1,000 checked-in dev queries at strong consistency against exhaustive top-10 truth. Both arms use the production release profile, two Rayon and two Tokio workers, a 1 GiB cache (4,000-byte blocks), and a retained OS page cache, changing only scalar Rust in `bf-text` with formats, public signatures, and the bucket fence unchanged. The baseline is `e49c509` (`v0.1.15`); the implementation is `3b5f06f`, `08130a9`, and `155b007`.
+
+### Changes
+
+- I probe dense decoded frames after window selection, skipping hashes, clones, retention, and CLOCK refreshes on rejected windows while keeping early sparse probes.
+- I cache query-independent normalization summaries by term and row window inside the 8 MiB admission budget, invalidating on new frames or `k1`, `b`, and average-length changes, with an empty-window prefix sentinel.
+- I prefetch postings in one row-order sweep across selected windows, keeping descending-bound window order and canonical term addition order in scoring.
+- I skip redundant posting binary searches via directory endpoints, searching only remaining suffixes.
+
+### Results
+
+| Metric | Baseline | New |
+| --- | ---: | ---: |
+| M4 warm c1, p50 / p90 | 1.702 / 3.096 ms | 1.468 / 3.001 ms |
+| M4 warm c16 throughput | 505.8 queries/s | 520.3 queries/s |
+| M4 cold 25 ms facade (60q), p50 / p90 | 206.3 / 245.4 ms | 206.2 / 240.6 ms |
+| VM instructions/query (200q), c1 | 28.870 million | 26.558 million |
+| VM instructions/query (200q), c16 | 26.851 million | 25.278 million |
+
+- Across two M4 A/B/A/B sequences (four warm passes per arm), c1 p50 drops 13.7%, p90 drops 3.1%, and c16 throughput rises 2.9% (`24.61 / 56.36` to `23.96 / 55.07 ms`). Cold I/O stays flat across one 60-query A/B/A/B pass at `116.88–116.97` reads, `3.598–3.599 MB`, and `3.417–3.442` waves.
+- On the VM (CPUs 6–7, nice 10, 200-query A/B/A/B under `perf stat` on the copied store), median server instructions fall 8.0% at c1 and 5.9% at c16. I omit VM wall times because other work was running; VM claims are instruction counts.
+- All 17,840 checked responses (16,240 M4 and 1,600 VM) match exhaustive top-10 IDs and `f32` score bits (`overlap@10` `1.0000`).
+
+### Limits
+
+- On the M4, the baseline already beat turbopuffer's published warm 13 / 18 ms, so I make no claim of crossing that threshold, comparing on equal hardware, or bringing the earlier 21.8 ms p90 (measured on two shared VM CPUs) below 18 ms.
+- Posting-slice searches, candidate generation, and scoring still dominate long, common-word queries, and some M4 c1 tail medians rise slightly (query 672: `16.13` to `16.83 ms`; 182: `10.52` to `10.87 ms`), though 769 drops from `5.84` to `5.41 ms`.
+- The 200-query VM pass is not comparable to round 2's 1,000-query mean, and candidate c1 counts vary (`27.509` vs. `25.606` million) with segment-floor ordering under contention.
+- Other applications stayed open on the unpinned Mac, and the fixed 25 ms/request S3 facade makes no in-region cold claim.

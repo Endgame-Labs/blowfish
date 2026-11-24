@@ -896,3 +896,21 @@ moves from 335/392 to 303/366 ms, with reads falling from 233 to 193 per query. 
 scores, and independently fused RRF results match. Full methodology, paired repetitions, cache
 budgets, and the remaining p90 gap are in `docs/benchmarks.md`, "BM25 round 2". I update only the
 README's local BM25 paragraph; the in-region figures retain their existing measurements.
+
+## 2026-11-24 — v0.1.15 hardening (H2)
+
+Shipped in v0.1.15. SIGTERM now stops every background job (indexer, compaction, upgrades, recluster, GC,
+and the recall sampler) within seconds; a recluster build used to hold shutdown for minutes, and NQ now
+stops in 0.1 s. The recall sampler skips its first interval after startup and then waits at least 50 times
+its last run, so a restart no longer rereads every row (about 5.5 GB on NQ). An end-to-end upgrade from a
+real v0.1.14 bucket found and fixed a blocker: v0.1.14 cluster blobs carry no checksum, and main rejected
+them, so every ANN query failed after upgrading. The read-cache tests now count request waves by
+dependency instead of timing. Upgrade steps and timings are in `docs/operations.md`, "Upgrading to v0.1.15".
+
+## 2026-11-24 — BM25 round 3
+
+`bf-text` probes dense posting caches only for selected windows, caches per-term normalization summaries
+inside the existing 8 MiB budget, sweeps posting frames in one pass, and reuses directory endpoints. On a
+10-core Apple M4, warm 1-client p50/p90 moves from 1.70/3.10 to 1.47/3.00 ms and 16-client throughput from
+506 to 520 q/s; VM instructions per query fall 8.0% (1 client) and 5.9% (16 clients). All 17,840 checked
+responses match exhaustive results exactly. Details in `docs/benchmarks.md`, "BM25 round 3".
