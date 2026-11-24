@@ -127,7 +127,39 @@ pub(crate) struct Saturation {
 #[derive(Default)]
 pub(crate) struct BoundCache {
     pub(crate) frames: std::collections::HashMap<u64, Vec<(usize, f64)>>,
+    // Term maxima use -1 for windows without any posting. This keeps
+    // prefix presence separate from a zero normalization value.
+    terms: std::collections::HashMap<u64, TermBounds>,
     bytes: usize,
+}
+struct TermBounds {
+    known_frames: usize,
+    maxima: Vec<f64>,
+}
+impl BoundCache {
+    pub(crate) fn term(&self, offset: u64) -> Option<&[f64]> {
+        self.terms
+            .get(&offset)
+            .filter(|term| term.known_frames == self.frames.len())
+            .map(|term| term.maxima.as_slice())
+    }
+
+    pub(crate) fn remember_term(&mut self, offset: u64, windows: Vec<f64>) {
+        let charge = windows.capacity() * std::mem::size_of::<f64>() + 64;
+        let old_charge = self.terms.get(&offset).map_or(0, |term| {
+            term.maxima.capacity() * std::mem::size_of::<f64>() + 64
+        });
+        if self.bytes - old_charge + charge <= Saturation::MAX_BOUND_BYTES {
+            self.bytes = self.bytes - old_charge + charge;
+            self.terms.insert(
+                offset,
+                TermBounds {
+                    known_frames: self.frames.len(),
+                    maxima: windows,
+                },
+            );
+        }
+    }
 }
 impl Saturation {
     const LENGTHS: usize = 1025;
@@ -167,6 +199,15 @@ impl Saturation {
         ((tf as usize) < Self::FREQUENCIES && (length as usize) < Self::LENGTHS)
             .then(|| self.values[length as usize * Self::FREQUENCIES + tf as usize])
     }
+    pub(crate) fn factor(&self, tf: u32, length: u32) -> f64 {
+        self.get(tf, length).unwrap_or_else(|| {
+            let k1 = f32::from_bits(self.key.0) as f64;
+            let b = f32::from_bits(self.key.1) as f64;
+            let average = f64::from_bits(self.key.2);
+            let norm = k1 * (1.0 - b + b * length as f64 / average);
+            tf as f64 * (k1 + 1.0) / (tf as f64 + norm)
+        })
+    }
     pub(crate) fn remember(
         &self,
         offset: u64,
@@ -180,19 +221,10 @@ impl Saturation {
                 return;
             }
         }
-        let k1 = f32::from_bits(self.key.0) as f64;
-        let b = f32::from_bits(self.key.1) as f64;
-        let average = f64::from_bits(self.key.2);
         let mut windows: Vec<(usize, f64)> = Vec::new();
         for &(row, tf) in postings {
             let length = lengths[row as usize];
-            let saturation = self
-                .get(tf, length)
-                .unwrap_or_else(|| {
-                    let norm = k1 * (1.0 - b + b * length as f64 / average);
-                    tf as f64 * (k1 + 1.0) / (tf as f64 + norm)
-                })
-                .max(0.0);
+            let saturation = self.factor(tf, length).max(0.0);
             let window = row as usize / window_rows;
             if let Some((last, maximum)) = windows.last_mut()
                 && *last == window
@@ -303,6 +335,39 @@ pub fn score_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn term_bounds_refresh_after_new_frames_and_share_the_admission_budget() {
+        let params = FtsParams::default();
+        let stats = CorpusStats {
+            total_docs: 256,
+            average_doc_length: 1.0,
+            ..Default::default()
+        };
+        let table = Saturation::new(&stats, &params);
+        table.remember(10, &[(0, 1)], &[1; 256], 128);
+        {
+            let mut maxima = table.maxima.lock().unwrap();
+            maxima.remember_term(10, vec![1.0, -1.0]);
+            assert_eq!(maxima.term(10), Some([1.0, -1.0].as_slice()));
+        }
+        table.remember(20, &[(128, 1)], &[1; 256], 128);
+        let mut maxima = table.maxima.lock().unwrap();
+        assert!(
+            maxima.term(10).is_none(),
+            "a new frame tightens the summary"
+        );
+        let bytes = maxima.bytes;
+        maxima.remember_term(10, vec![1.0, 1.0]);
+        assert_eq!(maxima.bytes, bytes, "replacement charges only one vector");
+        assert_eq!(maxima.term(10), Some([1.0, 1.0].as_slice()));
+        for offset in 100..300 {
+            maxima.remember_term(offset, vec![1.0; 8192]);
+        }
+        assert!(maxima.bytes <= Saturation::MAX_BOUND_BYTES);
+        assert!(maxima.terms.len() < 200);
+        assert_eq!(maxima.term(10), Some([1.0, 1.0].as_slice()));
+    }
 
     #[test]
     fn prepared_weights_preserve_reference_score_bits() {

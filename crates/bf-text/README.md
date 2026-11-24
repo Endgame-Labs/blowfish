@@ -87,6 +87,13 @@ ordinary lengths and term frequencies, and searches only each window's slice of 
 decoded posting block. The factor table refreshes when average length, k1, or b
 changes; uncommon values retain the reference arithmetic.
 
+Dense decoded frames are probed after window pruning, so rejected windows do not
+retain frames or refresh their CLOCK-cache priority. Sparse and dense decoded
+payloads each have an 8 MiB allowance. Query-independent normalization bounds
+share a separate 8 MiB allowance: term-window summaries reuse frame maxima and
+refresh when newly decoded frames can tighten them. Scores still use the
+reference f32 addition order, including repetitions, prefixes, and ties.
+
 Versions 1 through 4 remain readable during upgrades. New writes always use
 version 5. The engine automatically rebuilds old indexes from immutable document
 columns, one field per fenced publication; there is no layout-selection setting.
