@@ -276,8 +276,8 @@ fn single(
     }
     let total = limits(q, true)?;
     let rank = q.rank_by.as_ref().expect("validated rank");
-    // Precomputed vector scores, looked up once: the key serializes the whole query vector.
-    let vector_scores = matches!(rank, RankBy::Vector { .. })
+    // Precomputed vector scores, looked up once: the key preserves every query-vector bit.
+    let vector_scores = (matches!(rank, RankBy::Vector { .. }) && !state.scores.is_empty())
         .then(|| state.scores.get(&crate::indexed::rank_key(rank)))
         .flatten();
     let mut ranked = vec![];

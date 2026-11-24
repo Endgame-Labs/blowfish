@@ -4909,6 +4909,176 @@ before and after the manifest write and a merge of a merged segment.
 Not done in this round. The covered segments' ANN objects total 6.0 GB on NQ (about 2,240 bytes per covered row),
 which is what D4 would save. `disk-footprint.md` lists what retiring them needs.
 
+## Round X1: the resident ceiling and warm query path
+
+Measured on 2026-11-24 on a dedicated c7g.2xlarge (eight Graviton3 vCPUs, 16 GB,
+Linux, Rust 1.100.0, and GCC 14), against the unchanged `b663eb2` server. This is a
+paired ARM measurement, separate from the Apple M4 results above. The corpus is the
+same persisted NQ tier used in Q1: 2,681,468 f16 vectors of 1,024 dimensions, 32 slabs,
+and 13,395 leaves. All 3,452 queries request ten IDs with strong consistency.
+
+The non-shipped `bf-engine` example `resident_ceiling` loads validated code, center,
+and exact-vector arrays, and runs each query synchronously to completion on an OS
+thread. Each thread owns reusable scratch. There is no Tokio, range reader, block
+cache, or allocation in a warmed query. The probe scaling, directory order,
+per-slab running bounds, fine rescoring, rerank cap, f32 query, and f16-to-f32 exact
+rerank match the server. Every top-ten ID list matches the server at both settings.
+
+The harness replays the full query set three times after warming every query on
+every worker. Linux hardware counters count user instructions on the query threads.
+The server uses sixteen keep-alive HTTP clients, pre-encoded JSON arrays, a 4 GiB
+memory block cache, no disk cache, no indexing, and no recall sampling. Its two
+independent passes each warm and measure the full query set. `perf stat` counts
+all server threads after warm-up; counter coverage is 100%.
+
+| Probes | Recall@10, both paths | Resident instructions/query | HTTP instructions/query, two passes | Resident q/s, one / eight threads | HTTP q/s, two passes |
+|---:|---:|---:|---:|---:|---:|
+| 48 | 0.9490151 | 22.2856 M | 25.7217 / 25.7220 M | 357 / 2,695 | 1,248 / 1,256 |
+| 64 | 0.9598204 | 25.9276 M | 29.6851 / 29.6794 M | 294 / 2,264 | 1,062 / 1,096 |
+
+| Probes | HTTP p50 / p90, first pass (ms) | HTTP p50 / p90, second pass (ms) |
+|---:|---:|---:|
+| 48 | 12.13 / 17.14 | 12.02 / 17.12 |
+| 64 | 14.33 / 20.08 | 13.85 / 19.27 |
+
+The instruction budget outside the resident pipeline is 3.44 M/query (13.36%) at 48
+probes and 3.75 M/query (12.65%) at 64. The roughly twofold throughput gap is larger
+than that instruction ratio. Server task-clock is 4.95 / 5.67 CPU-ms per query;
+eight times the resident wall duration gives an upper bound of 2.97 / 3.53 CPU-ms
+per query for its eight workers. This points to execution, scheduling, and data
+locality as well as retired instructions. The AVX-512 profile's cost split should
+not be applied directly to this NEON machine.
+
+Resident payloads occupy 5.994 GB, including every exact vector; peak process RSS
+is 6.25 GB. Server peak RSS is 3.64–3.74 GB. The server reports a logical cache-hit
+ratio of 1.000 and no exhaustive tail in every retained pass. The resident example
+is a ceiling experiment, not a proposal to retain every exact vector in the server.
+
+The allocation check and the ordinary-reader comparison run on both ARM and x86.
+They cover cosine and squared Euclidean distances, zero vectors, f16 and f32
+storage, corrupt admission, reused rotation, center ranking, and scan estimates.
+One premise from the study reports did not survive a source check: serde's
+flattened `extra` field buffers unknown fields; known `rank_by` fields still use
+typed deserialization. No request-deserializer rewrite is justified by that premise.
+
+The harness is reproducible with a local, fully indexed, single-tier NQ store and
+a headerless little-endian f32 query file:
+
+```sh
+cargo run --release -p bf-engine --example resident_ceiling -- \
+  "$STORE" nq "$QUERIES_F32" 8 48 3
+```
+
+It requires Linux user instruction counters, uint document IDs, and an unmerged
+covered-segment ID index. Its resident APIs live in `bf-vector`; it adds no HTTP
+endpoint, configuration flag, or persisted format.
+
+### Compiled warm tiers
+
+The real query path now admits an immutable compiled view on a tier generation's
+second query. Ordinary reads supply validated leaf codes and exact-vector rows;
+admission issues no extra I/O. The decoded cache reserves the complete code and
+metadata capacity before admission, including a bounded sparse exact-vector
+cache. Generation keys and immutable references keep replacement atomic for
+readers. Eviction drops the cache's reference while in-flight queries finish.
+
+A compiled hit performs rotation, center ranking, probe selection, bounded scan,
+candidate pruning, and exact reranking on the query's existing compute thread,
+with reusable thread-local scratch. The small winner list then enters the same
+hydration, lineage, ID ordering, projection, snapshot, and WAL-tail logic as the
+ordinary path. Masks, filters, joint-tier plans, missing resident data, paged
+directories, legacy formats, and exact-all plans retain the ordinary reader.
+The `blowfish_ann_compiled_queries_total` metric counts completed compiled plans.
+
+Vector score-map keys now retain each query float's bits in binary. Empty score
+maps skip key construction, and disabled recall sampling skips UUID generation.
+HTTP parsing and serialization are unchanged.
+
+The original Spot instance was reclaimed after the initial implementation runs.
+Final comparisons use a dedicated replacement c7g.2xlarge, with the same corpus,
+toolchain, settings, and sixteen clients for every arm. Each process warms two
+complete query epochs, then measures all 3,452 queries. Baseline and candidate
+are paired in both orders; a separate control contains the compiled tier without
+the score-key and disabled-sampling changes. Release builds invalidate the changed
+crates between source snapshots so Cargo cannot reuse another arm's artifacts.
+
+| Probes | Baseline instructions/query, two passes | Final instructions/query, two passes | Baseline q/s, two passes | Final q/s, two passes |
+|---:|---:|---:|---:|---:|
+| 48 | 25.7034 / 25.6970 M | 21.5091 / 21.5088 M | 1,148 / 1,176 | 1,526 / 1,551 |
+| 64 | 29.6650 / 29.6694 M | 24.9513 / 24.9521 M | 1,036 / 1,018 | 1,310 / 1,347 |
+
+Mean user instructions fall 16.3% at 48 probes and 15.9% at 64; mean throughput
+increases 32.4% and 29.4%. The compiled-only control takes 21.6975 / 25.1402 M
+instructions at 48 / 64 probes, so the score-key and sampling changes remove a
+further 0.189 M instructions/query. Their separate throughput difference is within
+run-to-run variation; the instruction saving is the reason to retain them.
+
+| Probes | Baseline p50 / p90, two passes (ms) | Final p50 / p90, two passes (ms) |
+|---:|---:|---:|
+| 48 | 13.20 / 18.91; 12.92 / 18.38 | 9.91 / 14.53; 9.70 / 14.31 |
+| 64 | 14.63 / 20.68; 14.90 / 20.93 | 11.63 / 16.79; 11.31 / 16.33 |
+
+All 3,452 ordered top-ten ID lists match across baseline, control, and final builds
+at both settings. Recall remains 0.9490151 / 0.9598204. Every measured final query
+uses the compiled plan, has a logical cache-hit ratio of 1.000, and reads no
+exhaustive tail. Final peak RSS is 4.64–4.66 GB versus baseline 3.68–3.83 GB; the
+improvement retains about 0.9 GB more resident data within the cache reservation.
+
+Workspace formatting, full-workspace ARM all-target clippy with warnings denied, and tests
+pass (336 tests, zero failures). Engine/vector all-target clippy, tests, and
+doctests also pass on x86 (198 tests, zero failures). Tests include allocation-free
+scoring, checksums, ties, concurrent admission, cache bounds, cache eviction,
+projections, WAL-tail changes, indexed masks, filters, and exact-all fallback.
+
+### Cold gate and remaining budget
+
+The cold gate alternates AB/BA for 30 matching queries per probe setting, starting
+a fresh server process for each arm. It uses the standard local S3 facade with
+25 ms per-read delay, eight runtime workers, no disk cache, no indexing, no recall
+sampling, and connection warming disabled. All ordered ID lists match.
+
+| Probes | Baseline p50 / p90 (ms) | Final p50 / p90 (ms) | Mean reads/query, both | Mean bytes/query, both |
+|---:|---:|---:|---:|---:|
+| 48 | 250.71 / 315.83 | 255.68 / 316.66 | 96.47 | 113.20 MB |
+| 64 | 273.33 / 338.26 | 277.64 / 326.21 | 104.53 | 138.23 MB |
+
+The median paired latency changes are +0.67 / +0.22 ms, with paired-bootstrap
+95% intervals of [-2.21, +3.20] / [-4.21, +2.45] ms (20,000 resamples). Mean paired
+changes are -0.08 / -4.33 ms. This sample detects no cold regression and does not
+rule out a small latency change. Every query pair has identical read and byte
+counts; the first query retains the ordinary plan.
+
+On the replacement machine, the final eight-thread resident harness reaches
+2,670 / 2,256 q/s and 22.4591 / 26.1451 M instructions/query at 48 / 64 probes.
+Its full ID lists again match the server. The server reaches about 58% of that
+throughput. Different specializations of the shared scoring code produce
+different instruction sequences: the server now retires fewer instructions than
+the harness while taking longer. The harness is a throughput ceiling experiment,
+not a strict instruction lower bound.
+
+A final 15,000-query, 48-probe all-cycle profile attributes 79.3% of sampled cycles
+to vector functions, including 30.2% to NEON block sums and 18.3% to plane dots.
+Kernel symbols account for 2.5%, libc copies for 3.4%, moka for 2.2%, and jemalloc
+for 0.9%. Eight samples were lost out of roughly 17,000. The warm server averages
+3.85 CPU-ms/query and uses about 5.9 CPUs during the measured HTTP interval; the
+resident run's eight-worker duration bounds its CPU cost by 3.00 ms/query.
+These measurements suggest that the remaining wall-time gap includes request
+work and pipeline utilization, beyond the count of retired instructions. They
+do not establish a throughput win over Qdrant.
+
+After merging main `52525a4`, paired ABBA runs on an owned c7g.2xlarge
+(Rust 1.100.0, Clang 19/22) used a newly built NQ tier: 32 slabs, 13,392 leaves,
+and all 3,452 queries, with the same sixteen clients and cache settings above.
+At 48 / 64 probes, mean warm throughput rose from 1,234 / 1,101 to
+1,619 / 1,405 q/s (**+31.2% / +27.6%**); instructions/query fell from
+23.125 / 26.782 M to 20.781 / 24.068 M (**10.1%** at both settings).
+Every ordered top-ten list matched, recall stayed 0.9516802 / 0.9618192, and every
+measured merged query used the compiled path. Two 30-pair fresh-process cold
+ABBA checks per setting, using the same 25 ms S3 facade, detected no regression:
+pooled p50/p90 changed from 208.7/245.3 to 200.2/239.5 ms at 48 probes, and
+205.4/246.3 to 207.8/236.2 ms at 64. Median paired changes were -4.36 / +1.31 ms,
+with query-clustered bootstrap 95% intervals [-12.44, +2.22] / [-4.52, +5.63] ms;
+all cold lists matched. The first 64-probe p50 increase did not reproduce.
 
 ## Round Q1: warm vector query cost
 
@@ -5598,6 +5768,339 @@ EBS and S3 request charges are additional. No S3 data was added. All instances w
 terminated, and the temporary key pair and security group were deleted. Local run artifacts
 were removed after recording these results. Workspace and SDK compatibility
 checks remain the coordinator's merge checks.
+
+## Round I2: binary vectors in the WAL (2026-11-24)
+
+I test whether replacing the WAL's f32-base64 vectors with a binary section at the declared
+precision improves acknowledged ingest by at least 1.30×, preserves replayed values, and avoids a
+write-p90 increase. The starting source is `d79c6757`.
+
+### Method and kill test
+
+All measurements run on one disposable c7g.2xlarge Spot instance in us-west-2 (8 vCPU, 16 GiB RAM,
+swap off), against Amazon S3 in that region. The server uses CPUs 0–5, six Tokio workers, and six
+Rayon workers; the client uses CPUs 6–7. Both binaries use the same Rust release profile, with
+`CARGO_PROFILE_RELEASE_LTO=false` and `CARGO_PROFILE_RELEASE_DEBUG=1`.
+
+The input is the first 500,000 BEIR NQ rows: 1,024-dimensional f16 vectors, original titles, and
+original text. I prepare identical 1,000-row JSON request bodies once, outside timing. They carry
+f32-base64 vectors, as the official SDK does. Four clients write into a fresh namespace in a fresh
+S3 prefix for every arm. Timing includes the first schema-bearing write, request-body reads,
+backpressure retries, and the last durable acknowledgment. Write percentiles include retry delays.
+No query traffic runs during ingest.
+
+Both arms use a 512 MiB memory cache, no disk cache, a 100,000-row or 256 MiB indexing threshold,
+a 30-second indexing age, a 256 MiB bulk-flush threshold, and a 384 MiB unindexed-WAL limit. The
+WAL pipeline remains eight; background indexing, compaction, and automatic reclustering stay on.
+
+The initial profiled baseline takes 181.91 s (2,749 acknowledged rows/s), with write p50/p90
+669.5/1,378.9 ms and 44 backpressure retries. A 99 Hz `perf record` captures 36,696 samples with
+no lost samples. Vector-distance work in `l2_squared_f32` accounts for 28.98% of sampled cycles
+on Tokio workers; text posting construction accounts for 5.68%. The WAL staging stack accounts for
+9.64% inclusively, including 8.77% in `encode_payload`. The main JSON string-escaping sample accounts
+for 1.33%. Compression samples include both WAL payloads and segment blocks, so I do not attribute
+all compression time to the WAL. The profiled load is excluded from the paired timing
+comparison.
+
+### Codec experiment
+
+The disposable prototype replaces only the external WAL payload codec. It writes zstd-compressed
+JSON metadata followed by little-endian binary vector records. Dense f16 values occupy two bytes
+per dimension, and dense f32 values occupy four. Metadata borrows documents without cloning their
+large vector strings. Small inline commits keep their existing representation. Public `WalEntry`
+and `WriteBatch` values, HTTP bodies, acknowledgment durability, indexing, and query code stay the
+same.
+
+The prototype uses payload version 4 because versions 2 and 3 identify commit-slot encodings.
+It reads version-1 payloads automatically until checkpointing and normal GC remove them. There is
+one payload writer. Before timing, prototype tests pass for mixed old/new logs, conflicts, retries,
+pruning, malformed binary sections, missing/null fields, dense f16/f32 values, arrays, sparse vectors,
+multi-vectors, and every finite f16 bit pattern. Values that cannot round-trip through their declared precision stay in
+JSON instead of being silently rounded by the codec.
+
+I run unprofiled arms in candidate/baseline/baseline/candidate order:
+
+| Arm | Seconds | Acknowledged rows/s | Write p50 / p90 ms | Backpressure retries |
+| --- | ---: | ---: | ---: | ---: |
+| Candidate 1 | 169.55 | 2,949 | 393.3 / 812.6 | 56 |
+| Baseline 1 | 125.27 | 3,991 | 678.6 / 883.3 | 28 |
+| Baseline 2 | 125.41 | 3,987 | 687.8 / 926.4 | 28 |
+| Candidate 2 | 114.80 | 4,355 | 398.0 / 740.3 | 44 |
+
+The retained WAL payload objects shrink from 1,548,985,444 and 1,548,985,398 bytes in the
+baselines to 1,041,784,805 and 1,041,756,063 bytes in the candidates: about 3,098 versus 2,084 B/row,
+a 32.7% reduction. These are compressed object payload sizes, including the storage identity header;
+commit slots and segment objects are excluded.
+
+Fresh-process replay with the prototype reader checks baseline 1 and candidate 1 independently
+against the original input. Both reproduce every ID exactly once, all 512,000,000 vector coordinates
+bit-for-bit, and every title and text. They contain 321 and 338 WAL slots, respectively. The five
+prototype codec tests also pass; they are removed with the unadopted codec.
+
+**Rejected.** The baselines agree within 0.11%. The candidate ranges from 0.74× to 1.09× their
+throughput, and neither run reaches 1.30×. Write p90 improves, but acknowledged ingest does not
+meet the gate. Faster individual commits do not remove background indexing work or backpressure:
+the candidate receives 44–56 retry responses, compared with 28 in both baselines. The difference
+between uncompressed base64 size and binary size is not an ingest-speed prediction.
+
+I remove the experimental codec instead of adding a format or a setting for it. Production WAL
+payload version 1, commit slots, bucket fencing, and public APIs remain unchanged. No upgrade is
+needed. The retained HTTP driver and replay checker support future ingest experiments.
+
+### Reproduction and cleanup
+
+`crates/bf-wal/benches/http_ingest.py` prepares the fixed request bodies and measures acknowledged
+HTTP ingest. Run it with `uv run --with numpy python`, using `prepare BODIES --corpus CORPUS.npy
+--attrs ATTRS.jsonl`, then `load BODIES --clients 4` against each fresh server. The corpus is a
+little-endian f16 NumPy matrix; attributes are JSONL objects containing `title` and `text` in corpus
+row order. Put every input, body directory, store, and log below the run's `.scratch/` directory.
+
+`crates/bf-wal/examples/replay_check.rs` checks retained WAL payloads independently of the writer's
+resident state. Set `I2_URL` to the disposable S3 prefix, `I2_CORPUS` to that matrix, and `I2_ATTRS`
+to that JSONL file, then run `cargo run --release -p bf-wal --example replay_check`. The checker
+requires every source ID exactly once, compares all 1,024 f32 bit patterns with the original f16
+values expanded to f32, and compares every title and text. It fails on missing or duplicate rows.
+
+All disposable S3 prefixes are deleted and verified empty. The instance, key pair, and security
+group are removed. The instance ran for about 0.50 hours; the observed Spot price was $0.1074/hour,
+or about $0.05 in compute, excluding EBS and S3 requests. Local run inputs, logs, and source archives
+are removed after retaining these results. Final `cargo fmt --check`,
+`cargo clippy -p bf-wal --all-targets -- -D warnings`, and all 13 `cargo test -p bf-wal` tests pass.
+
+## Round B4: impact ordering, and dense BM25 scoring
+
+The tested impact-ordered TAAT path fails the CPU and cold-block gates. The
+row-aligned NEON scorer also fails the gate when combined with the existing
+reader's planner, caches, and posting reads. No production algorithm or text
+format changes ship from this round; text format 6 and automatic upgrades remain
+unchanged.
+
+The workload is T1's first 1,000,000 MS MARCO passages, five consecutive 200,000-row
+segments, and all 1,000 checked-in dev queries, with default BM25 parameters and
+limit 10. The offline example was `crates/bf-text/examples/impact_bm25.rs` (removed after the round; it is in commit 11a4738); its
+adjacent README documents preparation, counter control, and each variant.
+Final measurements use an owned on-demand c7g.2xlarge, pinned to one core, with
+one complete warm-up before each measured pass, on Rust 1.100.0. Perf's control
+FIFOs exclude preparation and warm-up. All arms use the release profile and sequential segments with a shared
+query threshold. These are paired ARM instruction/cycle measurements, with no
+HTTP, S3 latency, or Apple M4 throughput claim.
+
+| Offline variant | Million instructions/query | Million cycles/query |
+| --- | ---: | ---: |
+| Existing reader | 17.832 | 11.975 |
+| Impact TAAT | 127.684 | 111.551 |
+| Impact, free exact block maxima | 127.105 | 112.032 |
+| Dense, optimistic NEON | 13.653 | 7.291 |
+| Dense, optimistic cached scalar | 13.056 | 7.132 |
+| Dense, existing planner, NEON | 17.023 | 10.453 |
+| Dense, existing planner, cached scalar | 16.927 | 10.331 |
+
+Counts are medians of two measured passes per variant, except the free exact
+block-maxima diagnostic, which has one. The integrated NEON variant reduces
+instructions by **1.047×** and cycles by **1.146×**, missing both the 15.6M
+instruction limit and the 1.3× cycle gate. Cached scalar in the same planner is
+slightly cheaper, at **1.053×** fewer instructions and **1.159×** fewer cycles.
+The optimistic standalone NEON result passes its absolute instruction and cycle
+gates, but the scalar control is cheaper still; that result cannot be attributed
+to SIMD or substituted for the integrated gate.
+
+The final embedded reader's paired baseline differs from T1's historical 20.32M
+instructions/query. Compare variants inside this binary; embedding the reader,
+changing the offline driver, or changing release code generation is not a shipped
+production improvement. Both integrated variants also miss the absolute 15.6M gate.
+
+Resetting decoded postings and saturation/bound caches before each segment/query
+gives **3,928,538** required baseline posting blocks across the 1,000 queries.
+Impact order needs **6,863,734** (**1.747×** baseline), and free exact block maxima
+still need **6,815,551** (**1.735×**). Neither meets the ≤50% cold-block gate.
+These are logical payload-block counts, with no GET coalescing or latency claim.
+
+Repacking every long list, including terms outside the queries, adds **13,186,336**
+packed posting bytes to the **336,318,220**-byte format-6 text index: **3.921%**.
+This estimates the posting codec delta with the current bitpacking implementation;
+it does not include changes to dictionary reservation sizes or validate an emitted
+format-7 file. Footprint is not the reason this candidate is rejected.
+
+The impact prototype sorts long lists (df > 4,096 or more than 32 blocks) by
+build-time segment-normalized saturation, keeps rows sorted within each
+128-posting block, and leaves shorter lists in row order. Runtime suffix maxima
+of independent max-TF/min-length bounds remain conservative when namespace
+statistics change. A priority queue selects the next term block. Per-row term
+contributions preserve canonical f32 addition, and an indexed top-k heap tracks
+increasing lower scores.
+
+The proposed sum of remaining term bounds is only a bound on **untouched** rows.
+A touched row can retain a missing contribution, and a current winner needs its
+exact score before it can be returned. The prototype also checks unresolved
+partials and requires winners to have exact scores. An absent term can force
+exhaustion of its list to establish that missing contribution as zero. This
+experiment supplies no free candidate completion through a separate row index.
+The exact sorted-access implementation is rejected; this does not establish a
+ceiling for impact layouts with a separately charged candidate-completion index.
+
+The dense experiment transposes long query terms into row-aligned u32 frequencies.
+The NEON kernel uses two f64 lanes, keeps the reference arithmetic order, converts
+each term's contribution to f32, and adds terms in dictionary order. Sparse
+candidate windows retain the cached scalar scorer. The standalone planner gets
+unlimited exact window maxima and a fully prepared frequency cache. Its cached
+scalar control isolates the kernel from the planner/cache advantage.
+
+The integrated control retains the existing planner, bounded decoded cache,
+window-bound cache, posting reads, and shared threshold, changing only the final
+scoring loop to consult the prepared frequencies. Preparation of that additional
+frequency cache is free in this test. It does not model a persisted row-aligned
+representation or establish that all possible format-7 layouts fail. Its measured
+cost still misses the requested gate, so the optimistic standalone result is
+insufficient evidence to ship a format bump.
+
+The example tests compare randomized corpora with exhaustive scoring, covering
+missing terms, repeated query terms, changed namespace averages, and score ties.
+A native ARM test checks SIMD score bits against the existing scorer for zero
+frequencies, frequencies and lengths beyond the saturation cache, odd batch
+lengths, and multiple query frequencies. The full-corpus checks compare ordered
+IDs and f32 score bits, rather than overlap alone.
+
+The final crate gate passes: formatting, clippy for all bf-text targets, 39 library
+and integration tests, and 14 example tests. Seven historical corpus experiments
+remain ignored in each relevant test binary. The independent exhaustive utility
+checks all 1,000 queries and 10,000 ordered hits, with every f32 score bit equal;
+every prototype pass asserts against that validated baseline. No HTTP, SDK, or
+full-workspace validation is claimed for these example-only changes.
+
+A Spot c7g.2xlarge was reclaimed during an incomplete repeat. Incomplete counters
+are discarded; the final table comes entirely from the replacement on-demand
+host. No S3 objects are created, and both hosts and their temporary access
+resources are cleaned up at the end of the round.
+
+## Round RR1: recluster readiness and spill ownership (2026-11-24)
+
+NQ's full tier became ready **257.5 seconds after the last load acknowledgment**, versus **756.7 seconds**
+before RR1: **2.94 times sooner**. There were no intermediate recluster builds during loading. The final build
+fell from **426.4 to 255.0 seconds**, or **1.67 times faster**, with equal or better measured recall.
+The requested **2 times faster full build was not achieved**; leaf assignment remains the largest cost.
+
+### Matched setup
+
+These numbers isolate RR1 through `5a34b2d` against `b663eb2`, before integrating later main changes. The baseline
+has only spill cleanup and the same stage timers added; its trigger, training, and assignment algorithms are
+unchanged. Both use native release builds with the repository's thin LTO profile, four codegen units, no native
+Rust CPU flags, and Clang 19 for C dependencies.
+
+One dedicated Graviton3 `c7gd.2xlarge`: eight cores, 16 GiB RAM, local NVMe, and a fresh local file store per arm.
+The server and HTTP loader share CPUs 0 to 7, at nice 19, with no competing compilation or benchmark. The default
+recluster pool has four threads. Both servers have a 4 GiB payload cache, no disk cache, and automatic recall
+sampling disabled. No S3 bucket or paid oracle is used.
+
+The corpus is the NQ vectors used by the Mac and Q1 runs: 2,681,468 rows, 1,024 dimensions in f16, cosine, and
+3,452 queries with exact ground truth. `bench/nq/load.py --vectors-only` sends 5,000-row HTTP batches with four
+requests in flight. A sampler sends at most one serial top-10 ANN request a second, with only IDs returned,
+using a fixed sequence of query vectors and a persistent connection. Every 20 seconds, a separate diagnostic
+compares one query against exact search on the same live snapshot. These sparse load-time recall samples do
+not replace the full quality gate below. Expected 404 responses before the first write creates the namespace
+are excluded from query samples.
+
+The last acknowledgment is approximated by the loader's final status write. Readiness is the full-row-count
+tier installation in the server log, polled every 250 ms and checked against namespace metadata. Latencies
+cover requests started during the load, including time spent competing with ingest and the exact diagnostics.
+This is one paired run, with independently generated segment IDs and layouts; it does not give confidence
+intervals or establish Mac performance.
+
+### Load and readiness
+
+| Measurement | Before | RR1 |
+|---|---:|---:|
+| HTTP load, seconds | 190.5 | 176.5 |
+| Intermediate builds started during the load | 5 | 0 |
+| Last acknowledgment to full-build start, seconds | 330.3 | 2.5 |
+| Full build, seconds | 426.4 | 255.0 |
+| Last acknowledgment to full-tier installation, seconds | 756.7 | 257.5 |
+| Query p50 during load, ms | 563.8 | 408.7 |
+| Query p90 during load, ms | 1,623.9 | 1,589.2 |
+| Successful timed queries during load | 160 | 153 |
+| Query errors | 0 | 0 |
+| Snapshot-exact recall samples | 8, all 1.0 | 7, all 1.0 |
+| Server CPU through readiness, seconds | 3,377.6 | 1,813.3 |
+
+The baseline installed intermediate tiers over 160K, 75K, 440K, 410K, and 950K rows. Four installed during the
+load, and the fifth shortly afterward. Together they rebuilt 2.035M rows before the final 2.681M-row build.
+Its doubling exception starts work during a load, but its five-minute history can still hold the final build
+once uncovered rows fall just below covered rows.
+
+RR1 uses that history only to recognize bulk ingestion. A classified load holds first bases, merges, and deltas
+while writes arrived in the last two seconds or the tail is unindexed. It retries after two seconds, without
+requiring another publication. The first base then takes priority over remaining compaction, protecting its
+sources before its background task can yield. After installation, format-4 lineage lets those segments compact.
+Queries continue searching uncovered segments and any existing tiers throughout the load. There is no setting
+that selects the previous behavior.
+
+### Full-build profile
+
+Times below are seconds, summed over the final full build's stage events. Uploads overlap the next slab's CPU
+work. Spill service times sum work across concurrent readers or writers and are already inside their parent
+stages; they must not be added to build wall time. "Upload" here means publication to the local object store,
+not a network or S3 upload measurement.
+
+| Stage | Before | RR1 |
+|---|---:|---:|
+| Copy source vectors to spill | 20.193 | 13.557 |
+| Spill write service time, inside copy | 17.835 | 11.277 |
+| Coarse k-means | 1.211 | 1.156 |
+| Coarse assignment | 6.788 | 6.456 |
+| Leaf k-means | 116.099 | 21.948 |
+| Leaf assignment, both passes | 253.871 | 183.309 |
+| Center refinement | 2.560 | 2.547 |
+| Read slab vectors from spill | 3.649 | 3.861 |
+| RaBitQ encoding and ANN serialization | 21.172 | 21.359 |
+| Upload, overlapping | 2.249 | 2.437 |
+| Random spill read service time, inside earlier stages | 31.039 | 39.129 |
+| Directory construction | 0.033 | 0.016 |
+
+Lloyd training and coarse assignment use bounded batches of 128 rows against packed centers. Seeds, samples,
+iteration counts, near-cell counts, group probes, and the refinement pass stay unchanged. Center accumulation
+stays in input order in f64. Leaf assignment keeps direct four-row dot products, with independent FMA chains
+on NEON, AVX2, and AVX-512. Whole source clusters are written contiguously to the spill; a four-byte address
+per global row preserves identity without scattering one small write per vector. This changes only temporary
+spill layout, with no persistent format change.
+
+Larger assignment blocks were counterproductive: a 16-row experiment compared 1,549 centers per row, versus
+812 with four rows, and its first assignment took 144.2 seconds, versus 91.2. It was stopped and discarded.
+Packing selected leaf centers into matrices was also slower in a separate prototype. Batched near-group
+selection completed a full build in 250.5 seconds, only 1.8% below the selected implementation in a separate
+layout, and was not retained. These controls explain why the final path uses matrix batches for training and
+direct four-row scoring for leaves; they do not demonstrate the missing 2 times build gain.
+
+### Recall and memory
+
+Separate read-only servers run the full 3,452-query quality gate, top 10, with explicit probes:
+
+| Probes | Before recall@10 | RR1 recall@10 | Difference |
+|---|---:|---:|---:|
+| 48 | 0.9494 | 0.9501 | +0.0007 |
+| 64 | 0.9602 | 0.9603 | +0.0001 |
+
+Both are within 0.002 of the baseline. RSS is sampled every 250 ms; the process high-water mark is read from
+`VmHWM`. GB below are decimal. The build-only sample uses current `VmRSS` between full-build start and install,
+so an earlier ingest or exact-diagnostic peak is not mistaken for build memory.
+
+| Server memory measurement | Before | RR1 |
+|---|---:|---:|
+| Sampled full-build peak RSS, GB | 6.884 | 6.964 |
+| Process high-water RSS over load, diagnostics, and build, GB | 9.543 | 9.817 |
+
+The full-build sampled peak rose 1.2%, with the same cache and slab budgets. This 16 GiB-host profile includes
+a configured 4 GiB cache and exact diagnostics, so it is not a matched comparison with the historical Mac's
+approximately 2.7 GB load/build peak. No full-precision corpus or corpus-sized distance matrix is materialized.
+
+### Spill recovery
+
+Each build holds an exclusive ownership lock in its own process-named directory. A drop guard unlinks its
+spill on success, failure, cancellation, shutdown, or panic unwinding, even while a blocking worker has an open
+descriptor. Startup and new builds recover only unlocked abandoned directories. A lock on the root directory
+serializes creation and sweeping, including the interval before the ownership file exists.
+
+Tests cover cancellation, stopped engines, panic unwinding, and a separate live process surviving a sweep,
+followed by recovery after that process is killed. Legacy loose spills have no ownership lock and are left
+alone; remove those only after the old processes using their directory have stopped.
 
 ## Round D4: one stored vector copy in covered namespaces (2026-11-24)
 

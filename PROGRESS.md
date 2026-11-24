@@ -4,6 +4,43 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Recluster readiness after bulk loads, 2.94x sooner** (round RR1; `docs/benchmarks.md`, "Round RR1").
+  An active bulk load now defers recluster builds instead of building and discarding intermediate tiers, and the
+  first base starts as soon as the load goes quiet, ahead of the remaining segment compaction (its sources are
+  protected before the task yields). Leaf assignment uses a four-row dot-product kernel with independent FMA
+  chains (NEON, AVX2, and AVX-512), and training and coarse assignment run in bounded 128-row matrix batches.
+  Spill files are owned per build with a lock and cleaned up on every exit path, including panics, and
+  abandoned ones are swept at startup. On NQ (c7gd.2xlarge, in-region S3): full-tier readiness after the last
+  acknowledged write went from 756.7 s to 257.5 s, the full build from 426.4 s to 255.0 s (1.67x; the 2x build
+  target was not met), and recall@10 from 0.9494 / 0.9602 to 0.9501 / 0.9603 at 48 / 64 probes. New metric:
+  `blowfish_recluster_stage_seconds{stage}`.
+
+- **Compiled warm tiers** (round X1; `docs/benchmarks.md`, "Round X1"). Once a recluster tier is resident, the
+  engine compiles a generation-scoped view of it (codes, factors, leaf metadata, and a sparse cache of exact
+  vectors charged to the decoded-cache budget) and runs warm queries on it synchronously, with reusable
+  per-thread scratch and no I/O; any miss falls back to the normal planner. Paired on a c7g.2xlarge, all 3,452
+  NQ queries at 16 clients, on top of the cold-streaming and shared-bound work: +31.2% q/s at 48 probes and
+  +27.6% at 64, with 10.1% fewer instructions per query, recall 0.9517 / 0.9618, and every ordered top 10
+  identical. Cold queries are unchanged (120 paired cold queries, identical results, no detectable shift). Peak
+  RSS is about 0.9 GB higher, within the cache budget. A resident ceiling harness
+  (`crates/bf-engine/examples/resident_ceiling.rs`) shows the server still reaches about 58% of the same scan
+  run in-process; that gap is the next round's target.
+
+- **BM25: impact-ordered postings and SIMD scoring, tested and rejected** (round B4; `docs/benchmarks.md`,
+  "Round B4"). On 1,000 MS MARCO queries (c7g.2xlarge, paired), exact term-at-a-time scoring over
+  impact-ordered blocks cost 127.7M instructions per query against 17.8M for the current reader, because
+  exactness still has to complete every touched candidate's partial score. Dense NEON scoring in the real reader
+  saved only 4.7% instructions, and plain cached scalar code did as well. Text format 6 and the reader are
+  unchanged; the BM25 cost target stays open.
+
+- **Binary WAL vectors: tested and rejected** (round I2; `docs/benchmarks.md`, "Round I2"). Writing vectors
+  to the WAL as binary at their declared precision, instead of JSON, reached at best 1.09x acknowledged rows/s
+  on paired 500K-row NQ loads (in-region S3, c7g.2xlarge), and the other candidate run was slower than the
+  baseline, so the codec was removed and the WAL format is unchanged. The profile shows where ingest time goes:
+  vector distances while indexing during the load are 29% of CPU cycles, text index construction 5.7%, and
+  JSON string escaping 1.3%. The round leaves a repeatable HTTP ingest benchmark
+  (`crates/bf-wal/benches/http_ingest.py`) and a WAL replay check (`crates/bf-wal/examples/replay_check.rs`).
+
 - **Cold vector queries stream their slab scans** (round C1; `docs/benchmarks.md`, "Round C1"). On a cold
   slab search, scan reads are reserved nearest leaf first and each batch of leaves is scanned as its bytes
   land, and bounded rerank and document reads start before the slowest scan read returns. In-region

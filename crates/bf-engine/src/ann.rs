@@ -186,6 +186,7 @@ async fn from_directory(
                 skip,
                 None,
                 source,
+                None,
             )
             .await?;
             if slack > 0 {
@@ -510,6 +511,11 @@ async fn from_slabs(
             mask.is_some()
         );
     }
+    let warm = if mask.is_none() && seat.is_none() {
+        crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone())
+    } else {
+        None
+    };
     let lives = if filter.is_some() {
         futures::future::try_join_all(set.slabs.iter().map(|slab| {
             let mask = &mask;
@@ -548,6 +554,7 @@ async fn from_slabs(
         &[],
         seat,
         state,
+        warm,
     )
     .await?;
     if slack > 0 {

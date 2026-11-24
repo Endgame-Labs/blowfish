@@ -30,6 +30,28 @@ use rayon::prelude::*;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
+mod math;
+pub(crate) mod spill;
+
+/// Wall time within one build stage. Concurrent uploads overlap CPU stages; aggregate I/O times
+/// across workers are service time, so neither is added to the total build's wall time.
+struct Stage(&'static str, std::time::Instant);
+impl Stage {
+    fn new(name: &'static str) -> Self {
+        Self(name, std::time::Instant::now())
+    }
+    fn record(name: &'static str, elapsed: std::time::Duration) {
+        let seconds = elapsed.as_secs_f64();
+        metrics::histogram!("blowfish_recluster_stage_seconds", "stage" => name).record(seconds);
+        tracing::info!(stage = name, seconds, "recluster: stage finished");
+    }
+}
+impl Drop for Stage {
+    fn drop(&mut self) {
+        Self::record(self.0, self.1.elapsed());
+    }
+}
+
 /// What to build.
 #[derive(Clone, Debug)]
 pub struct ReclusterOptions {
@@ -190,37 +212,23 @@ impl Engine {
         );
 
         // Pass 1: copy every live row's vector into a spill file indexed by global row.
-        std::fs::create_dir_all(&opts.scratch).map_err(segment::index_error)?;
-        let spill_path = opts
-            .scratch
-            .join(format!("spill-{}.bin", uuid::Uuid::new_v4()));
-        let spill = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&spill_path)
+        // Keep the owner in this future: dropping it unlinks the spill even if a blocking
+        // worker still has the open file. Unix keeps that worker's descriptor valid.
+        let spill = spill::Spill::create(&opts.scratch, total * width as u64)
             .map_err(segment::index_error)?;
-        spill
-            .set_len(total * width as u64)
-            .map_err(segment::index_error)?;
-        let spill = Arc::new(spill);
-        let result = self
-            .recluster_with_spill(
-                target,
-                manifest,
-                &wal,
-                opts,
-                covered,
-                spill.clone(),
-                (dims, width, dtype, metric),
-                first,
-                t0,
-                job,
-            )
-            .await;
-        drop(spill);
-        let _ = std::fs::remove_file(&spill_path);
-        result
+        self.recluster_with_spill(
+            target,
+            manifest,
+            &wal,
+            opts,
+            covered,
+            spill.file.clone(),
+            (dims, width, dtype, metric),
+            first,
+            t0,
+            job,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -243,10 +251,22 @@ impl Engine {
         let segments = target.segments.clone();
         let source = crate::vector_locator::Source::from(manifest);
         let bases: Vec<u32> = covered.iter().map(|c| c.base).collect();
+        // Cluster payloads arrive contiguously. Keep that order on disk instead of scattering
+        // millions of tiny writes by global row; a four-byte address per row preserves identity.
+        let total_rows: usize = covered.iter().map(|c| c.rows as usize).sum();
+        let spill_offsets: Vec<std::sync::atomic::AtomicU32> = (0..total_rows)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect();
+        let next_spill_row = std::sync::atomic::AtomicU32::new(0);
+        let copy_stage = Stage::new("copy");
+        let spill_write_nanos = std::sync::atomic::AtomicU64::new(0);
         let copied: Vec<Vec<u32>> = futures::stream::iter(segments.into_iter().zip(bases).map(
             |(seg, base): (Segment, u32)| {
                 let spill = spill.clone();
                 let ann_key = ann_key.clone();
+                let spill_write_nanos = &spill_write_nanos;
+                let spill_offsets = &spill_offsets;
+                let next_spill_row = &next_spill_row;
                 async move {
                     job.pause().await;
                     if source.covers(&seg, attr) {
@@ -261,15 +281,21 @@ impl Engine {
                             }
                             let (rows, bytes) =
                                 source.read(store, &seg, &selected, attr, true).await?;
-                            for (row, raw) in rows.into_iter().zip(bytes.chunks_exact(width)) {
-                                spill
-                                    .write_all_at(
-                                        raw,
-                                        (u64::from(base) + u64::from(row)) * width as u64,
-                                    )
-                                    .map_err(segment::index_error)?;
+                            let writing = std::time::Instant::now();
+                            let start = next_spill_row
+                                .fetch_add(rows.len() as u32, std::sync::atomic::Ordering::Relaxed);
+                            spill
+                                .write_all_at(&bytes, u64::from(start) * width as u64)
+                                .map_err(segment::index_error)?;
+                            for (i, row) in rows.into_iter().enumerate() {
+                                spill_offsets[(base + row) as usize]
+                                    .store(start + i as u32, std::sync::atomic::Ordering::Relaxed);
                                 present.push(base + row);
                             }
+                            spill_write_nanos.fetch_add(
+                                writing.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
                         return Ok::<_, ApiError>(present);
                     }
@@ -289,16 +315,24 @@ impl Engine {
                     while let Some((rows, bytes)) =
                         reads.try_next().await.map_err(segment::index_error)?
                     {
+                        let writing = std::time::Instant::now();
+                        let start = next_spill_row
+                            .fetch_add(rows.len() as u32, std::sync::atomic::Ordering::Relaxed);
+                        spill
+                            .write_all_at(&bytes, u64::from(start) * width as u64)
+                            .map_err(segment::index_error)?;
                         for (i, row) in rows.iter().enumerate() {
                             if live.as_ref().is_some_and(|l| !l.contains(*row)) {
                                 continue;
                             }
-                            let at = (u64::from(base) + u64::from(*row)) * width as u64;
-                            spill
-                                .write_all_at(&bytes[i * width..(i + 1) * width], at)
-                                .map_err(segment::index_error)?;
+                            spill_offsets[(base + *row) as usize]
+                                .store(start + i as u32, std::sync::atomic::Ordering::Relaxed);
                             present.push(base + *row);
                         }
+                        spill_write_nanos.fetch_add(
+                            writing.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     Ok::<_, ApiError>(present)
                 }
@@ -307,6 +341,17 @@ impl Engine {
         .buffer_unordered(6)
         .try_collect()
         .await?;
+        drop(copy_stage);
+        Stage::record(
+            "spill_write",
+            std::time::Duration::from_nanos(spill_write_nanos.into_inner()),
+        );
+        let spill_offsets: Arc<Vec<u32>> = Arc::new(
+            spill_offsets
+                .into_iter()
+                .map(std::sync::atomic::AtomicU32::into_inner)
+                .collect(),
+        );
         let mut present: Vec<u32> = copied.into_iter().flatten().collect();
         present.sort_unstable();
         if present.is_empty() {
@@ -322,14 +367,22 @@ impl Engine {
         // Pass 2: coarse partition. Train on a sample (or take the base's cells), then assign
         // every row.
         let present = Arc::new(present);
+        let spill_read_nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let read_row = {
             let spill = spill.clone();
             let first = first.clone();
+            let spill_read_nanos = spill_read_nanos.clone();
+            let spill_offsets = spill_offsets.clone();
             move |g: u32, buf: &mut Vec<u8>| -> Vec<f32> {
                 buf.resize(width, 0);
+                let reading = std::time::Instant::now();
                 spill
-                    .read_exact_at(buf, u64::from(g) * width as u64)
+                    .read_exact_at(buf, u64::from(spill_offsets[g as usize]) * width as u64)
                     .expect("spill file read");
+                spill_read_nanos.fetch_add(
+                    reading.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 bf_vector::prepare_vector(&first.decode_stored(buf), metric)
             }
         };
@@ -347,6 +400,7 @@ impl Engine {
             let stop = self.0.stop.clone();
             on_pool(move || {
                 let centers = known.unwrap_or_else(|| {
+                    let _training = Stage::new("coarse_kmeans");
                     let mut state = 0x9E37_79B9_7F4A_7C15u64;
                     let mut next = move || {
                         state ^= state << 13;
@@ -364,15 +418,32 @@ impl Engine {
                         .map_init(Vec::new, |buf, g| read_row(*g, buf))
                         .collect();
                     let refs: Vec<&[f32]> = sample.iter().map(|v| v.as_slice()).collect();
-                    bf_vector::kmeans(&refs, cells_n, 8, 7)
+                    math::kmeans(&refs, cells_n, 8, 7)
                 });
+                let _assignment = Stage::new("coarse_assignment");
+                let packed = math::Centers::new(centers.iter().map(Vec::as_slice));
                 let assignment: Vec<u16> = present
-                    .par_iter()
-                    .map_init(Vec::new, |buf, g| {
-                        (!stop.stopping())
-                            .then(|| bf_vector::nearest_center(&read_row(*g, buf), &centers) as u16)
+                    .par_chunks(128)
+                    .map_init(Vec::new, |buf, ids| {
+                        if stop.stopping() {
+                            return None;
+                        }
+                        let rows: Vec<Vec<f32>> = ids.iter().map(|g| read_row(*g, buf)).collect();
+                        let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+                        Some(
+                            packed
+                                .nearest(&refs)
+                                .into_iter()
+                                .map(|c| c as u16)
+                                .collect::<Vec<_>>(),
+                        )
                     })
-                    .collect::<Option<_>>()?;
+                    .while_some()
+                    .flatten_iter()
+                    .collect();
+                if stop.stopping() {
+                    return None;
+                }
                 let mut cell_rows: Vec<Vec<u32>> = vec![Vec::new(); centers.len()];
                 for (g, c) in present.iter().zip(&assignment) {
                     cell_rows[*c as usize].push(*g);
@@ -451,18 +522,22 @@ impl Engine {
             let k = centers.len();
             clusters += k;
             let spill = spill.clone();
+            let spill_offsets = spill_offsets.clone();
             let rows_n = rows.len() as u32;
             let global_rows = rows.clone();
             // Between slabs, let a queued flush or compaction run first.
             job.pause().await;
             let blob = on_pool(move || -> Result<(Vec<u8>, u64), ApiError> {
+                let reading = Stage::new("spill_read");
                 // Rows stay packed at the stored precision (about 2 KB each at 1,024 dims in f16).
                 let mut data = vec![0u8; rows.len() * width];
                 for (g, chunk) in rows.iter().zip(data.chunks_exact_mut(width)) {
                     spill
-                        .read_exact_at(chunk, u64::from(*g) * width as u64)
+                        .read_exact_at(chunk, u64::from(spill_offsets[*g as usize]) * width as u64)
                         .map_err(segment::index_error)?;
                 }
+                drop(reading);
+                let _encoding = Stage::new("encoding");
                 let params = bf_vector::BuildParams {
                     clusters: Some(k),
                     ..Default::default()
@@ -492,6 +567,7 @@ impl Engine {
                 p.await.map_err(segment::index_error)??;
             }
             pending = Some(tokio::spawn(async move {
+                let _upload = Stage::new("upload");
                 let prefix = format!("ns/{ns2}/slabs/{id2}");
                 let ann = segment::put_file(
                     &store2,
@@ -538,9 +614,16 @@ impl Engine {
         }
         slabs.extend(uploads.lock().await.drain(..));
         slabs.sort_by(|a, b| a.id.cmp(&b.id));
+        Stage::record(
+            "spill_random_read",
+            std::time::Duration::from_nanos(
+                spill_read_nanos.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        );
 
         // The directory over the slabs. The indexer publishes the tier. The cold-query hint is
         // the base's (a delta's directory is small, and read beside it).
+        let _directory = Stage::new("directory");
         let (dir, pages) =
             slab_directories(store, &ns, attr, &slabs, target.kind == Kind::Base).await?;
         let report = ReclusterReport {
@@ -682,9 +765,9 @@ fn norm2(v: &[f32]) -> f32 {
 }
 
 /// Squared distances from each of `rows` (with squared norms `norms`) to `count` centers given
-/// by `center(n)` as (center, squared norm): `out[row][n]`. Four rows share each pass over a
-/// center.
-#[allow(clippy::needless_range_loop)] // `n` indexes both the centers and each row's output.
+/// by `center(n)` as (center, squared norm): `out[row][n]`. The SIMD kernel reads each center
+/// once for four rows, without repacking the selected centers for every block.
+#[allow(clippy::needless_range_loop)] // n addresses the center and each row's output.
 fn block_distances<'a>(
     rows: &[&[f32]],
     norms: &[f32],
@@ -733,6 +816,7 @@ fn assign_leaves(
 ) -> Option<Vec<SlabJob>> {
     let distance = bf_vector::squared_distance;
     let t0 = std::time::Instant::now();
+    let training = Stage::new("leaf_kmeans");
     let mut leaves: Vec<Vec<f32>> = Vec::new();
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(cell_rows.len());
     // Each cell's leaf groups (global leaf numbers).
@@ -777,10 +861,10 @@ fn assign_leaves(
                     cell_groups.push((first..leaves.len() as u32).collect::<Vec<u32>>());
                 }
             } else {
-                let trained = bf_vector::kmeans(&refs, k, 8, 42 + cell as u64);
+                let trained = math::kmeans(&refs, k, 8, 42 + cell as u64);
                 let trained_refs: Vec<&[f32]> = trained.iter().map(Vec::as_slice).collect();
                 let g = (trained.len() as f64).sqrt().ceil() as usize;
-                let centers = bf_vector::kmeans(&trained_refs, g, 8, 7 + cell as u64);
+                let centers = math::kmeans(&trained_refs, g, 8, 7 + cell as u64);
                 cell_groups = vec![Vec::new(); centers.len()];
                 for leaf in &trained {
                     cell_groups[bf_vector::nearest_center(leaf, &centers)]
@@ -796,6 +880,7 @@ fn assign_leaves(
         ranges.push(start..leaves.len());
     }
     drop(cell_rows);
+    drop(training);
     tracing::info!(
         "recluster: {} leaves trained in {:.0}s",
         leaves.len(),
@@ -805,6 +890,7 @@ fn assign_leaves(
     let probes = GROUP_PROBES;
     let by_distance = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
     let assign = |leaves: &[Vec<f32>]| -> Option<Vec<u32>> {
+        let _assignment = Stage::new("leaf_assignment");
         // Each cell's leaves under about sqrt(leaves) group centers (the means of their leaves),
         // so a row compares against the groups of its near cells and the leaves of its nearest
         // groups only, not every leaf of every near cell (a 100M layout has about 15,600 leaves a
@@ -1012,6 +1098,7 @@ fn assign_leaves(
     // One refinement: recompute every leaf center from its rows, and assign again. (Stopping at
     // the recomputed centers, without the second assignment, cost 0.003 of recall@10 on NQ.)
     {
+        let refinement = Stage::new("refine_centers");
         let mut members: Vec<Vec<u32>> = vec![Vec::new(); leaves.len()];
         for (g, l) in present.iter().zip(&leaf_of) {
             members[*l as usize].push(*g);
@@ -1036,6 +1123,7 @@ fn assign_leaves(
             })
             .collect();
         leaves = centers;
+        drop(refinement);
         leaf_of = assign(&leaves)?;
         tracing::info!("recluster: refined at {:.0}s", t0.elapsed().as_secs_f64());
     }

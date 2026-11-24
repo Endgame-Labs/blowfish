@@ -987,6 +987,11 @@ fn total_order_key(x: f32) -> u32 {
     }
 }
 
+type Real<'a> = (
+    &'a NamespaceState,
+    &'a [bf_wal::SlabCover],
+    &'a crate::lineage::Placement,
+);
 /// Streaming pays for itself on large cold slab searches; small and resident searches keep
 /// the per-slab path.
 fn stream_scan(dir: &Directory, layout: Layout) -> bool {
@@ -1020,14 +1025,11 @@ pub(crate) async fn search(
     _attribute: &str,
     members: Option<Vec<Option<Arc<Membership>>>>,
     layout: Layout,
-    real: Option<(
-        &NamespaceState,
-        &[bf_wal::SlabCover],
-        &crate::lineage::Placement,
-    )>,
+    real: Option<Real<'_>>,
     skip: &[bool],
     joint: Option<&Seat>,
     source: &NamespaceState,
+    warm: Option<Arc<crate::warm_ann::WarmTier>>,
 ) -> Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError> {
     // With slabs, `state` lists the slabs and `real` the segments that hold the documents: a
     // slab row is a global row number, mapped back by the covered segments' bases to a covered
@@ -1044,6 +1046,29 @@ pub(crate) async fn search(
     let filtered = members.is_some();
     let members = members.unwrap_or_default();
     let t0 = std::time::Instant::now();
+    if let Some(warm) = &warm
+        && layout == Layout::Slabs && real.is_some() && joint.is_none() && !filtered
+        && !skip.iter().any(|skip| *skip) && lives.iter().all(Option::is_none)
+        // Small populations and very large k use the normal exact-all plan.
+        && warm.rows > EXACT_ROWS.max(dir.entries().len().saturating_add(k.saturating_mul(config.ann_rerank_factor)))
+        && let Some(found) = warm.search(vector, config.ann_nprobe, config.ann_rerank_factor, k).map_err(segment::index_error)?
+    {
+        let winners = found.winners;
+        let scanned = found.scanned_rows;
+        metrics::counter!("blowfish_ann_compiled_queries_total").increment(1);
+        if let Some(context) = read_cache::context() {
+            context
+                .ann_rows
+                .fetch_add(scanned as u64, std::sync::atomic::Ordering::Relaxed);
+            context.stats.record_memory_hit(
+                (scanned as u64).saturating_mul((dir.dims().next_power_of_two() / 8 + 16) as u64),
+            );
+        }
+        if crate::ann::trace_stages() {
+            eprintln!("COMPILED rows={scanned} winners={}", winners.len());
+        }
+        return hydrate(store, state, source, real, columns, k, winners, t0).await;
+    }
     let vector: Arc<[f32]> = vector.into();
     let width = dir.vector_row_bytes();
     // One rotation serves the ranking and every segment's scan (they share one vector space).
@@ -1352,6 +1377,7 @@ pub(crate) async fn search(
         ns.sort_unstable();
         let seg_entries: Vec<_> = ns.iter().map(|n| entries[*n].clone()).collect();
         let trace_t0 = t0;
+        let warm = warm.clone();
         tasks.push(
             async move {
                 let task_start = trace_t0.elapsed().as_micros();
@@ -1417,7 +1443,7 @@ pub(crate) async fn search(
                 let (blobs, codes) = read;
                 let read_done = trace_t0.elapsed().as_micros();
                 let mut blobs = blobs.iter();
-                for (cluster, known) in wanted.iter().zip(decoded) {
+                for (position, (cluster, known)) in wanted.iter().zip(decoded).enumerate() {
                     let d = match known {
                         Some(d) => d,
                         None => {
@@ -1431,6 +1457,11 @@ pub(crate) async fn search(
                             d
                         }
                     };
+                    if let Some(warm) = &warm && let Some(code) = codes.get(position) {
+                        // Best effort: unsupported layouts keep their ordinary reader. Validation
+                        // here covers the same immutable bytes the scan would check below.
+                        let _ = warm.codes.admit(i, *cluster, &d, code);
+                    }
                     partial
                         .install_decoded(*cluster, &d)
                         .map_err(segment::index_error)?;
@@ -1546,18 +1577,32 @@ pub(crate) async fn search(
                     });
                 }
                 for (i, rows) in rows {
-                    let (store, segment, columns, context, source) = (
+                    let (
+                        store,
+                        segment,
+                        columns,
+                        context,
+                        source_segments,
+                        source_tiers,
+                        source_lineage,
+                    ) = (
                         store.clone(),
                         docs_state.segments[i].clone(),
                         columns.clone(),
                         context.clone(),
-                        source.without_docs(),
+                        source.segments.clone(),
+                        source.ann_tiers.clone(),
+                        source.lineage.clone(),
                     );
                     early.spawn(async move {
                         let work = async move {
                             let _ = segment::projected_rows_with_from(
                                 &store,
-                                Some((&source).into()),
+                                Some(crate::vector_locator::Source {
+                                    segments: &source_segments,
+                                    tiers: &source_tiers,
+                                    lineage: &source_lineage,
+                                }),
                                 &segment,
                                 &rows,
                                 Some(&columns),
@@ -1654,11 +1699,16 @@ pub(crate) async fn search(
     // A rerank is a few small reads and a little arithmetic. Running it on a worker would hold
     // one of the few permits through the read latency, and the segments would queue for them.
     let reranks = by_segment.into_iter().map(|(i, locations)| {
-        let (index, vector) = (indexes[&i].clone(), vector.clone());
+        let (index, vector, warm) = (indexes[&i].clone(), vector.clone(), warm.clone());
         let i = sources[i];
         async move {
             let hits = index
-                .rerank_candidates(&vector, k, locations)
+                .rerank_candidates_recorded(
+                    &vector,
+                    k,
+                    locations,
+                    warm.as_deref().map(|w| w as &dyn bf_vector::VectorRecorder),
+                )
                 .await
                 .map_err(segment::index_error)?;
             Ok::<_, ApiError>(hits.into_iter().map(|(r, d)| (d, i, r)).collect::<Vec<_>>())
@@ -1694,6 +1744,27 @@ pub(crate) async fn search(
         seat.withdraw();
     }
 
+    hydrate(store, state, source, real, columns, k, winners, t0).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hydrate(
+    store: &Storage,
+    state: &NamespaceState,
+    source: &NamespaceState,
+    real: Option<Real<'_>>,
+    columns: &BTreeSet<String>,
+    k: usize,
+    mut winners: Vec<(f32, usize, u32)>,
+    t0: std::time::Instant,
+) -> Result<(BTreeMap<Id, f64>, BTreeMap<Id, Document>), ApiError> {
+    let docs_state = real.map_or(state, |r| r.0);
+    let to_real = |i: usize, row: u32| -> Option<(usize, u32)> {
+        match real {
+            None => Some((i, row)),
+            Some((_, covers, at)) => at.real(covers, row),
+        }
+    };
     // Top k by (distance, segment, row), extended by every row tied with the k-th distance so
     // that the final tie-break by ID is the same as the per-segment path's.
     winners.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));

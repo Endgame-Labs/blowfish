@@ -93,8 +93,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             result["warm"] = percentiles(times);
             result["rows"] = json!(rows);
             let requests: Vec<_> = requests.into_iter().take(2000).collect();
-            for q in &requests {
-                engine.query("nq", q.clone()).await?;
+            if requests.len() > 1000 {
+                for q in &requests {
+                    engine.query("nq", q.clone()).await?;
+                }
             }
             let start = Instant::now();
             let mut tasks = tokio::task::JoinSet::new();

@@ -10,31 +10,26 @@ use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap},
 };
 
-pub(crate) fn rank_key(rank: &RankBy) -> String {
+pub(crate) fn rank_key(rank: &RankBy) -> Vec<u8> {
     match rank {
-        // Exact and much cheaper than serializing the query vector as JSON: the bits in hex.
-        // (The prefix cannot begin a JSON value, so these keys never equal another kind's.)
         RankBy::Vector {
             attribute,
             exact,
             vector,
             ..
         } => {
-            use std::fmt::Write;
-            let mut key = String::with_capacity(attribute.len() + 12 + vector.len() * 8);
-            let _ = write!(key, "~vector {exact} {}:", attribute.len());
-            key.push_str(attribute);
-            // `{:08x}` of each value's bits, without a formatter call per value.
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let mut hex = Vec::with_capacity(vector.len() * 8);
+            // An invalid JSON prefix separates binary vector keys from every other rank.
+            // Attribute length and every float bit preserve exact identity, without hashing.
+            let mut key = Vec::with_capacity(10 + attribute.len() + vector.len() * 4);
+            key.extend_from_slice(&[0xff, u8::from(*exact)]);
+            key.extend_from_slice(&(attribute.len() as u64).to_le_bytes());
+            key.extend_from_slice(attribute.as_bytes());
             for x in vector.iter() {
-                let bits = x.to_bits();
-                hex.extend((0..8).rev().map(|n| HEX[(bits >> (n * 4)) as usize & 15]));
+                key.extend_from_slice(&x.to_bits().to_le_bytes());
             }
-            key.push_str(std::str::from_utf8(&hex).expect("hex digits are ASCII"));
             key
         }
-        _ => rank.value().to_string(),
+        _ => rank.value().to_string().into_bytes(),
     }
 }
 
@@ -231,6 +226,9 @@ fn improves(id: &Id, score: f64, descending: bool, worst: &HitKey) -> bool {
 }
 /// Keep only the globally competitive candidates while merging segment-local top-k lists.
 fn trim_candidates(state: &mut NamespaceState, q: &QueryRequest) {
+    if state.scores.is_empty() {
+        return;
+    }
     if q.limit.as_ref().and_then(Limit::per).is_some() {
         return;
     }
@@ -844,7 +842,7 @@ async fn prepare_segment(
     } else {
         whole_ids
     };
-    let mut bm25_hits: Vec<(String, Vec<bf_text::SearchHit>)> = vec![];
+    let mut bm25_hits = Vec::new();
     let mut selected = if all {
         allowed.clone()
     } else {
@@ -1093,14 +1091,35 @@ mod rank_key_tests {
     use super::*;
 
     #[test]
-    fn vector_key_is_each_value_bits_in_hex() {
-        let vector = vec![0.0f32, -0.0, 1.5, -3.25e-7, f32::MAX, 7.0e-45];
+    fn vector_keys_preserve_float_bits_and_unambiguous_rank_identity() {
+        let values = [0.0f32, -0.0, 1.5, -3.25e-7, f32::MAX, 7.0e-45];
         let rank: RankBy =
-            serde_json::from_value(serde_json::json!(["vector", "ANN", vector])).unwrap();
-        let mut want = "~vector false 6:vector".to_string();
-        for x in &vector {
-            want += &format!("{:08x}", x.to_bits());
-        }
-        assert_eq!(rank_key(&rank), want);
+            serde_json::from_value(serde_json::json!(["vector", "ANN", values])).unwrap();
+        let key = rank_key(&rank);
+        assert_eq!(&key[..2], &[0xff, 0]);
+        assert_eq!(&key[2..10], &6u64.to_le_bytes());
+        assert_eq!(&key[10..16], b"vector");
+        let decoded: Vec<u32> = key[16..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect();
+        assert_eq!(decoded, values.map(f32::to_bits));
+        let shapes = [
+            serde_json::json!(["v", "ANN", [0.0]]),
+            serde_json::json!(["v", "ANN", [-0.0]]),
+            serde_json::json!(["v", "kNN", [0.0]]),
+            serde_json::json!(["v:", "ANN", [0.0]]),
+            serde_json::json!(["v", "ANN", [0.0, 0.0]]),
+            serde_json::json!(["id", "asc"]),
+            serde_json::json!(["text", "BM25", "v"]),
+        ];
+        let keys: BTreeSet<_> = shapes
+            .iter()
+            .map(|shape| rank_key(&serde_json::from_value(shape.clone()).unwrap()))
+            .collect();
+        assert_eq!(keys.len(), shapes.len());
+        assert_eq!(rank_key(&rank.clone()), key);
     }
 }
