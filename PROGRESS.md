@@ -4,6 +4,20 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **BM25 under heavy writes another 1.65x faster** (round BW2; `docs/benchmarks.md`, "Round BW2"). Correcting
+  corpus statistics for indexed rows that the WAL tail replaced or deleted was the largest remaining stage. It
+  now reads indexed lengths and the exact masked postings of the query's own terms, and reuses the snapshot's
+  shadow bitmap when masking hits. On 1M MS MARCO with 1,000 text-changing upserts/s: p50/p90 49.0/70.0 to
+  29.7/40.8 ms (the shadow stage 22.4 to 6.3 ms p50), bit-identical on all 4,000 validation queries, write p90
+  +2.6%, idle BM25 unchanged. No format change.
+
+- **Warm queries stay compiled after compaction, and a core is kept for completions** (round Q3; `docs/benchmarks.md`,
+  "Round Q3"). After a compaction that fully covered a recluster tier's segments, the tier's live mask came back as
+  "everything" instead of none, which silently sent warm queries off the compiled fast path. Fixed, with a regression
+  test at both leaf sizes. The query CPU pool also uses `N - 1` workers on hosts with 8 or more CPUs. Paired on 8 CPUs
+  with 16 clients at 48/64 probes, identical results: after compaction +22%/+19% q/s and p90 -24%/-23%; freshly
+  published +3%/+2% q/s and p90 -8%/-11%. Cold queries are unchanged; the 4-CPU shape is flat within noise.
+
 - **Filtered queries 100x faster in throughput: immutable predicate results are cached** (from round D4). A filter's
   result over an immutable segment was recomputed for every query, and snapshot warm-up and query planning
   each did it separately. They now share one cached result keyed by the segment files, live generation, schema,

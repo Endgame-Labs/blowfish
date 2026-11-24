@@ -25,8 +25,12 @@ where
 {
     static WORKERS: OnceLock<rayon::ThreadPool> = OnceLock::new();
     let pool = WORKERS.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+        // Leave capacity for WAL completions and response delivery under sustained CPU
+        // load. Small hosts retain every compute worker; their spare-core cost is larger.
+        let workers = if cpus >= 8 { cpus - 1 } else { cpus };
         rayon::ThreadPoolBuilder::new()
-            .num_threads(std::thread::available_parallelism().map_or(1, usize::from))
+            .num_threads(workers)
             .thread_name(|i| format!("bf-query-{i}"))
             .build()
             .expect("query worker pool")
