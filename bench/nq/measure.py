@@ -13,6 +13,11 @@ Usage:
 
 `--cpus` pins this process and its client processes (the server is pinned separately, with taskset).
 Results are printed and appended as one JSON line to `--out` (default DATA_DIR/../nq-results.jsonl).
+
+`--first-pass --parts latency` skips warm-up and adds `latency_ms.first_query`. Use a fresh server with
+empty application caches; later queries progressively warm it. This mode rejects quality and throughput
+parts so they cannot warm the server first. The runner controls the OS page cache separately.
+Throughput aborts and reaps its client processes if a request fails or a worker exits without a result.
 """
 
 import argparse
@@ -21,6 +26,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import queue
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -106,29 +112,36 @@ def score(got, truth, qrels):
     return {"recall10_exact": m(r10), "f1_10": m(f1), "ndcg10": m(ndcg), "recall100_qrels": m(r100), "queries": len(got)}
 
 
-def latency(a, q):
+def latency(a, q, *, warmup=True):
     c = Client(a.base_url, a.namespace)
     bodies = [body(v, 10) for v in q[:1000]]
-    for b in bodies:
-        c.query(b)
+    if warmup:
+        for b in bodies:
+            c.query(b)
     t = []
     for b in bodies:
         s = time.perf_counter()
         c.query(b)
         t.append((time.perf_counter() - s) * 1000)
     p = lambda x: round(float(np.percentile(t, x)), 1)
-    return {"p50": p(50), "p90": p(90), "p95": p(95), "p99": p(99), "mean": round(float(np.mean(t)), 1), "max": round(max(t), 1)}
+    result = {"p50": p(50), "p90": p(90), "p95": p(95), "p99": p(99), "mean": round(float(np.mean(t)), 1), "max": round(max(t), 1)}
+    if not warmup:
+        result["first_query"] = round(t[0], 1)
+    return result
 
 
 def worker(base, ns, bodies, cpus, start, out):
-    pin(cpus)
-    c = Client(base, ns)
-    c.query(bodies[0])  # open the connection before the clock starts
-    while time.time() < start:
-        time.sleep(0.0005)
-    for b in bodies:
-        c.query(b)
-    out.put(time.time())
+    try:
+        pin(cpus)
+        c = Client(base, ns)
+        c.query(bodies[0])  # open the connection before the clock starts
+        while time.time() < start:
+            time.sleep(0.0005)
+        for b in bodies:
+            c.query(b)
+        out.put((True, time.time()))
+    except Exception as error:
+        out.put((False, repr(error)))
 
 
 def throughput(a, q, clients):
@@ -142,9 +155,27 @@ def throughput(a, q, clients):
     ]
     for p in ps:
         p.start()
-    ends = [out.get() for _ in ps]
-    for p in ps:
-        p.join()
+    ends = []
+    try:
+        while len(ends) < len(ps):
+            try:
+                ok, value = out.get(timeout=1)
+            except queue.Empty:
+                failed = [p.exitcode for p in ps if p.exitcode not in (None, 0)]
+                if failed:
+                    raise RuntimeError(f"throughput workers exited without results: {failed}")
+                continue
+            if not ok:
+                raise RuntimeError(f"throughput query failed: {value}")
+            ends.append(value)
+    finally:
+        for p in ps:
+            if p.is_alive():
+                p.terminate()
+        for p in ps:
+            p.join()
+        out.close()
+        out.join_thread()
     return round(len(bodies) / (max(ends) - start), 1)
 
 
@@ -158,7 +189,13 @@ def main():
     p.add_argument("--parts", default="quality,latency,throughput")
     p.add_argument("--clients", default="1,4,16")
     p.add_argument("--out", type=Path)
+    p.add_argument(
+        "--first-pass", action="store_true",
+        help="skip latency warm-up; requires --parts latency and a fresh server with empty application caches",
+    )
     a = p.parse_args()
+    if a.first_pass and a.parts != "latency":
+        p.error("--first-pass requires --parts latency, so quality or throughput cannot warm the server first")
     a.cpus = {int(x) for x in a.cpus.split(",") if x}
     pin(a.cpus)
     q = np.load(a.data / "queries.npy")
@@ -170,7 +207,9 @@ def main():
         res["quality"] = quality(a, q, truth, qrels)
         print(json.dumps(res["quality"]), flush=True)
     if "latency" in parts:
-        res["latency_ms"] = latency(a, q)
+        res["latency_ms"] = latency(a, q, warmup=not a.first_pass)
+        if a.first_pass:
+            res["cache_state"] = "first-pass-no-warmup"
         print(json.dumps(res["latency_ms"]), flush=True)
     if "throughput" in parts:
         res["qps"] = {}
