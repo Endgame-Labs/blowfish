@@ -34,12 +34,13 @@ impl Local {
         let path = self.backend.path_to_filesystem(path)?;
         if path.parent().is_some_and(|dir| {
             self.durable_dirs
-                .lock()
-                .expect("local directory lock")
-                .contains(dir)
+                .try_lock()
+                .is_ok_and(|known| known.contains(dir))
         }) {
             return Ok(());
         }
+        // A contended lock can be held across directory fsyncs. Wait on the blocking pool,
+        // rather than making a runtime worker wait for another writer's disk I/O.
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
             // Directory creation must finish durably before another local writer can use it.
