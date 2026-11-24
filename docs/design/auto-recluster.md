@@ -154,6 +154,12 @@ of a fresh recluster at any time, and the build work happens in the background.
     a base build, and a tenth to a half of that for a delta.
   - It goes in the engine's scratch directory (the disk cache directory when one is set, otherwise the system
     temporary directory), and needs 1.1 times its size free.
+  - Each build owns a `process-<pid>-<uuid>` directory under `blowfish-recluster`, with an exclusive
+    `owner.lock` held until cleanup. A drop guard removes its spill and directory on success, failure,
+    cancellation, shutdown, or panic unwinding. Open blocking-worker descriptors remain valid after unlinking.
+    Startup and new builds sweep only directories whose owner lock can be acquired; another live process's
+    spill stays. Creation, sweeping, and removal serialize on the root directory's lock, so recovery cannot
+    race a creator before its owner lock exists. Legacy loose spills have no ownership lock and are left alone.
   - Otherwise the job reports `reason="disk"` and waits. It never fills the disk the cache or the OS needs.
 - **Input:** for covered rows, the tier's own slabs (one sequential read per slab); for uncovered rows, the segment
   ANN objects. Rows masked as deleted are skipped. Nothing is read twice.

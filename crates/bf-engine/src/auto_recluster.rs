@@ -750,6 +750,13 @@ fn scratch_dir(engine: &Engine) -> std::path::PathBuf {
         .join("blowfish-recluster")
 }
 
+/// Recover only unlocked process directories; live builds in other engines and processes stay.
+pub(crate) fn sweep_spills(engine: &Engine) {
+    if let Err(error) = recluster::spill::sweep(&scratch_dir(engine)) {
+        tracing::warn!(%error, "recluster: abandoned spill recovery failed");
+    }
+}
+
 /// Free bytes on the file system holding `path` (or its nearest existing parent).
 fn free_bytes(path: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;

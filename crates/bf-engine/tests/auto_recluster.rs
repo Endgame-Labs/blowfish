@@ -583,6 +583,22 @@ async fn a_delta_whose_rows_are_all_deleted_leaves_the_joint_plan_to_the_base() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_build_removes_its_spill() {
+    let (faults, _, engine) = setup().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let _open = faults.gate("/slabs/");
+    let build = tokio::spawn({
+        let (engine, opts) = (engine.clone(), options(scratch.path()));
+        async move { engine.recluster("t", &opts).await }
+    });
+    faults.gated().await;
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
+    build.abort();
+    assert!(build.await.unwrap_err().is_cancelled());
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_stops_a_running_build_at_once_and_a_restart_builds_again() {
     let (faults, store, engine) = setup().await;
     let scratch = tempfile::tempdir().unwrap();
@@ -593,6 +609,7 @@ async fn shutdown_stops_a_running_build_at_once_and_a_restart_builds_again() {
         async move { engine.recluster("t", &opts).await }
     });
     faults.hung().await;
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
     let started = std::time::Instant::now();
     assert!(engine.shutdown(Duration::from_secs(10)).await);
     assert!(
@@ -605,6 +622,7 @@ async fn shutdown_stops_a_running_build_at_once_and_a_restart_builds_again() {
         .expect("the build returns")
         .unwrap();
     assert_eq!(stopped.unwrap_err().status, 503);
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
     faults.hang(None);
     // Its record stays, so GC keeps whatever it uploaded until the record is stale.
     assert!(

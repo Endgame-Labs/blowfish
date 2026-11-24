@@ -30,6 +30,8 @@ use rayon::prelude::*;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
+pub(crate) mod spill;
+
 /// What to build.
 #[derive(Clone, Debug)]
 pub struct ReclusterOptions {
@@ -176,36 +178,22 @@ impl Engine {
         );
 
         // Pass 1: copy every live row's vector into a spill file indexed by global row.
-        std::fs::create_dir_all(&opts.scratch).map_err(segment::index_error)?;
-        let spill_path = opts
-            .scratch
-            .join(format!("spill-{}.bin", uuid::Uuid::new_v4()));
-        let spill = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&spill_path)
+        // Keep the owner in this future: dropping it unlinks the spill even if a blocking
+        // worker still has the open file. Unix keeps that worker's descriptor valid.
+        let spill = spill::Spill::create(&opts.scratch, total * width as u64)
             .map_err(segment::index_error)?;
-        spill
-            .set_len(total * width as u64)
-            .map_err(segment::index_error)?;
-        let spill = Arc::new(spill);
-        let result = self
-            .recluster_with_spill(
-                target,
-                &wal,
-                opts,
-                covered,
-                spill.clone(),
-                (dims, width, dtype, metric),
-                first,
-                t0,
-                job,
-            )
-            .await;
-        drop(spill);
-        let _ = std::fs::remove_file(&spill_path);
-        result
+        self.recluster_with_spill(
+            target,
+            &wal,
+            opts,
+            covered,
+            spill.file.clone(),
+            (dims, width, dtype, metric),
+            first,
+            t0,
+            job,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
