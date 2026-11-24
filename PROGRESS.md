@@ -4,6 +4,15 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Text format 6: compressed phrase positions** (`docs/benchmarks.md`, "Round T1"). Phrase positions were
+  stored as two raw `u32`s per token occurrence, 62% of the text index. Format 6 drops the element index for
+  scalar string fields and delta-codes positions, losslessly. On 1M MS MARCO, text indexes go from 743.5 MB to
+  348.2 MB (2.14x smaller) and whole segments from 932.5 MB to 537.2 MB (1.74x). Formats 4 and 5 upgrade
+  automatically through the background upgrade pass. All 8,480 HTTP responses match exact IDs and score
+  bits; cold phrase queries read 28.7% fewer objects and 18.4% fewer bytes (p90 560 to 541 ms); segment
+  build time is unchanged. BM25 seed lists, document reordering by graph bisection, and exact per-window
+  bounds were measured and rejected (1.09x to 1.28x).
+
 - **Compaction through recluster tiers, and bucket format 4** (`docs/benchmarks.md`, "Round AR3";
   `docs/design/auto-recluster.md`, R4). Compaction now merges segments that a tier covers instead of skipping
   them. It records where each merged segment's surviving rows went (lineage), so the tiers keep answering

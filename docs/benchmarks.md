@@ -5265,3 +5265,194 @@ setting. `--parts latency --first-pass` skips latency warm-up for the separate f
 The harness now reports a failed or killed throughput worker, and reaps its peers. Its three
 regressions pass, along with formatting, full-workspace clippy, and all 324 Rust tests. The runtime
 helper is syntax-checked and exercised by the actual signed build, VM boots, and memory sweeps.
+
+## Round T1: smaller phrase positions, and BM25 kill tests
+
+Text format 6 reduces live MS MARCO text indexes by 2.14×, with identical results.
+The 1.3× BM25 cost target remains open. The seed, document-order, and bound
+experiments did not pass their instruction gates, so their implementations stay
+out of the production path.
+
+I use the first 1,000,000 MS MARCO passages, the checked-in 1,000 dev queries,
+default BM25 parameters, and exhaustive truth from `bf-text/examples/exact_bm25.rs`.
+Measurements run on one disposable c7g.2xlarge (8 Graviton vCPUs, 16 GiB RAM).
+Both arms use the production release profile. The server has two Rayon and two
+Tokio workers, a 1 GiB memory cache, 4,000-byte blocks, 512-block coalescing,
+and fetch concurrency 512. Builds and loads finish before measured query passes.
+This is local disk and a fixed-delay S3 facade on EC2, with no real S3 latency claim.
+
+### Footprint and format
+
+The first kill test uses five consecutive 200,000-row text segments, with positions
+enabled. It inspects every block before selecting a codec.
+
+| Region | Format 5 bytes |
+| --- | ---: |
+| Phrase positions | 453,410,160 |
+| Packed postings | 168,369,046 |
+| Term records | 82,327,828 |
+| Packed lengths | 950,355 |
+| Dictionary bundles, padding, chunk index, and footers | 26,638,311 |
+| Total | 731,695,700 |
+
+Positions occupy 62.0% of the index. All 56,676,270 occurrences have element zero.
+Unsigned delta varints take 56,699,677 bytes; one scalar/array flag per block brings
+that to 58,032,680 bytes, 7.81× smaller than raw pairs. Total text bytes fall to
+336,318,220, a 2.18× reduction. A complete decode comparison checks every occurrence,
+not just phrases or samples.
+
+A separate HTTP-loaded namespace contains six compacted segments of 125,000,
+200,000, 165,000, 200,000, 200,000, and 110,000 rows. Its existing background upgrade
+moves all six text fields from format 5 to format 6. Live text bytes fall from
+743,516,484 to 348,199,345 (2.14×). The other live segment files are unchanged:
+documents 126,088,846 bytes, filters 52,991,262, ID filters 3,000,163, ID indexes
+6,889,704, and compact text keys 222. Retired files remain eligible for ordinary
+retention and GC; these figures count live references.
+
+Format 6 keeps the footer and 52-byte block-directory shape. Position blocks have
+a one-byte flag, followed by unsigned LEB128 position deltas. Array blocks also
+encode element deltas. Coordinates restart per document, and positions restart
+when the element changes. Gaps, repetitions, and array boundaries are lossless.
+BM25 does not read the position stream.
+
+Formats 4 and 5 transcode directly without retokenizing documents. The background
+upgrade recognizes `TextHeader::is_current`; manifest and bucket versions are
+unchanged. The current reader can serve older files while an upgrade runs. Unknown versions
+fail, new writes always use format 6, and there is no downgrade switch.
+
+The binary `ids.bfi` hypothesis is not implemented. On this integer-ID corpus,
+those files use 6.89 bytes/row rather than the estimated 35. Eliminating every ID-index
+byte would save less than 1% of format-5 live segment bytes, and ID-only BM25 already has
+222 bytes of stride-encoded text keys. A separate UUID/string-ID study is needed
+before changing the engine's ID format.
+
+### Build cost
+
+The Spot host was reclaimed after the query checks. I repeated the build gate on
+one replacement c7g.2xlarge, with both arms paired on that machine. Two A/B/A/B
+builds parse, tokenize, build, and write the same five 200,000-row segments.
+Separate binary hashes and every emitted segment footer are checked (5 before,
+6 after). An initial pass that reused Cargo artifacts after archive extraction
+was discarded; these runs follow a forced rebuild.
+
+| Build metric, median of two runs | Format 5 | Format 6 |
+| --- | ---: | ---: |
+| Parse, tokenize, build, and write | 34.124 s | 33.818 s |
+| Within `SegmentBuilder::finish` | 4.438 s | 4.370 s |
+
+Individual full-build times are 34.611 and 33.637 s before, versus 34.460 and
+33.176 s after. The codec passes the ≤1.05× build-time gate.
+
+### CPU hypotheses
+
+These kill tests call `bf-text` directly over immutable memory-backed segments.
+They search the five segments sequentially with the existing shared threshold,
+warm all 1,000 queries once, and count only the measured pass with perf's control
+FIFO. They exclude HTTP and engine work, and are not throughput comparisons with
+the earlier Apple M4 results. Counts are the median of two measured passes.
+
+| Variant | Million instructions/query | Reduction factor |
+| --- | ---: | ---: |
+| Baseline | 20.32 | 1.00× |
+| Exact kth score supplied free | 14.91 | 1.36× |
+| Best 64 rows per term, free seed scoring | 17.75 | 1.14× |
+| Best 64 rows per term per segment, free seed scoring | 15.92 | 1.28× |
+| Recursive document bisection prototype | 18.66 | 1.09× |
+| Experimental window-span cache | 19.60 | 1.04× |
+| Unlimited exact window bounds plus span cache | 18.61 | 1.09× |
+| Bisection, unlimited exact bounds, and span cache | 16.37 | 1.24× |
+
+The larger seed union contains 1,656 candidate rows/query on average. Its 1.28×
+ceiling already misses 1.3× before charging selection, scoring, or I/O, so no seed
+lists are written. The ideal floor clears 1.3× by too little to rescue these lists.
+
+The bisection prototype uses four log-odds refinement passes per balanced split,
+recursing to at most 128 rows and omitting unique or twice-occurring graph edges.
+Partitioning takes 2.38–2.44 seconds per 200,000-row segment. Its compressed text
+files grow from 336,318,220 to 342,407,182 bytes, and instructions fall only 9%.
+This prototype misses both the byte and instruction gates; it is not a general
+claim about other graph-partitioning implementations.
+
+Unlimited exact per-window maxima are a stronger bound than one joint `(tf, len)`
+pair per block. Even their combined ceiling misses 1.3×, so no bound metadata or
+row permutation is added to format 6. Persisting a single winning pair would also
+need to account for changed namespace average length, since that can change which
+posting wins.
+
+### Committed codec: HTTP checks
+
+The baseline production source is `b663eb2` (the test-only `c3eafdd` has identical
+production code). The codec is `3e49a4a`; corpus-backed kill and round-trip tests
+are in `5f13376`. Both binaries use Rust 1.100.0 and Clang 21.1.8 for native
+dependencies. Warm A/B/A/B passes start fresh servers, warm the full workload,
+and then measure 1,000 queries at each client count. Perf attaches only to the
+server during the measured pass. Cold A/B/A/B uses 60 queries and a fresh process
+per query, through the read-only facade with 25 ms/request. The OS page cache is
+retained. Tables give the median of each arm's two passes.
+
+| Metric | Format 5 | Format 6 |
+| --- | ---: | ---: |
+| Live text index bytes | 743,516,484 | 348,199,345 |
+| All live segment bytes | 932,486,681 | 537,169,542 |
+| Warm c1 p50 / p90 | 3.31 / 5.55 ms | 3.28 / 5.51 ms |
+| Warm c16 p50 / p90 | 26.47 / 52.14 ms | 25.41 / 48.54 ms |
+| Warm c16 queries/s | 499.3 | 517.3 |
+| Server instructions/query, c1 | 27.851 million | 27.811 million |
+| Server instructions/query, c16 | 27.037 million | 26.698 million |
+| Fresh-process facade p50 / p90 | 165.9 / 232.5 ms | 170.4 / 231.0 ms |
+| Cold reads/query | 113.78 | 113.86 |
+| Cold MB/query | 3.600 | 3.617 |
+| Cold waves/query | 3.15 | 3.15 |
+| Peak server RSS, median after c16 | 616.1 MiB | 616.4 MiB |
+| overlap@10, all 1,000 dev queries | 1.000 | 1.000 |
+
+BM25 cost is essentially unchanged. Cold p50 is 2.7% higher, p90 is 0.7% lower,
+and reads, bytes, and waves are essentially flat. Individual cold p50/p90 pairs
+are 161.2/237.7 and 170.6/227.4 ms before, versus 178.0/234.1 and 162.8/227.9 ms
+after. I do not claim a BM25 speedup from position compression.
+
+For phrase checks, I use the first four whitespace-delimited words of each of the
+first 60 passages, with `ContainsTokenSequence`, BM25 over the same words, and
+ID-only projection. This is a separate correctness and position-I/O workload,
+not a claim about the MS MARCO relevance distribution.
+
+| Cold phrase metric, 60 queries, A/B/A/B | Format 5 | Format 6 |
+| --- | ---: | ---: |
+| p50 / p90 | 363.2 / 560.2 ms | 355.1 / 540.8 ms |
+| Reads/query | 553.82 | 395.00 |
+| MB/query | 6.128 | 5.001 |
+
+Phrase p90 stays below the 5% regression gate; reads fall 28.7%, and bytes fall
+18.4%. These are whole-query numbers, including dictionaries, postings, and
+manifest reads. Fixed 4,000-byte cache blocks limit the benefit from the 7.81×
+smaller position payload.
+
+All **8,480 final HTTP responses** pass strict ordered-ID and f32 score-bit
+comparisons: 8,240 BM25 responses against exhaustive truth, and 240 phrase responses
+against one another. The complete 1,000-query offline result also matches the
+exhaustive IDs and score bits. Codec properties cover arbitrary u32 coordinates,
+arrays, scalar fields, repetitions, truncation, overflow, and noncanonical varints.
+Migration tests cover formats 4 and 5, missing and empty fields, long and short
+posting lists, header-only opens, and byte-identical fresh builds and upgrades.
+
+### Reproduction and limits
+
+Prepare the corpus with the same source and settings as
+`bench/scale/msmarco_load.py`. Keep corpus, binaries, stores, and output in an
+owned `.scratch/` directory, and remove it after preserving measurements. The
+ignored tests in `bf-text/src/experiments.rs` provide `prepare_msmarco`,
+`inspect_msmarco`, `upgrade_msmarco`, `lossless_msmarco`, `seeds_msmarco`,
+`reorder_msmarco`, and `query_msmarco`. They take `BF_TEXT_EXPERIMENT` as their
+scratch root, with `corpus.jsonl` and `workload.json`. Use the baseline revision's
+prepare test for format-5 input, and the current revision for transcoding and
+round-trip validation. The query test accepts `BF_TEXT_IDEAL_FLOOR`,
+`BF_TEXT_SEED_FLOOR`, and `BF_TEXT_PERFECT_BOUNDS` for the optimistic ceilings.
+Perf's enable/disable FIFO excludes preparation and warm-up from instruction counts.
+
+For the HTTP runs, use `bench/scale/bm25_local.py warm` with `--queries 1000
+--clients 1 16`, and `cold` with `--queries 60`, selecting each separately built
+binary and its corresponding immutable store. Supply `--namespace msmarco` and
+an owned `--profile-dir` under `.scratch/` when using perf. Repeat A/B/A/B, and
+compare every response to the exhaustive scorer using strict IDs and score bits.
+The published timings are not Apple M4 timings, in-region S3 latency, or a new
+comparison with hosted turbopuffer.
