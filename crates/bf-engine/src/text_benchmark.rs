@@ -38,6 +38,10 @@ async fn bm25_serialized_msmarco_snapshots() {
     let engine = Engine::with_config(store.clone(), config.clone());
     let context = read_cache::ReadContext::new(Arc::new(read_cache::DecodedCache::new(1 << 30, 1)));
     read_cache::scope(context,async {
+        // Loading metadata can precede the final checkpoint. Drain the initial
+        // load explicitly before disabling background work for captured snapshots.
+        while engine.index_namespace("msmarco",true).await.unwrap() {}
+        let mut pending=Vec::new();
         for phase in 0..4 {
             if phase==1 {
                 for batch in 0..50 {
@@ -62,7 +66,13 @@ async fn bm25_serialized_msmarco_snapshots() {
                     writeln!(input).unwrap();
                 }
             }
+            pending.push((phase,state,child));
+        }
+        // Reference passes are independent CPU work, outside every timed run.
+        // Retaining all snapshots also checks cache reuse across later publications.
+        for (phase,state,child) in pending {
             let output=child.wait_with_output().unwrap();assert!(output.status.success());
+            std::fs::write(path.parent().unwrap().join(format!("bm25-truth-phase-{phase}.json")), &output.stdout).unwrap();
             let truth:Vec<Value>=serde_json::from_slice(&output.stdout).unwrap();
             for (item,expected) in queries.iter().zip(&truth) {
                 let mut request=item["request"].clone();request["include_attributes"]=json!(["id"]);
