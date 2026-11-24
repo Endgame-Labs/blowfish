@@ -303,6 +303,87 @@ async fn cold_ann_has_three_read_stages_no_heads_and_warm_queries_hit_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn covered_namespaces_with_retired_ann_objects_keep_warm_queries_off_directory_hints() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let tuning = EngineConfig {
+        retention: Duration::ZERO,
+        ..config()
+    };
+    let writer = Engine::with_config(writable.clone(), tuning.clone());
+    let docs: Vec<_> = (0..3000)
+        .map(|id| {
+            let vector: Vec<_> = (0..32)
+                .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+                .collect();
+            json!({"id":id,"vector":vector})
+        })
+        .collect();
+    writer.write("covered", serde_json::from_value(json!({
+        "distance_metric":"cosine_distance", "schema":{"vector":{"type":"[32]f16"}}, "upsert_rows":docs,
+    })).unwrap()).await.unwrap();
+    writer.index_namespace("covered", true).await.unwrap();
+    let wal = bf_wal::Wal::new(writable.clone(), "covered").unwrap();
+    let own = wal.latest_manifest().await.unwrap().unwrap().1.segments;
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/d4-cache-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    let scratch = tempfile::tempdir_in(root).unwrap();
+    writer
+        .recluster(
+            "covered",
+            &bf_engine::ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 3,
+                cluster_rows: 40,
+                max_slab_rows: 1500,
+                scratch: scratch.path().into(),
+            },
+        )
+        .await
+        .unwrap();
+    writer.collect_garbage("covered").await.unwrap();
+    let manifest = wal.latest_manifest().await.unwrap().unwrap().1;
+    assert!(manifest.ann_dirs.is_empty());
+    assert!(!manifest.ann_tiers.is_empty());
+    for segment in own {
+        assert!(matches!(
+            writable.head(&segment.files["annv2:vector"].key).await,
+            Err(bf_storage::Error::NotFound)
+        ));
+    }
+    let engine = Engine::with_config(store(backend.clone()).await, tuning);
+    let request: bf_types::QueryRequest = serde_json::from_value(json!({
+        "rank_by":["vector","ANN",docs[17]["vector"]], "top_k":10, "include_attributes":["id"],
+    }))
+    .unwrap();
+    let cold = engine.query("covered", request.clone()).await.unwrap();
+    assert!(
+        backend
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.contains("/ann-dir-latest-")),
+        "cold opens should still fetch a directory hint alongside the manifest"
+    );
+    backend.paths.lock().unwrap().clear();
+    for _ in 0..2 {
+        let warm = engine.query("covered", request.clone()).await.unwrap();
+        assert_eq!(cold.result.rows, warm.result.rows);
+    }
+    let paths = backend.paths.lock().unwrap();
+    assert!(
+        paths
+            .iter()
+            .all(|(path, _)| !path.contains("/ann-dir-latest-")),
+        "warm covered queries must not fetch directory hints: {paths:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_open_reads_the_directory_hint_alongside_the_manifest() {
     let backend = Arc::new(Counting::default());
     let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)

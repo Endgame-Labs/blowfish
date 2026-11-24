@@ -441,7 +441,12 @@ pub(crate) async fn catch_up_hinted(
         };
         let (manifest, prefetched) = tokio::join!(wal.manifest_view_after(known, view), async {
             let mut found = BTreeMap::new();
-            if let Some(hint) = hint.filter(|_| state.ann_dirs.is_empty()) {
+            // Fully covered namespaces retire their segment directories. Their resident tiers
+            // still make this a warm snapshot; refetching the large hint on every query both
+            // wastes I/O and repeats speculative work alongside the query's normal scan.
+            if let Some(hint) =
+                hint.filter(|_| state.ann_dirs.is_empty() && state.ann_tiers.is_empty())
+            {
                 let reads = hint.ann.iter().map(|a| async move {
                     // A lone unfiltered ANN query wants the block-layout directory: try its hint
                     // first, and the plain one when the namespace has none.

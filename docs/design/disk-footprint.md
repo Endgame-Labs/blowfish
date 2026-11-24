@@ -236,6 +236,9 @@ Two additional reader requirements emerged during implementation:
   its other covers unreachable. Exact and scalar workers, and ANN plans over uncovered segments, pass the original source explicitly.
 - A row-list file is slab metadata, so legacy upgrade fixtures and readers must identify slabs by their
   document role, rather than by an otherwise empty file map.
+- An empty segment-directory map no longer identifies a cold namespace: a fully covered namespace
+  retains its resident tiers while retiring those directories. Snapshot warm-up checks both maps,
+  so warm queries do not repeatedly fetch large directory hints or repeat speculative scans.
 
 Filtered tier queries shift exact per-segment filter results back through lineage into global rows,
 then intersect them with each slab's resident row list. Their probe plan uses those matching counts
