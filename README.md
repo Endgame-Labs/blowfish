@@ -88,6 +88,23 @@ On a 10-core Apple M4, the same store and queries measure warm p50/p90 **1.47/3.
 Details and reproduction: [BM25 measurements](docs/benchmarks.md#bm25-round-2-exact-maxscore-and-hybrid-concurrency)
 and [BM25 round 3](docs/benchmarks.md#bm25-round-3-fewer-posting-probes-and-a-mac-baseline).
 
+### One machine: blowfish, Qdrant, and LanceDB (BEIR NQ)
+
+On a 10-core Apple M4 Mac mini, I loaded the same 2.68M BEIR NQ passages (1,024-dim `f16`, cosine) into
+each engine, one engine at a time, on local disk. blowfish v0.1.15 ran with defaults and reclustered by itself.
+Latency is one client; throughput is 16 clients.
+
+| Engine, setting | Recall@10 | p50 / p99 | q/s at 16 clients | Peak RSS |
+| --- | ---: | --- | ---: | ---: |
+| blowfish v0.1.15, 64 probes (default) | 0.961 | 1.4 / 2.0 ms | 1,814 | 2.7–3.3 GB |
+| blowfish v0.1.15, 48 probes | 0.951 | 1.2 / 1.8 ms | 2,101 | 2.7–3.3 GB |
+| Qdrant 1.20.0, HNSW `ef=64` | 0.950 | 0.5 / 0.7 ms | 7,752 | 14.7 GB |
+| LanceDB 0.41.0, IVF-PQ, 120 probes | 0.949 | 18.7 / 19.9 ms | 278 | 8.8 GB build, 0.6 GB query |
+
+Qdrant keeps its HNSW graph and vectors in RAM and is about 3.7 times faster at the same recall. blowfish
+scans one-bit codes and reads exact vectors through its object-storage cache, so the same layout serves
+cold from S3. Details: [Apple M4 at v0.1.15](docs/benchmarks.md#apple-m4-at-v0115-blowfish-qdrant-and-lancedb).
+
 ### My own measurements of hosted services (10M)
 
 I also measured turbopuffer and Amazon S3 Vectors on the same 10M 1,024-dim `f16` Wikipedia dataset. Because caches cannot be forced cold externally on either hosted service, their idle-gap latency is not directly comparable to blowfish's cold numbers:
