@@ -24,7 +24,12 @@ struct Counting {
     calls: AtomicUsize,
     ranges: Mutex<Vec<Range<u64>>>,
     paths: Mutex<Vec<(String, Option<Range<u64>>)>>,
+    /// Waves of dependent segment reads (see [`Counting::wave`]).
     waves: AtomicUsize,
+    /// The highest wave whose reads have returned.
+    returned_wave: AtomicUsize,
+    /// When the last segment read of each wave was issued.
+    last_issue: Mutex<std::collections::HashMap<usize, std::time::Instant>>,
     heads: AtomicUsize,
     active: AtomicUsize,
     max_active: AtomicUsize,
@@ -42,6 +47,45 @@ struct Counting {
 impl fmt::Display for Counting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("counting store")
+    }
+}
+/// With `delay` on, a segment read returns only once no other read of its wave has been issued
+/// for this long, so every read of one wave (issued together) is in flight before any returns.
+const QUIET: Duration = Duration::from_millis(50);
+impl Counting {
+    /// Start counting waves afresh.
+    fn reset_waves(&self) {
+        self.waves.store(0, Ordering::SeqCst);
+        self.returned_wave.store(0, Ordering::SeqCst);
+        self.last_issue.lock().unwrap().clear();
+    }
+    /// A read's wave: one past the highest wave that had returned when it was issued, so a read
+    /// can depend only on reads of earlier waves. Waves are counted by dependency, not by
+    /// overlap in time, so a scheduling stall between two reads of one wave cannot split it:
+    /// with `delay` on, reads are held until their wave goes quiet (see [`QUIET`]).
+    fn wave(&self) -> usize {
+        let wave = self.returned_wave.load(Ordering::SeqCst) + 1;
+        self.last_issue
+            .lock()
+            .unwrap()
+            .insert(wave, std::time::Instant::now());
+        self.waves.fetch_max(wave, Ordering::SeqCst);
+        wave
+    }
+    /// Hold a read of `wave` until no read of that wave has been issued for [`QUIET`]. Reads of
+    /// later waves (which can depend only on returned reads) do not extend it.
+    async fn hold(&self, wave: usize) {
+        loop {
+            // A reset meanwhile releases it.
+            let Some(last) = self.last_issue.lock().unwrap().get(&wave).copied() else {
+                return;
+            };
+            let wait = (last + QUIET).saturating_duration_since(std::time::Instant::now());
+            if wait.is_zero() {
+                return;
+            }
+            tokio::time::sleep(wait).await;
+        }
     }
 }
 struct Active<'a>(&'a AtomicUsize);
@@ -107,15 +151,13 @@ impl ObjectStore for Counting {
         }
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
-        if active == 1 {
-            self.waves.fetch_add(1, Ordering::SeqCst);
-        }
-        self.paths.lock().unwrap().last_mut().unwrap().0 +=
-            &format!(" w{}", self.waves.load(Ordering::SeqCst));
+        let wave = self.wave();
+        self.paths.lock().unwrap().last_mut().unwrap().0 += &format!(" w{wave}");
         let _active = Active(&self.active);
         if self.delay.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.hold(wave).await;
         }
+        self.returned_wave.fetch_max(wave, Ordering::SeqCst);
         if self.fail.swap(false, Ordering::SeqCst) {
             return Err(object_store::Error::Generic {
                 store: "counting",
@@ -202,7 +244,7 @@ async fn cold_ann_has_three_read_stages_no_heads_and_warm_queries_hit_cache() {
     writer.index_namespace("stages", true).await.unwrap();
     let engine = Engine::with_config(store(backend.clone()).await, config());
     engine.schema("stages").await.unwrap();
-    backend.waves.store(0, Ordering::SeqCst);
+    backend.reset_waves();
     backend.heads.store(0, Ordering::SeqCst);
     backend.ranges.lock().unwrap().clear();
     backend.delay.store(true, Ordering::SeqCst);
@@ -243,7 +285,7 @@ async fn cold_ann_has_three_read_stages_no_heads_and_warm_queries_hit_cache() {
     assert!(diagnostics.backend.is_empty(), "{diagnostics:?}");
     // A fresh engine and storage handle also keep the text metadata stage together.
     let engine = Engine::with_config(store(backend.clone()).await, config());
-    backend.waves.store(0, Ordering::SeqCst);
+    backend.reset_waves();
     let request =
         serde_json::from_value(json!({"rank_by":["text","BM25","search engine term1"],"top_k":10}))
             .unwrap();
@@ -286,7 +328,7 @@ async fn cold_open_reads_the_directory_hint_alongside_the_manifest() {
     writer.index_namespace("hinted", true).await.unwrap();
     let cold_waves = |backend: Arc<Counting>| async move {
         let engine = Engine::with_config(store(backend.clone()).await, config());
-        backend.waves.store(0, Ordering::SeqCst);
+        backend.reset_waves();
         backend.delay.store(true, Ordering::SeqCst);
         let request =
             serde_json::from_value(json!({"rank_by":["vector","ANN",docs_vector()],"top_k":10}))
@@ -581,7 +623,7 @@ async fn cold_ann_over_twenty_segments_uses_the_directory() {
     };
     for (ids_only, max_waves) in [(true, 3), (false, 4)] {
         let engine = Engine::with_config(store(backend.clone()).await, config());
-        backend.waves.store(0, Ordering::SeqCst);
+        backend.reset_waves();
         backend.ranges.lock().unwrap().clear();
         backend.paths.lock().unwrap().clear();
         backend.delay.store(true, Ordering::SeqCst);
@@ -683,7 +725,7 @@ async fn directory_cost_and_publication_do_not_grow_with_segment_count() {
         publish_reads.push((batch, count(".bfa"), count(".bfd")));
         if batch + 1 == 6 || batch + 1 == 60 {
             let engine = Engine::with_config(store(backend.clone()).await, config());
-            backend.waves.store(0, Ordering::SeqCst);
+            backend.reset_waves();
             backend.ranges.lock().unwrap().clear();
             backend.delay.store(true, Ordering::SeqCst);
             let result = engine.query("grow", query()).await.unwrap();
@@ -770,7 +812,7 @@ async fn filtered_ann_uses_the_directory_without_opening_id_indexes() {
                 ..config()
             },
         );
-        backend.waves.store(0, Ordering::SeqCst);
+        backend.reset_waves();
         backend.paths.lock().unwrap().clear();
         backend.delay.store(true, Ordering::SeqCst);
         let request = serde_json::from_value(json!({
@@ -804,7 +846,8 @@ async fn filtered_ann_uses_the_directory_without_opening_id_indexes() {
             !reads.iter().any(|p| p.contains(".bfi")),
             "filtered ANN read an ID index: {reads:?}"
         );
-        assert!(backend.waves.load(Ordering::SeqCst) <= 5);
+        let waves = backend.waves.load(Ordering::SeqCst);
+        assert!(waves <= 5, "{waves} waves: {reads:#?}");
     }
 }
 
@@ -877,7 +920,7 @@ async fn unindexed_tail_keeps_the_directory_path() {
     expected.sort_by(|a, b| distance(&logical[a]).total_cmp(&distance(&logical[b])));
     expected.truncate(10);
     let engine = Engine::with_config(store(backend.clone()).await, config());
-    backend.waves.store(0, Ordering::SeqCst);
+    backend.reset_waves();
     backend.paths.lock().unwrap().clear();
     backend.delay.store(true, Ordering::SeqCst);
     let request = serde_json::from_value(json!({
