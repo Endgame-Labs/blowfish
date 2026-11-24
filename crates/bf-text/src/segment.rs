@@ -1,5 +1,7 @@
 #[path = "bundle.rs"]
 mod bundle;
+#[path = "compact.rs"]
+mod compact;
 #[path = "positions.rs"]
 mod positions;
 use crate::scoring::{Saturation, TermWeight};
@@ -19,6 +21,8 @@ use std::sync::Arc;
 
 /// Bundled dictionaries with lossless per-document position and element deltas.
 const VERSION_COMPRESSED: u32 = 6;
+/// Actual-length posting tails and variable-width block directories.
+const VERSION_COMPACT: u32 = 7;
 
 const BLOCK: usize = 128;
 const FOOTER: usize = 72;
@@ -379,6 +383,12 @@ impl SegmentBuilder {
     #[cfg(feature = "legacy-fixtures")]
     pub fn finish_bundled_fixture(self) -> io::Result<Vec<u8>> {
         bundle::legacy_bundle(self.finish_colocated()?)
+    }
+
+    /// Produce format-6 bytes solely for migration tests and measurements.
+    #[cfg(feature = "legacy-fixtures")]
+    pub fn finish_compressed_fixture(self) -> io::Result<Vec<u8>> {
+        bundle::format_six(self.finish_colocated_impl(true)?)
     }
 
     fn finish_colocated_impl(self, compressed_positions: bool) -> io::Result<Vec<u8>> {
@@ -759,6 +769,7 @@ enum Terms {
     },
 }
 
+#[derive(Clone)]
 struct DictionaryChunk {
     map: fst::Map<Bytes>,
     bytes: Bytes,
@@ -794,11 +805,11 @@ impl TextHeader {
     /// Whether this header describes the current dictionary-bundled layout.
     /// Older layouts remain readable while the indexer upgrades them.
     pub fn is_current(&self) -> bool {
-        self.footer.get(8..12) == Some(VERSION_COMPRESSED.to_le_bytes().as_slice())
+        self.footer.get(8..12) == Some(VERSION_COMPACT.to_le_bytes().as_slice())
     }
 }
 
-/// Upgrade format-4 or format-5 postings to format 6 without tokenizing documents.
+/// Upgrade format-4, format-5, or format-6 postings to format 7 without tokenizing documents.
 /// Current bytes are returned unchanged. Formats 1–3 return `None`, so callers can rebuild
 /// from their immutable document columns. The footer, lengths, and dictionary index are checked;
 /// conversion also checks posting and phrase payloads. Unknown formats are errors.
@@ -814,7 +825,7 @@ pub fn upgrade_segment(bytes: Vec<u8>) -> io::Result<Option<Vec<u8>>> {
     let version = u32::from_le_bytes(footer[8..12].try_into().unwrap());
     match version {
         VERSION | VERSION_LAZY | VERSION_CHUNKED => Ok(None),
-        VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED => {
+        VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED | VERSION_COMPACT => {
             let _header = text_header(&bytes)?.ok_or_else(|| invalid("missing text header"))?;
             let lengths = u64::from_le_bytes(footer[32..40].try_into().unwrap()) as usize;
             let positions = u64::from_le_bytes(footer[40..48].try_into().unwrap()) as usize;
@@ -835,16 +846,16 @@ pub fn upgrade_segment(bytes: Vec<u8>) -> io::Result<Option<Vec<u8>>> {
                 checked_slice(&bytes, dictionary..bytes.len() - FOOTER)?,
                 u32::from_le_bytes(footer[64..68].try_into().unwrap()),
             )?;
-            if version == VERSION_COMPRESSED {
+            if version == VERSION_COMPACT {
                 Ok(Some(bytes))
             } else {
-                bundle::bundle(bytes, false).map(Some)
+                bundle::bundle(bytes, version >= VERSION_COMPRESSED).map(Some)
             }
         }
         _ => Err(invalid("unknown text segment format")),
     }
 }
-/// The header of a finished version 4, 5, or 6 segment (`None` for older versions).
+/// The header of a finished version 4, 5, 6, or 7 segment (`None` for older versions).
 pub fn text_header(bytes: &[u8]) -> io::Result<Option<TextHeader>> {
     if bytes.len() < FOOTER {
         return Err(invalid("text segment has no footer"));
@@ -856,7 +867,7 @@ pub fn text_header(bytes: &[u8]) -> io::Result<Option<TextHeader>> {
     }
     if !matches!(
         c.u32()?,
-        VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED
+        VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED | VERSION_COMPACT
     ) {
         return Ok(None);
     }
@@ -895,6 +906,7 @@ pub struct SegmentReader {
     colocated: bool,
     bundled: bool,
     compressed_positions: bool,
+    compact: bool,
     decoded: std::sync::Mutex<DecodedPostings>,
     saturation: std::sync::Mutex<Option<Arc<Saturation>>>,
 }
@@ -913,8 +925,8 @@ fn check_block(
         || previous.is_some_and(|last| last >= b.first)
         || b.max_tf == 0
         || b.min_length == 0
-        || b.size < 2
-        || b.size > 1026
+        || b.size == 0
+        || b.size > 1275
         || b.offset
             .checked_add(b.size as u64)
             .is_none_or(|end| end > postings_end)
@@ -1021,6 +1033,7 @@ impl SegmentReader {
             && version != VERSION_COLOCATED
             && version != VERSION_BUNDLED
             && version != VERSION_COMPRESSED
+            && version != VERSION_COMPACT
         {
             return Err(invalid("unknown text segment format"));
         }
@@ -1134,6 +1147,7 @@ impl SegmentReader {
                 colocated,
                 bundled,
                 compressed_positions: version >= VERSION_COMPRESSED,
+                compact: version >= VERSION_COMPACT,
                 decoded: Default::default(),
                 saturation: Default::default(),
             });
@@ -1159,6 +1173,7 @@ impl SegmentReader {
                 colocated: false,
                 bundled: false,
                 compressed_positions: false,
+                compact: false,
                 decoded: Default::default(),
                 saturation: Default::default(),
             });
@@ -1219,6 +1234,7 @@ impl SegmentReader {
             colocated: false,
             bundled: false,
             compressed_positions: false,
+            compact: false,
             decoded: Default::default(),
             saturation: Default::default(),
         })
@@ -1259,6 +1275,18 @@ impl SegmentReader {
                 missing.sort_unstable();
                 missing.dedup();
                 if missing.is_empty() {
+                    return Ok(out);
+                }
+                if self.compact {
+                    let decoded = self.compact_records(&missing).await?;
+                    let mut memo = memo.lock().unwrap();
+                    if memo.len() + decoded.len() > MEMO_TERMS {
+                        memo.clear();
+                    }
+                    for (h, meta) in missing.into_iter().zip(decoded) {
+                        memo.insert(h, meta.clone());
+                        out.insert(h, meta);
+                    }
                     return Ok(out);
                 }
                 let docs = self.num_docs();
@@ -1386,7 +1414,7 @@ impl SegmentReader {
     }
     /// Open from a header kept elsewhere (the manifest), without reading the object: the footer
     /// and the dictionary's chunk index. Document lengths load on first use. Versions 4,
-    /// 5, and 6 have headers.
+    /// 5, 6, and 7 have headers.
     pub fn open_with_header(source: Arc<dyn RangeRead>, header: &TextHeader) -> io::Result<Self> {
         let len = source.len();
         if header.footer.len() != FOOTER || len < FOOTER as u64 {
@@ -1400,7 +1428,7 @@ impl SegmentReader {
         let version = c.u32()?;
         if !matches!(
             version,
-            VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED
+            VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED | VERSION_COMPACT
         ) {
             return Err(invalid("unknown text segment format"));
         }
@@ -1464,6 +1492,7 @@ impl SegmentReader {
             colocated: true,
             bundled: version >= VERSION_BUNDLED,
             compressed_positions: version >= VERSION_COMPRESSED,
+            compact: version >= VERSION_COMPACT,
             decoded: Default::default(),
             saturation: Default::default(),
         })
@@ -1500,18 +1529,18 @@ impl SegmentReader {
         Ok(stats)
     }
     /// Decoded chunks, fetched in one batch for those the memo lacks.
-    async fn chunks(&self, wanted: &[usize]) -> io::Result<Vec<fst::Map<Bytes>>> {
+    async fn chunks(&self, wanted: &[usize]) -> io::Result<Vec<DictionaryChunk>> {
         let Dictionary::Chunked { entries, memo } = &self.dictionary else {
             return Ok(Vec::new());
         };
-        let mut have: BTreeMap<usize, fst::Map<Bytes>> = BTreeMap::new();
+        let mut have: BTreeMap<usize, DictionaryChunk> = BTreeMap::new();
         let mut missing = Vec::new();
         {
             let memo = memo.lock().unwrap();
             for &c in wanted {
                 match memo.get(&c) {
                     Some(map) => {
-                        have.insert(c, map.map.clone());
+                        have.insert(c, map.clone());
                     }
                     None => missing.push(c),
                 }
@@ -1553,7 +1582,7 @@ impl SegmentReader {
                 memo.clear();
             }
             for (c, map) in decoded {
-                have.insert(c, map.map.clone());
+                have.insert(c, map.clone());
                 memo.insert(c, map);
             }
             while memo.len() > MEMO_CHUNKS {
@@ -1578,8 +1607,11 @@ impl SegmentReader {
                     .collect();
                 let wanted: Vec<usize> = at.iter().flatten().copied().collect();
                 let maps = self.chunks(&wanted).await?;
-                let by_chunk: BTreeMap<usize, &fst::Map<Bytes>> =
-                    wanted.iter().copied().zip(maps.iter()).collect();
+                let by_chunk: BTreeMap<usize, &fst::Map<Bytes>> = wanted
+                    .iter()
+                    .copied()
+                    .zip(maps.iter().map(|chunk| &chunk.map))
+                    .collect();
                 Ok(texts
                     .iter()
                     .zip(at)
@@ -1615,7 +1647,7 @@ impl SegmentReader {
                         .take_while(|&c| entries[c].first.starts_with(prefix.as_bytes())),
                 );
                 for map in self.chunks(&wanted).await? {
-                    scan(&map, &mut terms);
+                    scan(&map.map, &mut terms);
                 }
             }
         }
@@ -1635,7 +1667,7 @@ impl SegmentReader {
             Dictionary::Chunked { entries, .. } => {
                 let all: Vec<usize> = (0..entries.len()).collect();
                 for map in self.chunks(&all).await? {
-                    collect(&map);
+                    collect(&map.map);
                 }
             }
         }
@@ -1665,41 +1697,59 @@ impl SegmentReader {
             return Err(invalid("short posting block"));
         }
         verify(bytes, b.crc)?;
-        let bits = bytes[0];
-        let tf_bits = bytes[1];
-        if bits > 32 || tf_bits > 32 || bytes.len() != 2 + 16 * (bits as usize + tf_bits as usize) {
-            return Err(invalid("invalid packed posting size"));
-        }
-        let packer = BitPacker4x::new();
-        let mut deltas = [0; BLOCK];
-        let mut tfs = [0; BLOCK];
-        let n = packer.decompress(&bytes[2..], &mut deltas, bits);
-        packer.decompress(&bytes[2 + n..], &mut tfs, tf_bits);
-        let mut row = b.first;
-        let mut out = Vec::with_capacity(b.count as usize);
-        let lengths = self.lens();
-        for i in 0..b.count as usize {
-            if (i == 0 && deltas[i] != 0)
-                || (i > 0 && deltas[i] == 0)
-                || tfs[i] == 0
-                || tfs[i] > b.max_tf
-            {
-                return Err(invalid("invalid posting payload"));
+        let out = if self.compact && b.count < BLOCK as u32 {
+            let out = compact::decode_tail(bytes, b)?;
+            let lengths = self.lens();
+            for &(row, tf) in &out {
+                if tf > lengths[row as usize] || lengths[row as usize] < b.min_length {
+                    return Err(invalid("posting row out of bounds"));
+                }
             }
-            row = row
-                .checked_add(deltas[i])
-                .ok_or_else(|| invalid("posting row overflow"))?;
-            if row > b.last
-                || tfs[i] > lengths[row as usize]
-                || lengths[row as usize] < b.min_length
-            {
-                return Err(invalid("posting row out of bounds"));
+            out
+        } else {
+            if bytes.len() < 2 {
+                return Err(invalid("short posting block"));
             }
-            out.push((row, tfs[i]));
-        }
-        if row != b.last {
-            return Err(invalid("invalid last posting row"));
-        }
+            let bits = bytes[0];
+            let tf_bits = bytes[1];
+            if bits > 32
+                || tf_bits > 32
+                || bytes.len() != 2 + 16 * (bits as usize + tf_bits as usize)
+            {
+                return Err(invalid("invalid packed posting size"));
+            }
+            let packer = BitPacker4x::new();
+            let mut deltas = [0; BLOCK];
+            let mut tfs = [0; BLOCK];
+            let n = packer.decompress(&bytes[2..], &mut deltas, bits);
+            packer.decompress(&bytes[2 + n..], &mut tfs, tf_bits);
+            let mut row = b.first;
+            let mut out = Vec::with_capacity(b.count as usize);
+            let lengths = self.lens();
+            for i in 0..b.count as usize {
+                if (i == 0 && deltas[i] != 0)
+                    || (i > 0 && deltas[i] == 0)
+                    || tfs[i] == 0
+                    || tfs[i] > b.max_tf
+                {
+                    return Err(invalid("invalid posting payload"));
+                }
+                row = row
+                    .checked_add(deltas[i])
+                    .ok_or_else(|| invalid("posting row overflow"))?;
+                if row > b.last
+                    || tfs[i] > lengths[row as usize]
+                    || lengths[row as usize] < b.min_length
+                {
+                    return Err(invalid("posting row out of bounds"));
+                }
+                out.push((row, tfs[i]));
+            }
+            if row != b.last {
+                return Err(invalid("invalid last posting row"));
+            }
+            out
+        };
         let out: Postings = out.into();
         let mut memo = self.decoded.lock().unwrap();
         if let Some(existing) = memo.get(b.offset) {
