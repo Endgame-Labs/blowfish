@@ -6617,3 +6617,113 @@ The checked diff contains no private settings, credentials, or hostnames.
 
 The checks host was terminated immediately after verification. The measured
 results and all gate decisions are recorded above before deleting scratch data.
+
+## Round B6: exact random-access completion, and bitmap score bands
+
+Both offline kill tests fail. B6 ships no production code, public API, dependency,
+query option, or text format. The failed prototypes are removed from the final
+source tree; implementation, tests, and reproduction notes remain in `eae8ece`
+and `83c6574` (`crates/bf-text/examples/b6`).
+
+### Corpus and paired protocol
+
+The first 1,000,000 passages from `msmarco_load.py`'s stream form five consecutive
+200,000-row, format-7 segments, built by `experiments::prepare_msmarco`. The workload
+is all 1,000 checked-in MS MARCO dev queries, with default BM25 parameters and
+limit 10. An independent `exact_bm25` run validates all 10,000 ordered hit IDs and
+f32 score bits. Every warm and measured candidate pass compares against those
+validated production results.
+
+All arms compile natively on one owned, on-demand c7g.2xlarge, use the same final
+release executable, and run pinned to CPU 3. Builds, indexing, and truth generation
+finish before counters start. Each invocation verifies truth, warms the complete
+workload, and counts the next pass using B5's perf control/ack FIFOs. Values below
+are medians of two complete invocations per arm. Counters measure instructions and
+cycles in user mode, without multiplexing. Two hardware-counter reads per query
+provide p90 cycles, and their cost is included in the outer counters.
+
+| Arm | M instructions/query | M cycles/query | p90 M cycles/query |
+| --- | ---: | ---: | ---: |
+| Existing reader | 18.230 | 11.485 | 28.102 |
+| Impact threshold algorithm, with forward TF completion | 16.658 | 16.780 | 44.483 |
+| Four scalar bitmap bands | 19.163 | 11.146 | 26.105 |
+| Eight scalar bitmap bands | 19.083 | 11.739 | 28.197 |
+| Four bands, direct bitmap intersections | 19.433 | 11.501 | 27.398 |
+| Eight bands, direct bitmap intersections | 20.402 | 12.061 | 28.745 |
+
+The final executable's SHA-256 is
+`f06618000d28167b2b0727d23644f9c63030e281756291059da0402afe5d54ef`.
+The paired baseline differs from B5's historical 20.581M instructions/query;
+comparisons use this executable's baseline. No improvement is inferred from a
+changed driver or release code generation.
+
+### Threshold algorithm with forward TF: rejected
+
+Query-term postings sort by exact saturation under the current namespace
+normalization, and form 128-row impact blocks. BitPacker4x packs their absolute
+row IDs. Each surfaced candidate is completed once from its document's forward
+TF slice, scored in canonical term order, and inserted into a heap shared across
+segments. Summing the remaining term maxima in canonical f32 order bounds
+untouched documents; strict termination retains score ties.
+
+The forward index stores row offsets and lexical term-ID deltas. A low bit folds
+in the common tf=1; other TFs use unsigned LEB128. Completion decodes the actual
+compressed bytes during queries. Saturation-sorted impact blocks and exact maxima
+are prepared outside counters, giving this warm experiment favorable conditions.
+Only workload terms need experimental impact lists; the forward index includes
+**every term in every document**.
+
+| Forward TF encoding | Bytes, including row offsets |
+| --- | ---: |
+| Lexical term-ID deltas, used for measured completion | 100,100,908 |
+| Frequency-ranked IDs, also including the ID mapping | 77,773,764 |
+
+Both measured encodings miss the 65 MB footprint gate. The corpus contains
+39.714 distinct terms/document, rather than the proposed roughly 35. The ranked
+alternative is a footprint diagnostic; its query completion is not measured.
+
+The algorithm reads 114.140 impact blocks/query, but completes **13,331.462
+candidates/query**, far above the proposal's 400–1,200. Reduced sorted access
+does not make completion cheap enough. Instructions exceed the 12.0M kill gate,
+mean cycles rise 1.46×, and p90 cycles rise **1.583×**, exceeding the 1.2× kill
+gate. Random access resolves the missing-contribution correctness problem, but
+the tested completion index fails both the CPU and footprint requirements.
+
+### Frequent-term bitmap bands: rejected
+
+The namespace's 32 most frequent terms receive four or eight disjoint bitmaps of
+upward-rounded saturation bounds. During normal window selection, the prototype
+combines those frequent-term row bounds with exact sparse partials and other dense
+terms' window maxima. Empty windows are removed before posting prefetch; surviving
+rows retain the original scorer, bounded decoded caches, and shared threshold.
+No query-truth floor is supplied.
+
+Eight scalar bands reduce posting reads from **663.770 to 495.275 blocks/query**
+(25.4%), and fully scored rows from **5,364.998 to 4,117.256/query**. Four bands
+read 509.794 blocks and score 4,163.172 rows/query. Bound evaluation costs more
+instructions than the saved posting/scoring work. Four bands improve p90 cycles,
+but still fail both absolute mean gates.
+
+A second implementation directly intersects the disjoint bitmap bands, pruning
+recursive intersections with suffix score bounds. It uses the sparse window
+maximum to avoid per-row bound accumulation. Those looser bounds leave
+654.372 blocks/query with four bands, and 642.218 with eight. Direct bitmap
+combination also fails: all bitmap variants exceed **15.9M instructions** and
+**8.34M cycles/query**. No bitmap layout or production hook ships.
+
+### Validation and limits
+
+Native ARM formatting, `cargo clippy -p bf-text --all-targets -- -D warnings`,
+and `cargo test -p bf-text` pass: **42 tests**, with eight corpus experiments
+ignored. The historical example adds its own checks: **16 pass**, with eight
+embedded corpus experiments ignored. New tests compare forward decoding and
+reference score bits, and exercise repeated terms, missing terms, ties, changed
+namespace averages, and both bitmap combinations. A 12K-row case forces frequent
+terms through the bitmap pruning path, and verifies that rows are actually pruned.
+Final bf-text checks pass again after removing the prototypes.
+
+This is an optimistic warm library experiment. Normalization-specific impact
+order, maxima, and bands are prepared outside counters; actual impact decoding,
+forward decoding, and query-bound evaluation are charged. There is no HTTP,
+engine, cold-I/O, SDK, M4, or real-S3 measurement. No format publication or update
+lifecycle is implemented. The existing BM25 CPU target remains open.
