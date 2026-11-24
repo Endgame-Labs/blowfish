@@ -4,10 +4,13 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-11-24
+
 ### Upgrade notes
 
-- **Bucket and manifest format 4:** Compaction through recluster tiers adds `lineage` to the manifest, moving the manifest and bucket formats to 4. The format upgrades automatically, and v0.1.15 and older binaries refuse an upgraded bucket.
-- **Background text index upgrades (formats 6 and 7):** Existing format-4 and format-5 text indexes upgrade automatically in the background to format 6, and format-6 segments upgrade automatically in the background to format 7 (about 4 s for 1M rows).
+- **Bucket and manifest format 4:** Stop every older writer and back up the entire prefix before upgrading. Compaction through recluster tiers adds `lineage` to the manifest, moving the manifest and bucket formats to 4. Writable startup writes `_system/format/4.json`, and v0.1.15 refuses the upgraded bucket with `BucketFormat { required: 4, supported: 3 }`. There is no in-place downgrade.
+- **Background text index upgrades (formats 6 and 7):** Existing format-4, format-5, and format-6 text indexes are repacked directly into format 7 in the background, combining lossless phrase-position compression with compact short posting lists (the format-6-to-7 test took about 4 s for 1M rows).
+- **Measured v0.1.15 upgrade:** Separate local-disk and S3 stores with 200K NQ rows, 1,024-dimensional vectors, text, six segments, and 32 slabs reached text format 7 in 30.24 and 27.11 s under continuous query traffic. Recall@10 stayed 0.9725 and 0.9775, respectively; every BM25 check matched 40/40, and 42,640 candidate requests had zero errors or exhaustive fallbacks. Both old-binary restarts refused cleanly. Text shrank about 3.50x; old objects remain until GC. See [Upgrading to v0.1.16](docs/operations.md#upgrading-to-v0116) for marker timings, byte totals, and the limits of `reindex --dry-run`.
 
 ### Added
 
@@ -129,7 +132,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/dorkitude/blowfish/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/dorkitude/blowfish/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/dorkitude/blowfish/releases/tag/v0.1.16
 [0.1.15]: https://github.com/dorkitude/blowfish/releases/tag/v0.1.15
 [0.1.14]: https://github.com/dorkitude/blowfish/releases/tag/v0.1.14
 [0.1.13]: https://github.com/dorkitude/blowfish/releases/tag/v0.1.13

@@ -4845,6 +4845,136 @@ inventory above. Final read-only checkpoint checks matched all three originals,
 including selected live-object sizes and ETags and deployment format markers.
 Neither original prefix nor the production process on this VM was modified.
 
+## v0.1.16 upgrade validation
+
+On 2026-11-24, I built v0.1.15 (`e49c509`) and the v0.1.16 candidate (`5c5fec8`
+with the workspace version bump) using the release profile, Rust 1.100.0, Clang
+19, and the LLVM 22 linker on one 16-vCPU, 32-GB ARM machine. Baseline and
+candidate ran serially on the same host; builds and compatibility tests did not
+overlap the upgrade measurements.
+
+I loaded each backend separately with `bench/nq/load.py`: the first 200,000 BEIR
+NQ corpus rows, 1,024-dimensional f16 cosine vectors, titles, and full-text
+passages. Index age and interval were 100 ms, maximum segment rows were 40,000,
+and the compaction threshold was 1,000 segments so both baseline layouts
+retained six segments. Recall sampling was disabled, and the decoded-cache
+budget was 2 GiB. I waited for the WAL tail to drain and for an automatic base
+tier to be installed before stopping the older binary. The local tier covered all 200K rows; the S3
+tier covered 135K, with 65K in uncovered, indexed segments. Both tiers had 32
+slabs. These independently built layouts explain differences in recall and
+referenced bytes; comparisons use each backend’s own baseline.
+
+The validation workload used the first 40 test query vectors and their text.
+Exact cosine top-10 ground truth was computed independently in float32 from the
+stored-precision f16 corpus. Four clients continuously sent 40 ANN and 40 BM25
+queries per check after candidate readiness; two more checks followed observed
+upgrade completion. Every BM25 ordered top-10 list was compared against results
+from that backend's older binary. The deployment marker and latest full,
+decompressed manifest were polled separately, roughly every 50 ms plus read and
+decompression time. Reported times are observations in seconds from process
+launch, not isolated conversion CPU times.
+
+| Observed event | Local disk | S3 |
+| --- | ---: | ---: |
+| Generation-4 marker | 0.14 | 0.30 |
+| First format-4 manifest | 29.65 | 25.34 |
+| Every text object at format 7 | 30.24 | 27.11 |
+| Zero legacy counts verified by dry-run | 30.38 | 28.63 |
+
+The local run completed 444 candidate checks (35,520 requests), and S3 completed
+89 (7,120 requests). Recall@10 remained 0.9725 and 0.9775, respectively, on every
+check. Different independently built indexes produced different baseline recall;
+there was no within-backend recall change. Every check matched all 40 BM25
+ordered top-10 lists, with zero HTTP errors and zero exhaustive fallbacks. This
+validates ranking preservation, not agreement with an independent BM25
+exact-score oracle.
+
+Stored bytes use decimal MB. Live bytes sum unique file references in the latest
+full manifest; prefix totals also include WAL, retained obsolete objects,
+manifests, and unpublished build objects.
+
+| Backend | Live referenced MB, before → after | Text MB, before → after | Entire prefix MB, before → after |
+| --- | ---: | ---: | ---: |
+| Local disk | 1,212.61 → 1,025.91 | 261.24 → 74.54 | 2,109.52 → 2,184.23 |
+| S3 | 1,068.16 → 881.14 | 261.78 → 74.76 | 1,982.02 → 2,056.95 |
+
+Text is about 3.50x smaller in these NQ upgrades. The entire prefix initially
+grows because old text objects remain until the retention window expires; these
+are pre-GC totals, not a claim of immediate bucket-space recovery.
+
+Both final manifests had format 4, six text objects at format 7, and one
+format-1 tier containing 32 slabs. `reindex --dry-run` reported zero legacy
+row-major, fast-scan, other, and document objects. Its current single-object
+counts were six segment ANN objects and 32 slabs; the command does not report
+text progress, so full-manifest inspection was required as well.
+
+After I stopped the candidate, restarting v0.1.15 on each backend exited with
+status 1 and wrote exactly `Error: BucketFormat { required: 4, supported: 3 }`
+to stderr. I deleted the S3 test prefix after the run. This is a v0.1.15 upgrade
+check, not a measurement of older format-1 or format-2 migrations.
+
+## Steady-write vector queries (W1)
+
+These W1 measurements, recorded in `PROGRESS.md`, used BEIR NQ and
+`crates/bf-engine/bench/steady_writes.py`. At 1,000 upserts/s on a quiet shared
+machine, ANN p50/p90 fell from 156/451 to 15/28 ms. Recall@10 was 0.9511 versus
+0.9517 across 300 matched queries, with no detected shift. At 300 upserts/s
+under load, p50/p90 fell from 160/280 to 29/41 ms. All 3.79M writes across
+40 runs were acknowledged.
+
+The changes cache decoded WAL vectors within the existing byte budget, keep a
+bounded global top-k, and score wide tails in parallel. These are paired W1
+results, not a fresh v0.1.15-to-v0.1.16 comparison. The five-second flush age,
+2,048-row flat threshold, and ANN overfetch defaults are unchanged.
+
+## Filtered vector queries: predicate caching and probe budgets
+
+These D4 predicate-cache and planner measurements were recorded in `PROGRESS.md`;
+they do not use the held bucket-format-5 storage change. On full BEIR NQ with an
+ID-range filter at normal retention, sharing cached immutable filter results
+between snapshot warm-up and planning reduced warm p50 from 1,522 to 12 ms and
+raised 16-client throughput from 5 to 601 q/s, with identical results.
+
+At 48 probes, replacing the fixed three-times filtered probe cap with a budget
+based on membership-map selectivity raised recall@10 for hash-distributed 1%
+filters from 0.936 to 1.0 and for 10% filters from 0.961 to 0.989. ID-range 1%
+and 10% filters remained at 1.0, and 50% filters were unchanged.
+
+The extra recall costs CPU work. Against the prior planner at 256 probes, the new
+planner at 48 probes used 64.1 rather than 46.4 ms CPU/query for the 1% hash
+filter (+38%). For the 10% hash filter, it used 39.5 rather than 42.8 ms, at
+recall 0.989 versus 0.994. The 10% ID-range filter used 11.3 rather than 9.6 ms
+(+18%), both at recall 1.0. These are separate experiments from the
+predicate-cache comparison; their speedups cannot be multiplied.
+`BF_FILTER_PROBE_CAP` is removed.
+
+## BM25 concurrency: shared bound snapshots and reusable scratch (T4)
+
+The T4 results recorded in `PROGRESS.md` use 1M MS MARCO passages and 1,000
+queries over HTTP. A persistent Rust client, checked in as
+`crates/bf-text/examples/concurrent_bm25.rs`, ran the paired ABBA comparison.
+
+| Warm measurement | Before | After |
+| --- | ---: | ---: |
+| 16-client throughput, q/s | 743.6 | 2,134.1 |
+| 1-client p50, ms | 2.124 | 1.111 |
+| Instructions/query, millions | 27.2 | 19.8 |
+| Bound-lock wait per 1,000 queries | 7.8 s | 45 ms |
+| Scratch allocated per 1,000 queries | 4.34 GB | 89 MB |
+
+BM25 query execution takes a shared snapshot of cached saturation bounds,
+releases the mutex before scoring, and publishes newly computed bounds
+afterward. Per-thread scratch is reused and cleared by touched rows, rather than
+allocating a segment-sized bound vector per query. All 12,240 validation
+responses matched exhaustive ordered IDs and score bits. Cold p50 increased
+0.97%, and cold p90 fell 3.55%.
+
+The earlier asyncio HTTPX driver was itself the bottleneck at 16 clients: its
+p50 was about 29 ms while the server reported about 2.5 ms, so earlier
+multi-client BM25 throughput measurements understated server capacity. T4's
+2.87x improvement uses the persistent Rust driver on both arms; it is not a
+ratio against those earlier client-limited measurements.
+
 ## Round AR3: compaction through the tiers (lineage), and deltas beside a base build (2026-11-24)
 
 NQ (2,681,468 rows, 768 dims in f16, cosine) on one shared 8-CPU VM: server on CPUs 0 to 5, clients on 4 and 5, local
