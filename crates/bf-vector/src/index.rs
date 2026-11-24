@@ -131,6 +131,7 @@ pub struct ScanScratch {
     fast: Option<crate::fastscan::FastQuery>,
     ordered: Vec<u32>,
     rescore: Vec<(Range<usize>, usize, usize, f32)>,
+    selected: Vec<usize>,
 }
 
 /// A parsed immutable index. Metadata and centroids stay resident; codes and
@@ -804,6 +805,7 @@ impl<R: RangeRead> Index<R> {
             fast,
             ordered,
             rescore,
+            selected,
         } = scratch;
         let (keep, upper_bound) = keep.map_or((None, f32::INFINITY), |(k, bound)| (Some(k), bound));
         let cut = std::cell::Cell::new(upper_bound);
@@ -812,6 +814,10 @@ impl<R: RangeRead> Index<R> {
         let t_cpu = std::time::Instant::now();
         let rows: usize = clusters.iter().map(|c| cluster(*c).len()).sum();
         estimated.reserve(rows);
+        // A sparse scan pays scalar table lookups per allowed row. Dense and unfiltered
+        // scans retain their block kernel, including its existing admission and cut order.
+        let sparse_filter = filter.filter(|f| f.len().saturating_mul(16) <= rows as u64);
+        let mut skipped_codes = 0usize;
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
         let padded = self.rq.padded;
         let cosine = self.metric() == Metric::CosineDistance;
@@ -897,26 +903,54 @@ impl<R: RangeRead> Index<R> {
                 // A zero query has a fixed distance to every row: no cut applies.
                 let open = std::cell::Cell::new(f32::INFINITY);
                 let scan_cut = if cosine && q_zero { &open } else { &cut };
-                fq.scan(
-                    bytes,
-                    n,
-                    qc2,
-                    cosine,
-                    scan_cut,
-                    &mut |start, mut rows, d, e, zero| {
-                        while rows != 0 {
-                            let j = rows.trailing_zeros() as usize;
-                            rows &= rows - 1;
-                            let z = zero & (1 << j) != 0;
+                selected.clear();
+                if let Some(filter) = sparse_filter {
+                    selected.extend(
+                        ids.iter()
+                            .enumerate()
+                            .filter_map(|(ordinal, row)| filter.contains(*row).then_some(ordinal)),
+                    );
+                }
+                if sparse_filter.is_some() && selected.len().saturating_mul(16) <= n {
+                    skipped_codes += n - selected.len();
+                    fq.scan_selected(
+                        bytes,
+                        n,
+                        qc2,
+                        cosine,
+                        scan_cut,
+                        selected,
+                        &mut |ordinal, d, e, z| {
                             let (d, e) = if cosine && (q_zero || z) {
                                 fixed(z)
                             } else {
-                                (d[j], e[j])
+                                (d, e)
                             };
-                            accept(start + j, d, e);
-                        }
-                    },
-                )?;
+                            accept(ordinal, d, e);
+                        },
+                    )?;
+                } else {
+                    fq.scan(
+                        bytes,
+                        n,
+                        qc2,
+                        cosine,
+                        scan_cut,
+                        &mut |start, mut rows, d, e, zero| {
+                            while rows != 0 {
+                                let j = rows.trailing_zeros() as usize;
+                                rows &= rows - 1;
+                                let z = zero & (1 << j) != 0;
+                                let (d, e) = if cosine && (q_zero || z) {
+                                    fixed(z)
+                                } else {
+                                    (d[j], e[j])
+                                };
+                                accept(start + j, d, e);
+                            }
+                        },
+                    )?;
+                }
                 if keep.is_some() && estimated.len() > first && fq.rounding_matters(qc2) {
                     rescore.push((first..estimated.len(), position, n, qc2));
                 }
@@ -971,11 +1005,12 @@ impl<R: RangeRead> Index<R> {
         }
         if trace_stages() {
             eprintln!(
-                "SCAN clusters={} read={}us cpu={}us scanned={} candidates={}",
+                "SCAN clusters={} read={}us cpu={}us scanned={} evaluated={} candidates={}",
                 clusters.len(),
                 read_us,
                 t_cpu.elapsed().as_micros(),
                 rows,
+                rows - skipped_codes,
                 estimated.len()
             );
         }
