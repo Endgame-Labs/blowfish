@@ -72,10 +72,9 @@ pub struct EngineConfig {
     /// A filtered ANN query with at most this many allowed rows fetches and ranks exactly
     /// those rows' vectors instead of scanning quantized codes.
     pub exact_fetch_rows: usize,
-    /// Maximum filtered probe multiplier when nonzero. Zero (the default) preserves full
-    /// inverse-selectivity coverage, with a witness margin. A positive operator cap trades
-    /// filtered recall for less work; `BF_FILTERED_PROBE_CAP` overrides this setting.
-    pub filtered_probe_cap: usize,
+    /// Fixed legacy behavior used only by the internal recall regression test.
+    #[cfg(test)]
+    pub(crate) legacy_three_filter_test: bool,
     /// Fraction of ANN requests checked against exhaustive ground truth.
     pub recall_sample_rate: f64,
     /// Least time between two sampled recall comparisons (and only one runs at a time).
@@ -144,7 +143,8 @@ impl Default for EngineConfig {
             ann_nprobe_explicit: false,
             ann_rerank_factor: 32,
             exact_fetch_rows: 8192,
-            filtered_probe_cap: 0,
+            #[cfg(test)]
+            legacy_three_filter_test: false,
             recall_sample_rate: 0.01,
             recall_sample_interval: Duration::from_secs(60),
             models: None,
@@ -231,9 +231,7 @@ impl EngineConfig {
         if let Some(v) = number("BF_EXACT_FETCH") {
             c.exact_fetch_rows = v as usize;
         }
-        if let Some(v) = number("BF_FILTER_PROBE_CAP") {
-            c.filtered_probe_cap = v as usize;
-        }
+
         c
     }
 }

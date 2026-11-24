@@ -786,18 +786,19 @@ fn pick_clusters(
         .filter(|(n, e)| !flat[e.segment] && e.rows > 0 && in_cluster(*n) > 0.0)
         .map(|(n, _)| (u64::from(total_order_key(distances[n])) << 32) | n as u64)
         .collect();
-    // Preserve the expected candidate coverage under selective filters, with a witness
-    // margin for independent thinning. A nonzero operator cap explicitly trades recall
-    // for a shallower probe; the default has no selectivity cap.
+    // Preserve candidate coverage under selective filters, including survivor variance.
+    // Selectivity changes the plan automatically; there is no lower-recall configuration.
     let thin = if filtered {
-        let scale = filtered_probe_scale(ann_rows, matching, k);
-        if config.filtered_probe_cap == 0 {
-            scale
-        } else {
-            scale.min(config.filtered_probe_cap as f64)
-        }
+        filtered_probe_scale(ann_rows, matching, k)
     } else {
         ann_rows as f64 / matching.max(1) as f64
+    };
+    // Reproduce the removed cap only in the private regression test.
+    #[cfg(test)]
+    let thin = if filtered && config.legacy_three_filter_test {
+        (ann_rows as f64 / matching.max(1) as f64).min(3.0)
+    } else {
+        thin
     };
     let probes = probe_count(config, ann_rows, clusters, thin * spread, layout);
     // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
@@ -2185,7 +2186,6 @@ mod spread_tests {
     #[test]
     fn selective_probes_preserve_candidate_coverage_for_both_layouts() {
         let config = EngineConfig::default();
-        assert_eq!(config.filtered_probe_cap, 0);
         for layout in [Layout::Segments, Layout::Slabs] {
             let unfiltered = probe_count(&config, 1_000_000, 10_000, 1.0, layout);
             for matching in [1, 10, 1000, 10_000, 100_000, 500_000, 1_000_000] {

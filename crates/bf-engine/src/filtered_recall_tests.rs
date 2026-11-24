@@ -1,5 +1,5 @@
 //! Selective scalar masks keep ANN recall without changing the vector format.
-use bf_engine::{Engine, EngineConfig};
+use crate::{Engine, EngineConfig};
 use bf_storage::{Storage, StorageConfig};
 use bf_types::Document;
 use bf_wal::Wal;
@@ -101,7 +101,7 @@ async fn selective_distributed_masks_preserve_recall_and_format_four() {
     let capped = Engine::with_config(
         store.clone(),
         EngineConfig {
-            filtered_probe_cap: 3,
+            legacy_three_filter_test: true,
             ..config
         },
     );
