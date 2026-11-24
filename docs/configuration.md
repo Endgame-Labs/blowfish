@@ -221,7 +221,7 @@ from 0.906 to 0.958. Reclustering removes the cost: it gets the recall at the ba
 | Queries the engine runs at once | 8 | `BF_QUERY_CONCURRENCY` |
 | Segment searches one query runs at once | 8 | `BF_SEARCH_CONCURRENCY` |
 | Queries in flight up to which one query fans its slab work out over the thread pool (more run each query on its own thread) | half the CPUs | `BF_FANOUT_QUERIES` |
-| Least time between two sampled recall comparisons | 60,000 ms | `BF_RECALL_SAMPLE_INTERVAL_MS` |
+| Least time between two sampled recall comparisons (the first waits this long after startup, and a comparison that took `t` delays the next by at least `50 × t`) | 60,000 ms | `BF_RECALL_SAMPLE_INTERVAL_MS` |
 | Cache block size for scattered small reads (rerank vectors) | 16,384 | `BF_SPARSE_BLOCK_BYTES` |
 
 On x86-64 the RaBitQ scan uses AVX-512 (`VPOPCNTQ`) when the CPU has it; on arm64 it uses NEON (`CNT` and pairwise adds).
@@ -235,7 +235,7 @@ read and scanned as before, and the background indexer upgrades them to the new 
 A running server upgrades older-layout indexes to this layout in the background; `blowfish reindex NAMESPACE` (or
 `--all`, with `--dry-run` to report counts and bytes per layout) does the same upgrade now. It takes the storage flags and
 variables of `serve` (`--config`, `--storage-url`, `--storage-endpoint`, `--storage-region`, `--storage-profile`). See
-"Upgrading to v0.1.14" in [operations](operations.md).
+"Bucket format 3" in [operations](operations.md).
 
 ### Connection warming, hedging, and diagnostics
 
