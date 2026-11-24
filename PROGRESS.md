@@ -4,6 +4,14 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Binary WAL vectors: tested and rejected** (round I2; `docs/benchmarks.md`, "Round I2"). Writing vectors
+  to the WAL as binary at their declared precision, instead of JSON, reached at best 1.09x acknowledged rows/s
+  on paired 500K-row NQ loads (in-region S3, c7g.2xlarge), and the other candidate run was slower than the
+  baseline, so the codec was removed and the WAL format is unchanged. The profile shows where ingest time goes:
+  vector distances while indexing during the load are 29% of CPU cycles, text index construction 5.7%, and
+  JSON string escaping 1.3%. The round leaves a repeatable HTTP ingest benchmark
+  (`crates/bf-wal/benches/http_ingest.py`) and a WAL replay check (`crates/bf-wal/examples/replay_check.rs`).
+
 - **Cold vector queries stream their slab scans** (round C1; `docs/benchmarks.md`, "Round C1"). On a cold
   slab search, scan reads are reserved nearest leaf first and each batch of leaves is scanned as its bytes
   land, and bounded rerank and document reads start before the slowest scan read returns. In-region
