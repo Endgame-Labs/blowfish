@@ -8633,3 +8633,227 @@ work. An incorrect experimental residency guard was caught by its unchanged larg
 was corrected before committing. Earlier pre-C3 measurements are not substituted for the
 construction gates, and the newest reader merge is not claimed as a new full-corpus construction
 run.
+
+## Round Q4: independent HTTP reactors
+
+The final baseline is main `5c5fec8`. One owned, on-demand c7g.8xlarge supplies the
+server and separate client CPUs. Every warm run uses sixteen keep-alive clients,
+the complete 3,452-query NQ sequence, and identical frozen tier payloads. The
+fixture has 2,681,468 rows, 32 slabs, and 13,390 leaves. The 10K fixture uses the
+first 10,000 corpus vectors and exact truth computed for that subset. Build flags,
+cache budgets, probe counts, and data are paired on the same host. Warm runs use
+a frozen local copy through the production mapped-read backend; the cold replay
+below uses S3.
+
+### Scheduling and immutable snapshots
+
+Accepted TCP connections are handed round-robin to independent `current_thread`
+Tokio runtimes. Each connection keeps its runtime. An eligible compiled ANN plan
+executes inline there; a yielded future retains its state and continues on the
+shared I/O runtime. Writes, administration, and maintenance use the shared runtime.
+
+Namespace handles and states publish immutable `ArcSwap` snapshots. Writers remain
+serialized and publish on guard release. A warm strong query checks the next WAL
+slot and reconciles the published sequence and manifest before accepting speculative
+results. Checkpoint expiry, remote writes, deletion, and ordinary cold opening keep
+the existing refresh path. Retaining a snapshot does not extend its reclamation age.
+
+Inline eligibility is conservative: one complete, already compiled tier, no tail
+or masks, no filters or multi-query, at most ten results including offset, at most
+64 probes, rerank factor at most 32, vectors of at most 1,024 dimensions, and no
+model provider, computed attributes, or limit override. When a compiled plan
+misses, it yields before the general planner runs, even when its bytes are cached. A reactor cache miss also skips new tier admission, closing the
+eviction race between eligibility and execution. Other plans retain the fixed
+compute pool and shared I/O path.
+There are no new settings, storage formats, or wire types.
+
+The first diagnostic sequence isolates the prerequisite: independent reactors with
+the old namespace locks deliver only 855–996 q/s, versus about 2,286 q/s for the
+baseline. With immutable snapshots, the prototype reaches about 2,448 q/s. These
+initial screens use main `d37a323`; the final gates below rebuild both arms after
+integrating main `5c5fec8`, including RR3 slab scheduling and T4 BM25 scoring. Ordered
+rows and distances agree throughout. The snapshot-only forward screen stays near
+the baseline; the combined architecture is the retained hypothesis.
+
+### Sparse CLOCK is rejected
+
+A separate candidate replaces only the large tier's sparse exact-vector Moka cache
+with the existing sharded CLOCK cache, at the same byte reservation. Small tiers
+keep the full-cache policy. Its diagnostic ABBA compares against the reactor and
+immutable-snapshot branch, at 48 probes, with three warm epochs and two measured
+epochs per process. These policy screens precede the final main integration.
+
+| Cache | Process-median q/s, forward / reverse | Compiled queries per 3,452 | Logical cache-hit ratio |
+|---|---:|---:|---:|
+| Moka | 2,428 / 2,448 | 3,452 | 1.000 |
+| Sparse CLOCK | 1,345 / 1,814 | 837–2,614 | 0.492–0.836 |
+
+Every ordered row and distance still agrees. The bounded CLOCK policy loses the
+compiled working set and repeatedly falls back. It fails the warm residency gate
+and is discarded; the production vector-cache policy and reservation stay unchanged.
+The diagnostic deliberately records the failed residency instead of treating those
+passes as successful warm gates. The rerank recorder can offer a whole cluster
+once at least a third of its rows are candidates. The tested CLOCK admits all
+offered vectors, while Moka uses frequency-based admission. Admission and
+per-shard capacity remain confounded in this screen.
+
+A separate cycle-sampling pass over sixteen full-query epochs attributes the cache
+cost. Percentages are call-chain sample shares; housekeeping and Moka shares are
+inclusive and overlap.
+
+| Sample family | Moka reactor | Sparse CLOCK reactor |
+|---|---:|---:|
+| Moka callers | 2.289% | 0.203% |
+| Housekeeping callers | 0.705% | 0.097% |
+| `try_advance`, first three leaf frames | 0.087% | 0.095% |
+
+There are 33,467 / 43,283 samples, including 29 / 41 samples with `try_advance`
+among the first three leaf frames. Reducing
+housekeeping does not compensate for lost compiled reuse. Concurrent PMU counting
+in this diagnostic has only 74–75% scheduling coverage and is excluded from precise
+counter comparisons; the retained-change counters use separate event groups.
+
+### Paired final gates
+
+The final matrix uses ABBA process order, three full warm epochs per process, and
+four measured epochs per process. The summary is the mean of the two process
+medians for each arm; p50 and p90 use the same process-level summary. Server CPU
+sets are 0–3, 0–7, or 0–15, and clients use CPUs 16–31. Physical query-worker counts
+remain the existing automatic policy in the baseline. The candidate creates one
+reactor per available CPU. Both arms use four GiB each for the raw-read and decoded
+caches, no disk cache, and the same unmodified Moka exact-vector policy.
+
+| Population | Cores | Probes | Main q/s | Q4 q/s | Gain | p90 ms, main → Q4 |
+|---|---:|---:|---:|---:|---:|---:|
+| Full NQ | 4 | 48 | 1,204 | 1,230 | +2.2% | 15.386 → 13.433 |
+| Full NQ | 4 | 64 | 1,031 | 1,055 | +2.3% | 17.726 → 15.584 |
+| Full NQ | 8 | 48 | 2,293 | 2,418 | +5.4% | 8.040 → 6.908 |
+| Full NQ | 8 | 64 | 1,956 | 2,077 | +6.2% | 9.768 → 8.000 |
+| Full NQ | 16 | 48 | 3,709 | 4,486 | +20.9% | 6.161 → 3.734 |
+| Full NQ | 16 | 64 | 3,180 | 3,839 | +20.7% | 7.283 → 4.342 |
+| 10K | 4 | 48 | 5,699 | 5,937 | +4.2% | 3.818 → 3.102 |
+| 10K | 4 | 64 | 5,477 | 5,714 | +4.3% | 3.979 → 3.240 |
+| 10K | 8 | 48 | 10,266 | 11,258 | +9.7% | 2.151 → 1.693 |
+| 10K | 8 | 64 | 9,747 | 10,738 | +10.2% | 2.272 → 1.780 |
+| 10K | 16 | 48 | 14,818 | 19,692 | +32.9% | 1.515 → 1.016 |
+| 10K | 16 | 64 | 14,189 | 18,707 | +31.8% | 1.570 → 1.063 |
+
+Eight-core full NQ process medians, in forward / reverse order:
+
+| Probes | Main q/s | Q4 q/s |
+|---|---:|---:|
+| 48 | 2,296.7 / 2,290.0 | 2,410.2 / 2,426.2 |
+| 64 | 1,957.3 / 1,954.7 | 2,074.1 / 2,079.6 |
+
+All 662,784 measured HTTP responses use the compiled path, report a logical
+cache-hit ratio of 1.0 and zero tail rows, and match every ordered row and distance
+across arms and epochs. Ordered references also agree across CPU shapes. Full NQ
+recall is 0.9511877173 / 0.9617033604 at 48 / 64 probes; the 10K tier is
+0.9806199305 / 0.9930475087. The production-router differential also agrees on
+96 request shapes: 80 successes and 16 expected errors.
+
+The new eight-thread native control reaches 2,744.37 / 2,329.33 q/s, with
+41,424 compiled searches per probe budget, zero misses, and 100% counter coverage.
+HTTP is 5.6% below the brief's fixed 2,562 q/s ceiling at 48 probes. The
+freshly matched control leaves 11.88% / 10.84% gaps at 48 / 64 probes.
+The matched 10% goal remains open.
+The retained change improves every tested shape.
+
+Separate ABBA counting passes use four measured full-query epochs per event
+group after three warm epochs. Every counter has 100% scheduling coverage.
+
+| Per-query counter | Main | Q4 | Change |
+|---|---:|---:|---:|
+| User cycles | 8.234M | 8.363M | +1.6% |
+| User instructions | 22.589M | 22.637M | +0.2% |
+| Kernel cycles | 0.174M | 0.169M | -2.8% |
+| Kernel instructions | 0.094M | 0.060M | -36.3% |
+| Context switches | 4.676 | 2.104 | -55.0% |
+| CPU migrations | 0.504 | 0.039 | -92.2% |
+
+Context switches change by -55.0% and migrations by -92.2%.
+User cycles change by +1.6%, and user instructions by +0.2%.
+The gain accompanies less scheduling and completion traffic. At eight cores,
+peak RSS is 5.032 / 5.049 GB at 48 probes and
+5.068 / 5.088 GB at 64 probes, for main / Q4 respectively (decimal GB).
+
+### Fresh S3 replay
+
+Each probe budget replays the first 80 NQ queries in paired AB/BA order, with a
+fresh process and empty disk cache for every arm/query. Both arms use the same
+temporary copy of the frozen store, eight server CPUs, one client, an eight-GiB
+raw cache, and a 512-MiB decoded cache. Readiness and its 1.5-second settling delay
+are outside request latency. Every ordered ID and distance agrees across arms
+and with the warm reference, and every paired scanned-row count agrees.
+
+| Probes | Main p50 ms | Q4 p50 ms | Main p90 ms | Q4 p90 ms | Completed GETs, main → Q4 | MiB/query, main → Q4 |
+|---|---:|---:|---:|---:|---:|---:|
+| 48 | 508.5 | 518.7 | 821.7 | 782.2 | 341.61 → 339.21 | 21.83 → 21.79 |
+| 64 | 545.3 | 532.1 | 786.5 | 829.4 | 396.54 → 398.74 | 26.67 → 26.64 |
+
+Paired bootstrap intervals resample query pairs 10,000 times with seed 24. The
+median of per-query latency changes is distinct from a ratio of arm percentiles:
+
+| Probes | Median paired change, 95% CI | p50 ratio change, 95% CI | p90 ratio change, 95% CI |
+|---|---:|---:|---:|
+| 48 | +0.8%, [-10.4%, +14.2%] | [-5.6%, +16.5%] | [-31.2%, +19.8%] |
+| 64 | -0.5%, [-7.4%, +7.7%] | [-11.4%, +9.7%] | [-15.0%, +34.9%] |
+
+The replay preserves results and scanned work. Physical requests and transferred
+bytes include timing-dependent hedges. Tail timing remains noisy with 80 query
+pairs; the intervals above show the remaining uncertainty.
+
+### Reproduction and validation
+
+Build both revisions with `RUSTFLAGS='-C target-cpu=neoverse-v1'`, the same Rust
+toolchain (Rust 1.100.0 for this run), Clang 19 for C/C++, and Clang 22 linking
+with compiler-rt builtins. Preserve
+the baseline and candidate `blowfish-scale-server` executables and production
+`blowfish` executables. Prepare the public NQ data and exact truth, load the vectors
+with `bench/nq/load.py --vectors-only`, wait for automatic tier installation, stop
+the writer, and reuse the immutable store for both arms. Build the 10K tier with
+`server_tax_fixture`, and calculate exact truth against that subset. The final
+frozen full layout has 32 slabs and 13,390 leaves, after ordinary covered compactions.
+
+An arms JSON file maps `base` and `candidate` to their `binary`, `storage` config
+path, and `probes`. The warm driver forces read-only storage and the paired cache
+budgets. Run each probe budget and CPU shape in a fresh scratch directory:
+
+```bash
+uv run crates/bf-engine/examples/warm_ab.py \
+  --data .scratch/q4/data --scratch .scratch/q4/warm-8-48 \
+  --arms .scratch/q4/arms-48.json --warm-epochs 3 --epochs 4 \
+  --identical-results --server-cpus 0-7 --client-cpus 16-31
+```
+
+For the small tier, use its query/truth directory, `--namespace small`, and
+`--population 10000`. Repeat with probes 64 and server CPUs 0–3 / 0–15 for both
+populations. `warm_ab.py` records p50, p90, complete ordered rows and distances,
+compiled-query counts, logical cache hits, tail rows, population, and peak RSS.
+
+`server_tax_verify.py --mode shapes` compares production binaries across projections,
+filters, eventual consistency, offsets, aggregates, multi-query RRF, base64 vectors,
+scalar ranking, and validation errors. The native control is the existing ignored
+`warm_ann::benchmark::compiled_kernel_profile` test, with eight OS threads and twelve
+full-query repeats. Count HTTP events in separate user and kernel event groups,
+requiring 100% scheduling coverage, rather than combining those counters with
+call-chain sampling.
+
+For cold replay, copy only the frozen store to a temporary S3 prefix, give
+`cold_ab.py` a private `config.local`, and use `--mode fresh --queries 80` with
+`--nq-data`, at both probe counts. It alternates AB/BA by query, launches a fresh
+process for every arm/query, and deletes each disk-cache directory on exit. Fresh
+processes now truncate their trace log before launch, so scanned-row and read-wave
+counts cannot accumulate across previous queries. Compare every ordered ID and
+distance, including against the warm reference, before summarizing timing. Delete
+the temporary prefix and all scratch data when finished.
+
+Formatting, `cargo clippy -p bf-engine -p blowfish --all-targets -- -D warnings`,
+and `cargo test -p bf-engine -p blowfish` pass: 249 tests, zero failures, and eight
+explicit ignores. Both native controls were also run explicitly and passed.
+The compiled-generation regression additionally checks eviction with the admission
+marker retained: the reactor refuses to rebuild, and shared I/O can admit the same
+generation. The test covers both synthetic leaf populations. Other regressions
+cover connection ownership, shared-runtime dispatch, panic responses, continuation
+state, timers, backend accounting, concurrent writes, and shutdown/restart.
+All 257 source and manifest hashes match the tested and measured candidate.
