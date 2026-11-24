@@ -36,7 +36,7 @@ pub(crate) struct DecodedCache {
     columns: moka::sync::Cache<String, Arc<Vec<Option<serde_json::Value>>>>,
     /// Decoded resident WAL vectors; charged to the same total budget as immutable metadata.
     pub(crate) tail_vectors: crate::tail::VectorCache,
-    /// Immutable WAL and shadow-row term counts, charged to this cache's total budget.
+    /// Immutable WAL term counts, charged to this cache's total budget.
     pub(crate) text_terms: Arc<ClockCache<Arc<crate::text_tail::Analysis>, crate::text_tail::Key>>,
 }
 /// foldhash, seeded per process (the keys are object keys and cluster numbers).
@@ -311,6 +311,9 @@ pub(crate) struct ReadContext {
     pub admit: bool,
     pub ann_rows: Arc<std::sync::atomic::AtomicU64>,
     pub document_scan_rows: Arc<std::sync::atomic::AtomicU64>,
+    /// Snapshot-local BM25 shadow masks, shared with segment search workers.
+    /// Never retained in the decoded cache or reused by a later query.
+    pub text_shadowed: Option<Arc<std::collections::BTreeMap<String, roaring::RoaringBitmap>>>,
 }
 impl ReadContext {
     /// A context with fresh statistics that admits its reads.
@@ -322,6 +325,7 @@ impl ReadContext {
             admit: true,
             ann_rows: Arc::default(),
             document_scan_rows: Arc::default(),
+            text_shadowed: None,
         }
     }
 }

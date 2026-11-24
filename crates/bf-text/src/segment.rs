@@ -1506,6 +1506,80 @@ impl SegmentReader {
     pub fn doc_lengths(&self) -> &[u32] {
         self.lens()
     }
+    /// Count rows containing each exact term within a segment-local row mask.
+    /// Counts follow the input order, including repeated and absent terms. No
+    /// prefix expansion or boolean subword matching is applied.
+    ///
+    /// Only blocks intersecting the mask are read, without positions. Within
+    /// each block, intersection walks the smaller of the mask and the postings.
+    /// A row outside this segment returns an error.
+    pub async fn document_frequencies(
+        &self,
+        terms: &[&str],
+        rows: &RoaringBitmap,
+    ) -> io::Result<Vec<u64>> {
+        if rows.max().is_some_and(|row| row >= self.docs) {
+            return Err(input("statistics row outside segment"));
+        }
+        if rows.is_empty() || terms.is_empty() {
+            return Ok(vec![0; terms.len()]);
+        }
+        let handles = self.lookup(terms).await?;
+        // A complete mask needs only the frequencies already in the dictionary.
+        if rows.len() == u64::from(self.docs) {
+            return Ok(handles
+                .iter()
+                .map(|h| h.map_or(0, |h| u64::from(self.handle_df(h))))
+                .collect());
+        }
+        let metas = self.load(handles.iter().flatten().copied()).await?;
+        let mut counts = BTreeMap::<u64, u64>::new();
+        let mut missing = Vec::new();
+        {
+            let mut decoded = self.decoded.lock().unwrap();
+            for (&handle, meta) in &metas {
+                let count = counts.entry(handle).or_default();
+                for block in &meta.blocks {
+                    let selected = rows.range_cardinality(block.first..=block.last);
+                    if selected == 0 {
+                        continue;
+                    }
+                    let span = u64::from(block.last) - u64::from(block.first) + 1;
+                    if selected == span {
+                        *count += u64::from(block.count);
+                    } else if u64::from(block.count) == span {
+                        // A gap-free block contains every selected row, even
+                        // for a ubiquitous term and a very sparse mask.
+                        *count += selected;
+                    } else if let Some(postings) = decoded.get(block.offset) {
+                        *count += masked_count(&postings, block, rows, selected);
+                    } else {
+                        missing.push((handle, meta.df, block, selected));
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() {
+            self.ensure_lengths().await?;
+            let ranges = missing
+                .iter()
+                .map(|(_, _, block, _)| block.offset..block.offset + u64::from(block.size))
+                .collect();
+            let values = self.read_ranges(ranges).await?;
+            if values.len() != missing.len() {
+                return Err(invalid("invalid statistics posting batch"));
+            }
+            for ((handle, df, block, selected), bytes) in missing.into_iter().zip(values) {
+                let postings = self.decode_postings(block, &bytes, df)?;
+                *counts.entry(handle).or_default() +=
+                    masked_count(&postings, block, rows, selected);
+            }
+        }
+        Ok(handles
+            .iter()
+            .map(|h| h.map_or(0, |h| counts[&h]))
+            .collect())
+    }
     /// Per-segment statistics for the engine's namespace-wide aggregation. Reads the whole
     /// dictionary (every chunk, for version 3 segments).
     pub async fn stats(&self) -> io::Result<CorpusStats> {
@@ -2540,6 +2614,26 @@ impl SegmentReader {
                 })
             })
             .collect())
+    }
+}
+
+/// Each posting block has at most 128 rows. Sparse masks probe those sorted
+/// postings, while dense masks visit each posting once.
+fn masked_count(
+    postings: &[(u32, u32)],
+    block: &BlockMeta,
+    rows: &RoaringBitmap,
+    selected: u64,
+) -> u64 {
+    if selected < u64::from(block.count) {
+        rows.range(block.first..=block.last)
+            .filter(|row| postings.binary_search_by_key(row, |&(row, _)| row).is_ok())
+            .count() as u64
+    } else {
+        postings
+            .iter()
+            .filter(|(row, _)| rows.contains(*row))
+            .count() as u64
     }
 }
 
