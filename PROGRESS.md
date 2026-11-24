@@ -4,6 +4,13 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Truthful index status in namespace metadata** (round MD1). Metadata always said `"index": {"status":
+  "up-to-date"}`, so a client polling for indexing to finish could be told it was done while the WAL tail still
+  held unindexed rows. It now reports `{"status": "updating", "unindexed_bytes": ..., "unindexed_rows": ...}`
+  from counts the snapshot already holds (no new I/O or format change), and `up-to-date` once the tail is
+  published. Metadata polling also refreshes the checkpoint while data is pending, so a reader sees another
+  node's index publication without a new write. The official Python SDK parses both states (`compat/`).
+
 - **BM25 under heavy writes 9.5x faster** (round BW1; `docs/benchmarks.md`, "Round BW1"). BM25 over an
   unindexed write tail recomputed full-vocabulary statistics and re-tokenized tail rows on every query. Queries
   now compute statistics for their own terms only and reuse cached per-row term counts from immutable tail
