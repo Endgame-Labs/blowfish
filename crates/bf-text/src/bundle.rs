@@ -1,4 +1,4 @@
-//! Dictionary bundles for text formats 5 and 6. Long postings and phrase positions precede
+//! Dictionary bundles for text formats 5, 6, and 7. Long postings and phrase positions precede
 //! bundles; short postings share their term's directory and dictionary read.
 use super::*;
 use fst::Streamer;
@@ -11,10 +11,16 @@ struct Term {
     text: Vec<u8>,
     df: u32,
     blocks: Vec<BlockMeta>,
+    payloads: Vec<Vec<u8>>,
+    compact: bool,
 }
 impl Term {
     fn record_size(&self) -> usize {
-        RECORD_HEADER + BLOCK_META * self.blocks.len() + 4
+        if self.compact {
+            compact::record_size(&self.blocks)
+        } else {
+            RECORD_HEADER + BLOCK_META * self.blocks.len() + 4
+        }
     }
     fn stored_size(&self) -> usize {
         self.record_size()
@@ -54,36 +60,51 @@ fn dictionary(terms: &[Term], base: u64) -> io::Result<(Vec<u8>, usize)> {
 /// Repack the builder's intermediate colocated bytes. Every posting and directory
 /// has exactly one final address; no old-format records or duplicate postings remain.
 pub(super) fn bundle(bytes: Vec<u8>, compressed_positions: bool) -> io::Result<Vec<u8>> {
-    bundle_as(bytes, compressed_positions, true)
+    bundle_as(bytes, compressed_positions, true, true)
 }
 
 #[cfg(any(test, feature = "legacy-fixtures"))]
 pub(super) fn legacy_bundle(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
-    bundle_as(bytes, false, false)
+    bundle_as(bytes, false, false, false)
 }
 
 fn bundle_as(
     bytes: Vec<u8>,
     compressed_positions: bool,
     output_compressed: bool,
+    output_compact: bool,
 ) -> io::Result<Vec<u8>> {
     let footer = checked_slice(&bytes, bytes.len().saturating_sub(FOOTER)..bytes.len())?;
     let header = text_header(&bytes)?.ok_or_else(|| invalid("text header missing"))?;
     let version = u32::from_le_bytes(footer[8..12].try_into().unwrap());
-    if !matches!(version, VERSION_COLOCATED | VERSION_BUNDLED) {
+    if !matches!(
+        version,
+        VERSION_COLOCATED | VERSION_BUNDLED | VERSION_COMPRESSED
+    ) {
         return Err(invalid("expected legacy text builder output"));
     }
     let lengths = u64::from_le_bytes(footer[32..40].try_into().unwrap()) as usize;
     let positions = u64::from_le_bytes(footer[40..48].try_into().unwrap()) as usize;
     let old_dictionary = u64::from_le_bytes(footer[48..56].try_into().unwrap()) as usize;
     let chunks_start = header.chunks.first().map_or(lengths, |c| c.1 as usize);
+    let docs = u32::from_le_bytes(footer[16..20].try_into().unwrap());
+    let doc_lengths = decode_lengths(
+        checked_slice(&bytes, lengths..old_dictionary)?,
+        docs as usize,
+    )?;
+    if doc_lengths.iter().map(|&n| u64::from(n)).sum::<u64>()
+        != u64::from_le_bytes(footer[24..32].try_into().unwrap())
+    {
+        return Err(invalid("invalid transcode document lengths"));
+    }
+    let has_positions = u32::from_le_bytes(footer[12..16].try_into().unwrap()) != 0;
     let mut terms = Vec::new();
     let mut position_data = Vec::new();
     for (_, offset, len, crc) in &header.chunks {
         let blob = checked_slice(&bytes, *offset as usize..*offset as usize + *len as usize)?;
         verify(blob, *crc)?;
         let blob = Bytes::copy_from_slice(blob);
-        let map = if version == VERSION_BUNDLED {
+        let map = if version >= VERSION_BUNDLED {
             SegmentReader::decode_bundle(&blob)?
         } else {
             fst::Map::new(blob).map_err(|e| invalid(&e.to_string()))?
@@ -106,7 +127,35 @@ fn bundle_as(
             let mut blocks = (0..count)
                 .map(|_| BlockMeta::decode(&mut c))
                 .collect::<io::Result<Vec<_>>>()?;
+            let mut previous = None;
+            for (i, b) in blocks.iter().enumerate() {
+                check_block(b, docs, previous, lengths as u64, has_positions)?;
+                if b.count as usize != (df as usize - i * BLOCK).min(BLOCK) {
+                    return Err(invalid("invalid transcode block count"));
+                }
+                previous = Some(b.last);
+            }
+            let mut payloads = Vec::with_capacity(blocks.len());
             for b in &mut blocks {
+                let posting = checked_slice(
+                    &bytes,
+                    b.offset as usize..b.offset as usize + b.size as usize,
+                )?;
+                verify(posting, b.crc)?;
+                let decoded = packed_postings(posting, b)?;
+                if decoded.iter().any(|&(row, tf)| {
+                    tf > doc_lengths[row as usize] || doc_lengths[row as usize] < b.min_length
+                }) {
+                    return Err(invalid("invalid transcode posting length"));
+                }
+                let payload = if output_compact && b.count < BLOCK as u32 {
+                    compact::encode_tail(&decoded)
+                } else {
+                    posting.to_vec()
+                };
+                b.size = payload.len() as u32;
+                b.crc = crc32fast::hash(&payload);
+                payloads.push(payload);
                 let start = usize::try_from(b.positions)
                     .map_err(|_| invalid("position offset overflow"))?;
                 let end = start
@@ -119,17 +168,18 @@ fn bundle_as(
                 verify(raw, b.positions_crc)?;
                 let new_start = position_data.len();
                 if compressed_positions || !output_compressed {
+                    if !raw.is_empty() {
+                        let mut decoder = positions::Decoder::new(raw, compressed_positions)?;
+                        for &(_, tf) in &decoded {
+                            decoder.document(tf)?;
+                        }
+                        decoder.finish()?;
+                    }
                     position_data.extend_from_slice(raw);
                 } else if !raw.is_empty() {
-                    let posting = checked_slice(
-                        &bytes,
-                        b.offset as usize..b.offset as usize + b.size as usize,
-                    )?;
-                    verify(posting, b.crc)?;
-                    let frequencies = frequencies(posting, b.count)?;
+                    let frequencies = decoded.iter().map(|&(_, tf)| tf);
                     let mut decoder = positions::Decoder::new(raw, false)?;
                     let documents = frequencies
-                        .into_iter()
                         .map(|tf| decoder.document(tf))
                         .collect::<io::Result<Vec<_>>>()?;
                     decoder.finish()?;
@@ -144,18 +194,15 @@ fn bundle_as(
                 text: text.to_vec(),
                 df,
                 blocks,
+                payloads,
+                compact: output_compact,
             });
         }
     }
     let mut out = Vec::new();
     for term in &mut terms {
         if term.blocks.len() > SMALL_BLOCKS {
-            for b in &mut term.blocks {
-                let raw = checked_slice(
-                    &bytes,
-                    b.offset as usize..b.offset as usize + b.size as usize,
-                )?;
-                verify(raw, b.crc)?;
+            for (b, raw) in term.blocks.iter_mut().zip(&term.payloads) {
                 b.offset = out.len() as u64;
                 out.extend_from_slice(raw);
             }
@@ -196,24 +243,23 @@ fn bundle_as(
             let record_size = term.record_size();
             let mut payload = Vec::new();
             if term.blocks.len() <= SMALL_BLOCKS {
-                for b in &mut term.blocks {
-                    let raw = checked_slice(
-                        &bytes,
-                        b.offset as usize..b.offset as usize + b.size as usize,
-                    )?;
-                    verify(raw, b.crc)?;
+                for (b, raw) in term.blocks.iter_mut().zip(&term.payloads) {
                     b.offset = base + blob.len() as u64 + record_size as u64 + payload.len() as u64;
                     payload.extend_from_slice(raw);
                 }
             }
-            let start = blob.len();
-            put32(&mut blob, term.df);
-            put32(&mut blob, term.blocks.len() as u32);
-            for b in &term.blocks {
-                b.encode(&mut blob);
+            if output_compact {
+                blob.extend(compact::encode_record(&term.blocks));
+            } else {
+                let start = blob.len();
+                put32(&mut blob, term.df);
+                put32(&mut blob, term.blocks.len() as u32);
+                for b in &term.blocks {
+                    b.encode(&mut blob);
+                }
+                let crc = crc32fast::hash(&blob[start..]);
+                put32(&mut blob, crc);
             }
-            let crc = crc32fast::hash(&blob[start..]);
-            put32(&mut blob, crc);
             blob.extend(payload);
         }
         put32(&mut index, chunk[0].text.len() as u32);
@@ -233,7 +279,9 @@ fn bundle_as(
     out.extend(index);
     let mut footer = footer.to_vec();
     footer[8..12].copy_from_slice(
-        &if output_compressed {
+        &if output_compact {
+            VERSION_COMPACT
+        } else if output_compressed {
             VERSION_COMPRESSED
         } else {
             VERSION_BUNDLED
@@ -248,6 +296,35 @@ fn bundle_as(
     footer[68..].copy_from_slice(&crc.to_le_bytes());
     out.extend(footer);
     Ok(out)
+}
+
+fn packed_postings(bytes: &[u8], b: &BlockMeta) -> io::Result<Vec<(u32, u32)>> {
+    let frequencies = frequencies(bytes, b.count)?;
+    let mut deltas = [0; BLOCK];
+    BitPacker4x::new().decompress(&bytes[2..], &mut deltas, bytes[0]);
+    let mut row = b.first;
+    let mut out = Vec::with_capacity(b.count as usize);
+    for (i, tf) in frequencies.into_iter().enumerate() {
+        if (i == 0 && deltas[i] != 0) || (i > 0 && deltas[i] == 0) || tf > b.max_tf {
+            return Err(invalid("invalid transcode posting"));
+        }
+        row = row
+            .checked_add(deltas[i])
+            .ok_or_else(|| invalid("posting overflow"))?;
+        if row > b.last {
+            return Err(invalid("posting row out of bounds"));
+        }
+        out.push((row, tf));
+    }
+    if row != b.last {
+        return Err(invalid("invalid last posting row"));
+    }
+    Ok(out)
+}
+
+#[cfg(any(test, feature = "legacy-fixtures"))]
+pub(super) fn format_six(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+    bundle_as(bytes, true, true, false)
 }
 
 fn frequencies(bytes: &[u8], count: u32) -> io::Result<Vec<u32>> {

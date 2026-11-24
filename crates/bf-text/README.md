@@ -52,12 +52,14 @@ Phrase positions preserve gaps, repeated terms, and input element boundaries.
 Sequence queries reject prefix matching, and indexes without positions return
 `io::ErrorKind::Unsupported` for sequence queries.
 
-## Segment format (version 6)
+## Segment format (version 7)
 
 All integers are little-endian. The fixed 72-byte footer records the format,
 row count, tokenizer, normalization length, region offsets, and checksums.
-Posting blocks contain at most 128 rows, with bit-packed row deltas and term
-frequencies. Block directories store first/last rows, maximum TF, minimum
+Posting blocks contain at most 128 rows. Full blocks keep SIMD bit-packed row
+deltas and term frequencies. Partial blocks encode only their actual rows: the
+first row comes from the directory, followed by its unsigned LEB128 TF, and each
+remaining row has an unsigned LEB128 positive row delta and TF. Block directories store first/last rows, maximum TF, minimum
 length, and offsets, lengths, and checksums for postings and phrase positions.
 Independent TF and length extrema stay conservative when corpus statistics change.
 
@@ -67,8 +69,12 @@ has an FST, checksummed term directories, and the posting payloads for terms wit
 most 32 blocks. Its encoding is `FST length (u32) | reserved bytes (u32) | FST |
 padding | term directories and short postings`. The dictionary region is reserved
 before assigning absolute directory offsets, avoiding a circular dependency on
-FST size. Directories retain the version-4 layout:
-`DF (u32) | block count (u32) | 52-byte block records | crc32`. A bundle CRC
+FST size. A format-7 directory contains `record bytes (u32) | posting base (u64) |
+position base (u64) | block records | crc32`. Document frequency comes from the
+FST handle; block counts and final-block row counts follow from that frequency.
+Each block records unsigned LEB128 first row, last-minus-first row, maximum TF,
+minimum length, posting bytes, and position bytes, followed by two u32 frame CRCs.
+Posting and position offsets advance by the corresponding frame sizes. A bundle CRC
 protects the complete range. Phrase positions remain independent. Each position
 block starts with a one-byte flag: zero omits array element ordinals, and one
 includes them. Within each posting, unsigned LEB128 encodes position deltas and,
@@ -99,8 +105,8 @@ bounds share a separate 8 MiB allowance: term-window summaries reuse frame maxim
 refresh when newly decoded frames can tighten them. Scores still use the
 reference f32 addition order, including repetitions, prefixes, and ties.
 
-Versions 1 through 5 remain readable during upgrades. New writes always use
-version 6. `upgrade_segment` transcodes formats 4 and 5 directly, validating
+Versions 1 through 6 remain readable during upgrades. New writes always use
+version 7. `upgrade_segment` transcodes formats 4, 5, and 6 directly, validating
 posting, position, length, and dictionary checksums. It does not retokenize
 documents. Formats 1 through 3 rebuild from immutable document columns through
 the existing background upgrade pass. There is no layout-selection setting.
