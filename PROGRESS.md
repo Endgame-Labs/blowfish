@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **F1 cheaper filtered ANN (merged).** Fixed-width table chunks plus a bounded per-scan membership bitset. CPU/query main -> F1 (two reversed orders, 28 arms, 100% PMU): ID1 4.74 -> 3.90 ms, ID10 12.09 -> 8.81, ID50 19.90 -> 14.11, hash1 67.18 -> 40.33 (instructions -61%, q/s16 98.9 -> 167.7), hash10 45.78 -> 43.62, hash50 22.93 -> 17.55; unfiltered 3.48 -> 3.55 (+2.2%). 768/768 identical. Open: ID1 q/s16 -11.8% despite lower CPU (unexplained; snapshot HEAD latency suspected), hash50 pooled q/s -2.1%.
+
 - **RR4 exact recluster speedup (merged).** BF16 screening with certified conversion and roundoff bounds plus FP32 verification of every possible winner; candidate work grouped by leaf group; coarse neighbors cached. Live NQ ABBA on 4 threads: assignment 175.8 -> 97.4 s (1.81x), ack to full tier 254.5 -> 176.9 s (1.44x), recall 0.9507/0.9606 at 48/64. Frozen replay byte-identical. 10M assignment-only 570 -> 349 s (1.63x). Drift pruning certified only 0.02% of rows (not shipped). Follow-ups: x86 AVX-512 BF16 path, idle-priority all-core assignment.
 
 - **Q4 per-core serving (merged).** Warm compiled-tier queries run on per-core reactors; cold continuations, tier rebuilding, and background work stay on shared I/O. Final pinned-5c5fec8 matrix: 12 cells, 662,784 identical responses; full NQ +2.2/+2.3% (4 cores), +5.5/+6.2% (8), +20.9/+20.7% (16) at 48/64 probes; 10K up to +33% at 16 cores. Cold S3 replay: 160 identical pairs, median change +0.8% and -0.5% (within noise). Native matched gap still 11-12%; round H1 targets the HTTP wrapper next.

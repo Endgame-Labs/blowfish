@@ -572,9 +572,10 @@ pub(crate) async fn live_masks(
 ) -> Result<Vec<Option<Arc<RoaringBitmap>>>, ApiError> {
     futures::future::try_join_all(state.segments.iter().map(|seg| async move {
         if let Some(f) = filter {
-            return Ok(Some(Arc::new(
-                crate::snapshot::allowed_with(store, state, seg, Some(f), false).await?,
-            )));
+            crate::filter::validate(f, &state.schema, false)?;
+            return Ok(Some(
+                segment::filter_live(store, seg, f, &state.schema).await?,
+            ));
         }
         if seg.live_generation == 0 {
             return Ok(None);
@@ -582,6 +583,45 @@ pub(crate) async fn live_masks(
         Ok(Some(Arc::new(segment::live(store, seg).await?)))
     }))
     .await
+}
+
+/// Pin the immutable predicate along with its derived counts, so its address cannot be
+/// reused while a cache entry names it. The fragment key fences vector membership, and the
+/// decoded cache scopes this key to the namespace's storage view.
+struct ClusterCounts {
+    _allowed: Arc<RoaringBitmap>,
+    counts: Vec<u32>,
+    matching: usize,
+}
+fn cluster_counts(
+    fragment: &str,
+    member: &Membership,
+    allowed: &Arc<RoaringBitmap>,
+    clusters: usize,
+) -> Arc<ClusterCounts> {
+    let key = format!("ann-counts:{fragment}:{:p}", Arc::as_ptr(allowed));
+    if let Some(counts) = read_cache::get(&key, 0) {
+        return counts;
+    }
+    let counts = member.counts(allowed, clusters);
+    let matching = counts.iter().map(|n| *n as usize).sum();
+    // Charge the pinned predicate even if its protected-cache entry is evicted. Both key
+    // copies and the value's containers are included in this conservative reservation.
+    let stats = allowed.statistics();
+    let predicate_bytes = stats.n_bytes_array_containers
+        + stats.n_bytes_bitset_containers
+        + stats.n_bytes_run_containers
+        + u64::from(stats.n_containers) * 64;
+    let bytes = (counts.capacity() * 4 + key.len() * 2 + 256) as u64 + predicate_bytes;
+    read_cache::insert(
+        &key,
+        bytes,
+        ClusterCounts {
+            _allowed: allowed.clone(),
+            counts,
+            matching,
+        },
+    )
 }
 
 /// Load (and cache) the row-to-cluster map of every segment that has one. `None` for flat
@@ -806,6 +846,40 @@ fn pick_clusters(
         thin
     };
     let probes = probe_count(config, ann_rows, clusters, thin * spread, layout);
+    let base_probes = probe_count(config, ann_rows, clusters, spread, layout);
+    // Empty leaves expose the filter's concentration without assuming independent row
+    // thinning. Increase the coverage goal smoothly as less source data is excluded;
+    // with no wholly excluded leaves, retain the original geometric plan.
+    let eligible_rows: u64 = if filtered {
+        order
+            .iter()
+            .map(|key| u64::from(dir.entries()[(*key as u32) as usize].rows))
+            .sum()
+    } else {
+        0
+    };
+    let excluded_rows = (ann_rows as u64).saturating_sub(eligible_rows);
+    let coverage = if filtered && excluded_rows > 0 {
+        // Exact membership counts determine when this population has actually been
+        // covered. Keep two unfiltered probe populations, with the existing witness margin;
+        // a smaller population regressed localized NQ queries despite filling rerank.
+        let witnesses = thin * matching as f64 / ann_rows.max(1) as f64;
+        let concentration = (ann_rows as f64 / excluded_rows as f64).sqrt();
+        (2.0 * base_probes as f64 * ann_rows as f64 / clusters.max(1) as f64
+            * witnesses
+            * concentration)
+            .ceil()
+            .max(target as f64)
+            .min(matching as f64)
+    } else {
+        f64::INFINITY
+    };
+    #[cfg(test)]
+    let coverage = if config.baseline_filter_test || config.legacy_three_filter_test {
+        f64::INFINITY
+    } else {
+        coverage
+    };
     // Only the nearest few times `probes` are ever walked: partition them off, and sort the rest
     // only in the unlikely case the walk runs past them.
     let mut sorted = if order.len() > probes.saturating_mul(8).max(256) {
@@ -830,9 +904,17 @@ fn pick_clusters(
         picked.push(n);
         count += 1;
         candidates += in_cluster(n);
-        if count >= probes && candidates >= target as f64 {
+        if (count >= probes && candidates >= target as f64)
+            || (count >= base_probes && candidates >= coverage)
+        {
             break;
         }
+    }
+    if crate::ann::trace_stages() {
+        eprintln!(
+            "COVERAGE clusters={} allowed={candidates} minimum={probes} target={target}",
+            picked.len()
+        );
     }
     picked
 }
@@ -1114,7 +1196,15 @@ pub(crate) async fn search(
     // One rotation serves the ranking and every segment's scan (they share one vector space).
     let rotated = Arc::new(dir.rotate_query(&vector).map_err(segment::index_error)?);
     let distances = {
-        let (dir, rotated, skip) = (dir.clone(), rotated.clone(), skip.to_vec());
+        let (dir, rotated, mut skip) = (dir.clone(), rotated.clone(), skip.to_vec());
+        if filtered {
+            // An empty predicate cannot contribute a candidate. Avoid even ranking that
+            // segment's center codes; nonempty segments keep identical distances.
+            skip.resize(lives.len(), false);
+            for (i, mask) in lives.iter().enumerate() {
+                skip[i] |= mask.as_ref().is_some_and(|rows| rows.is_empty());
+            }
+        }
         on_worker(async move {
             // Segments a recluster tier answers for are not ranked at all.
             dir.center_distances_rotated_except(&rotated, crate::fan_out(), &skip)
@@ -1133,14 +1223,16 @@ pub(crate) async fn search(
     let (seg_rows, seg_clusters): (Vec<usize>, Vec<usize>) =
         dir.segment_totals().into_iter().unzip();
     // Filtered: allowed rows in each cluster, exactly, from the row-to-cluster maps.
-    let counts: Vec<Vec<u32>> = if filtered {
+    let counts: Vec<Option<Arc<ClusterCounts>>> = if filtered {
         dir.segments()
             .iter()
             .enumerate()
             .map(
                 |(i, seg)| match (members.get(i).and_then(Option::as_ref), &lives[i]) {
-                    (Some(m), Some(allowed)) if !seg.flat => m.counts(allowed, seg.clusters),
-                    _ => Vec::new(),
+                    (Some(m), Some(allowed)) if !seg.flat => {
+                        Some(cluster_counts(&seg.fragment, m, allowed, seg.clusters))
+                    }
+                    _ => None,
                 },
             )
             .collect()
@@ -1161,11 +1253,8 @@ pub(crate) async fn search(
             // vector members, rather than treating those rows as surviving witnesses.
             let selected = counts
                 .get(i)
-                .filter(|counts| !counts.is_empty())
-                .map_or_else(
-                    || live_rows(i).min(seg_rows[i]),
-                    |counts| counts.iter().map(|n| *n as usize).sum(),
-                );
+                .and_then(Option::as_ref)
+                .map_or_else(|| live_rows(i).min(seg_rows[i]), |counts| counts.matching);
             matching += selected;
             clusters += seg_clusters[i];
             fraction[i] = selected as f64 / seg_rows[i].max(1) as f64;
@@ -1176,8 +1265,8 @@ pub(crate) async fn search(
     let mut rerank_cap = target;
     let in_cluster = |n: usize| -> f64 {
         let e = &entries[n];
-        match counts.get(e.segment).filter(|c| !c.is_empty()) {
-            Some(c) => f64::from(c[e.cluster]),
+        match counts.get(e.segment).and_then(Option::as_ref) {
+            Some(c) => f64::from(c.counts[e.cluster]),
             None => e.rows as f64 * fraction[e.segment],
         }
     };
@@ -2219,6 +2308,91 @@ pub(crate) async fn speculate_slab_scan(
 mod spread_tests {
     use super::{Layout, MAX_SPREAD, filtered_probe_scale, independent_spread, probe_count};
     use crate::EngineConfig;
+
+    #[test]
+    fn local_coverage_skips_empty_leaves_and_keeps_distributed_probe_geometry() {
+        use bf_vector::{BuildParams, Directory, Fragment, IndexBuilder, Metric};
+        let rows: Vec<_> = (0..1000u32)
+            .map(|id| {
+                let mut vector = vec![0.; 8];
+                vector[0] = (id / 100) as f32;
+                (id, vector)
+            })
+            .collect();
+        let blob = IndexBuilder::new(8, Metric::EuclideanSquared)
+            .unwrap()
+            .params(BuildParams {
+                flat_threshold: 0,
+                clusters: Some(10),
+                ..Default::default()
+            })
+            .build(&rows)
+            .unwrap();
+        let (ann, length) = Fragment::build_ann(&blob).unwrap();
+        let sources: Vec<_> = (0..10)
+            .map(|i| {
+                (
+                    format!("segment-{i}"),
+                    format!("ann-{i}"),
+                    format!("ann-{i}"),
+                    Fragment::decode(&ann[..length as usize]).unwrap(),
+                )
+            })
+            .collect();
+        let bytes = Directory::build(&sources).unwrap().unwrap();
+        let directory = Directory::decode(&bytes).unwrap();
+        assert_eq!(directory.entries().len(), 100);
+        assert!(directory.entries().iter().all(|e| e.rows == 100));
+        let distances: Vec<_> = (0..100).map(|i| (100 - i) as f32).collect();
+        let config = EngineConfig {
+            ann_nprobe: 1,
+            ann_nprobe_explicit: true,
+            ann_rerank_factor: 1,
+            exact_fetch_rows: 0,
+            ..Default::default()
+        };
+        let baseline = EngineConfig {
+            baseline_filter_test: true,
+            ..config.clone()
+        };
+        let totals = super::Totals {
+            layout: Layout::Segments,
+            ann_rows: 10000,
+            matching: 2000,
+            clusters: 100,
+            target: 10,
+            k: 10,
+            filtered: true,
+            spread: 1.,
+        };
+        let local = |n| if n < 20 { 100. } else { 0. };
+        assert_eq!(
+            super::pick_clusters(&directory, &distances, &local, &totals, &config),
+            vec![19, 18, 17, 16]
+        );
+        assert_eq!(
+            super::pick_clusters(&directory, &distances, &local, &totals, &baseline),
+            vec![19, 18, 17, 16, 15, 14, 13]
+        );
+        // The same allowed cardinality spread across all leaves retains main's probe floor.
+        let distributed = |_| 20.;
+        assert_eq!(
+            super::pick_clusters(&directory, &distances, &distributed, &totals, &config),
+            super::pick_clusters(&directory, &distances, &distributed, &totals, &baseline)
+        );
+        // Nearby broad masks share main's geometry without a hard 50% boundary.
+        for allowed_clusters in [49, 50, 51] {
+            let broad = |n| if n < allowed_clusters { 100. } else { 0. };
+            let broad_totals = super::Totals {
+                matching: allowed_clusters * 100,
+                ..totals
+            };
+            assert_eq!(
+                super::pick_clusters(&directory, &distances, &broad, &broad_totals, &config),
+                super::pick_clusters(&directory, &distances, &broad, &broad_totals, &baseline)
+            );
+        }
+    }
 
     #[test]
     fn filtered_margin_covers_survivor_variance_under_independent_thinning() {

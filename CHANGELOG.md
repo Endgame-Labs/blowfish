@@ -4,6 +4,11 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Performance
+
+- **Cheaper filtered vector search:** Filtered ANN scans now use fixed-width table chunks and a bounded per-scan membership bitset (at most 8 bytes per scanned row; widely spaced IDs fall back to bitmap merging). On full NQ, CPU per query drops 20 to 40% across ID and hash filters at 1%, 10%, and 50% selectivity. The hardest case, a 1% hash filter, goes from 67 to 40 ms and uses 61% fewer instructions, and its 16-client throughput rises from 99 to 168 q/s. All 768 per-query comparisons return identical rows and distances. Unfiltered queries cost about 2% more CPU. See [docs/benchmarks/filtered-ann.md](docs/benchmarks/filtered-ann.md).
+
+
 ## [0.1.18] - 2026-11-24
 
 ### Performance

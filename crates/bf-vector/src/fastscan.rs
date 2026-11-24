@@ -578,6 +578,71 @@ impl FastQuery {
         }
     }
 
+    /// Score only selected ordinals with the same coarse tables and arithmetic as the
+    /// block scan. Sparse filters avoid evaluating every excluded row in a 32-row block;
+    /// surviving candidates still use the ordinary fine-rescore pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_selected(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        qc2: f32,
+        cosine: bool,
+        cut: &std::cell::Cell<f32>,
+        selected: &[usize],
+        emit: &mut impl FnMut(usize, f32, f32, bool),
+    ) -> crate::Result<()> {
+        let padded = self.padded;
+        if bytes.len() != block_len(rows, padded) {
+            return Err(crate::format::bad("code block length mismatch"));
+        }
+        let root = (padded as f32).sqrt();
+        let spread =
+            ERROR_CONFIDENCE as f32 * 2. * qc2.max(0.).sqrt() / ((padded - 1).max(1) as f32).sqrt();
+        let coarse_error = self.rounding(self.delta);
+        let (scale, offset) = (2. * self.delta / root, (2. * self.base - self.sum) / root);
+        let (half, top) = if cosine {
+            (0.5, 2.)
+        } else {
+            (1., f32::INFINITY)
+        };
+        for &ordinal in selected {
+            if ordinal >= rows {
+                return Err(crate::format::bad("code ordinal outside cluster"));
+            }
+            let factor = |i: usize| {
+                let at = (i * rows + ordinal) * 4;
+                f32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
+            };
+            let (sq, signed_k1, k2, cb) = (factor(0), factor(1), factor(2), factor(3));
+            let width = padded / 8 * BLOCK;
+            let block = &bytes[16 * rows + ordinal / BLOCK * width..][..width];
+            let j = ordinal % BLOCK;
+            let mut sum = 0u32;
+            // Fixed-width chunks expose the nibble bounds once, instead of checking
+            // offsets into the entire table and code buffer for every lookup.
+            for (code, table) in block
+                .as_chunks::<BLOCK>()
+                .0
+                .iter()
+                .zip(self.coarse.lut.as_chunks::<32>().0)
+            {
+                let byte = code[j];
+                sum += u32::from(table[(byte & 15) as usize])
+                    + u32::from(table[16 + (byte >> 4) as usize]);
+            }
+            let k = signed_k1.abs();
+            let zero = signed_k1.is_sign_negative();
+            let dot = sum as f32 * scale + offset - cb;
+            let distance = ((sq + qc2 - 2. * k * dot) * half).clamp(0., top);
+            let bound = (spread * k2 + 2. * k * coarse_error) * half;
+            if zero || distance - bound <= cut.get() {
+                emit(ordinal, distance, bound, zero);
+            }
+        }
+        Ok(())
+    }
+
     /// Table rounding at `step`: up to half a step per group, about uniform and independent,
     /// so the dot product is off by `2 step / sqrt(D) * sqrt(groups / 12)` (one standard
     /// deviation), times the confidence factor.
@@ -761,6 +826,97 @@ mod tests {
                         "dims {dims}: {got} vs {exact} (norm {norm})"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_codes_match_block_scores_bounds_zeros_and_cuts() {
+        let mut rng = Rng(17);
+        for dims in [8usize, 24, 100, 1024] {
+            let rq = RaBitQ::new(dims, 9).unwrap();
+            let q = rq.rotate(&sample(&mut rng, dims));
+            let g = vec![0.; rq.padded];
+            let fq = FastQuery::new(&q, &g);
+            for rows in [1usize, 31, 32, 33, 70, 200] {
+                let codes: Vec<Vec<u8>> = (0..rows)
+                    .map(|_| (0..rq.padded / 8).map(|_| rng.next() as u8).collect())
+                    .collect();
+                let mut inputs = row_codes(&codes);
+                for (i, input) in inputs.iter_mut().enumerate() {
+                    input.zero = i.is_multiple_of(17);
+                }
+                let bytes = encode(&inputs, rq.padded);
+                for cosine in [false, true] {
+                    for threshold in [f32::INFINITY, 0., 1., 100.] {
+                        let cut = std::cell::Cell::new(threshold);
+                        let mut expected = std::collections::BTreeMap::new();
+                        fq.scan(
+                            &bytes,
+                            rows,
+                            0.25,
+                            cosine,
+                            &cut,
+                            &mut |start, mut mask, d, e, zero| {
+                                while mask != 0 {
+                                    let j = mask.trailing_zeros() as usize;
+                                    mask &= mask - 1;
+                                    expected.insert(
+                                        start + j,
+                                        (d[j].to_bits(), e[j].to_bits(), zero & (1 << j) != 0),
+                                    );
+                                }
+                            },
+                        )
+                        .unwrap();
+                        for selected in [
+                            (0..rows).collect::<Vec<_>>(),
+                            (0..rows).step_by(19).collect(),
+                            vec![],
+                            vec![rows - 1],
+                        ] {
+                            let mut actual = std::collections::BTreeMap::new();
+                            fq.scan_selected(
+                                &bytes,
+                                rows,
+                                0.25,
+                                cosine,
+                                &cut,
+                                &selected,
+                                &mut |i, d, e, z| {
+                                    actual.insert(i, (d.to_bits(), e.to_bits(), z));
+                                },
+                            )
+                            .unwrap();
+                            let wanted: std::collections::BTreeMap<_, _> = expected
+                                .iter()
+                                .filter(|(i, _)| selected.contains(i))
+                                .map(|(i, value)| (*i, *value))
+                                .collect();
+                            assert_eq!(
+                                actual, wanted,
+                                "dims={dims}, rows={rows}, cosine={cosine}, cut={threshold}"
+                            );
+                        }
+                    }
+                }
+                let cut = std::cell::Cell::new(f32::INFINITY);
+                assert!(
+                    fq.scan_selected(&bytes, rows, 1., false, &cut, &[rows], &mut |_, _, _, _| {})
+                        .is_err()
+                );
+                assert!(
+                    fq.scan_selected(
+                        &bytes[..bytes.len() - 1],
+                        rows,
+                        1.,
+                        false,
+                        &cut,
+                        &[],
+                        &mut |_, _, _, _| {}
+                    )
+                    .is_err()
+                );
             }
         }
     }

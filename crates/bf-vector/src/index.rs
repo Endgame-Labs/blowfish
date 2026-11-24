@@ -131,6 +131,27 @@ pub struct ScanScratch {
     fast: Option<crate::fastscan::FastQuery>,
     ordered: Vec<u32>,
     rescore: Vec<(Range<usize>, usize, usize, f32)>,
+    selected: Vec<usize>,
+    filter_bits: Vec<u64>,
+}
+
+// One lookup per row avoids repeatedly merging each leaf with the same sparse predicate.
+// Bound scratch by the scan population; widely spaced external row IDs use the bitmap merge.
+fn filter_bits<'a>(
+    filter: &RoaringBitmap,
+    rows: usize,
+    scratch: &'a mut Vec<u64>,
+) -> Option<&'a [u64]> {
+    let words = filter.max().map_or(0, |row| row as usize / 64 + 1);
+    if words > rows {
+        return None;
+    }
+    scratch.clear();
+    scratch.resize(words, 0);
+    for row in filter {
+        scratch[row as usize / 64] |= 1u64 << (row % 64);
+    }
+    Some(scratch)
 }
 
 /// A parsed immutable index. Metadata and centroids stay resident; codes and
@@ -804,6 +825,8 @@ impl<R: RangeRead> Index<R> {
             fast,
             ordered,
             rescore,
+            selected,
+            filter_bits: bits,
         } = scratch;
         let (keep, upper_bound) = keep.map_or((None, f32::INFINITY), |(k, bound)| (Some(k), bound));
         let cut = std::cell::Cell::new(upper_bound);
@@ -812,6 +835,11 @@ impl<R: RangeRead> Index<R> {
         let t_cpu = std::time::Instant::now();
         let rows: usize = clusters.iter().map(|c| cluster(*c).len()).sum();
         estimated.reserve(rows);
+        // A sparse scan pays scalar table lookups per allowed row. Dense and unfiltered
+        // scans retain their block kernel, including its existing admission and cut order.
+        let sparse_filter = filter.filter(|f| f.len().saturating_mul(16) <= rows as u64);
+        let bits = sparse_filter.and_then(|filter| filter_bits(filter, rows, bits));
+        let mut skipped_codes = 0usize;
         let compact = self.metadata.flags & format::FLAG_COMPACT != 0;
         let padded = self.rq.padded;
         let cosine = self.metric() == Metric::CosineDistance;
@@ -897,26 +925,59 @@ impl<R: RangeRead> Index<R> {
                 // A zero query has a fixed distance to every row: no cut applies.
                 let open = std::cell::Cell::new(f32::INFINITY);
                 let scan_cut = if cosine && q_zero { &open } else { &cut };
-                fq.scan(
-                    bytes,
-                    n,
-                    qc2,
-                    cosine,
-                    scan_cut,
-                    &mut |start, mut rows, d, e, zero| {
-                        while rows != 0 {
-                            let j = rows.trailing_zeros() as usize;
-                            rows &= rows - 1;
-                            let z = zero & (1 << j) != 0;
+                selected.clear();
+                if let Some(filter) = sparse_filter {
+                    if let Some(bits) = bits {
+                        selected.extend(ids.iter().enumerate().filter_map(|(ordinal, &row)| {
+                            bits.get(row as usize / 64)
+                                .is_some_and(|word| word & (1u64 << (row % 64)) != 0)
+                                .then_some(ordinal)
+                        }));
+                    } else {
+                        let allowed = &c.rows & filter;
+                        selected.extend(allowed.iter().map(|row| (c.rows.rank(row) - 1) as usize));
+                    }
+                }
+                if sparse_filter.is_some() && selected.len().saturating_mul(16) <= n {
+                    skipped_codes += n - selected.len();
+                    fq.scan_selected(
+                        bytes,
+                        n,
+                        qc2,
+                        cosine,
+                        scan_cut,
+                        selected,
+                        &mut |ordinal, d, e, z| {
                             let (d, e) = if cosine && (q_zero || z) {
                                 fixed(z)
                             } else {
-                                (d[j], e[j])
+                                (d, e)
                             };
-                            accept(start + j, d, e);
-                        }
-                    },
-                )?;
+                            accept(ordinal, d, e);
+                        },
+                    )?;
+                } else {
+                    fq.scan(
+                        bytes,
+                        n,
+                        qc2,
+                        cosine,
+                        scan_cut,
+                        &mut |start, mut rows, d, e, zero| {
+                            while rows != 0 {
+                                let j = rows.trailing_zeros() as usize;
+                                rows &= rows - 1;
+                                let z = zero & (1 << j) != 0;
+                                let (d, e) = if cosine && (q_zero || z) {
+                                    fixed(z)
+                                } else {
+                                    (d[j], e[j])
+                                };
+                                accept(start + j, d, e);
+                            }
+                        },
+                    )?;
+                }
                 if keep.is_some() && estimated.len() > first && fq.rounding_matters(qc2) {
                     rescore.push((first..estimated.len(), position, n, qc2));
                 }
@@ -971,11 +1032,12 @@ impl<R: RangeRead> Index<R> {
         }
         if trace_stages() {
             eprintln!(
-                "SCAN clusters={} read={}us cpu={}us scanned={} candidates={}",
+                "SCAN clusters={} read={}us cpu={}us scanned={} evaluated={} candidates={}",
                 clusters.len(),
                 read_us,
                 t_cpu.elapsed().as_micros(),
                 rows,
+                rows - skipped_codes,
                 estimated.len()
             );
         }
@@ -1405,4 +1467,35 @@ async fn merged<R: RangeRead>(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod sparse_filter_tests {
+    use super::*;
+
+    #[test]
+    fn scratch_membership_matches_bitmap_and_bounds_widely_spaced_rows() {
+        let mut scratch = Vec::new();
+        for allowed in [vec![0, 63, 64, 129], vec![255], vec![]] {
+            let filter: RoaringBitmap = allowed.into_iter().collect();
+            let bits = filter_bits(&filter, 4, &mut scratch).unwrap();
+            for row in 0u32..300 {
+                assert_eq!(
+                    bits.get(row as usize / 64)
+                        .is_some_and(|word| word & (1u64 << (row % 64)) != 0),
+                    filter.contains(row)
+                );
+            }
+        }
+        let capacity = scratch.capacity();
+        for row in [256, u32::MAX] {
+            assert!(filter_bits(&[row].into(), 4, &mut scratch).is_none());
+            assert_eq!(scratch.capacity(), capacity);
+        }
+        assert!(
+            filter_bits(&RoaringBitmap::new(), 0, &mut scratch)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
