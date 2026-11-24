@@ -45,18 +45,20 @@ Client-side `p50 / p90` latency in milliseconds (strong consistency on queries),
 
 ### In-region (AWS S3)
 
-Measured on `c7gd.2xlarge` in `us-west-2` reading a same-region S3 bucket (current `main`, which includes memory-sized defaults, paged slab directories, compact manifest copies, and parallel slab scans beyond `v0.1.12`). Cold numbers are shown both for a fresh server process with empty caches and for a warm process with caches dropped before each query (turbopuffer's definition of cold):
+Measured on `c7gd.2xlarge` in `us-west-2` reading a same-region S3 bucket, with the `v0.1.14` release (2026-11-24). Cold numbers are shown both for a fresh server process with empty caches and for a warm process with caches dropped before each query (turbopuffer's definition of cold):
 
 | Benchmark | turbopuffer published | blowfish in-region |
 | --- | --- | --- |
-| Vector, 10M, cold (48 probes, recall@10 0.953 vs. turbopuffer's 0.943) | 874 / 1,214 ms | 680 / 907 ms fresh (533 / 656 ms cache-cold) |
-| Vector, 10M, warm (48 probes) | 14 / 17 ms | 36.6 / 50.8 ms |
-| BM25, 1M, cold (`overlap@10` 1.000 vs. exact BM25) | 316 / 381 ms | 380 / 526 ms fresh (301 / 369 ms cache-cold) |
-| BM25, 1M, warm | 13 / 18 ms | 17.1 / 34.5 ms |
+| Vector, 10M, cold (48 probes, recall@10 0.953 vs. turbopuffer's 0.943) | 874 / 1,214 ms | 626 / 924 ms fresh (454 / 534 ms cache-cold) |
+| Vector, 10M, warm (48 probes) | 14 / 17 ms | 18.2 / 25.7 ms |
+| BM25, 1M, cold (`overlap@10` 1.000 vs. exact BM25) | 316 / 381 ms | 249 / 449 ms fresh (207 / 261 ms cache-cold) |
+| BM25, 1M, warm | 13 / 18 ms | 11.2 / 14.2 ms |
 
-- **100M vector (in-region, `c7gd.2xlarge`):** 100M rows of 1,024-dim `f16` Wikipedia embeddings (160 slabs, paged slab directory, and compact manifest copy) at 64 probes and recall@10 `0.954` take **1,201 / 1,391 ms** cache-cold, **1,243 / 1,370 ms** with a fresh process, and **99.7 / 162.8 ms** warm (**72.6 / 90.4 ms** warm at 48 probes, recall@10 `0.941–0.950`). Each cold query reads about 160 MB. Loading 100M rows took 5.7 h at **4,891 docs/s**; `recluster` took 1.7 h. turbopuffer publishes no 100M number.
+- **100M vector (in-region, `c7gd.2xlarge`):** with `v0.1.14` in a 10 GiB cgroup, 64 probes measure **1,149 / 1,342 ms** cache-cold and **1,252 / 1,429 ms** fresh, at the same recall@10 (`0.954`); warm at 48 probes is **44.8 / 56.9 ms** with an 8 GiB cache in a 12 GiB cgroup. Earlier (`v0.1.13`-era) measurements: 100M rows of 1,024-dim `f16` Wikipedia embeddings (160 slabs, paged slab directory, and compact manifest copy) at 64 probes and recall@10 `0.954` take **1,201 / 1,391 ms** cache-cold, **1,243 / 1,370 ms** with a fresh process, and **99.7 / 162.8 ms** warm (**72.6 / 90.4 ms** warm at 48 probes, recall@10 `0.941–0.950`). Each cold query reads about 160 MB. Loading 100M rows took 5.7 h at **4,891 docs/s**; `recluster` took 1.7 h. turbopuffer publishes no 100M number.
 - **Memory and instance sizing:** a 4 GB `c7gd.large` (swap off) holds a 10M load plus `recluster` at **2.3–2.9 GB** peak RSS; on `c7gd.large`, cold 10M vector search is **769 / 973 ms** fresh and **623 / 740 ms** cache-cold. On `c7gd.xlarge` (4 vCPU, 8 GB), 10M ingest stays flat at about **4,500 docs/s**.
-- **Network floor:** a 4 KB `GET` to S3 is 24.5 ms p50.
+- **Network floor:** a 4 KB `GET` to S3 is 25–26 ms p50.
+- **10M at 16 clients:** 216 queries/s at 48 probes (72 / 87 ms).
+- **On a 4 GB `c7gd.large` with `v0.1.14`:** cold 10M vector search is **670 / 833 ms** fresh and **536 / 637 ms** cache-cold at 48 probes.
 - **Vectors and layout:** vectors are 1,024-dim `f16` Cohere Wikipedia embeddings (while turbopuffer's published benchmark uses 768-dim), served from the namespace-wide ANN slab layout built by `recluster` (about 200 rows per cluster; unfiltered ANN only). The server builds it on its own in the background, and rows written after it are searched beside it. Across runs, 10M recall@10 at 48 probes is `0.953–0.956`.
 - **BM25:** 1M MS MARCO passages (335 MB of text), `overlap@10` `1.000` against exact BM25.
 - **Single-batch upserts:** not measured in-region; see the over-the-internet table below for 512 KB batch latency.
