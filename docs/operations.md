@@ -4,6 +4,104 @@ Object storage is the source of truth. Local process state is disposable; protec
 credentials. Use blowfish for development, testing, and modest deployments. For production at scale,
 I recommend turbopuffer as the upgrade path, using the same SDKs with a different base URL and key.
 
+## Local filesystem durability
+
+Writable `file://` stores always sync file data and the directory entries that publish it
+before acknowledging a write. There is no switch to disable durability. This applies to WAL
+payloads and commit slots, manifest versions and their latest-copy hints, segments, and mutable
+system objects. S3-compatible stores keep their existing behavior. Read-only opens and mapped
+reads do not write or sync files.
+
+The pinned `object_store` 0.14.2 local backend defaults `with_fsync` to false. Blowfish now
+always enables it. The backend's publication paths behave as follows:
+
+| Operation | With fsync disabled | With fsync enabled |
+|---|---|---|
+| Overwrite PUT | Stage, close, and rename | Sync staged file, close, rename, and sync destination directory |
+| Create-only PUT | Stage, close, and hard-link without replacing | Sync staged file, close, hard-link, and sync destination directory |
+| Multipart completion | Close and rename completed staging file | Sync completed file, close, rename, and sync destination directory; no sync per part |
+| Rename existing object | Rename, or copy-and-delete for create-only mode | Sync affected directories; the source file was synced when originally published |
+
+Create-only staging-file cleanup may be lost in a crash, leaving an ignored temporary name;
+the published object is already durable. The backend also syncs newly created directory
+chains. Blowfish separately persists the configured root and its ancestors, and prepares
+each newly used parent chain before writing into it. The latter closes a race where another
+writer could see a new directory before its creator had synced its parent. Completed directory
+barriers are remembered across scoped handles, so existing directories need no repeated
+ancestor syncs.
+
+A readable object is not sufficient evidence of a durable write after an I/O error: a link or
+rename can succeed before its directory fsync fails. On an identical create retry or redaction
+recovery, blowfish syncs the visible file and its parent before returning success. Persistent
+file or directory fsync errors therefore fail the write even if its body is readable.
+
+WAL staging awaits payload durability before publishing its commit slot. Group commit still
+syncs the group's objects, rather than each document or client request. Segment uploads finish
+before the manifest that references them is published. The fixed-key latest-manifest copy is
+best effort; its failure is safe because the immutable manifest slot is already durable and
+readers validate the copy. These ordered publication barriers cannot be combined without
+changing the storage protocol. Standalone garbage-collection unlinks remain best effort;
+logical deletes are acknowledged through durable WAL records.
+
+Use a filesystem that supports directory fsync, as on Linux and macOS, and storage that honors
+flush requests. An unsupported or failed sync returns an error. External changes to store files
+or directories are unsupported. Disposable disk caches retain their existing write policy.
+Backends supplied through the Rust `from_backend` constructors remain the caller's responsibility.
+
+On Linux, install `strace`, and run `cargo test -p bf-storage --test local_durability`. The tests
+check file sync before publication and directory sync before acknowledgment for creates,
+overwrites, multipart writes, and redactions. They also cover newly created ancestors,
+read-only reopening, and injected file and directory fsync failures after publication. These
+checks establish syscall ordering, not a physical power-cut guarantee from the device.
+
+### Measured local write cost
+
+Two matched baseline/durable pairs ran serially on one dedicated on-demand c7gd.2xlarge
+(eight cores, 16 GiB RAM), using its local NVMe with XFS. Both builds use native stable Rust,
+Clang 19 compilation,
+Clang 22 linking, and the unchanged release profile, without native CPU flags. The baseline
+is `478de32`; the durable storage implementation is `27dc1c1`. Storage source hashes on the
+measurement host matched the tested source.
+
+The prepared-body HTTP loader (`crates/bf-wal/benches/http_ingest.py`), with its existing timing
+wrapper, loaded all 2,681,468 public BEIR NQ vectors from the shared fixture: 1,024 dimensions,
+f16 storage, cosine distance, 5,000 rows per full batch, 537 schema-first writes, and four
+clients. Servers use four Tokio workers, four Rayon workers, a 4 GiB memory cache, no disk
+cache, and default indexing, compaction, reclustering, and backpressure. Both server and
+loader run at nice 19. Every run starts with a fresh store and dropped OS caches; builds,
+preparation, and tests do not overlap timed loads. Throughput includes body reads and all
+acknowledgments; p50/p90 use the original loader's complete request intervals and lower order
+statistics. Retry handling is unchanged. Every measured run had zero retries.
+
+| Pair | Local writes | Rows/s | Write p50, ms | Write p90, ms | WAL groups |
+|---|---|---:|---:|---:|---:|
+| 1 | Baseline, fsync off | 14,761 | 1,222.9 | 2,136.8 | 390 |
+| 1 | Always durable | 14,640 | 1,241.3 | 2,174.5 | 392 |
+| 2 | Baseline, fsync off | 17,707 | 876.0 | 2,074.9 | 451 |
+| 2 | Always durable | 17,431 | 897.1 | 2,143.9 | 462 |
+
+Durability reduced throughput by 0.82% and 1.56% in the two pairs, and increased write p90 by
+1.76% and 3.32%. Absolute throughput varied substantially as concurrent WAL grouping changed;
+the table includes group counts to make that visible. These two pairs describe this workload
+on this device, not a general fsync cost or a portable performance guarantee.
+
+A separate check used 2,000 sequential one-row writes per fresh store, each with a numeric ID
+and one short string attribute, without vectors. Default background indexing stayed enabled.
+
+| Pair | Local writes | Write p50, ms | Write p90, ms |
+|---|---|---:|---:|
+| 1 | Baseline, fsync off | 0.671 | 0.828 |
+| 1 | Always durable | 0.811 | 0.973 |
+| 2 | Baseline, fsync off | 0.647 | 0.829 |
+| 2 | Always durable | 0.809 | 0.998 |
+
+The small-write cost repeated: p50 increased by 0.140 and 0.162 ms, and p90 by 0.145 and
+0.169 ms. After every small-write run, the server was killed with SIGKILL and reopened
+read-only; an exact count recovered all 2,000 acknowledged rows in all four runs. Together
+with the syscall and replay tests above, this checks software ordering and recovery; it does
+not simulate a device power cut. Each run's store was deleted, and the temporary instance,
+security group, and SSH key pair were removed after measurements.
+
 ## Running under systemd with Caddy
 
 Install a release binary outside the checkout so subsequent builds cannot change the deployed

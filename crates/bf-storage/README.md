@@ -2,6 +2,27 @@
 
 Object storage, conditional creates, immutable range caching, and backend metrics.
 
+## Local durability
+
+`Storage::open` always enables file and directory fsync for writable `file://` stores.
+Puts, conditional creates, and multipart completion sync the staged file before atomic
+publication, and sync its parent directory before returning success. Newly used directory
+chains are made durable first, including the configured store root. Completed directory
+barriers are shared by scoped handles; ordinary writes do not repeat the ancestor walk.
+An identical create or redaction recovered by reading an existing object must also sync
+that file and its parent before succeeding: visibility alone cannot hide a failed fsync.
+There is no durability toggle. Filesystems must support directory fsync, as on Linux and
+macOS, and the device must honor flush requests. External mutation of store directories
+is unsupported. Read-only opens and immutable mapped reads perform no fsync.
+
+Custom backends passed to `from_backend` or `from_backend_with_cache` supply their own
+durability contract. Disk cache files are disposable and do not use this write policy.
+Standalone garbage-collection unlinks retain the upstream backend's best-effort deletion
+semantics; acknowledged logical deletes are durable WAL records.
+
+On Linux, `cargo test -p bf-storage --test local_durability` uses `strace` when installed
+to verify publication ordering and inject fsync failures into visible-object retries.
+
 ## Cache API
 
 ```rust,no_run

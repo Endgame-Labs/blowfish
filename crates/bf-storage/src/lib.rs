@@ -4,6 +4,7 @@ mod diagnostics;
 mod disk;
 mod format;
 mod hedge;
+mod local;
 mod mapped;
 pub use diagnostics::{BackendMeasurement, BackendStats};
 pub use format::BUCKET_FORMAT_VERSION;
@@ -119,6 +120,7 @@ impl Default for StorageConfig {
 }
 struct Inner {
     backend: Arc<dyn ObjectStore>,
+    local: Option<Arc<local::Local>>,
     cache: cache::RangeCache,
     prefix: Path,
     mode: StorageMode,
@@ -169,19 +171,22 @@ impl Storage {
         self.0.cache.drop_all();
     }
     /// Open a local or S3-compatible URL, probe create semantics, and acquire a fallback heartbeat.
+    /// Writable local stores always fsync file data and publication directories before success.
     pub async fn open(config: &StorageConfig) -> Result<Self, Error> {
         let url = url::Url::parse(&config.url).map_err(|_| Error::Config("invalid storage URL"))?;
         let mut namespace = config.url.clone();
+        let mut local = None;
         let (backend, prefix): (Arc<dyn ObjectStore>, Path) = match url.scheme() {
             "file" => {
                 let path = url
                     .to_file_path()
                     .map_err(|_| Error::Config("invalid file URL"))?;
-                std::fs::create_dir_all(&path)?;
-                (
-                    Arc::new(object_store::local::LocalFileSystem::new_with_prefix(path)?),
-                    Path::default(),
-                )
+                let read_only = config.read_only;
+                let disk = tokio::task::spawn_blocking(move || local::Local::open(path, read_only))
+                    .await
+                    .map_err(|_| Error::Config("local open task failed"))??;
+                local = Some(disk.clone());
+                (Arc::new(disk.backend.clone()), Path::default())
             }
             "s3" => {
                 let bucket = url
@@ -244,12 +249,13 @@ impl Storage {
         if cache.namespace.is_none() {
             cache.namespace = Some(namespace);
         }
-        let store = Self::from_backend_with_cache(
+        let store = Self::from_backend_with_local(
             backend,
             prefix,
             config.read_only,
             config.single_writer,
             cache,
+            local,
         )
         .await?;
         if cfg!(unix) && url.scheme() == "file" {
@@ -310,7 +316,8 @@ impl Storage {
             }
         });
     }
-    /// Wrap an object_store backend. Read-only instances do not run a mutating CAS probe.
+    /// Wrap an object_store backend, whose caller supplies its durability policy.
+    /// Read-only instances do not run a mutating CAS probe.
     pub async fn from_backend(
         backend: Arc<dyn ObjectStore>,
         prefix: Path,
@@ -333,7 +340,17 @@ impl Storage {
         prefix: Path,
         read_only: bool,
         force_single: bool,
+        cache: CacheConfig,
+    ) -> Result<Self, Error> {
+        Self::from_backend_with_local(backend, prefix, read_only, force_single, cache, None).await
+    }
+    async fn from_backend_with_local(
+        backend: Arc<dyn ObjectStore>,
+        prefix: Path,
+        read_only: bool,
+        force_single: bool,
         mut cache: CacheConfig,
+        local: Option<Arc<local::Local>>,
     ) -> Result<Self, Error> {
         if let Some(namespace) = &mut cache.namespace {
             *namespace = serde_json::to_string(&(&namespace, prefix.as_ref()))
@@ -357,6 +374,7 @@ impl Storage {
         let store = Self(
             Arc::new(Inner {
                 backend,
+                local,
                 cache,
                 prefix,
                 mode,
@@ -508,7 +526,9 @@ impl Storage {
         } else {
             value
         };
-        self.0.backend.put(&self.path(key), value.into()).await?;
+        let path = self.path(key);
+        self.prepare_local(&path).await?;
+        self.0.backend.put(&path, value.into()).await?;
         Ok(())
     }
     /// Create with a random retry identity. Conflicts never overwrite an existing object.
@@ -549,6 +569,7 @@ impl Storage {
         }
         self.writable()?;
         let path = self.path(key);
+        self.prepare_local(&path).await?;
         let upload = self.0.backend.put_multipart(&path).await?;
         let mut writer = object_store::WriteMultipart::new_with_chunk_size(upload, part);
         let mut header = Vec::with_capacity(HEADER);
@@ -591,6 +612,7 @@ impl Storage {
             None
         };
         let path = self.path(key);
+        self.prepare_local(&path).await?;
         let value = value.into();
         let mut payload = Vec::with_capacity(HEADER + value.len());
         payload.extend_from_slice(MAGIC);
@@ -598,7 +620,11 @@ impl Storage {
         payload.extend_from_slice(&value);
         if self.0.mode == StorageMode::SingleWriter {
             match self.0.backend.get(&path).await {
-                Ok(found) => return Ok(identity(&found.bytes().await?, write_id)),
+                Ok(found) => {
+                    return self
+                        .recovered_identity(&path, &found.bytes().await?, write_id)
+                        .await;
+                }
                 Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => return Err(e.into()),
             }
@@ -625,14 +651,21 @@ impl Storage {
             Err(
                 object_store::Error::AlreadyExists { .. }
                 | object_store::Error::Precondition { .. },
-            ) => Ok(identity(
-                &self.0.backend.get(&path).await?.bytes().await?,
-                write_id,
-            )),
+            ) => {
+                self.recovered_identity(
+                    &path,
+                    &self.0.backend.get(&path).await?.bytes().await?,
+                    write_id,
+                )
+                .await
+            }
             Err(e) => {
                 // Resolve a lost response before reporting failure; retry once with the same identity.
                 match self.0.backend.get(&path).await {
-                    Ok(found) => Ok(identity(&found.bytes().await?, write_id)),
+                    Ok(found) => {
+                        self.recovered_identity(&path, &found.bytes().await?, write_id)
+                            .await
+                    }
                     Err(object_store::Error::NotFound { .. }) => Err(e.into()),
                     Err(_) => Err(e.into()),
                 }
@@ -659,6 +692,7 @@ impl Storage {
             None
         };
         let path = self.path(key);
+        self.prepare_local(&path).await?;
         let current = match self.0.backend.get(&path).await {
             Ok(found) => found.bytes().await?,
             Err(object_store::Error::NotFound { .. }) => return Ok(false),
@@ -674,6 +708,7 @@ impl Storage {
         encoded.extend_from_slice(&value);
         let encoded = Bytes::from(encoded);
         if current == encoded {
+            self.recover_local(&path).await?;
             return Ok(true);
         }
         match self.0.backend.put(&path, encoded.clone().into()).await {
@@ -683,11 +718,36 @@ impl Storage {
                 if let Ok(found) = self.0.backend.get(&path).await
                     && found.bytes().await.is_ok_and(|bytes| bytes == encoded)
                 {
+                    self.recover_local(&path).await?;
                     return Ok(true);
                 }
                 Err(e.into())
             }
         }
+    }
+    async fn prepare_local(&self, path: &Path) -> Result<(), Error> {
+        if let Some(local) = &self.0.local {
+            local.prepare(path).await?;
+        }
+        Ok(())
+    }
+    async fn recover_local(&self, path: &Path) -> Result<(), Error> {
+        if let Some(local) = &self.0.local {
+            local.recover(path).await?;
+        }
+        Ok(())
+    }
+    async fn recovered_identity(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        write_id: Uuid,
+    ) -> Result<CreateResult, Error> {
+        let result = identity(bytes, write_id);
+        if result == CreateResult::AlreadyCommitted {
+            self.recover_local(path).await?;
+        }
+        Ok(result)
     }
     /// List objects under a relative prefix, sorted by key.
     pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, Error> {
