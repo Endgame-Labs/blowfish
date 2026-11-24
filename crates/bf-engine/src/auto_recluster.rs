@@ -48,6 +48,9 @@ const MASKED_SHARE: f64 = 0.2;
 const COARSE_GROWTH: u64 = 4;
 /// A namespace whose indexer flushed a bulk-load-sized tail this recently is still loading.
 const BULK_WINDOW: Duration = Duration::from_secs(300);
+/// A bulk load has settled once writes have paused this long and its tail is indexed. This is
+/// deliberately shorter than the history window: a completed load must not wait five minutes.
+const LOAD_QUIET: Duration = Duration::from_secs(2);
 /// How soon a deferred evaluation runs again, though nothing was published since.
 const RETRY_DEFERRED: Duration = Duration::from_secs(60);
 /// How soon a failed build is tried again.
@@ -234,9 +237,8 @@ pub(crate) fn decide(
                 None => continue,
             },
         };
-        // A load-then-query namespace builds once its load ends, plus doubling builds while the
-        // load outgrows what is covered.
-        if bulk && l.uncovered_rows <= l.covered_rows && why != "upgrade" {
+        // Loading never starts a throwaway base or delta, even with no covered rows yet.
+        if bulk && why != "upgrade" {
             return (Decision::Wait("bulk_load"), Some(l));
         }
         if compacting {
@@ -279,6 +281,7 @@ fn decide_beside(
     tiers: &std::collections::BTreeMap<String, Vec<SlabSet>>,
     lineage: &[bf_wal::Lineage],
     building: &BTreeSet<String>,
+    bulk: bool,
     compacting: bool,
 ) -> Decision {
     let classes = crate::lineage::classes(segments, tiers, lineage);
@@ -302,6 +305,9 @@ fn decide_beside(
         if outside > 0
             && outside as f64 >= (DELTA_SHARE * base_rows).max(DELTA_GROWTH * beside as f64)
         {
+            if bulk {
+                return Decision::Wait("bulk_load");
+            }
             if compacting {
                 return Decision::Wait("compaction");
             }
@@ -750,6 +756,21 @@ fn scratch_dir(engine: &Engine) -> std::path::PathBuf {
         .join("blowfish-recluster")
 }
 
+/// Recent load-rate flushes establish that writes are a bulk load. Its history survives restarts,
+/// while write recency and an unindexed tail distinguish an active load from a completed one.
+fn loading(state: &crate::NamespaceState, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let recent = state
+        .bulk_load_at
+        .is_some_and(|at| now.signed_duration_since(at).to_std().unwrap_or_default() < BULK_WINDOW);
+    recent
+        && (state.seq > state.indexed_through
+            || now
+                .signed_duration_since(state.updated_at)
+                .to_std()
+                .unwrap_or_default()
+                < LOAD_QUIET)
+}
+
 /// Recover only unlocked process directories; live builds in other engines and processes stay.
 pub(crate) fn sweep_spills(engine: &Engine) {
     if let Err(error) = recluster::spill::sweep(&scratch_dir(engine)) {
@@ -806,12 +827,7 @@ impl Engine {
             // under steady writes), waiting for it would leave the new rows outside the tiers.
             let compacting =
                 !crate::indexer::tier(&state, &self.0.config, false, &protected).is_empty();
-            let bulk = state.bulk_load_at.is_some_and(|at| {
-                (chrono::Utc::now() - at)
-                    .to_std()
-                    .is_ok_and(|since| since < BULK_WINDOW)
-                    || at > chrono::Utc::now()
-            });
+            let bulk = loading(&state, chrono::Utc::now());
             let (decision, numbers) = match &building {
                 // Beside a base building here, only a delta over the rows outside it.
                 Some(building) => (
@@ -820,6 +836,7 @@ impl Engine {
                         &state.ann_tiers,
                         &state.lineage,
                         building,
+                        bulk,
                         compacting,
                     ),
                     None,
@@ -842,7 +859,14 @@ impl Engine {
             Decision::Nothing => return,
             Decision::Wait(reason) => {
                 defer(ns, reason, numbers);
-                self.0.jobs.retry_later(ns, RETRY_DEFERRED);
+                self.0.jobs.retry_later(
+                    ns,
+                    if reason == "bulk_load" {
+                        LOAD_QUIET
+                    } else {
+                        RETRY_DEFERRED
+                    },
+                );
                 return;
             }
             Decision::Build(attr, why) => (attr, why),
@@ -1158,6 +1182,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_bulk_load_finishes_after_a_short_quiet_period_and_an_indexed_tail() {
+        let now = chrono::Utc::now();
+        let mut state = crate::NamespaceState {
+            bulk_load_at: Some(now),
+            updated_at: now,
+            seq: 9,
+            indexed_through: 9,
+            ..Default::default()
+        };
+        assert!(loading(&state, now));
+        let quiet = now + chrono::Duration::from_std(LOAD_QUIET).unwrap();
+        assert!(!loading(&state, quiet));
+        // Include delete-only tails, whose document map is empty.
+        state.seq += 1;
+        assert!(loading(&state, quiet));
+        state.indexed_through = state.seq;
+        assert!(!loading(&state, quiet));
+        // Persisted load history never delays a quiet namespace on restart.
+        assert!(!loading(&state, now + chrono::Duration::seconds(60)));
+        // A later steady stream no longer inherits the bulk-load classification.
+        state.updated_at = now + chrono::Duration::seconds(301);
+        state.seq += 1;
+        assert!(!loading(&state, state.updated_at));
+        state.bulk_load_at = None;
+        assert!(!loading(&state, now));
+    }
+
+    #[test]
     fn a_generation_is_evaluated_once_unless_a_deferral_comes_due() {
         let jobs = Jobs::default();
         assert!(jobs.evaluate("n", 7));
@@ -1228,23 +1280,27 @@ mod tests {
         // Everything outside the tiers is in the base building: nothing to do, though a delta
         // would be due without it.
         assert_eq!(
-            decide_beside(&segments, &tiers, &[], &building, false),
+            decide_beside(&segments, &tiers, &[], &building, false, false),
             Decision::Nothing
         );
         // Rows written since it started: below the delta share of the base, then above it.
         segments.push(segment("e", 30_000));
         assert_eq!(
-            decide_beside(&segments, &tiers, &[], &building, false),
+            decide_beside(&segments, &tiers, &[], &building, false, false),
             Decision::Nothing
         );
         segments.push(segment("f", 20_000));
         assert_eq!(
-            decide_beside(&segments, &tiers, &[], &building, false),
+            decide_beside(&segments, &tiers, &[], &building, false, false),
             Decision::Build("v".into(), "delta")
         );
         assert_eq!(
-            decide_beside(&segments, &tiers, &[], &building, true),
+            decide_beside(&segments, &tiers, &[], &building, false, true),
             Decision::Wait("compaction")
+        );
+        assert_eq!(
+            decide_beside(&segments, &tiers, &[], &building, true, false),
+            Decision::Wait("bulk_load")
         );
     }
 
@@ -1278,10 +1334,10 @@ mod tests {
             decide(&loaded, &none, &[], None, false, true).0,
             Decision::Wait("compaction")
         );
-        // No base yet, so uncovered rows exceed covered ones: a load does not hold the first one.
+        // No base yet: an active load still waits, rather than building throwaway tiers.
         assert_eq!(
             decide(&loaded, &none, &[], None, true, false).0,
-            Decision::Build("v".into(), "base")
+            Decision::Wait("bulk_load")
         );
     }
 
@@ -1312,9 +1368,15 @@ mod tests {
             decide(&segments, &tiers, &[], None, false, false).0,
             Decision::Build("v".into(), "delta")
         );
-        // While a load runs, it waits until the load outgrows what is covered.
+        // While a load runs, a delta waits too.
         assert_eq!(
             decide(&segments, &tiers, &[], None, true, false).0,
+            Decision::Wait("bulk_load")
+        );
+        let mut growing = segments.clone();
+        growing.push(segment("bulk", 1_000_000));
+        assert_eq!(
+            decide(&growing, &tiers, &[], None, true, false).0,
             Decision::Wait("bulk_load")
         );
         // With a 20K delta installed, the next one waits for 4% of the base again (the delta's

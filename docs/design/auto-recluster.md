@@ -111,9 +111,12 @@ The indexer evaluates this after each publication, from manifest numbers only, s
 4. **Merge:** the delta reaches half the base, or masked rows reach 20% of a tier. (Round R3 estimates masked rows
    from manifest numbers: the tiers' rows minus the live rows outside the uncovered segments.) All rows are rebuilt into a new
    base, and the delta is dropped.
-5. **Bulk-load guard:** while a bulk load is running (the indexer flushed in bulk mode in the last 5 minutes),
-   steps 2 to 4 wait, unless uncovered rows exceed the covered rows. A load-then-query namespace therefore pays
-   about one full build after the load, plus at most a few doubling builds during it.
+5. **Bulk-load guard:** a bulk-rate flush in the last 5 minutes classifies the namespace as recently loading.
+   While it has an unindexed tail or its last write was less than 2 seconds ago, steps 2 to 4 wait,
+   including a first base with no covered rows and a delta beside an existing base build. No doubling
+   exception starts intermediate tiers. Once writes have been quiet for 2 seconds and indexing has caught up,
+   the guard releases; its deferred evaluation retries every 2 seconds, even without a new publication.
+   Queries keep searching segments and any existing tiers during the load. Format upgrades still run.
 6. **Compaction first:** a build starts only when the indexer would not compact now (`tier()` without `force`
    returns nothing). Otherwise the build would cover segments that are about to disappear. (Round R3 first asked
    `tier()` with `force`, which lists merges the indexer defers while a long write tail is pending: under 1,000
@@ -233,9 +236,9 @@ layout until the new one is published.
 | Storage overlap (old and new tier until GC, 1 h) | negligible | 238 GB-hours, about $0.01 |
 | Steady growth to this size, total build work | 3.7 times one base build | 3.9 times, about 6.5 h of 8-vCPU time spread over the load |
 
-At 100M, a load-then-query namespace pays about one base build after the load (1.7 to 3 h), plus doubling builds
-while the guard trips. On a single c7gd.2xlarge doing both, the job takes CPU from ingest. The bulk-load guard
-exists so that it mostly doesn't.
+At 100M, a load-then-query namespace pays one base build after the load (the historical build took 1.7 to
+3 h), without intermediate doubling builds. The bulk-load guard reserves build CPU for ingest until the
+load settles; queries remain available against segments throughout.
 
 ## How to measure success
 
