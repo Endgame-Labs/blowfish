@@ -11,6 +11,7 @@ mod indexer;
 #[cfg(test)]
 mod ingest_benchmark;
 mod lineage;
+mod local_ann;
 mod pattern;
 mod plan;
 mod read_cache;
@@ -478,11 +479,15 @@ impl Engine {
     }
     /// Configure indexing, tail limits, retention, and ANN behavior explicitly.
     pub fn with_config(store: Storage, config: EngineConfig) -> Self {
+        let stop: Arc<stop::Stop> = Arc::default();
         let engine = Self(Arc::new(Inner {
-            read_cache: Arc::new(read_cache::DecodedCache::new(
-                config.decoded_cache_bytes,
-                config.search_concurrency,
-            )),
+            read_cache: Arc::new(
+                read_cache::DecodedCache::new(
+                    config.decoded_cache_bytes,
+                    config.search_concurrency,
+                )
+                .with_store(&store, stop.clone()),
+            ),
             queries: Arc::new(tokio::sync::Semaphore::new(config.query_concurrency.max(1))),
             recall_sampler: Arc::new(RecallSampler::new(config.recall_sample_interval)),
             store,
@@ -490,15 +495,15 @@ impl Engine {
             owner: uuid::Uuid::new_v4(),
             namespaces: Mutex::new(HashMap::new()),
             jobs: Default::default(),
-            stop: Arc::default(),
+            stop,
         }));
         bf_alloc::adaptive_decay();
         auto_recluster::sweep_spills(&engine);
         indexer::start(&engine);
         engine
     }
-    /// Drop every cache the engine and its store hold, including resident namespace state, so
-    /// the next query is cache-cold on a warm process. For benchmarks only.
+    /// Drop query caches and resident namespace state, retaining provisioned immutable ANN
+    /// files. The next query has cold query caches on a provisioned node. For benchmarks only.
     pub async fn drop_caches(&self) {
         self.0.read_cache.clear();
         self.0.store.drop_caches();
@@ -785,6 +790,7 @@ impl Engine {
             ..read_cache::ReadContext::new(self.0.read_cache.clone())
         };
         let ann_rows = context.ann_rows.clone();
+        let local_ann_bytes = context.local_ann_bytes.clone();
         let document_scan_rows = context.document_scan_rows.clone();
         let cached = if matches!(request.consistency, Consistency::Strong) {
             let handle = self.handle(ns).await?;
@@ -885,9 +891,11 @@ impl Engine {
                 .await;
             });
         }
+        let mut cache_stats = stats.snapshot();
+        cache_stats.disk_bytes += local_ann_bytes.load(std::sync::atomic::Ordering::Relaxed);
         response.performance = QueryPerformance {
-            cache_hit_ratio: stats.cache_hit_ratio(),
-            cache_temperature: stats.temperature().into(),
+            cache_hit_ratio: cache_stats.cache_hit_ratio(),
+            cache_temperature: cache_stats.temperature().into(),
             server_total_ms: start.elapsed().as_millis() as u64,
             query_execution_ms: execution_elapsed.as_millis() as u64,
             exhaustive_search_count: state.docs.len() as u64,
@@ -913,7 +921,7 @@ impl Engine {
             snapshot_elapsed,
             execution_elapsed,
             backend: backend.snapshot(),
-            cache: stats.snapshot(),
+            cache: cache_stats,
             ann_rows_scanned: ann_rows.load(std::sync::atomic::Ordering::Relaxed),
             document_scan_rows: document_scan_rows.load(std::sync::atomic::Ordering::Relaxed),
         };

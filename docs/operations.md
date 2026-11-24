@@ -76,6 +76,8 @@ workload; hitting `MemoryMax` can kill the process. On `429` backpressure and `5
 storage errors, blowfish emits `Retry-After`, `retry-after-ms`, and `x-should-retry` headers so
 official SDKs back off automatically.
 
+**Local ANN staging.** With an S3-compatible backend and a disk cache directory, blowfish copies each recluster tier's routing directory and vector codes (not the full vectors, which stay in object storage) to local disk after the tier is first queried, and serves later cold queries from that copy. Files go in `<storage.cache.disk_dir>/ann-staging-v1/`, one locked directory per running process; directories left by a stopped process are removed at startup. The budget is the smaller of 20 GiB and a quarter of the free space on that filesystem when the process starts; it is separate from `storage.cache.disk_bytes`. Files are keyed by tier generation and checksummed, so a new tier replaces the old files and a damaged file is rebuilt. If staging cannot finish (budget, disk error, or a failed copy), queries keep reading from object storage. Staging adds about 1.6 GB of disk for 10M vectors and 16.3 GB for 100M at 1,024 dimensions, publishes in 13 s and 144 s respectively, and cuts cold p50 from 325 to 220 ms at 10M and from 715 to 400 ms at 100M (in-region S3, same results). The local filesystem backend skips staging, since its objects are already memory-mapped. There is no setting: delete the directory to reclaim the space.
+
 When an upstream proxy terminates HTTPS, Caddy can listen on an internal HTTP port:
 
 ```caddyfile

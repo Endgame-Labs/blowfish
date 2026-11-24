@@ -154,6 +154,10 @@ log entry in the same commit.
 - **One machine, warm vectors:** match or beat Qdrant's 16-client q/s at equal recall@10 (0.95 and 0.96) on the same
   Apple M4 with BEIR NQ, without regressing cold queries from S3 (2026-11-24). Design changes are allowed; a winning
   design replaces the old one.
+- **Local ANN staging (2026-11-24):** with remote storage and a disk cache directory, recluster-tier routing and
+  codes are staged on local disk automatically (smaller of 20 GiB and a quarter of free disk; no setting). Vectors and
+  the source of truth stay in object storage, and S3-cold behavior must not regress. Cold results are reported both
+  disk-staged and pure S3-cold.
 - Engineering moves in iterations: profile, diagnose, fix, wipe the data, and measure again. When hill-climbing stops
   paying off, test bigger hypotheses on a branch, even ones that change the index layout or the storage scheme
   (2026-11-17).
@@ -258,3 +262,6 @@ S3 until the run is cleaned up.
     have to change design to make it so, so be it"). If two rounds of profiling and tuning don't get there, switch to
     divergent ideation across several models, including side-by-side studies of Qdrant's implementation, and test the
     best ideas from each.
+28. 2026-11-24: Stage each recluster tier's routing directory and codes on local disk automatically when a disk cache is
+    configured (round C4): 10M cold p50 325 to 220 ms and 100M 715 to 400 ms at identical results, warm NQ +4-5%. Kyle
+    gave release authority (2026-11-23) and asked that each changelog-worthy change ship as a release (2026-11-24).

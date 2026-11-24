@@ -5,7 +5,8 @@
 //! be under `.scratch/`. Copy a quiescent checkpoint first, and delete the owned
 //! prefix after measurement. Existing scale prefixes are never writable here.
 //! Use `--upgrade-only` to prepare an unchanged-center control before copying it
-//! and rebuilding leaves. The normal run upgrades old objects before rebuilding.
+//! and rebuilding leaves. Normal rebuilds read legacy vectors without rewriting their indexes,
+//! document columns, or the old slab tier.
 use bf_engine::{Engine, EngineConfig, ReclusterOptions};
 use bf_storage::{Storage, StorageConfig};
 use std::{error::Error, path::PathBuf};
@@ -49,17 +50,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ..EngineConfig::from_env()
         },
     );
-    // A quiescent copy may predate the single-object ANN layout. Finish the normal
-    // automatic upgrade before building leaves; this does not retrain its centers.
-    let upgrade = engine.reindex(&args[1], &Default::default()).await?;
-    eprintln!(
-        "upgraded {} segments, {} slabs, and {} documents in {:.3}s",
-        upgrade.converted_segments,
-        upgrade.converted_slabs,
-        upgrade.converted_documents,
-        upgrade.seconds
-    );
     if args.len() == 5 {
+        let upgrade = engine.reindex(&args[1], &Default::default()).await?;
+        eprintln!(
+            "upgraded {} segments, {} slabs, and {} documents in {:.3}s",
+            upgrade.converted_segments,
+            upgrade.converted_slabs,
+            upgrade.converted_documents,
+            upgrade.seconds
+        );
         return Ok(());
     }
     let report = engine

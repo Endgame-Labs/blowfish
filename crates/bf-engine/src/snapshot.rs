@@ -199,6 +199,7 @@ impl OpenHint {
                                 prefetched.get(&name),
                                 vector,
                                 config,
+                                attribute,
                             )
                             .await?;
                             // Everything this query touches is already in memory: the scan's
@@ -597,7 +598,15 @@ pub(crate) async fn catch_up_hinted(
                         got
                     }
                 });
-                found.extend(futures::future::join_all(reads).await.into_iter().flatten());
+                found.extend(
+                    crate::read_cache::scope_hints(
+                        hint.context.clone(),
+                        futures::future::join_all(reads),
+                    )
+                    .await
+                    .into_iter()
+                    .flatten(),
+                );
             }
             found
         });

@@ -8633,3 +8633,252 @@ work. An incorrect experimental residency guard was caught by its unchanged larg
 was corrected before committing. Earlier pre-C3 measurements are not substituted for the
 construction gates, and the newest reader merge is not claimed as a new full-corpus construction
 run.
+
+## Round C4: cold-query kill tests
+
+C4 screens four ways to remove cold reads before changing an index format or query policy.
+The early-witness, directory-code, and stored projection-bound screens reject those implementations.
+Provisioned local routing and code reads pass the optimistic screen, and are implemented automatically.
+
+### Method and controls
+
+The 10M workload is C3's 200 oracle queries, and the 100M workload is C2's first 60.
+Initial screens use owned in-region c7gd.4xlarge instances, with 16 vCPUs, 32 GiB RAM,
+and local NVMe. Final qualification uses one m6id.16xlarge, with 64 vCPUs, 256 GiB RAM,
+and local NVMe. Every comparison pairs the control and candidate on the same host and
+copied tier. Existing source prefixes remain read-only.
+Cold replays alternate arm order, clear the ordinary application caches, keep connections
+warm, and retain the existing strong consistency check. Each arm uses eight Rayon threads,
+8 GiB payload memory, 512 MiB decoded metadata, 4,000-byte blocks, and 512-request concurrency.
+Physical GET attempts include hedges; completed bytes exclude cancelled reads.
+
+The 100M copied layout reproduces C2's **0.951667 recall** and **809,325 mean planned rows**.
+The 10M copy is upgraded without retraining before rebuilding its 640-row tier with the
+current builder. The final 100M comparison also rebuilds a fresh 640-row tier, and compares
+the candidate against a current-main query control over that exact same tier. The initial
+100M screens use C2's unchanged copied tier. These two comparisons are kept separate.
+No historical layout substitutes for a fresh same-builder control.
+
+A spot interruption destroyed the first host's local files before the 10M rebuild finished.
+The replacement is on demand. Subsequent binaries, summaries, and query records are saved
+to the owned temporary prefix after each completed step, and leaf-bound records after each
+query. Only completed measurements are reported; interrupted preparation is charged to cost.
+
+### More precise directory codes: rejected at high recall
+
+The offline test maps each exact oracle neighbor to its stored leaf, then ranks every leaf
+using the production one-bit directory score, cell-centered SQ4, or its exact f32 center.
+This measures **leaf coverage**, rather than full ANN recall: it excludes row-code pruning,
+the rerank cap, and hydration. The one-bit paged simulation reproduces the 100M engine's
+0.951667 recall, so the membership and page-selection replay agree with the live plan.
+
+SQ4 uses four bits per residual coordinate, plus each row's minimum and scale. At 100M,
+centering groups are the actual paged-directory cells. The offline exact arm is favorable:
+its additional center bytes and ranking CPU are not charged.
+
+| Corpus and leaf-coverage target | One-bit probes | SQ4 probes | Exact-center probes | SQ4 / exact reduction |
+| --- | ---: | ---: | ---: | ---: |
+| 10M, 0.960000 | 257 | 233 | 227 | 9.34% / 11.67% |
+| 10M, 0.970000 | 344 | 304 | 297 | 11.63% / 13.66% |
+| 100M default full-directory coverage, 0.953333 | 3,065 | 2,884 | 2,817 | 5.91% / 8.09% |
+| 100M, 0.960000 | 5,019 | 3,729 | 3,773 | 25.70% / 24.83% |
+| 100M, 0.970000 | 5,530 | 5,258 | 5,139 | 4.92% / 7.07% |
+
+The benefit depends on the quality point. The 0.96 point is promising, but even exact centers
+save only **7.07%** at 0.97, below the 15% kill threshold. SQ4 misses the required 25% reduction
+there before paying for a larger directory. At 10M, exact centers save less than 15% at both
+quality targets. The one-bit replay reproduces C3's entire tested 48/56/64/70/80-unit curve: .9560,
+.9620, .9660, .9700, and .9730 coverage, respectively.
+
+At the default 3,200-leaf probe budget, better page routing also fails the required margin:
+
+| Page margin | One-bit coverage | SQ4 coverage | Exact-center coverage |
+| --- | ---: | ---: | ---: |
+| 2x | 0.888333 | 0.906667 | 0.906667 |
+| 3x | 0.913333 | 0.928333 | 0.928333 |
+| 4x | 0.930000 | 0.941667 | 0.941667 |
+| 8x | 0.950000 | 0.953333 | 0.953333 |
+| 16x | 0.951667 | 0.955000 | 0.955000 |
+
+SQ4 needs 8x to preserve the ordinary 16x one-bit quality. At the requested 4x, it loses
+0.010000 absolute coverage. No four-bit directory format or page-margin change is retained.
+
+### Per-leaf projection bounds: the tested bounds do not prune
+
+The 100M offline replay reads exact f16 vectors from the 3,200 leaves selected by the normal
+paged plan. Four nearest seed leaves provide an exact tenth-best distance. An oracle minimum
+for every remaining leaf would retain **66.55 leaves** on average, a 97.92% reduction. With the
+final exact tenth-best distance provided for free, only **7.97 leaves** remain. Exact search
+within the selected leaves recalls **0.951667**, matching the engine's mean over the same 60 queries.
+
+That opportunity does not survive the tested stored bounds. Per-coordinate intervals over
+normalized leaf vectors, at 16, 64, 128, 256, and all 1,024 coordinates, retain **all 3,200 leaves
+on every query**. The centroid-radius sphere bound does too. These are conservative lower
+bounds on normalized squared distance; accepting a leaf only costs more work, so floating
+point slack cannot explain the absence of pruning.
+
+The experiment rejects these interval and sphere representations, not every possible
+projection construction. Their extra metadata is not worth implementing when they eliminate
+no reads. Query-specific exact minima are an oracle, and cannot be stored ahead of an
+arbitrary future query. No projection metadata or on-disk format is retained.
+
+
+### Early exact witnesses: the actual pool is smaller than assumed
+
+On the fresh 640-row 10M build, all 200 requests reproduce **0.9700 recall** and
+**227,173.84 mean planned rows**. The ordinary pool after shared and global upper-bound pruning
+contains **81.225 candidates** on average, rather than the proposed 250–320. Using the exact
+k-th distance from the existing early batch leaves **66.100**, an 18.62% reduction. This misses
+the required **at most 60 survivors**. A free final exact k-th distance leaves **31.015**;
+that is a stronger witness than the early subset actually provides.
+
+This diagnostic counts eligibility without applying the new cut. Its instrumentation returns
+identical ordered IDs and distances to the control on all 200 queries, but does not establish
+the recall of a counterfactual pruned search. It stops at the failed count screen. Waiting for
+all speculative reads also includes document prefetches, so the diagnostic's extra wait is
+not presented as the cost of a feedback implementation. No exact-witness pruning ships.
+
+### Charged oracle minima: extra seed reads consume the benefit
+
+The 60-query 100M replay charges four full-vector seed-leaf reads, and a separate
+1,999,680-byte S3 metadata read per query, while retaining ordinary directory paging.
+It then scans only the leaves allowed by the exact minima. This favorable diagnostic
+reduces mean GETs from **2,239.05 to 653.78**, completed bytes from **170.50 MB to 29.59 MB**,
+and planned rows from **809,325 to 21,728**. Its p50 is **594.90 ms**, versus **613.71 ms**
+for the paired control; p90 is **783.02 ms**, versus **825.30 ms**. All 60 ordered ID and
+distance lists match. The serial seed wave consumes most of the transfer saving, even
+with query-specific oracle metadata. This is a charged screen, rather than a mathematical
+lower bound on every possible leaf-skipping implementation.
+
+### Local routing and codes: optimistic screen passes
+
+Only the immutable directory, page-routing data, cluster blobs, and code prefixes are
+copied to local NVMe. Exact vectors, result attributes, IDs, manifests, and consistency
+reads remain in S3. Before every staged sample the harness flushes these local files,
+and uses `posix_fadvise(DONTNEED)` on every file. The files exist, but their filesystem
+pages begin cold. This measures a **provisioned node**, and is not a claim that the data
+can be absent from every cache and local disk simultaneously.
+
+| Copied layout | Arm | p50 / p90 ms | Recall@10 | Mean physical GETs | Mean completed MB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Fresh 640-row 10M, 200 pairs | S3 control | 303.56 / 404.26 | 0.970000 | 351.05 | 47.63 |
+| Fresh 640-row 10M, 200 pairs | Provisioned local codes | 181.76 / 236.83 | 0.970000 | 124.01 | 5.06 |
+| C2 copied 100M, 60 pairs | S3 control | 613.71 / 825.30 | 0.951667 | 2,239.05 | 170.50 |
+| C2 copied 100M, 60 pairs | Provisioned local codes | 329.07 / 497.38 | 0.951667 | 257.37 | 5.14 |
+
+Ordered IDs and distances match on every pair, and planned rows are identical. The 10M
+screen passes the 250 ms p50 gate. Staging occupies **1,634,850,410 bytes** across 60 files
+at 10M, and **18,761,279,160 bytes** on the old 100M layout. The 10M prototype takes
+**3.642 seconds** to provision, including flushing and page eviction. Its first HTTP
+query after provisioning takes **151.09 ms**, for **3.793 seconds** combined. These are
+prototype preparation costs; the automatic implementation's first query and background
+publication are measured separately below.
+
+An initial prototype left the streaming bulk-prefetch path downloading codes from S3,
+even though normal range reads used the local files. Those partial-staging timings are
+discarded. The reported replay bypasses those redundant reservations as well.
+
+### Automatic implementation and operational limits
+
+The engine observes a queried immutable ANN tier, and asynchronously copies its routing
+and code prefixes beneath the existing disk-cache directory. It publishes the stage only
+after every file has been written, flushed, and checksummed. A query never waits for this
+preparation: an unavailable, incomplete, oversized, or corrupt stage falls back to S3.
+Each 16 KiB block is verified before use. Exact-vector ranges extend beyond the staged
+prefix, and continue through the ordinary object-store reader.
+
+The automatic budget is the smaller of **20 GiB** and **one quarter of free filesystem
+space** when the engine opens. Admission also requires twice the proposed stage's bytes
+still free. This is additional local provisioning beside the ordinary block-cache budget.
+Only one preparation runs per engine. At most 128 tiers and 4,096 file records are admitted;
+least-recently-used tiers are evicted, and their disk reservation remains charged until
+active readers finish. A failed preparation backs off for 60 seconds. Storage-scoped keys
+separate tenants that happen to use the same object names. Native mapped local storage
+already has locality, and does not receive a duplicate stage.
+
+A storage view without a staging manager returns before cloning the query context, so
+local mapped NQ reads and memory-only configurations avoid that work. Snapshot hint
+prefetches enter the query cache scope while preserving their snapshot-stage accounting.
+
+Stages belong to one engine lifetime. Shutdown cancels preparation, and removes owned files;
+a later engine reclaims directories whose ownership locks are no longer held. A restart
+prepares the data again. The first query therefore carries normal cold S3 costs, plus any
+contention with background preparation. There is no new product setting, storage format,
+query parameter, or requirement to put exact vectors on local disk.
+
+A narrow source-reader fix lets reclustering read legacy ANN vector objects directly.
+Training, assignment, and encoding use the same builder. Rebuilding a frozen copy no
+longer requires rewriting superseded code layouts, document columns, and its old slab tier
+first. A parity test checks identical current-builder centers and query results from modern
+and legacy f16 sources with deleted rows, and verifies that legacy source bytes stay intact.
+
+### Production qualification
+
+Final controls use current-main revision `557fc8f` over the exact same fresh tier as the candidate.
+The candidate includes that revision too, including its warm-query scheduling and resident scans.
+Both layouts are rebuilt with the unchanged current training and encoding code: the 10M
+640-row tier on c6id.8xlarge, and the 100M 640-row tier on m6id.16xlarge. The final query
+replays all run on m6id.16xlarge. The 10M rebuild takes **290.99 seconds**, producing
+15,611 leaves across 55 slabs. The 100M rebuild takes **3,618.19 seconds**, producing
+156,226 leaves across 418 slabs, and a 32,472,078-byte flat directory. These preparation
+costs are separate from query latency. The namespace name, strong consistency check, default
+64-unit request, automatic 70/64 adjustment for 640-row leaves, rerank cap, and hydration
+are identical within every pair.
+
+Staged data exists on local disk throughout the measurement. Every sample clears ordinary
+query/block caches, flushes the staged files, and evicts their filesystem pages. HTTP
+connections remain warm. Query order alternates AB/BA. Results are checkpointed between
+measured batches, and between warm epochs, with no upload overlapping a timed query.
+The harness records the first HTTP query after process readiness and the wall time from
+that request until the complete stage is published.
+
+The warm NQ workload uses all 3,452 queries over a frozen 2,681,468-vector, 200-row tier.
+Sixteen clients run against eight pinned server CPUs. Each 48/64-probe arm has two
+independent processes in forward/reverse order, two full warm epochs, and two measured
+epochs per process. Cache hit ratio must be 1.0, tail rows must be zero, and all ordered
+ID lists must agree across arms and repetitions.
+
+| Fresh layout | Arm | p50 / p90 ms | Recall@10 | Mean physical GETs | Mean completed MB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 10M, 200 pairs | Current-main S3 control | 324.94 / 451.84 | 0.968000 | 350.71 | 47.51 |
+| 10M, 200 pairs | Automatic local codes | 219.61 / 312.49 | 0.968000 | 140.16 | 5.85 |
+| 100M, 60 pairs | Current-main S3 control | 714.94 / 1022.89 | 0.965000 | 909.78 | 137.84 |
+| 100M, 60 pairs | Automatic local codes | 399.82 / 508.25 | 0.965000 | 157.37 | 4.68 |
+
+The candidate passes the 10M **250 ms p50** and **235 GET** gates. Neither corpus has a
+p90 regression. Ordered IDs, exact distances, and planned rows agree on every one of
+the 260 pairs; recall delta is **zero** against each fresh same-builder control. Mean
+planned rows are **227,134.705** at 10M, and **762,327.433** at 100M in both arms.
+The fresh 100M recall of **0.965000** is kept separate from the old C2 layout's
+**0.951667** used in the screens.
+
+Automatic provisioning is a node cost, measured separately from the paired samples:
+
+| Fresh layout | Files | Local bytes | First HTTP query ms | Stage ready after first request s |
+| --- | ---: | ---: | ---: | ---: |
+| 10M | 56 | 1,615,240,267 | 403.97 | 13.362 |
+| 100M | 420 | 16,299,674,984 | 598.88 | 143.577 |
+
+The first request completes using the normal S3 path while preparation continues. The
+ready time includes writing and flushing the complete stage. A restart incurs preparation
+again. Provisioned files exist on disk in every paired sample, with their filesystem pages
+evicted before the query.
+
+| Warm NQ probes | Recall@10, both arms | Control median q/s | Candidate median q/s | Change |
+| --- | ---: | ---: | ---: | ---: |
+| 48 | 0.950492 | 2,762.83 | 2,894.45 | +4.76% |
+| 64 | 0.960110 | 2,278.78 | 2,363.29 | +3.71% |
+
+Every measured epoch runs all 3,452 queries through the compiled path, has cache hit
+ratio **1.0**, and has **zero tail rows**. All ordered ID lists match across arms and
+repetitions at each probe count. Peak process RSS stays below **5.48 GB** in both arms.
+Mapped NQ bypasses the staging manager. Warm throughput does not regress in either
+tested probe configuration.
+
+Formatting, strict scoped clippy across all targets, and the complete engine/vector suite
+pass after merging the control revision: **261 tests pass, zero fail, and 11 are ignored**.
+The two changed example fixtures pass too. Six staging tests cover range checksums and
+corrupt-file fallback, storage/generation isolation, reservation and cancellation, eviction
+with an active reader, live/orphan ownership, and query-cache-drop parity and hint accounting.
+The legacy-source parity fixture verifies current-builder centers, deleted rows, ordered
+results, and unchanged source bytes.

@@ -528,6 +528,10 @@ impl PagedDirectory {
     pub fn cell_count(&self) -> usize {
         self.cells.len()
     }
+    /// The unpadded vector dimension shared by the directory's segments.
+    pub fn dims(&self) -> usize {
+        self.shape.dims
+    }
     /// Entries in all pages together.
     pub fn entry_count(&self) -> u64 {
         self.heads.iter().map(|h| h.entry_count).sum()

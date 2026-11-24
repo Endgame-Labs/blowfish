@@ -478,7 +478,8 @@ async fn from_slabs(
     prefetched: Option<&crate::ann_dir::Prefetched>,
     seat: Option<&crate::ann_dir::Seat>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    let Ok((dir, _)) = crate::ann_dir::slab_directory(store, set, prefetched, vector, config).await
+    let Ok((dir, _)) =
+        crate::ann_dir::slab_directory(store, set, prefetched, vector, config, attribute).await
     else {
         return Ok(None);
     };

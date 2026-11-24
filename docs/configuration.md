@@ -46,6 +46,8 @@ are errors. Nested storage settings currently follow `bf-storage`'s parser.
 | `storage.cache.prefetch_concurrency` | `--cache-prefetch-concurrency` | `BLOWFISH_CACHE_PREFETCH_CONCURRENCY` | `4` |
 | `storage.cache.hedge_budget` | — | `BF_HEDGE_BUDGET` | `0.1` (`0` disables hedged ranged reads) |
 
+With a disk cache directory and an S3-compatible backend, `storage.cache.disk_dir` also holds staged recluster-tier routing and code files (`ann-staging-v1/`), budgeted at the smaller of 20 GiB and a quarter of free disk, separately from `disk_bytes`. See [operations](operations.md#running-under-systemd-with-caddy) (Local ANN staging).
+
 ### Models (native embedding and reranking)
 
 `[models."<name>"]` tables map the model names clients use (for example `google/embeddinggemma-2`, or

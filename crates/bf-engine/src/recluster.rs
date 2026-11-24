@@ -171,16 +171,13 @@ impl Engine {
         let store = &self.0.store;
         let attr = opts.attribute.as_str();
         let wal = Wal::new(store.clone(), ns).map_err(log_error)?;
-        let (ann_key, frag_key) = (format!("annv2:{attr}"), format!("annv2:{attr}"));
+        let ann_key = format!("annv2:{attr}");
         if segments.is_empty()
             || segments
                 .iter()
-                .any(|s| !s.files.contains_key(&ann_key) || !s.files.contains_key(&frag_key))
+                .any(|s| crate::upgrade::files(s, attr).is_none())
         {
-            return Err(ApiError::new(
-                400,
-                "every segment needs an ANN index and a block fragment",
-            ));
+            return Err(ApiError::new(400, "every segment needs an ANN index"));
         }
 
         // Global row numbers: segment bases in manifest order.
@@ -664,7 +661,14 @@ async fn segment_index(
     seg: &Segment,
     key: &str,
 ) -> Result<Arc<bf_vector::Index<segment::ObjectReader>>, ApiError> {
-    let file = &seg.files[key];
+    // Training reads stored vectors, not the code layout or the old slab tier. The vector
+    // reader already understands old indexes, so a rebuild need not first rewrite them.
+    let legacy = key.strip_prefix("annv2:").map(|attr| format!("ann:{attr}"));
+    let file = seg
+        .files
+        .get(key)
+        .or_else(|| legacy.as_ref().and_then(|key| seg.files.get(key)))
+        .ok_or_else(|| segment::index_error("recluster source has no ANN index"))?;
     bf_vector::Index::open_with_metadata_len(
         segment::ObjectReader::new(store, file).bypass_cache(),
         file.metadata_len,
