@@ -4,6 +4,26 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Fix: WAL payloads orphaned after a failed write group** (round WF1). When a group's slot commit failed,
+  the pipeline cancelled the later groups' uploads and deleted their payloads at once; a PUT already in flight
+  could land after the DELETE and stay forever. Cleanup now lets an abandoned upload finish before deleting its
+  payload, and GC reclaims expired payloads that no committed slot references, independent of checkpoint
+  progress (including after a restart and before the first manifest). Before deleting a payload in an empty
+  slot range, GC fills the gap with empty WAL entries, so a paused writer loses its conditional commit instead of
+  publishing a reference to deleted data. Acknowledged-write semantics are unchanged. A deterministic test forces
+  the PUT-after-DELETE ordering (20 of 20 failures before, none after), and the pipeline tests passed 200 runs in
+  a row under CPU contention (4% failure before).
+
+- **Text format 7: 1.69x smaller text indexes** (round B5; `docs/benchmarks.md`, "Round B5"). Partial posting
+  blocks now store only their real rows (LEB128 row deltas and term frequencies) instead of padding to 128, and
+  block directories use variable-width records with offsets derived from frame sizes. On 1M MS MARCO
+  passages, the text index went from 336.3 MB to 198.8 MB (a further 40.9% on top of format 6), lossless for
+  every posting and all 56.7M phrase occurrences, with identical scores and ordered hits on 1,000 queries,
+  flat warm CPU, unchanged cold latency (154.8 vs 156.7 ms p50), and build cost +4.4%. Format-6 segments
+  upgrade automatically in the background (about 4 s for 1M rows). Two other ideas were tested and rejected:
+  block-max pruning over clustered 64-document forward blocks (2.2x more instructions) and cross-segment cold
+  term packing (1.04x, below its gate). The BM25 CPU and cold latency targets stay open.
+
 - **Recluster readiness after bulk loads, 2.94x sooner** (round RR1; `docs/benchmarks.md`, "Round RR1").
   An active bulk load now defers recluster builds instead of building and discarding intermediate tiers, and the
   first base starts as soon as the load goes quiet, ahead of the remaining segment compaction (its sources are

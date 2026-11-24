@@ -440,8 +440,8 @@ pub struct Staged {
     uploaded: bool,
 }
 impl Staged {
-    /// A payload that may or may not have been uploaded (an abandoned upload task): `discard`
-    /// then attempts the delete regardless.
+    /// A completed upload with an unknown outcome: `discard` attempts the delete regardless.
+    /// The caller must wait for an abandoned upload to finish before discarding its payload.
     pub fn maybe_uploaded() -> Self {
         Self {
             inline: false,
@@ -540,6 +540,62 @@ impl Wal {
                 .await?;
         }
         Ok(())
+    }
+    /// Reclaim expired, unreferenced payloads whose keys identify their attempted WAL slots.
+    ///
+    /// An empty slot is fenced with an empty entry before deletion: an arbitrarily paused writer
+    /// must lose its conditional commit, rather than publish a reference to a deleted payload.
+    /// Fill earlier gaps in order, preserving the contiguous log. Payloads referenced by occupied
+    /// slots remain intact, regardless of age; checkpoint reclamation is a separate operation.
+    /// Legacy UUID-only keys have no attempted slot to fence and are left untouched.
+    pub async fn collect_orphan_payloads(&self, cutoff: DateTime<Utc>) -> Result<usize, Error> {
+        self.store.check_bucket_format().await?;
+        self.latest_manifest().await?;
+        let mut attempts = std::collections::BTreeMap::<u64, Vec<String>>::new();
+        for object in self
+            .store
+            .list(&format!("ns/{}/wal-data/", self.namespace))
+            .await?
+        {
+            if object.last_modified > cutoff {
+                continue;
+            }
+            let attempt = object
+                .key
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".wal"))
+                .and_then(|name| name.split_once('-'))
+                .filter(|(seq, id)| seq.len() == 20 && Uuid::parse_str(id).is_ok())
+                .and_then(|(seq, _)| seq.parse::<u64>().ok())
+                .filter(|seq| *seq > 0);
+            if let Some(seq) = attempt {
+                attempts.entry(seq).or_default().push(object.key);
+            }
+        }
+        let mut removed = 0;
+        for (seq, keys) in attempts {
+            let record = match self.record(seq).await? {
+                Some(record) => record,
+                None => {
+                    let head = self.head().await?;
+                    for fence in head.saturating_add(1)..=seq {
+                        self.append(fence, &WalEntry::new(vec![])).await?;
+                    }
+                    // Another writer may have won the fence; protect its payload in that case.
+                    self.record(seq).await?.ok_or(Error::Format)?
+                }
+            };
+            let referenced = (!record.tombstone && !record.redacted && record.inline.is_none())
+                .then(|| self.record_payload_key(&record));
+            for key in keys {
+                if referenced.as_ref() != Some(&key) {
+                    self.store.delete(&key).await?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
     /// Second half of an append: the create-only conditional PUT of the slot record. `Conflict`
     /// means another writer holds the slot; the staged payload is deleted and the caller must

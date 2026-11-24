@@ -1104,7 +1104,7 @@ impl Engine {
         crate::ann::stage(t0, "idx done");
         Ok(true)
     }
-    /// Reclaim retired files and checkpointed WAL payloads after the retention window.
+    /// Reclaim retired files, checkpointed WAL payloads, and abandoned uploads after retention.
     /// Permanent WAL slot records continue to fence every stale writer.
     pub async fn collect_garbage(&self, ns: &str) -> Result<usize, ApiError> {
         self.0
@@ -1113,12 +1113,18 @@ impl Engine {
             .await
             .map_err(storage_error)?;
         let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
-        let Some((sequence, mut manifest)) = wal.latest_manifest().await.map_err(log_error)? else {
-            return Ok(0);
-        };
         let grace = chrono::Duration::from_std(self.0.config.retention)
             .unwrap_or(chrono::Duration::hours(1));
         let cutoff = Utc::now() - grace;
+        // This also runs before the first checkpoint, including after a process crashed while
+        // uploading its first groups. Slot fences make it independent of the manifest epoch.
+        let orphans = wal
+            .collect_orphan_payloads(cutoff)
+            .await
+            .map_err(log_error)?;
+        let Some((sequence, mut manifest)) = wal.latest_manifest().await.map_err(log_error)? else {
+            return Ok(orphans);
+        };
         // Start from the resident state when this node has one: a fresh replay would download
         // every unindexed WAL payload again on each collection.
         let mut checkpoint = match self.0.namespaces.lock().await.get(ns).cloned() {
@@ -1127,7 +1133,7 @@ impl Engine {
         };
         catch_up(&wal, &mut checkpoint, &self.0.store).await?;
         if checkpoint.manifest_seq != sequence {
-            return Ok(0);
+            return Ok(orphans);
         }
         let deleting = !checkpoint.exists && !manifest.deleted;
         if deleting {
@@ -1226,13 +1232,13 @@ impl Engine {
             .max()
             .unwrap_or(0);
         if candidates.is_empty() && through == 0 && !deleting {
-            return Ok(0);
+            return Ok(orphans);
         }
         let epoch = manifest.indexer_epoch;
         manifest.indexer_epoch += 1;
         let claim = match wal.publish_fenced(sequence, epoch, &manifest).await {
             Ok(s) => s,
-            Err(bf_wal::Error::Fenced) => return Ok(0),
+            Err(bf_wal::Error::Fenced) => return Ok(orphans),
             Err(e) => return Err(log_error(e)),
         };
         // Reread durable pins AFTER the epoch claim. A new copier either pinned
@@ -1258,10 +1264,10 @@ impl Engine {
                 .map_err(log_error)?;
         }
         let Some((latest, mut manifest)) = wal.latest_manifest().await.map_err(log_error)? else {
-            return Ok(candidates.len());
+            return Ok(candidates.len() + orphans);
         };
         if latest != claim {
-            return Ok(candidates.len());
+            return Ok(candidates.len() + orphans);
         }
         manifest
             .retired
@@ -1275,7 +1281,7 @@ impl Engine {
             Ok(_) | Err(bf_wal::Error::Fenced) => {}
             Err(e) => return Err(log_error(e)),
         }
-        Ok(candidates.len())
+        Ok(candidates.len() + orphans)
     }
 }
 /// A flush of a tail written at least this fast is a bulk load's (NQ loads at about 10,000 rows a
