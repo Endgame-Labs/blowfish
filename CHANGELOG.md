@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Fixed
+
+- **Durable local writes:** `file://` stores now always fsync file data and publication directories before acknowledging WAL, manifest, and segment writes. Newly created directory chains and identical-write recovery also require successful syncs; a visible object can no longer hide an fsync failure. There is no durability toggle. Two dedicated NVMe full-NQ load pairs measured 0.8–1.6% less throughput and 1.8–3.3% higher write p90; sequential one-row writes added 0.14–0.17 ms at p50/p90. S3-compatible stores are unchanged. See [local filesystem durability](docs/operations.md#local-filesystem-durability) for ordering, tests, and measured cost.
+
 ## [0.1.19] - 2026-11-24
 
 ### Performance
