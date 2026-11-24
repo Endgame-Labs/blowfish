@@ -1861,12 +1861,18 @@ impl SegmentReader {
         {
             let mut memo = self.decoded.lock().unwrap();
             for term in &mut terms {
-                term.postings = term
-                    .meta
-                    .blocks
-                    .iter()
-                    .map(|b| memo.get(b.offset))
-                    .collect();
+                // Dense frames are consulted only after window pruning. Probing
+                // them here hashes and retains every common-word frame, including
+                // those that cannot affect the top k.
+                term.postings = if self.sparse_term(term.meta.df) {
+                    term.meta
+                        .blocks
+                        .iter()
+                        .map(|b| memo.get(b.offset))
+                        .collect()
+                } else {
+                    vec![None; term.meta.blocks.len()]
+                };
                 term.small = prefetch
                     && !term.prefix
                     && (term.meta.blocks.len() <= SMALL_BLOCKS
@@ -1958,7 +1964,7 @@ impl SegmentReader {
             term.cache_windows(cached_windows);
         }
         {
-            let maxima = saturation.maxima.lock().unwrap();
+            let mut maxima = saturation.maxima.lock().unwrap();
             for term in &mut terms {
                 let mut best = vec![0.0f64; windows];
                 if term.small {
@@ -1973,25 +1979,42 @@ impl SegmentReader {
                         }
                     }
                 } else {
-                    for b in &term.meta.blocks {
-                        if let Some(windows) = maxima.frames.get(&b.offset) {
-                            // A frame can span many row windows. Its best posting
-                            // cannot make an unrelated window competitive.
-                            for &(w, maximum) in windows {
-                                let bound = f64::from(
+                    let key = term.meta.blocks.first().map(|b| b.offset);
+                    let mut apply = |normalized: &[f64]| {
+                        for (w, &maximum) in normalized.iter().enumerate() {
+                            if maximum >= 0.0 {
+                                best[w] = f64::from(
                                     term.weight.score_saturation(maximum)
                                         * (1.0 + 8.0 * f32::EPSILON),
                                 );
-                                best[w] = best[w].max(bound);
                                 prefix_windows[w] |= term.prefix;
                             }
-                        } else {
-                            let bound = f64::from(b.upper_bound(&term.weight, &saturation));
-                            for w in b.first as usize / BLOCK..=b.last as usize / BLOCK {
-                                // A row occurs in only one of the intersecting frames.
-                                best[w] = best[w].max(bound);
-                                prefix_windows[w] |= term.prefix;
+                        }
+                    };
+                    if let Some(cached) = key.and_then(|key| maxima.term(key)) {
+                        // Reuse query-independent window maxima while the set of
+                        // decoded frame bounds is unchanged. New frames invalidate
+                        // this summary, allowing their tighter bounds to take effect.
+                        apply(cached);
+                    } else {
+                        let mut normalized = vec![-1.0f64; windows];
+                        for b in &term.meta.blocks {
+                            if let Some(windows) = maxima.frames.get(&b.offset) {
+                                for &(w, maximum) in windows {
+                                    normalized[w] = normalized[w].max(maximum);
+                                }
+                            } else {
+                                let maximum = saturation.factor(b.max_tf, b.min_length).max(0.0);
+                                for value in &mut normalized
+                                    [b.first as usize / BLOCK..=b.last as usize / BLOCK]
+                                {
+                                    *value = value.max(maximum);
+                                }
                             }
+                        }
+                        apply(&normalized);
+                        if let Some(key) = key {
+                            maxima.remember_term(key, normalized);
                         }
                     }
                     for (bound, &value) in bounds.iter_mut().zip(&best) {
@@ -2054,9 +2077,17 @@ impl SegmentReader {
             batch_size = usize::MAX;
             if prefetch {
                 let mut wanted = Vec::new();
-                for &(window, _) in &batch {
-                    for (t, term) in terms.iter().enumerate() {
-                        for b in term.span(window) {
+                // A frame can intersect several windows. Sweep their union in
+                // row order, requesting each frame once, without sorting a much
+                // larger vector of duplicate term/frame pairs. Scoring retains
+                // the original descending-bound window order.
+                let mut windows: Vec<_> = batch.iter().map(|&(w, _)| w).collect();
+                windows.sort_unstable();
+                for (t, term) in terms.iter().enumerate() {
+                    let mut after = 0;
+                    for &window in &windows {
+                        let span = term.span(window);
+                        for b in span.start.max(after)..span.end {
                             let meta = &term.meta.blocks[b];
                             if term.postings[b].is_none()
                                 && allowed.is_none_or(|rows| {
@@ -2066,10 +2097,9 @@ impl SegmentReader {
                                 wanted.push((t, b));
                             }
                         }
+                        after = after.max(span.end);
                     }
                 }
-                wanted.sort_unstable();
-                wanted.dedup();
                 self.read_search_blocks(&mut terms, wanted, &saturation, &mut metrics)
                     .await?;
             }
@@ -2131,7 +2161,11 @@ impl SegmentReader {
                                 let Some(postings) = &term.postings[b] else {
                                     continue;
                                 };
-                                let lo = postings.partition_point(|&(row, _)| row < start);
+                                let lo = if term.meta.blocks[b].first < start {
+                                    postings.partition_point(|&(row, _)| row < start)
+                                } else {
+                                    0
+                                };
                                 for &(row, _) in
                                     postings[lo..].iter().take_while(|&&(row, _)| row < end)
                                 {
@@ -2171,8 +2205,20 @@ impl SegmentReader {
                         let Some(postings) = &term.postings[b] else {
                             continue;
                         };
-                        let lo = postings.partition_point(|&(row, _)| row < start);
-                        let hi = postings.partition_point(|&(row, _)| row < end);
+                        // The directory already proves either endpoint when the
+                        // frame begins or ends inside this window. Search only
+                        // the remaining boundary, within the retained suffix.
+                        let block = &term.meta.blocks[b];
+                        let lo = if block.first < start {
+                            postings.partition_point(|&(row, _)| row < start)
+                        } else {
+                            0
+                        };
+                        let hi = if block.last >= end {
+                            lo + postings[lo..].partition_point(|&(row, _)| row < end)
+                        } else {
+                            postings.len()
+                        };
                         let postings = &postings[lo..hi];
                         let mut add = |row: u32, tf| {
                             let i = (row - start) as usize;
@@ -2231,6 +2277,19 @@ impl SegmentReader {
         saturation: &Saturation,
         metrics: &mut SearchMetrics,
     ) -> io::Result<()> {
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut memo = self.decoded.lock().unwrap();
+            wanted.retain(|&(t, b)| {
+                let term = &mut terms[t];
+                if term.postings[b].is_none() {
+                    term.postings[b] = memo.get(term.meta.blocks[b].offset);
+                }
+                term.postings[b].is_none()
+            });
+        }
         if wanted.is_empty() {
             return Ok(());
         }
@@ -2486,6 +2545,64 @@ async fn read_exact(source: &dyn RangeRead, range: Range<u64>) -> io::Result<Byt
 #[cfg(test)]
 mod posting_cache_tests {
     use super::*;
+
+    #[test]
+    fn pruned_dense_frames_do_not_receive_cache_second_chances() {
+        futures::executor::block_on(async {
+            let params = FtsParams::default();
+            let docs: Vec<_> = (0..32_768)
+                .map(|row| {
+                    crate::tokenize(if row < 10 { "common jackpot" } else { "common" }, &params)
+                })
+                .collect();
+            let mut builder = SegmentBuilder::new(false);
+            for doc in &docs {
+                builder.add_document(doc).unwrap();
+            }
+            let reader =
+                SegmentReader::open(Arc::new(MemoryRangeRead::from(builder.finish().unwrap())))
+                    .await
+                    .unwrap();
+            let stats = CorpusStats::from_documents(&docs);
+            reader
+                .search_prefetched(
+                    &Query::new(crate::tokenize("common", &params), false),
+                    &stats,
+                    &params,
+                    docs.len(),
+                    None,
+                )
+                .await
+                .unwrap();
+            {
+                let mut memo = reader.decoded.lock().unwrap();
+                for cached in memo.blocks.values_mut() {
+                    cached.recent = false;
+                }
+            }
+            let query = Query::new(crate::tokenize("common jackpot", &params), false);
+            let (hits, metrics) = reader
+                .search_prefetched_with_metrics(&query, &stats, &params, 10, None)
+                .await
+                .unwrap();
+            let expected: Vec<_> = (0..10)
+                .map(|row| SearchHit {
+                    row,
+                    score: crate::score_document(&docs[row as usize], &query, &stats, &params),
+                })
+                .collect();
+            assert_eq!(hits, expected);
+            assert!(metrics.windows_pruned > 200, "{metrics:?}");
+            let memo = reader.decoded.lock().unwrap();
+            let dense = memo.blocks.values().filter(|cached| cached.dense).count();
+            let probed = memo
+                .blocks
+                .values()
+                .filter(|cached| cached.dense && cached.recent)
+                .count();
+            assert!(probed > 0 && probed < dense / 4, "{probed}/{dense}");
+        });
+    }
 
     #[test]
     fn dense_clock_is_bounded_and_cannot_evict_sparse_frames() {

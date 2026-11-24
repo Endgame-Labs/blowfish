@@ -854,6 +854,27 @@ fn dense_frames_reuse_data_but_rescore_changed_statistics_and_masks() {
     );
 }
 
+#[test]
+fn cached_normalization_bounds_preserve_prefix_presence_without_idf() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..16_385)
+        .map(|row| tokenize(if row % 512 < 256 { "common" } else { "filler" }, &params))
+        .collect();
+    let reader = open(build(&docs, false, params.tokenizer));
+    // Prefix scoring does not depend on corpus statistics. Even a zero
+    // normalization value must retain presence, and distinguish empty windows.
+    let stats = CorpusStats::default();
+    let query = Query::new(tokenize("common co", &params), true);
+    let empty_windows: RoaringBitmap = (256..512).chain(768..1024).collect();
+    for _ in 0..3 {
+        for filter in [None, Some(&empty_windows)] {
+            let hits =
+                block_on(reader.search_prefetched(&query, &stats, &params, 10, filter)).unwrap();
+            assert_eq!(hits, expected(&docs, &query, &stats, &params, 10, filter));
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(16))]
     #[test]
