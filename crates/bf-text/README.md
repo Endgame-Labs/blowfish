@@ -77,9 +77,9 @@ lengths are packed in blocks of 128 rows. Zero length denotes a missing field.
 can then load concurrently. A query reads term directories and short postings
 from those resident bundles without another backend wave, even with an uncached
 `RangeRead`. Bundle, term, and decoded-posting memos are bounded. Decoded posting
-payloads use at most 8 MiB per reader, with their allowance charged to the engine
-metadata cache; changing statistics or allowed rows never reuses scores. Sparse
-lists receive cache priority. Their known term scores are summed at the same row
+payloads use separate 8 MiB allowances for sparse and dense lists, charged to the
+engine metadata cache; changing statistics or allowed rows never reuses scores.
+Sparse lists receive cache priority. Their known term scores are summed at the same row
 before taking window maxima, and dense terms skip rows whose remaining bound
 cannot reach the heap threshold. The rounding margin covers all query terms. Larger posting lists still use exact window bounds, reading promising windows before any remaining competitive
 windows. Scoring precomputes term weights, caches exact f64 saturation factors for
@@ -88,9 +88,8 @@ decoded posting block. The factor table refreshes when average length, k1, or b
 changes; uncommon values retain the reference arithmetic.
 
 Dense decoded frames are probed after window pruning, so rejected windows do not
-retain frames or refresh their CLOCK-cache priority. Sparse and dense decoded
-payloads each have an 8 MiB allowance. Query-independent normalization bounds
-share a separate 8 MiB allowance: term-window summaries reuse frame maxima and
+retain frames or refresh their CLOCK-cache priority. Query-independent normalization
+bounds share a separate 8 MiB allowance: term-window summaries reuse frame maxima and
 refresh when newly decoded frames can tighten them. Scores still use the
 reference f32 addition order, including repetitions, prefixes, and ties.
 
