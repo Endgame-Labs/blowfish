@@ -13,6 +13,11 @@ Usage:
 
 `--cpus` pins this process and its client processes (the server is pinned separately, with taskset).
 Results are printed and appended as one JSON line to `--out` (default DATA_DIR/../nq-results.jsonl).
+
+`--first-pass --parts latency` skips warm-up and adds `latency_ms.first_query`. Use a fresh server with
+empty application caches; later queries progressively warm it. This mode rejects quality and throughput
+parts so they cannot warm the server first. The runner controls the OS page cache separately.
+Throughput aborts and reaps its client processes if a request fails or a worker exits without a result.
 """
 
 import argparse

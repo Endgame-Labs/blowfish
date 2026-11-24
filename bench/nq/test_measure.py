@@ -1,4 +1,4 @@
-"""Measurement regressions: uv run python -m unittest discover -s bench/nq -p test_measure.py."""
+"""Regressions: uv run --project bench/nq python -m unittest discover -s bench/nq -p test_measure.py."""
 
 import contextlib
 import io
