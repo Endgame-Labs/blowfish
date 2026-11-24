@@ -30,7 +30,11 @@ use rayon::prelude::*;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod graph;
 mod math;
+#[cfg(test)]
+mod offline;
 pub(crate) mod spill;
 
 /// Wall time within one build stage. Concurrent uploads overlap CPU stages; aggregate I/O times
@@ -849,7 +853,41 @@ fn assign_leaves(
     let near = NEAR_CELLS.min(coarse.len()).max(1);
     let probes = GROUP_PROBES;
     let by_distance = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
-    let assign = |leaves: &[Vec<f32>]| -> Option<Vec<u32>> {
+    #[cfg(test)]
+    let graph = if std::env::var("RR3_ALGORITHM").as_deref() == Ok("graph") {
+        let started = std::time::Instant::now();
+        let graph = graph::Graph::build(&leaves, &members);
+        println!(
+            "RR3 graph build seconds={:.3}",
+            started.elapsed().as_secs_f64()
+        );
+        Some(graph)
+    } else {
+        None
+    };
+    let assign = |leaves: &[Vec<f32>], _previous: Option<&[u32]>| -> Option<Vec<u32>> {
+        #[cfg(test)]
+        if let Some(graph) = &graph {
+            let started = std::time::Instant::now();
+            let visit_order = if _previous.is_none() {
+                offline::visit_order(present)
+            } else {
+                None
+            };
+            let out = graph.assign(
+                leaves,
+                coarse,
+                present,
+                read_row,
+                _previous,
+                visit_order.as_deref(),
+            );
+            println!(
+                "RR3 graph assignment seconds={:.3}",
+                started.elapsed().as_secs_f64()
+            );
+            return Some(out);
+        }
         let _assignment = Stage::new("leaf_assignment");
         // Each cell's leaves under about sqrt(leaves) group centers (the means of their leaves),
         // so a row compares against the groups of its near cells and the leaves of its nearest
@@ -1050,7 +1088,7 @@ fn assign_leaves(
         }
         Some(leaf_of)
     };
-    let mut leaf_of = assign(&leaves)?;
+    let mut leaf_of = assign(&leaves, None)?;
     tracing::info!(
         "recluster: rows assigned at {:.0}s",
         t0.elapsed().as_secs_f64()
@@ -1084,7 +1122,7 @@ fn assign_leaves(
             .collect();
         leaves = centers;
         drop(refinement);
-        leaf_of = assign(&leaves)?;
+        leaf_of = assign(&leaves, Some(&leaf_of))?;
         tracing::info!("recluster: refined at {:.0}s", t0.elapsed().as_secs_f64());
     }
     // Each cell's leaves, with the rows that chose them, in canonical document order.
