@@ -722,7 +722,7 @@ pub(crate) async fn for_writes(
     let mut wanted = BTreeSet::new();
     let mut hydrate = BTreeSet::new();
     for p in pending {
-        let Operation::Write(req, _) = &p.request else {
+        let Operation::Write(req, _, _activity) = &p.request else {
             continue;
         };
         if req.delete_by_filter.is_some() || req.patch_by_filter.is_some() {

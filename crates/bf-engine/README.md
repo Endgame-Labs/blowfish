@@ -239,9 +239,14 @@ include immutable object generations; storage handles and decoded caches must no
 be shared across unrelated backends. Performance fields report per-query logical
 bytes, including decoded metadata hits, instead of guessing from namespace age.
 
-`query_concurrency` and `search_concurrency` each default to eight. Query drivers
-and segment scorers use bounded blocking tasks, keeping CPU work off Tokio reactor
-threads. Independent masks, IDs, and index metadata open together; ANN code reads
+`query_concurrency` admits twice the available CPU count, with a minimum of eight;
+`search_concurrency` defaults to eight. Warm query plans receive one poll on a fixed
+CPU pool sized to the available cores. Plans that finish return through a oneshot;
+plans that yield retain their future and continue on the blocking I/O path. Cold
+snapshots use that original path directly. CPU work stays off Tokio reactor threads,
+and pending I/O cannot occupy the fixed CPU pool. `blowfish_query_cpu_dispatch_total`
+labels these paths `ready`, `yielded`, and `cold`. Independent masks, IDs, and index
+metadata open together; ANN code reads
 and rerank vectors each use one coalesced batch. The counting-store regression
 requires exactly three dependent cold ANN read stages, zero HEADs, and zero backend
 reads for an identical warm query. That test uses 512 fetch permits to isolate
@@ -388,3 +393,8 @@ batches as they arrive, and overlap a bounded vector and document prefetch with
 the remaining scan. The probe set and final rerank bound are unchanged. Resident
 queries, filtered queries, busy processes, cache-bypass reads, and searches sharing
 a plan across tiers keep the per-slab path.
+
+A hot compiled ANN tier retains every validated exact vector when its full code,
+metadata, and vector reservation fits the decoded-cache budget. Larger tiers keep
+a bounded sparse vector cache. Admission only retains rows already read by normal
+queries; it never fetches the full tier eagerly.

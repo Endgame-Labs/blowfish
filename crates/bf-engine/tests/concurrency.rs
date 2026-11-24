@@ -145,3 +145,86 @@ async fn eventual_snapshot_is_bounded_and_strong_catches_up() {
         2
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_strong_reads_include_every_previously_acknowledged_write() {
+    use bf_engine::EngineConfig;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let config = EngineConfig {
+        indexing: false,
+        recall_sample_rate: 0.,
+        ..Default::default()
+    };
+    let writer = Engine::with_config(store.clone(), config.clone());
+    let reader = Engine::with_config(store, config);
+    writer
+        .write(
+            "linear",
+            serde_json::from_value(json!({
+                "upsert_rows":[{"id":1,"revision":0}],
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let request: QueryRequest = serde_json::from_value(json!({
+        "rank_by":["id","asc"], "top_k":1, "include_attributes":true,
+    }))
+    .unwrap();
+    reader.query("linear", request.clone()).await.unwrap();
+    let acknowledged = Arc::new(AtomicU64::new(0));
+    let barrier = Arc::new(tokio::sync::Barrier::new(17));
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let (reader, request, acknowledged, barrier) = (
+            reader.clone(),
+            request.clone(),
+            acknowledged.clone(),
+            barrier.clone(),
+        );
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            for _ in 0..256 {
+                let before = acknowledged.load(Ordering::Acquire);
+                let response = reader.query("linear", request.clone()).await.unwrap();
+                let revision = response.result.rows.unwrap()[0]["revision"]
+                    .as_u64()
+                    .unwrap();
+                assert!(
+                    revision >= before,
+                    "strong read {revision} predates acknowledged write {before}"
+                );
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+    barrier.wait().await;
+    for revision in 1..=128 {
+        writer
+            .write(
+                "linear",
+                serde_json::from_value(json!({
+                    "patch_rows":[{"id":1,"revision":revision}],
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        acknowledged.store(revision, Ordering::Release);
+        tokio::task::yield_now().await;
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let response = reader.query("linear", request).await.unwrap();
+    assert_eq!(response.result.rows.unwrap()[0]["revision"], 128);
+}
