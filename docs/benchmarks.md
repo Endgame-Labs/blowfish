@@ -4421,3 +4421,67 @@ The harness terminates its exact server and profiler PIDs, and removes temporary
 I remove input copies, disposable stores, profiles, and build snapshots after preserving these
 numbers. The facade models fixed dependent round trips and local transfer; I have not measured
 this revision against an in-region S3 bucket or hosted turbopuffer.
+
+## Round AR3: compaction through the tiers (lineage), and deltas beside a base build (2026-11-24)
+
+NQ (2,681,468 rows, 768 dims in f16, cosine) on one shared 8-CPU VM: server on CPUs 0 to 5, clients on 4 and 5, local
+file store. Other workers were running benchmarks at the same time (load average 10 to 15), so latencies are noisy.
+The gate uses instruction counts (`perf stat -e instructions:u` on the server over 2,000 one-client queries, after
+2,000 warm-up queries).
+
+### State before compaction
+
+v0.1.15 loaded NQ, built its base, then took 10 minutes of upserts at 1,000 rows a second (random existing rows, same
+vector, new title). Since AR1 it never compacts covered segments: 51 segments, a base over 31 of them, a delta over
+19 flush segments (625,447 rows), and one uncovered segment. Both sides below start from copies of that store, with
+the write tail flushed by v0.1.15.
+
+### Gate: before and after compaction
+
+- **Before:** this branch, read-only, on the v0.1.15 store (format 3, nothing compacted).
+- **After:** this branch, writable, until no manifest was published for 60 seconds, then read-only. It upgraded the
+  bucket to format 4 and merged the delta's 19 flush segments with lineage: 51 segments became 33, with 25 lineage
+  entries. Both tiers kept their directory keys, so nothing was rebuilt.
+
+| Run | Instructions per query, before | After | Recall@10, both |
+|---|---:|---:|---:|
+| 1 (before, then after) | 23.17M | 23.09M | 0.9521 |
+| 2 (after, then before) | 32.65M | 23.05M | 0.9521 |
+| 3 | 44.19M | 42.90M | 0.9521 |
+| 4 | 30.31M | 38.58M | 0.9521 |
+
+On the least-contended runs (1 and 2), after is 0.5% below before. Runs 3 and 4 ran with the VM at load average 15:
+counts rose on both sides, because idle runtime threads spin more under contention. Recall is identical, query for
+query in aggregate. A read-only server in front of an unindexed 46,681-row write tail spent 3.2G instructions and 344
+ms p50 per query, nearly all decoding and scoring the tail's base64 vectors. That is the WAL tail path, not lineage.
+
+### Continuous writes
+
+On the compacted store, the branch writable, with 10 minutes of upserts at a target of 1,000 rows a second (506,900
+sent, about 850 a second on the loaded VM, none rejected):
+- The masked-rows rebuild the trigger wanted at startup ran for 19 minutes (the VM was loaded). Beside it, three
+  deltas over the rows written meanwhile built in 42 to 338 seconds and installed, each replacing the previous one.
+  The rows outside the tiers therefore stayed at a few flush segments, not the whole run's writes. In AR2 they reached
+  24% during the rebuild.
+- After the writes stopped, compaction merged the beside-delta's flush segments twice, with lineage.
+- The new base installed over its 33 segments and kept the delta built beside it (2 tiers). Lineage went back to
+  zero, because the new base covers the merged targets itself.
+- No tier was retired as stale, none was discarded, and with retention at 60 seconds, GC kept every object the final
+  manifest names.
+
+### Crash points
+
+Each was run on a fresh copy of the v0.1.15 store, with `kill -9`, then a restart:
+
+| Killed at | State left | After restart |
+|---|---|---|
+| The first lineage map written, before its manifest | 4 maps, no lineage in the manifest | Recall@10 0.955 over 200 queries. The merges re-ran (25 entries, same tiers). GC deleted the 4 orphan maps, and every named object exists |
+| The first manifest with lineage | 4 entries published | Recall@10 0.955, no exhaustive rows. Compaction finished (25 entries, same tiers), and every named object exists |
+
+The unit and integration tests cover the same points with injected store failures. Those tests also cover a failure
+before and after the manifest write and a merge of a merged segment.
+
+### D4
+
+Not done in this round. The covered segments' ANN objects total 6.0 GB on NQ (about 2,240 bytes per covered row),
+which is what D4 would save. `disk-footprint.md` lists what retiring them needs.
