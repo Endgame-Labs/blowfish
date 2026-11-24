@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-2024_edition-orange.svg?logo=rust)](https://www.rust-lang.org)
 [![turbopuffer API compatible](https://img.shields.io/badge/turbopuffer_API-compatible-6f42c1.svg)](compat/README.md)
+[![Website](https://img.shields.io/badge/website-endgame--labs.github.io%2Fblowfish-0b0d12.svg)](https://endgame-labs.github.io/blowfish/)
 
 blowfish is a self-hostable search engine that implements the [turbopuffer](https://turbopuffer.com) HTTP API in a single Rust binary. Point it at any S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, or SeaweedFS) or a local directory; the bucket is the only source of truth, with no separate database and no dedicated WAL disk. The official turbopuffer SDKs work against it unchanged by setting the base URL and API key.
 
