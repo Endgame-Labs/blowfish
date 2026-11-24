@@ -91,3 +91,99 @@ async fn unconditional_replacements_do_not_read_the_old_document_or_vector_objec
         .unwrap();
     assert_eq!(rows[0]["title"], "patched");
 }
+
+#[tokio::test]
+async fn unchanged_corpus_statistics_reuse_the_object_without_hiding_row_changes() {
+    async fn open() -> (Engine, Storage) {
+        let store = Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store.clone(),
+            EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.0,
+                ..Default::default()
+            },
+        );
+        (engine, store)
+    }
+    let (engine, store) = open().await;
+    let (reference, _) = open().await;
+    let initial = json!({"schema":{"text":{"type":"string","full_text_search":true}},
+        "upsert_rows":[{"id":1,"text":"red fish fish"},{"id":2,"text":"blue fish"},
+            {"id":3,"text":null},{"id":4,"text":""}]});
+    for node in [&engine, &reference] {
+        node.write("u", serde_json::from_value(initial.clone()).unwrap())
+            .await
+            .unwrap();
+    }
+    engine.index_namespace("u", true).await.unwrap();
+    let wal = Wal::new(store, "u").unwrap();
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    let mut previous = manifest.text_stats.unwrap().key;
+    // Non-text replacements, a swap across documents, length-only changes, changed
+    // frequencies at equal length, and missing fields exercise every cancellation input.
+    for (body, reuse) in [
+        (
+            json!({"upsert_rows":[{"id":1,"text":"red fish fish","title":"a longer title"}]}),
+            true,
+        ),
+        (
+            json!({"upsert_rows":[{"id":1,"text":"blue fish"},{"id":2,"text":"red fish fish"}]}),
+            true,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"text":"red fish fish fish"}]}),
+            false,
+        ),
+        (json!({"upsert_rows":[{"id":1,"text":"green fish"}]}), false),
+        (
+            json!({"upsert_rows":[{"id":2,"title":"text removed"}]}),
+            false,
+        ),
+        (
+            json!({"upsert_rows":[{"id":3,"text":""},{"id":4,"text":null}]}),
+            true,
+        ),
+    ] {
+        for node in [&engine, &reference] {
+            node.write("u", serde_json::from_value(body.clone()).unwrap())
+                .await
+                .unwrap();
+        }
+        engine.index_namespace("u", true).await.unwrap();
+        let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+        let current = manifest.text_stats.unwrap().key;
+        assert_eq!(current == previous, reuse, "{body}");
+        previous = current;
+        let actual = engine.metadata("u").await.unwrap();
+        let expected = reference.metadata("u").await.unwrap();
+        for name in ["approx_row_count", "approx_logical_bytes"] {
+            assert_eq!(actual[name], expected[name], "{name}, {body}");
+        }
+        for text in ["fish", "red", "green", "blue fish"] {
+            let q = serde_json::from_value(json!({"rank_by":["text","BM25",text],
+                "top_k":10,"include_attributes":true}))
+            .unwrap();
+            assert_eq!(
+                engine.query("u", q).await.unwrap().result.rows,
+                reference
+                    .query(
+                        "u",
+                        serde_json::from_value(json!({"rank_by":["text","BM25",text],
+                    "top_k":10,"include_attributes":true}))
+                        .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .result
+                    .rows,
+                "{text}, {body}"
+            );
+        }
+    }
+}

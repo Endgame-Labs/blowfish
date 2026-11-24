@@ -858,7 +858,7 @@ impl Engine {
                     .as_mut()
                     .map(|s| std::mem::take(&mut s.text))
                     .unwrap_or_default();
-                if added_text.is_empty() && removed_text.is_empty() {
+                if crate::text::unchanged_stats(&added_text, &removed_text) {
                     return Ok((tail_stats, None));
                 }
                 let previous = previous_for_merge
