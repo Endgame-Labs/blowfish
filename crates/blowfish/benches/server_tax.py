@@ -78,6 +78,9 @@ def run(a):
             return json.dumps(body).encode()
 
         bodies = [project(raw) for raw in bodies]
+    if a.query_repeats != 1:
+        bodies *= a.query_repeats
+        truth = np.tile(truth, (a.query_repeats, 1))
     local = threading.local()
 
     def query(item):
@@ -162,9 +165,10 @@ def run(a):
                     perf.wait()
         ids = [r[3] for r in rows]
         if a.baseline:
-            assert ids == json.loads(a.baseline.read_text()), (
-                "ordered ID/distance mismatch"
-            )
+            expected = json.loads(a.baseline.read_text())
+            if a.query_repeats != 1 and len(expected) == len(queries):
+                expected *= a.query_repeats
+            assert ids == expected, "ordered ID/distance mismatch"
         a.out.with_suffix(".ids").write_text(json.dumps(ids))
         ms = [(r[2] - r[1]) / 1e6 for r in rows]
         recall = np.mean(
@@ -176,6 +180,7 @@ def run(a):
         record = dict(
             queries=len(rows),
             qps=len(rows) / elapsed,
+            mean=float(np.mean(ms)),
             p50=float(np.percentile(ms, 50)),
             p90=float(np.percentile(ms, 90)),
             recall=float(recall),
@@ -195,6 +200,12 @@ if __name__ == "__main__":
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--baseline", type=Path)
     p.add_argument("--count", type=int, default=0)
+    p.add_argument(
+        "--query-repeats",
+        type=int,
+        default=1,
+        help="repeat the selected query sequence for longer counter and cycle samples",
+    )
     p.add_argument("--warm-epochs", type=int, default=3)
     p.add_argument("--order", action="store_true")
     p.add_argument(
@@ -215,7 +226,7 @@ if __name__ == "__main__":
     args = p.parse_args()
     if not args.out.resolve().is_relative_to(ROOT / ".scratch"):
         p.error("--out must be under the repository .scratch directory")
-    if min(args.repeats, args.warm_epochs + 1) <= 0 or args.count < 0:
+    if min(args.repeats, args.warm_epochs + 1, args.query_repeats) <= 0 or args.count < 0:
         p.error("invalid repeat, warm-up, or query count")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     run(args)

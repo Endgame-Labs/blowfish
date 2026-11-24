@@ -7865,6 +7865,374 @@ Set `BF_TEXT_RARE_PAIR=1` for candidate passes, and select the combined-posting
 limit with `BF_TEXT_PAIR_LIMIT=16384` or `65536`; leave the first variable unset
 for baseline passes. These variables belong only to the historical experiment.
 
+## Round Q3: warm HTTP stalls
+
+The attribution baseline is main `ddbb7bb`, including Q2's CPU dispatcher and
+small-tier cache policy; the final integrated-main gate is recorded below. Measurements use one owned c7g.4xlarge, eight server CPUs, eight separate
+client CPUs, and sixteen keep-alive clients. NQ is downloaded from its public
+source, prepared with `bench/nq/prepare.py`, and loaded with `bench/nq/load.py`.
+Both arms use the same frozen automatic tier, build flags, cache budgets, query
+sequence, and host. Warm gates use the complete 3,452-query sequence at 48 and
+64 probes, with three warming epochs and four measured epochs per process.
+
+The resident ceiling can collect additional raw, user-only hardware events around
+only its warmed loop with `BF_BENCH_EVENTS=name:hex-config,...`. Its JSON includes
+counts per query and actual counter scheduling coverage. This is a benchmark-only
+control, rather than a server setting. For example, Neoverse V1 frontend and
+backend stall-cycle events are `stall_frontend:23` and `stall_backend:24`.
+`server_tax.py --query-repeats N` repeats the selected sequence to lengthen HTTP
+counter and cycle samples without replacing distinct vectors with one vector.
+Use separate small event groups to avoid multiplexing, and report kernel work
+separately from user work. Stalled-cycle counts are distinct from slot-based
+top-down percentages.
+
+A parser-only kill test compares Sonic 0.5.12 with the existing `serde_json`
+deserializer over every NQ request and eighteen numeric boundary cases. All NQ
+requests agree, but `1.0000000596046449` changes both a numeric filter value and
+the resulting ANN f32 component. A wholesale parser replacement is rejected:
+faster parsing must preserve the existing query bits and acceptance behavior.
+No parser dependency or production parser change is retained.
+
+### Pure compaction must preserve the resident plan
+
+A covered-segment compaction can move every row without deleting one. The old
+`tier_mask` returns `Some(full_bitmap)` in that case, despite its documented
+mask-free contract, and the bitmap disables the compiled tier. The fix checks
+coverage of every original row range and caches `None` under the existing
+immutable live-object and lineage-map key. Real deletions retain their masks.
+The regression case checks reuse of the compiled generation through compaction,
+repeated cached proofs, unindexed updates, indexed deletes, projections, and eviction.
+
+The new NQ tier has 32 slabs and 13,393 leaves. Its paired recall is
+0.9484067207 / 0.9590092700 at 48 / 64 probes. Its layout differs from Q2's;
+compare arms within this round. A copy of the first complete publication receives
+one ordinary covered-segment compaction, with no writes or tier rebuild. The
+native reference keeps the original publication's ID mapping and identical tier
+payloads. Every ordered row and distance in the following ABBA matches both the
+other arm and the first-publication reference.
+
+| Probes | Main q/s, two processes | Mask fix q/s, two processes | Main / fix p90, two processes (ms) |
+|---:|---:|---:|---|
+| 48 | 1,489 / 1,486 | 1,953 / 1,955 | 14.80 / 11.22; 14.83 / 11.16 |
+| 64 | 1,296 / 1,350 | 1,686 / 1,669 | 16.86 / 12.98; 16.21 / 13.05 |
+
+Mean process-median throughput rises **31.4% / 26.8%**. User instructions fall
+25.556→22.639 M / 29.331→26.110 M per query, while user cycles fall
+12.079→9.063 M / 13.774→10.708 M. Context switches fall
+9.53→5.17 / 8.88→5.43 per query. These counts have 100% scheduling coverage.
+An already unmasked first publication has no corresponding work reduction;
+its separate process controls vary by roughly 1–3%, and are not credited as a win.
+
+The first 40-pair cold check uses fresh processes and the standard 25 ms loopback
+S3 facade. Rows and distances agree. Paired median changes are +2.25 ms
+[-1.29, +3.85] / -2.09 ms [-3.87, +0.61]. The 48-probe p90 point worsens by
+42.97 ms, with a wide [-37.22, +60.12] ms interval, so this sample does **not**
+clear the cold-tail gate. A larger confirmation is required before the final result.
+
+### Match the scorer before attributing the HTTP difference
+
+The packed resident harness and the server use different scorer representations.
+The new ignored `warm_ann::benchmark::compiled_kernel_profile` control warms through
+ordinary engine queries, retains that exact `WarmTier` and sparse vector cache,
+and runs its scorer on eight OS threads. Timed loops exclude snapshots, hydration,
+HTTP, and worker dispatch. Both controls report user-only counters, with zero
+missing compiled payloads and 100% counter coverage.
+
+| Dataset, 48 probes | Packed native instructions / cycles (M/query) | Exact compiled scorer instructions / cycles (M/query) | Packed / compiled q/s |
+|---|---:|---:|---:|
+| 10K control | 3.348 / 1.073 | 3.377 / 1.310 | 18,682 / 15,191 |
+| Full NQ | 22.247 / 8.099 | 21.716 / 8.031 | 2,546 / 2,562 |
+
+The representation difference affects the small control, but does not explain the
+full-NQ HTTP gap. The full-NQ server takes about 22.64 M user instructions and
+9.3 M user cycles/query, at roughly 1,900–2,000 q/s. Fixing a presumed packed-array
+gap on full NQ would target the wrong cause.
+
+`BF_BENCH_COMPILED` points to a JSON control file under `.scratch`, with `store`,
+`namespace`, `queries` (headerless little-endian f32), `dims`, `probes`, `threads`,
+and `repeats`. Run the explicitly ignored test in release mode. Both scorer
+harnesses support `BF_BENCH_PROFILE_STOP`: after warming, the Unix process emits
+`NATIVE_PROFILE_READY`, stops itself, and resumes on `SIGCONT`. Attach a profiler
+before resuming to exclude startup and warming from function-cycle samples.
+With two raw events, the instruction counter is omitted and reported as `null`,
+so cycles plus the two events fit this host's three available PMU counters.
+
+Initial larger event groups multiplexed and were discarded. The corrected groups
+have 100% coverage. L3 refill events read zero on this host and are not interpreted
+as evidence of no L3 misses.
+
+Formatting, scoped all-target Clippy with warnings denied, and scoped tests pass:
+223 passed, zero failed, and six explicit ignores, including the new diagnostic.
+The large synthetic fixture uses a separate 8 MiB test-driver stack; runtime
+workers retain their normal stacks. No production API, wire type, format, or
+setting changes in the mask fix.
+
+### Stall attribution
+
+Corrected user-only PMU groups give the following counts per query. The small
+control uses 10,000 rows; full NQ uses all 2,681,468 rows. These compare the packed
+native control with the ordinary HTTP server at 48 probes, rather than claiming
+that subtracting the two isolates one function. Each raw group has 100% scheduling
+coverage. Frontend, backend, and memory stall events overlap and are not additive.
+
+| Event/query | Small native | Small HTTP | NQ native | NQ HTTP |
+|---|---:|---:|---:|---:|
+| Frontend stalled cycles | 18,905 | 255,946 | 80,153 | 433,319 |
+| Backend stalled cycles | 369,437 | 819,902 | 3,310,533 | 4,074,237 |
+| Memory stalled cycles | 37,857 | 323,704 | 814,382 | 1,203,757 |
+| L1D refills | 8,843 | 20,587 | 102,643 | 110,994 |
+| L2D refills | 1,326 | 15,709 | 16,376 | 37,016 |
+| L1I refills | 196 | 16,421 | 1,039 | 20,625 |
+| Data TLB walks | 160 | 1,436 | 6,974 | 9,543 |
+| Instruction TLB walks | 0.28 | 166 | 2.83 | 365 |
+| Branch mispredictions | 2,337 | 6,649 | 8,947 | 10,269 |
+| Frontend stalled slots | 1.562 M | 4.004 M | 10.660 M | 13.980 M |
+| Backend stalled slots | 3.370 M | 7.142 M | 30.107 M | 36.144 M |
+
+The excess is consistent with a wider instruction working set, instruction-TLB
+activity, and cache disruption around HTTP work and dispatch. It is particularly
+large for the short small-tier scorer. On full NQ, most cycles still belong to
+scoring. Warm-only function-cycle samples have zero lost samples. The exact
+compiled control spends 35.74% in `block_sums`, 19.24% in `PlaneQuery::dot`,
+7.60% in its scan, 6.55% in exact L2, 6.26% in `FastQuery::reset`, 5.55% in
+`PlaneQuery::reset`, and 3.78% in memcpy. Full-NQ HTTP spends respectively
+31.18%, 17.54%, 5.78%, 5.75%, 5.71%, 5.05%, and 3.82% there. Its number parser
+is 0.98%; the small HTTP parser is 4.61%. These are cycle shares, not instruction
+shares, and symbol inlining differs between binaries.
+
+Scheduler traces expose a second cost that user-cycle counts cannot capture.
+Cropped to the interval with active query workers, the 27,616-query NQ trace has
+95.32 aggregate CPU-seconds and 6.96 runnable-wait seconds on query workers;
+Tokio runtime workers add 7.35 CPU-seconds and **34.17 runnable-wait seconds**.
+There are 9,475 query-worker wakes, including 3,334 from another CPU, and 74,659
+runtime-worker wakes, including 42,379 from another CPU. Query/runtime threads
+migrate 3,326 / 19,857 times. The 24,576-query small trace has 5.12 / 5.20
+query/runtime runnable-wait seconds, and 4,127 / 6,053 migrations. These are
+aggregate scheduler measurements, not a sum of one query's critical-path stages;
+several threads can wait simultaneously.
+
+Pinning query workers to individual CPUs loses roughly 3–4% throughput and worsens
+p90. A one-thread Tokio screen has no consistent win. Deferring the slab-state
+clone until a compiled miss saves a little work, but its ABBA wins 2.1% at 48
+probes and loses 2.2% at 64 probes, so it is discarded. No affinity, reactor-thread
+setting, or clone-path change is retained.
+
+The expanded 80-pair cold confirmation for the mask fix follows the inconclusive
+40-pair sample above. At 48 / 64 probes, main p50 is 262.60 / 265.40 ms and the fix
+is 260.93 / 266.71 ms. Paired median changes are -0.82 ms [-2.80, +2.18] /
+-1.15 ms [-3.93, +1.41]. P90 improves 294.57→274.67 / 286.55→280.74 ms;
+paired p90 changes are -19.89 ms [-50.77, +3.61] / -5.81 ms [-43.69, +37.77].
+Rows and distances agree. This confirmation detects no cold regression; its broad
+p90 intervals still limit the precision of any claimed cold benefit.
+
+Applying Arm's Neoverse V1 `Topdown_L1` formulas (Telemetry Specification, issue 02,
+section 5.1) gives the approximate slot shares below. Backend slots are divided by
+eight times cycles; frontend slots also subtract the specified branch-mispredict
+correction. Retiring and bad speculation use the retired/speculated operation
+ratio. Events come from separate non-multiplexed passes over identical query
+sequences, so the four estimates need not sum to exactly 100% (observed totals
+99.1–100.4%). They are not the overlapping stalled-cycle ratios above.
+
+https://documentation-service.arm.com/static/66f715817243ed16264336b6
+
+| Dataset and path | Frontend bound | Backend bound | Retiring | Bad speculation |
+|---|---:|---:|---:|---:|
+| Small native | 17.3% | 39.1% | 40.3% | 3.3% |
+| Small HTTP | 23.8% | 44.9% | 27.2% | 4.5% |
+| NQ native | 16.0% | 46.4% | 34.9% | 1.7% |
+| NQ HTTP | 18.3% | 48.6% | 32.0% | 1.4% |
+
+### Leave scheduling capacity for completions
+
+For `N` available CPUs, the CPU pool uses `N - 1` workers when `N >= 8`, and `N`
+workers otherwise. The minimum remains one; query admission remains
+`max(8, 2 * N)`. Workers remain schedulable on every allowed CPU. This leaves some
+capacity for WAL-check completions and response delivery under sustained compute
+load, while preserving the existing worker count on small hosts.
+
+On the unmasked first publication, the initial four-epoch ABBA gains 2.1% q/s at
+48 probes but loses 1.2% at 64, with p90 improving 10.4% / 9.6%. The longer
+confirmation uses twelve measured full-query epochs per process:
+
+| Probes | Main / candidate q/s | Change | Main / candidate p90 (ms) | User cycles/query, main / candidate |
+|---:|---:|---:|---:|---:|
+| 48 | 1,894 / 1,994 | +5.3% | 11.52 / 10.08 | 9.325 / 8.976 M |
+| 64 | 1,682 / 1,696 | +0.8% | 13.00 / 11.65 | 10.603 / 10.661 M |
+
+The throughput gain at 64 probes is small relative to process variation. The
+repeatable result is the lower p90 at both probe counts. Instructions remain
+22.628→22.616 M / 26.110→26.098 M; this is a scheduling change, rather than less
+scoring work. Migrations fall 0.899→0.485 / 0.845→0.440 per query. Context switches
+are 5.017→4.954 / 5.397→5.154 per query. All counts have 100% scheduling coverage.
+
+With one covered-segment compaction, the combined mask and worker-pool candidate's
+four-epoch ABBA gives:
+
+| Probes | Main / candidate q/s | Change | Main / candidate p90 (ms) | User cycles/query, main / candidate |
+|---:|---:|---:|---:|---:|
+| 48 | 1,489 / 1,948 | +30.8% | 14.77 / 10.33 | 12.059 / 9.123 M |
+| 64 | 1,336 / 1,722 | +28.9% | 16.40 / 11.52 | 13.610 / 10.464 M |
+
+Every ordered row and distance matches the original reference. The separate
+96-case response-shape comparison passes: 80 successes and sixteen expected
+errors, including repeated requests against both binaries. Scoped checks pass
+again: 223 tests, zero failures, and six explicit ignores.
+
+### Wall-time stages
+
+A separate diagnostic build replaces per-request stderr output with aggregate
+histograms. The sample subtracts a metrics snapshot after warming from another
+after four measured epochs, giving exactly 2,048 small / 13,808 NQ samples for
+each stage. It uses the combined mask and seven-worker candidate at 48 probes.
+These are diagnostic timings, rather than additional throughput gate results.
+The earlier stderr trace slowed NQ to about 1,509 q/s and was discarded for
+quantitative wall attribution; aggregate instrumentation runs at about 1,934 q/s.
+
+| Mean stage (µs) | Small tier | NQ |
+|---|---:|---:|
+| Body collection | 10 | 6 |
+| JSON decode | 63 | 65 |
+| Search-state clone | 1.3 | 2.2 |
+| CPU-worker queue | 292 | 3,051 |
+| CPU-worker poll, including scoring and result assembly | 671 | 3,473 |
+| Worker completion to Tokio continuation | 191 | 544 |
+| Search execution, including dispatch | 1,160 | 7,077 |
+| Snapshot check, overlapping search | 862 | 766 |
+| Complete engine call | 1,561 | 7,499 |
+| Response encoding | 7.5 | 13.3 |
+| Client request to fully received response | 2,259 | 8,183 |
+
+Queue, poll, and continuation nearly sum to search execution. Snapshot time
+**overlaps** search and must not be added to it. The complete engine call includes
+other state-lock acquisition, context setup, and finalization. Another roughly
+0.6 ms remains outside the measured engine, parser, collector, and encoder stages:
+this includes routing, scheduling before the extractor runs, response delivery,
+and client transport. Connections are reused, so accept cost is amortized over
+an epoch; the body timer starts when the extractor is polled, rather than when
+bytes reach the socket. These are per-stage means over complete query cohorts,
+not a reconstruction of each request's unobserved network timeline.
+
+Snapshot cloning and encoding are small here. Memcpy's cycle share also includes
+scoring scratch and rerank work, so charging it all to query-vector copies would
+misidentify the cause. The fixed pool's queue and the Tokio continuation explain
+substantial wall time that is absent from an isolated scorer's user-cycle count.
+All additional timing hooks remain scratch-only experiment code.
+
+### Direct-response ceiling and bounded candidate
+
+The scratch-only numeric-ID ceiling loads one flat ID table before measurement,
+skips document hydration and generic result evaluation, and emits rows directly
+into a JSON byte buffer. Against the seven-worker candidate, its ABBA gains
+1.04% / 3.58% q/s at 48 / 64 probes, with p90 down 0.75% / 2.24% and instructions
+down about 1.1%. Every ordered row and distance matches.
+
+A bounded version learns numeric IDs from ordinary winner reads, allocates pages
+lazily, reserves their complete upper bound, and falls back for strings, unknown
+IDs, and `u64::MAX`. Its narrow, normally validated ID-only ANN shortcut preserves
+the existing response type and serializer. The corrected eight-epoch ABBA gains
+**2.37% / 1.58%** q/s, p90 improves 1.83% / 0.98%, and instructions fall
+0.49% / 0.40%. This misses the coordinator's two-probe 2% retention gate, so the
+cache, assembly shortcut, and candidate-only tests are discarded. The initial
+bounded screen did not match the benchmark's `["id"]` projection and is excluded
+from the decision. No new production ID table or response path is shipped.
+
+The long small control repeats 512 distinct queries 64 times per epoch. It gains
+0.69% q/s, improves p90 1.50%, and leaves user cycles effectively unchanged
+(1.988 M/query in both arms). The repeat-aware baseline verifier accepts either
+one original epoch or the complete repeated sequence, and still compares every
+ordered row and distance. Its first run exposed the old verifier's sequence-length
+mismatch; that failed measurement is discarded.
+
+A remaining miscellaneous cycle cost is Crossbeam epoch advancement. In the
+full-NQ HTTP sample, 1,456 of 2,095 samples whose leaf is `try_advance` have
+identifiable vector-cache lookup or housekeeping callers; 97 identify document
+columns. The exact compiled scorer has only 75 such samples in its comparable
+warm-only profile. Stack recovery is incomplete for some samples, and these are
+sample counts rather than a new percentage estimate. This points to sparse-vector
+cache maintenance as follow-up work; bypassing document hydration alone does not
+remove it.
+
+### Final gate on integrated main
+
+The attribution, prototypes, and initial gates above use task-start main
+`ddbb7bb`. The final gate rebuilds both arms against **`aba5c96`**, incorporating
+RR2, C3, MEM2, BW1, and MD1. The coordinator approved closing on this pinned
+comparison after the later predicate-cache change landed. That combination will
+receive its own coordinator gate. The original NQ publication and its ordinary
+compaction remain frozen; upgrading the code does not rebuild either tier.
+
+Both release binaries use the same toolchain and frame-pointer flags. Unpacking
+source with preserved old mtimes initially let Cargo reuse the baseline artifact;
+that was caught by comparing binary hashes before measurement. Cleaning the two
+release packages forced a distinct candidate build. The merged source passes
+formatting, scoped all-target Clippy with warnings denied, and scoped tests:
+**235 passed, zero failed, and eight explicit ignores**. The compiled-tier
+regression retains the upstream 60-row and 640-row cases and the rejection-marker
+coverage, alongside Q3's compaction and mutation cases.
+
+Final warm ABBA, sixteen clients, three warming epochs, and four measured epochs
+per process:
+
+| Publication | Probes | Main / Q3 q/s | Change | Main / Q3 p90 (ms) | User cycles/query, main / Q3 |
+|---|---:|---:|---:|---:|---:|
+| First complete tier | 48 | 2,016 / 2,077 | +3.0% | 10.78 / 9.87 | 8.723 / 8.548 M |
+| First complete tier | 64 | 1,731 / 1,770 | +2.3% | 12.61 / 11.29 | 10.340 / 10.170 M |
+| After pure compaction | 48 | 1,671 / 2,040 | +22.1% | 13.14 / 10.04 | 10.507 / 8.702 M |
+| After pure compaction | 64 | 1,467 / 1,745 | +19.0% | 15.00 / 11.51 | 12.184 / 10.347 M |
+
+All ordered rows and distances match both arms and the original publication
+reference. Recall remains 0.9484067207 / 0.9590092700. After compaction, user
+instructions fall 24.901→22.307 M / 28.571→25.749 M; context switches fall
+9.212→4.817 / 9.205→4.925, and migrations fall 1.079→0.424 / 1.012→0.358 per
+query. Counter scheduling coverage is 100%.
+
+The four-core confirmation uses four CPU workers in both arms. Its q/s changes
+are -0.96% / -2.09%, with p90 +0.37% / +2.10%. These small-host point differences
+remain an uncertainty; there is no claimed four-core gain. The earlier task-start
+four-core screen was -2.7% / -3.3%. The sixteen-core task-start control is flat /
++1.1% q/s, with p90 -2.2% / -3.6%; its clients share CPUs 8–15, so it is a topology
+control rather than the isolated-client gate. The worker rule preserves one and
+two workers on one- and two-CPU hosts. No M4, larger-host, or simultaneous-ingest
+performance claim is made.
+
+The final 96-case response-shape check again gives 80 successes, sixteen expected
+errors, and identical responses. Final cold confirmation uses eighty ABBA query
+pairs at each probe count, fresh processes, and the standard 25 ms S3 facade:
+
+| Probes | Main / Q3 p50 (ms) | Main / Q3 p90 (ms) | Paired median change, 95% CI (ms) | Paired p90 change, 95% CI (ms) |
+|---:|---:|---:|---:|---:|
+| 48 | 262.32 / 261.94 | 298.56 / 288.24 | -1.39 [-3.37, +1.47] | -10.32 [-49.60, +41.68] |
+| 64 | 266.36 / 265.83 | 301.98 / 280.50 | +0.01 [-2.44, +1.64] | -21.48 [-53.68, +12.98] |
+
+Rows and distances agree. This detects no cold regression; broad tail intervals
+limit any claim of a cold benefit. The preceding sixty-pair combined-candidate
+screen had higher p90 points (+11.88 / +19.90 ms), with intervals spanning zero;
+it is superseded by this confirmation, rather than treated as evidence of a win.
+
+A separate four-epoch counter control on the first publication collects user
+cycles, kernel cycles, and user instructions together, within the host's three
+available PMU counters. The native reference uses eight scorer threads; the HTTP
+candidate uses seven compute workers plus its runtime. Native kernel counting
+starts after the warmed-ready stop and ends when the timed result is emitted,
+excluding teardown of the multi-gigabyte resident arrays. The initial through-exit
+native kernel samples are discarded because teardown inflated them.
+
+| Dataset | Native user / kernel cycles (M/query) | Main HTTP user / kernel cycles | Q3 HTTP user / kernel cycles |
+|---|---:|---:|---:|
+| Small, 48 probes | 1.073 / 0.001 | 1.997 / 0.182 | 1.991 / 0.178 |
+| NQ, 48 probes | 8.213 / 0.008 | 8.700 / 0.232 | 8.430 / 0.193 |
+| NQ, 64 probes | 9.550 / 0.009 | 10.039 / 0.235 | 10.378 / 0.216 |
+
+The scorer is unchanged by Q3, so its native result is a common before/after
+reference. User instructions are 3.337 / 4.162 / 4.156 M for small native / main
+HTTP / Q3 HTTP; 22.216 / 22.300 / 22.285 M for NQ48; and
+25.813 / 25.786 / 25.756 M for NQ64. Counter coverage is 100% in both the internal
+native counters and the external kernel interval. The independent NQ64 user-cycle
+point varies by 3.4% in the opposite direction from the warm ABBA's 1.6% decrease;
+this is not evidence of a repeatable unmasked CPU-cycle win at that probe count.
+Use the paired warm gates above for throughput and latency conclusions. The small
+HTTP/native cycle difference remains substantial.
+
 ## Round D4: one stored vector copy in covered namespaces (2026-11-24)
 
 I loaded all 2,681,468 NQ passages as 1,024-dimensional f16 cosine vectors, with IDs and vectors only,
