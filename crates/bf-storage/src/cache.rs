@@ -417,6 +417,24 @@ impl RangeReader {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Whether every block of a valid logical range is already in the memory tier.
+    /// This advisory check performs no I/O, and concurrent eviction may change the answer.
+    pub fn is_memory_resident(&self, range: Range<u64>) -> bool {
+        if range.start > range.end || range.end > self.len() {
+            return false;
+        }
+        if range.is_empty() {
+            return true;
+        }
+        let size = self.block_size();
+        (range.start / size..=(range.end - 1) / size).all(|index| {
+            self.storage
+                .0
+                .cache
+                .memory
+                .contains_key(&self.block_key(index))
+        })
+    }
     /// Read one exact half-open range.
     pub async fn read(&self, range: Range<u64>) -> Result<Bytes, Error> {
         self.read_with_stats(range, &CacheStats::default()).await
@@ -440,10 +458,31 @@ impl RangeReader {
         ranges: &[Range<u64>],
         stats: &CacheStats,
     ) -> Result<Vec<Bytes>, Error> {
+        self.read_batch_inner(ranges, stats, None).await
+    }
+    /// Read a coalesced batch, signaling once its misses are reserved. Readers started after
+    /// the signal share those requests and may finish before the whole batch does. Input
+    /// range order prioritizes newly reserved reads. Keep this future alive until they finish.
+    pub async fn read_batch_notifying(
+        &self,
+        ranges: &[Range<u64>],
+        stats: &CacheStats,
+        ready: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Vec<Bytes>, Error> {
+        self.read_batch_inner(ranges, stats, Some(ready)).await
+    }
+    async fn read_batch_inner(
+        &self,
+        ranges: &[Range<u64>],
+        stats: &CacheStats,
+        mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<Vec<Bytes>, Error> {
+        let prioritized = ready.is_some();
+        let mut priorities = BTreeMap::new();
         let cache = &self.storage.0.cache;
         let size = self.block_size();
         let mut requested = BTreeMap::<u64, u64>::new();
-        for range in ranges {
+        for (priority, range) in ranges.iter().enumerate() {
             if range.start > range.end || range.end > self.len() {
                 return Err(Error::Config("invalid object range"));
             }
@@ -451,6 +490,9 @@ impl RangeReader {
                 continue;
             }
             for index in range.start / size..=(range.end - 1) / size {
+                if prioritized {
+                    priorities.entry(index).or_insert(priority);
+                }
                 *requested.entry(index).or_default() +=
                     range.end.min((index * size).saturating_add(size))
                         - range.start.max(index * size);
@@ -615,6 +657,12 @@ impl RangeReader {
                 start = end;
             }
             drop(planning);
+            if prioritized {
+                pending.sort_unstable_by_key(|(index, _)| priorities[index]);
+            }
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
             let fetched: Vec<_> = stream::iter(pending)
                 .map(|(index, flight)| async move {
                     let bytes = flight.0.clone().await.map_err(Error::from_shared)?;
@@ -631,6 +679,9 @@ impl RangeReader {
                 .try_collect()
                 .await?;
             blocks.extend(fetched);
+        }
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(());
         }
         ranges
             .iter()

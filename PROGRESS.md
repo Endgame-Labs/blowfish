@@ -4,6 +4,14 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **Cold vector queries stream their slab scans** (round C1; `docs/benchmarks.md`, "Round C1"). On a cold
+  slab search, scan reads are reserved nearest leaf first and each batch of leaves is scanned as its bytes
+  land, and bounded rerank and document reads start before the slowest scan read returns. In-region
+  (c7gd.2xlarge, cache-cold, paired): 10M p50/p90 554/701 to 425/544 ms (1.30x) with GET attempts +11.5%;
+  100M 1,028/1,166 to 715/907 ms (1.44x) with GET attempts +1.6%. Recall@10 unchanged (0.9615 and 0.9540),
+  and all 500 final pairs returned identical IDs and distances. Calibrated hedging and a straggler cutoff
+  were tried and removed. No format change; small and resident searches keep the per-slab path.
+
 - **Fast queries under steady writes** (round W1; `docs/benchmarks.md`, worker harness
   `crates/bf-engine/bench/steady_writes.py`). Queries over the unindexed WAL tail decoded every resident
   vector from base64 on each query. A byte-bounded cache of decoded tail vectors (inside the existing decoded
