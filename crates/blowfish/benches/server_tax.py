@@ -59,6 +59,9 @@ def run(a):
             np.repeat(queries[:1], len(queries), axis=0),
             np.repeat(truth[:1], len(truth), axis=0),
         )
+    if a.query_repeats != 1:
+        queries = np.tile(queries, (a.query_repeats, 1))
+        truth = np.tile(truth, (a.query_repeats, 1))
     bodies = [nq.body(v, a.top_k) for v in queries]
     if a.order:
         bodies = [
@@ -195,6 +198,12 @@ if __name__ == "__main__":
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--baseline", type=Path)
     p.add_argument("--count", type=int, default=0)
+    p.add_argument(
+        "--query-repeats",
+        type=int,
+        default=1,
+        help="repeat the selected query sequence for longer counter and cycle samples",
+    )
     p.add_argument("--warm-epochs", type=int, default=3)
     p.add_argument("--order", action="store_true")
     p.add_argument(
@@ -215,7 +224,7 @@ if __name__ == "__main__":
     args = p.parse_args()
     if not args.out.resolve().is_relative_to(ROOT / ".scratch"):
         p.error("--out must be under the repository .scratch directory")
-    if min(args.repeats, args.warm_epochs + 1) <= 0 or args.count < 0:
+    if min(args.repeats, args.warm_epochs + 1, args.query_repeats) <= 0 or args.count < 0:
         p.error("invalid repeat, warm-up, or query count")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     run(args)

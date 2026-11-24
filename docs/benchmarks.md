@@ -7076,3 +7076,31 @@ The owned c7g.4xlarge, its root volume, its temporary key pair, and its security
 group are removed after measurements. No S3 objects or paid oracle namespaces are
 created. Scratch results are discarded after the retained numbers enter this
 record.
+
+## Round Q3: warm HTTP stalls
+
+The baseline is main `ddbb7bb`, including Q2's CPU dispatcher and small-tier cache
+policy. Measurements use one owned c7g.4xlarge, eight server CPUs, eight separate
+client CPUs, and sixteen keep-alive clients. NQ is downloaded from its public
+source, prepared with `bench/nq/prepare.py`, and loaded with `bench/nq/load.py`.
+Both arms use the same frozen automatic tier, build flags, cache budgets, query
+sequence, and host. Warm gates use the complete 3,452-query sequence at 48 and
+64 probes, with three warming epochs and four measured epochs per process.
+
+The resident ceiling can collect additional raw, user-only hardware events around
+only its warmed loop with `BF_BENCH_EVENTS=name:hex-config,...`. Its JSON includes
+counts per query and actual counter scheduling coverage. This is a benchmark-only
+control, rather than a server setting. For example, Neoverse V1 frontend and
+backend stall-cycle events are `stall_frontend:23` and `stall_backend:24`.
+`server_tax.py --query-repeats N` repeats the selected sequence to lengthen HTTP
+counter and cycle samples without replacing distinct vectors with one vector.
+Use separate small event groups to avoid multiplexing, and report kernel work
+separately from user work. Stalled-cycle counts are distinct from slot-based
+top-down percentages.
+
+A parser-only kill test compares Sonic 0.5.12 with the existing `serde_json`
+deserializer over every NQ request and eighteen numeric boundary cases. All NQ
+requests agree, but `1.0000000596046449` changes both a numeric filter value and
+the resulting ANN f32 component. A wholesale parser replacement is rejected:
+faster parsing must preserve the existing query bits and acceptance behavior.
+No parser dependency or production parser change is retained.
