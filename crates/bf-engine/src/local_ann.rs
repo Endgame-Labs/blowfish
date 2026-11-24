@@ -143,7 +143,9 @@ fn free_bytes(path: &Path) -> io::Result<u64> {
     }
     // SAFETY: statvfs succeeded above.
     let stats = unsafe { stats.assume_init() };
-    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+    // Field widths differ by platform (u32 blocks on macOS, u64 on Linux); widen before multiplying.
+    let free = u128::from(stats.f_bavail) * u128::from(stats.f_frsize);
+    Ok(u64::try_from(free).unwrap_or(u64::MAX))
 }
 impl Manager {
     pub fn for_store(store: &Storage, stop: Arc<crate::stop::Stop>) -> Option<Arc<Self>> {
