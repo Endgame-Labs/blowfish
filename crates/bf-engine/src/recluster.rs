@@ -63,7 +63,7 @@ pub struct ReclusterOptions {
     pub attribute: String,
     /// Coarse partitions (slabs). Cells larger than `max_slab_rows` are split into several slabs.
     pub cells: usize,
-    /// Target rows per leaf cluster inside a slab.
+    /// Target rows per leaf cluster inside a slab; zero chooses from the tier's live population.
     pub cluster_rows: usize,
     /// Most rows in one slab (bounds the builder's memory: about 6.6 KB per row at 1,024 dims in f16).
     pub max_slab_rows: usize,
@@ -75,6 +75,8 @@ pub struct ReclusterOptions {
 #[derive(Clone, Debug, Default)]
 pub struct ReclusterReport {
     pub rows: u64,
+    /// Target leaf population used for this build.
+    pub cluster_rows: usize,
     pub slabs: usize,
     pub clusters: usize,
     pub directory_bytes: u64,
@@ -83,7 +85,13 @@ pub struct ReclusterReport {
 
 /// The leaf clusters and coarse cells every build uses.
 pub(crate) const CELLS: usize = 32;
-pub(crate) const CLUSTER_ROWS: usize = 200;
+/// Two measured regimes, with no interpolation into an unqualified warm layout. NQ's
+/// 320-row leaves regress at matched recall, so smaller tiers retain 200-row leaves. The
+/// 640-row layout wins at 10M; that is the first population where it is selected, and the
+/// leaf size stays capped there for larger tiers pending their own measurements.
+pub(crate) fn target_leaf_rows(rows: u64) -> usize {
+    if rows < 10_000_000 { 200 } else { 640 }
+}
 
 /// A finished build: the tier, ready for the indexer to install.
 pub(crate) struct Built {
@@ -452,9 +460,13 @@ impl Engine {
         // `assign_leaves`), and each cell's leaves make a slab (a huge cell is split), built and
         // uploaded in turn.
         let max = opts.max_slab_rows.max(1);
+        let cluster_rows = if opts.cluster_rows == 0 {
+            target_leaf_rows(present.len() as u64)
+        } else {
+            opts.cluster_rows
+        };
         let jobs: Vec<SlabJob> = {
             let (present, read_row) = (present.clone(), read_row.clone());
-            let cluster_rows = opts.cluster_rows.max(1);
             // A delta's few rows go in as few slabs as memory allows.
             let pack = target.kind == Kind::Delta;
             let stop = self.0.stop.clone();
@@ -592,6 +604,7 @@ impl Engine {
             slab_directories(store, &ns, attr, &slabs, target.kind == Kind::Base).await?;
         let report = ReclusterReport {
             rows: present.len() as u64,
+            cluster_rows,
             slabs: slabs.len(),
             clusters,
             directory_bytes: dir.size,
@@ -1197,4 +1210,28 @@ fn assign_leaves(
         }
     }
     Some(jobs)
+}
+
+#[cfg(test)]
+mod leaf_policy_tests {
+    use super::target_leaf_rows;
+
+    #[test]
+    fn coarse_leaves_start_at_the_measured_large_tier_and_then_stop_growing() {
+        assert_eq!(target_leaf_rows(0), 200);
+        assert_eq!(target_leaf_rows(100_000), 200);
+        assert_eq!(target_leaf_rows(1_000_000), 200);
+        assert_eq!(target_leaf_rows(2_681_468), 200);
+        assert_eq!(target_leaf_rows(9_999_999), 200);
+        assert_eq!(target_leaf_rows(10_000_000), 640);
+        assert_eq!(target_leaf_rows(100_000_000), 640);
+        assert_eq!(target_leaf_rows(u64::MAX), 640);
+        let mut previous = 200;
+        for rows in (0..=100_000_000).step_by(100_000) {
+            let leaf = target_leaf_rows(rows);
+            assert!(leaf >= previous && leaf <= 640);
+            assert!(leaf == 200 || leaf.is_multiple_of(32));
+            previous = leaf;
+        }
+    }
 }

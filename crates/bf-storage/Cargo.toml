@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+memmap2 = "=0.9.12"
 async-trait = "0.1.92"
 metrics = "=0.24.6"
 bf-alloc = { path = "../bf-alloc" }

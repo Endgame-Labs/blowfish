@@ -87,10 +87,10 @@ pub struct EngineConfig {
 fn memory_limit_bytes() -> u64 {
     bf_alloc::memory_limit_bytes()
 }
-/// An eighth of the memory this process may use, within 512 MiB to 4 GiB. Entries are charged at
+/// A quarter of the memory this process may use, within 512 MiB to 4 GiB. Entries are charged at
 /// their resident size, so this bounds real memory.
 fn default_decoded_cache_bytes() -> u64 {
-    (memory_limit_bytes() / 8).clamp(512 << 20, 4 << 30)
+    (memory_limit_bytes() / 4).clamp(512 << 20, 4 << 30)
 }
 /// Rows in one built or compacted segment that a machine of this size can hold in memory. A
 /// compaction of 1,024-dimension vectors needs about 30 KB per row while it runs (measured with the

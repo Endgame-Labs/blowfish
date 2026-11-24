@@ -39,7 +39,7 @@ async fn full_nq_recluster_copy() {
             &ReclusterOptions {
                 attribute: "vector".into(),
                 cells: 32,
-                cluster_rows: CLUSTER_ROWS,
+                cluster_rows: 0,
                 max_slab_rows: 250_000,
                 scratch: scratch.clone(),
             },
@@ -261,6 +261,7 @@ fn full_nq_assignment_prerequisite() {
     let width = 1024 * 2;
     let count = ((file.metadata().unwrap().len() - offset) / width) as usize;
     assert_eq!(count, 2_681_468);
+    let target_rows = super::target_leaf_rows(count as u64);
     let read_row = |g: u32, buf: &mut Vec<u8>| {
         buf.resize(width as usize, 0);
         let position = positions.as_ref().map_or(g, |p| p[g as usize]);
@@ -308,14 +309,14 @@ fn full_nq_assignment_prerequisite() {
     println!("RR3 coarse seconds={:.3}", started.elapsed().as_secs_f64());
     let started = std::time::Instant::now();
     let jobs = if algorithm == "projection" {
-        projection(members, &read_row, super::CLUSTER_ROWS)
+        projection(members, &read_row, target_rows)
     } else {
         assign_leaves(
             &present,
             &read_row,
             &coarse,
             members,
-            super::CLUSTER_ROWS,
+            target_rows,
             250_000,
             &|| false,
         )

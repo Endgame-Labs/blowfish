@@ -40,6 +40,28 @@ Concurrent overlapping readers share futures, including with memory caching disa
 is cancelled, another waiter can finish the fetch; if all waiters cancel, a later read can retry.
 Completed errors are not retained.
 
+On Unix, `file://` immutable range readers instead map the original files and return exact
+slices. Sparse and small reads use random-access advice to avoid unrequested neighbors;
+bulk reads use normal read-ahead. The two views share the original file pages.
+The operating system manages their resident pages, and a cgroup charges those pages once;
+there is no second heap block cache or disk-cache copy. `cache_limits()` reports an effective heap
+block budget of zero for these sources. Mutable `get`, `put`, and metadata operations keep using
+the ordinary backend. S3 sources retain the block-cache policy above.
+
+The mapping cache budgets 16 GiB of virtual file references and 512 file descriptors. Their pages
+remain reclaimable by the operating system. Idle mappings expire after a minute, including while
+the service receives no queries. Deleting an object invalidates its mapping; bytes already held
+by a reader remain valid after unlinking. Outstanding bytes, including those in higher-level
+caches, keep their inode alive; expiry releases only the mapping cache's own references.
+Published objects must remain immutable: concurrent
+external truncation or in-place rewriting is unsupported. Checksums are still validated by the
+index readers.
+
+Diagnostics report these exact local batches as `mapped_read`; their byte counts describe returned
+ranges, rather than physical page faults. Query cache statistics conservatively count mapped bytes
+as misses because they do not inspect operating-system residency. Decoded metadata hits are still
+counted normally.
+
 Disk files have SHA-256 checksums and are validated on read. Missing, corrupt, or unreadable cache
 files become misses; a failed cache write does not fail a successful backend read. Files survive
 reopening without a graceful shutdown, though a machine crash may lose recently written cache data.

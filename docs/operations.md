@@ -64,7 +64,7 @@ WantedBy=multi-user.target
 
 Set `storage.cache.disk_dir` under `/var/lib/blowfish`. blowfish links jemalloc and sizes its
 memory-sensitive defaults from host RAM or the process's cgroup `memory.max` (`hw.memsize` on macOS; see [configuration](configuration.md)):
-unindexed WAL backpressure (`limit / 8`, 128 MiB to 2 GB), decoded metadata cache (`limit / 8`,
+unindexed WAL backpressure (`limit / 8`, 128 MiB to 2 GB), decoded metadata cache (`limit / 4`,
 512 MiB to 4 GiB), memory block cache (`limit / 4`, up to 8 GiB), segment row cap, and build
 concurrency. jemalloc switches adaptively between a 1 s page decay during writes, segment builds,
 compactions, and `recluster` and a 30 s decay while only queries run. On a 4 GB `c7gd.large`
