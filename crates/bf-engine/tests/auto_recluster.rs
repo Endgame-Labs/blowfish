@@ -23,8 +23,24 @@ use std::{
 struct Faults {
     inner: object_store::memory::InMemory,
     rule: Mutex<Option<(String, usize, bool)>>,
+    /// PUTs whose key contains this never return, and how many have started.
+    hang: Mutex<Option<String>>,
+    hung: std::sync::atomic::AtomicUsize,
 }
 impl Faults {
+    fn hang(&self, pattern: Option<&str>) {
+        *self.hang.lock().unwrap() = pattern.map(str::to_string);
+    }
+    /// Wait until a PUT hangs.
+    async fn hung(&self) {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while self.hung.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a PUT hangs");
+    }
     fn arm(&self, pattern: &str, skip: usize, after: bool) {
         *self.rule.lock().unwrap() = Some((pattern.to_string(), skip, after));
     }
@@ -67,6 +83,16 @@ impl ObjectStore for Faults {
         payload: PutPayload,
         opts: PutOptions,
     ) -> StoreResult<PutResult> {
+        let hangs = self
+            .hang
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| path.as_ref().contains(p.as_str()));
+        if hangs {
+            self.hung.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            std::future::pending::<()>().await;
+        }
         match self.check(path) {
             Some(false) => failure(),
             Some(true) => {
@@ -443,4 +469,109 @@ async fn a_delta_whose_rows_are_all_deleted_leaves_the_joint_plan_to_the_base() 
         assert_eq!(found, json!(q));
     }
     assert_ne!(top(&engine, 6100).await, json!(6100));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_stops_a_running_build_at_once_and_a_restart_builds_again() {
+    let (faults, store, engine) = setup().await;
+    let scratch = tempfile::tempdir().unwrap();
+    // The build's slab uploads never return, as a long build would not.
+    faults.hang(Some("/slabs/"));
+    let build = tokio::spawn({
+        let (engine, opts) = (engine.clone(), options(scratch.path()));
+        async move { engine.recluster("t", &opts).await }
+    });
+    faults.hung().await;
+    let started = std::time::Instant::now();
+    assert!(engine.shutdown(Duration::from_secs(10)).await);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    let stopped = tokio::time::timeout(Duration::from_secs(2), build)
+        .await
+        .expect("the build returns")
+        .unwrap();
+    assert_eq!(stopped.unwrap_err().status, 503);
+    faults.hang(None);
+    // Its record stays, so GC keeps whatever it uploaded until the record is stale.
+    assert!(
+        keys(&store, "ns/t/indexer/")
+            .await
+            .iter()
+            .any(|k| k.contains("/build-"))
+    );
+    assert!(tiers(&store).await.is_empty());
+    // A restarted engine answers at once, and builds.
+    let restarted = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            retention: Duration::ZERO,
+            ..Default::default()
+        },
+    );
+    assert_eq!(top(&restarted, 1234).await, json!(1234));
+    restarted
+        .recluster("t", &options(scratch.path()))
+        .await
+        .unwrap();
+    assert_eq!(tiers(&store).await.len(), 1);
+    assert_eq!(top(&restarted, 4321).await, json!(4321));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_stops_background_indexing_mid_flush() {
+    let faults = Arc::new(Faults::default());
+    let store = Storage::from_backend(faults.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let engine = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            index_interval: Duration::from_millis(10),
+            index_rows: 1,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    // The flush's segment upload never returns.
+    faults.hang(Some("/segments/"));
+    write_rows_unindexed(&engine, 0..100).await;
+    faults.hung().await;
+    let started = std::time::Instant::now();
+    assert!(engine.shutdown(Duration::from_secs(10)).await);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    faults.hang(None);
+    // Nothing was published, and the acknowledged rows are in the WAL: a restart indexes them.
+    let restarted = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    restarted.index_namespace("t", true).await.unwrap();
+    assert_eq!(top(&restarted, 42).await, json!(42));
+}
+
+async fn write_rows_unindexed(engine: &Engine, ids: std::ops::Range<usize>) {
+    let docs: Vec<_> = ids.map(|n| json!({"id": n, "vector": vector(n)})).collect();
+    engine
+        .write(
+            "t",
+            serde_json::from_value(
+                json!({"distance_metric": "euclidean_squared", "upsert_rows": docs}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 }

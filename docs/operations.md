@@ -100,7 +100,53 @@ search, full-text search, and filter through the proxy; restart, wait for readin
 queries before deleting the test namespace. Check the object-store prefix directly as well.
 Namespace deletion can retain permanent WAL fences; do not remove these manually.
 
-## Upgrading to v0.1.14
+## Upgrading to v0.1.15
+
+v0.1.15 raises the bucket format from generation 2 (v0.1.14) to generation 3. Follow the steps in Bucket
+format 3 below: stop every older writer, back up the whole prefix, then start v0.1.15. At writable startup it
+writes the `_system/format/3.json` marker. From then on, v0.1.14 and older refuse the bucket
+(`BucketFormat { required: 3, supported: 2 }`). There is no downgrade except restoring the backup.
+
+Everything else upgrades in the background while queries keep using their indexes:
+
+- **ANN objects.** Legacy `.bfv` indexes and their fragments are rewritten as single `.bfa` objects (see
+  below). Slab sets made by the old manual recluster tool become a format-1 tier in the same publications.
+- **Documents.** `docs.bfc` is rewritten as version 2, and `ids.bfi` loses its Bloom filter.
+- **Text.** Objects older than format 5 are repacked. v0.1.14 already writes format 5.
+- **Recluster.** A tier older than the binary's format is rebuilt as a base. Otherwise the usual triggers
+  apply (see Large namespaces).
+
+On my test, a v0.1.14 bucket with 200,000 rows of 1,024 dimensions and text, in 5 segments and 32 slabs,
+reached manifest format 3 within 2 seconds of startup. All its ANN objects were converted 3.6 seconds after
+startup. Recall, BM25 results, and errors were unchanged throughout, and every query stayed indexed. Check
+what is left with `blowfish reindex --dry-run`. Every legacy count reads 0 when the upgrade is done.
+
+**Background jobs.** Each writable node runs:
+
+- the indexer, which flushes the WAL into segments and runs the upgrades above;
+- compaction, which merges small segments;
+- the automatic recluster, which builds tiers;
+- garbage collection, which deletes unreferenced objects after the retention window;
+- the recall sampler, which compares a sampled ANN query with an exhaustive search.
+
+Their metrics are `blowfish_recluster_*`, `blowfish_ann_recall`, and the indexing and GC series in
+[metrics](metrics.md). The recall sampler runs at most once per `BF_RECALL_SAMPLE_INTERVAL_MS` (60 seconds).
+It skips the first interval after startup, so a restart doesn't reread every row of a large namespace. After
+a comparison that took `t`, it waits at least `50 × t`, so it never uses more than about 2% of the time.
+
+**Shutdown.** On SIGTERM or SIGINT, I stop accepting connections and tell every background job to stop.
+In-flight requests and jobs get 5 seconds together. A job stops at its next await, or between cells of a
+recluster's CPU steps. The process then exits, well within systemd's default 90-second stop timeout. The
+log line `stopped background_jobs_stopped=true` means every job stopped in time. Stopping mid-job is
+crash-safe:
+
+- A recluster build leaves its build record and objects. GC keeps them for 20 minutes, then deletes them.
+  The next start builds again.
+- An interrupted flush, compaction, or upgrade batch publishes nothing. Its uploaded objects are orphans
+  that GC deletes after the retention window.
+- Already-published batches stay durable, and the next start resumes from them.
+
+## Bucket format 3: what the upgrade does
 
 Before upgrading, stop every writer and background maintenance process using the deployment prefix.
 If rollback might be necessary, I recommend a consistent backup of the **entire bucket prefix before
@@ -125,7 +171,7 @@ or garbage-collect its objects. Format-2 manifests rename the required `indexed_
 Those releases predate the bucket marker, so the marker alone cannot stop them from starting or touching
 namespaces whose manifests have not yet been upgraded. Stop all older processes before upgrading.
 
-v0.1.14 writes one `ann.<column>.bfa` object per vector attribute in each segment or slab. Its resident
+v0.1.15 writes one `ann.<column>.bfa` object per vector attribute in each segment or slab. Its resident
 metadata includes the directory entries and, for dense segment rows, the row-to-cluster map. Each leaf
 stores a checksummed blob with its exact center, row set, and row checksums, followed by its quantized
 codes. Leaves follow locality order; one region of full-precision vectors and a checksummed footer
@@ -243,8 +289,9 @@ closed with `503`; see [auth](auth.md) and [security](security.md).
 The packaged container runs as UID/GID 10001. Its healthcheck reads the break-glass key from
 `BLOWFISH_ADMIN_KEY`, and expects internal port 8000. The Compose S3 profile is a real local
 SeaweedFS setup with demo credentials, not a hardened public object-storage service. Keep its ports
-private, and replace demo credentials before adapting it for shared use. SIGINT and SIGTERM allow
-in-flight main-port HTTP requests to finish before shutdown.
+private, and replace demo credentials before adapting it for shared use. On SIGINT or SIGTERM, I stop
+accepting connections and give in-flight requests and background jobs 5 seconds in total to finish (see
+Upgrading to v0.1.15).
 
 If blowfish dies on a fatal signal (SIGSEGV, SIGBUS, SIGILL, or SIGFPE), it first writes a line to stderr naming the
 signal, the fault address, and the thread, followed by the stack frames. The exit status is unchanged (139 for SIGSEGV).

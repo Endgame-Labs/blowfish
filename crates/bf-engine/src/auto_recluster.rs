@@ -730,7 +730,16 @@ impl Engine {
                 numbers = ?numbers,
                 "recluster: starting a build"
             );
-            match engine.background_build(&ns, &attr, why).await {
+            let stop = engine.0.stop.clone();
+            let Some(result) = stop.run(engine.background_build(&ns, &attr, why)).await else {
+                // Its record stays until it is stale; the next start builds again.
+                tracing::info!(
+                    namespace = ns.as_str(),
+                    "recluster: build stopped for shutdown"
+                );
+                return;
+            };
+            match result {
                 Ok(Some(report)) => tracing::info!(
                     namespace = ns.as_str(),
                     rows = report.rows,
@@ -931,8 +940,12 @@ impl Engine {
             &opts.attribute,
         );
         let target = target(&manifest, &opts.attribute, kind);
-        self.build_and_install(ns, &manifest, &target, opts, true)
+        self.0
+            .stop
+            .clone()
+            .run(self.build_and_install(ns, &manifest, &target, opts, true))
             .await
+            .unwrap_or_else(|| Err(ApiError::new(503, "the server is shutting down")))
     }
 }
 

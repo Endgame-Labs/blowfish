@@ -150,8 +150,23 @@ struct Config {
     /// Embedding and reranking models, keyed by the model name clients use.
     models: bf_models::ModelsConfig,
 }
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// After SIGTERM or Ctrl-C: how long requests in flight and background jobs get to finish.
+/// systemd's default stop timeout is 90 s; this stays well inside it.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // Dropping a runtime waits for every blocking task, such as a build step still on the CPU.
+    // Background work is crash-safe wherever it stops, so it gets a moment, and then the process
+    // exits without it.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     crash::install();
     blowfish::start_alloc_monitor();
     tracing_subscriber::fmt()
@@ -468,8 +483,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen = listen
         .or(config.listen)
         .unwrap_or_else(|| "0.0.0.0:8000".into());
+    let engine = Engine::with_config(storage.clone(), engine_config);
     let app = router(
-        Engine::with_config(storage.clone(), engine_config),
+        engine.clone(),
         keys,
         ServerOptions {
             auth_enabled: admin_key.is_some(),
@@ -487,12 +503,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!(listen,mode=?storage.mode(),read_only=storage.is_read_only(),"blowfish is ready 🐡");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    // On the signal, the server stops accepting connections and background jobs (indexing,
+    // compaction, GC, upgrades, and recluster builds) begin stopping at once. Requests in
+    // flight and the jobs share one grace period; whatever is left after it is dropped, which is
+    // crash-safe (an interrupted build's record stays, and GC reclaims its objects later).
+    let signalled = std::sync::Arc::new(tokio::sync::Notify::new());
+    let server = axum::serve(listener, app).with_graceful_shutdown({
+        let (signalled, engine) = (signalled.clone(), engine.clone());
+        async move {
+            shutdown().await;
+            tracing::info!("shutting down");
+            signalled.notify_one();
+            engine.begin_shutdown();
+        }
+    });
+    let mut server = std::pin::pin!(server.into_future());
+    let deadline = tokio::select! {
+        served = &mut server => {
+            served?;
+            tokio::time::Instant::now() + SHUTDOWN_GRACE
+        }
+        () = signalled.notified() => {
+            let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+            if tokio::time::timeout_at(deadline, &mut server).await.is_err() {
+                tracing::warn!("requests still in flight at shutdown were dropped");
+            }
+            deadline
+        }
+    };
     if let Some(task) = metrics_task {
         task.abort();
     }
+    let stopped = engine
+        .shutdown(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .await;
+    tracing::info!(background_jobs_stopped = stopped, "stopped");
     Ok(())
 }
 async fn shutdown() {

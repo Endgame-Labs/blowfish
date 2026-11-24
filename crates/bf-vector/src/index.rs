@@ -139,6 +139,9 @@ pub struct Index<R: RangeRead> {
     /// The mean rotated center fast-scan codes are relative to (see [`crate::fastscan`]): for a
     /// fast-scan index, or for a partial index, the directory section's centroid.
     reference: Option<Arc<Vec<f32>>>,
+    /// Cluster blobs come from a fragment written before v0.1.15, whose blobs carry no
+    /// checksum (see [`Self::decode_cluster`]).
+    legacy_blobs: bool,
 }
 impl<R: RangeRead> Index<R> {
     /// Open an index with two metadata reads: fixed footer, then directory.
@@ -230,6 +233,7 @@ impl<R: RangeRead> Index<R> {
             metadata,
             rq,
             reference,
+            legacy_blobs: false,
         })
     }
     /// Parse only the metadata of a complete in-memory index blob (no payload reads are possible).
@@ -300,6 +304,7 @@ impl<R: RangeRead> Index<R> {
             metadata,
             rq,
             reference: Some(reference),
+            legacy_blobs: false,
         })
     }
     /// Install a directory cluster blob (rotated center, row set, row checksums).
@@ -309,11 +314,14 @@ impl<R: RangeRead> Index<R> {
     }
     /// Decode a directory cluster blob without installing it.
     pub(crate) fn decode_cluster(&self, blob: &[u8]) -> Result<DecodedCluster> {
-        if blob.len() < 4 {
-            return Err(bad("truncated cluster blob"));
-        }
-        let (body, crc) = blob.split_at(blob.len() - 4);
-        check_crc(body, u32::from_le_bytes(crc.try_into().unwrap()))?;
+        let body = match blob.split_last_chunk::<4>() {
+            Some((body, crc)) if crc32fast::hash(body) == u32::from_le_bytes(*crc) => body,
+            // A pre-v0.1.15 block fragment's blob has no trailing checksum. Its parse below must
+            // still consume it exactly. Blobs rebuilt from such an index do carry one.
+            _ if self.legacy_blobs => blob,
+            Some(_) => return Err(bad("checksum mismatch")),
+            None => return Err(bad("truncated cluster blob")),
+        };
         let padded = self.rq.padded;
         let mut p = format::Parser::new(body);
         let center = p.vector(padded)?;
@@ -365,6 +373,10 @@ impl<R: RangeRead> Index<R> {
         let crc = crc32fast::hash(&out);
         out.extend(crc.to_le_bytes());
         out
+    }
+    /// Accept cluster blobs without a checksum, as fragments before v0.1.15 wrote them.
+    pub(crate) fn accept_legacy_blobs(&mut self) {
+        self.legacy_blobs = true;
     }
     pub(crate) fn metadata_mut(&mut self) -> &mut Metadata {
         &mut self.metadata

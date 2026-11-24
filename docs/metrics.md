@@ -26,7 +26,7 @@ by namespace, object key, token, or raw URL.
 | `blowfish_commit_stage_seconds` | Histogram | `stage` | Duration of write commit stages: `catch_up`, `for_writes`, `prepare`, `append`, or `replay` |
 | `blowfish_segment_build_millis_total` | Counter | None | Cumulative wall time in milliseconds spent building segments |
 | `blowfish_segment_build_rows_total` | Counter | None | Total rows built into immutable segments |
-| `blowfish_ann_recall` | Histogram | None | Sampled overlap between ANN and exhaustive results |
+| `blowfish_ann_recall` | Histogram | None | Sampled overlap between ANN and exhaustive results (at most one comparison per `BF_RECALL_SAMPLE_INTERVAL_MS`, none in the first interval after startup) |
 | `blowfish_recluster_running` | Gauge | None | 1 while an automatic recluster build runs in this process |
 | `blowfish_recluster_builds_total` | Counter | `outcome` | Finished recluster builds: `installed`, `discarded` (the segments it covered changed before it could be installed), or `failed` |
 | `blowfish_recluster_build_seconds` | Histogram | None | Time from a build's start until its tier was installed or discarded |
