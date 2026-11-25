@@ -3,7 +3,7 @@ use crate::{Engine, NamespaceState, lineage::Placement, read_cache, segment};
 use bf_storage::Storage;
 use bf_types::{ApiError, DistanceMetric, Document, Id, QueryRequest, RankBy};
 use bf_vector::{
-    Index, RoaringBitmap, VectorType,
+    CosineQuery, Index, RoaringBitmap, VectorType,
     warm_graph::{HotCancellation, HotGraph, HotGraphBuilder, HotScratch},
 };
 use bf_wal::{SlabSet, Wal};
@@ -116,10 +116,43 @@ struct Calibration {
     graph_seconds: f64,
     build_seconds: f64,
 }
+enum Locations {
+    Dense(Vec<[u32; 3]>),
+    Sparse(Vec<(u32, [u32; 3])>),
+}
+impl Locations {
+    fn new(mut rows: Vec<(u32, [u32; 3])>) -> Self {
+        rows.sort_unstable_by_key(|row| row.0);
+        if rows.iter().enumerate().all(|(i, row)| i == row.0 as usize) {
+            // Dense immutable tiers already encode the row ID in the array position. Drop
+            // its redundant copy, including capacity retained by an in-place collect.
+            let mut dense = rows.into_iter().map(|(_, at)| at).collect::<Vec<_>>();
+            dense.shrink_to_fit();
+            Self::Dense(dense)
+        } else {
+            Self::Sparse(rows)
+        }
+    }
+    fn get(&self, row: u32) -> Option<[u32; 3]> {
+        match self {
+            Self::Dense(rows) => rows.get(row as usize).copied(),
+            Self::Sparse(rows) => rows
+                .binary_search_by_key(&row, |entry| entry.0)
+                .ok()
+                .map(|i| rows[i].1),
+        }
+    }
+    fn resident_bytes(&self) -> u64 {
+        match self {
+            Self::Dense(rows) => (rows.capacity() * 12) as u64,
+            Self::Sparse(rows) => (rows.capacity() * 16) as u64,
+        }
+    }
+}
 struct Entry {
     graph: HotGraph,
     sources: Vec<Index<segment::ObjectReader>>,
-    locations: Vec<(u32, [u32; 3])>,
+    locations: Locations,
     scratch: Mutex<Vec<HotScratch>>,
     mask_live: Mutex<Option<(std::sync::Weak<RoaringBitmap>, usize)>>,
     slots: tokio::sync::Semaphore,
@@ -530,24 +563,22 @@ struct Source {
 struct Built {
     graph: HotGraph,
     sources: Vec<Index<segment::ObjectReader>>,
-    locations: Vec<(u32, [u32; 3])>,
+    locations: Locations,
     source_cpu: f64,
     build_cpu: f64,
     reservation: Reservation,
     _slot: BuildSlot,
-    _spill: crate::recluster::spill::Spill,
     _running: crate::stop::Running,
 }
 async fn read_source(
     engine: &Engine,
     set: &SlabSet,
     attribute: &str,
-    root: &std::path::Path,
     dims: usize,
     count: usize,
     cancel: &HotCancellation,
 ) -> Result<Source, ApiError> {
-    let mut builder = HotGraphBuilder::new(root, dims, count).map_err(segment::index_error)?;
+    let mut builder = HotGraphBuilder::new(dims, count).map_err(segment::index_error)?;
     let mut sources = Vec::new();
     let mut locations = Vec::with_capacity(count);
     for (slab_id, slab) in set.slabs.iter().enumerate() {
@@ -751,32 +782,21 @@ impl Engine {
         let Some(reservation) = reserved else {
             return Ok(None);
         };
-        // Reuse the engine's process-owned spill lifecycle. A cache directory is optional.
-        let root = scratch_dir(self);
-        std::fs::create_dir_all(&root).map_err(segment::index_error)?;
-        let spill_bytes = (count as u64)
-            .saturating_mul((dims.next_power_of_two() + 4) as u64)
-            .saturating_mul(2);
-        if !disk_available(&root, spill_bytes) {
-            return Ok(None);
-        }
-        let spill =
-            crate::recluster::spill::Spill::create(&root, 0).map_err(segment::index_error)?;
         let c = cancel.clone();
         let stop = self.0.stop.clone();
         let engine = self.clone();
         let source_set = set.clone();
         let source_attribute = attribute.to_owned();
         let runtime = tokio::runtime::Handle::current();
-        // Source decoding, spill I/O, and graph construction all run on the same two-worker
-        // low-priority pool. The worker owns its charge and spill even if its waiter is aborted.
+        // Source decoding and graph construction run on the same two-worker
+        // low-priority pool. The worker owns its charge even if its waiter is aborted.
         let worker_running = self.0.stop.track();
         let mut built = tokio::task::spawn_blocking(move || {
             pool().install(|| {
                 let _busy = bf_alloc::busy();
                 let source_started = thread_cpu();
-                let source = read_source(&engine, &source_set, &source_attribute, spill.directory(), dims, count, &c);
-                let Source { builder, sources, mut locations } = runtime.block_on(async {
+                let source = read_source(&engine, &source_set, &source_attribute, dims, count, &c);
+                let Source { builder, sources, locations } = runtime.block_on(async {
                     tokio::select! {
                         biased;
                         () = stop.stopped() => Err(ApiError::new(503, "warm graph build cancelled")),
@@ -788,9 +808,9 @@ impl Engine {
                 let checks = AtomicU64::new(0);
                 let graph = builder.finish(&|| c.cancelled() || stop.stopping() || overcommitted()
                     || (checks.fetch_add(1, Ordering::Relaxed).is_multiple_of(16384) && !memory_available(limit / 5))).map_err(segment::index_error)?;
-                locations.sort_unstable_by_key(|p| p.0);
+                let locations = Locations::new(locations);
                 let after: f64 = pool().broadcast(|_| thread_cpu()).into_iter().sum();
-                Ok::<_, ApiError>(Built { graph, sources, locations, source_cpu, build_cpu: (after-before).max(0.), reservation, _slot, _spill: spill, _running: worker_running })
+                Ok::<_, ApiError>(Built { graph, sources, locations, source_cpu, build_cpu: (after-before).max(0.), reservation, _slot, _running: worker_running })
             })
         }).await.map_err(segment::index_error)??;
         let current = wal.latest_manifest().await.map_err(segment::index_error)?;
@@ -808,8 +828,10 @@ impl Engine {
         }
         let resident = built.graph.resident_bytes()
             + built.sources.iter().map(Index::resident_bytes).sum::<u64>()
-            + (built.locations.capacity() * 16) as u64;
-        let retained = (resident + count as u64 * workers as u64 + workers as u64 * (2 << 20))
+            + built.locations.resident_bytes();
+        let retained = (resident
+            + (count as u64).div_ceil(32) * 8 * workers as u64
+            + workers as u64 * (2 << 20))
             .saturating_mul(5)
             / 4;
         if retained > built.reservation.0 {
@@ -1052,7 +1074,7 @@ async fn search_entry(
     };
     let (hits, evaluations) = entry
         .graph
-        .candidates(
+        .candidates_with_norms(
             vector,
             ef,
             RERANK,
@@ -1062,32 +1084,38 @@ async fn search_entry(
         .map_err(segment::index_error)?;
     drop(loan);
     #[cfg(all(test, target_os = "macos"))]
-    nav_probe::end(counter_started, evaluations, &hits);
+    nav_probe::end(
+        counter_started,
+        evaluations,
+        &hits.iter().map(|h| h.0).collect::<Vec<_>>(),
+    );
     #[cfg(not(all(test, target_os = "macos")))]
     let _ = evaluations;
     entry.phase_cpu[0].fetch_add(
         ((thread_cpu() - navigation_started).max(0.) * 1e9) as u64,
         Ordering::Relaxed,
     );
-    let mut by_source: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
-    for row in hits {
-        let p = entry
-            .locations
-            .binary_search_by_key(&row, |p| p.0)
-            .map_err(|_| segment::corrupt())?;
-        let [slab, cluster, ordinal] = entry.locations[p].1;
-        by_source
-            .entry(slab as usize)
-            .or_default()
-            .push((cluster, ordinal));
+    let mut by_source: BTreeMap<usize, Vec<(usize, usize, bf_vector::CosineNorm)>> =
+        BTreeMap::new();
+    for (row, norm) in hits {
+        let [slab, cluster, ordinal] = entry.locations.get(row).ok_or_else(segment::corrupt)?;
+        by_source.entry(slab as usize).or_default().push((
+            cluster as usize,
+            ordinal as usize,
+            norm,
+        ));
     }
+    let prepared = CosineQuery::new(vector).map_err(segment::index_error)?;
     let mut exact = measure_phase(
         &entry.phase_cpu[1],
-        futures::future::try_join_all(by_source.into_iter().map(|(slab, locations)| async move {
-            entry.sources[slab]
-                .rerank_candidates(vector, k, locations)
-                .await
-                .map_err(segment::index_error)
+        futures::future::try_join_all(by_source.into_iter().map(|(slab, locations)| {
+            let prepared = &prepared;
+            async move {
+                entry.sources[slab]
+                    .rerank_cosine_candidates(prepared, k, locations)
+                    .await
+                    .map_err(segment::index_error)
+            }
         })),
     )
     .await?
@@ -1270,21 +1298,6 @@ impl Engine {
     }
 }
 
-fn disk_available(path: &std::path::Path, bytes: u64) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    let mut out = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: both pointers are valid for the syscall; the output is read only on success.
-    if unsafe { libc::statvfs(path.as_ptr(), out.as_mut_ptr()) } != 0 {
-        return false;
-    }
-    // SAFETY: statvfs initialized the structure on success.
-    let out = unsafe { out.assume_init() };
-    u128::from(out.f_bavail) * u128::from(out.f_frsize)
-        > u128::from(bytes.saturating_add(256 << 20))
-}
 fn memory_available(bytes: u64) -> bool {
     #[cfg(target_os = "linux")]
     {

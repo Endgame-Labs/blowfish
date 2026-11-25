@@ -3,6 +3,12 @@
 use bf_storage::{CacheConfig, CacheStats, Error, Storage, StorageConfig};
 use bytes::Bytes;
 
+fn directory() -> tempfile::TempDir {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
+    std::fs::create_dir_all(&root).unwrap();
+    tempfile::tempdir_in(root).unwrap()
+}
+
 async fn store(root: &std::path::Path) -> Storage {
     Storage::open(&StorageConfig {
         url: url::Url::from_file_path(root).unwrap().to_string(),
@@ -18,7 +24,7 @@ async fn store(root: &std::path::Path) -> Storage {
 
 #[tokio::test]
 async fn mapped_ranges_share_pages_and_keep_unlinked_bytes_alive() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = directory();
     let store = store(dir.path()).await;
     assert_eq!(store.cache_limits().0, 0);
     let data = Bytes::from_static(b"immutable mapped bytes");
@@ -60,7 +66,7 @@ async fn mapped_ranges_share_pages_and_keep_unlinked_bytes_alive() {
 
 #[tokio::test]
 async fn mapped_scopes_empty_objects_and_missing_files_preserve_range_semantics() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = directory();
     let store = store(dir.path()).await;
     let alpha = store.scoped("alpha");
     let beta = store.scoped("beta");
@@ -97,12 +103,11 @@ async fn mapped_scopes_empty_objects_and_missing_files_preserve_range_semantics(
 }
 
 #[tokio::test]
-async fn sequential_truncation_is_reported_before_accessing_a_cached_mapping() {
-    let dir = tempfile::tempdir().unwrap();
+async fn short_objects_are_rejected_when_opening_and_reusing_a_mapping() {
+    let dir = directory();
     let store = store(dir.path()).await;
     store.create("short", "a complete payload").await.unwrap();
     let reader = store.range_reader("short").await.unwrap();
-    assert_eq!(reader.read(0..1).await.unwrap(), "a");
     std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
@@ -112,11 +117,15 @@ async fn sequential_truncation_is_reported_before_accessing_a_cached_mapping() {
         reader.read(0..1).await.unwrap_err(),
         Error::Config(_)
     ));
+    assert!(matches!(
+        reader.read(0..1).await.unwrap_err(),
+        Error::Config(_)
+    ));
 }
 
 #[tokio::test]
 async fn bulk_and_sparse_views_invalidate_together_without_invalidating_held_bytes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = directory();
     let store = store(dir.path()).await;
     let first = Bytes::from(vec![b'a'; 128 << 10]);
     store.create("both-views", first.clone()).await.unwrap();
@@ -135,4 +144,20 @@ async fn bulk_and_sparse_views_invalidate_together_without_invalidating_held_byt
     store.drop_caches();
     assert_eq!(bulk_bytes, first);
     assert_eq!(sparse_bytes, first);
+}
+
+#[tokio::test]
+async fn cached_mapping_rejects_a_larger_declared_length() {
+    let dir = directory();
+    let store = store(dir.path()).await;
+    store.create("size", "complete").await.unwrap();
+    let reader = store.range_reader("size").await.unwrap();
+    assert_eq!(reader.read(0..1).await.unwrap(), "c");
+    let larger = store
+        .range_reader_with_length("size", 1 << 20, false)
+        .unwrap();
+    assert!(matches!(
+        larger.read(0..1).await.unwrap_err(),
+        Error::Config(_)
+    ));
 }

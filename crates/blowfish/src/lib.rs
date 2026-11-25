@@ -254,8 +254,13 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
             bf_storage::StorageMode::SingleWriter => "single_writer",
         }
     };
+    let namespaces = s.engine.cached_namespaces().await;
+    let hot_graphs = namespaces
+        .iter()
+        .map(|namespace| (namespace.clone(), s.engine.hot_graph_status(namespace)))
+        .collect::<std::collections::BTreeMap<_, _>>();
     Json(
-        json!({"version":env!("CARGO_PKG_VERSION"), "storage_url":redacted_storage_url(&s.options.storage_url), "storage_mode":mode, "uptime_seconds":s.started.elapsed().as_secs_f64(), "namespaces_cached":s.engine.cached_namespaces().await}),
+        json!({"version":env!("CARGO_PKG_VERSION"), "storage_url":redacted_storage_url(&s.options.storage_url), "storage_mode":mode, "uptime_seconds":s.started.elapsed().as_secs_f64(), "namespaces_cached":namespaces, "hot_graphs":hot_graphs}),
     )
 }
 async fn whoami(Extension(p): Extension<Principal>) -> Json<bf_auth::WhoAmI> {

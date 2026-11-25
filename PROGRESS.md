@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **G5 warm graph navigation (merged).** Cached norms, bitset plus contiguous beam, four-accumulator ARM int8 dot (567 -> 275 instructions per dot), neighbor-code prefetch (160 -> 55 ns per dot), dense locations, `/status` hot_graphs. M4 production binary, matched recall 0.944: 8,720 vs Qdrant 8,407 q/s (+3.7%), +9-11% over main controls, 2.65M vs 1.96M instr/q (G4 3.57M). RSS ~4.4 GB vs Qdrant ~5.6 GB. Untried: graph-walk packing, progressive precision.
+
 - **BW6 per-window posting offsets (merged).** Decoded posting blocks carry a per-window offset table (no per-window binary search), offset-keyed maps use a cheap hasher, and the span cache is compact. 1M MS MARCO, paired A/B/B/A on one c7g.4xlarge: 16 clients 1,100 -> 1,258 q/s (1.14x), p50 12.2 -> 10.9 ms; 1 client 531 -> 582 q/s, p50 1.29 -> 1.24 ms. Bit-identical; the frozen 4,000-query check passes. BW4 and BW5 (docs only) showed global window scheduling and setup cuts were not material.
 
 - **C8 staged hydration companions (merged).** Stages hold covered segments' docs.bfc directories and an 8 B/row row-to-ID map (numeric IDs), admitted before exact vectors under the same cap and records (`FileRecord.base`/`source`, serde-default). 10M cold IDs-only p50 126.9 -> 58.0 ms (2.19x; repeat 2.25x), GETs 37.9 -> 4.5; title/text 139.6 -> 101.6 ms; 100M IDs-only 396.4 -> 309.4 ms. +92 MB at 10M. 100M first staging 92 -> 172 s; ~3,900 of 4,096 descriptor budget. Identical results; restart adoption unchanged.

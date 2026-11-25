@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **Faster warm graph search:** The resident graph index caches vector norms, keeps its beam in a contiguous buffer with a bitset of visited nodes, prefetches neighbor codes, stores locations densely, and uses a four-accumulator int8 dot product on ARM. On an Apple M4 with the Natural Questions benchmark and the production server, 16-client throughput at recall 0.944 is 8,720 queries/s versus Qdrant's 8,407 on the same machine, 9 to 11 percent above v0.1.28, at 2.65M instructions per query (was 3.57M). Memory is unchanged (about 4.4 GB versus Qdrant's 5.6 GB). `/status` now reports each cached namespace's resident graph state.
+
 ## [0.1.28] - 2026-11-25
 
 ### Changed

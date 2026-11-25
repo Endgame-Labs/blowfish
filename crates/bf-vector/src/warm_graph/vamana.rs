@@ -165,16 +165,16 @@ pub(super) fn reservation(rows: u64, padded: u64, queries: u64) -> Option<u64> {
     let lock = std::mem::size_of::<RwLock<Neighbors>>() as u64;
     // Codes/scales, row coordinates, insertion permutation, and two construction scratch sets.
     // Each scratch set permits byte marks, expanded IDs, candidate IDs, and scored prune pools.
-    let building = padded.checked_add(lock)?.checked_add(12 + 2 * 40)?;
+    let building = padded.checked_add(lock)?.checked_add(16 + 2 * 40)?;
     // Old construction adjacency and the final compact representation coexist during conversion.
-    let publication = padded.checked_add(lock)?.checked_add(4 + 4 + 136 + 1)?;
-    let retained = padded.checked_add(4 + 4 + 136 + 1)?.checked_add(queries)?;
+    let publication = padded.checked_add(lock)?.checked_add(4 + 4 + 4 + 136 + 1)?;
+    let retained = padded.checked_add(4 + 4 + 4 + 136 + 1)?;
     let construction = rows
         .checked_mul(building.max(publication))?
         .checked_add(64 << 20)?;
-    let serving = rows
-        .checked_mul(retained)?
-        .checked_add(queries.checked_mul(2 << 20)?)?;
+    let serving = rows.checked_mul(retained)?.checked_add(
+        queries.checked_mul(rows.div_ceil(32).checked_mul(8)?.checked_add(2 << 20)?)?,
+    )?;
     construction.max(serving).checked_mul(5).map(|n| n / 4)
 }
 pub fn build(
@@ -278,6 +278,7 @@ mod tests {
             dims,
             values: Vec::new(),
             scales: Vec::new(),
+            dot: super::super::quant::dot_kernel(),
         };
         for id in 0..n {
             let row = (0..dims)
