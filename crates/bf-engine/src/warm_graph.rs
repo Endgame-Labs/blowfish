@@ -530,19 +530,17 @@ struct Built {
     build_cpu: f64,
     reservation: Reservation,
     _slot: BuildSlot,
-    _spill: crate::recluster::spill::Spill,
     _running: crate::stop::Running,
 }
 async fn read_source(
     engine: &Engine,
     set: &SlabSet,
     attribute: &str,
-    root: &std::path::Path,
     dims: usize,
     count: usize,
     cancel: &HotCancellation,
 ) -> Result<Source, ApiError> {
-    let mut builder = HotGraphBuilder::new(root, dims, count).map_err(segment::index_error)?;
+    let mut builder = HotGraphBuilder::new(dims, count).map_err(segment::index_error)?;
     let mut sources = Vec::new();
     let mut locations = Vec::with_capacity(count);
     for (slab_id, slab) in set.slabs.iter().enumerate() {
@@ -739,31 +737,20 @@ impl Engine {
         let Some(reservation) = reserved else {
             return Ok(None);
         };
-        // Reuse the engine's process-owned spill lifecycle. A cache directory is optional.
-        let root = scratch_dir(self);
-        std::fs::create_dir_all(&root).map_err(segment::index_error)?;
-        let spill_bytes = (count as u64)
-            .saturating_mul((dims.next_power_of_two() + 4) as u64)
-            .saturating_mul(2);
-        if !disk_available(&root, spill_bytes) {
-            return Ok(None);
-        }
-        let spill =
-            crate::recluster::spill::Spill::create(&root, 0).map_err(segment::index_error)?;
         let c = cancel.clone();
         let stop = self.0.stop.clone();
         let engine = self.clone();
         let source_set = set.clone();
         let source_attribute = attribute.to_owned();
         let runtime = tokio::runtime::Handle::current();
-        // Source decoding, spill I/O, and graph construction all run on the same two-worker
-        // low-priority pool. The worker owns its charge and spill even if its waiter is aborted.
+        // Source decoding and graph construction run on the same two-worker
+        // low-priority pool. The worker owns its charge even if its waiter is aborted.
         let worker_running = self.0.stop.track();
         let mut built = tokio::task::spawn_blocking(move || {
             pool().install(|| {
                 let _busy = bf_alloc::busy();
                 let source_started = thread_cpu();
-                let source = read_source(&engine, &source_set, &source_attribute, spill.directory(), dims, count, &c);
+                let source = read_source(&engine, &source_set, &source_attribute, dims, count, &c);
                 let Source { builder, sources, mut locations } = runtime.block_on(async {
                     tokio::select! {
                         biased;
@@ -778,7 +765,7 @@ impl Engine {
                     || (checks.fetch_add(1, Ordering::Relaxed).is_multiple_of(16384) && !memory_available(limit / 5))).map_err(segment::index_error)?;
                 locations.sort_unstable_by_key(|p| p.0);
                 let after: f64 = pool().broadcast(|_| thread_cpu()).into_iter().sum();
-                Ok::<_, ApiError>(Built { graph, sources, locations, source_cpu, build_cpu: (after-before).max(0.), reservation, _slot, _spill: spill, _running: worker_running })
+                Ok::<_, ApiError>(Built { graph, sources, locations, source_cpu, build_cpu: (after-before).max(0.), reservation, _slot, _running: worker_running })
             })
         }).await.map_err(segment::index_error)??;
         let current = wal.latest_manifest().await.map_err(segment::index_error)?;
@@ -797,7 +784,9 @@ impl Engine {
         let resident = built.graph.resident_bytes()
             + built.sources.iter().map(Index::resident_bytes).sum::<u64>()
             + (built.locations.capacity() * 16) as u64;
-        let retained = (resident + count as u64 * workers as u64 + workers as u64 * (2 << 20))
+        let retained = (resident
+            + (count as u64).div_ceil(32) * 8 * workers as u64
+            + workers as u64 * (2 << 20))
             .saturating_mul(5)
             / 4;
         if retained > built.reservation.0 {
@@ -1268,21 +1257,6 @@ impl Engine {
     }
 }
 
-fn disk_available(path: &std::path::Path, bytes: u64) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    let mut out = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: both pointers are valid for the syscall; the output is read only on success.
-    if unsafe { libc::statvfs(path.as_ptr(), out.as_mut_ptr()) } != 0 {
-        return false;
-    }
-    // SAFETY: statvfs initialized the structure on success.
-    let out = unsafe { out.assume_init() };
-    u128::from(out.f_bavail) * u128::from(out.f_frsize)
-        > u128::from(bytes.saturating_add(256 << 20))
-}
 fn memory_available(bytes: u64) -> bool {
     #[cfg(target_os = "linux")]
     {

@@ -2,24 +2,11 @@ use super::{HotGraph, check, quant, vamana};
 use crate::{Error, Result, rabitq::RaBitQ};
 use half::f16;
 use numkong::Dot;
-use std::{
-    fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, Read, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
-struct Spill(PathBuf);
-impl Drop for Spill {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 /// Streaming SQ8 collector for a disposable, whole-tier row graph.
-/// Dropping it removes its owned spill. Run collection and `finish` on a bounded CPU pool.
-/// Original f16 rows are never retained or reread during construction.
+/// Final code arrays are filled directly under the caller's memory reservation. Run collection
+/// and `finish` on a bounded CPU pool. Original f16 rows are never retained or reread.
 pub struct HotGraphBuilder {
-    spill: Spill,
-    codes: BufWriter<File>,
+    codes: quant::Codes,
     transform: RaBitQ,
     dims: usize,
     count: usize,
@@ -29,33 +16,18 @@ pub struct HotGraphBuilder {
     norms: Vec<crate::CosineNorm>,
 }
 impl HotGraphBuilder {
-    /// Create a uniquely owned spill under `root`. No existing directory is modified.
-    /// At most `count` rows may be appended, in immutable source-leaf order.
-    pub fn new(root: &Path, dims: usize, count: usize) -> Result<Self> {
+    /// Reserve final SQ8 arrays without creating temporary files. At most `count` rows may
+    /// be appended, in immutable source-leaf order. The caller reserves the complete build.
+    pub fn new(dims: usize, count: usize) -> Result<Self> {
         if HotGraph::reservation(count, dims, 1).is_none() {
             return Err(Error::InvalidInput("unsupported graph source shape".into()));
         }
-        std::fs::create_dir_all(root)?;
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = root.join(format!(
-            "hot-{}-{stamp}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path)?;
-        let spill = Spill(path);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(spill.0.join("codes"))?;
-        uncached(&file)?;
         Ok(Self {
-            spill,
-            codes: BufWriter::with_capacity(1 << 20, file),
+            codes: quant::Codes {
+                dims: dims.next_power_of_two(),
+                values: Vec::with_capacity(count * dims.next_power_of_two()),
+                scales: Vec::with_capacity(count),
+            },
             transform: RaBitQ::new(dims, 42)?,
             dims,
             count,
@@ -67,7 +39,7 @@ impl HotGraphBuilder {
     }
     /// Append little-endian f16 rows. Immutable tier coordinates are preserved explicitly;
     /// graph node IDs follow arrival order. Nonfinite and zero vectors are rejected.
-    /// Cancellation is checked for each row. Drop the builder after an I/O or cancellation error.
+    /// Cancellation is checked for each row. Drop the builder after a cancellation error.
     pub fn append(
         &mut self,
         rows: &[u32],
@@ -129,11 +101,8 @@ impl HotGraphBuilder {
                 *sum += f64::from(*value);
             }
             let (values, scale) = quant::encode(&self.transform.rotate(&normalized));
-            self.codes.write_all(&scale.to_le_bytes())?;
-            // SAFETY: i8 and u8 have identical layout, and admit every bit pattern.
-            let bytes =
-                unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len()) };
-            self.codes.write_all(bytes)?;
+            self.codes.scales.push(scale);
+            self.codes.values.extend(values);
         }
         self.rows.extend_from_slice(rows);
         Ok(())
@@ -142,7 +111,11 @@ impl HotGraphBuilder {
     /// Construction checks cancellation between source rows, graph points, and bounded phases.
     pub fn finish(mut self, cancelled: &(impl Fn() -> bool + Sync)) -> Result<HotGraph> {
         check(cancelled)?;
-        if self.rows.len() != self.count {
+        if self.rows.len() != self.count
+            || self.codes.values.len() != self.count * self.codes.dims
+            || self.codes.scales.len() != self.count
+            || self.norms.len() != self.count
+        {
             return Err(Error::InvalidInput("incomplete graph source".into()));
         }
         let mut sorted = self.rows.clone();
@@ -151,36 +124,7 @@ impl HotGraphBuilder {
             return Err(Error::InvalidInput("duplicate tier row".into()));
         }
         drop(sorted);
-        self.codes.flush()?;
-        self.codes.get_ref().sync_all()?;
-        let file = File::open(self.spill.0.join("codes"))?;
-        uncached(&file)?;
-        let padded = self.dims.next_power_of_two();
-        if file.metadata()?.len() != (self.count * (padded + 4)) as u64 {
-            return Err(Error::InvalidInput("incomplete graph codes".into()));
-        }
-        let mut reader = BufReader::with_capacity(1 << 20, file);
-        let mut values = Vec::with_capacity(self.count * padded);
-        let mut scales = Vec::with_capacity(self.count);
-        let mut row = vec![0; padded];
-        for id in 0..self.count {
-            check(cancelled)?;
-            let mut scale = [0; 4];
-            reader.read_exact(&mut scale)?;
-            scales.push(f32::from_le_bytes(scale));
-            reader.read_exact(&mut row)?;
-            values.extend(row.iter().map(|x| *x as i8));
-            if id.is_multiple_of(8192) {
-                discard(reader.get_ref())?;
-            }
-        }
-        discard(reader.get_ref())?;
-        drop(reader);
-        let codes = quant::Codes {
-            dims: padded,
-            values,
-            scales,
-        };
+        let codes = self.codes;
         let norm = self.sum.iter().map(|x| x * x).sum::<f64>().sqrt();
         let center = if norm > 0. {
             self.sum.iter().map(|x| (x / norm) as f32).collect()
@@ -224,32 +168,4 @@ impl HotGraphBuilder {
             norms: std::mem::take(&mut self.norms),
         })
     }
-}
-fn uncached(file: &File) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: F_NOCACHE changes only this valid, privately owned spill descriptor.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = file;
-    Ok(())
-}
-fn discard(file: &File) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: the code spool was flushed before reading, and is immutable here.
-        let result =
-            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-        if result != 0 {
-            return Err(std::io::Error::from_raw_os_error(result).into());
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = file;
-    Ok(())
 }

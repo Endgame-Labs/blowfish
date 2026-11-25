@@ -192,7 +192,6 @@ async fn same_graph_navigation_cpu() {
         &engine,
         set,
         "vector",
-        &root,
         queries[0].len(),
         count,
         &HotCancellation::default(),

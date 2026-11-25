@@ -1,6 +1,6 @@
 //! Disposable, bounded-memory row graphs for warm immutable cosine-f16 tiers.
 //!
-//! Quantized source codes spill to caller-owned local storage. Construction retains global SQ8
+//! Source rows fill the final code arrays directly. Construction retains global SQ8
 //! and fixed-capacity adjacency, without a full f16 corpus or spatial partitions. Nothing here
 //! defines a bucket format. The caller supplies a pool with at most two construction workers.
 mod builder;
@@ -32,7 +32,7 @@ pub struct HotGraph {
     codes: quant::Codes,
     norms: Vec<crate::CosineNorm>,
 }
-/// Reusable per-query visited bytes and bounded heaps.
+/// Reusable per-query exact visitation and bounded beam.
 pub struct HotScratch(navigation::Scratch);
 impl HotGraph {
     /// Number of graph nodes.
@@ -69,7 +69,7 @@ impl HotGraph {
     pub fn live_count(&self, mask: &RoaringBitmap) -> usize {
         self.rows.iter().filter(|row| mask.contains(**row)).count()
     }
-    /// Allocate a byte-per-node visited array. Callers bound and reserve the number retained.
+    /// Allocate cache-sized visitation state. Callers bound and reserve the number retained.
     pub fn scratch(&self) -> HotScratch {
         HotScratch(navigation::Scratch::new(self.len()))
     }
@@ -165,7 +165,7 @@ mod tests {
         }
     }
     #[test]
-    fn spilled_build_maps_rows_masks_dead_nodes_and_cleans_up() {
+    fn streaming_build_maps_rows_masks_dead_nodes_and_never_spills() {
         let root = root();
         let _cleanup = Cleanup(root.clone());
         let dims = 16;
@@ -177,7 +177,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let mut b = HotGraphBuilder::new(&root, dims, n).unwrap();
+        let mut b = HotGraphBuilder::new(dims, n).unwrap();
         for (part, rows) in source.chunks(40).enumerate() {
             let ids = (part * 40..part * 40 + rows.len())
                 .map(|i| 1000 + i as u32 * 3)
@@ -195,7 +195,7 @@ mod tests {
             .unwrap()
             .install(|| b.finish(&|| false))
             .unwrap();
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert!(!root.exists());
         let mut scratch = graph.scratch();
         let live = (0..n)
             .filter(|i| *i != 7)
@@ -235,7 +235,7 @@ mod tests {
     fn cancellation_and_invalid_input_leave_no_spills() {
         let root = root();
         let _cleanup = Cleanup(root.clone());
-        let mut b = HotGraphBuilder::new(&root, 2, 1).unwrap();
+        let mut b = HotGraphBuilder::new(2, 1).unwrap();
         assert!(b.append(&[1], &[0; 4], &|| false).is_err());
         let p = [f16::ONE, f16::ZERO]
             .into_iter()
@@ -245,6 +245,6 @@ mod tests {
         let cancel = HotCancellation::default();
         cancel.cancel();
         assert!(b.finish(&|| cancel.cancelled()).is_err());
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert!(!root.exists());
     }
 }
