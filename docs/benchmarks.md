@@ -9792,3 +9792,208 @@ All 32 answers returned identical rows and distance bits. Backend request counts
 the two baseline runs because of concurrent speculative IVF reads. Large ordering and network
 variation prevents a speedup claim; this short gate found no cold latency regression.
 
+
+## Round BW3: reuse WAL term summaries during BM25 queries
+
+Measured on 2026-11-25 against baseline `4ce093e0a4177a93541671a8f58bbc85489f271f`,
+with implementation `626a9e9`.
+
+BM25 under 1,000 text upserts/s improves **31.419 → 22.000 ms p50
+(1.428× faster)**, and 44.010 → 33.956 ms p90.
+Warm 16-client throughput is **1,177.2 → 1,180.6 queries/s
+(+0.29%)**. These clear the write-loaded query-latency threshold and
+warm-throughput non-regression limit. Every final offered write is acknowledged:
+480,000/480,000 rows, with zero rejections.
+
+Write-service p50/p90 changes from 2.019/2.816 to
+2.045/2.838 ms: +1.31%/+0.78%.
+The offered write throughput is unchanged. The service-latency increases remain
+visible; these runs do not establish a literal zero write-latency regression.
+Maximum write capacity is not measured.
+
+| Write-loaded arm | BM25 p50 / p90, ms | Write-service p50 / p90, ms | Tail median / maximum | Acknowledged / offered |
+| --- | ---: | ---: | ---: | ---: |
+| A1 | 31.249 / 45.675 | 2.028 / 2.811 | 2997 / 6876 | 120,000 / 120,000 |
+| B1 | 22.498 / 33.601 | 2.036 / 2.854 | 3096 / 6079 | 120,000 / 120,000 |
+| B2 | 21.502 / 34.311 | 2.055 / 2.822 | 3096 / 6975 | 120,000 / 120,000 |
+| A2 | 31.588 / 42.345 | 2.010 / 2.820 | 3294 / 6776 | 120,000 / 120,000 |
+
+| Warm arm | 16-client queries/s | p50 / p90, ms | Validated queries |
+| --- | ---: | ---: | ---: |
+| A1 | 1,179.0 | 11.677 / 19.752 | 10,000 |
+| B1 | 1,178.5 | 11.661 / 19.975 | 10,000 |
+| B2 | 1,182.8 | 11.644 / 19.857 | 10,000 |
+| A2 | 1,175.3 | 11.815 / 19.889 | 10,000 |
+
+Headline changes use the medians of the two run values. Every write-loaded arm
+measures the same 90 query IDs in the same order; their index-list SHA-256 is
+`d7c5fdacd887c880c0e518841ac904d3a4b77dc83379b18122ce8e2f9143ed59`.
+Maximum sampled server RSS is approximately 1.46 GiB in both versions.
+
+The traced first final pair isolates the retained savings. Durations below are
+per-query medians; segment work is summed over workers, and nested or overlapping
+stages are not additive.
+
+| Stage | Baseline p50 / p90, ms | Candidate p50 / p90, ms |
+| --- | ---: | ---: |
+| Global statistics | 20.798 / 28.268 | 13.192 / 21.836 |
+| Tail-statistics gathering | 14.010 / 18.174 | 6.475 / 10.964 |
+| Shadow correction | 7.023 / 10.775 | 7.121 / 11.107 |
+| Tail summary lookup for ranking | 1.580 / 3.191 | 0.515 / 1.193 |
+| Tail scoring | 2.524 / 5.505 | 2.240 / 5.202 |
+| Complete tail phase | 5.006 / 9.164 | 3.214 / 6.716 |
+| Segment scoring and hydration, summed workers | 8.418 / 24.552 | 8.878 / 21.999 |
+
+Separate final read-only warm profiles have zero lost samples. The main search
+future accounts for 40.21%/40.07% of baseline/candidate samples; posting decode
+and searches remain the warm cost. The write-loaded 1 Hz stream offers no
+simultaneous query walks to share. No cross-query posting-walk implementation
+ships in this round.
+
+
+### Change and measured cause
+
+The first warm and steady-write profiles used the production HTTP router, the
+Rust `concurrent_bm25` driver, and BW1's `steady_writes.py`. Under writes, the
+90 measured queries spent a median 14.964 ms gathering tail statistics and
+8.775 ms correcting shadowed rows. Warm checkpoint statistics took about
+0.057 ms. These diagnostics used stage traces and sampling, and are separate
+from the final paired timing results.
+
+WAL analysis now captures the query's immutable analysis configuration and cache
+handle once. Large tails gather their term summaries in parallel when the
+existing fan-out policy allows it. A query-local map shares the same summaries
+with tail ranking, avoiding a second round of cache lookups or analysis. Weak
+references reserve document allocation identities, and the complete analysis
+configuration guards reuse. The map leaves scope with the query. It retains
+summaries until that query finishes, including with a disabled persistent cache;
+its temporary memory is additional to the existing byte-bounded cache.
+
+Tail gathering explicitly reuses the existing query CPU pool after I/O
+continuations. It does not create another pool or change that pool's sizing.
+The existing fan-out policy retains serial gathering under saturation.
+Each gather exposes at most one fewer runnable chunk than query-pool workers.
+Plain BM25 queries with no WAL rows skip tail-analysis setup.
+
+Plain BM25 tail ranking keeps a bounded top `k + offset` using the evaluator's
+same score and ID order. It retains document references only for those winners,
+and avoids cloning the rank key or allocating score-tree entries for every tail
+row. Compound scores and diversified limits retain their existing full-candidate
+path. Floating-point scoring is unchanged.
+
+Shadow correction retains its previous execution path. A separate prototype
+parallelized each segment's batch of query-term intersections, and cut that
+stage substantially, but worsened write-service latency in the paired gate.
+That prototype was removed. The per-query term-summary reuse remains. Integer
+counts and lengths, live masks, BM25 arithmetic, and lexical f32 addition order
+are unchanged. There are no public API, dependency, configuration, write-path,
+or stored-format changes.
+
+The rejected parallel-shadow A/B/B/A measured BM25 p50/p90 of
+31.245/44.005 → 18.002/29.375 ms,
+but write-service p50/p90 increased from
+2.016/2.766 to 2.122/3.059 ms.
+That is a 10.60% write-service p90 regression, despite all 480,000 offered rows
+being acknowledged. These results are rejected diagnostics, not the accepted
+headline comparison. The final comparison starts fresh after removing
+parallel correction.
+
+
+The hydration proposal was not selected: the IDs-only gate already uses inline
+row keys without reading projected text columns. Starting ranking before exact
+statistics was not implemented; final namespace-wide weights still require
+those statistics, and this round preserves their existing exact sequencing.
+Cross-query posting sharing was not needed for the selected write-loaded cost.
+
+### Fixture and protocol
+
+One dedicated on-demand c7g.4xlarge, Ubuntu 24.04 arm64, 16 Neoverse-V1 cores,
+and 32 GiB RAM. Rust 1.100.0 and Clang 19; both release binaries use the same
+production thin-LTO profile and GNU linker, with LLVM 19's ARM compiler-runtime
+archive appended for NumKong. Debug tests use LLD 19 and omit debug sections
+from executables. Builds, reference generation, and profiles do not overlap the
+final timing measurements.
+
+The server is pinned to CPUs 0–5, and clients to CPUs 14–15. Both arms use two
+Tokio workers, two global Rayon workers, the normal CPU-derived query pool,
+a 2 GiB raw cache, 4,000-byte blocks, up to 512 coalesced blocks, 512 fetches,
+no disk cache, and default decoded-cache and indexing settings.
+The local store resides on a 120 GiB gp3 root volume. Comparisons use this round's
+fresh paired controls; historical T4 and BW2 absolute times are not controls.
+
+The first million MS MARCO passages were loaded with
+`bench/scale/msmarco_load.py`, 5,000-row batches, and four concurrent writes.
+The load was drained until `performance.exhaustive_search_count` was zero.
+The reusable fixture is retained at `tmp/msmarco-1m-v021/`, with its store,
+numeric-ID JSONL corpus, independent reference answers, and a SHA-256 manifest.
+Its builder is `4ce093e0a4177a93541671a8f58bbc85489f271f`. The shared NQ fixture
+remains unchanged; the small-store check uses a local copy.
+
+Every final arm starts a fresh process and a disposable copy of the same
+checkpointed store. Warm arms are read-only, prewarm all 1,000 queries at one
+client, and run ten complete 1,000-query passes at 16 clients. Each response is
+checked for ordered IDs and f32 score bits by `concurrent_bm25`. Per-arm throughput
+is total validated queries divided by summed measured elapsed time.
+
+Write-loaded arms use BW1's seeds, text-changing 100-row upserts, 1,000 rows/s,
+strong top-ten IDs-only queries, and a 1 Hz schedule. Each runs for 120 seconds;
+query percentiles exclude 30 seconds of warm-up, and write-service percentiles
+cover all 1,200 requests. Both warm and write-loaded arms use A/B/B/A order.
+Only the first write-loaded A/B pair enables stage traces. All arms prewarm the
+full workload before starting their measurement window.
+
+### Validation and reproduction
+
+`cargo fmt --all -- --check`,
+`cargo clippy -p bf-engine -p bf-text --all-targets -- -D warnings`, and
+`cargo test -p bf-engine -p bf-text` pass: 294 tests, zero failures, and 19
+expected ignores across 39 suites. New coverage checks query-local summary
+reuse, changed analysis configurations, replacement identities, ties, offsets,
+projections, computed scores, and a zero persistent-cache budget. Existing cases cover arrays, prefixes, filters,
+computed scores, publications, and concurrent snapshots.
+
+The release-mode `text_benchmark::bm25_serialized_msmarco_snapshots` test passes
+all 4,000 queries and 40,000 ordered ID and f32 score-bit comparisons against
+the independent exhaustive scorer in 169.90 seconds. Its four states cover the
+checkpointed million passages, 5,000 overwrites, overlapping updates plus deletes
+and nulls, and the next publication. Earlier snapshots remain alive across later
+publications. This validation is rerun after removing parallel shadow correction.
+
+All 40,000 final measured warm responses, plus their 4,000 warm-up responses,
+match the independent reference's ordered IDs and f32 score bits. The shared
+small-NQ local copy returns identical rows for 72 baseline/candidate queries
+covering named and full projections, filters, offsets, and prefix ranking.
+
+Cold S3 latency, maximum ingest capacity, full-workspace checks, and official-SDK
+merge validation remain outside this worker's measurements.
+
+Build the existing scale server and `bf-text` examples from each revision, keep
+the binaries under an owned `.scratch/` run directory, and use a fresh local-store
+copy for each arm. With the server pinned as above, the write-loaded client is:
+
+```sh
+uv run --with numpy crates/bf-engine/bench/steady_writes.py \
+  --corpus "$BW3_RUN/corpus.jsonl" \
+  --workload bench/scale/data/bm25-msmarco.json \
+  --namespace msmarco --base-url http://127.0.0.1:18323 \
+  --query-count 1000 --rate 1000 --batch 100 --bm25-hz 1 \
+  --seconds 120 --warmup 30 --cpus 14,15 \
+  --tag writes-a1 --out "$BW3_RUN/results.jsonl"
+```
+
+Warm requests use the existing `concurrent_bm25` example, first with one client,
+then with 16, with the same workload, independent reference JSON, address, and
+namespace. The frozen checker uses `BW1_STORE` and `BW1_REFERENCE` as documented
+in Round BW1. Delete owned local stores, outputs, and processes after recording
+results; retain the shared MS MARCO fixture for subsequent rounds.
+
+Round BW3 input and executable SHA-256 values:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Numeric-ID corpus JSONL | `6e83d701f078fea375bc3dffefa4a05635eac71e7c1cebc0db11fd8c8d341a0a` |
+| Workload | `3c8f1b03e4d8293ec9c45f53e8d1f94bfe4bd5cbb23d1e31623df655baf9f472` |
+| Independent reference JSON | `11527f614bd4ed6cb4d4efe19b47dc90343c12051a8693fbf084ee65903ad201` |
+| Baseline release binary | `6ece8f6a4da180cc47d65855d56cf0a84ecbff2c942b71355d56e07b6fdd4707` |
+| Final candidate release binary | `f41c00c1de46cec78e4797ca95bc33a96cc866332eb83c101fab312364b71b2f` |
+| Rust load driver | `465801003ccf739296a9fe34c1c57517a15d3caa0a33d02a168341f679509526` |
