@@ -11491,3 +11491,72 @@ One c7gd.4xlarge for about 24 minutes (about $0.30 on-demand). The instance, key
 deleted, and the `tmp/c13/` test objects (1.5 GB copy, 1.5 GB single-part, 64 MiB, and 1 MiB) were removed from the bucket.
 No writes to the 100M prefix. The harness (a 250-line Rust binary using hyper, rustls, and `object_store`'s presigned URLs)
 was scratch code and is not kept.
+
+## Round BW11: dense-term frequency arrays as the one serving path (shipped)
+
+BW10 (`04e91eb`) measured 1.275x warm 16-client with arrays chosen from a training split. BW11 removes the setting and the
+training workload, and measures startup, cold, and write-loaded latency, which BW10 did not.
+
+### The rule
+
+A term is **dense** in a segment when its document frequency is above the existing sparse threshold. A reader counts
+each query's use of each dense term (exact query terms only; prefix expansions are never counted). On the **second** use,
+the reader builds that term's array: one byte per row, an overflow table for frequencies of 255 or more, and window bounds.
+Rent twice, then buy: the build costs one decode of the whole posting list (frames already in the posting memo are reused,
+and the rest come in one batched read), so it is repaid after a few queries, and a first (cold) query pays nothing extra.
+The limits are 32 arrays per reader and the reader's decoded-pool budget (a thirty-second of the general cache, 8 to 64 MiB),
+and a term that does not fit stays on the posting path. Arrays are charged to the owning cache through BW9's memo charge
+hook, so they count against the decoded cache and leave with the reader. No format change.
+
+Bounds stay exact without a training pass or a per-row scan: each window keeps the Pareto frontier of its rows'
+(tf, length) pairs. BM25's saturation factor is monotone in both, so the window maximum is the maximum over the frontier.
+A first version recomputed bounds per row whenever corpus statistics changed. Writes change them on almost every query, and
+that cost **+7% write-loaded p50** (19.7 to 21.0 ms, in two paired rounds, consistently). Raising the earn threshold from 2 to 8
+did not help, which pointed to the bounds. The frontier removed it (19.7 versus 19.7 ms).
+
+### Measurement
+
+One on-demand c7g.4xlarge (Ubuntu 24.04, Clang 19, Rust 1.100.0), baseline main `ad97166` against the candidate on the same
+host, A/B/B/A. Fixture `tmp/msmarco-1m-v021/` copied locally per arm, a 2 GiB raw cache, 4,000-byte blocks, default decoded
+cache. Server on CPUs 0 to 5 with two Rayon and two Tokio workers, client on CPUs 14 and 15. Both binaries link a stub for
+NumKong's `__arm_get_current_vg`. The workload is T4's `concurrent_bm25` on the held-out odd-indexed 500 queries, repeated
+eight times per pass, with no selection on any query. Two single-client prewarm passes, then three single-client and six
+16-client passes per arm. Every one of the 144,000 timed replies matches the fixture truth in ordered IDs and f32 score bits.
+
+| Arm | 1 client q/s | 1 client p50 / p90 ms | 16 clients q/s | 16 clients p50 / p90 ms | RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline A1 | 777 | 1.10 / 1.92 | 1,942 | 7.62 / 12.03 | 464 |
+| Candidate B1 | 873 | 1.02 / 1.50 | 2,470 | 5.95 / 10.03 | 459 |
+| Candidate B2 | 876 | 1.02 / 1.50 | 2,460 | 5.97 / 10.04 | 453 |
+| Baseline A2 | 775 | 1.09 / 1.90 | 1,953 | 7.55 / 11.99 | 462 |
+
+Warm 16-client gain **1.27x** (2,465 versus 1,947 q/s; the bar was 1.2x). Single-client **1.12x**, with lower p50 and p90.
+Resident memory does not rise (arrays replace decoded posting frames).
+
+**Cold and restart first query** (fresh server per sample, S3 in-region, 2 GiB cache, six queries, two A/B/B/A rounds,
+24 samples per arm): empty cache 231 ms (baseline) versus 200 ms (candidate) median, and a restart with the disk cache kept
+82 versus 83 ms. No regression, as expected: nothing is built on a first use, and opening a segment reads and allocates
+nothing new (arrays are lazy).
+
+**BW1 steady writes** (1,000 upserts/s in 100-row batches, paced BM25 at 1 Hz, 120 s after a 30 s warm-up, fresh store per arm,
+120,000 rows acknowledged and none rejected in every run), query p50 / p90 ms:
+
+| Candidate | Baseline | Candidate |
+| --- | ---: | ---: |
+| First version (two rounds, 8 arms) | 19.9, 19.3, 19.4, 19.2 / 31.1, 31.8, 31.3, 32.2 | 20.9, 20.9, 20.5, 21.6 / 34.4, 32.9, 33.1, 32.9 |
+| Frontier bounds (B, A, A, B) | 20.3, 19.0 / 30.1, 32.8 | 19.3, 20.1 / 32.0, 31.5 |
+
+Median p50 is 19.7 ms for both arms in the final pair. Write acknowledgement latency is unchanged.
+
+### Validation
+
+`cargo fmt`, `cargo clippy -p bf-text -p bf-engine --all-targets -- -D warnings`, and `cargo test -p bf-text -p bf-engine` pass.
+New test: arrays are earned on the second use only, never by prefix-only queries or sparse terms, are built once, are charged
+through the hook, and are refused when the budget is too small; scores stay bit-identical with changed statistics, filters,
+prefixes, partial windows, and frequencies of 254, 255, and 300.
+The release-mode frozen `text_benchmark::bm25_serialized_msmarco_snapshots` check passes on the final code in **148.55 s**: all
+4,000 queries across the four serialized snapshot states match the independent exhaustive scorer's ordered IDs and f32 score
+bits, with arrays earned during the run.
+
+
+EC2: one on-demand c7g.4xlarge, about 1.6 hours, roughly $1.1 including the 120 GiB gp3 volume.

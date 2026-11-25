@@ -1109,3 +1109,107 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn dense_frequency_arrays_preserve_score_bits_and_respect_the_budget() {
+    let params = FtsParams::default();
+    // A nonsparse term, partial final windows, missing rows, and byte overflows.
+    let docs: Vec<_> = (0..9001)
+        .map(|row| {
+            let count = match row % 13 {
+                0 => 0,
+                1 => 254,
+                2 => 255,
+                3 => 300,
+                _ => row % 5 + 1,
+            };
+            tokenize(
+                &format!(
+                    "{} rare{} tail{}",
+                    "common ".repeat(count),
+                    row % 997,
+                    row % 17
+                ),
+                &params,
+            )
+        })
+        .collect();
+    let bytes = build(&docs, true, params.tokenizer);
+    let baseline = open(bytes.clone());
+    let direct = open(bytes.clone());
+    let stats = block_on(baseline.stats()).unwrap();
+    // Charges reported to the owning cache: arrays must be paid for, within the pool budget.
+    let charged = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let hook = charged.clone();
+    direct.set_memo_charge(
+        docs.len() * 8,
+        Arc::new(move |bytes| hook.store(bytes, std::sync::atomic::Ordering::Relaxed)),
+    );
+    let first = Query::new(tokenize("common rare1 missing", &params), false);
+    block_on(direct.search(&first, &stats, &params, 10, None)).unwrap();
+    assert_eq!(
+        direct.dense_arrays(),
+        (0, 0),
+        "one use does not earn an array"
+    );
+    // A prefix-only expansion is never counted.
+    let prefix = Query::new(Vec::new(), true);
+    let _ = block_on(direct.search(&prefix, &stats, &params, 10, None));
+    block_on(direct.search(&first, &stats, &params, 10, None)).unwrap();
+    let (terms, held) = direct.dense_arrays();
+    assert_eq!(
+        terms, 1,
+        "only the dense term earns one: rare and missing terms do not"
+    );
+    assert!(held > docs.len() && held <= docs.len() * 8);
+    assert!(charged.load(std::sync::atomic::Ordering::Relaxed) >= held as u64);
+    block_on(direct.search(&first, &stats, &params, 10, None)).unwrap();
+    assert_eq!(
+        direct.dense_arrays(),
+        (terms, held),
+        "arrays are built once"
+    );
+    // A budget too small for an array keeps the posting path.
+    let tight = open(bytes.clone());
+    tight.set_memo_charge(1, Arc::new(|_| {}));
+    for _ in 0..3 {
+        block_on(tight.search(&first, &stats, &params, 10, None)).unwrap();
+    }
+    assert_eq!(tight.dense_arrays(), (0, 0));
+    let mut changed = stats.clone();
+    changed.average_doc_length *= 1.5;
+    let allowed: RoaringBitmap = (0..docs.len() as u32).filter(|r| r % 3 == 0).collect();
+    for stats in [&stats, &changed, &stats] {
+        for (text, prefix) in [
+            ("common", false),
+            ("common common rare1", false),
+            ("rare1 com", true),
+            ("common tail1", false),
+        ] {
+            let query = Query::new(tokenize(text, &params), prefix);
+            for filter in [None, Some(&allowed)] {
+                for k in [0, 1, 10, 130] {
+                    let expected =
+                        block_on(baseline.search_prefetched(&query, stats, &params, k, filter))
+                            .unwrap();
+                    for actual in [
+                        block_on(direct.search_prefetched(&query, stats, &params, k, filter))
+                            .unwrap(),
+                        block_on(direct.search(&query, stats, &params, k, filter)).unwrap(),
+                    ] {
+                        assert_eq!(
+                            actual
+                                .iter()
+                                .map(|h| (h.row, h.score.to_bits()))
+                                .collect::<Vec<_>>(),
+                            expected
+                                .iter()
+                                .map(|h| (h.row, h.score.to_bits()))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

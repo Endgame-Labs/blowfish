@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-11-25
+
+### Changed
+
+- **Faster warm BM25 for common terms:** When a term is dense in a text segment, its second use builds a byte-per-row array of term frequencies (with an overflow table for large values), up to 32 terms per segment reader, within the decoded-posting budget and charged to the cache like any other decoded data. Windows score those terms straight from the array instead of decoding postings, and exact per-window (tf, length) frontiers keep the block bounds tight. On a 1M-document MS MARCO namespace, warm full-text throughput at 16 clients rose from 1,947 to 2,465 queries/s and single-client throughput from 776 to 875 queries/s; the median cold first query fell from 231 to 200 ms. Restart time and write latency are unchanged. Scores and order are bit-identical. No format change and no setting.
+
 ## [0.1.31] - 2026-11-25
 
 ### Fixed
@@ -245,7 +251,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.31...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.32...HEAD
+[0.1.32]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.32
 [0.1.31]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.31
 [0.1.30]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.30
 [0.1.29]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.29

@@ -145,6 +145,115 @@ impl From<Vec<(u32, u32)>> for Postings {
         Self(data.into())
     }
 }
+/// Raw, statistics-independent frequencies for one selected dense term.
+struct DenseFrequencies {
+    values: Box<[u8]>,
+    overflow: Box<[(u32, u32)]>,
+    /// Per window, the Pareto frontier of its rows' (tf, length) pairs: no other row has both a
+    /// frequency at least as high and a length at least as short. BM25's saturation factor is
+    /// monotone in both, so a window's exact maximum is the maximum over its frontier. This keeps
+    /// the bounds exact while making a recompute (when corpus statistics change, as they do on
+    /// every write) cost a few points per window instead of every row. Window `w` owns
+    /// `frontier[frontier_start[w]..frontier_start[w + 1]]`.
+    frontier_start: Box<[u32]>,
+    frontier: Box<[(u32, u32)]>,
+    bounds: std::sync::Mutex<Option<DenseBounds>>,
+}
+struct DenseBounds {
+    saturation: std::sync::Weak<Saturation>,
+    values: Arc<[f32]>,
+}
+/// A term earns its array on this use (see `SegmentReader::earn_dense`).
+const DENSE_USES: u32 = 2;
+/// Most arrays one reader keeps.
+const MAX_DENSE_TERMS: usize = 32;
+#[derive(Default)]
+struct DenseSelection {
+    uses: std::collections::HashMap<u64, u32>,
+    /// Arrays built or being built, and the bytes they hold or will hold.
+    terms: usize,
+    bytes: usize,
+}
+impl DenseFrequencies {
+    /// Bytes an array for `docs` rows takes before any overflow entries.
+    fn reserve(docs: usize) -> usize {
+        // Bounds plus an allowance of four frontier points per window.
+        docs + std::mem::size_of::<Self>() + 128 + docs.div_ceil(BLOCK) * (4 + 4 + 4 * 8)
+    }
+    fn get(&self, row: u32) -> u32 {
+        let tf = self.values[row as usize];
+        if tf < u8::MAX {
+            u32::from(tf)
+        } else {
+            let i = self
+                .overflow
+                .binary_search_by_key(&row, |&(r, _)| r)
+                .unwrap();
+            self.overflow[i].1
+        }
+    }
+    fn bytes(&self) -> usize {
+        self.values.len()
+            + self.overflow.len() * 8
+            + std::mem::size_of::<Self>()
+            + 128
+            + self.values.len().div_ceil(BLOCK) * 4
+            + self.frontier_start.len() * 4
+            + self.frontier.len() * 8
+    }
+    /// Build the per-window frontiers of already-filled values and overflow.
+    fn frontiers(&mut self, lengths: &[u32]) {
+        let mut start = Vec::with_capacity(self.values.len().div_ceil(BLOCK) + 1);
+        let mut points = Vec::new();
+        let mut window = Vec::with_capacity(BLOCK);
+        for (w, rows) in self.values.chunks(BLOCK).enumerate() {
+            start.push(points.len() as u32);
+            window.clear();
+            for (i, &tf) in rows.iter().enumerate() {
+                if tf != 0 {
+                    let row = w * BLOCK + i;
+                    window.push((self.get(row as u32), lengths[row]));
+                }
+            }
+            window.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let mut shortest = u32::MAX;
+            for &(tf, length) in &window {
+                if length < shortest {
+                    shortest = length;
+                    points.push((tf, length));
+                }
+            }
+        }
+        start.push(points.len() as u32);
+        self.frontier_start = start.into();
+        self.frontier = points.into();
+    }
+    fn bounds(&self, saturation: &Arc<Saturation>) -> Arc<[f32]> {
+        let mut memo = self.bounds.lock().unwrap();
+        if let Some(bounds) = &*memo
+            && bounds.saturation.ptr_eq(&Arc::downgrade(saturation))
+        {
+            return bounds.values.clone();
+        }
+        let mut values = vec![-1.0f32; self.values.len().div_ceil(BLOCK)];
+        for (w, value) in values.iter_mut().enumerate() {
+            let points = &self.frontier
+                [self.frontier_start[w] as usize..self.frontier_start[w + 1] as usize];
+            for &(tf, length) in points {
+                // Round upward when narrowing, preserving the exact upper bound.
+                let bound = (saturation.factor(tf, length) as f32).next_up();
+                *value = value.max(bound);
+            }
+        }
+        let values: Arc<[f32]> = values.into();
+        *memo = Some(DenseBounds {
+            saturation: Arc::downgrade(saturation),
+            values: values.clone(),
+        });
+        values
+    }
+}
+
 struct CachedPostings {
     postings: Postings,
     dense: bool,
@@ -160,6 +269,8 @@ struct DecodedPostings {
     bytes: usize,
     dense_order: std::collections::VecDeque<u64>,
     dense_bytes: usize,
+    /// Bytes of the reader's frequency arrays, charged with the memo.
+    arrays: usize,
 }
 impl Default for DecodedPostings {
     fn default() -> Self {
@@ -171,6 +282,7 @@ impl Default for DecodedPostings {
             bytes: 0,
             dense_order: Default::default(),
             dense_bytes: 0,
+            arrays: 0,
         }
     }
 }
@@ -179,7 +291,7 @@ impl DecodedPostings {
     /// allocation header, and window table).
     fn charge(&self) -> u64 {
         const PER_BLOCK: usize = 200;
-        (self.bytes + self.dense_bytes + self.blocks.len() * PER_BLOCK) as u64
+        (self.bytes + self.dense_bytes + self.arrays + self.blocks.len() * PER_BLOCK) as u64
     }
     /// The charge to report to the cache if it moved enough since the last report.
     fn report(&mut self) -> Option<u64> {
@@ -823,6 +935,7 @@ struct SearchTerm {
     spans: Vec<(u32, u32)>,
     bounds: crate::scratch::Windows,
     small: bool,
+    dense: Option<Arc<DenseFrequencies>>,
 }
 
 impl SearchTerm {
@@ -835,10 +948,14 @@ impl SearchTerm {
             spans: Vec::new(),
             bounds: Default::default(),
             small: false,
+            dense: None,
         }
     }
 
     fn cache_windows(&mut self, windows: usize) {
+        if self.dense.is_some() {
+            return;
+        }
         // Sweep the ordered blocks once instead of binary-searching each term's
         // directory again during planning, fetching, candidate selection, and scoring.
         let (mut first, mut last) = (0, 0);
@@ -1032,6 +1149,9 @@ pub struct SegmentReader {
     /// Told the memo's charge as it grows and shrinks (set once by the owning cache).
     memo_charge: std::sync::OnceLock<Arc<dyn Fn(u64) + Send + Sync>>,
     saturation: std::sync::Mutex<Option<Arc<Saturation>>>,
+    /// Directly addressable frequencies of the dense terms this reader has seen often (memory-only).
+    dense: std::sync::RwLock<BTreeMap<u64, Arc<DenseFrequencies>>>,
+    dense_select: std::sync::Mutex<DenseSelection>,
 }
 
 fn check_block(
@@ -1273,6 +1393,8 @@ impl SegmentReader {
                 compact: version >= VERSION_COMPACT,
                 decoded: Default::default(),
                 memo_charge: Default::default(),
+                dense: Default::default(),
+                dense_select: Default::default(),
                 saturation: Default::default(),
             });
         }
@@ -1300,6 +1422,8 @@ impl SegmentReader {
                 compact: false,
                 decoded: Default::default(),
                 memo_charge: Default::default(),
+                dense: Default::default(),
+                dense_select: Default::default(),
                 saturation: Default::default(),
             });
         }
@@ -1362,6 +1486,8 @@ impl SegmentReader {
             compact: false,
             decoded: Default::default(),
             memo_charge: Default::default(),
+            dense: Default::default(),
+            dense_select: Default::default(),
             saturation: Default::default(),
         })
     }
@@ -1515,6 +1641,121 @@ impl SegmentReader {
         };
         (terms + dictionary + self.docs as usize * 4 + Saturation::BYTES) as u64
     }
+    /// Dense terms with a resident frequency array, and the bytes those arrays hold.
+    pub fn dense_arrays(&self) -> (usize, usize) {
+        let dense = self.dense.read().unwrap();
+        (dense.len(), dense.values().map(|v| v.bytes()).sum())
+    }
+    /// Count this query's use of each dense term, and build the arrays that have earned one.
+    ///
+    /// Rule (no training workload, no setting): a term whose document frequency is above the
+    /// sparse threshold is "dense". Serving it from the posting memo costs a decode of the frames
+    /// each query touches, and building its array costs one decode of the whole list, so the array
+    /// is built when the term is seen for the `DENSE_USES`th time (rent twice, then buy). At most
+    /// `MAX_DENSE_TERMS` arrays per reader, and their bytes plus the posting memo's charge fit in
+    /// the reader's pool budget; a term that does not fit stays on the posting path. The
+    /// arrays are charged to the owning cache through the memo's charge hook, and are dropped with
+    /// the reader. Terms used only as prefix expansions are never counted.
+    async fn earn_dense(
+        &self,
+        selections: &BTreeMap<u64, (u32, bool, u64)>,
+        metas: &BTreeMap<u64, Arc<TermMeta>>,
+    ) -> io::Result<()> {
+        let mut earned = Vec::new();
+        {
+            let mut select = self.dense_select.lock().unwrap();
+            let budget = self.decoded.lock().unwrap().limit;
+            for (&id, &(qf, _, _)) in selections {
+                let meta = &metas[&id];
+                if qf == 0 || self.sparse_term(meta.df) {
+                    continue;
+                }
+                let uses = select.uses.entry(id).or_default();
+                *uses = uses.saturating_add(1);
+                if *uses != DENSE_USES {
+                    continue;
+                }
+                let cost = DenseFrequencies::reserve(self.docs as usize);
+                if select.terms < MAX_DENSE_TERMS && select.bytes + cost <= budget {
+                    select.terms += 1;
+                    select.bytes += cost;
+                    earned.push(id);
+                }
+            }
+        }
+        for id in earned {
+            let built = self.build_dense(&metas[&id]).await;
+            let mut select = self.dense_select.lock().unwrap();
+            match built {
+                Ok(dense) => {
+                    let cost = DenseFrequencies::reserve(self.docs as usize);
+                    select.bytes = select.bytes - cost + dense.bytes();
+                    self.dense.write().unwrap().insert(id, Arc::new(dense));
+                }
+                Err(e) => {
+                    select.terms -= 1;
+                    select.bytes -= DenseFrequencies::reserve(self.docs as usize);
+                    return Err(e);
+                }
+            }
+            let arrays = select.bytes;
+            drop(select);
+            let mut memo = self.decoded.lock().unwrap();
+            memo.arrays = arrays;
+            let charge = memo.charge();
+            memo.reported = charge;
+            drop(memo);
+            if let Some(hook) = self.memo_charge.get() {
+                hook(charge);
+            }
+        }
+        Ok(())
+    }
+    /// Decode a term's whole list (all blocks in one batched read) into a raw frequency array.
+    /// The decode bypasses the posting memo: the array replaces those frames.
+    async fn build_dense(&self, meta: &TermMeta) -> io::Result<DenseFrequencies> {
+        self.ensure_lengths().await?;
+        let mut values = vec![0u8; self.docs as usize];
+        let mut overflow = Vec::new();
+        let mut fill = |postings: &mut dyn Iterator<Item = (u32, u32)>| {
+            for (row, tf) in postings {
+                values[row as usize] = tf.min(u32::from(u8::MAX)) as u8;
+                if tf >= u32::from(u8::MAX) {
+                    overflow.push((row, tf));
+                }
+            }
+        };
+        // Frames the memo already decoded need no read; the rest come in one batched read.
+        let cached: Vec<_> = {
+            let mut memo = self.decoded.lock().unwrap();
+            meta.blocks.iter().map(|b| memo.get(b.offset)).collect()
+        };
+        let mut missing = Vec::new();
+        for (block, hit) in meta.blocks.iter().zip(&cached) {
+            match hit {
+                Some(postings) => fill(&mut postings.iter().copied()),
+                None => missing.push(block),
+            }
+        }
+        let ranges = missing
+            .iter()
+            .map(|b| b.offset..b.offset + u64::from(b.size))
+            .collect();
+        let raws = self.read_ranges(ranges).await?;
+        for (block, raw) in missing.into_iter().zip(raws) {
+            fill(&mut self.decode_posting_entries(block, &raw)?.into_iter());
+        }
+        let mut dense = DenseFrequencies {
+            values: values.into(),
+            overflow: overflow.into(),
+            frontier_start: Default::default(),
+            frontier: Default::default(),
+            bounds: Default::default(),
+        };
+        dense.frontiers(self.lens());
+        Ok(dense)
+    }
+
     /// Bound each decoded-posting pool (sparse and dense) to `limit` bytes, and report the memo's
     /// actual charge to `charge` as it grows and shrinks, so the owning cache pays for what is
     /// resident rather than for a flat worst case. Takes effect once; later calls do nothing.
@@ -1628,6 +1869,8 @@ impl SegmentReader {
             compact: version >= VERSION_COMPACT,
             decoded: Default::default(),
             memo_charge: Default::default(),
+            dense: Default::default(),
+            dense_select: Default::default(),
             saturation: Default::default(),
         })
     }
@@ -1900,7 +2143,7 @@ impl SegmentReader {
             .remove(0);
         self.decode_postings(b, &bytes, df)
     }
-    fn decode_postings(&self, b: &BlockMeta, bytes: &[u8], df: u32) -> io::Result<Postings> {
+    fn decode_posting_entries(&self, b: &BlockMeta, bytes: &[u8]) -> io::Result<Vec<(u32, u32)>> {
         if bytes.len() != b.size as usize {
             return Err(invalid("short posting block"));
         }
@@ -1958,7 +2201,10 @@ impl SegmentReader {
             }
             out
         };
-        let out: Postings = out.into();
+        Ok(out)
+    }
+    fn decode_postings(&self, b: &BlockMeta, bytes: &[u8], df: u32) -> io::Result<Postings> {
+        let out: Postings = self.decode_posting_entries(b, bytes)?.into();
         let mut memo = self.decoded.lock().unwrap();
         if let Some(existing) = memo.get(b.offset) {
             return Ok(existing);
@@ -2140,16 +2386,22 @@ impl SegmentReader {
         } else {
             0
         };
-        let mut terms: Vec<_> = selections
-            .iter()
-            .map(|(&id, &(qf, prefix, df))| {
-                SearchTerm::new(
-                    metas[&id].clone(),
-                    TermWeight::new(qf, df, stats, params),
-                    prefix,
-                )
-            })
-            .collect();
+        self.earn_dense(&selections, &metas).await?;
+        let mut terms: Vec<_> = {
+            let dense = self.dense.read().unwrap();
+            selections
+                .iter()
+                .map(|(&id, &(qf, prefix, df))| {
+                    let mut term = SearchTerm::new(
+                        metas[&id].clone(),
+                        TermWeight::new(qf, df, stats, params),
+                        prefix,
+                    );
+                    term.dense = dense.get(&id).cloned();
+                    term
+                })
+                .collect()
+        };
         if terms.is_empty() {
             return Ok((Vec::new(), metrics));
         }
@@ -2159,7 +2411,9 @@ impl SegmentReader {
                 // Dense frames are consulted only after window pruning. Probing
                 // them here hashes and retains every common-word frame, including
                 // those that cannot affect the top k.
-                term.postings = if self.sparse_term(term.meta.df) {
+                term.postings = if term.dense.is_some() {
+                    Vec::new()
+                } else if self.sparse_term(term.meta.df) {
                     term.meta
                         .blocks
                         .iter()
@@ -2169,6 +2423,7 @@ impl SegmentReader {
                     vec![None; term.meta.blocks.len()]
                 };
                 term.small = prefetch
+                    && term.dense.is_none()
                     && !term.prefix
                     && (term.meta.blocks.len() <= SMALL_BLOCKS
                         || (self.sparse_term(term.meta.df)
@@ -2256,7 +2511,21 @@ impl SegmentReader {
         }
         for term in &mut terms {
             let mut best = crate::scratch::Windows::take(windows);
-            if term.small {
+            if let Some(dense) = &term.dense {
+                let normalized = dense.bounds(&saturation);
+                for (w, &maximum) in normalized.iter().enumerate() {
+                    if maximum >= 0.0 {
+                        best[w] = f64::from(
+                            term.weight.score_saturation(f64::from(maximum))
+                                * (1.0 + 8.0 * f32::EPSILON),
+                        );
+                        prefix_windows[w] |= term.prefix;
+                    }
+                }
+                for (bound, &value) in bounds.iter_mut().zip(best.iter()) {
+                    *bound += value;
+                }
+            } else if term.small {
                 for postings in term.postings.iter().flatten() {
                     for &(row, tf) in postings.iter() {
                         let score =
@@ -2353,6 +2622,7 @@ impl SegmentReader {
         let mut batch_size = if prefetch { FIRST_WINDOWS } else { usize::MAX };
         let mut by_bound = Vec::with_capacity(terms.len());
         let mut essential = vec![true; terms.len()];
+        let mut dense_candidates = Vec::with_capacity(32);
         while next < order.len() {
             let mut batch = Vec::new();
             while next < order.len() && batch.len() < batch_size {
@@ -2394,6 +2664,9 @@ impl SegmentReader {
                 let mut windows: Vec<_> = batch.iter().map(|&(w, _)| w).collect();
                 windows.sort_unstable();
                 for (t, term) in terms.iter().enumerate() {
+                    if term.dense.is_some() {
+                        continue;
+                    }
                     let mut after = 0;
                     for &window in &windows {
                         let span = term.span(window);
@@ -2423,6 +2696,9 @@ impl SegmentReader {
                 if !prefetch {
                     let mut wanted = Vec::new();
                     for (t, term) in terms.iter().enumerate() {
+                        if term.dense.is_some() {
+                            continue;
+                        }
                         for b in term.span(window) {
                             let meta = &term.meta.blocks[b];
                             if term.postings[b].is_none()
@@ -2439,6 +2715,7 @@ impl SegmentReader {
                 }
                 let floor = search_floor(&heap, k, threshold);
                 let mut candidates = [true; BLOCK];
+                dense_candidates.clear();
                 if let Some(floor) = floor {
                     // Block-max MaxScore: low-impact terms cannot create a hit on
                     // their own. Generate candidates only from the essential terms.
@@ -2466,7 +2743,11 @@ impl SegmentReader {
                     }
                     if skipped > 0 {
                         candidates.fill(false);
-                        for (_, term) in terms.iter().enumerate().filter(|(t, _)| essential[*t]) {
+                        for (t, term) in terms.iter().enumerate().filter(|(t, _)| essential[*t]) {
+                            if term.dense.is_some() {
+                                dense_candidates.push(t);
+                                continue;
+                            }
                             for b in term.span(window) {
                                 let Some(postings) = &term.postings[b] else {
                                     continue;
@@ -2482,7 +2763,10 @@ impl SegmentReader {
                 // again for every term that hits it.
                 let competitive: Vec<_> = (start..end)
                     .filter(|&row| {
-                        candidates[(row - start) as usize]
+                        (candidates[(row - start) as usize]
+                            || dense_candidates.iter().any(|&t| {
+                                terms[t].dense.as_ref().unwrap().values[row as usize] != 0
+                            }))
                             && allowed.is_none_or(|rows| rows.contains(row))
                             && floor.is_none_or(|floor| {
                                 row_bounds.is_empty()
@@ -2504,6 +2788,21 @@ impl SegmentReader {
                 let mut scores = [0.0f32; BLOCK];
                 let mut prefix_matches = [false; BLOCK];
                 for term in &terms {
+                    if let Some(dense) = &term.dense {
+                        for &row in &competitive {
+                            let tf = dense.get(row);
+                            if tf > 0 {
+                                let i = (row - start) as usize;
+                                scores[i] += term.weight.score_cached(
+                                    tf,
+                                    lengths[row as usize],
+                                    &saturation,
+                                );
+                                prefix_matches[i] |= term.prefix;
+                            }
+                        }
+                        continue;
+                    }
                     for b in term.span(window) {
                         let Some(postings) = &term.postings[b] else {
                             continue;
@@ -2883,6 +3182,8 @@ mod posting_cache_tests {
                 SegmentReader::open(Arc::new(MemoryRangeRead::from(builder.finish().unwrap())))
                     .await
                     .unwrap();
+            // These tests exercise the posting memo: keep the frequency arrays off.
+            reader.dense_select.lock().unwrap().terms = MAX_DENSE_TERMS;
             let stats = CorpusStats::from_documents(&docs);
             reader
                 .search_prefetched(
@@ -2947,6 +3248,8 @@ mod posting_cache_tests {
                 SegmentReader::open(Arc::new(MemoryRangeRead::from(builder.finish().unwrap())))
                     .await
                     .unwrap();
+            // These tests exercise the posting memo: keep the frequency arrays off.
+            reader.dense_select.lock().unwrap().terms = MAX_DENSE_TERMS;
             let stats = CorpusStats::from_documents(&docs);
             let saturation = reader.saturation(&stats, &params);
             let id = reader.term("common").await.unwrap().unwrap();
