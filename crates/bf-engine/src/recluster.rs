@@ -1056,6 +1056,12 @@ fn assign_leaves(
             .map(|(centers, _)| centers.iter().map(|c| norm2(c)).collect())
             .collect();
         let compared = std::sync::atomic::AtomicU64::new(0);
+        #[cfg(test)]
+        let route_evals = std::sync::atomic::AtomicU64::new(0);
+        #[cfg(test)]
+        let route_nanos = std::sync::atomic::AtomicU64::new(0);
+        #[cfg(test)]
+        let score_nanos = std::sync::atomic::AtomicU64::new(0);
         let route = |buf: &mut Vec<u8>, block: &[u32]| {
             if stopping() {
                 return None;
@@ -1101,7 +1107,14 @@ fn assign_leaves(
                     group_norms[key >> 32][key & 0xFFFF_FFFF],
                 )
             });
+            #[cfg(test)]
+            route_evals.fetch_add(
+                (keys.len() * refs.len()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let mut wanted: Vec<usize> = Vec::new();
+            #[cfg(test)]
+            let mut row_wanted = Vec::with_capacity(refs.len());
             for d in &group_d {
                 let mut found: Vec<(f32, usize)> =
                     d.iter().enumerate().map(|(n, d)| (*d, keys[n])).collect();
@@ -1109,6 +1122,8 @@ fn assign_leaves(
                     found.select_nth_unstable_by(probes - 1, by_distance);
                     found.truncate(probes);
                 }
+                #[cfg(test)]
+                row_wanted.push(found.iter().map(|(_, key)| *key).collect());
                 wanted.extend(found.into_iter().map(|(_, key)| key));
             }
             wanted.sort_unstable();
@@ -1128,6 +1143,9 @@ fn assign_leaves(
                 wanted,
                 #[cfg(test)]
                 positions: block.to_vec(),
+                #[cfg(test)]
+                row_wanted: (experiment && std::env::var_os("RR5_ROW_GROUPS").is_some())
+                    .then_some(row_wanted),
             })
         };
         #[cfg(test)]
@@ -1143,12 +1161,27 @@ fn assign_leaves(
         let ordered: Vec<u32> = order
             .par_chunks(if batched { batch_rows } else { ASSIGN_BLOCK })
             .map_init(Vec::new, |buf, batch| {
+                #[cfg(test)]
+                let routing = std::time::Instant::now();
                 let blocks: Vec<_> = batch
                     .chunks(ASSIGN_BLOCK)
                     .map(|block| route(buf, block))
                     .collect::<Option<_>>()?;
+                #[cfg(test)]
+                route_nanos.fetch_add(
+                    routing.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if batched {
-                    return Some(scorer.as_ref().unwrap().nearest(&blocks));
+                    #[cfg(test)]
+                    let scoring = std::time::Instant::now();
+                    let out = scorer.as_ref().unwrap().nearest(&blocks);
+                    #[cfg(test)]
+                    score_nanos.fetch_add(
+                        scoring.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    return Some(out);
                 }
                 let mut out = Vec::new();
                 for block in blocks {
@@ -1194,8 +1227,18 @@ fn assign_leaves(
         }
         #[cfg(test)]
         if std::env::var_os("RR4_INPUT").is_some() {
-            let main =
-                compared.load(std::sync::atomic::Ordering::Relaxed) as f64 / present.len() as f64;
+            eprintln!(
+                "RR5 route_group_evals={} order_evals={} route_worker_seconds={:.6} score_worker_seconds={:.6}",
+                route_evals.load(std::sync::atomic::Ordering::Relaxed),
+                order_compared.load(std::sync::atomic::Ordering::Relaxed),
+                route_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+                score_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+            );
+            let main = scorer.as_ref().map_or_else(
+                || compared.load(std::sync::atomic::Ordering::Relaxed),
+                |s| s.counts().0 + route_evals.load(std::sync::atomic::Ordering::Relaxed),
+            ) as f64
+                / present.len() as f64;
             let ordering = order_compared.load(std::sync::atomic::Ordering::Relaxed) as f64
                 / present.len() as f64;
             let total = main

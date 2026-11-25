@@ -352,6 +352,7 @@ fn prepare_flat_spill() {
         (coarse, cells)
     });
     let cluster_rows = target_leaf_rows(rows as u64);
+    capture(&present, &read, &coarse, &cells, cluster_rows, 250_000);
     std::fs::write(
         root.join("input.json"),
         serde_json::to_vec(&(

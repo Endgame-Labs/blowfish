@@ -8,6 +8,9 @@ pub(super) struct Block {
     pub rows: Vec<Vec<f32>>,
     pub norms: Vec<f32>,
     pub wanted: Vec<usize>,
+    /// Experimental row-specific subsets of `wanted`, in the original row lanes.
+    #[cfg(test)]
+    pub row_wanted: Option<Vec<Vec<usize>>>,
 }
 
 /// A group is packed once per assignment pass, then reused for every batch that visits it.
@@ -75,8 +78,8 @@ impl<'a> Scorer<'a> {
     }
 
     pub fn nearest(&self, blocks: &[Block]) -> Vec<u32> {
-        // Keep the original four-row blocks and their candidate unions intact. Only schedule
-        // their matrix work together, so the same center block serves many nearby rows.
+        // Keep the original four-row lanes for exact verification. The experiment can narrow
+        // each row to its selected groups while keeping the original routing and row order.
         let rounded = self.reduced.then(|| {
             let refs: Vec<_> = blocks
                 .iter()
@@ -86,8 +89,17 @@ impl<'a> Scorer<'a> {
         });
         let mut visits: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (b, block) in blocks.iter().enumerate() {
-            for key in &block.wanted {
-                visits.entry(*key).or_default().push(b);
+            for r in 0..block.rows.len() {
+                #[cfg(test)]
+                let wanted = block
+                    .row_wanted
+                    .as_ref()
+                    .map_or(&block.wanted, |rows| &rows[r]);
+                #[cfg(not(test))]
+                let wanted = &block.wanted;
+                for key in wanted {
+                    visits.entry(*key).or_default().push(b * 4 + r);
+                }
             }
         }
         let mut scores = vec![Vec::<(f32, u32)>::new(); blocks.len() * 4];
@@ -95,22 +107,18 @@ impl<'a> Scorer<'a> {
             let (ids, packed) = &self.groups[&key];
             let norms: Vec<_> = visiting
                 .iter()
-                .flat_map(|b| blocks[*b].norms.iter().copied())
+                .map(|row| blocks[*row / 4].norms[*row % 4])
                 .collect();
             let distances = match packed {
                 Matrix::Full(packed) => {
                     let rows: Vec<_> = visiting
                         .iter()
-                        .flat_map(|b| blocks[*b].rows.iter().map(Vec::as_slice))
+                        .map(|row| blocks[*row / 4].rows[*row % 4].as_slice())
                         .collect();
                     packed.distances(&rows, &norms)
                 }
                 Matrix::Reduced(packed) => {
-                    let selected: Vec<_> = visiting
-                        .iter()
-                        .flat_map(|b| (0..blocks[*b].rows.len()).map(move |r| b * 4 + r))
-                        .collect();
-                    let mut dots = packed.dots(rounded.as_ref().unwrap(), &selected);
+                    let mut dots = packed.dots(rounded.as_ref().unwrap(), &visiting);
                     for (row, norm) in dots.chunks_exact_mut(ids.len()).zip(&norms) {
                         for (dot, l) in row.iter_mut().zip(ids) {
                             *dot = *norm + self.norms[*l as usize] - 2. * *dot;
@@ -124,16 +132,14 @@ impl<'a> Scorer<'a> {
                 std::sync::atomic::Ordering::Relaxed,
             );
             let mut at = 0;
-            for b in visiting {
-                for r in 0..blocks[b].rows.len() {
-                    scores[b * 4 + r].extend(
-                        distances[at..at + ids.len()]
-                            .iter()
-                            .copied()
-                            .zip(ids.iter().copied()),
-                    );
-                    at += ids.len();
-                }
+            for row in visiting {
+                scores[row].extend(
+                    distances[at..at + ids.len()]
+                        .iter()
+                        .copied()
+                        .zip(ids.iter().copied()),
+                );
+                at += ids.len();
             }
         }
         let mut out = Vec::with_capacity(blocks.len() * 4);
@@ -196,14 +202,18 @@ impl<'a> Scorer<'a> {
                 }
             }
             let mut best = [(f32::INFINITY, u32::MAX); 4];
-            let mut candidates: Vec<u32> = (0..refs.len())
-                .flat_map(|r| {
-                    scores[b * 4 + r]
+            let survivors: Vec<Vec<u32>> = (0..refs.len())
+                .map(|r| {
+                    let mut ids: Vec<_> = scores[b * 4 + r]
                         .iter()
-                        .filter(move |(d, _)| f64::from(*d) <= thresholds[r] || !d.is_finite())
+                        .filter(|(d, _)| f64::from(*d) <= thresholds[r] || !d.is_finite())
                         .map(|(_, l)| *l)
+                        .collect();
+                    ids.sort_unstable();
+                    ids
                 })
                 .collect();
+            let mut candidates: Vec<u32> = survivors.iter().flatten().copied().collect();
             candidates.sort_unstable();
             candidates.dedup();
             self.exact_evals.fetch_add(
@@ -219,6 +229,10 @@ impl<'a> Scorer<'a> {
                 for r in 0..refs.len() {
                     // Re-evaluate the original expression with the original dot kernel and
                     // original row lanes. Ties still choose the lower global leaf number.
+                    #[cfg(test)]
+                    if block.row_wanted.is_some() && survivors[r].binary_search(&l).is_err() {
+                        continue;
+                    }
                     let d = block.norms[r] + self.norms[l as usize] - 2. * dots[r];
                     if d < best[r].0 || (d == best[r].0 && l < best[r].1) {
                         best[r] = (d, l);
@@ -262,6 +276,7 @@ mod tests {
                         let norms = rows.iter().map(|v| norm2(v)).collect();
                         Block {
                             positions: Vec::new(),
+                            row_wanted: None,
                             rows,
                             norms,
                             wanted: if b % 2 == 0 { vec![0, 2] } else { vec![0, 1] },
@@ -349,6 +364,7 @@ mod tests {
                     let norms = rows.iter().map(|v| norm2(v)).collect();
                     Block {
                         positions: Vec::new(),
+                        row_wanted: None,
                         rows,
                         norms,
                         wanted: vec![0, 1, 2, 3],
@@ -413,6 +429,7 @@ mod tests {
         let row_norms = rows.iter().map(|r| norm2(r)).collect();
         let blocks = vec![Block {
             positions: Vec::new(),
+            row_wanted: None,
             rows,
             norms: row_norms,
             wanted: vec![0, 1],
@@ -438,6 +455,76 @@ mod tests {
                 Scorer::with_bf16(&leaves, &norms, &groups, reduced).nearest(&blocks),
                 expected
             );
+        }
+    }
+    #[test]
+    fn row_group_batches_preserve_each_rows_candidate_set_and_original_lanes() {
+        // Every row has a perfect center outside its allowed group. Verification must not
+        // silently reintroduce a neighbor's center, even when that neighbor survives screening.
+        for dims in [7, 128, 1024] {
+            let mut leaves: Vec<Vec<f32>> = (0..24)
+                .map(|c| {
+                    (0..dims)
+                        .map(|d| ((c * 7919 + d * 104729) as f64).sin() as f32)
+                        .collect()
+                })
+                .collect();
+            leaves[9] = leaves[8].clone();
+            let norms: Vec<_> = leaves.iter().map(|v| norm2(v)).collect();
+            let groups: Vec<LeafGroups> = vec![(
+                Vec::new(),
+                vec![(0..8).collect(), (8..16).collect(), (16..24).collect()],
+            )];
+            let blocks: Vec<_> = [4, 3]
+                .into_iter()
+                .enumerate()
+                .map(|(b, len)| {
+                    let rows: Vec<_> = (0..len).map(|r| leaves[(b * 4 + r) % 8].clone()).collect();
+                    Block {
+                        positions: Vec::new(),
+                        norms: rows.iter().map(|v| norm2(v)).collect(),
+                        rows,
+                        wanted: vec![0, 1, 2],
+                        row_wanted: Some(
+                            (0..len)
+                                .map(|r| if r % 2 == 0 { vec![1] } else { vec![2] })
+                                .collect(),
+                        ),
+                    }
+                })
+                .collect();
+            let mut expected = Vec::new();
+            let mut products = 0;
+            for block in &blocks {
+                let refs: Vec<_> = block.rows.iter().map(Vec::as_slice).collect();
+                let distances =
+                    super::super::block_distances(&refs, &block.norms, leaves.len(), |c| {
+                        (&leaves[c], norms[c])
+                    });
+                for (r, row) in distances.iter().enumerate() {
+                    let ids: Vec<_> = block.row_wanted.as_ref().unwrap()[r]
+                        .iter()
+                        .flat_map(|g| groups[0].1[*g].iter().copied())
+                        .collect();
+                    products += ids.len() as u64;
+                    expected.push(
+                        ids.into_iter()
+                            .min_by(|a, b| {
+                                row[*a as usize].total_cmp(&row[*b as usize]).then(a.cmp(b))
+                            })
+                            .unwrap(),
+                    );
+                }
+            }
+            for reduced in [false, true] {
+                let scorer = Scorer::with_bf16(&leaves, &norms, &groups, reduced);
+                assert_eq!(
+                    scorer.nearest(&blocks),
+                    expected,
+                    "dims={dims} reduced={reduced}"
+                );
+                assert_eq!(scorer.counts().0, products);
+            }
         }
     }
 }
