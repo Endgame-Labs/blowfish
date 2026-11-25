@@ -221,6 +221,22 @@ search, full-text search, and filter through the proxy; restart, wait for readin
 queries before deleting the test namespace. Check the object-store prefix directly as well.
 Namespace deletion can retain permanent WAL fences; do not remove these manually.
 
+## Upgrading to bucket format 5
+
+The release after v0.1.29 stores the vectors of f16 attributes as f16 base64 inside large WAL payloads
+(WAL encoding 2, `crates/bf-wal/src/packed.rs`) and raises the bucket format from generation 4 to 5. Stop every older
+writer, back up the entire deployment prefix, and start the new binary. Writable startup writes
+`_system/format/5.json`. From then on, v0.1.29 and older refuse local and S3 storage with:
+
+```text
+Error: BucketFormat { required: 5, supported: 4 }
+```
+
+There is no in-place downgrade; restore the backup to run an older binary. Read-only startup checks compatibility
+without advancing the marker. Nothing else needs converting: the new binary reads every older WAL payload (encoding 1),
+writes encoding 1 for payloads that are small or hold any vector that is not exactly an f16 (never the case for values
+the server rounded itself), and expands encoding 2 back to the exact strings that were encoded.
+
 ## Upgrading to v0.1.16
 
 v0.1.16 raises the bucket format from generation 3 (v0.1.15) to generation 4.

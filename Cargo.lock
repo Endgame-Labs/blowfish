@@ -434,6 +434,7 @@ dependencies = [
 name = "bf-wal"
 version = "0.1.29"
 dependencies = [
+ "base64 0.22.1",
  "bf-storage",
  "bf-types",
  "chrono",
