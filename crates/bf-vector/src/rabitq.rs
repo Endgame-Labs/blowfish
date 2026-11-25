@@ -181,27 +181,6 @@ impl RaBitQ {
         }
     }
 
-    pub(crate) fn inverse_in_place(&self, result: &mut [f64]) {
-        for signs in self.signs.iter().rev() {
-            let mut stride = 1;
-            while stride < self.padded {
-                for block in result.chunks_exact_mut(2 * stride) {
-                    let (left, right) = block.split_at_mut(stride);
-                    for (a, b) in left.iter_mut().zip(right) {
-                        let sum = *a + *b;
-                        *b = *a - *b;
-                        *a = sum;
-                    }
-                }
-                stride *= 2;
-            }
-            let scale = 1. / (self.padded as f64).sqrt();
-            for (x, sign) in result.iter_mut().zip(signs) {
-                *x *= scale * sign;
-            }
-        }
-    }
-
     pub(crate) fn estimate_rotated(&self, code: &RaBitQCode, q: &[f64]) -> DistanceEstimate {
         // The public reference path keeps all query coordinates at full precision.
         let dot = q

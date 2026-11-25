@@ -11423,3 +11423,141 @@ not identify its callers, so it does not by itself establish how much was memo c
 One c7g.4xlarge for about 19 minutes (0.31 instance-hours), estimated below $1 using the granted $2/hour ceiling,
 including a small allowance for disk and fixture reads. The instance was terminated, and its tagged key pair and security
 group were deleted. No bucket writes. All 396 fixture-file sizes and SHA-256 hashes were verified after the run.
+
+## Round RR6: packing existing segment leaves into the first tier (rejected)
+
+Measured 2026-11-25. Packing existing source leaves made frozen-checkpoint installation **167.65 →
+63.80 s**, but recall@10 fell **0.9507 → 0.8809** at 48 probes and **0.9609 → 0.9045** at 64.
+Both losses exceed the allowed 0.001 by a wide margin. The experiment was reverted. Production keeps
+RR4's exact assignment for every tier; no new setting, public API, dependency, or format ships.
+
+### Input and method
+
+The shared NQ corpus was read without modification, and a new untiered source checkpoint was built
+through ordinary writes and indexing, flushing each 50,000 rows. Compaction left 15 segments: thirteen
+of 200,000 rows, one of 50,000, and one of 31,468. All 2,681,468 rows have 1,024-dimensional f16 cosine
+vectors. Source leaves were trained once, then the same frozen checkpoint was copied into each owned
+S3 prefix. Existing installed fixture slabs were not reused as source leaves. This reconstructs the
+input from the shared corpus; it does not reproduce RR4's or RR5's historical spill fingerprint.
+
+One on-demand c7gd.2xlarge in the bucket's region, us-west-2: eight Graviton3 cores, 16 GiB RAM, and
+local NVMe. Rust 1.100.0, Clang 19 for native kernels, and Clang 22 with LLVM's linker; no native Rust
+target flags. Builds used two Cargo jobs after an initial debug link exhausted memory with the GNU
+linker. All builds and tests finished before measurements. Tier construction used the existing four-thread
+recluster pool, four Rayon threads, and a 1 GiB raw-cache configuration without disk staging. Reclustering
+bypasses that raw cache. The source remained frozen, and no builds or other measurement loads overlapped.
+
+The control trained namespace-wide leaves and ran both RR4 assignment passes. The candidate inverse-rotated
+source centers only for planning, grouped the leaves into 32 coarse cells, and packed whole leaves into
+slabs capped at 250,000 rows. Centers, membership, sign bits, residual factors, and vector bytes were retained,
+with global row addresses remapped. The existing ANN writer ordered each slab's leaves spatially. Neither
+row assignment nor vector requantization ran in the candidate. Future coarse-routing cells were also written,
+and the normal fenced installation path published each complete tier.
+
+One derived factor must change despite retaining the quantization: fast-scan codes store
+`<signs, leaf_center - reference_center> / sqrt(D)`. A new slab has a new reference center. The experiment
+recomputed only that fourth f32 factor from the existing sign bytes and center, using byte lookup tables.
+The first three factors, sign bits, stored centers, and vector bytes stayed intact. Keeping the old correction
+would silently change distance estimates. No format change was needed.
+
+### Installation and repeatability
+
+Run order was control, packing, packing, control. Times start from the explicit build request over an
+**already indexed frozen checkpoint**, and end after fenced tier installation. They exclude fixture copying
+and are not a fresh-ingest automatic ack-to-tier qualification. The original final tail flush took 0.822 s;
+adding that same work to each frozen replay still leaves both packing observations well below 136 s.
+
+| Arm, in run order | Checkpoint to installed tier | Leaves | Slabs | Peak process RSS |
+| --- | ---: | ---: | ---: | ---: |
+| Control 1 | 168.090 s | 13,392 | 32 | 903.7 MiB |
+| Packing 1 | 64.233 s | 6,226 | 32 | 1,613.7 MiB |
+| Packing 2 | 63.358 s | 6,226 | 32 | 1,625.3 MiB |
+| Control 2 | 167.213 s | 13,392 | 32 | 917.2 MiB |
+
+Mean frozen installation was **2.628x faster**, or 61.95% less time. The control's two assignment passes
+cost 95.542 and 94.873 s. Packing read existing leaf payloads for 35.143/34.015 s, rebased and assembled
+them for 4.675/4.630 s, and uploaded slabs for 21.393/21.367 s. Opening sources took 1.387/1.704 s,
+and planning took 0.064/0.065 s. Packing performed those stages sequentially. Both arms retained every row.
+The source-preparation harness held the complete corpus in RAM and peaked at 9,371.2 MiB; that harness
+and these frozen builds do not establish the separate 4 GiB ingest target.
+
+Within each arm, both complete slab sets matched byte for byte after removing the storage retry UUIDs.
+Fingerprints below hash the sorted per-slab SHA-256 strings, without object names or retry headers:
+
+- Control 1 and 2: `f46f6ba717b668d3a8d885a6dd2fd5b9167639b974274efe0defeea62dd1e2e5`.
+- Packing 1 and 2: `edd0069eb667197709070835d970b6096bdaeac3a123d2ed3f4ea77549e0fd2d`.
+
+The shared corpus SHA-256 was `b1f1fb5d2d49dad476e3f0419ae3ea2975f907ddff94e447133e868ba31be185`;
+the frozen source's latest-manifest copy was
+`ddecd87ca064f11ab6dfc7b2d2a65ac6e79cef0cb7b36a591fc237d1da7f361a`.
+
+### Recall gate
+
+The existing NQ request and client code ran all 3,452 queries at top-k 10, concurrency four, and rerank
+factor 32, against fresh read-only processes over local mirrors of the installed S3 layouts. Recall uses
+the same exact top-10 truth. The immutable output hashes above establish that each repeated arm has the
+same layout; the full quality suite ran on one control and one packing output.
+
+| Probe setting | Control hits / 34,520 | Control recall@10 | Packing hits / 34,520 | Packing recall@10 | Absolute loss |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 48 | 32,818 | 0.950695 | 30,409 | 0.880910 | 0.069786 |
+| 64 | 33,170 | 0.960892 | 31,225 | 0.904548 | 0.056344 |
+
+These are approximately 69.8 and 56.3 times the permitted loss. The retained source leaves average
+430.7 rows, versus 200.2 for the control's newly assigned leaves. The existing probe policy adjusts for
+leaf count, so equal API probe settings do not mean equal numbers of leaves. The cold trace below also
+shows that packing scanned 8.23% more rows while returning lower recall.
+
+A separate diagnostic doubled only packing's probe setting to 128: 32,680 hits, or **0.946698** recall@10.
+Extra probing recovered much of the loss, but still did not reach the control at 48 or 64. This supports
+the concern about routing independently trained, coarser leaves; it does not separate routing loss from
+quantization effects, establish a matched-recall probe setting, or change the failed fixed-probe gate.
+
+### Cold traces
+
+The existing cold trace harness ran the first 100 NQ queries at 64 probes twice, alternating AB/BA for
+each query. These are **pure S3, cache-cold queries on running processes**, with query caches dropped
+before every request, connections retained, and disk caching and automatic staging disabled. There was
+one unmeasured startup query per arm. Physical GET counts include hedged attempts. Results and row plans
+were identical across repetitions for every arm and query.
+
+| Repeat | Control p50 / p90 | Packing p50 / p90 | Control / packing GETs per query | Control / packing MB per query |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 231.3 / 295.3 ms | 223.5 / 281.5 ms | 377.29 / 250.99 | 26.275 / 23.558 |
+| 2 | 200.0 / 258.9 ms | 185.4 / 238.7 ms | 367.09 / 242.18 | 26.271 / 23.555 |
+
+Packing was within the 5% latency gate in both observed repeats. Absolute latency varied between runs,
+so these observations are not promoted as a stable speed claim. The layout needed about one-third fewer
+GET attempts and 10.3% fewer bytes, while scanning **120,787.93 versus 111,598.67 rows** per query.
+Read waves were 3.10/3.13 for packing and 3.04/3.14 for control. Recall on this 100-query slice was
+0.911 versus 0.957 in both repetitions. This is a comparison at different recall, and provides no
+matched-recall cold-speed qualification. Disk-staged and fresh-process cold behavior were not measured.
+
+### Validation and disposition
+
+Experimental commit `4775333` contains the implementation, the ignored
+`recluster::experiment::rr6_build_frozen` driver, and `examples/rr6_prepare.rs`. Its benchmark driver
+accepts an owned `RR6_CONFIG`, `RR6_SCRATCH`, and test-only `RR6_PACK=1`; omit the last variable for
+RR4 control assignment. Source preparation takes storage JSON, the shared NumPy corpus directory, the
+namespace, and a scratch path. The writable namespace must be a private copy under an owned temporary
+prefix, and all fixtures and prefixes must be removed afterward. S3 copies used `--copy-props none`
+because the instance role cannot read object tags.
+
+Before the experimental commit, formatting, strict all-target Clippy, and full serial engine/vector
+package tests passed on native ARM: **330 passed, zero failed, and 16 ignored across 44 suites**.
+New tests cover preserved centers, factors, sign bytes, vector bytes, sparse global IDs, masked rows,
+partial code blocks, inverse rotation, incompatible rotations, duplicate addresses, address overflow,
+and exhaustive-probe exact results. Remote source hashes matched the committed worktree. The rejected
+experiment is removed from the final branch; no dormant selector or alternate production algorithm remains.
+
+After the revert, formatting, strict all-target Clippy, and the full serial engine/vector package suites
+passed again on native ARM: **328 passed, zero failed, and 15 ignored across 44 suites**. Restored-source
+hashes matched the worktree, and the final crate diff against the branch base is empty. Full-workspace,
+SDK compatibility, Apple, 10M, and 100M qualification was outside this rejected experiment.
+
+The host ran from 10:50:03 to the 12:00:58 UTC termination request, **1.181944 instance-hours**. At RR4's
+historically quoted $0.3629/hour, estimated compute is **$0.4289**, plus small EBS and S3 charges, below
+the $6 cap. This is an estimate, not a current price quote or billing statement. The instance is terminated;
+independent queries found zero owned active instances, EBS volumes, security groups, key pairs, S3 objects,
+and multipart uploads. Shared fixtures were untouched. Owned local scratch artifacts were removed before
+completion; the uncommitted worker report retains the useful results and hashes.

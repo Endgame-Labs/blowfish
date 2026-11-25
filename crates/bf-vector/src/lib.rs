@@ -6,8 +6,6 @@ mod batched;
 pub use batched::{Bf16DotCenters, Bf16DotRows, bf16_matrix_accelerated};
 
 mod cluster;
-mod packing;
-pub use packing::{PackedLeaf, pack_leaves};
 mod directory;
 mod distance;
 mod fastscan;
