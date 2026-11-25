@@ -26,6 +26,7 @@ pub struct HotGraphBuilder {
     rows: Vec<u32>,
     sum: Vec<f64>,
     first: Vec<f32>,
+    norms: Vec<crate::CosineNorm>,
 }
 impl HotGraphBuilder {
     /// Create a uniquely owned spill under `root`. No existing directory is modified.
@@ -61,6 +62,7 @@ impl HotGraphBuilder {
             rows: Vec::with_capacity(count),
             sum: vec![0.; dims],
             first: Vec::new(),
+            norms: Vec::with_capacity(count),
         })
     }
     /// Append little-endian f16 rows. Immutable tier coordinates are preserved explicitly;
@@ -104,6 +106,8 @@ impl HotGraphBuilder {
             let half = unsafe {
                 std::slice::from_raw_parts(values.as_ptr().cast::<numkong::f16>(), values.len())
             };
+            let original = values.iter().map(|x| x.to_f32()).collect::<Vec<_>>();
+            self.norms.push(crate::CosineNorm::new(&original)?);
             let inv = 1. / numkong::f16::dot(half, half).unwrap().sqrt();
             let normalized = if inv.is_finite() && inv > 0. {
                 values.iter().map(|x| x.to_f32() * inv).collect::<Vec<_>>()
@@ -217,6 +221,7 @@ impl HotGraphBuilder {
             degrees,
             entries: vec![best.0],
             codes,
+            norms: std::mem::take(&mut self.norms),
         })
     }
 }

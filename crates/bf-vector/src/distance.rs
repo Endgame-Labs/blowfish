@@ -80,6 +80,55 @@ impl Metric {
     }
 }
 
+/// Cached squared norm using the exact distance kernel's sixteen-lane accumulation order.
+/// Scope this value to the same immutable vector and architecture that produced it.
+#[derive(Clone, Copy, Debug)]
+pub struct CosineNorm(f32);
+impl CosineNorm {
+    /// Validate a vector and compute its squared norm without changing its stored values.
+    pub fn new(vector: &[f32]) -> Result<Self> {
+        validate(vector, vector.len())?;
+        Ok(Self(dot_lanes(vector, vector)))
+    }
+}
+
+/// A cosine query whose norm is computed once for a batch of immutable candidates.
+pub struct CosineQuery<'a> {
+    vector: &'a [f32],
+    norm: CosineNorm,
+}
+impl<'a> CosineQuery<'a> {
+    /// Validate a query and prepare its norm. Extreme finite values retain the wider fallback.
+    pub fn new(vector: &'a [f32]) -> Result<Self> {
+        Ok(Self {
+            vector,
+            norm: CosineNorm::new(vector)?,
+        })
+    }
+    pub(crate) fn vector(&self) -> &[f32] {
+        self.vector
+    }
+    pub(crate) fn distance(&self, vector: &[f32], norm: CosineNorm) -> f32 {
+        let (aa, bb, ab) = (
+            self.norm.0 as f64,
+            norm.0 as f64,
+            dot_lanes(self.vector, vector) as f64,
+        );
+        if !aa.is_finite()
+            || !bb.is_finite()
+            || !ab.is_finite()
+            || (aa == 0. && self.vector.iter().any(|x| *x != 0.))
+            || (bb == 0. && vector.iter().any(|x| *x != 0.))
+        {
+            return scalar_cosine(self.vector, vector);
+        }
+        if aa == 0. || bb == 0. {
+            return if aa == bb { 0. } else { 1. };
+        }
+        (1. - ab / (aa.sqrt() * bb.sqrt())).clamp(0., 2.) as f32
+    }
+}
+
 fn scalar_cosine(a: &[f32], b: &[f32]) -> f32 {
     let aa: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum();
     let bb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum();
@@ -567,5 +616,43 @@ mod tests {
         assert!(decode_base64_f32("AAAA").is_err());
         assert!(decode_base64_f32(&encode_base64_f32(&[f32::NAN])).is_err());
         assert!(decode_base64_f32("!").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cached_norm_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_cosine_preserves_distance_bits_and_extreme_fallbacks() {
+        let mut seed = 0x123456789abcdefu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as i32 as f32) / i32::MAX as f32
+        };
+        for dims in [1, 2, 7, 15, 16, 17, 31, 32, 63, 64, 127, 255, 1024, 1027] {
+            for _ in 0..20 {
+                let a = (0..dims).map(|_| next()).collect::<Vec<_>>();
+                let b = (0..dims)
+                    .map(|_| f16::from_f32(next()).to_f32())
+                    .collect::<Vec<_>>();
+                for scale in [0., 1., f32::MAX, f32::from_bits(1)] {
+                    let q = a.iter().map(|x| x * scale).collect::<Vec<_>>();
+                    let prepared = CosineQuery::new(&q).unwrap();
+                    assert_eq!(
+                        prepared
+                            .distance(&b, CosineNorm::new(&b).unwrap())
+                            .to_bits(),
+                        Metric::CosineDistance.distance_unchecked(&q, &b).to_bits(),
+                        "dims={dims}, scale={scale}"
+                    );
+                }
+            }
+        }
+        assert!(CosineNorm::new(&[]).is_err());
+        assert!(CosineQuery::new(&[f32::NAN]).is_err());
+        assert!(CosineNorm::new(&[f32::INFINITY]).is_err());
     }
 }

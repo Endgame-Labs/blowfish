@@ -64,3 +64,5 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Bounded-memory construction and navigation for disposable warm-tier graphs.
 pub mod warm_graph;
+
+pub use distance::{CosineNorm, CosineQuery};

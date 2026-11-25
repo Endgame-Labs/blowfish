@@ -3,7 +3,7 @@ use crate::{Engine, NamespaceState, lineage::Placement, read_cache, segment};
 use bf_storage::Storage;
 use bf_types::{ApiError, DistanceMetric, Document, Id, QueryRequest, RankBy};
 use bf_vector::{
-    Index, RoaringBitmap, VectorType,
+    CosineQuery, Index, RoaringBitmap, VectorType,
     warm_graph::{HotCancellation, HotGraph, HotGraphBuilder, HotScratch},
 };
 use bf_wal::{SlabSet, Wal};
@@ -1040,7 +1040,7 @@ async fn search_entry(
     };
     let (hits, evaluations) = entry
         .graph
-        .candidates(
+        .candidates_with_norms(
             vector,
             ef,
             RERANK,
@@ -1050,32 +1050,42 @@ async fn search_entry(
         .map_err(segment::index_error)?;
     drop(loan);
     #[cfg(all(test, target_os = "macos"))]
-    nav_probe::end(counter_started, evaluations, &hits);
+    nav_probe::end(
+        counter_started,
+        evaluations,
+        &hits.iter().map(|h| h.0).collect::<Vec<_>>(),
+    );
     #[cfg(not(all(test, target_os = "macos")))]
     let _ = evaluations;
     entry.phase_cpu[0].fetch_add(
         ((thread_cpu() - navigation_started).max(0.) * 1e9) as u64,
         Ordering::Relaxed,
     );
-    let mut by_source: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
-    for row in hits {
+    let mut by_source: BTreeMap<usize, Vec<(usize, usize, bf_vector::CosineNorm)>> =
+        BTreeMap::new();
+    for (row, norm) in hits {
         let p = entry
             .locations
             .binary_search_by_key(&row, |p| p.0)
             .map_err(|_| segment::corrupt())?;
         let [slab, cluster, ordinal] = entry.locations[p].1;
-        by_source
-            .entry(slab as usize)
-            .or_default()
-            .push((cluster, ordinal));
+        by_source.entry(slab as usize).or_default().push((
+            cluster as usize,
+            ordinal as usize,
+            norm,
+        ));
     }
+    let prepared = CosineQuery::new(vector).map_err(segment::index_error)?;
     let mut exact = measure_phase(
         &entry.phase_cpu[1],
-        futures::future::try_join_all(by_source.into_iter().map(|(slab, locations)| async move {
-            entry.sources[slab]
-                .rerank_candidates(vector, k, locations)
-                .await
-                .map_err(segment::index_error)
+        futures::future::try_join_all(by_source.into_iter().map(|(slab, locations)| {
+            let prepared = &prepared;
+            async move {
+                entry.sources[slab]
+                    .rerank_cosine_candidates(prepared, k, locations)
+                    .await
+                    .map_err(segment::index_error)
+            }
         })),
     )
     .await?

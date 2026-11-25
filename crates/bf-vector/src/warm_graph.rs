@@ -30,6 +30,7 @@ pub struct HotGraph {
     degrees: Vec<u8>,
     entries: Vec<u32>,
     codes: quant::Codes,
+    norms: Vec<crate::CosineNorm>,
 }
 /// Reusable per-query visited bytes and bounded heaps.
 pub struct HotScratch(navigation::Scratch);
@@ -53,7 +54,8 @@ impl HotGraph {
             + self.degrees.capacity()
             + self.entries.capacity() * 4
             + self.codes.values.capacity()
-            + self.codes.scales.capacity() * 4) as u64
+            + self.codes.scales.capacity() * 4
+            + self.norms.capacity() * 4) as u64
     }
     /// Conservative construction/load reservation, excluding source-index metadata.
     /// `workers` is the maximum number of simultaneous query scratch arrays.
@@ -81,6 +83,19 @@ impl HotGraph {
         live: Option<&RoaringBitmap>,
         scratch: &mut HotScratch,
     ) -> Result<(Vec<u32>, usize)> {
+        let (hits, evaluations) = self.candidates_with_norms(query, ef, count, live, scratch)?;
+        Ok((hits.into_iter().map(|(row, _)| row).collect(), evaluations))
+    }
+    /// Navigate identically to [`Self::candidates`], carrying each immutable row's cached norm
+    /// for exact reranking. Norms describe original stored f16 values, before normalization.
+    pub fn candidates_with_norms(
+        &self,
+        query: &[f32],
+        ef: usize,
+        count: usize,
+        live: Option<&RoaringBitmap>,
+        scratch: &mut HotScratch,
+    ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
         crate::distance::validate(query, self.dims)?;
         if ef == 0 || count == 0 || query.iter().all(|x| *x == 0.) {
             return Err(Error::InvalidInput("unsupported graph query shape".into()));
@@ -104,7 +119,9 @@ impl HotGraph {
         hits.retain(|h| live.is_none_or(|m| m.contains(self.rows[h.id as usize])));
         hits.truncate(count);
         Ok((
-            hits.into_iter().map(|h| self.rows[h.id as usize]).collect(),
+            hits.into_iter()
+                .map(|h| (self.rows[h.id as usize], self.norms[h.id as usize]))
+                .collect(),
             evaluations + self.entries.len(),
         ))
     }
