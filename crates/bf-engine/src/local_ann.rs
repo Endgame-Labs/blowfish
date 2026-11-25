@@ -31,6 +31,7 @@ const MAX_FILES: usize = 4096;
 const MAX_STAGES: usize = 128;
 const BLOCK: usize = 16 << 10;
 const PIECE: u64 = 8 << 20;
+const DOWNLOADS: usize = 4;
 const RETRY: Duration = Duration::from_secs(60);
 
 struct StagedFile {
@@ -897,46 +898,59 @@ impl Manager {
                 .await?;
             stage.files.insert(file.key.clone(), bytes);
         }
-        for (key, len) in limits {
-            let file = refs
-                .get(key.as_str())
-                .ok_or_else(|| io::Error::other("ANN stage source missing"))?;
-            if len > file.size {
-                return Err(io::Error::other("ANN prefix exceeds object"));
-            }
-            let staged = self
-                .download(
-                    store,
-                    file,
-                    len,
-                    &stage
-                        .path
-                        .join(format!("source-{}", digest(key.as_bytes()))),
-                )
-                .await?;
-            stage.files.insert(key, staged);
-        }
+        let sources_to_copy = limits
+            .into_iter()
+            .map(|(key, len)| {
+                let source = refs
+                    .get(key.as_str())
+                    .ok_or_else(|| io::Error::other("ANN stage source missing"))?;
+                if len > source.size {
+                    return Err(io::Error::other("ANN prefix exceeds object"));
+                }
+                Ok(((*source).clone(), len))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        stage.files.extend(
+            self.download_many(store, &sources_to_copy, &stage.path)
+                .await?,
+        );
         let sources: HashMap<_, _> = std::iter::once(&set.dir)
             .chain(set.pages.iter())
             .chain(set.slabs.iter().flat_map(|s| s.files.values()))
             .map(|f| (f.key.as_str(), f))
             .collect();
+        let identities: Vec<_> = stage
+            .files
+            .iter()
+            .map(|(key, file)| (key.clone(), file.identity.clone()))
+            .collect();
+        futures::stream::iter(identities.into_iter().map(|(key, identity)| {
+            let store = store.clone();
+            async move {
+                let current = store
+                    .object_identity(&key)
+                    .await
+                    .map_err(io::Error::other)?;
+                if identity.as_ref() != Some(&current) {
+                    return Err(io::Error::other("ANN source changed during publication"));
+                }
+                Ok(())
+            }
+        }))
+        .buffer_unordered(32)
+        .try_collect::<Vec<_>>()
+        .await?;
         let mut files = BTreeMap::new();
         let mut keys: Vec<_> = stage.files.keys().collect();
         keys.sort_unstable();
         for (n, key) in keys.into_iter().enumerate() {
             let f = &stage.files[key];
-            let identity = store.object_identity(key).await.map_err(io::Error::other)?;
+            let identity = f
+                .identity
+                .clone()
+                .ok_or_else(|| io::Error::other("missing ANN identity"))?;
             if identity.etag.is_none() && identity.version.is_none() {
                 return Err(io::Error::other("backend has no immutable object identity"));
-            }
-            // Download checks the same identity before and after copying. Preserve it here.
-            if identity
-                != f.identity
-                    .clone()
-                    .ok_or_else(|| io::Error::other("missing ANN identity"))?
-            {
-                return Err(io::Error::other("ANN source changed during publication"));
             }
             let _ = sources
                 .get(key.as_str())
@@ -1018,6 +1032,108 @@ impl Manager {
         stage._lease.files = stage.files.len();
         metrics::histogram!("blowfish_ann_staging_bytes").record(actual as f64);
         Ok(stage)
+    }
+    /// One range pool spans every slab. A slot includes its positional write and CRC,
+    /// bounding payload memory to DOWNLOADS * PIECE without per-slab queues of bytes.
+    async fn download_many(
+        &self,
+        store: &Storage,
+        sources: &[(SegmentFile, u64)],
+        path: &Path,
+    ) -> io::Result<HashMap<String, StagedFile>> {
+        let mut files = HashMap::new();
+        let mut jobs = Vec::new();
+        // HEADs and file creation hold no payload memory.
+        // Own descriptors before constructing futures, keeping the spawned build Send.
+        let sources = sources.to_vec();
+        let mut opened = futures::stream::iter(sources.into_iter().map(|(source, len)| {
+            let (store, path) = (store.clone(), path.to_owned());
+            async move {
+                let identity = store
+                    .object_identity(&source.key)
+                    .await
+                    .map_err(io::Error::other)?;
+                let file = tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path.join(format!("source-{}", digest(source.key.as_bytes()))))
+                    .await?;
+                file.set_len(len).await?;
+                Ok::<_, io::Error>((source, len, identity, file.into_std().await))
+            }
+        }))
+        .buffer_unordered(32);
+        while let Some((source, len, identity, file)) = opened.try_next().await? {
+            let file = Arc::new(file);
+            let reader = store
+                .range_reader_with_length(&source.key, source.size, true)
+                .map_err(io::Error::other)?
+                .bypass_cache();
+            for start in (0..len).step_by(PIECE as usize) {
+                jobs.push((
+                    source.key.clone(),
+                    reader.clone(),
+                    file.clone(),
+                    start..(start + PIECE).min(len),
+                ));
+            }
+            files.insert(
+                source.key.clone(),
+                StagedFile {
+                    file: file.try_clone()?,
+                    len,
+                    crc: vec![0; len.div_ceil(BLOCK as u64) as usize],
+                    identity: Some(identity),
+                },
+            );
+        }
+        let mut reads = futures::stream::iter(jobs.into_iter().map(
+            |(key, reader, file, range)| async move {
+                let bytes = reader
+                    .read_direct(range.clone())
+                    .await
+                    .map_err(io::Error::other)?;
+                tokio::task::spawn_blocking(move || {
+                    file.write_all_at(&bytes, range.start)?;
+                    let crc: Vec<_> = bytes.chunks(BLOCK).map(crc32fast::hash).collect();
+                    Ok::<_, io::Error>((key, range.start / BLOCK as u64, crc))
+                })
+                .await
+                .map_err(io::Error::other)?
+            },
+        ))
+        .buffer_unordered(DOWNLOADS);
+        while let Some((key, block, crc)) = reads.try_next().await? {
+            let target = &mut files.get_mut(&key).expect("opened stage source").crc;
+            target[block as usize..block as usize + crc.len()].copy_from_slice(&crc);
+        }
+        // No range task remains when files are synced and their identities rechecked.
+        let syncing = files
+            .iter()
+            .map(|(key, file)| Ok((key.clone(), file.identity.clone(), file.file.try_clone()?)))
+            .collect::<io::Result<Vec<_>>>()?;
+        futures::stream::iter(syncing.into_iter().map(|(key, identity, handle)| {
+            let store = store.clone();
+            async move {
+                tokio::task::spawn_blocking(move || handle.sync_all())
+                    .await
+                    .map_err(io::Error::other)??;
+                let after = store
+                    .object_identity(&key)
+                    .await
+                    .map_err(io::Error::other)?;
+                if identity.as_ref() != Some(&after) {
+                    return Err(io::Error::other("ANN source changed during download"));
+                }
+                Ok(())
+            }
+        }))
+        .buffer_unordered(32)
+        .try_collect::<Vec<_>>()
+        .await?;
+        Ok(files)
     }
     async fn download(
         &self,
@@ -1638,6 +1754,41 @@ mod tests {
         .unwrap();
         assert_eq!(&actual[..], &ann[..37]);
         assert!(stage.bad.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn pooled_downloads_preserve_piece_boundaries_and_every_checksum() {
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        let (store, _, _, _) = fixture(1).await;
+        let mut sources = Vec::new();
+        for n in 0..3 {
+            let data: Vec<u8> = (0..PIECE as usize + BLOCK + 37)
+                .map(|i| ((i * 31 + n) % 251) as u8)
+                .collect();
+            let key = format!("pool-{n}");
+            store.create_unique(&key, data.clone()).await.unwrap();
+            sources.push((file(&key, data.len() as u64, 0), data.len() as u64));
+        }
+        let files = manager
+            .download_many(&store, &sources, work.path())
+            .await
+            .unwrap();
+        for (n, (source, len)) in sources.iter().enumerate() {
+            let file = &files[&source.key];
+            let ranges = [0..37, PIECE - 17..PIECE + 29, len - 37..*len];
+            for (bytes, range) in file.read(&ranges).unwrap().iter().zip(ranges) {
+                let expected: Vec<u8> = (range.start..range.end)
+                    .map(|i| ((i * 31 + n as u64) % 251) as u8)
+                    .collect();
+                assert_eq!(&bytes[..], expected);
+            }
+            assert_eq!(file.crc.len(), len.div_ceil(BLOCK as u64) as usize);
+            assert_eq!(
+                file.identity,
+                Some(store.object_identity(&source.key).await.unwrap())
+            );
+        }
     }
 
     #[tokio::test]
