@@ -146,6 +146,10 @@ impl Engine {
         ns: &str,
         opts: &ReclusterOptions,
     ) -> Result<ReclusterReport, ApiError> {
+        // Unit tests share one process, and a recluster owns its process-global build state.
+        // Hold the shared side of the gate so graph-admission tests can take it exclusively.
+        #[cfg(test)]
+        let _shared = crate::warm_graph::ADMISSION_GATE.read().await;
         self.run_recluster_job(ns, opts).await
     }
 
