@@ -21,4 +21,39 @@ fn main() {
         // extraction so both BFD and LLD resolve it, regardless of archive order.
         println!("cargo:rustc-link-lib=static:+whole-archive=cpp-httplib");
     }
+    // CMake's PRIVATE dependency edges do not reach Rust's static link. Forward
+    // the TLS libraries too when this copy of cpp-httplib was built with OpenSSL.
+    let cache = std::fs::read_to_string(root.join("build/CMakeCache.txt")).unwrap_or_default();
+    if cache.lines().any(|line| line == "LLAMA_OPENSSL:BOOL=ON")
+        && cache.lines().any(|line| {
+            matches!(
+                line,
+                "OPENSSL_VERSION_SUPPORTED:INTERNAL=1" | "OPENSSL_VERSION_SUPPORTED:INTERNAL=TRUE"
+            )
+        })
+    {
+        for (key, name) in [
+            ("OPENSSL_SSL_LIBRARY", "ssl"),
+            ("OPENSSL_CRYPTO_LIBRARY", "crypto"),
+        ] {
+            let prefix = format!("{key}:FILEPATH=");
+            let value = cache
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .expect("OpenSSL was enabled without its library path");
+            let library = std::path::Path::new(value);
+            let directory = library.parent().expect("OpenSSL library has no parent");
+            let kind = if library.extension().is_some_and(|ext| ext == "a") {
+                "static"
+            } else {
+                "dylib"
+            };
+            println!("cargo:rustc-link-search=native={}", directory.display());
+            println!("cargo:rustc-link-lib={kind}={name}");
+        }
+        if std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple") {
+            println!("cargo:rustc-link-lib=framework=CoreFoundation");
+            println!("cargo:rustc-link-lib=framework=Security");
+        }
+    }
 }

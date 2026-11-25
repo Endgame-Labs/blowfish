@@ -6,7 +6,7 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ### Fixed
 
-- **Local model build links:** Profile-instrumented `local-models` builds now link llama.cpp's HTTP archive, which its native bindings build but do not install. The affected bindings have been used since v0.1.12; ordinary uninstrumented release builds discard the unused HTTP paths and are unaffected by this link failure. The lockfile also pairs bindgen with a compatible prettyplease version.
+- **Local model build links:** Profile-instrumented `local-models` builds now link the HTTP archive omitted by llama.cpp's install step and forward its enabled TLS dependencies. The affected bindings have been used since v0.1.12; ordinary uninstrumented release builds discard the unused HTTP paths and are unaffected by this link failure. The lockfile also pairs bindgen with a compatible prettyplease version.
 
 ## [0.1.22] - 2026-11-24
 
