@@ -1178,18 +1178,19 @@ impl Cache {
         k: usize,
     ) -> Option<Vec<(u32, f32)>> {
         if overcommitted() {
-            return None;
+            return crate::resident::note(40);
         }
         let entry = self
             .entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&Key::new(ns, state, attribute, set))
-            .and_then(|h| h.ready.clone())?;
+            .and_then(|h| h.ready.clone())
+            .or_else(|| crate::resident::note(41))?;
         let ef = {
             let c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
             if !c.usable {
-                return None;
+                return crate::resident::note(42);
             }
             c.quality.serving.unwrap_or(c.quality.trial)
         };
@@ -1199,9 +1200,13 @@ impl Cache {
             || vector.len() != entry.graph.dims()
             || vector.iter().all(|x| *x == 0.)
         {
-            return None;
+            return crate::resident::note(43);
         }
-        let _slot = entry.slots.try_acquire().ok()?;
+        let _slot = entry
+            .slots
+            .try_acquire()
+            .ok()
+            .or_else(|| crate::resident::note(44))?;
         let started = thread_cpu();
         let found = entry.answer_sync(vector, k, ef)?;
         self.answers.fetch_add(1, Ordering::Relaxed);
@@ -1234,11 +1239,15 @@ impl Entry {
         let (hits, _) = self
             .graph
             .candidates_with_norms(vector, ef, RERANK, None, loan.scratch.as_mut()?)
-            .ok()?;
+            .ok()
+            .or_else(|| crate::resident::note(46))?;
         drop(loan);
         let mut located = Vec::with_capacity(hits.len());
         for (row, norm) in hits {
-            let [slab, cluster, ordinal] = self.locations.get(row)?;
+            let [slab, cluster, ordinal] = self
+                .locations
+                .get(row)
+                .or_else(|| crate::resident::note(47))?;
             located.push((slab as usize, cluster as usize, ordinal as usize, norm));
         }
         located.sort_unstable_by_key(|c| c.0);
@@ -1252,13 +1261,17 @@ impl Entry {
             exact.extend(
                 self.sources[slab]
                     .rerank_cosine_candidates(&prepared, k, locations)
-                    .now_or_never()?
-                    .ok()?,
+                    .now_or_never()
+                    .or_else(|| crate::resident::note(48))?
+                    .ok()
+                    .or_else(|| crate::resident::note(49))?,
             );
         }
         exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         exact.truncate(k);
-        (exact.len() == k).then_some(exact)
+        (exact.len() == k)
+            .then_some(exact)
+            .or_else(|| crate::resident::note(50))
     }
 }
 /// Run a calibration ANN plan through the same CPU dispatch as an ordinary warm query.
@@ -1392,7 +1405,7 @@ impl Engine {
             let calibration=h.ready.as_ref().map(|e|{let c=e.calibration.lock().unwrap_or_else(|e|e.into_inner());serde_json::json!({"ef":c.quality.serving.unwrap_or(c.quality.trial),"trial_ef":c.quality.trial,"usable":c.usable,"samples":c.quality.len(),"paired_quality":c.quality.statistics(),"trial_cpu_seconds":c.trial_seconds,"build_cpu_seconds":e.measured_cpu_seconds,"build_wall_seconds":e.build_wall_seconds,"build_reservation_bytes":e.build_reservation_bytes,"reserved_bytes":e._reservation.0,"promotion_cpu_cost_seconds":c.build_seconds,"graph_cpu_seconds":c.graph_seconds,"resident_bytes":e.graph.resident_bytes(),"phase_searches":e.searches.load(Ordering::Relaxed),"phase_cpu_seconds":e.phase_cpu.iter().map(|v|v.load(Ordering::Relaxed) as f64/1e9).collect::<Vec<_>>()})});
             serde_json::json!({"attribute":k.attribute,"building":h.building.is_some(),"calibration":calibration,"heat_seconds":h.first.elapsed().as_secs_f64(),"query_rate":h.rate_at(Instant::now()),"ivf_cpu_seconds":h.ivf_seconds,"retry_seconds":h.retry.saturating_duration_since(Instant::now()).as_secs_f64()})
         }).collect::<Vec<_>>();
-        serde_json::json!({"graphs":graphs,"answered":self.0.hot_graph.answers.load(Ordering::Relaxed),"process_reserved_bytes":RESERVED.load(Ordering::Relaxed)})
+        serde_json::json!({"graphs":graphs,"answered":self.0.hot_graph.answers.load(Ordering::Relaxed),"resident_declines":crate::resident::declines(),"process_reserved_bytes":RESERVED.load(Ordering::Relaxed)})
     }
 }
 

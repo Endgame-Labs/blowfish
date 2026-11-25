@@ -14,6 +14,29 @@ use bf_types::{
 use serde_json::Value;
 use std::{sync::Arc, time::Instant};
 
+/// Why the resident path declined, by site, for the admin graph status.
+static DECLINES: [std::sync::atomic::AtomicU64; 64] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+pub(crate) fn note<T>(site: usize) -> Option<T> {
+    DECLINES[site].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    None
+}
+fn decline(site: usize) -> Result<Option<QueryResponse>, ApiError> {
+    note::<()>(site);
+    Ok(None)
+}
+/// Decline counts by site (nonzero only), as `[site, count]` pairs.
+pub(crate) fn declines() -> Vec<[u64; 2]> {
+    DECLINES
+        .iter()
+        .enumerate()
+        .filter_map(|(site, n)| {
+            let n = n.load(std::sync::atomic::Ordering::Relaxed);
+            (n > 0).then_some([site as u64, n])
+        })
+        .collect()
+}
+
 /// The bare ANN shape this module answers, borrowed from the request.
 struct Bare<'a> {
     attribute: &'a str,
@@ -90,21 +113,21 @@ impl Engine {
         if !(enabled() && (query_worker::is_reactor() || cfg!(test)))
             || !matches!(request.consistency, bf_types::Consistency::Strong)
         {
-            return Ok(None);
+            return decline(1);
         }
         let Some(plan) = bare(request) else {
-            return Ok(None);
+            return decline(2);
         };
         if self.0.config.models.is_some() || self.0.read_cache.staging.is_some() {
-            return Ok(None);
+            return decline(3);
         }
         let Some(handle) = self.0.namespaces.load().get(ns).cloned() else {
-            return Ok(None);
+            return decline(4);
         };
         let state = handle.state.load();
         let fresh = self.0.config.retention.div_f64(2.0);
         if !state.exists || state.seq == 0 || state.checkpoint_refreshed.elapsed() >= fresh {
-            return Ok(None);
+            return decline(5);
         }
         // Everything the answer needs from the state must already be settled, so that the
         // synchronous steps below are the whole plan.
@@ -117,23 +140,23 @@ impl Engine {
                 Some(1)
             )
         {
-            return Ok(None);
+            return decline(6);
         }
         let set = &state.ann_tiers[plan.attribute][0];
         let Some(places) = lineage::direct(&state.segments, set) else {
-            return Ok(None);
+            return decline(7);
         };
         if crate::query::validate_rank(&state, request.rank_by.as_ref().expect("bare"), false)
             .is_err()
         {
-            return Ok(None);
+            return decline(8);
         }
         let start = Instant::now();
         // Strong consistency: the log must hold nothing after the published snapshot.
         let wal = bf_wal::Wal::new(self.0.store.clone(), ns).map_err(crate::log_error)?;
         match self.0.store.head(&wal.key(state.seq + 1)).await {
             Err(bf_storage::Error::NotFound) => {}
-            Ok(_) => return Ok(None),
+            Ok(_) => return decline(9),
             Err(error) => return Err(crate::storage_error(error)),
         }
         let current = handle.state.load();
@@ -141,12 +164,12 @@ impl Engine {
             || current.manifest_seq != state.manifest_seq
             || current.checkpoint_refreshed.elapsed() >= fresh
         {
-            return Ok(None);
+            return decline(10);
         }
         let _in_flight = crate::InFlight::enter();
         let cpu_started = warm_graph::thread_cpu();
         let Some(response) = self.answer_resident(ns, &state, set, &places, &plan, start) else {
-            return Ok(None);
+            return decline(11);
         };
         warm_graph::Cache::observe(
             self,
@@ -182,7 +205,8 @@ impl Engine {
             let p = set
                 .covered
                 .partition_point(|c| c.base <= row)
-                .checked_sub(1)?;
+                .checked_sub(1)
+                .or_else(|| note(31))?;
             let (at, local) = (places[p], row - set.covered[p].base);
             match by_segment.iter_mut().find(|(s, _)| *s == at) {
                 Some((_, rows)) => rows.push((local, n)),
@@ -193,7 +217,8 @@ impl Engine {
         for (at, mut rows) in by_segment {
             rows.sort_unstable();
             let locals: Vec<u32> = rows.iter().map(|r| r.0).collect();
-            let got = segment::cached_ids(&self.0.read_cache, &state.segments[at], &locals)?;
+            let got = segment::cached_ids(&self.0.read_cache, &state.segments[at], &locals)
+                .or_else(|| note(32))?;
             for ((_, n), id) in rows.into_iter().zip(got) {
                 ids[n] = Some(id);
             }

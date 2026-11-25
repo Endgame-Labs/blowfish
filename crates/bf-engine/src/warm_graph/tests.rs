@@ -751,7 +751,7 @@ async fn resident_answers_match_the_ordinary_plan_and_decline_what_they_cannot_p
     std::fs::create_dir_all(&root).unwrap();
     let _cleanup = Cleanup(root.clone());
     let config = StorageConfig {
-        url: "memory://".into(),
+        url: format!("file://{}", root.join("store").display()),
         cache: CacheConfig {
             memory_bytes: 32 << 20,
             ..Default::default()
