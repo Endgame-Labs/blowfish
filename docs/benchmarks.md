@@ -12742,5 +12742,5 @@ which does not translate into latency because a cold query's time is dominated b
 - **Side finding:** text-only compaction needs about 3.2 KB per row, so the 200,000-row cap is conservative for text by 25x. It is
   harmless for speed (above), but it is also why the pick rule cannot reach one segment, and it would matter if a smaller number of
   segments helped some other measure (for example, S3 request count at 10M rows).
-- **Cost:** one c7g.4xlarge for about 1.3 hours, an estimated $0.80 with the volume. The instance, key pair, security group, and
+- **Cost:** one c7g.4xlarge for about 25 minutes, an estimated under $0.50 with the volume. The instance, key pair, security group, and
   `tmp/bw15-1125/` S3 prefix are deleted.
