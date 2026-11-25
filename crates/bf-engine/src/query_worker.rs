@@ -152,6 +152,34 @@ where
         .map_err(crate::segment::index_error)
 }
 
+/// Cancel staged speculative work on its worker when its caller stops awaiting it.
+/// Ordinary remote and warm continuations retain `run_io`'s existing dispatch.
+pub(crate) async fn run_io_cancellable<F>(
+    runtime: tokio::runtime::Handle,
+    future: F,
+) -> Result<F::Output, ApiError>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    // Dropping a blocking JoinHandle detaches it. Abort the async plan as well, so a
+    // cancelled query releases its permits, stage readers, and pending I/O on the worker.
+    struct Cancel(futures::future::AbortHandle);
+    impl Drop for Cancel {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let (abort, registration) = futures::future::AbortHandle::new_pair();
+    let _cancel = Cancel(abort);
+    run_io(
+        runtime,
+        futures::future::Abortable::new(future, registration),
+    )
+    .await?
+    .map_err(crate::segment::index_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

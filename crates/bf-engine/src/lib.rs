@@ -863,11 +863,15 @@ impl Engine {
             if !resident {
                 let start = Instant::now();
                 let (engine, ns) = (self.clone(), ns.to_owned());
-                let result = query_worker::run_io(
-                    query_worker::shared_runtime(),
-                    Box::pin(async move { engine.query_configured(&ns, request).await }),
-                )
-                .await?;
+                let query = Box::pin(async move { engine.query_configured(&ns, request).await });
+                let runtime = query_worker::shared_runtime();
+                // A staged query can nest a speculative blocking search. Its outer
+                // continuation must drop that search on cancellation as well.
+                let result = if self.0.read_cache.staging.is_some() {
+                    query_worker::run_io_cancellable(runtime, query).await?
+                } else {
+                    query_worker::run_io(runtime, query).await?
+                };
                 return result.map(|(mut response, diagnostics)| {
                     response.performance.server_total_ms = start.elapsed().as_millis() as u64;
                     (response, diagnostics)
@@ -922,14 +926,39 @@ impl Engine {
         } else {
             None
         };
-        let hint = snapshot::OpenHint::for_request(
+        let staged = if cached.is_none()
+            && matches!(request.consistency, Consistency::Strong)
+            && request.queries.is_none()
+            && let Some(RankBy::Vector {
+                attribute,
+                exact: false,
+                ..
+            }) = &request.rank_by
+        {
+            self.0
+                .read_cache
+                .staging
+                .as_ref()
+                .filter(|_| {
+                    self.0
+                        .namespaces
+                        .load()
+                        .get(ns)
+                        .is_none_or(|handle| handle.state.load().seq == 0)
+                })
+                .and_then(|manager| manager.snapshot(&self.0.read_cache.key(""), ns, attribute))
+        } else {
+            None
+        };
+        let mut hint = snapshot::OpenHint::for_request(
             &request,
             context.clone(),
             &self.0.config,
             // With a resident checkpoint the query searches speculatively, concurrently with the
             // snapshot: prefetching its scan as well would read the same ranges twice.
-            cached.is_none(),
+            cached.is_none() && staged.is_none(),
         );
+        hint.searching = staged.is_some();
         let snapshot = async {
             let result = backend
                 .scope(
@@ -943,29 +972,61 @@ impl Engine {
         // results when the refreshed snapshot has the same WAL and manifest version.
         // A concurrent write, index publication, or deletion discards even errors
         // from the old search, and executes against the refreshed state instead.
-        let (state, mut response, execution_elapsed, snapshot_elapsed) =
-            if let Some(cached) = cached {
-                let ((snapshot, elapsed), searched) = tokio::join!(
-                    snapshot,
-                    self.search_snapshot(&cached, &request, context.clone(), true)
-                );
-                let (state, _) = snapshot?;
-                let (response, execution) =
-                    if state.seq == cached.seq && state.manifest_seq == cached.manifest_seq {
-                        searched?
-                    } else {
-                        self.search_snapshot(&state, &request, context, true)
-                            .await?
-                    };
-                (state, response, execution, elapsed)
-            } else {
-                let (snapshot, elapsed) = snapshot.await;
-                let (state, warm) = snapshot?;
-                let (response, execution) = self
-                    .search_snapshot(&state, &request, context, warm)
-                    .await?;
-                (state, response, execution, elapsed)
+        let (state, mut response, execution_elapsed, snapshot_elapsed) = if let Some(cached) =
+            cached
+        {
+            let ((snapshot, elapsed), searched) = tokio::join!(
+                snapshot,
+                self.search_snapshot(&cached, &request, context.clone(), true, false)
+            );
+            let (state, _) = snapshot?;
+            let (response, execution) =
+                if state.seq == cached.seq && state.manifest_seq == cached.manifest_seq {
+                    searched?
+                } else {
+                    self.search_snapshot(&state, &request, context, true, false)
+                        .await?
+                };
+            (state, response, execution, elapsed)
+        } else if let Some(staged) = staged {
+            // A snapshot error cancels the search immediately. A speculative search error
+            // waits for validation, and is retried against the confirmed state below.
+            let ((state, warm, elapsed), searched) = tokio::try_join!(
+                async {
+                    let (result, elapsed) = snapshot.await;
+                    result.map(|(state, warm)| (state, warm, elapsed))
+                },
+                async {
+                    Ok::<_, ApiError>(
+                        self.search_snapshot(&staged, &request, context.clone(), false, true)
+                            .await,
+                    )
+                }
+            )?;
+            let reusable = state.exists
+                && state.manifest_seq == staged.manifest_seq
+                && state.indexed_through == staged.indexed_through
+                && state.seq == staged.seq;
+            let (response, execution) = match searched {
+                Ok(result) if reusable => {
+                    metrics::counter!("blowfish_cold_search_speculation_total", "outcome" => "reused").increment(1);
+                    result
+                }
+                _ => {
+                    metrics::counter!("blowfish_cold_search_speculation_total", "outcome" => "fallback").increment(1);
+                    self.search_snapshot(&state, &request, context, warm, true)
+                        .await?
+                }
             };
+            (state, response, execution, elapsed)
+        } else {
+            let (snapshot, elapsed) = snapshot.await;
+            let (state, warm) = snapshot?;
+            let (response, execution) = self
+                .search_snapshot(&state, &request, context, warm, false)
+                .await?;
+            (state, response, execution, elapsed)
+        };
         if let Some(scope) = &graph_scope {
             scope.record_cpu(cpu_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
         }
@@ -1099,6 +1160,7 @@ impl Engine {
         request: &QueryRequest,
         mut context: read_cache::ReadContext,
         warm: bool,
+        cancellable: bool,
     ) -> Result<(QueryResponse, std::time::Duration), ApiError> {
         let start = Instant::now();
         context.cold = !warm;
@@ -1137,7 +1199,11 @@ impl Engine {
             query_worker::run(query, inline).await??
         } else {
             metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "cold").increment(1);
-            query_worker::run_io(tokio::runtime::Handle::current(), query).await??
+            if cancellable {
+                query_worker::run_io_cancellable(tokio::runtime::Handle::current(), query).await??
+            } else {
+                query_worker::run_io(tokio::runtime::Handle::current(), query).await??
+            }
         };
         Ok((response, start.elapsed()))
     }

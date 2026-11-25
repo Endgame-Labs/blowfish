@@ -4,6 +4,9 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **C21 speculative staged cold search (merged).** Routing, local scan, and rerank run on the stage's confirmed checkpoint while the manifest and WAL checks are in flight; accepted only if generation, indexed-through, and final WAL sequence agree, else the confirmed path reruns. 10M staged IDs-only, 200 groups: p50/p90 52.69/61.82 -> 32.13/35.92 ms (p90 ratio CI 0.516-0.613), 3,200 replies identical; pure-S3 ABBA flat. Since C18 this morning, 10M staged cold p90 went 103.4 -> 35.9 ms.
+- **G7, BW14, BW15 (negative).** Padding SQ8 graph rows: 0.92-0.99x. BM25 bound caches do not churn once warm. One 1M-row text segment: 1-client 0.52x, so segment fan-out stays.
+
 - **C20 cold staged path (merged).** WAL tail checks overlap the manifest GET using the stage-persisted indexed-through sequence (kept only if the manifest confirms it); cold fully staged final-rerank reads run on bounded workers. 10M staged IDs-only, 200 groups: p50/p90 54.8/73.0 -> 49.7/67.3 ms (first run 58.4/83.9 -> 49.6/58.6), rerank p90 9.62 -> 2.64 ms, one GET wave instead of two, identical; pure-S3 ABBA flat (p90 CI 0.906-1.091).
 - **G6 (negative).** A synchronous resident-graph fast path left warm M4 throughput within about 1%; kept on branch `g6-sync-path`.
 
