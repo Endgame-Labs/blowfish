@@ -4,8 +4,11 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-11-25
+
 ### Changed
 
+- **Faster BM25 under writes:** Full-text queries now gather term statistics from unindexed WAL entries once per query, in parallel on the existing query workers, and reuse them for ranking. Under 1,000 text upserts per second on 1M MS MARCO passages, BM25 p50 fell from 31.4 to 22.0 ms and p90 from 44.0 to 34.0 ms, with bit-identical scores and order. Write latency changed by about 1%, within run-to-run variation.
 - **Profile-guided builds by default:** The Dockerfile and `scripts/pgo-build.sh` now build blowfish with profile-guided optimization, trained in about one to two minutes on a small built-in workload (16K synthetic vectors, BM25, filters, and writes over loopback HTTP). Against the plain release build on 8 cores: filtered vector queries +98.5%, BM25 +16.0%, warm vector queries +4.7%, and durable writes +3.5%, with identical results. The small trainer keeps 85 to 101% of the gain of a profile trained on full BEIR NQ. Plain `cargo build --release` still works and is not profile-guided; see [docs/pgo.md](docs/pgo.md).
 
 ### Fixed
@@ -204,7 +207,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.24...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.25...HEAD
+[0.1.25]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.25
 [0.1.24]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.24
 [0.1.23]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.23
 [0.1.22]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.22

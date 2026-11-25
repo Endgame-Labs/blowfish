@@ -461,6 +461,8 @@ pub(crate) struct ReadContext {
     /// Snapshot-local BM25 shadow masks, shared with segment search workers.
     /// Never retained in the decoded cache or reused by a later query.
     pub text_shadowed: Option<Arc<std::collections::BTreeMap<String, roaring::RoaringBitmap>>>,
+    /// WAL summaries gathered for this query's immutable snapshot and schema.
+    pub text_tail: Option<Arc<crate::text_tail::PreparedTail>>,
 }
 impl ReadContext {
     /// Exhaustive reference work reads through existing caches without admitting its scan.
@@ -492,6 +494,7 @@ impl ReadContext {
             document_scan_rows: Arc::default(),
             local_ann_bytes: Arc::default(),
             text_shadowed: None,
+            text_tail: None,
         }
     }
 }

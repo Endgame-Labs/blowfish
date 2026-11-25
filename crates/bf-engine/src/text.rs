@@ -536,6 +536,7 @@ pub(crate) fn reference_stats(state: &mut NamespaceState) {
 pub(crate) struct GlobalStats {
     pub corpus: std::sync::Arc<BTreeMap<String, CorpusStats>>,
     pub shadowed: Option<std::sync::Arc<BTreeMap<String, roaring::RoaringBitmap>>>,
+    pub tail: Option<std::sync::Arc<crate::text_tail::PreparedTail>>,
 }
 
 /// Start at the checkpoint's live totals, subtract shadowed segment rows, and add the tail.
@@ -582,12 +583,14 @@ pub(crate) async fn global_stats(
                 .collect::<BTreeMap<_, _>>()
                 .into(),
             shadowed: None,
+            tail: None,
         });
     }
     if state.shadowed.is_empty() && state.docs.is_empty() {
         return Ok(GlobalStats {
             corpus: checkpoint_corpus_of(store, state, terms).await?,
             shadowed: None,
+            tail: None,
         });
     }
     let started = std::time::Instant::now();
@@ -650,8 +653,9 @@ pub(crate) async fn global_stats(
     };
     crate::ann::stage(started, "bm25 shadow stats");
     let started = std::time::Instant::now();
-    for doc in state.docs.values() {
-        adjust_summary(&mut stats, &analyzer.tail(doc), terms, true);
+    let tail = std::sync::Arc::new(analyzer.gather(&state.docs));
+    for summary in tail.rows.values() {
+        adjust_summary(&mut stats, summary, terms, true);
     }
     crate::ann::stage(started, "bm25 tail stats tokenization");
     Ok(GlobalStats {
@@ -664,6 +668,7 @@ pub(crate) async fn global_stats(
             .collect::<BTreeMap<_, _>>()
             .into(),
         shadowed,
+        tail: Some(tail),
     })
 }
 
