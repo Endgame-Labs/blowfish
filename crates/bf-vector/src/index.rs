@@ -1268,8 +1268,49 @@ impl<R: RangeRead> Index<R> {
         &self,
         query: &[f32],
         k: usize,
+        locations: Vec<(usize, usize)>,
+        recorder: Option<&dyn crate::VectorRecorder>,
+    ) -> Result<Vec<(u32, f32)>> {
+        self.rerank_with_norms(query, k, locations, recorder, None, &[])
+            .await
+    }
+    /// Exact cosine rerank with norms from the same immutable source rows. Validates the
+    /// query shape, stored checksums, and finite values just like [`Self::rerank_candidates`].
+    /// Passing a norm for a different vector violates this method's caller contract.
+    pub async fn rerank_cosine_candidates(
+        &self,
+        query: &crate::CosineQuery<'_>,
+        k: usize,
+        mut candidates: Vec<(usize, usize, crate::CosineNorm)>,
+    ) -> Result<Vec<(u32, f32)>> {
+        validate(query.vector(), self.dims())?;
+        if self.metric() != Metric::CosineDistance {
+            return Err(bad("cached cosine norms require cosine distance"));
+        }
+        candidates.sort_unstable_by_key(|c| (c.0, c.1));
+        let locations = candidates.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>();
+        // Match the public rerank's bounds validation before reading any candidate metadata.
+        for &(cid, ordinal) in &locations {
+            if self
+                .metadata
+                .clusters
+                .get(cid)
+                .is_none_or(|c| ordinal >= c.len() || c.data.is_none())
+            {
+                return Err(bad("invalid rerank location"));
+            }
+        }
+        self.rerank_with_norms(query.vector(), k, locations, None, Some(query), &candidates)
+            .await
+    }
+    async fn rerank_with_norms(
+        &self,
+        query: &[f32],
+        k: usize,
         mut locations: Vec<(usize, usize)>,
         recorder: Option<&dyn crate::VectorRecorder>,
+        prepared: Option<&crate::CosineQuery<'_>>,
+        norms: &[(usize, usize, crate::CosineNorm)],
     ) -> Result<Vec<(u32, f32)>> {
         locations.sort_unstable();
         locations.dedup();
@@ -1356,7 +1397,15 @@ impl<R: RangeRead> Index<R> {
                         vbytes,
                     ));
                 }
-                result.push((row, self.metric().distance_unchecked(query, &decoded)));
+                let distance = if let Some(prepared) = prepared {
+                    let p = norms
+                        .binary_search_by_key(&(cid, i), |c| (c.0, c.1))
+                        .expect("prepared rerank norm");
+                    prepared.distance(&decoded, norms[p].2)
+                } else {
+                    self.metric().distance_unchecked(query, &decoded)
+                };
+                result.push((row, distance));
             }
         }
         if trace_stages() {

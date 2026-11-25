@@ -1,6 +1,6 @@
 //! Disposable, bounded-memory row graphs for warm immutable cosine-f16 tiers.
 //!
-//! Quantized source codes spill to caller-owned local storage. Construction retains global SQ8
+//! Source rows fill the final code arrays directly. Construction retains global SQ8
 //! and fixed-capacity adjacency, without a full f16 corpus or spatial partitions. Nothing here
 //! defines a bucket format. The caller supplies a pool with at most two construction workers.
 mod builder;
@@ -30,8 +30,9 @@ pub struct HotGraph {
     degrees: Vec<u8>,
     entries: Vec<u32>,
     codes: quant::Codes,
+    norms: Vec<crate::CosineNorm>,
 }
-/// Reusable per-query visited bytes and bounded heaps.
+/// Reusable per-query exact visitation and bounded beam.
 pub struct HotScratch(navigation::Scratch);
 impl HotGraph {
     /// Number of graph nodes.
@@ -53,7 +54,8 @@ impl HotGraph {
             + self.degrees.capacity()
             + self.entries.capacity() * 4
             + self.codes.values.capacity()
-            + self.codes.scales.capacity() * 4) as u64
+            + self.codes.scales.capacity() * 4
+            + self.norms.capacity() * 4) as u64
     }
     /// Conservative construction/load reservation, excluding source-index metadata.
     /// `workers` is the maximum number of simultaneous query scratch arrays.
@@ -67,7 +69,7 @@ impl HotGraph {
     pub fn live_count(&self, mask: &RoaringBitmap) -> usize {
         self.rows.iter().filter(|row| mask.contains(**row)).count()
     }
-    /// Allocate a byte-per-node visited array. Callers bound and reserve the number retained.
+    /// Allocate cache-sized visitation state. Callers bound and reserve the number retained.
     pub fn scratch(&self) -> HotScratch {
         HotScratch(navigation::Scratch::new(self.len()))
     }
@@ -81,6 +83,19 @@ impl HotGraph {
         live: Option<&RoaringBitmap>,
         scratch: &mut HotScratch,
     ) -> Result<(Vec<u32>, usize)> {
+        let (hits, evaluations) = self.candidates_with_norms(query, ef, count, live, scratch)?;
+        Ok((hits.into_iter().map(|(row, _)| row).collect(), evaluations))
+    }
+    /// Navigate identically to [`Self::candidates`], carrying each immutable row's cached norm
+    /// for exact reranking. Norms describe original stored f16 values, before normalization.
+    pub fn candidates_with_norms(
+        &self,
+        query: &[f32],
+        ef: usize,
+        count: usize,
+        live: Option<&RoaringBitmap>,
+        scratch: &mut HotScratch,
+    ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
         crate::distance::validate(query, self.dims)?;
         if ef == 0 || count == 0 || query.iter().all(|x| *x == 0.) {
             return Err(Error::InvalidInput("unsupported graph query shape".into()));
@@ -94,17 +109,20 @@ impl HotGraph {
             .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
             .unwrap()
             .0;
-        let (mut hits, evaluations) = scratch.0.search(
+        let (mut hits, evaluations) = scratch.0.search_prefetched(
             &self.links,
             &self.degrees,
             entry,
             ef.max(count).min(self.len()),
             |id| self.codes.score(&code, scale, id),
+            |id| self.codes.prefetch(id),
         );
         hits.retain(|h| live.is_none_or(|m| m.contains(self.rows[h.id as usize])));
         hits.truncate(count);
         Ok((
-            hits.into_iter().map(|h| self.rows[h.id as usize]).collect(),
+            hits.into_iter()
+                .map(|h| (self.rows[h.id as usize], self.norms[h.id as usize]))
+                .collect(),
             evaluations + self.entries.len(),
         ))
     }
@@ -148,7 +166,7 @@ mod tests {
         }
     }
     #[test]
-    fn spilled_build_maps_rows_masks_dead_nodes_and_cleans_up() {
+    fn streaming_build_maps_rows_masks_dead_nodes_and_never_spills() {
         let root = root();
         let _cleanup = Cleanup(root.clone());
         let dims = 16;
@@ -160,7 +178,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let mut b = HotGraphBuilder::new(&root, dims, n).unwrap();
+        let mut b = HotGraphBuilder::new(dims, n).unwrap();
         for (part, rows) in source.chunks(40).enumerate() {
             let ids = (part * 40..part * 40 + rows.len())
                 .map(|i| 1000 + i as u32 * 3)
@@ -178,7 +196,7 @@ mod tests {
             .unwrap()
             .install(|| b.finish(&|| false))
             .unwrap();
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert!(!root.exists());
         let mut scratch = graph.scratch();
         let live = (0..n)
             .filter(|i| *i != 7)
@@ -218,7 +236,7 @@ mod tests {
     fn cancellation_and_invalid_input_leave_no_spills() {
         let root = root();
         let _cleanup = Cleanup(root.clone());
-        let mut b = HotGraphBuilder::new(&root, 2, 1).unwrap();
+        let mut b = HotGraphBuilder::new(2, 1).unwrap();
         assert!(b.append(&[1], &[0; 4], &|| false).is_err());
         let p = [f16::ONE, f16::ZERO]
             .into_iter()
@@ -228,6 +246,6 @@ mod tests {
         let cancel = HotCancellation::default();
         cancel.cancel();
         assert!(b.finish(&|| cancel.cancelled()).is_err());
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert!(!root.exists());
     }
 }

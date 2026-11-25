@@ -32,7 +32,19 @@ async fn recall(
     e.recall(&ns, q).await.map(Json).map_err(failure)
 }
 async fn status(State(e): State<Engine>, Path(ns): Path<String>) -> Json<Value> {
-    Json(e.hot_graph_status(&ns))
+    let mut status = e.hot_graph_status(&ns);
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage initializes this writable output on success.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
+        // SAFETY: the successful call initialized the complete structure.
+        let usage = unsafe { usage.assume_init() };
+        #[cfg(target_os = "macos")]
+        let peak_rss_bytes = usage.ru_maxrss as u64;
+        #[cfg(not(target_os = "macos"))]
+        let peak_rss_bytes = usage.ru_maxrss as u64 * 1024;
+        status["process"] = json!({"peak_rss_bytes":peak_rss_bytes,"swaps":usage.ru_nswap});
+    }
+    Json(status)
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

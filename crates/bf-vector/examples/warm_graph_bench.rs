@@ -1,5 +1,5 @@
 //! Build the production bounded graph from exported spatial slabs, then measure NQ recall.
-//! Usage: warm_graph_bench EXPORTED_IVF NQ_DATA SCRATCH_DIRECTORY [build_workers=2]
+//! Usage: warm_graph_bench EXPORTED_IVF NQ_DATA [build_workers=2]
 #[allow(dead_code)]
 #[path = "g3/data.rs"]
 mod data;
@@ -35,13 +35,10 @@ fn open(path: &Path) -> bf_vector::Result<Index<Reader>> {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() < 4 {
-        return Err(
-            "usage: warm_graph_bench EXPORTED_IVF NQ_DATA SCRATCH_DIRECTORY [build_workers=2]"
-                .into(),
-        );
+    if args.len() < 3 {
+        return Err("usage: warm_graph_bench EXPORTED_IVF NQ_DATA [build_workers=2]".into());
     }
-    let workers = args.get(4).map(|s| s.parse()).transpose()?.unwrap_or(2);
+    let workers = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(2);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .build()?;
@@ -66,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dims = open(&files[0])?.dims();
     let start = Instant::now();
     let cpu_before = usage().0;
-    let mut builder = HotGraphBuilder::new(Path::new(&args[3]), dims, count)?;
+    let mut builder = HotGraphBuilder::new(dims, count)?;
     for file in &files {
         let index = open(file)?;
         for c in 0..index.cluster_count() {

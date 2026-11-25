@@ -187,12 +187,11 @@ async fn same_graph_navigation_cpu() {
     let Source {
         builder,
         sources,
-        mut locations,
+        locations,
     } = read_source(
         &engine,
         set,
         "vector",
-        &root,
         queries[0].len(),
         count,
         &HotCancellation::default(),
@@ -206,7 +205,7 @@ async fn same_graph_navigation_cpu() {
         .build()
         .unwrap();
     let graph = pool.install(|| builder.finish(&|| false)).unwrap();
-    locations.sort_unstable_by_key(|p| p.0);
+    let locations = Locations::new(locations);
     println!(
         "NAV_DIAG_BUILD seconds={} rows={}",
         start.elapsed().as_secs_f64(),

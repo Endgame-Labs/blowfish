@@ -80,6 +80,55 @@ impl Metric {
     }
 }
 
+/// Cached squared norm using the exact distance kernel's sixteen-lane accumulation order.
+/// Scope this value to the same immutable vector and architecture that produced it.
+#[derive(Clone, Copy, Debug)]
+pub struct CosineNorm(f32);
+impl CosineNorm {
+    /// Validate a vector and compute its squared norm without changing its stored values.
+    pub fn new(vector: &[f32]) -> Result<Self> {
+        validate(vector, vector.len())?;
+        Ok(Self(dot_f32(vector, vector)))
+    }
+}
+
+/// A cosine query whose norm is computed once for a batch of immutable candidates.
+pub struct CosineQuery<'a> {
+    vector: &'a [f32],
+    norm: CosineNorm,
+}
+impl<'a> CosineQuery<'a> {
+    /// Validate a query and prepare its norm. Extreme finite values retain the wider fallback.
+    pub fn new(vector: &'a [f32]) -> Result<Self> {
+        Ok(Self {
+            vector,
+            norm: CosineNorm::new(vector)?,
+        })
+    }
+    pub(crate) fn vector(&self) -> &[f32] {
+        self.vector
+    }
+    pub(crate) fn distance(&self, vector: &[f32], norm: CosineNorm) -> f32 {
+        let (aa, bb, ab) = (
+            self.norm.0 as f64,
+            norm.0 as f64,
+            dot_f32(self.vector, vector) as f64,
+        );
+        if !aa.is_finite()
+            || !bb.is_finite()
+            || !ab.is_finite()
+            || (aa == 0. && self.vector.iter().any(|x| *x != 0.))
+            || (bb == 0. && vector.iter().any(|x| *x != 0.))
+        {
+            return scalar_cosine(self.vector, vector);
+        }
+        if aa == 0. || bb == 0. {
+            return if aa == bb { 0. } else { 1. };
+        }
+        (1. - ab / (aa.sqrt() * bb.sqrt())).clamp(0., 2.) as f32
+    }
+}
+
 fn scalar_cosine(a: &[f32], b: &[f32]) -> f32 {
     let aa: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum();
     let bb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum();
@@ -196,7 +245,7 @@ pub(crate) fn l2_squared_f32(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// `(|a|^2, |b|^2, <a, b>)` in one pass, with sixteen `f32` lanes per sum (compiled for
-/// AVX-512 or AVX2 when the CPU has them).
+/// NEON, AVX-512, or AVX2 when the CPU has them).
 pub(crate) fn norms_and_dot_f32(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -209,9 +258,16 @@ pub(crate) fn norms_and_dot_f32(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
             return unsafe { norms_and_dot_avx2(a, b) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on aarch64, and the kernel bounds every vector load.
+        unsafe { cosine_sums_neon::<true>(a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     norms_and_dot_lanes(a, b)
 }
 
+#[cfg(any(not(target_arch = "aarch64"), test))]
 #[inline(always)]
 fn norms_and_dot_lanes(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     let (mut aa, mut bb, mut ab) = ([0f32; 16], [0f32; 16], [0f32; 16]);
@@ -567,5 +623,127 @@ mod tests {
         assert!(decode_base64_f32("AAAA").is_err());
         assert!(decode_base64_f32(&encode_base64_f32(&[f32::NAN])).is_err());
         assert!(decode_base64_f32("!").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cached_norm_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_cosine_preserves_distance_bits_and_extreme_fallbacks() {
+        let mut seed = 0x123456789abcdefu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as i32 as f32) / i32::MAX as f32
+        };
+        for dims in [1, 2, 7, 15, 16, 17, 31, 32, 63, 64, 127, 255, 1024, 1027] {
+            for _ in 0..20 {
+                let a = (0..dims).map(|_| next()).collect::<Vec<_>>();
+                let b = (0..dims)
+                    .map(|_| f16::from_f32(next()).to_f32())
+                    .collect::<Vec<_>>();
+                for scale in [0., 1., f32::MAX, f32::from_bits(1)] {
+                    let q = a.iter().map(|x| x * scale).collect::<Vec<_>>();
+                    let prepared = CosineQuery::new(&q).unwrap();
+                    assert_eq!(
+                        prepared
+                            .distance(&b, CosineNorm::new(&b).unwrap())
+                            .to_bits(),
+                        Metric::CosineDistance.distance_unchecked(&q, &b).to_bits(),
+                        "dims={dims}, scale={scale}"
+                    );
+                }
+            }
+        }
+        assert!(CosineNorm::new(&[]).is_err());
+        assert!(CosineQuery::new(&[f32::NAN]).is_err());
+        assert!(CosineNorm::new(&[f32::INFINITY]).is_err());
+    }
+}
+
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on aarch64; the kernel checks every load's bounds.
+        unsafe { cosine_sums_neon::<false>(a, b).2 }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    dot_lanes(a, b)
+}
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn cosine_sums_neon<const NORMS: bool>(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    use std::arch::aarch64::*;
+    let (mut aa, mut bb, mut ab) = (
+        [vdupq_n_f32(0.); 4],
+        [vdupq_n_f32(0.); 4],
+        [vdupq_n_f32(0.); 4],
+    );
+    let n = a.len().min(b.len());
+    let end = n / 16 * 16;
+    // SAFETY: each unaligned load reads four elements inside a complete sixteen-lane block.
+    unsafe {
+        for offset in (0..end).step_by(16) {
+            for j in 0..4 {
+                let x = vld1q_f32(a.as_ptr().add(offset + j * 4));
+                let y = vld1q_f32(b.as_ptr().add(offset + j * 4));
+                // Separate multiplication and addition preserve the established rounding order.
+                ab[j] = vaddq_f32(ab[j], vmulq_f32(x, y));
+                if NORMS {
+                    aa[j] = vaddq_f32(aa[j], vmulq_f32(x, x));
+                    bb[j] = vaddq_f32(bb[j], vmulq_f32(y, y));
+                }
+            }
+        }
+        let reduce = |acc: [float32x4_t; 4]| {
+            let mut lanes = [0f32; 16];
+            for (j, value) in acc.into_iter().enumerate() {
+                vst1q_f32(lanes.as_mut_ptr().add(j * 4), value);
+            }
+            lanes.iter().sum::<f32>()
+        };
+        let (mut saa, mut sbb, mut sab) = (
+            if NORMS { reduce(aa) } else { 0. },
+            if NORMS { reduce(bb) } else { 0. },
+            reduce(ab),
+        );
+        for i in end..n {
+            sab += a[i] * b[i];
+            if NORMS {
+                saa += a[i] * a[i];
+                sbb += b[i] * b[i];
+            }
+        }
+        (saa, sbb, sab)
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod neon_cosine_tests {
+    use super::*;
+    #[test]
+    fn neon_preserves_all_lane_and_tail_rounding_bits() {
+        for dims in 1..1100 {
+            let a = (0..dims)
+                .map(|i| (i as f32 * 1.7).sin())
+                .collect::<Vec<_>>();
+            let b = (0..dims)
+                .map(|i| (i as f32 * 1.3).cos())
+                .collect::<Vec<_>>();
+            let expected = norms_and_dot_lanes(&a, &b);
+            let actual = norms_and_dot_f32(&a, &b);
+            assert_eq!(
+                (actual.0.to_bits(), actual.1.to_bits(), actual.2.to_bits()),
+                (
+                    expected.0.to_bits(),
+                    expected.1.to_bits(),
+                    expected.2.to_bits()
+                )
+            );
+            assert_eq!(dot_f32(&a, &b).to_bits(), expected.2.to_bits());
+        }
     }
 }
