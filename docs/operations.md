@@ -185,6 +185,19 @@ official SDKs back off automatically.
 
 **Local ANN staging.** With an S3-compatible backend and a disk cache directory, blowfish copies each recluster tier's routing directory and vector codes to local disk after the tier is first queried. It also stages exact-vector prefixes that fit after all codes are reserved, considering smaller extensions first. Unstaged vectors are read from object storage. Completed stages survive process exits, crashes, and restarts under `<storage.cache.disk_dir>/ann-staging-v2/`, in an exclusively locked directory keyed by the storage backend and prefix. A second engine using the same staging directory falls back to object storage while that lock is held. Local filesystem backends skip staging, since their objects are already memory-mapped.
 
+**Staging while recluster uploads (Round C17).** When the node that builds a recluster tier is the node that serves
+its queries, the build already holds the bytes a stage would fetch back from object storage. With staging enabled,
+each slab is also written under `ann-staging-v2/<backend>/prestage-<id>/` as it uploads: its routing and codes prefix,
+plus its exact vectors while the cap has room beside the codes of the slabs still to come. Every file is checksummed
+per 16 KiB and fsynced, and its object identity is read right after the upload. The bytes are charged against the same
+staging cap from the first write, and they stay inert until the manifest commit that publishes the tier has happened.
+The tier's first query then adopts them instead of downloading: it still fetches the directory and the paged header,
+checks every identity as before, and writes the usual completion record. A commit that fails, a build that errors or is
+cancelled, a namespace deletion, or a superseded tier discards the files and releases their charge. A process that dies
+first leaves a directory with no completion record, which the next start deletes, so a restart before the first
+query simply stages from object storage as before. Nodes that only serve queries are unchanged. `BF_PRESTAGE=0`
+turns the feature off for a build (the control in `docs/benchmarks.md`); there is no bucket format change.
+
 A stage is published only after its files and completion record are flushed, its directory is renamed to the record's SHA-256 digest, and the publication directory is flushed. The record binds the current manifest's tier, scoped object paths, sizes, ETags or version identifiers, local file lengths, and 16 KiB block CRCs. On restart, blowfish verifies the record, checks that the current manifest still references the tier, checks the WAL tail for a deletion after that checkpoint, validates remote identities with parallel HEAD requests, and checks local file lengths. It checks every payload block's CRC on every read, including after adoption; it does not scan all staged bytes at startup. A damaged read falls back to object storage, and the stage is rebuilt. Adoption downloads manifest metadata, and makes HEAD requests; it does not download the staged tier payloads again. Backends providing neither ETags nor version identifiers cannot retain verified stages.
 
 First preparation shares four download slots across the tier's slabs, with at most 32 MiB of range payloads buffered by that pool. Provisioning reads bypass the block-cache planner and admission, issue no hedge requests, and honor the storage-wide fetch limit. This shortens first staging while queries continue through object storage; the staged routing and code ranges are unchanged.

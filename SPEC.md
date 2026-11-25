@@ -163,6 +163,7 @@ log entry in the same commit.
   codes are staged on local disk automatically (smaller of 20 GiB and a quarter of free disk; no setting). Vectors and
   the source of truth stay in object storage, and S3-cold behavior must not regress. Cold results are reported both
   disk-staged and pure S3-cold.
+  Since 2026-11-25 (C17), a node that runs recluster writes the tier's stage while uploading it and activates it on the manifest commit.
 - Engineering moves in iterations: profile, diagnose, fix, wipe the data, and measure again. When hill-climbing stops
   paying off, test bigger hypotheses on a branch, even ones that change the index layout or the storage scheme
   (2026-11-17).

@@ -8,7 +8,7 @@ pub(super) const BLOCK: usize = 16 << 10;
 
 /// Encode a block, retaining the original bytes when any high exponent bit is set.
 pub(super) fn encode(raw: &[u8]) -> Vec<u8> {
-    if !raw.len().is_multiple_of(16) || raw.as_chunks::<2>().0.iter().any(|x| x[1] & 0x40 != 0) {
+    if encoded_len(raw) == raw.len() {
         return raw.to_vec();
     }
     let mut out = Vec::with_capacity(raw.len() / 16 * 15);
@@ -22,6 +22,15 @@ pub(super) fn encode(raw: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&packed.to_le_bytes()[..15]);
     }
     out
+}
+
+/// Stored length without allocating or packing, for capacity admission before writing.
+pub(super) fn encoded_len(raw: &[u8]) -> usize {
+    if !raw.len().is_multiple_of(16) || raw.as_chunks::<2>().0.iter().any(|x| x[1] & 0x40 != 0) {
+        raw.len()
+    } else {
+        raw.len() / 16 * 15
+    }
 }
 
 /// Reconstruct a block. The caller checks its encoded CRC before calling this function.

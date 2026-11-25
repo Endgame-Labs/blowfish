@@ -470,6 +470,9 @@ fn projection_columns(
             _ => {}
         }
     }
+    // IDs are intrinsic to every hydrated row, rather than an optional attribute.
+    // Naming `id` must leave the same attribute set as the default ID-only request.
+    columns.remove("id");
     columns
 }
 async fn prepare_one(
@@ -1087,6 +1090,37 @@ async fn prepare_scalar(
 #[cfg(test)]
 mod rank_key_tests {
     use super::*;
+
+    #[test]
+    fn named_id_projects_the_same_attributes_as_default_ids_only() {
+        let state = NamespaceState {
+            schema: serde_json::from_value(serde_json::json!({
+                "id": {"type": "uint"},
+                "text": {"type": "string"},
+                "vector": {"type": "[2]f16", "ann": true}
+            }))
+            .unwrap(),
+            ..Default::default()
+        };
+        let default: QueryRequest = serde_json::from_value(serde_json::json!({
+            "rank_by": ["vector", "ANN", [0.1, 0.2]], "top_k": 10
+        }))
+        .unwrap();
+        let mut named = default.clone();
+        named.include_attributes = Some(IncludeAttributes::Names(vec!["id".into()]));
+        for narrow in [false, true] {
+            assert!(projection_columns(&state, &default, narrow).is_empty());
+            assert_eq!(
+                projection_columns(&state, &default, narrow),
+                projection_columns(&state, &named, narrow)
+            );
+        }
+        named.include_attributes = Some(IncludeAttributes::Names(vec!["id".into(), "text".into()]));
+        assert_eq!(
+            projection_columns(&state, &named, true),
+            BTreeSet::from(["text".into()])
+        );
+    }
 
     #[test]
     fn vector_keys_preserve_float_bits_and_unambiguous_rank_identity() {
