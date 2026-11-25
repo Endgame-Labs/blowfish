@@ -924,6 +924,13 @@ pub(crate) async fn materialize(
     store: &Storage,
     state: &NamespaceState,
 ) -> Result<NamespaceState, ApiError> {
+    crate::vector_locator::scope(state, materialize_inner(store, state)).await
+}
+
+async fn materialize_inner(
+    store: &Storage,
+    state: &NamespaceState,
+) -> Result<NamespaceState, ApiError> {
     let mut full = state.clone();
     for seg in &state.segments {
         let live = allowed(store, state, seg, None).await?;
@@ -939,6 +946,15 @@ pub(crate) async fn materialize(
 /// Patches and conditions hydrate named rows; unconditional replacements need no old documents.
 /// By-filter writes still use a namespace scan.
 pub(crate) async fn for_writes(
+    store: &Storage,
+    state: &NamespaceState,
+    pending: &[Pending<Operation, Result<WriteResponse, ApiError>>],
+    overlay: &[std::sync::Arc<bf_wal::WalEntry>],
+) -> Result<NamespaceState, ApiError> {
+    crate::vector_locator::scope(state, for_writes_inner(store, state, pending, overlay)).await
+}
+
+async fn for_writes_inner(
     store: &Storage,
     state: &NamespaceState,
     pending: &[Pending<Operation, Result<WriteResponse, ApiError>>],
@@ -1068,6 +1084,13 @@ pub(crate) async fn for_writes(
 
 /// Exact row and logical-byte totals without materializing unaffected segment rows.
 pub(crate) async fn statistics(
+    store: &Storage,
+    state: &NamespaceState,
+) -> Result<bf_wal::NamespaceStats, ApiError> {
+    crate::vector_locator::scope(state, statistics_inner(store, state)).await
+}
+
+async fn statistics_inner(
     store: &Storage,
     state: &NamespaceState,
 ) -> Result<bf_wal::NamespaceStats, ApiError> {

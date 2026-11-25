@@ -174,3 +174,93 @@ async fn locator_follows_reverse_lineage_across_sources_and_rejects_uncovered_se
             == json!(0)
     );
 }
+
+#[tokio::test]
+async fn covered_projection_exact_search_and_materialization_keep_identical_values() {
+    let (store, _engine, state) = fixture().await;
+    let mut retired = state.clone();
+    for seg in retired.segments.iter_mut() {
+        seg.files.remove("annv2:vector");
+    }
+    for body in [
+        json!({"rank_by": ["id", "asc"], "top_k": 128, "include_attributes": true}),
+        json!({"rank_by": ["vector", "kNN", [1.0, 3.125, -0.5]], "filters": ["id", "Gte", 0], "top_k": 25, "include_attributes": true}),
+        json!({"rank_by": ["vector", "kNN", [1.0, 3.125, -0.5]], "filters": ["category", "Eq", 1], "top_k": 25, "include_attributes": true}),
+        json!({"rank_by": ["vector", "kNN", [0.0, 0.0, 0.0]], "filters": ["id", "Gte", 0], "top_k": 5, "include_attributes": true}),
+    ] {
+        let q = serde_json::from_value(body).unwrap();
+        let before = crate::indexed::execute(&store, &state, &q, &EngineConfig::default(), false)
+            .await
+            .unwrap();
+        let after = crate::indexed::execute(&store, &retired, &q, &EngineConfig::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(before.result.rows, after.result.rows);
+    }
+    let before = crate::snapshot::materialize(&store, &state).await.unwrap();
+    let after = crate::snapshot::materialize(&store, &retired)
+        .await
+        .unwrap();
+    assert_eq!(before.docs, after.docs);
+}
+
+#[tokio::test]
+async fn patches_and_recall_sampling_read_retired_vectors_after_restart() {
+    let (store, engine, _) = fixture().await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    for seg in &mut manifest.segments {
+        seg.files.remove("annv2:vector");
+    }
+    wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
+        .await
+        .unwrap();
+    engine.drop_caches().await;
+    engine
+        .write(
+            "locator",
+            serde_json::from_value(json!({"patch_rows": [{"id": 1, "category": 99}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    let restarted = Engine::with_config(
+        store,
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    let request = serde_json::from_value(json!({"rank_by": ["id", "asc"], "filters": ["id", "Eq", 1], "top_k": 1, "include_attributes": true})).unwrap();
+    let rows = restarted
+        .query("locator", request)
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap();
+    assert_eq!(rows[0]["category"], json!(99));
+    assert_eq!(rows[0]["vector"], json!([1.0, 0.0625, -0.5]));
+    let recall = restarted
+        .recall(
+            "locator",
+            json!({"num": 3, "top_k": 3, "include_ground_truth": true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recall["avg_recall"], json!(1.0));
+}
+
+#[tokio::test]
+async fn vector_scope_inherits_the_context_at_poll_time() {
+    let (_, _, state) = fixture().await;
+    let cache = Arc::new(read_cache::DecodedCache::new(1 << 20, 1));
+    let expected = cache.clone();
+    // Construction occurs before the caller installs its real cache and admission state.
+    let future = scope(&state, async move {
+        let actual = read_cache::context().unwrap();
+        assert!(Arc::ptr_eq(&actual.cache, &expected));
+        assert!(actual.vectors.is_some());
+    });
+    read_cache::scope(read_cache::ReadContext::new(cache), future).await;
+}
