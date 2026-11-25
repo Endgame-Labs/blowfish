@@ -12,7 +12,6 @@ use std::{
 };
 
 struct Mapping {
-    file: File,
     bytes: Bytes,
 }
 /// Bounds descriptors and virtual address retention; resident pages remain reclaimable by the OS.
@@ -57,13 +56,15 @@ impl Mapped {
                 Error::Io(error)
             }
         })?;
-        let bytes = if file.metadata()?.len() == 0 {
+        let len = usize::try_from(file.metadata()?.len())
+            .map_err(|_| Error::Config("mapped local object exceeds address space"))?;
+        let bytes = if len == 0 {
             Bytes::new()
         } else {
             // SAFETY: RangeReader's contract requires immutable objects. Blowfish publishes
             // files atomically and never truncates published objects. Unlinking during GC is
             // safe: the mapping owns its original inode until all returned Bytes are dropped.
-            let mapping = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            let mapping = unsafe { memmap2::MmapOptions::new().len(len).map(&file)? };
             #[cfg(unix)]
             if random {
                 // Sparse faults must not fill small budgets with unrequested vector neighbors.
@@ -71,7 +72,7 @@ impl Mapped {
             }
             Bytes::from_owner(mapping)
         };
-        Ok(Arc::new(Mapping { file, bytes }))
+        Ok(Arc::new(Mapping { bytes }))
     }
     pub(crate) fn read(
         &self,
@@ -103,10 +104,10 @@ impl Mapped {
                     None => self.open(path, random)?,
                 }
             };
-            // Report an ordinary short-object error before accessing a file truncated outside
-            // the immutable-object contract. Concurrent external mutation remains unsupported.
-            if (mapping.bytes.len() as u64) < expected || mapping.file.metadata()?.len() < expected
-            {
+            // The immutable object's length was checked when opening its mapping. Cached
+            // reads compare that length without another fstat, including readers with a newer
+            // expected size. External truncation violates the RangeReader contract.
+            if (mapping.bytes.len() as u64) < expected {
                 return Err(Error::Config("short mapped local object"));
             }
             Ok(ranges
