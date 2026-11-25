@@ -144,7 +144,7 @@ Use blowfish to:
 - develop, test, and run CI against the turbopuffer API without a turbopuffer account or network access;
 - self-host modest workloads, or keep search indexes inside your own cloud or on-premises bucket.
 
-blowfish works with [Factoid](https://github.com/Endgame-Labs/factoid), our framework that turns documents into facts and entities. Set Factoid's `TURBOPUFFER_BASE_URL` to a blowfish server, and its projects keep their turbopuffer search on their own bucket.
+blowfish works with [Factoid](https://open.endgame.io/factoid), our framework that turns documents into facts and entities. Set Factoid's `TURBOPUFFER_BASE_URL` to a blowfish server, and its projects keep their turbopuffer search on their own bucket.
 
 For production at scale, I recommend [turbopuffer](https://turbopuffer.com) itself. Because the APIs match, moving from blowfish to turbopuffer is a base-URL and API-key change.
 
