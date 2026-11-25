@@ -13,10 +13,10 @@ pub const FORMAT_VERSION: u8 = 1;
 /// (half the bytes, losslessly). Written for large payloads whose every such vector is exactly
 /// f16; readers accept both encodings.
 pub const PACKED_FORMAT_VERSION: u8 = 2;
-/// Current manifest generation. Formats 1 to 3 are accepted only for automatic upgrade (format 3
-/// replaced format 2's single `ann_slabs` layout with `ann_tiers`; format 4 added `lineage`, and
-/// segments a tier covers no longer need an ANN object of their own).
-pub const MANIFEST_FORMAT_VERSION: u8 = 4;
+/// Current manifest generation. Formats 1 to 4 are accepted only for automatic upgrade (format 3
+/// replaced format 2's single `ann_slabs` layout with `ann_tiers`; format 4 added `lineage`).
+/// Format 5 allows covering tiers to own a segment's vectors after its ANN objects are retired.
+pub const MANIFEST_FORMAT_VERSION: u8 = 5;
 /// Current format of a tier's slabs and directory. A tier written in an older one is rebuilt by
 /// the automatic recluster.
 pub const TIER_FORMAT_VERSION: u32 = 1;
@@ -1363,5 +1363,27 @@ mod manifest_codec_tests {
         assert_eq!(written["ann_tiers"]["vector"][0]["covered"][0]["rows"], 5);
         let again = decode_manifest(&serde_json::to_vec(&written).unwrap()).unwrap();
         assert_eq!(again.ann_tiers["vector"][0].format, 1);
+    }
+    #[test]
+    fn format_four_tiers_and_lineage_upgrade_without_changing_their_objects() {
+        assert_eq!(MANIFEST_FORMAT_VERSION, 5);
+        let mut value = serde_json::to_value(manifest_with_terms(3)).unwrap();
+        value["format_version"] = serde_json::json!(4);
+        let file = serde_json::json!({"key": "ns/a/slabs/source", "size": 1, "metadata_len": 0});
+        value["ann_tiers"] = serde_json::json!({"vector": [{
+            "covered": [{"segment": "s1", "base": 0, "rows": 5, "live_generation": 0}],
+            "slabs": [], "dir": file, "format": 1
+        }]});
+        value["lineage"] = serde_json::json!([{"source": "s1", "parts": [
+            {"target": "s2", "rows": 5, "map": file}
+        ]}]);
+        let old = decode_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(old.format_version, 4);
+        let encoded = encode_manifest(&old).unwrap();
+        let upgraded = decode_manifest(&encoded).unwrap();
+        assert_eq!(upgraded.format_version, 5);
+        assert_eq!(upgraded.ann_tiers["vector"][0].dir.key, "ns/a/slabs/source");
+        assert_eq!(upgraded.lineage[0].parts[0].map.key, "ns/a/slabs/source");
+        assert_eq!(upgraded.lineage[0].parts[0].target, "s2");
     }
 }

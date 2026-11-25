@@ -121,3 +121,29 @@ async fn background_refresh_is_delayed_shared_and_permanently_fails_closed() {
     assert!(scoped.put("after-refresh", "blocked").await.is_err());
     assert!(store.delete("projects/test/before-refresh").await.is_err());
 }
+
+#[tokio::test]
+async fn generation_five_buckets_raise_the_tier_vector_ownership_fence_only_when_writable() {
+    assert_eq!(BUCKET_FORMAT_VERSION, 6);
+    let dir = tempfile::tempdir().unwrap();
+    let markers = dir.path().join("_system/format");
+    std::fs::create_dir_all(&markers).unwrap();
+    std::fs::write(markers.join("5.json"), b"{\"format_version\":5}").unwrap();
+    let config = StorageConfig {
+        url: format!("file://{}", dir.path().display()),
+        read_only: true,
+        ..Default::default()
+    };
+    let reader = Storage::open(&config).await.unwrap();
+    assert_eq!(reader.check_bucket_format().await.unwrap(), 5);
+    assert!(!markers.join("6.json").exists());
+    let writer = Storage::open(&StorageConfig {
+        read_only: false,
+        ..config
+    })
+    .await
+    .unwrap();
+    assert_eq!(writer.check_bucket_format().await.unwrap(), 6);
+    assert!(markers.join("5.json").exists());
+    assert!(markers.join("6.json").exists());
+}
