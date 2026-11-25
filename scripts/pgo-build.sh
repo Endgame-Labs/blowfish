@@ -62,7 +62,13 @@ if [[ ${#raw[@]} -eq 0 ]]; then
 fi
 "$profdata" merge -o "$run/merged.profdata" "${raw[@]}"
 "$profdata" show "$run/merged.profdata" > "$run/profile.txt"
-RUSTFLAGS="$flags -Cprofile-use=$run/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
+# Put the profile's content hash in RUSTFLAGS, so a shared Cargo cache cannot
+# reuse an optimized artifact from a different profile at this same run path.
+profile_hash=$(sha256sum "$run/merged.profdata")
+profile_hash=${profile_hash%% *}
+profile="$run/profile-$profile_hash.profdata"
+ln "$run/merged.profdata" "$profile"
+RUSTFLAGS="$flags -Cprofile-use=$profile -Cllvm-args=-pgo-warn-missing-function" \
   "${build[@]}" --bin blowfish 2>&1 | tee "$run/optimize.log"
 cp "$binary" "$run/blowfish"
 sha256sum "$run/merged.profdata" "$run/blowfish" > "$run/outputs.sha256"

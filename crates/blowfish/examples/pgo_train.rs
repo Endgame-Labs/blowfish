@@ -15,7 +15,7 @@ fn client() -> Result<reqwest::Client> {
         .build()?)
 }
 const DIMS: usize = 1024;
-const ROWS: usize = 32_768;
+const ROWS: usize = 16_384;
 const TERMS: [&str; 8] = [
     "history of the world",
     "united states president",
@@ -126,7 +126,12 @@ impl Drop for Server {
         let _ = self.stop();
     }
 }
-async fn start(root: &Path, profile: &str, writable: bool) -> Result<(Server, String)> {
+async fn start(
+    root: &Path,
+    profile: &str,
+    writable: bool,
+    s3: Option<&str>,
+) -> Result<(Server, String)> {
     // Reserve an available loopback port. Startup detects a competing binder as an error.
     let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
     let address = socket.local_addr()?;
@@ -149,9 +154,10 @@ async fn start(root: &Path, profile: &str, writable: bool) -> Result<(Server, St
             "--listen",
             &address.to_string(),
             "--storage-url",
-            url::Url::from_directory_path(store)
-                .map_err(|()| "invalid store path")?
-                .as_str(),
+            &s3.map_or_else(
+                || url::Url::from_directory_path(store).unwrap().to_string(),
+                |_| "s3://local".into(),
+            ),
             "--indexing",
             "false",
             "--recall-sample-rate",
@@ -175,6 +181,19 @@ async fn start(root: &Path, profile: &str, writable: bool) -> Result<(Server, St
     if !writable {
         command.arg("--read-only");
     }
+    if let Some(endpoint) = s3 {
+        // Dummy credentials for the owned loopback facade; no vendor account is used.
+        command
+            .args([
+                "--storage-endpoint",
+                endpoint,
+                "--storage-region",
+                "us-east-1",
+            ])
+            .env("AWS_ACCESS_KEY_ID", "local")
+            .env("AWS_SECRET_ACCESS_KEY", "local")
+            .env("AWS_EC2_METADATA_DISABLED", "true");
+    }
     drop(socket);
     let mut server = Server(command.spawn()?);
     let base = format!("http://{address}");
@@ -183,7 +202,11 @@ async fn start(root: &Path, profile: &str, writable: bool) -> Result<(Server, St
         if server.0.try_wait()?.is_some() {
             return Err("training server failed; inspect server.log".into());
         }
-        if let Ok(response) = client.get(&base).send().await
+        if let Ok(response) = client
+            .get(&base)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
             && response.status().is_success()
         {
             return Ok((server, base));
@@ -237,9 +260,176 @@ async fn queries(base: &str, workload: &'static str, count: usize) -> Result<()>
     }
     Ok(())
 }
+// A read-only S3 facade keeps cold storage-client paths in the release profile.
+// It serves only the generated fixture, on an ephemeral loopback port.
+async fn facade(root: &Path) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    #[derive(Clone)]
+    struct State {
+        root: std::path::PathBuf,
+        keys: Vec<(String, u64)>,
+    }
+    fn collect(root: &Path, directory: &Path, keys: &mut Vec<(String, u64)>) -> Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                collect(root, &entry.path(), keys)?;
+            } else {
+                keys.push((
+                    entry
+                        .path()
+                        .strip_prefix(root)?
+                        .to_string_lossy()
+                        .into_owned(),
+                    entry.metadata()?.len(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    async fn serve(
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<State>>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        use axum::{
+            body::Body,
+            http::{Response, StatusCode},
+        };
+        let empty = |status| {
+            Response::builder()
+                .status(status)
+                .body(Body::empty())
+                .unwrap()
+        };
+        if request.method() != "GET" && request.method() != "HEAD" {
+            return empty(StatusCode::METHOD_NOT_ALLOWED);
+        }
+        let parameters: std::collections::BTreeMap<_, _> =
+            url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes())
+                .into_owned()
+                .collect();
+        let mut response = Response::builder()
+            .header("etag", "\"training\"")
+            .header("last-modified", "Sat, 01 Jan 2000 00:00:00 GMT");
+        if parameters.contains_key("list-type") {
+            let prefix = parameters.get("prefix").map_or("", String::as_str);
+            let after = parameters
+                .get("start-after")
+                .or_else(|| parameters.get("continuation-token"))
+                .map_or("", String::as_str);
+            let limit = parameters
+                .get("max-keys")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(1000);
+            let keys: Vec<_> = state
+                .keys
+                .iter()
+                .filter(|(key, _)| key.starts_with(prefix) && key.as_str() > after)
+                .collect();
+            let mut body = format!(
+                "<ListBucketResult><Name>local</Name><IsTruncated>{}</IsTruncated>",
+                keys.len() > limit
+            );
+            for (key, size) in keys.iter().take(limit) {
+                // All keys come from generated namespace and object names, with no XML metacharacters.
+                body.push_str(&format!("<Contents><Key>{key}</Key><LastModified>2000-01-01T00:00:00Z</LastModified><ETag>training</ETag><Size>{size}</Size></Contents>"));
+            }
+            if keys.len() > limit && limit > 0 {
+                body.push_str(&format!(
+                    "<NextContinuationToken>{}</NextContinuationToken>",
+                    keys[limit - 1].0
+                ));
+            }
+            body.push_str("</ListBucketResult>");
+            return response
+                .header("content-type", "application/xml")
+                .body(Body::from(body))
+                .unwrap();
+        }
+        let Ok(path) = percent_encoding::percent_decode_str(request.uri().path()).decode_utf8()
+        else {
+            return empty(StatusCode::BAD_REQUEST);
+        };
+        let Some(key) = path.strip_prefix("/local/") else {
+            return empty(StatusCode::NOT_FOUND);
+        };
+        if !Path::new(key)
+            .components()
+            .all(|p| matches!(p, std::path::Component::Normal(_)))
+        {
+            return empty(StatusCode::BAD_REQUEST);
+        }
+        let Ok(bytes) = tokio::fs::read(state.root.join(key)).await else {
+            return empty(StatusCode::NOT_FOUND);
+        };
+        let mut start = 0;
+        let mut end = bytes.len();
+        if let Some(range) = request.headers().get("range") {
+            let Some((lo, hi)) = range
+                .to_str()
+                .ok()
+                .and_then(|r| r.strip_prefix("bytes="))
+                .and_then(|r| r.split_once('-'))
+            else {
+                return empty(StatusCode::RANGE_NOT_SATISFIABLE);
+            };
+            if lo.is_empty() {
+                let Ok(suffix) = hi.parse::<usize>() else {
+                    return empty(StatusCode::RANGE_NOT_SATISFIABLE);
+                };
+                start = end.saturating_sub(suffix);
+            } else {
+                let Ok(lo) = lo.parse::<usize>() else {
+                    return empty(StatusCode::RANGE_NOT_SATISFIABLE);
+                };
+                start = lo;
+                if !hi.is_empty() {
+                    let Some(hi) = hi.parse::<usize>().ok().and_then(|n| n.checked_add(1)) else {
+                        return empty(StatusCode::RANGE_NOT_SATISFIABLE);
+                    };
+                    end = end.min(hi);
+                }
+            }
+            if start >= end {
+                return empty(StatusCode::RANGE_NOT_SATISFIABLE);
+            }
+            response = response.status(StatusCode::PARTIAL_CONTENT).header(
+                "content-range",
+                format!("bytes {start}-{}/{len}", end - 1, len = bytes.len()),
+            );
+        }
+        let body = if request.method() == "HEAD" {
+            Body::empty()
+        } else {
+            Body::from(bytes[start..end].to_vec())
+        };
+        response
+            .header("content-length", end - start)
+            .header("accept-ranges", "bytes")
+            .body(body)
+            .unwrap()
+    }
+    let mut keys = Vec::new();
+    collect(root, root, &mut keys)?;
+    keys.sort();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let app = axum::Router::new()
+        .fallback(serve)
+        .with_state(std::sync::Arc::new(State {
+            root: root.to_owned(),
+            keys,
+        }));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("training S3 facade");
+    });
+    Ok((endpoint, task))
+}
+
 async fn train(root: &Path, profile: &str) -> Result<()> {
     fixture(root).await?;
-    let (mut server, base) = start(root, profile, false).await?;
+    let (mut server, base) = start(root, profile, false, None).await?;
     queries(&base, "vector", 20_712).await?;
     let metrics = client()?
         .get(format!("{base}/metrics"))
@@ -258,25 +448,35 @@ async fn train(root: &Path, profile: &str) -> Result<()> {
     queries(&base, "filtered", 1024).await?;
     queries(&base, "bm25", 1024).await?;
     server.stop()?;
-    let (mut server, base) = start(root, profile, true).await?;
+    let (mut server, base) = start(root, profile, true, None).await?;
     let client = client()?;
-    for start in (0..512).step_by(16) {
-        let result: Value = client.post(format!("{base}/v2/namespaces/writes"))
-            .json(&json!({"distance_metric":"cosine_distance",
-                "schema":{"vector":{"type":"[1024]f16"},"text":{"type":"string","full_text_search":true}},
-                "upsert_rows":(start..start+16).map(row).collect::<Vec<_>>()}))
-            .send().await?.error_for_status()?.json().await?;
+    for start in (0..4096).step_by(16) {
+        let mut body = json!({"upsert_rows":(start..start+16).map(row).collect::<Vec<_>>()});
+        if start == 0 {
+            body["distance_metric"] = json!("cosine_distance");
+            body["schema"] = json!({"vector":{"type":"[1024]f16"},"text":{"type":"string","full_text_search":true}});
+        }
+        let result: Value = client
+            .post(format!("{base}/v2/namespaces/writes"))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         if result["rows_upserted"] != 16 {
             return Err("training write did not insert rows".into());
         }
     }
     server.stop()?;
     // Fresh processes exercise startup, disk decoding, and cache-cold query paths.
+    let (endpoint, facade) = facade(&root.join("store")).await?;
     for i in 0..8 {
-        let (mut server, base) = start(root, profile, false).await?;
+        let (mut server, base) = start(root, profile, false, Some(&endpoint)).await?;
         queries(&base, "vector", 16 + i).await?;
         server.stop()?;
     }
+    facade.abort();
     Ok(())
 }
 #[tokio::main]
@@ -326,5 +526,67 @@ mod tests {
             json!(["category", "Eq", 1])
         );
         assert_eq!(query(9, "bm25")["rank_by"][1], "BM25");
+    }
+
+    #[tokio::test]
+    async fn cold_facade_serves_ranges_metadata_and_lists() -> Result<()> {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.scratch")
+            .join(format!("pgo-facade-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        let cleanup = Cleanup(root);
+        std::fs::write(cleanup.0.join("blob"), b"0123456789")?;
+        let (base, task) = facade(&cleanup.0).await?;
+        let client = client()?;
+        let head = client.head(format!("{base}/local/blob")).send().await?;
+        assert_eq!(head.status(), 200);
+        assert_eq!(head.headers()["content-length"], "10");
+        assert!(head.headers().contains_key("last-modified"));
+        assert_eq!(head.headers()["etag"], "\"training\"");
+        let range = client
+            .get(format!("{base}/local/blob"))
+            .header("range", "bytes=2-5")
+            .send()
+            .await?;
+        assert_eq!(range.status(), 206);
+        assert_eq!(range.headers()["content-range"], "bytes 2-5/10");
+        assert_eq!(range.text().await?, "2345");
+        let suffix = client
+            .get(format!("{base}/local/blob"))
+            .header("range", "bytes=-3")
+            .send()
+            .await?;
+        assert_eq!(suffix.text().await?, "789");
+        let list = client
+            .get(format!("{base}/local?list-type=2&prefix=b"))
+            .send()
+            .await?
+            .text()
+            .await?;
+        assert!(list.contains("<Key>blob</Key>"));
+        assert_eq!(
+            client
+                .get(format!("{base}/local/missing"))
+                .send()
+                .await?
+                .status(),
+            404
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/local/blob"))
+                .send()
+                .await?
+                .status(),
+            405
+        );
+        task.abort();
+        Ok(())
     }
 }

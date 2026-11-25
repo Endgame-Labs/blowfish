@@ -109,10 +109,17 @@ executable. On a shared build host, check available memory first, and limit Carg
 
 ```bash
 free -g
-CARGO_BUILD_JOBS=4 cargo build --release -p blowfish
-sudo install -o root -g root -m 755 target/release/blowfish /usr/local/bin/blowfish.next
+rustup component add llvm-tools-preview
+CARGO_BUILD_JOBS=4 scripts/pgo-build.sh .scratch/release
+sudo install -o root -g root -m 755 .scratch/release/blowfish /usr/local/bin/blowfish.next
+rm -rf .scratch/release
 sudo mv /usr/local/bin/blowfish.next /usr/local/bin/blowfish
 ```
+
+Docker builds use the same profile-guided release path, with a generated local
+training corpus. See [PGO policy](pgo.md) for training, build evidence, and release
+qualification. `cargo build --locked --release -p blowfish` remains the non-PGO
+development and recovery fallback; its binary is `target/release/blowfish`.
 
 Create a dedicated system user named `blowfish`, and put configuration in
 `/etc/blowfish/blowfish.toml`, readable by that user. Bind `listen` to `127.0.0.1:8080`, set

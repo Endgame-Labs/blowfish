@@ -1,138 +1,141 @@
-# Profile-guided release experiment
+# Profile-guided release builds
 
-This is an opt-in measurement recipe, not the workspace's release policy.
-The experiment keeps the workspace's thin LTO and four codegen units. It compares
-an ordinary release, a mixed-workload profile, and a vector-only profile on the
-same frozen store and CPU allocation. Release adoption requires a separate decision.
+Docker and source release builds use `scripts/pgo-build.sh`. Each build trains its own profile on
+its own architecture, compiler, source, features, and native flags. The Docker builder pins Rust
+1.100.0 and its multi-architecture image digest. No profile or downloaded training corpus is shipped
+in the repository. Thin LTO and four codegen units remain unchanged. Plain Cargo release builds
+remain useful for development and as a non-PGO fallback.
 
-## Build and train
+## Build a release
 
-Install Rust's `llvm-tools-preview` component, and use the same compiler, lockfile,
-target, and flags for every arm. `scripts/pgo-build.sh` implements Rust's
-instrumentation workflow: build with `-Cprofile-generate`, run the supplied
-trainer, merge with the toolchain's `llvm-profdata`, and rebuild with
-`-Cprofile-use`. It uses an explicit Cargo target, so build scripts are not
-instrumented. See the [rustc PGO documentation](https://doc.rust-lang.org/rustc/profile-guided-optimization.html).
-
-The driver uses `-Cllvm-args=-instrprof-atomic-counter-update-all` so threads do not
-lose shared counter updates during eight-core training. This changes training
-instrumentation, not the production build, which has no profiling counters. LLVM documents the
-accuracy/overhead tradeoff under `-fprofile-update` in the
-[Clang user manual](https://clang.llvm.org/docs/UsersManual.html#cmdoption-fprofile-update).
-
-Prepare full NQ with `bench/nq/download.sh`, `prepare.py`, and
-`load.py --vectors-only`. Wait for indexing, compaction, and automatic reclustering
-to settle, and stop the writer. Keep this store immutable for training and
-measurement. `DATA` must contain the public raw corpus parquet files too, for the
-10K-row text and filtered regression fixture.
+Install Rust's `llvm-tools-preview` component, plus the ordinary native build requirements. The
+shell driver uses Bash and GNU coreutils (`realpath -m`, `sha256sum`, and NUL-delimited sorting).
+Run the script from any directory, with a new output directory beneath the checkout's `.scratch/`:
 
 ```bash
 source ~/.cargo/env
 rustup component add llvm-tools-preview
-export RUSTFLAGS='-Ctarget-cpu=neoverse-v1'
-# Set CC, CXX, and the Cargo target linker to working, identical tools for all arms.
-export DATA="$PWD/.scratch/nq-data"
-export STORE="$PWD/.scratch/nq-run/store"
-export SMALL="$PWD/.scratch/pgo-small"
-export TARGET=$(rustc -vV | sed -n 's/^host: //p')
-CARGO_TARGET_DIR="$PWD/.scratch/pgo-baseline" \
-  cargo build --locked --release --target "$TARGET" -p blowfish --bin blowfish
-BASE="$PWD/.scratch/pgo-baseline/$TARGET/release/blowfish"
-uv run --project bench/nq python crates/blowfish/benches/pgo_experiment.py fixture \
-  --binary "$BASE" --data "$DATA" --store "$STORE" --small-store "$SMALL" \
-  --out .scratch/pgo-fixture
-scripts/pgo-build.sh .scratch/pgo-mixed -- \
-  uv run --project bench/nq python crates/blowfish/benches/pgo_experiment.py train \
-  --training mixed --data "$DATA" --store "$STORE" --small-store "$SMALL" \
-  --out .scratch/pgo-train-mixed
-scripts/pgo-build.sh .scratch/pgo-vector -- \
-  uv run --project bench/nq python crates/blowfish/benches/pgo_experiment.py train \
-  --training vector --data "$DATA" --store "$STORE" --small-store "$SMALL" \
-  --out .scratch/pgo-train-vector
+scripts/pgo-build.sh .scratch/release
+# Copy the binary outside the build directory before cleaning it.
+install -m 755 .scratch/release/blowfish ./blowfish
+rm -rf .scratch/release
 ```
 
-Each build directory must be new. The trainer receives `BF_PGO_BINARY` and
-`LLVM_PROFILE_FILE`; it must stop every instrumented process gracefully and wait
-for exit. The driver refuses an empty profile. It retains the instrumented
-binary, merged profile, profile summary, optimized binary, and Cargo output under
-the requested scratch directory. The caller must remove these after recording
-results. `BF_PGO_TARGET` overrides the default host target; `LLVM_PROFDATA`
-overrides the toolchain's merger. `RUSTFLAGS` supplies the common build flags.
-Native C dependencies are not instrumented by this Rust-only recipe.
+`docker build -t blowfish .` runs the same script with `local-models` enabled. It preserves the
+existing x86-64-v3 C/C++ flags and ARM Clang/SME exclusions. Training runs natively for each
+architecture; a cross-compiled instrumented server must be executable on the build host. Prefer
+native x86_64 and aarch64 builders rather than training under emulation. The runtime image contains
+only the optimized server, its ordinary libraries, and certificates: no trainer, corpus, or profile.
 
-The supplied trainer uses six full vector epochs with sixteen HTTP clients and
-eight server cores. The mixed trainer also exercises 1,024 filtered queries,
-1,024 BM25 queries, 31 sixteen-row writes after namespace creation, and eight
-fresh-process queries through the cold facade. The vector-only arm deliberately
-omits those paths to test training-set sensitivity.
+The non-PGO fallback stays unchanged:
 
-## Compare
+```bash
+cargo build --locked --release -p blowfish
+```
 
-Create an external JSON file mapping arm names to absolute binary paths. Use
-`baseline` and `mixed` for the primary comparison, and `baseline` and `vector`
-for sensitivity. Then run:
+Do not add `profile-generate` or `profile-use` to workspace Cargo settings. Release PGO has one
+maintained trainer; the external-trainer interface exists for paired qualification experiments,
+rather than a second supported release recipe.
+
+## What training covers
+
+`crates/blowfish/examples/pgo_train.rs` generates a deterministic corpus without network access:
+16,384 clustered 1,024-dimensional cosine-f16 vectors, a separate 10,000-row BM25 and filter corpus,
+eight category values, and disjoint write IDs. It builds real persisted segment indexes and a
+reclustered IVF tier through the engine's public API. Fixture-builder and HTTP-client counters are
+excluded from the merged profile.
+
+The trainer starts the production server on ephemeral loopback ports, with eight Tokio threads and
+eight Rayon threads. Sixteen clients send 20,712 vector queries, 1,024 filtered vector queries,
+1,024 BM25 queries, and 256 sixteen-row writes. Only the first write sends schema, matching ordinary
+namespace creation followed by ingestion. Eight fresh server processes read the generated store
+through a read-only loopback S3 facade, exercising startup, range requests, XML metadata, signing,
+and cache-cold decoding. The facade uses dummy credentials and never contacts a vendor service.
+Training fails if indexed queries miss rows, writes are not acknowledged, or the compiled IVF scorer
+is never reached. Servers must exit successfully after SIGTERM so LLVM flushes all counters. The
+synthetic fixture and logs are deleted on success or failure. The caller owns the overall build
+directory and removes it after copying the binary and any evidence it needs.
+
+LLVM counters use atomic updates during training, as qualified in P1. An explicit Cargo target
+prevents build scripts from being instrumented. Native C/C++ dependencies are built normally; this
+workflow profiles Rust code. The compiler's own `llvm-profdata` merges the profiles. The merged
+profile's content hash is part of the compiler flags, preventing a shared Cargo cache from reusing
+an optimized build with a different profile at the same path. Every build generates a fresh profile,
+so there is no committed profile to go stale or refresh at release time.
+
+The build directory retains the instrumented binary, merged profile, profile summary, optimized
+binary, Cargo logs, training duration, toolchain version, lockfile hash, Rust-source hashes, and
+output hashes. These support auditing a build; deterministic input data does not promise
+byte-identical profiles from a multithreaded workload. CPU scheduling, the compiler, and native
+toolchains can still affect the result.
+
+Optional environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `BF_PGO_FEATURES` | Cargo feature list, identical in both build stages |
+| `RUSTFLAGS` | Common Rust flags, identical in both build stages |
+| `BF_PGO_TARGET` | Explicit target triple; defaults to the compiler host |
+| `LLVM_PROFDATA` | Matching merger; defaults to the Rust toolchain's copy |
+| `CARGO_TARGET_DIR` | Shared compilation cache; defaults inside the run directory |
+
+## Release checklist
+
+- Run formatting, scoped Clippy, tests, and the SDK compatibility checks.
+- Build and smoke-test native x86_64 and aarch64 Docker images. Existing CI does
+  this on both architectures; a successful image build also completes training.
+- Check training completed, the merged profile is nonempty, and LLVM did not
+  report a profile hash mismatch or discard a hot function's profile.
+- After compiler, trainer, or significant query changes, repeat the paired
+  qualification below before claiming the retained performance gains.
+- Copy the optimized binary or publish the image, record its source and toolchain,
+  and remove the owned build directory. Never publish the instrumented binary.
+
+## Qualification protocol
+
+The retained P1 harness is `crates/blowfish/benches/pgo_experiment.py`. Use the same frozen full NQ
+and 10K-row regression stores, the same host, flags, features, and compiler for the plain,
+full-NQ-profile, and compact-profile arms. Train the full profile by passing its trainer after `--`
+to `scripts/pgo-build.sh`; that command receives `BF_PGO_BINARY` and `LLVM_PROFILE_FILE`, and must
+stop and wait for every server. An empty profile is an error.
+
+```bash
+scripts/pgo-build.sh .scratch/reference -- \
+  uv run --project bench/nq python crates/blowfish/benches/pgo_experiment.py train \
+  --training mixed --data "$DATA" --store "$STORE" --small-store "$SMALL" \
+  --out .scratch/reference-training
+```
+
+To rebuild qualification inputs, use the public download, preparation, and load steps in
+`bench/nq/README.md`, then `pgo_experiment.py fixture` to create the 10K-row regression store. Keep
+both stores immutable after indexing settles. Release training needs neither of these stores.
+
+Create a JSON mapping from arm names to absolute binary paths, then run each paired comparison in
+ABBA order:
 
 ```bash
 uv run --project bench/nq python crates/blowfish/benches/pgo_experiment.py measure \
   --data "$DATA" --store "$STORE" --small-store "$SMALL" \
-  --arms .scratch/pgo-arms.json --out .scratch/pgo-throughput \
+  --arms .scratch/arms.json --out .scratch/measurement \
   --warm-epochs 3 --epochs 8
 ```
 
-Two arms run ABBA. Three arms run forward, then reverse. The warm vector loop
-uses H1's HTTP adapter, JSON bodies, sixteen-client distribution, and request
-clock boundaries. Server threads use CPUs 0–7, and clients use CPUs 8–15. Every
-measured vector response must be fully cached, tail-free, from the full
-2,681,468-row population, and counted by the compiled scorer. Every warm,
-filtered, BM25, and cold query must return identical complete ordered rows and
-distances across arms. Real write responses must agree after removing timing
-fields. Each write arm starts an empty, owned store and writes disjoint IDs.
+Use a fresh output directory for each comparison. Server CPUs are 0–7, and client CPUs are 8–15.
+Builds and uploads must finish before timing. Every measured vector response must be cache-hot,
+tail-free, from the full 2,681,468-row population, and counted by the compiled scorer. Compare
+complete ordered rows and distances for warm, filtered, BM25, and cold queries; compare write
+responses after removing timing fields. The compact trainer must retain at least 80% of the
+contemporaneous full-NQ profile's gain in each of warm vectors, filtered vectors, BM25, and writes.
+Compare both profiles on the same current source: P1 predates durable local filesystem writes, so
+its historical write rate and percentage are not the current write reference. Its training cost must
+stay below about ten minutes for training during the build to remain the release path. See the Round
+P2 entry in `benchmarks.md` for measurements and limitations.
 
-Cold runs use fresh processes and H1's read-only local S3 facade with 25 ms per
-request. They model dependent object-store round trips, not real S3 tails,
-throttling, or connection behavior. The regression fixture has 10K real NQ texts,
-vectors, and synthetic categories; it does not establish full-corpus BM25 or
-filtered performance. Training and measurement use the same public query set.
-
-Run counters separately from throughput:
-
-```bash
-uv run --project bench/nq python crates/blowfish/benches/pgo_experiment.py measure \
-  --data "$DATA" --store "$STORE" --small-store "$SMALL" \
-  --arms .scratch/pgo-arms.json --out .scratch/pgo-pmu \
-  --workloads vector --warm-epochs 3 --epochs 4 \
-  --perf-events '{cycles:u,r01:u,r23:u}'
-```
-
-On Neoverse V1, `r01` counts L1 instruction-cache refills, and `r23` counts frontend
-stalled cycles. The harness requires at least 99.9% scheduling coverage for every
-event, rejects missing counters, and reports counts per measured query.
-CPU-wide counts cover all user work on server CPUs; keep those cores exclusive.
-Do not present a profiled throughput number as the unprofiled pass gate.
-
-The requested gate is at least 5% higher warm vector HTTP throughput, identical
-results, and no measured BM25, filtered, write, or cold regression over 2%.
-Vector-only sensitivity must be reported separately, even if the mixed arm passes.
-
-## Optional BOLT screen
-
-Install a BOLT version that understands the binary's generated instructions.
-Build all compared arms with `-Clink-arg=-Wl,--emit-relocs`, or add that option to
-the common linker wrapper. Retain symbols, collect CPU-wide `cycles:u` samples
-from a warmed PGO server, and use the matching optimized binary:
-
-```bash
-perf2bolt -ba -p .scratch/pgo-bolt/perf.data \
-  -o .scratch/pgo-bolt/perf.fdata .scratch/pgo-mixed/blowfish
-llvm-bolt .scratch/pgo-mixed/blowfish -o .scratch/pgo-bolt/blowfish \
-  -data=.scratch/pgo-bolt/perf.fdata -reorder-blocks=ext-tsp \
-  -reorder-functions=cdsort -split-functions -split-all-cold -split-eh
-```
-
-`-ba` handles cycle samples without branch stacks. This supplies less information
-than hardware branch sampling. Follow the [LLVM BOLT guide](https://github.com/llvm/llvm-project/blob/main/bolt/README.md),
-and validate the rewritten executable before timing it. An unsupported binary or
-an incorrect result rejects that screen; it is not a successful optimization.
+The cold facade inserts 25 ms per object-store request; it does not reproduce real S3 tails. The 10K
+text/filter fixture cannot establish full-corpus BM25 or filter performance. Training and
+measurement use P1's public query set for the full-profile reference; the compact trainer uses only
+generated inputs. Qualification exercises compiled IVF, before automatic warm graph promotion. Graph
+throughput, full-corpus BM25, and model inference performance are not established by it.
 
 ## P1 measurement setup
 
