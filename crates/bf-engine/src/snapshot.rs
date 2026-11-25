@@ -37,6 +37,27 @@ enum Part {
     WithoutText,
     OnlyText,
 }
+
+fn tiers_cover_all(
+    segments: &[bf_wal::Segment],
+    lineage: &[bf_wal::Lineage],
+    tiers: &[bf_wal::SlabSet],
+) -> bool {
+    if !crate::ann::tiers_usable(segments, lineage, tiers) {
+        return false;
+    }
+    let sources: BTreeSet<&str> = tiers
+        .iter()
+        .flat_map(|set| set.covered.iter().map(|c| c.segment.as_str()))
+        .collect();
+    segments.iter().all(|segment| {
+        sources.contains(segment.id.as_str())
+            || lineage.iter().any(|entry| {
+                sources.contains(entry.source.as_str())
+                    && entry.parts.iter().any(|p| p.target == segment.id)
+            })
+    })
+}
 impl OpenHint {
     /// Whether the query ranks by text or filters on a text index, which read the segments' text
     /// headers from the manifest.
@@ -166,11 +187,18 @@ impl OpenHint {
             }
             let queries = &queries;
             let mut tasks = vec![];
-            // A directory replaces opening every segment's ANN metadata, ids, and docs footer.
-            let by_dir = self
-                .ann
-                .iter()
-                .all(|a| crate::upgrade::directory_file(dirs, a).is_some());
+            // A fully covering, usable tier also replaces the segment directories. Legacy
+            // source segments may have no namespace directory after tier installation.
+            let fully_tiered = self.scan.as_ref().is_some_and(|(attribute, _, _)| {
+                tiers
+                    .get(attribute)
+                    .is_some_and(|sets| tiers_cover_all(segments, lineage, sets))
+            });
+            // A directory replaces opening every segment's ANN metadata, IDs, and docs footer.
+            let by_dir = self.ann.iter().all(|a| {
+                crate::upgrade::directory_file(dirs, a).is_some()
+                    || (fully_tiered && self.scan.as_ref().is_some_and(|(attr, _, _)| a == attr))
+            });
             for attribute in self.ann.iter().filter(|_| with_rest) {
                 // A lone unfiltered ANN query reads the block-layout directory when there is one.
                 // A recluster's tiers take the scan of the rows they cover; the block-layout
@@ -181,10 +209,7 @@ impl OpenHint {
                     .filter(|(a, _, _)| a == attribute)
                     .and_then(|_| tiers.get(attribute))
                     .filter(|t| crate::ann::tiers_usable(segments, lineage, t));
-                let covers_all = tiered.is_some_and(|_| {
-                    let covered = crate::lineage::covered(segments, tiers, lineage);
-                    segments.iter().all(|s| covered.contains(&s.id))
-                });
+                let covers_all = tiered.is_some() && fully_tiered;
                 for set in tiered.into_iter().flatten() {
                     let Some((_, vector, k)) = self.scan.as_ref() else {
                         break;
@@ -952,4 +977,136 @@ pub(crate) async fn statistics(
         .map(|d| serde_json::to_vec(&**d).expect("document serializes").len() as u64)
         .sum::<u64>();
     Ok(stats)
+}
+
+#[cfg(test)]
+mod cold_tier_tests {
+    use super::*;
+    use crate::{Engine, EngineConfig, ReclusterOptions, read_cache};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tier_only_cold_open_skips_ids_but_uncovered_segments_keep_their_warmup() {
+        let parent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
+        std::fs::create_dir_all(&parent).unwrap();
+        let work = tempfile::Builder::new()
+            .prefix("cold-tier-")
+            .tempdir_in(parent)
+            .unwrap();
+        let store = Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store.clone(),
+            EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.0,
+                ..Default::default()
+            },
+        );
+        let rows: Vec<_> = (0..4096u32)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id, "vector": [id as f32, (id % 17) as f32]
+                })
+            })
+            .collect();
+        engine
+            .write(
+                "t",
+                serde_json::from_value(serde_json::json!({
+                    "distance_metric": "euclidean_squared", "upsert_rows": rows
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine.index_namespace("t", true).await.unwrap();
+        engine
+            .recluster(
+                "t",
+                &ReclusterOptions {
+                    attribute: "vector".into(),
+                    cells: 4,
+                    cluster_rows: 200,
+                    max_slab_rows: 2000,
+                    scratch: work.path().join("build"),
+                },
+            )
+            .await
+            .unwrap();
+        let query: QueryRequest = serde_json::from_value(serde_json::json!({
+            "rank_by": ["vector", "ANN", [17., 0.]], "top_k": 1,
+            "include_attributes": ["id"]
+        }))
+        .unwrap();
+        let expected = engine.query("t", query.clone()).await.unwrap();
+        let wal = Wal::new(store.clone(), "t").unwrap();
+        let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+        let ids = manifest.segments[0].files["ids"].clone();
+        manifest.ann_dirs.clear();
+        wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
+            .await
+            .unwrap();
+        engine.drop_caches().await;
+        let actual = engine.query("t", query.clone()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(actual.result.rows).unwrap(),
+            serde_json::to_value(expected.result.rows).unwrap()
+        );
+        let cached_ids = || {
+            let context = read_cache::ReadContext::new(engine.0.read_cache.clone());
+            let ids = ids.clone();
+            async move {
+                read_cache::scope(context, async move {
+                    read_cache::get::<segment::IdIndex>(&format!("validated:{}", ids.key), 0)
+                        .is_some()
+                })
+                .await
+            }
+        };
+        assert!(
+            !cached_ids().await,
+            "a covering tier must not load the source ID dictionary"
+        );
+
+        let sets = &manifest.ann_tiers["vector"];
+        let mut uncovered = manifest.segments.clone();
+        let mut extra = uncovered[0].clone();
+        extra.id = "uncovered".into();
+        uncovered.push(extra);
+        assert!(!tiers_cover_all(&uncovered, &manifest.lineage, sets));
+        let mut stale = manifest.segments.clone();
+        stale[0].row_count += 1;
+        assert!(!tiers_cover_all(&stale, &manifest.lineage, sets));
+        assert!(!tiers_cover_all(&manifest.segments, &manifest.lineage, &[]));
+        let mut moved = manifest.segments.clone();
+        let source = moved[0].id.clone();
+        moved[0].id = "moved".into();
+        let lineage = vec![bf_wal::Lineage {
+            source,
+            parts: vec![bf_wal::LineagePart {
+                target: moved[0].id.clone(),
+                rows: moved[0].row_count,
+                map: ids.clone(),
+            }],
+        }];
+        assert!(tiers_cover_all(&moved, &lineage, sets));
+        assert!(!tiers_cover_all(&moved, &[], sets));
+
+        let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+        manifest.ann_tiers.clear();
+        wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
+            .await
+            .unwrap();
+        engine.drop_caches().await;
+        engine.query("t", query).await.unwrap();
+        assert!(
+            cached_ids().await,
+            "an uncovered ANN query still warms its ID dictionary"
+        );
+        assert!(engine.shutdown(std::time::Duration::from_secs(5)).await);
+    }
 }

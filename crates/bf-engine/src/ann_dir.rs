@@ -365,9 +365,16 @@ pub(crate) async fn prefetch_scan(
     k: usize,
     config: &EngineConfig,
 ) -> Result<(), ApiError> {
-    // Let the query consume arriving scan batches instead of waiting for the whole
-    // speculative scan here, ahead of query execution.
-    if stream_scan(dir, layout) {
+    // Remote streams belong to the query's small scan batches. A ready local stage can
+    // submit its disk reads while the snapshot checks the WAL, without waiting for data or
+    // starting speculative S3 requests.
+    let streamed = stream_scan(dir, layout);
+    if streamed
+        && !dir
+            .segments()
+            .first()
+            .is_some_and(|s| crate::local_ann::prefetch(&s.fragment, &[]))
+    {
         return Ok(());
     }
     if segments.iter().any(|s| s.live_generation != 0) || !covers(dir, segments, attribute, layout)
@@ -430,6 +437,25 @@ pub(crate) async fn prefetch_scan(
         || (matching <= EXACT_ROWS.max(picked.len() + target)
             && matching * dir.vector_row_bytes() <= EXACT_BYTES)
     {
+        return Ok(());
+    }
+    if streamed {
+        let mut ranges: BTreeMap<&str, Vec<std::ops::Range<u64>>> = BTreeMap::new();
+        for p in picked {
+            let e = &dir.entries()[p];
+            let s = &dir.segments()[e.segment];
+            ranges.entry(&s.fragment).or_default().push(e.blob_range());
+            let key = if s.codes_in_fragment {
+                &s.fragment
+            } else {
+                &s.key
+            };
+            ranges.entry(key).or_default().push(e.codes_range());
+        }
+        for (key, ranges) in ranges {
+            let _ = crate::local_ann::prefetch(key, &ranges);
+        }
+        crate::ann::stage(t0, "local prefetch");
         return Ok(());
     }
     let likely = likely_segments(dir, &picked);
@@ -1425,6 +1451,7 @@ pub(crate) async fn search(
     // Streaming seeds the raw cache before its scan readers start. With no retention budget,
     // completed seed reads are discarded, and fast backends fetch them again for the scans.
     let streaming = store.cache_limits().0 > 0 && parallel_slab_scan && !resident;
+    let mut locally_staged = streaming && exact_segments.is_empty() && exact_rows.is_empty();
     let mut bulk = tokio::task::JoinSet::new();
     if streaming {
         let mut order: Vec<_> = chosen
@@ -1453,9 +1480,10 @@ pub(crate) async fn search(
                 vec![(fragment, blobs), (index, codes)]
             };
             for (file, ranges) in reads {
-                if crate::local_ann::covers(&file.key, &ranges) {
+                if crate::local_ann::prefetch(&file.key, &ranges) {
                     continue;
                 }
+                locally_staged = false;
                 let reader = store
                     .range_reader_with_length(&file.key, file.size, true)
                     .map_err(segment::index_error)?;
@@ -1727,10 +1755,17 @@ pub(crate) async fn search(
                     .flat_map(|(n, (_, (_, found)))| found.iter().map(move |c| (n, c)))
                     .collect();
                 leading.sort_unstable_by(|a, b| a.1.distance.total_cmp(&b.1.distance));
-                leading.truncate(k.saturating_mul(8).min(80));
+                // Staged batches leave a short overlap window. Read only their best vector
+                // guesses, and leave document guesses to the complete candidate set below.
+                let early_vectors = if locally_staged { 4 } else { 8 };
+                leading.truncate(k.saturating_mul(early_vectors).min(early_vectors * 10));
                 let mut locations: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
                 let mut rows: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
-                let docs_limit = k.saturating_mul(3).min(30);
+                let docs_limit = if locally_staged {
+                    0
+                } else {
+                    k.saturating_mul(3).min(30)
+                };
                 for (rank, (n, c)) in leading.into_iter().enumerate() {
                     locations.entry(n).or_default().push((c.cluster, c.ordinal));
                     if rank < docs_limit
@@ -1870,15 +1905,31 @@ pub(crate) async fn search(
         }
     });
     let rerank_limit = reranks.len().max(limit);
-    let prefetch = futures::future::join_all(speculative.iter().map(|(&i, rows)| async move {
-        let _ = segment::projected_rows(store, &docs_state.segments[i], rows, Some(columns)).await;
-    }));
-    let (reranked, _) = tokio::join!(
-        futures::stream::iter(reranks)
-            .buffer_unordered(rerank_limit)
-            .try_collect::<Vec<Vec<(f32, usize, u32)>>>(),
-        prefetch
-    );
+    // Keep advisory reads alive through hydration, whose winning rows share their flights.
+    // Unneeded documents must not hold the response behind their slowest read. The set aborts
+    // remaining speculation when this search returns, including on a rerank/hydration error.
+    for (i, rows) in speculative {
+        let (store, segment, columns, context) = (
+            store.clone(),
+            docs_state.segments[i].clone(),
+            columns.clone(),
+            read_cache::context(),
+        );
+        early.spawn(async move {
+            let work = async move {
+                let _ = segment::projected_rows(&store, &segment, &rows, Some(&columns)).await;
+            };
+            match context {
+                Some(context) => read_cache::scope(context, work).await,
+                None => work.await,
+            }
+        });
+    }
+    let reranked = futures::stream::iter(reranks)
+        .buffer_unordered(rerank_limit)
+        .try_collect::<Vec<Vec<(f32, usize, u32)>>>()
+        .await;
+    crate::ann::stage(t0, "rerank vectors");
     winners.extend(reranked?.into_iter().flatten());
     crate::ann::stage(t0, "rerank");
     // Beside other tiers, only this tier's rows in the global top k are hydrated (with every row
@@ -1891,7 +1942,11 @@ pub(crate) async fn search(
         seat.withdraw();
     }
 
-    hydrate(store, state, real, columns, k, winners, t0).await
+    let hydrated = hydrate(store, state, real, columns, k, winners, t0).await;
+    // Finish cancellation before returning: an advisory task must not admit decoded
+    // columns after a subsequent cache drop, or retain this query's context indefinitely.
+    early.shutdown().await;
+    hydrated
 }
 
 #[allow(clippy::too_many_arguments)]

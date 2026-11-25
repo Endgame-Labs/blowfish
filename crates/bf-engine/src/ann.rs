@@ -204,6 +204,12 @@ pub(crate) fn trace_stages() -> bool {
 pub(crate) fn stage(t0: std::time::Instant, name: &str) {
     if trace_stages() {
         eprintln!("STAGE {name} {} us", t0.elapsed().as_micros());
+        eprintln!(
+            "STAGE_TIME {name} {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros())
+        );
     }
 }
 

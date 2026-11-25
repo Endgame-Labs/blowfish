@@ -16,6 +16,10 @@ const MAGIC: &[u8; 8] = b"BFSEG001";
 const FOOTER: usize = 32;
 const BLOCK_ROWS: usize = 256;
 
+#[cfg(test)]
+#[path = "segment_prefetch_tests.rs"]
+mod prefetch_tests;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Block {
     offset: u64,

@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-24
 
+- **C5 cold critical path (merged).** Reused staged-file handles with merged positional reads (CRC checks kept), I/O advice overlapped with the WAL check, four-leaf batches, and bounded speculation for fully staged scans. Original staged layouts, cache and page-cache evicted per query: 10M (200 pairs) p50 200.4 -> 182.8 ms, GETs -14%; 100M (60 pairs) p50 443.4 -> 364.9 ms, p90 523 -> 468, GETs -17%; identical IDs and distances. Fresh-layout 10M 170.5 -> 151.7 ms.
+
 - **L1 durable local writes (merged).** Writable `file://` stores always enable object_store's file and directory fsync, persist the configured root and parent chains, and sync recovered identical writes before success. NVMe full-NQ load: -0.8% and -1.6% throughput across two pairs; 2,000 sequential one-row writes p50 0.67 -> 0.81 ms. SIGKILL/restart counts exact; strace-verified syncs. S3 unchanged.
 
 - **G4 automatic warm graphs (merged).** One bounded whole-tier SQ8 Vamana constructor (two idle-priority workers), heat-based admission with process-wide memory and disk reservations, paired recall monitoring that picks the serving effort, bounded warm cost blocks for CPU payback, eviction, and full IVF fallback; no setting, import, or promotion control. Final M4 (one binary, fresh self-built graphs, three paired HTTP repetitions): 0.957474 recall 8,133 vs. Qdrant 8,183 q/s (-0.6%); 0.95156 vs. 0.95119 recall 8,558 vs. 8,907 q/s (-3.9%); IVF baselines 2,940 and 3,502 q/s. Memory 4.44 GB vs. Qdrant 5.68 GB; ~3.57M vs. 2.04M instructions/query (G5 target). Build 1,027 s on M4 (4.1% foreground loss) and 1,884 s on 8-core EC2 (1.6%, cgroup peak 9.0 GB). Cold ABBA identical. SPEC decision 29.
