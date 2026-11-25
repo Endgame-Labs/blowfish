@@ -2454,6 +2454,55 @@ impl SegmentReader {
                 for &row in &competitive {
                     candidates[(row - start) as usize] = true;
                 }
+                let mut competitive = competitive;
+                if let Some(floor) = floor {
+                    // Row-level co-occurrence bound. The window bound assumes every
+                    // dense term reaches its maximum at one row, but most candidates
+                    // hold only some of those terms. Sum each dense term's window
+                    // bound over the terms that actually contain the row (the same
+                    // upper bound the window used), and drop rows that cannot reach
+                    // the floor. Ties are kept, so results are unchanged.
+                    let mut dense = [0.0f64; BLOCK];
+                    for term in terms.iter().filter(|t| !t.small) {
+                        let bound = term.bound(window, &saturation);
+                        for b in term.span(window) {
+                            let Some(postings) = &term.postings[b] else {
+                                continue;
+                            };
+                            let postings = postings.window(window);
+                            if competitive.len() * 8 < postings.len() {
+                                for &row in &competitive {
+                                    if postings.binary_search_by_key(&row, |&(r, _)| r).is_ok() {
+                                        dense[(row - start) as usize] += bound;
+                                    }
+                                }
+                            } else {
+                                for &(row, _) in postings {
+                                    if candidates[(row - start) as usize] {
+                                        dense[(row - start) as usize] += bound;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let flat = f64::from(prefix_windows[window]);
+                    competitive.retain(|&row| {
+                        let sparse = if row_bounds.is_empty() {
+                            0.0
+                        } else {
+                            f64::from(row_bounds[row as usize])
+                        };
+                        (sparse + dense[(row - start) as usize] + flat) * margin >= floor
+                    });
+                    if competitive.is_empty() {
+                        metrics.windows_pruned += 1;
+                        continue;
+                    }
+                    candidates.fill(false);
+                    for &row in &competitive {
+                        candidates[(row - start) as usize] = true;
+                    }
+                }
                 let mut scores = [0.0f32; BLOCK];
                 let mut prefix_matches = [false; BLOCK];
                 for term in &terms {
