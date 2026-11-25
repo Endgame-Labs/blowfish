@@ -11888,3 +11888,95 @@ One on-demand c7g.4xlarge ran for approximately **0.78 hours**. Estimated cost i
 $0.58/hour compute rate, a 120 GiB gp3 volume, and public IPv4; this is an estimate, excluding network charges and tax,
 not a billing audit. The instance is confirmed terminated, and its root volume, tagged key pair, and tagged security group
 are confirmed absent. No S3 objects were written. Owned local scratch artifacts were removed after preserving these results.
+
+
+## Round BW13: score highly selective filtered BM25 directly from the allowed rows (shipped)
+
+Hypothesis (Sol, `briefs/ideas/1225-sol.md` #2): a filter that admits very few rows still makes the window walk inspect
+tens of thousands of row slots, so score the allowed rows directly. Baseline was main `75d261e` (v0.1.32). No persisted
+format change, no setting (SPEC 25).
+
+### Baseline: filtered BM25 was slow, and mostly not in the scoring
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Rust 1.100.0, Clang 19), server on CPUs 0 to 5 with two Rayon and two Tokio
+workers, client on CPUs 14 and 15, 2 GiB raw cache, 4,000-byte blocks. The fixture's corpus (`tmp/msmarco-1m-v021/corpus.jsonl`,
+1M MS MARCO passages) was reloaded with two extra int attributes by `crates/bf-engine/examples/filtered_bm25_load.py`: `r`, a
+fixed pseudo-random bucket in 0 to 999 (random mask of p percent is `r < 10p`), and `pos`, the load order (contiguous
+mask is a `pos` range, here starting at 400,000). The reload produced nine text segments, close to the fixture's eight. Workload:
+the held-out odd-indexed 500 queries of `bench/scale/data/bm25-msmarco.json`, eight times per pass, two prewarm passes,
+four timed passes per client count. Driver: `crates/bf-text/examples/filtered_bm25.rs`.
+
+| Mask | 1 client q/s | p50 ms | 16 clients q/s | p50 / p90 ms |
+| --- | ---: | ---: | ---: | ---: |
+| unfiltered | 888 | 0.99 | 2,475 | 5.9 / 10.0 |
+| random 0.1% | 570 | 1.76 | 1,352 | 11.8 / 14.7 |
+| random 0.5% | 407 | 2.42 | 823 | 19.2 / 24.3 |
+| random 2% | 386 | 2.37 | 780 | 20.0 / 27.2 |
+| random 10% | 513 | 1.69 | 1,169 | 13.0 / 19.1 |
+| contiguous 0.1% | 1,029 | 0.98 | 5,071 | 3.0 / 4.5 |
+| contiguous 0.5% | 1,007 | 0.99 | 4,981 | 3.0 / 4.4 |
+| contiguous 2% | 941 | 1.05 | 4,724 | 3.2 / 4.7 |
+| contiguous 10% | 778 | 1.14 | 4,059 | 3.7 / 5.6 |
+
+(Both baseline arms pooled.) A random 0.5% mask ran at a third of unfiltered throughput.
+
+A 16-client profile of contiguous 0.5% on the baseline found **19% of CPU in `serde_json` serialization**: `filter_live` built
+its predicate-cache key per segment per query by serializing the whole `Segment` (every dictionary chunk index of every file),
+the filter, and the schema. That is a fixed filter tax, independent of selectivity.
+
+### Changes
+
+1. **Direct scoring** (`bf-text`, `SegmentReader::search_allowed_rows`). When a segment's mask is sparse and scattered, skip window
+   bounds and the window walk. List the allowed rows, read only the posting blocks of non-dense terms that intersect them
+   (one batched read, merged or binary-searched against the allowed rows), look dense terms up in BW11's arrays, and add into one
+   f32 accumulator per row in dictionary term order, exactly the window path's addition order. Prefix queries keep the
+   window path. The choice is automatic: at most a quarter of the segment's rows, and fewer than 24 allowed rows per touched
+   128-row window, measured on eight samples of 64 consecutive allowed rows. A contiguous range keeps the window walk, because bounds
+   prune it and the direct path measured slower there (contiguous 2%: 0.93x at one client when forced).
+2. **Cheaper predicate key** (`bf-engine`, `segment::filter_live`). The key names the segment by its id, WAL range, row count,
+   schema, file keys, sizes, live object, and live generation, and leaves out the dictionary chunk indexes, which derive from
+   immutable objects the file keys already name. The key prefix is bumped to `filter-live-v2`.
+
+### Measurement (paired A/B/B/A, same host)
+
+Baseline A is `75d261e`, candidate C is the final branch, each arm a fresh local copy of the same store, run in the order A1, C1, C2, A2.
+Every one of the **288,000 timed replies per arm** and the prewarm replies matched the baseline arm's recorded ordered IDs and
+f32 score bits (reference recorded by A1; the driver asserts on any mismatch). Medians of four passes:
+
+| Mask | 1 client A / C q/s | 16 clients A1 / A2 | 16 clients C1 / C2 | 16 clients gain | 16 clients p50 A to C ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| unfiltered | 888 / 883 | 2,471 / 2,478 | 2,468 / 2,458 | 1.00x | 5.9 to 5.9 |
+| random 0.1% | 570 / 1,183 | 1,348 / 1,355 | 5,451 / 5,540 | 4.1x | 11.8 to 2.7 |
+| **random 0.5%** | 407 / 1,059 | 821 / 825 | 4,134 / 4,173 | **5.0x** | 19.2 to 3.6 |
+| random 2% | 386 / 915 | 779 / 780 | 3,104 / 3,120 | 4.0x | 20.0 to 4.9 |
+| random 10% | 513 / 641 | 1,170 / 1,168 | 1,658 / 1,661 | 1.42x | 13.0 to 9.3 |
+| contiguous 0.1% | 1,029 / 1,143 | 5,066 / 5,076 | 8,738 / 8,909 | 1.74x | 3.0 to 1.5 |
+| **contiguous 0.5%** | 1,007 / 1,118 | 4,979 / 4,982 | 8,601 / 8,641 | **1.73x** | 3.0 to 1.6 |
+| contiguous 2% | 941 / 1,045 | 4,734 / 4,713 | 7,973 / 7,928 | 1.69x | 3.2 to 1.7 |
+| contiguous 10% | 778 / 855 | 4,053 / 4,065 | 6,236 / 6,224 | 1.54x | 3.7 to 2.2 |
+
+The bar (at least 1.3x warm throughput at 0.5% for random and contiguous masks, no regression at 10% or unfiltered, identical
+IDs and score bits) is met. Unfiltered is unchanged (p50 and p90 too), and 10% improved. One-client contiguous 0.5% improves by
+only 1.11x, since one query there is dominated by fixed per-query work.
+
+Where the gain comes from, on random 0.5% (a single paired prototype run, `B1`, with direct scoring and the old key, at a
+fixed one-in-sixteen threshold): 939 q/s at one client and 2,877 at 16, so direct scoring alone gave 2.3x and 3.5x, and the
+key fix the rest. The contiguous masks gain from the key fix alone, since they stay on the window path. Threshold sweep
+(forced direct scoring at one-in-eight, four, two, and one of a segment's rows): no gain over one-in-sixteen on random masks,
+and a loss on contiguous 2% (4,453 versus 4,734 q/s at 16 clients), which motivated the scatter test.
+
+Peak resident memory (VmHWM) was 1.20 and 1.23 GiB for A versus 1.31 and 1.33 GiB for C. I did not isolate the cause: the
+candidate adds no resident structure, but its filtered passes decode more posting blocks into the decoded cache.
+
+### Validation
+
+`cargo fmt`, `cargo clippy -p bf-text -p bf-engine --all-targets -- -D warnings`, and `cargo test -p bf-text -p bf-engine` pass
+(39 suites). New test `selective_masks_score_allowed_rows_with_the_same_bits_as_the_unfiltered_ranking` compares seven masks
+(random, contiguous, out-of-segment ordinals, empty, three rows, every ninth row, every fifth row) with the unfiltered ranking
+filtered to the mask, for demand and prefetched search, changed statistics, earned and unearned dense arrays, and k of 1, 10, and 130:
+ordered rows and f32 score bits are equal.
+
+### Cost
+
+One on-demand c7g.4xlarge for about 1.6 hours, roughly $1.1 including volume and IPv4 (historical $0.58/hour compute rate).
+The instance, key pair, and security group are deleted. No S3 objects were written.
