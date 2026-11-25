@@ -4,9 +4,15 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-11-25
+
 ### Changed
 
 - **Lower bulk write latency:** WAL group commit now also bounds each group by about 32 MiB of estimated document bytes, so large bulk upserts stop queueing behind one oversized group. Loading full BEIR NQ (2.68M 1,024-dimension vectors, four clients), write p90 fell from 2,067–2,125 ms to 1,079–1,125 ms (about 46%) with throughput unchanged within run-to-run variation. Every acknowledged row survives SIGKILL, and loaded data matches the source exactly. There is no setting.
+
+### Fixed
+
+- **Docker image build:** `Cargo.lock` paired bindgen's syn 3 with prettyplease 0.2 (built on syn 2), so builds with the `local-models` feature, including the Docker image, failed to compile in v0.1.16 through v0.1.22. prettyplease is now 0.3.
 
 ## [0.1.22] - 2026-11-24
 
@@ -184,7 +190,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.22...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.23...HEAD
+[0.1.23]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.23
 [0.1.22]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.22
 [0.1.21]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.21
 [0.1.20]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.20
