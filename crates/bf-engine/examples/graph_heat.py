@@ -15,6 +15,7 @@ import httpx
 root = pathlib.Path(sys.argv[1])
 port = int(sys.argv[2])
 rate = int(sys.argv[3])
+production = "--production" in sys.argv[4:]
 queries = np.load(root / "fixture/data/queries.npy")
 bodies = [
     json.dumps(
@@ -55,9 +56,16 @@ async def main():
 
         async def status():
             while True:
-                r = await client.get("/measure/nq/status")
+                r = await client.get(
+                    "/_blowfish/v1/status" if production else "/measure/nq/status"
+                )
                 r.raise_for_status()
-                value = {"time": time.time(), "status": r.json()}
+                diagnostic = r.json()
+                if production:
+                    diagnostic = diagnostic["hot_graphs"].get(
+                        "nq", {"graphs": [], "answered": 0, "process_reserved_bytes": 0}
+                    )
+                value = {"time": time.time(), "status": diagnostic}
                 with (root / "status.jsonl").open("a") as f:
                     f.write(json.dumps(value) + "\n")
                 print(json.dumps(value), flush=True)

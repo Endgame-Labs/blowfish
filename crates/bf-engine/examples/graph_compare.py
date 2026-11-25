@@ -5,9 +5,14 @@
 
 Run from an owned measurement directory containing src/ (a repository copy),
 .scratch/fixture/{store,data}, and a Qdrant fixture prepared by prepare_graph_qdrant.py.
-.scratch/candidate-server must be the release hot_graph_server example; source.json
-records its commit and SHA-256, and source-ready marks a completed build. Run one
-profile at a time: uv run src/crates/bf-engine/examples/graph_compare.py high 64.
+For production qualification, pass --production, --binary, and --source-json;
+the source record must contain the immutable binary's commit and SHA-256. Production
+runs use the ordinary blowfish binary, per-core reactors, and authenticated admin
+status diagnostics (authentication is disabled only on loopback, as for Qdrant).
+Without --production, candidate-server and source.json select the profiling example.
+source-ready and qdrant-ready mark completed preparation. Run one profile at a time:
+uv run src/crates/bf-engine/examples/graph_compare.py high 64 --production \
+    --binary .scratch/production-g5 --source-json .scratch/production-g5-source.json
 Then run a fresh lower profile with a new output name and 48 probes. Each process
 must earn ordinary heat admission, build its own graph, and calibrate through the
 ordinary recall endpoint. No effort or promotion override is used.
@@ -20,6 +25,8 @@ PGO binaries must be reported separately if both are measured.
 
 import argparse
 import http.client
+import hashlib
+import re
 import json
 import os
 import pathlib
@@ -34,7 +41,18 @@ import numpy as np
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("name", help="new output-directory name under .scratch/")
 parser.add_argument("probes", type=int, help="ordinary IVF profile, usually 64 or 48")
+parser.add_argument(
+    "--production",
+    action="store_true",
+    help="use the real blowfish server and admin diagnostics",
+)
+parser.add_argument("--binary", type=pathlib.Path, help="immutable server binary")
+parser.add_argument(
+    "--source-json", type=pathlib.Path, help="source commit and binary SHA-256 record"
+)
 args = parser.parse_args()
+if args.production and (args.binary is None or args.source_json is None):
+    parser.error("production comparisons require --binary and --source-json")
 if (
     args.probes <= 0
     or args.name in (".", "..")
@@ -52,7 +70,9 @@ OUT.mkdir()
 (OUT / "tmp").mkdir()
 assert (BASE / "source-ready").exists() and (BASE / "qdrant-ready").exists()
 assert shutil.disk_usage(ROOT).free >= 8 * 2**30
-SOURCE = json.loads((BASE / "source.json").read_text())
+SOURCE = json.loads((args.source_json or BASE / "source.json").read_text())
+BINARY = (args.binary or BASE / "candidate-server").resolve()
+assert hashlib.sha256(BINARY.read_bytes()).hexdigest() == SOURCE["binary_sha256"]
 QUERIES = np.load(BASE / "fixture/data/queries.npy")
 TRUTH = np.load(BASE / "fixture/data/truth.npy")[:, :10]
 
@@ -76,7 +96,32 @@ def api(port, method, path, body=None):
 
 
 def status():
+    if args.production:
+        result = api(18443, "GET", "/_blowfish/v1/status")
+        return result["hot_graphs"].get(
+            "nq", {"graphs": [], "answered": 0, "process_reserved_bytes": 0}
+        )
     return api(18443, "GET", "/measure/nq/status")
+
+
+def dispatch_counts():
+    if not args.production:
+        return {}
+    connection = http.client.HTTPConnection("127.0.0.1", 18443, timeout=30)
+    try:
+        connection.request("GET", "/metrics")
+        response = connection.getresponse()
+        raw = response.read().decode()
+        assert response.status == 200
+        counts = {}
+        for line in raw.splitlines():
+            if line.startswith("blowfish_query_cpu_dispatch_total{"):
+                match = re.search(r'path="([^"]+)"', line)
+                if match:
+                    counts[match.group(1)] = float(line.rsplit(" ", 1)[1])
+        return counts
+    finally:
+        connection.close()
 
 
 def calibration(s):
@@ -103,6 +148,7 @@ def counters(pid):
 
 def region(label, engine, pid, ef=0, steady=False, repeats=32):
     before = status() if engine == "bf" else None
+    dispatch_before = dispatch_counts() if engine == "bf" else {}
     if engine == "bf" and steady:
         ef = calibration(before)["ef"]
     command = [
@@ -130,6 +176,11 @@ def region(label, engine, pid, ef=0, steady=False, repeats=32):
         delta = after["answered"] - before["answered"]
         result["status_before"] = before
         result["status_after"] = after
+        dispatch_after = dispatch_counts()
+        result["dispatch_delta"] = {
+            key: dispatch_after.get(key, 0) - dispatch_before.get(key, 0)
+            for key in dispatch_after.keys() | dispatch_before.keys()
+        }
         if steady:
             a, b = calibration(before), calibration(after)
             assert a and b and a["usable"] and b["usable"] and a["ef"] == b["ef"], (
@@ -187,6 +238,7 @@ def qquality(ef):
 
 
 server = heater = qdrant = None
+summary = None
 config = {
     "url": (BASE / "fixture/store").as_uri(),
     "read_only": True,
@@ -199,6 +251,21 @@ config = {
     },
 }
 (OUT / "storage.json").write_text(json.dumps(config))
+if args.production:
+    settings = [
+        'listen = "127.0.0.1:18443"',
+        "require_auth = false",
+        "[engine]",
+        "indexing = false",
+        f"ann_nprobe = {PROBES}",
+        "recall_sample_rate = 0.0",
+        "[storage]",
+        "url = " + json.dumps(config["url"]),
+        "read_only = true",
+        "[storage.cache]",
+    ]
+    settings.extend(f"{key} = {value}" for key, value in config["cache"].items())
+    (OUT / "server.toml").write_text("\n".join(settings) + "\n")
 try:
     env = dict(
         os.environ,
@@ -210,26 +277,29 @@ try:
         TMPDIR=str(OUT / "tmp"),
     )
     sf = (OUT / "server.log").open("wb")
+    command = (
+        [str(BINARY), "serve", "--config", str(OUT / "server.toml")]
+        if args.production
+        else [str(BINARY), str(OUT / "storage.json"), "nq", str(OUT / "ready"), "18443"]
+    )
     server = subprocess.Popen(
-        [
-            str(BASE / "candidate-server"),
-            str(OUT / "storage.json"),
-            "nq",
-            str(OUT / "ready"),
-            "18443",
-        ],
-        stdout=sf,
-        stderr=sf,
-        env=env,
-        start_new_session=True,
+        command, stdout=sf, stderr=sf, env=env, start_new_session=True
     )
     (OUT / "server.pid").write_text(str(server.pid))
     for _ in range(120):
         if server.poll() is not None:
-            raise RuntimeError("server exited")
-        if (OUT / "ready").exists():
-            break
+            raise RuntimeError("server exited; inspect server.log")
+        try:
+            if args.production:
+                status()
+                break
+            if (OUT / "ready").exists():
+                break
+        except OSError:
+            pass
         time.sleep(1)
+    else:
+        raise RuntimeError("server did not become ready")
     hf = (OUT / "heater.log").open("wb")
     heater = subprocess.Popen(
         [
@@ -239,6 +309,7 @@ try:
             str(OUT),
             "18443",
             "800",
+            *(["--production"] if args.production else []),
         ],
         stdout=hf,
         stderr=hf,
@@ -363,6 +434,7 @@ try:
     )
     summary = {
         "source": SOURCE,
+        "server_kind": "production" if args.production else "example",
         "probes": PROBES,
         "recall": target,
         "qdrant_ef": ef,
@@ -391,11 +463,29 @@ try:
         qdrant=summary["qdrant_median_qps"],
     )
 finally:
-    for p in [heater, server, qdrant]:
-        if p is not None and p.poll() is None:
-            os.killpg(p.pid, signal.SIGTERM)
-            try:
-                p.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(p.pid, signal.SIGKILL)
-                p.wait()
+    exit_usage = {}
+    for label, process in [("heater", heater), ("server", server), ("qdrant", qdrant)]:
+        if process is None or process.poll() is not None:
+            continue
+        os.killpg(process.pid, signal.SIGTERM)
+        deadline = time.monotonic() + 30
+        while True:
+            pid, result, usage = os.wait4(process.pid, os.WNOHANG)
+            if pid:
+                process.returncode = os.waitstatus_to_exitcode(result)
+                exit_usage[label] = {
+                    "peak_rss_bytes": usage.ru_maxrss,
+                    "swaps": usage.ru_nswap,
+                    "user_cpu_seconds": usage.ru_utime,
+                    "system_cpu_seconds": usage.ru_stime,
+                }
+                break
+            if time.monotonic() > deadline:
+                os.killpg(process.pid, signal.SIGKILL)
+                pid, result, usage = os.wait4(process.pid, 0)
+                process.returncode = os.waitstatus_to_exitcode(result)
+                raise RuntimeError(f"{label} did not stop within thirty seconds")
+            time.sleep(0.1)
+    if summary is not None:
+        summary["exit_usage"] = exit_usage
+        (OUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
