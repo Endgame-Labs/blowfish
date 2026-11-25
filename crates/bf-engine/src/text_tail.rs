@@ -3,6 +3,7 @@
 use crate::{read_cache, text};
 use bf_text::{DocumentTerms, FtsParams};
 use bf_types::{Document, Schema};
+use rayon::prelude::*;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -32,6 +33,15 @@ impl Analysis {
 pub(crate) struct Analyzer {
     fields: Vec<(String, FtsParams)>,
     key: Arc<str>,
+    cache: Option<Arc<read_cache::ClockCache<Arc<Analysis>, Key>>>,
+    prepared: Option<Arc<PreparedTail>>,
+}
+
+/// Query-local immutable summaries. Weak document references reserve every
+/// allocation identity, and the full analysis key prevents cross-schema reuse.
+pub(crate) struct PreparedTail {
+    key: Arc<str>,
+    pub rows: BTreeMap<usize, Arc<Analysis>>,
 }
 impl Analyzer {
     pub fn new(schema: &Schema) -> Self {
@@ -41,9 +51,16 @@ impl Analyzer {
             .collect();
         // Include the complete analysis configuration, including array semantics.
         let key = serde_json::to_string(&fields).expect("text configurations serialize");
+        let context = read_cache::context();
+        let prepared = context
+            .as_ref()
+            .and_then(|context| context.text_tail.clone())
+            .filter(|tail| tail.key.as_ref() == key);
         Self {
             fields,
             key: key.into(),
+            cache: context.map(|context| context.cache.text_terms.clone()),
+            prepared,
         }
     }
     fn analyze(&self, doc: &Document, source: Option<Weak<Document>>) -> Analysis {
@@ -62,16 +79,38 @@ impl Analyzer {
         }
     }
     pub fn tail(&self, doc: &Arc<Document>) -> Arc<Analysis> {
+        if let Some(value) = self
+            .prepared
+            .as_ref()
+            .and_then(|tail| tail.rows.get(&(Arc::as_ptr(doc) as usize)))
+        {
+            return value.clone();
+        }
         let key = Key::Tail(Arc::as_ptr(doc) as usize, self.key.clone());
-        let context = read_cache::context();
-        if let Some(value) = context.as_ref().and_then(|c| c.cache.text_terms.get(&key)) {
+        if let Some(value) = self.cache.as_ref().and_then(|cache| cache.get(&key)) {
             return value;
         }
         let value = Arc::new(self.analyze(doc, Some(Arc::downgrade(doc))));
-        if let Some(context) = context {
-            context.cache.text_terms.insert(key, value.clone());
+        if let Some(cache) = &self.cache {
+            cache.insert(key, value.clone());
         }
         value
+    }
+
+    /// Analyze each WAL row once for statistics and ranking. Capture the cache
+    /// before entering Rayon: task-local read contexts do not follow CPU jobs.
+    pub fn gather(&self, docs: &BTreeMap<bf_types::Id, Arc<Document>>) -> PreparedTail {
+        let docs: Vec<_> = docs.values().collect();
+        let analyze = |doc: &&Arc<Document>| (Arc::as_ptr(doc) as usize, self.tail(doc));
+        let rows = if docs.len() >= 512 && crate::fan_out() && rayon::current_num_threads() > 1 {
+            docs.par_iter().map(analyze).collect()
+        } else {
+            docs.iter().map(analyze).collect()
+        };
+        PreparedTail {
+            key: self.key.clone(),
+            rows,
+        }
     }
 }
 
@@ -180,9 +219,9 @@ mod tests {
         let schema: Schema =
             serde_json::from_value(json!({"text":{"type":"string","full_text_search":true}}))
                 .unwrap();
-        let analyzer = Analyzer::new(&schema);
         let cache = Arc::new(read_cache::DecodedCache::new(1 << 24, 1));
         read_cache::scope(read_cache::ReadContext::new(cache), async {
+            let analyzer = Analyzer::new(&schema);
             let mut doc: Arc<Document> =
                 Arc::new(serde_json::from_value(json!({"id":1,"text":"Fox fox"})).unwrap());
             let old = analyzer.tail(&doc);
@@ -215,10 +254,10 @@ mod tests {
         let schema: Schema =
             serde_json::from_value(json!({"text":{"type":"string","full_text_search":true}}))
                 .unwrap();
-        let analyzer = Analyzer::new(&schema);
         for budget in [0, 1 << 24] {
             let cache = Arc::new(read_cache::DecodedCache::new(budget, 1));
             read_cache::scope(read_cache::ReadContext::new(cache.clone()), async {
+                let analyzer = Analyzer::new(&schema);
                 for id in 0..5000 {
                     let word = format!("term{id}");
                     let doc =
@@ -231,6 +270,59 @@ mod tests {
                 }
                 cache.clear();
                 assert_eq!(cache.text_terms.resident_bytes(), 0);
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn gathered_tail_is_query_local_and_reserves_replaced_document_identities() {
+        let schema: Schema = serde_json::from_value(json!({
+            "text":{"type":"string","full_text_search":true}
+        }))
+        .unwrap();
+        for budget in [0, 1 << 24] {
+            let cache = Arc::new(read_cache::DecodedCache::new(budget, 2));
+            let context = read_cache::ReadContext::new(cache);
+            read_cache::scope(context.clone(), async {
+                let analyzer = Analyzer::new(&schema);
+                let mut docs: BTreeMap<_, _> = (0..1024)
+                    .map(|id| {
+                        (
+                            bf_types::Id::Uint(id),
+                            Arc::new(
+                                serde_json::from_value(json!({
+                                    "id":id,"text":"Fox fox blue"
+                                }))
+                                .unwrap(),
+                            ),
+                        )
+                    })
+                    .collect();
+                let prepared = Arc::new(analyzer.gather(&docs));
+                assert_eq!(prepared.rows.len(), docs.len());
+                let original = docs[&bf_types::Id::Uint(0)].clone();
+                let summary = prepared.rows[&(Arc::as_ptr(&original) as usize)].clone();
+                let mut scoped = context;
+                scoped.text_tail = Some(prepared);
+                read_cache::scope(scoped, async {
+                    let analyzer = Analyzer::new(&schema);
+                    assert!(Arc::ptr_eq(&summary, &analyzer.tail(&original)));
+                    Arc::make_mut(docs.get_mut(&bf_types::Id::Uint(0)).unwrap())
+                        .insert("text".into(), json!("green"));
+                    let replacement = analyzer.tail(&docs[&bf_types::Id::Uint(0)]);
+                    assert_eq!(replacement.fields["text"].frequency("green"), 1);
+                    assert_eq!(replacement.fields["text"].frequency("fox"), 0);
+                    let changed: Schema = serde_json::from_value(json!({
+                        "text":{"type":"string","full_text_search":{"case_sensitive":true}}
+                    }))
+                    .unwrap();
+                    let changed = Analyzer::new(&changed).tail(&original);
+                    assert_eq!(changed.fields["text"].frequency("Fox"), 1);
+                    assert!(!Arc::ptr_eq(&changed, &summary));
+                })
+                .await;
+                assert!(read_cache::context().unwrap().text_tail.is_none());
             })
             .await;
         }

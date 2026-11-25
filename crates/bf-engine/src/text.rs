@@ -536,6 +536,7 @@ pub(crate) fn reference_stats(state: &mut NamespaceState) {
 pub(crate) struct GlobalStats {
     pub corpus: std::sync::Arc<BTreeMap<String, CorpusStats>>,
     pub shadowed: Option<std::sync::Arc<BTreeMap<String, roaring::RoaringBitmap>>>,
+    pub tail: Option<std::sync::Arc<crate::text_tail::PreparedTail>>,
 }
 
 /// Start at the checkpoint's live totals, subtract shadowed segment rows, and add the tail.
@@ -582,12 +583,14 @@ pub(crate) async fn global_stats(
                 .collect::<BTreeMap<_, _>>()
                 .into(),
             shadowed: None,
+            tail: None,
         });
     }
     if state.shadowed.is_empty() && state.docs.is_empty() {
         return Ok(GlobalStats {
             corpus: checkpoint_corpus_of(store, state, terms).await?,
             shadowed: None,
+            tail: None,
         });
     }
     let started = std::time::Instant::now();
@@ -650,8 +653,9 @@ pub(crate) async fn global_stats(
     };
     crate::ann::stage(started, "bm25 shadow stats");
     let started = std::time::Instant::now();
-    for doc in state.docs.values() {
-        adjust_summary(&mut stats, &analyzer.tail(doc), terms, true);
+    let tail = std::sync::Arc::new(analyzer.gather(&state.docs));
+    for summary in tail.rows.values() {
+        adjust_summary(&mut stats, summary, terms, true);
     }
     crate::ann::stage(started, "bm25 tail stats tokenization");
     Ok(GlobalStats {
@@ -664,7 +668,69 @@ pub(crate) async fn global_stats(
             .collect::<BTreeMap<_, _>>()
             .into(),
         shadowed,
+        tail: Some(tail),
     })
+}
+
+type ShadowCorrection = (String, roaring::RoaringBitmap, BTreeMap<String, TextStats>);
+
+async fn shadow_correction(
+    store: &Storage,
+    seg: &bf_wal::Segment,
+    shadowed: &BTreeSet<bf_types::Id>,
+    fields: &BTreeSet<String>,
+    terms: &QueryTerms,
+) -> Result<ShadowCorrection, ApiError> {
+    let (rows, live) = tokio::try_join!(
+        segment::lookup_many(store, seg, shadowed),
+        segment::live(store, seg),
+    )?;
+    let rows = rows & live;
+    let mut removed = BTreeMap::new();
+    if !rows.is_empty() {
+        for name in fields {
+            let file = seg
+                .files
+                .get(&format!("fts:{name}"))
+                .ok_or_else(segment::corrupt)?;
+            let reader = segment::text_index(store, file).await?;
+            reader
+                .ensure_lengths()
+                .await
+                .map_err(segment::index_error)?;
+            if reader.num_docs() != seg.row_count {
+                return Err(segment::corrupt());
+            }
+            let mut field = TextStats::default();
+            for row in &rows {
+                let length = reader.doc_lengths()[row as usize];
+                // Zero is a missing/null field; present empty fields have
+                // normalization length one, including stopword-only text.
+                if length != 0 {
+                    field.documents += 1;
+                    field.total_length += u64::from(length);
+                }
+            }
+            let wanted: Vec<_> = terms
+                .get(name)
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            let counts = reader
+                .document_frequencies(&wanted, &rows)
+                .await
+                .map_err(segment::index_error)?;
+            field.document_frequencies = wanted
+                .into_iter()
+                .zip(counts)
+                .filter(|(_, count)| *count != 0)
+                .map(|(term, count)| (term.to_owned(), count))
+                .collect();
+            removed.insert(name.clone(), field);
+        }
+    }
+    Ok((seg.id.clone(), rows, removed))
 }
 
 /// Read lengths and intersect query-term postings, rather than hydrating and
@@ -677,59 +743,51 @@ async fn subtract_shadowed(
     terms: &QueryTerms,
     stats: &mut NamespaceStats,
 ) -> Result<BTreeMap<String, roaring::RoaringBitmap>, ApiError> {
-    let removed = futures::future::try_join_all(state.segments.iter().map(|seg| async move {
-        let (rows, live) = tokio::try_join!(
-            segment::lookup_many(store, seg, &state.shadowed),
-            segment::live(store, seg),
-        )?;
-        let rows = rows & live;
-        let mut removed = BTreeMap::new();
-        if !rows.is_empty() {
-            for name in fields {
-                let file = seg
-                    .files
-                    .get(&format!("fts:{name}"))
-                    .ok_or_else(segment::corrupt)?;
-                let reader = segment::text_index(store, file).await?;
-                reader
-                    .ensure_lengths()
+    let context =
+        crate::read_cache::context().filter(|_| state.segments.len() > 1 && crate::fan_out());
+    let removed = if let Some(context) = context {
+        use futures::{StreamExt, TryStreamExt};
+        // Warm async reads can complete without yielding: try_join_all alone
+        // serializes their posting intersections on the caller. Share the CPU
+        // work across the same bounded workers as segment ranking.
+        let inputs = std::sync::Arc::new((state.shadowed.clone(), fields.clone(), terms.clone()));
+        let concurrency = context.cache.workers.available_permits().max(1);
+        futures::stream::iter(state.segments.iter().cloned().map(|seg| {
+            let context = context.clone();
+            let inputs = inputs.clone();
+            let store = store.clone();
+            async move {
+                let permit = context
+                    .cache
+                    .workers
+                    .clone()
+                    .acquire_owned()
                     .await
                     .map_err(segment::index_error)?;
-                if reader.num_docs() != seg.row_count {
-                    return Err(segment::corrupt());
-                }
-                let mut field = TextStats::default();
-                for row in &rows {
-                    let length = reader.doc_lengths()[row as usize];
-                    // Zero is a missing/null field; present empty fields have
-                    // normalization length one, including stopword-only text.
-                    if length != 0 {
-                        field.documents += 1;
-                        field.total_length += u64::from(length);
-                    }
-                }
-                let wanted: Vec<_> = terms
-                    .get(name)
-                    .into_iter()
-                    .flatten()
-                    .map(String::as_str)
-                    .collect();
-                let counts = reader
-                    .document_frequencies(&wanted, &rows)
-                    .await
-                    .map_err(segment::index_error)?;
-                field.document_frequencies = wanted
-                    .into_iter()
-                    .zip(counts)
-                    .filter(|(_, count)| *count != 0)
-                    .map(|(term, count)| (term.to_owned(), count))
-                    .collect();
-                removed.insert(name.clone(), field);
+                let runtime = crate::query_worker::shared_runtime();
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    runtime.block_on(crate::read_cache::scope(
+                        context,
+                        shadow_correction(&store, &seg, &inputs.0, &inputs.1, &inputs.2),
+                    ))
+                })
+                .await
+                .map_err(segment::index_error)?
             }
-        }
-        Ok::<_, ApiError>((seg.id.clone(), rows, removed))
-    }))
-    .await?;
+        }))
+        .buffered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await?
+    } else {
+        futures::future::try_join_all(
+            state
+                .segments
+                .iter()
+                .map(|seg| shadow_correction(store, seg, &state.shadowed, fields, terms)),
+        )
+        .await?
+    };
     let mut masks = BTreeMap::new();
     for (segment, rows, removed) in removed {
         masks.insert(segment, rows);

@@ -169,10 +169,11 @@ pub(crate) async fn execute(
                             force_exact,
                             request.queries.is_none(),
                         );
-                        if stats.shadowed.is_some()
+                        if (stats.shadowed.is_some() || stats.tail.is_some())
                             && let Some(mut context) = crate::read_cache::context()
                         {
                             context.text_shadowed = stats.shadowed;
+                            context.text_tail = stats.tail;
                             crate::read_cache::scope(context, work).await
                         } else {
                             work.await
