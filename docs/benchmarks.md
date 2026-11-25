@@ -11048,3 +11048,90 @@ At 300,000 rows the builder uses its two-level path, whose small center sets sta
 One on-demand c7gd.2xlarge for 0.97 h (launch 06:58 UTC, terminated 07:57 UTC), about $0.35 compute at $0.3629/h plus a
 60 GB root volume. The instance is terminated, its key pair and security group are deleted, and nothing was written to
 the bucket (the fixture was read only).
+
+
+## Round BW9: honest BM25 cache accounting (shipped) and essential-first block fetching (killed at the counting step)
+
+Neon's two hypotheses for warm and cold BM25 (`briefs/ideas/0725-neon.md`, idea 2). Exact BM25, no format change.
+
+### Kill test (counting only)
+
+Fixture `tmp/msmarco-1m-v021/` (eight text segments, read-only; a fresh local copy per arm), one client, the checked-in
+1,000-query workload run four times (4,000 queries). Server with 2 Rayon workers, a 2 GiB raw cache, 4,000-byte blocks,
+and the default decoded cache (4 GiB on this 32 GiB host, so 1.5 GiB for the general LRU that holds readers). Every reply
+matched ordered IDs and f32 score bits in every arm. Temporary counters (removed) counted reader evictions in the decoded
+cache, reader opens, memo hits and misses, and `blocks_read`.
+
+**Hypothesis 1, the flat `MEMO_POSTING_BYTES * 4` charge in `SegmentReader::resident_bytes()`.** It is real, and it was
+latent at the shipped 8 MiB memo (a flat 32 MiB per reader, about 256 MiB for eight, inside the 1.5 GiB pool). Raising
+the memo exposes it:
+
+| Memo per pool | Charge | Reader evictions (4,000 queries) | Memo hit rate | 1-client q/s on the shared VM |
+| --- | --- | ---: | ---: | ---: |
+| 8 MiB | flat (before) | 0 | 76.7% | about 360 to 460 |
+| 64 MiB | flat (before) | 16,087 (about 4 per query) | 4.0% | about 150 to 170 |
+| 8 MiB | actual bytes | 0 | 76.7% | about 355 to 460 |
+| 64 MiB | actual bytes | 0 | 97.6% | about 415 to 560 |
+
+At 64 MiB the flat charge is about 285 MiB per reader, so a few readers overflow the pool and every query evicts and
+reopens readers (lengths, term records, `Saturation`, and the memo all lost together). That is BW6's unexplained
+slowdown at 64 MiB.
+
+**Hypothesis 2, essential-first fetch** (partition terms before the post-`FIRST_WINDOWS` read, fetch essential blocks,
+keep windows with a row that can reach the floor, then fetch nonessential blocks for those windows only; built and run
+against the same trace, exact and bit-identical). Cold `blocks_read` with the window-bound frames and the memo disabled
+(the BW8 cold regime), 4,000 queries:
+
+| Fetch order | `blocks_read` |
+| --- | ---: |
+| All terms at once (current) | 14.64 M |
+| Essential first | 13.52 M (**-7.7%**, bar 25%) |
+
+Warm 16-client q/s with it off versus on, interleaved on the shared VM (the memo fixed): 1,481 to 1,756 versus
+1,490 to 1,641, indistinguishable. Cold reads fall only 7.7%, so most blocks are still needed (the first batch has no
+floor, and a window that survives needs every term's blocks); the extra candidate pass costs about what the skipped
+warm lookups save. This was not investigated further. **Killed: the code was removed** (the experiment is not committed).
+
+### The change
+
+`SegmentReader` no longer carries a flat memo charge. The decoded-posting memo counts its actual bytes (entries plus 200
+bytes of bookkeeping per block) and, through a hook set when the engine admits the reader, tells the decoded cache when
+that charge has moved by at least 1 MiB or an eighth (`DecodedCache::recharge`, which evicts the least recently used
+other entries if the pool is now over budget, and ignores a hook whose reader was since replaced). The engine sizes each
+of a reader's two pools (sparse and dense) at a thirty-second of the general budget, between 8 and 64 MiB: 48 MiB on a
+4 GiB decoded cache, 8 MiB on 512 MiB. The memo is thus larger than before on big hosts and no bigger on small ones.
+
+### Measurement (paired A/B/B/A, one on-demand c7g.4xlarge, Ubuntu 24.04, 1M MS MARCO, same release profile)
+
+Protocol as BW6 and BW7 (server on CPUs 0 to 5 with 2 Rayon workers, client on 14 and 15, fresh store copy per arm, two
+1-client prewarm passes, three 1-client and six 16-client passes of 1,000 queries; medians). Baseline is main at
+`13007fb`. Every reply was validated for ordered IDs and f32 score bits.
+
+| Arm | 1 client q/s | 1 client p50 / p90 ms | 16 clients q/s | 16 clients p50 / p90 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline (A1, A2) | 644 / 645 | 1.12 / 2.78 | 1,431 / 1,436 | 9.83 / 16.4 |
+| Candidate (B1, B2) | 800 / 795 | 1.05 / 1.75 | 1,978 / 1,955 | 7.11 / 12.0 |
+
+**1.37x warm q/s at 16 clients (bar 1.2x), 1.24x at one client**, with p90 down 27% (16 clients) and 37% (one client).
+
+Write-loaded, BW1's protocol (text-changing 100-row upserts at 1,000 rows/s, strong BM25 queries at 1 Hz, 120 s after a
+30 s warm-up, A/B/B/A): no regression. Query p50 / p90 ms: baseline 19.3 / 31.4 and 19.8 / 29.7, candidate 18.7 / 31.3
+and 18.5 / 30.8. Write p50 / p90 ms: baseline 4.94 / 7.90 and 5.37 / 7.96, candidate 5.02 / 7.89 and 5.04 / 7.86. All
+120,000 rows acknowledged in every arm, none rejected.
+
+### Validation
+
+`cargo fmt`, `cargo clippy -p bf-text -p bf-engine --all-targets -- -D warnings`, and `cargo test -p bf-text -p bf-engine`
+pass, with two new tests (the memo's reported charge follows growth and eviction, and `recharge` resizes one entry,
+evicts older ones, and ignores stale hooks). The frozen check, `text_benchmark::bm25_serialized_msmarco_snapshots`
+(release, ignored test), passes in 141 s: all 4,000 queries across its four snapshot states match the independent
+exhaustive scorer's ordered IDs and f32 score bits.
+
+### Not measured
+
+Cold S3 latency and cold `blocks_read` with the fix (it changes only the warm memo), resident memory of the larger memo on the fixture (it is
+charged to the 1.5 GiB general pool, and a pool that fills evicts whole readers least recently used first), and a
+sweep of other limits (64 MiB was the BW6 value; 48 MiB reached the same hit rate here).
+
+One c7g.4xlarge on-demand, about 20 minutes, about $0.25. Terminated; key pair and security group deleted. No bucket
+writes.

@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-11-25
+
+### Fixed
+
+- **Warm BM25 cache accounting (up to 1.37x faster):** Each text segment reader was charged a fixed estimate for its decoded-posting memo, four times the memo's limit, instead of the bytes it actually held. The general cache filled with charges for memory that did not exist and evicted whole readers, so the memo had to stay small. Readers are now charged what their memos hold as they grow and shrink, and memo pools are sized from the cache budget (1/32 of it, 8 to 64 MiB). On a 1M-document MS MARCO namespace, warm full-text throughput at 16 clients rose from 1,433 to 1,966 queries/s and single-client throughput from 645 to 797 queries/s, with p90 down 27 and 37 percent. Scores and order are bit-identical, and writes are not slower. No format change and no setting.
+
 ## [0.1.30] - 2026-11-25
 
 ### Changed
@@ -239,7 +245,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.30...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.31...HEAD
+[0.1.31]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.31
 [0.1.30]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.30
 [0.1.29]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.29
 [0.1.28]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.28

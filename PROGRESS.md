@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **BW9 honest BM25 memo accounting (merged).** `resident_bytes()` charged a flat `MEMO_POSTING_BYTES * 4` per reader; now `DecodedCache::recharge` charges actual memo bytes, and memo pools are 1/32 of the general budget (8-64 MiB). At a 64 MiB memo the old charge caused 16,087 reader evictions per 4,000 queries (memo hit 4%); now 0 (hit 97.6%). Warm 1M MS MARCO, c7g.4xlarge A/B/B/A: 16 clients 1,433 -> 1,966 q/s (1.37x), 1 client 645 -> 797 (1.24x), p90 -27%/-37%. Bit-identical; writes not slower. Essential-first decode killed (cold blocks_read -7.7%).
+
 - **W4 ingest (merged).** Exact BF16 matrix screening in segment-build k-means (byte-identical blobs; build 2.2x at 100K), WAL encoding 2 (lossless f16 packing for f16 vectors; WAL bytes -29%, compress 316 -> 65 ms per group), and vector normalization without a JSON number per element (100 -> 41 ms per group). Full NQ load on one c7gd.2xlarge: 17,357 -> 24,489 rows/s (1.41x), write p90 1,150 -> 892 ms, server CPU 724 -> 338 CPU-s, zero backpressure retries. Bucket format 5 (fenced; one-way per SPEC 25).
 
 - **C9 packed staging companions (merged).** One local pack per tier for docs directories and row-to-ID maps, identity-checked whole-object GETs, and two-phase publication (codes first). 100M: codes usable 154.5 -> 79.1 s, fully ready 88.5 s (78-97 s run to run), staged descriptors 4,217 -> 325. Live queries during staging equal; identical results. Steady p50 10M +1.1%, 100M +3.2% (edge of noise, one repetition).

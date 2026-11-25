@@ -389,6 +389,46 @@ impl DecodedCache {
     fn insert<T: Any + Send + Sync>(&self, key: &str, bytes: u64, value: Arc<T>) {
         self.install(key, bytes, value, false);
     }
+    /// Change the charge of the cached value `ptr` (the address `Arc::as_ptr` gave when it was
+    /// admitted) under `key` to `bytes`, evicting the least recently used other entries if the
+    /// total now exceeds the budget. Does nothing if the key holds a different value or none, and
+    /// leaves the charge alone if `bytes` alone cannot fit.
+    pub(crate) fn recharge<T: Any + Send + Sync>(&self, key: &str, ptr: usize, bytes: u64) {
+        if bytes > self.budget {
+            return;
+        }
+        let key = (TypeId::of::<T>(), self.key(key));
+        let mut retired = Vec::new();
+        let mut entries = self.entries.lock().expect("decoded cache lock");
+        entries.clock += 1;
+        let used = entries.clock;
+        let Some(entry) = entries.values.get_mut(&key) else {
+            return;
+        };
+        if Arc::as_ptr(&entry.value) as *const () as usize != ptr {
+            return;
+        }
+        let old = std::mem::replace(&mut entry.bytes, bytes);
+        entry.used = used;
+        entries.bytes = entries.bytes - old + bytes;
+        while entries.bytes > self.budget {
+            let Some(oldest) = entries
+                .values
+                .iter()
+                .filter(|(k, _)| **k != key)
+                .min_by_key(|(_, v)| v.used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            let old = entries.values.remove(&oldest).expect("LRU entry");
+            entries.bytes -= old.bytes;
+            retired.push(old);
+        }
+        drop(entries);
+        // Large values drop outside the lock, as in `install`.
+        drop(retired);
+    }
     fn install<T: Any + Send + Sync>(
         &self,
         key: &str,
@@ -579,6 +619,30 @@ pub(crate) fn insert_predicate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recharge_resizes_one_entry_and_evicts_the_oldest_others() {
+        // The general pool is a little over a third of 800 bytes.
+        let cache = DecodedCache::new(800, 1);
+        let budget = cache.budget;
+        assert!((300..310).contains(&budget));
+        let old = cache.install("old", 100, Arc::new(1u64), false);
+        let grown = cache.install("grown", 100, Arc::new(2u64), false);
+        let ptr = Arc::as_ptr(&grown) as *const () as usize;
+        // A stale pointer changes nothing.
+        cache.recharge::<u64>("grown", ptr + 8, 250);
+        assert_eq!(cache.entries.lock().unwrap().bytes, 200);
+        // Growing to 250 bytes evicts the older entry but never the grown one.
+        cache.recharge::<u64>("grown", ptr, 250);
+        assert!(cache.get::<u64>("old").is_none());
+        assert_eq!(*cache.get::<u64>("grown").unwrap(), 2);
+        assert_eq!(cache.entries.lock().unwrap().bytes, 250);
+        // Shrinking releases the charge; a charge that cannot fit at all is ignored.
+        cache.recharge::<u64>("grown", ptr, 40);
+        assert_eq!(cache.entries.lock().unwrap().bytes, 40);
+        cache.recharge::<u64>("grown", ptr, budget + 1);
+        assert_eq!(cache.entries.lock().unwrap().bytes, 40);
+        drop(old);
+    }
     #[test]
     fn atomic_resident_admission_shares_one_bounded_generation() {
         let cache = Arc::new(DecodedCache::new(192, 1));
