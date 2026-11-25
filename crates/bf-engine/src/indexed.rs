@@ -355,7 +355,20 @@ async fn prepare(
     let mut base = state.without_docs();
     base.segments.clear();
     let base = std::sync::Arc::new(base);
-    let parts = futures::stream::iter(state.segments.iter().cloned().map(|segment| {
+    // A lone BM25 query uses two balanced jobs rather than handing every segment
+    // to the blocking pool. Each job retains async I/O and shares the score floor.
+    // Busy queries take prepare_one above, without a scheduling hop per segment.
+    let text_workers = threshold.as_ref().map(|_| {
+        crate::query_worker::workers()
+            .current_num_threads()
+            .min(2)
+            .min(config.search_concurrency.max(1))
+    });
+    let groups = segment_groups(
+        &state.segments,
+        text_workers.unwrap_or(state.segments.len()),
+    );
+    let parts = futures::stream::iter(groups.into_iter().map(|segments| {
         let context = context.clone();
         let store = store.clone();
         let config = config.clone();
@@ -370,12 +383,11 @@ async fn prepare(
                 .acquire_owned()
                 .await
                 .map_err(segment::index_error)?;
-            let runtime = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
+            let work = async move {
                 let _permit = permit;
                 let mut state = (*base).clone();
-                state.segments.push(segment);
-                runtime.block_on(crate::read_cache::scope(
+                state.segments = segments.into();
+                crate::read_cache::scope(
                     context,
                     prepare_one(
                         &store,
@@ -386,10 +398,14 @@ async fn prepare(
                         narrow_columns,
                         threshold.as_deref(),
                     ),
-                ))
-            })
-            .await
-            .map_err(segment::index_error)?
+                )
+                .await
+            };
+            if text_workers.is_some() {
+                crate::query_worker::run(work, false).await?
+            } else {
+                crate::query_worker::run_io(tokio::runtime::Handle::current(), work).await?
+            }
         }
     }))
     .buffer_unordered(config.search_concurrency.max(1));
@@ -421,6 +437,24 @@ async fn prepare(
     trim_candidates(&mut out, q);
     Ok(out)
 }
+
+/// Keep original order within each job, balancing the immutable row counts.
+fn segment_groups(segments: &[bf_wal::Segment], workers: usize) -> Vec<Vec<bf_wal::Segment>> {
+    let mut groups = vec![Vec::new(); workers.max(1).min(segments.len())];
+    let mut rows = vec![0u64; groups.len()];
+    for segment in segments {
+        let next = rows
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, rows)| *rows)
+            .unwrap()
+            .0;
+        rows[next] += u64::from(segment.row_count);
+        groups[next].push(segment.clone());
+    }
+    groups
+}
+
 fn projection_columns(
     state: &NamespaceState,
     q: &QueryRequest,
@@ -1119,5 +1153,88 @@ mod rank_key_tests {
             .collect();
         assert_eq!(keys.len(), shapes.len());
         assert_eq!(rank_key(&rank.clone()), key);
+    }
+}
+
+#[cfg(test)]
+mod parallel_text_tests {
+    use super::*;
+    use crate::Engine;
+    use serde_json::json;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grouped_bm25_matches_reference_with_ties_masks_and_tail() {
+        let storage = Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            storage,
+            EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.0,
+                max_segment_rows: 100,
+                ..Default::default()
+            },
+        );
+        engine.write("groups", serde_json::from_value(json!({
+            "schema":{"text":{"type":"string","full_text_search":true}},
+            "upsert_rows":(0..800).map(|id|json!({"id":id,"group":id%3,
+                "text":if id%7==0 {"red red blue prefix"}else{"red blue"}})).collect::<Vec<_>>()
+        })).unwrap()).await.unwrap();
+        engine.index_namespace("groups", true).await.unwrap();
+        let (state, _) = engine
+            .snapshot("groups", &Consistency::Strong)
+            .await
+            .unwrap();
+        assert!(state.segments.len() > 2);
+        for phase in 0..3 {
+            if phase == 1 {
+                engine.write("groups", serde_json::from_value(json!({
+                    "upsert_rows":[{"id":0,"group":1,"text":"blue"},{"id":900,"group":1,"text":"red red red"}],
+                    "deletes":[7,14,21]
+                })).unwrap()).await.unwrap();
+            } else if phase == 2 {
+                engine.index_namespace("groups", true).await.unwrap();
+            }
+            for rank in [
+                json!(["text", "BM25", "red blue red"]),
+                json!(["text","BM25","pre",{"last_as_prefix":true}]),
+            ] {
+                for filter in [None, Some(json!(["group", "Eq", 1]))] {
+                    let mut body =
+                        json!({"rank_by":rank,"top_k":10,"offset":3,"include_attributes":["id"]});
+                    if let Some(filter) = filter {
+                        body["filters"] = filter;
+                    }
+                    let request: QueryRequest = serde_json::from_value(body).unwrap();
+                    let expected = serde_json::to_value(
+                        engine
+                            .query_exhaustive("groups", request.clone())
+                            .await
+                            .unwrap()
+                            .result,
+                    )
+                    .unwrap();
+                    // Exercise one query and a saturated batch against the same immutable
+                    // snapshot. Prefix ties, WAL shadows, and publication must be identical.
+                    for clients in [1, 16] {
+                        let results = futures::future::join_all(
+                            (0..clients).map(|_| engine.query("groups", request.clone())),
+                        )
+                        .await;
+                        for result in results {
+                            assert_eq!(
+                                serde_json::to_value(result.unwrap().result).unwrap(),
+                                expected,
+                                "phase={phase} clients={clients}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
