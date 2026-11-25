@@ -1100,6 +1100,16 @@ impl<R: RangeRead> Index<R> {
         self.rerank_recorded(query, k, locations, recorder).await
     }
 
+    /// Present row IDs in ascending order. A partial index includes only installed leaves.
+    /// Tier vector locators retain this four-byte-per-row address list without vector payloads.
+    pub fn row_ids(&self) -> Vec<u32> {
+        let mut rows = RoaringBitmap::new();
+        for cluster in &self.metadata.clusters {
+            rows |= &cluster.rows;
+        }
+        rows.iter().collect()
+    }
+
     /// Every `(cluster, ordinal)` location whose row passes `filter`.
     pub fn locations(&self, filter: Option<&RoaringBitmap>) -> Vec<(u32, u32)> {
         let mut out = Vec::new();

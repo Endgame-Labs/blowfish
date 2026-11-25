@@ -1402,7 +1402,7 @@ pub(crate) async fn projected_rows_with(
         if columns.is_some_and(|c| !c.contains(name)) {
             continue;
         }
-        let (present, packed) = read_ann_packed(store, segment, rows, name, bypass).await?;
+        let (present, packed) = read_own_ann_packed(store, segment, rows, name, bypass).await?;
         let dtype = if i8 {
             bf_vector::VectorType::I8
         } else if f16 {
@@ -1507,7 +1507,7 @@ pub(crate) async fn read_packed(
     rows: &RoaringBitmap,
     attribute: &str,
 ) -> Result<(Vec<u32>, Vec<u8>), ApiError> {
-    read_ann_packed(store, segment, rows, attribute, true).await
+    read_own_ann_packed(store, segment, rows, attribute, true).await
 }
 
 /// Resident ANN metadata for projection and vector-width accounting. No vector payload is read.
@@ -1546,7 +1546,7 @@ pub(crate) async fn projection_directory(
     Ok(dir)
 }
 
-async fn read_ann_packed(
+pub(crate) async fn read_own_ann_packed(
     store: &Storage,
     segment: &Segment,
     rows: &RoaringBitmap,

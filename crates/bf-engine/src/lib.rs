@@ -42,6 +42,7 @@ mod text;
 mod text_keys;
 mod text_tail;
 mod upgrade;
+mod vector_locator;
 mod warm_ann;
 mod write;
 

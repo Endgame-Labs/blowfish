@@ -36,7 +36,6 @@ impl Map {
         self.to.select((self.from.rank(row) - 1) as u32)
     }
     /// The source row a target row came from, if it came from this source.
-    #[allow(dead_code)] // Used once segments drop their own ANN objects (D4).
     pub fn back(&self, row: u32) -> Option<u32> {
         if !self.to.contains(row) {
             return None;
