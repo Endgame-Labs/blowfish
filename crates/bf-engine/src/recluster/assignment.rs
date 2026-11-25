@@ -74,22 +74,37 @@ impl<'a> Scorer<'a> {
         )
     }
 
+    #[cfg(test)]
     pub fn nearest(&self, blocks: &[Block]) -> Vec<u32> {
+        self.nearest_rounded(blocks, None)
+    }
+
+    pub fn nearest_rounded(
+        &self,
+        blocks: &[Block],
+        supplied: Option<bf_vector::Bf16DotRows>,
+    ) -> Vec<u32> {
         // Keep the original four-row blocks and their candidate unions intact. Only schedule
         // their matrix work together, so the same center block serves many nearby rows.
-        let rounded = self.reduced.then(|| {
-            let refs: Vec<_> = blocks
-                .iter()
-                .flat_map(|b| b.rows.iter().map(Vec::as_slice))
-                .collect();
-            bf_vector::Bf16DotRows::new(&refs)
-        });
+        let rounded = if self.reduced {
+            Some(supplied.unwrap_or_else(|| {
+                let refs: Vec<_> = blocks
+                    .iter()
+                    .flat_map(|b| b.rows.iter().map(Vec::as_slice))
+                    .collect();
+                bf_vector::Bf16DotRows::new(&refs)
+            }))
+        } else {
+            None
+        };
         let mut visits: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (b, block) in blocks.iter().enumerate() {
             for key in &block.wanted {
                 visits.entry(*key).or_default().push(b);
             }
         }
+        let mut errors = self.screening_errors(blocks, rounded.as_ref());
+        let mut minima = vec![f32::INFINITY; blocks.len() * 4];
         let mut scores = vec![Vec::<(f32, u32)>::new(); blocks.len() * 4];
         for (key, visiting) in visits {
             let (ids, packed) = &self.groups[&key];
@@ -126,12 +141,30 @@ impl<'a> Scorer<'a> {
             let mut at = 0;
             for b in visiting {
                 for r in 0..blocks[b].rows.len() {
-                    scores[b * 4 + r].extend(
-                        distances[at..at + ids.len()]
-                            .iter()
-                            .copied()
-                            .zip(ids.iter().copied()),
-                    );
+                    let position = b * 4 + r;
+                    let row = &distances[at..at + ids.len()];
+                    if errors[position].is_finite() {
+                        if row.iter().any(|d| !d.is_finite()) {
+                            errors[position] = f64::INFINITY;
+                            scores[position].clear();
+                        } else {
+                            let minimum = row.iter().copied().fold(minima[position], f32::min);
+                            let tightened = minimum < minima[position];
+                            minima[position] = minimum;
+                            let threshold = f64::from(minimum) + 2. * errors[position];
+                            // The eventual global minimum can only decrease. Anything
+                            // outside its current interval cannot survive the final one.
+                            if tightened {
+                                scores[position].retain(|(d, _)| f64::from(*d) <= threshold);
+                            }
+                            scores[position].extend(
+                                row.iter()
+                                    .copied()
+                                    .zip(ids.iter().copied())
+                                    .filter(|(d, _)| f64::from(*d) <= threshold),
+                            );
+                        }
+                    }
                     at += ids.len();
                 }
             }
@@ -139,71 +172,23 @@ impl<'a> Scorer<'a> {
         let mut out = Vec::with_capacity(blocks.len() * 4);
         for (b, block) in blocks.iter().enumerate() {
             let refs: Vec<_> = block.rows.iter().map(Vec::as_slice).collect();
-            let dims = refs[0].len();
-            let ne = (dims as f64 + 32.) * f64::from(f32::EPSILON);
-            // Both dot-product implementations accumulate at most `dims` products. Their
-            // roundoff is bounded by gamma(dims) times sum(abs(products)), itself bounded by
-            // the product of L2 norms. The extra factor covers both kernels, rounded norms,
-            // distance arithmetic, and gradual underflow. Unsafe scales use the reference path.
-            let gamma = ne / (1. - ne);
-            let max_norm = block
-                .wanted
-                .iter()
-                .flat_map(|key| self.groups[key].0.iter())
-                .map(|l| self.norms[*l as usize])
-                .fold(0f32, f32::max);
-            let (max_center_norm, max_center_error) =
-                block
-                    .wanted
-                    .iter()
-                    .fold((0f64, 0f64), |(norm, error), key| {
-                        match &self.groups[key].1 {
-                            Matrix::Full(_) => (norm, error),
-                            Matrix::Reduced(p) => {
-                                (norm.max(p.max_norm_upper()), error.max(p.max_error_upper()))
-                            }
-                        }
-                    });
-            let mut thresholds = [f64::INFINITY; 4];
+            let mut best = [(f32::INFINITY, u32::MAX); 4];
+            let mut candidates = Vec::new();
             for r in 0..refs.len() {
-                let row = &scores[b * 4 + r];
-                if ne < 0.01
-                    && block.norms[r].is_finite()
-                    && max_norm.is_finite()
-                    && block.norms[r] >= 0.
-                    && max_norm >= 0.
-                    // Leave headroom for both dot accumulators and the final distance sum.
-                    && block.norms[r] <= f32::MAX / 16.
-                    && max_norm <= f32::MAX / 16.
-                    && row.iter().all(|(d, _)| d.is_finite())
-                {
-                    let minimum = row.iter().map(|(d, _)| *d).fold(f32::INFINITY, f32::min);
-                    let mut error = 4. * gamma * (f64::from(block.norms[r]) + f64::from(max_norm))
-                        + (dims as f64 + 32.) * f64::from(f32::MIN_POSITIVE);
-                    if let Some(rounded) = &rounded {
-                        let row = b * 4 + r;
-                        // Cauchy-Schwarz bounds the change in a dot product by
-                        // ||delta_row|| ||center|| + ||row|| ||delta_center||
-                        // + ||delta_row|| ||delta_center||. Squared distances use twice it.
-                        error += 2.
-                            * (rounded.error_upper(row) * max_center_norm
-                                + rounded.norm_upper(row) * max_center_error
-                                + rounded.error_upper(row) * max_center_error);
-                    }
-                    if error.is_finite() {
-                        thresholds[r] = f64::from(minimum) + 2. * error;
-                    }
+                if errors[b * 4 + r].is_finite() {
+                    candidates.extend(scores[b * 4 + r].iter().map(|(_, l)| *l));
+                } else {
+                    // A nonfinite matrix result or an unsafe scale means no screening.
+                    // Membership already describes every reference candidate; its score
+                    // need not be retained to recover the complete original union.
+                    candidates.extend(
+                        block
+                            .wanted
+                            .iter()
+                            .flat_map(|key| self.groups[key].0.iter().copied()),
+                    );
                 }
             }
-            let mut best = [(f32::INFINITY, u32::MAX); 4];
-            let mut candidates: Vec<u32> = (0..refs.len())
-                .flat_map(|r| {
-                    scores[b * 4 + r]
-                        .iter()
-                        .filter(move |(d, _)| f64::from(*d) <= thresholds[r] || !d.is_finite())
-                        .map(|(_, l)| *l)
-                })
-                .collect();
             candidates.sort_unstable();
             candidates.dedup();
             self.exact_evals.fetch_add(
@@ -228,6 +213,70 @@ impl<'a> Scorer<'a> {
             out.extend(best[..refs.len()].iter().map(|(_, l)| *l));
         }
         out
+    }
+    /// Keep the existing whole-block certification bound. It is independent of matrix
+    /// scores, so it can screen each group before the next group is materialized.
+    fn screening_errors(
+        &self,
+        blocks: &[Block],
+        rounded: Option<&bf_vector::Bf16DotRows>,
+    ) -> Vec<f64> {
+        let mut errors = vec![f64::INFINITY; blocks.len() * 4];
+        for (b, block) in blocks.iter().enumerate() {
+            let dims = block.rows[0].len();
+            let ne = (dims as f64 + 32.) * f64::from(f32::EPSILON);
+            // Both dot-product implementations accumulate at most `dims` products. Their
+            // roundoff is bounded by gamma(dims) times sum(abs(products)), itself bounded by
+            // the product of L2 norms. The extra factor covers both kernels, rounded norms,
+            // distance arithmetic, and gradual underflow. Unsafe scales use the reference path.
+            let gamma = ne / (1. - ne);
+            let max_norm = block
+                .wanted
+                .iter()
+                .flat_map(|key| self.groups[key].0.iter())
+                .map(|l| self.norms[*l as usize])
+                .fold(0f32, f32::max);
+            let (max_center_norm, max_center_error) =
+                block
+                    .wanted
+                    .iter()
+                    .fold((0f64, 0f64), |(norm, error), key| {
+                        match &self.groups[key].1 {
+                            Matrix::Full(_) => (norm, error),
+                            Matrix::Reduced(p) => {
+                                (norm.max(p.max_norm_upper()), error.max(p.max_error_upper()))
+                            }
+                        }
+                    });
+            for r in 0..block.rows.len() {
+                if ne < 0.01
+                    && block.norms[r].is_finite()
+                    && max_norm.is_finite()
+                    && block.norms[r] >= 0.
+                    && max_norm >= 0.
+                    // Leave headroom for both dot accumulators and the final distance sum.
+                    && block.norms[r] <= f32::MAX / 16.
+                    && max_norm <= f32::MAX / 16.
+                {
+                    let mut error = 4. * gamma * (f64::from(block.norms[r]) + f64::from(max_norm))
+                        + (dims as f64 + 32.) * f64::from(f32::MIN_POSITIVE);
+                    if let Some(rounded) = rounded {
+                        let row = b * 4 + r;
+                        // Cauchy-Schwarz bounds the change in a dot product by
+                        // ||delta_row|| ||center|| + ||row|| ||delta_center||
+                        // + ||delta_row|| ||delta_center||. Squared distances use twice it.
+                        error += 2.
+                            * (rounded.error_upper(row) * max_center_norm
+                                + rounded.norm_upper(row) * max_center_error
+                                + rounded.error_upper(row) * max_center_error);
+                    }
+                    if error.is_finite() {
+                        errors[b * 4 + r] = error;
+                    }
+                }
+            }
+        }
+        errors
     }
 }
 
