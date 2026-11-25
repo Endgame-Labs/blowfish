@@ -97,6 +97,7 @@ impl Counting {
 struct ReadRounds {
     batches: Vec<(usize, tokio::sync::Barrier)>,
     issued: AtomicUsize,
+    release: tokio::sync::watch::Sender<bool>,
 }
 impl ReadRounds {
     fn new(sizes: &[usize]) -> Self {
@@ -111,6 +112,19 @@ impl ReadRounds {
                 })
                 .collect(),
             issued: AtomicUsize::new(0),
+            release: tokio::sync::watch::channel(false).0,
+        }
+    }
+    /// Release blocked workers before reporting a failed query or watchdog. Query plans can
+    /// run in blocking-pool continuations, which runtime shutdown otherwise waits for forever.
+    fn release(&self) {
+        self.release.send_replace(true);
+    }
+    async fn hold(&self, gate: &tokio::sync::Barrier) {
+        let mut released = self.release.subscribe();
+        tokio::select! {
+            _ = released.wait_for(|released| *released) => {},
+            _ = gate.wait() => {},
         }
     }
     fn issue(&self) -> (usize, &tokio::sync::Barrier) {
@@ -138,16 +152,29 @@ async fn explicit_read_rounds_hold_every_response_until_the_batch_is_issued() {
     let rounds = ReadRounds::new(&[2, 1]);
     let (wave, first) = rounds.issue();
     assert_eq!(wave, 1);
-    let mut held = Box::pin(first.wait());
+    let mut held = Box::pin(rounds.hold(first));
     assert!(held.as_mut().now_or_never().is_none());
     let (wave, second) = rounds.issue();
     assert_eq!(wave, 1);
-    second.wait().await;
+    rounds.hold(second).await;
     held.await;
     let (wave, third) = rounds.issue();
     assert_eq!(wave, 2);
-    third.wait().await;
+    rounds.hold(third).await;
     rounds.assert_finished();
+
+    // A changed plan may never issue the missing peer. Releasing it must also work when
+    // the worker subscribes after the watchdog has fired.
+    let rounds = ReadRounds::new(&[2]);
+    let (_, gate) = rounds.issue();
+    let mut held = Box::pin(rounds.hold(gate));
+    assert!(held.as_mut().now_or_never().is_none());
+    rounds.release();
+    held.await;
+    let rounds = ReadRounds::new(&[2]);
+    rounds.release();
+    let (_, gate) = rounds.issue();
+    assert!(rounds.hold(gate).now_or_never().is_some());
 }
 
 struct Active<'a>(&'a AtomicUsize);
@@ -220,8 +247,8 @@ impl ObjectStore for Counting {
             .map_or_else(|| self.wave(), |(wave, _)| *wave);
         self.waves.fetch_max(wave, Ordering::SeqCst);
         let _active = Active(&self.active);
-        if let Some((_, gate)) = gated {
-            gate.wait().await;
+        if let (Some(rounds), Some((_, gate))) = (&rounds, gated) {
+            rounds.hold(gate).await;
         } else if self.delay.load(Ordering::SeqCst) {
             self.hold(wave).await;
         }
@@ -799,11 +826,13 @@ async fn cold_ann_over_twenty_segments_uses_the_directory() {
             Duration::from_secs(120),
             engine.query("many", query(ids_only)),
         )
-        .await
-        .expect("cold query could not issue a complete read round")
-        .unwrap();
-        rounds.assert_finished();
+        .await;
+        rounds.release();
         *backend.read_rounds.lock().unwrap() = None;
+        let cold = cold
+            .expect("cold query could not issue a complete read round")
+            .unwrap();
+        rounds.assert_finished();
         let rows = cold.result.rows.as_ref().unwrap();
         assert_eq!(rows.len(), 10);
         assert_eq!(rows[0]["id"], 777);
