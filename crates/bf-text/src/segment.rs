@@ -149,6 +149,14 @@ impl From<Vec<(u32, u32)>> for Postings {
 struct DenseFrequencies {
     values: Box<[u8]>,
     overflow: Box<[(u32, u32)]>,
+    /// Per window, the Pareto frontier of its rows' (tf, length) pairs: no other row has both a
+    /// frequency at least as high and a length at least as short. BM25's saturation factor is
+    /// monotone in both, so a window's exact maximum is the maximum over its frontier. This keeps
+    /// the bounds exact while making a recompute (when corpus statistics change, as they do on
+    /// every write) cost a few points per window instead of every row. Window `w` owns
+    /// `frontier[frontier_start[w]..frontier_start[w + 1]]`.
+    frontier_start: Box<[u32]>,
+    frontier: Box<[(u32, u32)]>,
     bounds: std::sync::Mutex<Option<DenseBounds>>,
 }
 struct DenseBounds {
@@ -169,7 +177,8 @@ struct DenseSelection {
 impl DenseFrequencies {
     /// Bytes an array for `docs` rows takes before any overflow entries.
     fn reserve(docs: usize) -> usize {
-        docs + std::mem::size_of::<Self>() + 128 + docs.div_ceil(BLOCK) * 4
+        // Bounds plus an allowance of four frontier points per window.
+        docs + std::mem::size_of::<Self>() + 128 + docs.div_ceil(BLOCK) * (4 + 4 + 4 * 8)
     }
     fn get(&self, row: u32) -> u32 {
         let tf = self.values[row as usize];
@@ -189,8 +198,37 @@ impl DenseFrequencies {
             + std::mem::size_of::<Self>()
             + 128
             + self.values.len().div_ceil(BLOCK) * 4
+            + self.frontier_start.len() * 4
+            + self.frontier.len() * 8
     }
-    fn bounds(&self, saturation: &Arc<Saturation>, lengths: &[u32]) -> Arc<[f32]> {
+    /// Build the per-window frontiers of already-filled values and overflow.
+    fn frontiers(&mut self, lengths: &[u32]) {
+        let mut start = Vec::with_capacity(self.values.len().div_ceil(BLOCK) + 1);
+        let mut points = Vec::new();
+        let mut window = Vec::with_capacity(BLOCK);
+        for (w, rows) in self.values.chunks(BLOCK).enumerate() {
+            start.push(points.len() as u32);
+            window.clear();
+            for (i, &tf) in rows.iter().enumerate() {
+                if tf != 0 {
+                    let row = w * BLOCK + i;
+                    window.push((self.get(row as u32), lengths[row]));
+                }
+            }
+            window.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let mut shortest = u32::MAX;
+            for &(tf, length) in &window {
+                if length < shortest {
+                    shortest = length;
+                    points.push((tf, length));
+                }
+            }
+        }
+        start.push(points.len() as u32);
+        self.frontier_start = start.into();
+        self.frontier = points.into();
+    }
+    fn bounds(&self, saturation: &Arc<Saturation>) -> Arc<[f32]> {
         let mut memo = self.bounds.lock().unwrap();
         if let Some(bounds) = &*memo
             && bounds.saturation.ptr_eq(&Arc::downgrade(saturation))
@@ -198,12 +236,13 @@ impl DenseFrequencies {
             return bounds.values.clone();
         }
         let mut values = vec![-1.0f32; self.values.len().div_ceil(BLOCK)];
-        for (row, &tf) in self.values.iter().enumerate() {
-            if tf != 0 {
+        for (w, value) in values.iter_mut().enumerate() {
+            let points = &self.frontier
+                [self.frontier_start[w] as usize..self.frontier_start[w + 1] as usize];
+            for &(tf, length) in points {
                 // Round upward when narrowing, preserving the exact upper bound.
-                let factor = saturation.factor(self.get(row as u32), lengths[row]);
-                let bound = (factor as f32).next_up();
-                values[row / BLOCK] = values[row / BLOCK].max(bound);
+                let bound = (saturation.factor(tf, length) as f32).next_up();
+                *value = value.max(bound);
             }
         }
         let values: Arc<[f32]> = values.into();
@@ -1706,11 +1745,15 @@ impl SegmentReader {
         for (block, raw) in missing.into_iter().zip(raws) {
             fill(&mut self.decode_posting_entries(block, &raw)?.into_iter());
         }
-        Ok(DenseFrequencies {
+        let mut dense = DenseFrequencies {
             values: values.into(),
             overflow: overflow.into(),
+            frontier_start: Default::default(),
+            frontier: Default::default(),
             bounds: Default::default(),
-        })
+        };
+        dense.frontiers(self.lens());
+        Ok(dense)
     }
 
     /// Bound each decoded-posting pool (sparse and dense) to `limit` bytes, and report the memo's
@@ -2469,7 +2512,7 @@ impl SegmentReader {
         for term in &mut terms {
             let mut best = crate::scratch::Windows::take(windows);
             if let Some(dense) = &term.dense {
-                let normalized = dense.bounds(&saturation, lengths);
+                let normalized = dense.bounds(&saturation);
                 for (w, &maximum) in normalized.iter().enumerate() {
                     if maximum >= 0.0 {
                         best[w] = f64::from(
