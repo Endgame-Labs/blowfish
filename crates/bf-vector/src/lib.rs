@@ -11,6 +11,7 @@ mod distance;
 mod fastscan;
 mod format;
 mod index;
+mod nearest;
 mod policy;
 mod reader;
 pub use policy::tier_probe_budget;

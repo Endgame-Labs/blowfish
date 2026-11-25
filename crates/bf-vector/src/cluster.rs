@@ -259,9 +259,17 @@ impl IndexBuilder {
         let samples: Vec<&[f32]> = prepared.iter().map(|v| v.as_slice()).collect();
         if data.len() < self.params.two_level_threshold || k < 16 {
             let centers = train(&samples, k, self.params.iterations, &mut rng);
-            let assignments = (0..data.len())
+            let index = crate::nearest::NearestCenters::new(&centers);
+            let assignments = (0..data.len().div_ceil(ASSIGN_ROWS))
                 .into_par_iter()
-                .map(|i| nearest(&data.prepared(i), &centers))
+                .flat_map_iter(|chunk| {
+                    let rows: Vec<Vec<f32>> = (chunk * ASSIGN_ROWS
+                        ..((chunk + 1) * ASSIGN_ROWS).min(data.len()))
+                        .map(|i| data.prepared(i))
+                        .collect();
+                    let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+                    index.nearest_batch(&refs)
+                })
                 .collect();
             return Ok((centers, vec![], vec![u32::MAX; k], assignments));
         }
@@ -420,6 +428,17 @@ pub(crate) fn prepare(v: &[f32], metric: Metric) -> Vec<f32> {
     v.iter().map(|x| (*x as f64 / norm) as f32).collect()
 }
 
+/// Rows prepared and assigned together on one thread.
+const ASSIGN_ROWS: usize = 256;
+
+/// The nearest center of every row, in parallel, identical to calling [`nearest`] on each row.
+fn nearest_all(data: &[&[f32]], centers: &[Vec<f32>]) -> Vec<usize> {
+    let index = crate::nearest::NearestCenters::new(centers);
+    data.par_chunks(ASSIGN_ROWS)
+        .flat_map_iter(|rows| index.nearest_batch(rows))
+        .collect()
+}
+
 pub(crate) fn nearest(v: &[f32], centers: &[Vec<f32>]) -> usize {
     centers
         .iter()
@@ -439,7 +458,7 @@ fn train(data: &[&[f32]], k: usize, iterations: usize, rng: &mut Rng) -> Vec<Vec
     }
     let mut centers: Vec<_> = ids[..k].iter().map(|i| data[*i].to_vec()).collect();
     for _ in 0..iterations {
-        let assignments: Vec<_> = data.par_iter().map(|v| nearest(v, &centers)).collect();
+        let assignments = nearest_all(data, &centers);
         // Fixed-order accumulation makes the blob independent of rayon scheduling.
         let mut sums = vec![vec![0f64; dims]; k];
         let mut counts = vec![0usize; k];
