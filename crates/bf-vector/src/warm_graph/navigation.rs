@@ -73,13 +73,25 @@ impl Scratch {
             beam: Vec::new(),
         }
     }
+    #[cfg(test)]
     pub fn search(
         &mut self,
         links: &[[u32; 34]],
         degrees: &[u8],
         entry: u32,
         ef: usize,
+        score: impl FnMut(u32) -> f32,
+    ) -> (Vec<Hit>, usize) {
+        self.search_prefetched(links, degrees, entry, ef, score, |_| {})
+    }
+    pub fn search_prefetched(
+        &mut self,
+        links: &[[u32; 34]],
+        degrees: &[u8],
+        entry: u32,
+        ef: usize,
         mut score: impl FnMut(u32) -> f32,
+        mut prefetch: impl FnMut(u32),
     ) -> (Vec<Hit>, usize) {
         self.visited.begin();
         self.beam.clear();
@@ -103,9 +115,23 @@ impl Scratch {
             let current = self.beam[next].hit;
             self.beam[next].expanded = true;
             next += 1;
+            // Every unseen neighbor is scored before selecting another expansion. Collecting
+            // that same ordered batch lets two future code rows arrive while scoring this one.
+            let mut pending = [0u32; 34];
+            let mut count = 0;
             for &id in &links[current.id as usize][..degrees[current.id as usize] as usize] {
-                if !self.visited.insert(id) {
-                    continue;
+                if self.visited.insert(id) {
+                    pending[count] = id;
+                    count += 1;
+                }
+            }
+            let pending = &pending[..count];
+            for &id in pending.iter().take(2) {
+                prefetch(id);
+            }
+            for (position, &id) in pending.iter().enumerate() {
+                if let Some(&next) = pending.get(position + 2) {
+                    prefetch(next);
                 }
                 let hit = Hit {
                     id,
@@ -236,16 +262,24 @@ mod tests {
             let mut reference = Reference::new(n);
             for pass in 0..260 {
                 let entry = (pass * 97 % n) as u32;
-                let (mut va, mut vb) = (Vec::new(), Vec::new());
-                let a = actual.search(&links, &degrees, entry, ef, |id| {
-                    va.push(id);
-                    distances[id as usize]
-                });
+                let (mut va, mut vb, mut prefetched) = (Vec::new(), Vec::new(), Vec::new());
+                let a = actual.search_prefetched(
+                    &links,
+                    &degrees,
+                    entry,
+                    ef,
+                    |id| {
+                        va.push(id);
+                        distances[id as usize]
+                    },
+                    |id| prefetched.push(id),
+                );
                 let b = reference.search(&links, &degrees, entry, ef, |id| {
                     vb.push(id);
                     distances[id as usize]
                 });
                 assert_eq!(va, vb, "ef={ef}, pass={pass}");
+                assert_eq!(prefetched, va[1..], "no unused code row is prefetched");
                 assert_eq!(a.1, b.1);
                 assert_eq!(a.0, b.0);
             }

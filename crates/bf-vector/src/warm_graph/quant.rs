@@ -69,7 +69,33 @@ pub(super) fn encode(row: &[f64]) -> (Vec<i8>, f32) {
         scale as f32,
     )
 }
+fn prefetch_row(row: &[i8]) {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    for offset in
+        (0..row.len()).step_by(if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            128
+        } else {
+            64
+        })
+    {
+        // SAFETY: each address belongs to this immutable code row. These nonfaulting hints
+        // do not dereference a value or change the integer dot product.
+        unsafe {
+            let address = row.as_ptr().add(offset);
+            #[cfg(target_arch = "aarch64")]
+            std::arch::asm!("prfm pldl1keep, [{address}]", address = in(reg) address, options(readonly, nostack, preserves_flags));
+            #[cfg(target_arch = "x86_64")]
+            std::arch::x86_64::_mm_prefetch(address.cast(), std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = row;
+}
 impl Codes {
+    pub fn prefetch(&self, id: u32) {
+        let start = id as usize * self.dims;
+        prefetch_row(&self.values[start..start + self.dims]);
+    }
     pub fn between(&self, a: u32, b: u32) -> f32 {
         let a = a as usize;
         let b = b as usize;

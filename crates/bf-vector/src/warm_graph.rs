@@ -109,12 +109,13 @@ impl HotGraph {
             .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
             .unwrap()
             .0;
-        let (mut hits, evaluations) = scratch.0.search(
+        let (mut hits, evaluations) = scratch.0.search_prefetched(
             &self.links,
             &self.degrees,
             entry,
             ef.max(count).min(self.len()),
             |id| self.codes.score(&code, scale, id),
+            |id| self.codes.prefetch(id),
         );
         hits.retain(|h| live.is_none_or(|m| m.contains(self.rows[h.id as usize])));
         hits.truncate(count);
