@@ -14,7 +14,7 @@ use std::{
 struct Mapping {
     bytes: Bytes,
 }
-/// Bounds descriptors and virtual address retention; resident pages remain reclaimable by the OS.
+/// Bounds mapping count and virtual address retention; resident pages remain reclaimable by the OS.
 pub(crate) struct Mapped {
     backend: LocalFileSystem,
     files: Cache<(String, bool), Arc<Mapping>>,
@@ -25,7 +25,7 @@ impl Mapped {
             backend: LocalFileSystem::new_with_prefix(root)?,
             files: Cache::builder()
                 .max_capacity(16 * 1024)
-                // At least 32 MiB of virtual-budget charge also caps descriptors at 512.
+                // At least 32 MiB of virtual-budget charge also caps retained mappings at 512.
                 .weigher(|_: &(String, bool), value: &Arc<Mapping>| {
                     value
                         .bytes
