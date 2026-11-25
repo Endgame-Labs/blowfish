@@ -11423,3 +11423,71 @@ not identify its callers, so it does not by itself establish how much was memo c
 One c7g.4xlarge for about 19 minutes (0.31 instance-hours), estimated below $1 using the granted $2/hour ceiling,
 including a small allowance for disk and fixture reads. The instance was terminated, and its tagged key pair and security
 group were deleted. No bucket writes. All 396 fixture-file sizes and SHA-256 hashes were verified after the run.
+
+## Round C13: why in-region 16 KiB S3 GETs take about 100 ms (stopped, the latency is S3-side)
+
+C11 saw about 91 ms p50 per 16 KiB rerank GET from a us-west-2 host to us-west-2 S3, and suspected the client:
+one resolved front-end IP, connection-pool queueing, TLS setup, or our own concurrency limits. A standalone
+microbenchmark says it is not the client. No storage code changed.
+
+Setup: one on-demand c7gd.4xlarge in us-west-2b (instance profile credentials, same bucket region), random 16 KiB
+range GETs at 4 KiB-aligned offsets over the 160 exact-vector `.bfv` slabs (about 1.5 GB each) of the read-only 100M
+namespace, waves of 84 concurrent GETs 100 ms apart. Latencies in ms.
+
+| Arm | Single GET p50 / p90 | Per-GET in an 84-wave p50 / p90 | 84-wave total p50 / p90 | Queueing before send p50 |
+| --- | ---: | ---: | ---: | ---: |
+| a: `object_store` 0.14.2 as configured in production, pool prewarmed with 84 HEADs | 118.7 / 200.4 | 102.1 / 139.3 | 207.9 / 290.1 | not separable |
+| a0: the same, no prewarm | 105.6 / 143.3 | 103.2 / 139.9 | 194.0 / 273.2 | not separable |
+| b: raw hyper plus rustls, one S3 IP, 84 prewarmed connections | 102.0 / 135.0 | 101.1 / 136.3 | 194.7 / 258.1 | 0.1 |
+| b2: the same with 252 prewarmed connections | 105.2 / 137.5 | 100.1 / 135.0 | 185.7 / 242.1 | 0.1 |
+| c: raw hyper, 84 connections spread over 16 resolved S3 IPs | 101.1 / 137.3 | 99.7 / 133.5 | 191.6 / 250.3 | 0.1 |
+| d: boto3 default, 84 threads (the SDK reference) | 107.2 / 138.3 | 111.8 / 150.0 | 281.7 / 352.9 | not separable |
+
+The raw arms split each request. Time to first byte is 97 to 99 ms p50 and is nearly all of the GET; the body of
+16 KiB adds 2 to 3 ms. Queueing is 0.1 ms. TLS handshakes take 2 to 3 ms and TCP connects 1 ms when spread over IPs.
+So a larger pool, prewarming, spreading over IPs, and a different SDK change nothing at steady state, and the
+pass bar (single GET at most 35 ms) is not reachable from the client.
+
+### The latency depends on how widely the reads are spread
+
+The same raw client, one connection at a time, 300 random 16 KiB GETs per row:
+
+| Reads | p50 | p90 |
+| --- | ---: | ---: |
+| 1 MiB object, anywhere | 24.9 | 32.9 |
+| 64 MiB object (8 multipart parts), anywhere | 24.0 | 30.9 |
+| 1.5 GB object, a single fixed offset | 22.0 | 28.6 |
+| 1.5 GB object, offsets inside any 64 MiB window (six windows from the start to the end) | 24.1 to 26.2 | 32.2 to 42.3 |
+| 1.5 GB object, offsets inside the first 512 MiB | 28.5 | 90.1 |
+| 1.5 GB object, offsets over the whole object (single-part or 90-part, same) | 78.0 | 111.4 |
+| 100M slabs, 160 objects, offsets over each whole object | 103.4 | 137.5 |
+
+Reading the same 80 locations three times does not help (pass 1 p50 105 ms, pass 2 99.5 ms, pass 3 99.9 ms), so
+this is not a first-touch cache that a second read warms. Multipart layout, object position, and storage class
+(standard, SSE-S3) do not matter either. Reads confined to a small window of an object are fast, and reads
+scattered over a large object, or over many large objects, cost about 75 to 100 ms in S3's backend. An unauthenticated
+request that fails at the front end answers in about 25 ms, so the front end and network are not the cost.
+
+### Side findings about S3 connections
+
+- S3 closes a connection after 100 requests on it (100 of 100, three of three trials). `reqwest` handles this by
+  opening a new connection, but it means a warm pool is replaced steadily under load.
+- S3 closed an idle connection between 20 and 40 seconds (open at 20 s, closed at 40 s). The pool's 600 second idle
+  timeout therefore never applies, and the connection warmer's 45 second refresh can find some connections already
+  closed. Lowering the refresh to about 15 seconds would keep them open; it was not measured end to end, and the
+  gain is only in cold-pool queries, not the 100 ms backend time above.
+- A burst of 84 simultaneous connects to one IP takes 17 to 36 ms for the TCP connect (about 1 ms when spread over
+  IPs), so spreading helps pool creation, but not the GETs themselves.
+
+### What this means
+
+The C10 and C11 estimate (100M cold p50 from 350 ms down to about 245 ms by fixing the transport) does not hold:
+steps 2 and 3 of the brief are not attempted because step 1 fails its gate, and no end-to-end `cold_ab.py` run was made.
+Remaining options sit on the data side, not in the client, and are not tried here: lay out exact vectors so that one
+query's rerank reads fall in a narrow window of one or a few objects (the 64 MiB-window rows above show the payoff
+could reach 3x per GET), or move the exact-vector slabs to a lower-latency tier such as S3 Express One Zone.
+
+One c7gd.4xlarge for about 24 minutes (about $0.30 on-demand). The instance, key pair, and security group were
+deleted, and the `tmp/c13/` test objects (1.5 GB copy, 1.5 GB single-part, 64 MiB, and 1 MiB) were removed from the bucket.
+No writes to the 100M prefix. The harness (a 250-line Rust binary using hyper, rustls, and `object_store`'s presigned URLs)
+was scratch code and is not kept.
