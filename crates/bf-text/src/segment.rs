@@ -135,7 +135,7 @@ impl From<Vec<(u32, u32)>> for Postings {
         let table_pairs = offsets.len() / 8;
         let mut data = Vec::with_capacity(1 + table_pairs + entries.len());
         data.push((first_window as u32, shift | (table_pairs as u32) << 8));
-        data.extend(offsets.chunks_exact(8).map(|b| {
+        data.extend(offsets.as_chunks::<8>().0.iter().map(|b| {
             (
                 u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
                 u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
