@@ -13268,3 +13268,58 @@ Plain cold p50 differed by 4 to 6 ms between arms on a path this change does not
 was not re-measured. Cost: one c7g.4xlarge for about 1.5 hours (under $1.50); instance, key pair, and security group deleted, no S3 writes.
 
 **Coordinator decision (BW18):** not merged. The gain (1.04x and 1.15x cold phrase p50) is below the round's 1.3x bar for about 230 added lines, and warm phrase throughput was not re-measured. The code is kept on the `bw18-phrase-waves` branch. The remaining cost is the dependent wave (the phrase filter finishes before masked BM25 picks its blocks), so the next attempt should overlap the two, not shave the filter's own reads.
+
+## Round BW19: warm BM25 scaling on shared state (killed at the kill test)
+
+The four suspected shared-state costs total about **3% of 16-client CPU time**, far below the 20% kill line. Nothing ships:
+no code, setting, or format change.
+
+### Measurement
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Clang 19, Rust 1.100.0), about 0.25 hours, an estimated $0.15. Baseline is
+`cbb7224` built with frame pointers and debug info. BW11's setup: fixture `tmp/msmarco-1m-v021/` copied locally, server on CPUs
+0 to 5 with two Rayon and two Tokio workers, a 2 GiB raw cache, 4,000-byte blocks, and T4's `concurrent_bm25` on CPUs 14 and
+15 with the held-out odd-indexed 500 queries (every reply checked against truth). `perf record -F 999 -g` on the server CPUs
+during 60 passes at 16 clients and 30 passes at one client. Server CPU is `utime + stime` from `/proc` divided by queries.
+
+### Share of 16-client CPU time in the four suspects
+
+| Suspect | Inclusive share of 16-client samples |
+| --- | ---: |
+| 1. `DecodedCache` mutex and clock bump (`DecodedCache::get`, `read_cache::get`, and all lock and futex symbols) | about 0.3% (futex syscalls 1.0% in total, mostly pool wakeups) |
+| 2. `corpus_for` (FST chunk read, CRC32, `fst::Map` rebuild) | 1.2% (CRC32 1.5% of samples, FST lookups 0.9%, shared with other callers) |
+| 3. `RoaringBitmap` clone and full-coverage check | 0.4% |
+| 4. `SegmentReader` `decoded` mutex and `RwLock`s | 0.25% (all lock symbols together) |
+| **Together** | **about 3%** |
+
+Other items that could grow from one to 16 clients also stay small: the allocator is 3.2% at 16 clients (7.7% at one),
+atomics 3.7% (3.9% at one), and the kernel 2.9% (12.3% at one, mostly idle and task switching). Six `bf-query` threads hold
+93% of the 16-client CPU.
+
+### The premise does not hold: it is CPU-bound, not contended
+
+The "5.1x on 16 cores" figure compares 16-client q/s with a single client on a server **pinned to six CPUs**, and one client
+already fans out over about 2.8 of them. Server CPU per query does not grow with load:
+
+| Clients | q/s | p50 / p90 ms | Server CPU per query |
+| ---: | ---: | ---: | ---: |
+| 1 | 839 | 1.07 / 1.57 | 3.34 ms |
+| 4 | 1,588 | 2.10 / 3.97 | 2.96 ms |
+| 16 | 2,376 | 6.01 / 10.32 | 2.49 ms |
+
+Six CPUs at 2.5 ms per query is a 2,400 q/s ceiling, which is where it sits. Giving the server more CPUs at 16 clients
+(client still on CPUs 14 and 15):
+
+| Server CPUs | q/s | p50 / p90 ms | Server CPU per query |
+| ---: | ---: | ---: | ---: |
+| 6 (0 to 5) | 2,226 | 6.05 / 10.87 | 2.50 ms |
+| 10 (0 to 9) | 3,441 | 3.98 / 7.29 | 2.53 ms |
+| 14 (0 to 13) | 4,483 | 2.90 / 5.59 | 2.62 ms |
+
+Throughput scales 2.0x for 2.3x the CPUs, with CPU per query flat. There is no shared-state wall to remove.
+
+### Where the CPU is (16 clients, for a later round)
+
+`SegmentReader::search_internal` is 80% inclusive: 38.8% self, 13.6% in one `Range<u32>` filter that builds a `Vec<u32>`
+(closure 29, 10% self), 6.6% sorting `(usize, f64)` pairs, and 2.9% building window caches (`cache_windows`). Cutting CPU per
+query there, not locks, is what would raise warm 16-client q/s.
