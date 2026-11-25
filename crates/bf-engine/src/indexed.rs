@@ -967,6 +967,9 @@ async fn prepare_scalar(
         }
     }
     crate::ann::stage(segment_started, "bm25 segments+hydrate");
+    if plain_text && state.docs.is_empty() {
+        return Ok(out);
+    }
     let tail_started = std::time::Instant::now();
     let mut token_time = std::time::Duration::ZERO;
     let mut score_time = std::time::Duration::ZERO;
@@ -1011,6 +1014,15 @@ async fn prepare_scalar(
             )
         })
         .collect();
+    // A plain BM25 rank needs only its global k + offset winners. Keeping every
+    // tail score also cloned the rank key and allocated tree entries for misses.
+    let top_key = (!all).then(|| rank_key(q.rank_by.as_ref().expect("plain BM25")));
+    let mut best = BinaryHeap::new();
+    if let Some(scores) = top_key.as_ref().and_then(|key| out.scores.get(key)) {
+        for (id, score) in scores {
+            offer(&mut best, id, *score, true, k);
+        }
+    }
     for (id, doc) in &state.docs {
         if !q
             .filters
@@ -1027,7 +1039,6 @@ async fn prepare_scalar(
             token_time += before.elapsed();
         }
         let before = crate::ann::trace_stages().then(std::time::Instant::now);
-        let mut positive = false;
         for (attribute, key, scorer) in &scorers {
             let score = summary
                 .as_ref()
@@ -1035,18 +1046,33 @@ async fn prepare_scalar(
                 .fields
                 .get(**attribute)
                 .map_or(0.0, |terms| scorer.score(terms)) as f64;
-            out.scores
-                .entry((*key).clone())
-                .or_default()
-                .insert(id.clone(), score);
-            positive |= score > 0.0;
+            if top_key.is_some() {
+                if score > 0.0 {
+                    offer(&mut best, id, score, true, k);
+                }
+            } else {
+                out.scores
+                    .entry((*key).clone())
+                    .or_default()
+                    .insert(id.clone(), score);
+            }
         }
         if let Some(before) = before {
             score_time += before.elapsed();
         }
-        if all || positive {
+        if all {
             out.docs.insert(id.clone(), doc.clone());
         }
+    }
+    if let Some(key) = top_key {
+        let scores: BTreeMap<_, _> = best.into_iter().map(|hit| (hit.id, hit.score)).collect();
+        out.docs.retain(|id, _| scores.contains_key(id));
+        for id in scores.keys() {
+            if let Some(doc) = state.docs.get(id) {
+                out.docs.insert(id.clone(), doc.clone());
+            }
+        }
+        out.scores.insert(key, scores);
     }
     crate::ann::stage(tail_started, "bm25 tail total");
     if crate::ann::trace_stages() {

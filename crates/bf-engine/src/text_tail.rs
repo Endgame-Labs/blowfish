@@ -105,7 +105,15 @@ impl Analyzer {
         let rows = if docs.len() >= 512 && crate::fan_out() {
             // Async posting reads can resume on an I/O worker. Retain the query
             // pool's CPU budget instead of silently switching to global Rayon.
-            crate::query_worker::workers().install(|| docs.par_iter().map(analyze).collect())
+            let pool = crate::query_worker::workers();
+            // Bound runnable chunks, leaving capacity for WAL completions.
+            let chunks = pool.current_num_threads().saturating_sub(1).max(1);
+            let rows: Vec<Vec<_>> = pool.install(|| {
+                docs.par_chunks(docs.len().div_ceil(chunks))
+                    .map(|chunk| chunk.iter().map(analyze).collect())
+                    .collect()
+            });
+            rows.into_iter().flatten().collect()
         } else {
             docs.iter().map(analyze).collect()
         };
@@ -327,6 +335,66 @@ mod tests {
                 assert!(read_cache::context().unwrap().text_tail.is_none());
             })
             .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bm25_tail_ties_offsets_and_projections_match_snapshot() {
+        let store = Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let config = EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            max_segment_rows: 200,
+            ..Default::default()
+        };
+        let engine = Engine::with_config(store.clone(), config.clone());
+        engine
+            .write(
+                "ties",
+                serde_json::from_value(json!({
+                    "schema":{"text":{"type":"string","full_text_search":true}},
+                    "upsert_rows":(0..1200).map(|id|json!({"id":id,"group":id%3,
+                        "text":if id%4==0 {"red red blue"}else{"quiet"}})).collect::<Vec<_>>()
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine.index_namespace("ties", true).await.unwrap();
+        engine.write("ties", serde_json::from_value(json!({
+            "upsert_rows":(0..300).chain(1200..1600).filter(|id| ![10,16,24].contains(id)).map(|id|json!({"id":id,
+                "group":id%3,"text":if id==1201 {json!(null)}else if id==1202 {json!("")}else{json!("red red blue")}})).collect::<Vec<_>>(),
+            "deletes":[10,16,24]
+        })).unwrap()).await.unwrap();
+        let (state, _) = engine.snapshot("ties", &Consistency::Strong).await.unwrap();
+        let mut reference = snapshot::materialize(&store, &state).await.unwrap();
+        text::reference_stats(&mut reference);
+        for budget in [0, 1 << 24] {
+            let context =
+                read_cache::ReadContext::new(Arc::new(read_cache::DecodedCache::new(budget, 2)));
+            read_cache::scope(context, async {
+                for offset in [0, 3, 9] {
+                    for rank in [json!(["text","BM25","red red"]), json!(["text","BM25","re",{"last_as_prefix":true}])] {
+                        for filter in [None, Some(json!(["group","Eq",1]))] {
+                            for projection in [json!(false), json!(["text","group"]), json!(true)] {
+                                let mut body = json!({"rank_by":rank,"top_k":10,"offset":offset,
+                                    "include_attributes":projection,"compute_attributes":{"blue":["text","BM25","blue"]}});
+                                if let Some(filter)=&filter {body["filters"]=filter.clone();}
+                                let request: QueryRequest = serde_json::from_value(body).unwrap();
+                                let expected=query::execute(&reference,&request).unwrap();
+                                let actual=indexed::execute(&store,&state,&request,&config,false).await.unwrap();
+                                assert_eq!(serde_json::to_value(actual.result).unwrap(),serde_json::to_value(expected.result).unwrap(),"budget={budget} offset={offset}");
+                                assert!(read_cache::context().unwrap().text_tail.is_none());
+                            }
+                        }
+                    }
+                }
+            }).await;
         }
     }
 
