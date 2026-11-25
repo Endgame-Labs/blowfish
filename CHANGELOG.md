@@ -4,6 +4,17 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-11-24
+
+### Changed
+
+- **Faster cold vector queries:** Staged ANN files keep their handles open and are read with positional reads that merge overlapping extents while still checking every 16 KiB block. Local read-ahead starts during the snapshot's WAL check, and fully staged scans speculate on at most `min(4k, 40)` vectors and no early documents. On cold, staged S3 namespaces, p50 fell from 443 to 365 ms (-17.7%) at 100M vectors and from 200 to 183 ms (-8.8%) at 10M, with 14 to 17% fewer GET requests; results are identical.
+
+### Fixed
+
+- **macOS build:** Local ANN staging failed to compile on macOS since v0.1.16 because `statvfs` field widths differ there; both fields are now widened before multiplying.
+- **Durable local writes:** `file://` stores now always fsync file data and publication directories before acknowledging WAL, manifest, and segment writes. Newly created directory chains and identical-write recovery also require successful syncs; a visible object can no longer hide an fsync failure. There is no durability toggle. Two dedicated NVMe full-NQ load pairs measured 0.8–1.6% less throughput and 1.8–3.3% higher write p90; sequential one-row writes added 0.14–0.17 ms at p50/p90. S3-compatible stores are unchanged. See [local filesystem durability](docs/operations.md#local-filesystem-durability) for ordering, tests, and measured cost.
+
 ## [0.1.21] - 2026-11-24
 
 ### Added
@@ -169,7 +180,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.22...HEAD
+[0.1.22]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.22
 [0.1.21]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.21
 [0.1.20]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.20
 [0.1.19]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.19

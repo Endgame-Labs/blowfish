@@ -539,7 +539,18 @@ impl RangeReader {
                 (self.block_key(index), expected)
             })
             .collect();
+        let lookup_start = crate::observed::trace_reads().then(std::time::Instant::now);
         let looked_up = cache.lookup_many(&wanted, self.admit).await;
+        if let Some(start) = lookup_start {
+            eprintln!(
+                "TRACE_CACHE lookup_us={} blocks={} end_us={}",
+                start.elapsed().as_micros(),
+                wanted.len(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros())
+            );
+        }
         let mut blocks = BTreeMap::<u64, Bytes>::new();
         let mut unresolved = Vec::new();
         let (mut memory, mut disk, mut memory_blocks, mut disk_blocks) = (0, 0, 0, 0);
@@ -600,11 +611,21 @@ impl RangeReader {
                 let last = *indices.last().unwrap();
                 let group = async move {
                     let cache = &reader.storage.0.cache;
+                    let queued = std::time::Instant::now();
                     let _permit = cache
                         .fetches
                         .acquire()
                         .await
                         .expect("cache semaphore stays open");
+                    if crate::observed::trace_reads() {
+                        eprintln!(
+                            "TRACE_SLOT wait_us={} end_us={}",
+                            queued.elapsed().as_micros(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_micros())
+                        );
+                    }
                     let from = first * size;
                     let to = (last * size).saturating_add(size).min(reader.len());
                     let bytes = cache
