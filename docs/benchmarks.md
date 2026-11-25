@@ -12492,3 +12492,22 @@ Setup: Mac mini M4, NQ, the production binary with a file-toggled flag, three pa
 | ab3, arm 3 | 0.9494 | 8,875 | 8,890 |
 
 On and off agree within about 1%, and instructions per query are identical in both arms (2.89M, 2.90M, and 2.64M), so scheduling is not where warm graph time goes. Later runs could not be compared because recall calibration on the shared M4 rejected the graph. The flagged code is not merged; it is kept on branch `g6-sync-path`.
+
+## Round G7: padding SQ8 graph rows off a power-of-two stride (negative)
+
+Hypothesis: at 1,024 dimensions, SQ8 rows start exactly 1 KiB apart, so many neighbor rows could map to the same L1 and L2 cache sets. A row stride that is not a power of two should cut those conflicts and speed up the warm walk. The kill bar was 1.10x at 8 threads.
+
+Setup: the standalone `hot_graph search8` harness (`crates/bf-vector/examples`), full NQ (2,681,468 rows, 1,024 dimensions), one graph (R16, construction ef=100, built once on the blowfish VM and copied), one set of rotated SQ8 codes, and the same NumKong dot kernel. Only the byte stride between rows changed, set with `G7_STRIDE`. Rows are zero padded, and row 0 sits on a 4 KiB boundary for every stride. Fixed effort (ef=104, rerank 30), all 3,452 queries replayed 30 times at 8 threads and 8 times at 1 thread, on the shared Mac mini M4 (10 cores, with other agents' load averaging 3 to 5). Three runs per cell, with the stride order rotated between runs.
+
+Results are identical: recall@10 is 0.949565 and the order-sensitive digest of every query's final ids is the same at all four strides (checked separately at each thread count).
+
+| Stride (bytes) | 1 thread q/s (3 runs) | 8 threads q/s (3 runs) | 8-thread median vs 1,024 | Instructions per query (8 threads) | Cycles per query (8 threads) |
+|---:|---|---|---:|---:|---:|
+| 1,024 | 1,967 / 1,978 / 1,944 | 7,132 / 7,361 / 7,122 | 1.00x | 2.05M | 2.79M |
+| 1,088 | 1,830 / 1,772 / 1,819 | 7,037 / 7,048 / 7,147 | 0.99x | 2.07M | 2.85M |
+| 1,152 | 1,690 / 1,744 / 1,662 | 7,350 / 6,988 / 6,619 | 0.98x | 2.03M | 2.87M |
+| 1,408 | 1,316 / 1,414 / 1,424 | 6,518 / 6,824 / 5,333 | 0.92x | 2.15M | 3.12M |
+
+Instructions and cycles come from the M4 task counters (`RUSAGE_INFO_V4`) over the query region. The M4 exposes no per-query cache-miss counter, so cycles per query stand in for stalls: they do not fall with padding. Instruction counts are flat, as expected.
+
+Result: **killed.** The best padded stride is 0.99x of 1,024 at 8 threads (the 1,152 spread, 6.6K to 7.4K, is machine noise), and every padded stride is slower at 1 thread (0.93x, 0.86x, and 0.71x). Larger strides only add memory and a wider working set. No production code was touched, and nothing is proposed. The absolute 8-thread rate (about 7K q/s) is lower than G5's 15.1K because this graph was rebuilt from scratch on a different host, the M4 was shared, and only 8 of its 10 cores (4 performance, 6 efficiency) were used; the comparison across strides is what this round measures, and all four ran under the same conditions.

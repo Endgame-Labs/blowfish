@@ -14,6 +14,10 @@ pub struct Codes {
     pub dims: usize,
     pub values: Vec<i8>,
     pub scales: Vec<f32>,
+    /// Bytes between row starts (G7 kill test); `dims` unless repacked.
+    pub stride: usize,
+    /// Offset of row 0 inside `values`, so every stride starts on a 4 KiB boundary.
+    pub base: usize,
 }
 fn encode(row: &[f64]) -> (Vec<i8>, f32) {
     let scale = row.iter().map(|x| x.abs()).fold(0f64, f64::max) / 127.;
@@ -43,13 +47,34 @@ impl Codes {
             dims,
             values,
             scales,
+            stride: dims,
+            base: 0,
+        }
+    }
+    /// Repack rows at `stride` bytes (>= dims), zero padded, with row 0 on a 4 KiB boundary.
+    pub fn repack(&self, stride: usize) -> Self {
+        assert!(stride >= self.dims);
+        let rows = self.scales.len();
+        let mut values = vec![0i8; rows * stride + 4096];
+        let base = values.as_ptr().align_offset(4096);
+        for r in 0..rows {
+            let src = self.base + r * self.stride;
+            let dst = base + r * stride;
+            values[dst..dst + self.dims].copy_from_slice(&self.values[src..src + self.dims]);
+        }
+        Self {
+            dims: self.dims,
+            values,
+            scales: self.scales.clone(),
+            stride,
+            base,
         }
     }
     pub fn prepare(&self, q: &[f32]) -> (Vec<i8>, f32) {
         encode(&RaBitQ::new(q.len(), 42).unwrap().rotate(q))
     }
     pub fn score(&self, q: &[i8], scale: f32, id: u32) -> f32 {
-        let start = id as usize * self.dims;
+        let start = self.base + id as usize * self.stride;
         1. - i8::dot(q, &self.values[start..start + self.dims]).unwrap() as f32
             * scale
             * self.scales[id as usize]
@@ -110,6 +135,8 @@ impl Codes {
             dims,
             values,
             scales,
+            stride: dims,
+            base: 0,
         })
     }
 }
@@ -128,6 +155,8 @@ mod tests {
         let c = Codes {
             dims,
             values,
+            stride: dims,
+            base: 0,
             scales: vec![s],
         };
         let (code, s) = c.prepare(&q);

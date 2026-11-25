@@ -117,10 +117,12 @@ fn main() -> AnyResult<()> {
         let ef = args.get(5).map(|s| s.parse()).transpose()?.unwrap_or(64);
         let repeats = args.get(6).map(|s| s.parse()).transpose()?.unwrap_or(1);
         let codes = if args[1] != "search" {
-            Some(quant::Codes::read(Path::new(&format!(
-                "{}.codes8",
-                args[3]
-            )))?)
+            let c = quant::Codes::read(Path::new(&format!("{}.codes8", args[3])))?;
+            // G7 kill test: repack rows at a different byte stride, same graph and kernel.
+            match std::env::var("G7_STRIDE") {
+                Ok(s) => Some(c.repack(s.parse()?)),
+                Err(_) => Some(c),
+            }
         } else {
             None
         };
@@ -154,7 +156,11 @@ fn main() -> AnyResult<()> {
                     .take(10)
                     .filter(|h| truth[i % truth.len()].contains(&h.id))
                     .count();
-                (got, count)
+                // Order-sensitive digest of the final ids, to prove results do not change.
+                let digest = hits.iter().fold(i as u64, |h, x| {
+                    (h ^ u64::from(x.id)).wrapping_mul(0x100_0000_01b3)
+                });
+                (got, count, digest)
             },
         );
         let elapsed = region.end();
@@ -168,6 +174,11 @@ fn main() -> AnyResult<()> {
             results.len() as f64 / elapsed,
             rayon::current_num_threads(),
             data::rss_kib()
+        );
+        println!(
+            "digest={:016x} stride={}",
+            results.iter().fold(0u64, |a, x| a ^ x.2),
+            codes.as_ref().map_or(0, |c| c.stride)
         );
     } else {
         return Err("unknown command".into());
