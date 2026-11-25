@@ -4,6 +4,14 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **Profile-guided builds by default:** The Dockerfile and `scripts/pgo-build.sh` now build blowfish with profile-guided optimization, trained in about one to two minutes on a small built-in workload (16K synthetic vectors, BM25, filters, and writes over loopback HTTP). Against the plain release build on 8 cores: filtered vector queries +98.5%, BM25 +16.0%, warm vector queries +4.7%, and durable writes +3.5%, with identical results. The small trainer keeps 85 to 101% of the gain of a profile trained on full BEIR NQ. Plain `cargo build --release` still works and is not profile-guided; see [docs/pgo.md](docs/pgo.md).
+
+### Fixed
+
+- **Local model build links:** Profile-instrumented `local-models` builds now link the HTTP archive omitted by llama.cpp's install step and forward its enabled TLS dependencies. The affected bindings have been used since v0.1.12; ordinary uninstrumented release builds discard the unused HTTP paths and are unaffected by this link failure. The lockfile also pairs bindgen with a compatible prettyplease version.
+
 ## [0.1.24] - 2026-11-25
 
 ### Changed

@@ -1,9 +1,11 @@
 # syntax=docker/dockerfile:1
-FROM rust:1-slim-trixie AS builder
+FROM rust:1.100.0-slim-trixie@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates cmake clang libclang-dev && rm -rf /var/lib/apt/lists/*
+RUN rustup component add llvm-tools-preview
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY scripts/pgo-build.sh ./scripts/pgo-build.sh
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     if [ "$(uname -m)" = x86_64 ]; then export CFLAGS="-march=x86-64-v3" CXXFLAGS="-march=x86-64-v3"; fi && \
@@ -13,7 +15,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         export CC=clang CXX=clang++; \
         for t in SME SME2 SME2P1 SMEF64 SMEHALF SMEBF16 SMEBI32 SMELUT2 SMEFA64; do export NK_TARGET_$t=0; done; \
     fi && \
-    cargo build --locked --release -p blowfish --features local-models && cp target/release/blowfish /blowfish
+    CARGO_TARGET_DIR=/build/target BF_PGO_FEATURES=local-models scripts/pgo-build.sh .scratch/release && \
+    cp .scratch/release/blowfish /blowfish && rm -rf .scratch/release
 
 FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \

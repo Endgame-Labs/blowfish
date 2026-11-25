@@ -179,7 +179,27 @@ cargo run -p blowfish -- serve --storage-url file:///tmp/blowfish --listen 127.0
 
 ### Binary from source
 
-Build a release binary:
+Build the profile-guided release binary (the Docker image uses the same trainer):
+
+```bash
+rustup component add llvm-tools-preview
+scripts/pgo-build.sh .scratch/release
+install -m 755 .scratch/release/blowfish ./blowfish
+rm -rf .scratch/release
+./blowfish serve --storage-url file:///tmp/blowfish --listen 127.0.0.1:8000
+```
+
+Training generates its own small corpus and runs over loopback; it downloads no
+training data. See [the release build policy](docs/pgo.md) for native build
+requirements, architecture support, and qualification results.
+
+On eight Graviton cores, this build improved warm full-NQ HTTP vector throughput
+4.70%, filtered 10K throughput 98.55%, BM25 10K throughput 15.97%, and durable
+sixteen-row writes 3.47%, with identical responses. Training took 72–126 seconds
+on the measured build hosts. See [Round P2](docs/benchmarks.md#round-p2-profile-guided-release-builds)
+for the paired measurements and their limits.
+
+For development, or as a non-PGO fallback:
 
 ```bash
 cargo build --release -p blowfish

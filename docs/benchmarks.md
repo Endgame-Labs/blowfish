@@ -9932,3 +9932,111 @@ approximately $0.80 at the recorded rate. Estimated total round cost is **below 
 discarded attempts, requests, EBS, and public IPv4, within the $6 cap; AWS billing is not
 final. Local benchmark receipts, binaries, and test output are removed after the numbers
 are recorded here.
+
+
+## Round P2: profile-guided release builds
+
+The release build now trains its own profile from generated data. It needs no NQ download,
+committed profile, or architecture-specific profile refresh. Docker and the documented source
+release path use `scripts/pgo-build.sh`; ordinary `cargo build --release -p blowfish` remains the
+non-PGO fallback. See [the build policy](pgo.md) for commands and the release checklist.
+
+### Trainer selection
+
+I tested 32K and 16K generated vector corpora, each with a separate 10K-row text/filter corpus.
+Both use 1,024-dimensional cosine-f16 vectors, real segment indexes, and an installed IVF tier.
+The retained 16K trainer builds eight slabs and 78 leaves, enough to exercise the compiled scorer
+with 48 probes. It is the smallest tested power-of-two corpus that retains the required gains;
+this is not a search over every possible corpus size or distribution.
+
+The initial 32K trainer took 99 seconds. Its paired matrix improved warm vectors 6.53%, filtered
+queries 99.84%, and BM25 18.87%. Eight dedicated write ABBA blocks measured +2.61%
+(95% block-bootstrap interval +2.51% to +2.72%), versus +1.56% for its full-NQ training control.
+The initial two-trial write screen had suggested +3.69%; the repeated blocks are the stronger
+write evidence. Its simulated-cold p50 rose 2.29%.
+
+The retained 16K trainer took 71.9 seconds, 27% less time despite concurrent build activity. It
+sends schema only on the first write, trains 256 real sixteen-row writes, and covers cold storage
+reads through a loopback S3 facade over its own generated store. Its fixture, clients, and S3
+facade do not contribute counters; only production server processes do. No vendor service is
+contacted during training.
+
+### Paired qualification
+
+Measured on 2026-11-25 UTC, based on v0.1.22 (`785333a`) plus the P2 trainer and native model link
+repair, with no engine or vector algorithm changes. One on-demand c7g.4xlarge runs Ubuntu 24.04,
+Rust 1.100.0 / LLVM 23.1.5, Clang 19 native compilation, and Clang 22 linking with ARM builtins
+and retained relocations. All arms use Neoverse V1, thin LTO, and four codegen units. Qualification
+uses default Cargo features; the `local-models` Docker images are built and smoke-tested separately.
+
+P1's frozen v0.1.19 NQ fixture is unchanged: 2,681,468 vectors, 32 slabs, and 3,452 queries, plus
+its 10K-row real NQ text/filter fixture. Queries use 48 probes, rerank factor 32, top ten, ID
+projection, and strong consistency. Server CPUs 0–7 and client CPUs 8–15 are exclusive during
+timing. Builds, uploads, and other validation finish first.
+
+Each comparison is ABBA, with two fresh processes per arm, three warm epochs, and eight timed
+epochs per process. The full-NQ reference is retrained on the same current source as the compact
+candidate. Throughput entries below pool sixteen timed epochs per arm. Each control belongs to
+its own paired comparison; they are not one shared control run.
+
+| Workload | Full-NQ pair, plain → PGO | Full-NQ gain | 16K pair, plain → PGO | 16K gain | Gain retained |
+|---|---:|---:|---:|---:|---:|
+| Warm full-NQ HTTP, queries/s | 2,370.97 → 2,501.59 | +5.51% | 2,370.19 → 2,481.69 | +4.70% | 85.4% |
+| Filtered 10K, queries/s | 2,129.32 → 4,199.93 | +97.24% | 2,123.68 → 4,216.55 | +98.55% | 101.3% |
+| BM25 10K, queries/s | 20,545.31 → 24,295.08 | +18.25% | 20,742.74 → 24,054.84 | +15.97% | 87.5% |
+| Durable 16-row writes, requests/s, confirmation | 47.63 → 48.37 | +1.55% | 47.55 → 49.19 | +3.47% | 223.1% |
+| Simulated cold, p50 ms | 270.39 → 268.21 | −0.81% latency | 286.59 → 272.10 | −5.05% latency | — |
+
+The write row uses the dedicated confirmation: eight compact-profile ABBA blocks and four
+full-profile blocks, 48 fresh stores, and 12,240 timed requests. Each trial times 255 disjoint
+sixteen-row writes after namespace creation. The change is the mean paired log-ratio across
+blocks, transformed back to percent, rather than the ratio of the displayed pooled medians.
+The 16K gain is **+3.466%, with a 95% interval of +3.276% to +3.675%**; full-NQ training gives
++1.554%, with an interval of +1.412% to +1.695%. Intervals resample whole ABBA blocks 20,000 times,
+with seed 27. These are serial batch rates, not maximum ingestion throughput.
+
+The main matrix had only two write trials per arm. Its full-profile write control drifted from
+56.60 to 47.50 requests/s, producing an apparent −7.26% aggregate result. The compact pair gave
++3.20%. The repeated write blocks above supersede those sparse write estimates. Current local
+writes always fsync; P1 predates that change. Even against P1's historical percentage gains, the
+16K trainer retains 87.9% for warm vectors, 93.5% for filtered queries, 100.1% for BM25, and 86.9%
+for writes. It clears the 80% gate under both comparisons.
+
+Across the four complete matrices, all 441,856 timed full-NQ responses agree on complete ordered
+rows and distances, and pass the cache-hot, tail-free, full-population, and compiled-scorer checks.
+All filtered, BM25, cold, and write responses agree too, including comparisons between matrices.
+Neither retained profile-use build reports a hot-function profile mismatch or discarded profile.
+
+Cold uses P1's read-only facade with 25 ms per request and twenty fresh processes per arm in
+each direction. Baseline cold medians vary between matrices; these samples are a regression
+screen, not a precise real-S3 latency prediction. Full-corpus BM25, other filter distributions,
+held-out corpora, promoted warm graphs, other CPUs, and native model inference throughput remain
+outside this qualification. Model inference is checked for correctness only.
+
+### Build and runtime validation
+
+The compiler image is pinned to Rust 1.100.0 and its multi-architecture digest. Each build creates
+fresh atomic-counter profiles, merges them with its own toolchain's `llvm-profdata`, and puts the
+profile content hash into compiler flags so the Cargo cache can distinguish profiles at the same
+path. The existing Docker x86-64-v3 flags, ARM Clang/SME exclusions, and `local-models` feature stay.
+
+Native training measured 71.9 seconds; Docker training measured 79.6 seconds on c7g.4xlarge and
+126.4 seconds on c7i.4xlarge. The observed Docker build steps took about six minutes with warm
+native-dependency caches, including other concurrent build activity. These are not clean-cache
+build-time promises for smaller CI hosts. The trainer's cost supports training during the build;
+there is no committed `.profdata` to become stale.
+
+Both architecture images build, run health checks, embed real text with EmbeddingGemma, and rerank
+with Qwen. The packaged optimized binaries contain no LLVM counter runtime, with the instrumented
+binary checked as a positive control. The PGO x86 image passes Python compatibility 121/121 plus
+four SDK retry checks in both normal and forced-indexing modes, and the TypeScript SDK smoke and
+429 retry checks in both modes. Scoped Clippy with warnings denied, Rust tests, and trainer
+range/list/metadata tests pass. Native model link dependencies are repaired separately from PGO; a fresh, instrumented
+OpenSSL-enabled model build also passes its scoped Clippy and seven tests.
+
+To reproduce the throughput matrices, use `pgo_experiment.py measure` as documented in `pgo.md`,
+with a fresh output directory for each pair. For write confirmation, repeat the same command with
+`--workloads write` and a new output directory for each ABBA block. Compute each block's difference
+between the two arms' mean log-rates, then average those differences before applying `expm1`.
+All owned EC2 hosts and scratch artifacts are removed after preserving these results; the shared
+read-only fixture is retained.

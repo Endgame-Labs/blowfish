@@ -11,6 +11,9 @@
 //!
 //! Calls share a bounded per-model concurrency pool and retry on 429 and 5xx. Nothing is cached
 //! across writes; query embeddings use a small in-memory LRU.
+#[cfg(feature = "local-models")]
+use llama_cpp_sys_4 as _;
+
 use bf_types::ApiError;
 use serde::Deserialize;
 use serde_json::{Value, json};

@@ -1,5 +1,7 @@
 **/.git
 **/target
+**/.scratch
+*.local
 **/*.local
 **/*.local.*
 **/.env
