@@ -69,6 +69,7 @@ P.add_argument(
     default=[],
     help="staging arm that publishes codes first and companions after (Round C9 and later)",
 )
+P.add_argument("--stage-timeout", type=int, default=600, help="seconds to wait for staging to publish")
 P.add_argument("--oracle", choices=["100k", "1m", "10m", "100m"], default="10m")
 P.add_argument(
     "--include-attributes",
@@ -311,7 +312,7 @@ def staged(text, two_phase):
 
 
 def wait_staging(client, work, proc, first, start, two_phase=False):
-    deadline = time.monotonic() + 600
+    deadline = time.monotonic() + a.stage_timeout
     codes_ms = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:

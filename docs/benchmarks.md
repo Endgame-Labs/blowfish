@@ -10650,6 +10650,66 @@ taskset -c 0-7 uv run crates/bf-engine/examples/cold_ab.py \
   --scratch .scratch/c9-check --label ids --oracle 100m --queries 60
 ```
 
+## Round C10: staging exact-vector pages chosen from rerank traces (stopped, coverage too low)
+
+Hypothesis (Sol): at 100M only about 712K rows' exact vectors fit under the 20 GiB stage cap, so almost every
+rerank read is remote. Spend the leftover budget on 16 KiB pages of exact vectors chosen from prior rerank
+traces, favoring page sets that remove a query's last remote read. Kill gate: if making every rerank read
+local saves less than 64 ms of 100M p50, stop. Pass: 100M p50 at most 212 ms on 200 held-out cold pairs with
+identical replies.
+
+**Result: the oracle passes its gate, but no page pack can come near it, because a held-out query shares
+almost none of its rerank pages with other queries. No code is merged.**
+
+### The oracle: every rerank read local
+
+One on-demand c7gd.4xlarge (us-west-2, local NVMe), CPUs 0 to 7, `-C target-cpu=neoverse-v1`, the original
+100M layout (`v014/big`, read-only), 60 paired cold queries, default attribute output. The oracle arm lifts
+the stage cap (a temporary `BF_C10_ORACLE_CAP` hook, kept on branch `c10-experiment`) so that all 100,000,000
+rows of exact vectors are staged: 242.8 GB in 1,320 s. The base arm is the shipped 20 GiB stage.
+
+| Arm | p50 | p90 | GET attempts per query | Recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| Base (20 GiB stage, 712K rows of vectors) | 350.5 ms | 419.8 ms | 90.2 | 0.9517 |
+| Oracle (all vectors local) | **170.7 ms** | 188.6 ms | 3.0 | 0.9517 |
+
+Making every rerank read local saves **179.8 ms (51 percent)**, well over the 64 ms gate. These runs return
+documents, so the base p50 reads higher than C9's IDs-only 275 ms; the saving is a paired difference on one
+host. The hypothesis passes the first gate, and the second question is whether a small page set can capture it.
+
+### Page overlap between queries
+
+The available real workload is the 200 oracle queries (Cohere Wikipedia embeddings), so a 200-pair held-out
+replay is the whole set, split in two. I ran all 200 with staging off (`BF_C10_NO_STAGE`, also on the
+experiment branch), so that every rerank read is remote and traced, kept the `.bfv` reads above the 1 MiB
+header region, and mapped them to 16 KiB pages (`crates/bf-engine/examples/page_overlap.py`).
+
+| Measure | Value |
+| --- | ---: |
+| Rerank vector reads per query (median) | 84 |
+| 16 KiB pages per query (median) | 154.5 |
+| Distinct pages over 200 queries / pages seen by more than one query | 34,669 / 227 |
+| Share of a held-out query's pages found in a pack from the other half (even to odd, odd to even, first 100 to last 100) | 0.53%, 0.54%, 0.62% |
+| Held-out queries with every page covered | 0 of 100, in each split |
+| Leave-one-out with all 199 other queries' pages and no size limit: mean / median / max coverage | 1.4% / 0.4% / 46.8% |
+
+Even an unbounded pack built from every other query covers 1.4 percent of a query's pages on average and
+removes no query's last remote read, so the replay could not move p50. The spare budget is not the limit
+(about 1.5 GB is roughly 90K pages, and 100 training queries touch about 15K): the rerank pool is a query's own
+neighborhood, 154 pages out of about 12 million, and near-duplicate queries are rare. Only a workload that
+repeats queries or hammers a few hubs could profit, and the block cache already serves repeats. The held-out
+pass criterion (at most 212 ms) is out of reach, so I did not build the page pack, the admission policy, or the
+adaptation rule. SPEC 25 (whole-object exact staging) stands.
+
+What would help instead: shorten the remote rerank wave itself (fewer, larger, or earlier reads, since the
+oracle shows its full cost is 180 ms), or raise how many rows' exact vectors fit (smaller exact copies).
+
+### Cost
+
+c7gd.4xlarge from 08:46 to 09:26 UTC on 2026-11-25, about 0.7 hours (about $0.5, under the $6 cap). The
+instance, key pair, and security group are deleted, and nothing was written to any bucket prefix.
+`cold_ab.py` gained `--stage-timeout` (the oracle stage needs 22 minutes).
+
 ## Round BW5: cutting per-segment BM25 setup (stopped, no measurable gain)
 
 Hypothesis (from BW4): per-segment window setup is about 70 percent of warm BM25 time on 1M MS MARCO,
