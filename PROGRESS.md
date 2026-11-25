@@ -4,6 +4,10 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **T8 BF16 kernel pinning (merged).** NumKong's SME matrix kernel overwrote partial tiles on the M4 (observed error 145.8x the bound); recluster now pins reviewed kernels and excludes SME and AMX. BF16 subnormals flushed explicitly. Full suite passes on x86, the M4, and Graviton.
+- **I3 issue #3 re-measure (docs).** v0.1.39 on BEIR NQ: 16 clients 512 q/s, warm p99 10.7 to 16.4 ms, recall 0.962, disk 14.18 GB settled (not met: vectors stored twice). Follow-ups D4b, WC1, and T9.
+- **BW17 (negative).** Phrase shortlist holds 10 matches for only 24 to 27% of queries.
+
 - **T7 query cancellation (merged).** `run_io` aborts a plan's I/O continuation when its caller is dropped, for every caller; C21's separate cancellable helper and flag are removed (one way). Warm A/B within noise.
 - **BW16 (negative).** Ideal precomputed shadow masks under 1,000 upserts/s give only 1.15x BM25 p50.
 
