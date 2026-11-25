@@ -12879,3 +12879,123 @@ which does not translate into latency because a cold query's time is dominated b
   segments helped some other measure (for example, S3 request count at 10M rows).
 - **Cost:** one c7g.4xlarge for about 25 minutes, an estimated under $0.50 with the volume. The instance, key pair, security group, and
   `tmp/bw15-1125/` S3 prefix are deleted.
+
+## Round I3: issue #3 (BEIR NQ on one machine) on v0.1.39
+
+[Issue #3](https://github.com/Endgame-Labs/blowfish/issues/3) tracks four targets from an outside benchmark of v0.1.13: at least 400 q/s at
+16 clients, warm p99 of 50 ms or less at one client (with p50 no worse), recall@10 against exact of at least 0.95 at default settings,
+and a disk footprint near the other engines' (29 GB against about 6 GB). Its last number was for v0.1.16. I reran
+[Iteration 19](#iteration-19-beir-natural-questions-on-one-machine)'s protocol on `main` at `4d13669` (v0.1.39), a release build, to see where
+each one stands. Nothing was fixed in this round.
+
+### Method
+
+Iteration 19's setup and harness (`bench/nq/`, `run.sh` and `measure.py` at their defaults): this 8-vCPU VM, the server pinned to CPUs 0 to 5 in a
+12 GB cgroup with swap off, clients on CPUs 6 and 7, a 3 GiB block cache, no disk cache, a `file://` store, and the 2,681,468 BEIR NQ passages
+with id, vector (`[1024]f16`, cosine), title, and text (BM25). Defaults everywhere: 64 probes, no tuning. I loaded with `load.py`, left the server
+running so that its automatic recluster ran on its own, and recorded when it installed. Timed passes ran only with the load average under 1.5 and
+no other cargo, rustc, or blowfish process from other worktrees; each started after four consecutive quiet checks 15 s apart. The
+load and the recluster did not get that: other workers were building on the VM at the time (load average 9 to 10 during the first part of the load),
+so their durations below are upper bounds.
+
+### Recall
+
+Recall@10 is against the exact top 10; F1@10, nDCG@10, and recall@100 are against the qrels (top_k 100 requests).
+
+| Layout (64 probes, default) | Recall@10 | F1@10 | nDCG@10 | Recall@100 |
+|---|---:|---:|---:|---:|
+| As loaded (26 segments; measured while the recluster was building, before it installed) | 0.9604 | 0.1677 | 0.6032 | 0.9270 |
+| After the automatic recluster | 0.9621 | 0.1692 | 0.6082 | 0.9356 |
+| Iteration 19, v0.1.13, as loaded (scaled 2.6x) / reclustered | 0.960 / 0.955 | 0.168 / 0.168 | 0.604 / 0.606 | 0.929 / 0.929 |
+| Issue, v0.1.13 as loaded with no scaling / v0.1.16 reclustered | 0.907 / about 0.961 | | | |
+
+- Load took 544 s (4,930 rows/s; Iteration 19: 287 s). The recluster started within a minute of the load ending
+  and installed 319 s later (32 slabs, 13,390 leaves, one tier). Iteration 19's manual `recluster` took 162 s, and v0.1.15's automatic
+  build 231 s on an otherwise idle VM. The stages that took longest were leaf k-means (39 s) and the spill random read (58 s). I did not
+  separate the contention from any real change.
+- The as-loaded quality pass ran while the build was in flight, so its latency is not reported. Recall does not depend on it.
+
+### Warm latency and throughput
+
+Protocol as in Iteration 19 and `measure.py`: quality pass first (3,452 queries at top_k 100), then one warm-up pass and 1,000 queries at one
+client, then 2,000 queries at 1, 4, and 16 clients. Two full runs on a fresh server each, both on a quiet VM, reclustered, default probes:
+
+| Run | p50 / p95 / p99 ms | q/s at 1 / 4 / 16 |
+|---|---|---|
+| 1 | 6.7 / 10.6 / 16.4 | 128.0 / 315.3 / 512.5 |
+| 2 | 6.7 / 9.3 / 10.7 | 149.2 / 386.6 / 510.5 |
+| Iteration 19, v0.1.13 baseline (reclustered, 64 probes) | 28.7 / 457 / 732 | 19.8 / 23.8 / 27.1 |
+| Iteration 19, after (v0.1.13 plus its fixes) | 8.3 / 13.3 / 18.1 | 111.3 / 311.4 / 444.2 |
+| Issue, v0.1.14 session | 5.3 / 8.2 / 9.7 | 616 at 16 clients |
+| Issue, v0.1.15 session | | 587 at 16 clients |
+
+**The order of the passes matters, by a factor of 2 to 3.** With the same binary, store, and settings, I measured on a fresh server:
+
+| Passes run, in order | p50 / p95 / p99 ms | q/s at 1 / 4 / 16 |
+|---|---|---|
+| throughput only | | 163.1 / 1,009 / 1,319 |
+| throughput only (second run) | | 158.1 / 1,052 / 1,337 |
+| latency, then throughput | 2.8 / 3.6 / 4.9 | 216.1 / 1,081 / 1,465 |
+| quality (top_k 100), then latency, then throughput (the protocol above) | 6.7 / 10.6 / 16.4 | 128 / 315 / 513 |
+
+The clean-start numbers are the warm numbers of a server answering top-10 queries; the protocol's numbers are what a server gives after it has
+answered 3,452 top-100 queries. Evidence for the mechanism:
+
+- `blowfish_ann_compiled_queries_total` counts queries served by the compiled resident tier. A latency pass of 2,000 queries (warm-up plus measured)
+  compiled 999 on a fresh server, but only 535 to 556 after the top-100 quality pass, and the same ratio held over three repeated passes
+  (535, 547, and 556 compiled), so the warm-up does not recover it. Mapped reads for the same 2,000 queries rose from 17.7 GB to 25.8 GB, and
+  cache misses from 580,000 to 817,000.
+- The quality pass at top_k 10 instead (`NQ_QUALITY_K=10`, same 3,452 queries) leaves nothing behind: 2,000 of 2,000 queries compiled in each
+  following pass, and p50 2.9 ms. So the cause is the top-100 pass specifically (3,200 reranked rows a query instead of 320), not the number
+  of distinct queries.
+- Raising `BF_DECODED_CACHE_BYTES` to 8 GiB changed nothing (538 and 547 compiled), but the configuration page lists its range as 512 MiB to 4 GiB and I did not check whether larger values are clamped.
+- In the code, a compiled query falls back to the general path when any exact row it needs is missing from the tier's exact-vector cache
+  (`WarmTier::search`, `crates/bf-engine/src/warm_ann.rs`). For a tier whose vectors do not all fit (5.5 GB here), that cache is a `moka` cache
+  bounded to about the size of the codes. My reading is that the top-100 pass's rerank rows crowd out the working set and keep it out, but I did
+  not isolate moka's admission policy. Treat the mechanism as likely, not proven. The effect is real and measured either way.
+
+### Disk footprint
+
+Bytes under the store, by object kind (`du -b` and `find -printf %s`; 2,681,468 rows; the vectors alone are 5.49 GB as f16):
+
+| Kind | After load, before recluster | After recluster, before GC | After recluster and GC settled | Bytes a row (settled) |
+|---|---:|---:|---:|---:|
+| WAL (`wal-data/`, `wal/`) | 5.96 GB | 5.96 GB | 0 | 0 |
+| Segment ANN objects (`ann.*.bfa`: blobs, codes, vectors) | | 6.50 GB | 6.50 GB | 2,422 |
+| Segment documents (`docs.bfc`: id, title, text) | | 0.58 GB | 0.58 GB | 217 |
+| Text index and stats (`fts.*.bft`, `text-stats.*.bfs`) | | 0.95 GB | 0.86 GB | 319 |
+| Filters, ID filters, directories, lineage, live masks | | 0.25 GB | 0.23 GB | 86 |
+| Slab ANN objects (`slab-*/ann.*.bfa`, 32 slabs) | 0 | 5.98 GB | 5.98 GB | 2,231 |
+| Manifests | | 0.02 GB | 0.03 GB | 12 |
+| **Total** | about 13 GB (`du -h`, sampled as the recluster was building, before any slab was written) | **20.24 GB** | **14.18 GB (5,287 B/row)** | 5,287 |
+
+- **Settled:** I waited past the one-hour retention (`engine.retention_ms`), and GC deleted the WAL and the superseded objects. The as-loaded layout alone
+  (everything except the slabs) is 8.20 GB, 3,056 bytes a row (the v0.1.15 changelog reports 3,581 B/row for this data, down from 5,945 in v0.1.14).
+- **Vectors are still stored twice, once as stored data and once more beside it, and the codes with them.** The segment `.bfa` objects (2,422 B/row)
+  and the slab `.bfa` objects (2,231 B/row) each hold every row's f16 vector (2,048 B/row) plus its code. Recluster builds the slabs beside the segments
+  and the covered segments stay in place, so after the recluster a second full copy exists. `docs.bfc` no longer carries vectors (217 B/row of
+  id, title, and text), and the WAL copy is gone after GC, so the two ANN copies are the whole duplication.
+  `docs/design/disk-footprint.md` option 4 ("slabs replace segment ANN objects") is the unbuilt part; it needs filtered ANN on slabs first.
+- **Peak** is 20.24 GB, 1.43 times the settled size, and lasts until the one-hour retention passes (WAL copy of every vector, plus the superseded objects).
+
+| | Issue (v0.1.13) | v0.1.39 reclustered, settled | v0.1.39 as loaded, settled | Others in the issue |
+|---|---:|---:|---:|---|
+| Store on disk | 29 GB | 14.18 GB | 8.20 GB | about 6 GB |
+
+### Where each target stands
+
+| Target | Result on v0.1.39 | Met |
+|---|---|---|
+| 16-client throughput of at least 400 q/s | 512.5 and 510.5 q/s in the protocol; 1,319 to 1,465 q/s from a clean start | yes |
+| Warm p99 at one client of 50 ms or less, p50 no worse | p99 16.4 and 10.7 ms, p50 6.7 ms (28.7 ms before); 4.9 and 2.8 ms from a clean start | yes |
+| Recall@10 vs exact at default settings of at least 0.95 | 0.9604 as loaded, 0.9621 reclustered | yes |
+| Disk footprint near the others' (about 6 GB) | 14.18 GB reclustered, 8.20 GB as loaded; two copies of every vector | no (down from 29 GB) |
+
+### Caveats
+
+- The 16-client rate varies by 5 to 15% between sessions on this VM, and the earlier issue numbers (616, 587) came from other sessions. The
+  protocol's 512 q/s is below those, and the pass-order effect above is the reason I know of; a v0.1.14 or v0.1.15 binary run through the same
+  protocol would settle whether anything else changed. I did not run one.
+- The warm graph (v0.1.21) needs ten minutes of sustained eligible queries, so none of these one-minute passes used it.
+- The clean-start runs used `--parts throughput` and `--parts latency,throughput` with the same harness; the protocol rows used the defaults.
+- The Mac and EC2 were not used. `/tmp/blowfish-recluster/` holds 25 GB of spill files from 2026-11-24 that are not mine; I left them.
