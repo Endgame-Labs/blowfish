@@ -144,7 +144,7 @@ def stats(client):
 def trace_summary(log):
     """Completed read waves and bytes by object kind, separate from attempted GETs."""
     reads, kinds, stages, timeline, local, slots, stage_times, lookups = [], {}, {}, [], [], [], [], []
-    hydration = []
+    hydration, c11 = [], []
     # Provisioning can still be appending a trace when an HTTP query completes.
     # Read only complete records; a partial trailing write is not a query failure.
     for line in log.rpartition("\n")[0].splitlines():
@@ -176,6 +176,8 @@ def trace_summary(log):
                     "end_us": int(end) * 1000,
                 }
             )
+        elif line.startswith("C11_"):
+            c11.append(line)
         elif line.startswith("HYDRATION "):
             _, key, phase, count, elapsed, end = line.split()
             hydration.append({"object": key, "phase": phase, "rows": int(count), "start_us": int(end) - int(elapsed), "end_us": int(end)})
@@ -212,6 +214,7 @@ def trace_summary(log):
         "stage_timeline": stage_times,
         "cache_lookups": lookups,
         "hydration_timeline": hydration,
+        "c11": c11,
     }
 
 
@@ -399,6 +402,7 @@ def query(name, item, client, work, proc):
                     "cache_lookups",
                     "hydration_timeline",
                     "documents",
+                    "c11",
                 ]
             }
         ),
