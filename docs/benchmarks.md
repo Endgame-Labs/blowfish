@@ -13268,3 +13268,52 @@ Plain cold p50 differed by 4 to 6 ms between arms on a path this change does not
 was not re-measured. Cost: one c7g.4xlarge for about 1.5 hours (under $1.50); instance, key pair, and security group deleted, no S3 writes.
 
 **Coordinator decision (BW18):** not merged. The gain (1.04x and 1.15x cold phrase p50) is below the round's 1.3x bar for about 230 added lines, and warm phrase throughput was not re-measured. The code is kept on the `bw18-phrase-waves` branch. The remaining cost is the dependent wave (the phrase filter finishes before masked BM25 picks its blocks), so the next attempt should overlap the two, not shave the filter's own reads.
+
+## Round W6: cold queries fetch committed WAL payloads one at a time (concurrent fetch, 3.2x at 32 payloads)
+
+Hypothesis (Sol, `briefs/ideas/2225-sol.md` #1): `tail_bounded` discovers WAL slots concurrently but then calls `materialize` on each record in
+turn, so every out-of-line payload (over 64 KiB, `INLINE_PAYLOAD_BYTES`) costs one serial object-store round trip on a cold strong query.
+Inline payloads, tombstones, and checkpointed slots cost none. Gate: cold strong p50 at least 1.3x lower with 32 payloads, identical replies,
+no regression with an empty or small tail. Kill line: serial fetch under 30% of cold query time.
+
+### Method
+
+One on-demand c7g.2xlarge (Ubuntu 24.04 arm64, Clang 19) in us-west-2, same region as the bucket. Server built at v0.1.42 (baseline) and with the
+change, both on the same box. Each sample is a fresh `serve --read-only` process (read-only so no startup pass opens namespaces), one strong
+`rank_by id asc, limit 10` query, 15 samples per cell, run A/B/B/A. Indexing was never run, so every write is an unindexed tail. Namespaces:
+`ext32` (32 writes of one 150 KB document, so 32 external payloads), `ext1` (one such write), and `inl32` (32 tiny inline writes).
+
+### Kill test (baseline only)
+
+| Namespace | Cold p50 ms | p90 ms |
+| --- | ---: | ---: |
+| ext32 | 1,013 | 1,045 |
+| inl32 | 186 | 196 |
+| ext1 | 68 | 78 |
+
+The 32 payload reads were about 800 of 1,013 ms (about 80%), far above the 30% line. The remaining 190 ms is slot discovery and the query.
+
+### Change (no format change)
+
+`tail_bounded` streams the records after the last tombstone through `futures::stream::buffered(8)`. Payloads are fetched up to 8 at a time, but
+results arrive in WAL order, so the byte budget, the `Pruned` rescan, the corruption check, and errors behave exactly as the serial loop did.
+Stopping early (budget, pruned, or error) drops fetches still in flight. Concurrency is bounded by count only: a payload's size is not in its slot
+record, so bytes in flight cannot be known before the read (at most 8 entries).
+
+### Results (cold p50 ms, A/B/B/A)
+
+| Namespace | Base | New | Speedup |
+| --- | ---: | ---: | ---: |
+| ext32 | 1,040 / 1,026 | 320 / 318 | 3.2x |
+| inl32 (empty-ish tail, no external payloads) | 177 / 208 | 192 / 165 | noise |
+| ext1 | 73 / 71 | 67 / 67 | noise |
+
+p90 for ext32 was 1,207 to 2,157 ms (base) against 360 to 419 ms (new). Rows from all three namespaces (50 rows, all attributes) hashed identically
+on both binaries. Tests added in `crates/bf-wal/tests/log.rs`: 40-entry order with mixed inline and external payloads, a tombstone in the middle,
+reclaimed payloads (still `Format`, byte budget unchanged), cleanup racing a reader, and an empty tail.
+
+### Conclusion
+
+**Passes** (3.2x on the 1.3x gate). What is left at 32 payloads is about 130 ms over the inline case: 32 payloads at 8 in flight is four waves of
+about 25 to 30 ms (150 KB each). A larger window would cut that further but is unbounded in bytes. Cost: one c7g.2xlarge for about 1.2 hours
+(under $0.50); instance, key pair, security group, and the `tmp/w6-20261125/` prefix deleted.
