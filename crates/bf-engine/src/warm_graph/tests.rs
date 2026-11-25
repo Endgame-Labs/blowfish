@@ -739,3 +739,150 @@ async fn unsupported_metric_and_precision_keep_identical_ivf_answers() {
         assert!(control.shutdown(Duration::from_secs(5)).await);
     }
 }
+
+/// The synchronous resident path returns exactly the rows and distance bits of the ordinary
+/// plan, declines every shape and state it cannot prove resident, and never answers stale data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resident_answers_match_the_ordinary_plan_and_decline_what_they_cannot_prove() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.scratch")
+        .join(format!("g6-resident-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let config = StorageConfig {
+        url: "memory://".into(),
+        cache: CacheConfig {
+            memory_bytes: 32 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let store = Storage::open(&config).await.unwrap();
+    let config = EngineConfig {
+        indexing: false,
+        recall_sample_rate: 0.,
+        decoded_cache_bytes: 64 << 20,
+        ..Default::default()
+    };
+    let e = Engine::with_config(store.clone(), config.clone());
+    let mut seed = 11u64;
+    let vectors = (0..2500)
+        .map(|_| {
+            (0..16)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 40) as f32 / 16777216. * 2. - 1.
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let rows = vectors
+        .iter()
+        .enumerate()
+        .map(|(id, v)| json!({"id":id,"vector":v,"group":id%3}))
+        .collect::<Vec<_>>();
+    e.write("hot",serde_json::from_value::<WriteRequest>(json!({"distance_metric":"cosine_distance","schema":{"vector":{"type":"[16]f16","ann":true}},"upsert_rows":rows})).unwrap()).await.unwrap();
+    e.index_namespace("hot", true).await.unwrap();
+    let opts = ReclusterOptions {
+        attribute: "vector".into(),
+        cells: 2,
+        cluster_rows: 32,
+        max_slab_rows: 5000,
+        scratch: root.clone(),
+    };
+    e.run_recluster_job("hot", &opts).await.unwrap();
+    let (state, _) = e
+        .snapshot("hot", &bf_types::Consistency::Strong)
+        .await
+        .unwrap();
+    let set = &state.ann_tiers["vector"][0];
+    let key = Key::new("hot", &state, "vector", set);
+    let held = Arc::new(admitted_entry(&e, set).await);
+    let mut heat = Heat::new(Instant::now());
+    heat.rate = 100.;
+    heat.ivf_seconds = 1.;
+    heat.ready = Some(held.clone());
+    e.0.hot_graph
+        .entries
+        .lock()
+        .unwrap()
+        .insert(key.clone(), heat);
+    let resident = |body: Value| {
+        let e = e.clone();
+        async move {
+            e.query_resident("hot", &serde_json::from_value(body).unwrap())
+                .await
+                .unwrap()
+                .map(|r| serde_json::to_value(r).unwrap()["rows"].clone())
+        }
+    };
+    let request = |i: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":10});
+    // Uncalibrated graphs never answer.
+    assert!(resident(request(17)).await.is_none());
+    {
+        let mut calibration = held.calibration.lock().unwrap();
+        calibration.quality = effort::Effort::new();
+        calibration.build_seconds = 1.;
+    }
+    for _ in 0..128 {
+        let scope = Scope::new(e.0.hot_graph.clone(), "hot").trial();
+        *scope.used.lock().unwrap() = Some(vec![key.clone()]);
+        scope.record_cpu(0.001);
+        scope.record_ivf_cpu(0.01);
+        scope.feedback(1., 1.);
+    }
+    assert!(held.calibration.lock().unwrap().usable);
+    // Cold ID blocks decline; the ordinary plan then warms them.
+    assert!(resident(request(17)).await.is_none());
+    let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
+    query(&e, "hot", request(17)).await;
+    assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
+    let mut answered = 0;
+    for i in (0..2500).step_by(97) {
+        let expected = query(&e, "hot", request(i)).await;
+        let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
+        match resident(request(i)).await {
+            Some(rows) => {
+                same_rows(rows, expected);
+                assert_eq!(e.0.hot_graph.answers.load(Ordering::Relaxed), before + 1);
+                answered += 1;
+            }
+            // A query whose rows sit in an unwarmed ID block declines; warm and retry.
+            None => {
+                query(&e, "hot", request(i)).await;
+            }
+        }
+    }
+    assert!(
+        answered > 0,
+        "warm ID blocks must let the resident path answer"
+    );
+    // Shapes outside the bare top-k ANN query decline.
+    for body in [
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":11}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":1,"offset":3}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"include_attributes":["group"]}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"consistency":{"level":"eventual"}}),
+        json!({"rank_by":["vector","ANN",vec![0.;16]],"top_k":10}),
+        json!({"rank_by":["vector","kNN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
+        json!({"rank_by":["vector","ANN",vec![0.5;3]],"top_k":10}),
+    ] {
+        assert!(resident(body).await.is_none());
+    }
+    // A write after the snapshot makes the published state stale: the check declines it.
+    e.write(
+        "hot",
+        serde_json::from_value::<WriteRequest>(
+            json!({"deletes":[17],"upsert_rows":[{"id":9000,"vector":vectors[17],"group":1}]}),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(resident(request(17)).await.is_none());
+    assert_eq!(query(&e, "hot", request(17)).await[0]["id"], 9000);
+}

@@ -1163,6 +1163,104 @@ async fn search_entry(
     }
     Ok(Some((scores, documents)))
 }
+impl Cache {
+    /// Exact top-`k` `(row, distance)` pairs, nearest first, from the ready graph of tier `set`,
+    /// answered synchronously on the calling thread. `None` when no ready, calibrated graph can
+    /// answer this query, or when any step would have to wait (for I/O or another query's slot);
+    /// the caller then runs the ordinary asynchronous plan, which reaches the same answer.
+    pub(crate) fn answer_resident(
+        &self,
+        ns: &str,
+        state: &NamespaceState,
+        attribute: &str,
+        set: &SlabSet,
+        vector: &[f32],
+        k: usize,
+    ) -> Option<Vec<(u32, f32)>> {
+        if overcommitted() {
+            return None;
+        }
+        let entry = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&Key::new(ns, state, attribute, set))
+            .and_then(|h| h.ready.clone())?;
+        let ef = {
+            let c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
+            if !c.usable {
+                return None;
+            }
+            c.quality.serving.unwrap_or(c.quality.trial)
+        };
+        if k == 0
+            || k > RERANK
+            || entry.graph.len() < k
+            || vector.len() != entry.graph.dims()
+            || vector.iter().all(|x| *x == 0.)
+        {
+            return None;
+        }
+        let _slot = entry.slots.try_acquire().ok()?;
+        let started = thread_cpu();
+        let found = entry.answer_sync(vector, k, ef)?;
+        self.answers.fetch_add(1, Ordering::Relaxed);
+        let seconds = (thread_cpu() - started).max(0.);
+        let mut c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        c.graph_seconds = if c.graph_seconds == 0. {
+            seconds
+        } else {
+            c.graph_seconds * 0.8 + seconds * 0.2
+        };
+        Some(found)
+    }
+}
+impl Entry {
+    /// Graph navigation, then exact reranking of the candidates from their source slabs, with
+    /// each rerank polled once: a read that is not already resident declines the whole answer.
+    fn answer_sync(&self, vector: &[f32], k: usize, ef: usize) -> Option<Vec<(u32, f32)>> {
+        use futures::FutureExt;
+        self.searches.fetch_add(1, Ordering::Relaxed);
+        let scratch = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .unwrap_or_else(|| self.graph.scratch());
+        let mut loan = ScratchLoan {
+            entry: self,
+            scratch: Some(scratch),
+        };
+        let (hits, _) = self
+            .graph
+            .candidates_with_norms(vector, ef, RERANK, None, loan.scratch.as_mut()?)
+            .ok()?;
+        drop(loan);
+        let mut located = Vec::with_capacity(hits.len());
+        for (row, norm) in hits {
+            let [slab, cluster, ordinal] = self.locations.get(row)?;
+            located.push((slab as usize, cluster as usize, ordinal as usize, norm));
+        }
+        located.sort_unstable_by_key(|c| c.0);
+        let prepared = CosineQuery::new(vector).ok()?;
+        let mut exact = Vec::with_capacity(located.len());
+        let mut rest = located.as_slice();
+        while let Some(&(slab, ..)) = rest.first() {
+            let run = rest.iter().take_while(|c| c.0 == slab).count();
+            let locations = rest[..run].iter().map(|c| (c.1, c.2, c.3)).collect();
+            rest = &rest[run..];
+            exact.extend(
+                self.sources[slab]
+                    .rerank_cosine_candidates(&prepared, k, locations)
+                    .now_or_never()?
+                    .ok()?,
+            );
+        }
+        exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        exact.truncate(k);
+        (exact.len() == k).then_some(exact)
+    }
+}
 /// Run a calibration ANN plan through the same CPU dispatch as an ordinary warm query.
 /// Exhaustive truth retains its separate blocking worker and nonadmitting context.
 pub(crate) async fn trial_plan(

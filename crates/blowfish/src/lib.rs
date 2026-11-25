@@ -618,7 +618,10 @@ async fn query(
     input: Result<FastJson<QueryRequest>, JsonRejection>,
 ) -> Result<Response, HttpError> {
     let request = body(input.map(|FastJson(v)| Json(v)))?;
-    let response = s.engine.query(&ns, request.clone()).await?;
+    let response = match s.engine.query_resident(&ns, &request).await? {
+        Some(response) => response,
+        None => s.engine.query(&ns, request.clone()).await?,
+    };
     record_query(&request);
     metrics::counter!("blowfish_query_rows_scanned_total")
         .increment(response.performance.exhaustive_search_count);

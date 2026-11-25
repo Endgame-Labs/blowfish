@@ -34,6 +34,7 @@ mod models;
 mod published;
 mod query;
 mod query_worker;
+mod resident;
 use published::Published;
 mod recluster;
 mod reindex;

@@ -1233,6 +1233,35 @@ pub(crate) async fn projected_rows(
 ) -> Result<BTreeMap<u32, Document>, ApiError> {
     projected_rows_with(store, segment, rows, columns, false).await
 }
+/// Row IDs of `rows` (ascending local rows of `segment`) from the decoded caches alone, or
+/// `None` when the directory or any needed block is not resident, so a caller falls back to
+/// [`projected_rows`]. Never reads storage, so it is safe to call from a synchronous path.
+pub(crate) fn cached_ids(
+    cache: &read_cache::DecodedCache,
+    segment: &Segment,
+    rows: &[u32],
+) -> Option<Vec<Id>> {
+    let docs_key = &segment.files.get("docs")?.key;
+    let dir = cache.get::<Directory>(docs_key)?;
+    let col = dir.columns.get("id")?;
+    let mut block: Option<(usize, Arc<Vec<Option<Value>>>)> = None;
+    let mut ids = Vec::with_capacity(rows.len());
+    for &row in rows {
+        let i = row as usize / BLOCK_ROWS;
+        if block.as_ref().is_none_or(|(held, _)| *held != i) {
+            col.blocks.get(i)?;
+            let values = cache.column(&format!("{docs_key}#id#{i}"))?;
+            block = Some((i, values));
+        }
+        let values = &block.as_ref()?.1;
+        ids.push(match values.get(row as usize - i * BLOCK_ROWS)?.as_ref()? {
+            Value::Number(n) => Id::Uint(n.as_u64()?),
+            Value::String(s) => Id::String(s.clone()),
+            _ => return None,
+        });
+    }
+    Some(ids)
+}
 /// [`projected_rows`], optionally reading through the block caches without filling them.
 pub(crate) async fn projected_rows_with(
     store: &Storage,
