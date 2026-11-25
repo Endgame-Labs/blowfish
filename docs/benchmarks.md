@@ -11560,3 +11560,110 @@ bits, with arrays earned during the run.
 
 
 EC2: one on-demand c7g.4xlarge, about 1.6 hours, roughly $1.1 including the 120 GiB gp3 volume.
+
+## Round BW12: worker fan-out for a lone BM25 query (killed)
+
+The two-worker prototype fails the single-client gate: **908 to 629 queries/s (0.69x)**, with p50 rising from **0.984 to
+1.338 ms**. The required improvement was at least 1.30x in throughput or p50. No serving change, configuration switch,
+public API, or format change ships from this round.
+
+### Source finding and experiment
+
+The brief assumed that warm BM25 segment scoring always ran on its polling thread. On baseline `0569c4f` (v0.1.32),
+`indexed::prepare` already dispatches segments through `spawn_blocking` when `fan_out()` permits it, with one query-local
+atomic `SearchThreshold`. Once admitted queries exceed half the available CPUs, `prepare_scalar` polls segment futures
+inline. This already supplies the requested low-load parallelism and busy-server fallback.
+
+The prototype replaced the low-load BM25 dispatch with two jobs on the existing fixed query pool. It assigned each segment,
+in its existing order, to the job with fewer accumulated rows. Each job retained async I/O, the captured read context,
+snapshot masks, and the same shared score floor. The busy path was unchanged. This tested whether fewer handoffs and worker
+reuse could improve on the existing blocking-pool path. Other rank expressions retained their dispatch behavior.
+
+### Paired warm measurement
+
+One on-demand c7g.4xlarge in us-west-2, Ubuntu 24.04 arm64, Rust 1.100.0, and the production release profile. Baseline and candidate were
+built on the same host with Clang 19 and the same NumKong `__arm_get_current_vg` link stub. No builds or profiles overlapped
+timing. Server affinity was CPUs 0–5, with two global Rayon workers and two Tokio workers; the dedicated query pool kept its
+normal CPU-derived size. The client used CPUs 14 and 15.
+
+Each arm used a fresh local copy of read-only fixture `tmp/msmarco-1m-v021/`, a 2 GiB raw cache, 4,000-byte blocks,
+512-block coalescing, and fetch concurrency 512. T4's `concurrent_bm25` replayed BW11's held-out odd-indexed 500 queries eight
+times per pass. Each fresh process received two single-client prewarm passes, then four measured passes each at 1, 4, and
+16 clients. The arm order was A/B/B/A. Every one of **192,000 timed replies** and **32,000 prewarm replies** matched the
+fixture's independent exhaustive truth in ordered IDs and f32 score bits.
+
+Throughput below is total validated requests divided by summed elapsed time; latency entries are medians of the four pass
+percentiles, rather than pooled request percentiles.
+
+| Arm | 1 client q/s | 1 client p50 / p90 ms | 4 clients q/s | 4 clients p50 / p90 ms | 16 clients q/s | 16 clients p50 / p90 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline A1 | 910.2 | 0.982 / 1.427 | 1,668.4 | 1.990 / 3.746 | 2,557.1 | 5.683 / 9.984 |
+| Candidate B1 | 628.7 | 1.342 / 2.323 | 1,763.1 | 1.823 / 3.668 | 2,571.7 | 5.691 / 9.891 |
+| Candidate B2 | 630.1 | 1.336 / 2.313 | 1,764.4 | 1.828 / 3.628 | 2,563.3 | 5.626 / 9.943 |
+| Baseline A2 | 905.4 | 0.986 / 1.448 | 1,672.1 | 1.982 / 3.766 | 2,550.2 | 5.766 / 9.933 |
+
+Across both arms, candidate throughput is **−30.7% at one client**, **+5.6% at four clients**, and **+0.5% at 16 clients**.
+The saturated-throughput guard passes, but the lone-query gate clearly fails.
+
+### Fan-out controls
+
+Separate diagnostic runs, outside the paired timing runs, used the baseline binary, one client, identical prewarming, and
+4,000 checked requests per setting. These are single diagnostic passes, not additional paired headline measurements.
+Server CPU seconds came from all live server threads' `/proc` user and system tick counters around the measured pass.
+
+| Baseline setting | q/s | p50 / p90 ms | Average server cores |
+| --- | ---: | ---: | ---: |
+| Default fan-out, eight segment permits | 904.8 | 0.987 / 1.442 | 2.78 |
+| Six segment permits | 841.6 | 1.070 / 1.542 | 2.62 |
+| Four segment permits | 871.6 | 0.991 / 1.547 | 2.64 |
+| Two segment permits | 606.1 | 1.410 / 2.314 | 1.82 |
+| Forced inline (`BF_FANOUT_QUERIES=0`) | 480.0 | 1.620 / 3.531 | 1.05 |
+
+The default already runs a lone query across multiple cores and provides **1.88x** the inline throughput in this control.
+Restricting it to two tasks reduces useful parallelism. These results reject the proposed two-worker replacement; they do
+not establish that every possible scheduling improvement is exhausted. Stack window masks and partial window selection
+were not attempted: this round produced no profile evidence to justify those separate changes.
+
+### Validation
+
+The prototype and its dedicated regression test are preserved in `3ef4b9a` for inspection, and are removed from the final
+tree. The prototype passes `cargo fmt --all -- --check`,
+`cargo clippy -p bf-engine -p bf-text --all-targets -- -D warnings`, and `cargo test -p bf-engine -p bf-text`:
+**326 passed, zero failed, and 19 expected ignores**, across 39 suite results. The new test compares one and 16 clients
+against the exhaustive scorer across prefix ties, offsets, filters, WAL overwrites, deletes, and index publication.
+
+The prototype also passes the release-mode `text_benchmark::bm25_serialized_msmarco_snapshots` check in **137.19 s**:
+all **4,000 queries** and **40,000 ordered ID and f32 score-bit comparisons** match the independent exhaustive scorer.
+The four retained snapshot states cover the indexed million passages, 5,000 overwrites, overlapping updates with deletes
+and nulls, and the next publication.
+
+### Writes
+
+BW1's `steady_writes.py`, A/B/B/A, a fresh writable local store copy per arm, 1,000 text-changing upserts/s in 100-row
+batches, and strong top-ten IDs-only BM25 queries paced at 1 Hz. Each arm ran for 120 seconds; the first 30 seconds of
+query samples were excluded, leaving 90 measured queries per arm. All arms acknowledged **120,000 rows**, with **zero
+rejections**, over 1,200 write requests each.
+
+| Arm | BM25 p50 / p90 ms | Write acknowledgement p50 / p90 ms |
+| --- | ---: | ---: |
+| Baseline A1 | 18.431 / 30.651 | 5.908 / 8.042 |
+| Candidate B1 | 18.933 / 30.747 | 5.975 / 8.005 |
+| Candidate B2 | 19.877 / 29.578 | 5.608 / 7.974 |
+| Baseline A2 | 18.594 / 31.525 | 5.789 / 7.963 |
+
+The median of the arm p50s is **18.512 to 19.405 ms (+4.8%)**. The corresponding p90 is **31.088 to 30.163 ms (−3.0%)**.
+Both candidate p50s exceed both baseline p50s, so this experiment also fails the write latency guard on p50.
+Write acknowledgements remain similar, and every offered row is accepted. The failed warm throughput gate alone already
+rules out shipping this prototype.
+
+After removing the experiment and its dedicated test, the restored final source passes formatting, scoped Clippy, and
+`cargo test -p bf-engine -p bf-text`: **325 passed, zero failed, and 19 expected ignores**, across 39 suite results.
+The final source is byte-identical to baseline; the net tracked change is this report. Full-workspace and official-SDK
+merge validation remain the coordinator's responsibility.
+
+### Resource cleanup
+
+One on-demand c7g.4xlarge ran for approximately **0.78 hours**. Estimated cost is **$0.47**, using the historical
+$0.58/hour compute rate, a 120 GiB gp3 volume, and public IPv4; this is an estimate, excluding network charges and tax,
+not a billing audit. The instance is confirmed terminated, and its root volume, tagged key pair, and tagged security group
+are confirmed absent. No S3 objects were written. Owned local scratch artifacts were removed after preserving these results.
