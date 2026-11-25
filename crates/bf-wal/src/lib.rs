@@ -98,10 +98,11 @@ impl WalEntry {
     /// The entry's JSON and the encoding version that reads it back: f16 vectors are packed
     /// when the entry is too large to stay inline and every one of them packs exactly.
     fn to_json(&self) -> Result<(Vec<u8>, u8), Error> {
-        if !self.tombstone && packed::candidate_bytes(self) > INLINE_PAYLOAD_BYTES {
-            if let Some(packed) = packed::pack_entry(self) {
-                return Ok((serde_json::to_vec(&packed)?, PACKED_FORMAT_VERSION));
-            }
+        if !self.tombstone
+            && packed::candidate_bytes(self) > INLINE_PAYLOAD_BYTES
+            && let Some(packed) = packed::pack_entry(self)
+        {
+            return Ok((serde_json::to_vec(&packed)?, PACKED_FORMAT_VERSION));
         }
         Ok((serde_json::to_vec(self)?, FORMAT_VERSION))
     }

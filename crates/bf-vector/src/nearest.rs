@@ -13,12 +13,14 @@ const BLOCK_ROWS: usize = 64;
 const MIN_CENTERS: usize = 24;
 const MIN_DIMS: usize = 64;
 
-/// Makes `NearestCenters::new` use the matrix path on any CPU, for the end-to-end test.
+/// Set only by tests: 0 chooses by CPU, 1 uses the matrix path on any CPU, 2 never does.
+pub(crate) static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Rows screened and centers that survived the screen, counted only under test.
 #[cfg(test)]
-pub(crate) static FORCE_MATRIX: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(not(test))]
-const FORCE_MATRIX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static SCREENED: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// Centers prepared for repeated nearest searches.
 pub(crate) struct NearestCenters<'a> {
@@ -35,10 +37,15 @@ struct Matrix {
 impl<'a> NearestCenters<'a> {
     /// Use the matrix path when the CPU has BF16 matrix instructions and the sizes reward it.
     pub fn new(centers: &'a [Vec<f32>]) -> Self {
-        let wanted = (cfg!(test) && FORCE_MATRIX.load(std::sync::atomic::Ordering::Relaxed))
-            || bf16_matrix_accelerated()
-                && centers.len() >= MIN_CENTERS
-                && centers.first().is_some_and(|c| c.len() >= MIN_DIMS);
+        let wanted = match MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                bf16_matrix_accelerated()
+                    && centers.len() >= MIN_CENTERS
+                    && centers.first().is_some_and(|c| c.len() >= MIN_DIMS)
+            }
+        };
         Self::with_matrix(centers, wanted)
     }
 
@@ -124,17 +131,18 @@ impl<'a> NearestCenters<'a> {
             return self.exact(row, None);
         }
         let threshold = minimum + 2. * error;
-        self.exact(
-            row,
-            Some(
-                approx
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, d)| **d <= threshold)
-                    .map(|(i, _)| i)
-                    .collect(),
-            ),
-        )
+        let survivors: Vec<usize> = approx
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| **d <= threshold)
+            .map(|(i, _)| i)
+            .collect();
+        #[cfg(test)]
+        {
+            SCREENED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SCREENED[1].fetch_add(survivors.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.exact(row, Some(survivors))
     }
 
     /// The nearest of `candidates` (all centers when `None`) by the original kernel, ties to the
@@ -231,10 +239,53 @@ mod tests {
                 .build_packed(ids.clone(), data.clone())
                 .unwrap()
         };
+        MODE.store(2, std::sync::atomic::Ordering::Relaxed);
         let plain = build();
-        FORCE_MATRIX.store(true, std::sync::atomic::Ordering::Relaxed);
+        MODE.store(1, std::sync::atomic::Ordering::Relaxed);
         let screened = build();
-        FORCE_MATRIX.store(false, std::sync::atomic::Ordering::Relaxed);
+        MODE.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(plain == screened, "blobs differ");
+    }
+
+    /// Real data: `NQ_CORPUS` is the benchmark's `corpus.f16` (an .npy of 1,024-d f16 rows).
+    /// Builds the same segment both ways, then compares blobs, time, and screen survivors.
+    #[test]
+    #[ignore = "needs NQ_CORPUS and NQ_ROWS; run with --release --ignored --nocapture"]
+    fn real_corpus_segment_blobs_are_identical_and_faster() {
+        use crate::{BuildParams, IndexBuilder, Metric, VectorType};
+        let path = std::env::var("NQ_CORPUS").expect("NQ_CORPUS");
+        let rows: usize = std::env::var("NQ_ROWS").map_or(100_000, |v| v.parse().unwrap());
+        let start: usize = std::env::var("NQ_START").map_or(1_000_000, |v| v.parse().unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        let header = 10 + u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        let row_bytes = 1024 * 2;
+        let data = bytes[header + start * row_bytes..header + (start + rows) * row_bytes].to_vec();
+        let ids: Vec<u32> = (0..rows as u32).collect();
+        let build = |mode: u8| {
+            MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let blob = IndexBuilder::new(1024, Metric::CosineDistance)
+                .unwrap()
+                .vector_type(VectorType::F16)
+                .params(BuildParams {
+                    clusters: Some((rows as f64).sqrt().ceil() as usize),
+                    ..Default::default()
+                })
+                .build_packed(ids.clone(), data.clone())
+                .unwrap();
+            (blob, started.elapsed())
+        };
+        let (plain, plain_time) = build(2);
+        let (screened, screened_time) = build(1);
+        MODE.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (n, kept) = (
+            SCREENED[0].load(std::sync::atomic::Ordering::Relaxed),
+            SCREENED[1].load(std::sync::atomic::Ordering::Relaxed),
+        );
+        println!(
+            "rows {rows}: scalar {plain_time:?}, screened {screened_time:?}; {n} screened rows kept {:.2} centers on average",
+            kept as f64 / n as f64
+        );
         assert!(plain == screened, "blobs differ");
     }
 

@@ -29,8 +29,8 @@ fn pack(value: &str) -> Option<Box<RawValue>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(4) {
-        let x = f32::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in bytes.as_chunks::<4>().0 {
+        let x = f32::from_le_bytes(*chunk);
         let h = half::f16::from_f32(x);
         if h.to_f32().to_bits() != x.to_bits() {
             return None;
@@ -48,8 +48,8 @@ fn unpack(value: &str) -> Result<String, Error> {
         return Err(Error::Format);
     }
     let mut out = Vec::with_capacity(bytes.len() * 2);
-    for chunk in bytes.chunks_exact(2) {
-        let h = half::f16::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in bytes.as_chunks::<2>().0 {
+        let h = half::f16::from_le_bytes(*chunk);
         out.extend_from_slice(&h.to_f32().to_le_bytes());
     }
     Ok(STANDARD.encode(out))
