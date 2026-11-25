@@ -25,16 +25,34 @@ const VERSION_COMPRESSED: u32 = 6;
 const VERSION_COMPACT: u32 = 7;
 
 const BLOCK: usize = 128;
-/// A mask admitting at most one row in this many is scored directly.
-fn direct_mask(allowed: u64, docs: u32) -> bool {
-    static DIV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let div = *DIV.get_or_init(|| {
-        std::env::var("BF_DIRECT_DIV")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(16)
-    });
-    allowed.saturating_mul(div) <= u64::from(docs)
+/// Whether to score a mask's rows directly instead of walking windows. The window walk pays per
+/// window it touches and the direct path per allowed row, so the direct path wins when the mask is
+/// sparse and scattered: at most a quarter of the segment's rows, and (sampling eight spots of
+/// 64 consecutive allowed rows) fewer than `DIRECT_ROWS_PER_WINDOW` allowed rows per touched window.
+/// A contiguous range keeps the window walk, whose bounds prune it. Only speed depends on this.
+fn direct_mask(allowed: &RoaringBitmap, docs: u32) -> bool {
+    const SPOTS: u64 = 8;
+    const RUN: usize = 64;
+    const DIRECT_ROWS_PER_WINDOW: u64 = 24;
+    let len = allowed.len();
+    if len == 0 || len.saturating_mul(4) > u64::from(docs) {
+        return false;
+    }
+    let (mut rows, mut windows) = (0u64, 0u64);
+    for spot in 0..SPOTS.min(len) {
+        let Some(first) = allowed.select((spot * len / SPOTS) as u32) else {
+            return false;
+        };
+        let mut last = usize::MAX;
+        for row in allowed.range(first..).take(RUN) {
+            rows += 1;
+            if row as usize / BLOCK != last {
+                windows += 1;
+                last = row as usize / BLOCK;
+            }
+        }
+    }
+    rows < windows * DIRECT_ROWS_PER_WINDOW
 }
 const FOOTER: usize = 72;
 const MAGIC: &[u8; 8] = b"BFTEXT01";
@@ -2514,7 +2532,7 @@ impl SegmentReader {
         }
         if let Some(rows) = allowed
             && query.prefix().is_none()
-            && direct_mask(rows.len(), self.docs)
+            && direct_mask(rows, self.docs)
         {
             return self
                 .search_allowed_rows(&mut terms, rows, k, &saturation, threshold, &mut metrics)

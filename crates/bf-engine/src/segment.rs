@@ -1681,8 +1681,30 @@ pub(crate) async fn filter_live(
     f: &Filter,
     schema: &Schema,
 ) -> Result<Arc<RoaringBitmap>, ApiError> {
+    // Object keys name immutable bytes, so the file keys, sizes, and live generation identify the
+    // segment. The bulky dictionary chunk indexes they carry derive from those objects and are
+    // left out, since serializing them on every query cost about a fifth of a selective filter's CPU.
+    let files: Vec<_> = segment
+        .files
+        .iter()
+        .map(|(name, file)| (name, &file.key, file.size, file.metadata_len))
+        .collect();
+    let identity = (
+        &segment.id,
+        segment.wal_start,
+        segment.wal_end,
+        segment.row_count,
+        &segment.schema,
+        files,
+        (
+            &segment.live.key,
+            segment.live.size,
+            segment.live.metadata_len,
+        ),
+        segment.live_generation,
+    );
     let key =
-        serde_json::to_string(&("filter-live-v1", segment, f, schema)).map_err(index_error)?;
+        serde_json::to_string(&("filter-live-v2", identity, f, schema)).map_err(index_error)?;
     if let Some(rows) = read_cache::predicate(&key) {
         return Ok(rows);
     }
