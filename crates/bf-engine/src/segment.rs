@@ -202,8 +202,9 @@ pub(crate) async fn text_index(
     if let Some(header) = &file.text_header {
         // The manifest carries the footer and dictionary index: no read until a query needs data.
         let header = text_header_of(header)?;
-        let index = bf_text::SegmentReader::open_with_header(Arc::new(reader), &header)
+        let mut index = bf_text::SegmentReader::open_with_header(Arc::new(reader), &header)
             .map_err(index_error)?;
+        prepare_dense_terms(&mut index).await?;
         let resident = index.resident_bytes() + 16384;
         let index = read_cache::insert(&file.key, resident, index);
         return Ok(charge_memo(&file.key, resident, index));
@@ -211,13 +212,27 @@ pub(crate) async fn text_index(
     let start = file.size.saturating_sub(file.metadata_len.max(65536));
     let bytes = reader.read(start..file.size).await.map_err(index_error)?;
     reader.prefetched = Some((start, bytes));
-    let index = bf_text::SegmentReader::open(Arc::new(reader))
+    let mut index = bf_text::SegmentReader::open(Arc::new(reader))
         .await
         .map_err(index_error)?;
+    prepare_dense_terms(&mut index).await?;
     // The retained encoded buffer (the dictionary borrows it) plus the decoded directory.
     let resident = file.metadata_len.max(65536) + index.resident_bytes();
     let index = read_cache::insert(&file.key, resident, index);
     Ok(charge_memo(&file.key, resident, index))
+}
+
+/// BW10 experiment: selection is frozen from a separate training workload.
+async fn prepare_dense_terms(index: &mut bf_text::SegmentReader) -> Result<(), ApiError> {
+    if let Ok(selected) = std::env::var("BF_TEXT_DENSE_TERMS") {
+        let terms: Vec<_> = selected.split(',').collect();
+        let bytes = index
+            .prepare_dense_terms(&terms, index.num_docs() as usize * 33)
+            .await
+            .map_err(index_error)?;
+        eprintln!("BW10 dense rows={} bytes={bytes}", index.num_docs());
+    }
+    Ok(())
 }
 
 /// Make a cached reader's decoded-posting memo pay its actual size into the decoded cache. Each

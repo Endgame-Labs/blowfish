@@ -11135,3 +11135,52 @@ sweep of other limits (64 MiB was the BW6 value; 48 MiB reached the same hit rat
 
 One c7g.4xlarge on-demand, about 20 minutes, about $0.25. Terminated; key pair and security group deleted. No bucket
 writes.
+
+## Round BW10: directly addressable dense-term frequencies (below the throughput bar)
+
+Tested against main at `c86aec6` (v0.1.31, including BW9), on one on-demand c7g.4xlarge running Ubuntu 24.04.
+The hypothesis was a byte per row for selected dense terms, replacing posting decode, window-slice lookup, and
+posting-based candidate preparation. The pass bar was at least **1.30x warm 16-client q/s**, bit-identical ordered IDs
+and f32 scores on the frozen 4,000-query snapshot check, and at most 32 MiB of extra resident data at 1M rows.
+
+### Prototype and selection
+
+The memory-only prototype builds up to 32 arrays before a text reader enters the decoded cache. Zero means absent,
+1 through 254 are direct frequencies, and 255 uses a sorted `(row, tf)` overflow table. It reuses the checked posting
+decoder without filling the posting memo, charges arrays and bookkeeping to the reader, and keeps the original
+term order and f32 addition order. Dense terms skip posting-frame allocation, span preparation, fetches, and slice
+lookups. Essential dense terms are tested while selecting competitive rows, and those rows are scored directly.
+Conservative per-window saturation bounds are cached as upward-rounded f32 values and rebuilt when normalization
+statistics change. No format change.
+
+Selection uses only the even-indexed 500 queries in `bench/scale/data/bm25-msmarco.json`: rank unique query-term
+frequency times corpus document frequency, and freeze the top 32. Terms that are sparse in an individual segment keep
+the posting path. Selected terms, in cost order:
+
+```text
+is,the,of,a,in,to,and,for,what,are,on,how,you,can,when,an,it,with,does,who,which,have,was,as,be,from,do,your,many,at,definition,where
+```
+
+### Paired measurement
+
+The read-only 1M MS MARCO fixture from v0.1.21, copied to a separate local store per arm. Timing order A/B/B/A,
+server on CPUs 0 through 5 with two Rayon workers and two Tokio workers, client on CPUs 14 and 15, a 2 GiB raw cache,
+4,000-byte cache blocks, and the default decoded cache. Same release profile for both binaries. Two single-client
+prewarm passes over the held-out odd-indexed 500 queries precede timing. Each timed pass repeats those 500 queries
+eight times (4,000 replies): three passes at one client, and six at 16 clients. Every reply checks ordered IDs and
+f32 score bits against the fixture truth. Values below are medians within each arm.
+
+| Arm | 1 client q/s | 1 client p50 / p90 ms | 16 clients q/s | 16 clients p50 / p90 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline A1 | 816 | 1.04 / 1.84 | 2,042 | 7.14 / 11.50 |
+| Candidate B1 | 923 | 0.97 / 1.40 | 2,602 | 5.54 / 9.69 |
+| Candidate B2 | 921 | 0.97 / 1.41 | 2,607 | 5.53 / 9.70 |
+| Baseline A2 | 817 | 1.04 / 1.82 | 2,043 | 7.14 / 11.50 |
+
+Across all 12 passes per binary at 16 clients, the median gain is **1.275x**, about 2,604 versus 2,043 q/s.
+The 1.30x bar requires 2,655 q/s in this pair; the candidate falls short by 51 q/s. Comparing against BW9's historical
+1,966 q/s would overstate the gain because this run uses a different query split.
+
+Array, overflow, reserved bound, and bookkeeping charges total **30,232,576 bytes (28.83 MiB)** across eight readers.
+Whole-server warm RSS was 460 / 464 MiB in A1 / A2, and 431 / 413 MiB in B1 / B2: replacing decoded dense postings
+reduced total RSS despite the additional arrays. These are observed RSS values, not a general memory guarantee.
