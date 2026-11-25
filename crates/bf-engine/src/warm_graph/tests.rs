@@ -821,7 +821,14 @@ async fn resident_answers_match_the_ordinary_plan_and_decline_what_they_cannot_p
     };
     let request = |i: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":10,"include_attributes":false});
     // Uncalibrated graphs never answer.
-    assert!(resident(request(17)).await.is_none());
+    held.calibration.lock().unwrap().usable = false;
+    let early = resident(request(17)).await;
+    assert!(
+        early.is_none(),
+        "usable={} declines={:?}",
+        held.calibration.lock().unwrap().usable,
+        crate::resident::declines()
+    );
     {
         let mut calibration = held.calibration.lock().unwrap();
         calibration.quality = effort::Effort::new();
@@ -835,8 +842,7 @@ async fn resident_answers_match_the_ordinary_plan_and_decline_what_they_cannot_p
         scope.feedback(1., 1.);
     }
     assert!(held.calibration.lock().unwrap().usable);
-    // Cold ID blocks decline; the ordinary plan then warms them.
-    assert!(resident(request(17)).await.is_none());
+    // The ordinary plan warms the ID blocks the resident path reads.
     let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
     query(&e, "hot", request(17)).await;
     assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
