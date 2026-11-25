@@ -10851,3 +10851,89 @@ tightening the bound on one window rarely removes the last window that needs a b
 paid per block, which is why BW7's 90% skippable windows also did not move time.
 
 No implementation, format change, or EC2 measurement was done; nothing was written to the bucket. Cost: $0.
+
+## Round RR5: row-specific recluster group batches (stopped at the assignment gate)
+
+Measured 2026-11-25. Restricting each row to the leaf groups it chose nearly halved BF16 leaf products,
+but did not reach the **56.5 s** assignment gate. The experiment was reverted; production retains RR4's
+exact candidate unions. No paired full-tier build, readiness measurement, recall qualification, or cold-query
+measurement was started.
+
+The experiment kept the original four-row blocks, pooled nearby coarse cells, group-distance arithmetic,
+12 group probes per row, refinement, and FP32 verification lanes. Instead of sending all four rows to the
+union of their chosen leaf groups, it sent each row only to its own groups. BF16 batches still collected
+visitors by group within each 2,048-row batch. Verification enforced each row's candidate membership, so a
+neighbor's surviving center could not silently reenter an excluded group. The union control used the same
+row-index scheduling machinery with the original candidate sets.
+
+The fixture contains all 2,681,468 BEIR NQ rows, 1,024 dimensions, 32 coarse cells, and the automatic leaf
+size. RR4's historical scratch spill had been deleted. This run reused the frozen NQ corpus, regenerated
+coarse routing with `prepare_flat_spill`, and captured normalized f32 rows with `RR4_CAPTURE`. Both arms
+replayed the same new frozen input; it is not RR4's historical input fingerprint. Source reads were warmed
+equally before each run. The on-demand c7gd.2xlarge had eight Graviton3 cores and 16 GiB; assignment used
+four Rayon threads, native ARM BF16, Rust 1.100.0, Clang 19, and a Clang 22 linker, with no native Rust target
+flags. Builds and measurements did not overlap.
+
+Logical leaf row-center evaluations, excluding the BF16 backend's internal padding:
+
+| Pass | Union BF16 | Own-group BF16 | Union FP32 verification | Own-group FP32 verification |
+| --- | ---: | ---: | ---: | ---: |
+| First | 1,803,461,520 | 915,518,238 | 10,697,944 | 10,708,332 |
+| Second | 1,801,063,248 | 912,653,679 | 10,169,640 | 10,203,224 |
+| Both | 3,604,524,768 | 1,828,171,917 | 20,867,584 | 20,911,556 |
+
+BF16 evaluations fell **49.28%**. The four-row exact kernel still computes all four lanes for each
+surviving center, so its product count did not fall. Counts reproduced exactly in both repetitions.
+
+| Replay, in run order | First assignment | Second assignment | Both assignments | Complete leaf phase |
+| --- | ---: | ---: | ---: | ---: |
+| Union control 1 | 45.898 s | 42.638 s | 88.535 s | 112.047 s |
+| Own groups 1 | 37.844 s | 34.868 s | 72.712 s | 95.512 s |
+| Own groups 2 | 36.976 s | 33.753 s | 70.729 s | 93.489 s |
+| Union control 2 | 45.693 s | 41.314 s | 87.006 s | 110.091 s |
+
+Mean assignment was **87.771 → 71.720 s**, a **1.224x** speedup, or 18.29% less time. The repeat added
+per-batch routing and scorer timers; its assignments, complete jobs, and evaluation counts were identical
+to the first run within each arm. Complete leaf time includes training and refinement; it is not readiness.
+
+The unchanged work explains much of the gap between products and elapsed time. In the reverse pair,
+ordering took 23.367 s for the control and 23.423 s for own groups. Routing inside the scoring stage took
+80.124 and 79.521 **summed worker-seconds**, respectively, or roughly 20 wall seconds across four workers.
+It still computes about 406 million FP32 row-group distances per pass; ordering adds 313,155,956 FP32
+distances in the first pass and 227,348,980 in the second. Leaf gathering, conversion, matrix scoring,
+screening, and verification fell from 171.874 to 106.717 summed worker-seconds, but still cost roughly
+27 wall seconds in the candidate. Worker-seconds are elapsed times summed across concurrent batches,
+not CPU-counter measurements, and are not added directly to wall time.
+
+Counting ordering, group routing, BF16 leaf scoring, and FP32 verification together gives
+**4,977,428,292 → 3,201,091,753** logical row-center comparisons, or **35.69%** fewer. These
+counts mix kernels with different costs; the unchanged routing work uses FP32.
+
+Candidate narrowing also changed winners: **26,284 first-pass assignments (0.9802%)** and **70,142
+second-pass assignments (2.6158%)** differed from the union control. The first pass loses candidates
+supplied by neighboring rows; the second also uses the resulting different refined centers. These are
+assignment differences, not recall losses. Recall loss at most 0.001 was not established, and neither
+the 136 s readiness gate nor the no-cold-slowdown gate is claimed.
+
+A final diagnostic replaced linear eligibility lookup with binary search of each row's screened survivors.
+It produced identical assignments, complete jobs, and evaluation counts, and took **38.459 + 34.500 =
+72.959 s** for assignment (96.224 s complete leaf phase). It is outside the four-run mean above, and also
+misses the gate. The fastest candidate observation was still 14.229 s above 56.5 s.
+
+Single larger-batch diagnostics also failed: **79.536 s** at 8,192 rows and **81.329 s** at 32,768 rows.
+Both retained the same BF16 and verification counts, both assignment arrays, and the complete candidate
+jobs byte for byte. They are outside the paired 2,048-row estimate; larger batches did not rescue the gate.
+
+The replay implementation is preserved in experimental commit `d318af1`, then reverted. Use RR4's
+`recluster::experiment::replay_leaf_assignment` release test with `RR4_INPUT`, `RR4_OUTPUT`,
+`RR4_THREADS=4`, `RR4_BATCHED=1`, `RR4_CACHE_CELLS=1`, `RR4_BF16=1`, and `RR4_BATCH_ROWS=2048`.
+Set `RR5_ROW_GROUPS=1` for own groups, and omit it for the union control. The larger diagnostics change
+only `RR4_BATCH_ROWS`. Preparation can capture normalized f32 input by setting `RR4_CAPTURE` while
+running `prepare_flat_spill` on raw, headerless f16 vectors beneath an owned `.scratch/` directory.
+
+The experiment passed formatting, strict engine/vector all-target Clippy, and all 44 native ARM package
+suites: **324 passed, zero failed, and 14 ignored**. Native ARM release library suites also passed:
+**167 passed, zero failed, and 11 ignored**, including the added candidate-eligibility regression.
+After reverting, formatting and the same strict Clippy and full native package checks passed again:
+**323 passed, zero failed, and 14 ignored across 44 suites**. Engine and vector source match the starting
+revision byte for byte; only this benchmark section remains in the final diff.
