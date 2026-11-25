@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.37] - 2026-11-25
+
+### Changed
+
+- **Recluster spill skips deleted rows:** Recluster copied every row's vector into its local spill file, including rows already deleted, and filtered them out later. It now writes only live rows, keeping their global row IDs, so the output is byte-identical. With 30% of rows deleted, the spill takes 70% of the bytes it did.
+
 ## [0.1.36] - 2026-11-25
 
 ### Changed
@@ -284,7 +290,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.36...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.37...HEAD
+[0.1.37]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.37
 [0.1.36]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.36
 [0.1.35]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.35
 [0.1.34]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.34

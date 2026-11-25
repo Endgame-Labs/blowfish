@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **RR8 recluster spill skips dead rows (merged).** The copy pass wrote deleted rows into the spill; it now packs only live rows with global row IDs preserved. 30% dead: spill bytes 70% of baseline, slab digest identical.
+
 - **C18 lossless exponent codec for staged exact vectors (merged, with C18b).** 15-bit packing per 16 KiB block when the high f16 exponent bit is clear, raw otherwise; physical block ends, CRCs over stored bytes, stage identity `ann-staging-v3`; writer-side prestaging encodes too; XFS preallocation trimmed; `include_attributes: ["id"]` uses staged row IDs. 10M, c7gd.4xlarge, 200 cold pairs: full coverage 10M vectors in 19.50 GiB (control 9.50M), IDs-only p50/p90 57.8/103.4 -> 57.5/88.5 ms, 4.90 -> 3 GETs per query, identical, recall 0.9700; pure S3 flat.
 - **C19 (killed).** RaBitQ sign bits are incompressible: best 127.84 B/row of 128 on 100M samples; the per-dimension entropy bound is 126.67.
 
