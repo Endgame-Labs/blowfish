@@ -133,7 +133,8 @@ where
 }
 
 /// Cold snapshots retain the original dispatch; yielded warm plans continue from their
-/// saved suspension point with the same blocking-pool I/O capacity.
+/// saved suspension point with the same blocking-pool I/O capacity. Dropping the caller
+/// aborts the plan at its next await point, for every caller.
 pub(crate) async fn run_io<F>(
     runtime: tokio::runtime::Handle,
     future: F,
@@ -146,9 +147,21 @@ where
         .with(|slot| slot.borrow().clone())
         .unwrap_or(runtime);
     let worker_runtime = runtime.clone();
+    // Dropping a blocking JoinHandle detaches its task. Abort the async plan when the
+    // caller stops awaiting, so it releases its permits and pending I/O at its next await.
+    struct Cancel(futures::future::AbortHandle);
+    impl Drop for Cancel {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let (abort, registration) = futures::future::AbortHandle::new_pair();
+    let _cancel = Cancel(abort);
+    let future = futures::future::Abortable::new(future, registration);
     runtime
         .spawn_blocking(move || worker_runtime.block_on(future))
         .await
+        .map_err(crate::segment::index_error)?
         .map_err(crate::segment::index_error)
 }
 
@@ -438,5 +451,53 @@ mod tests {
             .unwrap(),
             19
         );
+    }
+    /// A dropped caller must not leave its blocked plan running with its permits held.
+    #[test]
+    fn dropping_the_caller_aborts_a_plan_waiting_on_io() {
+        // A detached plan would block a normal runtime's shutdown, so fail cleanly instead.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(dropped_caller_releases_its_plan())
+        }));
+        runtime.shutdown_background();
+        outcome.unwrap();
+    }
+
+    async fn dropped_caller_releases_its_plan() {
+        struct Held(Arc<AtomicUsize>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let released = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (p, r, s) = (permits.clone(), released.clone(), started.clone());
+        let caller = tokio::spawn(run_io(tokio::runtime::Handle::current(), async move {
+            let _permit = p.acquire_owned().await.unwrap();
+            let _held = Held(r);
+            s.notify_one();
+            std::future::pending::<()>().await; // an I/O backend that never answers
+        }));
+        started.notified().await;
+        assert_eq!(permits.available_permits(), 0);
+        caller.abort();
+        let _ = caller.await;
+        let freed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            permits.clone().acquire_owned(),
+        )
+        .await;
+        assert!(
+            freed.is_ok(),
+            "the plan kept its permit after its caller was dropped"
+        );
+        assert_eq!(released.load(Ordering::SeqCst), 1);
     }
 }
