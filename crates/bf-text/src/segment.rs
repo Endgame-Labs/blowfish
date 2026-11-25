@@ -150,15 +150,46 @@ struct CachedPostings {
     dense: bool,
     recent: bool,
 }
-#[derive(Default)]
 struct DecodedPostings {
+    /// Byte budget of each of the sparse and dense pools.
+    limit: usize,
+    /// The charge last reported to the owner's cache.
+    reported: u64,
     blocks: crate::scoring::OffsetMap<CachedPostings>,
     order: std::collections::VecDeque<u64>,
     bytes: usize,
     dense_order: std::collections::VecDeque<u64>,
     dense_bytes: usize,
 }
+impl Default for DecodedPostings {
+    fn default() -> Self {
+        Self {
+            limit: MEMO_POSTING_BYTES,
+            reported: 0,
+            blocks: Default::default(),
+            order: Default::default(),
+            bytes: 0,
+            dense_order: Default::default(),
+            dense_bytes: 0,
+        }
+    }
+}
 impl DecodedPostings {
+    /// Bytes the memo holds now: decoded entries plus per-block bookkeeping (map slot, queue slot,
+    /// allocation header, and window table).
+    fn charge(&self) -> u64 {
+        const PER_BLOCK: usize = 200;
+        (self.bytes + self.dense_bytes + self.blocks.len() * PER_BLOCK) as u64
+    }
+    /// The charge to report to the cache if it moved enough since the last report.
+    fn report(&mut self) -> Option<u64> {
+        let now = self.charge();
+        if now.abs_diff(self.reported) < (1 << 20).max(self.reported / 8) {
+            return None;
+        }
+        self.reported = now;
+        Some(now)
+    }
     fn get(&mut self, offset: u64) -> Option<Postings> {
         let cached = self.blocks.get_mut(&offset)?;
         if cached.dense {
@@ -182,9 +213,7 @@ impl DecodedPostings {
             self.dense_order.push_back(offset);
             // CLOCK protects frequently queried common words. Sparse lists retain
             // their own budget, so long lists cannot evict exact sparse bounds.
-            while self.dense_bytes > MEMO_POSTING_BYTES
-                || self.dense_order.len() > MEMO_POSTING_BYTES / 1024
-            {
+            while self.dense_bytes > self.limit || self.dense_order.len() > self.limit / 1024 {
                 let offset = self
                     .dense_order
                     .pop_front()
@@ -204,7 +233,7 @@ impl DecodedPostings {
         } else {
             self.bytes += bytes;
             self.order.push_back(offset);
-            while self.bytes > MEMO_POSTING_BYTES || self.order.len() > MEMO_POSTING_BYTES / 1024 {
+            while self.bytes > self.limit || self.order.len() > self.limit / 1024 {
                 let offset = self
                     .order
                     .pop_front()
@@ -1000,6 +1029,8 @@ pub struct SegmentReader {
     compressed_positions: bool,
     compact: bool,
     decoded: std::sync::Mutex<DecodedPostings>,
+    /// Told the memo's charge as it grows and shrinks (set once by the owning cache).
+    memo_charge: std::sync::OnceLock<Arc<dyn Fn(u64) + Send + Sync>>,
     saturation: std::sync::Mutex<Option<Arc<Saturation>>>,
 }
 
@@ -1241,6 +1272,7 @@ impl SegmentReader {
                 compressed_positions: version >= VERSION_COMPRESSED,
                 compact: version >= VERSION_COMPACT,
                 decoded: Default::default(),
+                memo_charge: Default::default(),
                 saturation: Default::default(),
             });
         }
@@ -1267,6 +1299,7 @@ impl SegmentReader {
                 compressed_positions: false,
                 compact: false,
                 decoded: Default::default(),
+                memo_charge: Default::default(),
                 saturation: Default::default(),
             });
         }
@@ -1328,6 +1361,7 @@ impl SegmentReader {
             compressed_positions: false,
             compact: false,
             decoded: Default::default(),
+            memo_charge: Default::default(),
             saturation: Default::default(),
         })
     }
@@ -1452,7 +1486,7 @@ impl SegmentReader {
         Ok(out)
     }
     /// Conservative cache charge for lengths, term metadata, dictionary bundles,
-    /// and the bounded decoded-posting memo. A whole legacy FST's backing bytes
+    /// (the decoded-posting memo is charged as it grows, through `set_memo_charge`). A whole legacy FST's backing bytes
     /// are charged separately by the caller. Lazy lengths are charged before loading.
     pub fn resident_bytes(&self) -> u64 {
         const MALLOC_OVERHEAD: usize = 16;
@@ -1479,8 +1513,15 @@ impl SegmentReader {
                     + sizes.into_iter().take(MEMO_CHUNKS).sum::<usize>()
             }
         };
-        (terms + dictionary + self.docs as usize * 4 + MEMO_POSTING_BYTES * 4 + Saturation::BYTES)
-            as u64
+        (terms + dictionary + self.docs as usize * 4 + Saturation::BYTES) as u64
+    }
+    /// Bound each decoded-posting pool (sparse and dense) to `limit` bytes, and report the memo's
+    /// actual charge to `charge` as it grows and shrinks, so the owning cache pays for what is
+    /// resident rather than for a flat worst case. Takes effect once; later calls do nothing.
+    pub fn set_memo_charge(&self, limit: usize, charge: Arc<dyn Fn(u64) + Send + Sync>) {
+        if self.memo_charge.set(charge).is_ok() {
+            self.decoded.lock().unwrap().limit = limit;
+        }
     }
     /// The decoded lengths. Callers that read postings or score call `ensure_lengths` first.
     fn lens(&self) -> &[u32] {
@@ -1586,6 +1627,7 @@ impl SegmentReader {
             compressed_positions: version >= VERSION_COMPRESSED,
             compact: version >= VERSION_COMPACT,
             decoded: Default::default(),
+            memo_charge: Default::default(),
             saturation: Default::default(),
         })
     }
@@ -1922,6 +1964,11 @@ impl SegmentReader {
             return Ok(existing);
         }
         memo.insert(b.offset, out.clone(), !self.sparse_term(df));
+        let report = memo.report();
+        drop(memo);
+        if let (Some(charge), Some(hook)) = (report, self.memo_charge.get()) {
+            hook(charge);
+        }
         Ok(out)
     }
     /// Posting payload ranges for exact terms and the final prefix expansion.
@@ -2795,6 +2842,29 @@ async fn read_exact(source: &dyn RangeRead, range: Range<u64>) -> io::Result<Byt
 #[cfg(test)]
 mod posting_cache_tests {
     use super::*;
+
+    #[test]
+    fn memo_reports_its_actual_charge_as_it_grows_and_shrinks() {
+        let mut memo = DecodedPostings {
+            limit: 4 << 20,
+            ..Default::default()
+        };
+        assert_eq!(memo.charge(), 0);
+        assert_eq!(memo.report(), None, "a small change is not reported");
+        let block = || -> Postings { (0..128u32).map(|row| (row, 1)).collect::<Vec<_>>().into() };
+        let mut reports = Vec::new();
+        for offset in 0..20_000u64 {
+            memo.insert(offset, block(), true);
+            reports.extend(memo.report());
+        }
+        // Dense blocks beyond the limit evict older ones, so the charge stays bounded.
+        assert!(memo.dense_bytes <= memo.limit);
+        assert!(reports.len() > 1, "growth is reported in steps");
+        let last = *reports.last().unwrap();
+        assert!(last >= memo.dense_bytes as u64);
+        assert!(last <= memo.limit as u64 + (memo.blocks.len() * 200) as u64 + (1 << 20));
+        assert_eq!(memo.reported, last);
+    }
 
     #[test]
     fn pruned_dense_frames_do_not_receive_cache_second_chances() {

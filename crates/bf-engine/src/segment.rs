@@ -205,7 +205,8 @@ pub(crate) async fn text_index(
         let index = bf_text::SegmentReader::open_with_header(Arc::new(reader), &header)
             .map_err(index_error)?;
         let resident = index.resident_bytes() + 16384;
-        return Ok(read_cache::insert(&file.key, resident, index));
+        let index = read_cache::insert(&file.key, resident, index);
+        return Ok(charge_memo(&file.key, resident, index));
     }
     let start = file.size.saturating_sub(file.metadata_len.max(65536));
     let bytes = reader.read(start..file.size).await.map_err(index_error)?;
@@ -215,7 +216,27 @@ pub(crate) async fn text_index(
         .map_err(index_error)?;
     // The retained encoded buffer (the dictionary borrows it) plus the decoded directory.
     let resident = file.metadata_len.max(65536) + index.resident_bytes();
-    Ok(read_cache::insert(&file.key, resident, index))
+    let index = read_cache::insert(&file.key, resident, index);
+    Ok(charge_memo(&file.key, resident, index))
+}
+
+/// Make a cached reader's decoded-posting memo pay its actual size into the decoded cache. Each
+/// pool may hold up to a thirty-second of the general budget (8 to 64 MiB), so a few readers
+/// cannot crowd out the rest.
+fn charge_memo(
+    key: &str,
+    base: u64,
+    index: Arc<bf_text::SegmentReader>,
+) -> Arc<bf_text::SegmentReader> {
+    if let Some(cache) = read_cache::context().map(|c| c.cache) {
+        let limit = (read_cache::capacity() / 32).clamp(8 << 20, 64 << 20) as usize;
+        let (key, ptr) = (key.to_owned(), Arc::as_ptr(&index) as usize);
+        index.set_memo_charge(
+            limit,
+            Arc::new(move |memo| cache.recharge::<bf_text::SegmentReader>(&key, ptr, base + memo)),
+        );
+    }
+    index
 }
 
 fn text_header_of(header: &bf_wal::TextHeaderRef) -> Result<bf_text::TextHeader, ApiError> {
