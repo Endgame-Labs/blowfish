@@ -53,8 +53,9 @@ impl Stage {
             experiment::perf_control(false);
         }
         let seconds = elapsed.as_secs_f64();
-        #[cfg(test)]
-        if std::env::var_os("RR4_INPUT").is_some() {
+        if std::env::var_os("BF_TRACE_STAGES").is_some()
+            || (cfg!(test) && std::env::var_os("RR4_INPUT").is_some())
+        {
             eprintln!("RR4 stage={name} seconds={seconds:.6}");
         }
         metrics::histogram!("blowfish_recluster_stage_seconds", "stage" => name).record(seconds);
@@ -517,7 +518,7 @@ impl Engine {
                         .map_err(segment::index_error)?;
                 }
                 drop(reading);
-                let _encoding = Stage::new("encoding");
+                let encoding = Stage::new("encoding");
                 let params = bf_vector::BuildParams {
                     clusters: Some(k),
                     ..Default::default()
@@ -529,6 +530,8 @@ impl Engine {
                 let blob = builder
                     .build_packed_assigned(rows, data, centers, assignment)
                     .map_err(segment::index_error)?;
+                drop(encoding);
+                let _packing = Stage::new("packing_container");
                 bf_vector::Fragment::build_ann(&blob).map_err(segment::index_error)
             })
             .await??;
@@ -1056,10 +1059,13 @@ fn assign_leaves(
             .map(|(centers, _)| centers.iter().map(|c| norm2(c)).collect())
             .collect();
         let compared = std::sync::atomic::AtomicU64::new(0);
+        let routing_nanos = std::sync::atomic::AtomicU64::new(0);
+        let profile = std::env::var_os("BF_TRACE_STAGES").is_some();
         let route = |buf: &mut Vec<u8>, block: &[u32]| {
             if stopping() {
                 return None;
             }
+            let route_started = profile.then(std::time::Instant::now);
             let rows: Vec<Vec<f32>> = block
                 .iter()
                 .map(|i| read_row(present[*i as usize], buf))
@@ -1122,6 +1128,12 @@ fn assign_leaves(
                     * refs.len()) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            if let Some(start) = route_started {
+                routing_nanos.fetch_add(
+                    start.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             Some(assignment::Block {
                 rows,
                 norms,
@@ -1188,6 +1200,12 @@ fn assign_leaves(
             .flatten_iter()
             .collect();
         drop(score_stage);
+        if profile {
+            Stage::record(
+                "assignment_routing_service",
+                std::time::Duration::from_nanos(routing_nanos.into_inner()),
+            );
+        }
         #[cfg(test)]
         if let Some(scorer) = &scorer {
             eprintln!("RR4 matrix_and_verification_evals={:?}", scorer.counts());

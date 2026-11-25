@@ -235,6 +235,9 @@ pub(crate) fn build_blob(
     assignments: Vec<usize>,
     flat: bool,
 ) -> Result<Vec<u8>> {
+    let profile = std::env::var_os("BF_TRACE_STAGES").is_some();
+    let started = std::time::Instant::now();
+    let times: [std::sync::atomic::AtomicU64; 4] = std::array::from_fn(|_| 0.into());
     let rq = RaBitQ::new(b.dims, b.params.seed)?;
     let mut groups: Vec<Vec<u32>> = vec![Vec::new(); centers.len()];
     for (i, c) in assignments.into_iter().enumerate() {
@@ -259,6 +262,12 @@ pub(crate) fn build_blob(
         .par_iter()
         .enumerate()
         .map(|(c, group)| {
+            let local: [std::cell::Cell<u64>; 4] = std::array::from_fn(|_| std::cell::Cell::new(0));
+            let record = |stage: usize, start: Option<std::time::Instant>| {
+                if let Some(start) = start {
+                    local[stage].set(local[stage].get() + start.elapsed().as_nanos() as u64);
+                }
+            };
             let mut codes = Vec::new();
             let mut row_crcs = Vec::with_capacity(group.len());
             let mut vectors_crc = crc32fast::Hasher::new();
@@ -269,12 +278,19 @@ pub(crate) fn build_blob(
                 let i = i as usize;
                 ids.insert(rows.row_id(i));
                 let raw = rows.raw(i);
+                let start = profile.then(std::time::Instant::now);
                 row_crcs.push(crc32fast::hash(raw));
                 vectors_crc.update(raw);
+                record(3, start);
                 vectors_len += raw.len() as u64;
                 if !flat {
+                    let start = profile.then(std::time::Instant::now);
                     let training = rows.prepared(i);
+                    record(0, start);
+                    let start = profile.then(std::time::Instant::now);
                     let code = rq.encode_unchecked(&training, &centers[c]);
+                    record(1, start);
+                    let start = profile.then(std::time::Instant::now);
                     let zero = training.iter().all(|x| *x == 0.);
                     let alpha = (code.alpha as f32).clamp(1e-6, 1.);
                     let signed = if zero { -alpha } else { alpha };
@@ -307,10 +323,21 @@ pub(crate) fn build_blob(
                         codes.extend(signed.to_le_bytes());
                         codes.extend(code.bits);
                     }
+                    record(2, start);
                 }
             }
+            let start = profile.then(std::time::Instant::now);
             if fastscan {
                 codes = crate::fastscan::encode(&fast_rows, rq.padded);
+            }
+            record(2, start);
+            let start = profile.then(std::time::Instant::now);
+            let codes_crc = crc32fast::hash(&codes);
+            record(3, start);
+            if profile {
+                for (total, local) in times.iter().zip(local) {
+                    total.fetch_add(local.get(), std::sync::atomic::Ordering::Relaxed);
+                }
             }
             Block {
                 cluster: Cluster {
@@ -323,7 +350,7 @@ pub(crate) fn build_blob(
                     parent: parent_ids[c],
                     codes: 0..codes.len() as u64,
                     vectors: 0..vectors_len,
-                    codes_crc: crc32fast::hash(&codes),
+                    codes_crc,
                     vectors_crc: vectors_crc.finalize(),
                 },
                 codes,
@@ -376,6 +403,17 @@ pub(crate) fn build_blob(
     let checksum = crc32fast::hash(&footer[..60]);
     footer[60..].copy_from_slice(&checksum.to_le_bytes());
     blob.extend(footer);
+    if profile {
+        eprintln!(
+            "RR7 vector rows={} wall={:.6} prepare={:.6} rabitq={:.6} packing={:.6} crc={:.6}",
+            rows.len(),
+            started.elapsed().as_secs_f64(),
+            times[0].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+            times[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+            times[2].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+            times[3].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+        );
+    }
     Ok(blob)
 }
 
