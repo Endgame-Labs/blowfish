@@ -64,6 +64,12 @@ P.add_argument(
     help="single-tier staging arm to provision, then read with cold filesystem pages",
 )
 P.add_argument(
+    "--s3-only-arm",
+    action="append",
+    default=[],
+    help="arm with no disk cache or automatic ANN staging, for a pure-S3 control",
+)
+P.add_argument(
     "--two-phase-arm",
     action="append",
     default=[],
@@ -116,6 +122,8 @@ if not arms or any(not re.fullmatch(r"[A-Za-z0-9_-]+", name) for name in arms):
     P.error("arm names must contain only letters, numbers, hyphens, or underscores")
 if any(name not in arms for name in a.stage_arm) or (a.stage_arm and a.mode != "cachecold"):
     P.error("stage arms must be named cachecold arms")
+if any(name not in arms or name in a.stage_arm for name in a.s3_only_arm):
+    P.error("pure-S3 arms must be named arms without staging")
 if a.queries <= 0 or a.offset < 0 or a.offset + a.queries > len(items) or a.probes <= 0:
     P.error("select positive probes and a nonempty slice within the oracle workload")
 if not 0 <= a.stage_live_queries <= len(items):
@@ -234,7 +242,7 @@ def server(name, index):
         "read_only": True,
         "cache": {
             "memory_bytes": 8 * 2**30,
-            "disk_bytes": 48 * 2**30,
+            "disk_bytes": 0 if name in a.s3_only_arm else 48 * 2**30,
             "disk_dir": str(work / "cache"),
             "block_size": 4000,
             "max_coalesce_blocks": 512,
