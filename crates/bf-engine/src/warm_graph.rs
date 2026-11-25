@@ -47,6 +47,11 @@ fn overcommitted() -> bool {
         > bf_alloc::memory_limit_bytes().saturating_mul(4) / 5
 }
 
+/// Unit tests that need the process-global build slot, automatic-recluster flags, or the memory
+/// reservations to themselves hold this exclusively; every other recluster in a test holds it
+/// shared (see `Engine::recluster`), so no other test's build can starve them of admission.
+#[cfg(test)]
+pub(crate) static ADMISSION_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 static BUILDING: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct Key {

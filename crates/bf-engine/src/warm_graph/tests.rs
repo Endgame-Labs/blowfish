@@ -57,6 +57,7 @@ async fn admitted_entry(e: &Engine, set: &SlabSet) -> Entry {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
+    let _exclusive = ADMISSION_GATE.write().await;
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.scratch")
         .join(format!("g4-lifecycle-{}", uuid::Uuid::new_v4()));
@@ -107,7 +108,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         max_slab_rows: 5000,
         scratch: root.clone(),
     };
-    e.recluster("hot", &opts).await.unwrap();
+    e.run_recluster_job("hot", &opts).await.unwrap();
     let (state, _) = e
         .snapshot("hot", &bf_types::Consistency::Strong)
         .await
@@ -227,7 +228,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     assert_eq!(query(&e, "hot", request(17)).await[0]["id"], 5000);
     e.index_namespace("hot", true).await.unwrap();
     assert_eq!(query(&e, "hot", request(17)).await[0]["id"], 5000);
-    e.recluster("hot", &opts).await.unwrap();
+    e.run_recluster_job("hot", &opts).await.unwrap();
     assert_eq!(query(&e, "hot", request(17)).await[0]["id"], 5000);
     let (_, new_state) = Wal::new(store.clone(), "hot")
         .unwrap()
@@ -450,6 +451,7 @@ async fn migrated_query_polls_charge_cpu_without_charging_io_waits() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan() {
+    let _exclusive = ADMISSION_GATE.write().await;
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.scratch")
         .join(format!("g4-recall-cache-{}", uuid::Uuid::new_v4()));
@@ -496,7 +498,7 @@ async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan
         "upsert_rows":vectors.iter().enumerate().map(|(id,v)| json!({"id":id,"vector":v})).collect::<Vec<_>>()
     })).unwrap()).await.unwrap();
     e.index_namespace("hot", true).await.unwrap();
-    e.recluster(
+    e.run_recluster_job(
         "hot",
         &ReclusterOptions {
             attribute: "vector".into(),
@@ -656,6 +658,7 @@ fn production_priority_is_applied_without_waiting_for_idle_work() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_metric_and_precision_keep_identical_ivf_answers() {
+    let _exclusive = ADMISSION_GATE.write().await;
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.scratch")
         .join(format!("g4-unsupported-{}", uuid::Uuid::new_v4()));
@@ -682,7 +685,7 @@ async fn unsupported_metric_and_precision_keep_identical_ivf_answers() {
         engine.write("hot", serde_json::from_value(json!({"distance_metric":metric,"schema":{"vector":{"type":format!("[4]{precision}"),"ann":true}},"upsert_rows":vectors.iter().enumerate().map(|(i,v)| json!({"id":i,"vector":v})).collect::<Vec<_>>()})).unwrap()).await.unwrap();
         engine.index_namespace("hot", true).await.unwrap();
         engine
-            .recluster(
+            .run_recluster_job(
                 "hot",
                 &ReclusterOptions {
                     attribute: "vector".into(),
