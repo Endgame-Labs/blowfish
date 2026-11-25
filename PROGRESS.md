@@ -4,6 +4,9 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **T7 query cancellation (merged).** `run_io` aborts a plan's I/O continuation when its caller is dropped, for every caller; C21's separate cancellable helper and flag are removed (one way). Warm A/B within noise.
+- **BW16 (negative).** Ideal precomputed shadow masks under 1,000 upserts/s give only 1.15x BM25 p50.
+
 - **C21 speculative staged cold search (merged).** Routing, local scan, and rerank run on the stage's confirmed checkpoint while the manifest and WAL checks are in flight; accepted only if generation, indexed-through, and final WAL sequence agree, else the confirmed path reruns. 10M staged IDs-only, 200 groups: p50/p90 52.69/61.82 -> 32.13/35.92 ms (p90 ratio CI 0.516-0.613), 3,200 replies identical; pure-S3 ABBA flat. Since C18 this morning, 10M staged cold p90 went 103.4 -> 35.9 ms.
 - **G7, BW14, BW15 (negative).** Padding SQ8 graph rows: 0.92-0.99x. BM25 bound caches do not churn once warm. One 1M-row text segment: 1-client 0.52x, so segment fan-out stays.
 

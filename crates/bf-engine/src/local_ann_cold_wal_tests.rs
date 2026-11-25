@@ -711,7 +711,6 @@ async fn cold_search_revalidates_generation_checkpoint_and_speculative_errors() 
                         &f.request,
                         read_cache::ReadContext::new(f.engine.0.read_cache.clone()),
                         false,
-                        true
                     )
                     .await
                     .is_err()
@@ -791,7 +790,7 @@ async fn cancelling_blocked_io_drops_the_actual_worker_future() {
     let permits = permit.semaphore().clone();
     let started = Arc::new(Notify::new());
     let notify = started.clone();
-    let task = tokio::spawn(crate::query_worker::run_io_cancellable(
+    let task = tokio::spawn(crate::query_worker::run_io(
         tokio::runtime::Handle::current(),
         async move {
             let (_lease, _permit) = (lease, permit);

@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.40] - 2026-11-25
+
+### Fixed
+
+- **Dropped queries release their workers:** When a query's caller went away (a client disconnect, a timeout, or shutdown) while its plan waited on I/O, the plan kept running on the blocking pool and held its worker permits until it finished. Every query plan is now aborted at its next await point when its caller is dropped, and releases its permits promptly. Results of queries that complete are unchanged, and warm throughput is unchanged within noise.
+
 ## [0.1.39] - 2026-11-25
 
 ### Changed
@@ -302,7 +308,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.39...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.40...HEAD
+[0.1.40]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.40
 [0.1.39]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.39
 [0.1.38]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.38
 [0.1.37]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.37

@@ -12925,3 +12925,28 @@ A single trial arm before the sequence gave 16.48 / 27.69 ms.
   analysis. A cheaper route would be maintaining per-segment shadowed-row statistics incrementally across writes, a different design.
 - **Cost:** one c7g.4xlarge for about 18 minutes, an estimated under $0.30 with the volume. The instance, key pair, and security group
   are deleted (confirmed with describe-instances, describe-volumes, and describe-key-pairs). No S3 objects were created.
+
+## Round T7: a dropped query aborts its plan's I/O continuation
+
+`run_io` awaited `spawn_blocking(... block_on(future))` directly. Dropping that await (client disconnect, timeout, or
+shutdown) detaches a blocking task, so a plan waiting on I/O kept running and held its worker permits until the I/O
+finished. A test with a backend that never answers showed it: after the caller was dropped, the permit stayed held (the
+test failed before the fix, and a plain `#[tokio::test]` hung at runtime shutdown on the detached task).
+
+Now every `run_io` caller wraps the plan in `futures::future::Abortable`, and a drop guard aborts it when the caller goes
+away. The plan stops at its next await point, which releases its permits and pending I/O. Queries that are not dropped run
+the same code and return the same results. This is the same mechanism C21 added for staged speculative searches, now the one
+behavior (SPEC 25) instead of an opt-in.
+
+Paired warm micro-benchmark (`crates/bf-engine/examples/t7_ab.rs`, 20,000 rows, 64-d, 400 queries per arm, release, this
+shared VM, ABBA order, parent commit as base):
+
+| Arm | vector 1 client p50 / p90 ms | vector 16 clients p50 / p90 ms | BM25 1 client p50 / p90 ms | BM25 16 clients p50 / p90 ms |
+| --- | --- | --- | --- | --- |
+| base (A1) | 0.49 / 0.70 | 1.43 / 4.93 | 0.089 / 0.164 | 0.27 / 0.47 |
+| candidate (B1) | 0.45 / 0.56 | 1.04 / 2.83 | 0.076 / 0.098 | 0.25 / 0.46 |
+| candidate (B2) | 0.50 / 0.74 | 1.00 / 2.55 | 0.096 / 0.140 | 0.21 / 0.40 |
+| base (A2) | 0.58 / 1.64 | 1.62 / 4.93 | 0.098 / 0.193 | 0.31 / 1.50 |
+
+The candidate is within the base's run-to-run spread, with no measurable cost. Warm queries rarely yield to `run_io`, and
+the guard is one small allocation when they do.
