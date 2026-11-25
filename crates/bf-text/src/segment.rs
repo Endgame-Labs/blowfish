@@ -160,6 +160,9 @@ struct DecodedPostings {
 }
 impl DecodedPostings {
     fn get(&mut self, offset: u64) -> Option<Postings> {
+        if bw8::flag("BW8_NOMEMO") {
+            return None;
+        }
         let cached = self.blocks.get_mut(&offset)?;
         if cached.dense {
             cached.recent = true;
@@ -2046,6 +2049,22 @@ impl SegmentReader {
         allowed: Option<&RoaringBitmap>,
         mode: SearchMode<'_>,
     ) -> io::Result<(Vec<SearchHit>, SearchMetrics)> {
+        bw8::build(self).await?;
+        let out = self
+            .search_internal_inner(query, stats, params, k, allowed, mode)
+            .await?;
+        bw8::record(&out.1);
+        Ok(out)
+    }
+    async fn search_internal_inner(
+        &self,
+        query: &Query,
+        stats: &CorpusStats,
+        params: &FtsParams,
+        k: usize,
+        allowed: Option<&RoaringBitmap>,
+        mode: SearchMode<'_>,
+    ) -> io::Result<(Vec<SearchHit>, SearchMetrics)> {
         let prefetch = !matches!(mode, SearchMode::Demand);
         let threshold = if let SearchMode::Shared(threshold) = mode {
             Some(threshold)
@@ -2236,12 +2255,12 @@ impl SegmentReader {
                 // scoring, normalization, and query weights run without it.
                 let (known_frames, cached, frames) = {
                     let maxima = saturation.maxima.read().unwrap();
-                    let cached = key.and_then(|key| maxima.term(key));
+                    let cached = if bw8::flag("BW8_NOFRAMES") { None } else { key.and_then(|key| maxima.term(key)) };
                     let frames: Vec<_> = if cached.is_none() {
                         term.meta
                             .blocks
                             .iter()
-                            .map(|b| maxima.frames.get(&b.offset).cloned())
+                            .map(|b| if bw8::flag("BW8_NOFRAMES") { None } else { maxima.frames.get(&b.offset).cloned() })
                             .collect()
                     } else {
                         Vec::new()
@@ -2261,7 +2280,7 @@ impl SegmentReader {
                                 normalized[w] = normalized[w].max(maximum);
                             }
                         } else {
-                            let maximum = saturation.factor(b.max_tf, b.min_length).max(0.0);
+                            let maximum = bw8::block_factor(self, b, &saturation).max(0.0);
                             for value in
                                 &mut normalized[b.first as usize / BLOCK..=b.last as usize / BLOCK]
                             {
@@ -2551,7 +2570,7 @@ impl SegmentReader {
             let term = &mut terms[t];
             term.postings[b] =
                 Some(self.decode_postings(&term.meta.blocks[b], &bytes, term.meta.df)?);
-            if !self.sparse_term(term.meta.df) {
+            if !self.sparse_term(term.meta.df) && !bw8::flag("BW8_NOFRAMES") {
                 saturation.remember(
                     term.meta.blocks[b].offset,
                     term.postings[b].as_ref().unwrap(),
@@ -2981,3 +3000,111 @@ mod posting_cache_tests {
 #[cfg(test)]
 #[path = "experiments.rs"]
 mod experiments;
+
+/// Temporary BW8 kill-test instrumentation (counting only).
+mod bw8 {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::{Mutex, OnceLock};
+    static BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static ROWS: AtomicUsize = AtomicUsize::new(0);
+    static PRUNED: AtomicUsize = AtomicUsize::new(0);
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SKY: OnceLock<Mutex<std::collections::HashMap<(usize, u64), Vec<(u32, u32)>>>> =
+        OnceLock::new();
+    static BUILT: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+    static REPORTER: std::sync::Once = std::sync::Once::new();
+    pub fn flag(name: &str) -> bool {
+        std::env::var_os(name).is_some()
+    }
+    pub fn record(m: &SearchMetrics) {
+        BLOCKS.fetch_add(m.blocks_read, Relaxed);
+        ROWS.fetch_add(m.rows_scored, Relaxed);
+        PRUNED.fetch_add(m.windows_pruned, Relaxed);
+        CALLS.fetch_add(1, Relaxed);
+    }
+    fn cap() -> usize {
+        std::env::var("BW8_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX)
+    }
+    pub fn block_factor(r: &SegmentReader, b: &BlockMeta, sat: &Saturation) -> f64 {
+        let coarse = sat.factor(b.max_tf, b.min_length);
+        if !flag("BW8_SKY") {
+            return coarse;
+        }
+        let map = SKY.get_or_init(Default::default).lock().unwrap();
+        match map.get(&(r as *const _ as usize, b.offset)) {
+            Some(sky) if sky.len() <= cap() => {
+                let exact = sky.iter().map(|&(tf, dl)| sat.factor(tf, dl)).fold(0.0, f64::max);
+                assert!(exact <= coarse * (1.0 + 1e-12), "skyline bound exceeds coarse bound");
+                exact
+            }
+            _ => coarse,
+        }
+    }
+    pub async fn build(r: &SegmentReader) -> io::Result<()> {
+        REPORTER.call_once(|| {
+            std::thread::spawn(|| {
+                let mut last = (0, 0, 0, 0);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    let now = (
+                        CALLS.load(Relaxed),
+                        BLOCKS.load(Relaxed),
+                        ROWS.load(Relaxed),
+                        PRUNED.load(Relaxed),
+                    );
+                    if now != last {
+                        eprintln!("BW8 calls={} blocks_read={} rows_scored={} windows_pruned={}", now.0, now.1, now.2, now.3);
+                        last = now;
+                    }
+                }
+            });
+        });
+        let key = r as *const _ as usize;
+        if !flag("BW8_SKY") {
+            return Ok(());
+        }
+        {
+            let mut built = BUILT.get_or_init(Default::default).lock().unwrap();
+            if !built.insert(key) {
+                return Ok(());
+            }
+        }
+        r.ensure_lengths().await?;
+        let lengths = r.lens();
+        let mut hist = [0usize; 12];
+        let mut total = 0usize;
+        let mut inflated = 0usize;
+        for (_, id) in r.all_terms().await? {
+            let meta = r.load([id]).await?.remove(&id).unwrap();
+            if meta.blocks.len() <= SMALL_BLOCKS {
+                continue;
+            }
+            let ranges = meta.blocks.iter().map(|b| b.offset..b.offset + u64::from(b.size)).collect();
+            let values = r.read_ranges(ranges).await?;
+            let mut map = SKY.get_or_init(Default::default).lock().unwrap();
+            for (b, bytes) in meta.blocks.iter().zip(values) {
+                let postings = r.decode_postings(b, &bytes, meta.df)?;
+                let mut pairs: Vec<(u32, u32)> =
+                    postings.iter().map(|&(row, tf)| (tf, lengths[row as usize])).collect();
+                pairs.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                let mut sky: Vec<(u32, u32)> = Vec::new();
+                let mut best = u32::MAX;
+                for (tf, dl) in pairs {
+                    if dl < best {
+                        sky.push((tf, dl));
+                        best = dl;
+                    }
+                }
+                hist[sky.len().min(11)] += 1;
+                total += 1;
+                if sky.iter().all(|&(tf, dl)| (tf, dl) != (b.max_tf, b.min_length)) {
+                    inflated += 1;
+                }
+                map.insert((key, b.offset), sky);
+            }
+        }
+        eprintln!("BW8 skyline built segment={key:x} blocks={total} not_single_point={inflated} hist(len 0..11+)={hist:?}");
+        Ok(())
+    }
+}
