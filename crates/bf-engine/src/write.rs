@@ -502,15 +502,20 @@ fn normalize_document(doc: &mut Document, schema: &Schema) -> Result<(), ApiErro
                 "cannot infer type of '{name}'; declare it in schema"
             ))
         })?;
+        // Keep dense vectors compact in the WAL and its resident overlay. Internal
+        // base64 always contains f32 values, including values rounded for f16 storage.
+        // Decode, validate, and encode once, without building a JSON number per element.
+        if let Some(AttributeType::Vector { dimensions, f16 }) = &cfg.data_type {
+            *value = Value::String(encode_vector(
+                &normalize_vector(value, *dimensions, *f16)?,
+                false,
+            ));
+            continue;
+        }
         *value = normalize_value(
             value,
             cfg.data_type.as_ref().expect("normalized schema type"),
         )?;
-        // Keep dense vectors compact in the WAL and its resident overlay. Internal
-        // base64 always contains f32 values, including values rounded for f16 storage.
-        if matches!(cfg.data_type, Some(AttributeType::Vector { .. })) {
-            *value = Value::String(encode_vector(&decode_vector(value)?, false));
-        }
     }
     validate_document_size(doc, schema)
 }
@@ -577,6 +582,27 @@ fn validate_document_size(doc: &Document, schema: &Schema) -> Result<(), ApiErro
     Ok(())
 }
 
+/// Decode a dense vector (array or base64), check its dimensions, and round it to f16 when
+/// the attribute is stored that way. The result holds exactly the f32 values to store.
+fn normalize_vector(value: &Value, dimensions: usize, f16: bool) -> Result<Vec<f32>, ApiError> {
+    let mut v = decode_vector(value)?;
+    if v.len() != dimensions {
+        return Err(ApiError::bad(format!(
+            "invalid vector dimensions: expected {dimensions}, got {}",
+            v.len()
+        )));
+    }
+    if f16 {
+        for n in &mut v {
+            *n = half::f16::from_f32(*n).to_f32();
+            if !n.is_finite() {
+                return Err(ApiError::bad("vector value exceeds f16 range"));
+            }
+        }
+    }
+    Ok(v)
+}
+
 /// Validate and canonicalize a non-null attribute or filter operand.
 pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value, ApiError> {
     use base64::Engine as _;
@@ -628,22 +654,7 @@ pub(crate) fn normalize_value(value: &Value, t: &AttributeType) -> Result<Value,
             Ok(json!(v.iter().map(|x| *x as i8).collect::<Vec<_>>()))
         }
         AttributeType::Vector { dimensions, f16 } => {
-            let mut v = decode_vector(value)?;
-            if v.len() != *dimensions {
-                return Err(ApiError::bad(format!(
-                    "invalid vector dimensions: expected {dimensions}, got {}",
-                    v.len()
-                )));
-            }
-            if *f16 {
-                for n in &mut v {
-                    *n = half::f16::from_f32(*n).to_f32();
-                    if !n.is_finite() {
-                        return Err(ApiError::bad("vector value exceeds f16 range"));
-                    }
-                }
-            }
-            Ok(json!(v))
+            Ok(json!(normalize_vector(value, *dimensions, *f16)?))
         }
         AttributeType::Array(s) => {
             let values = value.as_array().ok_or_else(mismatch)?;

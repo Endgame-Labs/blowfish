@@ -158,14 +158,16 @@ pub(crate) fn check_vector(values: Vec<f32>) -> Result<Vec<f32>, ApiError> {
 /// Encode a vector in its declared element width for responses.
 pub fn encode_vector(values: &[f32], f16: bool) -> String {
     use base64::Engine;
-    let bytes: Vec<u8> = if f16 {
-        values
-            .iter()
-            .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
-            .collect()
+    let mut bytes = Vec::with_capacity(values.len() * if f16 { 2 } else { 4 });
+    if f16 {
+        for x in values {
+            bytes.extend_from_slice(&half::f16::from_f32(*x).to_le_bytes());
+        }
     } else {
-        values.iter().flat_map(|x| x.to_le_bytes()).collect()
-    };
+        for x in values {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+    }
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 /// ISO-8601 dates and datetimes normalized to UTC milliseconds.
