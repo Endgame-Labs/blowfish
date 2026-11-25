@@ -272,6 +272,8 @@ struct State {
     hints: HashMap<String, Hint>,
     /// Bounded, scoped checkpoint hints survive query-cache eviction with the stages.
     checkpoints: VecDeque<(String, Checkpoint)>,
+    /// Immutable checkpoint metadata, independent of disposable query caches and WAL overlays.
+    snapshots: HashMap<String, Arc<crate::NamespaceState>>,
     /// Slab bytes a local recluster wrote while uploading, by the tier's stage key.
     prestaged: HashMap<String, Arc<PreInner>>,
 }
@@ -804,12 +806,71 @@ impl Manager {
             }
             state.checkpoints.remove(i);
         }
+        if state.snapshots.get(&key).is_some_and(|s| {
+            checkpoint.is_none_or(|c| {
+                c.generation != s.manifest_seq || c.indexed_through != s.indexed_through
+            })
+        }) {
+            state.snapshots.remove(&key);
+        }
         if let Some(checkpoint) = checkpoint {
             state.checkpoints.push_back((key, checkpoint));
-            if state.checkpoints.len() > MAX_STAGES {
-                state.checkpoints.pop_front();
+            if state.checkpoints.len() > MAX_STAGES
+                && let Some((key, _)) = state.checkpoints.pop_front()
+            {
+                state.snapshots.remove(&key);
             }
         }
+    }
+    /// Retain only a manifest-confirmed checkpoint, before replaying any WAL overlay.
+    pub(crate) fn note_snapshot(&self, scope: &str, ns: &str, snapshot: &crate::NamespaceState) {
+        if !snapshot.exists
+            || snapshot.seq != snapshot.indexed_through
+            || snapshot.tail_bytes != 0
+            || !snapshot.docs.is_empty()
+            || !snapshot.shadowed.is_empty()
+        {
+            return;
+        }
+        let key = format!("{scope}ns/{ns}/");
+        let mut state = self.state.lock().expect("ANN staging lock");
+        if state.checkpoints.iter().any(|(k, c)| {
+            k == &key
+                && c.generation == snapshot.manifest_seq
+                && c.indexed_through == snapshot.indexed_through
+        }) {
+            state.snapshots.insert(key, Arc::new(snapshot.clone()));
+        }
+    }
+    /// Advisory state for a cold staged search. A fresh snapshot must validate every result.
+    pub(crate) fn snapshot(
+        &self,
+        scope: &str,
+        ns: &str,
+        attribute: &str,
+    ) -> Option<Arc<crate::NamespaceState>> {
+        let checkpoint = self.checkpoint(scope, ns)?;
+        let state = self.state.lock().expect("ANN staging lock");
+        let snapshot = state
+            .snapshots
+            .get(&format!("{scope}ns/{ns}/"))
+            .filter(|s| {
+                s.manifest_seq == checkpoint.generation
+                    && s.indexed_through == checkpoint.indexed_through
+            })
+            .cloned()?;
+        let sets = snapshot
+            .ann_tiers
+            .get(attribute)
+            .filter(|sets| !sets.is_empty())?;
+        sets.iter()
+            .all(|set| {
+                state
+                    .ready
+                    .get(&stage_key(scope, &set.dir.key, false))
+                    .is_some_and(|(_, stage)| !stage.bad.load(Ordering::Relaxed))
+            })
+            .then_some(snapshot)
     }
     fn known_checkpoint(&self, scope: &str, ns: &str) -> Option<Checkpoint> {
         let key = format!("{scope}ns/{ns}/");

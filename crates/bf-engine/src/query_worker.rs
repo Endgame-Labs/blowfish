@@ -146,9 +146,22 @@ where
         .with(|slot| slot.borrow().clone())
         .unwrap_or(runtime);
     let worker_runtime = runtime.clone();
+    // Dropping a blocking JoinHandle detaches it. Abort the async plan as well, so a
+    // cancelled query releases its permits, stage readers, and pending I/O on the worker.
+    struct Cancel(futures::future::AbortHandle);
+    impl Drop for Cancel {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let (abort, registration) = futures::future::AbortHandle::new_pair();
+    let _cancel = Cancel(abort);
     runtime
-        .spawn_blocking(move || worker_runtime.block_on(future))
+        .spawn_blocking(move || {
+            worker_runtime.block_on(futures::future::Abortable::new(future, registration))
+        })
         .await
+        .map_err(crate::segment::index_error)?
         .map_err(crate::segment::index_error)
 }
 

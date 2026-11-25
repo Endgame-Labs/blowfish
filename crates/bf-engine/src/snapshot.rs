@@ -13,6 +13,8 @@ use std::{
 /// What a query will open, so a cold snapshot can fetch it in parallel with the WAL tail.
 #[derive(Clone)]
 pub(crate) struct OpenHint {
+    /// A cold staged search is already opening these files; avoid duplicate prefetch work.
+    pub(crate) searching: bool,
     context: crate::read_cache::ReadContext,
     ann: BTreeSet<String>,
     text: BTreeSet<String>,
@@ -81,6 +83,7 @@ impl OpenHint {
         prefetch_scan: bool,
     ) -> Self {
         let mut hint = Self {
+            searching: false,
             config: config.clone(),
             scan: None,
             context,
@@ -497,10 +500,11 @@ async fn catch_up_hinted_inner(
         } else {
             (bf_wal::ManifestView::Full, state.manifest_seq)
         };
-        // This hint never supplies namespace state. Its only purpose is to start the
-        // ordinary WAL reader earlier; the fresh manifest must confirm its identity.
+        // The fresh manifest must confirm the advisory checkpoint before its tail is reused.
         let checkpoint = hint
-            .filter(|h| attempt == 0 && state.seq == 0 && cap.is_none() && h.scan.is_some())
+            .filter(|h| {
+                attempt == 0 && state.seq == 0 && cap.is_none() && (h.scan.is_some() || h.searching)
+            })
             .and_then(|h| {
                 h.context.cache.staging.as_ref().and_then(|manager| {
                     manager.checkpoint(&h.context.cache.key(""), wal.namespace())
@@ -536,7 +540,7 @@ async fn catch_up_hinted_inner(
         };
         let prefetch_read = async {
             let mut found = BTreeMap::new();
-            if let Some(hint) = hint.filter(|_| state.ann_dirs.is_empty()) {
+            if let Some(hint) = hint.filter(|h| state.ann_dirs.is_empty() && !h.searching) {
                 let reads = hint.ann.iter().map(|a| {
                     let mut layouts = layouts_rx.clone();
                     async move {
@@ -763,6 +767,11 @@ async fn catch_up_hinted_inner(
             state.manifest_seq = generation.max(state.manifest_seq);
         }
         state.checkpoint_refreshed = Instant::now();
+        if let Some(hint) = hint
+            && let Some(manager) = &hint.context.cache.staging
+        {
+            manager.note_snapshot(&hint.context.cache.key(""), wal.namespace(), state);
+        }
         let tail = async {
             if reuse_tail && checkpoint.is_some_and(|c| c.indexed_through == state.seq) {
                 let result = match completed_tail {
@@ -796,7 +805,7 @@ async fn catch_up_hinted_inner(
             )
             .await
         };
-        let tail = if let Some(hint) = hint.filter(|_| !state.segments.is_empty()) {
+        let tail = if let Some(hint) = hint.filter(|h| !state.segments.is_empty() && !h.searching) {
             // The checkpoint's files do not depend on the tail: open them meanwhile.
             let (segments, text) = (state.segments.clone(), state.text_stats.clone());
             let dirs = state.ann_dirs.clone();
