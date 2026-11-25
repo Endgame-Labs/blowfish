@@ -11560,3 +11560,116 @@ bits, with arrays earned during the run.
 
 
 EC2: one on-demand c7g.4xlarge, about 1.6 hours, roughly $1.1 including the 120 GiB gp3 volume.
+
+## Round C15: staged document columns (the cap decides, a larger cap passes)
+
+Round C8 left a query that returns `title` and `text` at about 100 ms, one storage round for the data blocks of the
+columns. Round C15 stages those blocks locally. A query's projection is noted per namespace (the first eight column
+names seen, plus `id`, which every projection reads). For each such column, a tier gets one pack file holding the
+column's blocks from every source segment it covers (a column whose blocks are not one contiguous run in the object is
+skipped). The pack has its own completion record, source-identity checks, adoption across restarts, and 16 KiB CRCs on
+every read; hydration reads a staged column before it asks storage. No bucket format changes, and no setting.
+
+### Where the bytes come from
+
+At 10M the 20 GiB cap is already full: exact vectors take 9,504,006 rows (95.04 percent) and 21.19 GB. Title, text, and
+`id` need about 4.1 GB more. Under the unchanged cap there are two ways to find room, and the first one fails.
+
+**Columns ahead of the exact vectors (first build).** One c7gd.4xlarge, `cold_ab.py`, 100 paired queries, cold caches
+and evicted staging pages before every query, 10M (`tmp/c5/10m/`, read-only):
+
+| Measure | C14 control | Columns first |
+| --- | ---: | ---: |
+| `["title","text"]` p50 / p90 | 145.7 / 220.9 ms | 148.9 / 239.9 ms |
+| GETs per query, document bytes read from storage | 63.9, 2.03 MB | 16.1, 0 |
+| Exact-vector rows staged | 9,504,006 | 7,453,339 (-21.6 percent) |
+| IDs-only p50 / p90, after the same staging | 58.4 / 119.6 ms | **137.6 / 213.8 ms** |
+
+Hydration is local (GETs fall by three quarters and document bytes to zero), but the 2.05M displaced vector rows move
+the rerank wait to storage. The rerank stage went from 18.8 to 104.5 ms at p50 and the response finished where it did
+before. IDs-only queries lose 80 ms, because any query that probes a segment without staged vectors waits for a
+storage round. Columns must not displace vectors, so the shipped code stages them last.
+
+**Columns after the exact vectors (shipped).** They take only what the cap leaves: at 10M that is about 79 MB, enough
+for the `id` column and nothing else. Two builds ran side by side on one host with the control, 90 queries each, in
+rotation (so base, b, x see the same query at the same time of day, within a rotation):
+
+- **b**: the shipped code, 20 GiB cap.
+- **x**: the same code with the cap raised to 40 GiB (not shipped: the constant was changed in a scratch copy, so that
+  everything fits).
+
+| 10M, 90 paired queries | Control (C14) | b: 20 GiB cap | x: 40 GiB cap |
+| --- | ---: | ---: | ---: |
+| `["title","text"]` p50 / p90 | 141.9 / 232.5 ms | 123.0 / 249.0 ms | **62.7 / 99.9 ms** |
+| GETs per query | 64.5 | 45.1 | **3.0** |
+| Document bytes read from storage | 2.10 MB | 2.00 MB | **0** |
+| Hydration stage p50 | 100.1 ms | 77.2 ms | 17.6 ms |
+| IDs-only p50 / p90 | 61.8 / 170.7 ms | 56.9 / 135.7 ms | 56.7 / 84.5 ms |
+| Exact-vector rows staged | 9,504,006 | 9,504,006 | 10,000,000 |
+| Staged footprint, files | 21,185,895,641 B, 59 | 21,264,923,698 B, 61 | 26,267,749,526 B, 65 |
+| Fully ready after the first query | 125.4 s | 122.0 s | 153.6 s |
+
+Another session of the same three arms before the last build changes (90 queries, first-version planning): attributes
+118.4 / 186.1 (control), 116.0 / 188.1 (b), **58.4 / 75.7 ms (x)**; IDs-only 55.0 / 96.6, 56.8 / 127.7, 51.9 / 64.0 ms.
+S3 latency moved between sessions (the control read 118 and 142 ms), but each session ranks the arms the same way.
+
+All 90 paired queries return identical ordered IDs, distances, and documents in both arms, in both sessions.
+
+### What this says
+
+- **Staged columns work.** With room for both, attribute p50 halves (141.9 to 62.7 ms, and 118.4 to 58.4 ms in the other
+  session), meeting the 80 ms target, IDs-only is no slower (it is faster, with every vector staged), and a query
+  makes 3 GETs instead of 64. The cost is disk and time: a 5.1 GB larger footprint (4.1 GB of columns and 1.0 GB of
+  the vectors the control left out) and 18 to 28 s longer to be fully ready.
+- **Under the 20 GiB cap at 10M they do not fit.** The columns are 4.1 GB and the cap has 0.08 GB left, so the pass
+  condition (p50 at most 80 ms within the cap) is **not met**: 123.0 ms. Only the 79 MB `id` column fits; the 19 ms
+  below the control (with a worse p90, and 116.0 against 118.4 in the other session) is mostly noise.
+  Taking the room from the vectors costs more than it saves (above).
+- **The decision is the cap, not the code.** A cap of 25 GiB (the x arm used 24.5 GiB) holds 10M rows of 1,024-d f16 vectors, their
+  codes, the companions, and title, text, and `id`. This host has 880 GB of NVMe; the cap is the smaller of 20 GiB and
+  a quarter of the free filesystem space. I did not change it: the brief fixed it, and a larger default is a
+  disk-footprint decision for Kyle. Raising `MAX_BYTES` in `crates/bf-engine/src/local_ann.rs` is the whole change.
+
+### 100M
+
+The original 100M layout (`v014/big`, read-only), the control and the shipped build, 60 paired queries, IDs-only
+after staging with `["title","text"]` projected, one repetition:
+
+| Arm | p50 / p90 | GETs per query | Document bytes from storage | Vector rows staged | Files | Footprint |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Control (C14) | 344.0 / 432.7 ms | 88.8 | 0 | 712,354 | 325 | 21,136,174,001 B |
+| Shipped | 343.2 / 426.7 ms | 87.1 | 0 | 712,354 | 325 | 21,136,174,006 B |
+
+At 100M the cap is full of codes, companions, and a few vectors, so no column is staged and nothing changes: same
+files, same vector rows, same footprint to within the completion record, identical ordered IDs and distances in all 60
+pairs. Two earlier builds had a fault that this run caught: the first measured queries of the shipped arm read
+5 to 17 MB of document blocks each, because a refused column was planned again after its 60-second memo expired (about
+700 directory-tail GETs per attempt at 100M). The shipped code plans columns once the code stage is published, and keeps
+a refusal until some staged bytes are freed, so a full cap is not probed again.
+
+### Method and cost
+
+`cold_ab.py` gained `--column-arm` (wait for the column phase), `--stage-attributes` (the projection of the staging
+and live queries only, so IDs-only queries can be measured against a stage built from attribute queries), and the arm
+names above. One on-demand c7gd.4xlarge (us-west-2, local NVMe for the run directories), CPUs 0 to 7,
+`-C target-cpu=neoverse-v1`, all arms built on the box and run alternately with caches dropped and staging pages
+evicted before each query. The control is `0569c4f` (v0.1.32). From `.scratch/<run>` on the host:
+
+```sh
+taskset -c 0-7 uv run crates/bf-engine/examples/cold_ab.py --config CONFIG.local --oracle 10m --queries 90 \
+  --binary C15_SCALE_SERVER --arms '{"base":{"BINARY":"C14_SCALE_SERVER"},"b":{},"x":{"BINARY":"X_SERVER"}}' \
+  --stage-arm base --stage-arm b --stage-arm x --two-phase-arm base --two-phase-arm b --two-phase-arm x \
+  --column-arm b --column-arm x --include-attributes '["title","text"]' --scratch .scratch/c15 --label attr
+```
+
+Use `--stage-attributes '["title","text"]'` and no `--include-attributes` for the IDs-only run. The `x` build changes
+only `MAX_BYTES` to `40 << 30`. The instance ran 12:00 to 13:17 UTC on 2026-11-25 (about 1.3 hours, roughly $1 with
+requests). The instance, key pair, and security group are deleted, and no bucket object was written.
+
+### Verification
+
+New tests (`crates/bf-engine/src/local_ann.rs`): requested columns stage into packs that serve CRC-checked reads of
+object offsets, refuse bytes outside the column's run, skip vector and absent columns, add a column a later query
+projects, are adopted after a restart, and are discarded on corruption; a full cap refuses a column, evicts nothing, is
+not probed again, and stages it once room returns. `cargo fmt`, `cargo clippy -p bf-engine --all-targets -- -D warnings`,
+and `cargo test -p bf-engine -p bf-storage` pass.
