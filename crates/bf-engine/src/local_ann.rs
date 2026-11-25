@@ -41,6 +41,8 @@ struct StagedFile {
     len: u64,
     crc: Vec<u32>,
     identity: Option<ObjectIdentity>,
+    /// The object whose identity covers these bytes when they are derived from it.
+    source: Option<String>,
 }
 impl StagedFile {
     /// Object ranges as offsets into the stored bytes, or `None` when any is not wholly stored.
@@ -237,6 +239,9 @@ struct FileRecord {
     /// tails were staged) start at zero.
     #[serde(default)]
     base: u64,
+    /// The object these bytes were derived from, when the key names a derived file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
 }
 fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -262,17 +267,37 @@ fn read_record(path: &Path) -> io::Result<Record> {
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
-/// Part of a source segment's documents that hydration reads on every query: a whole
-/// object (the ID index), or its last `len` bytes (the column directory).
+/// What hydration reads on every query from a source segment, for a stage to hold.
 #[derive(Clone)]
 pub(crate) struct Extra {
     pub file: SegmentFile,
-    pub base: u64,
+    pub kind: ExtraKind,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum ExtraKind {
+    /// The object's last bytes from this offset: a column directory.
+    Tail(u64),
+    /// A derived map from row to ID, 8 bytes per row, when every ID of the object's ID index
+    /// (of this many rows) is an unsigned integer.
+    NumericIds(u32),
 }
 impl Extra {
     fn len(&self) -> u64 {
-        self.file.size - self.base
+        match self.kind {
+            ExtraKind::Tail(base) => self.file.size - base,
+            ExtraKind::NumericIds(rows) => u64::from(rows) * 8,
+        }
     }
+    /// The key a stage files these bytes under.
+    fn key(&self) -> String {
+        match self.kind {
+            ExtraKind::Tail(_) => self.file.key.clone(),
+            ExtraKind::NumericIds(_) => rowid_key(&self.file.key),
+        }
+    }
+}
+fn rowid_key(ids_key: &str) -> String {
+    format!("{ids_key}#rowid")
 }
 
 /// One engine's bounded disk staging area; scoped engines share its budget, but separate keys.
@@ -572,7 +597,12 @@ impl Manager {
         let objects: Vec<_> = record
             .files
             .iter()
-            .map(|(key, file)| (key.clone(), file.identity.clone()))
+            .map(|(key, file)| {
+                (
+                    file.source.clone().unwrap_or_else(|| key.clone()),
+                    file.identity.clone(),
+                )
+            })
             .collect();
         futures::stream::iter(objects.into_iter().map(|(key, expected)| {
             let scoped = scoped.clone();
@@ -627,6 +657,7 @@ impl Manager {
                     len: f.len,
                     crc: f.crc.clone(),
                     identity: Some(f.identity.clone()),
+                    source: f.source.clone(),
                 },
             );
         }
@@ -893,6 +924,71 @@ impl Manager {
         lease.bytes = bytes;
         true
     }
+    /// Build each segment's row-to-ID map from its ID index. A segment with any string ID gets
+    /// none, and its IDs are read from the object as before.
+    async fn derive_row_ids(
+        &self,
+        store: &Storage,
+        maps: &[Extra],
+        path: &Path,
+    ) -> io::Result<HashMap<String, StagedFile>> {
+        futures::stream::iter(maps.iter().cloned().map(|extra| {
+            let (store, path) = (store.clone(), path.to_owned());
+            async move {
+                let ExtraKind::NumericIds(rows) = extra.kind else {
+                    return Ok(None);
+                };
+                let before = store
+                    .object_identity(&extra.file.key)
+                    .await
+                    .map_err(io::Error::other)?;
+                let bytes = store
+                    .range_reader_with_length(&extra.file.key, extra.file.size, true)
+                    .map_err(io::Error::other)?
+                    .bypass_cache()
+                    .read_direct(0..extra.file.size)
+                    .await
+                    .map_err(io::Error::other)?;
+                let (derived, source, size) = (extra.key(), extra.file.clone(), extra.file.size);
+                let target = path.join(format!("source-{}", digest(derived.as_bytes())));
+                let staged = tokio::task::spawn_blocking(move || {
+                    debug_assert_eq!(bytes.len() as u64, size);
+                    let Some(packed) =
+                        crate::segment::packed_numeric_ids(&store, &source, rows, bytes)
+                            .map_err(|e| io::Error::other(format!("{e:?}")))?
+                    else {
+                        return Ok::<_, io::Error>(None);
+                    };
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(target)?;
+                    file.write_all_at(&packed, 0)?;
+                    file.sync_all()?;
+                    Ok(Some((
+                        derived,
+                        StagedFile {
+                            file,
+                            base: 0,
+                            len: packed.len() as u64,
+                            crc: packed.chunks(BLOCK).map(crc32fast::hash).collect(),
+                            identity: Some(before),
+                            source: Some(source.key),
+                        },
+                    )))
+                })
+                .await
+                .map_err(io::Error::other)??;
+                Ok::<_, io::Error>(staged)
+            }
+        }))
+        .buffer_unordered(DOWNLOADS)
+        .try_filter_map(|staged| async move { Ok(staged) })
+        .try_collect()
+        .await
+    }
     /// Reserve descriptors for optional files, within the manager's file limit.
     fn extend_files(&self, lease: &mut Lease, files: usize) -> bool {
         let mut state = self.state.lock().expect("ANN staging lock");
@@ -975,10 +1071,10 @@ impl Manager {
         // the vectors: admit them first, smallest (the column directories) before IDs.
         let mut companions: Vec<Extra> = Vec::new();
         let mut hydration = extras;
-        hydration.sort_by_key(|e| (e.len(), e.file.key.clone()));
+        hydration.sort_by_key(|e| (e.len(), e.key()));
         for extra in hydration {
             let len = extra.len();
-            let cost = len + len.div_ceil(BLOCK as u64) * 11 + extra.file.key.len() as u64 + 1024;
+            let cost = len + len.div_ceil(BLOCK as u64) * 11 + extra.key().len() as u64 + 1024;
             if limits.contains_key(&extra.file.key) || !self.extend_files(&mut stage._lease, 1) {
                 continue;
             }
@@ -1068,16 +1164,23 @@ impl Manager {
                 }
                 Ok(((*source).clone(), 0, len))
             })
-            .chain(
-                companions
-                    .iter()
-                    .map(|e| Ok((e.file.clone(), e.base, e.len()))),
-            )
+            .chain(companions.iter().filter_map(|e| match e.kind {
+                ExtraKind::Tail(base) => Some(Ok((e.file.clone(), base, e.len()))),
+                ExtraKind::NumericIds(_) => None,
+            }))
             .collect::<io::Result<Vec<_>>>()?;
         stage.files.extend(
             self.download_many(store, &sources_to_copy, &stage.path)
                 .await?,
         );
+        let maps: Vec<_> = companions
+            .iter()
+            .filter(|e| matches!(e.kind, ExtraKind::NumericIds(_)))
+            .cloned()
+            .collect();
+        stage
+            .files
+            .extend(self.derive_row_ids(store, &maps, &stage.path).await?);
         let sources: HashMap<_, _> = std::iter::once(&set.dir)
             .chain(set.pages.iter())
             .chain(set.slabs.iter().flat_map(|s| s.files.values()))
@@ -1087,7 +1190,12 @@ impl Manager {
         let identities: Vec<_> = stage
             .files
             .iter()
-            .map(|(key, file)| (key.clone(), file.identity.clone()))
+            .map(|(key, file)| {
+                (
+                    file.source.clone().unwrap_or_else(|| key.clone()),
+                    file.identity.clone(),
+                )
+            })
             .collect();
         futures::stream::iter(identities.into_iter().map(|(key, identity)| {
             let store = store.clone();
@@ -1118,7 +1226,7 @@ impl Manager {
                 return Err(io::Error::other("backend has no immutable object identity"));
             }
             let _ = sources
-                .get(key.as_str())
+                .get(f.source.as_deref().unwrap_or(key.as_str()))
                 .ok_or_else(|| io::Error::other("unknown staged object"))?;
             let name = format!("object-{n}");
             // Existing builder names are deliberately unrelated to final record names.
@@ -1139,6 +1247,7 @@ impl Manager {
                     len: f.len,
                     crc: f.crc.clone(),
                     identity,
+                    source: f.source.clone(),
                 },
             );
         }
@@ -1254,6 +1363,7 @@ impl Manager {
                     len,
                     crc: vec![0; len.div_ceil(BLOCK as u64) as usize],
                     identity: Some(identity),
+                    source: None,
                 },
             );
         }
@@ -1353,6 +1463,7 @@ impl Manager {
             len,
             crc,
             identity: Some(before),
+            source: None,
         })
     }
 }
@@ -1408,34 +1519,20 @@ pub(crate) fn hydration_extras(set: &SlabSet, segments: &[bf_wal::Segment]) -> V
             if tail > 0 {
                 extras.push(Extra {
                     file: file.clone(),
-                    base: file.size - tail,
+                    kind: ExtraKind::Tail(file.size - tail),
                 });
             }
         }
         if let Some(file) = segment.files.get("ids")
-            && file.size > 0
+            && segment.row_count > 0
         {
             extras.push(Extra {
                 file: file.clone(),
-                base: 0,
+                kind: ExtraKind::NumericIds(segment.row_count),
             });
         }
     }
     extras
-}
-/// Whether a stage holds this whole object, so reading it costs no storage request.
-pub(crate) fn staged(key: &str, size: u64) -> bool {
-    let Some(context) = read_cache::staging_context() else {
-        return false;
-    };
-    let Some(manager) = &context.cache.staging else {
-        return false;
-    };
-    context.admit
-        && manager
-            .file(&context.cache.key(key))
-            .and_then(|stage| stage.files.get(key).map(|f| f.base == 0 && f.len >= size))
-            .unwrap_or(false)
 }
 pub(crate) fn prefetch(key: &str, ranges: &[Range<u64>]) -> bool {
     let Some(context) = read_cache::staging_context() else {
@@ -1472,6 +1569,19 @@ pub(crate) fn read(key: &str, ranges: &[Range<u64>]) -> Option<Vec<Bytes>> {
         .fetch_add(logical, Ordering::Relaxed);
     metrics::counter!("blowfish_cache_hits_total", "tier" => "disk").increment(ranges.len() as u64);
     Some(bytes)
+}
+/// The IDs of these rows of an ID index, from a stage's derived row-to-ID map. `None` when no
+/// verified map covers them, and the caller reads the object instead.
+pub(crate) fn staged_row_ids(ids_key: &str, rows: &roaring::RoaringBitmap) -> Option<Vec<u64>> {
+    let ranges: Vec<Range<u64>> = rows
+        .iter()
+        .map(|row| u64::from(row) * 8..u64::from(row) * 8 + 8)
+        .collect();
+    let bytes = read(&rowid_key(ids_key), &ranges)?;
+    bytes
+        .into_iter()
+        .map(|b| Some(u64::from_le_bytes(b.as_ref().try_into().ok()?)))
+        .collect()
 }
 pub(crate) fn note_hint(hint: &str, object: Option<&str>, len: u64) {
     let Some(context) = read_cache::staging_context() else {
@@ -1536,6 +1646,7 @@ mod tests {
             len: data.len() as u64,
             crc: data.chunks(BLOCK).map(crc32fast::hash).collect(),
             identity: None,
+            source: None,
         };
         // The live descriptor, rather than a reopened pathname, owns the immutable bytes.
         temporary.close().unwrap();
@@ -2052,6 +2163,57 @@ mod tests {
                 .is_none()
         );
         assert!(tail.read(std::slice::from_ref(&(0..8))).is_err());
+    }
+
+    #[tokio::test]
+    async fn derived_row_ids_answer_from_the_stage_and_skip_string_ids() {
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        let (store, _, _, _) = fixture(1).await;
+        let numeric: Vec<bf_types::Id> = (0..5000u64)
+            .map(|n| bf_types::Id::Uint(n * 7 + 3))
+            .collect();
+        let text: Vec<bf_types::Id> = (0..10u32)
+            .map(|n| bf_types::Id::String(format!("id-{n}")))
+            .collect();
+        let a = crate::segment::put_ids(&store, "ids-a".into(), numeric.clone())
+            .await
+            .unwrap();
+        let b = crate::segment::put_ids(&store, "ids-b".into(), text)
+            .await
+            .unwrap();
+        let maps = [
+            Extra {
+                file: a.clone(),
+                kind: ExtraKind::NumericIds(5000),
+            },
+            Extra {
+                file: b,
+                kind: ExtraKind::NumericIds(10),
+            },
+        ];
+        let files = manager
+            .derive_row_ids(&store, &maps, work.path())
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let staged = &files[&rowid_key("ids-a")];
+        assert_eq!(staged.source.as_deref(), Some("ids-a"));
+        assert_eq!(staged.len, 5000 * 8);
+        let rows = [0u64, 1, 2047, 2048, 4999];
+        let ranges: Vec<_> = rows.iter().map(|r| r * 8..r * 8 + 8).collect();
+        for (bytes, row) in staged.read(&ranges).unwrap().iter().zip(rows) {
+            let want = match &numeric[row as usize] {
+                bf_types::Id::Uint(n) => *n,
+                _ => unreachable!(),
+            };
+            assert_eq!(u64::from_le_bytes(bytes.as_ref().try_into().unwrap()), want);
+        }
+        assert!(
+            staged
+                .read(std::slice::from_ref(&(5000 * 8..5000 * 8 + 8)))
+                .is_err()
+        );
     }
 
     #[tokio::test]

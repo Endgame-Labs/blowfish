@@ -1161,9 +1161,52 @@ pub(crate) async fn projected_documents(
         })
         .collect()
 }
-/// Rows for hydrating search winners. An ID-only projection reads the segment's ID index when
-/// a local stage holds it, so the response costs no storage request; otherwise this is
-/// [`projected_rows`], whose directory and one small ID block read are cheaper over the network.
+/// Write an ID index object, as a segment build does.
+#[cfg(test)]
+pub(crate) async fn put_ids(
+    store: &Storage,
+    key: String,
+    ids: Vec<Id>,
+) -> Result<SegmentFile, ApiError> {
+    put_value(store, key, &IdIndex { ids }).await
+}
+/// A segment's IDs in row order as packed little-endian `u64`s, built from the bytes of its ID
+/// index for a local stage. `None` when any ID is not an unsigned integer.
+pub(crate) fn packed_numeric_ids(
+    store: &Storage,
+    file: &SegmentFile,
+    rows: u32,
+    bytes: Bytes,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let reader = ObjectReader::new(store, file);
+    let dir = decode_directory(&reader, &bytes, 0)?;
+    let b = dir
+        .columns
+        .get("value")
+        .and_then(|c| c.blocks.first())
+        .ok_or_else(corrupt)?;
+    let data = bytes
+        .get(b.offset as usize..b.offset.checked_add(b.length).ok_or_else(corrupt)? as usize)
+        .ok_or_else(corrupt)?;
+    if crc32fast::hash(data) != b.crc {
+        return Err(corrupt());
+    }
+    let index: IdIndex = decode(data)?;
+    if index.ids.len() != rows as usize || index.ids.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(corrupt());
+    }
+    let mut packed = Vec::with_capacity(index.ids.len() * 8);
+    for id in &index.ids {
+        match id {
+            Id::Uint(n) => packed.extend_from_slice(&n.to_le_bytes()),
+            Id::String(_) => return Ok(None),
+        }
+    }
+    Ok(Some(packed))
+}
+/// Rows for hydrating search winners. An ID-only projection reads a few bytes of the segment's
+/// staged row-to-ID map when a local stage holds one, so the response costs no storage request;
+/// otherwise this is [`projected_rows`].
 pub(crate) async fn hydrated_rows(
     store: &Storage,
     segment: &Segment,
@@ -1172,19 +1215,12 @@ pub(crate) async fn hydrated_rows(
 ) -> Result<BTreeMap<u32, Document>, ApiError> {
     if columns.is_empty()
         && let Some(file) = segment.files.get("ids")
-        && crate::local_ann::staged(&file.key, file.size)
+        && let Some(ids) = crate::local_ann::staged_row_ids(&file.key, rows)
     {
-        let ids = ids(store, segment).await?;
         return rows
             .iter()
-            .map(|row| {
-                let id = ids.get(row as usize).ok_or_else(corrupt)?;
-                let doc = Document::from_iter([(
-                    "id".into(),
-                    serde_json::to_value(id).map_err(index_error)?,
-                )]);
-                Ok((row, doc))
-            })
+            .zip(ids)
+            .map(|(row, id)| Ok((row, Document::from_iter([("id".into(), Value::from(id))]))))
             .collect();
     }
     projected_rows(store, segment, rows, Some(columns)).await
