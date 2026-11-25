@@ -13212,3 +13212,57 @@ Bytes under the store, by object kind (`du -b` and `find -printf %s`; 2,681,468 
 - The warm graph (v0.1.21) needs ten minutes of sustained eligible queries, so none of these one-minute passes used it.
 - The clean-start runs used `--parts throughput` and `--parts latency,throughput` with the same harness; the protocol rows used the defaults.
 - The Mac and EC2 were not used. `/tmp/blowfish-recluster/` holds 25 GB of spill files from 2026-11-24 that are not mine; I left them.
+
+## Round BW18: cold phrase queries pay serial waves (fewer waves, exact, misses the 1.3x gate)
+
+Hypothesis (Neon, `briefs/ideas/2125-neon.md` #2): phrase-filtered BM25 serializes extra cold I/O waves. Gate: cold phrase p50 at least
+1.3x faster on either phrase set, with no regression on plain cold or warm BM25, paired A/B/B/A on one host.
+
+### Method
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Clang 19, `__arm_get_current_vg` stub), BW17's setup and workloads exactly (`tmp/msmarco-1m-v021/`
+on S3 us-west-2, 500 held-out queries, `first` and `long` adjacent-pair phrase filters, server on CPUs 0 to 5, client on 14 and 15, 2 GiB
+cache, one sequential cold pass per fresh server). Profile: `BF_TRACE_READS=1` on a fresh server per set, reads assigned to each query by
+wall-clock window; **serial depth** is the deepest chain of dependent backend reads within one segment (the eight segments run side by side).
+
+### Profile (baseline v0.1.41)
+
+| Set | p50 ms | Reads (p50) | KB (p50) | Serial depth p50 / p90 |
+| --- | ---: | ---: | ---: | ---: |
+| plain | 40.9 | 10 | 144 | 2 / 3 |
+| phrase, first pair | 81.4 | 16 | 252 | 3 / 5 |
+| phrase, longest pair | 115.7 | 21 | 280 | 4 / 7 |
+
+All three hypotheses held in the code: `contains_token_sequence` looked up and read every posting block of each token in turn, then ran a
+second per-term pass with uncoalesced position reads, and `OpenHint` ignored phrase terms. In this workload the phrase words are also BM25
+words, so the missing prefetch mattered little here.
+
+### Change (no format change, exact)
+
+- `OpenHint` collects `ContainsTokenSequence` terms from filters and prefetches their dictionary chunks and term records with the BM25 terms.
+- `contains_token_sequence`: one batched dictionary lookup and one batched term-record load for all distinct terms; the rarest term (by
+  document frequency) bounds the candidates; rows outside every block of another term are dropped without a read (so a segment with an
+  empty conjunction ends early); then all needed posting blocks and position streams are read in **one coalesced, address-sorted batch**.
+  When metadata shows at most 64 blocks of the other terms inside the rarest term's block ranges, the rarest-postings wave is merged into
+  that batch too (one wave). A unit test forces both paths against brute force.
+- Every reply matched the baseline's ordered IDs and f32 score bits on all 500 queries of each set (warm, `filtered_bm25 record`/`check`).
+
+### Results (cold, p50 ms, A/B/B/A on one host; baseline then candidate)
+
+| Set | Base | Candidate | Speedup |
+| --- | ---: | ---: | ---: |
+| plain (unchanged path) | 34.4, 36.2 | 41.6, 40.7 | noise: code path identical |
+| phrase, first pair | 78.3, 70.2 | 72.7, 70.6 | 1.04x |
+| phrase, longest pair | 106.9, 106.1 | 89.2, 95.2 | 1.15x |
+
+An earlier two-wave-only build measured first 83.1 to 73.1 ms and long 115 to 99 ms (about 1.14x and 1.16x); p90 improved about 1.2x
+(193 to 160 ms first, 243 to 193 ms long). Candidate serial depth was 3 (first) and 3 (long) at p50, down from 3 and 4.
+
+### Conclusion
+
+**Misses the 1.3x gate** (best 1.15x on the longest pair). The remaining depth is one wave above plain: the phrase filter must finish before
+the masked BM25 search can pick its blocks, and the masked search reaches deeper blocks than the unmasked one because most top-ranked rows
+do not match the phrase (BW17). Lazy score-gated verification was not added: the profile shows the cost is a dependent wave, not bytes.
+The change is exact and small, so it is committed, but whether to keep it for a 1.04x to 1.16x cold gain is the coordinator's call.
+Plain cold p50 differed by 4 to 6 ms between arms on a path this change does not touch, so treat that as host or S3 noise; warm BM25
+was not re-measured. Cost: one c7g.4xlarge for about 1.5 hours (under $1.50); instance, key pair, and security group deleted, no S3 writes.

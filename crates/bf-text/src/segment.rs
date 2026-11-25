@@ -3119,10 +3119,76 @@ impl SegmentReader {
         ids.dedup();
         self.bitmap(&ids).await
     }
+    /// Postings (and optionally position streams) of the given blocks, `(block, df, positions)`,
+    /// in one coalesced batch. Blocks in `known` or the decoded memo are not read again.
+    async fn phrase_blocks(
+        &self,
+        wanted: &[(&BlockMeta, u32, bool)],
+        known: &BTreeMap<u64, Postings>,
+    ) -> io::Result<Vec<(Postings, Bytes)>> {
+        self.ensure_lengths().await?;
+        let mut cached: Vec<Option<Postings>> = vec![None; wanted.len()];
+        // (range, index into `wanted`, whether it is the positions stream)
+        let mut ranges: Vec<(Range<u64>, usize, bool)> = Vec::new();
+        {
+            let mut memo = self.decoded.lock().unwrap();
+            for (i, &(b, _, positions)) in wanted.iter().enumerate() {
+                cached[i] = known.get(&b.offset).cloned().or_else(|| memo.get(b.offset));
+                if cached[i].is_none() {
+                    ranges.push((b.offset..b.offset + u64::from(b.size), i, false));
+                }
+                if positions {
+                    ranges.push((
+                        b.positions..b.positions + u64::from(b.positions_size),
+                        i,
+                        true,
+                    ));
+                }
+            }
+        }
+        if ranges.iter().any(|(r, _, _)| r.end > self.source.len()) {
+            return Err(invalid("invalid object range"));
+        }
+        ranges.sort_unstable_by_key(|(r, _, _)| r.start);
+        let values = self
+            .read_ranges(ranges.iter().map(|(r, _, _)| r.clone()).collect())
+            .await?;
+        if values.len() != ranges.len() {
+            return Err(invalid("invalid range batch"));
+        }
+        let mut raws = vec![Bytes::new(); wanted.len()];
+        for ((range, i, is_positions), bytes) in ranges.into_iter().zip(values) {
+            if bytes.len() as u64 != range.end - range.start {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "short object range read",
+                ));
+            }
+            let (b, df, _) = wanted[i];
+            if is_positions {
+                verify(&bytes, b.positions_crc)?;
+                raws[i] = bytes;
+            } else {
+                cached[i] = Some(self.decode_postings(b, &bytes, df)?);
+            }
+        }
+        Ok(cached
+            .into_iter()
+            .zip(raws)
+            .map(|(p, raw)| (p.expect("every block was read or cached"), raw))
+            .collect())
+    }
     /// Rows containing query tokens at their relative positions within one array
     /// element. Returns `Unsupported` if positions were omitted at build time.
     /// Prefix matching is not valid for this operator.
     pub async fn contains_token_sequence(&self, query: &Query) -> io::Result<RoaringBitmap> {
+        self.phrase_rows(query, ONE_WAVE_PHRASE_BLOCKS).await
+    }
+    async fn phrase_rows(
+        &self,
+        query: &Query,
+        one_wave_blocks: usize,
+    ) -> io::Result<RoaringBitmap> {
         if query.last_as_prefix {
             return Err(input("phrase queries do not support last_as_prefix"));
         }
@@ -3132,67 +3198,134 @@ impl SegmentReader {
                 "segment has no positions",
             ));
         }
-        let mut candidates: RoaringBitmap = (0..self.num_docs()).collect();
-        for token in &query.tokens {
-            let Some(id) = self.term(&token.text).await? else {
+        if query.tokens.is_empty() {
+            return Ok((0..self.num_docs()).collect());
+        }
+        // One dictionary wave and one term-record wave cover every distinct term. Then only the
+        // rarest term's postings are read: its rows bound every other term's blocks, so an
+        // empty conjunction ends here without touching common words.
+        let distinct: Vec<&str> = query.exact_terms().keys().copied().collect();
+        let mut handles = Vec::with_capacity(distinct.len());
+        for (term, id) in distinct.iter().zip(self.lookup(&distinct).await?) {
+            let Some(id) = id else {
                 return Ok(RoaringBitmap::new());
             };
-            candidates &= self.bitmap(&[id]).await?;
+            handles.push((*term, id));
         }
-        if query.tokens.is_empty() || candidates.is_empty() {
-            return Ok(candidates);
-        }
-        let mut terms: BTreeMap<String, BTreeMap<u32, Vec<(u32, u32)>>> = BTreeMap::new();
-        for term in query.exact_terms().keys() {
-            let id = self.term(term).await?.unwrap();
-            let meta = self.load([id]).await?.remove(&id).unwrap();
-            let mut docs = BTreeMap::new();
-            let blocks: Vec<_> = meta
+        handles.sort_by_key(|&(term, id)| (self.handle_df(id), term));
+        let metas = self.load(handles.iter().map(|&(_, id)| id)).await?;
+        let rarest = &metas[&handles[0].1];
+        let inside_blocks = |bitmap: &RoaringBitmap, id: u64| {
+            metas[&id]
                 .blocks
                 .iter()
-                .filter(|b| candidates.range(b.first..=b.last).next().is_some())
+                .filter(|b| bitmap.range(b.first..=b.last).next().is_some())
+                .count()
+        };
+        // The rarest term's block ranges bound where any match can be. When few blocks of the
+        // other terms fall inside them, skip the separate rarest-postings wave: fetch everything
+        // at once and intersect exactly afterwards. Otherwise read the rarest postings first.
+        let mut spans = RoaringBitmap::new();
+        for b in &rarest.blocks {
+            spans.insert_range(b.first..=b.last);
+        }
+        let others: usize = handles[1..]
+            .iter()
+            .map(|&(_, id)| inside_blocks(&spans, id))
+            .sum();
+        let mut known: BTreeMap<u64, Postings> = BTreeMap::new();
+        let mut candidates = if others <= one_wave_blocks {
+            spans
+        } else {
+            let all: Vec<_> = rarest
+                .blocks
+                .iter()
+                .map(|b| (b, rarest.df, false))
                 .collect();
-            let results = try_join_all(blocks.iter().map(|b| async {
-                let postings = self.postings(b, meta.df).await?;
-                let raw = read_exact(
-                    &*self.source,
-                    b.positions..b.positions + b.positions_size as u64,
-                )
-                .await?;
-                verify(&raw, b.positions_crc)?;
-                Ok::<_, io::Error>((postings, raw))
-            }))
-            .await?;
-            for (postings, raw) in results {
-                let mut decoder = positions::Decoder::new(&raw, self.compressed_positions)?;
-                for (row, tf) in postings.iter().copied() {
-                    let positions = decoder.document(tf)?;
-                    if candidates.contains(row) {
-                        docs.insert(row, positions);
-                    }
-                }
-                decoder.finish()?;
+            known = self
+                .phrase_blocks(&all, &BTreeMap::new())
+                .await?
+                .into_iter()
+                .zip(&rarest.blocks)
+                .map(|((postings, _), b)| (b.offset, postings))
+                .collect();
+            known
+                .values()
+                .flat_map(|p| p.iter().map(|&(row, _)| row))
+                .collect()
+        };
+        for &(_, id) in &handles[1..] {
+            // Rows outside every block of a term cannot contain it, and this needs no read.
+            let mut inside = RoaringBitmap::new();
+            for b in &metas[&id].blocks {
+                inside.insert_range(b.first..=b.last);
             }
-            terms.insert((*term).to_owned(), docs);
+            candidates &= inside;
+        }
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        // Every remaining posting block and every positions stream, in one coalesced batch.
+        let mut wanted = Vec::new();
+        let mut owners = Vec::new();
+        for (t, &(_, id)) in handles.iter().enumerate() {
+            let meta = &metas[&id];
+            for b in &meta.blocks {
+                if candidates.range(b.first..=b.last).next().is_some() {
+                    wanted.push((b, meta.df, true));
+                    owners.push(t);
+                }
+            }
+        }
+        let fetched = self.phrase_blocks(&wanted, &known).await?;
+        let mut rows = vec![RoaringBitmap::new(); handles.len()];
+        for (&t, (postings, _)) in owners.iter().zip(&fetched) {
+            rows[t].extend(postings.iter().map(|&(row, _)| row));
+        }
+        for present in &rows {
+            candidates &= present;
+        }
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        type RowPositions = BTreeMap<u32, Vec<(u32, u32)>>;
+        let mut terms: BTreeMap<&str, RowPositions> = BTreeMap::new();
+        for (&t, (postings, raw)) in owners.iter().zip(&fetched) {
+            let docs = terms.entry(handles[t].0).or_default();
+            let mut decoder = positions::Decoder::new(raw, self.compressed_positions)?;
+            for (row, tf) in postings.iter().copied() {
+                let positions = decoder.document(tf)?;
+                if candidates.contains(row) {
+                    docs.insert(row, positions);
+                }
+            }
+            decoder.finish()?;
         }
         let first = &query.tokens[0];
         Ok(candidates
             .into_iter()
             .filter(|row| {
-                terms[&first.text][row].iter().any(|&(element, position)| {
-                    query.tokens.iter().all(|q| {
-                        let target = position as i64 + q.position as i64 - first.position as i64;
-                        target >= 0
-                            && target <= u32::MAX as i64
-                            && terms[&q.text][row]
-                                .binary_search(&(element, target as u32))
-                                .is_ok()
+                terms[first.text.as_str()][row]
+                    .iter()
+                    .any(|&(element, position)| {
+                        query.tokens.iter().all(|q| {
+                            let target =
+                                position as i64 + q.position as i64 - first.position as i64;
+                            target >= 0
+                                && target <= u32::MAX as i64
+                                && terms[q.text.as_str()][row]
+                                    .binary_search(&(element, target as u32))
+                                    .is_ok()
+                        })
                     })
-                })
             })
             .collect())
     }
 }
+
+/// Most blocks of the other phrase terms that may lie inside the rarest term's block ranges for
+/// the phrase to be read in a single wave.
+const ONE_WAVE_PHRASE_BLOCKS: usize = 64;
 
 /// Each posting block has at most 128 rows. Sparse masks probe those sorted
 /// postings, while dense masks visit each posting once.
@@ -3286,6 +3419,61 @@ async fn read_exact(source: &dyn RangeRead, range: Range<u64>) -> io::Result<Byt
 #[cfg(test)]
 mod posting_cache_tests {
     use super::*;
+
+    #[test]
+    fn phrase_reads_agree_in_one_wave_and_two() {
+        futures::executor::block_on(async {
+            let params = FtsParams::default();
+            let texts: Vec<String> = (0..3000u32)
+                .map(|row| {
+                    let mut t = String::from("alpha beta");
+                    if row % 7 == 0 {
+                        t.push_str(" gamma delta");
+                    }
+                    if row % 11 == 0 {
+                        t.push_str(" delta gamma");
+                    }
+                    if row % 500 == 3 {
+                        t.push_str(" rare gamma");
+                    }
+                    t
+                })
+                .collect();
+            let mut builder = SegmentBuilder::new(true);
+            for t in &texts {
+                builder.add_document(&crate::tokenize(t, &params)).unwrap();
+            }
+            let reader =
+                SegmentReader::open(Arc::new(MemoryRangeRead::from(builder.finish().unwrap())))
+                    .await
+                    .unwrap();
+            for phrase in [
+                "gamma delta",
+                "delta gamma",
+                "rare gamma",
+                "beta gamma",
+                "alpha beta gamma delta",
+                "zzz gamma",
+            ] {
+                let q = Query::new(crate::tokenize(phrase, &params), false);
+                let expected: RoaringBitmap = texts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| {
+                        crate::matches_token_sequence(&crate::tokenize(t, &params), &q)
+                    })
+                    .map(|(i, _)| i as u32)
+                    .collect();
+                for limit in [0, usize::MAX] {
+                    assert_eq!(
+                        reader.phrase_rows(&q, limit).await.unwrap(),
+                        expected,
+                        "{phrase} with limit {limit}"
+                    );
+                }
+            }
+        });
+    }
 
     #[test]
     fn memo_reports_its_actual_charge_as_it_grows_and_shrinks() {
