@@ -126,3 +126,11 @@ pub(crate) async fn ensure(
     }
     Ok(count)
 }
+
+/// Retirement requires current sparse maps on every authoritative slab.
+pub(crate) fn ready(sets: &[bf_wal::SlabSet], attr: &str) -> bool {
+    !sets.is_empty()
+        && sets.iter().all(|set| {
+            !set.slabs.is_empty() && set.slabs.iter().all(|s| current(s, attr).is_some())
+        })
+}

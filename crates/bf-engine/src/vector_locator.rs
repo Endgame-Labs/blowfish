@@ -338,3 +338,65 @@ pub(crate) async fn restore_uncovered(
     }
     Ok(())
 }
+
+/// Both legacy fragments and current containers are redundant once a current tier owns them.
+fn ann_attribute(role: &str) -> Option<&str> {
+    ["annv2:", "ann:", "annfrag:", "annfrag2:"]
+        .into_iter()
+        .find_map(|prefix| role.strip_prefix(prefix))
+}
+
+/// Eligible segment copies only; an in-flight builder keeps its source objects until install.
+pub(crate) fn needs_retirement(
+    state: &NamespaceState,
+    protected: &std::collections::BTreeSet<String>,
+) -> bool {
+    let sources = Sources::new(state);
+    state.segments.iter().any(|seg| {
+        !protected.contains(&seg.id)
+            && seg
+                .files
+                .keys()
+                .filter_map(|k| ann_attribute(k))
+                .any(|attr| {
+                    sources.covers(seg, attr)
+                        && state
+                            .ann_tiers
+                            .get(attr)
+                            .is_some_and(|sets| crate::slab_rows::ready(sets, attr))
+                })
+    })
+}
+/// Remove redundant vector descriptors and enqueue their immutable objects in this same publication.
+pub(crate) fn retire_covered(
+    manifest: &mut bf_wal::Manifest,
+    protected: &std::collections::BTreeSet<String>,
+) {
+    let sources = Sources::from_manifest(manifest);
+    let mut retired = Vec::new();
+    for seg in &mut manifest.segments {
+        if protected.contains(&seg.id) {
+            continue;
+        }
+        let roles: Vec<_> = seg
+            .files
+            .keys()
+            .filter(|role| {
+                ann_attribute(role).is_some_and(|attr| {
+                    sources.covers(seg, attr)
+                        && manifest
+                            .ann_tiers
+                            .get(attr)
+                            .is_some_and(|sets| crate::slab_rows::ready(sets, attr))
+                })
+            })
+            .cloned()
+            .collect();
+        for role in roles {
+            retired.push(seg.files.remove(&role).expect("selected above").key);
+        }
+    }
+    for key in retired {
+        crate::indexer::retire(manifest, key);
+    }
+}

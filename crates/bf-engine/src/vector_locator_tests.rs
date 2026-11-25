@@ -10,6 +10,13 @@ async fn fixture_rows(count: usize) -> (Storage, Engine, NamespaceState) {
     fixture_rows_parts(count, 2).await
 }
 async fn fixture_rows_parts(count: usize, parts: usize) -> (Storage, Engine, NamespaceState) {
+    fixture_rows_parts_kind(count, parts, true).await
+}
+async fn fixture_rows_parts_kind(
+    count: usize,
+    parts: usize,
+    sparse: bool,
+) -> (Storage, Engine, NamespaceState) {
     let store = Storage::open(&bf_storage::StorageConfig {
         url: "memory://".into(),
         ..Default::default()
@@ -48,35 +55,37 @@ async fn fixture_rows_parts(count: usize, parts: usize) -> (Storage, Engine, Nam
     // Sparse columns occur in upgrade fixtures, although current upserts require all vectors.
     let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
     let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
-    let mut segments = Vec::new();
-    for seg in &manifest.segments {
-        let mut docs = segment::documents(&store, seg, &(0..seg.row_count).collect())
+    if sparse {
+        let mut segments = Vec::new();
+        for seg in &manifest.segments {
+            let mut docs = segment::documents(&store, seg, &(0..seg.row_count).collect())
+                .await
+                .unwrap();
+            for (id, doc) in &mut docs {
+                if matches!(id, bf_types::Id::Uint(n) if n % 7 == 0) {
+                    doc.remove("vector");
+                }
+            }
+            segments.push(
+                segment::build_with(
+                    &store,
+                    "locator",
+                    &seg.schema,
+                    manifest.distance_metric,
+                    &docs,
+                    BTreeMap::new(),
+                    seg.wal_start,
+                    seg.wal_end,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        manifest.segments = segments;
+        wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
             .await
             .unwrap();
-        for (id, doc) in &mut docs {
-            if matches!(id, bf_types::Id::Uint(n) if n % 7 == 0) {
-                doc.remove("vector");
-            }
-        }
-        segments.push(
-            segment::build_with(
-                &store,
-                "locator",
-                &seg.schema,
-                manifest.distance_metric,
-                &docs,
-                BTreeMap::new(),
-                seg.wal_start,
-                seg.wal_end,
-            )
-            .await
-            .unwrap(),
-        );
     }
-    manifest.segments = segments;
-    wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
-        .await
-        .unwrap();
     engine.drop_caches().await;
     let parent =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/d4b-tests");
@@ -123,6 +132,17 @@ async fn locator_reads_direct_coverage_at_stored_precision_and_preserves_sparse_
 #[tokio::test]
 async fn locator_follows_reverse_lineage_across_sources_and_rejects_uncovered_segments() {
     let (store, engine, state) = fixture().await;
+    let mut original = BTreeMap::new();
+    for seg in &state.segments {
+        let (rows, bytes) =
+            segment::read_packed(&store, seg, &(0..seg.row_count).collect(), "vector")
+                .await
+                .unwrap();
+        let ids = segment::ids(&store, seg).await.unwrap();
+        for (row, bytes) in rows.into_iter().zip(bytes.as_chunks::<6>().0) {
+            original.insert(ids[row as usize].clone(), bytes.to_vec());
+        }
+    }
     let merger = Engine::with_config(
         store.clone(),
         EngineConfig {
@@ -143,14 +163,21 @@ async fn locator_follows_reverse_lineage_across_sources_and_rejects_uncovered_se
     let sources = Sources::new(&merged);
     for seg in &merged.segments {
         let rows = (0..seg.row_count).collect();
+        let ids = segment::ids(&store, seg).await.unwrap();
+        let mut expected_rows = Vec::new();
+        let mut expected_bytes = Vec::new();
+        for (row, id) in ids.iter().enumerate() {
+            if let Some(bytes) = original.get(id) {
+                expected_rows.push(row as u32);
+                expected_bytes.extend(bytes);
+            }
+        }
         assert_eq!(
             sources
                 .read(&store, seg, &rows, "vector", true)
                 .await
                 .unwrap(),
-            segment::read_packed(&store, seg, &rows, "vector")
-                .await
-                .unwrap()
+            (expected_rows, expected_bytes)
         );
     }
     let unrelated = Sources::new(&NamespaceState::default());
@@ -877,6 +904,375 @@ async fn last_tier_removal_after_compaction_restores_sparse_stored_precision() {
     assert_eq!(
         maintenance_engine(&store)
             .query_exhaustive("locator", reference_request())
+            .await
+            .unwrap()
+            .result
+            .rows,
+        before
+    );
+}
+
+#[tokio::test]
+async fn retirement_publishes_once_preserves_retention_and_gc_keeps_every_live_reference() {
+    let (store, _, _) = fixture_rows(2000).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (_, before) = wal.latest_manifest().await.unwrap().unwrap();
+    let old: Vec<_> = before
+        .segments
+        .iter()
+        .filter_map(|s| s.files.get("annv2:vector").cloned())
+        .collect();
+    assert!(
+        !old.is_empty(),
+        "the install pass keeps protected builder inputs until the next pass"
+    );
+    let retiring = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            compaction_segments: usize::MAX,
+            retention: std::time::Duration::from_secs(3600),
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    retiring.index_namespace("locator", true).await.unwrap();
+    let (_, retired) = wal.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(retired.format_version, bf_wal::MANIFEST_FORMAT_VERSION);
+    assert!(
+        retired
+            .segments
+            .iter()
+            .all(|s| !s.files.contains_key("annv2:vector"))
+    );
+    retiring.collect_garbage("locator").await.unwrap();
+    for file in &old {
+        assert!(store.get(&file.key).await.is_ok());
+    }
+    let request = serde_json::from_value(json!({"rank_by": ["vector", "ANN", [1.0, 13.0, -0.5]], "top_k": 10, "include_attributes": true})).unwrap();
+    let expected = retiring
+        .query("locator", request)
+        .await
+        .unwrap()
+        .result
+        .rows;
+    let collecting = maintenance_engine(&store);
+    collecting.collect_garbage("locator").await.unwrap();
+    let (_, current) = wal.latest_manifest().await.unwrap().unwrap();
+    for file in current
+        .segments
+        .iter()
+        .flat_map(|s| s.files.values().chain([&s.live]))
+        .chain(current.ann_tiers.values().flatten().flat_map(|set| {
+            set.slabs
+                .iter()
+                .flat_map(|s| s.files.values())
+                .chain([&set.dir])
+                .chain(set.pages.iter())
+                .chain(set.coarse.iter())
+        }))
+        .chain(
+            current
+                .lineage
+                .iter()
+                .flat_map(|l| l.parts.iter().map(|p| &p.map)),
+        )
+        .chain(current.ann_dirs.values())
+        .chain(current.text_stats.iter())
+    {
+        assert!(
+            store.get(&file.key).await.is_ok(),
+            "manifest object missing: {}",
+            file.key
+        );
+    }
+    for file in old {
+        assert!(store.get(&file.key).await.is_err());
+    }
+    assert_eq!(maintenance_engine(&store).query("locator", serde_json::from_value(json!({"rank_by": ["vector", "ANN", [1.0, 13.0, -0.5]], "top_k": 10, "include_attributes": true})).unwrap()).await.unwrap().result.rows, expected);
+}
+
+#[tokio::test]
+async fn gc_pins_predecessor_inputs_named_by_a_fresh_build_record() {
+    let (store, _, _) = fixture_rows(2000).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (_, before) = wal.latest_manifest().await.unwrap().unwrap();
+    let old: Vec<_> = before
+        .segments
+        .iter()
+        .map(|s| s.files["annv2:vector"].key.clone())
+        .collect();
+    let key = "ns/locator/indexer/build-durable-inputs-000000.json";
+    store.create(key, serde_json::to_vec(&json!({"prefix": "ns/locator/slabs/slab-durable-inputs-", "started_at": chrono::Utc::now(), "references": old})).unwrap()).await.unwrap();
+    retire_test_sources_without_deleting(&store).await;
+    maintenance_engine(&store)
+        .collect_garbage("locator")
+        .await
+        .unwrap();
+    for key in &old {
+        assert!(
+            store.get(key).await.is_ok(),
+            "active build input was collected"
+        );
+    }
+    store.delete(key).await.unwrap();
+    maintenance_engine(&store)
+        .collect_garbage("locator")
+        .await
+        .unwrap();
+    for key in &old {
+        assert!(store.get(key).await.is_err());
+    }
+}
+async fn retire_test_sources_without_deleting(store: &Storage) {
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    let old: Vec<_> = m
+        .segments
+        .iter_mut()
+        .filter_map(|s| s.files.remove("annv2:vector"))
+        .collect();
+    for file in std::mem::take(&mut m.ann_dirs).into_values() {
+        crate::indexer::retire(&mut m, file.key);
+    }
+    for f in old {
+        crate::indexer::retire(&mut m, f.key);
+    }
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_branch_first_checkpoint_compacts_inherited_coverage_through_lineage() {
+    let (store, _, _) = fixture_rows(2000).await;
+    retire_test_sources(&store).await;
+    let engine = maintenance_engine(&store);
+    let expected = engine
+        .query_exhaustive("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    engine
+        .write(
+            "first-compact",
+            serde_json::from_value(json!({"branch_from_namespace": "locator"})).unwrap(),
+        )
+        .await
+        .unwrap();
+    engine.index_namespace("first-compact", true).await.unwrap();
+    let m = bf_wal::Wal::new(store.clone(), "first-compact")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(m.segments.len(), 1);
+    assert_eq!(m.ann_tiers["vector"].len(), 1);
+    assert_eq!(m.lineage.len(), 2);
+    engine.collect_garbage("first-compact").await.unwrap();
+    assert_eq!(
+        maintenance_engine(&store)
+            .query_exhaustive("first-compact", reference_request())
+            .await
+            .unwrap()
+            .result
+            .rows,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn retirement_preserves_f16_f32_and_i8_projection_and_exact_ranking() {
+    for dtype in ["[3]f16", "[3]f32", "[3]i8"] {
+        let store = Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let engine = Engine::with_config(
+            store.clone(),
+            EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.0,
+                compaction_segments: usize::MAX,
+                retention: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+        );
+        for batch in 0..2 {
+            let rows: Vec<_> = (batch * 128..(batch + 1) * 128)
+                .map(|id| {
+                    let vector = if dtype == "[3]i8" {
+                        json!([-128, id - 128, 127])
+                    } else {
+                        json!([0.12345679, id as f32 / 16.0, 1.0e-10])
+                    };
+                    json!({"id": id, "vector": vector})
+                })
+                .collect();
+            engine.write("precision", serde_json::from_value(json!({"distance_metric": "euclidean_squared", "schema": {"vector": {"type": dtype}}, "upsert_rows": rows})).unwrap()).await.unwrap();
+            engine.index_namespace("precision", true).await.unwrap();
+        }
+        let order: bf_types::QueryRequest = serde_json::from_value(
+            json!({"rank_by": ["id", "asc"], "top_k": 256, "include_attributes": true}),
+        )
+        .unwrap();
+        let query = if dtype == "[3]i8" {
+            json!([1, 7, -2])
+        } else {
+            json!([0.125, 7.25, -2.345])
+        };
+        let exact: bf_types::QueryRequest = serde_json::from_value(json!({"rank_by": ["vector", "kNN", query], "top_k": 20, "filters": ["id", "Gte", 0], "include_attributes": true})).unwrap();
+        let expected = engine
+            .query("precision", order.clone())
+            .await
+            .unwrap()
+            .result
+            .rows;
+        let expected_exact = engine
+            .query("precision", exact.clone())
+            .await
+            .unwrap()
+            .result
+            .rows;
+        let parent =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/d4b-tests");
+        std::fs::create_dir_all(&parent).unwrap();
+        let scratch = tempfile::tempdir_in(parent).unwrap();
+        engine
+            .recluster(
+                "precision",
+                &ReclusterOptions {
+                    attribute: "vector".into(),
+                    cells: 2,
+                    cluster_rows: 16,
+                    max_slab_rows: 128,
+                    scratch: scratch.path().into(),
+                },
+            )
+            .await
+            .unwrap();
+        engine.index_namespace("precision", true).await.unwrap();
+        engine.collect_garbage("precision").await.unwrap();
+        let m = bf_wal::Wal::new(store.clone(), "precision")
+            .unwrap()
+            .latest_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(
+            m.segments
+                .iter()
+                .all(|s| !s.files.contains_key("annv2:vector")),
+            "{dtype}"
+        );
+        let cold = Engine::with_config(
+            store,
+            EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cold.query("precision", order).await.unwrap().result.rows,
+            expected,
+            "{dtype}"
+        );
+        assert_eq!(
+            cold.query("precision", exact).await.unwrap().result.rows,
+            expected_exact,
+            "{dtype}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn covered_legacy_indexes_and_fragments_retire_without_rewriting_vector_payloads() {
+    let (store, engine, _) = fixture_rows_parts_kind(4000, 2, false).await;
+    let before = engine
+        .query("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    let mut old_keys = Vec::new();
+    for seg in &mut m.segments {
+        let (rows, packed) =
+            segment::read_packed(&store, seg, &(0..seg.row_count).collect(), "vector")
+                .await
+                .unwrap();
+        let legacy = bf_vector::IndexBuilder::new(3, bf_vector::Metric::EuclideanSquared)
+            .unwrap()
+            .vector_type(bf_vector::VectorType::F16)
+            .build_packed(rows, packed)
+            .unwrap();
+        seg.files.remove("annv2:vector");
+        let prefix = format!(
+            "ns/locator/segments/{}/legacy-{}",
+            seg.id,
+            uuid::Uuid::new_v4()
+        );
+        for blocks in [false, true] {
+            let (bytes, metadata) = bf_vector::Fragment::legacy_fragment(&legacy, blocks).unwrap();
+            let role = if blocks {
+                "annfrag2:vector"
+            } else {
+                "annfrag:vector"
+            };
+            let file =
+                segment::put_bytes(&store, format!("{prefix}.{role}"), bytes.into(), metadata)
+                    .await
+                    .unwrap();
+            old_keys.push(file.key.clone());
+            seg.files.insert(role.into(), file);
+        }
+        let meta = bf_vector::metadata_len(&legacy).unwrap();
+        let file = segment::put_bytes(&store, format!("{prefix}.bfv"), legacy.into(), meta)
+            .await
+            .unwrap();
+        old_keys.push(file.key.clone());
+        seg.files.insert("ann:vector".into(), file);
+    }
+    m.ann_dirs.clear();
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+    let maintenance = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            compaction_segments: usize::MAX,
+            retention: std::time::Duration::ZERO,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    assert!(maintenance.index_namespace("locator", true).await.unwrap());
+    let m = wal.latest_manifest().await.unwrap().unwrap().1;
+    assert!(
+        m.segments
+            .iter()
+            .all(|s| crate::upgrade::files(s, "vector").is_none())
+    );
+    let report = maintenance
+        .reindex("locator", &crate::ReindexOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        report.converted_segments, 0,
+        "no redundant full ANN rewrite"
+    );
+    maintenance.collect_garbage("locator").await.unwrap();
+    for key in old_keys {
+        assert!(store.get(&key).await.is_err());
+    }
+    assert_eq!(
+        maintenance_engine(&store)
+            .query("locator", reference_request())
             .await
             .unwrap()
             .result

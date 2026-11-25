@@ -491,7 +491,9 @@ impl Engine {
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
                 && tier(&state, &self.0.config, force, &protected, bulk(&state)).is_empty()
-                && !(needs_text_upgrade(&state) || crate::slab_rows::needs(&state.ann_tiers))
+                && !(needs_text_upgrade(&state)
+                    || (crate::slab_rows::needs(&state.ann_tiers)
+                        || crate::vector_locator::needs_retirement(&state, &protected)))
                 && !installing
             {
                 return Ok(false);
@@ -520,7 +522,8 @@ impl Engine {
             });
             let will_compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
             let upgrade = needs_text_upgrade(&state)
-                || crate::slab_rows::needs(&state.ann_tiers)
+                || (crate::slab_rows::needs(&state.ann_tiers)
+                    || crate::vector_locator::needs_retirement(&state, &protected))
                 || installing;
             if state.seq == state.indexed_through
                 && will_compact.is_empty()
@@ -583,8 +586,10 @@ impl Engine {
         }
         crate::ann::stage(t0, "idx hydrate");
         let compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
-        let upgrade =
-            needs_text_upgrade(&state) || crate::slab_rows::needs(&state.ann_tiers) || installing;
+        let upgrade = needs_text_upgrade(&state)
+            || (crate::slab_rows::needs(&state.ann_tiers)
+                || crate::vector_locator::needs_retirement(&state, &protected))
+            || installing;
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
         }
@@ -617,7 +622,7 @@ impl Engine {
             indexed_through: 0,
             indexer_epoch: 0,
             deleted: false,
-            segments: vec![],
+            segments: state.segments.to_vec(),
             stats: Default::default(),
             text_stats: None,
             ann_dirs: Default::default(),
@@ -976,6 +981,7 @@ impl Engine {
         }
         crate::vector_locator::restore_uncovered(store, ns, &mut manifest, &old_vectors).await?;
         crate::slab_rows::ensure(store, &mut manifest, 1).await?;
+        crate::vector_locator::retire_covered(&mut manifest, &protected);
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest
             .segments
@@ -1010,7 +1016,10 @@ impl Engine {
                 }
             }
         }
-        for old in previous_dirs.values() {
+        for (role, old) in &previous_dirs {
+            if !manifest.ann_dirs.contains_key(role) {
+                retire(&mut manifest, crate::ann_dir::hint_key(ns, role));
+            }
             if !manifest.ann_dirs.values().any(|f| f.key == old.key) {
                 retire(&mut manifest, old.key.clone());
             }
@@ -1230,7 +1239,10 @@ impl Engine {
         // Reread durable pins AFTER the epoch claim. A new copier either pinned
         // before this read, or observes the new epoch and retries its snapshot.
         let shared = crate::branch::protected(&self.0.store).await?;
-        candidates.retain(|key| !shared.contains(key));
+        let fresh_builds = crate::auto_recluster::building_prefixes(&self.0.store, ns).await?;
+        candidates.retain(|key| {
+            !shared.contains(key) && !fresh_builds.iter().any(|p| key.starts_with(p))
+        });
         // The winner owns no reusable file names. Repeating deletes after a crash is safe.
         // Deletes are independent round trips; run them concurrently so reclaiming
         // thousands of retired objects does not stall indexing for minutes.

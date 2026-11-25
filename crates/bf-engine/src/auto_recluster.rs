@@ -703,6 +703,8 @@ fn record_key(ns: &str, id: &str, n: u64) -> String {
 pub(crate) struct BuildRecord {
     pub prefix: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub references: Vec<String>,
 }
 
 /// Object-key prefixes of builds whose records are fresh, and those records: GC must keep them.
@@ -723,13 +725,13 @@ pub(crate) async fn building_prefixes(
         if !object.key.starts_with(&records) || object.last_modified <= fresh {
             continue;
         }
-        // An unreadable record protects nothing; GC then treats its objects as orphans.
-        if let Ok(bytes) = store.get(&object.key).await
-            && let Ok(record) = serde_json::from_slice::<BuildRecord>(&bytes)
-            && record.prefix.starts_with(&format!("ns/{ns}/slabs/"))
-        {
+        // A fresh unreadable record may own the last copy of a build input. Fail closed.
+        let bytes = store.get(&object.key).await.map_err(storage_error)?;
+        let record: BuildRecord =
+            serde_json::from_slice(&bytes).map_err(crate::segment::index_error)?;
+        if record.prefix.starts_with(&format!("ns/{ns}/slabs/")) {
             out.push(record.prefix);
-            // The record itself, too, whatever the retention window.
+            out.extend(record.references);
             out.push(object.key);
         }
     }
@@ -1119,7 +1121,9 @@ impl Engine {
         let started = Instant::now();
         metrics::gauge!("blowfish_recluster_running").set(1.0);
         let _gauge = scopeguard(|| metrics::gauge!("blowfish_recluster_running").set(0.0));
-        let job = self.start_job(ns, target.kind, &target.segments).await?;
+        let job = self
+            .start_job(ns, target.kind, &target.segments, manifest)
+            .await?;
         let mut built = self.build_tier(ns, manifest, target, opts, &job).await?;
         // Slab bytes staged locally wait, inert, for the commit; dropping the handle discards them.
         let prestage = built.prestage.take();
@@ -1183,12 +1187,20 @@ impl Engine {
         ns: &str,
         kind: Kind,
         segments: &[bf_wal::Segment],
+        manifest: &Manifest,
     ) -> Result<Job, ApiError> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let slab_prefix = format!("slab-{id}-");
         let record = BuildRecord {
             prefix: format!("ns/{ns}/slabs/{slab_prefix}"),
             started_at: chrono::Utc::now(),
+            references: segments
+                .iter()
+                .flat_map(|s| s.files.values().chain([&s.live]))
+                .map(|f| f.key.clone())
+                .chain(manifest.ann_tiers.values().flatten().flat_map(tier_keys))
+                .chain(crate::lineage::keys(manifest).cloned())
+                .collect(),
         };
         let body = serde_json::to_vec(&record).map_err(crate::segment::index_error)?;
         let store = self.0.store.clone();
@@ -1224,6 +1236,19 @@ impl Engine {
             }
         });
         job.record = Some(refresh);
+        // GC rereads records after its epoch claim. Either it sees this record, or this
+        // check rejects a snapshot it could already have reclaimed before we read inputs.
+        let latest = Wal::new(self.0.store.clone(), ns)
+            .map_err(log_error)?
+            .latest_manifest()
+            .await
+            .map_err(log_error)?;
+        if latest.is_none_or(|(_, m)| m.indexer_epoch != manifest.indexer_epoch) {
+            return Err(ApiError::new(
+                503,
+                "recluster snapshot changed while pinning inputs",
+            ));
+        }
         Ok(job)
     }
 

@@ -59,7 +59,7 @@ pub(crate) async fn needs_upgrade(store: &Storage, segment: &Segment) -> Result<
 }
 
 /// Copy non-vector columns into document-v2, without decoding a namespace or retraining ANN.
-/// ANN must already be current, and its object remains referenced by the same segment.
+/// A current segment ANN or a covering tier must retain the authoritative vector bytes.
 pub(crate) async fn rewrite(
     store: &Storage,
     ns: &str,

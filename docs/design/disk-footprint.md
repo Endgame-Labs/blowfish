@@ -1,6 +1,6 @@
 # Disk footprint: one copy of every vector
 
-Status: proposed (2026-11-23). Answers SPEC decision 24 ("disk footprint (vectors stored twice)"). Follows
+Status: implemented through D4b (2026-11-25). Answers SPEC decision 24 ("disk footprint (vectors stored twice)"). Follows
 decision 25: one layout, reached by automatic upgrade.
 
 ## The problem, in numbers
@@ -212,3 +212,40 @@ through the tier first:
 
 Every bullet is a path where a missed case loses vectors, not just speed, so D4 needs a round of its own. Lineage
 and the fence (format 4) are in place for it.
+
+
+### Round D4b: authoritative tier ownership
+
+D4b completes the paths listed above. The vector locator binds coverage and reverse lineage to an
+immutable reader snapshot. It maps a segment row to its tier-global row and then its slab-local
+ordinal, preserving sparse holes and stored precision. Projection, exact ranking, write hydration,
+statistics, compaction, and document upgrade use that source when no independent segment ANN exists.
+A base rebuild streams each predecessor slab once, translating its global rows through lineage into
+the new build's row space; uncovered segments still stream their own ANN objects.
+
+Filtered ANN shifts each immutable segment predicate into tier-global rows and intersects it with
+resident sparse slab membership. The existing selectivity-scaled planner chooses leaves from that
+intersection. A namespace directory describes only independent segment indexes beside the tiers.
+Trigger evaluation, delta targets, plans, and snapshot warming recognize covering ownership.
+
+Each current slab has an `annrows:<attribute>` descriptor naming a deterministic
+`<ANN-key>.rows-v1.bfr` object. Its `BFR1` encoding stores the leaf count, present row count, ascending
+global row IDs, leaf IDs, and a CRC. Leaf IDs use u16 below 65,536 leaves and u32 otherwise. Thus the
+usual stored cost is six bytes per present row, rather than a dense map over every global row for
+each slab. The decoded cache retains the sparse map and its ordinal information. Existing slabs
+backfill one at a time without rewriting their codes or vectors; retirement waits for complete maps.
+
+Version-2 branch pins include covering tiers and lineage, and GC protects every pinned object.
+Version-1 pins remain readable for older independent segment copies. Dropping a
+stale or overlapping tier first restores independent ANN ownership for surviving segments that no
+remaining tier covers. Build records pin predecessor inputs as well as outputs, GC rereads records
+after claiming its epoch, and a builder checks its snapshot epoch after pinning inputs.
+
+Retirement removes fully covered segment ANN references and enqueues their immutable keys in one
+fenced manifest publication. Covered legacy ANN indexes and fragments retire directly instead of
+copying their full payload into a new container first; document upgrade uses the retained tier. GC
+deletes them only after retention. Restart, publication failure,
+ambiguous success, and partial GC tests verify tier-backed answers and every manifest reference.
+Generation 6 and manifest format 5 fence this ownership change, accepting older layouts only for
+automatic upgrade. Older binaries refuse the prefix; there is no downgrade path. Measurements and
+limits are recorded in the Round D4b section of `docs/benchmarks.md`.
