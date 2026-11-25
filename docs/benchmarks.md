@@ -10842,9 +10842,9 @@ dominate the block bound, so the skyline changes nothing (the small differences 
 
 ### Why the posting reads do not fall with the scored rows
 
-The skyline does tighten bounds: scored rows drop 43%, and about 4% of blocks have a single-point skyline (the old bound
-was already exact there). But the skyline is longer than hoped: in the largest segments the median block has 4 or 5
-non-dominated points, only about 64% have 4 or fewer, and 8% have 8 or more, so a cap of a few entries gives up most of
+The skyline does tighten bounds: scored rows drop 43%, and only 0.2% of blocks have a single-point skyline, so the old bound paired extrema from different
+documents in 99.8% of blocks. But the skyline is longer than hoped: in the largest segments the median block has 4
+non-dominated points, only about 64% have 4 or fewer, and 3% have 8 or more, so a cap of a few entries gives up most of
 the gain (cap 4 reaches only -11% reads). More to the point, `blocks_read` also counts the small-term prefetch wave and
 every dense block that survives window pruning, and a dense block serves 128 postings spread over many windows, so
 tightening the bound on one window rarely removes the last window that needs a block. Rows scored are cheap and decode is
