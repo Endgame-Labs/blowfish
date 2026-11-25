@@ -11889,7 +11889,7 @@ $0.58/hour compute rate, a 120 GiB gp3 volume, and public IPv4; this is an estim
 not a billing audit. The instance is confirmed terminated, and its root volume, tagged key pair, and tagged security group
 are confirmed absent. No S3 objects were written. Owned local scratch artifacts were removed after preserving these results.
 
-## Round RR7: profiling full-tier recluster installation
+## Round RR7: installation profiling and certified routing reuse (rejected)
 
 Measured 2026-11-25 on one on-demand c7gd.2xlarge: eight Graviton3 cores, 16 GiB,
 local NVMe, four recluster and Rayon workers, Rust 1.100.0, Clang 19, and a Clang 22
@@ -11944,3 +11944,102 @@ engine test. It requires owned `RR7_CONFIG`, `RR7_SCRATCH`, and `RR7_OUTPUT` pat
 `BF_TRACE_STAGES=1` enables nested timers. `examples/rr7_prepare.rs` creates the
 untiered local scratch checkpoint through normal APIs. Every benchmark prefix and
 scratch artifact must be removed after the run.
+
+### Exact routing experiments and the installation gate
+
+A second control took **166.040 s**, including 95.630 s in assignment. Its upload
+service was 21.837 s, versus 35.237 s in the initial diagnostic run; assignment
+reproduced within about 1%. Comparisons below use this faster control rather than
+claiming a gain from the slower upload observation. All four runs used the same
+frozen source, the same host, and the same release profile. No competing work ran
+inside an installation clock. Slab hashing and quality checks are outside it.
+
+| Arm, in execution order | Installation seconds | Both assignments seconds | Peak RSS MiB |
+| --- | ---: | ---: | ---: |
+| Certified ordering cache and streaming scores | 150.591 | 80.222 | 1,106.7 |
+| Original control repeat | 166.040 | 95.630 | 920.5 |
+| Cache plus certified missing-cell screening | **147.365** | **76.713** | 1,072.8 |
+
+The first experiment used bounded BF16 matrix batches to screen ordering and cache
+possible top groups in each row's original near cells. Ordering winners were
+rechecked with the original direct squared-distance kernel. Assignment retained
+all groups supplied by a neighbor's cells and used the original four-row norm/dot
+expression to select its groups. A group was excluded only when a conservative
+conversion and arithmetic bound proved that it could not enter the original top
+12. Unsafe scales, nonfinite scores, excessive ties, and oversized caches retained
+the full reference candidate set. The cache budget was an eighth of the process
+memory limit, capped at 1 GiB, with at most 32 cached groups per row.
+
+The leaf scorer also retained only scores within its current certified interval.
+Its global minimum can only decrease as groups arrive, so discarded scores could
+not survive the final interval. The original full-block error bound and final FP32
+verification were unchanged; any nonfinite matrix result restored the complete
+reference candidate union.
+
+The second experiment screened the neighboring rows' additional cells in matrix
+batches as well, using a certified cutoff from each row's own cells. It cached each
+row's exact FP32 norm and reused one BF16 row conversion for group and leaf scoring.
+Every possible group winner was still ranked with the original four-row kernel.
+No row-level candidate-union approximation was introduced.
+
+The best complete observation was **1.127x** versus the faster control, below the
+**1.30x** gate, which requires at most **127.723 s**. Ordering fell from 28.468 to
+19.996 s, and scoring including routing from 67.138 to 56.568 s. Routing measured
+92.135 to 81.787 summed worker-seconds, but the latter also includes BF16 row
+preparation moved from leaf scoring, so those service times are not separate CPU
+measurements. Both passes still performed **3,640,666,916** BF16 row/leaf products.
+The exact leaf candidate unions were intentionally unchanged.
+
+The best variant's entire vector build was 17.419 s. Even deleting that whole stage
+would give only **1.278x** against the faster control, before accounting for uploads
+that become exposed. This rules out RaBitQ vectorization as a way to rescue this
+experiment's installation gate; no SIMD encoder or speculative speed claim ships.
+
+### Identity and quality
+
+Every logical slab payload, including centers, membership, codes, vector bytes,
+checksums, and footer, was SHA-256 hashed. Storage retry headers and randomized
+object names are excluded. All **32 slabs** matched between both controls and both
+experiments. The slab-set fingerprint is
+`4448015e6854014e29a278983feaa6b748016591c1d355ca7b28a6efe63663ad`:
+SHA-256 of the sorted per-slab hexadecimal hashes joined with newline characters,
+with no trailing newline.
+
+All 3,452 NQ queries ran through fresh read-only engine processes at top-k 10,
+rerank factor 32, concurrency four, and explicit 48 and 64 probes. Automatic graph
+admission was held off by the test gate. The second experiment and control returned
+identical ordered rows and distance values across all **69,040** result rows.
+
+| Probes | Control hits / 34,520 | Experiment hits / 34,520 | Recall@10, both |
+| --- | ---: | ---: | ---: |
+| 48 | 32,818 | 32,818 | 0.95069525 |
+| 64 | 33,170 | 33,170 | 0.96089224 |
+
+The serialized result fingerprint is
+`2dc022c82435f37fb50a7222e4e76416cf7d67030d2d60dff6bd953ee69bb7b7`.
+The source corpus, queries, and truth retain their shared-fixture SHA-256 hashes:
+`b1f1fb5d2d49dad476e3f0419ae3ea2975f907ddff94e447133e868ba31be185`,
+`841a621c983f0299d60873ee976990806f5d01e20116516f7bdc9842f4be2aaf`, and
+`0989770850ca34cefbabde1d9c5fa38fd539d84c3829199145cd832f39165a52`.
+
+**Rejected at the speed gate.** The experimental routing cache and streaming scorer
+are reverted. The stage instrumentation, fresh-source helper, full-tier replay,
+and quality replay remain for subsequent profiling. No public API, dependency,
+wire behavior, or persistent format changes. These are explicit frozen-checkpoint
+installations, not live ingest-to-tier, cold-query, Apple, 10M, 100M, or 4 GiB memory
+qualifications.
+
+Native formatting, strict all-target engine/vector Clippy, and full serial package
+tests passed before the profiling commit (329 passed), before preserving the
+experiment (331 passed), and after its revert (329 passed), with zero failures and
+17 ignored tests across 44 suites each time. Both experimental default-thin-LTO
+engine unit binaries separately passed 143 tests. Package suites disabled LTO to
+avoid repeated integration-binary link optimization; measured builds retained the
+repository's default thin LTO. Checked source hashes matched the worktree.
+
+One on-demand c7gd.2xlarge used 1.534444 instance-hours. Estimated compute at
+RR4's historical $0.3629/hour rate is **$0.5568**, plus small EBS and S3 charges,
+below the $6 cap. This is an estimate, not a current price quote or billing statement.
+The instance is terminated, and independent checks found zero owned active
+instances, volumes, security groups, key pairs, S3 objects, and multipart uploads.
+Shared fixtures were untouched.

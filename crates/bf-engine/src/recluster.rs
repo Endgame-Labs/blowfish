@@ -34,7 +34,6 @@ mod assignment;
 #[cfg(test)]
 mod experiment;
 mod math;
-mod routing;
 pub(crate) mod spill;
 
 /// Wall time within one build stage. Concurrent uploads overlap CPU stages; aggregate I/O times
@@ -940,10 +939,6 @@ fn assign_leaves(
                 (centers, cell_groups.clone())
             })
             .collect();
-        let group_norms: Vec<Vec<f32>> = groups
-            .iter()
-            .map(|(centers, _)| centers.iter().map(|c| norm2(c)).collect())
-            .collect();
         #[cfg(test)]
         let order_compared = std::sync::atomic::AtomicU64::new(0);
         // A row's nearest groups among its near cells, nearest first.
@@ -1010,54 +1005,7 @@ fn assign_leaves(
             });
             (group, packed)
         };
-        #[cfg(test)]
-        let reuse_routing = cache_neighbors
-            && routing::fits(present.len())
-            && (!experiment || std::env::var_os("RR7_ROUTING").is_some());
-        #[cfg(not(test))]
-        let reuse_routing = cache_neighbors && routing::fits(present.len());
-        let router = reuse_routing.then(|| routing::Router::new(&groups, &group_norms));
-        let mut routing_cache = None;
-        let nearest_group: Vec<u32> = if let Some(router) = &router {
-            let batches: Vec<_> = present
-                .par_chunks(batch_rows)
-                .enumerate()
-                .map_init(Vec::new, |buf, (batch, ids)| {
-                    if stopping() {
-                        return None;
-                    }
-                    let rows: Vec<_> = ids.iter().map(|g| read_row(*g, buf)).collect();
-                    let start = batch * batch_rows;
-                    Some(
-                        router.order(
-                            &rows,
-                            coarse,
-                            near_cells_cache
-                                .get()
-                                .map(|cs| &cs[start..start + ids.len()]),
-                            probes,
-                        ),
-                    )
-                })
-                .collect::<Option<_>>()?;
-            let mut nearest = Vec::with_capacity(present.len());
-            let mut cells = Vec::with_capacity(present.len());
-            let mut candidates = Vec::with_capacity(present.len());
-            for row in batches.into_iter().flatten() {
-                nearest.push(row.nearest);
-                cells.push(row.cells);
-                candidates.push(routing::Cached {
-                    candidates: row.candidates,
-                    cutoff: row.cutoff,
-                    norm: row.norm,
-                });
-            }
-            if near_cells_cache.get().is_none() {
-                let _ = near_cells_cache.set(cells);
-            }
-            routing_cache = Some(candidates);
-            nearest
-        } else if cache_neighbors {
+        let nearest_group: Vec<u32> = if cache_neighbors {
             let nearest_and_cells: Vec<_> = present
                 .par_iter()
                 .enumerate()
@@ -1085,26 +1033,6 @@ fn assign_leaves(
                 })
                 .collect::<Option<_>>()?
         };
-        if std::env::var_os("BF_TRACE_STAGES").is_some()
-            && let Some(cache) = &routing_cache
-        {
-            let retained: usize = cache
-                .iter()
-                .filter_map(|c| c.candidates.as_ref())
-                .map(Vec::len)
-                .sum();
-            let cached_rows = cache.iter().filter(|c| c.candidates.is_some()).count();
-            let bytes = cache.capacity() * std::mem::size_of::<routing::Cached>()
-                + cache
-                    .iter()
-                    .filter_map(|c| c.candidates.as_ref())
-                    .map(|v| v.capacity() * std::mem::size_of::<usize>())
-                    .sum::<usize>();
-            eprintln!(
-                "RR7 routing rows={} cached_rows={cached_rows} retained_groups={retained} cache_bytes={bytes}",
-                present.len()
-            );
-        }
         // A counting sort of row positions by nearest group.
         let mut starts = vec![0usize; group_count + 1];
         for g in &nearest_group {
@@ -1126,6 +1054,10 @@ fn assign_leaves(
         // nearest groups (nearly the same groups for neighbors), four rows per pass over each
         // center, as dot products against precomputed squared norms.
         let leaf_norms: Vec<f32> = leaves.par_iter().map(|l| norm2(l)).collect();
+        let group_norms: Vec<Vec<f32>> = groups
+            .iter()
+            .map(|(centers, _)| centers.iter().map(|c| norm2(c)).collect())
+            .collect();
         let compared = std::sync::atomic::AtomicU64::new(0);
         let routing_nanos = std::sync::atomic::AtomicU64::new(0);
         let profile = std::env::var_os("BF_TRACE_STAGES").is_some();
@@ -1133,17 +1065,13 @@ fn assign_leaves(
             if stopping() {
                 return None;
             }
-            let route_started = (profile && !reuse_routing).then(std::time::Instant::now);
+            let route_started = profile.then(std::time::Instant::now);
             let rows: Vec<Vec<f32>> = block
                 .iter()
                 .map(|i| read_row(present[*i as usize], buf))
                 .collect();
             let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
-            let norms: Vec<f32> = if let Some(cached) = &routing_cache {
-                block.iter().map(|p| cached[*p as usize].norm).collect()
-            } else {
-                rows.iter().map(|r| norm2(r)).collect()
-            };
+            let norms: Vec<f32> = rows.iter().map(|r| norm2(r)).collect();
             // The block's near cells, and each row's nearest groups among all of their groups.
             let mut cells: Vec<usize> = Vec::new();
             for (r, v) in refs.iter().enumerate() {
@@ -1172,16 +1100,6 @@ fn assign_leaves(
                 .iter()
                 .flat_map(|&cell| (0..groups[cell].0.len()).map(move |j| cell << 32 | j))
                 .collect();
-            if reuse_routing {
-                drop(refs);
-                return Some(assignment::Block {
-                    rows,
-                    norms,
-                    wanted: keys,
-                    #[cfg(test)]
-                    positions: block.to_vec(),
-                });
-            }
             let group_d = block_distances(&refs, &norms, keys.len(), |n| {
                 let key = keys[n];
                 (
@@ -1237,28 +1155,12 @@ fn assign_leaves(
         let ordered: Vec<u32> = order
             .par_chunks(if batched { batch_rows } else { ASSIGN_BLOCK })
             .map_init(Vec::new, |buf, batch| {
-                let routing_started = (profile && reuse_routing).then(std::time::Instant::now);
-                let mut blocks: Vec<_> = batch
+                let blocks: Vec<_> = batch
                     .chunks(ASSIGN_BLOCK)
                     .map(|block| route(buf, block))
                     .collect::<Option<_>>()?;
-                let rounded = router.as_ref().map(|router| {
-                    router.assign(
-                        &mut blocks,
-                        batch,
-                        routing_cache.as_ref().unwrap(),
-                        near_cells_cache.get().unwrap(),
-                        probes,
-                    )
-                });
-                if let Some(start) = routing_started {
-                    routing_nanos.fetch_add(
-                        start.elapsed().as_nanos() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                }
                 if batched {
-                    return Some(scorer.as_ref().unwrap().nearest_rounded(&blocks, rounded));
+                    return Some(scorer.as_ref().unwrap().nearest(&blocks));
                 }
                 let mut out = Vec::new();
                 for block in blocks {
