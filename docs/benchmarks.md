@@ -11272,3 +11272,65 @@ suites: **324 passed, zero failed, and 14 ignored**. Native ARM release library 
 After reverting, formatting and the same strict Clippy and full native package checks passed again:
 **323 passed, zero failed, and 14 ignored across 44 suites**. Engine and vector source match the starting
 revision byte for byte; only this benchmark section remains in the final diff.
+
+## Round C12: a PCA second-stage bound for the cold rerank (stopped, the provable bound prunes nothing)
+
+Hypothesis (Neon): a compact second-stage code (top-k PCA components plus a residual norm, 32 to 48 B per row)
+would give each rerank candidate a much tighter distance interval than the 1-bit RaBitQ code, so far fewer
+candidates would need an exact read. The rule was identical results: drop a candidate only when a provable lower
+bound on its exact distance exceeds a provable upper bound on the k-th exact distance. Gate: stop if the median
+exact-read count falls by less than 2x.
+
+**Result: the provable bound prunes 0 of today's candidates (1.0x, gate 2x), even with unquantized PCA
+coordinates and 8 times the byte budget. No format, engine, or storage code was written.**
+
+### The offline replay
+
+`crates/bf-engine/examples/c12_offline.py` runs on this VM with numpy and no format change. It takes the first N
+rows of the NQ corpus fixture (1,024-d f16), builds leaves of about 640 rows with k-means, encodes 1-bit RaBitQ
+residual codes with a random rotation, and for 60 NQ queries (k = 10, 48 probes) reproduces today's pool: rows
+whose `distance - error` (1.9 sigma) is at most the k-th smallest `distance + error`. On that pool it applies the
+second-stage bound, with a stored PCA code per row (residual PCA, leaf-centered) and checks every bound against
+the exact distance of every candidate (an assertion; none violated):
+
+- With `x - c = p + t` (the top-m PCA part and the tail), `|q-x|^2 = |qp - p|^2 + |qt - t|^2`.
+- Lower bound: `max(|qp - p'| - eps, 0)^2 + (|qt| - |t|)^2`. Upper bound: `(|qp - p'| + eps)^2 + (|qt| + |t|)^2`.
+  Here `p'` is the stored code, `eps` is its stored quantization error norm, and `|t|` is the stored tail norm
+  (reverse triangle inequality, so no probabilistic term).
+- Prune a candidate when its lower bound exceeds the k-th smallest upper bound over the pool.
+
+| Second-stage code (per row) | Bytes | Median survivors / pool | Reduction | Median interval width (d^2) |
+| --- | ---: | ---: | ---: | ---: |
+| PCA 128, 8-bit scalar | 130 | 4,464 / 4,464 | 1.00x | 2.31 |
+| PCA 128, 4-bit scalar | 66 | 4,464 / 4,464 | 1.00x | 2.51 |
+| PCA 192, 4-bit scalar | 98 | 4,464 / 4,464 | 1.00x | 2.16 |
+| PCA 256, 2-bit scalar | 66 | 4,464 / 4,464 | 1.00x | 3.36 |
+| PCA 128, unquantized (ceiling) | 256 | 4,464 / 4,464 | 1.00x | 2.28 |
+| PCA 256, unquantized (ceiling) | 512 | 4,464 / 4,464 | 1.00x | 1.55 |
+| PCA 384, unquantized (ceiling) | 768 | 4,464 / 4,464 | 1.00x | 1.02 |
+
+(100,000-row run; the 300,000-row run gave the same 1.00x for every row. The median exact k-th d^2 was 1.78.)
+
+### Why it fails
+
+- **The tail term decides the interval.** Cauchy-Schwarz bounds the tail by `|qt| - |t|` below and `|qt| + |t|`
+  above, a width of `4 |qt| |t|` in d^2. Residual tails are large: the mean tail norm is 0.56 after 128
+  components and still 0.30 after 384, so the interval is wider than the whole range of candidate distances.
+- **The premise did not hold on NQ.** The top 64, 128, 192, and 256 residual components hold 33%, 52%, 64%, and
+  73% of the variance (raw vectors: 43%, 60%, 71%, 79%), not the 85 to 92% the idea assumed. Better coverage
+  would take hundreds of bytes per row.
+- **Quantization is the smaller loss.** Unquantized PCA coordinates, the best any 32 to 48 B code could do, still
+  prune nothing, so a product quantizer would not change the verdict.
+- A tighter bound would have to be statistical (like today's 1.9 sigma), which is outside this round's identical-results
+  rule. The 1-bit code is already a statistical bound over all 1,024 dimensions; a second statistical interval
+  would be a new approximation to evaluate for recall, not a free pruning step.
+
+### Caveats
+
+My simulated pool (about 4,400 rows from 48 probes of a 100K to 300K sample) is far larger than a 100M cold
+query's (about 90 range reads), because the sample is sparser and leaf quality differs. The pool size does not matter
+here: the bounds are loose against the k-th distance, so every candidate survives. Queries are NQ, not the Cohere
+60 cold queries, and the sample is 100K and 300K rows, not 1M, so the offline numbers show a structural failure, not a
+100M projection.
+
+EC2: not used (the study ran on this VM). SPEC 25 stands; PROGRESS and the SPEC decision log should note the stop.
