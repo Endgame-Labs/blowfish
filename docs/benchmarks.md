@@ -11154,8 +11154,9 @@ Conservative per-window saturation bounds are cached as upward-rounded f32 value
 statistics change. No format change.
 
 Selection uses only the even-indexed 500 queries in `bench/scale/data/bm25-msmarco.json`: rank unique query-term
-frequency times corpus document frequency, and freeze the top 32. Terms that are sparse in an individual segment keep
-the posting path. Selected terms, in cost order:
+frequency times corpus document frequency, and freeze the top 32. The prototype's `dense_bm25_terms` example takes the
+training workload and raw text-segment payloads; copied fixture objects need their 24-byte `BFPUT001` storage envelope
+removed before selection. Terms that are sparse in an individual segment keep the posting path. Selected terms, in cost order:
 
 ```text
 is,the,of,a,in,to,and,for,what,are,on,how,you,can,when,an,it,with,does,who,which,have,was,as,be,from,do,your,many,at,definition,where
@@ -11184,3 +11185,42 @@ The 1.30x bar requires 2,655 q/s in this pair; the candidate falls short by 51 q
 Array, overflow, reserved bound, and bookkeeping charges total **30,232,576 bytes (28.83 MiB)** across eight readers.
 Whole-server warm RSS was 460 / 464 MiB in A1 / A2, and 431 / 413 MiB in B1 / B2: replacing decoded dense postings
 reduced total RSS despite the additional arrays. These are observed RSS values, not a general memory guarantee.
+
+### Validation and decision
+
+The prototype is preserved at `04e91eb`. `cargo fmt`, `cargo clippy -p bf-text -p bf-engine --all-targets -- -D warnings`,
+and `cargo test -p bf-text -p bf-engine` pass. Its new test checks byte-boundary frequencies (254, 255, and 300), missing
+terms, duplicate selections, budget refusal, filters, prefixes, repeated query terms, partial windows, changed corpus
+normalization, demand reads, and prefetched reads, comparing score bits and IDs.
+
+The release-mode frozen check, `text_benchmark::bm25_serialized_msmarco_snapshots`, passes in **133.42 s** with arrays
+on: all 4,000 queries across the four serialized snapshot states match the independent exhaustive scorer's ordered IDs
+and f32 score bits. The states include text-changing writes, null text, deletes, WAL overlays, and a later index publication.
+All 144,000 timed replies also match the fixture truth (plus prewarm and profiling replies).
+
+**Not shipped: the throughput bar was missed.** The memory and exactness bars pass, but the paired gain is 1.275x,
+so the prototype's runtime hook, arrays, selector example, and dedicated test are removed from the final tree. BW9 remains
+the serving path. There is no reason to persist this layout or change the bucket format on these results. Startup/cold
+latency and write-loaded performance were not measured; this is a warm-read experiment only.
+
+### Where the remaining CPU went
+
+After timing and the frozen check, separate 199 Hz `cpu-clock` profiles ran 48,000 held-out queries per binary at
+16 clients on the same CPU placement. These are sample shares, not independent latency measurements:
+
+| Symbol or operation | Baseline samples | Candidate samples |
+| --- | ---: | ---: |
+| `Postings::window` | 3.82% | 2.23% |
+| `SearchTerm::cache_windows` span preparation | 4.89% | 2.73% |
+| Relaxed 64-bit atomic add | 5.63% | 1.96% |
+| Competitive-row predicate | 6.57% | 10.64% |
+| Main `search_internal` body, including inlined work | 37.45% | 35.65% |
+
+The targeted costs do shrink. The shared window planner, competitive-row filtering, and scoring still consume much
+of the query, and sparse and unselected terms still use postings. The larger 16-client gain than single-client gain
+(1.275x versus about 1.13x) is consistent with reducing shared memo and reference-count traffic. The atomic sample does
+not identify its callers, so it does not by itself establish how much was memo contention.
+
+One c7g.4xlarge for about 19 minutes (0.31 instance-hours), estimated below $1 using the granted $2/hour ceiling,
+including a small allowance for disk and fixture reads. The instance was terminated, and its tagged key pair and security
+group were deleted. No bucket writes. All 396 fixture-file sizes and SHA-256 hashes were verified after the run.
