@@ -71,8 +71,9 @@ for rep in range(a.reps):
         shutil.rmtree(work / "scratch", ignore_errors=True)
 
 
-def ids(resp):
-    return json.dumps(resp, sort_keys=True)
+def rows(resp):
+    """The reply minus its timing block: the ranked rows and distances."""
+    return json.dumps(resp["rows"], sort_keys=True)
 
 
 def p(xs, q):
@@ -87,16 +88,21 @@ for arm in ("control", "prestage"):
         "codes_usable_s": [r["codes_usable_ms"] / 1000 for r in rs if r["codes_usable_ms"] is not None],
         "fully_staged_s": [r["fully_staged_ms"] / 1000 for r in rs if r["fully_staged_ms"] is not None],
         "staged_bytes": [r["staged_bytes"] for r in rs],
-        "steady_p50_ms": [p([q["ms"] for q in r["steady"]], 50) for r in rs],
-        "steady_p90_ms": [p([q["ms"] for q in r["steady"]], 90) for r in rs],
-        "early_p50_ms": [p([q["ms"] for q in r["early"]], 50) for r in rs],
+        "restart_p50_ms": [p([q["ms"] for q in r["restart"]], 50) for r in rs],
+        "restart_p90_ms": [p([q["ms"] for q in r["restart"]], 90) for r in rs],
     }
-# Reply identity: every steady reply of every run against the first run's, and early replies
-# (answered while staging ran, some from object storage) against the same query's steady reply.
-base = {q["i"]: ids(q["response"]) for q in runs[0]["steady"]}
-summary["identical_steady"] = all(ids(q["response"]) == base[q["i"]] for r in runs for q in r["steady"])
-summary["identical_early_vs_steady"] = all(
-    ids(q["response"]) == base[q["i"]] for r in runs for q in r["early"] if q["i"] in base)
-summary["pairs"] = sum(len(r["steady"]) + len(r["early"]) for r in runs)
+# Reclusters are not deterministic, so replies are compared within a run: every reply given
+# while staging ran (some from object storage), after it (from the stage), and after a restart
+# (adopting the stage from disk) must agree for the same query.
+same = []
+for r in runs:
+    ref = {q["i"]: rows(q["response"]) for q in r["restart"]}
+    same.append({
+        "arm": r["arm"], "rep": r["rep"],
+        "steady_vs_restart": [sum(rows(q["response"]) == ref[q["i"]] for q in r["steady"]), len(r["steady"])],
+        "early_vs_restart": [sum(rows(q["response"]) == ref[q["i"]] for q in r["early"] if q["i"] in ref),
+                             sum(q["i"] in ref for q in r["early"])],
+    })
+summary["identical_within_run"] = same
 (RUN / "summary.json").write_text(json.dumps(summary, indent=1))
 print(json.dumps(summary, indent=1))

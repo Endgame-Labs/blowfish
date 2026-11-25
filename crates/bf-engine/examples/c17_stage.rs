@@ -138,6 +138,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let (ms, response) = query(n).await?;
         steady.push(json!({"i": n, "ms": ms, "response": response}));
     }
+    // A restart: a fresh engine adopts the stage from disk, with cold decoded caches in both arms.
+    drop(engine);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let engine = Engine::with_config(
+        Storage::open(&config).await?,
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            ..EngineConfig::from_env()
+        },
+    );
+    let mut restart = Vec::new();
+    for (n, input) in requests.iter().enumerate().take(100) {
+        let request: QueryRequest = serde_json::from_value(input["request"].clone())?;
+        let tick = Instant::now();
+        let response = engine.query(&ns, request).await?;
+        restart.push(
+            json!({"i": n, "ms": tick.elapsed().as_secs_f64() * 1000.0, "response": response}),
+        );
+    }
     let bytes: u64 = walk(&disk.join("ann-staging-v2"));
     std::fs::write(
         &args[4],
@@ -151,6 +171,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "staged_bytes": bytes,
             "early": early,
             "steady": steady,
+            "restart": restart,
         }))?,
     )?;
     println!(

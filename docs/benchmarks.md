@@ -12048,3 +12048,63 @@ not probed again, and stages it once room returns. `cargo fmt`, `cargo clippy -p
 and `cargo test -p bf-engine -p bf-storage` pass.
 
 The column-staging code is not merged: under the 20 GiB cap it gains nothing measured. It is kept on branch `c15-columns` pending a decision on the staging budget.
+
+## Round C17: stage slabs locally while recluster uploads them
+
+Rounds C6 to C9 stage a recluster tier by fetching its codes, exact vectors, and companions back from object
+storage after the tier is first queried (79 to 88.5 s at 100M, C9). When the node that builds the tier also serves
+it, the build already holds those bytes. C17 writes each slab's stage bytes (the routing and codes prefix, plus the
+exact vectors while the cap has room beside the codes still to come) to the local stage as the slab uploads, with
+the same 16 KiB CRCs, object identities, and staging cap. They stay inert until the manifest commit, then the tier's
+first query adopts them instead of downloading. A failed commit, an error, a deletion, or a restart discards them
+(tests in `local_ann.rs`). No bucket format change. `BF_PRESTAGE=0` is the control.
+
+### Paired results (10M, one c7gd.4xlarge, CPUs 0 to 7, `-C target-cpu=neoverse-v1`)
+
+A fresh copy of the C5 10M namespace (`wikipedia-10m`, 10,000,000 rows, 55 slabs). Each run reclusters the copy,
+then queries from the commit until the stage and its companion pack are on disk. Four runs, alternating order
+(control, prestage, prestage, control), the same binary and host (`examples/c17_stage.rs`, `examples/c17_ab.py`).
+Times are from the recluster's return (the manifest commit) to the stage appearing on disk.
+
+| Measure | Control (2 runs) | Prestage (2 runs) | Ratio |
+| --- | ---: | ---: | ---: |
+| Codes usable | 84.0, 90.8 s (mean 87.4) | 2.0, 2.6 s (mean 2.3) | **38x** |
+| Fully staged (companions published) | 84.6, 91.5 s (mean 88.1) | 2.9, 3.2 s (mean 3.0) | **29x** |
+| Recluster time | 493.1, 503.6 s (mean 498.4) | 497.0, 498.0 s (mean 497.5) | 0.998x |
+| Staged bytes | 21.186 GB | 21.319 GB | equal cap |
+| p50 / p90 after a restart (100 queries, cold decoded caches) | 22.0, 27.8 / 42.7, 41.9 ms | 12.0, 10.4 / 18.0, 13.7 ms | n/a |
+
+Passes the 3x target by 10x, with no slower recluster (the pass bound was 5 percent). The prestage runs also
+stage 0.6 percent more bytes (326 MB), because the vectors written beside each upload are admitted before the
+smallest-first order would pick them; the cap and the 2x free-space check are unchanged. The faster post-restart
+queries mean that the prestaged stage serves at least as many exact vectors locally as the control's.
+
+**Identical results.** Reclusters are not deterministic (two control tiers disagree on most queries), so replies
+are compared within a run, on ranked rows and distances: every query answered while staging ran (from object
+storage), after it (from the stage), and after a restart that adopts the stage from disk agree. That is 5,023
+comparisons (control 2,500 and 2,400, prestage 11 and 12, plus 100 steady replies per run), all identical.
+Few early replies exist in the prestage runs because the stage is ready within seconds.
+
+### What it costs and leaves out
+- Local writes: the recluster now also writes up to the cap (about 21 GB here) to the NVMe, beside the S3 PUTs, with
+  one fsync per slab. It did not slow the build (above).
+- The directory and the paged header are written after the last slab and still download after the commit, with a
+  HEAD per object to recheck identities. That is the 2 to 3 s that remain.
+- Companions come from the source segments, not the slabs, so they are still fetched (about 0.6 s at 10M).
+- Prestage never evicts a stage that serves queries: while the superseded tier's stage still holds the cap, slabs
+  that do not fit are left to the download.
+
+### 100M projection (not rebuilt)
+The 79 to 88.5 s of C9 is download time for the same 20 GiB-capped bytes, which prestage removes. The remaining
+work is the directory and header download plus about 320 identity checks at 32 in flight, which grew from about
+2 s at 55 slabs, so expect roughly 3 to 6 s to codes usable and fully staged (14x to 29x). The recluster's extra
+local writes are bounded by the same 20 GiB cap, so the build-time cost should stay near zero.
+
+### Cost
+c7gd.4xlarge from 14:01 to about 15:24 UTC on 2026-11-25 (about 1.4 hours, about $1.0), plus a copy of the 77 GB
+10M prefix (`tmp/c17-20261125/`, deleted). The instance, key pair, and security group are deleted.
+
+```sh
+taskset -c 0-7 uv run crates/bf-engine/examples/c17_ab.py --config CONFIG.local \
+  --binary target/release/examples/c17_stage --scratch .scratch/c17 --label r2 --reps 2
+```
