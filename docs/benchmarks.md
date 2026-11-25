@@ -12678,7 +12678,7 @@ first-touch stalls), not in bound rebuilds.
   `default_max_segment_rows().min(100_000)`. `auto_recluster.rs` separately uses `SEGMENT_ROW_BYTES = 30_000`.
 - **Effective rows on MS MARCO:** on this 32 GiB host (30 GiB MemTotal), memory / 80,000 is about 394,000, so the clamp makes the cap
   **200,000 rows**; a host needs about 16 GB to reach it, and a 4 GiB limit gives 53,000 rows. The 1M fixture's live segments hold
-  25,000, 50,000, 100,000, 110,000, 115,000, and three of 200,000 rows (eight segments, 209 MB of `fts.1.bft`); BW13's reload
+  25,000, 50,000, 100,000, 110,000, 115,000, and three of 200,000 rows (eight segments, about 199 MB of `fts.1.bft`); BW13's reload
   produced nine. So the cap is the binding limit for the three largest segments, and the rest are tier leftovers.
 - **Sizing is not just the cap:** even with `BF_MAX_SEGMENT_ROWS` raised, `max_segment_bytes` is 2 GiB, and a hard upper clamp of
   200,000 applies to the default only. Collapsing to one or two segments therefore needs a text-aware default (rows from
