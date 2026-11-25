@@ -134,6 +134,16 @@ struct Inner {
 /// Cloneable store handle. Creates carry a portable body header with a retry identity.
 #[derive(Clone)]
 pub struct Storage(Arc<Inner>, Arc<str>);
+/// Immutable backend identity used to validate a durable local copy without downloading it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectIdentity {
+    /// Physical object length, including any portable create header.
+    pub size: u64,
+    /// Backend entity tag. Absence requires a version identifier.
+    pub etag: Option<String>,
+    /// Backend generation or version identifier, when available.
+    pub version: Option<String>,
+}
 /// Object metadata; size includes the portable conditional-create header, if present.
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
@@ -159,6 +169,26 @@ impl Storage {
             },
             config.disk_dir.clone().filter(|_| config.disk_bytes > 0),
         )
+    }
+    /// Stable, opaque identity of the backend and root prefix for durable local caches.
+    /// Scoped views share this identity, and must additionally separate their relative keys.
+    pub fn cache_identity(&self) -> Option<String> {
+        self.0
+            .cache
+            .config
+            .namespace
+            .as_ref()
+            .map(crate::disk::digest)
+    }
+    /// Read an immutable object's entity tag, version, and physical length using HEAD only.
+    /// A backend providing neither an entity tag nor a version cannot validate durable copies.
+    pub async fn object_identity(&self, key: &str) -> Result<ObjectIdentity, Error> {
+        let meta = self.0.backend.head(&self.path(key)).await?;
+        Ok(ObjectIdentity {
+            size: meta.size,
+            etag: meta.e_tag,
+            version: meta.version,
+        })
     }
     /// Whether immutable local reads use native memory mappings, independently of the block
     /// cache's budget (which [`Storage::cache_limits`] reports as zero for mapped stores).

@@ -636,6 +636,15 @@ pub(crate) async fn catch_up_hinted(
             found
         });
         if let Some((generation, m)) = manifest.map_err(log_error)? {
+            if let Some(hint) = hint
+                && let Some(manager) = &hint.context.cache.staging
+            {
+                manager.retain_namespace(
+                    &hint.context.cache.key(""),
+                    wal.namespace(),
+                    &m.ann_tiers,
+                );
+            }
             if m.indexed_through > 0
                 && generation > state.manifest_seq
                 && !same_checkpoint(state, &m)

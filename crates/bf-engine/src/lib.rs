@@ -691,6 +691,9 @@ impl Engine {
         }
         if !state.exists {
             self.0.hot_graph.delete(ns);
+            if let Some(manager) = &self.0.read_cache.staging {
+                manager.remove_namespace(&self.0.read_cache.key(""), ns);
+            }
             if cap.is_some()
                 && Wal::new(self.0.store.clone(), ns)
                     .map_err(log_error)?
@@ -888,6 +891,9 @@ impl Engine {
         request: QueryRequest,
     ) -> Result<(QueryResponse, QueryDiagnostics), ApiError> {
         let start = Instant::now();
+        if let Some(manager) = &self.0.read_cache.staging {
+            manager.recover(&self.0.store).await;
+        }
         let backend = Arc::new(bf_storage::BackendStats::default());
         let stats = Arc::new(bf_storage::CacheStats::default());
         let context = read_cache::ReadContext {
@@ -1191,6 +1197,11 @@ impl Engine {
             .submit(Operation::Delete(handle.backpressure.begin()))
             .await??;
         self.0.hot_graph.delete(ns);
+        if let Some(manager) = &self.0.read_cache.staging {
+            // Drain startup adoption before removing this namespace's retained stages.
+            manager.recover(&self.0.store).await;
+            manager.remove_namespace(&self.0.read_cache.key(""), ns);
+        }
         Ok(())
     }
     /// Sorted, consistent namespace listing, using opaque base64 cursors.
