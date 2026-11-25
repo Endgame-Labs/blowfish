@@ -13018,8 +13018,8 @@ New counters (`/metrics`): `blowfish_warm_exact_lookups_total{result}`, `blowfis
 - The exact-vector cache holds 413 MB, the size of the tier's code bytes: 185,770 rows of 2.2 KB, 6.9% of the corpus.
 - A `top_k` 100 query reranks about 800 rows and records every one. The quality pass inserted **2.77 million** rows and
   evicted **1.80 million**, so the cache was full after about 250 queries. 3,451 of its 3,452 queries fell back.
-- Afterwards, `top_k` 10 queries could not get their rows back. Over the next 8,000 queries, 9,333 lookups missed (7%)
-  and every one ended a compiled attempt (`exact_row_missing`): only 1,361 of those 8,000 queries stayed compiled (17%),
+- Afterwards, `top_k` 10 queries could not get their rows back. By the end of the next 8,000 queries, 9,333 lookups had missed
+  (counting the pass), and every miss ended a compiled attempt (`exact_row_missing`): only 1,361 of those 8,000 queries stayed compiled (17%),
   and the repeat 16-client pass was still at 600 q/s. Each fallback re-records its rows, but eviction continued (2.1
   million evictions by the end of the main pass) because the cache's admission policy keeps the rows the top-100 pass
   hit most often.
@@ -13056,7 +13056,7 @@ p50 is the 1-client latency pass; q/s is 16 clients, first and repeat passes. Pa
 - Fresh server, fix against main: p50 4.0 against 4.0 to 4.2, and 1,059 to 1,108 against 1,105 to 1,161 q/s. The runs
   vary by about 5% between repeats, so I read this as no regression, but I did not run enough pairs to resolve a 2%
   difference.
-- **Identical results:** the top 10 ids of the first 2,000 queries are the same in all eight runs (0 differences).
+- **Identical results:** the top 10 ids of the first 2,000 queries are the same in the six runs I compared, main and fix, fresh and after the pass (0 differences).
 
 ### Not done
 
