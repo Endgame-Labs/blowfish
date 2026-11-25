@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **C13/C14 S3 latency diagnosis (merged; warmer 15 s).** 16 KiB range-GET latency is S3-side and follows the total span of a wave's reads, not the client (object_store, raw hyper, 16-IP spread, boto3 all ~100 ms) or object size (16 MiB to 1.5 GB alike): within ~1 GiB 25-50 ms, over 2-4 GiB or more 80-100 ms. Lead for C16: cluster-local placement of exact vectors. Warmer refresh 45 -> 15 s.
+
 - **BW11 dense-term frequency arrays (merged).** A term dense in a segment earns a byte-per-row TF array (overflow table for >= 255) on its second use, 32 per reader, within the BW9 memo pool and charged through the memo hook; exact per-window (tf, length) frontiers. c7g.4xlarge A/B/B/A: warm 16 clients 1,947 -> 2,465 q/s (1.27x), 1 client 776 -> 875 (1.12x), cold first query 231 -> 200 ms median, restart 82 vs 83 ms, steady-write p50 equal. Frozen 4,000-query check and 144,000 warm replies bit-identical. Prototype was BW10 (both advisors proposed it).
 
 - **BW9 honest BM25 memo accounting (merged).** `resident_bytes()` charged a flat `MEMO_POSTING_BYTES * 4` per reader; now `DecodedCache::recharge` charges actual memo bytes, and memo pools are 1/32 of the general budget (8-64 MiB). At a 64 MiB memo the old charge caused 16,087 reader evictions per 4,000 queries (memo hit 4%); now 0 (hit 97.6%). Warm 1M MS MARCO, c7g.4xlarge A/B/B/A: 16 clients 1,433 -> 1,966 q/s (1.37x), 1 client 645 -> 797 (1.24x), p90 -27%/-37%. Bit-identical; writes not slower. Essential-first decode killed (cold blocks_read -7.7%).

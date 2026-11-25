@@ -469,6 +469,13 @@ writer; a failed heartbeat disables writes. Heartbeats become stale after 30 sec
 may need to wait. This is best-effort detection, not a distributed lock: without conditional writes,
 concurrent startup is not guaranteed safe. Do not run multiple writers on such a backend.
 
+On S3, a background warmer keeps idle connections open so a cold wave of parallel reads does not pay a TLS
+handshake per request. S3 closes an idle connection after 20 to 40 seconds (and any connection after 100
+requests), so the warmer touches its idle connections every 15 seconds. Earlier releases refreshed every 45
+seconds, which found most of them already closed. There is no setting for the interval; `BF_WARM_CONNECTIONS`
+and `BF_WARM_FLOOR` still size the pool (see [configuration](configuration.md)). An idle server pays
+`BF_WARM_FLOOR` small HEAD requests every 15 seconds.
+
 Start replicas with `--read-only`. They do not run a mutating probe or acquire a heartbeat, and they
 reject storage mutations, including key creation/revocation. They can serve strong queries against
 new writes in the shared prefix. Read-only status reports `read_only`, irrespective of the writer's
