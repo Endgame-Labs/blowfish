@@ -538,9 +538,9 @@ async fn write(
     Path(ns): Path<String>,
     Extension(p): Extension<Principal>,
     headers: HeaderMap,
-    input: Result<Json<WriteRequest>, JsonRejection>,
+    input: Result<FastJson<WriteRequest, true>, JsonRejection>,
 ) -> Result<Response, HttpError> {
-    let request = body(input)?;
+    let request = body(input.map(|FastJson(v)| Json(v)))?;
     operations::authorize_copy(&s, &p, &request)?;
     if request.copy_from_namespace.is_some()
         && headers.get_all("prefer").iter().any(|v| {
@@ -570,8 +570,8 @@ fn trace_query_stages() -> bool {
 /// `Json<T>`, with the same rejections, that parses a valid body without
 /// `serde_path_to_error`'s per-value path tracking (several percent of a vector query's CPU).
 /// Only a body that fails to parse is parsed again through `Json`, for its error path.
-struct FastJson<T>(T);
-impl<T, S> FromRequest<S> for FastJson<T>
+struct FastJson<T, const STAGES: bool = false>(T);
+impl<T, S, const STAGES: bool> FromRequest<S> for FastJson<T, STAGES>
 where
     T: serde::de::DeserializeOwned,
     S: Send + Sync,
@@ -596,7 +596,15 @@ where
         let started = std::time::Instant::now();
         let bytes = axum::body::Bytes::from_request(req, state).await?;
         let collected = started.elapsed();
-        match serde_json::from_slice(&bytes) {
+        let parsed = serde_json::from_slice(&bytes);
+        if STAGES {
+            let seconds = |d: std::time::Duration| d.as_secs_f64();
+            metrics::histogram!("blowfish_commit_stage_seconds", "stage" => "http_receive")
+                .record(seconds(collected));
+            metrics::histogram!("blowfish_commit_stage_seconds", "stage" => "http_parse")
+                .record(seconds(started.elapsed() - collected));
+        }
+        match parsed {
             Ok(v) => {
                 if trace_query_stages() {
                     eprintln!(

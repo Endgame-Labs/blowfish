@@ -4,6 +4,13 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-11-25
+
+### Changed
+
+- **Faster bulk ingest (about 1.4x):** Three CPU costs on the write path are gone. Index builds find each row's nearest center with a certified BF16 matrix screen and recompute only the surviving centers with the original kernel, so every assignment and every index byte is unchanged (segment-build time per row about halves on Graviton). Large WAL payloads store the vectors of f16 attributes as f16 base64 (exactly the same values in half the bytes), which halves the JSON, leaves little for zstd to do, and cuts uploaded WAL bytes by 29%. Vector values are normalized straight to base64 instead of through a JSON number per element. On a full Natural Questions load (2.68M rows of 1,024-d f16 vectors, four clients of 5,000-row writes, one c7gd.2xlarge), paired against v0.1.29: 17.4K to 24.5K rows/s, write p90 about 1,150 to 890 ms, with no backpressure retries, and 53% less server CPU. Query results are unchanged. No setting.
+- **Bucket format 5 (WAL encoding 2):** Large WAL payloads can now be written in encoding 2 (see above), so the bucket format moves to 5: writable startup writes `_system/format/5.json`. v0.1.29 and older refuse the bucket with `BucketFormat { required: 5, supported: 4 }`, and there is no in-place downgrade. Stop older writers and back up the prefix before upgrading, as for format 4. New binaries read every existing WAL payload.
+
 ## [0.1.29] - 2026-11-25
 
 ### Changed
@@ -232,7 +239,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.29...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.30...HEAD
+[0.1.30]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.30
 [0.1.29]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.29
 [0.1.28]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.28
 [0.1.27]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.27

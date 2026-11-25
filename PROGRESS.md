@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **W4 ingest (merged).** Exact BF16 matrix screening in segment-build k-means (byte-identical blobs; build 2.2x at 100K), WAL encoding 2 (lossless f16 packing for f16 vectors; WAL bytes -29%, compress 316 -> 65 ms per group), and vector normalization without a JSON number per element (100 -> 41 ms per group). Full NQ load on one c7gd.2xlarge: 17,357 -> 24,489 rows/s (1.41x), write p90 1,150 -> 892 ms, server CPU 724 -> 338 CPU-s, zero backpressure retries. Bucket format 5 (fenced; one-way per SPEC 25).
+
 - **C9 packed staging companions (merged).** One local pack per tier for docs directories and row-to-ID maps, identity-checked whole-object GETs, and two-phase publication (codes first). 100M: codes usable 154.5 -> 79.1 s, fully ready 88.5 s (78-97 s run to run), staged descriptors 4,217 -> 325. Live queries during staging equal; identical results. Steady p50 10M +1.1%, 100M +3.2% (edge of noise, one repetition).
 
 - **G5 warm graph navigation (merged).** Cached norms, bitset plus contiguous beam, four-accumulator ARM int8 dot (567 -> 275 instructions per dot), neighbor-code prefetch (160 -> 55 ns per dot), dense locations, `/status` hot_graphs. M4 production binary, matched recall 0.944: 8,720 vs Qdrant 8,407 q/s (+3.7%), +9-11% over main controls, 2.65M vs 1.96M instr/q (G4 3.57M). RSS ~4.4 GB vs Qdrant ~5.6 GB. Untried: graph-walk packing, progressive precision.

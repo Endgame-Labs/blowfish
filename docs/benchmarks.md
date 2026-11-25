@@ -10851,3 +10851,140 @@ tightening the bound on one window rarely removes the last window that needs a b
 paid per block, which is why BW7's 90% skippable windows also did not move time.
 
 No implementation, format change, or EC2 measurement was done; nothing was written to the bucket. Cost: $0.
+
+## Round W4: profile and cut end-to-end ingest cost
+
+Round W3 bounded WAL groups by bytes and cut full-load write p90 by about 46%. Ingest had not been profiled end to end
+since. This round profiled the full Natural Questions load first, then attacked what the profile showed.
+
+### Method
+
+One on-demand `c7gd.2xlarge` (Graviton3, eight cores, 16 GiB, local NVMe), Rust 1.100.0, Clang 19 for NumKong with the
+Clang 22 linker wrapper, no native CPU flags, release thin LTO with debug info. The load is W3's: 537 prepared bodies of
+5,000 rows (2,681,468 vectors, 1,024 dimensions, f16 storage, cosine, vectors as base64 f32), four clients, the W2/W3
+`write_admission.py --stages` wrapper, a fresh `file://` store on NVMe, four Tokio and four Rayon workers, 4 GiB memory
+cache, no disk cache, default indexing, compaction, recluster, and backpressure, server and loader at nice 19, OS
+caches dropped before each run. The source corpus and queries came from the read-only `tmp/nq-fixture-v019/data/`
+fixture, so the bucket was never written. The control and the candidate ran on the same instance, alternating, and
+every run includes backpressure sleeps. CPU profiles use `perf record -F 199` on the server process (frame pointers,
+flat symbols), bucketed by symbol.
+
+### Profile (control, v0.1.29 plus timing for HTTP receive and parse)
+
+Per-group means from the wrapper's stage metrics (control run 3; mean of 537 groups, stages overlap, so they do not add):
+
+| Stage | Mean, ms |
+| --- | ---: |
+| WAL compression (zstd 3, 27.5 MB JSON per group) | 316 |
+| Row normalization (base64 decode, f16 round, `json!(Vec<f32>)`, decode again, base64 encode) | 100 |
+| Replay and publication | 47 |
+| WAL JSON serialization | 26 |
+| HTTP body receive (27 MB) | 18 |
+| HTTP JSON parse | 10 |
+| Payload write (local NVMe, no fsync) | 16 |
+| State lock, clone, expand, extract, mutate, apply | about 30 |
+
+Server CPU by phase (perf, run with 724 CPU-seconds, 5.1 cores average over the 141 s load):
+
+| Phase | CPU % | CPU-s | us per row |
+| --- | ---: | ---: | ---: |
+| Indexing: segment build (k-means `l2_squared_f32` alone is 34%, then RaBitQ and packing) | 47.1 | 341 | 127 |
+| WAL compression (zstd) | 22.7 | 165 | 61 |
+| Kernel (page faults, copies, IO) | 7.7 | 56 | 21 |
+| Write normalization (base64, `json!` round trip, `Value` drops) | 6.7 | 49 | 18 |
+| WAL JSON serialization | 5.0 | 36 | 14 |
+| State clone and apply | 1.4 | 10 | 4 |
+| HTTP JSON parse | 1.1 | 8 | 3 |
+| Allocator, memcpy, other | 7.5 | 54 | 20 |
+| Recluster | 0 (deferred 22 times, reason `bulk_load`) | 0 | 0 |
+
+Recluster does not run during a bulk load; it follows the load and took 161 to 162 s here (control and candidate alike).
+The vectors in this load arrive as base64, so parsing JSON arrays of numbers is not on the measured path (HTTP parse
+is 1.1% of CPU). Segment-build k-means was the top cost, and it competes with the write path for the same eight
+cores. Backpressure retries (4 to 7 per run, 18 to 20 s advertised sleep each, 71 to 137 aggregate client seconds)
+come from the indexer not keeping up, so indexing speed also gates throughput.
+
+### What changed
+
+1. **Exact BF16 screening for k-means assignment in index builds** (`bf-vector`, `nearest.rs`). `train` and the final
+   assignment of a segment build find each row's nearest center with a 64-row BF16 matrix product against all centers
+   (NumKong, ARM `bfdot`), keep the centers whose BF16 score is within a certified error bound of the best (the bound
+   in `bf-vector::batched`, plus f32 accumulation of the reference kernel), and recompute only those with the original
+   `l2_squared_f32`, ties to the lowest index. The winner is identical to scoring every center, so every blob is
+   byte-identical. Nonfinite scores, unsafe scales, and very large dimensions fall back to the full scan. Used only when
+   the CPU has the BF16 matrix instructions and there are at least 24 centers of at least 64 dimensions. This is the
+   RR4 certification applied to index builds, outside the listed scope but where the profile pointed.
+2. **WAL encoding 2** (`bf-wal`, `packed.rs`). The engine keeps an f16 attribute's vector as base64 of f32 values
+   already rounded to f16. A payload too large to stay inline writes those vectors as f16 base64 (two bytes per value).
+   Packing is all or nothing per payload: if any such value is not exactly an f16, or any string is not canonical
+   base64, the payload keeps encoding 1. Decoding expands each packed string back to exactly the string that was
+   encoded. The version byte (2) is new, so the bucket format moves from 4 to 5 and older binaries refuse the bucket
+   (`bf-storage` constant, per decision 26's format fence). Readers keep reading every existing WAL (encoding 1).
+   Compression also moved to one-shot `zstd::bulk::compress`, about 20% cheaper than the streaming encoder on this
+   data, and packed strings are written as raw JSON because base64 needs no escaping.
+3. **Normalize vectors straight to base64** (`bf-engine`, `bf-types`). A vector is decoded, checked, rounded to f16, and
+   encoded once, instead of through a JSON number per element and back (`json!(Vec<f32>)` then `decode_vector`).
+   Dimension, finiteness, and f16 range errors are unchanged.
+
+Screened out: the zero-JSON-array parse (not on the measured path, 1.1% of CPU), the entropy gate (the f16 packing
+removes the incompressible bytes instead, so zstd has little left to try), and a B-ary assignment tree for recluster
+(recluster is not part of the load).
+
+### Results (same instance, paired)
+
+| Run | Seconds | Rows/s | Write p50, ms | Write p90, ms | Retries | WAL bytes written |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Control 1 | 156.0 | 17,188 | 899 | 1,154 | 6 | 7.54 GB |
+| Control 2 | 147.5 | 18,175 | 895 | 1,146 | 4 | 7.54 GB |
+| Control 3 | 160.5 | 16,708 | 884 | 1,149 | 7 | 7.54 GB |
+| Candidate 1 | 107.6 | 24,931 | 810 | 879 | 0 | 5.35 GB |
+| Candidate 2 | 111.5 | 24,046 | 839 | 905 | 0 | 5.35 GB |
+
+(Two further runs with `perf` attached agree: control 141.6 s, 18,943 rows/s, p90 1,172 ms; the screening and f16
+packing build without the later zstd change, 112.5 s, 23,841 rows/s, p90 910 ms, zero retries.)
+
+Means: throughput 17,357 to 24,489 rows/s (**1.41x**; the worst candidate against the best control is 1.32x), write p50
+890 to 825 ms, and write p90 1,150 to 892 ms (**1.29x lower**; worst candidate against best control 1.27x). The
+throughput bar (1.25x) passes in every pairing. The p90 bar (1.3x) is within noise but not met in every pairing, so the
+pass rests on throughput. Candidate runs had no backpressure retries, so none of the gain is retry sleep removed by a
+policy change; the indexer simply kept up.
+
+Per-group means, candidate against control 3: WAL compression 316 to 65 ms, row normalization 100 to 41, payload
+write 16 to 10, WAL serialization (now including packing) 26 to 43, state clone through apply unchanged. Server CPU
+for the load fell from 724 to 338 CPU-seconds (perf-attached runs): segment build 341 to 122, WAL compression 165 to
+40, write normalization 49 to 36. Segment-build time per row fell from 122 s to 61 s of build time over the load.
+
+Segment build alone, on 1,024-d NQ rows with `sqrt(n)` centers, blobs compared byte for byte
+(`nearest::tests::real_corpus_segment_blobs_are_identical_and_faster`, `NQ_CORPUS=.../corpus.f16 NQ_ROWS=n`,
+release, Graviton3, eight threads):
+
+| Rows | Scalar | Screened | Blobs | Centers kept per row |
+| ---: | ---: | ---: | --- | ---: |
+| 25,000 | 374 ms | 211 ms | identical | 1.08 |
+| 100,000 | 1,729 ms | 787 ms | identical | 1.15 |
+| 300,000 (two-level) | 2,030 ms | 2,082 ms | identical | 1.12 |
+
+At 300,000 rows the builder uses its two-level path, whose small center sets stay scalar, so there is no change.
+
+### Correctness
+
+- Bit-identical index builds: the table above, plus a unit test on a 6,000-row clustered fixture with the matrix path
+  forced on and off, and randomized tests of the screen against `nearest` for dimensions 3 to 1,024, scales 0 to 1e20,
+  exact ties, and nonfinite rows.
+- Lossless WAL packing: tests round-trip entries with several f16 attributes, null values, signed zero, f16
+  subnormals and extremes, infinities, and NaN (which falls back), decode a hand-built encoding-1 payload, and fail
+  closed on a corrupted packed string.
+- End to end, after each run's recluster finished (control and candidate stores were restarted read-write, so all data
+  came back through manifest and WAL replay): the row count is 2,681,468 in both; 3,003 sampled vectors (random IDs
+  plus the first, second, and last) match the corpus exactly in both; ANN recall@10 over 300 queries against the
+  fixture's exact truth is 0.9553 (control) and 0.9583 (candidate). Two independent loads produce different segment
+  boundaries, because commit timing differs, so approximate results are not compared across stores; exact identity is
+  established at the build step above.
+- `cargo fmt`, `cargo clippy -p bf-wal -p bf-types -p bf-vector -p bf-engine -p blowfish -p bf-storage --all-targets -- -D warnings`,
+  and `cargo test` for the same crates pass.
+
+### Cost and cleanup
+
+One on-demand c7gd.2xlarge for 0.97 h (launch 06:58 UTC, terminated 07:57 UTC), about $0.35 compute at $0.3629/h plus a
+60 GB root volume. The instance is terminated, its key pair and security group are deleted, and nothing was written to
+the bucket (the fixture was read only).

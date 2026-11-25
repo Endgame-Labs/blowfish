@@ -5,8 +5,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Current WAL encoding: one version byte followed by zstd-compressed JSON.
+mod packed;
+
+/// WAL encoding 1: one version byte followed by zstd-compressed JSON.
 pub const FORMAT_VERSION: u8 = 1;
+/// WAL encoding 2: as encoding 1, with the vectors of f16 attributes packed as f16 base64
+/// (half the bytes, losslessly). Written for large payloads whose every such vector is exactly
+/// f16; readers accept both encodings.
+pub const PACKED_FORMAT_VERSION: u8 = 2;
 /// Current manifest generation. Formats 1 to 3 are accepted only for automatic upgrade (format 3
 /// replaced format 2's single `ann_slabs` layout with `ann_tiers`; format 4 added `lineage`, and
 /// segments a tier covers no longer need an ANN object of their own).
@@ -86,14 +92,27 @@ impl WalEntry {
     }
     /// Serialize with a version header and bounded decompression on reads.
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        encode_payload(&serde_json::to_vec(self)?)
+        let (json, version) = self.to_json()?;
+        encode_payload(&json, version)
+    }
+    /// The entry's JSON and the encoding version that reads it back: f16 vectors are packed
+    /// when the entry is too large to stay inline and every one of them packs exactly.
+    fn to_json(&self) -> Result<(Vec<u8>, u8), Error> {
+        if !self.tombstone
+            && packed::candidate_bytes(self) > INLINE_PAYLOAD_BYTES
+            && let Some(packed) = packed::pack_entry(self)
+        {
+            return Ok((serde_json::to_vec(&packed)?, PACKED_FORMAT_VERSION));
+        }
+        Ok((serde_json::to_vec(self)?, FORMAT_VERSION))
     }
     /// Read a supported WAL encoding; corrupt and future versions fail closed.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         use std::io::Read;
-        if bytes.first() != Some(&FORMAT_VERSION) {
-            return Err(Error::Format);
-        }
+        let version = match bytes.first() {
+            Some(v) if *v == FORMAT_VERSION || *v == PACKED_FORMAT_VERSION => *v,
+            _ => return Err(Error::Format),
+        };
         let mut out = Vec::new();
         zstd::stream::read::Decoder::new(&bytes[1..])?
             .take(1024 * 1024 * 1024 + 1)
@@ -101,12 +120,20 @@ impl WalEntry {
         if out.len() > 1024 * 1024 * 1024 {
             return Err(Error::Format);
         }
-        Ok(serde_json::from_slice(&out)?)
+        let mut entry: Self = serde_json::from_slice(&out)?;
+        if version == PACKED_FORMAT_VERSION {
+            packed::unpack_entry(&mut entry)?;
+        }
+        Ok(entry)
     }
 }
-fn encode_payload(json: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut out = vec![FORMAT_VERSION];
-    out.extend(zstd::stream::encode_all(json, 3)?);
+fn encode_payload(json: &[u8], version: u8) -> Result<Vec<u8>, Error> {
+    // One-shot compression reads the contiguous JSON in place; the streaming encoder copies it
+    // through a small buffer, which costs about 20% more on payloads zstd can barely shrink.
+    let compressed = zstd::bulk::compress(json, 3)?;
+    let mut out = Vec::with_capacity(compressed.len() + 1);
+    out.push(version);
+    out.extend_from_slice(&compressed);
     Ok(out)
 }
 // Slot occupancy and retry identities are permanent. Small payloads transition only
@@ -510,10 +537,10 @@ impl Wal {
         self.store.cached_bucket_format()?;
         let payload_key = self.staged_payload_key(seq, entry.write_id);
         let started = std::time::Instant::now();
-        let json = if entry.tombstone {
-            vec![]
+        let (json, version) = if entry.tombstone {
+            (vec![], FORMAT_VERSION)
         } else {
-            serde_json::to_vec(entry)?
+            entry.to_json()?
         };
         record_stage("serialize", started);
         metrics::histogram!("blowfish_wal_uncompressed_bytes").record(json.len() as f64);
@@ -521,7 +548,7 @@ impl Wal {
         let mut uploaded = false;
         if !entry.tombstone && !inline {
             let started = std::time::Instant::now();
-            let payload = encode_payload(&json)?;
+            let payload = encode_payload(&json, version)?;
             record_stage("compress", started);
             let len = payload.len();
             // The key carries this attempt's UUID, so no other writer can use it: a large
