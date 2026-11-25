@@ -453,3 +453,66 @@ async fn response_compression_follows_accept_encoding() {
         );
     }
 }
+
+#[tokio::test]
+async fn status_includes_read_only_graph_diagnostics_for_cached_namespaces() {
+    let app = app(Some("test-admin")).await;
+    assert_eq!(
+        call(&app, "GET", "/_blowfish/v1/status", Value::Null)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    for (method, path, body) in [
+        (
+            "POST",
+            "/v2/namespaces/graph-status",
+            json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"vector":[1.,0.]}]}),
+        ),
+        (
+            "POST",
+            "/v2/namespaces/graph-status/query",
+            json!({"rank_by":["vector","ANN",[1.,0.]],"top_k":1}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-admin")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_blowfish/v1/status")
+                .header("authorization", "Bearer test-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let status: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        status["namespaces_cached"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("graph-status"))
+    );
+    let graph = &status["hot_graphs"]["graph-status"];
+    assert!(graph["graphs"].is_array());
+    assert_eq!(graph["answered"], 0);
+    assert!(graph["process_reserved_bytes"].is_u64());
+}
