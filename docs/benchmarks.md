@@ -10808,3 +10808,46 @@ measured. The code was reverted; the experiment is commit `9ef7267`.
 ### Cost
 
 One c7g.4xlarge on-demand, about 1 hour, about $0.75. Terminated; key pair and security group deleted. No bucket writes.
+
+## Round BW8: Pareto-skyline (tf, length) block bounds for exact BM25 (killed at the counting step)
+
+Hypothesis: a posting block's bound is `score(max_tf, min_length)`, which pairs extrema from different documents. Storing the
+exact non-dominated `(tf, length)` pairs per block and bounding by their maximum is still a true upper bound, and should
+let a query skip many posting blocks. Step 1 was a counting-only kill test with a 25% bar on `blocks_read`.
+
+### Kill test
+
+Temporary instrumentation (experiment commit `f0cad2b`, reverted): at first use of a segment, decode every block of every
+term with more than 32 blocks and compute its exact skyline; the fallback block bound in `search_internal` then takes the
+maximum `factor(tf, length)` over the skyline (asserted never above the old bound). Counters sum `blocks_read`,
+`rows_scored`, and `windows_pruned` over every segment call. Fixture `tmp/msmarco-1m-v021/` (eight text segments) on this
+VM, a fresh store copy per arm, one client, the checked-in 1,000-query workload run four times (4,000 queries). Every reply
+matched ordered IDs and f32 score bits against the fixture's truth in all arms. Counting only, so the shared VM is fine.
+
+Two regimes. **Cold bounds** is the case the skyline is meant for: the window-bound cache (`BoundCache` frames) and the
+decoded-block memo are both disabled, so every query starts with directory-only bounds, as on a cold open or after a
+write changes the average length. **Warm** is the default process, where frames and the memo fill as queries run.
+Numbers are totals over passes 2 to 4 (pass 1 includes one-time skyline build effects).
+
+| Regime | Bound | `blocks_read` | `rows_scored` |
+| --- | --- | ---: | ---: |
+| Cold bounds | `(max_tf, min_length)` (current) | 11.65 M | 44.6 M |
+| Cold bounds | exact skyline | 9.77 M (**-16%**) | 25.3 M (-43%) |
+| Cold bounds | skyline, only blocks with at most 4 points | 10.34 M (-11%) | 33.4 M (-25%) |
+| Warm | current | 1.65 M | 15.5 M |
+| Warm | exact skyline | 1.61 M (-3%) | 16.9 M (+9%) |
+
+**Cold `blocks_read` falls 16% against a 25% bar, so the round stops here.** Warm, the cached exact window maxima already
+dominate the block bound, so the skyline changes nothing (the small differences are scheduling and memo-clock noise).
+
+### Why the posting reads do not fall with the scored rows
+
+The skyline does tighten bounds: scored rows drop 43%, and only 0.2% of blocks have a single-point skyline, so the old bound paired extrema from different
+documents in 99.8% of blocks. But the skyline is longer than hoped: in the largest segments the median block has 4
+non-dominated points, only about 64% have 4 or fewer, and 3% have 8 or more, so a cap of a few entries gives up most of
+the gain (cap 4 reaches only -11% reads). More to the point, `blocks_read` also counts the small-term prefetch wave and
+every dense block that survives window pruning, and a dense block serves 128 postings spread over many windows, so
+tightening the bound on one window rarely removes the last window that needs a block. Rows scored are cheap and decode is
+paid per block, which is why BW7's 90% skippable windows also did not move time.
+
+No implementation, format change, or EC2 measurement was done; nothing was written to the bucket. Cost: $0.
