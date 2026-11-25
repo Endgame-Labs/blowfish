@@ -4,6 +4,28 @@ use bf_storage::{CacheConfig, StorageConfig};
 use bf_types::WriteRequest;
 use serde_json::{Value, json};
 struct Cleanup(std::path::PathBuf);
+#[test]
+fn source_locations_compact_dense_rows_and_preserve_sparse_coordinates() {
+    let count = 10000;
+    let source = (0..count)
+        .rev()
+        .map(|row| (row, [row / 100, row % 100, row * 3]))
+        .collect::<Vec<_>>();
+    let dense = Locations::new(source.clone());
+    assert!(dense.resident_bytes() < u64::from(count) * 16);
+    for (row, at) in source {
+        assert_eq!(dense.get(row), Some(at));
+    }
+    assert_eq!(dense.get(count), None);
+    assert_eq!(dense.get(u32::MAX), None);
+    let sparse = Locations::new(vec![(u32::MAX, [7, 8, 9]), (0, [1, 2, 3]), (12, [4, 5, 6])]);
+    for (row, at) in [(0, [1, 2, 3]), (12, [4, 5, 6]), (u32::MAX, [7, 8, 9])] {
+        assert_eq!(sparse.get(row), Some(at));
+    }
+    assert_eq!(sparse.get(1), None);
+    assert_eq!(sparse.get(u32::MAX - 1), None);
+    assert_eq!(Locations::new(Vec::new()).get(0), None);
+}
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -527,11 +549,7 @@ async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan
         .graph
         .candidates(vector, 64, 30, None, &mut entry.graph.scratch())
         .unwrap();
-    let at = entry
-        .locations
-        .binary_search_by_key(&hits[0], |p| p.0)
-        .unwrap();
-    let [slab, cluster, ordinal] = entry.locations[at].1;
+    let [slab, cluster, ordinal] = entry.locations.get(hits[0]).unwrap();
     let probe = || {
         let mut context = crate::read_cache::ReadContext::new(e.0.read_cache.clone());
         context.admit = false;

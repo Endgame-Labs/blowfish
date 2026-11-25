@@ -111,10 +111,43 @@ struct Calibration {
     graph_seconds: f64,
     build_seconds: f64,
 }
+enum Locations {
+    Dense(Vec<[u32; 3]>),
+    Sparse(Vec<(u32, [u32; 3])>),
+}
+impl Locations {
+    fn new(mut rows: Vec<(u32, [u32; 3])>) -> Self {
+        rows.sort_unstable_by_key(|row| row.0);
+        if rows.iter().enumerate().all(|(i, row)| i == row.0 as usize) {
+            // Dense immutable tiers already encode the row ID in the array position. Drop
+            // its redundant copy, including capacity retained by an in-place collect.
+            let mut dense = rows.into_iter().map(|(_, at)| at).collect::<Vec<_>>();
+            dense.shrink_to_fit();
+            Self::Dense(dense)
+        } else {
+            Self::Sparse(rows)
+        }
+    }
+    fn get(&self, row: u32) -> Option<[u32; 3]> {
+        match self {
+            Self::Dense(rows) => rows.get(row as usize).copied(),
+            Self::Sparse(rows) => rows
+                .binary_search_by_key(&row, |entry| entry.0)
+                .ok()
+                .map(|i| rows[i].1),
+        }
+    }
+    fn resident_bytes(&self) -> u64 {
+        match self {
+            Self::Dense(rows) => (rows.capacity() * 12) as u64,
+            Self::Sparse(rows) => (rows.capacity() * 16) as u64,
+        }
+    }
+}
 struct Entry {
     graph: HotGraph,
     sources: Vec<Index<segment::ObjectReader>>,
-    locations: Vec<(u32, [u32; 3])>,
+    locations: Locations,
     scratch: Mutex<Vec<HotScratch>>,
     mask_live: Mutex<Option<(std::sync::Weak<RoaringBitmap>, usize)>>,
     slots: tokio::sync::Semaphore,
@@ -525,7 +558,7 @@ struct Source {
 struct Built {
     graph: HotGraph,
     sources: Vec<Index<segment::ObjectReader>>,
-    locations: Vec<(u32, [u32; 3])>,
+    locations: Locations,
     source_cpu: f64,
     build_cpu: f64,
     reservation: Reservation,
@@ -758,7 +791,7 @@ impl Engine {
                 let _busy = bf_alloc::busy();
                 let source_started = thread_cpu();
                 let source = read_source(&engine, &source_set, &source_attribute, dims, count, &c);
-                let Source { builder, sources, mut locations } = runtime.block_on(async {
+                let Source { builder, sources, locations } = runtime.block_on(async {
                     tokio::select! {
                         biased;
                         () = stop.stopped() => Err(ApiError::new(503, "warm graph build cancelled")),
@@ -770,7 +803,7 @@ impl Engine {
                 let checks = AtomicU64::new(0);
                 let graph = builder.finish(&|| c.cancelled() || stop.stopping() || overcommitted()
                     || (checks.fetch_add(1, Ordering::Relaxed).is_multiple_of(16384) && !memory_available(limit / 5))).map_err(segment::index_error)?;
-                locations.sort_unstable_by_key(|p| p.0);
+                let locations = Locations::new(locations);
                 let after: f64 = pool().broadcast(|_| thread_cpu()).into_iter().sum();
                 Ok::<_, ApiError>(Built { graph, sources, locations, source_cpu, build_cpu: (after-before).max(0.), reservation, _slot, _running: worker_running })
             })
@@ -790,7 +823,7 @@ impl Engine {
         }
         let resident = built.graph.resident_bytes()
             + built.sources.iter().map(Index::resident_bytes).sum::<u64>()
-            + (built.locations.capacity() * 16) as u64;
+            + built.locations.resident_bytes();
         let retained = (resident
             + (count as u64).div_ceil(32) * 8 * workers as u64
             + workers as u64 * (2 << 20))
@@ -1060,11 +1093,7 @@ async fn search_entry(
     let mut by_source: BTreeMap<usize, Vec<(usize, usize, bf_vector::CosineNorm)>> =
         BTreeMap::new();
     for (row, norm) in hits {
-        let p = entry
-            .locations
-            .binary_search_by_key(&row, |p| p.0)
-            .map_err(|_| segment::corrupt())?;
-        let [slab, cluster, ordinal] = entry.locations[p].1;
+        let [slab, cluster, ordinal] = entry.locations.get(row).ok_or_else(segment::corrupt)?;
         by_source.entry(slab as usize).or_default().push((
             cluster as usize,
             ordinal as usize,
