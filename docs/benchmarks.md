@@ -9792,3 +9792,143 @@ All 32 answers returned identical rows and distance bits. Backend request counts
 the two baseline runs because of concurrent speculative IVF reads. Large ordering and network
 variation prevents a speedup claim; this short gate found no cold latency regression.
 
+## Round C6: retain local ANN stages across restarts
+
+Completed ANN stages survive restarts, and resume staged serving after identity validation.
+Two independent, paired runs at each scale use the retained 10M layout and the original
+100M layout, without rebuilding their indexes. Each arm runs the same first 100 oracle
+queries: top-10, probes64, strong consistency, and default returned attributes. Every
+sample drops query caches and evicts staged filesystem pages. No ANN request warms the
+restarted process before its measured first request.
+
+All measurements use one on-demand c7gd.4xlarge in the bucket's AWS region, us-west-2,
+with local NVMe, 32 GiB RAM, CPUs 0–7, and eight Rayon workers. Both binaries target
+`neoverse-v1`. Raw memory cache is 8 GiB, decoded cache is 512 MiB, disk cache is 48 GiB,
+range blocks are 4,000 bytes, coalescing is 512 blocks, and fetch concurrency is 512.
+Compilers and other loads are stopped during timing. The control is `785333a`; the two
+initial query comparisons use candidate `f918932`. A final-source confirmation below
+also includes bounded configured-query futures and cleanup of stopped cache areas from
+previous storage backends.
+
+The candidate provisions a complete stage before steady-state sampling, then terminates
+and restarts on the same cache area. The 100M stage is downloaded once from the read-only
+original layout; later runs reuse its completed files through hard links, and independently
+validate their current manifest, WAL deletion fence, remote identities, lengths, and CRC
+metadata. The control also completes a stage before termination; its disposable owner
+area is removed at restart, and it prepares another stage while queries run. No bucket
+objects are written, copied, or deleted.
+
+### First 100 cache-cold queries
+
+| Layout | Run | Steady staged p50 / p90 ms | Restart, adopt p50 / p90 ms | Restart, restage p50 / p90 ms |
+| --- | ---: | ---: | ---: | ---: |
+| 10M | 1 | 227.10 / 295.35 | 205.12 / 260.19 | 235.45 / 382.33 |
+| 10M | 2 | 224.98 / 320.25 | 226.37 / 333.08 | 217.40 / 339.95 |
+| 100M | 1 | 420.60 / 506.35 | 402.45 / 503.46 | 754.58 / 919.67 |
+| 100M | 2 | 408.09 / 475.52 | 401.80 / 482.15 | 767.17 / 886.35 |
+
+Every run passes the first-100 p50 gate of at most 1.10 times steady staged p50. The
+adopted/steady ratios are 0.903 and 1.006 at 10M, and 0.957 and 0.985 at 100M. Ordered
+IDs, exact returned distances, and planned ANN rows match in every three-arm comparison.
+Recall@10 is 0.969 at 10M, and 0.959 at 100M in all arms. These first-100 slices differ
+from earlier 200-query 10M and 60-query 100M reports.
+
+At 10M, the control finishes staging during its first 100 requests, so its batch median
+includes staged requests; the second control median is lower than the adopted median.
+The restart benefit is earlier availability of steady staged serving, rather than a
+pointwise latency improvement for every request. First adopted requests take 668–829 ms
+at 10M, versus 355–500 ms for restaging; their validation barrier can outweigh the first
+S3 query. At 100M, first adopted requests take 646–664 ms, versus 810–812 ms for restaging.
+
+### Restart cost and object-store traffic
+
+The adoption timer covers manifest/WAL validation, parallel object-identity HEADs, and
+opening the local files, after the initial completion-record scan. Observed time-to-fast
+starts at process launch, and includes that scan and ordinary server initialization; it
+is an upper bound observed at query boundaries or after the final readiness poll.
+
+| Layout | Run | Adoption timer s | Observed adopt time-to-fast s | Observed restage time-to-fast s |
+| --- | ---: | ---: | ---: | ---: |
+| 10M | 1 | 0.657 | 1.024 | 10.480 |
+| 10M | 2 | 0.433 | 0.872 | 8.613 |
+| 100M | 1 | 0.391 | 0.998 | 111.580 |
+| 100M | 2 | 0.310 | 1.067 | 111.497 |
+
+| Layout | Run | Steady mean GET attempts | Adopt mean GET attempts | Restage mean GET attempts |
+| --- | ---: | ---: | ---: | ---: |
+| 10M | 1 | 106.90 | 107.32 | 168.80 |
+| 10M | 2 | 106.78 | 106.84 | 160.78 |
+| 100M | 1 | 125.88 | 125.77 | 2326.51 |
+| 100M | 2 | 126.77 | 126.11 | 2321.19 |
+
+GET attempts include hedges and concurrent preparation during each request's measurement
+interval. They are not the complete bill for preparation between requests. All **400 initial
+adopted requests have zero GETs for already-staged tier payloads**; full vectors, result
+columns, and consistency metadata continue to use S3. The four restaging batches record
+4,302, 3,794, 197,170, and 196,955 staged-prefix GETs, respectively.
+
+Candidate staging remains exactly **1,616,596,773 bytes at 10M**, and
+**18,595,598,173 bytes at 100M**, including completion metadata, before and after every
+restart and every sample. Both fit below the existing 20 GiB cap. The completion records
+add 1,100,058 and 12,513,241 bytes, respectively. Repeated adoption does not duplicate
+files, or shrink the free-space allowance. Tests also verify cap reduction, active-reader
+leases, deletion during preparation, namespace and retired-tier cleanup, and removal of
+stopped previous-backend cache areas while preserving live owners.
+
+### Final-source confirmation and reproduction
+
+The final source (`83129e8`) also passes a complete confirmation at each scale:
+
+| Layout | Steady staged p50 / p90 ms | Restart, adopt p50 / p90 ms | Restart, restage p50 / p90 ms |
+| --- | ---: | ---: | ---: |
+| 10M | 207.74 / 290.52 | 201.94 / 263.71 | 203.15 / 344.52 |
+| 100M | 433.70 / 512.65 | 412.29 / 514.77 | 789.13 / 886.02 |
+
+The final adopted/steady p50 ratios are 0.972 and 0.951. Adoption timers are 0.254 s
+and 0.363 s, respectively, and observed time-to-fast is 0.613 s versus 9.229 s at 10M,
+and 0.961 s versus 118.026 s at 100M. These extra 200 adopted queries also have zero
+staged-tier payload GETs, exact result and planned-row parity, and the same fixed disk
+footprints. Their first adopted requests take 439 ms at 10M, and 699 ms at 100M. Across
+all six runs, **600 adopted cold queries pass**.
+
+Three additional 100M process starts, with staged pages and completion records evicted,
+make the stage available in **0.510, 0.620, and 0.666 s from launch**, before any ANN
+warm-up. This includes the initial record scan, connection warming, and adoption, and
+meets the complete startup-check budget of 2 s. Each records three non-tier GETs and
+577–578 HEADs, including connection warming and object-identity validation. Queries 0
+and 98 after each timer match the recorded ordered IDs and exact distances. Six source
+hashes match between the measured build and the final worktree.
+
+Formatting, strict scoped clippy over all targets, and the full engine/storage test
+suite pass: **300 passed, zero failed, and 13 ignored across 46 suites**. Three further
+concurrent graph-test stress runs pass, covering the deep recall path that originally
+exposed query-future stack growth. Public query and bucket formats are unchanged;
+there are no new product settings.
+
+The committed `cold_restart.py` harness checks result parity, complete plan traces,
+staged-prefix traffic, and a constant bounded staging footprint. Supply private storage
+configuration externally; the harness always sets `read_only = true`:
+
+```sh
+uv run crates/bf-engine/examples/cold_restart.py \
+  --config CONFIG.local --baseline CONTROL --candidate CANDIDATE \
+  --oracle bench/scale/data/oracle-100m.npz \
+  --scratch .scratch/restart-check --queries 100 --repeats 2
+```
+
+Use the 10M oracle for its retained layout. An optional `--seed-stage` accepts a completed
+`ann-staging-v2` directory from a stopped candidate process on the same filesystem, and
+reuses its inodes. The caller owns and removes that seed. Harness cache areas and servers
+are removed on exit; preserve the measured numbers, and remove the remaining receipts
+when the run ends. Adoption never scans the entire staged payload at startup: its stored
+CRC table is protected by the completion record's SHA-256 checksum, and every payload
+block is checked before its bytes are served. Damaged or stale local data falls back to object storage.
+
+
+The owned instance is terminated, its key pair and security group are deleted, and its
+root volume no longer exists. The measured source prefixes were read-only throughout;
+no benchmark bucket prefix needs cleanup. Compute lifetime is at most 1.10 hours,
+approximately $0.80 at the recorded rate. Estimated total round cost is **below $2**, including
+discarded attempts, requests, EBS, and public IPv4, within the $6 cap; AWS billing is not
+final. Local benchmark receipts, binaries, and test output are removed after the numbers
+are recorded here.
