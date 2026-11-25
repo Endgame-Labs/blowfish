@@ -433,6 +433,11 @@ pub enum Error {
     #[error(transparent)]
     Api(#[from] ApiError),
 }
+fn record_stage(stage: &'static str, since: std::time::Instant) {
+    metrics::histogram!("blowfish_wal_stage_seconds", "stage" => stage)
+        .record(since.elapsed().as_secs_f64());
+}
+
 /// A payload made durable by `Wal::stage`, awaiting its slot's commit.
 #[derive(Debug, Clone, Copy)]
 pub struct Staged {
@@ -504,18 +509,24 @@ impl Wal {
     pub async fn stage(&self, seq: u64, entry: &WalEntry) -> Result<Staged, Error> {
         self.store.cached_bucket_format()?;
         let payload_key = self.staged_payload_key(seq, entry.write_id);
+        let started = std::time::Instant::now();
         let json = if entry.tombstone {
             vec![]
         } else {
             serde_json::to_vec(entry)?
         };
+        record_stage("serialize", started);
+        metrics::histogram!("blowfish_wal_uncompressed_bytes").record(json.len() as f64);
         let inline = !entry.tombstone && json.len() <= INLINE_PAYLOAD_BYTES;
         let mut uploaded = false;
         if !entry.tombstone && !inline {
+            let started = std::time::Instant::now();
             let payload = encode_payload(&json)?;
+            record_stage("compress", started);
             let len = payload.len();
             // The key carries this attempt's UUID, so no other writer can use it: a large
             // payload goes up as concurrent parts (one PUT stream moves about 5 MB/s).
+            let started = std::time::Instant::now();
             let result = if len >= WAL_MULTIPART_MIN && self.store.is_conditional() {
                 self.store
                     .create_unique_sized(&payload_key, payload, WAL_MULTIPART_MIN, WAL_PART)
@@ -525,6 +536,7 @@ impl Wal {
                     .create_with_id(&payload_key, payload, entry.write_id)
                     .await?
             };
+            record_stage("payload_put", started);
             if result == CreateResult::Created {
                 metrics::counter!("blowfish_wal_bytes_written_total").increment(len as u64);
             }
@@ -616,12 +628,16 @@ impl Wal {
             inline: inline.then(|| entry.clone()),
             redacted: false,
         };
+        let started = std::time::Instant::now();
         let record = record.encode()?;
+        record_stage("slot_encode", started);
         let record_len = record.len();
+        let started = std::time::Instant::now();
         let result = self
             .store
             .create_with_id(&self.key(seq), record, entry.write_id)
             .await?;
+        record_stage("slot_put", started);
         if result == CreateResult::Created {
             metrics::counter!("blowfish_wal_bytes_written_total").increment(record_len as u64);
         }

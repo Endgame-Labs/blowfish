@@ -1582,6 +1582,76 @@ async fn drain(
     }
 }
 
+/// Estimate document bytes without serializing or copying a queued request. String lengths
+/// dominate encoded vectors; scalar and collection overhead is rounded up. This is a batching
+/// budget, not a hard bound on the serialized WAL size or on an individual request.
+fn request_document_bytes(op: &Operation) -> usize {
+    fn value_bytes(value: &Value) -> usize {
+        match value {
+            Value::String(s) => s.len().saturating_add(8),
+            Value::Array(values) => values
+                .iter()
+                .fold(8usize, |n, v| n.saturating_add(value_bytes(v))),
+            Value::Object(doc) => document_bytes(doc),
+            _ => 24,
+        }
+    }
+    fn document_bytes(doc: &Document) -> usize {
+        doc.iter().fold(8usize, |n, (name, value)| {
+            n.saturating_add(name.len())
+                .saturating_add(value_bytes(value))
+        })
+    }
+    let Operation::Write(req, _, _) = op else {
+        return 0;
+    };
+    req.upsert_rows
+        .iter()
+        .flatten()
+        .chain(req.patch_rows.iter().flatten())
+        .chain(req.upsert_columns.iter())
+        .chain(req.patch_columns.iter())
+        .fold(0usize, |n, doc| n.saturating_add(document_bytes(doc)))
+        .saturating_add(
+            req.deletes
+                .as_ref()
+                .map_or(0, |ids| ids.len().saturating_mul(32)),
+        )
+}
+
+/// Take a FIFO group, leaving a successor that exceeds the budget, or a barrier, in the backlog.
+/// The first request always makes progress, even when it exceeds the automatic byte budget.
+fn collect_pending(
+    first: Op,
+    backlog: &mut VecDeque<Op>,
+    receiver: &mut tokio::sync::mpsc::Receiver<Op>,
+    budget: usize,
+) -> Vec<Op> {
+    let mut bytes = request_document_bytes(&first.request);
+    let mut pending = vec![first];
+    while pending.len() < 128 {
+        let next = match backlog.pop_front() {
+            Some(p) => p,
+            None => match receiver.try_recv() {
+                Ok(p) => p,
+                Err(_) => break,
+            },
+        };
+        if is_barrier(&next.request) {
+            backlog.push_front(next);
+            break;
+        }
+        let next_bytes = request_document_bytes(&next.request);
+        if bytes.saturating_add(next_bytes) > budget {
+            backlog.push_front(next);
+            break;
+        }
+        bytes = bytes.saturating_add(next_bytes);
+        pending.push(next);
+    }
+    pending
+}
+
 async fn commit_worker(
     wal: Wal,
     state: Arc<Published<NamespaceState>>,
@@ -1594,6 +1664,13 @@ async fn commit_worker(
     let mut backlog: VecDeque<Op> = VecDeque::new();
     let mut flights: VecDeque<Flight> = VecDeque::new();
     loop {
+        // A byte boundary can leave ordinary writes in the backlog. It must obey the
+        // same pipeline depth as requests still in the receiver.
+        if flights.len() >= depth {
+            let staged = (&mut flights.front_mut().expect("full pipeline").upload).await;
+            commit_front(&wal, &state, &store, &mut flights, staged, &mut backlog).await;
+            continue;
+        }
         let first = if let Some(p) = backlog.pop_front() {
             p
         } else if flights.is_empty() {
@@ -1647,23 +1724,15 @@ async fn commit_worker(
             reply_all(pending, committed, start);
             continue;
         }
-        let mut pending = vec![first];
+        // Large writes keep their own flight; small writes still share the original group.
+        // A single oversized request is allowed, and barriers retain their original ordering.
+        const GROUP_DOCUMENT_BYTES: usize = 32 << 20;
         tokio::task::yield_now().await;
-        while pending.len() < 128 {
-            let next = match backlog.pop_front() {
-                Some(p) => p,
-                None => match receiver.try_recv() {
-                    Ok(p) => p,
-                    Err(_) => break,
-                },
-            };
-            if is_barrier(&next.request) {
-                backlog.push_front(next);
-                break;
-            }
-            pending.push(next);
-        }
+        let pending = collect_pending(first, &mut backlog, &mut receiver, GROUP_DOCUMENT_BYTES);
+        record_stage("batch", start);
+        let stage = Instant::now();
         let mut current = state.lock().await;
+        record_stage("state_lock", stage);
         if flights.is_empty() {
             // A state this node just committed or refreshed is current unless another writer
             // has since appended. The conditional create of the next WAL slot detects exactly
@@ -1708,7 +1777,9 @@ async fn commit_worker(
             };
             match write::prepare(&working, req, None) {
                 Ok((batch, result)) => {
+                    let stage = Instant::now();
                     working.apply(&batch, 0);
+                    record_stage("prepare_apply", stage);
                     batches.push(batch);
                     results.push(Ok(result));
                 }
@@ -2012,3 +2083,110 @@ mod warm_graph;
 
 #[cfg(test)]
 mod filtered_recall_tests;
+
+#[cfg(test)]
+mod commit_group_tests {
+    use super::*;
+
+    fn operation(id: u64, bytes: usize) -> Op {
+        let activity = Arc::new(auto_recluster::LoadBackpressure::default()).begin();
+        let (reply, _) = tokio::sync::oneshot::channel();
+        Pending {
+            request: Operation::Write(
+                Box::new(
+                    serde_json::from_value(json!({
+                        "upsert_rows": [{"id": id, "text": "x".repeat(bytes)}]
+                    }))
+                    .unwrap(),
+                ),
+                None,
+                activity,
+            ),
+            reply,
+        }
+    }
+
+    fn ids(pending: &[Op]) -> Vec<u64> {
+        pending
+            .iter()
+            .map(|p| {
+                let Operation::Write(req, _, _) = &p.request else {
+                    panic!("expected a write")
+                };
+                req.upsert_rows.as_ref().unwrap()[0]["id"].as_u64().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn byte_bound_preserves_fifo_barriers_and_oversized_request_progress() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut backlog = VecDeque::from([operation(2, 4096)]);
+        assert!(tx.try_send(operation(3, 100)).is_ok());
+        let (reply, _) = tokio::sync::oneshot::channel();
+        assert!(
+            tx.try_send(Pending {
+                request: Operation::Delete(
+                    Arc::new(auto_recluster::LoadBackpressure::default()).begin()
+                ),
+                reply,
+            })
+            .is_ok()
+        );
+        assert!(tx.try_send(operation(5, 100)).is_ok());
+        assert_eq!(
+            ids(&collect_pending(
+                operation(1, 100),
+                &mut backlog,
+                &mut rx,
+                1024
+            )),
+            [1]
+        );
+        let first = backlog.pop_front().unwrap();
+        assert_eq!(
+            ids(&collect_pending(first, &mut backlog, &mut rx, 1024)),
+            [2]
+        );
+        let first = backlog.pop_front().unwrap();
+        assert_eq!(
+            ids(&collect_pending(first, &mut backlog, &mut rx, 1024)),
+            [3]
+        );
+        assert!(matches!(
+            backlog.pop_front().unwrap().request,
+            Operation::Delete(_)
+        ));
+        let first = rx.try_recv().unwrap();
+        assert_eq!(
+            ids(&collect_pending(first, &mut backlog, &mut rx, 1024)),
+            [5]
+        );
+        assert!(backlog.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn small_requests_keep_the_existing_request_count_bound() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        for id in 2..=130 {
+            assert!(tx.try_send(operation(id, 1)).is_ok());
+        }
+        let mut backlog = VecDeque::new();
+        assert_eq!(
+            ids(&collect_pending(
+                operation(1, 1),
+                &mut backlog,
+                &mut rx,
+                1 << 20
+            )),
+            (1..=128).collect::<Vec<_>>()
+        );
+        let first = rx.try_recv().unwrap();
+        assert_eq!(
+            ids(&collect_pending(first, &mut backlog, &mut rx, 1 << 20)),
+            [129, 130]
+        );
+        assert!(rx.try_recv().is_err());
+    }
+}

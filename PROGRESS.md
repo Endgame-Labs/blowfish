@@ -2,6 +2,10 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-25
+
+- **W3 byte-bounded WAL groups (merged).** A 32 MiB estimated-document-byte budget per group (FIFO collector, existing flight-depth limit applied before backlog consumption). Full NQ, four clients: write p90 2,067/2,125 -> 1,125/1,079 ms (-46%); throughput 16,652/17,148 vs. 16,741 rows/s control. Compression p90 640 -> 330 ms, preparation 255 -> 130 ms. Offload and parallel preparation screened and removed (their gains were within run-to-run variance).
+
 ## 2026-11-24
 
 - **C5 cold critical path (merged).** Reused staged-file handles with merged positional reads (CRC checks kept), I/O advice overlapped with the WAL check, four-leaf batches, and bounded speculation for fully staged scans. Original staged layouts, cache and page-cache evicted per query: 10M (200 pairs) p50 200.4 -> 182.8 ms, GETs -14%; 100M (60 pairs) p50 443.4 -> 364.9 ms, p90 523 -> 468, GETs -17%; identical IDs and distances. Fresh-layout 10M 170.5 -> 151.7 ms.

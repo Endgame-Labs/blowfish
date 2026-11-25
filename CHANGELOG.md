@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **Lower bulk write latency:** WAL group commit now also bounds each group by about 32 MiB of estimated document bytes, so large bulk upserts stop queueing behind one oversized group. Loading full BEIR NQ (2.68M 1,024-dimension vectors, four clients), write p90 fell from 2,067–2,125 ms to 1,079–1,125 ms (about 46%) with throughput unchanged within run-to-run variation. Every acknowledged row survives SIGKILL, and loaded data matches the source exactly. There is no setting.
+
 ## [0.1.22] - 2026-11-24
 
 ### Changed
