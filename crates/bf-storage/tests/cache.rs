@@ -134,6 +134,49 @@ fn ranges(backend: &Counting) -> Vec<Range<u64>> {
 }
 
 #[tokio::test]
+async fn direct_provisioning_ranges_are_exact_uncached_and_bounded() {
+    let (store, backend, data) = setup(CacheConfig {
+        fetch_concurrency: 2,
+        ..config()
+    })
+    .await;
+    // A portable create header must stay invisible to provisioning callers.
+    let writable =
+        Storage::from_backend_with_cache(backend.clone(), Path::default(), false, false, config())
+            .await
+            .unwrap();
+    writable
+        .create_unique("portable", data.clone())
+        .await
+        .unwrap();
+    drop(writable);
+    let reader = store
+        .range_reader_with_length("portable", data.len() as u64, true)
+        .unwrap();
+    backend.ranges.lock().unwrap().clear();
+    backend.max_active.store(0, Ordering::SeqCst);
+    backend.delay.store(true, Ordering::SeqCst);
+    let output = futures::future::try_join_all((0..8).map(|_| reader.read_direct(7..93)))
+        .await
+        .unwrap();
+    assert!(output.iter().all(|b| b == &data.slice(7..93)));
+    assert_eq!(ranges(&backend), vec![31..117; 8]);
+    assert_eq!(backend.max_active.load(Ordering::SeqCst), 2);
+    assert!(!reader.is_memory_resident(7..93));
+    assert!(
+        reader
+            .read_direct(Range { start: 9, end: 8 })
+            .await
+            .is_err()
+    );
+    assert!(reader.read_direct(0..data.len() as u64 + 1).await.is_err());
+    assert!(reader.read_direct(5..5).await.unwrap().is_empty());
+    assert_eq!(ranges(&backend).len(), 8);
+    backend.short.store(true, Ordering::SeqCst);
+    assert!(reader.read_direct(7..93).await.is_err());
+}
+
+#[tokio::test]
 async fn random_ranges_match_direct_reads() {
     let (store, backend, data) = setup(config()).await;
     let reader = store.range_reader("object").await.unwrap();

@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-11-25
+
+### Changed
+
+- **Faster cold queries with staged exact vectors:** Local ANN staging now also stages whole exact-vector objects when they fit in the existing staging limit, after the scan codes, so the exact rerank reads them from local disk instead of S3. Staging downloads now share one bounded pool across slabs. On a cold, staged 10M-vector S3 namespace (95% of its exact vectors fit), p50 fell from 163 to 125 ms and 151 to 122 ms in two 200-query runs (about 1.27x), and p90 fell about 30%, with identical results and 60% fewer GET requests. Staging an empty disk took 68 instead of 131 s at 10M and 73 instead of 128 s at 100M, without slowing live queries. At 100M only about 1% of the exact vectors fit, so most still come from S3. Stages from v0.1.24 are adopted unchanged; exact vectors are added when a namespace is staged again. There is no setting.
+
 ## [0.1.25] - 2026-11-25
 
 ### Changed
@@ -207,7 +213,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.25...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.26...HEAD
+[0.1.26]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.26
 [0.1.25]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.25
 [0.1.24]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.24
 [0.1.23]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.23

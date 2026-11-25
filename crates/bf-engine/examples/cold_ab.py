@@ -19,6 +19,8 @@ ANN row counts require BF_TRACE_STAGES output containing PLAN rows= records.
 For a single-tier automatic-staging candidate, pass --stage-arm NAME. The harness
 records its first query and provisioning cost, waits for publication, and evicts
 the staged files from the filesystem page cache before every measured query.
+Use --stage-live-queries to measure cache-cold queries during first preparation;
+compare the same query IDs across arms, since faster staging can finish sooner.
 Outputs, traces, and temporary storage configuration stay under --scratch. Cache
 files are removed on exit. Summarize the results, and remove the run directory
 when the experiment ends.
@@ -49,6 +51,12 @@ P.add_argument("--binary", required=True)
 P.add_argument("--config", type=Path, required=True)
 P.add_argument("--scratch", type=Path, required=True)
 P.add_argument("--port", type=int, default=8400)
+P.add_argument(
+    "--stage-live-queries",
+    type=int,
+    default=0,
+    help="run this many cache-cold queries during first staging, before steady samples",
+)
 P.add_argument(
     "--stage-arm",
     action="append",
@@ -97,6 +105,10 @@ if any(name not in arms for name in a.stage_arm) or (a.stage_arm and a.mode != "
     P.error("stage arms must be named cachecold arms")
 if a.queries <= 0 or a.offset < 0 or a.offset + a.queries > len(items) or a.probes <= 0:
     P.error("select positive probes and a nonempty slice within the oracle workload")
+if not 0 <= a.stage_live_queries <= len(items):
+    P.error("live provisioning queries must be within the oracle workload")
+if a.stage_live_queries and not a.stage_arm:
+    P.error("live provisioning queries require at least one staging arm")
 RUN.mkdir(parents=True, exist_ok=True, mode=0o700)
 rows = []
 
@@ -119,7 +131,9 @@ def stats(client):
 def trace_summary(log):
     """Completed read waves and bytes by object kind, separate from attempted GETs."""
     reads, kinds, stages, timeline, local, slots, stage_times, lookups = [], {}, {}, [], [], [], [], []
-    for line in log.splitlines():
+    # Provisioning can still be appending a trace when an HTTP query completes.
+    # Read only complete records; a partial trailing write is not a query failure.
+    for line in log.rpartition("\n")[0].splitlines():
         if line.startswith("TRACE_READ "):
             _, path, _, _, size, end, elapsed = line.split()
             reads.append((int(end) - int(elapsed), int(end)))
@@ -276,10 +290,18 @@ def wait_staging(client, work, proc, first, start):
         if re.search(r'blowfish_ann_staging_total\{outcome="error"\} [1-9]', text):
             raise RuntimeError("automatic staging failed; inspect server.log")
         if re.search(r'blowfish_ann_staging_total\{outcome="(?:ready|adopted)"\} [1-9]', text):
+            coverage = re.search(
+                r"^STAGED_VECTORS rows=(\d+) total_rows=(\d+)$",
+                (work / "server.log").read_text(),
+                re.MULTILINE,
+            )
             provision = {
                 "first_query_ms": first["ms"],
                 "ready_after_ms": (time.perf_counter() - start) * 1000,
                 **evict_staging(work),
+                "backend_totals": stats(client),
+                "staged_vector_rows": int(coverage[1]) if coverage else None,
+                "tier_rows": int(coverage[2]) if coverage else None,
             }
             (work / "provision.json").write_text(json.dumps(provision, indent=2))
             return
@@ -357,6 +379,15 @@ try:
                 start = time.perf_counter()
                 first = query(name, items[-1], c, w, p)
                 if name in a.stage_arm:
+                    live = []
+                    for item in items[: a.stage_live_queries]:
+                        text = c.get("/metrics").text
+                        if re.search(r'blowfish_ann_staging_total\{outcome="(?:ready|adopted)"\} [1-9]', text):
+                            break
+                        c.post("/_bench/drop_caches").raise_for_status()
+                        (w / "server.log").write_text("")
+                        live.append(query(name, item, c, w, p))
+                    (w / "live.json").write_text(json.dumps(live))
                     wait_staging(c, w, p, first, start)
             rows.clear()
             (RUN / "rows.jsonl").write_text("")

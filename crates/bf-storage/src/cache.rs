@@ -447,6 +447,39 @@ impl RangeReader {
     pub async fn read(&self, range: Range<u64>) -> Result<Bytes, Error> {
         self.read_with_stats(range, &CacheStats::default()).await
     }
+    /// Copy one exact range directly from object storage for background provisioning.
+    /// This uses the shared fetch limit, hides portable headers, checks response length,
+    /// and neither consults nor fills the block caches. It issues no hedge requests.
+    /// Callers copying several objects must also bound their own buffered payloads.
+    pub async fn read_direct(&self, range: Range<u64>) -> Result<Bytes, Error> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(Error::Config("invalid object range"));
+        }
+        if range.is_empty() {
+            return Ok(Bytes::new());
+        }
+        let _permit = self
+            .storage
+            .0
+            .cache
+            .fetches
+            .acquire()
+            .await
+            .expect("cache semaphore stays open");
+        let bytes = self
+            .storage
+            .0
+            .backend
+            .get_range(
+                &self.storage.path(&self.key),
+                range.start + self.layout.offset..range.end + self.layout.offset,
+            )
+            .await?;
+        if bytes.len() as u64 != range.end - range.start {
+            return Err(Error::Config("short object-store range response"));
+        }
+        Ok(bytes)
+    }
     /// Read one range and charge the provided query accumulator.
     pub async fn read_with_stats(
         &self,

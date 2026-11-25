@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **C7 staged exact vectors and a shared staging pool (merged).** Whole exact-vector objects are staged when they fit the existing cap (codes first); one bounded 4-range pool across slabs. Original 10M (2x200 pairs): p50 162.7/151.1 -> 125.1/121.6 ms (1.27x pooled), p90 -30%, GETs 107 -> 40; 9.5M of 10M rows staged. First staging 131/139 -> 68/62 s (10M), 128/124 -> 73/73 s (100M) with live queries unchanged. 100M covers 1.1% of rows (cap-limited). Identical results.
+
 - **BW3 BM25 under writes (merged).** Captured cache handles, query-local immutable WAL summaries, and bounded parallel tail gathering on the query CPU pool. 1M MS MARCO at 1,000 text upserts/s: p50 31.4 -> 22.0 ms (1.43x), p90 44.0 -> 34.0 ms; warm +0.3%; write service +1.3%/+0.8% p50/p90; 4,000 frozen queries bit-identical. Parallel shadow correction killed (+10.6% write p90).
 
 - **P2 profile-guided builds by default (merged).** Dockerfile and `scripts/pgo-build.sh` train on a 16K synthetic loopback workload (`crates/blowfish/examples/pgo_train.rs`, ~72 s native, 80-126 s in Docker) with content-hashed profiles and a pinned compiler. vs plain on 8 Graviton cores: warm +4.7%, filtered +98.5%, BM25 +16.0%, durable writes +3.5%; 85-101% of a fresh full-NQ profile; identical responses. bf-models links cpp-httplib and its TLS deps for instrumented local-models builds. Both architectures' images and real model smokes pass.
