@@ -10498,3 +10498,66 @@ chunks (`segment.rs`, the `row_bounds.chunks(BLOCK)` loop) with its touched list
 sort with a lazy partial order, since only about 12 percent of windows are ever scored. Neither is attempted here.
 
 No EC2 cost and no bucket writes. The fixture was copied to `.scratch/` and deleted.
+
+## Round BW5: cutting per-segment BM25 setup (stopped, no measurable gain)
+
+Hypothesis (from BW4): per-segment window setup is about 70 percent of warm BM25 time on 1M MS MARCO,
+so iterating the row-bounds touched list and ordering windows lazily should lift warm 16-client q/s by 1.25x
+and cut single-client p50 by 1.2x. Result: **the changes are bit-identical but do not move end-to-end time,
+because setup is not 70 percent of the query.** The round stops with no code merged; the experiment is kept on
+branch `bw5-setup-experiment` (`1ec897b`, plus one follow-up commit).
+
+### What was built and tried
+
+1. Row-bounds window maxima come from the touched row list instead of scanning every row of the segment.
+2. Windows sit in a max-heap (descending bound, then ascending window) and are popped lazily, instead of a full sort.
+3. A second commit cached term spans only over each term's own windows, dropped windows already below the shared
+   floor before heapifying (counted as pruned), stopped `Rows::take` from zero-filling megabytes when segment sizes
+   alternate, and reused the per-window `competitive` buffer.
+
+### Measurement
+
+Fixture `tmp/msmarco-1m-v021/`, the checked-in 1,000-query workload, T4's `concurrent_bm25` driver (checks ordered IDs
+and f32 score bits on every reply, no mismatches), baseline `bc6097e` versus candidate, same release profile,
+fresh store copy per arm, server on CPUs 0 to 5 with 2 Rayon workers, client on CPUs 6 and 7, A/B/B/A order, three
+1-client and five 16-client passes per arm after a prewarm. The shared 8-vCPU VM carried load of 3 to 9 from other
+workers and no EC2 host was used, so differences under about 5 percent are noise.
+
+| Arm | 1-client p50 ms (median of 3) | 16-client q/s (median of 5) |
+| --- | ---: | ---: |
+| Baseline A1 | 1.835 | 971.5 |
+| Candidate B1 | 1.850 | 928.2 |
+| Candidate B2 | 1.735 | 876.5 |
+| Baseline A2 | 1.830 | 926.8 |
+
+Candidate over baseline is about 1.00x at p50 and 0.95x in q/s: no gain, well short of 1.2x and 1.25x.
+
+### Why: where a segment search spends its time
+
+Temporary phase timers (removed) on the candidate, per segment search, 1-client warm, averaged over 20,000 searches:
+
+| Phase | Microseconds |
+| --- | ---: |
+| Prep (saturation, term metadata, lengths) | 15 |
+| Prefetch of small-term postings | 32 |
+| Span cache build | 35 |
+| Term loop (small-term scoring into row bounds, cached dense bounds) | 135 |
+| Row-bounds maxima plus window heap | 39 |
+| Window scoring | 736 |
+
+Setup is roughly 30 percent of a segment search and scoring about 70 percent, the reverse of BW4's estimate. BW4
+likely attributed the cost of scoring windows (bound lookups, candidate selection, and the per-window loop) to setup.
+The touched-list and heap changes removed only the 40 microsecond row-bounds-plus-order slice, and the rest of
+the setup is real work (scoring small terms' postings) that has to happen. A `perf` sample of the warm server showed
+`search_internal` inlined into one closure at about 41 percent of samples, `decode_postings` at about 10 percent, and
+about 18 percent of samples inside `core::hint` (the select-unpredictable used by `partition_point` and
+`binary_search`).
+
+### Lead for a later round
+
+The cost is in per-window scoring: roughly 120 scored windows per segment search at about 6 microseconds each.
+Candidates: avoid `partition_point` and `binary_search_by_key` per block per window (walk each block's posting
+cursor forward instead), and avoid recomputing MaxScore ordering per window. Exact BM25 only; no format change.
+
+No EC2 cost, no bucket writes. The fixture copy and run directories were deleted.
+
