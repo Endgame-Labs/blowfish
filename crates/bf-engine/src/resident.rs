@@ -53,10 +53,25 @@ fn bare(request: &QueryRequest) -> Option<Bare<'_>> {
         })
 }
 
-/// Whether the synchronous path is enabled. It is a kill-test flag in round G6.
+/// Whether the synchronous path is enabled. This is the round G6 kill-test flag: with
+/// `BF_QUERY_SYNC` naming a file, the path is on while that file exists (re-checked every 256
+/// queries), so one running server can be measured with the path off and on over one graph.
+/// If it passes, the flag goes away and the path is the only one.
 fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cfg!(test) || std::env::var_os("BF_QUERY_SYNC").is_some_and(|v| v != "0"))
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static ON: AtomicU64 = AtomicU64::new(0);
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if cfg!(test) {
+        return true;
+    }
+    let Some(flag) = STATE.get_or_init(|| std::env::var_os("BF_QUERY_SYNC").map(Into::into)) else {
+        return false;
+    };
+    if CALLS.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+        ON.store(u64::from(flag.exists()), Ordering::Relaxed);
+    }
+    ON.load(Ordering::Relaxed) == 1
 }
 
 impl Engine {
