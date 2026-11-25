@@ -290,11 +290,18 @@ def wait_staging(client, work, proc, first, start):
         if re.search(r'blowfish_ann_staging_total\{outcome="error"\} [1-9]', text):
             raise RuntimeError("automatic staging failed; inspect server.log")
         if re.search(r'blowfish_ann_staging_total\{outcome="(?:ready|adopted)"\} [1-9]', text):
+            coverage = re.search(
+                r"^STAGED_VECTORS rows=(\d+) total_rows=(\d+)$",
+                (work / "server.log").read_text(),
+                re.MULTILINE,
+            )
             provision = {
                 "first_query_ms": first["ms"],
                 "ready_after_ms": (time.perf_counter() - start) * 1000,
                 **evict_staging(work),
                 "backend_totals": stats(client),
+                "staged_vector_rows": int(coverage[1]) if coverage else None,
+                "tier_rows": int(coverage[2]) if coverage else None,
             }
             (work / "provision.json").write_text(json.dumps(provision, indent=2))
             return

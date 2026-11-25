@@ -1,4 +1,4 @@
-//! Durable, identity-checked ANN routing and code files. Vectors remain in object storage.
+//! Durable, identity-checked ANN routing, codes, and capacity-admitted exact vectors.
 use crate::read_cache;
 use bf_storage::{ObjectIdentity, Storage};
 use bf_wal::{SegmentFile, SlabSet};
@@ -837,6 +837,28 @@ impl Manager {
             }
         });
     }
+    /// Optional vectors cannot evict another tier's codes. Keep the original reservation
+    /// on refusal, and charge the extra bytes for the entire active-reader lifetime.
+    fn extend(&self, lease: &mut Lease, extra: u64) -> bool {
+        if extra == 0 {
+            return true;
+        }
+        let Some(bytes) = lease.bytes.checked_add(extra) else {
+            return false;
+        };
+        if bytes > self.capacity
+            || !free_bytes(&self.path).is_ok_and(|n| n >= bytes.saturating_mul(2))
+        {
+            return false;
+        }
+        let mut state = self.state.lock().expect("ANN staging lock");
+        if state.used.saturating_add(extra) > self.capacity {
+            return false;
+        }
+        state.used += extra;
+        lease.bytes = bytes;
+        true
+    }
     async fn build(
         self: &Arc<Self>,
         store: &Storage,
@@ -880,6 +902,75 @@ impl Manager {
             if seg.key != seg.fragment {
                 limits.entry(seg.key.clone()).or_insert(48);
             }
+        }
+        let mut exact = limits.clone();
+        for entry in dir.entries() {
+            let key = &dir.segments()[entry.segment].key;
+            exact
+                .entry(key.clone())
+                .and_modify(|n| *n = (*n).max(entry.vectors_range().end))
+                .or_insert(entry.vectors_range().end);
+        }
+        // Codes keep priority. Release unused estimation slack, retaining the completion
+        // reader's full metadata allowance, then admit whole exact-vector objects that fit.
+        let code_bytes = limits
+            .values()
+            .try_fold(
+                set.dir.size + set.pages.as_ref().map_or(0, |p| p.size),
+                |sum, n| sum.checked_add(*n),
+            )
+            .ok_or_else(|| io::Error::other("ANN stage size overflow"))?;
+        let code_reservation = code_bytes.saturating_add(32 << 20);
+        if code_reservation < stage._lease.bytes {
+            let released = stage._lease.bytes - code_reservation;
+            self.state.lock().expect("ANN staging lock").used -= released;
+            stage._lease.bytes = code_reservation;
+        }
+        let mut extras: Vec<_> = exact
+            .into_iter()
+            .filter_map(|(key, len)| {
+                let delta = len.saturating_sub(limits.get(&key).copied().unwrap_or(0));
+                if delta == 0 {
+                    return None;
+                }
+                let extra = delta
+                    .checked_add(delta.div_ceil(BLOCK as u64).checked_mul(11)?)?
+                    .checked_add(if limits.contains_key(&key) {
+                        0
+                    } else {
+                        key.len() as u64 + 1024
+                    })?;
+                Some((extra, key, len))
+            })
+            .collect();
+        extras.sort_unstable();
+        for (extra, key, len) in extras {
+            let count = limits.len() + usize::from(!limits.contains_key(&key));
+            if count
+                <= stage
+                    ._lease
+                    .files
+                    .saturating_sub(1 + usize::from(set.pages.is_some()))
+                && self.extend(&mut stage._lease, extra)
+            {
+                limits.insert(key, len);
+            }
+        }
+        if crate::ann::trace_stages() {
+            let staged_rows: u64 = dir
+                .entries()
+                .iter()
+                .filter(|e| {
+                    limits
+                        .get(&dir.segments()[e.segment].key)
+                        .is_some_and(|len| *len >= e.vectors_range().end)
+                })
+                .map(|e| u64::from(e.rows))
+                .sum();
+            eprintln!(
+                "STAGED_VECTORS rows={staged_rows} total_rows={}",
+                set.rows()
+            );
         }
         let actual = limits
             .values()
@@ -1502,6 +1593,7 @@ mod tests {
     async fn restart_adopts_without_payload_gets_and_keeps_capacity_stable() {
         let work = scratch();
         let (store, set, ann, end) = fixture(11).await;
+        let end = end + 128; // Include exact-vector bytes in every restart check.
         let (path, bytes) = completed(work.path(), &store, &set).await;
         for _ in 0..3 {
             let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
@@ -1712,7 +1804,7 @@ mod tests {
     #[tokio::test]
     async fn verified_prefixes_preserve_ranges_and_corruption_falls_back_to_storage() {
         let work = scratch();
-        let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
+        let manager = Manager::open(work.path(), Some(128 << 10), Arc::default()).unwrap();
         let (store, set, ann, end) = fixture(1).await;
         manager.observe(&store, "left\0", &set, 32, 16);
         let stage = ready(&manager, "left\0", &set).await;
@@ -1789,6 +1881,161 @@ mod tests {
                 Some(store.object_identity(&source.key).await.unwrap())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exact_vectors_use_verified_sparse_reads_and_corruption_falls_back() {
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
+        let (store, set, ann, codes_end) = fixture(22).await;
+        manager.observe(&store, "left\0", &set, 32, 16);
+        let stage = ready(&manager, "left\0", &set).await;
+        let source = &set.slabs[0].files["annv2:vector"];
+        let dir_raw = store.get(&set.dir.key).await.unwrap();
+        let dir = bf_vector::upgrade::directory(&dir_raw).unwrap();
+        let vector_end = dir
+            .entries()
+            .iter()
+            .map(|e| e.vectors_range().end)
+            .max()
+            .unwrap();
+        assert!(vector_end > codes_end);
+        assert_eq!(stage.files[&source.key].len, vector_end);
+        let ranges = vec![codes_end..codes_end + 127, vector_end - 64..vector_end];
+        let mut cache = read_cache::DecodedCache::new(1 << 20, 1).scoped("left");
+        cache.staging = Some(manager.clone());
+        let context = read_cache::ReadContext::new(Arc::new(cache));
+        let stats = Arc::new(bf_storage::BackendStats::default());
+        let actual = stats
+            .scope(
+                "exact-local",
+                read_cache::scope(
+                    context.clone(),
+                    crate::segment::ObjectReader::new(&store, source)
+                        .read_batch_sparse(ranges.clone()),
+                ),
+            )
+            .await
+            .unwrap();
+        for (data, range) in actual.iter().zip(&ranges) {
+            assert_eq!(&data[..], &ann[range.start as usize..range.end as usize]);
+        }
+        assert!(stats.snapshot().iter().all(|m| m.operation != "get_range"));
+        stage.files[&source.key]
+            .file
+            .write_all_at(&[ann[codes_end as usize] ^ 0xff], codes_end)
+            .unwrap();
+        let actual = read_cache::scope(
+            context,
+            crate::segment::ObjectReader::new(&store, source).read_batch_sparse(ranges.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            &actual[0][..],
+            &ann[codes_end as usize..codes_end as usize + 127]
+        );
+        assert!(stage.bad.load(Ordering::Relaxed));
+        assert!(manager.state.lock().unwrap().used <= manager.capacity);
+    }
+
+    #[tokio::test]
+    async fn capacity_keeps_all_codes_and_adopts_only_fitting_exact_objects() {
+        let work = scratch();
+        let (store, mut set, ann, codes_end) = fixture(23).await;
+        let first = set.slabs[0].files["annv2:vector"].clone();
+        let second_key = "ns/test/slabs/s2/ann.bfa";
+        store.create_unique(second_key, ann.clone()).await.unwrap();
+        let mut second = set.slabs[0].clone();
+        second.id = "s2".into();
+        second.files.get_mut("annv2:vector").unwrap().key = second_key.into();
+        let raw = Directory::build(&[
+            (
+                "s".into(),
+                first.key.clone(),
+                first.key.clone(),
+                Fragment::decode(&ann[..first.metadata_len as usize]).unwrap(),
+            ),
+            (
+                "s2".into(),
+                second_key.into(),
+                second_key.into(),
+                Fragment::decode(&ann[..first.metadata_len as usize]).unwrap(),
+            ),
+        ])
+        .unwrap()
+        .unwrap();
+        let dir = Directory::decode(&raw).unwrap();
+        let vectors_end = dir
+            .entries()
+            .iter()
+            .map(|e| e.vectors_range().end)
+            .max()
+            .unwrap();
+        set.dir = file(
+            "ns/test/segments/pair-directory",
+            raw.len() as u64,
+            raw.len() as u64,
+        );
+        store.create_unique(&set.dir.key, raw).await.unwrap();
+        set.slabs.push(second);
+        let mut cover = set.covered[0].clone();
+        cover.segment = "docs2".into();
+        set.covered.push(cover);
+        let estimate = set.rows() * 52 + 32 * 256 + set.dir.size;
+        let delta = vectors_end - codes_end;
+        let capacity = estimate + delta + delta.div_ceil(BLOCK as u64) * 11 + 512;
+        publish(&store, &set, false, 1).await;
+        for restarting in [false, true] {
+            let manager = Manager::open(work.path(), Some(capacity), Arc::default()).unwrap();
+            if restarting {
+                manager.recover(&store).await;
+            } else {
+                manager.observe(&store, "", &set, 32, 32);
+            }
+            let stage = ready(&manager, "", &set).await;
+            let mut exact = 0;
+            for key in [&first.key[..], second_key] {
+                let code = manager
+                    .read(key, key, std::slice::from_ref(&(0..codes_end)))
+                    .unwrap();
+                assert_eq!(&code[0][..], &ann[..codes_end as usize]);
+                if let Some(data) = manager.read(
+                    key,
+                    key,
+                    std::slice::from_ref(&(vectors_end - 64..vectors_end)),
+                ) {
+                    exact += 1;
+                    assert_eq!(
+                        &data[0][..],
+                        &ann[vectors_end as usize - 64..vectors_end as usize]
+                    );
+                }
+            }
+            assert_eq!(
+                exact, 1,
+                "one complete exact object fits beside both code prefixes"
+            );
+            assert!(manager.state.lock().unwrap().used <= capacity);
+            drop(stage);
+            drop(manager);
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_vectors_do_not_evict_existing_code_leases() {
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(256 << 10), Arc::default()).unwrap();
+        let mut first = manager.reserve(128 << 10, 1).unwrap();
+        let second = manager.reserve(64 << 10, 1).unwrap();
+        assert!(!manager.extend(&mut first, 128 << 10));
+        assert_eq!(first.bytes, 128 << 10);
+        assert_eq!(manager.state.lock().unwrap().used, 192 << 10);
+        drop(second);
+        assert!(manager.extend(&mut first, 64 << 10));
+        assert_eq!(manager.state.lock().unwrap().used, 192 << 10);
+        drop(first);
+        assert_eq!(manager.state.lock().unwrap().used, 0);
     }
 
     #[tokio::test]

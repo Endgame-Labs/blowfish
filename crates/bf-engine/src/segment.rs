@@ -116,6 +116,11 @@ impl ObjectReader {
     /// blocks, so a miss fetches `BF_SPARSE_BLOCK_BYTES` (default 16 KiB) instead of a full
     /// block, and the cache holds those vectors without the megabyte around each one.
     pub async fn read_batch_sparse(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        if !self.bypass
+            && let Some(bytes) = crate::local_ann::read(&self.file.key, &ranges)
+        {
+            return Ok(bytes);
+        }
         static BLOCK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let block = *BLOCK.get_or_init(|| {
             std::env::var("BF_SPARSE_BLOCK_BYTES")
