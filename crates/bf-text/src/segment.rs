@@ -791,7 +791,7 @@ struct SearchTerm {
     weight: TermWeight,
     prefix: bool,
     postings: Vec<Option<Postings>>,
-    spans: Vec<Range<usize>>,
+    spans: Vec<(u32, u32)>,
     bounds: crate::scratch::Windows,
     small: bool,
 }
@@ -825,14 +825,14 @@ impl SearchTerm {
                 {
                     last += 1;
                 }
-                first..last
+                (first as u32, last as u32)
             })
             .collect();
     }
 
     fn span(&self, window: usize) -> Range<usize> {
-        if let Some(span) = self.spans.get(window) {
-            return span.clone();
+        if let Some(&(first, last)) = self.spans.get(window) {
+            return first as usize..last as usize;
         }
         let blocks = &self.meta.blocks;
         blocks.partition_point(|b| (b.last as usize) < window * BLOCK)
