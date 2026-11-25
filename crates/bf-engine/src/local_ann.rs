@@ -228,6 +228,8 @@ struct State {
     /// Tiers whose companion phase has finished (or had nothing to add) in this process.
     settled: HashSet<String>,
     hints: HashMap<String, Hint>,
+    /// Slab bytes a local recluster wrote while uploading, by the tier's stage key.
+    prestaged: HashMap<String, Arc<PreInner>>,
 }
 
 /// A completion record binds the manifest's tier, scoped object identities, local lengths,
@@ -753,6 +755,16 @@ impl Manager {
                 removed.push(stage);
             }
         }
+        let doomed: Vec<_> = state
+            .prestaged
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let doomed: Vec<_> = doomed
+            .iter()
+            .filter_map(|key| state.prestaged.remove(key))
+            .collect();
         state.files.retain(|_, stage| {
             stage
                 .upgrade()
@@ -763,6 +775,7 @@ impl Manager {
             .retain(|key, _| !key.starts_with(&format!("{scope}ns/{ns}/")));
         drop(state);
         drop(removed);
+        drop(doomed);
     }
     pub(crate) fn retain_namespace(
         &self,
@@ -789,6 +802,20 @@ impl Manager {
             .filter(|key| key.starts_with(&prefix) && !live.contains(*key))
             .cloned()
             .collect();
+        // A committed tier that the manifest no longer names was superseded before any query
+        // used it. One awaiting its commit is not in the manifest yet, and stays.
+        let stale: Vec<_> = state
+            .prestaged
+            .iter()
+            .filter(|(key, p)| {
+                key.starts_with(&prefix) && p.active.load(Ordering::Acquire) && !live.contains(*key)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let stale: Vec<_> = stale
+            .iter()
+            .filter_map(|key| state.prestaged.remove(key))
+            .collect();
         let mut removed = Vec::new();
         for key in obsolete {
             if state.pending.contains(&key) {
@@ -806,6 +833,7 @@ impl Manager {
         });
         drop(state);
         drop(removed);
+        drop(stale);
     }
     fn reserve(self: &Arc<Self>, bytes: u64, files: usize) -> Option<Lease> {
         if bytes > self.capacity
@@ -888,6 +916,7 @@ impl Manager {
         let key = stage_key(scope, &set.dir.key, false);
         let ckey = stage_key(scope, &set.dir.key, true);
         let mut doomed = Vec::new();
+        let mut pre = None;
         let (go, companion_only) = {
             let mut state = self.state.lock().expect("ANN staging lock");
             for k in [&key, &ckey] {
@@ -905,14 +934,22 @@ impl Manager {
             }
             let main = state.ready.contains_key(&key);
             let retry = if main { &ckey } else { &key };
+            // Prestaged bytes wait for the manifest commit that publishes their tier: until then
+            // this tier is not staged at all, and the next query asks again.
+            let uncommitted = state
+                .prestaged
+                .get(&key)
+                .is_some_and(|p| !p.active.load(Ordering::Acquire));
             let go = !(main && state.settled.contains(&key))
                 && state.pending.is_empty()
+                && !uncommitted
                 && !state
                     .failed
                     .get(retry)
                     .is_some_and(|at| at.elapsed() < RETRY);
             if go {
                 state.pending.insert(key.clone());
+                pre = state.prestaged.remove(&key);
             }
             (go, main)
         };
@@ -949,6 +986,11 @@ impl Manager {
         let files = set.slabs.iter().map(|s| s.files.len()).sum::<usize>()
             + 1
             + usize::from(set.pages.is_some());
+        // The prestage's own charge is released first, and the stage reserves its estimate as
+        // usual: the bytes are on disk, and the sum never exceeds the cap.
+        if let Some(pre) = &pre {
+            drop(pre.lease.lock().expect("prestage lease").take());
+        }
         let Some(lease) = self.reserve(estimate, files) else {
             self.state
                 .lock()
@@ -962,7 +1004,7 @@ impl Manager {
             // Phase one: routing, codes, and any exact vectors. Queries use it at once.
             let result = manager
                 .stop
-                .run(manager.build(&store, &scope, &set, lease, extras))
+                .run(manager.build(&store, &scope, &set, lease, extras, pre))
                 .await;
             let job = {
                 let mut state = manager.state.lock().expect("ANN staging lock");
@@ -1140,9 +1182,20 @@ impl Manager {
         set: &SlabSet,
         lease: Lease,
         extras: Vec<Extra>,
+        pre: Option<Arc<PreInner>>,
     ) -> io::Result<(Stage, Option<(Lease, Vec<Extra>)>)> {
-        let path = self.path.join(uuid::Uuid::new_v4().to_string());
-        fs::create_dir(&path)?;
+        // A prestage's directory becomes this stage's: from here the stage owns its deletion.
+        let path = match &pre {
+            Some(pre) => {
+                pre.taken.store(true, Ordering::Release);
+                pre.dir.clone()
+            }
+            None => {
+                let path = self.path.join(uuid::Uuid::new_v4().to_string());
+                fs::create_dir(&path)?;
+                path
+            }
+        };
         let mut stage = Stage {
             path,
             files: HashMap::new(),
@@ -1228,7 +1281,10 @@ impl Manager {
                 Some((extra, key, len))
             })
             .collect();
-        extras.sort_unstable();
+        // Objects already written locally to their full length cost no download: admit them
+        // first. Without a prestage this is the plain smallest-first order.
+        let local = |key: &str, len: u64| pre.as_ref().is_some_and(|p| p.covers(key, len));
+        extras.sort_unstable_by(|a, b| (!local(&a.1, a.2), a).cmp(&(!local(&b.1, b.2), b)));
         for (extra, key, len) in extras {
             let count = limits.len() + usize::from(!limits.contains_key(&key));
             if count
@@ -1286,6 +1342,14 @@ impl Manager {
                 Ok(((*source).clone(), 0, len))
             })
             .collect::<io::Result<Vec<_>>>()?;
+        let mut sources_to_copy = sources_to_copy;
+        if let Some(pre) = &pre {
+            let reused = pre
+                .adopt(&mut sources_to_copy)
+                .await
+                .map_err(|e| io::Error::other(format!("prestage: {e}")))?;
+            stage.files.extend(reused);
+        }
         stage.files.extend(
             self.download_many(store, &sources_to_copy, &stage.path)
                 .await?,
@@ -1761,6 +1825,282 @@ async fn flush_pack(file: &Arc<File>, buffer: &mut Vec<u8>, at: u64) -> io::Resu
         .await
         .map_err(io::Error::other)??;
     Ok(end)
+}
+
+// ---- Prestage: slab bytes written locally while a recluster uploads them ----
+
+/// One slab object's stage bytes, written beside its upload.
+struct Written {
+    file: Arc<File>,
+    /// Bytes stored: the codes' prefix, or through the exact vectors.
+    len: u64,
+    crc: Vec<u32>,
+    identity: ObjectIdentity,
+}
+/// What a [`Prestage`] shares with the manager's registry.
+struct PreInner {
+    manager: Arc<Manager>,
+    scope: String,
+    dir: PathBuf,
+    files: Mutex<HashMap<String, Written>>,
+    /// Charges the written bytes against the staging cap until a query's stage takes over.
+    lease: Mutex<Option<Lease>>,
+    /// Set once the manifest commit that publishes the tier has happened.
+    active: AtomicBool,
+    /// Set when a stage owns the directory, which then decides its fate.
+    taken: AtomicBool,
+    /// Bytes per row a stage's codes will need, to keep room for the slabs still to come.
+    code_row_bytes: u64,
+}
+impl Drop for PreInner {
+    fn drop(&mut self) {
+        if !self.taken.load(Ordering::Acquire) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+impl PreInner {
+    /// Whether the object is stored locally through at least `len` bytes.
+    fn covers(&self, key: &str, len: u64) -> bool {
+        self.files
+            .lock()
+            .expect("prestage files")
+            .get(key)
+            .is_some_and(|w| w.len >= len)
+    }
+    /// Take the files a stage needs (`wanted` is each object's key and prefix length), as
+    /// staged files cut to exactly those lengths. Entries taken leave `wanted`; every other
+    /// file is deleted, so the directory holds only what the stage will own.
+    async fn adopt(
+        &self,
+        wanted: &mut Vec<(bf_wal::SegmentFile, u64, u64)>,
+    ) -> io::Result<HashMap<String, StagedFile>> {
+        let mut written = std::mem::take(&mut *self.files.lock().expect("prestage files"));
+        let dir = self.dir.clone();
+        let mut take = Vec::new();
+        wanted.retain(|(source, _, len)| match written.remove(&source.key) {
+            Some(w) if w.len >= *len => {
+                take.push((source.key.clone(), *len, w));
+                false
+            }
+            Some(w) => {
+                drop(w.file);
+                let _ = fs::remove_file(dir.join(source_name(&source.key)));
+                true
+            }
+            None => true,
+        });
+        for key in written.keys() {
+            let _ = fs::remove_file(dir.join(source_name(key)));
+        }
+        tokio::task::spawn_blocking(move || {
+            let mut out = HashMap::new();
+            for (key, len, mut w) in take {
+                if w.len > len {
+                    w.file.set_len(len)?;
+                    w.crc.truncate(len.div_ceil(BLOCK as u64) as usize);
+                    // The last block is shorter now, so its checksum changes.
+                    if len % BLOCK as u64 != 0 {
+                        let start = len / BLOCK as u64 * BLOCK as u64;
+                        let mut tail = vec![0; (len - start) as usize];
+                        w.file.read_exact_at(&mut tail, start)?;
+                        *w.crc.last_mut().expect("a partial block") = crc32fast::hash(&tail);
+                    }
+                    w.file.sync_all()?;
+                }
+                out.insert(
+                    key,
+                    StagedFile {
+                        file: w.file,
+                        offset: 0,
+                        base: 0,
+                        len,
+                        crc: w.crc,
+                        identity: Some(w.identity),
+                        source: None,
+                    },
+                );
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+}
+fn source_name(key: &str) -> String {
+    format!("source-{}", digest(key.as_bytes()))
+}
+
+impl PrestageWriter {
+    /// Upload `bytes` as `key` with `upload` while writing its stage bytes beside it: through
+    /// `code_len` (the codes), and through `vector_len` as well when the cap has room left
+    /// for the `rows_after` rows of codes still to come. Local trouble never fails the upload.
+    pub(crate) async fn upload<E>(
+        &self,
+        store: &Storage,
+        key: &str,
+        bytes: Bytes,
+        (code_len, vector_len): (u64, u64),
+        rows_after: u64,
+        upload: impl Future<Output = Result<bf_wal::SegmentFile, E>>,
+    ) -> Result<bf_wal::SegmentFile, E> {
+        let pre = self.0.clone();
+        let (path, name) = (pre.dir.clone(), source_name(key));
+        let len = {
+            let mut guard = pre.lease.lock().expect("prestage lease");
+            guard
+                .as_mut()
+                .and_then(|lease| pre.admit(lease, code_len, vector_len, rows_after))
+        };
+        let local = async {
+            let len = len?.min(bytes.len() as u64);
+            tokio::task::spawn_blocking(move || {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path.join(name))?;
+                let data = &bytes[..len as usize];
+                file.write_all_at(data, 0)?;
+                let crc: Vec<u32> = data.chunks(BLOCK).map(crc32fast::hash).collect();
+                file.sync_all()?;
+                Ok::<_, io::Error>((Arc::new(file), crc, len))
+            })
+            .await
+            .ok()?
+            .map_err(|error| tracing::debug!(%error, "prestage write failed"))
+            .ok()
+        };
+        let (uploaded, local) = futures::future::join(upload, local).await;
+        let file = uploaded?;
+        if let Some((handle, crc, len)) = local
+            && let Ok(identity) = store.object_identity(key).await
+            && (identity.etag.is_some() || identity.version.is_some())
+        {
+            pre.files.lock().expect("prestage files").insert(
+                key.to_owned(),
+                Written {
+                    file: handle,
+                    len,
+                    crc,
+                    identity,
+                },
+            );
+        }
+        Ok(file)
+    }
+}
+/// A recluster's handle on the slab bytes it stages locally for the node that serves queries.
+/// The bytes are inert until [`Prestage::activate`] follows the manifest commit, and are
+/// discarded if the handle is dropped first (a failed commit, an error, or a shutdown).
+pub(crate) struct Prestage(Arc<PreInner>);
+/// The part of a [`Prestage`] a slab upload task holds.
+#[derive(Clone)]
+pub(crate) struct PrestageWriter(Arc<PreInner>);
+impl Prestage {
+    /// A cloneable writer for upload tasks.
+    pub(crate) fn writer(&self) -> PrestageWriter {
+        PrestageWriter(self.0.clone())
+    }
+    /// Start staging for a build over vectors of `dims` dimensions, or `None` when this
+    /// node has no staging area, or `BF_PRESTAGE=0` switches the feature off.
+    pub(crate) fn begin(dims: usize) -> Option<Self> {
+        if std::env::var("BF_PRESTAGE").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let context = read_cache::staging_context()?;
+        let manager = context.cache.staging.clone()?;
+        if !context.admit {
+            return None;
+        }
+        Self::open(manager, context.cache.key(""), dims)
+    }
+    fn open(manager: Arc<Manager>, scope: String, dims: usize) -> Option<Self> {
+        if manager.stop.stopping() {
+            return None;
+        }
+        let dir = manager
+            .path
+            .join(format!("prestage-{}", uuid::Uuid::new_v4()));
+        fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
+        let lease = manager.empty_lease();
+        Some(Self(Arc::new(PreInner {
+            scope,
+            manager,
+            dir,
+            files: Mutex::default(),
+            lease: Mutex::new(Some(lease)),
+            active: AtomicBool::new(false),
+            taken: AtomicBool::new(false),
+            code_row_bytes: (dims.next_power_of_two() / 8 + 48) as u64,
+        })))
+    }
+    /// Register the finished tier. Its bytes stay inert until [`Prestage::activate`].
+    pub(crate) fn publish(&self, set: &SlabSet) {
+        let key = stage_key(&self.0.scope, &set.dir.key, false);
+        self.0
+            .manager
+            .state
+            .lock()
+            .expect("ANN staging lock")
+            .prestaged
+            .insert(key, self.0.clone());
+    }
+    /// The tier's manifest commit happened: its first query may adopt the bytes.
+    pub(crate) fn activate(self) {
+        // The registry holds the bytes from here on; dropping this handle no longer discards.
+        self.0.active.store(true, Ordering::Release);
+    }
+}
+impl Drop for Prestage {
+    fn drop(&mut self) {
+        if self.0.active.load(Ordering::Acquire) {
+            return;
+        }
+        // Not committed: unregister, so no query adopts it, and let the last reference delete it.
+        let removed = {
+            let mut state = self.0.manager.state.lock().expect("ANN staging lock");
+            let key = state
+                .prestaged
+                .iter()
+                .find(|(_, p)| Arc::ptr_eq(p, &self.0))
+                .map(|(k, _)| k.clone());
+            key.and_then(|k| state.prestaged.remove(&k))
+        };
+        drop(removed);
+    }
+}
+impl PreInner {
+    /// Charge the bytes of one slab object to the lease and say how long a prefix to write.
+    fn admit(
+        &self,
+        lease: &mut Lease,
+        code_len: u64,
+        vector_len: u64,
+        rows_after: u64,
+    ) -> Option<u64> {
+        let cost = |len: u64| len + len.div_ceil(BLOCK as u64) * 11;
+        let m = &self.manager;
+        if !m.extend_files(lease, 1) {
+            return None;
+        }
+        if !m.extend(lease, cost(code_len)) {
+            return None;
+        }
+        let extra = cost(vector_len).saturating_sub(cost(code_len));
+        // Keep room for the codes of the slabs still to come, plus the stage's metadata.
+        let reserve = rows_after
+            .saturating_mul(self.code_row_bytes)
+            .saturating_add(64 << 20);
+        if vector_len > code_len
+            && lease.bytes.saturating_add(extra).saturating_add(reserve) <= m.capacity
+            && m.extend(lease, extra)
+        {
+            return Some(vector_len);
+        }
+        Some(code_len)
+    }
 }
 
 pub(crate) fn observe(
@@ -3086,5 +3426,202 @@ mod tests {
         );
         assert!(peer.shutdown(Duration::from_secs(5)).await);
         assert!(engine.shutdown(Duration::from_secs(5)).await);
+    }
+
+    /// Upload-time staging of one fixture slab, as a recluster does it. The object already
+    /// sits in the store, so the "upload" is the file it was given.
+    async fn prestaged(
+        manager: &Arc<Manager>,
+        store: &Storage,
+        set: &SlabSet,
+        ann: &[u8],
+        through_vectors: bool,
+    ) -> Prestage {
+        let file = set.slabs[0].files["annv2:vector"].clone();
+        let lens = crate::recluster::stage_lengths(ann, file.metadata_len);
+        assert!(lens.0 > 0 && lens.1 > lens.0, "{lens:?}");
+        let pre = Prestage::open(manager.clone(), String::new(), 32).unwrap();
+        let wanted = if through_vectors {
+            lens
+        } else {
+            (lens.0, lens.0)
+        };
+        let done = file.clone();
+        let got = pre
+            .writer()
+            .upload(
+                store,
+                &file.key,
+                Bytes::from(ann.to_vec()),
+                wanted,
+                0,
+                async move { Ok::<_, ()>(done) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.key, file.key);
+        pre
+    }
+
+    #[tokio::test]
+    async fn prestaged_bytes_wait_for_the_commit_then_become_the_stage_without_a_download() {
+        let (store, set, ann, _) = fixture(41).await;
+        publish(&store, &set, false, 1).await;
+        let key = set.slabs[0].files["annv2:vector"].key.clone();
+        let control = scratch();
+        let manager = Manager::open(control.path(), Some(512 << 20), Arc::default()).unwrap();
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
+        let want = ready(&manager, "", &set).await;
+
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(512 << 20), Arc::default()).unwrap();
+        let pre = prestaged(&manager, &store, &set, &ann, true).await;
+        let local = pre.0.files.lock().unwrap()[&key].file.clone();
+        assert!(manager.state.lock().unwrap().used > 0, "the cap is charged");
+        pre.publish(&set);
+        // Until the commit is confirmed, no query stages this tier at all.
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
+        {
+            let state = manager.state.lock().unwrap();
+            assert!(state.pending.is_empty() && state.ready.is_empty());
+        }
+        pre.activate();
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
+        let got = ready(&manager, "", &set).await;
+        assert!(
+            Arc::ptr_eq(&got.files[&key].file, &local),
+            "the slab was not fetched again"
+        );
+        assert_eq!(got.files.len(), want.files.len());
+        for (name, f) in &want.files {
+            let g = &got.files[name];
+            assert_eq!((g.len, &g.crc, &g.identity), (f.len, &f.crc, &f.identity));
+            let all = std::slice::from_ref(&(0..f.len)).to_vec();
+            assert_eq!(g.read(&all).unwrap(), f.read(&all).unwrap());
+        }
+        assert!(manager.state.lock().unwrap().prestaged.is_empty());
+        let used = manager.state.lock().unwrap().used;
+        assert!(used <= manager.capacity);
+        // Another observation starts nothing, and the stage survives a restart.
+        let path = got.path.clone();
+        drop((got, manager));
+        assert!(path.join("complete").exists());
+        let manager = Manager::open(work.path(), Some(512 << 20), Arc::default()).unwrap();
+        manager.recover(&store).await;
+        assert!(
+            manager
+                .read(&key, &key, std::slice::from_ref(&(0..64)))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_discards_prestaged_bytes_and_the_cap() {
+        let (store, set, ann, _) = fixture(42).await;
+        publish(&store, &set, false, 1).await;
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(512 << 20), Arc::default()).unwrap();
+        let pre = prestaged(&manager, &store, &set, &ann, true).await;
+        let dir = pre.0.dir.clone();
+        assert!(dir.is_dir());
+        pre.publish(&set);
+        drop(pre);
+        assert!(!dir.exists(), "nothing of the failed tier stays on disk");
+        {
+            let state = manager.state.lock().unwrap();
+            assert!(state.prestaged.is_empty());
+            assert_eq!((state.used, state.files_used), (0, 0));
+        }
+        // The tier still stages the ordinary way if it is published after all.
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
+        ready(&manager, "", &set).await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_before_the_first_query_leaves_no_prestage_and_the_tier_stages_normally() {
+        let (store, set, ann, _) = fixture(43).await;
+        publish(&store, &set, false, 1).await;
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(512 << 20), Arc::default()).unwrap();
+        let pre = prestaged(&manager, &store, &set, &ann, true).await;
+        let dir = pre.0.dir.clone();
+        pre.publish(&set);
+        pre.activate();
+        // The process dies here: the manager's registry is gone, but the files are still on disk.
+        let leaked = manager
+            .state
+            .lock()
+            .unwrap()
+            .prestaged
+            .drain()
+            .collect::<Vec<_>>();
+        for (_, p) in &leaked {
+            p.taken.store(true, Ordering::Release);
+        }
+        drop((leaked, manager));
+        assert!(dir.is_dir());
+        let manager = Manager::open(work.path(), Some(512 << 20), Arc::default()).unwrap();
+        assert!(
+            !dir.exists(),
+            "an uncommitted-looking directory is never adopted"
+        );
+        manager.recover(&store).await;
+        assert!(manager.state.lock().unwrap().ready.is_empty());
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
+        let stage = ready(&manager, "", &set).await;
+        let key = &set.slabs[0].files["annv2:vector"].key;
+        assert!(stage.files.contains_key(key));
+    }
+
+    #[tokio::test]
+    async fn prestaging_respects_the_cap_and_a_tight_one_leaves_the_rest_to_the_download() {
+        let (store, set, ann, end) = fixture(44).await;
+        publish(&store, &set, false, 1).await;
+        let work = scratch();
+        // Room for the codes, but not for the exact vectors beside them.
+        let manager = Manager::open(work.path(), Some(end + (64 << 10)), Arc::default()).unwrap();
+        let pre = prestaged(&manager, &store, &set, &ann, true).await;
+        let key = &set.slabs[0].files["annv2:vector"].key;
+        assert_eq!(pre.0.files.lock().unwrap()[key].len, end);
+        assert!(manager.state.lock().unwrap().used <= manager.capacity);
+        drop(pre);
+        // No room at all: nothing is written, and the upload is unaffected.
+        let tiny_dir = scratch();
+        let tiny = Manager::open(tiny_dir.path(), Some(1024), Arc::default()).unwrap();
+        let pre = prestaged(&tiny, &store, &set, &ann, true).await;
+        assert!(pre.0.files.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_prefix_cut_from_a_longer_prestage_keeps_every_checksum_true() {
+        let (store, set, ann, end) = fixture(45).await;
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(512 << 20), Arc::default()).unwrap();
+        let pre = prestaged(&manager, &store, &set, &ann, true).await;
+        let file = set.slabs[0].files["annv2:vector"].clone();
+        // Not a multiple of the block size, so the last block's checksum must be redone.
+        let len = end - 1;
+        assert_ne!(len % BLOCK as u64, 0);
+        let mut wanted = vec![(file.clone(), 0, len)];
+        let taken = pre.0.adopt(&mut wanted).await.unwrap();
+        assert!(wanted.is_empty());
+        let f = &taken[&file.key];
+        assert_eq!(f.len, len);
+        let all = f.read(std::slice::from_ref(&(0..len))).unwrap();
+        assert_eq!(&all[0][..], &ann[..len as usize]);
+        assert_eq!(
+            fs::metadata(pre.0.dir.join(source_name(&file.key)))
+                .unwrap()
+                .len(),
+            len
+        );
+        // An object stored shorter than wanted is left to the download, and its file removed.
+        let short = scratch();
+        let manager = Manager::open(short.path(), Some(512 << 20), Arc::default()).unwrap();
+        let pre = prestaged(&manager, &store, &set, &ann, false).await;
+        let mut wanted = vec![(file.clone(), 0, end + 1)];
+        assert!(pre.0.adopt(&mut wanted).await.unwrap().is_empty());
+        assert_eq!(wanted.len(), 1);
+        assert!(!pre.0.dir.join(source_name(&file.key)).exists());
     }
 }

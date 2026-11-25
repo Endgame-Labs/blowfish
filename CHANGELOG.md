@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.35] - 2026-11-25
+
+### Changed
+
+- **New recluster tiers are query-ready in seconds:** When the node that runs recluster also serves queries, it now writes each slab's routing directory, codes, and exact vectors to its local stage while uploading them, and activates them when the manifest commit publishes the tier. Before, the first query fetched them back from object storage. On a 10M-vector namespace, the new tier's codes became usable 2.3 s after the commit instead of 87.4 s, and it was fully staged in 3.0 s instead of 88.1 s. Recluster time and query results are unchanged. A failed commit, a cancelled build, or a crash discards the local files. Nodes that only serve queries are unchanged, and there is no bucket format change.
+
 ## [0.1.34] - 2026-11-25
 
 ### Changed
@@ -267,7 +273,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.34...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.35...HEAD
+[0.1.35]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.35
 [0.1.34]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.34
 [0.1.33]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.33
 [0.1.32]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.32

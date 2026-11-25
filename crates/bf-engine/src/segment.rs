@@ -499,6 +499,15 @@ pub(crate) async fn put_file(
     bytes: Vec<u8>,
     metadata_len: u64,
 ) -> Result<SegmentFile, ApiError> {
+    put_bytes(store, key, bytes.into(), metadata_len).await
+}
+/// [`put_file`] for bytes the caller keeps a handle on.
+pub(crate) async fn put_bytes(
+    store: &Storage,
+    key: String,
+    bytes: bytes::Bytes,
+    metadata_len: u64,
+) -> Result<SegmentFile, ApiError> {
     let file = SegmentFile {
         stats_index: None,
         text_header: None,
