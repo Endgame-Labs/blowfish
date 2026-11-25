@@ -172,6 +172,12 @@ async fn direct_provisioning_ranges_are_exact_uncached_and_bounded() {
     assert!(reader.read_direct(0..data.len() as u64 + 1).await.is_err());
     assert!(reader.read_direct(5..5).await.unwrap().is_empty());
     assert_eq!(ranges(&backend).len(), 8);
+    // The identity comes from the same response, matching a HEAD, with no extra request.
+    let (bytes, identity) = reader.read_direct_identified(7..93).await.unwrap();
+    assert_eq!(bytes, data.slice(7..93));
+    assert_eq!(identity, store.object_identity("portable").await.unwrap());
+    assert!(reader.read_direct_identified(5..5).await.is_err());
+    backend.ranges.lock().unwrap().pop();
     backend.short.store(true, Ordering::SeqCst);
     assert!(reader.read_direct(7..93).await.is_err());
 }

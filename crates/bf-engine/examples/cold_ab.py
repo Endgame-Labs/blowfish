@@ -63,6 +63,12 @@ P.add_argument(
     default=[],
     help="single-tier staging arm to provision, then read with cold filesystem pages",
 )
+P.add_argument(
+    "--two-phase-arm",
+    action="append",
+    default=[],
+    help="staging arm that publishes codes first and companions after (Round C9 and later)",
+)
 P.add_argument("--oracle", choices=["100k", "1m", "10m", "100m"], default="10m")
 P.add_argument(
     "--include-attributes",
@@ -294,15 +300,29 @@ def evict_staging(work):
     return {"files": len(files), "bytes": sum(p.stat().st_size for p in files)}
 
 
-def wait_staging(client, work, proc, first, start):
+def staged(text, two_phase):
+    """(codes usable, everything usable). Two-phase builds publish codes, then companions."""
+    done = re.search(r'blowfish_ann_staging_total\{outcome="(?:ready|adopted)"\} [1-9]', text)
+    if not two_phase or not done:
+        return bool(done), bool(done)
+    adopted = re.search(r'blowfish_ann_staging_total\{outcome="adopted"\} [1-9]', text)
+    companions = re.search(r'blowfish_ann_staging_total\{outcome="companions"\} [1-9]', text)
+    return True, bool(adopted or companions)
+
+
+def wait_staging(client, work, proc, first, start, two_phase=False):
     deadline = time.monotonic() + 600
+    codes_ms = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise RuntimeError("staging server exited")
         text = client.get("/metrics").text
         if re.search(r'blowfish_ann_staging_total\{outcome="error"\} [1-9]', text):
             raise RuntimeError("automatic staging failed; inspect server.log")
-        if re.search(r'blowfish_ann_staging_total\{outcome="(?:ready|adopted)"\} [1-9]', text):
+        codes, everything = staged(text, two_phase)
+        if codes and codes_ms is None:
+            codes_ms = (time.perf_counter() - start) * 1000
+        if everything:
             coverage = re.search(
                 r"^STAGED_VECTORS rows=(\d+) total_rows=(\d+)$",
                 (work / "server.log").read_text(),
@@ -311,6 +331,7 @@ def wait_staging(client, work, proc, first, start):
             provision = {
                 "first_query_ms": first["ms"],
                 "ready_after_ms": (time.perf_counter() - start) * 1000,
+                "codes_ready_after_ms": codes_ms,
                 **evict_staging(work),
                 "backend_totals": stats(client),
                 "staged_vector_rows": int(coverage[1]) if coverage else None,
@@ -397,14 +418,13 @@ try:
                 if name in a.stage_arm:
                     live = []
                     for item in items[: a.stage_live_queries]:
-                        text = c.get("/metrics").text
-                        if re.search(r'blowfish_ann_staging_total\{outcome="(?:ready|adopted)"\} [1-9]', text):
+                        if staged(c.get("/metrics").text, name in a.two_phase_arm)[1]:
                             break
                         c.post("/_bench/drop_caches").raise_for_status()
                         (w / "server.log").write_text("")
                         live.append(query(name, item, c, w, p))
                     (w / "live.json").write_text(json.dumps(live))
-                    wait_staging(c, w, p, first, start)
+                    wait_staging(c, w, p, first, start, name in a.two_phase_arm)
             rows.clear()
             (RUN / "rows.jsonl").write_text("")
         for qi in range(a.offset, a.offset + a.queries):
