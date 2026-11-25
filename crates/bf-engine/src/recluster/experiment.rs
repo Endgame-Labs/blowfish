@@ -367,3 +367,42 @@ fn prepare_flat_spill() {
     .unwrap();
     println!("RR4 flat fixture rows={rows} dims={dims} cluster_rows={cluster_rows}");
 }
+
+/// Build one frozen source checkpoint through the real fenced installation path.
+#[tokio::test]
+#[ignore = "requires owned RR6_CONFIG, RR6_SCRATCH, and optional RR6_PACK=1"]
+async fn rr6_build_frozen() {
+    let config: bf_storage::StorageConfig = serde_json::from_slice(
+        &std::fs::read(std::env::var_os("RR6_CONFIG").expect("RR6_CONFIG")).unwrap(),
+    )
+    .unwrap();
+    assert!(config.url.contains("/tmp/rr6/") || config.url.contains("/.scratch/"));
+    let store = bf_storage::Storage::open(&config).await.unwrap();
+    let engine = Engine::with_config(
+        store,
+        crate::EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.,
+            ..crate::EngineConfig::from_env()
+        },
+    );
+    let start = std::time::Instant::now();
+    let report = engine
+        .recluster(
+            "nq",
+            &ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 32,
+                cluster_rows: 0,
+                max_slab_rows: 250_000,
+                scratch: PathBuf::from(std::env::var_os("RR6_SCRATCH").expect("RR6_SCRATCH")),
+            },
+        )
+        .await
+        .unwrap();
+    println!(
+        "RR6_READY {}",
+        serde_json::json!({"rows":report.rows,"slabs":report.slabs,"clusters":report.clusters,"build_seconds":report.seconds,"installed_seconds":start.elapsed().as_secs_f64(),"packed":std::env::var_os("RR6_PACK").is_some()})
+    );
+    engine.shutdown(std::time::Duration::from_secs(5)).await;
+}

@@ -34,6 +34,8 @@ mod assignment;
 #[cfg(test)]
 mod experiment;
 mod math;
+#[cfg(test)]
+mod packing;
 pub(crate) mod spill;
 
 /// Wall time within one build stage. Concurrent uploads overlap CPU stages; aggregate I/O times
@@ -56,6 +58,10 @@ impl Stage {
         #[cfg(test)]
         if std::env::var_os("RR4_INPUT").is_some() {
             eprintln!("RR4 stage={name} seconds={seconds:.6}");
+        }
+        #[cfg(test)]
+        if std::env::var_os("RR6_CONFIG").is_some() {
+            eprintln!("RR6 stage={name} seconds={seconds:.6}");
         }
         metrics::histogram!("blowfish_recluster_stage_seconds", "stage" => name).record(seconds);
         tracing::info!(stage = name, seconds, "recluster: stage finished");
@@ -213,6 +219,11 @@ impl Engine {
         }
         if total >= u64::from(u32::MAX) {
             return Err(ApiError::new(400, "too many rows for one recluster"));
+        }
+        #[cfg(test)]
+        if std::env::var_os("RR6_PACK").is_some() {
+            assert!(target.kind == Kind::Base && target.coarse.is_none());
+            return self.pack_first_tier(ns, target, opts, covered, job).await;
         }
         let first = segment_index(store, &segments[0], &ann_key).await?;
         let (dims, width) = (first.dims(), first.vector_row_bytes());
