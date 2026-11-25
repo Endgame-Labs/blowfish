@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **T9 legacy spill sweep (merged).** Startup deletes loose spill files from older releases once idle for an hour; locked per-process spill directories were already on main.
+
 - **T8 BF16 kernel pinning (merged).** NumKong's SME matrix kernel overwrote partial tiles on the M4 (observed error 145.8x the bound); recluster now pins reviewed kernels and excludes SME and AMX. BF16 subnormals flushed explicitly. Full suite passes on x86, the M4, and Graviton.
 - **I3 issue #3 re-measure (docs).** v0.1.39 on BEIR NQ: 16 clients 512 q/s, warm p99 10.7 to 16.4 ms, recall 0.962, disk 14.18 GB settled (not met: vectors stored twice). Follow-ups D4b, WC1, and T9.
 - **BW17 (negative).** Phrase shortlist holds 10 matches for only 24 to 27% of queries.

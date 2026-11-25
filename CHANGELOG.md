@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.42] - 2026-11-25
+
+### Fixed
+
+- **Leftover recluster spill files are cleaned up:** Releases before the locked spill directories wrote loose `spill-<uuid>.bin` files into the system temporary directory, and an interrupted build left them behind (one test machine had 25 GB of them). Startup now deletes loose spill files that have been untouched for an hour. `docs/operations.md` describes where spills live and how they are recovered.
+
 ## [0.1.41] - 2026-11-25
 
 ### Fixed
@@ -315,7 +321,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.41...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.42...HEAD
+[0.1.42]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.42
 [0.1.41]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.41
 [0.1.40]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.40
 [0.1.39]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.39
