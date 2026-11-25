@@ -13266,3 +13266,5 @@ do not match the phrase (BW17). Lazy score-gated verification was not added: the
 The change is exact and small, so it is committed, but whether to keep it for a 1.04x to 1.16x cold gain is the coordinator's call.
 Plain cold p50 differed by 4 to 6 ms between arms on a path this change does not touch, so treat that as host or S3 noise; warm BM25
 was not re-measured. Cost: one c7g.4xlarge for about 1.5 hours (under $1.50); instance, key pair, and security group deleted, no S3 writes.
+
+**Coordinator decision (BW18):** not merged. The gain (1.04x and 1.15x cold phrase p50) is below the round's 1.3x bar for about 230 added lines, and warm phrase throughput was not re-measured. The code is kept on the `bw18-phrase-waves` branch. The remaining cost is the dependent wave (the phrase filter finishes before masked BM25 picks its blocks), so the next attempt should overlap the two, not shave the filter's own reads.
