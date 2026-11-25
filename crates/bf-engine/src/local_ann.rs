@@ -36,11 +36,24 @@ const RETRY: Duration = Duration::from_secs(60);
 
 struct StagedFile {
     file: File,
+    /// Object offset of the first stored byte: zero for a prefix, or where a staged tail starts.
+    base: u64,
     len: u64,
     crc: Vec<u32>,
     identity: Option<ObjectIdentity>,
 }
 impl StagedFile {
+    /// Object ranges as offsets into the stored bytes, or `None` when any is not wholly stored.
+    fn local(&self, ranges: &[Range<u64>]) -> Option<Vec<Range<u64>>> {
+        let end = self.base.checked_add(self.len)?;
+        ranges
+            .iter()
+            .map(|r| {
+                (r.start <= r.end && r.start >= self.base && r.end <= end)
+                    .then(|| r.start - self.base..r.end - self.base)
+            })
+            .collect()
+    }
     /// Align before merging, so overlapping requests read and verify each block once.
     fn aligned(&self, ranges: &[Range<u64>]) -> io::Result<Vec<Range<u64>>> {
         let mut aligned = Vec::with_capacity(ranges.len());
@@ -93,6 +106,9 @@ impl StagedFile {
     }
 
     fn read(&self, ranges: &[Range<u64>]) -> io::Result<Vec<Bytes>> {
+        let ranges = &self
+            .local(ranges)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
         let trace = crate::ann::trace_stages();
         let started = Instant::now();
         let aligned = self.aligned(ranges)?;
@@ -217,6 +233,10 @@ struct FileRecord {
     len: u64,
     crc: Vec<u32>,
     identity: ObjectIdentity,
+    /// Where the stored bytes start in the object. Prefix copies (and records written before
+    /// tails were staged) start at zero.
+    #[serde(default)]
+    base: u64,
 }
 fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -240,6 +260,19 @@ fn read_record(path: &Path) -> io::Result<Record> {
         return Err(io::Error::other("ANN completion checksum"));
     }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+/// Part of a source segment's documents that hydration reads on every query: a whole
+/// object (the ID index), or its last `len` bytes (the column directory).
+#[derive(Clone)]
+pub(crate) struct Extra {
+    pub file: SegmentFile,
+    pub base: u64,
+}
+impl Extra {
+    fn len(&self) -> u64 {
+        self.file.size - self.base
+    }
 }
 
 /// One engine's bounded disk staging area; scoped engines share its budget, but separate keys.
@@ -590,6 +623,7 @@ impl Manager {
                 key.clone(),
                 StagedFile {
                     file,
+                    base: f.base,
                     len: f.len,
                     crc: f.crc.clone(),
                     identity: Some(f.identity.clone()),
@@ -737,9 +771,7 @@ impl Manager {
     fn read(&self, scoped: &str, object: &str, ranges: &[Range<u64>]) -> Option<Vec<Bytes>> {
         let stage = self.file(scoped)?;
         let file = stage.files.get(object)?;
-        if ranges.iter().any(|r| r.start > r.end || r.end > file.len) {
-            return None;
-        }
+        file.local(ranges)?;
         match file.read(ranges) {
             Ok(bytes) => Some(bytes),
             Err(error) => {
@@ -758,6 +790,7 @@ impl Manager {
         set: &SlabSet,
         dims: usize,
         leaves: u64,
+        extras: &dyn Fn() -> Vec<Extra>,
     ) {
         if self.stop.stopping() {
             return;
@@ -805,10 +838,11 @@ impl Manager {
         };
         let (manager, store, scope, set) =
             (self.clone(), store.clone(), scope.to_owned(), set.clone());
+        let extras = extras();
         tokio::spawn(async move {
             let result = manager
                 .stop
-                .run(manager.build(&store, &scope, &set, lease))
+                .run(manager.build(&store, &scope, &set, lease, extras))
                 .await;
             let mut state = manager.state.lock().expect("ANN staging lock");
             state.pending.remove(&key);
@@ -859,12 +893,23 @@ impl Manager {
         lease.bytes = bytes;
         true
     }
+    /// Reserve descriptors for optional files, within the manager's file limit.
+    fn extend_files(&self, lease: &mut Lease, files: usize) -> bool {
+        let mut state = self.state.lock().expect("ANN staging lock");
+        if state.files_used.saturating_add(files) > self.file_capacity {
+            return false;
+        }
+        state.files_used += files;
+        lease.files += files;
+        true
+    }
     async fn build(
         self: &Arc<Self>,
         store: &Storage,
         scope: &str,
         set: &SlabSet,
         lease: Lease,
+        extras: Vec<Extra>,
     ) -> io::Result<Stage> {
         let path = self.path.join(uuid::Uuid::new_v4().to_string());
         fs::create_dir(&path)?;
@@ -926,6 +971,29 @@ impl Manager {
             self.state.lock().expect("ANN staging lock").used -= released;
             stage._lease.bytes = code_reservation;
         }
+        // Hydration reads follow the vector rerank on every query, and are far smaller than
+        // the vectors: admit them first, smallest (the column directories) before IDs.
+        let mut companions: Vec<Extra> = Vec::new();
+        let mut hydration = extras;
+        hydration.sort_by_key(|e| (e.len(), e.file.key.clone()));
+        for extra in hydration {
+            let len = extra.len();
+            let cost = len + len.div_ceil(BLOCK as u64) * 11 + extra.file.key.len() as u64 + 1024;
+            if limits.contains_key(&extra.file.key) || !self.extend_files(&mut stage._lease, 1) {
+                continue;
+            }
+            if self.extend(&mut stage._lease, cost) {
+                companions.push(extra);
+            } else {
+                // Return the descriptor. Larger objects will not fit either.
+                let mut state = self.state.lock().expect("ANN staging lock");
+                state.files_used -= 1;
+                stage._lease.files -= 1;
+                break;
+            }
+        }
+        let companion_files = companions.len();
+        let companion_bytes: u64 = companions.iter().map(Extra::len).sum();
         let mut extras: Vec<_> = exact
             .into_iter()
             .filter_map(|(key, len)| {
@@ -950,7 +1018,7 @@ impl Manager {
                 <= stage
                     ._lease
                     .files
-                    .saturating_sub(1 + usize::from(set.pages.is_some()))
+                    .saturating_sub(companion_files + 1 + usize::from(set.pages.is_some()))
                 && self.extend(&mut stage._lease, extra)
             {
                 limits.insert(key, len);
@@ -975,7 +1043,7 @@ impl Manager {
         let actual = limits
             .values()
             .try_fold(
-                set.dir.size + set.pages.as_ref().map_or(0, |p| p.size),
+                set.dir.size + set.pages.as_ref().map_or(0, |p| p.size) + companion_bytes,
                 |sum, n| sum.checked_add(*n),
             )
             .ok_or_else(|| io::Error::other("ANN stage size overflow"))?;
@@ -998,8 +1066,13 @@ impl Manager {
                 if len > source.size {
                     return Err(io::Error::other("ANN prefix exceeds object"));
                 }
-                Ok(((*source).clone(), len))
+                Ok(((*source).clone(), 0, len))
             })
+            .chain(
+                companions
+                    .iter()
+                    .map(|e| Ok((e.file.clone(), e.base, e.len()))),
+            )
             .collect::<io::Result<Vec<_>>>()?;
         stage.files.extend(
             self.download_many(store, &sources_to_copy, &stage.path)
@@ -1008,6 +1081,7 @@ impl Manager {
         let sources: HashMap<_, _> = std::iter::once(&set.dir)
             .chain(set.pages.iter())
             .chain(set.slabs.iter().flat_map(|s| s.files.values()))
+            .chain(companions.iter().map(|e| &e.file))
             .map(|f| (f.key.as_str(), f))
             .collect();
         let identities: Vec<_> = stage
@@ -1061,6 +1135,7 @@ impl Manager {
                 key.clone(),
                 FileRecord {
                     name,
+                    base: f.base,
                     len: f.len,
                     crc: f.crc.clone(),
                     identity,
@@ -1129,7 +1204,7 @@ impl Manager {
     async fn download_many(
         &self,
         store: &Storage,
-        sources: &[(SegmentFile, u64)],
+        sources: &[(SegmentFile, u64, u64)],
         path: &Path,
     ) -> io::Result<HashMap<String, StagedFile>> {
         let mut files = HashMap::new();
@@ -1137,7 +1212,7 @@ impl Manager {
         // HEADs and file creation hold no payload memory.
         // Own descriptors before constructing futures, keeping the spawned build Send.
         let sources = sources.to_vec();
-        let mut opened = futures::stream::iter(sources.into_iter().map(|(source, len)| {
+        let mut opened = futures::stream::iter(sources.into_iter().map(|(source, base, len)| {
             let (store, path) = (store.clone(), path.to_owned());
             async move {
                 let identity = store
@@ -1152,11 +1227,11 @@ impl Manager {
                     .open(path.join(format!("source-{}", digest(source.key.as_bytes()))))
                     .await?;
                 file.set_len(len).await?;
-                Ok::<_, io::Error>((source, len, identity, file.into_std().await))
+                Ok::<_, io::Error>((source, base, len, identity, file.into_std().await))
             }
         }))
         .buffer_unordered(32);
-        while let Some((source, len, identity, file)) = opened.try_next().await? {
+        while let Some((source, base, len, identity, file)) = opened.try_next().await? {
             let file = Arc::new(file);
             let reader = store
                 .range_reader_with_length(&source.key, source.size, true)
@@ -1167,6 +1242,7 @@ impl Manager {
                     source.key.clone(),
                     reader.clone(),
                     file.clone(),
+                    base,
                     start..(start + PIECE).min(len),
                 ));
             }
@@ -1174,6 +1250,7 @@ impl Manager {
                 source.key.clone(),
                 StagedFile {
                     file: file.try_clone()?,
+                    base,
                     len,
                     crc: vec![0; len.div_ceil(BLOCK as u64) as usize],
                     identity: Some(identity),
@@ -1181,9 +1258,9 @@ impl Manager {
             );
         }
         let mut reads = futures::stream::iter(jobs.into_iter().map(
-            |(key, reader, file, range)| async move {
+            |(key, reader, file, base, range)| async move {
                 let bytes = reader
-                    .read_direct(range.clone())
+                    .read_direct(base + range.start..base + range.end)
                     .await
                     .map_err(io::Error::other)?;
                 tokio::task::spawn_blocking(move || {
@@ -1272,6 +1349,7 @@ impl Manager {
         }
         Ok(StagedFile {
             file: file.into_std().await,
+            base: 0,
             len,
             crc,
             identity: Some(before),
@@ -1279,7 +1357,14 @@ impl Manager {
     }
 }
 
-pub(crate) fn observe(store: &Storage, set: &SlabSet, dims: usize, leaves: u64, attribute: &str) {
+pub(crate) fn observe(
+    store: &Storage,
+    set: &SlabSet,
+    dims: usize,
+    leaves: u64,
+    attribute: &str,
+    extras: &dyn Fn() -> Vec<Extra>,
+) {
     let Some(context) = read_cache::staging_context() else {
         return;
     };
@@ -1305,7 +1390,52 @@ pub(crate) fn observe(store: &Storage, set: &SlabSet, dims: usize, leaves: u64, 
         );
     }
     // `key("")` includes the separator used for every storage-scoped cache key.
-    manager.observe(store, &context.cache.key(""), set, dims, leaves);
+    manager.observe(store, &context.cache.key(""), set, dims, leaves, extras);
+}
+/// The hydration parts of a slab set's covered segments that a stage should hold: each
+/// column directory (the tail a reader fetches first) and each ID index.
+pub(crate) fn hydration_extras(set: &SlabSet, segments: &[bf_wal::Segment]) -> Vec<Extra> {
+    let by_id: HashMap<&str, &bf_wal::Segment> =
+        segments.iter().map(|s| (s.id.as_str(), s)).collect();
+    let mut extras = Vec::new();
+    for cover in &set.covered {
+        let Some(segment) = by_id.get(cover.segment.as_str()) else {
+            continue;
+        };
+        if let Some(file) = segment.files.get("docs") {
+            // The same range `segment::directory` reads.
+            let tail = file.metadata_len.max(65536).min(file.size);
+            if tail > 0 {
+                extras.push(Extra {
+                    file: file.clone(),
+                    base: file.size - tail,
+                });
+            }
+        }
+        if let Some(file) = segment.files.get("ids")
+            && file.size > 0
+        {
+            extras.push(Extra {
+                file: file.clone(),
+                base: 0,
+            });
+        }
+    }
+    extras
+}
+/// Whether a stage holds this whole object, so reading it costs no storage request.
+pub(crate) fn staged(key: &str, size: u64) -> bool {
+    let Some(context) = read_cache::staging_context() else {
+        return false;
+    };
+    let Some(manager) = &context.cache.staging else {
+        return false;
+    };
+    context.admit
+        && manager
+            .file(&context.cache.key(key))
+            .and_then(|stage| stage.files.get(key).map(|f| f.base == 0 && f.len >= size))
+            .unwrap_or(false)
 }
 pub(crate) fn prefetch(key: &str, ranges: &[Range<u64>]) -> bool {
     let Some(context) = read_cache::staging_context() else {
@@ -1323,7 +1453,7 @@ pub(crate) fn prefetch(key: &str, ranges: &[Range<u64>]) -> bool {
     let Some(file) = stage.files.get(key) else {
         return false;
     };
-    let Ok(aligned) = file.aligned(ranges) else {
+    let Some(Ok(aligned)) = file.local(ranges).map(|local| file.aligned(&local)) else {
         return false;
     };
     file.advise(&aligned);
@@ -1402,6 +1532,7 @@ mod tests {
         temporary.as_file().write_all_at(&data, 0).unwrap();
         let staged = StagedFile {
             file: temporary.as_file().try_clone().unwrap(),
+            base: 0,
             len: data.len() as u64,
             crc: data.chunks(BLOCK).map(crc32fast::hash).collect(),
             identity: None,
@@ -1579,7 +1710,7 @@ mod tests {
     async fn completed(work: &Path, store: &Storage, set: &SlabSet) -> (PathBuf, u64) {
         publish(store, set, false, 1).await;
         let manager = Manager::open(work, Some(1 << 20), Arc::default()).unwrap();
-        manager.observe(store, "", set, 32, 16);
+        manager.observe(store, "", set, 32, 16, &Vec::new);
         let stage = ready(&manager, "", set).await;
         let path = stage.path.clone();
         let bytes = manager.state.lock().unwrap().used;
@@ -1637,7 +1768,7 @@ mod tests {
         }
         publish(&tenant, &set, false, 1).await;
         let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
-        manager.observe(&tenant, "tenant\0", &set, 32, 16);
+        manager.observe(&tenant, "tenant\0", &set, 32, 16, &Vec::new);
         let stage = ready(&manager, "tenant\0", &set).await;
         let path = stage.path.clone();
         drop(stage);
@@ -1791,7 +1922,7 @@ mod tests {
         assert_eq!(manager.state.lock().unwrap().used, 0);
         drop(manager);
         let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
-        manager.observe(&store, "", &set, 32, 16);
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
         let stage = ready(&manager, "", &set).await;
         let path = stage.path.clone();
         drop(stage);
@@ -1806,7 +1937,7 @@ mod tests {
         let work = scratch();
         let manager = Manager::open(work.path(), Some(128 << 10), Arc::default()).unwrap();
         let (store, set, ann, end) = fixture(1).await;
-        manager.observe(&store, "left\0", &set, 32, 16);
+        manager.observe(&store, "left\0", &set, 32, 16, &Vec::new);
         let stage = ready(&manager, "left\0", &set).await;
         let key = &set.slabs[0].files["annv2:vector"].key;
         let ranges = [0..37, BLOCK as u64 - 7..BLOCK as u64 + 23, end..end];
@@ -1860,13 +1991,13 @@ mod tests {
                 .collect();
             let key = format!("pool-{n}");
             store.create_unique(&key, data.clone()).await.unwrap();
-            sources.push((file(&key, data.len() as u64, 0), data.len() as u64));
+            sources.push((file(&key, data.len() as u64, 0), 0, data.len() as u64));
         }
         let files = manager
             .download_many(&store, &sources, work.path())
             .await
             .unwrap();
-        for (n, (source, len)) in sources.iter().enumerate() {
+        for (n, (source, _, len)) in sources.iter().enumerate() {
             let file = &files[&source.key];
             let ranges = [0..37, PIECE - 17..PIECE + 29, len - 37..*len];
             for (bytes, range) in file.read(&ranges).unwrap().iter().zip(ranges) {
@@ -1884,11 +2015,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_staged_tail_serves_object_offsets_and_nothing_before_them() {
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        let (store, _, _, _) = fixture(1).await;
+        let data: Vec<u8> = (0..PIECE as usize + BLOCK * 3 + 41)
+            .map(|i| (i * 13 % 251) as u8)
+            .collect();
+        store
+            .create_unique("tail-source", data.clone())
+            .await
+            .unwrap();
+        let base = data.len() as u64 - (BLOCK as u64 * 2 + 41);
+        let sources = [(
+            file("tail-source", data.len() as u64, 0),
+            base,
+            data.len() as u64 - base,
+        )];
+        let files = manager
+            .download_many(&store, &sources, work.path())
+            .await
+            .unwrap();
+        let tail = &files["tail-source"];
+        let end = data.len() as u64;
+        let ranges = [base..base + 5, end - 9..end, base + 100..base + 100];
+        let got = tail.read(&ranges).unwrap();
+        for (bytes, range) in got.iter().zip(&ranges) {
+            assert_eq!(&bytes[..], &data[range.start as usize..range.end as usize]);
+        }
+        assert!(
+            tail.local(std::slice::from_ref(&(base - 1..base + 4)))
+                .is_none()
+        );
+        assert!(
+            tail.local(std::slice::from_ref(&(end - 1..end + 1)))
+                .is_none()
+        );
+        assert!(tail.read(std::slice::from_ref(&(0..8))).is_err());
+    }
+
+    #[tokio::test]
     async fn exact_vectors_use_verified_sparse_reads_and_corruption_falls_back() {
         let work = scratch();
         let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
         let (store, set, ann, codes_end) = fixture(22).await;
-        manager.observe(&store, "left\0", &set, 32, 16);
+        manager.observe(&store, "left\0", &set, 32, 16, &Vec::new);
         let stage = ready(&manager, "left\0", &set).await;
         let source = &set.slabs[0].files["annv2:vector"];
         let dir_raw = store.get(&set.dir.key).await.unwrap();
@@ -1991,7 +2162,7 @@ mod tests {
             if restarting {
                 manager.recover(&store).await;
             } else {
-                manager.observe(&store, "", &set, 32, 32);
+                manager.observe(&store, "", &set, 32, 32, &Vec::new);
             }
             let stage = ready(&manager, "", &set).await;
             let mut exact = 0;
@@ -2043,7 +2214,7 @@ mod tests {
         let work = scratch();
         let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
         let (store, set, _, _) = fixture(18).await;
-        manager.observe(&store, "", &set, 32, 16);
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
         manager.remove_namespace("", "test");
         tokio::time::timeout(Duration::from_secs(10), async {
             while !manager.state.lock().unwrap().pending.is_empty() {
@@ -2063,9 +2234,9 @@ mod tests {
         let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
         let (left, a, ann_a, end_a) = fixture(1).await;
         let (right, b, ann_b, end_b) = fixture(2).await;
-        manager.observe(&left, "left\0", &a, 32, 16);
+        manager.observe(&left, "left\0", &a, 32, 16, &Vec::new);
         let _a = ready(&manager, "left\0", &a).await;
-        manager.observe(&right, "right\0", &b, 32, 16);
+        manager.observe(&right, "right\0", &b, 32, 16, &Vec::new);
         let _b = ready(&manager, "right\0", &b).await;
         let key = &a.slabs[0].files["annv2:vector"].key;
         assert_ne!(&ann_a[..end_a as usize], &ann_b[..end_b as usize]);
@@ -2113,7 +2284,7 @@ mod tests {
         drop(lease);
         assert_eq!(manager.state.lock().unwrap().used, 0);
         let (store, set, _, _) = fixture(3).await;
-        manager.observe(&store, "", &set, 32, 16);
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
         stop.begin();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !manager.state.lock().unwrap().pending.is_empty() {
@@ -2124,7 +2295,7 @@ mod tests {
         .unwrap();
         assert_eq!(manager.state.lock().unwrap().used, 0);
         assert!(manager.state.lock().unwrap().ready.is_empty());
-        manager.observe(&store, "", &set, 32, 16);
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
         assert!(manager.state.lock().unwrap().pending.is_empty());
     }
 
@@ -2133,7 +2304,7 @@ mod tests {
         let work = scratch();
         let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
         let (store, set, _, _) = fixture(7).await;
-        manager.observe(&store, "", &set, 32, 16);
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
         let active_reader = ready(&manager, "", &set).await;
         let key = &set.slabs[0].files["annv2:vector"].key;
         let used = manager.state.lock().unwrap().used;

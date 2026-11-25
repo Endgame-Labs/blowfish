@@ -1161,6 +1161,34 @@ pub(crate) async fn projected_documents(
         })
         .collect()
 }
+/// Rows for hydrating search winners. An ID-only projection reads the segment's ID index when
+/// a local stage holds it, so the response costs no storage request; otherwise this is
+/// [`projected_rows`], whose directory and one small ID block read are cheaper over the network.
+pub(crate) async fn hydrated_rows(
+    store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    columns: &std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<u32, Document>, ApiError> {
+    if columns.is_empty()
+        && let Some(file) = segment.files.get("ids")
+        && crate::local_ann::staged(&file.key, file.size)
+    {
+        let ids = ids(store, segment).await?;
+        return rows
+            .iter()
+            .map(|row| {
+                let id = ids.get(row as usize).ok_or_else(corrupt)?;
+                let doc = Document::from_iter([(
+                    "id".into(),
+                    serde_json::to_value(id).map_err(index_error)?,
+                )]);
+                Ok((row, doc))
+            })
+            .collect();
+    }
+    projected_rows(store, segment, rows, Some(columns)).await
+}
 pub(crate) async fn projected_rows(
     store: &Storage,
     segment: &Segment,
@@ -1186,7 +1214,10 @@ pub(crate) async fn projected_rows_with(
     if bypass {
         reader = reader.bypass_cache();
     }
+    let trace_start = crate::ann::trace_stages().then(std::time::Instant::now);
     let dir = directory(&reader).await?;
+    trace_hydration(trace_start, docs_key, "directory", rows.len());
+    let trace_start = crate::ann::trace_stages().then(std::time::Instant::now);
     let mut docs: BTreeMap<u32, Document> = rows.iter().map(|row| (row, Document::new())).collect();
     let blocks: std::collections::BTreeSet<_> =
         rows.iter().map(|row| row as usize / BLOCK_ROWS).collect();
@@ -1340,7 +1371,20 @@ pub(crate) async fn projected_rows_with(
                 .insert(name.clone(), value);
         }
     }
+    trace_hydration(trace_start, docs_key, "data", rows.len());
     Ok(docs)
+}
+/// Diagnostic boundaries distinguish dependent directory and data waves, including cache hits.
+fn trace_hydration(start: Option<std::time::Instant>, key: &str, phase: &str, rows: u64) {
+    if let Some(start) = start {
+        eprintln!(
+            "HYDRATION {key} {phase} {rows} {} {}",
+            start.elapsed().as_micros(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros())
+        );
+    }
 }
 /// A segment's rows for compaction: documents without the `strip` columns (vector attributes,
 /// read separately) keyed by ID, plus each stripped column's present values as packed bytes
