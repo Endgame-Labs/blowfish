@@ -819,7 +819,7 @@ async fn resident_answers_match_the_ordinary_plan_and_decline_what_they_cannot_p
                 .map(|r| serde_json::to_value(r).unwrap()["rows"].clone())
         }
     };
-    let request = |i: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":10});
+    let request = |i: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":10,"include_attributes":false});
     // Uncalibrated graphs never answer.
     assert!(resident(request(17)).await.is_none());
     {

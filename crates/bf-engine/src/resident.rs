@@ -40,7 +40,10 @@ fn bare(request: &QueryRequest) -> Option<Bare<'_>> {
         && request.rerank_by.is_none()
         && request.limit.is_none()
         && request.compute_attributes.is_none()
-        && request.include_attributes.is_none()
+        && matches!(
+            request.include_attributes,
+            None | Some(bf_types::IncludeAttributes::All(false))
+        )
         && request.exclude_attributes.is_none()
         && request.distance_metric.is_none()
         && request.offset == 0
