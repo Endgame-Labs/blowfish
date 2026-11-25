@@ -1577,7 +1577,8 @@ impl Manager {
             files.insert(
                 source.key.clone(),
                 StagedFile {
-                    file: Arc::new(file.try_clone()?),
+                    // One descriptor per source: the staged file shares the download handle.
+                    file: file.clone(),
                     offset: 0,
                     base,
                     len,
@@ -1610,8 +1611,8 @@ impl Manager {
         // No range task remains when files are synced and their identities rechecked.
         let syncing = files
             .iter()
-            .map(|(key, file)| Ok((key.clone(), file.identity.clone(), file.file.try_clone()?)))
-            .collect::<io::Result<Vec<_>>>()?;
+            .map(|(key, file)| (key.clone(), file.identity.clone(), file.file.clone()))
+            .collect::<Vec<_>>();
         futures::stream::iter(syncing.into_iter().map(|(key, identity, handle)| {
             let store = store.clone();
             async move {
