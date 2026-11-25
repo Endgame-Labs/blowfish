@@ -51,6 +51,22 @@ enum Work<F: Future> {
     Panicked,
 }
 
+/// Shared CPU pool for query execution and fan-out after an I/O continuation.
+pub(crate) fn workers() -> &'static rayon::ThreadPool {
+    static WORKERS: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    WORKERS.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+        // Leave capacity for WAL completions and response delivery under sustained CPU
+        // load. Small hosts retain every compute worker; their spare-core cost is larger.
+        let workers = if cpus >= 8 { cpus - 1 } else { cpus };
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|i| format!("bf-query-{i}"))
+            .build()
+            .expect("query worker pool")
+    })
+}
+
 /// A resident plan completes on its CPU worker without entering `block_on`. A yielded plan
 /// keeps its partially polled future, including I/O and locks, rather than executing twice.
 /// Its blocking-pool continuation cannot exhaust the fixed CPU workers while waiting for I/O.
@@ -79,18 +95,7 @@ where
             Err(_) => Err(ApiError::new(500, "query worker panicked")),
         };
     }
-    static WORKERS: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    let pool = WORKERS.get_or_init(|| {
-        let cpus = std::thread::available_parallelism().map_or(1, usize::from);
-        // Leave capacity for WAL completions and response delivery under sustained CPU
-        // load. Small hosts retain every compute worker; their spare-core cost is larger.
-        let workers = if cpus >= 8 { cpus - 1 } else { cpus };
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .thread_name(|i| format!("bf-query-{i}"))
-            .build()
-            .expect("query worker pool")
-    });
+    let pool = workers();
     let runtime = shared_runtime();
     let worker_runtime = runtime.clone();
     let (send, receive) = oneshot::channel();

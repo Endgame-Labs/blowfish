@@ -102,8 +102,10 @@ impl Analyzer {
     pub fn gather(&self, docs: &BTreeMap<bf_types::Id, Arc<Document>>) -> PreparedTail {
         let docs: Vec<_> = docs.values().collect();
         let analyze = |doc: &&Arc<Document>| (Arc::as_ptr(doc) as usize, self.tail(doc));
-        let rows = if docs.len() >= 512 && crate::fan_out() && rayon::current_num_threads() > 1 {
-            docs.par_iter().map(analyze).collect()
+        let rows = if docs.len() >= 512 && crate::fan_out() {
+            // Async posting reads can resume on an I/O worker. Retain the query
+            // pool's CPU budget instead of silently switching to global Rayon.
+            crate::query_worker::workers().install(|| docs.par_iter().map(analyze).collect())
         } else {
             docs.iter().map(analyze).collect()
         };
