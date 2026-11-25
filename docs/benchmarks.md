@@ -12993,3 +12993,80 @@ unfiltered top 64, which is the condition that at least 10 of the 64 match.
   documents, which is the same cold cost the filter pays; it was out of scope for the 64-row hypothesis and not measured.
 - **Cost:** one c7g.4xlarge for about 45 minutes, an estimated under $0.60 with the volume. The instance, key pair, and security group are
   deleted, and no S3 prefix was written.
+
+## Round WC1: a top-100 pass no longer leaves warm vector queries twice as slow
+
+Round I3 found that the protocol's 3,452-query `top_k` 100 pass leaves later warm `top_k` 10 queries at about half
+speed, and that only about half of a fresh server's queries stayed on the compiled path. I suspected the warm tier's
+bounded exact-vector cache. This round proves it with counters and fixes it.
+
+**Setup.** One c7i.2xlarge (8 vCPUs, 16 GB, x86), on demand, in us-west-2. The warm NQ fixture (2,681,468 x 1,024 f16,
+cosine, 32 slabs; the store settles with seven compactions on first start, so I let one idle server finish those before
+measuring) and the Iteration 19 limits: server pinned to CPUs 0-5 in a 12 GB cgroup, 3 GiB cache, disk cache off, 64
+probes, recall sampling off, clients on CPUs 6-7. Each run starts a fresh server with an empty OS cache, optionally runs
+the top-100 quality pass first, then the protocol's latency pass (1,000 warm-up queries, then 1,000 timed) and the
+throughput passes at 1, 4, and 16 clients, then a repeat 16-client pass. The fixture has no qrels, so the quality pass
+ran against an empty qrels file: its scores are meaningless, but its load is the same 3,452 `top_k` 100 queries.
+
+### Cause
+
+New counters (`/metrics`): `blowfish_warm_exact_lookups_total{result}`, `blowfish_warm_exact_inserted_total`,
+`blowfish_warm_exact_evicted_total`, `blowfish_warm_exact_entries` / `_bytes` / `_capacity_bytes`,
+`blowfish_warm_declined_total{reason}` (`not_ready`, `leaf_missing`, `exact_row_missing`, `no_tier`), and
+`blowfish_warm_fallback_queries_total`.
+
+- The exact-vector cache holds 413 MB, the size of the tier's code bytes: 185,770 rows of 2.2 KB, 6.9% of the corpus.
+- A `top_k` 100 query reranks about 800 rows and records every one. The quality pass inserted **2.77 million** rows and
+  evicted **1.80 million**, so the cache was full after about 250 queries. 3,451 of its 3,452 queries fell back.
+- Afterwards, `top_k` 10 queries could not get their rows back. Over the next 8,000 queries, 9,333 lookups missed (7%)
+  and every one ended a compiled attempt (`exact_row_missing`): only 1,361 of those 8,000 queries stayed compiled (17%),
+  and the repeat 16-client pass was still at 600 q/s. Each fallback re-records its rows, but eviction continued (2.1
+  million evictions by the end of the main pass) because the cache's admission policy keeps the rows the top-100 pass
+  hit most often.
+- **Why half of a fresh server's queries leave the compiled path.** They are first-seen queries. The protocol warms 1,000
+  queries and then times the first 2,000, so the first 1,000 of the 2,000 are being seen for the first time. A first-seen
+  query has no admitted leaf (686 of the declines) or exact rows (1,313) yet, falls back once, and records them; after
+  that it is compiled. A fresh server fell back on exactly 2,000 queries in all, those 1,000 and the 1,000 warm-up ones,
+  and then on none across the 4-client and 16-client passes. So the 999 of 2,000 figure is the learning pass, not a defect.
+
+### Fix
+
+A sparse tier (one whose exact rows cannot all be resident) now keeps two caches. Rows recorded by queries asking for
+at most 10 results go to the ordinary cache, as before. Rows recorded by queries asking for more go to a **bulk
+cache** of a quarter of its size, charged to the tier's reservation, so a pass of large `top_k` queries churns the bulk
+cache and never evicts what keeps ordinary queries compiled. Lookups check both. A tier that holds every row keeps one
+cache, as before. No setting, no format change, and the results are unchanged (the same rows, from the same checksummed
+reads).
+
+### Results
+
+p50 is the 1-client latency pass; q/s is 16 clients, first and repeat passes. Paired runs on the same host and store.
+
+| Run | p50 ms | 16 clients q/s |
+| --- | ---: | ---: |
+| main, fresh server (1st, 2nd run) | 4.2, 4.0 | 1,110 and 1,105; 1,161 and 1,152 |
+| main, after the top-100 pass (1st, 2nd run) | **7.7**, 7.8 | **592 and 593**; 601 and 600 |
+| fix, fresh server | 4.0 | 1,108 and 1,059 |
+| fix, after the top-100 pass (1st, 2nd run) | 4.1, 4.2 | **1,148 and 1,142**; 1,146 and 1,112 |
+
+- After the top-100 pass, the fix serves 1,112 to 1,148 q/s against main's 592 to 601 (1.9x), at p50 4.1 to 4.2 ms
+  against 7.7 to 7.8. Against main's fresh-server rate of 1,105 to 1,161, that is within 4% on throughput and 5% on p50.
+- Compiled queries after the pass: the fix falls back on 1,957 queries across the main and repeat passes (the first-seen
+  ones, as on a fresh server), where main falls back on over 80% of them.
+- Fresh server, fix against main: p50 4.0 against 4.0 to 4.2, and 1,059 to 1,108 against 1,105 to 1,161 q/s. The runs
+  vary by about 5% between repeats, so I read this as no regression, but I did not run enough pairs to resolve a 2%
+  difference.
+- **Identical results:** the top 10 ids of the first 2,000 queries are the same in all eight runs (0 differences).
+
+### Not done
+
+- **Fetching only the missing exact rows.** A compiled query that misses one exact row still falls back to the whole
+  planner. Fetching just the missing rows needs `CompiledTier::try_search` (in `bf-vector`) to return the missing
+  candidates' slab, cluster, and ordinal, and an async reader for the slab's vectors inside the compiled branch. Both are
+  outside `bf-engine`, so I did not build them; with the bulk cache in place the remaining misses are first-seen
+  queries, which need the I/O anyway.
+- A unit test for the split: at the fixture's size the window in which a tier is admitted and still sparse is so narrow
+  that the test's own queries evict the tier. The end-to-end measurement above is the proof.
+
+Cost: one c7i.2xlarge for about 55 minutes, an estimated $0.45 with the 120 GB volume. The instance, key pair, and
+security group are deleted, and no S3 prefix was written.
