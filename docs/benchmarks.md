@@ -12950,3 +12950,46 @@ shared VM, ABBA order, parent commit as base):
 
 The candidate is within the base's run-to-run spread, with no measurable cost. Warm queries rarely yield to `run_io`, and
 the guard is one small allocation when they do.
+
+## Round BW17: verify a required phrase after ranking instead of before (killed at the kill test)
+
+Hypothesis (Sol, `briefs/ideas/2025-sol.md` #2): for a required phrase (`ContainsTokenSequence`), take the unfiltered top 64 by BM25,
+verify the phrase on just those rows, and return the first k matches (exact, with a fallback to today's full filter when fewer than k
+match). Kill bars: phrase queries at least 1.3x slower than plain ones today, and the shortlist succeeding for at least half the queries.
+No production change was made.
+
+### Method
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Rust 1.100.0, Clang 19, NumKong `__arm_get_current_vg` link stub), main at `084ce12`
+(v0.1.39). Fixture `tmp/msmarco-1m-v021/` (read-only, eight text segments), the BW13 setup: server on CPUs 0 to 5 with two Rayon and two
+Tokio workers, client on CPUs 14 and 15, 2 GiB raw cache, 4,000-byte blocks, 512-block coalescing, fetch concurrency 512. Workloads from the
+held-out odd-indexed 500 queries, each keeping its BM25 query and adding one phrase filter built from the query's adjacent word pairs
+(lowercased alphanumeric words): **first** (the first pair) and **long** (the longest pair by characters, a cheap proxy for rarer).
+Warm: `filtered_bm25` over the local copy, two passes per run, two runs per client count. Cold: fresh server process and empty cache per run
+against the fixture on S3 (us-west-2), one sequential pass.
+Shortlist success is measured exactly without a tokenizer: a query succeeds when all 10 of its phrase-filtered results appear in the
+unfiltered top 64, which is the condition that at least 10 of the 64 match.
+
+### Results
+
+| Workload | Warm 1 client p50 ms | Warm 16 clients p50 / p90 ms (q/s) | Cold p50 / p90 ms | Shortlist holds 10 matches | Fewer than 10 matches overall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| plain | 1.01, 1.07 | 6.0 / 10.1 (2,416 to 2,460) | 40.4, 45.4 / 119, 121 | n/a | n/a |
+| phrase, first pair | 0.93, 0.94 | 3.1 / 5.5 (4,650) | 81.2, 84.1 / 210, 182 | **136 of 500 (27%)** | 118 |
+| phrase, longest pair | 0.69, 0.69 | 1.5 / 3.0 (9,000 to 9,100) | 117 / 237 | **119 of 500 (24%)** | 305 |
+
+### Conclusion
+
+- **Killed on the shortlist.** Only 27% (first pair) and 24% (longest pair) of queries have 10 phrase matches in the unfiltered top 64,
+  against the bar of 50%. The fallback would run on three of four queries, paying a 64-row ranking and verification on top of today's path.
+  Per-segment shortlists would do worse, since each of the eight segments holds a fraction of the top 64. A phrase from a query's own words
+  rarely matches many of the passages that rank best on the full query, and for the longest pair 305 of 500 queries have fewer than 10
+  matches in the whole corpus, so no shortlist could ever answer them.
+- **Slowdown bar: warm fails, cold passes.** Warm, phrase queries are **faster** than plain ones (1 client 0.9x to 0.7x the p50; 16 clients about
+  2x to 4x the throughput), because the phrase mask is selective and the BM25 walk prunes against it. Cold, they are **2.0x** (first) and
+  **2.6x** (longest) slower at p50: the positions streams add round trips. So the cost worth attacking is cold position reads, not the
+  warm filter, and a shortlist would not remove it for the queries that fall back.
+- **Idea not pursued:** a larger or adaptive shortlist (256 or 1,024 rows) would raise the hit rate but costs more verification reads of the
+  documents, which is the same cold cost the filter pays; it was out of scope for the 64-row hypothesis and not measured.
+- **Cost:** one c7g.4xlarge for about 45 minutes, an estimated under $0.60 with the volume. The instance, key pair, and security group are
+  deleted, and no S3 prefix was written.
