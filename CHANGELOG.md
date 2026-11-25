@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.38] - 2026-11-25
+
+### Changed
+
+- **Faster cold queries on a staged node:** A cold query on a node with a ready local stage now starts its WAL tail checks at the same time as the manifest read, using the indexed-through sequence saved with the stage, and keeps their results only if the manifest confirms that sequence and generation. Without a ready stage, nothing changes. The final rerank's local reads now run on the bounded worker pool; before, they ran one after another even though they looked concurrent. On a fully staged 10M-vector namespace, cold IDs-only p50 / p90 went from 54.8 / 73.0 ms to 49.7 / 67.3 ms (200 cold query groups), and final-rerank p90 from 9.6 to 2.6 ms. Results are identical, and pure object-storage latency is unchanged within run-to-run variance.
+
 ## [0.1.37] - 2026-11-25
 
 ### Changed
@@ -290,7 +296,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.37...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.38...HEAD
+[0.1.38]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.38
 [0.1.37]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.37
 [0.1.36]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.36
 [0.1.35]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.35

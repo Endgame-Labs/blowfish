@@ -459,7 +459,19 @@ async fn without_tier(
     }
 }
 
-pub(crate) async fn catch_up_hinted(
+/// Writers and indexers nest snapshot refreshes deeply. Keep the cold read plan
+/// pointer-sized in their futures, including its speculative branch.
+pub(crate) fn catch_up_hinted<'a>(
+    wal: &'a Wal,
+    state: &'a mut NamespaceState,
+    cap: Option<u64>,
+    store: &'a Storage,
+    hint: Option<&'a OpenHint>,
+) -> futures::future::BoxFuture<'a, Result<(), ApiError>> {
+    catch_up_hinted_inner(wal, state, cap, store, hint).boxed()
+}
+
+async fn catch_up_hinted_inner(
     wal: &Wal,
     state: &mut NamespaceState,
     cap: Option<u64>,
@@ -485,6 +497,18 @@ pub(crate) async fn catch_up_hinted(
         } else {
             (bf_wal::ManifestView::Full, state.manifest_seq)
         };
+        // This hint never supplies namespace state. Its only purpose is to start the
+        // ordinary WAL reader earlier; the fresh manifest must confirm its identity.
+        let checkpoint = hint
+            .filter(|h| attempt == 0 && state.seq == 0 && cap.is_none() && h.scan.is_some())
+            .and_then(|h| {
+                h.context.cache.staging.as_ref().and_then(|manager| {
+                    manager.checkpoint(&h.context.cache.key(""), wal.namespace())
+                })
+            });
+        let mut speculative_tail =
+            checkpoint.map(|c| wal.tail_bounded(c.indexed_through, u64::MAX).boxed().fuse());
+        let mut completed_tail = None;
         // The notice exists only for a cold unfiltered open; warm queries allocate nothing here.
         let (layouts_tx, layouts_rx) =
             if state.ann_dirs.is_empty() && hint.is_some_and(|hint| hint.scan.is_some()) {
@@ -510,7 +534,7 @@ pub(crate) async fn catch_up_hinted(
             }
             result
         };
-        let (manifest, prefetched) = tokio::join!(manifest_read, async {
+        let prefetch_read = async {
             let mut found = BTreeMap::new();
             if let Some(hint) = hint.filter(|_| state.ann_dirs.is_empty()) {
                 let reads = hint.ann.iter().map(|a| {
@@ -635,11 +659,50 @@ pub(crate) async fn catch_up_hinted(
                 );
             }
             found
+        };
+        let (manifest, prefetched) = {
+            let opening = async { tokio::join!(manifest_read, prefetch_read) };
+            tokio::pin!(opening);
+            if let Some(tail) = &mut speculative_tail {
+                tokio::select! {
+                    opened = &mut opening => opened,
+                    entries = tail => {
+                        completed_tail = Some(entries);
+                        opening.await
+                    }
+                }
+            } else {
+                opening.await
+            }
+        };
+        let reuse_tail = checkpoint.is_some_and(|checkpoint| {
+            manifest
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .is_some_and(|(generation, m)| {
+                    !m.deleted
+                        && *generation == checkpoint.generation
+                        && m.indexed_through == checkpoint.indexed_through
+                })
         });
+        if !reuse_tail {
+            // Cancel a stale scan immediately, even if its old tail is very large.
+            speculative_tail = None;
+            completed_tail = None;
+        }
         if let Some((generation, m)) = manifest.map_err(log_error)? {
             if let Some(hint) = hint
                 && let Some(manager) = &hint.context.cache.staging
             {
+                manager.note_checkpoint(
+                    &hint.context.cache.key(""),
+                    wal.namespace(),
+                    (!m.deleted && m.indexed_through > 0).then_some(crate::local_ann::Checkpoint {
+                        generation,
+                        indexed_through: m.indexed_through,
+                    }),
+                );
                 manager.retain_namespace(
                     &hint.context.cache.key(""),
                     wal.namespace(),
@@ -700,10 +763,39 @@ pub(crate) async fn catch_up_hinted(
             state.manifest_seq = generation.max(state.manifest_seq);
         }
         state.checkpoint_refreshed = Instant::now();
-        let tail = wal.tail_bounded(
-            state.seq,
-            cap.unwrap_or(u64::MAX).saturating_sub(state.tail_bytes),
-        );
+        let tail = async {
+            if reuse_tail && checkpoint.is_some_and(|c| c.indexed_through == state.seq) {
+                let result = match completed_tail {
+                    Some(entries) => entries,
+                    None => {
+                        speculative_tail
+                            .as_mut()
+                            .expect("matching checkpoint probe")
+                            .await
+                    }
+                };
+                if let Ok(entries) = result {
+                    // The probe began after this query began. A slot committed after its
+                    // first miss is a concurrent write, and can belong to the next snapshot.
+                    // Writes acknowledged before the query are included by the normal WAL
+                    // scan, including tombstones. No negative result survives this query.
+                    metrics::counter!("blowfish_wal_speculation_total", "outcome" => "reused")
+                        .increment(1);
+                    return Ok(entries);
+                }
+            }
+            // A changed checkpoint or a speculative error takes the existing serial path,
+            // including its reclamation retry. Speculation cannot turn an error into a miss.
+            if checkpoint.is_some() {
+                metrics::counter!("blowfish_wal_speculation_total", "outcome" => "fallback")
+                    .increment(1);
+            }
+            wal.tail_bounded(
+                state.seq,
+                cap.unwrap_or(u64::MAX).saturating_sub(state.tail_bytes),
+            )
+            .await
+        };
         let tail = if let Some(hint) = hint.filter(|_| !state.segments.is_empty()) {
             // The checkpoint's files do not depend on the tail: open them meanwhile.
             let (segments, text) = (state.segments.clone(), state.text_stats.clone());

@@ -12492,3 +12492,124 @@ Setup: Mac mini M4, NQ, the production binary with a file-toggled flag, three pa
 | ab3, arm 3 | 0.9494 | 8,875 | 8,890 |
 
 On and off agree within about 1%, and instructions per query are identical in both arms (2.89M, 2.90M, and 2.64M), so scheduling is not where warm graph time goes. Later runs could not be compared because recall calibration on the shared M4 rejected the graph. The flagged code is not merged; it is kept on branch `g6-sync-path`.
+
+## Round C20: overlap cold WAL checks, and submit local reranks together
+
+The C18 IDs-only path makes three GETs, in two dependent waves: the manifest
+reader copy, then two parallel probes of the next WAL slots. Five cold queries
+on the retained 55-slab 10M fixture confirm that the probes delay the snapshot.
+Times below are milliseconds after each HTTP request starts; backend trace
+boundaries have 1 ms precision.
+
+| Query | Manifest GET | First WAL probe | Second WAL probe | HTTP total |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 0.9–22.9 | 23.9–30.9 | 24.9–30.9 | 46.5 |
+| 1 | 0.7–23.7 | 25.7–33.7 | 25.7–30.7 | 66.6 |
+| 2 | 0.4–22.4 | 23.4–30.4 | 23.4–30.4 | 48.4 |
+| 3 | 1.3–28.3 | 29.3–35.3 | 29.3–35.3 | 53.4 |
+| 4 | 0.9–23.9 | 24.9–30.9 | 24.9–32.9 | 56.7 |
+
+Each query makes exactly three GETs, with zero remote vector or document bytes.
+The observed WAL wave is **6–9 ms**, smaller than the hypothesized 25 ms.
+Routing and task setup after the snapshot cost 0.7–0.9 ms, scan costs
+11.2–13.2 ms, final exact rerank costs 1.6–17.2 ms, hydration costs 0.1–0.5 ms,
+and the remaining HTTP work costs 0.8–0.9 ms. Local routing prefetch overlaps
+the snapshot. These are five diagnostic queries, not the 200-query gate.
+
+Local stage completion metadata now records an advisory manifest generation and
+indexed-through WAL sequence. A cold staged strong ANN query starts the ordinary WAL
+reader with its manifest read, and reuses the result only when the fresh manifest
+confirms both fields. Changed checkpoints, deleted manifests, and speculative
+errors use the serial path. Restart adoption refreshes the hint from the manifest
+it already validates. Hints are scoped, bounded, and discarded when the namespace
+is removed; no negative WAL result survives a query. A write that commits after
+the speculative miss can follow that query's snapshot, while writes acknowledged
+before the query are included. Deterministic tests cover both cases, tombstones,
+stale stages, generation changes, checkpoint changes, and read failures. The cold
+snapshot future stays boxed to preserve stack space in nested indexing work.
+No bucket format changes.
+
+The final rerank previously polled synchronous local reads serially despite using
+`buffer_unordered`. Cold queries whose selected vectors are all staged now submit
+their per-slab reranks through the existing bounded workers. Coverage checks use
+vector extents, excluding the intentionally unstaged object footer, and account
+for multiple streamed batches of one slab. Warm queries, busy queries, and partial
+stages retain the existing dispatch. CRC checks and object-store fallback still
+apply to every read.
+
+### Paired replay
+
+One on-demand c7gd.4xlarge, release `neoverse-v1`, eight pinned CPUs and Rayon
+workers, probes64, top10, strong consistency, and default IDs-only responses.
+`cold_ab.py` alternates five arms, and clears process caches and evicts staging
+pages before every measured query. Pure-S3 arms have no disk cache or staging.
+The fixture is read-only. A first 200-group replay included an executable audit;
+a second, declared before inspecting the first run's results, uses the exact final
+executable for both candidate arms. The first-run candidate rebuild followed a test-only fixture change; its code
+and read-only data sections match the running candidate byte for byte. The second run starts fresh processes, re-adopting preserved
+immutable local stages without downloading payloads. No compiler, test, or
+artifact-audit activity runs during its timed queries.
+
+| Path, 200 queries per arm | First replay p50 / p90 | Clean replay p50 / p90 |
+| --- | ---: | ---: |
+| Baseline, staged | 58.4 / 83.9 ms | 54.8 / 73.0 ms |
+| WAL overlap, staged | 52.8 / 71.3 ms | 51.2 / 66.3 ms |
+| WAL overlap and local rerank workers, staged | 49.6 / 58.6 ms | **49.7 / 67.3 ms** |
+| Baseline, pure S3 | 258.8 / 351.9 ms | 260.4 / 350.2 ms |
+| Candidate, pure S3 | 269.2 / 376.1 ms | 272.9 / 387.8 ms |
+
+**The staged latency target passes in both replays**, below 68.1 ms p90. All
+2,000 replies across the two five-arm runs have identical ordered rows, exact
+distances, and planned row counts, with recall@10 **0.9700**. Every staged query
+makes exactly three GETs and reads zero remote vector or document bytes. The
+candidate and WAL-only arm need one GET wave, versus two for baseline. Every
+stage contains all 10M vectors across 59 files, with **20,935,618,560 allocated
+bytes (19.50 GiB)**, below the unchanged 20 GiB cap.
+
+In the clean replay, final exact rerank after scan falls from WAL-only
+**3.08 / 9.62 ms** p50 / p90 to **1.29 / 2.64 ms**. Workers are used on 191 of
+200 queries; the others have one final-rerank batch. Scan remains about 14.5 ms
+at median. Its aggregate local read wait is about 70 ms across workers, versus
+5.3 ms for CRC checks and decoding, pointing to local I/O as the main remaining
+scan cost. Manifest discovery is the larger whole-query tail in this replay.
+
+The pure-S3 control is slower in both five-arm runs, so these runs alone do not
+establish the full no-regression gate. Its paired-bootstrap 95% candidate/control
+p90 ratio intervals are 0.967–1.152 and 0.961–1.253 (10,000 resamples, seed 20).
+Both include parity. Neither optimization runs without a healthy local stage.
+Pure-S3 traces show that the manifest-to-WAL gap is spent waiting for the existing
+directory-hint GET: probes start 0–1 ms after that read completes in both builds.
+A separate alternating-build process control follows below.
+
+The follow-up pure-S3 control runs baseline, candidate, candidate, and baseline
+in four fresh processes, with 200 balanced query groups and the same cache
+protocol. This separates within-build process variation from the build label.
+All 800 replies and planned row counts match the staged replays.
+
+| Pure-S3 process | p50 / p90 |
+| --- | ---: |
+| Baseline A | 236.2 / 319.3 ms |
+| Candidate A | 237.6 / 332.4 ms |
+| Candidate B | 227.7 / 302.1 ms |
+| Baseline B | 231.2 / 313.2 ms |
+| Baseline, pooled 400 queries | 235.1 / 316.8 ms |
+| Candidate, pooled 400 queries | 232.9 / 321.5 ms |
+
+Pooled candidate p50 improves 0.9%, and p90 increases 1.5%. The paired-bootstrap
+95% p90 ratio interval is **0.906–1.091**, resampling the 200 query groups with
+both processes of each build together. The 30.3 ms p90 spread between candidate
+processes exceeds the 4.7 ms pooled build difference. The control is approximately
+flat within this measured process variation, but a strict pure-S3 no-increase
+claim is **not established**. Both earlier controls' slower point estimates remain
+reported above. No requests, responses, or outliers were dropped.
+
+The clean replay's staged p90 ratio interval is 0.782–1.047, so its absolute
+target passes while the improvement size remains uncertain. The staged target
+is demonstrated; the strength of the pure-S3 no-regression claim is limited by
+these measurements. No 100M projection is made. The code
+changes are confined to the engine, and bucket objects are unchanged.
+
+One on-demand c7gd.4xlarge ran for at most 56.8 minutes (about $0.69 compute,
+and below $1.25 estimated total, excluding ongoing fixture storage). The instance,
+root volume, key pair, and security group were deleted. No bucket writes or
+fixture cleanup were performed.

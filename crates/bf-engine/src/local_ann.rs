@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -251,6 +251,12 @@ struct Hint {
     object: Option<String>,
     len: u64,
 }
+/// Advisory WAL starting point, usable only after a fresh manifest confirms both fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Checkpoint {
+    pub generation: u64,
+    pub indexed_through: u64,
+}
 #[derive(Default)]
 struct State {
     used: u64,
@@ -264,6 +270,8 @@ struct State {
     /// Tiers whose companion phase has finished (or had nothing to add) in this process.
     settled: HashSet<String>,
     hints: HashMap<String, Hint>,
+    /// Bounded, scoped checkpoint hints survive query-cache eviction with the stages.
+    checkpoints: VecDeque<(String, Checkpoint)>,
     /// Slab bytes a local recluster wrote while uploading, by the tier's stage key.
     prestaged: HashMap<String, Arc<PreInner>>,
 }
@@ -280,6 +288,8 @@ struct Record {
     /// packs hold one stage that includes any companions, and never set this.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     companions: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<Checkpoint>,
 }
 fn stage_key(scope: &str, dir_key: &str, companions: bool) -> String {
     format!(
@@ -643,7 +653,7 @@ impl Manager {
         })
     }
     async fn adopt(self: &Arc<Self>, store: &Storage, path: &Path) -> io::Result<(Record, Stage)> {
-        let record = read_record(path)?;
+        let mut record = read_record(path)?;
         let scoped = store.scoped(record.scope.trim_end_matches('\0'));
         let ns = record
             .set
@@ -653,7 +663,7 @@ impl Manager {
             .and_then(|s| s.split('/').next())
             .ok_or_else(|| io::Error::other("invalid staged namespace"))?;
         let wal = bf_wal::Wal::new(scoped.clone(), ns).map_err(io::Error::other)?;
-        let (_, manifest) = wal
+        let (generation, manifest) = wal
             .manifest_view_after(0, bf_wal::ManifestView::Reader)
             .await
             .map_err(io::Error::other)?
@@ -773,8 +783,59 @@ impl Manager {
         }
         // Only metadata is inspected here. Every 16 KiB payload block is still CRC-checked
         // on every read, including bytes outside the requested subrange.
+        // The saved checkpoint is advisory, and may predate a maintenance publication.
+        // Rebuild it from the manifest already read during adoption, never from disk alone.
+        record.checkpoint =
+            (!manifest.deleted && manifest.indexed_through > 0).then_some(Checkpoint {
+                generation,
+                indexed_through: manifest.indexed_through,
+            });
+        self.note_checkpoint(&record.scope, ns, record.checkpoint);
         stage.durable = true;
         Ok((record, stage))
+    }
+    /// Remember an authoritative observation without retaining an unbounded namespace map.
+    pub(crate) fn note_checkpoint(&self, scope: &str, ns: &str, checkpoint: Option<Checkpoint>) {
+        let key = format!("{scope}ns/{ns}/");
+        let mut state = self.state.lock().expect("ANN staging lock");
+        if let Some(i) = state.checkpoints.iter().position(|(k, _)| k == &key) {
+            if checkpoint.is_some_and(|c| c.generation < state.checkpoints[i].1.generation) {
+                return;
+            }
+            state.checkpoints.remove(i);
+        }
+        if let Some(checkpoint) = checkpoint {
+            state.checkpoints.push_back((key, checkpoint));
+            if state.checkpoints.len() > MAX_STAGES {
+                state.checkpoints.pop_front();
+            }
+        }
+    }
+    fn known_checkpoint(&self, scope: &str, ns: &str) -> Option<Checkpoint> {
+        let key = format!("{scope}ns/{ns}/");
+        self.state
+            .lock()
+            .expect("ANN staging lock")
+            .checkpoints
+            .iter()
+            .find_map(|(k, checkpoint)| (k == &key).then_some(*checkpoint))
+    }
+    /// Only provisioned namespaces speculate; ordinary S3 queries keep their read plan.
+    pub(crate) fn checkpoint(&self, scope: &str, ns: &str) -> Option<Checkpoint> {
+        let prefix = format!("{scope}stage:ns/{ns}/");
+        let state = self.state.lock().expect("ANN staging lock");
+        if !state
+            .ready
+            .iter()
+            .any(|(key, (_, stage))| key.starts_with(&prefix) && !stage.bad.load(Ordering::Relaxed))
+        {
+            return None;
+        }
+        let key = format!("{scope}ns/{ns}/");
+        state
+            .checkpoints
+            .iter()
+            .find_map(|(k, checkpoint)| (k == &key).then_some(*checkpoint))
     }
     fn install(state: &mut State, key: String, scope: &str, stage: Stage) {
         let stage = Arc::new(stage);
@@ -787,6 +848,7 @@ impl Manager {
         state.ready.insert(key, (state.clock, stage));
     }
     pub(crate) fn remove_namespace(&self, scope: &str, ns: &str) {
+        self.note_checkpoint(scope, ns, None);
         let prefix = format!("{scope}stage:ns/{ns}/");
         let mut state = self.state.lock().expect("ANN staging lock");
         let pending: Vec<_> = state
@@ -1483,6 +1545,7 @@ impl Manager {
             hints,
             files,
             companions: false,
+            checkpoint: self.known_checkpoint(scope, ns),
         };
         // Exceptional blocks may invalidate the normalized-vector size estimate. Use
         // the actual completion size, and retain every code prefix if optional tails
@@ -1674,6 +1737,12 @@ impl Manager {
             hints: BTreeMap::new(),
             files: records,
             companions: true,
+            checkpoint: set
+                .dir
+                .key
+                .strip_prefix("ns/")
+                .and_then(|s| s.split('/').next())
+                .and_then(|ns| self.known_checkpoint(scope, ns)),
         };
         stage.files = files;
         self.seal(&mut stage, &record, written, 1)?;
@@ -2408,6 +2477,25 @@ pub(crate) fn read(key: &str, ranges: &[Range<u64>]) -> Option<Vec<Bytes>> {
     metrics::counter!("blowfish_cache_hits_total", "tier" => "disk").increment(ranges.len() as u64);
     Some(bytes)
 }
+/// Metadata-only coverage check for dispatching local I/O. Reads still verify every CRC,
+/// and retain the ordinary object-store fallback if a stage is retired meanwhile.
+pub(crate) fn covers(key: &str, range: Range<u64>) -> bool {
+    let Some(context) = read_cache::staging_context().filter(|c| c.admit) else {
+        return false;
+    };
+    let Some(stage) = context
+        .cache
+        .staging
+        .as_ref()
+        .and_then(|m| m.file(&context.cache.key(key)))
+    else {
+        return false;
+    };
+    stage
+        .files
+        .get(key)
+        .is_some_and(|f| f.local(std::slice::from_ref(&range)).is_some())
+}
 /// The IDs of these rows of an ID index, from a stage's derived row-to-ID map. `None` when no
 /// verified map covers them, and the caller reads the object instead.
 pub(crate) fn staged_row_ids(ids_key: &str, rows: &roaring::RoaringBitmap) -> Option<Vec<u64>> {
@@ -2767,6 +2855,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_metadata_is_saved_and_refreshed_during_restart_adoption() {
+        let work = scratch();
+        let (store, set, _, _) = fixture(13).await;
+        publish(&store, &set, false, 1).await;
+        let wal = bf_wal::Wal::new(store.clone(), "test").unwrap();
+        let (_, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+        manifest.indexed_through = 7;
+        wal.publish_manifest(2, &manifest).await.unwrap();
+        let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
+        let checkpoint = Checkpoint {
+            generation: 2,
+            indexed_through: 7,
+        };
+        manager.note_checkpoint("", "test", Some(checkpoint));
+        manager.observe(&store, "", &set, 32, 16, &Vec::new);
+        let stage = ready(&manager, "", &set).await;
+        assert_eq!(
+            read_record(&stage.path).unwrap().checkpoint,
+            Some(checkpoint)
+        );
+        assert_eq!(manager.checkpoint("", "test"), Some(checkpoint));
+        drop(stage);
+        drop(manager);
+        // A maintenance generation can keep exactly the same tier and WAL checkpoint.
+        wal.publish_manifest(3, &manifest).await.unwrap();
+        let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
+        manager.recover(&store).await;
+        assert_eq!(
+            manager.checkpoint("", "test"),
+            Some(Checkpoint {
+                generation: 3,
+                ..checkpoint
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn restart_adopts_without_payload_gets_and_keeps_capacity_stable() {
         let work = scratch();
         let (store, set, ann, end) = fixture(11).await;
@@ -2976,6 +3101,48 @@ mod tests {
         let manager = Manager::open(work.path(), Some(bytes - 1), Arc::default()).unwrap();
         assert!(!path.exists());
         assert!(manager.candidates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_io_coverage_rejects_partial_retired_and_differently_scoped_files() {
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(128 << 10), Arc::default()).unwrap();
+        let (store, set, ann, end) = fixture(1).await;
+        manager.observe(&store, "left\0", &set, 32, 16, &Vec::new);
+        let stage = ready(&manager, "left\0", &set).await;
+        let key = &set.slabs[0].files["annv2:vector"].key;
+        let mut cache = read_cache::DecodedCache::new(1 << 20, 1).scoped("left");
+        cache.staging = Some(manager.clone());
+        let context = read_cache::ReadContext::new(Arc::new(cache));
+        let stats = Arc::new(bf_storage::BackendStats::default());
+        stats
+            .scope(
+                "coverage",
+                read_cache::scope(context.clone(), async {
+                    assert!(covers(key, 0..end));
+                    assert!(
+                        !covers(key, 0..ann.len() as u64),
+                        "code prefixes cannot enable local vector dispatch"
+                    );
+                    assert!(!covers("missing", 0..1));
+                }),
+            )
+            .await;
+        assert!(
+            stats.snapshot().is_empty(),
+            "dispatch planning must issue no I/O"
+        );
+        let mut other = read_cache::DecodedCache::new(1 << 20, 1).scoped("right");
+        other.staging = Some(manager);
+        read_cache::scope(read_cache::ReadContext::new(Arc::new(other)), async {
+            assert!(!covers(key, 0..end));
+        })
+        .await;
+        stage.bad.store(true, Ordering::Relaxed);
+        read_cache::scope(context, async {
+            assert!(!covers(key, 0..end));
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3666,6 +3833,8 @@ mod tests {
                 indexing: false,
                 recall_sample_rate: 0.0,
                 decoded_cache_bytes: 16 << 20,
+                // Force final reranks across multiple streamed batches and slab sources.
+                ann_rerank_factor: 1,
                 ..Default::default()
             },
         );
@@ -3696,7 +3865,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let request: bf_types::QueryRequest = serde_json::from_value(serde_json::json!({"rank_by":["vector","ANN",vector(17,5)],"top_k":10,"include_attributes":["id"]})).unwrap();
+        let request: bf_types::QueryRequest = serde_json::from_value(serde_json::json!({"rank_by":["vector","ANN",vector(17,5)],"top_k":2500,"include_attributes":["id"]})).unwrap();
         let configured = engine.query_configured("test", request.clone());
         assert!(
             std::mem::size_of_val(&configured) <= 32,
@@ -3740,12 +3909,17 @@ mod tests {
         default_request.include_attributes = None;
         engine.drop_caches().await;
         let (default, _) = engine
-            .query_with_diagnostics("test", default_request)
+            .query_with_diagnostics("test", default_request.clone())
             .await
             .unwrap();
         assert_eq!(
             serde_json::to_value(&after.result.rows).unwrap(),
             serde_json::to_value(&default.result.rows).unwrap()
+        );
+        let warm = engine.query("test", default_request).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&default.result.rows).unwrap(),
+            serde_json::to_value(&warm.result.rows).unwrap()
         );
         assert!(diagnostics.cache.disk_bytes > 0);
         assert_eq!(after.performance.cache_temperature, "warm");
@@ -4046,3 +4220,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "local_ann_cold_wal_tests.rs"]
+mod cold_wal_tests;

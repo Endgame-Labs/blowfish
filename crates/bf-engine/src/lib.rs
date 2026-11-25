@@ -1097,10 +1097,11 @@ impl Engine {
         &self,
         state: &Arc<NamespaceState>,
         request: &QueryRequest,
-        context: read_cache::ReadContext,
+        mut context: read_cache::ReadContext,
         warm: bool,
     ) -> Result<(QueryResponse, std::time::Duration), ApiError> {
         let start = Instant::now();
+        context.cold = !warm;
         let store = self.0.store.clone();
         let config = self.0.config.clone();
         let t_clone = Instant::now();

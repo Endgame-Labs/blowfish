@@ -498,6 +498,8 @@ pub(crate) struct ReadContext {
     pub document_scan_rows: Arc<std::sync::atomic::AtomicU64>,
     /// Logical bytes served by the engine's provisioned ANN files.
     pub local_ann_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// First search after opening a namespace; cold staged reranks can submit local I/O together.
+    pub cold: bool,
     /// Snapshot-local BM25 shadow masks, shared with segment search workers.
     /// Never retained in the decoded cache or reused by a later query.
     pub text_shadowed: Option<Arc<std::collections::BTreeMap<String, roaring::RoaringBitmap>>>,
@@ -533,6 +535,7 @@ impl ReadContext {
             ann_rows: Arc::default(),
             document_scan_rows: Arc::default(),
             local_ann_bytes: Arc::default(),
+            cold: false,
             text_shadowed: None,
             text_tail: None,
         }
