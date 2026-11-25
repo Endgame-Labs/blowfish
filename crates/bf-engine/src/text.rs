@@ -682,23 +682,12 @@ async fn subtract_shadowed(
     terms: &QueryTerms,
     stats: &mut NamespaceStats,
 ) -> Result<BTreeMap<String, roaring::RoaringBitmap>, ApiError> {
-    let oracle = if crate::bw16_oracle::enabled() {
-        crate::bw16_oracle::get(state)
-    } else {
-        None
-    };
-    let oracle = &oracle;
     let removed = futures::future::try_join_all(state.segments.iter().map(|seg| async move {
-        let rows = match oracle.as_ref().and_then(|m| m.get(&seg.id)) {
-            Some(rows) => rows.clone(),
-            None => {
-                let (rows, live) = tokio::try_join!(
-                    segment::lookup_many(store, seg, &state.shadowed),
-                    segment::live(store, seg),
-                )?;
-                rows & live
-            }
-        };
+        let (rows, live) = tokio::try_join!(
+            segment::lookup_many(store, seg, &state.shadowed),
+            segment::live(store, seg),
+        )?;
+        let rows = rows & live;
         let mut removed = BTreeMap::new();
         if !rows.is_empty() {
             for name in fields {

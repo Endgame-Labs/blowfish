@@ -30,7 +30,6 @@ mod text_upgrade;
 pub use indexer::EngineConfig;
 pub use recluster::{ReclusterOptions, ReclusterReport};
 pub use reindex::{LayoutCounts, ReindexOptions, ReindexReport};
-mod bw16_oracle;
 mod metadata;
 mod models;
 mod published;
@@ -597,13 +596,6 @@ impl Engine {
         });
         handles.insert(ns.into(), handle.clone());
         let context = read_cache::ReadContext::new(self.0.read_cache.clone());
-        if bw16_oracle::enabled() {
-            bw16_oracle::spawn(
-                state.clone(),
-                self.0.store.clone(),
-                read_cache::ReadContext::new(self.0.read_cache.clone()),
-            );
-        }
         query_worker::shared_runtime().spawn(read_cache::scope(
             context,
             commit_worker(
