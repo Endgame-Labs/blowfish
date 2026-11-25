@@ -12819,3 +12819,63 @@ One on-demand c7gd.4xlarge ran for at most **49.0 minutes**, about **$0.60 compu
 and below **$1.50 estimated total**, excluding ongoing fixture storage. The
 instance was terminated, and its root volume, key pair, and security group were
 deleted. No bucket objects or benchmark prefixes were created or deleted.
+
+## Round BW15: one 1,000,000-row text segment instead of 200,000-row segments (killed at the gate)
+
+Hypothesis (Neon, `briefs/ideas/1825-neon.md` #2): `default_max_segment_rows()` is a vector-sized budget, so text-only namespaces get
+several 200,000-row segments, and one or two large text segments would cut per-segment setup (dictionary, term records, lengths,
+first-wave windows) for warm and cold BM25. Gate: 16-client warm at least 1.20x or cold p50 at least 1.30x, with 1-client within 10%.
+No production change was made.
+
+### Method
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Rust 1.100.0, Clang 19, NumKong `__arm_get_current_vg` link stub), the build at `8a3366c`
+(v0.1.38). Fixture `tmp/msmarco-1m-v021/` (read-only; the store was copied to local disk and to a `tmp/bw15-` prefix that is now deleted).
+Server on CPUs 0 to 5 with two Rayon and two Tokio workers, client on CPUs 14 and 15, 2 GiB raw cache, 4,000-byte blocks, 512-block
+coalescing, fetch concurrency 512 (BW13 and BW14's setup). Both arms were served from the same host.
+
+- **Default layout (A):** the fixture's eight text segments (25,000 to 200,000 rows).
+- **Large layout (B):** a copy of the fixture compacted with `BF_MAX_SEGMENT_ROWS=1000000`. The default pick rule did not reach one segment
+  on its own: with two segments per merge it stopped at 25,000, 50,000, 100,000, and 825,000 rows (a tier needs two segments of one
+  power-of-two size, and only segments of at least an eighth of the cap join the size-ordered merge). Two more passes (cap 200,000 with
+  three segments per merge, then cap 1,000,000) produced **one 1,000,000-row segment** of 359 MB.
+- **Warm:** T4's `concurrent_bm25` over the held-out odd-indexed 500 queries, eight times per pass, two single-client prewarm passes,
+  then four timed passes at 16 and at 1 client, in the order A, B, B, A. Every reply (192,000 timed and 32,000 prewarm per arm)
+  matched the fixture's exhaustive truth in ordered IDs and f32 score bits, so the two layouts return identical results.
+- **Cold:** the same two layouts on S3 in us-west-2, a fresh server process with an empty cache for each run, one sequential pass over
+  the 500 queries (cold-start cache fill included, the same for both arms), in the order A, B, B, A, A, B. GETs are
+  `blowfish_object_store_attempts_total` by `op`.
+
+### Results
+
+Compaction peak memory, 825,000 plus 175,000 rows into one segment: **VmHWM 3.19 GiB**, about 3.2 KB per row, against the 80,000 bytes per
+row the default budgets for vectors. (The first, cascading pass peaked at 2.71 GiB.)
+
+| Warm, medians of 8 timed passes | A: 8 segments | B: 1 segment | B / A |
+| --- | ---: | ---: | ---: |
+| 16 clients q/s | 2,472 | 2,272 | **0.92x** |
+| 16 clients p50 / p90 ms | 5.92 / 10.14 | 5.95 / 10.74 | |
+| 1 client q/s | 825 | 429 | **0.52x** |
+| 1 client p50 / p90 ms | 1.06 / 1.66 | 1.46 / 3.39 | |
+| Peak resident memory (GiB) | 1.01, 0.47 | 0.44, 0.44 | |
+
+| Cold, three runs per arm | p50 ms (runs) | p90 ms (runs) | range GETs | HEADs |
+| --- | --- | --- | ---: | ---: |
+| A: 8 segments | 62.8, 56.4, 62.8 (median 62.8) | 166, 146, 137 (median 146) | about 6,950 | about 1,012 |
+| B: 1 segment | 55.7, 62.1, 59.6 (median 59.6) | 157, 156, 155 (median 156) | about 3,300 | about 1,011 |
+
+Cold p50 is **1.05x** (inside the run-to-run spread of 56 to 63 ms for either arm), p90 is 0.94x, and range GETs fall to about 47%,
+which does not translate into latency because a cold query's time is dominated by the round trips that remain.
+
+### Conclusion
+
+- **Gate failed on both counts.** 16-client warm is 0.92x (bar 1.20x) and cold p50 is 1.05x (bar 1.30x). One-client warm drops to
+  0.52x, so BW12's finding holds: cross-segment fan-out is what makes a lone BM25 query fast, and eight segments overlap their windows
+  across the two query workers. Per-segment setup was not the cost the hypothesis assumed.
+- **Step 2 was not started.** A per-row-cost default row budget has no throughput gain to chase, and intra-segment window fan-out
+  would only try to win back the 1-client loss. No code changed.
+- **Side finding:** text-only compaction needs about 3.2 KB per row, so the 200,000-row cap is conservative for text by 25x. It is
+  harmless for speed (above), but it is also why the pick rule cannot reach one segment, and it would matter if a smaller number of
+  segments helped some other measure (for example, S3 request count at 10M rows).
+- **Cost:** one c7g.4xlarge for about 25 minutes, an estimated under $0.50 with the volume. The instance, key pair, security group, and
+  `tmp/bw15-1125/` S3 prefix are deleted.
