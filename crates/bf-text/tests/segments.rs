@@ -1213,3 +1213,92 @@ fn dense_frequency_arrays_preserve_score_bits_and_respect_the_budget() {
         }
     }
 }
+
+#[test]
+fn selective_masks_score_allowed_rows_with_the_same_bits_as_the_unfiltered_ranking() {
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..9001)
+        .map(|row| {
+            let count = match row % 13 {
+                0 => 0,
+                1 => 254,
+                2 => 255,
+                3 => 300,
+                _ => row % 5 + 1,
+            };
+            tokenize(
+                &format!(
+                    "{} rare{} tail{} mid{}",
+                    "common ".repeat(count),
+                    row % 997,
+                    row % 17,
+                    row % 61
+                ),
+                &params,
+            )
+        })
+        .collect();
+    let bytes = build(&docs, true, params.tokenizer);
+    let reader = open(bytes.clone());
+    let stats = block_on(reader.stats()).unwrap();
+    let mut changed = stats.clone();
+    changed.average_doc_length *= 1.5;
+    let n = docs.len() as u32;
+    let random: RoaringBitmap = (0..n)
+        .filter(|r| r.wrapping_mul(2_654_435_761) % 200 == 7)
+        .collect();
+    let contiguous: RoaringBitmap = (4000..4000 + n / 100).collect();
+    let mut outside = random.clone();
+    outside.insert_range(n..n + 50);
+    let masks = [
+        random,
+        contiguous,
+        outside,
+        RoaringBitmap::new(),
+        (0..3).collect(),
+    ];
+    // The second pass runs after dense arrays are earned.
+    for pass in 0..2 {
+        for stats in [&stats, &changed] {
+            for text in [
+                "common",
+                "common common rare1",
+                "rare1 tail1",
+                "mid3 common tail1",
+                "missing rare5",
+            ] {
+                let query = Query::new(tokenize(text, &params), false);
+                let everything =
+                    block_on(reader.search(&query, stats, &params, n as usize, None)).unwrap();
+                for mask in &masks {
+                    for k in [1, 10, 130] {
+                        let expected: Vec<_> = everything
+                            .iter()
+                            .filter(|h| mask.contains(h.row))
+                            .take(k)
+                            .map(|h| (h.row, h.score.to_bits()))
+                            .collect();
+                        for hits in [
+                            block_on(reader.search(&query, stats, &params, k, Some(mask))).unwrap(),
+                            block_on(reader.search_prefetched(
+                                &query,
+                                stats,
+                                &params,
+                                k,
+                                Some(mask),
+                            ))
+                            .unwrap(),
+                        ] {
+                            let actual: Vec<_> =
+                                hits.iter().map(|h| (h.row, h.score.to_bits())).collect();
+                            assert_eq!(actual, expected, "pass {pass} {text:?} k={k}");
+                        }
+                    }
+                }
+            }
+        }
+        if pass == 0 {
+            assert!(reader.dense_arrays().0 > 0, "the first pass earns arrays");
+        }
+    }
+}
