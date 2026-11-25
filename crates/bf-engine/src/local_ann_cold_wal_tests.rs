@@ -710,7 +710,8 @@ async fn cold_search_revalidates_generation_checkpoint_and_speculative_errors() 
                         &Arc::new(stale.clone()),
                         &f.request,
                         read_cache::ReadContext::new(f.engine.0.read_cache.clone()),
-                        false
+                        false,
+                        true
                     )
                     .await
                     .is_err()
@@ -790,7 +791,7 @@ async fn cancelling_blocked_io_drops_the_actual_worker_future() {
     let permits = permit.semaphore().clone();
     let started = Arc::new(Notify::new());
     let notify = started.clone();
-    let task = tokio::spawn(crate::query_worker::run_io(
+    let task = tokio::spawn(crate::query_worker::run_io_cancellable(
         tokio::runtime::Handle::current(),
         async move {
             let (_lease, _permit) = (lease, permit);
@@ -893,4 +894,36 @@ async fn speculative_snapshot_requires_the_requested_healthy_stage_and_storage_s
     assert!(f.manager.snapshot("", "test", "vector").is_none());
     f.manager.remove_namespace("", "test");
     assert!(f.manager.state.lock().unwrap().snapshots.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_on_the_http_reactor_also_cancels_the_nested_speculative_worker() {
+    let f = SearchFixture::new().await;
+    f.backend.arm();
+    let engine = f.engine.clone();
+    let request = f.request.clone();
+    let io = tokio::runtime::Handle::current();
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let reactor = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(crate::query_worker::on_query_reactor(io, async move {
+                tokio::select! {
+                    result = engine.query("test", request) => panic!("query finished before cancellation: {result:?}"),
+                    _ = cancelled => {}
+                }
+            }));
+    });
+    f.backend.manifest_entered.notified().await;
+    f.search_started().await;
+    cancel.send(()).unwrap();
+    reactor.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let _permit = f.engine.0.queries.acquire().await.unwrap();
+        let handle = f.engine.handle("test").await.unwrap();
+        let _state = handle.state.lock().await;
+    })
+    .await
+    .expect("both nested blocking futures must release their resources");
+    f.backend.release_manifest.notify_one();
+    f.query().await.unwrap();
 }

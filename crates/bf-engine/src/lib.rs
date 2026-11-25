@@ -863,11 +863,15 @@ impl Engine {
             if !resident {
                 let start = Instant::now();
                 let (engine, ns) = (self.clone(), ns.to_owned());
-                let result = query_worker::run_io(
-                    query_worker::shared_runtime(),
-                    Box::pin(async move { engine.query_configured(&ns, request).await }),
-                )
-                .await?;
+                let query = Box::pin(async move { engine.query_configured(&ns, request).await });
+                let runtime = query_worker::shared_runtime();
+                // A staged query can nest a speculative blocking search. Its outer
+                // continuation must drop that search on cancellation as well.
+                let result = if self.0.read_cache.staging.is_some() {
+                    query_worker::run_io_cancellable(runtime, query).await?
+                } else {
+                    query_worker::run_io(runtime, query).await?
+                };
                 return result.map(|(mut response, diagnostics)| {
                     response.performance.server_total_ms = start.elapsed().as_millis() as u64;
                     (response, diagnostics)
@@ -973,14 +977,14 @@ impl Engine {
         {
             let ((snapshot, elapsed), searched) = tokio::join!(
                 snapshot,
-                self.search_snapshot(&cached, &request, context.clone(), true)
+                self.search_snapshot(&cached, &request, context.clone(), true, false)
             );
             let (state, _) = snapshot?;
             let (response, execution) =
                 if state.seq == cached.seq && state.manifest_seq == cached.manifest_seq {
                     searched?
                 } else {
-                    self.search_snapshot(&state, &request, context, true)
+                    self.search_snapshot(&state, &request, context, true, false)
                         .await?
                 };
             (state, response, execution, elapsed)
@@ -994,7 +998,7 @@ impl Engine {
                 },
                 async {
                     Ok::<_, ApiError>(
-                        self.search_snapshot(&staged, &request, context.clone(), false)
+                        self.search_snapshot(&staged, &request, context.clone(), false, true)
                             .await,
                     )
                 }
@@ -1010,7 +1014,7 @@ impl Engine {
                 }
                 _ => {
                     metrics::counter!("blowfish_cold_search_speculation_total", "outcome" => "fallback").increment(1);
-                    self.search_snapshot(&state, &request, context, warm)
+                    self.search_snapshot(&state, &request, context, warm, true)
                         .await?
                 }
             };
@@ -1019,7 +1023,7 @@ impl Engine {
             let (snapshot, elapsed) = snapshot.await;
             let (state, warm) = snapshot?;
             let (response, execution) = self
-                .search_snapshot(&state, &request, context, warm)
+                .search_snapshot(&state, &request, context, warm, false)
                 .await?;
             (state, response, execution, elapsed)
         };
@@ -1156,6 +1160,7 @@ impl Engine {
         request: &QueryRequest,
         mut context: read_cache::ReadContext,
         warm: bool,
+        cancellable: bool,
     ) -> Result<(QueryResponse, std::time::Duration), ApiError> {
         let start = Instant::now();
         context.cold = !warm;
@@ -1194,7 +1199,11 @@ impl Engine {
             query_worker::run(query, inline).await??
         } else {
             metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "cold").increment(1);
-            query_worker::run_io(tokio::runtime::Handle::current(), query).await??
+            if cancellable {
+                query_worker::run_io_cancellable(tokio::runtime::Handle::current(), query).await??
+            } else {
+                query_worker::run_io(tokio::runtime::Handle::current(), query).await??
+            }
         };
         Ok((response, start.elapsed()))
     }
