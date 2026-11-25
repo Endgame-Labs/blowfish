@@ -183,7 +183,7 @@ async fn small_wide_vector_flushes_remain_exact_and_preserve_top_k() {
     }
 }
 
-pub(super) fn input(n: u32) -> (Schema, BTreeMap<Id, Document>) {
+pub(crate) fn input(n: u32) -> (Schema, BTreeMap<Id, Document>) {
     let schema = serde_json::from_value(json!({
         "id":{"type":"uint"}, "text":{"type":"string"}, "tags":{"type":"[]string"},
         "f32":{"type":"[3]f32"}, "f16":{"type":"[3]f16"}, "i8":{"type":"[3]i8"},

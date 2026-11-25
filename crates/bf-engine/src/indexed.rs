@@ -326,6 +326,8 @@ async fn prepare(
     {
         let k = q.total().unwrap_or(10) + q.offset;
         let columns = projection_columns(state, q, narrow_columns);
+        // Before the search starts any staging, so a first stage can reserve these columns.
+        crate::local_ann::note_columns(&state.segments, &columns);
         if let Some((scores, docs)) =
             crate::ann::search(store, state, q, attribute, vector, config, k, &columns).await?
         {

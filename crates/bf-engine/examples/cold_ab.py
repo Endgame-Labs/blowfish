@@ -69,6 +69,12 @@ P.add_argument(
     default=[],
     help="staging arm that publishes codes first and companions after (Round C9 and later)",
 )
+P.add_argument(
+    "--column-arm",
+    action="append",
+    default=[],
+    help="staging arm that also stages projected document columns (Round C15 and later)",
+)
 P.add_argument("--stage-timeout", type=int, default=600, help="seconds to wait for staging to publish")
 P.add_argument("--oracle", choices=["100k", "1m", "10m", "100m"], default="10m")
 P.add_argument(
@@ -304,17 +310,20 @@ def evict_staging(work):
     return {"files": len(files), "bytes": sum(p.stat().st_size for p in files)}
 
 
-def staged(text, two_phase):
-    """(codes usable, everything usable). Two-phase builds publish codes, then companions."""
+def staged(text, two_phase, columns=False):
+    """(codes usable, everything usable). Two-phase builds publish codes, then companions,
+    then (with columns) each projected document column."""
     done = re.search(r'blowfish_ann_staging_total\{outcome="(?:ready|adopted)"\} [1-9]', text)
     if not two_phase or not done:
         return bool(done), bool(done)
     adopted = re.search(r'blowfish_ann_staging_total\{outcome="adopted"\} [1-9]', text)
     companions = re.search(r'blowfish_ann_staging_total\{outcome="companions"\} [1-9]', text)
+    if columns:
+        return True, bool(re.search(r'blowfish_ann_staging_total\{outcome="columns"\} [1-9]', text))
     return True, bool(adopted or companions)
 
 
-def wait_staging(client, work, proc, first, start, two_phase=False):
+def wait_staging(client, work, proc, first, start, two_phase=False, columns=False):
     deadline = time.monotonic() + a.stage_timeout
     codes_ms = None
     while time.monotonic() < deadline:
@@ -323,7 +332,7 @@ def wait_staging(client, work, proc, first, start, two_phase=False):
         text = client.get("/metrics").text
         if re.search(r'blowfish_ann_staging_total\{outcome="error"\} [1-9]', text):
             raise RuntimeError("automatic staging failed; inspect server.log")
-        codes, everything = staged(text, two_phase)
+        codes, everything = staged(text, two_phase, columns)
         if codes and codes_ms is None:
             codes_ms = (time.perf_counter() - start) * 1000
         if everything:
@@ -423,13 +432,13 @@ try:
                 if name in a.stage_arm:
                     live = []
                     for item in items[: a.stage_live_queries]:
-                        if staged(c.get("/metrics").text, name in a.two_phase_arm)[1]:
+                        if staged(c.get("/metrics").text, name in a.two_phase_arm, name in a.column_arm)[1]:
                             break
                         c.post("/_bench/drop_caches").raise_for_status()
                         (w / "server.log").write_text("")
                         live.append(query(name, item, c, w, p))
                     (w / "live.json").write_text(json.dumps(live))
-                    wait_staging(c, w, p, first, start, name in a.two_phase_arm)
+                    wait_staging(c, w, p, first, start, name in a.two_phase_arm, name in a.column_arm)
             rows.clear()
             (RUN / "rows.jsonl").write_text("")
         for qi in range(a.offset, a.offset + a.queries):

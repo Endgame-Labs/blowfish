@@ -37,6 +37,12 @@ const BLOCK: usize = 16 << 10;
 const PIECE: u64 = 8 << 20;
 const DOWNLOADS: usize = 4;
 const RETRY: Duration = Duration::from_secs(60);
+/// Columns staged per namespace: the first this many names that queries project.
+const COLUMN_NAMES: usize = 8;
+/// Bytes per ranged GET while gathering a column.
+const COLUMN_PIECE: u64 = PIECE;
+/// Concurrent ranged GETs while gathering a column.
+const COLUMN_FETCHES: usize = 8;
 
 struct StagedFile {
     /// Shared by every companion of a pack, each at its own `offset`.
@@ -228,6 +234,8 @@ struct State {
     /// Tiers whose companion phase has finished (or had nothing to add) in this process.
     settled: HashSet<String>,
     hints: HashMap<String, Hint>,
+    /// Columns that queries have projected, by namespace, in the order first seen.
+    columns: HashMap<String, Vec<String>>,
 }
 
 /// A completion record binds the manifest's tier, scoped object identities, local lengths,
@@ -242,6 +250,28 @@ struct Record {
     /// packs hold one stage that includes any companions, and never set this.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     companions: bool,
+    /// The column this record's pack holds, when it is a column pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    column: Option<String>,
+}
+impl Record {
+    fn is_pack(&self) -> bool {
+        self.companions || self.column.is_some()
+    }
+    fn key(&self) -> String {
+        match &self.column {
+            Some(name) => column_stage_key(&self.scope, &self.set.dir.key, name),
+            None => stage_key(&self.scope, &self.set.dir.key, self.companions),
+        }
+    }
+}
+/// The key a tier's pack of one document column is stored under.
+fn column_stage_key(scope: &str, dir_key: &str, column: &str) -> String {
+    format!("{scope}stage:{dir_key}#column:{column}")
+}
+/// The key under which a stage files a docs object's bytes of one column.
+pub(crate) fn column_key(docs_key: &str, column: &str) -> String {
+    format!("{docs_key}#col:{column}")
 }
 fn stage_key(scope: &str, dir_key: &str, companions: bool) -> String {
     format!(
@@ -326,6 +356,23 @@ impl Extra {
             ExtraKind::NumericIds(_) => rowid_key(&self.file.key),
         }
     }
+}
+/// One docs object's bytes of a column, to stage.
+struct ColumnPart {
+    file: SegmentFile,
+    range: Range<u64>,
+}
+/// One column of a tier, reserved and ready to gather into its own pack.
+struct ColumnJob {
+    name: String,
+    lease: Lease,
+    parts: Vec<ColumnPart>,
+}
+/// What a published code stage still has to stage: the companion pack, then column packs.
+#[derive(Default)]
+struct Follow {
+    companions: Option<(Lease, Vec<Extra>)>,
+    columns: Vec<ColumnJob>,
 }
 fn rowid_key(ids_key: &str) -> String {
     format!("{ids_key}#rowid")
@@ -568,8 +615,7 @@ impl Manager {
                     let result = self.stop.run(self.adopt(store, &path)).await;
                     match result {
                         Some(Ok((record, stage))) => {
-                            let key =
-                                stage_key(&record.scope, &record.set.dir.key, record.companions);
+                            let key = record.key();
                             let mut state = self.state.lock().expect("ANN staging lock");
                             for (hint, (object, len)) in record.hints {
                                 state.hints.insert(hint, Hint { object, len });
@@ -693,7 +739,7 @@ impl Manager {
             opened.insert(name, Arc::new(handle));
         }
         for (key, f) in &record.files {
-            let packed = record.companions && f.name == PACK;
+            let packed = record.is_pack() && f.name == PACK;
             if !(f.name.starts_with("object-") || packed)
                 || f.name.contains('/')
                 || f.name.contains('\\')
@@ -781,12 +827,18 @@ impl Manager {
                 ]
             })
             .collect();
+        let live = |key: &String| {
+            live.contains(key)
+                || key
+                    .split_once("#column:")
+                    .is_some_and(|(base, _)| live.contains(base))
+        };
         let mut state = self.state.lock().expect("ANN staging lock");
         let obsolete: Vec<_> = state
             .ready
             .keys()
             .chain(state.pending.iter())
-            .filter(|key| key.starts_with(&prefix) && !live.contains(*key))
+            .filter(|key| key.starts_with(&prefix) && !live(key))
             .cloned()
             .collect();
         let mut removed = Vec::new();
@@ -888,7 +940,7 @@ impl Manager {
         let key = stage_key(scope, &set.dir.key, false);
         let ckey = stage_key(scope, &set.dir.key, true);
         let mut doomed = Vec::new();
-        let (go, companion_only) = {
+        let (go, companion_only, columns_only) = {
             let mut state = self.state.lock().expect("ANN staging lock");
             for k in [&key, &ckey] {
                 if state
@@ -905,16 +957,23 @@ impl Manager {
             }
             let main = state.ready.contains_key(&key);
             let retry = if main { &ckey } else { &key };
-            let go = !(main && state.settled.contains(&key))
+            let main_go = !(main && state.settled.contains(&key))
                 && state.pending.is_empty()
                 && !state
                     .failed
                     .get(retry)
                     .is_some_and(|at| at.elapsed() < RETRY);
+            // A finished tier stages a column that queries have since projected.
+            let columns_only = !main_go
+                && main
+                && state.settled.contains(&key)
+                && state.pending.is_empty()
+                && !Self::wanted_columns(&state, scope, set).is_empty();
+            let go = main_go || columns_only;
             if go {
                 state.pending.insert(key.clone());
             }
-            (go, main)
+            (go, main, columns_only)
         };
         drop(doomed);
         if !go {
@@ -922,6 +981,24 @@ impl Manager {
         }
         let (manager, store, scope, set) =
             (self.clone(), store.clone(), scope.to_owned(), set.clone());
+        if columns_only {
+            let docs: Vec<SegmentFile> = extras()
+                .into_iter()
+                .filter(|e| matches!(e.kind, ExtraKind::Tail(_)))
+                .map(|e| e.file)
+                .collect();
+            tokio::spawn(async move {
+                let columns = manager.plan_columns(&store, &scope, &set, &docs).await;
+                let follow = Follow {
+                    companions: None,
+                    columns,
+                };
+                manager
+                    .finish_companions(&store, &scope, &set, key, follow)
+                    .await;
+            });
+            return;
+        }
         if companion_only {
             // The code stage is already published (adopted after a restart, or from a version
             // that staged no pack). Add whichever companions no stage holds yet.
@@ -935,7 +1012,16 @@ impl Manager {
             }
             tokio::spawn(async move {
                 manager
-                    .finish_companions(&store, &scope, &set, key, Some((lease, extras)))
+                    .finish_companions(
+                        &store,
+                        &scope,
+                        &set,
+                        key,
+                        Follow {
+                            companions: Some((lease, extras)),
+                            columns: Vec::new(),
+                        },
+                    )
                     .await;
             });
             return;
@@ -1014,17 +1100,18 @@ impl Manager {
         }
     }
     /// Phase two: gather the tier's companions into one pack and publish it beside the code
-    /// stage. The pending marker taken for the tier is released here.
+    /// stage. Phase three does the same for each requested document column. The pending marker
+    /// taken for the tier is released when both are done.
     async fn finish_companions(
         self: &Arc<Self>,
         store: &Storage,
         scope: &str,
         set: &SlabSet,
         key: String,
-        job: Option<(Lease, Vec<Extra>)>,
+        follow: Follow,
     ) {
         let ckey = stage_key(scope, &set.dir.key, true);
-        let result = match job {
+        let result = match follow.companions {
             Some((lease, extras)) => {
                 if self
                     .state
@@ -1042,35 +1129,332 @@ impl Manager {
             }
             None => Some(Ok(None)),
         };
+        let mut settle = false;
+        {
+            let mut state = self.state.lock().expect("ANN staging lock");
+            let cancelled = state.cancelled.contains(&key);
+            match result {
+                Some(Ok(Some(stage))) if cancelled => {
+                    stage.bad.store(true, Ordering::Relaxed);
+                    drop(state);
+                    drop(stage);
+                }
+                Some(Ok(stage)) if !cancelled => {
+                    if let Some(stage) = stage {
+                        Self::install(&mut state, ckey, scope, stage);
+                    }
+                    metrics::counter!("blowfish_ann_staging_total", "outcome" => "companions")
+                        .increment(1);
+                    settle = true;
+                }
+                Some(Err(error)) => {
+                    if state.failed.len() >= 128 {
+                        state.failed.clear();
+                    }
+                    state.failed.insert(ckey, Instant::now());
+                    tracing::debug!(%error, "ANN companions unavailable; using object storage");
+                }
+                _ => {}
+            }
+        }
+        for job in follow.columns {
+            let name = job.name.clone();
+            let cancelled = self
+                .state
+                .lock()
+                .expect("ANN staging lock")
+                .cancelled
+                .contains(&key);
+            if cancelled {
+                break;
+            }
+            let result = self
+                .stop
+                .run(self.build_column(store, scope, set, job))
+                .await;
+            let ckey = column_stage_key(scope, &set.dir.key, &name);
+            let mut state = self.state.lock().expect("ANN staging lock");
+            let cancelled = state.cancelled.contains(&key);
+            match result {
+                Some(Ok(Some(stage))) if cancelled => {
+                    stage.bad.store(true, Ordering::Relaxed);
+                    drop(state);
+                    drop(stage);
+                }
+                Some(Ok(Some(stage))) => {
+                    Self::install(&mut state, ckey, scope, stage);
+                    metrics::counter!("blowfish_ann_staging_total", "outcome" => "column")
+                        .increment(1);
+                }
+                Some(Err(error)) => {
+                    if state.failed.len() >= 128 {
+                        state.failed.clear();
+                    }
+                    state.failed.insert(ckey, Instant::now());
+                    tracing::debug!(%error, column = %name, "ANN column unavailable; using object storage");
+                }
+                _ => {}
+            }
+        }
+        // The column phase has finished, whether or not it had anything to stage.
+        metrics::counter!("blowfish_ann_staging_total", "outcome" => "columns").increment(1);
         let mut state = self.state.lock().expect("ANN staging lock");
         state.pending.remove(&key);
         let cancelled = state.cancelled.remove(&key);
-        match result {
-            Some(Ok(Some(stage))) if cancelled => {
-                stage.bad.store(true, Ordering::Relaxed);
-                drop(state);
-                drop(stage);
+        if settle && !cancelled {
+            if state.settled.len() >= 1024 {
+                state.settled.clear();
             }
-            Some(Ok(stage)) if !cancelled => {
-                if let Some(stage) = stage {
-                    Self::install(&mut state, ckey, scope, stage);
-                }
-                metrics::counter!("blowfish_ann_staging_total", "outcome" => "companions")
-                    .increment(1);
-                if state.settled.len() >= 1024 {
-                    state.settled.clear();
-                }
-                state.settled.insert(key);
-            }
-            Some(Err(error)) => {
-                if state.failed.len() >= 128 {
-                    state.failed.clear();
-                }
-                state.failed.insert(ckey, Instant::now());
-                tracing::debug!(%error, "ANN companions unavailable; using object storage");
-            }
-            _ => {}
+            state.settled.insert(key);
         }
+    }
+    /// The columns that queries have projected for this tier's namespace and that no stage
+    /// holds yet (and whose last attempt is not recent), "id" first: every projection reads it.
+    fn wanted_columns(state: &State, scope: &str, set: &SlabSet) -> Vec<String> {
+        let Some(ns) = set
+            .dir
+            .key
+            .strip_prefix("ns/")
+            .and_then(|s| s.split('/').next())
+        else {
+            return Vec::new();
+        };
+        let Some(seen) = state.columns.get(&format!("{scope}ns/{ns}/")) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = Vec::new();
+        for name in std::iter::once(&"id".to_owned()).chain(seen) {
+            let key = column_stage_key(scope, &set.dir.key, name);
+            let staged = state
+                .ready
+                .get(&key)
+                .is_some_and(|(_, s)| !s.bad.load(Ordering::Relaxed));
+            let recent = state
+                .failed
+                .get(&key)
+                .is_some_and(|at| at.elapsed() < RETRY);
+            if !staged && !recent && !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+    /// Reserve each wanted column of the tier's docs objects, within the cap and without
+    /// evicting anything, in the order first seen.
+    async fn plan_columns(
+        self: &Arc<Self>,
+        store: &Storage,
+        scope: &str,
+        set: &SlabSet,
+        docs: &[SegmentFile],
+    ) -> Vec<ColumnJob> {
+        let names = {
+            let state = self.state.lock().expect("ANN staging lock");
+            Self::wanted_columns(&state, scope, set)
+        };
+        if names.is_empty() || docs.is_empty() {
+            return Vec::new();
+        }
+        let extents: Vec<_> = futures::stream::iter(docs.iter().cloned().map(|file| {
+            let (store, names) = (store.clone(), names.clone());
+            async move {
+                crate::segment::column_extents(&store, &file, &names)
+                    .await
+                    .map(|found| (file, found))
+            }
+        }))
+        .buffer_unordered(COMPANION_FETCHES)
+        .collect()
+        .await;
+        let mut parts: HashMap<String, Vec<ColumnPart>> = HashMap::new();
+        for found in extents {
+            let Ok((file, found)) = found else {
+                self.fail_columns(scope, set, &names);
+                return Vec::new();
+            };
+            for (name, range) in found {
+                parts.entry(name).or_default().push(ColumnPart {
+                    file: file.clone(),
+                    range,
+                });
+            }
+        }
+        let mut jobs = Vec::new();
+        let mut missed = Vec::new();
+        for name in names {
+            let Some(parts) = parts.remove(&name) else {
+                missed.push(name);
+                continue;
+            };
+            let mut lease = self.empty_lease();
+            let cost = parts.iter().fold(0u64, |sum, p| {
+                let len = p.range.end - p.range.start;
+                sum + len + len.div_ceil(BLOCK as u64) * 11 + p.file.key.len() as u64 + 1024
+            }) + 4096;
+            if !self.extend_files(&mut lease, 1) || !self.extend(&mut lease, cost) {
+                missed.push(name);
+                continue;
+            }
+            jobs.push(ColumnJob { name, lease, parts });
+        }
+        self.fail_columns(scope, set, &missed);
+        jobs
+    }
+    /// Remember that these columns could not be staged, so they are not planned again at once.
+    fn fail_columns(&self, scope: &str, set: &SlabSet, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().expect("ANN staging lock");
+        if state.failed.len() >= 128 {
+            state.failed.clear();
+        }
+        for name in names {
+            state
+                .failed
+                .insert(column_stage_key(scope, &set.dir.key, name), Instant::now());
+        }
+    }
+    /// Gather one column of every docs object of a tier into one local pack, with bounded
+    /// ranged GETs whose responses carry the identity they were served from.
+    async fn build_column(
+        self: &Arc<Self>,
+        store: &Storage,
+        scope: &str,
+        set: &SlabSet,
+        job: ColumnJob,
+    ) -> io::Result<Option<Stage>> {
+        let ColumnJob { name, lease, parts } = job;
+        let path = self.path.join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&path)?;
+        let mut stage = Stage {
+            path: path.clone(),
+            files: HashMap::new(),
+            bad: AtomicBool::new(false),
+            _lease: lease,
+            durable: false,
+        };
+        let pack = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path.join(PACK))?,
+        );
+        // Each part's offset in the pack is known before any byte arrives.
+        let mut at = 0u64;
+        let mut offsets = Vec::with_capacity(parts.len());
+        let mut pieces = Vec::new();
+        for (n, part) in parts.iter().enumerate() {
+            offsets.push(at);
+            let mut start = part.range.start;
+            while start < part.range.end {
+                let end = (start + COLUMN_PIECE).min(part.range.end);
+                pieces.push((n, start, end));
+                start = end;
+            }
+            at += part.range.end - part.range.start;
+        }
+        let written = at;
+        let mut crcs: Vec<BTreeMap<u64, Vec<u32>>> = vec![BTreeMap::new(); parts.len()];
+        let mut identities: Vec<Option<ObjectIdentity>> = vec![None; parts.len()];
+        let mut fetched = futures::stream::iter(pieces.into_iter().map(|(n, start, end)| {
+            let (store, file, pack) = (store.clone(), parts[n].file.clone(), pack.clone());
+            let offset = offsets[n] + start - parts[n].range.start;
+            async move {
+                let reader = store
+                    .range_reader_with_length(&file.key, file.size, true)
+                    .map_err(io::Error::other)?
+                    .bypass_cache();
+                let (bytes, identity) = reader
+                    .read_direct_identified(start..end)
+                    .await
+                    .map_err(io::Error::other)?;
+                if bytes.len() as u64 != end - start {
+                    return Err(io::Error::other("short column read"));
+                }
+                if identity.etag.is_none() && identity.version.is_none() {
+                    return Err(io::Error::other("backend has no immutable object identity"));
+                }
+                let crc: Vec<u32> = bytes.chunks(BLOCK).map(crc32fast::hash).collect();
+                tokio::task::spawn_blocking(move || pack.write_all_at(&bytes, offset))
+                    .await
+                    .map_err(io::Error::other)??;
+                Ok::<_, io::Error>((n, start, crc, identity))
+            }
+        }))
+        .buffer_unordered(COLUMN_FETCHES);
+        while let Some((n, start, crc, identity)) = fetched.try_next().await? {
+            if identities[n]
+                .as_ref()
+                .is_some_and(|known| known != &identity)
+            {
+                return Err(io::Error::other("column object changed during staging"));
+            }
+            identities[n] = Some(identity);
+            crcs[n].insert(start, crc);
+        }
+        drop(fetched);
+        let handle = pack.clone();
+        tokio::task::spawn_blocking(move || handle.sync_all())
+            .await
+            .map_err(io::Error::other)??;
+        let mut files = HashMap::new();
+        for (n, part) in parts.iter().enumerate() {
+            let identity = identities[n]
+                .take()
+                .ok_or_else(|| io::Error::other("missing ANN identity"))?;
+            files.insert(
+                column_key(&part.file.key, &name),
+                StagedFile {
+                    file: pack.clone(),
+                    offset: offsets[n],
+                    base: part.range.start,
+                    len: part.range.end - part.range.start,
+                    crc: std::mem::take(&mut crcs[n])
+                        .into_values()
+                        .flatten()
+                        .collect(),
+                    identity: Some(identity),
+                    source: Some(part.file.key.clone()),
+                },
+            );
+        }
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let records = files
+            .iter()
+            .map(|(key, f)| {
+                Ok((
+                    key.clone(),
+                    FileRecord {
+                        name: PACK.to_owned(),
+                        offset: f.offset,
+                        base: f.base,
+                        len: f.len,
+                        crc: f.crc.clone(),
+                        identity: f
+                            .identity
+                            .clone()
+                            .ok_or_else(|| io::Error::other("missing ANN identity"))?,
+                        source: f.source.clone(),
+                    },
+                ))
+            })
+            .collect::<io::Result<BTreeMap<_, _>>>()?;
+        let record = Record {
+            scope: scope.to_owned(),
+            set: set.clone(),
+            hints: BTreeMap::new(),
+            files: records,
+            companions: false,
+            column: Some(name),
+        };
+        stage.files = files;
+        self.seal(&mut stage, &record, written, 1)?;
+        Ok(Some(stage))
     }
     /// Admit companions that no stage holds yet, smallest first (the column directories
     /// before the ID maps), charging `lease` without evicting anything. They are far smaller
@@ -1140,7 +1524,7 @@ impl Manager {
         set: &SlabSet,
         lease: Lease,
         extras: Vec<Extra>,
-    ) -> io::Result<(Stage, Option<(Lease, Vec<Extra>)>)> {
+    ) -> io::Result<(Stage, Follow)> {
         let path = self.path.join(uuid::Uuid::new_v4().to_string());
         fs::create_dir(&path)?;
         let mut stage = Stage {
@@ -1204,6 +1588,11 @@ impl Manager {
         // Hydration reads follow the vector rerank on every query, and are far smaller than
         // the vectors: reserve them first. They are fetched into a pack after this stage
         // is published, so queries never wait for them.
+        let docs: Vec<SegmentFile> = extras
+            .iter()
+            .filter(|e| matches!(e.kind, ExtraKind::Tail(_)))
+            .map(|e| e.file.clone())
+            .collect();
         let mut comp_lease = self.empty_lease();
         let companions = self.plan_companions(
             scope,
@@ -1211,6 +1600,9 @@ impl Manager {
             &|e| limits.contains_key(&e.file.key),
             &mut comp_lease,
         );
+        // Document columns that queries already project come next, ahead of the exact vectors,
+        // which take whatever the cap still allows.
+        let columns = self.plan_columns(store, scope, set, &docs).await;
         let mut extras: Vec<_> = exact
             .into_iter()
             .filter_map(|(key, len)| {
@@ -1387,11 +1779,15 @@ impl Manager {
             hints,
             files,
             companions: false,
+            column: None,
         };
         let descriptors = stage.files.len();
         self.seal(&mut stage, &record, actual, descriptors)?;
-        let job = (!companions.is_empty()).then_some((comp_lease, companions));
-        Ok((stage, job))
+        let follow = Follow {
+            companions: (!companions.is_empty()).then_some((comp_lease, companions)),
+            columns,
+        };
+        Ok((stage, follow))
     }
     /// Write the completion record, publish the stage directory under its digest, and
     /// shrink the reservation to the bytes and descriptors actually used.
@@ -1521,6 +1917,7 @@ impl Manager {
             hints: BTreeMap::new(),
             files: records,
             companions: true,
+            column: None,
         };
         stage.files = files;
         self.seal(&mut stage, &record, written, 1)?;
@@ -1877,6 +2274,41 @@ pub(crate) fn staged_row_ids(ids_key: &str, rows: &roaring::RoaringBitmap) -> Op
         .into_iter()
         .map(|b| Some(u64::from_le_bytes(b.as_ref().try_into().ok()?)))
         .collect()
+}
+/// Remember which columns queries project for a namespace (the first few names seen), so
+/// staging can hold them. Called before a query searches, so a first stage can reserve them.
+pub(crate) fn note_columns(
+    segments: &[bf_wal::Segment],
+    columns: &std::collections::BTreeSet<String>,
+) {
+    if columns.is_empty() {
+        return;
+    }
+    let Some(context) = read_cache::staging_context() else {
+        return;
+    };
+    let Some(manager) = &context.cache.staging else {
+        return;
+    };
+    let Some(ns) = segments
+        .iter()
+        .find_map(|s| s.files.get("docs"))
+        .and_then(|f| f.key.strip_prefix("ns/"))
+        .and_then(|k| k.split('/').next())
+    else {
+        return;
+    };
+    let key = context.cache.key(&format!("ns/{ns}/"));
+    let mut state = manager.state.lock().expect("ANN staging lock");
+    if state.columns.len() >= 1024 && !state.columns.contains_key(&key) {
+        state.columns.clear();
+    }
+    let seen = state.columns.entry(key).or_default();
+    for name in columns {
+        if seen.len() < COLUMN_NAMES && !seen.contains(name) {
+            seen.push(name.clone());
+        }
+    }
 }
 pub(crate) fn note_hint(hint: &str, object: Option<&str>, len: u64) {
     let Some(context) = read_cache::staging_context() else {
@@ -2624,6 +3056,154 @@ mod tests {
                 .read("ids-a#rowid", "ids-a#rowid", std::slice::from_ref(&(0..8)))
                 .is_some()
         );
+    }
+
+    async fn column_stage(manager: &Arc<Manager>, set: &SlabSet, column: &str) -> Arc<Stage> {
+        let key = column_stage_key("", &set.dir.key, column);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((_, stage)) = manager.state.lock().unwrap().ready.get(&key) {
+                    return stage.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn requested_columns_stage_into_packs_that_serve_verified_reads_and_survive_restart() {
+        let work = scratch();
+        let (store, set, _, _) = fixture(31).await;
+        publish(&store, &set, false, 1).await;
+        let (schema, docs) = crate::segment::document_tests::input(1400);
+        let segment = crate::segment::build_with(
+            &store,
+            "t",
+            &schema,
+            bf_types::DistanceMetric::CosineDistance,
+            &docs,
+            BTreeMap::new(),
+            0,
+            1,
+        )
+        .await
+        .unwrap();
+        let file = segment.files["docs"].clone();
+        let tail = file.metadata_len.max(65536).min(file.size);
+        let extras = vec![Extra {
+            file: file.clone(),
+            kind: ExtraKind::Tail(file.size - tail),
+        }];
+        let names: Vec<String> = ["id", "text", "tags", "f32", "missing"]
+            .map(String::from)
+            .to_vec();
+        let found = crate::segment::column_extents(&store, &file, &names)
+            .await
+            .unwrap();
+        let found: BTreeMap<_, _> = found.into_iter().collect();
+        assert_eq!(
+            found.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["id", "tags", "text"]
+        );
+
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        manager
+            .state
+            .lock()
+            .unwrap()
+            .columns
+            .insert("ns/test/".into(), vec!["text".into(), "f32".into()]);
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        let main = ready(&manager, "", &set).await;
+        let text = column_stage(&manager, &set, "text").await;
+        let id = column_stage(&manager, &set, "id").await;
+        // Vector columns and absent ones are never staged.
+        assert!(
+            !manager
+                .state
+                .lock()
+                .unwrap()
+                .ready
+                .contains_key(&column_stage_key("", &set.dir.key, "f32"))
+        );
+        let raw = store.get(&file.key).await.unwrap();
+        let hull = found["text"].clone();
+        let key = column_key(&file.key, "text");
+        let inside = hull.start + 5..hull.start + 900;
+        let got = manager
+            .read(&key, &key, std::slice::from_ref(&inside))
+            .unwrap();
+        assert_eq!(
+            &got[0][..],
+            &raw[inside.start as usize..inside.end as usize]
+        );
+        // Bytes outside the column are not served from its pack.
+        assert!(
+            manager
+                .read(
+                    &key,
+                    &key,
+                    std::slice::from_ref(&(hull.start - 1..hull.start + 4))
+                )
+                .is_none()
+        );
+        assert_eq!(text.files[&key].source.as_deref(), Some(file.key.as_str()));
+        assert!(Arc::ptr_eq(&text.files[&key].file, &text.files[&key].file));
+        assert_ne!(
+            Arc::as_ptr(&text.files[&key].file),
+            Arc::as_ptr(&id.files[&column_key(&file.key, "id")].file)
+        );
+        // A column a later query projects is staged on the next observation.
+        manager
+            .state
+            .lock()
+            .unwrap()
+            .columns
+            .get_mut("ns/test/")
+            .unwrap()
+            .push("tags".into());
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        column_stage(&manager, &set, "tags").await;
+        drop((main, text, id, got));
+        drop(manager);
+
+        // A restart adopts every pack and has nothing left to stage.
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        manager.recover(&store).await;
+        for column in ["text", "tags", "id"] {
+            let key = column_key(&file.key, column);
+            let hull = &crate::segment::column_extents(&store, &file, &[column.to_owned()])
+                .await
+                .unwrap()[0]
+                .1;
+            let range = hull.start..hull.start + 100;
+            let got = manager
+                .read(&key, &key, std::slice::from_ref(&range))
+                .unwrap();
+            assert_eq!(&got[0][..], &raw[range.start as usize..range.end as usize]);
+        }
+        // Corruption is caught on read, and the read falls back to storage.
+        let key = column_key(&file.key, "text");
+        let stage = manager.file(&key).unwrap();
+        let staged = &stage.files[&key];
+        OpenOptions::new()
+            .write(true)
+            .open(stage.path.join(PACK))
+            .unwrap()
+            .write_all_at(&[0xff; 8], staged.offset + 40)
+            .unwrap();
+        assert!(
+            manager
+                .read(
+                    &key,
+                    &key,
+                    std::slice::from_ref(&(hull.start..hull.start + 100))
+                )
+                .is_none()
+        );
+        assert!(stage.bad.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

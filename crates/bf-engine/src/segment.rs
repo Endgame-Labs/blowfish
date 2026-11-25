@@ -112,6 +112,16 @@ impl ObjectReader {
             .await
             .map_err(io::Error::other)
     }
+    /// Read column blocks, from a stage that holds the whole column when one does.
+    pub async fn read_column(&self, name: &str, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
+        if !self.bypass
+            && let Some(bytes) =
+                crate::local_ann::read(&crate::local_ann::column_key(&self.file.key, name), &ranges)
+        {
+            return Ok(bytes);
+        }
+        self.read_batch(ranges).await
+    }
     /// Read small ranges scattered over the object (rerank vectors) through small cache
     /// blocks, so a miss fetches `BF_SPARSE_BLOCK_BYTES` (default 16 KiB) instead of a full
     /// block, and the cache holds those vectors without the megabyte around each one.
@@ -188,6 +198,37 @@ pub(crate) async fn warm_docs(store: &Storage, segment: &Segment) {
     }
 }
 
+/// The byte range of each named non-vector column of a docs file, for staging: the hull of its
+/// blocks, kept only when the blocks tile it exactly (a column written in one run). Reads the
+/// directory straight from storage, so it works outside a query's context.
+pub(crate) async fn column_extents(
+    store: &Storage,
+    file: &SegmentFile,
+    names: &[String],
+) -> Result<Vec<(String, Range<u64>)>, ApiError> {
+    let reader = ObjectReader::new(store, file).bypass_cache();
+    let start = file.size.saturating_sub(file.metadata_len.max(65536));
+    let bytes = reader.read(start..file.size).await.map_err(index_error)?;
+    let dir = decode_directory(&reader, &bytes, start)?;
+    let mut out = Vec::new();
+    for name in names {
+        let Some(col) = dir.columns.get(name).filter(|c| c.vector.is_none()) else {
+            continue;
+        };
+        let (Some(first), Some(last)) = (col.blocks.first(), col.blocks.last()) else {
+            continue;
+        };
+        let hull = first.offset..last.offset + last.length;
+        let tiled = col
+            .blocks
+            .windows(2)
+            .all(|w| w[0].offset + w[0].length == w[1].offset);
+        if tiled && hull.end > hull.start {
+            out.push((name.clone(), hull));
+        }
+    }
+    Ok(out)
+}
 pub(crate) async fn text_index(
     store: &Storage,
     file: &SegmentFile,
@@ -1313,7 +1354,8 @@ pub(crate) async fn projected_rows_with(
                         .map(|n| col.blocks.get(indices[*n]).ok_or_else(corrupt))
                         .collect::<Result<Vec<_>, _>>()?;
                     let data = reader
-                        .read_batch(
+                        .read_column(
+                            name,
                             descriptors
                                 .iter()
                                 .map(|b| b.offset..b.offset + b.length)
@@ -1942,4 +1984,4 @@ mod id_filter_tests {
 
 #[cfg(test)]
 #[path = "document_tests.rs"]
-mod document_tests;
+pub(crate) mod document_tests;
