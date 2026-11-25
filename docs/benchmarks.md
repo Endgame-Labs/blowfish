@@ -9932,3 +9932,200 @@ approximately $0.80 at the recorded rate. Estimated total round cost is **below 
 discarded attempts, requests, EBS, and public IPv4, within the $6 cap; AWS billing is not
 final. Local benchmark receipts, binaries, and test output are removed after the numbers
 are recorded here.
+
+## Round C7: faster first staging and capacity-admitted exact vectors
+
+Measured on one on-demand c7gd.4xlarge in the bucket's region. Final paired runs use
+CPUs 0–7, eight Rayon workers, 64 probes, top 10, and strong consistency.
+Both original immutable layouts remained read-only. The 10M layout is the retained C5
+fixture; the 100M layout is the original large namespace. The control is v0.1.24.
+Paired steady queries alternate arms, wait for staging to finish, clear query caches,
+and evict stage files from the filesystem page cache before every request. During
+first preparation, cache-cold queries continue until publication; live comparisons
+use the same query IDs from both arms.
+
+### Profile and capacity screen
+
+A fresh 40-query 10M profile, with all 16 host CPUs available and eight Rayon workers,
+measured 188.79 ms cold staged p50. Median request-relative
+scan completion was 47.49 ms, vector-rerank completion was 182.61 ms, and hydration
+completion was 187.77 ms. These component medians are not additive. Exact-vector reads
+remain a useful target after code staging.
+
+The original layouts contain 1,024-dimensional f16 vectors. Full exact-vector prefixes
+exceed the existing cap at **both** scales, even though the 10M vectors alone fit:
+
+| Layout | Exact-vector bytes | Routing and code payload bytes | Payload bytes with every exact prefix | Maximum staging budget bytes |
+| --- | ---: | ---: | ---: | ---: |
+| 10M | 20,480,000,000 | 1,615,496,715 | 22,095,496,715 | 21,474,836,480 |
+| 100M | 204,800,000,000 | 18,583,084,932 | 241,723,610,820 | 21,474,836,480 |
+
+These counts come from the immutable directories' code, blob, and vector extents,
+including all intervening bytes needed by a staged prefix. The older 100M layout has
+additional intervening data, so its combined prefixes exceed the sum of its two other
+columns. Completion records need additional space. All-or-nothing admission therefore
+kept code-only stages at both scales: a 60-pair 10M screen measured 180.18 versus
+180.02 ms p50, with identical results. That screen is not an exact-vector speedup.
+
+First-staging profiling also identified block-cache planning work in background copies.
+A larger pool through that planner interfered with queries. The selected implementation
+uses one shared pool of four exact-range downloads across slabs, bypassing the block
+cache and its planner, and issuing no background hedge requests. The 8 MiB range size
+bounds the pool's buffered payloads to 32 MiB. Per-file identities, every 16 KiB CRC,
+durable publication, and restart validation remain in place.
+
+### First staging with continuous cold queries
+
+Both repetitions start with empty staging directories and keep one cache-cold request
+in flight until the stage is published. The control serves 132 and 133 live requests;
+the pool serves 63 and 62. Latency comparisons use the matching first 63 and 62 query
+IDs, respectively, while both arms are preparing. Every matched live result, exact
+distance, and planned-row count agrees.
+
+| Repetition | Control stage ready s | Pool stage ready s | Speedup | Matched live queries | Control live p50 / p90 ms | Pool live p50 / p90 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 130.854 | 68.259 | 1.92× | 63 | 709.53 / 832.09 | 709.43 / 854.18 |
+| 2 | 138.927 | 61.894 | 2.24× | 62 | 703.44 / 800.37 | 705.71 / 839.31 |
+
+Both pass the at-least-1.3× staging target. Live p50 changes by −0.01% and +0.32%;
+live p90 changes by +2.66% and +4.87%, within the 5% limit. This includes the final
+flush and publication period. The same routing and code prefixes total
+18,583,084,932 payload bytes in both arms, or **18,595,598,173 bytes including the
+completion records**. Direct background range GETs add no hedges or new payload ranges.
+Request counters collected during preparation also include foreground queries, whose
+counts differ because the faster arm becomes ready sooner.
+
+Two earlier confirmations with a fixed 40-query live workload also pass: first staging
+109.360 → 67.046 s and 115.390 → 72.269 s; live p50 changes −4.86% and −0.17%, and
+p90 changes −2.43% and +1.54%. A larger pool through the block-cache planner was
+rejected for foreground interference. A 16-range direct pool staged in 34.59 s, with
++1.64% / +3.08% live p50 / p90 over 34 matched queries; the selected four-slot pool
+leaves more foreground bandwidth.
+
+### Exact-vector contribution at 10M
+
+All codes are reserved first. Whole exact-vector prefixes are then considered in
+increasing reservation size, without evicting another tier to obtain optional vector
+space. This admits **9,504,006 of 10,000,000 vector rows (95.04%)** in the original
+10M fixture. Reads of the remaining vectors retain the ordinary S3 path. Exact reads
+use the same staged-file handles, aligned checksums, and completion records as codes.
+The wire, bucket, and completion-record schemas are unchanged.
+
+Two full repetitions use three matched arms: v0.1.24, the shared download pool with
+code-only staging, and the pool with fitting exact vectors. All 400 three-arm trials
+have identical ordered IDs, exact distances, and planned rows. Recall is **0.9700**
+in every arm, and mean planned rows are **227,173.84**.
+
+| Repetition | v0.1.24 p50 / p90 ms | Pool-only p50 / p90 ms | With exact vectors p50 / p90 ms | Speedup over pool-only | Speedup over v0.1.24 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 162.69 / 232.73 | 167.43 / 228.04 | 125.14 / 154.18 | 1.34× | 1.30× |
+| 2 | 151.05 / 209.40 | 159.23 / 218.35 | 121.61 / 152.87 | 1.31× | 1.24× |
+
+The isolated exact-vector contribution passes 1.25× in both repetitions. The combined
+change against v0.1.24 passes in the first repetition, and narrowly misses a strict
+per-repetition 1.25× requirement in the second. These comparisons are kept separate.
+Pooling the two 200-query repetitions gives 400 paired observations per arm:
+v0.1.24 **156.30 / 218.81 ms**, pool-only **161.18 / 223.38 ms**, and C7
+**123.26 / 154.18 ms** p50 / p90. The pooled release-to-C7 p50 ratio is **1.268×**;
+the isolated exact-vector ratio is **1.308×**. The per-repetition caveat above remains.
+
+Mean physical GET attempts fall from 105.00 / 103.95 to 37.88 / 38.00, and completed
+backend bytes fall from 3.821 / 3.814 MB to 2.900 / 2.911 MB per query.
+
+A preliminary 60-pair screen measured pool-only 201.96 / 257.83 ms versus vectors
+126.28 / 179.68 ms. Median request-relative scan completion was 52.35 → 50.40 ms,
+vector-rerank completion 194.57 → 56.61 ms, and hydration completion 200.95 → 125.28 ms.
+Hydration becomes the response gate after most vector GETs are removed. The completed
+10M stage is **21,093,562,465 bytes**, including metadata, below the existing 20 GiB
+cap. Its first preparation takes 105.37 s in that screen, versus about 6 s for code-only
+pool staging: the added vectors increase provisioning bytes and time, and persistent
+adoption avoids paying that copy again on an ordinary restart.
+
+### Capacity-limited behavior at 100M
+
+The 100M layout admits exact vectors for **1,132,999 rows (1.13%)**, and keeps the
+remaining vectors on S3. Its complete stage uses **21,126,141,716 bytes**, below the
+same cap. All codes remain staged. A 60-query three-arm comparison gives:
+
+| Arm | p50 / p90 ms | Mean GET attempts | Mean completed MB | Recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| v0.1.24 | 278.47 / 378.22 | 130.47 | 3.328 | 0.951667 |
+| Pool-only | 290.96 / 420.60 | 132.42 | 3.342 | 0.951667 |
+| Pool and fitting exact vectors | 260.46 / 370.54 | 129.75 | 3.314 | 0.951667 |
+
+All ordered IDs, exact distances, and planned rows agree. Mean planned rows are
+**809,325.0167** in every arm. This is a measured comparison at limited vector
+coverage; the 100M response still depends on remote exact vectors and documents.
+The combined stage takes 84.08 s to prepare in this run. Vector extensions increase
+its provisioning footprint by about 2.53 GB; the pool-only first-staging comparison
+above retains exactly the original payload.
+
+### Combined-feature first staging at 100M
+
+Two further repetitions run the final combined binary, including its fitting exact
+prefixes, with continuous cold queries until publication. Both optimizations are active
+in these runs:
+
+| Repetition | v0.1.24 ready s | C7 ready s | Speedup | Matched live queries | v0.1.24 live p50 / p90 ms | C7 live p50 / p90 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128.421 | 72.919 | 1.76× | 76 | 678.79 / 801.82 | 680.54 / 770.21 |
+| 2 | 124.089 | 72.691 | 1.71× | 76 | 661.53 / 790.43 | 675.26 / 765.22 |
+
+Live p50 changes by +0.26% and +2.08%, and p90 by −3.94% and −3.19%. Both pass
+the staging and live-query gates. Each C7 stage is **21,126,141,716 bytes**, versus
+18,595,598,173 for code-only control. The additional bytes are the explicitly admitted
+vector prefixes; the pool-only experiment above isolates preparation at equal payload.
+All 152 matched live queries and 120 steady pairs have identical results, distances,
+and planned rows. After publication, steady v0.1.24 → C7 p50 / p90 is
+311.28 / 433.72 → 308.57 / 415.91 ms, and 297.73 / 386.74 → 295.59 / 382.83 ms.
+
+### Restart and integrity qualification
+
+A real 10M process restart adopts the combined stage in **0.145 s** on the existing
+adoption timer. Forty cache-cold queries before and after restart have identical IDs,
+exact distances, and planned rows, with **zero staged-tier payload GETs after adoption**.
+The footprint remains exactly **21,093,562,465 bytes**. Steady p50 / p90 is
+139.91 / 220.70 ms, and adopted p50 / p90 is 126.30 / 155.08 ms in this restart probe.
+Payload pages are evicted before every request. Adoption validates metadata and remote
+identities; every payload read still verifies its full checksum blocks.
+
+The final Rust qualification passes formatting, scoped strict clippy over all targets,
+and the full engine and storage suites: **308 passed, zero failed, and 13 ignored across
+46 suites**. Coverage includes cross-piece pooled downloads, exact uncached reads with
+portable headers and shared fetch limits, short responses, checksum fallback, whole-object
+admission beside retained code prefixes, optional reservations that preserve other leases,
+and repeated adoption of both full and partial vector stages. A second complete suite
+run gives the same counts. Measured production-source hashes match the final worktree.
+
+### Reproduction
+
+Build the v0.1.24 control, commit `7bae833` for the pool-only arm, and `1a04849` for
+the combined arm. Use the same release flags (`-C target-cpu=neoverse-v1`), host, and
+immutable namespace for each comparison. The scale-server example accepts a private
+storage config, and the harness always sets read-only storage. For first preparation:
+
+```sh
+taskset -c 0-7 uv run crates/bf-engine/examples/cold_ab.py \
+  --binary COMBINED_BINARY --config CONFIG.local \
+  --arms '{"control":{"BINARY":"CONTROL_BINARY"},"combined":{}}' \
+  --scratch .scratch/c7-check --label first-preparation --oracle 100m \
+  --queries 60 --stage-arm control --stage-arm combined --stage-live-queries 200
+```
+
+For steady 10M qualification, add the pool-only binary as a third arm, stage all three
+arms, use `--oracle 10m --queries 200`, and omit `--stage-live-queries`. Repeat each
+comparison. Readiness is timed from the initial query, including copying, flushing,
+and publication. Server startup and connection warming precede that clock. The harness
+saves initial-request cost, readiness time, live queries, completed-stage footprint,
+vector coverage when its trace remains available, backend totals, and paired cold
+results. Summarize the receipts before removing scratch. Previously completed code-only
+stages are adopted unchanged; the fresh-stage tests deliberately begin with empty cache
+directories so fitting vectors are provisioned.
+
+One on-demand c7gd.4xlarge ran from 01:42:58 to the 02:57:18 UTC termination request
+on 2026-11-25, with termination confirmed afterward. The rounded lifetime upper bound
+is 1.25 hours, about $0.91 compute at the previously recorded rate. Estimated total
+cost, including requests, EBS, and public IPv4, is below $4, within the $6 cap; billing
+is not finalized. The instance, temporary key pair, security group, and root volume
+are gone. Every storage run was read-only, with no owned bucket prefix or bucket
+writes to clean up.
