@@ -213,14 +213,16 @@ pub(crate) fn decide(
 ) -> (Decision, Option<Layout>) {
     // Vector attributes every segment has a current ANN object for (an older layout is upgraded
     // first, by `reindex`).
+    let sources = crate::vector_locator::Sources::from_parts(tiers.clone(), lineage.to_vec());
     let attrs: BTreeSet<String> = segments
         .iter()
         .flat_map(|s| s.files.keys())
         .filter_map(|k| k.strip_prefix("annv2:").map(str::to_string))
+        .chain(tiers.keys().cloned())
         .filter(|a| {
             segments
                 .iter()
-                .all(|s| s.files.contains_key(&format!("annv2:{a}")))
+                .all(|s| s.files.contains_key(&format!("annv2:{a}")) || sources.covers(s, a))
         })
         .collect();
     for attr in attrs {
@@ -296,10 +298,10 @@ fn decide_beside(
         };
         let key = format!("annv2:{attr}");
         let (mut outside, mut beside) = (0u64, 0u64);
-        for s in segments
-            .iter()
-            .filter(|s| s.files.contains_key(&key) && !building.contains(&s.id))
-        {
+        for s in segments.iter().filter(|s| {
+            (s.files.contains_key(&key) || classes.get(&s.id).is_some_and(|c| !c.is_empty()))
+                && !building.contains(&s.id)
+        }) {
             match classes.get(&s.id) {
                 Some(class) if class.contains(&base.dir.key) => {}
                 Some(class) if !class.is_empty() => beside += u64::from(s.row_count),
@@ -374,13 +376,14 @@ fn target(manifest: &Manifest, attr: &str, kind: Kind, building: &BTreeSet<Strin
                 &manifest.lineage,
             );
             let key = format!("annv2:{attr}");
+            let sources = crate::vector_locator::Sources::from_manifest(manifest);
             Target {
                 kind,
                 segments: manifest
                     .segments
                     .iter()
                     .filter(|s| {
-                        s.files.contains_key(&key)
+                        (s.files.contains_key(&key) || sources.covers(s, attr))
                             && !in_base.contains(&s.id)
                             && !building.contains(&s.id)
                     })

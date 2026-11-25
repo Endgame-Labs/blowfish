@@ -586,3 +586,115 @@ async fn repeated_compactions_read_tiers_and_compose_lineage_without_segment_vec
         before
     );
 }
+
+#[tokio::test]
+async fn maintenance_backfills_resident_rows_without_recreating_retired_ann() {
+    let (store, _, _) = fixture_rows(2000).await;
+    retire_test_sources(&store).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    for slab in manifest
+        .ann_tiers
+        .values_mut()
+        .flatten()
+        .flat_map(|s| &mut s.slabs)
+    {
+        slab.files.remove("annrows:vector");
+    }
+    wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
+        .await
+        .unwrap();
+    let engine = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            compaction_segments: usize::MAX,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    );
+    assert!(engine.index_namespace("locator", true).await.unwrap());
+    for _ in 0..16 {
+        if !engine.index_namespace("locator", true).await.unwrap() {
+            break;
+        }
+    }
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    assert!(!crate::slab_rows::needs(&manifest.ann_tiers));
+    assert!(
+        manifest
+            .segments
+            .iter()
+            .all(|s| !s.files.contains_key("annv2:vector"))
+    );
+    engine
+        .reindex("locator", &crate::ReindexOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        wal.latest_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .segments
+            .iter()
+            .all(|s| !s.files.contains_key("annv2:vector"))
+    );
+}
+#[tokio::test]
+async fn statistics_and_filtered_warmup_use_covering_vectors_after_restart() {
+    let (store, engine, _) = fixture_rows(2000).await;
+    let request: bf_types::QueryRequest = serde_json::from_value(json!({"rank_by": ["vector", "ANN", [1.0, 13.0, -0.5]], "top_k": 10, "filters": ["category", "Eq", 1], "include_attributes": true})).unwrap();
+    let expected = engine
+        .query("locator", request.clone())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    let stats = engine.metadata("locator").await.unwrap();
+    retire_test_sources(&store).await;
+    let restarted = maintenance_engine(&store);
+    assert_eq!(
+        restarted
+            .query("locator", request)
+            .await
+            .unwrap()
+            .result
+            .rows,
+        expected
+    );
+    let actual = restarted.metadata("locator").await.unwrap();
+    assert_eq!(actual["approx_row_count"], stats["approx_row_count"]);
+    assert_eq!(
+        actual["approx_logical_bytes"],
+        stats["approx_logical_bytes"]
+    );
+    let state = restarted
+        .snapshot("locator", &Consistency::Strong)
+        .await
+        .unwrap()
+        .0;
+    let explain = crate::plan::explain(
+        &state,
+        &serde_json::from_value(
+            json!({"rank_by": ["vector", "ANN", [1.0, 13.0, -0.5]], "top_k": 10}),
+        )
+        .unwrap(),
+        &EngineConfig::default(),
+    );
+    assert!(explain.contains("covering tier: vector"), "{explain}");
+    assert!(!explain.contains("fallbacks [annv2:vector]"), "{explain}");
+    let (decision, _) = crate::auto_recluster::decide(
+        &state.segments,
+        &state.ann_tiers,
+        &state.lineage,
+        Some(1),
+        false,
+        false,
+    );
+    assert_eq!(
+        decision,
+        crate::auto_recluster::Decision::Build("vector".into(), "masked")
+    );
+}

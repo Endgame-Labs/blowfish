@@ -491,7 +491,7 @@ impl Engine {
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
                 && tier(&state, &self.0.config, force, &protected, bulk(&state)).is_empty()
-                && !needs_text_upgrade(&state)
+                && !(needs_text_upgrade(&state) || crate::slab_rows::needs(&state.ann_tiers))
                 && !installing
             {
                 return Ok(false);
@@ -519,7 +519,9 @@ impl Engine {
                     })
             });
             let will_compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
-            let upgrade = needs_text_upgrade(&state) || installing;
+            let upgrade = needs_text_upgrade(&state)
+                || crate::slab_rows::needs(&state.ann_tiers)
+                || installing;
             if state.seq == state.indexed_through
                 && will_compact.is_empty()
                 && !will_rebuild
@@ -581,7 +583,8 @@ impl Engine {
         }
         crate::ann::stage(t0, "idx hydrate");
         let compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
-        let upgrade = needs_text_upgrade(&state) || installing;
+        let upgrade =
+            needs_text_upgrade(&state) || crate::slab_rows::needs(&state.ann_tiers) || installing;
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
         }
@@ -963,6 +966,7 @@ impl Engine {
         for key in old {
             retire(&mut manifest, key);
         }
+        crate::slab_rows::ensure(store, &mut manifest, 1).await?;
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest
             .segments
@@ -973,12 +977,18 @@ impl Engine {
         let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
         for attr in attributes {
             // The two layouts are independent objects: write them at the same time.
+            let sources = manifest
+                .segments
+                .iter()
+                .filter(|s| crate::upgrade::files(s, &attr).is_some())
+                .cloned()
+                .collect::<Vec<_>>();
             let layouts = [crate::ann_dir::Layout::Segments];
             let built = futures::future::try_join_all(layouts.iter().map(|layout| {
                 crate::ann_dir::build(
                     store,
                     ns,
-                    &manifest.segments,
+                    &sources,
                     &attr,
                     *layout,
                     previous_dirs.get(&layout.dir_key(&attr)),

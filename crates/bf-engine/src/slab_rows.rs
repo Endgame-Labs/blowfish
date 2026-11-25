@@ -75,7 +75,6 @@ pub(crate) async fn write(
 }
 
 /// Current containers whose sparse resident metadata has not yet been backfilled.
-#[allow(dead_code)] // Wired into the maintenance trigger in the next ordered step.
 pub(crate) fn needs(tiers: &std::collections::BTreeMap<String, Vec<bf_wal::SlabSet>>) -> bool {
     tiers.iter().any(|(attr, sets)| {
         sets.iter()
@@ -86,7 +85,6 @@ pub(crate) fn needs(tiers: &std::collections::BTreeMap<String, Vec<bf_wal::SlabS
 
 /// Backfill a bounded number of old slabs, preserving every center, code, and exact vector.
 /// The caller publishes descriptors and retirement records together under its manifest fence.
-#[allow(dead_code)] // Wired into the maintenance trigger in the next ordered step.
 pub(crate) async fn ensure(
     store: &Storage,
     manifest: &mut Manifest,

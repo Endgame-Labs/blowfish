@@ -192,35 +192,37 @@ impl OpenHint {
             let mut tasks = vec![];
             // A fully covering, usable tier also replaces the segment directories. Legacy
             // source segments may have no namespace directory after tier installation.
-            let fully_tiered = self.scan.as_ref().is_some_and(|(attribute, _, _)| {
-                tiers
-                    .get(attribute)
-                    .is_some_and(|sets| tiers_cover_all(segments, lineage, sets))
-            });
             // A directory replaces opening every segment's ANN metadata, IDs, and docs footer.
             let by_dir = self.ann.iter().all(|a| {
                 crate::upgrade::directory_file(dirs, a).is_some()
-                    || (fully_tiered && self.scan.as_ref().is_some_and(|(attr, _, _)| a == attr))
+                    || tiers
+                        .get(a)
+                        .is_some_and(|sets| tiers_cover_all(segments, lineage, sets))
             });
             for attribute in self.ann.iter().filter(|_| with_rest) {
                 // A lone unfiltered ANN query reads the block-layout directory when there is one.
                 // A recluster's tiers take the scan of the rows they cover; the block-layout
                 // directory is still loaded for the segments they don't.
-                let tiered = self
-                    .scan
-                    .as_ref()
-                    .filter(|(a, _, _)| a == attribute)
-                    .and_then(|_| tiers.get(attribute))
+                let tiered = tiers
+                    .get(attribute)
                     .filter(|t| crate::ann::tiers_usable(segments, lineage, t));
-                let covers_all = tiered.is_some() && fully_tiered;
+                let covers_all = tiered.is_some_and(|t| tiers_cover_all(segments, lineage, t));
                 for set in tiered.into_iter().flatten() {
-                    let Some((_, vector, k)) = self.scan.as_ref() else {
-                        break;
-                    };
+                    let scan = self.scan.as_ref().filter(|(a, _, _)| a == attribute);
+                    let filtered = !self.filters.is_empty();
                     let config = &self.config;
                     let name = crate::ann_dir::Layout::Slabs.dir_key(attribute);
                     tasks.push(
                         async move {
+                            if filtered || scan.is_none() {
+                                let dir = crate::ann_dir::load(store, &set.dir, None).await?;
+                                if filtered {
+                                    crate::ann_dir::memberships(store, &set.slabs, &dir, attribute)
+                                        .await?;
+                                }
+                                return Ok(());
+                            }
+                            let (_, vector, k) = scan.unwrap();
                             let (dir, warm) = crate::ann_dir::slab_directory(
                                 store,
                                 set,
@@ -272,8 +274,17 @@ impl OpenHint {
                                 .await?;
                             if filtered {
                                 // Filtered queries also need each segment's row-to-cluster map.
-                                crate::ann_dir::memberships(store, segments, &dir, attribute)
-                                    .await?;
+                                crate::ann_dir::memberships(
+                                    store,
+                                    &segments
+                                        .iter()
+                                        .filter(|s| crate::upgrade::files(s, attribute).is_some())
+                                        .cloned()
+                                        .collect::<Vec<_>>(),
+                                    &dir,
+                                    attribute,
+                                )
+                                .await?;
                             } else if let Some((_, vector, k)) = scan {
                                 crate::ann_dir::prefetch_scan(
                                     store, segments, &dir, attribute, layout, vector, *k, config,

@@ -1215,7 +1215,11 @@ impl Engine {
         let (s, _) = self
             .snapshot_hinted(ns, &Consistency::Strong, None, true)
             .await?;
-        let totals = snapshot::statistics(&self.0.store, &s).await?;
+        let totals = read_cache::scope(
+            read_cache::ReadContext::new(self.0.read_cache.clone()),
+            snapshot::statistics(&self.0.store, &s),
+        )
+        .await?;
         let mut metadata = json!({"schema":s.schema,"approx_logical_bytes":totals.logical_bytes,"approx_row_count":totals.rows,"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}});
         // Every live tail row is searched exhaustively, including scalar-only namespaces.
         // Deletes and schema-only writes leave bytes to checkpoint even with zero tail rows.

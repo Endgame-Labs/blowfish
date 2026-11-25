@@ -43,6 +43,12 @@ impl Sources {
         }
     }
 
+    pub fn from_parts(tiers: BTreeMap<String, Vec<SlabSet>>, lineage: Vec<Lineage>) -> Self {
+        Self {
+            tiers: Arc::new(tiers),
+            lineage: Arc::new(lineage),
+        }
+    }
     pub fn from_manifest(manifest: &bf_wal::Manifest) -> Self {
         Self {
             tiers: Arc::new(manifest.ann_tiers.clone()),
