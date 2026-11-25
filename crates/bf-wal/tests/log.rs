@@ -460,3 +460,136 @@ async fn compact_reader_copy_omits_text_headers_and_full_reads_ignore_it() {
 fn rand_crc(i: u64) -> u32 {
     (i.wrapping_mul(2_654_435_761) & 0xffff_ffff) as u32
 }
+
+async fn memory_wal(name: &str) -> (Storage, Wal) {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let wal = Wal::new(store.clone(), name).unwrap();
+    (store, wal)
+}
+
+fn external_entry(tag: usize) -> WalEntry {
+    document_entry(format!("{tag}-{}", "x".repeat(INLINE_PAYLOAD_BYTES + 1)))
+}
+
+fn tag_of(entry: &WalEntry) -> usize {
+    let text = entry.batches[0].upserts[0]["text"].as_str().unwrap();
+    text.split('-').next().unwrap().parse().unwrap()
+}
+
+/// More out-of-line payloads than the fetch window still come back in WAL order, mixed with inline ones.
+#[tokio::test]
+async fn tail_returns_many_external_payloads_in_wal_order() {
+    let (store, wal) = memory_wal("ordered").await;
+    let total = 40u64;
+    for seq in 1..=total {
+        let entry = if seq % 5 == 0 {
+            document_entry(format!("{seq}-small"))
+        } else {
+            external_entry(seq as usize)
+        };
+        assert_eq!(
+            wal.append(seq, &entry).await.unwrap(),
+            CreateResult::Created
+        );
+    }
+    assert_eq!(store.list("ns/ordered/wal-data/").await.unwrap().len(), 32);
+    let tail = wal.tail(0).await.unwrap();
+    assert_eq!(tail.len(), total as usize);
+    for (i, (seq, entry)) in tail.iter().enumerate() {
+        assert_eq!(*seq, i as u64 + 1);
+        assert_eq!(tag_of(entry), i + 1);
+    }
+    let from = wal.tail(30).await.unwrap();
+    assert_eq!(from.first().unwrap().0, 31);
+    assert_eq!(from.len(), 10);
+}
+
+/// The replay starts at the last tombstone; payloads before it are never needed.
+#[tokio::test]
+async fn tail_starts_at_a_tombstone_in_the_middle() {
+    let (_store, wal) = memory_wal("middle").await;
+    for seq in 1..=12u64 {
+        let entry = if seq == 6 {
+            let mut t = WalEntry::new(vec![]);
+            t.tombstone = true;
+            t
+        } else {
+            external_entry(seq as usize)
+        };
+        wal.append(seq, &entry).await.unwrap();
+    }
+    // Reclaim the payloads before the tombstone, as deletion cleanup does.
+    wal.cleanup_deleted(6).await.unwrap();
+    let tail = wal.tail(0).await.unwrap();
+    let seqs: Vec<u64> = tail.iter().map(|(s, _)| *s).collect();
+    assert_eq!(seqs, (6..=12).collect::<Vec<_>>());
+    assert!(tail[0].1.tombstone);
+    for (seq, entry) in &tail[1..] {
+        assert_eq!(tag_of(entry), *seq as usize);
+    }
+}
+
+/// A reclaimed payload without a tombstone is still reported as corruption, and a budget still
+/// stops the replay at the same entry, as before fetches ran concurrently.
+#[tokio::test]
+async fn tail_reports_reclaimed_payloads_and_honors_the_byte_budget() {
+    let (_store, wal) = memory_wal("reclaimed").await;
+    for seq in 1..=12u64 {
+        wal.append(seq, &external_entry(seq as usize))
+            .await
+            .unwrap();
+    }
+    wal.prune_payloads(6).await.unwrap();
+    assert!(matches!(wal.tail(0).await, Err(Error::Format)));
+    let tail = wal.tail(6).await.unwrap();
+    assert_eq!(tail.len(), 6);
+    let one = serde_json::to_vec(&tail[0].1).unwrap().len() as u64;
+    let bounded = wal.tail_bounded(6, one * 2 + 1).await.unwrap();
+    assert_eq!(
+        bounded.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![7, 8]
+    );
+}
+
+/// Cleanup racing a reader: the reader either sees every payload or restarts at the tombstone.
+#[tokio::test]
+async fn tail_survives_payloads_reclaimed_mid_read() {
+    for round in 0..10 {
+        let (_store, wal) = memory_wal(&format!("race{round}")).await;
+        for seq in 1..=12u64 {
+            wal.append(seq, &external_entry(seq as usize))
+                .await
+                .unwrap();
+        }
+        let mut tombstone = WalEntry::new(vec![]);
+        tombstone.tombstone = true;
+        let deleter = async {
+            wal.append(13, &tombstone).await.unwrap();
+            wal.cleanup_deleted(13).await.unwrap();
+        };
+        let (tail, ()) = tokio::join!(wal.tail(0), deleter);
+        let tail = tail.unwrap();
+        let first = tail.first().unwrap().0;
+        assert!(first == 1 || first == 13, "{first}");
+        let seqs: Vec<u64> = tail.iter().map(|(s, _)| *s).collect();
+        // A reader that scanned before the tombstone committed ends at 12.
+        let last = *seqs.last().unwrap();
+        assert!(last == 12 || last == 13, "{last}");
+        assert_eq!(seqs, (first..=last).collect::<Vec<_>>());
+    }
+}
+
+/// An empty or fully indexed tail is cheap and empty.
+#[tokio::test]
+async fn tail_of_nothing_is_empty() {
+    let (_store, wal) = memory_wal("empty").await;
+    assert!(wal.tail(0).await.unwrap().is_empty());
+    wal.append(1, &external_entry(1)).await.unwrap();
+    assert!(wal.tail(1).await.unwrap().is_empty());
+    assert_eq!(wal.tail(0).await.unwrap().len(), 1);
+}

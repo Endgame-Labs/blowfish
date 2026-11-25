@@ -141,6 +141,8 @@ fn encode_payload(json: &[u8], version: u8) -> Result<Vec<u8>, Error> {
 const SLOT_VERSION: u8 = 3;
 /// Maximum uncompressed entry size stored directly in a commit slot (64 KiB).
 pub const INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Out-of-line payloads `tail_bounded` fetches at once.
+const TAIL_FETCH_CONCURRENCY: usize = 8;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitRecord {
     write_id: Uuid,
@@ -744,6 +746,7 @@ impl Wal {
         after: u64,
         max_bytes: u64,
     ) -> Result<Vec<(u64, WalEntry)>, Error> {
+        use futures::StreamExt;
         let mut previous_head = None;
         loop {
             let mut records = vec![];
@@ -770,8 +773,16 @@ impl Wal {
             let mut entries = vec![];
             let mut pruned = false;
             let mut included_bytes = 0u64;
-            for (seq, record) in records.into_iter().skip(start) {
-                match self.materialize(&record).await {
+            // Out-of-line payloads are fetched concurrently (a cold reader of n of them paid n
+            // serial round trips), but `buffered` yields them in WAL order, so entries are
+            // applied, budgeted, and failed exactly as the serial loop did. Concurrency is
+            // bounded by count; a payload's size is unknown until it is read. Stopping early
+            // (budget, pruned, or error) drops the fetches still in flight.
+            let mut fetched = futures::stream::iter(records.into_iter().skip(start))
+                .map(|(seq, record)| async move { (seq, self.materialize(&record).await) })
+                .buffered(TAIL_FETCH_CONCURRENCY);
+            while let Some((seq, materialized)) = fetched.next().await {
+                match materialized {
                     Ok(entry) => {
                         let size = serde_json::to_vec(&entry)?.len() as u64;
                         if included_bytes.saturating_add(size) > max_bytes {
