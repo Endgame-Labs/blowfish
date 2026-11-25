@@ -1600,9 +1600,6 @@ impl Manager {
             &|e| limits.contains_key(&e.file.key),
             &mut comp_lease,
         );
-        // Document columns that queries already project come next, ahead of the exact vectors,
-        // which take whatever the cap still allows.
-        let columns = self.plan_columns(store, scope, set, &docs).await;
         let mut extras: Vec<_> = exact
             .into_iter()
             .filter_map(|(key, len)| {
@@ -1633,6 +1630,10 @@ impl Manager {
                 limits.insert(key, len);
             }
         }
+        // Document columns that queries already project take what the cap still allows after
+        // the exact vectors. They never displace vectors: round C15 measured that each
+        // displaced vector row moves the wait from hydration to the rerank.
+        let columns = self.plan_columns(store, scope, set, &docs).await;
         if crate::ann::trace_stages() {
             let staged_rows: u64 = dir
                 .entries()
@@ -3204,6 +3205,86 @@ mod tests {
                 .is_none()
         );
         assert!(stage.bad.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn columns_use_only_what_the_cap_leaves_after_the_vectors() {
+        let (store, set, _, _) = fixture(32).await;
+        publish(&store, &set, false, 1).await;
+        let (schema, docs) = crate::segment::document_tests::input(1400);
+        let segment = crate::segment::build_with(
+            &store,
+            "t",
+            &schema,
+            bf_types::DistanceMetric::CosineDistance,
+            &docs,
+            BTreeMap::new(),
+            0,
+            1,
+        )
+        .await
+        .unwrap();
+        let file = segment.files["docs"].clone();
+        let tail = file.metadata_len.max(65536).min(file.size);
+        let extras = vec![Extra {
+            file: file.clone(),
+            kind: ExtraKind::Tail(file.size - tail),
+        }];
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        // Stage the tier before any query has projected a column.
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        let main = ready(&manager, "", &set).await;
+        companion_stage(&manager, &set).await;
+        let settled = async {
+            while !manager.state.lock().unwrap().pending.is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), settled)
+            .await
+            .unwrap();
+        // The cap is now full: a column that a later query projects finds no room, and
+        // nothing is evicted to make it.
+        let capacity = manager.capacity;
+        let used = std::mem::replace(&mut manager.state.lock().unwrap().used, capacity);
+        manager
+            .state
+            .lock()
+            .unwrap()
+            .columns
+            .insert("ns/test/".into(), vec!["text".into()]);
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        let settled = async {
+            while !manager.state.lock().unwrap().pending.is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), settled)
+            .await
+            .unwrap();
+        {
+            let state = manager.state.lock().unwrap();
+            for column in ["text", "id"] {
+                assert!(
+                    !state
+                        .ready
+                        .contains_key(&column_stage_key("", &set.dir.key, column))
+                );
+            }
+            assert_eq!(state.used, capacity);
+            assert!(
+                state
+                    .ready
+                    .contains_key(&stage_key("", &set.dir.key, false))
+            );
+        }
+        assert!(Arc::strong_count(&main) >= 1);
+        // With room again (after the retry delay), the same column is staged.
+        manager.state.lock().unwrap().used = used;
+        manager.state.lock().unwrap().failed.clear();
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        column_stage(&manager, &set, "text").await;
     }
 
     #[tokio::test]

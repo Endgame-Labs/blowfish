@@ -87,6 +87,11 @@ P.add_argument(
     type=Path,
     help="prepared NQ queries.npy and truth.npy instead of the scale oracle",
 )
+P.add_argument(
+    "--stage-attributes",
+    type=json.loads,
+    help="include_attributes for the staging query and live queries only (measured queries keep --include-attributes)",
+)
 a = P.parse_args()
 signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(143)))
 ROOT = Path(__file__).resolve().parents[3]
@@ -117,6 +122,13 @@ items = [
     }
     for i in range(len(truth["vector"]))
 ]
+def staging_item(item):
+    """The item as sent while staging: --stage-attributes replaces its projection."""
+    if a.stage_attributes is None:
+        return item
+    return {**item, "request": {**item["request"], "include_attributes": a.stage_attributes}}
+
+
 arms = json.loads(a.arms)
 if not arms or any(not re.fullmatch(r"[A-Za-z0-9_-]+", name) for name in arms):
     P.error("arm names must contain only letters, numbers, hyphens, or underscores")
@@ -428,7 +440,7 @@ try:
                 servers[name] = stack.enter_context(server(name, n))
                 c, w, p = servers[name]
                 start = time.perf_counter()
-                first = query(name, items[-1], c, w, p)
+                first = query(name, staging_item(items[-1]), c, w, p)
                 if name in a.stage_arm:
                     live = []
                     for item in items[: a.stage_live_queries]:
@@ -436,7 +448,7 @@ try:
                             break
                         c.post("/_bench/drop_caches").raise_for_status()
                         (w / "server.log").write_text("")
-                        live.append(query(name, item, c, w, p))
+                        live.append(query(name, staging_item(item), c, w, p))
                     (w / "live.json").write_text(json.dumps(live))
                     wait_staging(c, w, p, first, start, name in a.two_phase_arm, name in a.column_arm)
             rows.clear()
