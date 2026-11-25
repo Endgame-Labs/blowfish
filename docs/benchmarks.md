@@ -10708,3 +10708,49 @@ the reference's ordered IDs and score bits.
 Raising the decoded-posting budget from 8 MiB to 64 MiB per reader made warm BM25 far slower (212 q/s at one client,
 about 378 at 16); reverted and not investigated. Decoding still costs about 14% of CPU (decode, memo insert, table
 build, bound summaries) because the 8 MiB dense budget cannot hold the working set; that is the next lead.
+
+## Round BW7: row-mask co-occurrence pruning for exact BM25 (negative result)
+
+Hypothesis: windows are scored because each essential term appears somewhere in the 128-row window, not in the same
+rows. Summing term bounds only over the terms that actually contain a row should let most windows be skipped. Exact
+BM25 only, no format change.
+
+### Kill test
+
+Temporary counters (removed) in `search_internal` on the 1M MS MARCO warm trace (`tmp/msmarco-1m-v021/`, 1,000-query
+workload). For every window that reached scoring with a heap floor and a nonempty `competitive` set, count windows
+where `max over rows of (exact sparse bound + sum of dense term bounds for terms containing the row + prefix) * margin`
+is below the floor. Warm interval (searches 2,000 to 4,000): 333,937 such windows, 300,771 of them (90%) skippable.
+Over all 4,000 searches, 520,090 of 586,669 (89%). The 25% bar was passed by a wide margin.
+
+### Candidate
+
+Instead of 128-bit masks, a direct per-row filter: after `competitive` is built, one pass over each dense term's
+decoded window slice accumulates per-row bound sums, and rows below the floor are dropped (a window with no rows left
+is skipped). This is the same bound a mask AND would give, so it measures the best case for the idea except for the
+mask's cheaper pass. Ties are kept, so results are unchanged. All replies matched ordered IDs and f32 score bits.
+
+### Measurement (paired A/B/B/A, one on-demand c7g.4xlarge, Ubuntu 24.04, 1M MS MARCO, same release profile)
+
+Protocol as BW6 (server on CPUs 0 to 5, 2 Rayon workers, client on 14 and 15, fresh store copy per arm, two 1-client
+prewarm passes, three 1-client and six 16-client passes of 1,000 queries; medians). Baseline `dc0aa2e`, candidate `9ef7267`.
+
+| Arm | 1 client q/s | 1 client p50 / p90 ms | 16 clients q/s | 16 clients p50 / p90 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline (A, A) | 637.7 | 1.12 / 2.8 | 1,341 | 10.23 / 17.5 |
+| Candidate (B, B) | 656.0 | 1.11 / 2.8 | 1,365 | 10.17 / 17.3 |
+
+**1.02x at 16 clients (bar 1.2x), 1.03x at one client.** Fails.
+
+### Why the 90% did not turn into time
+
+The skipped windows are skipped *after* their posting blocks were fetched and decoded, their bounds computed, and their
+candidates generated. What the filter saves is only the final `score_cached` loop (a `lengths[row]` load and a
+division per candidate), and it adds one more pass over the dense postings to do so. The two roughly cancel. The saving
+that would matter is skipping a window before reading or decoding its blocks, which needs per-block row masks to be
+persisted (a format change, out of scope) and would still pay the window-bound sort and heap that BW5 and BW6
+measured. The code was reverted; the experiment is commit `9ef7267`.
+
+### Cost
+
+One c7g.4xlarge on-demand, about 1 hour, about $0.75. Terminated; key pair and security group deleted. No bucket writes.
