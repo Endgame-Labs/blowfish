@@ -38,6 +38,7 @@ mod query_worker;
 use published::Published;
 mod recluster;
 mod reindex;
+mod slab_rows;
 mod text;
 mod text_keys;
 mod text_tail;

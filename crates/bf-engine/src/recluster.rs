@@ -590,6 +590,11 @@ impl Engine {
                 let prefix = format!("ns/{ns2}/slabs/{id2}");
                 let key = format!("{prefix}/ann.{}.bfa", uuid::Uuid::new_v4());
                 let blob = bytes::Bytes::from(blob);
+                let member = bf_vector::Index::open_with_metadata_len(blob.clone(), meta)
+                    .await
+                    .map_err(segment::index_error)?
+                    .membership()
+                    .map_err(segment::index_error)?;
                 let put = segment::put_bytes(&store2, key.clone(), blob.clone(), meta);
                 let ann = match (&prestage2, lens) {
                     (Some(pre), lens) if lens.0 > 0 => {
@@ -600,6 +605,8 @@ impl Engine {
                     _ => put.await?,
                 };
                 let mut files = std::collections::BTreeMap::new();
+                let rows = crate::slab_rows::write(&store2, &ann, &member).await?;
+                files.insert(crate::slab_rows::role(&attr2), rows);
                 files.insert(format!("annv2:{attr2}"), ann);
                 uploads2.lock().await.push(Segment {
                     id: id2,

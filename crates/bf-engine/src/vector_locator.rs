@@ -106,20 +106,31 @@ impl Sources {
                 let file = crate::upgrade::files(slab, attr)
                     .ok_or_else(segment::corrupt)?
                     .0;
-                let key = format!("slab-rows:{}", file.key);
-                let resident: Arc<Vec<u32>> = if let Some(rows) = read_cache::get(&key, 0) {
-                    rows
+                let member = crate::slab_rows::load(store, slab, attr).await?;
+                let fallback = if member.is_none() {
+                    let key = format!("slab-rows:{}", file.key);
+                    let fallback: Arc<Vec<u32>> = if let Some(rows) = read_cache::get(&key, 0) {
+                        rows
+                    } else {
+                        let index = segment::vector_index(store, file).await?;
+                        if index.dims() != dims || index.vector_type() != dtype {
+                            return Err(segment::corrupt());
+                        }
+                        let rows = index.row_ids();
+                        if rows.len() != slab.row_count as usize {
+                            return Err(segment::corrupt());
+                        }
+                        read_cache::insert(&key, (rows.len() * 4) as u64, rows)
+                    };
+                    Some(fallback)
                 } else {
-                    let index = segment::vector_index(store, file).await?;
-                    if index.dims() != dims || index.vector_type() != dtype {
-                        return Err(segment::corrupt());
-                    }
-                    let rows = index.row_ids();
-                    if rows.len() != slab.row_count as usize {
-                        return Err(segment::corrupt());
-                    }
-                    read_cache::insert(&key, (rows.len() * 4) as u64, rows)
+                    None
                 };
+                let resident = member
+                    .as_ref()
+                    .and_then(|m| m.row_ids())
+                    .or_else(|| fallback.as_deref().map(Vec::as_slice))
+                    .ok_or_else(segment::corrupt)?;
                 let wanted: RoaringBitmap = global_to_row
                     .keys()
                     .filter(|r| resident.binary_search(r).is_ok())
