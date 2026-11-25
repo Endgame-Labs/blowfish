@@ -11334,3 +11334,92 @@ here: the bounds are loose against the k-th distance, so every candidate survive
 100M projection.
 
 EC2: not used (the study ran on this VM). SPEC 25 stands; PROGRESS and the SPEC decision log should note the stop.
+
+## Round BW10: directly addressable dense-term frequencies (below the throughput bar)
+
+Tested against main at `c86aec6` (v0.1.31, including BW9), on one on-demand c7g.4xlarge running Ubuntu 24.04.
+The hypothesis was a byte per row for selected dense terms, replacing posting decode, window-slice lookup, and
+posting-based candidate preparation. The pass bar was at least **1.30x warm 16-client q/s**, bit-identical ordered IDs
+and f32 scores on the frozen 4,000-query snapshot check, and at most 32 MiB of extra resident data at 1M rows.
+
+### Prototype and selection
+
+The memory-only prototype builds up to 32 arrays before a text reader enters the decoded cache. Zero means absent,
+1 through 254 are direct frequencies, and 255 uses a sorted `(row, tf)` overflow table. It reuses the checked posting
+decoder without filling the posting memo, charges arrays and bookkeeping to the reader, and keeps the original
+term order and f32 addition order. Dense terms skip posting-frame allocation, span preparation, fetches, and slice
+lookups. Essential dense terms are tested while selecting competitive rows, and those rows are scored directly.
+Conservative per-window saturation bounds are cached as upward-rounded f32 values and rebuilt when normalization
+statistics change. No format change.
+
+Selection uses only the even-indexed 500 queries in `bench/scale/data/bm25-msmarco.json`: rank unique query-term
+frequency times corpus document frequency, and freeze the top 32. The prototype's `dense_bm25_terms` example takes the
+training workload and raw text-segment payloads; copied fixture objects need their 24-byte `BFPUT001` storage envelope
+removed before selection. Terms that are sparse in an individual segment keep the posting path. Selected terms, in cost order:
+
+```text
+is,the,of,a,in,to,and,for,what,are,on,how,you,can,when,an,it,with,does,who,which,have,was,as,be,from,do,your,many,at,definition,where
+```
+
+### Paired measurement
+
+The read-only 1M MS MARCO fixture from v0.1.21, copied to a separate local store per arm. Timing order A/B/B/A,
+server on CPUs 0 through 5 with two Rayon workers and two Tokio workers, client on CPUs 14 and 15, a 2 GiB raw cache,
+4,000-byte cache blocks, and the default decoded cache. Same release profile for both binaries. Two single-client
+prewarm passes over the held-out odd-indexed 500 queries precede timing. Each timed pass repeats those 500 queries
+eight times (4,000 replies): three passes at one client, and six at 16 clients. Every reply checks ordered IDs and
+f32 score bits against the fixture truth. Values below are medians within each arm.
+
+| Arm | 1 client q/s | 1 client p50 / p90 ms | 16 clients q/s | 16 clients p50 / p90 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline A1 | 816 | 1.04 / 1.84 | 2,042 | 7.14 / 11.50 |
+| Candidate B1 | 923 | 0.97 / 1.40 | 2,602 | 5.54 / 9.69 |
+| Candidate B2 | 921 | 0.97 / 1.41 | 2,607 | 5.53 / 9.70 |
+| Baseline A2 | 817 | 1.04 / 1.82 | 2,043 | 7.14 / 11.50 |
+
+Across all 12 passes per binary at 16 clients, the median gain is **1.275x**, about 2,604 versus 2,043 q/s.
+The 1.30x bar requires 2,655 q/s in this pair; the candidate falls short by 51 q/s. Comparing against BW9's historical
+1,966 q/s would overstate the gain because this run uses a different query split.
+
+Array, overflow, reserved bound, and bookkeeping charges total **30,232,576 bytes (28.83 MiB)** across eight readers.
+Whole-server warm RSS was 460 / 464 MiB in A1 / A2, and 431 / 413 MiB in B1 / B2: replacing decoded dense postings
+reduced total RSS despite the additional arrays. These are observed RSS values, not a general memory guarantee.
+
+### Validation and decision
+
+The prototype is preserved at `04e91eb`. `cargo fmt`, `cargo clippy -p bf-text -p bf-engine --all-targets -- -D warnings`,
+and `cargo test -p bf-text -p bf-engine` pass. Its new test checks byte-boundary frequencies (254, 255, and 300), missing
+terms, duplicate selections, budget refusal, filters, prefixes, repeated query terms, partial windows, changed corpus
+normalization, demand reads, and prefetched reads, comparing score bits and IDs.
+
+The release-mode frozen check, `text_benchmark::bm25_serialized_msmarco_snapshots`, passes in **133.42 s** with arrays
+on: all 4,000 queries across the four serialized snapshot states match the independent exhaustive scorer's ordered IDs
+and f32 score bits. The states include text-changing writes, null text, deletes, WAL overlays, and a later index publication.
+All 144,000 timed replies also match the fixture truth (plus prewarm and profiling replies).
+
+**Not shipped: the throughput bar was missed.** The memory and exactness bars pass, but the paired gain is 1.275x,
+so the prototype's runtime hook, arrays, selector example, and dedicated test are removed from the final tree. BW9 remains
+the serving path. There is no reason to persist this layout or change the bucket format on these results. Startup/cold
+latency and write-loaded performance were not measured; this is a warm-read experiment only.
+
+### Where the remaining CPU went
+
+After timing and the frozen check, separate 199 Hz `cpu-clock` profiles ran 48,000 held-out queries per binary at
+16 clients on the same CPU placement. These are sample shares, not independent latency measurements:
+
+| Symbol or operation | Baseline samples | Candidate samples |
+| --- | ---: | ---: |
+| `Postings::window` | 3.82% | 2.23% |
+| `SearchTerm::cache_windows` span preparation | 4.89% | 2.73% |
+| Relaxed 64-bit atomic add | 5.63% | 1.96% |
+| Competitive-row predicate | 6.57% | 10.64% |
+| Main `search_internal` body, including inlined work | 37.45% | 35.65% |
+
+The targeted costs do shrink. The shared window planner, competitive-row filtering, and scoring still consume much
+of the query, and sparse and unselected terms still use postings. The larger 16-client gain than single-client gain
+(1.275x versus about 1.13x) is consistent with reducing shared memo and reference-count traffic. The atomic sample does
+not identify its callers, so it does not by itself establish how much was memo contention.
+
+One c7g.4xlarge for about 19 minutes (0.31 instance-hours), estimated below $1 using the granted $2/hour ceiling,
+including a small allowance for disk and fixture reads. The instance was terminated, and its tagged key pair and security
+group were deleted. No bucket writes. All 396 fixture-file sizes and SHA-256 hashes were verified after the run.
