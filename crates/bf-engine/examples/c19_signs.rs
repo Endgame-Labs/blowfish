@@ -108,7 +108,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for &p in &picks {
         let e = &dir.entries()[p];
         let s = &dir.segments()[e.segment];
-        let key = if s.codes_in_fragment { &s.fragment } else { &s.key };
+        let key = if s.codes_in_fragment {
+            &s.fragment
+        } else {
+            &s.key
+        };
         let blob = store.get_range(key, e.codes_range()).await?;
         let n = e.rows as usize;
         let stored = &blob[16 * n..];
@@ -129,7 +133,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         rows_total += n;
         // Order-0 per-dimension entropy bound.
         for d in 0..padded {
-            let ones = (0..n).filter(|r| rows[r * width + d / 8] >> (d % 8) & 1 != 0).count() as f64;
+            let ones = (0..n)
+                .filter(|r| rows[r * width + d / 8] >> (d % 8) & 1 != 0)
+                .count() as f64;
             let p = ones / n as f64;
             if p > 0. && p < 1. {
                 entropy_bits += n as f64 * -(p * p.log2() + (1. - p) * (1. - p).log2());
@@ -138,15 +144,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Majority pattern.
         let mut maj = vec![0u8; width];
         for d in 0..padded {
-            let ones = (0..n).filter(|r| rows[r * width + d / 8] >> (d % 8) & 1 != 0).count();
+            let ones = (0..n)
+                .filter(|r| rows[r * width + d / 8] >> (d % 8) & 1 != 0)
+                .count();
             if ones * 2 > n {
                 maj[d / 8] |= 1 << (d % 8);
             }
         }
         let xp: Vec<u8> = (0..rows.len())
-            .map(|i| if i < width { rows[i] } else { rows[i] ^ rows[i - width] })
+            .map(|i| {
+                if i < width {
+                    rows[i]
+                } else {
+                    rows[i] ^ rows[i - width]
+                }
+            })
             .collect();
-        let xm: Vec<u8> = rows.iter().enumerate().map(|(i, b)| b ^ maj[i % width]).collect();
+        let xm: Vec<u8> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ maj[i % width])
+            .collect();
         let rpb = BLK / width; // rows per 16 KiB block
         acc[0].bytes += rows.len() as f64;
         for lv in [1, 3] {

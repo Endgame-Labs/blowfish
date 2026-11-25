@@ -12452,3 +12452,23 @@ which is optimistic for leaves this small (about 246 rows), is still 126.7 bytes
 help either. Sign bits of a rotated residual are close to i.i.d. fair coins: the leaf center already absorbs the
 correlation, and that is what RaBitQ's rotation is for. Nothing to merge; the 100M stage still needs another way to make
 room for exact vectors (for example fewer routing bytes or the C18 vector codec).
+
+## Round RR8: leave dead rows out of the recluster spill
+
+Recluster's copy pass wrote every cluster's vectors into the local spill before it applied the live mask, so deleted rows took
+spill space and copy time (a 10M namespace's spill is about 20.48 GB). The copy loop now packs each cluster's live rows
+before writing and addresses them by the same global row IDs, so nothing after the copy changes. No format change.
+
+Measured with the unit test `recluster::dead_row_tests` (two 3,000-row segments of `[64]f16`, 30% of rows deleted by a fixed
+`id % 10 < 3` mask, 4 cells):
+
+| | Spill rows | Spill bytes (128 B per row) | Digest of every slab object |
+|---|---:|---:|---|
+| Before | 6,000 | 768,000 | c94fdde09fcd9507 |
+| After | 4,200 | 537,600 (70.0%) | c94fdde09fcd9507 |
+
+Result: **kept.** Allocated spill bytes are 70% of baseline (the pass bar was 77%), and the recluster output is identical:
+the same assignments and byte-identical slab objects (old and new builds hash the same, and the test asserts the digest is
+stable across runs). The copy writes fewer bytes and does one extra in-memory pack per cluster that has deletes, so it cannot be
+slower in I/O terms. I did not time it at NQ scale on this round: the in-memory test is too small to show a wall-clock
+difference, so a 10M-scale timing is still open.

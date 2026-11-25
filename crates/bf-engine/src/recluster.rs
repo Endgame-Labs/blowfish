@@ -295,18 +295,34 @@ impl Engine {
                     while let Some((rows, bytes)) =
                         reads.try_next().await.map_err(segment::index_error)?
                     {
+                        // Dead rows never reach the spill: compact the live rows of this
+                        // cluster, keeping their order, and address them by global row below.
+                        let is_live = |row: u32| live.as_ref().is_none_or(|l| l.contains(row));
+                        let kept = rows.iter().filter(|r| is_live(**r)).count();
+                        if kept == 0 {
+                            continue;
+                        }
                         let writing = std::time::Instant::now();
                         let start = next_spill_row
-                            .fetch_add(rows.len() as u32, std::sync::atomic::Ordering::Relaxed);
-                        spill
-                            .write_all_at(&bytes, u64::from(start) * width as u64)
-                            .map_err(segment::index_error)?;
-                        for (i, row) in rows.iter().enumerate() {
-                            if live.as_ref().is_some_and(|l| !l.contains(*row)) {
-                                continue;
+                            .fetch_add(kept as u32, std::sync::atomic::Ordering::Relaxed);
+                        if kept == rows.len() {
+                            spill
+                                .write_all_at(&bytes, u64::from(start) * width as u64)
+                                .map_err(segment::index_error)?;
+                        } else {
+                            let mut packed = Vec::with_capacity(kept * width);
+                            for (i, row) in rows.iter().enumerate() {
+                                if is_live(*row) {
+                                    packed.extend_from_slice(&bytes[i * width..(i + 1) * width]);
+                                }
                             }
+                            spill
+                                .write_all_at(&packed, u64::from(start) * width as u64)
+                                .map_err(segment::index_error)?;
+                        }
+                        for (slot, row) in rows.iter().filter(|r| is_live(**r)).enumerate() {
                             spill_offsets[(base + *row) as usize]
-                                .store(start + i as u32, std::sync::atomic::Ordering::Relaxed);
+                                .store(start + slot as u32, std::sync::atomic::Ordering::Relaxed);
                             present.push(base + *row);
                         }
                         spill_write_nanos.fetch_add(
@@ -322,6 +338,11 @@ impl Engine {
         .try_collect()
         .await?;
         drop(copy_stage);
+        #[cfg(test)]
+        LAST_SPILL_ROWS.store(
+            u64::from(next_spill_row.load(std::sync::atomic::Ordering::Relaxed)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Stage::record(
             "spill_write",
             std::time::Duration::from_nanos(spill_write_nanos.into_inner()),
@@ -1409,6 +1430,99 @@ fn assign_leaves(
         }
     }
     Some(jobs)
+}
+
+/// Rows the latest copy pass wrote to the spill (tests only).
+#[cfg(test)]
+static LAST_SPILL_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod dead_row_tests {
+    use super::*;
+    use bf_storage::{Storage, StorageConfig};
+    use bf_types::WriteRequest;
+    use serde_json::json;
+
+    fn vector(id: usize) -> Vec<f32> {
+        (0..64)
+            .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+            .collect()
+    }
+
+    /// Recluster 6,000 rows with every third deleted. Returns the spill rows and a digest of
+    /// every object the recluster wrote, so a run can be compared with another build's.
+    async fn run(deleted: &[usize]) -> (u64, String) {
+        let store = Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let e = Engine::with_config(
+            store.clone(),
+            crate::EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.0,
+                ..Default::default()
+            },
+        );
+        for batch in 0..2 {
+            let docs: Vec<_> = (batch * 3000..(batch + 1) * 3000)
+                .map(|id| json!({"id": id, "vector": vector(id)}))
+                .collect();
+            let body = json!({"distance_metric": "euclidean_squared",
+                "schema": {"vector": {"type": "[64]f16", "ann": true}}, "upsert_rows": docs});
+            e.write("t", serde_json::from_value::<WriteRequest>(body).unwrap())
+                .await
+                .unwrap();
+            e.index_namespace("t", true).await.unwrap();
+        }
+        let body = json!({ "deletes": deleted });
+        e.write("t", serde_json::from_value::<WriteRequest>(body).unwrap())
+            .await
+            .unwrap();
+        e.index_namespace("t", true).await.unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        e.recluster(
+            "t",
+            &ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 4,
+                cluster_rows: 60,
+                max_slab_rows: 3000,
+                scratch: scratch.path().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut keys: Vec<String> = store
+            .list("")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        keys.sort();
+        let mut digest = std::collections::hash_map::DefaultHasher::new();
+        for key in keys.iter().filter(|k| k.contains("slab")) {
+            std::hash::Hash::hash(&store.get(key).await.unwrap().to_vec(), &mut digest);
+        }
+        let rows = LAST_SPILL_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        (rows, format!("{:x}", std::hash::Hasher::finish(&digest)))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spill_holds_only_live_rows_and_output_is_stable() {
+        let deleted: Vec<usize> = (0..6000).filter(|i| i % 10 < 3).collect();
+        let (rows, digest) = run(&deleted).await;
+        eprintln!("RR8_DIGEST {digest}");
+        assert_eq!(
+            rows,
+            6000 - deleted.len() as u64,
+            "spill holds no dead rows"
+        );
+        assert_eq!(digest, run(&deleted).await.1);
+    }
 }
 
 #[cfg(test)]
