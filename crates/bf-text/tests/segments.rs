@@ -1256,6 +1256,8 @@ fn selective_masks_score_allowed_rows_with_the_same_bits_as_the_unfiltered_ranki
         outside,
         RoaringBitmap::new(),
         (0..3).collect(),
+        (0..n).filter(|r| r % 9 == 0).collect(),
+        (0..n).filter(|r| r % 5 == 0).collect(),
     ];
     // The second pass runs after dense arrays are earned.
     for pass in 0..2 {
