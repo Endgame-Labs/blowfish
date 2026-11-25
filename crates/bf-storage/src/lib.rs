@@ -28,6 +28,11 @@ use uuid::Uuid;
 
 const MAGIC: &[u8; 8] = b"BFPUT001";
 const HEADER: usize = 24;
+/// How often the connection warmer re-touches its idle connections. S3 closes an idle connection
+/// somewhere between 20 and 40 seconds (and any connection after 100 requests), so the refresh has
+/// to come well inside 20 seconds; a longer interval finds closed connections and the next wave
+/// pays a TLS handshake per request.
+const WARM_REFRESH: Duration = Duration::from_secs(15);
 /// Safe storage errors. Backend messages are retained as sources, not displayed to HTTP clients.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -316,8 +321,8 @@ impl Storage {
     /// pays a TLS handshake per request (measured at about 65 ms each, and about half the wall
     /// time of a 250-request wave). The pool follows the largest recent wave (see `PoolSizer`),
     /// grows within seconds of a bigger wave, and decays to a small floor after an idle period, so
-    /// an idle server does not pay for hundreds of keepalive HEADs. Refreshes before the pool's
-    /// idle timeout.
+    /// an idle server does not pay for hundreds of keepalive HEADs. Refreshes every
+    /// [`WARM_REFRESH`], before S3 closes an idle connection.
     fn spawn_connection_warmer(&self, mut sizer: PoolSizer) {
         if sizer.fixed == Some(0) {
             return;
@@ -334,8 +339,7 @@ impl Storage {
                 drop(inner);
                 let now = std::time::Instant::now();
                 let target = sizer.observe(peak, now);
-                let due =
-                    last_refresh.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(45));
+                let due = last_refresh.is_none_or(|t| now.duration_since(t) >= WARM_REFRESH);
                 if target > 0 && (due || target > warmed) {
                     // HEAD of a missing key answers 404 on a connection that then returns to the pool.
                     futures::future::join_all((0..target).map(|_| backend.head(&path))).await;

@@ -11491,3 +11491,86 @@ One c7gd.4xlarge for about 24 minutes (about $0.30 on-demand). The instance, key
 deleted, and the `tmp/c13/` test objects (1.5 GB copy, 1.5 GB single-part, 64 MiB, and 1 MiB) were removed from the bucket.
 No writes to the 100M prefix. The harness (a 250-line Rust binary using hyper, rustls, and `object_store`'s presigned URLs)
 was scratch code and is not kept.
+
+## Round C14: exact-vector object size versus S3 read latency (stopped, object size does not matter)
+
+C13 found that 16 KiB range GETs cost about 25 ms inside a 64 MiB object but about 100 ms scattered over the 100M
+namespace's 160 slabs. The idea was to write exact vectors in smaller objects so a query's rerank reads would land in
+small ones. This round tests that before changing any format, and it fails the gate: scattered reads cost about
+100 ms whatever the object size. No slab format change was made.
+
+Setup: one on-demand c7gd.4xlarge in us-west-2b, instance-profile credentials, boto3 with 84 threads and prewarmed
+connections. Test objects (random bytes) were written under a fresh `tmp/c14-20261125/` prefix and deleted afterward.
+Each GET is 16 KiB at a random 4 KiB-aligned offset over every object in the layout. Single = 300 sequential GETs; wave
+= 25 waves of 84 concurrent GETs, 100 ms apart. "Idle" is the first pass after the layout sat unread for at least
+five minutes; "warm" and "warm2" are the next two passes (new random offsets). p50 / p90 in ms.
+
+| Layout | Pass | Single GET | Per-GET in an 84-wave | 84-wave total |
+| --- | --- | ---: | ---: | ---: |
+| a: 800 x 64 MiB (51 GB) | idle | 98.1 / 131.5 | 103.5 / 149.3 | 263.2 / 387.8 |
+| | warm | 98.3 / 127.4 | 103.8 / 147.0 | 266.1 / 323.1 |
+| | warm2 | 102.7 / 137.0 | 103.3 / 142.0 | 264.6 / 332.8 |
+| b: 3,200 x 16 MiB (54 GB) | idle | 95.6 / 125.8 | 100.5 / 139.0 | 263.1 / 306.7 |
+| | warm | 102.3 / 147.3 | 101.4 / 143.7 | 273.5 / 326.8 |
+| | warm2 | 91.9 / 124.3 | 102.2 / 139.6 | 273.2 / 325.4 |
+| c: 200 x 256 MiB (54 GB) | idle | 102.9 / 146.8 | 101.0 / 143.8 | 258.1 / 373.9 |
+| | warm | 97.3 / 128.7 | 101.8 / 143.6 | 260.7 / 331.1 |
+| | warm2 | 94.9 / 129.3 | 101.7 / 136.8 | 251.4 / 283.7 |
+| d: 156 x 1.5 GB slabs, control (the 100M namespace, read only) | idle | 104.1 / 134.3 | 106.6 / 145.5 | 253.3 / 316.9 |
+| | warm | 102.3 / 137.2 | 107.8 / 150.6 | 273.3 / 324.5 |
+| | warm2 | 101.0 / 130.8 | 105.6 / 143.1 | 275.7 / 333.1 |
+
+Every layout matches the 1.5 GB control, idle or warm. Dispersion across many small objects costs the same as
+dispersion inside a big one, so the gate fails and step 2 (writing exact vectors as small objects, the 10M rebuild, and
+the `cold_ab.py` run) was not attempted.
+
+### What the cost does follow: the total span of the scattered reads
+
+A follow-up sweep reads random 16 KiB ranges from only the first N objects of a layout (same client, fresh offsets):
+
+| Reads scattered over | Total span | Single GET | Per-GET in an 84-wave | 84-wave total |
+| --- | ---: | ---: | ---: | ---: |
+| 1 x 64 MiB | 64 MiB | 25.9 / 33.2 | 49.0 / 71.5 | 156.2 / 170.6 |
+| 4 x 64 MiB | 256 MiB | 26.3 / 64.1 | 49.8 / 72.8 | 170.8 / 367.3 |
+| 16 x 64 MiB | 1 GiB | 41.4 / 106.9 | 50.0 / 76.3 | 163.9 / 220.9 |
+| 64 x 64 MiB | 4 GiB | 86.1 / 140.4 | 52.6 / 108.0 | 212.6 / 276.9 |
+| 256 x 64 MiB | 16 GiB | 93.2 / 133.6 | 92.3 / 143.2 | 271.1 / 377.6 |
+| 1 x 256 MiB | 256 MiB | 26.9 / 77.3 | 49.4 / 72.5 | 158.2 / 268.1 |
+| 8 x 256 MiB | 2 GiB | 81.2 / 119.5 | 52.6 / 91.9 | 183.0 / 254.7 |
+| 32 x 256 MiB | 8 GiB | 86.2 / 118.2 | 65.6 / 124.8 | 248.5 / 396.9 |
+
+Latency follows how many bytes the reads span, not how many objects hold them: reads within about 1 GiB stay at 25 to 50
+ms per GET (the 84-wave rows include client concurrency cost), and past about 2 to 4 GiB they cost 80 to 100 ms,
+whether that is eight 256 MiB objects or sixty-four 64 MiB ones. So the remaining data-side idea is not smaller
+objects but cluster-local placement: a query's rerank reads would have to fall inside roughly 1 GiB of the bucket
+(for example, vectors of neighboring clusters stored together and a query's probed clusters chosen from a
+narrow region), which the current layout does not do. That is a different design from this round's brief and is
+not tried here.
+
+### Connection warmer refresh: 15 seconds, no measurable end-to-end gain in-region
+
+S3 closes an idle connection after 20 to 40 seconds, but the warmer refreshed every 45. The refresh is now 15
+seconds (`WARM_REFRESH` in `bf-storage`). To see the effect on a wave after a pause, `bf-storage/examples/warmer_idle.rs`
+opens the real `Storage` (so the real warmer runs), raises the pool to 84 with one wave, idles for the gap, and
+times one wave of 84 random 16 KiB range GETs inside a single 64 MiB object. Two builds, 15 s and 45 s, ran at the same time on
+one c7gd.4xlarge, 12 waves each at 30 s and 40 s idle gaps. Wave wall time in ms:
+
+| Refresh | Gap | p50 | mean | p90 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 45 s (before) | 30 s | 139.9 | 169.8 | 328.1 | 332.8 |
+| 15 s (now) | 30 s | 147.4 | 170.8 | 280.5 | 284.4 |
+| 45 s (before) | 40 s | 132.6 | 133.3 | 156.9 | 175.2 |
+| 15 s (now) | 40 s | 125.4 | 148.7 | 174.1 | 350.4 |
+
+The two are indistinguishable. A shorter first run with gaps of 5 to 43 s was just as noisy (waves from 75 to 800 ms in
+both arms). The likely reason: hyper drops a pooled connection as soon as S3 closes it, so a wave after a long
+pause opens new ones, and in-region a TCP and TLS handshake costs a few milliseconds (C13: 2 to 3 ms TLS), which the roughly 100 ms
+S3 tail hides. The change stays because it keeps connections open as intended and costs only the floor's worth of
+HEAD requests every 15 seconds when idle; a host with a longer round trip to its store (R2, or S3 from another
+region) pays much more per handshake and may gain more, which was not measured.
+
+### Cost and cleanup
+
+One on-demand c7gd.4xlarge for about 0.75 hours (about $0.55) plus about 150 GB of test objects in S3 for about an hour.
+The instance was terminated, its key pair and security group deleted, and `tmp/c14-20261125/` removed. No writes to
+the 100M prefix. The microbenchmark scripts (boto3) were scratch code and are not kept.
