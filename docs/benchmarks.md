@@ -12925,3 +12925,102 @@ A single trial arm before the sequence gave 16.48 / 27.69 ms.
   analysis. A cheaper route would be maintaining per-segment shadowed-row statistics incrementally across writes, a different design.
 - **Cost:** one c7g.4xlarge for about 18 minutes, an estimated under $0.30 with the volume. The instance, key pair, and security group
   are deleted (confirmed with describe-instances, describe-volumes, and describe-key-pairs). No S3 objects were created.
+
+## Round T8: exact BF16 screening on Arm
+
+Measured 2026-11-25 with NumKong 7.8.7 on an Apple M4 (Rust 1.99.1) and an
+on-demand c7g.xlarge, Graviton3 (Rust 1.100.0, Clang 19, and LLVM 22 builtins).
+The M4's nearest-center index identity test fails both alone and in the complete
+vector suite. The unmodified Graviton suite passes, including that identity test.
+
+The cause is a partial-output-tile overwrite in NumKong's **SME** matrix kernel,
+not a demonstrated shortfall in the roundoff allowance. Runtime kernel lookup
+for packing size, packing, and multiplication selects `*_bf16_sme` on M4;
+Graviton selects `*_bf16_neonbfdot`. Checking NEON BF16 capability did not constrain
+the matrix dispatcher to NEON. In `dots/sme.h`, the three-column-tile fast path
+stores all three tiles with an all-true predicate, including a partial final tile.
+At 90 columns and M4's 16-column tiles, it stores columns 48–95 into a 90-column
+row stride. The padding zeros replace centers 0–5 of the following row, and the
+last row writes six floats beyond the output allocation. Increasing the numerical
+error bound cannot repair this memory overwrite.
+
+A guarded diagnostic uses 64 rows, 96 dimensions, deterministic sine/cosine inputs
+scaled by 0.1, and extra allocation space after the logical output. Its largest
+observed errors against f64 sums of the original f32 products are:
+
+| Runtime kernel and width | Largest absolute dot error | Corresponding `dot_error` | Row, center | Floats written after logical output |
+| --- | ---: | ---: | --- | ---: |
+| M4 SME, 81 | 0.008201443786 | 0.001668448670 | 2, 14 | 15 |
+| M4 SME, 90 | 0.008091095486 | 0.001669338413 | 2, 0 | 6 |
+| M4 SME, 95 | 0.008091095486 | 0.001669338413 | 2, 0 | 1 |
+| Graviton NEON BFDOT, 90 | 0.000370660581 | 0.001615619162 | 56, 25 | 0 |
+| x86 Genoa BF16, 90 | 0.000370660581 | 0.001615619162 | 56, 25 | 0 |
+
+Widths 9, 48, 61, 80, 96, and 97 have no guard writes on either Arm host. Across
+these shapes, Graviton's maximum error/bound ratio is 0.229730. During the failing
+normalized index build, the largest observed absolute error before the first
+missing-winner assertion is **0.534292734535**, against **0.003665320294**
+(145.77 times the bound). The first captured dropped winner is input row **1771**
+(seed 1848, base 7), block lane 1, center **4**, in the existing 6,000-row,
+96-dimensional test. Its exact f64 dot is approximately **0.5323289123**; the
+returned dot is zero. Its approximate distance is **2.0000000007**, outside the
+**1.0998839308** survivor threshold; its own `dot_error` is **0.003474498636**.
+
+### Fix and certificate
+
+`Bf16DotCenters` selects and retains matching size, pack, and multiply function
+pointers through NumKong's kernel lookup API. Its allowlist is serial, Haswell,
+Skylake, Genoa BF16, and NEON BFDOT. SME, AMX, and future families require review
+before admission. The packed allocation remains 64-byte aligned. This changes
+neither NumKong's global dispatch nor other callers' kernels. M4 now uses NEON
+BFDOT, and Graviton retains the same NEON BFDOT family.
+
+The arithmetic allowance is unchanged. BF16 products have at most 16 significant
+bits and fit exactly in normal f32. The reviewed accumulation paths have fewer
+than `dimensions + 32` rounding steps from any product to the result. Using
+`f32::EPSILON`, rather than half epsilon, also bounds round-to-odd pair sums and
+accumulation on Arm. Cauchy–Schwarz bounds the sum of absolute products by the
+product of the operand norms. The existing gamma, magnitude guards, reference-L2
+allowance, and intermediate-underflow allowance therefore remain conservative
+for the selected families.
+
+Separately, conversion now explicitly flushes BF16 subnormal operands to signed
+zero and charges their full values to the conversion-error norms. An additive
+intermediate-underflow allowance alone cannot bound an input flushed before
+multiplication by a large value. This makes input behavior independent of the
+selected hardware's flush policy. Normal NQ inputs, the gamma formula, and the
+Graviton kernel are unchanged; there is no widened normal-data certificate whose
+recluster speed effect needs measurement.
+
+Regression coverage compares all matrix dots with their certificates across
+partial row and column tiles, checks nearest winners directly across the failing
+widths, rejects unreviewed capabilities even when injected on x86, and checks
+subnormal conversion and large multipliers independently of architecture.
+
+The x86 regression was verified by restoring the old conversion while retaining
+the new test: the observed dot error is **2.0000032332e-21**, versus a certified
+bound of **2.9408549768e-23**, and the test fails. Restoring explicit subnormal
+flushing makes it pass. This exposes a numerical issue on x86 independently of
+the M4-specific memory overwrite.
+
+The fixed M4's diagnostic has the same maximum absolute error as
+Graviton's NEON result (**0.000370660581**) at width 90, within the
+**0.001615619162** bound. Its selected family is `0x200` (NEON BFDOT).
+
+The complete `bf-vector` suite passes on M4 and Graviton: **62 passed, zero failed,
+and four ignored** on each. The existing ignored real-corpus test additionally
+compares byte-identical blobs on the first **100,000 NQ rows**, at 1,024 f16
+cosine dimensions and 317 centers, on both Arm hosts. The 8,100-row/90-center
+real-corpus check also passes, directly covering the failing partial-tile shape.
+The 100,000-row checks retain **1.14 centers per screened row** on average.
+Single observations of plain/screened build time are 0.975/0.609 seconds on M4
+and 3.246/1.443 seconds on Graviton. These compare two scoring modes within the
+fixed binary; they are identity diagnostics, not paired before/after recluster
+performance measurements. `BF_TRACE_STAGES=1` also records the RR7 vector-build
+stages during these runs.
+
+On x86, `cargo fmt --all --check`, strict all-target workspace Clippy, and
+`cargo test --workspace` pass: **544 passed, zero failed, and 27 ignored across
+81 suites**. Cargo builds and tests use `nice -n 19` and `-j 3` on the shared VM.
+The additional release-mode 100,000-row real-corpus identity check passes on x86
+as well, completing that check on all three platforms.

@@ -119,6 +119,11 @@ impl<'a> NearestCenters<'a> {
         let a = rounded.norm_upper(r);
         let b = matrix.packed.max_norm_upper();
         let (ea, eb) = (rounded.error_upper(r), matrix.packed.max_error_upper());
+        // The reviewed BF16 backends use at most dims + 32 rounding steps on
+        // any product-to-result path. EPSILON (rather than EPSILON / 2) also
+        // covers Arm BFDOT's round-to-odd pair sum and accumulation. BF16
+        // subnormal operands were flushed during conversion and charged to ea/eb;
+        // the additive allowance covers flushed intermediate results instead.
         let gamma = ne / (1. - ne);
         let underflow = (dims + 32.) * f64::from(f32::MIN_POSITIVE);
         // One BF16 dot product differs from the real one by at most this much.
@@ -211,6 +216,22 @@ mod tests {
                 for (row, got) in rows.iter().zip(got) {
                     assert_eq!(got, reference(row, &centers), "dims={dims} scale={scale}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_tiles_keep_the_exact_winner_including_ties() {
+        for count in [48, 80, 81, 90, 95, 96, 97] {
+            let centers: Vec<_> = (0..count).map(|i| vector(i as u64, 96, 1., &[])).collect();
+            // Every center is its own exact winner. Repeated rows also exercise
+            // the first columns of every row tile, where SME lost previous winners.
+            let mut rows = centers.clone();
+            rows.extend(centers.iter().take(7).cloned());
+            let refs: Vec<_> = rows.iter().map(Vec::as_slice).collect();
+            let index = NearestCenters::with_matrix(&centers, true);
+            for (r, got) in index.nearest_batch(&refs).into_iter().enumerate() {
+                assert_eq!(got, reference(&rows[r], &centers), "count={count} row={r}");
             }
         }
     }
