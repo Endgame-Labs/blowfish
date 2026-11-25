@@ -256,7 +256,8 @@ def evict_staging(work):
     """Evict only this run's durable staging files, without privileged global drops."""
     files = [
         p
-        for p in (work / "cache" / "ann-staging-v1").rglob("*")
+        for root in (work / "cache").glob("ann-staging-v*")
+        for p in root.rglob("*")
         if p.is_file() and p.name != ".lock"
     ]
     for path in files:
@@ -274,7 +275,7 @@ def wait_staging(client, work, proc, first, start):
         text = client.get("/metrics").text
         if re.search(r'blowfish_ann_staging_total\{outcome="error"\} [1-9]', text):
             raise RuntimeError("automatic staging failed; inspect server.log")
-        if re.search(r'blowfish_ann_staging_total\{outcome="ready"\} [1-9]', text):
+        if re.search(r'blowfish_ann_staging_total\{outcome="(?:ready|adopted)"\} [1-9]', text):
             provision = {
                 "first_query_ms": first["ms"],
                 "ready_after_ms": (time.perf_counter() - start) * 1000,

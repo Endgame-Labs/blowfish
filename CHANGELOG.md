@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-11-25
+
+### Changed
+
+- **Staged ANN files survive restarts:** Locally staged cold ANN tiers are now kept across restarts, deploys, and crashes. On startup, blowfish removes partial stages, checks each completed stage against the current manifest, the WAL, and object ETags or versions with HEAD requests, and adopts it without downloading the tier again; every 16 KiB block is still CRC-checked on read. On cold S3 namespaces after a restart, 100M-vector p50 fell from 789 to 412 ms, and the time until queries were fast again fell from 118 s to under 1 s (10M: 9.2 s to 0.6 s). Disk use stays within the existing staging limit. There is no setting.
+
 ## [0.1.23] - 2026-11-25
 
 ### Changed
@@ -190,7 +196,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.23...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.24...HEAD
+[0.1.24]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.24
 [0.1.23]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.23
 [0.1.22]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.22
 [0.1.21]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.21

@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **C6 staged ANN files survive restarts (merged).** ann-staging-v2 with SHA-256 completion records binding manifest tier, object identities (ETags/versions), lengths, and CRC tables; atomic fsynced publication; startup removes partials and validates against the manifest, WAL deletions, and parallel HEADs. After restart, original 100M: adopt p50 412 ms vs restage 789 ms (steady 434), time-to-fast 0.96 s vs 118 s; 10M 0.61 s vs 9.2 s. 600 adopted queries with zero tier GETs, identical results, fixed footprint.
+
 - **W3 byte-bounded WAL groups (merged).** A 32 MiB estimated-document-byte budget per group (FIFO collector, existing flight-depth limit applied before backlog consumption). Full NQ, four clients: write p90 2,067/2,125 -> 1,125/1,079 ms (-46%); throughput 16,652/17,148 vs. 16,741 rows/s control. Compression p90 640 -> 330 ms, preparation 255 -> 130 ms. Offload and parallel preparation screened and removed (their gains were within run-to-run variance).
 
 ## 2026-11-24
