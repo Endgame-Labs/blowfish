@@ -12472,3 +12472,23 @@ the same assignments and byte-identical slab objects (old and new builds hash th
 stable across runs). The copy writes fewer bytes and does one extra in-memory pack per cluster that has deletes, so it cannot be
 slower in I/O terms. I did not time it at NQ scale on this round: the in-memory test is too small to show a wall-clock
 difference, so a 10M-scale timing is still open.
+
+## Round G6: a synchronous fast path for resident graph queries (negative)
+
+Hypothesis: warm graph queries on the M4 pay for async scheduling and reactor hand-offs, so answering fully resident HotGraph queries synchronously on the request thread would raise 16-client throughput by about 30%.
+
+Setup: Mac mini M4, NQ, the production binary with a file-toggled flag, three paired off/on arms per run at matched recall.
+
+| Run | Recall@10 | Off q/s | On q/s |
+|---|---:|---:|---:|
+| ab1, arm 1 | 0.9593 | 8,508 | 8,580 |
+| ab1, arm 2 | 0.9593 | 8,582 | 8,600 |
+| ab1, arm 3 | 0.9593 | 8,659 | 8,590 |
+| ab2, arm 1 | 0.9596 | 8,640 | 8,612 |
+| ab2, arm 2 | 0.9596 | 8,630 | 8,642 |
+| ab2, arm 3 | 0.9596 | 8,660 | 8,646 |
+| ab3, arm 1 | 0.9494 | 8,746 | 8,891 |
+| ab3, arm 2 | 0.9494 | 8,921 | 8,856 |
+| ab3, arm 3 | 0.9494 | 8,875 | 8,890 |
+
+On and off agree within about 1%, and instructions per query are identical in both arms (2.89M, 2.90M, and 2.64M), so scheduling is not where warm graph time goes. Later runs could not be compared because recall calibration on the shared M4 rejected the graph. The flagged code is not merged; it is kept on branch `g6-sync-path`.
