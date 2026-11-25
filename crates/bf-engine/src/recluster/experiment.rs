@@ -367,3 +367,144 @@ fn prepare_flat_spill() {
     .unwrap();
     println!("RR4 flat fixture rows={rows} dims={dims} cluster_rows={cluster_rows}");
 }
+
+/// Full-tier replay over an owned, freshly prepared untiered namespace. Copy the same
+/// checkpoint before each arm; the clock includes the engine's fenced installation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires owned RR7_CONFIG, RR7_SCRATCH, and RR7_OUTPUT beneath .scratch"]
+async fn rr7_install() {
+    use sha2::{Digest, Sha256};
+    let config: bf_storage::StorageConfig =
+        serde_json::from_slice(&std::fs::read(std::env::var_os("RR7_CONFIG").unwrap()).unwrap())
+            .unwrap();
+    assert!(config.url.contains("/tmp/rr7/"));
+    let scratch = PathBuf::from(std::env::var_os("RR7_SCRATCH").unwrap());
+    assert!(scratch.components().any(|p| p.as_os_str() == ".scratch"));
+    let store = bf_storage::Storage::open(&config).await.unwrap();
+    let engine = Engine::with_config(
+        store.clone(),
+        crate::EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.,
+            ..Default::default()
+        },
+    );
+    let wal = Wal::new(store.clone(), "nq").unwrap();
+    assert!(
+        wal.latest_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .ann_tiers
+            .is_empty()
+    );
+    let start = std::time::Instant::now();
+    let report = engine
+        .recluster(
+            "nq",
+            &ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 32,
+                cluster_rows: 0,
+                max_slab_rows: 250_000,
+                scratch,
+            },
+        )
+        .await
+        .unwrap();
+    let seconds = start.elapsed().as_secs_f64();
+    let manifest = wal.latest_manifest().await.unwrap().unwrap().1;
+    let mut hashes = Vec::new();
+    for slab in &manifest.ann_tiers["vector"][0].slabs {
+        let bytes = store.get(&slab.files["annv2:vector"].key).await.unwrap();
+        hashes.push(
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        );
+    }
+    let output = PathBuf::from(std::env::var_os("RR7_OUTPUT").unwrap());
+    assert!(output.components().any(|p| p.as_os_str() == ".scratch"));
+    std::fs::write(output, hashes.join("\n")).unwrap();
+    println!(
+        "RR7 installed seconds={seconds:.6} build={:.6} rows={} slabs={} leaves={}",
+        report.seconds, report.rows, report.slabs, report.clusters
+    );
+}
+
+#[allow(dead_code)]
+#[path = "../../../bf-vector/examples/g3/data.rs"]
+mod nq;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires owned RR7_CONFIG, RR7_DATA NumPy matrices, and RR7_OUTPUT beneath .scratch"]
+async fn rr7_quality() {
+    let _gate = crate::warm_graph::ADMISSION_GATE.write().await;
+    let mut config: bf_storage::StorageConfig =
+        serde_json::from_slice(&std::fs::read(std::env::var_os("RR7_CONFIG").unwrap()).unwrap())
+            .unwrap();
+    assert!(config.url.contains("/tmp/rr7/") || config.url.contains("/.scratch/"));
+    config.read_only = true;
+    let root = PathBuf::from(std::env::var_os("RR7_DATA").unwrap());
+    let queries = nq::Matrix::load(&root.join("queries.npy"), "<f4", 4, usize::MAX)
+        .unwrap()
+        .floats();
+    let truth = nq::Matrix::load(&root.join("truth.npy"), "<i4", 4, usize::MAX)
+        .unwrap()
+        .truth();
+    assert_eq!(queries.len(), truth.len());
+    let mut outputs = Vec::new();
+    for probes in [48, 64] {
+        let store = bf_storage::Storage::open(&config).await.unwrap();
+        let engine = Engine::with_config(
+            store,
+            crate::EngineConfig {
+                indexing: false,
+                recall_sample_rate: 0.,
+                ann_nprobe: probes,
+                ann_nprobe_explicit: true,
+                ann_rerank_factor: 32,
+                ..Default::default()
+            },
+        );
+        let results: Vec<_> = futures::stream::iter(queries.iter().map(|q| {
+            let engine = &engine;
+            async move {
+                let request = serde_json::from_value(serde_json::json!({
+                    "rank_by":["vector", "ANN", q], "top_k":10, "include_attributes":false
+                }))
+                .unwrap();
+                engine
+                    .query("nq", request)
+                    .await
+                    .unwrap()
+                    .result
+                    .rows
+                    .unwrap()
+            }
+        }))
+        .buffered(4)
+        .collect()
+        .await;
+        let hits: usize = results
+            .iter()
+            .zip(&truth)
+            .map(|(rows, truth)| {
+                rows.iter()
+                    .filter(|r| truth.contains(&(r["id"].as_u64().unwrap() as u32)))
+                    .count()
+            })
+            .sum();
+        println!(
+            "RR7 quality probes={probes} hits={hits} total={} recall={:.8}",
+            queries.len() * 10,
+            hits as f64 / (queries.len() * 10) as f64
+        );
+        outputs.push(results);
+    }
+    let output = PathBuf::from(std::env::var_os("RR7_OUTPUT").unwrap());
+    assert!(output.components().any(|p| p.as_os_str() == ".scratch"));
+    std::fs::write(output, serde_json::to_vec(&outputs).unwrap()).unwrap();
+}

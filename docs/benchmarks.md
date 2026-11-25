@@ -11888,3 +11888,59 @@ One on-demand c7g.4xlarge ran for approximately **0.78 hours**. Estimated cost i
 $0.58/hour compute rate, a 120 GiB gp3 volume, and public IPv4; this is an estimate, excluding network charges and tax,
 not a billing audit. The instance is confirmed terminated, and its root volume, tagged key pair, and tagged security group
 are confirmed absent. No S3 objects were written. Owned local scratch artifacts were removed after preserving these results.
+
+## Round RR7: profiling full-tier recluster installation
+
+Measured 2026-11-25 on one on-demand c7gd.2xlarge: eight Graviton3 cores, 16 GiB,
+local NVMe, four recluster and Rayon workers, Rust 1.100.0, Clang 19, and a Clang 22
+linker. Release thin LTO, without native Rust target flags. The control is `75d261e`
+with timing instrumentation. No build or other load overlapped installation.
+
+A fresh namespace was recreated through ordinary writes and indexing from all
+2,681,468 public BEIR NQ vectors, 1,024-dimensional f16 cosine, then frozen without
+a tier. Each arm copies this same checkpoint into its own temporary S3 prefix.
+Installation starts at the explicit foreground recluster call and ends after fenced
+publication; ingest, checkpoint copying, and subsequent slab hashing are excluded.
+The control installed 32 slabs with 13,392 leaves.
+
+| Control stage | Wall seconds | Summed worker seconds |
+| --- | ---: | ---: |
+| Full-tier installation | **179.513** | — |
+| Source read and spill | 9.889 | — |
+| Spill writes, within source copy | — | 4.364 |
+| Coarse training | 0.579 | — |
+| Coarse assignment | 4.457 | — |
+| Leaf training | 22.047 | — |
+| Leaf assignment, both passes | **96.663** | — |
+| Ordering, within leaf assignment | 27.998 | — |
+| Scoring including routing, within leaf assignment | 68.640 | — |
+| Routing including read/decode, within scoring | — | 92.662 |
+| Center refinement | 2.658 | — |
+| Random spill reads, within training and assignment | — | 25.321 |
+| Final slab reads | 3.365 | — |
+| Vector blob build | 16.364 | — |
+| Row preparation, within vector build | — | 6.025 |
+| RaBitQ encoding, within vector build | — | 42.991 |
+| Code packing, within vector build | — | 3.564 |
+| Row/code CRCs, within vector build | — | 1.352 |
+| ANN container assembly | 4.894 | — |
+| Uploads, overlapping subsequent slab builds | 35.237 | — |
+| Directory | 0.527 | — |
+
+These are elapsed timers, not CPU counters. Nested stages and overlapping uploads
+must not be added. Worker-seconds sum concurrent workers and cannot be added to wall
+seconds. CRC timing covers row and code checksums; metadata checksums remain inside
+assembly. Vector build also includes metadata construction and copying packed vectors.
+
+RaBitQ is too small to reach the requested 1.30x installation gain alone: removing
+the entire 16.364-second vector build would give only 1.100x. Leaf assignment occupies
+53.85% of installation. Its ordering and routing cost roughly 51 wall seconds across
+four workers, so the experiment targets certified group routing reuse and streaming
+leaf-score screening. Ordering and assignment use different original distance kernels;
+their numerical scores cannot simply be treated as interchangeable.
+
+The profiling harness is `recluster::experiment::rr7_install`, an ignored native
+engine test. It requires owned `RR7_CONFIG`, `RR7_SCRATCH`, and `RR7_OUTPUT` paths;
+`BF_TRACE_STAGES=1` enables nested timers. `examples/rr7_prepare.rs` creates the
+untiered local scratch checkpoint through normal APIs. Every benchmark prefix and
+scratch artifact must be removed after the run.
