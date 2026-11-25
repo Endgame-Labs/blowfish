@@ -4,6 +4,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.33] - 2026-11-25
+
 ### Changed
 
 - **Connection warmer refresh 45 s to 15 s:** S3 closes idle connections after 20 to 40 seconds, so the warmer now refreshes before that happens. No measurable end-to-end change in-region; it keeps the first cold query after a quiet spell from paying for new connections.
@@ -255,7 +257,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.32...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.33...HEAD
+[0.1.33]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.33
 [0.1.32]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.32
 [0.1.31]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.31
 [0.1.30]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.30
