@@ -187,7 +187,7 @@ async fn same_graph_navigation_cpu() {
     let Source {
         builder,
         sources,
-        mut locations,
+        locations,
     } = read_source(
         &engine,
         set,
