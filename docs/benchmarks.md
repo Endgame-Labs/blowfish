@@ -10710,6 +10710,57 @@ c7gd.4xlarge from 08:46 to 09:26 UTC on 2026-11-25, about 0.7 hours (about $0.5,
 instance, key pair, and security group are deleted, and nothing was written to any bucket prefix.
 `cold_ab.py` gained `--stage-timeout` (the oracle stage needs 22 minutes).
 
+## Round C11: finishing the cold rerank early (stopped, the ceiling is 22 ms)
+
+Hypothesis (Neon and Sol): the 100M rerank fires about 87 range reads and waits for the slowest, so score
+candidates as their reads arrive, keep the live exact k-th distance, and finish when every unfinished
+candidate's lower bound is strictly above it (ties stay unfinished), cancelling the rest. The only bound
+involved is the one pool selection already trusts: `distance - error`, the RaBitQ estimate minus its
+1.9-sigma error (`ERROR_CONFIDENCE`), so the early finish adds no new approximation. Gate: stop if the median
+ceiling saving is under 60 ms.
+
+**Result: the ceiling is 22.5 ms at p50 even with the answer known in advance, so I stopped before writing the
+real bound. No engine code is merged.**
+
+### The ceiling replay
+
+One on-demand c7gd.4xlarge (us-west-2, local NVMe), CPUs 0 to 7, `-C target-cpu=neoverse-v1`, the original 100M
+layout (`v014/big`, read-only) with the shipped 20 GiB stage, and C10's 60 cold queries, default attribute
+output. A trace-only build (branch `c11-experiment`, `BF_TRACE_C11`) printed each rerank pool candidate's
+estimate and error, each exact distance, and the exact distances of rows scanned exactly. Together with the
+per-GET `TRACE_READ` completion times, `crates/bf-engine/examples/c11_ceiling.py` finds for each candidate the
+GET that covered its vector (5,063 of 5,069 candidates matched one) and replays the arrivals. This run's steady
+p50 was 310 ms (p90 371 ms, recall 0.9517, 88.9 GET attempts per query).
+
+| Measure (60 queries) | p50 | p90 |
+| --- | ---: | ---: |
+| Rerank wall time (start to end of the rerank stage) | 154.0 ms | 199.7 ms |
+| Wait for the last candidate's read (today) | 137.4 ms | 193.6 ms |
+| Streamed finish (live exact k-th against the lower bounds of the unfinished) | 119.6 ms | 167.9 ms |
+| Oracle finish (every row of the final top k has arrived; needs the answer) | 109.5 ms | 155.9 ms |
+| **Saving, streamed** | **6.5 ms** | 36.0 ms |
+| **Saving, oracle** | **22.5 ms** | 72.0 ms |
+
+The streamed finish gave the same top k as waiting on all 60 queries (it stopped early on none that it
+should not have), so the bound itself would hold. It just finds too little to cancel: a query has a median of 52
+pool candidates, and the 10 rows that win are spread across the reads, so the slowest winner's read is close to
+the slowest read overall. Even a perfect oracle saves 22.5 ms at p50, against the 60 ms gate.
+
+A generous model of hedging adds little. If every read of a final top-k row still pending at 25 ms got one free
+duplicate drawn from the measured read durations (p50 91 ms, p90 130 ms for all segment reads), with the
+answer known in advance, the saving is 36.7 ms at p50 (30.4 ms at 40 ms and 24.7 ms at 60 ms). That is also
+below the gate, and the store already hedges slow reads (8.0 hedges per query in this run), so the real gain
+would be smaller.
+
+What this means: the rerank wait is not a long tail of dead reads that cancellation could drop. The winners
+themselves are behind the slow reads. Only fewer or faster reads can shorten it, not finishing earlier on the same reads.
+
+### Cost
+
+c7gd.4xlarge from 09:46 to 09:56 UTC on 2026-11-25, about 0.2 hours (about $0.15, under the $6 cap). The
+instance, key pair, and security group are deleted, and nothing was written to any bucket prefix. The 10M run was
+not needed once the 100M gate failed.
+
 ## Round BW5: cutting per-segment BM25 setup (stopped, no measurable gain)
 
 Hypothesis (from BW4): per-segment window setup is about 70 percent of warm BM25 time on 1M MS MARCO,
