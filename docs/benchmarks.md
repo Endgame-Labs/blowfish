@@ -10596,6 +10596,60 @@ taskset -c 0-7 uv run crates/bf-engine/examples/cold_ab.py \
 Add `--include-attributes '["title","text"]'` for the attribute comparison. `cold_ab.py` now records
 each query's documents and a `HYDRATION` timeline for this analysis.
 
+## Round C9: one packfile for staged companions
+
+Round C8 staged each segment's docs directory and row-to-ID map as separate files. At 100M that took
+3,897 files (about 95 percent of the 4,096-descriptor budget) and 154 to 172 s to stage, against 92 s
+before companions. C9 gathers all companions of a tier into one pack file with an internal offset table,
+fetches them with bounded whole-object GETs whose responses are checked against the identity recorded
+in the completion record (no separate HEAD per companion), and publishes in two phases: the code stage
+(codes and exact vectors) first, then a second completion record for the pack. Per-16 KiB CRCs on read,
+adoption across restarts, and the staging cap are unchanged. A stage from v0.1.27 adopts as it is. A
+follow-up commit shares one descriptor per source file during download and sync, which halved the
+transient peak.
+
+### Paired results
+
+One on-demand c7gd.4xlarge (us-west-2, local NVMe), CPUs 0 to 7, `-C target-cpu=neoverse-v1`, C8 (`4f9ac4a`)
+versus C9 on the same host, run alternately with `cold_ab.py --stage-arm c8 --stage-arm c9 --two-phase-arm c9
+--stage-live-queries 20`. Storage was read-only: `tmp/c5/10m/` and the original 100M prefix.
+
+| Measure | 10M C8 | 10M C9 | 100M C8 | 100M C9 |
+| --- | ---: | ---: | ---: | ---: |
+| Codes usable after first query | 91.2 s | 85.2 s | 154.5 s | **79.1 s** |
+| Fully ready (companions published) | 91.2 s | 85.7 s | 154.5 s | **88.5 s** |
+| Staged files | 197 | 59 | 3,897 | **325** |
+| Peak open staged-cache descriptors | n/a | n/a | 4,217 | **325** |
+| Live-query p50 (20, during staging) | 343 ms | 306 ms | 685 ms | 684 ms |
+| Steady IDs-only p50 / p90 | 54.05 / 88.26 ms | 54.66 / 88.96 ms | 266.9 / 332.0 ms | 275.5 / 326.1 ms |
+
+100M time to fully ready improves **1.75x** and time to usable codes **1.95x** (target 1.8x and about
+95 s; the ready time of 88.5 s meets it, and an earlier run without the descriptor fix measured 96.6 s
+and 77.4 s to codes in a live-query run, so expect 78 to 97 s). Peak staged-cache descriptors fall from 4,217
+to 325 (target 400). Live queries during staging are not slower at either scale. All 60 100M pairs and
+all 200 10M pairs return identical ordered IDs, distances, and planned rows. At 10M steady p50 is within
+1.1 percent. At 100M steady p50 reads 3.2 percent above C8 in this run (and 2.6 to 4.9 percent in three
+earlier runs, which measured companions-less steady state or fewer pairs), with a better p90, so I treat
+it as at the edge of the noise rather than a win. Footprint is 21.136 GB for both arms at 100M, and the
+10M footprint is equal to within 28 KB.
+
+An earlier run that waited only for the code stage showed 12 MB per query of docs reads at 100M: the
+harness had started measuring before the companion phase published. `cold_ab.py --two-phase-arm`
+waits for both.
+
+### Cost
+
+c7gd.4xlarge from 05:03 to 05:54 UTC on 2026-11-25, about 0.85 hours (about $0.6, under the $6 cap). The
+instance, key pair, and security group are deleted, and nothing was written to any bucket prefix.
+
+```sh
+taskset -c 0-7 uv run crates/bf-engine/examples/cold_ab.py \
+  --binary C9_BINARY --config CONFIG.local \
+  --arms '{"c8":{"BINARY":"C8_BINARY"},"c9":{}}' \
+  --stage-arm c8 --stage-arm c9 --two-phase-arm c9 --stage-live-queries 20 \
+  --scratch .scratch/c9-check --label ids --oracle 100m --queries 60
+```
+
 ## Round BW5: cutting per-segment BM25 setup (stopped, no measurable gain)
 
 Hypothesis (from BW4): per-segment window setup is about 70 percent of warm BM25 time on 1M MS MARCO,
