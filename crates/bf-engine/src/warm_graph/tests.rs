@@ -609,20 +609,48 @@ async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan
 
 #[cfg(target_os = "linux")]
 #[test]
-fn background_workers_yield_to_normal_serving_threads() {
-    let policies = pool().broadcast(|_| {
-        // SAFETY: these calls inspect only the calling background worker.
-        unsafe {
-            (
-                libc::getpriority(libc::PRIO_PROCESS, 0),
-                libc::sched_getscheduler(0),
-            )
-        }
+fn production_priority_is_applied_without_waiting_for_idle_work() {
+    let (tid_tx, tid_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        // SAFETY: gettid returns the calling thread's kernel identifier.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+        tid_tx.send(tid).unwrap();
+        background_priority();
+        // The inspecting thread releases this channel; it never waits for work scheduled
+        // after lowering priority. Dropping the handle lets this thread exit when scheduled.
+        let _ = release_rx.recv();
     });
-    assert_eq!(policies.len(), 2);
+    let tid = tid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let started = Instant::now();
+    loop {
+        // SAFETY: these read-only calls inspect our live worker by kernel thread ID.
+        let (nice, policy) = unsafe {
+            (
+                libc::getpriority(libc::PRIO_PROCESS, tid as u32),
+                libc::sched_getscheduler(tid),
+            )
+        };
+        if nice == 19 && (policy == libc::SCHED_IDLE || policy == libc::SCHED_OTHER) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "priority was not applied: nice={nice}, policy={policy}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    release_tx.send(()).unwrap();
+    drop(worker);
+    // Lifecycle tests retain normal scheduling even while other builds saturate the host.
     assert!(
-        policies.into_iter().all(|(nice, policy)| nice == 19
-            && (policy == libc::SCHED_IDLE || policy == libc::SCHED_OTHER))
+        pool()
+            .broadcast(|_| {
+                // SAFETY: inspect only the calling test-pool worker.
+                unsafe { libc::sched_getscheduler(0) != libc::SCHED_IDLE }
+            })
+            .into_iter()
+            .all(|normal| normal)
     );
 }
 

@@ -623,6 +623,31 @@ async fn read_source(
         locations,
     })
 }
+// Production priority is tested separately from constructor correctness. A SCHED_IDLE
+// worker can be starved indefinitely by unrelated builds on a shared Linux test host.
+fn background_priority() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: both calls affect only this worker on Linux. Idle scheduling yields
+    // to serving work; nice 19 remains a fallback when a sandbox denies it.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        let priority = libc::sched_param { sched_priority: 0 };
+        libc::sched_setscheduler(0, libc::SCHED_IDLE, &priority);
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: the QoS call changes only the calling worker's scheduling class.
+    unsafe {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(
+                class: libc::c_uint,
+                priority: libc::c_int,
+            ) -> libc::c_int;
+        }
+        // QOS_CLASS_UTILITY from Apple's sys/qos.h (the libc enum is not reexported).
+        pthread_set_qos_class_self_np(0x11, 0);
+    }
+}
+
 fn pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
@@ -630,26 +655,8 @@ fn pool() -> &'static rayon::ThreadPool {
             .num_threads(2)
             .thread_name(|n| format!("warm-graph-{n}"))
             .start_handler(|_| {
-                #[cfg(target_os = "linux")]
-                // SAFETY: both calls affect only this worker on Linux. Idle scheduling yields
-                // to serving work; nice 19 remains a fallback when a sandbox denies it.
-                unsafe {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, 19);
-                    let priority = libc::sched_param { sched_priority: 0 };
-                    libc::sched_setscheduler(0, libc::SCHED_IDLE, &priority);
-                }
-                #[cfg(target_os = "macos")]
-                // SAFETY: the QoS call changes only the calling worker's scheduling class.
-                unsafe {
-                    unsafe extern "C" {
-                        fn pthread_set_qos_class_self_np(
-                            class: libc::c_uint,
-                            priority: libc::c_int,
-                        ) -> libc::c_int;
-                    }
-                    // QOS_CLASS_UTILITY from Apple's sys/qos.h (the libc enum is not reexported).
-                    pthread_set_qos_class_self_np(0x11, 0);
-                }
+                #[cfg(not(all(test, target_os = "linux")))]
+                background_priority();
             })
             .build()
             .expect("warm graph CPU pool")
