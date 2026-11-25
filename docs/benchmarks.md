@@ -10443,3 +10443,58 @@ cost, including requests, EBS, and public IPv4, is below $4, within the $6 cap; 
 is not finalized. The instance, temporary key pair, security group, and root volume
 are gone. Every storage run was read-only, with no owned bucket prefix or bucket
 writes to clean up.
+
+## Round BW4: cross-segment block-max windows for exact BM25 (stopped after profiling)
+
+Hypothesis: `bf-engine` searches every text segment independently, so a global schedule that visits
+block-max windows across all segments in descending upper-bound order, against one shared k-th score,
+would score fewer windows and avoid an O(segments) cost. Result: **not material, and the round stops
+at the profile.** No code changed. Exactness was never at risk, because the scheduler was not written.
+
+What the code already does: all segments of one query are searched concurrently with one shared,
+monotone `SearchThreshold`. Every segment publishes its heap floor as soon as it holds `k` hits, and
+every segment skips a window whose bound is below `max(local floor, shared floor)`. What the idea
+adds is only the visiting order across segments.
+
+### Measurement
+
+Fixture `tmp/msmarco-1m-v021/` (1M MS MARCO passages, eight text segments of 25,000, 50,000, 100,000,
+110,000, 115,000, and three of 200,000 rows), the checked-in 1,000-query strong top-10 workload, and
+T4's `concurrent_bm25` driver. The server was built from `8c9af7d` plus temporary, uncommitted counters
+(removed afterward). Counts are deterministic. Timings were taken on this shared 8-vCPU VM at a load
+average of 8 to 14, so they are **relative proportions only, not headline numbers**, and no EC2 host was used.
+
+| Measure, warm, per query | Value |
+| --- | ---: |
+| Segment searches (1,000 queries, 1 and 16 clients) | 6.8 |
+| Windows in those segments (candidates after dropping zero-bound windows) | 6,858 |
+| Windows actually scored today (16 clients, 2,000 queries) | 804 |
+| Windows scored today (1 client, 904 queries that logged a segment search) | 838 |
+| Windows with bound at or above the final k-th score (the floor for any exact scheme) | 753 |
+| Segments holding at least one such window | 6.97 of 7.5 |
+
+- **Ordering headroom is 1.11x in scored windows** (838 versus 753), and this is an upper bound: it assumes a
+  perfect global order at zero scheduling cost. The pass bar is 1.2x warm 16-client throughput.
+- **Fan-out cannot be skipped.** Almost every segment (6.97 of 7.5) holds a window that any exact scheme
+  must score, so no segment can be dropped from a query.
+- **Per-segment setup dominates, and it is not O(segments).** Before scoring begins, each segment computes
+  window bounds, scans its row bounds, and sorts its windows. At one client that is about 325 microseconds per
+  segment search, 2.2 ms of roughly 3 ms per query, with scoring the remainder. It grows linearly with segment
+  size (p50 98, 160, 269, 270, 251, and 404 microseconds for 25,000 through 200,000 rows, about a 55
+  microsecond intercept plus 1.75 microseconds per 1,000 rows). Summed over segments it is about what one
+  1M-row segment would cost, so merging the schedule does not remove it. The only fan-out-specific part is the
+  intercept: 55 microseconds times 6.8 searches, about 0.4 ms per query, and a global scheduler still needs each
+  segment's dictionary lookup and term metadata to compute its bounds.
+
+Best case for the hypothesis: scoring is at most 30 percent of query time, and 11 percent of it is the ceiling
+on removable windows, so about 3 percent of CPU, before adding any cross-segment coordination. That is far
+below 1.2x. The round was stopped per the brief.
+
+### Lead for a later round
+
+Per-segment window setup is about 70 percent of warm BM25 time at 1M rows and is inside one segment, so
+it applies to single-segment namespaces too. Candidates: replace the full-length zero scan over `row_bounds`
+chunks (`segment.rs`, the `row_bounds.chunks(BLOCK)` loop) with its touched list, and replace the full window
+sort with a lazy partial order, since only about 12 percent of windows are ever scored. Neither is attempted here.
+
+No EC2 cost and no bucket writes. The fixture was copied to `.scratch/` and deleted.
