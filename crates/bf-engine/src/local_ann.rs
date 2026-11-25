@@ -367,6 +367,16 @@ impl Manager {
         sweep_legacy(parent)?;
         let base = parent.join("ann-staging-v2");
         fs::create_dir_all(&base)?;
+        // Serialize ownership changes, so deleting an unlocked backend cannot race a
+        // new engine opening that backend's lock file.
+        let guard = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(base.join(".lock"))?;
+        guard.lock()?;
         let path = base.join(identity);
         fs::DirBuilder::new()
             .recursive(true)
@@ -381,6 +391,27 @@ impl Manager {
             .open(path.join(".lock"))?;
         // A second live engine for this backend falls back to S3 rather than sharing files.
         lock.try_lock().map_err(io::Error::other)?;
+        // A changed bucket, prefix, or endpoint must not leave another full staging
+        // allowance on disk forever. Live backends retain their own locked areas.
+        for entry in fs::read_dir(&base)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() || entry.path() == path {
+                continue;
+            }
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path().join(".lock"))
+            {
+                Ok(other) if other.try_lock().is_ok() => {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+                _ => {}
+            }
+        }
         let mut candidates = Vec::new();
         let mut retained = 0u64;
         for entry in fs::read_dir(&path)? {
@@ -1734,6 +1765,26 @@ mod tests {
     }
 
     #[test]
+    fn backend_changes_remove_stopped_cache_areas_and_preserve_live_ones() {
+        let work = scratch();
+        let left = Manager::open_named(work.path(), "left", Some(1 << 20), Arc::default()).unwrap();
+        let left_path = left.path.clone();
+        fs::write(left.path.join("retained-data"), b"retained").unwrap();
+        let right =
+            Manager::open_named(work.path(), "right", Some(1 << 20), Arc::default()).unwrap();
+        assert!(left_path.exists(), "a live backend keeps its area");
+        drop(left);
+        drop(right);
+        let right =
+            Manager::open_named(work.path(), "right", Some(1 << 20), Arc::default()).unwrap();
+        assert!(
+            !left_path.exists(),
+            "a stopped previous backend cannot accumulate another allowance"
+        );
+        assert!(right.path.exists());
+    }
+
+    #[test]
     fn upgrades_remove_orphaned_legacy_stages_and_keep_live_owners() {
         let work = scratch();
         let base = work.path().join("ann-staging-v1");
@@ -1809,6 +1860,12 @@ mod tests {
             .await
             .unwrap();
         let request: bf_types::QueryRequest = serde_json::from_value(serde_json::json!({"rank_by":["vector","ANN",vector(17,5)],"top_k":10,"include_attributes":["id"]})).unwrap();
+        let configured = engine.query_configured("test", request.clone());
+        assert!(
+            std::mem::size_of_val(&configured) <= 32,
+            "nested recall queries must keep a bounded future"
+        );
+        drop(configured);
         engine.drop_caches().await;
         let (before, cold) = engine
             .query_with_diagnostics("test", request.clone())

@@ -875,15 +875,19 @@ impl Engine {
         }
         self.query_configured(ns, request).await
     }
-    async fn query_configured(
-        &self,
-        ns: &str,
+    // Model resolution, recall, and graph admission nest this path. Keep the complete
+    // configured query off their stacks, including when recovery has already finished.
+    fn query_configured<'a>(
+        &'a self,
+        ns: &'a str,
         request: QueryRequest,
-    ) -> Result<(QueryResponse, QueryDiagnostics), ApiError> {
-        match self.0.config.models.clone() {
-            Some(models) => self.query_with_models(models, ns, request).await,
-            None => self.query_inner(ns, request).await,
-        }
+    ) -> futures::future::BoxFuture<'a, Result<(QueryResponse, QueryDiagnostics), ApiError>> {
+        Box::pin(async move {
+            match self.0.config.models.clone() {
+                Some(models) => self.query_with_models(models, ns, request).await,
+                None => self.query_inner(ns, request).await,
+            }
+        })
     }
     async fn query_inner(
         &self,
