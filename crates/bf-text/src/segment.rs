@@ -52,7 +52,99 @@ const CHUNK_TERMS: usize = 2048;
 const MEMO_CHUNKS: usize = 512;
 /// Separate decoded posting budgets for sparse and dense lists.
 const MEMO_POSTING_BYTES: usize = 8 << 20;
-type Postings = Arc<[(u32, u32)]>;
+/// One decoded posting block: `(row, tf)` entries in row order, with a small table that maps a
+/// scoring window to its slice of entries without a binary search. The table is built once when
+/// the block is decoded and shared by every query that scores the block.
+///
+/// Everything lives in one allocation so a query touches one pointer: pair 0 is a header
+/// (`first window`, `shift | table pairs << 8`), the next pairs hold the table's bytes, and the
+/// entries follow. Each table bucket spans `1 << shift` windows, so the table never exceeds 129
+/// bytes, and `offsets[k]` counts the entries before bucket `k`'s first row. The last item equals
+/// the entry count.
+#[derive(Clone, Debug)]
+struct Postings(Arc<[(u32, u32)]>);
+impl Postings {
+    fn header(&self) -> (usize, u32, usize) {
+        let (first_window, packed) = self.0[0];
+        (
+            first_window as usize,
+            packed & 0xff,
+            1 + (packed >> 8) as usize,
+        )
+    }
+    fn offset(&self, k: usize) -> usize {
+        let pair = self.0[1 + k / 8];
+        let word = if k % 8 < 4 { pair.0 } else { pair.1 };
+        (word >> (8 * (k % 4))) as usize & 0xff
+    }
+    /// The entries whose rows lie in `window`, exactly as two partition points would find them.
+    /// The caller must pass a window the block touches.
+    fn window(&self, window: usize) -> &[(u32, u32)] {
+        let (first_window, shift, entries) = self.header();
+        let k = (window - first_window) >> shift;
+        let bucket = &self.0[entries..][self.offset(k)..self.offset(k + 1)];
+        if shift == 0 {
+            return bucket;
+        }
+        let (start, end) = (window * BLOCK, (window + 1) * BLOCK);
+        let a = bucket.partition_point(|&(row, _)| (row as usize) < start);
+        let b = a + bucket[a..].partition_point(|&(row, _)| (row as usize) < end);
+        &bucket[a..b]
+    }
+}
+impl std::ops::Deref for Postings {
+    type Target = [(u32, u32)];
+    fn deref(&self) -> &[(u32, u32)] {
+        &self.0[self.header().2..]
+    }
+}
+impl PartialEq for Postings {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl From<Vec<(u32, u32)>> for Postings {
+    fn from(entries: Vec<(u32, u32)>) -> Self {
+        assert!(
+            entries.len() <= BLOCK,
+            "a posting block holds at most BLOCK entries"
+        );
+        let (first_window, last_window) = match (entries.first(), entries.last()) {
+            (Some(&(first, _)), Some(&(last, _))) => {
+                (first as usize / BLOCK, last as usize / BLOCK)
+            }
+            _ => (0, 0),
+        };
+        let windows = last_window - first_window + 1;
+        let mut shift = 0;
+        while windows.div_ceil(1 << shift) > BLOCK {
+            shift += 1;
+        }
+        let buckets = windows.div_ceil(1 << shift);
+        let mut offsets = Vec::with_capacity(buckets + 8);
+        let mut at = 0;
+        for k in 0..buckets {
+            let boundary = (first_window + (k << shift)) * BLOCK;
+            while at < entries.len() && (entries[at].0 as usize) < boundary {
+                at += 1;
+            }
+            offsets.push(at as u8);
+        }
+        offsets.push(entries.len() as u8);
+        offsets.resize(offsets.len().next_multiple_of(8), 0);
+        let table_pairs = offsets.len() / 8;
+        let mut data = Vec::with_capacity(1 + table_pairs + entries.len());
+        data.push((first_window as u32, shift | (table_pairs as u32) << 8));
+        data.extend(offsets.as_chunks::<8>().0.iter().map(|b| {
+            (
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            )
+        }));
+        data.extend(entries);
+        Self(data.into())
+    }
+}
 struct CachedPostings {
     postings: Postings,
     dense: bool,
@@ -60,7 +152,7 @@ struct CachedPostings {
 }
 #[derive(Default)]
 struct DecodedPostings {
-    blocks: std::collections::HashMap<u64, CachedPostings>,
+    blocks: crate::scoring::OffsetMap<CachedPostings>,
     order: std::collections::VecDeque<u64>,
     bytes: usize,
     dense_order: std::collections::VecDeque<u64>,
@@ -699,7 +791,7 @@ struct SearchTerm {
     weight: TermWeight,
     prefix: bool,
     postings: Vec<Option<Postings>>,
-    spans: Vec<Range<usize>>,
+    spans: Vec<(u32, u32)>,
     bounds: crate::scratch::Windows,
     small: bool,
 }
@@ -733,14 +825,14 @@ impl SearchTerm {
                 {
                     last += 1;
                 }
-                first..last
+                (first as u32, last as u32)
             })
             .collect();
     }
 
     fn span(&self, window: usize) -> Range<usize> {
-        if let Some(span) = self.spans.get(window) {
-            return span.clone();
+        if let Some(&(first, last)) = self.spans.get(window) {
+            return first as usize..last as usize;
         }
         let blocks = &self.meta.blocks;
         blocks.partition_point(|b| (b.last as usize) < window * BLOCK)
@@ -2332,14 +2424,7 @@ impl SegmentReader {
                                 let Some(postings) = &term.postings[b] else {
                                     continue;
                                 };
-                                let lo = if term.meta.blocks[b].first < start {
-                                    postings.partition_point(|&(row, _)| row < start)
-                                } else {
-                                    0
-                                };
-                                for &(row, _) in
-                                    postings[lo..].iter().take_while(|&&(row, _)| row < end)
-                                {
+                                for &(row, _) in postings.window(window) {
                                     candidates[(row - start) as usize] = true;
                                 }
                             }
@@ -2376,21 +2461,7 @@ impl SegmentReader {
                         let Some(postings) = &term.postings[b] else {
                             continue;
                         };
-                        // The directory already proves either endpoint when the
-                        // frame begins or ends inside this window. Search only
-                        // the remaining boundary, within the retained suffix.
-                        let block = &term.meta.blocks[b];
-                        let lo = if block.first < start {
-                            postings.partition_point(|&(row, _)| row < start)
-                        } else {
-                            0
-                        };
-                        let hi = if block.last >= end {
-                            lo + postings[lo..].partition_point(|&(row, _)| row < end)
-                        } else {
-                            postings.len()
-                        };
-                        let postings = &postings[lo..hi];
+                        let postings = postings.window(window);
                         let mut add = |row: u32, tf| {
                             let i = (row - start) as usize;
                             scores[i] +=
@@ -2843,6 +2914,43 @@ mod posting_cache_tests {
             expected.truncate(10);
             assert_eq!(hits, expected);
         });
+    }
+
+    #[test]
+    fn posting_window_slices_match_partition_points() {
+        // Dense blocks (one window per bucket), wide sparse blocks (several windows per
+        // bucket), single-window blocks, and blocks that start or end mid-window.
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..400u64 {
+            let n = 1 + (next() % BLOCK as u64) as usize;
+            let spread = [1u64, 3, 40, 900, 100_000][(case % 5) as usize];
+            let mut row = (next() % 5000) as u32;
+            let entries: Vec<(u32, u32)> = (0..n)
+                .map(|i| {
+                    if i > 0 {
+                        row += 1 + (next() % spread) as u32;
+                    }
+                    (row, 1 + (next() % 4) as u32)
+                })
+                .collect();
+            let postings: Postings = entries.clone().into();
+            let (first, last) = (
+                entries[0].0 as usize / BLOCK,
+                entries[n - 1].0 as usize / BLOCK,
+            );
+            for window in first..=last {
+                let (start, end) = ((window * BLOCK) as u32, ((window + 1) * BLOCK) as u32);
+                let lo = entries.partition_point(|&(r, _)| r < start);
+                let hi = entries.partition_point(|&(r, _)| r < end);
+                assert_eq!(postings.window(window), &entries[lo..hi], "case {case}");
+            }
+        }
     }
 
     #[test]

@@ -10658,3 +10658,53 @@ cursor forward instead), and avoid recomputing MaxScore ordering per window. Exa
 
 No EC2 cost, no bucket writes. The fixture copy and run directories were deleted.
 
+
+## Round BW6: cheaper per-window BM25 scoring
+
+BW5's lead was `partition_point` and `binary_search` per posting block per window (about 18% of samples). This round
+profiled on a dedicated host first, then removed that cost and two smaller ones. No format change, exact BM25 only.
+
+### Protocol
+
+One on-demand c7g.4xlarge (16 Neoverse-V1 cores, Ubuntu 24.04 arm64, Rust 1.100.0, Clang 19), no other load.
+Fixture `tmp/msmarco-1m-v021/` (read-only; eight text segments), copied to local disk for every arm. Fresh server
+per arm on CPUs 0 to 5 with two Rayon workers, a 2 GiB raw cache, and 4,000-byte blocks. T4's `concurrent_bm25`
+on CPUs 14 and 15 checks ordered IDs and f32 score bits of every reply. Each arm prewarms with two 1-client passes,
+then runs three 1-client passes and six 16-client passes (1,000 queries each); medians are reported. Arms run
+A/B/B/A. Baseline is release code at `94ed981`. Both binaries link a stub for NumKong's SME `__arm_get_current_vg`
+(never executed on this CPU).
+
+### Profile (baseline, 16 clients)
+
+96% of CPU is in the query pool. `search_internal`'s scoring closure is 41% of it, and within that closure 35% is
+the two per-window `partition_point` calls (about 14% of all CPU). The rest of the time is stalls on first touch of
+decoded posting blocks and on `lengths[row]`. Outside the closure: decoding posting blocks 6%, `HashMap` lookups
+with `SipHash` 4.5%, atomics 7.5%, per-query span-vector construction 2.8%.
+
+### Changes
+
+1. **Per-block window table.** A decoded posting block carries, in the same allocation, a table of at most 129
+   bytes that maps a window to its entries. Scoring and candidate generation read the exact slice with no binary
+   search. Wide sparse blocks use buckets of `1 << shift` windows and a tiny search inside the bucket. The slice is
+   the same one two partition points would return.
+2. **Cheap hasher** for the offset-keyed decoded-block and bound maps (was `SipHash`).
+3. **Compact span cache** (`u32` pairs).
+
+### Results (paired A/B/B/A, median q/s and p50 ms)
+
+| Arm | 1 client q/s | 1 client p50 | 16 clients q/s | 16 clients p50 / p90 |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 531 / 527 / 541 / 534 | 1.29 | 1,096 / 1,104 / 1,100 / 1,103 | 12.2 / 21.7 |
+| Window table only | 549 / 552 | 1.30 | 1,148 | 11.8 / 20.8 |
+| Table + hasher | 566 / 579 | 1.25 | 1,253 | 11.0 / 18.9 |
+| Table + hasher + compact spans | 583 / 580 | 1.24 | 1,258 | 10.9 / 18.9 |
+
+The final candidate is **1.14x warm 16-client q/s** (1,258 versus about 1,100) and 1.09x at one client, with a lower
+single-client p50 (1.24 versus 1.29 ms). **That misses the 1.2x bar.** Every validated reply in every arm matched
+the reference's ordered IDs and score bits.
+
+### Not helpful
+
+Raising the decoded-posting budget from 8 MiB to 64 MiB per reader made warm BM25 far slower (212 q/s at one client,
+about 378 at 16); reverted and not investigated. Decoding still costs about 14% of CPU (decode, memo insert, table
+build, bound summaries) because the 8 MiB dense budget cannot hold the working set; that is the next lead.

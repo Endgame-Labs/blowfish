@@ -125,12 +125,34 @@ pub(crate) struct Saturation {
     pub(crate) maxima: RwLock<BoundCache>,
 }
 
+/// A multiplicative hasher for maps keyed by one object offset or term hash. These keys are
+/// never attacker-chosen hash-flooding inputs, and `SipHash` showed up in warm-query profiles.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct OffsetHasher(u64);
+impl std::hash::Hasher for OffsetHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        // The high bits carry the entropy hashbrown uses for its control bytes.
+        self.0 = (self.0 ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 ^= self.0 >> 29;
+    }
+}
+pub(crate) type OffsetMap<V> =
+    std::collections::HashMap<u64, V, std::hash::BuildHasherDefault<OffsetHasher>>;
+
 #[derive(Default)]
 pub(crate) struct BoundCache {
-    pub(crate) frames: std::collections::HashMap<u64, Arc<[(usize, f64)]>>,
+    pub(crate) frames: OffsetMap<Arc<[(usize, f64)]>>,
     // Term maxima use -1 for windows without any posting. This keeps
     // prefix presence separate from a zero normalization value.
-    terms: std::collections::HashMap<u64, TermBounds>,
+    terms: OffsetMap<TermBounds>,
     bytes: usize,
 }
 struct TermBounds {

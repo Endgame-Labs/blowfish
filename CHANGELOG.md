@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-11-25
+
+### Changed
+
+- **Faster warm BM25 scoring:** Each decoded posting block now carries a small table of where every 128-row scoring window starts, so scoring a window no longer binary-searches each block. Offset-keyed caches use a cheaper hasher, and the span cache is more compact. On a 1M-document MS MARCO namespace, warm full-text throughput at 16 clients rose from 1,100 to 1,258 queries/s (p50 12.2 to 10.9 ms), and single-client throughput from 531 to 582 queries/s. Scores and order are bit-identical. No format change and no setting.
+
 ## [0.1.27] - 2026-11-25
 
 ### Changed
@@ -219,7 +225,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.27...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.28...HEAD
+[0.1.28]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.28
 [0.1.27]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.27
 [0.1.26]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.26
 [0.1.25]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.25
