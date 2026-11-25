@@ -1884,22 +1884,48 @@ pub(crate) async fn search(
             .or_default()
             .push((c.cluster, c.ordinal));
     }
-    // A rerank is a few small reads and a little arithmetic. Running it on a worker would hold
-    // one of the few permits through the read latency, and the segments would queue for them.
+    // Synchronous local reads never yield when buffer_unordered polls these futures.
+    // On a cold, fully staged query, submit the slabs on bounded workers so their small
+    // scattered NVMe reads overlap. Partial stages retain the ordinary async remote plan.
+    let parallel_local = by_segment.len() > 1
+        && crate::fan_out()
+        && read_cache::context().is_some_and(|c| c.cold)
+        && {
+            // Streamed batches can install several partial indexes for one slab. Check
+            // each source once, through its last selected vector (the object footer is
+            // deliberately not staged, and is irrelevant to the rerank).
+            let sources: BTreeSet<_> = by_segment.keys().map(|&n| sources[n]).collect();
+            sources.into_iter().all(|i| {
+                chosen
+                    .get(&i)
+                    .and_then(|cs| cs.iter().map(|&n| entries[n].vectors_range().end).max())
+                    .is_some_and(|end| crate::local_ann::covers(&dir.segments()[i].key, 0..end))
+            })
+        };
+    if parallel_local {
+        crate::ann::stage(t0, "local rerank dispatched");
+    }
     let reranks = by_segment.into_iter().map(|(i, locations)| {
         let (index, vector, warm) = (indexes[&i].clone(), vector.clone(), warm.clone());
         let i = sources[i];
         async move {
-            let hits = index
-                .rerank_candidates_recorded(
-                    &vector,
-                    k,
-                    locations,
-                    warm.as_deref().map(|w| w as &dyn bf_vector::VectorRecorder),
-                )
-                .await
-                .map_err(segment::index_error)?;
-            Ok::<_, ApiError>(hits.into_iter().map(|(r, d)| (d, i, r)).collect::<Vec<_>>())
+            let work = async move {
+                let hits = index
+                    .rerank_candidates_recorded(
+                        &vector,
+                        k,
+                        locations,
+                        warm.as_deref().map(|w| w as &dyn bf_vector::VectorRecorder),
+                    )
+                    .await
+                    .map_err(segment::index_error)?;
+                Ok::<_, ApiError>(hits.into_iter().map(|(r, d)| (d, i, r)).collect::<Vec<_>>())
+            };
+            if parallel_local {
+                on_worker(work).await
+            } else {
+                work.await
+            }
         }
     });
     let rerank_limit = reranks.len().max(limit);

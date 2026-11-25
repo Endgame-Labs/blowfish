@@ -2477,6 +2477,25 @@ pub(crate) fn read(key: &str, ranges: &[Range<u64>]) -> Option<Vec<Bytes>> {
     metrics::counter!("blowfish_cache_hits_total", "tier" => "disk").increment(ranges.len() as u64);
     Some(bytes)
 }
+/// Metadata-only coverage check for dispatching local I/O. Reads still verify every CRC,
+/// and retain the ordinary object-store fallback if a stage is retired meanwhile.
+pub(crate) fn covers(key: &str, range: Range<u64>) -> bool {
+    let Some(context) = read_cache::staging_context().filter(|c| c.admit) else {
+        return false;
+    };
+    let Some(stage) = context
+        .cache
+        .staging
+        .as_ref()
+        .and_then(|m| m.file(&context.cache.key(key)))
+    else {
+        return false;
+    };
+    stage
+        .files
+        .get(key)
+        .is_some_and(|f| f.local(std::slice::from_ref(&range)).is_some())
+}
 /// The IDs of these rows of an ID index, from a stage's derived row-to-ID map. `None` when no
 /// verified map covers them, and the caller reads the object instead.
 pub(crate) fn staged_row_ids(ids_key: &str, rows: &roaring::RoaringBitmap) -> Option<Vec<u64>> {
@@ -3082,6 +3101,48 @@ mod tests {
         let manager = Manager::open(work.path(), Some(bytes - 1), Arc::default()).unwrap();
         assert!(!path.exists());
         assert!(manager.candidates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_io_coverage_rejects_partial_retired_and_differently_scoped_files() {
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(128 << 10), Arc::default()).unwrap();
+        let (store, set, ann, end) = fixture(1).await;
+        manager.observe(&store, "left\0", &set, 32, 16, &Vec::new);
+        let stage = ready(&manager, "left\0", &set).await;
+        let key = &set.slabs[0].files["annv2:vector"].key;
+        let mut cache = read_cache::DecodedCache::new(1 << 20, 1).scoped("left");
+        cache.staging = Some(manager.clone());
+        let context = read_cache::ReadContext::new(Arc::new(cache));
+        let stats = Arc::new(bf_storage::BackendStats::default());
+        stats
+            .scope(
+                "coverage",
+                read_cache::scope(context.clone(), async {
+                    assert!(covers(key, 0..end));
+                    assert!(
+                        !covers(key, 0..ann.len() as u64),
+                        "code prefixes cannot enable local vector dispatch"
+                    );
+                    assert!(!covers("missing", 0..1));
+                }),
+            )
+            .await;
+        assert!(
+            stats.snapshot().is_empty(),
+            "dispatch planning must issue no I/O"
+        );
+        let mut other = read_cache::DecodedCache::new(1 << 20, 1).scoped("right");
+        other.staging = Some(manager);
+        read_cache::scope(read_cache::ReadContext::new(Arc::new(other)), async {
+            assert!(!covers(key, 0..end));
+        })
+        .await;
+        stage.bad.store(true, Ordering::Relaxed);
+        read_cache::scope(context, async {
+            assert!(!covers(key, 0..end));
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -3772,6 +3833,8 @@ mod tests {
                 indexing: false,
                 recall_sample_rate: 0.0,
                 decoded_cache_bytes: 16 << 20,
+                // Force final reranks across multiple streamed batches and slab sources.
+                ann_rerank_factor: 1,
                 ..Default::default()
             },
         );
@@ -3802,7 +3865,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let request: bf_types::QueryRequest = serde_json::from_value(serde_json::json!({"rank_by":["vector","ANN",vector(17,5)],"top_k":10,"include_attributes":["id"]})).unwrap();
+        let request: bf_types::QueryRequest = serde_json::from_value(serde_json::json!({"rank_by":["vector","ANN",vector(17,5)],"top_k":2500,"include_attributes":["id"]})).unwrap();
         let configured = engine.query_configured("test", request.clone());
         assert!(
             std::mem::size_of_val(&configured) <= 32,
@@ -3846,12 +3909,17 @@ mod tests {
         default_request.include_attributes = None;
         engine.drop_caches().await;
         let (default, _) = engine
-            .query_with_diagnostics("test", default_request)
+            .query_with_diagnostics("test", default_request.clone())
             .await
             .unwrap();
         assert_eq!(
             serde_json::to_value(&after.result.rows).unwrap(),
             serde_json::to_value(&default.result.rows).unwrap()
+        );
+        let warm = engine.query("test", default_request).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&default.result.rows).unwrap(),
+            serde_json::to_value(&warm.result.rows).unwrap()
         );
         assert!(diagnostics.cache.disk_bytes > 0);
         assert_eq!(after.performance.cache_temperature, "warm");
