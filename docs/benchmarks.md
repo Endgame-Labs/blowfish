@@ -12296,6 +12296,77 @@ The instance is terminated, and independent checks found zero owned active
 instances, volumes, security groups, key pairs, S3 objects, and multipart uploads.
 Shared fixtures were untouched.
 
+## Round C18: fit the 10M exact vectors with lossless exponent packing
+
+The current-format 10M tier requires **22,095,496,715 bytes** for its complete
+routing, codes, and exact-vector stage before companions and completion records.
+That exceeds the unchanged 20 GiB cap. A read-only sample of 1,536 vectors from
+each of its 55 slabs (84,480 vectors, 86,507,520 f16 components) contained only
+exponents 0 through 13. Omitting the zero high exponent bit saves 6.25% of vector
+bytes, projecting a 1,280,000,000-byte saving and about 659 MB of headroom for
+IDs and metadata. The sign and mantissa are stored verbatim, and blocks with a
+nonzero high exponent bit remain raw.
+
+The initial three-bit exponent palette used escapes for about 2.68% of components;
+its decoder took 2.334 microseconds per 1,024-dimensional vector on Graviton. The
+simpler 15-bit packing was selected: the Rust decoder took **0.537 microseconds**
+per vector in the initial test, and **0.436 microseconds** in the final fresh-sample
+check after the HTTP replay, including allocation and exact reconstruction. Tests exercise
+all 65,536 f16 bit patterns, odd and partial ranges, mixed packed and raw blocks,
+CRC failures, truncation, stored-byte accounting, and restart adoption.
+
+The paired HTTP gate uses one on-demand c7gd.4xlarge, release builds targeting
+`neoverse-v1`, eight pinned CPUs, eight Rayon workers, probes64, top10, strong
+consistency, and the default IDs-only response (no `include_attributes` field).
+Both staged arms finish automatic
+provisioning before timing; each measured query clears process caches and evicts
+its stage's filesystem pages. Two additional arms disable the disk cache and
+staging to check pure-S3 latency. All four arms replay the same 200 query IDs,
+interleaved on the same host, with no concurrent compiler or data preparation.
+The server opens the retained current-format fixture read-only. An initial
+provisioning run on the older layout was canceled when its duplicate-code storage
+was identified; it contributes no timed samples to this gate. A second
+provisioning run exposed XFS preallocation beyond EOF on open streamed files;
+the final build trims that allocation before sealing, and the gate records both
+logical and allocated bytes. That provisioning run also contributes no timed pairs.
+
+The default IDs-only gate **passes**: candidate p90 is **88.5 ms**, below 104 ms.
+
+| Path, 200 cold pairs | Control p50 / p90 | Codec p50 / p90 |
+| --- | ---: | ---: |
+| Staged, default IDs-only | 57.8 / 103.4 ms | **57.5 / 88.5 ms** |
+| Pure S3, no staging or disk cache | 259.8 / 348.0 ms | 255.4 / 345.9 ms |
+
+All four arms return identical ordered rows and exact distances for all 200
+queries, with identical planned row counts and recall@10 **0.9700**. The codec
+arm issues exactly **three backend GETs per query**, versus 4.90 on average for
+the control, and fetches no remote vector or document bytes. Pure-S3 p90 is flat
+(-0.6%). The observed staged p90 improvement is 14.4%; paired bootstrap 95%
+intervals for candidate/control p90 are 0.722–1.009 staged and 0.921–1.119 pure S3
+(10,000 resamples, seed 18), so these are one-host measurements with tail noise.
+
+The codec stages **all 10,000,000 vectors**, versus 9,504,006 in the control.
+The complete codec stage, including IDs and metadata, contains **20,935,497,123
+logical bytes** and occupies **20,935,618,560 allocated bytes (19.50 GiB)** across
+59 files, leaving 514 MiB below the unchanged cap. Control logical / allocated
+bytes are 21,185,895,647 / 21,230,882,816. Provisioning takes 104.5 seconds for
+control and 139.8 seconds for codec; the latter also fetches the additional
+495,994 vectors. This round improves coverage and query latency, with extra
+preparation work. No bucket objects are written or reformatted.
+
+An additional 200-pair run explicitly requested `include_attributes: ["id"]`.
+Its staged p50 / p90 was **86.3 / 134.1 → 85.7 / 118.3 ms**, which misses the
+104 ms target. Naming the ID column retains it in document projection, bypassing
+the staged row-to-ID shortcut used by the default IDs-only request; document GETs
+then dominate. All response rows and distances still match, and full vector
+coverage and the physical cap hold. Pure-S3 p50 / p90 was 261.6 / 359.0 versus
+248.4 / 341.3 ms. This projection result is retained separately from the default
+IDs-only gate.
+
+One on-demand c7gd.4xlarge ran for at most 41.2 minutes, approximately $0.50 in
+compute (under the $6 cap). The instance, root volume, key pair, and security
+group were deleted. Shared fixtures were only read.
+
 ## Round C17: stage slabs locally while recluster uploads them
 
 Rounds C6 to C9 stage a recluster tier by fetching its codes, exact vectors, and companions back from object

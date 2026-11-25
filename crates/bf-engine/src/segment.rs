@@ -1167,7 +1167,7 @@ pub(crate) async fn projected_documents(
     if rows.is_empty() {
         return Ok(BTreeMap::new());
     }
-    if columns.is_some_and(|c| c.is_empty()) {
+    if columns.is_some_and(|c| c.iter().all(|name| name == "id")) {
         let ids = ids(store, segment).await?;
         return rows
             .iter()
@@ -1243,7 +1243,7 @@ pub(crate) async fn hydrated_rows(
     rows: &RoaringBitmap,
     columns: &std::collections::BTreeSet<String>,
 ) -> Result<BTreeMap<u32, Document>, ApiError> {
-    if columns.is_empty()
+    if columns.iter().all(|name| name == "id")
         && let Some(file) = segment.files.get("ids")
         && let Some(ids) = crate::local_ann::staged_row_ids(&file.key, rows)
     {

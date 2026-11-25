@@ -4,6 +4,9 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **C18 lossless exponent codec for staged exact vectors (merged, with C18b).** 15-bit packing per 16 KiB block when the high f16 exponent bit is clear, raw otherwise; physical block ends, CRCs over stored bytes, stage identity `ann-staging-v3`; writer-side prestaging encodes too; XFS preallocation trimmed; `include_attributes: ["id"]` uses staged row IDs. 10M, c7gd.4xlarge, 200 cold pairs: full coverage 10M vectors in 19.50 GiB (control 9.50M), IDs-only p50/p90 57.8/103.4 -> 57.5/88.5 ms, 4.90 -> 3 GETs per query, identical, recall 0.9700; pure S3 flat.
+- **C19 (killed).** RaBitQ sign bits are incompressible: best 127.84 B/row of 128 on 100M samples; the per-dimension entropy bound is 126.67.
+
 - **C17 writer-side local prestaging (merged).** recluster writes each slab's stageable ranges to the local stage during upload; the manifest commit activates them, and failures, cancellations, and crashes discard them. 10M on c7gd.4xlarge, paired: codes usable 87.4 -> 2.3 s (38x), fully staged 88.1 -> 3.0 s (29x), recluster 498.4 -> 497.5 s, 5,023 replies identical. `BF_PRESTAGE=0` is the benchmark control.
 
 - **BW13 filtered BM25 (merged).** Direct scoring of allowed rows for sparse, scattered masks (<= 1/4 of rows, < 24 allowed per touched window); `filter_live` cache key no longer serializes the whole Segment (19% of filtered-query CPU). 1M MS MARCO, c7g.4xlarge A/B/B/A, 16 clients: random 0.5% 823 -> 4,153 q/s (5.0x), contiguous 0.5% 4,981 -> 8,621 (1.73x), random 10% 1,169 -> 1,660 (1.42x), contiguous 10% 4,059 -> 6,230 (1.54x), unfiltered 2,475 -> 2,463. Bit-identical.

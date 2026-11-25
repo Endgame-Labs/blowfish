@@ -1,5 +1,5 @@
 //! Durable, identity-checked ANN routing, codes, and capacity-admitted exact vectors.
-use crate::read_cache;
+use crate::{local_ann_codec as codec, read_cache};
 use bf_storage::{ObjectIdentity, Storage};
 use bf_wal::{SegmentFile, SlabSet};
 use bytes::Bytes;
@@ -33,7 +33,7 @@ const MAX_STAGES: usize = 256;
 const COMPANION_FETCHES: usize = 32;
 /// Buffered companion bytes before one positional write to the pack.
 const PACK_FLUSH: usize = 4 << 20;
-const BLOCK: usize = 16 << 10;
+const BLOCK: usize = codec::BLOCK;
 const PIECE: u64 = 8 << 20;
 const DOWNLOADS: usize = 4;
 const RETRY: Duration = Duration::from_secs(60);
@@ -47,11 +47,31 @@ struct StagedFile {
     base: u64,
     len: u64,
     crc: Vec<u32>,
+    /// Cumulative physical block ends for losslessly packed local bytes.
+    encoded: Option<Vec<u32>>,
     identity: Option<ObjectIdentity>,
     /// The object whose identity covers these bytes when they are derived from it.
     source: Option<String>,
 }
 impl StagedFile {
+    fn stored_len(&self) -> u64 {
+        self.encoded.as_ref().map_or(self.len, |ends| {
+            u64::from(ends.last().copied().unwrap_or(0))
+        })
+    }
+    fn physical(&self, range: &Range<u64>) -> Range<u64> {
+        self.encoded.as_ref().map_or_else(
+            || range.clone(),
+            |ends| {
+                let first = range.start as usize / BLOCK;
+                let last = range.end.div_ceil(BLOCK as u64) as usize;
+                let start = if first == 0 { 0 } else { ends[first - 1] };
+                let end = if last == 0 { 0 } else { ends[last - 1] };
+                u64::from(start)..u64::from(end)
+            },
+        )
+    }
+
     /// Object ranges as offsets into the stored bytes, or `None` when any is not wholly stored.
     fn local(&self, ranges: &[Range<u64>]) -> Option<Vec<Range<u64>>> {
         let end = self.base.checked_add(self.len)?;
@@ -98,6 +118,7 @@ impl StagedFile {
     fn advise(&self, ranges: &[Range<u64>]) {
         #[cfg(target_os = "linux")]
         for range in ranges {
+            let range = self.physical(range);
             let (Ok(start), Ok(len)) = (
                 libc::off_t::try_from(range.start + self.offset),
                 libc::off_t::try_from(range.end - range.start),
@@ -125,25 +146,40 @@ impl StagedFile {
         let (mut read_ns, mut crc_ns, mut blocks, mut bytes) = (0, 0, 0, 0);
         let mut extents = BTreeMap::new();
         for range in aligned {
-            let len = usize::try_from(range.end - range.start)
+            let physical = self.physical(&range);
+            let len = usize::try_from(physical.end - physical.start)
                 .map_err(|_| io::Error::other("staged range exceeds address space"))?;
             let mut data = vec![0; len];
             let at = trace.then(Instant::now);
             self.file
-                .read_exact_at(&mut data, range.start + self.offset)?;
+                .read_exact_at(&mut data, physical.start + self.offset)?;
             if let Some(at) = at {
                 read_ns += at.elapsed().as_nanos();
             }
             let at = trace.then(Instant::now);
-            for (n, block) in data.chunks(BLOCK).enumerate() {
-                let index = range.start / BLOCK as u64 + n as u64;
+            let mut decoded = self
+                .encoded
+                .as_ref()
+                .map(|_| Vec::with_capacity((range.end - range.start) as usize));
+            for index in range.start / BLOCK as u64..range.end.div_ceil(BLOCK as u64) {
+                let raw_start = index * BLOCK as u64;
+                let raw_end = (raw_start + BLOCK as u64).min(self.len);
+                let stored = self.physical(&(raw_start..raw_end));
+                let block = &data[(stored.start - physical.start) as usize
+                    ..(stored.end - physical.start) as usize];
                 if self.crc.get(index as usize).copied() != Some(crc32fast::hash(block)) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "staged ANN checksum",
                     ));
                 }
+                if let Some(decoded) = &mut decoded {
+                    decoded.extend(codec::decode(block, (raw_end - raw_start) as usize)?);
+                }
                 blocks += 1;
+            }
+            if let Some(decoded) = decoded {
+                data = decoded;
             }
             if let Some(at) = at {
                 crc_ns += at.elapsed().as_nanos();
@@ -260,6 +296,9 @@ struct FileRecord {
     name: String,
     len: u64,
     crc: Vec<u32>,
+    /// Cumulative physical block ends for losslessly packed local bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoded: Option<Vec<u32>>,
     identity: ObjectIdentity,
     /// Where the stored bytes start in the object. Prefix copies (and records written before
     /// tails were staged) start at zero.
@@ -272,6 +311,13 @@ struct FileRecord {
     /// The object these bytes were derived from, when the key names a derived file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+}
+impl FileRecord {
+    fn stored_len(&self) -> u64 {
+        self.encoded.as_ref().map_or(self.len, |ends| {
+            u64::from(ends.last().copied().unwrap_or(0))
+        })
+    }
 }
 fn is_zero(n: &u64) -> bool {
     *n == 0
@@ -389,7 +435,11 @@ fn file_capacity() -> io::Result<usize> {
 }
 /// Remove caches from the disposable format after an upgrade, preserving live owners.
 fn sweep_legacy(parent: &Path) -> io::Result<()> {
-    let base = parent.join("ann-staging-v1");
+    sweep_format(parent, "ann-staging-v1", true)?;
+    sweep_format(parent, "ann-staging-v2", false)
+}
+fn sweep_format(parent: &Path, name: &str, owner_prefix: bool) -> io::Result<()> {
+    let base = parent.join(name);
     if !base.is_dir() {
         return Ok(());
     }
@@ -406,7 +456,7 @@ fn sweep_legacy(parent: &Path) -> io::Result<()> {
     for entry in fs::read_dir(base)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir()
-            || !entry.file_name().to_string_lossy().starts_with("owner-")
+            || (owner_prefix && !entry.file_name().to_string_lossy().starts_with("owner-"))
         {
             continue;
         }
@@ -457,7 +507,7 @@ impl Manager {
         stop: Arc<crate::stop::Stop>,
     ) -> io::Result<Arc<Self>> {
         sweep_legacy(parent)?;
-        let base = parent.join("ann-staging-v2");
+        let base = parent.join("ann-staging-v3");
         fs::create_dir_all(&base)?;
         // Serialize ownership changes, so deleting an unlocked backend cannot race a
         // new engine opening that backend's lock file.
@@ -515,7 +565,7 @@ impl Manager {
             let bytes = read_record(&stage).ok().and_then(|r| {
                 r.files.values().try_fold(
                     fs::metadata(stage.join("complete")).ok()?.len(),
-                    |sum, f| sum.checked_add(f.len),
+                    |sum, f| sum.checked_add(f.stored_len()),
                 )
             });
             if let Some(bytes) = bytes.filter(|_| candidates.len() < MAX_STAGES) {
@@ -658,7 +708,7 @@ impl Manager {
             .files
             .values()
             .try_fold(fs::metadata(path.join("complete"))?.len(), |sum, f| {
-                sum.checked_add(f.len)
+                sum.checked_add(f.stored_len())
             })
             .ok_or_else(|| io::Error::other("ANN size overflow"))?;
         let physical: HashSet<_> = record.files.values().map(|f| f.name.as_str()).collect();
@@ -678,7 +728,7 @@ impl Manager {
         for f in record.files.values() {
             let end = f
                 .offset
-                .checked_add(f.len)
+                .checked_add(f.stored_len())
                 .ok_or_else(|| io::Error::other("ANN size overflow"))?;
             let slot = ends.entry(f.name.as_str()).or_default();
             *slot = (*slot).max(end);
@@ -695,6 +745,9 @@ impl Manager {
             opened.insert(name, Arc::new(handle));
         }
         for (key, f) in &record.files {
+            if let Some(ends) = &f.encoded {
+                codec::validate(ends, f.len)?;
+            }
             let packed = record.companions && f.name == PACK;
             if !(f.name.starts_with("object-") || packed)
                 || f.name.contains('/')
@@ -712,6 +765,7 @@ impl Manager {
                     base: f.base,
                     len: f.len,
                     crc: f.crc.clone(),
+                    encoded: f.encoded.clone(),
                     identity: Some(f.identity.clone()),
                     source: f.source.clone(),
                 },
@@ -1264,6 +1318,7 @@ impl Manager {
             &|e| limits.contains_key(&e.file.key),
             &mut comp_lease,
         );
+        let prefixes = limits.clone();
         let mut extras: Vec<_> = exact
             .into_iter()
             .filter_map(|(key, len)| {
@@ -1272,7 +1327,9 @@ impl Manager {
                     return None;
                 }
                 let extra = delta
-                    .checked_add(delta.div_ceil(BLOCK as u64).checked_mul(11)?)?
+                    .div_ceil(16)
+                    .checked_mul(15)?
+                    .checked_add(delta.div_ceil(BLOCK as u64).checked_mul(22)?)?
                     .checked_add(if limits.contains_key(&key) {
                         0
                     } else {
@@ -1296,32 +1353,6 @@ impl Manager {
             {
                 limits.insert(key, len);
             }
-        }
-        if crate::ann::trace_stages() {
-            let staged_rows: u64 = dir
-                .entries()
-                .iter()
-                .filter(|e| {
-                    limits
-                        .get(&dir.segments()[e.segment].key)
-                        .is_some_and(|len| *len >= e.vectors_range().end)
-                })
-                .map(|e| u64::from(e.rows))
-                .sum();
-            eprintln!(
-                "STAGED_VECTORS rows={staged_rows} total_rows={}",
-                set.rows()
-            );
-        }
-        let actual = limits
-            .values()
-            .try_fold(
-                set.dir.size + set.pages.as_ref().map_or(0, |p| p.size),
-                |sum, n| sum.checked_add(*n),
-            )
-            .ok_or_else(|| io::Error::other("ANN stage size overflow"))?;
-        if actual > stage._lease.bytes {
-            return Err(io::Error::other("ANN stage exceeds reservation"));
         }
         stage.files.insert(set.dir.key.clone(), directory);
         if let Some(file) = &set.pages {
@@ -1351,7 +1382,7 @@ impl Manager {
             stage.files.extend(reused);
         }
         stage.files.extend(
-            self.download_many(store, &sources_to_copy, &stage.path)
+            self.download_many(store, &sources_to_copy, &stage.path, true)
                 .await?,
         );
         let sources: HashMap<_, _> = std::iter::once(&set.dir)
@@ -1419,6 +1450,7 @@ impl Manager {
                     base: f.base,
                     len: f.len,
                     crc: f.crc.clone(),
+                    encoded: f.encoded.clone(),
                     identity,
                     source: f.source.clone(),
                 },
@@ -1445,13 +1477,65 @@ impl Manager {
             })
             .map(|(k, h)| (k.clone(), (h.object.clone(), h.len)))
             .collect();
-        let record = Record {
+        let mut record = Record {
             scope: scope.to_owned(),
             set: set.clone(),
             hints,
             files,
             companions: false,
         };
+        // Exceptional blocks may invalidate the normalized-vector size estimate. Use
+        // the actual completion size, and retain every code prefix if optional tails
+        // cannot be charged. No published stage exceeds its active-reader lease.
+        let mut actual: u64 = stage.files.values().map(StagedFile::stored_len).sum();
+        let mut optional: Vec<_> = prefixes.keys().cloned().collect();
+        optional.sort();
+        loop {
+            let metadata = serde_json::to_vec(&record).map_err(io::Error::other)?.len() as u64 + 32;
+            let needed = actual.saturating_add(metadata);
+            let extra = needed.saturating_sub(stage._lease.bytes);
+            if needed <= stage._lease.bytes || self.extend(&mut stage._lease, extra) {
+                break;
+            }
+            let key = optional
+                .pop()
+                .ok_or_else(|| io::Error::other("ANN stage exceeds reservation"))?;
+            let len = prefixes[&key];
+            let file = stage.files.get_mut(&key).expect("source");
+            if file.len <= len {
+                continue;
+            }
+            let raw = file.read(std::slice::from_ref(&(0..len)))?.remove(0);
+            let previous = file.stored_len();
+            file.file.write_all_at(&raw, 0)?;
+            file.file.set_len(len)?;
+            file.file.sync_all()?;
+            file.len = len;
+            file.encoded = None;
+            file.crc = raw.chunks(BLOCK).map(crc32fast::hash).collect();
+            actual = actual - previous + len;
+            let saved = record.files.get_mut(&key).expect("record");
+            saved.len = len;
+            saved.encoded = None;
+            saved.crc = file.crc.clone();
+        }
+        if crate::ann::trace_stages() {
+            let staged_rows: u64 = dir
+                .entries()
+                .iter()
+                .filter(|e| {
+                    stage
+                        .files
+                        .get(&dir.segments()[e.segment].key)
+                        .is_some_and(|f| f.len >= e.vectors_range().end)
+                })
+                .map(|e| u64::from(e.rows))
+                .sum();
+            eprintln!(
+                "STAGED_VECTORS rows={staged_rows} total_rows={}",
+                set.rows()
+            );
+        }
         let descriptors = stage.files.len();
         self.seal(&mut stage, &record, actual, descriptors)?;
         let job = (!companions.is_empty()).then_some((comp_lease, companions));
@@ -1541,6 +1625,7 @@ impl Manager {
                     base: item.base,
                     len: item.bytes.len() as u64,
                     crc: item.crc,
+                    encoded: None,
                     identity: Some(item.identity),
                     source: item.source,
                 },
@@ -1556,9 +1641,12 @@ impl Manager {
         }
         written = flush_pack(&pack, &mut buffer, written).await?;
         let handle = pack.clone();
-        tokio::task::spawn_blocking(move || handle.sync_all())
-            .await
-            .map_err(io::Error::other)??;
+        tokio::task::spawn_blocking(move || {
+            handle.set_len(written)?;
+            handle.sync_all()
+        })
+        .await
+        .map_err(io::Error::other)??;
         let records = files
             .iter()
             .map(|(key, f)| {
@@ -1570,6 +1658,7 @@ impl Manager {
                         base: f.base,
                         len: f.len,
                         crc: f.crc.clone(),
+                        encoded: f.encoded.clone(),
                         identity: f
                             .identity
                             .clone()
@@ -1598,6 +1687,7 @@ impl Manager {
         store: &Storage,
         sources: &[(SegmentFile, u64, u64)],
         path: &Path,
+        compress: bool,
     ) -> io::Result<HashMap<String, StagedFile>> {
         let mut files = HashMap::new();
         let mut jobs = Vec::new();
@@ -1618,7 +1708,9 @@ impl Manager {
                     .mode(0o600)
                     .open(path.join(format!("source-{}", digest(source.key.as_bytes()))))
                     .await?;
-                file.set_len(len).await?;
+                if !compress {
+                    file.set_len(len).await?;
+                }
                 Ok::<_, io::Error>((source, base, len, identity, file.into_std().await))
             }
         }))
@@ -1635,6 +1727,7 @@ impl Manager {
                     reader.clone(),
                     file.clone(),
                     base,
+                    compress && len <= u64::from(u32::MAX),
                     start..(start + PIECE).min(len),
                 ));
             }
@@ -1647,42 +1740,92 @@ impl Manager {
                     base,
                     len,
                     crc: vec![0; len.div_ceil(BLOCK as u64) as usize],
+                    encoded: (compress && len <= u64::from(u32::MAX)).then(Vec::new),
                     identity: Some(identity),
                     source: None,
                 },
             );
         }
         let mut reads = futures::stream::iter(jobs.into_iter().map(
-            |(key, reader, file, base, range)| async move {
+            |(key, reader, file, base, compress, range)| async move {
                 let bytes = reader
                     .read_direct(base + range.start..base + range.end)
                     .await
                     .map_err(io::Error::other)?;
                 tokio::task::spawn_blocking(move || {
-                    file.write_all_at(&bytes, range.start)?;
-                    let crc: Vec<_> = bytes.chunks(BLOCK).map(crc32fast::hash).collect();
-                    Ok::<_, io::Error>((key, range.start / BLOCK as u64, crc))
+                    let mut data = Vec::with_capacity(bytes.len());
+                    let mut ends = Vec::new();
+                    let mut crc = Vec::new();
+                    for raw in bytes.chunks(BLOCK) {
+                        let block = if compress {
+                            codec::encode(raw)
+                        } else {
+                            raw.to_vec()
+                        };
+                        crc.push(crc32fast::hash(&block));
+                        data.extend(block);
+                        ends.push(data.len() as u32);
+                    }
+                    (key, file, range.start, data, ends, crc)
                 })
                 .await
-                .map_err(io::Error::other)?
+                .map_err(io::Error::other)
             },
         ))
-        .buffer_unordered(DOWNLOADS);
-        while let Some((key, block, crc)) = reads.try_next().await? {
-            let target = &mut files.get_mut(&key).expect("opened stage source").crc;
-            target[block as usize..block as usize + crc.len()].copy_from_slice(&crc);
+        // Preserve per-file order while overlapping bounded GETs and encoding work.
+        .buffered(DOWNLOADS);
+        while let Some((key, file, start, data, ends, crc)) = reads.try_next().await? {
+            let target = files.get_mut(&key).expect("opened stage source");
+            let offset = if let Some(index) = &mut target.encoded {
+                let offset = index.last().copied().unwrap_or(0);
+                for end in ends {
+                    index.push(
+                        offset
+                            .checked_add(end)
+                            .ok_or_else(|| io::Error::other("local exponent index overflow"))?,
+                    );
+                }
+                u64::from(offset)
+            } else {
+                start
+            };
+            tokio::task::spawn_blocking(move || file.write_all_at(&data, offset))
+                .await
+                .map_err(io::Error::other)??;
+            let first = start as usize / BLOCK;
+            target.crc[first..first + crc.len()].copy_from_slice(&crc);
+        }
+        // Routing and code objects usually contain no compressible blocks. Keep their
+        // existing zero-copy read path, and omit an index that would save no bytes.
+        for file in files.values_mut() {
+            if file.stored_len() == file.len {
+                file.encoded = None;
+            }
         }
         // No range task remains when files are synced and their identities rechecked.
         let syncing = files
             .iter()
-            .map(|(key, file)| (key.clone(), file.identity.clone(), file.file.clone()))
+            .map(|(key, file)| {
+                (
+                    key.clone(),
+                    file.identity.clone(),
+                    file.file.clone(),
+                    file.stored_len(),
+                )
+            })
             .collect::<Vec<_>>();
-        futures::stream::iter(syncing.into_iter().map(|(key, identity, handle)| {
+        futures::stream::iter(syncing.into_iter().map(|(key, identity, handle, len)| {
             let store = store.clone();
             async move {
-                tokio::task::spawn_blocking(move || handle.sync_all())
-                    .await
-                    .map_err(io::Error::other)??;
+                tokio::task::spawn_blocking(move || {
+                    // XFS can retain speculative allocation beyond EOF on an open
+                    // streamed file. Even truncating to the current length releases it,
+                    // keeping the physical footprint within the stage's reservation.
+                    handle.set_len(len)?;
+                    handle.sync_all()
+                })
+                .await
+                .map_err(io::Error::other)??;
                 let after = store
                     .object_identity(&key)
                     .await
@@ -1733,6 +1876,7 @@ impl Manager {
             crc.extend(bytes.chunks(BLOCK).map(crc32fast::hash));
             tokio::task::yield_now().await;
         }
+        file.set_len(len).await?;
         file.sync_all().await?;
         if before
             != store
@@ -1748,6 +1892,7 @@ impl Manager {
             base: 0,
             len,
             crc,
+            encoded: None,
             identity: Some(before),
             source: None,
         })
@@ -1832,9 +1977,10 @@ async fn flush_pack(file: &Arc<File>, buffer: &mut Vec<u8>, at: u64) -> io::Resu
 /// One slab object's stage bytes, written beside its upload.
 struct Written {
     file: Arc<File>,
-    /// Bytes stored: the codes' prefix, or through the exact vectors.
+    /// Logical bytes covered: the codes' prefix, or through the exact vectors.
     len: u64,
     crc: Vec<u32>,
+    encoded: Option<Vec<u32>>,
     identity: ObjectIdentity,
 }
 /// What a [`Prestage`] shares with the manager's registry.
@@ -1895,31 +2041,53 @@ impl PreInner {
         }
         tokio::task::spawn_blocking(move || {
             let mut out = HashMap::new();
-            for (key, len, mut w) in take {
-                if w.len > len {
-                    w.file.set_len(len)?;
-                    w.crc.truncate(len.div_ceil(BLOCK as u64) as usize);
-                    // The last block is shorter now, so its checksum changes.
-                    if len % BLOCK as u64 != 0 {
+            for (key, len, w) in take {
+                let mut staged = StagedFile {
+                    file: w.file,
+                    offset: 0,
+                    base: 0,
+                    len: w.len,
+                    crc: w.crc,
+                    encoded: w.encoded,
+                    identity: Some(w.identity),
+                    source: None,
+                };
+                if staged.len > len {
+                    let blocks = len.div_ceil(BLOCK as u64) as usize;
+                    // A cut within a packed block must decode the old block before
+                    // encoding its shorter replacement, and checksumming stored bytes.
+                    let tail = if !len.is_multiple_of(BLOCK as u64) {
                         let start = len / BLOCK as u64 * BLOCK as u64;
-                        let mut tail = vec![0; (len - start) as usize];
-                        w.file.read_exact_at(&mut tail, start)?;
-                        *w.crc.last_mut().expect("a partial block") = crc32fast::hash(&tail);
+                        let raw = staged.read(std::slice::from_ref(&(start..len)))?.remove(0);
+                        Some((start, raw))
+                    } else {
+                        None
+                    };
+                    staged.crc.truncate(blocks);
+                    if let Some((start, raw)) = tail {
+                        let offset = staged.physical(&(start..len)).start;
+                        let data = if staged.encoded.is_some() {
+                            codec::encode(&raw)
+                        } else {
+                            raw.to_vec()
+                        };
+                        staged.file.write_all_at(&data, offset)?;
+                        *staged.crc.last_mut().expect("a partial block") = crc32fast::hash(&data);
+                        if let Some(ends) = &mut staged.encoded {
+                            ends[blocks - 1] = (offset + data.len() as u64) as u32;
+                        }
                     }
-                    w.file.sync_all()?;
+                    if let Some(ends) = &mut staged.encoded {
+                        ends.truncate(blocks);
+                    }
+                    staged.len = len;
+                    staged.file.set_len(staged.stored_len())?;
+                    staged.file.sync_all()?;
                 }
-                out.insert(
-                    key,
-                    StagedFile {
-                        file: w.file,
-                        offset: 0,
-                        base: 0,
-                        len,
-                        crc: w.crc,
-                        identity: Some(w.identity),
-                        source: None,
-                    },
-                );
+                if staged.stored_len() == staged.len {
+                    staged.encoded = None;
+                }
+                out.insert(key, staged);
             }
             Ok(out)
         })
@@ -1946,35 +2114,56 @@ impl PrestageWriter {
     ) -> Result<bf_wal::SegmentFile, E> {
         let pre = self.0.clone();
         let (path, name) = (pre.dir.clone(), source_name(key));
-        let len = {
-            let mut guard = pre.lease.lock().expect("prestage lease");
-            guard
-                .as_mut()
-                .and_then(|lease| pre.admit(lease, code_len, vector_len, rows_after))
-        };
         let local = async {
-            let len = len?.min(bytes.len() as u64);
+            let pre = pre.clone();
             tokio::task::spawn_blocking(move || {
+                let code_len = code_len.min(bytes.len() as u64);
+                let vector_len = vector_len.min(bytes.len() as u64);
+                let len = {
+                    let mut guard = pre.lease.lock().expect("prestage lease");
+                    guard.as_mut().and_then(|lease| {
+                        pre.admit(lease, &bytes, code_len, vector_len, rows_after)
+                    })
+                };
+                let Some(len) = len else { return Ok(None) };
                 let file = OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create_new(true)
                     .mode(0o600)
                     .open(path.join(name))?;
-                let data = &bytes[..len as usize];
-                file.write_all_at(data, 0)?;
-                let crc: Vec<u32> = data.chunks(BLOCK).map(crc32fast::hash).collect();
+                let compress = len <= u64::from(u32::MAX);
+                let mut ends = Vec::new();
+                let mut crc = Vec::new();
+                let mut stored = 0u64;
+                for raw in bytes[..len as usize].chunks(BLOCK) {
+                    let data = if compress {
+                        codec::encode(raw)
+                    } else {
+                        raw.to_vec()
+                    };
+                    file.write_all_at(&data, stored)?;
+                    crc.push(crc32fast::hash(&data));
+                    stored += data.len() as u64;
+                    if compress {
+                        ends.push(stored as u32);
+                    }
+                }
+                // Release XFS speculative allocation beyond EOF before the final fsync,
+                // including while the descriptor remains open for the adopting reader.
+                file.set_len(stored)?;
                 file.sync_all()?;
-                Ok::<_, io::Error>((Arc::new(file), crc, len))
+                let encoded = (stored < len).then_some(ends);
+                Ok::<_, io::Error>(Some((Arc::new(file), crc, encoded, len)))
             })
             .await
             .ok()?
             .map_err(|error| tracing::debug!(%error, "prestage write failed"))
-            .ok()
+            .ok()?
         };
         let (uploaded, local) = futures::future::join(upload, local).await;
         let file = uploaded?;
-        if let Some((handle, crc, len)) = local
+        if let Some((handle, crc, encoded, len)) = local
             && let Ok(identity) = store.object_identity(key).await
             && (identity.etag.is_some() || identity.version.is_some())
         {
@@ -1984,6 +2173,7 @@ impl PrestageWriter {
                     file: handle,
                     len,
                     crc,
+                    encoded,
                     identity,
                 },
             );
@@ -2076,11 +2266,24 @@ impl PreInner {
     fn admit(
         &self,
         lease: &mut Lease,
+        bytes: &[u8],
         code_len: u64,
         vector_len: u64,
         rows_after: u64,
     ) -> Option<u64> {
-        let cost = |len: u64| len + len.div_ceil(BLOCK as u64) * 11;
+        // Charge actual stored bytes and both per-block CRC and physical-end metadata.
+        // Exceptional blocks stay raw, so they cannot overrun the lease's estimate.
+        let cost = |len: u64| {
+            let stored = if len <= u64::from(u32::MAX) {
+                bytes[..len as usize]
+                    .chunks(BLOCK)
+                    .map(codec::encoded_len)
+                    .sum::<usize>() as u64
+            } else {
+                len
+            };
+            stored + len.div_ceil(BLOCK as u64) * 22
+        };
         let m = &self.manager;
         if !m.extend_files(lease, 1) {
             return None;
@@ -2268,6 +2471,62 @@ mod tests {
     }
 
     #[test]
+    fn encoded_ranges_preserve_odd_offsets_raw_blocks_and_checksum_boundaries() {
+        let work = scratch();
+        let temporary = tempfile::NamedTempFile::new_in(work.path()).unwrap();
+        let mut raw: Vec<u8> = (0..BLOCK * 5 + 123)
+            .map(|i| ((i * 37 % 251) as u8) & 0xbf)
+            .collect();
+        raw[BLOCK + 1] = 0x7c; // A block with an infinity exponent stays raw.
+        let mut data = Vec::new();
+        let mut ends = Vec::new();
+        let mut crc = Vec::new();
+        for block in raw.chunks(BLOCK) {
+            let encoded = codec::encode(block);
+            crc.push(crc32fast::hash(&encoded));
+            data.extend(encoded);
+            ends.push(data.len() as u32);
+        }
+        codec::validate(&ends, raw.len() as u64).unwrap();
+        temporary.as_file().write_all_at(&data, 0).unwrap();
+        let staged = StagedFile {
+            file: Arc::new(temporary.as_file().try_clone().unwrap()),
+            offset: 0,
+            base: 71,
+            len: raw.len() as u64,
+            crc,
+            encoded: Some(ends),
+            identity: None,
+            source: None,
+        };
+        assert!(staged.stored_len() < staged.len);
+        for offset in [0, 1, BLOCK - 1, BLOCK, BLOCK * 2 - 3, BLOCK * 5 + 122] {
+            for size in [0, 1, 2, 2048, BLOCK * 2] {
+                let end = (offset + size).min(raw.len());
+                let ranges = [71 + offset as u64..71 + end as u64, 71..73];
+                let got = staged.read(&ranges).unwrap();
+                assert_eq!(&got[0][..], &raw[offset..end]);
+                assert_eq!(&got[1][..], &raw[..2]);
+            }
+        }
+        // Corruption outside the requested subrange still invalidates the entire block.
+        let last = staged.encoded.as_ref().unwrap()[0] as u64 - 1;
+        staged
+            .file
+            .write_all_at(&[data[last as usize] ^ 1], last)
+            .unwrap();
+        assert!(staged.read(std::slice::from_ref(&(71..72))).is_err());
+        staged.file.set_len(staged.stored_len() - 1).unwrap();
+        assert!(
+            staged
+                .read(std::slice::from_ref(
+                    &(71 + staged.len - 1..71 + staged.len)
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn scattered_overlapping_ranges_share_an_open_file_without_a_shared_cursor() {
         let work = scratch();
         let temporary = tempfile::NamedTempFile::new_in(work.path()).unwrap();
@@ -2281,6 +2540,7 @@ mod tests {
             base: 0,
             len: data.len() as u64,
             crc: data.chunks(BLOCK).map(crc32fast::hash).collect(),
+            encoded: None,
             identity: None,
             source: None,
         };
@@ -2347,6 +2607,13 @@ mod tests {
         }
     }
     async fn fixture(salt: u32) -> (Storage, SlabSet, Vec<u8>, u64) {
+        fixture_dtype(salt, bf_vector::VectorType::F32).await
+    }
+
+    async fn fixture_dtype(
+        salt: u32,
+        dtype: bf_vector::VectorType,
+    ) -> (Storage, SlabSet, Vec<u8>, u64) {
         let store = Storage::open(&StorageConfig {
             url: "memory://".into(),
             ..Default::default()
@@ -2355,6 +2622,7 @@ mod tests {
         .unwrap();
         let builder = IndexBuilder::new(32, Metric::EuclideanSquared)
             .unwrap()
+            .vector_type(dtype)
             .params(BuildParams {
                 flat_threshold: 0,
                 clusters: Some(16),
@@ -2465,6 +2733,37 @@ mod tests {
         drop(manager);
         assert!(path.join("complete").exists());
         (path, bytes)
+    }
+
+    #[tokio::test]
+    async fn f16_stages_charge_physical_bytes_and_adopt_encoded_vectors() {
+        let work = scratch();
+        let (store, set, ann, codes) = fixture_dtype(31, bf_vector::VectorType::F16).await;
+        let (path, charged) = completed(work.path(), &store, &set).await;
+        let record = read_record(&path).unwrap();
+        let source = &set.slabs[0].files["annv2:vector"];
+        let file = &record.files[&source.key];
+        assert!(file.encoded.is_some());
+        assert!(file.stored_len() < file.len);
+        assert_eq!(
+            charged,
+            record
+                .files
+                .values()
+                .map(FileRecord::stored_len)
+                .sum::<u64>()
+                + fs::metadata(path.join("complete")).unwrap().len()
+        );
+        let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
+        let stats = Arc::new(bf_storage::BackendStats::default());
+        stats.scope("adopt", manager.recover(&store)).await;
+        assert_eq!(manager.state.lock().unwrap().used, charged);
+        assert!(stats.snapshot().iter().all(|m| m.operation != "get_range"));
+        let ranges = [codes - 1..codes + 65, file.len - 64..file.len];
+        let got = manager.read(&source.key, &source.key, &ranges).unwrap();
+        for (got, range) in got.iter().zip(&ranges) {
+            assert_eq!(&got[..], &ann[range.start as usize..range.end as usize]);
+        }
     }
 
     #[tokio::test]
@@ -2741,7 +3040,7 @@ mod tests {
             sources.push((file(&key, data.len() as u64, 0), 0, data.len() as u64));
         }
         let files = manager
-            .download_many(&store, &sources, work.path())
+            .download_many(&store, &sources, work.path(), false)
             .await
             .unwrap();
         for (n, (source, _, len)) in sources.iter().enumerate() {
@@ -2780,7 +3079,7 @@ mod tests {
             data.len() as u64 - base,
         )];
         let files = manager
-            .download_many(&store, &sources, work.path())
+            .download_many(&store, &sources, work.path(), false)
             .await
             .unwrap();
         let tail = &files["tail-source"];
@@ -2853,6 +3152,61 @@ mod tests {
             staged
                 .read(std::slice::from_ref(&(5000 * 8..5000 * 8 + 8)))
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn named_id_and_default_hydration_read_only_staged_ids() {
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        let (store, set, _, _) = fixture(46).await;
+        let ids = crate::segment::put_ids(
+            &store,
+            "numeric-ids".into(),
+            (0..2048).map(|n| bf_types::Id::Uint(n * 7 + 3)).collect(),
+        )
+        .await
+        .unwrap();
+        let extras = vec![Extra {
+            file: ids.clone(),
+            kind: ExtraKind::NumericIds(2048),
+        }];
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        let _main = ready(&manager, "", &set).await;
+        let _pack = companion_stage(&manager, &set).await;
+        let mut segment = set.slabs[0].clone();
+        // No docs object exists: any attempt to hydrate document bytes would fail.
+        segment.files = BTreeMap::from([("ids".into(), ids)]);
+        let mut cache = read_cache::DecodedCache::new(1 << 20, 1);
+        cache.staging = Some(manager);
+        let context = read_cache::ReadContext::new(Arc::new(cache));
+        let rows = roaring::RoaringBitmap::from_iter([0, 1, 2047]);
+        let stats = Arc::new(bf_storage::BackendStats::default());
+        let (default, named) = stats
+            .scope(
+                "hydrate",
+                read_cache::scope(context, async {
+                    let default =
+                        crate::segment::hydrated_rows(&store, &segment, &rows, &Default::default())
+                            .await
+                            .unwrap();
+                    let named = crate::segment::hydrated_rows(
+                        &store,
+                        &segment,
+                        &rows,
+                        &std::collections::BTreeSet::from(["id".into()]),
+                    )
+                    .await
+                    .unwrap();
+                    (default, named)
+                }),
+            )
+            .await;
+        assert_eq!(default, named);
+        assert_eq!(named[&2047]["id"], serde_json::json!(2047 * 7 + 3));
+        assert!(
+            stats.snapshot().is_empty(),
+            "ID hydration makes no backend requests"
         );
     }
 
@@ -2944,7 +3298,7 @@ mod tests {
         drop(manager);
 
         // Losing only the pack leaves the code stage adoptable, and the pack is rebuilt.
-        for entry in fs::read_dir(work.path().join("ann-staging-v2/test")).unwrap() {
+        for entry in fs::read_dir(work.path().join("ann-staging-v3/test")).unwrap() {
             let dir = entry.unwrap().path();
             if dir.join(PACK).exists() {
                 fs::remove_dir_all(dir).unwrap();
@@ -3268,21 +3622,23 @@ mod tests {
     #[test]
     fn upgrades_remove_orphaned_legacy_stages_and_keep_live_owners() {
         let work = scratch();
-        let base = work.path().join("ann-staging-v1");
-        let live = base.join("owner-live");
-        let dead = base.join("owner-dead");
-        fs::create_dir_all(&live).unwrap();
-        fs::create_dir_all(&dead).unwrap();
-        let guard = File::create(live.join(".lock")).unwrap();
-        guard.lock().unwrap();
-        File::create(dead.join(".lock")).unwrap();
-        let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
-        assert!(live.exists());
-        assert!(!dead.exists());
-        drop(manager);
-        drop(guard);
-        sweep_legacy(work.path()).unwrap();
-        assert!(!live.exists());
+        for (version, prefix) in [("v1", "owner-"), ("v2", "backend-")] {
+            let base = work.path().join(format!("ann-staging-{version}"));
+            let live = base.join(format!("{prefix}live"));
+            let dead = base.join(format!("{prefix}dead"));
+            fs::create_dir_all(&live).unwrap();
+            fs::create_dir_all(&dead).unwrap();
+            let guard = File::create(live.join(".lock")).unwrap();
+            guard.lock().unwrap();
+            File::create(dead.join(".lock")).unwrap();
+            let manager = Manager::open(work.path(), Some(1 << 20), Arc::default()).unwrap();
+            assert!(live.exists());
+            assert!(!dead.exists());
+            drop(manager);
+            drop(guard);
+            sweep_legacy(work.path()).unwrap();
+            assert!(!live.exists());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3362,7 +3718,7 @@ mod tests {
         .unwrap();
         engine.drop_caches().await;
         let (after, diagnostics) = engine
-            .query_with_diagnostics("test", request)
+            .query_with_diagnostics("test", request.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -3379,6 +3735,17 @@ mod tests {
         assert!(
             snapshot_bytes(&diagnostics.backend) < snapshot_bytes(&cold.backend),
             "a cold snapshot must read routing hints from the published stage"
+        );
+        let mut default_request = request;
+        default_request.include_attributes = None;
+        engine.drop_caches().await;
+        let (default, _) = engine
+            .query_with_diagnostics("test", default_request)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&after.result.rows).unwrap(),
+            serde_json::to_value(&default.result.rows).unwrap()
         );
         assert!(diagnostics.cache.disk_bytes > 0);
         assert_eq!(after.performance.cache_temperature, "warm");
@@ -3465,7 +3832,7 @@ mod tests {
 
     #[tokio::test]
     async fn prestaged_bytes_wait_for_the_commit_then_become_the_stage_without_a_download() {
-        let (store, set, ann, _) = fixture(41).await;
+        let (store, set, ann, _) = fixture_dtype(41, bf_vector::VectorType::F16).await;
         publish(&store, &set, false, 1).await;
         let key = set.slabs[0].files["annv2:vector"].key.clone();
         let control = scratch();
@@ -3476,7 +3843,21 @@ mod tests {
         let work = scratch();
         let manager = Manager::open(work.path(), Some(512 << 20), Arc::default()).unwrap();
         let pre = prestaged(&manager, &store, &set, &ann, true).await;
-        let local = pre.0.files.lock().unwrap()[&key].file.clone();
+        let local = {
+            let files = pre.0.files.lock().unwrap();
+            let written = &files[&key];
+            let ends = written
+                .encoded
+                .as_ref()
+                .expect("prestaged f16 bytes are encoded");
+            codec::validate(ends, written.len).unwrap();
+            assert!(u64::from(*ends.last().unwrap()) < written.len);
+            assert_eq!(
+                written.file.metadata().unwrap().len(),
+                u64::from(*ends.last().unwrap())
+            );
+            written.file.clone()
+        };
         assert!(manager.state.lock().unwrap().used > 0, "the cap is charged");
         pre.publish(&set);
         // Until the commit is confirmed, no query stages this tier at all.
@@ -3495,7 +3876,10 @@ mod tests {
         assert_eq!(got.files.len(), want.files.len());
         for (name, f) in &want.files {
             let g = &got.files[name];
-            assert_eq!((g.len, &g.crc, &g.identity), (f.len, &f.crc, &f.identity));
+            assert_eq!(
+                (g.len, &g.crc, &g.encoded, &g.identity),
+                (f.len, &f.crc, &f.encoded, &f.identity)
+            );
             let all = std::slice::from_ref(&(0..f.len)).to_vec();
             assert_eq!(g.read(&all).unwrap(), f.read(&all).unwrap());
         }
@@ -3593,35 +3977,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_prefix_cut_from_a_longer_prestage_keeps_every_checksum_true() {
-        let (store, set, ann, end) = fixture(45).await;
+    async fn prestage_admits_all_vectors_when_only_the_encoded_bytes_fit() {
+        let (store, set, ann, _) = fixture_dtype(47, bf_vector::VectorType::F16).await;
+        let file = &set.slabs[0].files["annv2:vector"];
+        let (_, len) = crate::recluster::stage_lengths(&ann, file.metadata_len);
+        let metadata = len.div_ceil(BLOCK as u64) * 22;
+        let stored = ann[..len as usize]
+            .chunks(BLOCK)
+            .map(codec::encoded_len)
+            .sum::<usize>() as u64;
+        assert!(stored < len);
         let work = scratch();
-        let manager = Manager::open(work.path(), Some(512 << 20), Arc::default()).unwrap();
+        // The reserve protects future codes and metadata. Beside it, only the
+        // encoded payload fits; charging raw vector bytes would reject the tail.
+        let capacity = (64 << 20) + stored + metadata;
+        let manager = Manager::open(work.path(), Some(capacity), Arc::default()).unwrap();
         let pre = prestaged(&manager, &store, &set, &ann, true).await;
-        let file = set.slabs[0].files["annv2:vector"].clone();
-        // Not a multiple of the block size, so the last block's checksum must be redone.
-        let len = end - 1;
-        assert_ne!(len % BLOCK as u64, 0);
-        let mut wanted = vec![(file.clone(), 0, len)];
-        let taken = pre.0.adopt(&mut wanted).await.unwrap();
-        assert!(wanted.is_empty());
-        let f = &taken[&file.key];
-        assert_eq!(f.len, len);
-        let all = f.read(std::slice::from_ref(&(0..len))).unwrap();
-        assert_eq!(&all[0][..], &ann[..len as usize]);
-        assert_eq!(
-            fs::metadata(pre.0.dir.join(source_name(&file.key)))
-                .unwrap()
-                .len(),
-            len
-        );
-        // An object stored shorter than wanted is left to the download, and its file removed.
-        let short = scratch();
-        let manager = Manager::open(short.path(), Some(512 << 20), Arc::default()).unwrap();
-        let pre = prestaged(&manager, &store, &set, &ann, false).await;
-        let mut wanted = vec![(file.clone(), 0, end + 1)];
-        assert!(pre.0.adopt(&mut wanted).await.unwrap().is_empty());
-        assert_eq!(wanted.len(), 1);
-        assert!(!pre.0.dir.join(source_name(&file.key)).exists());
+        let files = pre.0.files.lock().unwrap();
+        let written = &files[&file.key];
+        assert_eq!(written.len, len);
+        assert_eq!(written.file.metadata().unwrap().len(), stored);
+        assert_eq!(manager.state.lock().unwrap().used, stored + metadata);
+    }
+
+    #[tokio::test]
+    async fn a_prefix_cut_from_a_longer_prestage_keeps_every_checksum_true() {
+        let (store, set, ann, end) = fixture_dtype(45, bf_vector::VectorType::F16).await;
+        for len in [
+            end - 1,
+            end + BLOCK as u64 + 16,
+            end + BLOCK as u64 + 17,
+            (end / BLOCK as u64 + 1) * BLOCK as u64,
+            0,
+        ] {
+            let work = scratch();
+            let manager = Manager::open(work.path(), Some(512 << 20), Arc::default()).unwrap();
+            let pre = prestaged(&manager, &store, &set, &ann, true).await;
+            let file = set.slabs[0].files["annv2:vector"].clone();
+            // Cover code cuts, packed vector cuts, block boundaries, and empty prefixes.
+            assert!(
+                len < crate::recluster::stage_lengths(
+                    &ann,
+                    set.slabs[0].files["annv2:vector"].metadata_len
+                )
+                .1
+            );
+            let mut wanted = vec![(file.clone(), 0, len)];
+            let taken = pre.0.adopt(&mut wanted).await.unwrap();
+            assert!(wanted.is_empty());
+            let f = &taken[&file.key];
+            assert_eq!(f.len, len);
+            let all = f.read(std::slice::from_ref(&(0..len))).unwrap();
+            assert_eq!(&all[0][..], &ann[..len as usize]);
+            assert_eq!(
+                fs::metadata(pre.0.dir.join(source_name(&file.key)))
+                    .unwrap()
+                    .len(),
+                f.stored_len()
+            );
+            // An object stored shorter than wanted is left to the download, and its file removed.
+            let short = scratch();
+            let manager = Manager::open(short.path(), Some(512 << 20), Arc::default()).unwrap();
+            let pre = prestaged(&manager, &store, &set, &ann, false).await;
+            let mut wanted = vec![(file.clone(), 0, end + 1)];
+            assert!(pre.0.adopt(&mut wanted).await.unwrap().is_empty());
+            assert_eq!(wanted.len(), 1);
+            assert!(!pre.0.dir.join(source_name(&file.key)).exists());
+        }
     }
 }

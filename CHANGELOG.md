@@ -4,6 +4,17 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.36] - 2026-11-25
+
+### Changed
+
+- **All 10M exact vectors fit in the local stage:** The local ANN stage now stores exact vectors with a lossless 15-bit packing: when every f16 value in a 16 KiB block has a clear high exponent bit, as normalized embeddings do, that bit is dropped; any other block is stored as-is. Reads reconstruct the exact bits. On a 10M-vector namespace the whole stage now takes 19.50 GiB, under the unchanged 20 GiB cap, where before 9.50M of the 10M vectors fit. Cold IDs-only queries went from 57.8 / 103.4 ms to 57.5 / 88.5 ms p50 / p90, with 3 object reads per query instead of 4.9 and identical results. Pure object-storage latency is unchanged. Object storage bytes are unchanged; older local stages are rebuilt automatically. Recluster's writer-side staging uses the same packing.
+- **Named ID projection uses staged row IDs:** A query with `include_attributes: ["id"]` now takes the same staged row-ID path as a default IDs-only query, instead of reading documents from object storage.
+
+### Fixed
+
+- **Local stage disk accounting on XFS:** Streamed stage files held open kept the filesystem's speculative preallocation beyond their end (a 65 MiB file occupied about 128 MiB). Each stage file is now truncated to its stored length before the final sync.
+
 ## [0.1.35] - 2026-11-25
 
 ### Changed
@@ -273,7 +284,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.35...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.36...HEAD
+[0.1.36]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.36
 [0.1.35]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.35
 [0.1.34]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.34
 [0.1.33]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.33

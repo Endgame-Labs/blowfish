@@ -634,3 +634,37 @@ On 2026-11-14, `scripts/multinode.sh` passed all 111 recorded compatibility scen
 since grown to 121 recorded scenarios plus SDK retry checks) through Caddy and three nodes sharing SeaweedFS. Its restart run verified all 67 acknowledged writes and
 one winning conditional update; 23 interrupted writes were unacknowledged. This is a small local
 smoke and stress run, not a durability or availability guarantee.
+
+## Round C18: lossless local exact-vector packing
+
+Automatic ANN staging packs eligible 16 KiB blocks of exact-vector objects into
+15 bits per f16 component. It omits the high exponent bit only when that bit is
+zero in every word of the block; sign bits and mantissa bits are preserved.
+Blocks with larger exponents, infinities, NaNs, arbitrary code bytes, or an
+unaligned final tail stay raw. Decoding restores the exact original bytes.
+This changes the disposable local cache only. Bucket objects, API responses,
+and the existing cap (20 GiB, or one quarter of available disk) are unchanged.
+
+The local stage identity is `ann-staging-v3`. On upgrade, unlocked stages from
+older identities are removed and rebuilt; stages owned by a running process
+remain protected by their locks. Completion records include cumulative physical
+block ends, logical source lengths, source identities, and CRCs of stored blocks.
+Recovery checks the index and stored file lengths, and each read verifies whole
+stored blocks before decoding. Corruption, truncation, or a stale source identity
+falls back to object storage through the existing invalidation path.
+
+Admission estimates the packed vector size, then checks the actual payload and
+completion record against the stage's reservation. Exceptional data can use raw
+blocks; when its extra bytes cannot be reserved, optional vector tails are dropped
+while retaining every admitted code prefix. Active readers keep their physical
+byte charge until they finish. Staged ranges larger than the 32-bit block-offset range
+stay raw. Finalizing a streamed file truncates it to its stored length before syncing,
+releasing filesystem preallocation beyond EOF even while its handle stays open.
+There is no codec setting or bucket migration.
+
+The measured current-format 10M fixture stages all vectors, IDs, and metadata in
+19.50 GiB of allocated disk space. Its default IDs-only p90 is 88.5 ms over 200
+cold pairs. Explicitly projecting `["id"]` currently bypasses the staged ID-map
+shortcut and still fetches document bytes; that separate run reaches 118.3 ms
+p90. Compression does not remove storage reads needed by projected document
+columns. The benchmark notes record both request forms and their paired controls.
