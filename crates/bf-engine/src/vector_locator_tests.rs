@@ -7,6 +7,9 @@ pub(super) async fn fixture() -> (Storage, Engine, NamespaceState) {
     fixture_rows(64).await
 }
 async fn fixture_rows(count: usize) -> (Storage, Engine, NamespaceState) {
+    fixture_rows_parts(count, 2).await
+}
+async fn fixture_rows_parts(count: usize, parts: usize) -> (Storage, Engine, NamespaceState) {
     let store = Storage::open(&bf_storage::StorageConfig {
         url: "memory://".into(),
         ..Default::default()
@@ -21,7 +24,7 @@ async fn fixture_rows(count: usize) -> (Storage, Engine, NamespaceState) {
             ..Default::default()
         },
     );
-    for batch in 0..2 {
+    for batch in 0..parts {
         let docs: Vec<_> = (0..count)
             .map(|r| {
                 let id = batch * count + r;
@@ -461,5 +464,125 @@ async fn resident_row_map_backfill_is_bounded_preserves_ann_and_rejects_corrupti
         crate::slab_rows::load(&store, slab, "vector")
             .await
             .is_err()
+    );
+}
+
+async fn retire_test_sources(store: &Storage) {
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    let mut removed = Vec::new();
+    for segment in &mut manifest.segments {
+        if let Some(file) = segment.files.remove("annv2:vector") {
+            removed.push(file.key);
+        }
+    }
+    for file in std::mem::take(&mut manifest.ann_dirs).into_values() {
+        crate::indexer::retire(&mut manifest, file.key);
+    }
+    for key in &removed {
+        crate::indexer::retire(&mut manifest, key.clone());
+    }
+    wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
+        .await
+        .unwrap();
+    for key in removed {
+        store.delete(&key).await.unwrap();
+    }
+}
+fn reference_request() -> bf_types::QueryRequest {
+    serde_json::from_value(
+        json!({"rank_by": ["id", "asc"], "top_k": 10_000, "include_attributes": true}),
+    )
+    .unwrap()
+}
+fn maintenance_engine(store: &Storage) -> Engine {
+    Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            retention: std::time::Duration::ZERO,
+            compaction_segments: 2,
+            max_segment_rows: 8192,
+            ..Default::default()
+        },
+    )
+}
+#[tokio::test]
+async fn recluster_reads_its_predecessor_after_segment_ann_objects_are_deleted() {
+    let (store, engine, _) = fixture_rows(2000).await;
+    let before = engine
+        .query_exhaustive("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    retire_test_sources(&store).await;
+    let rebuilt = maintenance_engine(&store);
+    let parent =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/d4b-tests");
+    let scratch = tempfile::tempdir_in(parent).unwrap();
+    rebuilt
+        .recluster(
+            "locator",
+            &ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 2,
+                cluster_rows: 16,
+                max_slab_rows: 8000,
+                scratch: scratch.path().into(),
+            },
+        )
+        .await
+        .unwrap();
+    rebuilt.collect_garbage("locator").await.unwrap();
+    assert_eq!(
+        maintenance_engine(&store)
+            .query_exhaustive("locator", reference_request())
+            .await
+            .unwrap()
+            .result
+            .rows,
+        before
+    );
+}
+#[tokio::test]
+async fn repeated_compactions_read_tiers_and_compose_lineage_without_segment_vectors() {
+    let (store, engine, _) = fixture_rows_parts(2000, 3).await;
+    let before = engine
+        .query_exhaustive("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    retire_test_sources(&store).await;
+    assert!(
+        maintenance_engine(&store)
+            .index_namespace("locator", true)
+            .await
+            .unwrap()
+    );
+    retire_test_sources(&store).await;
+    assert!(
+        maintenance_engine(&store)
+            .index_namespace("locator", true)
+            .await
+            .unwrap()
+    );
+    retire_test_sources(&store).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.lineage.len(), 3);
+    let final_engine = maintenance_engine(&store);
+    final_engine.collect_garbage("locator").await.unwrap();
+    assert_eq!(
+        final_engine
+            .query_exhaustive("locator", reference_request())
+            .await
+            .unwrap()
+            .result
+            .rows,
+        before
     );
 }

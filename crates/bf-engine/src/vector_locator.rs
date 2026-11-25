@@ -6,6 +6,8 @@ use bf_vector::RoaringBitmap;
 use bf_wal::{Lineage, Segment, SlabSet};
 use std::{collections::BTreeMap, sync::Arc};
 
+pub(crate) mod inputs;
+
 /// Snapshot-owned sources: readers never resolve a row against a newer publication.
 #[derive(Clone)]
 pub(crate) struct Sources {
@@ -38,6 +40,13 @@ impl Sources {
         Self {
             tiers: state.ann_tiers.clone(),
             lineage: state.lineage.clone(),
+        }
+    }
+
+    pub fn from_manifest(manifest: &bf_wal::Manifest) -> Self {
+        Self {
+            tiers: Arc::new(manifest.ann_tiers.clone()),
+            lineage: Arc::new(manifest.lineage.clone()),
         }
     }
 
@@ -178,10 +187,22 @@ pub(crate) fn scope<'a, T: Send + 'a>(
     state: &NamespaceState,
     future: impl std::future::Future<Output = T> + Send + 'a,
 ) -> futures::future::BoxFuture<'a, T> {
-    if state.ann_tiers.is_empty() {
+    scope_sources(Sources::new(state), future)
+}
+pub(crate) fn scope_manifest<'a, T: Send + 'a>(
+    manifest: &bf_wal::Manifest,
+    future: impl std::future::Future<Output = T> + Send + 'a,
+) -> futures::future::BoxFuture<'a, T> {
+    scope_sources(Sources::from_manifest(manifest), future)
+}
+fn scope_sources<'a, T: Send + 'a>(
+    sources: Sources,
+    future: impl std::future::Future<Output = T> + Send + 'a,
+) -> futures::future::BoxFuture<'a, T> {
+    if sources.tiers.is_empty() {
         return Box::pin(future);
     }
-    let sources = Arc::new(Sources::new(state));
+    let sources = Arc::new(sources);
     // The caller may construct this future before entering its read scope. Resolve the
     // cache, graph admission, and accounting on first poll, inside that caller's scope.
     Box::pin(async move {

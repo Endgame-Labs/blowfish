@@ -690,7 +690,9 @@ impl Engine {
             manifest.stats = NamespaceStats::default();
             for seg in &state.segments {
                 let live = snapshot::allowed(store, &state, seg, None).await?;
-                let mut docs = segment::documents(store, seg, &live).await?;
+                let mut docs =
+                    crate::vector_locator::scope(&state, segment::documents(store, seg, &live))
+                        .await?;
                 for doc in docs.values_mut() {
                     doc.retain(|name, _| state.schema.contains_key(name));
                 }
@@ -738,8 +740,11 @@ impl Engine {
             crate::ann::stage(t0, "idx pre-live");
             let mut covered = covered_segments(&manifest);
             covered.extend(protected.iter().cloned());
-            let (masks, removed) =
-                crate::statistics::removals(store, &state, self.0.config.build_concurrency).await?;
+            let (masks, removed) = crate::vector_locator::scope(
+                &state,
+                crate::statistics::removals(store, &state, self.0.config.build_concurrency),
+            )
+            .await?;
             if external {
                 removed_stats = removed;
             } else {
@@ -792,8 +797,11 @@ impl Engine {
                                 segment::ids(store, &seg).await?,
                             ));
                         }
-                        let (docs, vectors) =
-                            segment::compaction_rows(store, &seg, &live, &strip).await?;
+                        let (docs, vectors) = crate::vector_locator::scope(
+                            &state,
+                            segment::compaction_rows(store, &seg, &live, &strip),
+                        )
+                        .await?;
                         compact_docs.extend(crate::shared(docs));
                         for (name, part) in vectors {
                             compact_vectors.entry(name).or_default().push(part);
