@@ -29,6 +29,7 @@ struct Slow {
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
     fail_slot: AtomicU64,
+    payload_delay: Option<Duration>,
     late: Option<Arc<LateUpload>>,
     commit_gate: Option<Arc<CommitGate>>,
 }
@@ -97,7 +98,10 @@ impl ObjectStore for Slow {
             let n = self.uploads.fetch_add(1, Ordering::SeqCst);
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(5 + 12 * (7 - (n % 8)) as u64)).await;
+            let delay = self
+                .payload_delay
+                .unwrap_or(Duration::from_millis(5 + 12 * (7 - (n % 8)) as u64));
+            tokio::time::sleep(delay).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
         } else if name.contains("/wal/") {
             if name.ends_with("/00000000000000000002.wal")
@@ -634,4 +638,86 @@ async fn gc_preserves_a_payload_when_its_writer_wins_the_slot_fence() {
     })
     .await
     .expect("the writer and GC completed their slot race");
+}
+
+/// Byte boundaries put ordinary writes in the backlog; those writes must not bypass the
+/// configured flight depth. Each request fits the byte budget, and two requests exceed it.
+#[tokio::test]
+async fn byte_bounded_backlog_obeys_pipeline_depth_and_replays_exactly() {
+    let backend = Arc::new(Slow {
+        payload_delay: Some(Duration::from_secs(1)),
+        ..Default::default()
+    });
+    let store = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let tuning = EngineConfig {
+        wal_pipeline: 1,
+        ..config()
+    };
+    let engine = Engine::with_config(store.clone(), tuning.clone());
+    engine
+        .write(
+            "bounded",
+            serde_json::from_value(json!({
+                "schema": {"pad": {"type": "string", "filterable": false}},
+                "upsert_rows": [{"id": 0, "pad": ""}]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let pad = "x".repeat(40_000);
+    // Build every body before releasing the concurrent writers.
+    let mut requests: Vec<bf_types::WriteRequest> = Vec::with_capacity(4);
+    for group in 0..4u64 {
+        let rows: Vec<_> = (0..512u64)
+            .map(|row| json!({"id": 1 + group * 512 + row, "pad": pad}))
+            .collect();
+        requests.push(serde_json::from_value(json!({"upsert_rows": rows})).unwrap());
+    }
+    let ready = Arc::new(tokio::sync::Barrier::new(5));
+    let mut tasks = vec![];
+    for request in requests {
+        let (engine, ready) = (engine.clone(), ready.clone());
+        tasks.push(tokio::spawn(async move {
+            ready.wait().await;
+            engine.write("bounded", request).await.unwrap()
+        }));
+    }
+    ready.wait().await;
+    for task in tasks {
+        assert_eq!(task.await.unwrap().rows_upserted, Some(512));
+    }
+    assert_eq!(backend.max_in_flight.load(Ordering::SeqCst), 1);
+    let entries = bf_wal::Wal::new(store.clone(), "bounded")
+        .unwrap()
+        .tail(0)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 5);
+    assert!(entries.iter().all(|(_, entry)| entry.batches.len() == 1));
+    let mut replayed = BTreeSet::new();
+    for (_, entry) in entries {
+        for batch in entry.batches {
+            for doc in batch.upserts {
+                let id = doc["id"].as_u64().unwrap();
+                assert!(replayed.insert(id));
+                assert_eq!(doc["pad"].as_str(), Some(if id == 0 { "" } else { &pad }));
+            }
+        }
+    }
+    assert_eq!(replayed, (0..2049).collect());
+    let fresh = Engine::with_config(store, tuning);
+    let count = fresh
+        .query(
+            "bounded",
+            serde_json::from_value(json!({
+                "aggregate_by": {"count": ["Count"]}
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count.result.aggregations.unwrap()["count"], 2049);
 }
