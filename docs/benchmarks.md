@@ -12632,3 +12632,55 @@ Results are identical: recall@10 is 0.949565 and the order-sensitive digest of e
 Instructions and cycles come from the M4 task counters (`RUSAGE_INFO_V4`) over the query region. The M4 exposes no per-query cache-miss counter, so cycles per query stand in for stalls: they do not fall with padding. Instruction counts are flat, as expected.
 
 Result: **killed.** The best padded stride is 0.99x of 1,024 at 8 threads (the 1,152 spread, 6.6K to 7.4K, is machine noise), and every padded stride is slower at 1 thread (0.93x, 0.86x, and 0.71x). Larger strides only add memory and a wider working set. No production code was touched, and nothing is proposed. The absolute 8-thread rate (about 7K q/s) is lower than G5's 15.1K because this graph was rebuilt from scratch on a different host, the M4 was shared, and only 8 of its 10 cores (4 performance, 6 efficiency) were used; the comparison across strides is what this round measures, and all four ran under the same conditions.
+
+## Round BW14: per-term generations for warm BM25 bound caches (killed at the measurement)
+
+Hypothesis (Sol, `briefs/ideas/1825-sol.md` #2): `BoundCache::term` validates each term's cached window maxima against the
+segment-wide decoded-frame count, so decoding one term's posting block would invalidate every other term's bounds and force
+rebuilds, and per-term generations would remove that work. Kill rule: rebuilds under 10% of CPU once warm.
+
+### Measurement
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Rust 1.100.0, Clang 19, NumKong `__arm_get_current_vg` link stub). Fixture
+`tmp/msmarco-1m-v021/` copied to local disk, 2 GiB raw cache, 4,000-byte blocks, server on CPUs 0 to 5 with two Rayon and two
+Tokio workers, client on CPUs 14 and 15 (BW13's setup). Workload: T4's `concurrent_bm25` over the held-out odd-indexed 500 queries
+eight times per pass, two single-client prewarm passes, then four 16-client passes. The server was built from `93e4f35` plus
+temporary uncommitted counters (removed): reuse hits, rebuilds, rebuild wall time (the whole rebuild block in `search_internal`),
+and "stale" lookups (an entry exists but its frame count differs, the invalidation this round targets).
+
+| Point | Reuse hits | Rebuilds | Stale lookups | Rebuild time |
+| --- | ---: | ---: | ---: | ---: |
+| After prewarm and 16-client pass 1 | 11,872 | 3,741 | 2,966 | 34.5 ms |
+| After pass 2 | 21,414 | 3,743 | 2,968 | 34.5 ms |
+| After pass 4 | about 40,000 | 3,743 | 2,968 | 34.5 ms |
+
+(Counters are printed every two seconds, so the last two rows lag by up to one pass; the rebuild and stale counts are flat.)
+
+- The decoded-frame count stops growing at 12,691 during prewarm. From then on the cache is stable: **two rebuilds in four timed
+  16-client passes** (16,000 queries, about 38,000 term lookups), and every other lookup was a reuse hit.
+- All rebuilds in the run, including prewarm, took **34.5 ms of wall time in total**. One 16-client pass uses about 9 CPU-seconds
+  (898 ticks of the server's user and system time), so once warm rebuilds are **about 0.00%** of CPU, against a kill line of 10%.
+- The stale lookups (2,968) all happened while the cache filled in prewarm. The cache does not churn once warm, which was the risk
+  Sol named. 16-client throughput on this build was 2,636 to 2,652 q/s (the instrumented build; the BW13 unfiltered baseline is
+  2,471 to 2,478), p50 / p90 5.3 / 9.6 ms; peak resident memory 1.04 GiB. Every reply matched the fixture truth.
+
+Per-term generations would save at most the 34.5 ms spent while warming up. **Killed. No code change** (the tree is unchanged
+apart from this section). The remaining warm CPU is elsewhere (BW11's profile: the scoring closure, `partition_point`, and
+first-touch stalls), not in bound rebuilds.
+
+### Text segment sizing (Neon, `briefs/ideas/1825-neon.md` #2): confirmed, not changed
+
+- **Code:** `bf-engine/src/indexer.rs`, `default_max_segment_rows()` is `(memory_limit_bytes() / 80_000).clamp(25_000, 200_000)`.
+  Its comment says the 80,000 bytes per row come from compacting 1,024-dimension vectors (about 30 KB per row measured). The value
+  is the default `EngineConfig::max_segment_rows`; it caps both `build_segments` batches and the compaction groups in
+  `pick`. The schema is not consulted, so a text-only namespace gets the vector-sized cap. `BF_MAX_SEGMENT_ROWS` overrides it
+  but is clamped by nothing, whereas the default is clamped to at most 200,000 rows. `bulk_flush_rows` is also
+  `default_max_segment_rows().min(100_000)`. `auto_recluster.rs` separately uses `SEGMENT_ROW_BYTES = 30_000`.
+- **Effective rows on MS MARCO:** on this 32 GiB host (30 GiB MemTotal), memory / 80,000 is about 394,000, so the clamp makes the cap
+  **200,000 rows**; a host needs about 16 GB to reach it, and a 4 GiB limit gives 53,000 rows. The 1M fixture's live segments hold
+  25,000, 50,000, 100,000, 110,000, 115,000, and three of 200,000 rows (eight segments, about 199 MB of `fts.1.bft`); BW13's reload
+  produced nine. So the cap is the binding limit for the three largest segments, and the rest are tier leftovers.
+- **Sizing is not just the cap:** even with `BF_MAX_SEGMENT_ROWS` raised, `max_segment_bytes` is 2 GiB, and a hard upper clamp of
+  200,000 applies to the default only. Collapsing to one or two segments therefore needs a text-aware default (rows from
+  an estimated per-row builder cost, not the vector constant). I did not measure text builder or compaction memory per row, so a
+  safe value is unknown. Not changed this round.
