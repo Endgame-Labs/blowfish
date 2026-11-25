@@ -25,6 +25,35 @@ const VERSION_COMPRESSED: u32 = 6;
 const VERSION_COMPACT: u32 = 7;
 
 const BLOCK: usize = 128;
+/// Whether to score a mask's rows directly instead of walking windows. The window walk pays per
+/// window it touches and the direct path per allowed row, so the direct path wins when the mask is
+/// sparse and scattered: at most a quarter of the segment's rows, and (sampling eight spots of
+/// 64 consecutive allowed rows) fewer than `DIRECT_ROWS_PER_WINDOW` allowed rows per touched window.
+/// A contiguous range keeps the window walk, whose bounds prune it. Only speed depends on this.
+fn direct_mask(allowed: &RoaringBitmap, docs: u32) -> bool {
+    const SPOTS: u64 = 8;
+    const RUN: usize = 64;
+    const DIRECT_ROWS_PER_WINDOW: u64 = 24;
+    let len = allowed.len();
+    if len == 0 || len.saturating_mul(4) > u64::from(docs) {
+        return false;
+    }
+    let (mut rows, mut windows) = (0u64, 0u64);
+    for spot in 0..SPOTS.min(len) {
+        let Some(first) = allowed.select((spot * len / SPOTS) as u32) else {
+            return false;
+        };
+        let mut last = usize::MAX;
+        for row in allowed.range(first..).take(RUN) {
+            rows += 1;
+            if row as usize / BLOCK != last {
+                windows += 1;
+                last = row as usize / BLOCK;
+            }
+        }
+    }
+    rows < windows * DIRECT_ROWS_PER_WINDOW
+}
 const FOOTER: usize = 72;
 const MAGIC: &[u8; 8] = b"BFTEXT01";
 /// Eager term metadata: postings, lengths, term metadata, dictionary.
@@ -2501,6 +2530,15 @@ impl SegmentReader {
             hits.sort_unstable_by(|a, b| b.cmp(a));
             return Ok((hits, metrics));
         }
+        if let Some(rows) = allowed
+            && query.prefix().is_none()
+            && direct_mask(rows, self.docs)
+        {
+            return self
+                .search_allowed_rows(&mut terms, rows, k, &saturation, threshold, &mut metrics)
+                .await
+                .map(|hits| (hits, metrics));
+        }
         let mut row_bounds = crate::scratch::Rows::take(if terms.iter().any(|term| term.small) {
             self.docs as usize
         } else {
@@ -2857,6 +2895,113 @@ impl SegmentReader {
         Ok((hits, metrics))
     }
 
+    /// Score a highly selective mask directly: look up each query term's frequency at the allowed
+    /// rows (the dense array where present, the intersecting decoded posting blocks otherwise)
+    /// instead of walking windows. Terms add in dictionary order into one f32 accumulator per row,
+    /// exactly as the window path does, so scores and ordering are bit-identical.
+    async fn search_allowed_rows(
+        &self,
+        terms: &mut [SearchTerm],
+        allowed: &RoaringBitmap,
+        k: usize,
+        saturation: &Arc<Saturation>,
+        threshold: Option<&SearchThreshold>,
+        metrics: &mut SearchMetrics,
+    ) -> io::Result<Vec<SearchHit>> {
+        let rows: Vec<u32> = allowed.range(0..self.docs).collect();
+        let mut wanted = Vec::new();
+        for (t, term) in terms.iter().enumerate() {
+            if term.dense.is_some() {
+                continue;
+            }
+            for (b, meta) in term.meta.blocks.iter().enumerate() {
+                if term.postings[b].is_none()
+                    && allowed.range(meta.first..=meta.last).next().is_some()
+                {
+                    wanted.push((t, b));
+                }
+            }
+        }
+        self.read_search_blocks(terms, wanted, saturation, metrics)
+            .await?;
+        let lengths = self.lens();
+        let mut scores = crate::scratch::Rows::take(self.docs as usize);
+        for term in terms.iter() {
+            if let Some(dense) = &term.dense {
+                for &row in &rows {
+                    let tf = dense.get(row);
+                    if tf > 0 {
+                        let score = term
+                            .weight
+                            .score_cached(tf, lengths[row as usize], saturation);
+                        if score > 0.0 {
+                            scores.add(row, score);
+                        }
+                    }
+                }
+                continue;
+            }
+            for (meta, postings) in term.meta.blocks.iter().zip(&term.postings) {
+                let Some(postings) = postings else {
+                    continue;
+                };
+                let lo = rows.partition_point(|&r| r < meta.first);
+                let hi = lo + rows[lo..].partition_point(|&r| r <= meta.last);
+                let wanted = &rows[lo..hi];
+                let mut add = |row: u32, tf: u32| {
+                    let score = term
+                        .weight
+                        .score_cached(tf, lengths[row as usize], saturation);
+                    if score > 0.0 {
+                        scores.add(row, score);
+                    }
+                };
+                if wanted.len() * 8 < postings.len() {
+                    for &row in wanted {
+                        if let Ok(i) = postings.binary_search_by_key(&row, |&(r, _)| r) {
+                            add(row, postings[i].1);
+                        }
+                    }
+                } else {
+                    let mut at = 0;
+                    for &(row, tf) in postings.iter() {
+                        while at < wanted.len() && wanted[at] < row {
+                            at += 1;
+                        }
+                        if at == wanted.len() {
+                            break;
+                        }
+                        if wanted[at] == row {
+                            add(row, tf);
+                        }
+                    }
+                }
+            }
+        }
+        metrics.rows_scored = scores.touched().len();
+        let mut heap: BinaryHeap<Reverse<SearchHit>> = BinaryHeap::new();
+        let floor = search_floor(&heap, k, threshold);
+        for &row in scores.touched() {
+            if floor.is_some_and(|floor| f64::from(scores[row as usize]) < floor) {
+                continue;
+            }
+            let hit = SearchHit {
+                row,
+                score: scores[row as usize],
+            };
+            if heap.len() < k {
+                heap.push(Reverse(hit));
+            } else if hit > heap.peek().unwrap().0 {
+                *heap.peek_mut().unwrap() = Reverse(hit);
+            }
+        }
+        if let Some(threshold) = threshold {
+            threshold.publish(&heap);
+        }
+        let mut hits: Vec<_> = heap.into_iter().map(|r| r.0).collect();
+        hits.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(hits)
+    }
     /// Read missing frames in address order, keeping direct term/block ordinals.
     async fn read_search_blocks(
         &self,

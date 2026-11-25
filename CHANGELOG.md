@@ -4,6 +4,16 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.34] - 2026-11-25
+
+### Changed
+
+- **Much faster filtered BM25:** When a filter admits few, scattered rows of a text segment (at most a quarter of its rows, and fewer than 24 per touched window), blowfish scores those rows directly instead of walking windows. On a 1M-document MS MARCO namespace at 16 clients, a random 0.5% filter rose from 823 to 4,153 queries/s and a random 10% filter from 1,169 to 1,660. Unfiltered queries are unchanged. Scores and order are bit-identical. No format change and no setting.
+
+### Fixed
+
+- **Filter cache key cost:** The cache key for a segment's filter result was built by serializing the whole segment description, including its dictionary chunk indexes, on every filtered query: about a fifth of the CPU of a selective filter. The key now uses the segment's immutable object keys, sizes, WAL range, and live-row generation. This alone made contiguous 0.5% filters 1.73x faster (4,981 to 8,621 queries/s) and also applies to filtered vector queries.
+
 ## [0.1.33] - 2026-11-25
 
 ### Changed
@@ -257,7 +267,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.33...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.34...HEAD
+[0.1.34]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.34
 [0.1.33]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.33
 [0.1.32]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.32
 [0.1.31]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.31
