@@ -278,6 +278,7 @@ mod tests {
             dims,
             values: Vec::new(),
             scales: Vec::new(),
+            dot: super::super::quant::dot_kernel(),
         };
         for id in 0..n {
             let row = (0..dims)

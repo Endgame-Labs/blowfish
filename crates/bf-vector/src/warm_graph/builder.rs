@@ -27,6 +27,7 @@ impl HotGraphBuilder {
                 dims: dims.next_power_of_two(),
                 values: Vec::with_capacity(count * dims.next_power_of_two()),
                 scales: Vec::with_capacity(count),
+                dot: quant::dot_kernel(),
             },
             transform: RaBitQ::new(dims, 42)?,
             dims,
