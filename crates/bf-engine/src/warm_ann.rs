@@ -39,9 +39,20 @@ impl Stats {
     }
 }
 
+/// Queries asking for more than this many results are bulk readers: their shortlists are an
+/// order of magnitude larger than the rows an ordinary query keeps resident.
+const ORDINARY_K: usize = 10;
+/// The bulk cache holds this fraction of the ordinary cache's bytes.
+const BULK_SHARE: u64 = 4;
+
 pub(crate) struct WarmTier {
     pub codes: CompiledTier,
+    /// Rows fetched by ordinary queries (`k <= ORDINARY_K`). Only they may evict from it.
     vectors: moka::sync::Cache<u32, ValidatedVector>,
+    /// Rows fetched by bulk queries when `vectors` cannot hold the whole tier. Bounded on its own,
+    /// so a pass of large top_k queries churns this cache and never the ordinary one. `None` when
+    /// every row fits, where both kinds of query share `vectors`.
+    bulk: Option<moka::sync::Cache<u32, ValidatedVector>>,
     stats: Arc<Stats>,
     ready: AtomicBool,
     pub rows: usize,
@@ -161,7 +172,15 @@ impl WarmTier {
             } else {
                 CompiledTier::code_bytes(&directory)
             };
-        let reservation = code_reservation.saturating_add(vector_budget);
+        let sparse = vector_budget < all_vectors;
+        let bulk_budget = if sparse {
+            vector_budget / BULK_SHARE
+        } else {
+            0
+        };
+        let reservation = code_reservation
+            .saturating_add(vector_budget)
+            .saturating_add(bulk_budget);
         if listed != total || total <= 2048 || reservation > read_cache::capacity() {
             seen.0.store(2, Ordering::Relaxed);
             return None;
@@ -174,24 +193,28 @@ impl WarmTier {
             }
         };
         let stats = Arc::new(Stats::new(vector_budget));
-        let evicted = stats.evicted.clone();
-        let vectors = moka::sync::Cache::builder()
-            .max_capacity(vector_budget)
-            .eviction_listener(move |_, _, cause| {
-                if matches!(cause, moka::notification::RemovalCause::Size) {
-                    evicted.increment(1);
-                }
-            })
-            .weigher(|_: &u32, v: &ValidatedVector| {
-                v.resident_bytes().min(u64::from(u32::MAX)) as u32
-            })
-            .build();
+        let cache = |capacity: u64| {
+            let evicted = stats.evicted.clone();
+            moka::sync::Cache::builder()
+                .max_capacity(capacity)
+                .weigher(|_: &u32, v: &ValidatedVector| {
+                    v.resident_bytes().min(u64::from(u32::MAX)) as u32
+                })
+                .eviction_listener(move |_, _, cause| {
+                    if matches!(cause, moka::notification::RemovalCause::Size) {
+                        evicted.increment(1);
+                    }
+                })
+                .build()
+        };
+        let (vectors, bulk) = (cache(vector_budget), sparse.then(|| cache(bulk_budget)));
         read_cache::insert_once(
             key,
             reservation,
             Self {
                 codes,
                 vectors,
+                bulk,
                 stats,
                 ready: AtomicBool::new(false),
                 rows: total,
@@ -223,7 +246,7 @@ impl WarmTier {
                 rerank_factor,
                 k,
                 |row| {
-                    let found = self.vectors.get(&row);
+                    let found = self.get(row);
                     if found.is_some() {
                         hit.set(hit.get() + 1);
                     } else {
@@ -236,8 +259,14 @@ impl WarmTier {
             let (hit, miss) = (hit.get(), miss.get());
             self.stats.hit.increment(hit);
             self.stats.miss.increment(miss);
-            self.stats.entries.set(self.vectors.entry_count() as f64);
-            self.stats.bytes.set(self.vectors.weighted_size() as f64);
+            let bulk = self.bulk.iter();
+            let (entries, bytes) = std::iter::once(&self.vectors)
+                .chain(bulk)
+                .fold((0, 0), |(n, b), c| {
+                    (n + c.entry_count(), b + c.weighted_size())
+                });
+            self.stats.entries.set(entries as f64);
+            self.stats.bytes.set(bytes as f64);
             Ok(match found {
                 Some(found) => {
                     #[cfg(test)]
@@ -261,11 +290,36 @@ impl WarmTier {
         })
     }
 }
-impl VectorRecorder for WarmTier {
+impl WarmTier {
+    fn get(&self, row: u32) -> Option<ValidatedVector> {
+        self.vectors
+            .get(&row)
+            .or_else(|| self.bulk.as_ref()?.get(&row))
+    }
+    /// The recorder for a query that asked for `k` results. Rows from an ordinary query go to
+    /// the cache that keeps ordinary queries compiled. Rows from a bulk query go to the bulk
+    /// cache, so no pass of large top_k queries can evict them.
+    pub fn recorder(&self, k: usize) -> Recorder<'_> {
+        Recorder {
+            tier: self,
+            bulk: k > ORDINARY_K,
+        }
+    }
+}
+/// Records one query's validated exact rows into its tier. See [`WarmTier::recorder`].
+pub(crate) struct Recorder<'a> {
+    tier: &'a WarmTier,
+    bulk: bool,
+}
+impl VectorRecorder for Recorder<'_> {
     fn record(&self, vector: ValidatedVector) {
-        self.stats.inserted.increment(1);
-        self.vectors.insert(vector.row(), vector);
-        self.ready.store(true, Ordering::Release);
+        let tier = self.tier;
+        tier.stats.inserted.increment(1);
+        match tier.bulk.as_ref().filter(|_| self.bulk) {
+            Some(bulk) => bulk.insert(vector.row(), vector),
+            None => tier.vectors.insert(vector.row(), vector),
+        }
+        tier.ready.store(true, Ordering::Release);
     }
 }
 

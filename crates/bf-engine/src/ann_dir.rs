@@ -1914,12 +1914,15 @@ pub(crate) async fn search(
         let i = sources[i];
         async move {
             let work = async move {
+                let recorder = warm.as_deref().map(|w| w.recorder(k));
                 let hits = index
                     .rerank_candidates_recorded(
                         &vector,
                         k,
                         locations,
-                        warm.as_deref().map(|w| w as &dyn bf_vector::VectorRecorder),
+                        recorder
+                            .as_ref()
+                            .map(|r| r as &dyn bf_vector::VectorRecorder),
                     )
                     .await
                     .map_err(segment::index_error)?;
