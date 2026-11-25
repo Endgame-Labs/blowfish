@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **T5 deterministic load-sensitive tests (merged).** The cold-ANN directory test uses explicit read-round barriers (a release channel prevents hangs) instead of a 50 ms quiet window; recall-sampler, hedge, and recluster-shutdown tests check state instead of sleeping. 20 loaded repetitions (140 executions, four CPU hogs) all passed. Remaining quiet-window tests in read_cache.rs are listed in the T5 report.
+
 - **C7 staged exact vectors and a shared staging pool (merged).** Whole exact-vector objects are staged when they fit the existing cap (codes first); one bounded 4-range pool across slabs. Original 10M (2x200 pairs): p50 162.7/151.1 -> 125.1/121.6 ms (1.27x pooled), p90 -30%, GETs 107 -> 40; 9.5M of 10M rows staged. First staging 131/139 -> 68/62 s (10M), 128/124 -> 73/73 s (100M) with live queries unchanged. 100M covers 1.1% of rows (cap-limited). Identical results.
 
 - **BW3 BM25 under writes (merged).** Captured cache handles, query-local immutable WAL summaries, and bounded parallel tail gathering on the query CPU pool. 1M MS MARCO at 1,000 text upserts/s: p50 31.4 -> 22.0 ms (1.43x), p90 44.0 -> 34.0 ms; warm +0.3%; write service +1.3%/+0.8% p50/p90; 4,000 frozen queries bit-identical. Parallel shadow correction killed (+10.6% write p90).

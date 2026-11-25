@@ -24,6 +24,8 @@ struct Counting {
     calls: AtomicUsize,
     ranges: Mutex<Vec<Range<u64>>>,
     paths: Mutex<Vec<(String, Option<Range<u64>>)>>,
+    /// Optional explicit read batches for fixtures with a known cold-read plan.
+    read_rounds: Mutex<Option<Arc<ReadRounds>>>,
     /// Waves of dependent segment reads (see [`Counting::wave`]).
     waves: AtomicUsize,
     /// The highest wave whose reads have returned.
@@ -49,8 +51,8 @@ impl fmt::Display for Counting {
         f.write_str("counting store")
     }
 }
-/// With `delay` on, a segment read returns only once no other read of its wave has been issued
-/// for this long, so every read of one wave (issued together) is in flight before any returns.
+/// Legacy quiet-window heuristic used by fixtures without explicit read batches. A scheduler
+/// stall longer than this interval can split independent reads into apparent extra waves.
 const QUIET: Duration = Duration::from_millis(50);
 impl Counting {
     /// Start counting waves afresh.
@@ -59,10 +61,9 @@ impl Counting {
         self.returned_wave.store(0, Ordering::SeqCst);
         self.last_issue.lock().unwrap().clear();
     }
-    /// A read's wave: one past the highest wave that had returned when it was issued, so a read
-    /// can depend only on reads of earlier waves. Waves are counted by dependency, not by
-    /// overlap in time, so a scheduling stall between two reads of one wave cannot split it:
-    /// with `delay` on, reads are held until their wave goes quiet (see [`QUIET`]).
+    /// Approximate a read's wave as one past the highest returned wave. Holding reads until
+    /// their wave goes quiet groups nearby requests, but does not prove dependency depth under
+    /// scheduler stalls. Prefer [`ReadRounds`] when the fixture's batches are known.
     fn wave(&self) -> usize {
         let wave = self.returned_wave.load(Ordering::SeqCst) + 1;
         self.last_issue
@@ -88,6 +89,94 @@ impl Counting {
         }
     }
 }
+/// Explicit gates for a fixture's expected read batches. No response in a batch can return
+/// until every request in it has started. A newly serialized dependency therefore stalls at
+/// the gate instead of being mistaken for scheduler delay. The caller supplies a deadlock
+/// watchdog, and checks that every expected request was issued.
+#[derive(Debug)]
+struct ReadRounds {
+    batches: Vec<(usize, tokio::sync::Barrier)>,
+    issued: AtomicUsize,
+    release: tokio::sync::watch::Sender<bool>,
+}
+impl ReadRounds {
+    fn new(sizes: &[usize]) -> Self {
+        let mut end = 0;
+        Self {
+            batches: sizes
+                .iter()
+                .map(|&size| {
+                    assert!(size > 0);
+                    end += size;
+                    (end, tokio::sync::Barrier::new(size))
+                })
+                .collect(),
+            issued: AtomicUsize::new(0),
+            release: tokio::sync::watch::channel(false).0,
+        }
+    }
+    /// Release blocked workers before reporting a failed query or watchdog. Query plans can
+    /// run in blocking-pool continuations, which runtime shutdown otherwise waits for forever.
+    fn release(&self) {
+        self.release.send_replace(true);
+    }
+    async fn hold(&self, gate: &tokio::sync::Barrier) {
+        let mut released = self.release.subscribe();
+        tokio::select! {
+            _ = released.wait_for(|released| *released) => {},
+            _ = gate.wait() => {},
+        }
+    }
+    fn issue(&self) -> (usize, &tokio::sync::Barrier) {
+        let request = self.issued.fetch_add(1, Ordering::SeqCst);
+        let (round, (_, gate)) = self
+            .batches
+            .iter()
+            .enumerate()
+            .find(|(_, (end, _))| request < *end)
+            .expect("unexpected extra segment read");
+        (round + 1, gate)
+    }
+    fn assert_finished(&self) {
+        assert_eq!(
+            self.issued.load(Ordering::SeqCst),
+            self.batches.last().unwrap().0,
+            "all fixture reads must pass their gates"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_read_rounds_hold_every_response_until_the_batch_is_issued() {
+    use futures::FutureExt;
+    let rounds = ReadRounds::new(&[2, 1]);
+    let (wave, first) = rounds.issue();
+    assert_eq!(wave, 1);
+    let mut held = Box::pin(rounds.hold(first));
+    assert!(held.as_mut().now_or_never().is_none());
+    let (wave, second) = rounds.issue();
+    assert_eq!(wave, 1);
+    rounds.hold(second).await;
+    held.await;
+    let (wave, third) = rounds.issue();
+    assert_eq!(wave, 2);
+    rounds.hold(third).await;
+    rounds.assert_finished();
+
+    // A changed plan may never issue the missing peer. Releasing it must also work when
+    // the worker subscribes after the watchdog has fired.
+    let rounds = ReadRounds::new(&[2]);
+    let (_, gate) = rounds.issue();
+    let mut held = Box::pin(rounds.hold(gate));
+    assert!(held.as_mut().now_or_never().is_none());
+    rounds.release();
+    held.await;
+    let rounds = ReadRounds::new(&[2]);
+    rounds.release();
+    let (_, gate) = rounds.issue();
+    assert!(rounds.hold(gate).now_or_never().is_some());
+}
+
 struct Active<'a>(&'a AtomicUsize);
 impl Drop for Active<'_> {
     fn drop(&mut self) {
@@ -151,10 +240,16 @@ impl ObjectStore for Counting {
         }
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
-        let wave = self.wave();
-        self.paths.lock().unwrap().last_mut().unwrap().0 += &format!(" w{wave}");
+        let rounds = self.read_rounds.lock().unwrap().clone();
+        let gated = rounds.as_ref().map(|rounds| rounds.issue());
+        let wave = gated
+            .as_ref()
+            .map_or_else(|| self.wave(), |(wave, _)| *wave);
+        self.waves.fetch_max(wave, Ordering::SeqCst);
         let _active = Active(&self.active);
-        if self.delay.load(Ordering::SeqCst) {
+        if let (Some(rounds), Some((_, gate))) = (&rounds, gated) {
+            rounds.hold(gate).await;
+        } else if self.delay.load(Ordering::SeqCst) {
             self.hold(wave).await;
         }
         self.returned_wave.fetch_max(wave, Ordering::SeqCst);
@@ -720,9 +815,24 @@ async fn cold_ann_over_twenty_segments_uses_the_directory() {
         backend.reset_waves();
         backend.ranges.lock().unwrap().clear();
         backend.paths.lock().unwrap().clear();
-        backend.delay.store(true, Ordering::SeqCst);
-        let cold = engine.query("many", query(ids_only)).await.unwrap();
-        backend.delay.store(false, Ordering::SeqCst);
+        // This fixed fixture issues three directory hints, 23 parallel scan and column
+        // prefetch reads, and 14 rerank and winner-column reads. Holding each whole batch
+        // proves that the query needs at most three sequential read rounds. In particular,
+        // a fourth dependent read round cannot sneak through because a CPU stall split a
+        // timing window. The generous timeout only detects a blocked or changed plan.
+        let rounds = Arc::new(ReadRounds::new(&[3, 23, 14]));
+        *backend.read_rounds.lock().unwrap() = Some(rounds.clone());
+        let cold = tokio::time::timeout(
+            Duration::from_secs(120),
+            engine.query("many", query(ids_only)),
+        )
+        .await;
+        rounds.release();
+        *backend.read_rounds.lock().unwrap() = None;
+        let cold = cold
+            .expect("cold query could not issue a complete read round")
+            .unwrap();
+        rounds.assert_finished();
         let rows = cold.result.rows.as_ref().unwrap();
         assert_eq!(rows.len(), 10);
         assert_eq!(rows[0]["id"], 777);
