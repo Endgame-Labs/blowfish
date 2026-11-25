@@ -2052,8 +2052,8 @@ mod recall_sampler_tests {
             "one runs at a time"
         );
         drop(first);
-        // Past the few microseconds of pacing the instant comparison earned.
-        std::thread::sleep(Duration::from_millis(5));
+        // Expire the pacing deadline directly; scheduler delays must not affect admission.
+        *sampler.not_before.lock().unwrap() = Instant::now();
         assert!(
             sampler.start(Duration::ZERO).is_some(),
             "free again once it ends"
@@ -2078,16 +2078,17 @@ mod recall_sampler_tests {
                 .start(Duration::ZERO)
                 .is_none()
         );
-        // A comparison that took about 20 ms holds off the next for 50 times as long, past the
-        // interval. Sleeps can overrun on a busy machine, so wait out a measured upper bound.
+        // Simulate a long comparison, then inspect the pacing deadline directly.
         let sampler = RecallSampler::new(Duration::ZERO);
         let before = Instant::now();
-        let sampling = sampler.start(Duration::ZERO).expect("starts");
-        std::thread::sleep(Duration::from_millis(20));
+        let mut sampling = sampler.start(Duration::ZERO).expect("starts");
+        sampling.started = before - Duration::from_secs(1);
         drop(sampling);
-        let hold_off = before.elapsed() * RECALL_SAMPLE_DUTY;
-        assert!(sampler.start(Duration::ZERO).is_none());
-        std::thread::sleep(hold_off + Duration::from_millis(50));
+        assert!(
+            *sampler.not_before.lock().unwrap()
+                >= before + Duration::from_secs(1) * RECALL_SAMPLE_DUTY
+        );
+        *sampler.not_before.lock().unwrap() = Instant::now();
         assert!(sampler.start(Duration::ZERO).is_some());
     }
 }

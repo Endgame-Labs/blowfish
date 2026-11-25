@@ -161,7 +161,11 @@ mod tests {
         }
         async fn get_opts(&self, p: &Path, o: GetOptions) -> object_store::Result<GetResult> {
             if self.calls.fetch_add(1, Ordering::SeqCst) < self.slow {
-                tokio::time::sleep(self.delay).await;
+                if self.delay == Duration::MAX {
+                    std::future::pending::<()>().await;
+                } else {
+                    tokio::time::sleep(self.delay).await;
+                }
             }
             self.inner.get_opts(p, o).await
         }
@@ -199,20 +203,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalled_first_attempt_is_beaten_by_the_hedge() {
-        let (s, path) = store(1, Duration::from_secs(30)).await;
+        let (s, path) = store(1, Duration::MAX).await;
         let backend: Arc<dyn ObjectStore> = s.clone();
         let hedger = Hedger::new(1.0);
         // Seed the latency window so the threshold is the floor, not the 250 ms prior.
         for _ in 0..MIN_SAMPLES {
             hedger.record(Duration::from_millis(5));
         }
-        let start = Instant::now();
-        let bytes = hedger.get_range(&backend, &path, 0..16).await.unwrap();
+        // The primary never returns, so only the hedge can satisfy this read. The timeout
+        // is a deadlock watchdog, not a latency measurement.
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(60),
+            hedger.get_range(&backend, &path, 0..16),
+        )
+        .await
+        .expect("hedge never fired")
+        .unwrap();
         assert_eq!(bytes.len(), 16);
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "hedge never fired"
-        );
         assert_eq!(s.calls.load(Ordering::SeqCst), 2);
     }
 
