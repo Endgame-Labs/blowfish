@@ -127,8 +127,12 @@ impl WalEntry {
     }
 }
 fn encode_payload(json: &[u8], version: u8) -> Result<Vec<u8>, Error> {
-    let mut out = vec![version];
-    out.extend(zstd::stream::encode_all(json, 3)?);
+    // One-shot compression reads the contiguous JSON in place; the streaming encoder copies it
+    // through a small buffer, which costs about 20% more on payloads zstd can barely shrink.
+    let compressed = zstd::bulk::compress(json, 3)?;
+    let mut out = Vec::with_capacity(compressed.len() + 1);
+    out.push(version);
+    out.extend_from_slice(&compressed);
     Ok(out)
 }
 // Slot occupancy and retry identities are permanent. Small payloads transition only

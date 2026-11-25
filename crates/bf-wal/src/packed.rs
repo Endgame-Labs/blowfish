@@ -10,6 +10,7 @@ use crate::{Error, WalEntry, WriteBatch};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bf_types::{AttributeType, DistanceMetric, Document, Id, Schema};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, SerializeStruct, Serializer};
+use serde_json::value::RawValue;
 
 /// The attributes of `batch` whose values are f16-rounded dense vectors.
 fn f16_attributes(schema: &Schema) -> Vec<&str> {
@@ -22,7 +23,7 @@ fn f16_attributes(schema: &Schema) -> Vec<&str> {
 
 /// Pack one internal f32 base64 vector into f16 base64, or `None` if any value is not
 /// exactly an f16 (or the string is not canonical base64 of whole f32 values).
-fn pack(value: &str) -> Option<String> {
+fn pack(value: &str) -> Option<Box<RawValue>> {
     let bytes = STANDARD.decode(value).ok()?;
     if bytes.is_empty() || bytes.len() % 4 != 0 {
         return None;
@@ -36,7 +37,8 @@ fn pack(value: &str) -> Option<String> {
         }
         out.extend_from_slice(&h.to_le_bytes());
     }
-    Some(STANDARD.encode(out))
+    // Base64 never needs JSON escaping, so the string is written out as is.
+    RawValue::from_string(format!("\"{}\"", STANDARD.encode(out))).ok()
 }
 
 /// The inverse of [`pack`].
@@ -73,7 +75,7 @@ pub(crate) fn candidate_bytes(entry: &WalEntry) -> usize {
 pub(crate) struct Packed<'a> {
     entry: &'a WalEntry,
     attrs: Vec<Vec<&'a str>>,
-    strings: Vec<Vec<String>>,
+    strings: Vec<Vec<Box<RawValue>>>,
 }
 
 /// Pack every f16-attribute vector in `entry`; `None` when there are none or any one
@@ -138,7 +140,7 @@ impl Serialize for Batches<'_, '_> {
 struct PackedBatch<'a> {
     batch: &'a WriteBatch,
     attrs: &'a [&'a str],
-    strings: &'a [String],
+    strings: &'a [Box<RawValue>],
 }
 impl Serialize for PackedBatch<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -163,7 +165,7 @@ impl Serialize for PackedBatch<'_> {
 struct Upserts<'a> {
     docs: &'a [Document],
     attrs: &'a [&'a str],
-    strings: &'a [String],
+    strings: &'a [Box<RawValue>],
 }
 impl Serialize for Upserts<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -182,7 +184,7 @@ impl Serialize for Upserts<'_> {
 struct PackedDoc<'a, 'b> {
     doc: &'a Document,
     attrs: &'a [&'a str],
-    next: std::cell::RefCell<&'b mut std::slice::Iter<'a, String>>,
+    next: std::cell::RefCell<&'b mut std::slice::Iter<'a, Box<RawValue>>>,
 }
 impl Serialize for PackedDoc<'_, '_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
