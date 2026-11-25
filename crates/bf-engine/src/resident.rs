@@ -25,6 +25,10 @@ fn decline(site: usize) -> Result<Option<QueryResponse>, ApiError> {
     note::<()>(site);
     Ok(None)
 }
+type Placed = std::collections::HashMap<(String, u64, String), Option<Arc<lineage::Placement>>>;
+static PLACED: std::sync::LazyLock<std::sync::Mutex<Placed>> =
+    std::sync::LazyLock::new(Default::default);
+
 /// Decline counts by site (nonzero only), as `[site, count]` pairs.
 pub(crate) fn declines() -> Vec<[u64; 2]> {
     DECLINES
@@ -94,13 +98,54 @@ fn enabled() -> bool {
     let Some(flag) = STATE.get_or_init(|| std::env::var_os("BF_QUERY_SYNC").map(Into::into)) else {
         return false;
     };
-    if CALLS.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+    if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(256) {
         ON.store(u64::from(flag.exists()), Ordering::Relaxed);
     }
     ON.load(Ordering::Relaxed) == 1
 }
 
 impl Engine {
+    /// Where the tier's rows live now, when its answer needs no live mask and every segment
+    /// holds some of its rows, so a graph answer is complete. Lineage maps and masks are
+    /// immutable per manifest, so one lookup serves every query on that manifest.
+    async fn placement(
+        &self,
+        ns: &str,
+        state: &NamespaceState,
+        set: &bf_wal::SlabSet,
+    ) -> Result<Option<Arc<lineage::Placement>>, ApiError> {
+        let key = (
+            format!(
+                "{ns}/{}",
+                state.created_at.timestamp_nanos_opt().unwrap_or(0)
+            ),
+            state.manifest_seq,
+            set.dir.key.clone(),
+        );
+        if let Some(found) = PLACED.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(found.clone());
+        }
+        let store = &self.0.store;
+        let found = match lineage::place(store, &state.segments, &state.lineage, set).await? {
+            Some(at) => {
+                let mut covered = vec![false; state.segments.len()];
+                at.positions().for_each(|i| covered[i] = true);
+                (covered.iter().all(|c| *c)
+                    && crate::ann::tier_mask(store, state, set, &at)
+                        .await?
+                        .is_none())
+                .then(|| Arc::new(at))
+            }
+            None => None,
+        };
+        let mut placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+        if placed.len() >= 16 {
+            placed.clear();
+        }
+        placed.insert(key, found.clone());
+        Ok(found)
+    }
+
     /// Answer `request` without suspending, or `None` when it needs the ordinary plan. Only
     /// the strong-consistency log check awaits; every other step either completes at once or
     /// declines.
@@ -143,7 +188,7 @@ impl Engine {
             return decline(6);
         }
         let set = &state.ann_tiers[plan.attribute][0];
-        let Some(places) = lineage::direct(&state.segments, set) else {
+        let Some(places) = self.placement(ns, &state, set).await? else {
             return decline(7);
         };
         if crate::query::validate_rank(&state, request.rank_by.as_ref().expect("bare"), false)
@@ -186,7 +231,7 @@ impl Engine {
         ns: &str,
         state: &Arc<NamespaceState>,
         set: &bf_wal::SlabSet,
-        places: &[usize],
+        places: &lineage::Placement,
         plan: &Bare<'_>,
         start: Instant,
     ) -> Option<QueryResponse> {
@@ -202,12 +247,7 @@ impl Engine {
         // decoded column blocks, one segment at a time.
         let mut by_segment: Vec<(usize, Vec<(u32, usize)>)> = Vec::new();
         for (n, &(row, _)) in found.iter().enumerate() {
-            let p = set
-                .covered
-                .partition_point(|c| c.base <= row)
-                .checked_sub(1)
-                .or_else(|| note(31))?;
-            let (at, local) = (places[p], row - set.covered[p].base);
+            let (at, local) = places.real(&set.covered, row).or_else(|| note(31))?;
             match by_segment.iter_mut().find(|(s, _)| *s == at) {
                 Some((_, rows)) => rows.push((local, n)),
                 None => by_segment.push((at, vec![(local, n)])),

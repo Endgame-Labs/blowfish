@@ -187,26 +187,6 @@ pub(crate) async fn place(
     Ok(Some(Placement { places, maps }))
 }
 
-/// The segment holding each of `set`'s covered runs, when every run is still live and unchanged
-/// (same rows, same live-row generation) and the runs account for every segment. Then no lineage
-/// map or live mask is needed, so the answer needs no I/O. `None` means "use [`place`]".
-pub(crate) fn direct(segments: &[Segment], set: &SlabSet) -> Option<Vec<usize>> {
-    if set.covered.len() != segments.len() {
-        return None;
-    }
-    set.covered
-        .iter()
-        .zip(segments)
-        .enumerate()
-        .map(|(at, (cover, segment))| {
-            (segment.id == cover.segment
-                && segment.row_count == cover.rows
-                && segment.live_generation == cover.live_generation)
-                .then_some(at)
-        })
-        .collect()
-}
-
 impl Placement {
     /// The live segment and row holding global row `row` of a tier with these covered segments,
     /// or `None` when the row was deleted before a merge.
