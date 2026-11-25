@@ -12879,3 +12879,49 @@ which does not translate into latency because a cold query's time is dominated b
   segments helped some other measure (for example, S3 request count at 10M rows).
 - **Cost:** one c7g.4xlarge for about 25 minutes, an estimated under $0.50 with the volume. The instance, key pair, security group, and
   `tmp/bw15-1125/` S3 prefix are deleted.
+
+## Round BW16: resolve shadowed IDs once per BM25 query under writes (killed at the kill test)
+
+Hypothesis (Sol, `briefs/ideas/1927-sol.md` #4): one checkpoint-scoped map from ID to (segment, row) would let shadow correction go
+straight to the affected rows instead of probing every segment's ID index. Kill rule: even the ideal case (exact per-segment shadow
+masks injected for free) must reach 1.3x p50 against the paired control in the BM25-under-writes replay. No production change was made.
+
+### Method
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Rust 1.100.0, Clang 19, LLVM 19's builtins archive appended at link), the build at
+`4d13669` (v0.1.39) plus the instrument in `56db7a7` (since reverted). Fixture `tmp/msmarco-1m-v021/`, read-only, copied to local disk
+(a fresh copy of the store per arm); nothing was written to S3. Server on CPUs 0 to 5 with two Rayon and two Tokio workers, a 2 GiB raw
+cache, 4,000-byte blocks, 512-block coalescing, and fetch concurrency 512. BW3's client: `steady_writes.py` with 1,000 text-changing
+upserts/s in 100-row batches, strong top-ten IDs-only BM25 queries at 1 Hz for 120 s (30 s warm-up excluded, 90 measured queries),
+client on CPUs 14 and 15. Order A/B/B/A on the same instance, every arm acknowledging all 120,000 rows.
+
+The ideal case: with `BF_BW16_ORACLE=1`, a separate thread polls the latest published state every 5 ms and, for each new state with
+shadowed IDs, resolves `lookup_many & live` for every segment ahead of the query. `subtract_shadowed` takes the masks from that
+memo (keyed by sequence, manifest sequence, shadowed count, and segment count) and skips ID resolution. A query pays nothing for
+mapping IDs to rows, which is the best any map could do. It still reads lengths and intersects the query-term postings of the shadowed
+rows, because a map does not remove that work. The memo was hit on 100 of 104, 100 of 101 queries (B1 and B2; misses fall back to
+the normal path). The poller's own CPU is charged to the oracle arms.
+
+### Results
+
+| Arm | BM25 p50 / p90 ms | Write-service p50 / p90 ms |
+| --- | ---: | ---: |
+| A1 control | 19.119 / 31.468 | 5.171 / 7.685 |
+| B1 ideal masks | 16.250 / 28.487 | 5.198 / 7.713 |
+| B2 ideal masks | 17.345 / 28.734 | 5.352 / 7.917 |
+| A2 control | 19.534 / 29.653 | 5.328 / 7.579 |
+
+Medians of the two runs: p50 **19.33 to 16.80 ms, 1.15x** (bar 1.3x, which needs at most 14.87 ms); p90 30.56 to 28.61 ms (1.07x).
+A single trial arm before the sequence gave 16.48 / 27.69 ms.
+
+### Conclusion
+
+- **Killed.** Removing ID resolution entirely saves about 2.5 ms of 19.3. Most of BW3's 7.1 ms shadow-correction stage is the per-row
+  length reads and term-posting intersections (`doc_lengths`, `document_frequencies`), which a map cannot skip, and the per-segment
+  probes already overlap across segments, so the part a map removes is small on the critical path.
+- **Step 2 was not started.** No map, no memory figure, no A/B. The instrument is in `56db7a7` and reverted in the next commit, so
+  the tree matches `4d13669` apart from this section.
+- **Where the rest is:** the shadowed-row statistics (lengths and per-term counts for up to a few thousand rows per query) and tail
+  analysis. A cheaper route would be maintaining per-segment shadowed-row statistics incrementally across writes, a different design.
+- **Cost:** one c7g.4xlarge for about 18 minutes, an estimated under $0.30 with the volume. The instance, key pair, and security group
+  are deleted (confirmed with describe-instances, describe-volumes, and describe-key-pairs). No S3 objects were created.
