@@ -4,6 +4,8 @@
 //! compared with a reference file instead of the unfiltered truth: `record` writes each query's
 //! ordered IDs and f32 score bits, `check` requires an exact match, and `none` only times.
 //!
+//! A `null` FILTER_JSON sends no filter (the unfiltered control).
+//!
 //! Usage: filtered_bm25 CLIENTS WORKLOAD_JSON ADDRESS NAMESPACE FILTER_JSON MODE REFERENCE_FILE [REPEAT]
 //! The workload is `bench/scale/data/bm25-msmarco.json`. `REPEAT` replays the workload that many times.
 use serde_json::Value;
@@ -99,7 +101,9 @@ fn main() {
         .map(|item| {
             let mut body = item["request"].clone();
             body["include_attributes"] = serde_json::json!(["id"]);
-            body["filters"] = filter.clone();
+            if !filter.is_null() {
+                body["filters"] = filter.clone();
+            }
             let body = serde_json::to_vec(&body).unwrap();
             let header = format!(
                 "POST /v2/namespaces/{namespace}/query HTTP/1.1\r\n\
