@@ -698,3 +698,72 @@ async fn statistics_and_filtered_warmup_use_covering_vectors_after_restart() {
         crate::auto_recluster::Decision::Build("vector".into(), "masked")
     );
 }
+
+#[tokio::test]
+async fn branches_and_copies_pin_covering_tiers_and_lineage_across_source_gc() {
+    let (store, _, _) = fixture_rows(2000).await;
+    retire_test_sources(&store).await;
+    let source = maintenance_engine(&store);
+    source.index_namespace("locator", true).await.unwrap();
+    retire_test_sources(&store).await;
+    let expected = maintenance_engine(&store)
+        .query_exhaustive("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    for (dest, body) in [
+        ("branch", json!({"branch_from_namespace": "locator"})),
+        (
+            "copy",
+            json!({"copy_from_namespace": {"source_namespace": "locator"}}),
+        ),
+        ("descendant", json!({"branch_from_namespace": "branch"})),
+    ] {
+        source
+            .write(dest, serde_json::from_value(body).unwrap())
+            .await
+            .unwrap();
+        // Replay the durable pin before the destination's first checkpoint.
+        let restarted = maintenance_engine(&store);
+        assert_eq!(
+            restarted
+                .query_exhaustive(dest, reference_request())
+                .await
+                .unwrap()
+                .result
+                .rows,
+            expected
+        );
+        restarted.index_namespace(dest, true).await.unwrap();
+    }
+    source
+        .write(
+            "locator",
+            serde_json::from_value(json!({"delete_by_filter": ["id", "Gte", 0]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    source.index_namespace("locator", true).await.unwrap();
+    source.collect_garbage("locator").await.unwrap();
+    source.delete_namespace("locator").await.unwrap();
+    source.collect_garbage("locator").await.unwrap();
+    for dest in ["branch", "copy", "descendant"] {
+        let restarted = maintenance_engine(&store);
+        restarted.index_namespace(dest, true).await.unwrap();
+        restarted.collect_garbage(dest).await.unwrap();
+        assert_eq!(
+            restarted
+                .query_exhaustive(dest, reference_request())
+                .await
+                .unwrap()
+                .result
+                .rows,
+            expected
+        );
+        let wal = bf_wal::Wal::new(store.clone(), dest).unwrap();
+        let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+        assert!(!manifest.ann_tiers.is_empty());
+        assert!(!manifest.lineage.is_empty());
+    }
+}
