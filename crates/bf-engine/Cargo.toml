@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Measurement only (round G6): admit a built graph without recall calibration. Never enabled
+# in a release build.
+bench-admit = []
+
 [dependencies]
 sha2 = "=0.11.1"
 arc-swap = "=1.9.5"

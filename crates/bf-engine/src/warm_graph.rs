@@ -544,6 +544,16 @@ impl Cache {
                         h.retry = Instant::now() + RETRY;
                         match result {
                             Ok(Some(entry)) if !cancel.cancelled() => {
+                                // Round G6 measurement only: skip recall calibration on a
+                                // machine too loaded to finish it, and serve at the first effort.
+                                #[cfg(feature = "bench-admit")]
+                                {
+                                    let mut c =
+                                        entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
+                                    c.quality.serving = Some(c.quality.trial);
+                                    c.graph_seconds = 1e-9;
+                                    c.usable = true;
+                                }
                                 h.ready = Some(Arc::new(entry));
                             }
                             Ok(_) => {}

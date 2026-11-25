@@ -37,6 +37,8 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 libc = "0.2.191"
 
 [features]
+# Measurement only (round G6): see bf-engine's `bench-admit`.
+bench-admit = ["bf-engine/bench-admit"]
 # jemalloc heap profiler (see bf-alloc).
 heap-profile = ["bf-alloc/heap-profile"]
 # Run GGUF embedding and reranking models in-process (llama.cpp). Needs cmake and clang to build.
