@@ -9,9 +9,40 @@ use std::{
     },
 };
 
+/// Counter and gauge handles for one tier's exact-vector cache, resolved once so the hot path
+/// pays an atomic add, never a registry lookup.
+struct Stats {
+    hit: metrics::Counter,
+    miss: metrics::Counter,
+    inserted: metrics::Counter,
+    evicted: metrics::Counter,
+    decline_not_ready: metrics::Counter,
+    decline_leaf: metrics::Counter,
+    decline_exact_row: metrics::Counter,
+    entries: metrics::Gauge,
+    bytes: metrics::Gauge,
+}
+impl Stats {
+    fn new(capacity: u64) -> Self {
+        metrics::gauge!("blowfish_warm_exact_capacity_bytes").set(capacity as f64);
+        Self {
+            hit: metrics::counter!("blowfish_warm_exact_lookups_total", "result" => "hit"),
+            miss: metrics::counter!("blowfish_warm_exact_lookups_total", "result" => "miss"),
+            inserted: metrics::counter!("blowfish_warm_exact_inserted_total"),
+            evicted: metrics::counter!("blowfish_warm_exact_evicted_total"),
+            decline_not_ready: metrics::counter!("blowfish_warm_declined_total", "reason" => "not_ready"),
+            decline_leaf: metrics::counter!("blowfish_warm_declined_total", "reason" => "leaf_missing"),
+            decline_exact_row: metrics::counter!("blowfish_warm_declined_total", "reason" => "exact_row_missing"),
+            entries: metrics::gauge!("blowfish_warm_exact_entries"),
+            bytes: metrics::gauge!("blowfish_warm_exact_bytes"),
+        }
+    }
+}
+
 pub(crate) struct WarmTier {
     pub codes: CompiledTier,
     vectors: moka::sync::Cache<u32, ValidatedVector>,
+    stats: Arc<Stats>,
     ready: AtomicBool,
     pub rows: usize,
     #[cfg(test)]
@@ -142,8 +173,15 @@ impl WarmTier {
                 return None;
             }
         };
+        let stats = Arc::new(Stats::new(vector_budget));
+        let evicted = stats.evicted.clone();
         let vectors = moka::sync::Cache::builder()
             .max_capacity(vector_budget)
+            .eviction_listener(move |_, _, cause| {
+                if matches!(cause, moka::notification::RemovalCause::Size) {
+                    evicted.increment(1);
+                }
+            })
             .weigher(|_: &u32, v: &ValidatedVector| {
                 v.resident_bytes().min(u64::from(u32::MAX)) as u32
             })
@@ -154,6 +192,7 @@ impl WarmTier {
             Self {
                 codes,
                 vectors,
+                stats,
                 ready: AtomicBool::new(false),
                 rows: total,
                 #[cfg(test)]
@@ -172,33 +211,59 @@ impl WarmTier {
         k: usize,
     ) -> bf_vector::Result<Option<Found>> {
         if !self.ready.load(Ordering::Acquire) {
+            self.stats.decline_not_ready.increment(1);
             return Ok(None);
         }
         SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
-            Ok(self
-                .codes
-                .try_search(
-                    vector,
-                    nprobe,
-                    rerank_factor,
-                    k,
-                    |row| self.vectors.get(&row),
-                    &mut scratch,
-                )?
-                .map(|found| {
+            let (hit, miss) = (std::cell::Cell::new(0u64), std::cell::Cell::new(0u64));
+            let found = self.codes.try_search(
+                vector,
+                nprobe,
+                rerank_factor,
+                k,
+                |row| {
+                    let found = self.vectors.get(&row);
+                    if found.is_some() {
+                        hit.set(hit.get() + 1);
+                    } else {
+                        miss.set(miss.get() + 1);
+                    }
+                    found
+                },
+                &mut scratch,
+            )?;
+            let (hit, miss) = (hit.get(), miss.get());
+            self.stats.hit.increment(hit);
+            self.stats.miss.increment(miss);
+            self.stats.entries.set(self.vectors.entry_count() as f64);
+            self.stats.bytes.set(self.vectors.weighted_size() as f64);
+            Ok(match found {
+                Some(found) => {
                     #[cfg(test)]
                     self.hits.fetch_add(1, Ordering::Relaxed);
-                    Found {
+                    Some(Found {
                         winners: found.hits.to_vec(),
                         scanned_rows: found.scanned_rows,
+                    })
+                }
+                None => {
+                    // The exact lookup is the only step that counts misses, and it ends the
+                    // search at the first one.
+                    if miss > 0 {
+                        self.stats.decline_exact_row.increment(1);
+                    } else {
+                        self.stats.decline_leaf.increment(1);
                     }
-                }))
+                    None
+                }
+            })
         })
     }
 }
 impl VectorRecorder for WarmTier {
     fn record(&self, vector: ValidatedVector) {
+        self.stats.inserted.increment(1);
         self.vectors.insert(vector.row(), vector);
         self.ready.store(true, Ordering::Release);
     }
