@@ -12613,3 +12613,138 @@ One on-demand c7gd.4xlarge ran for at most 56.8 minutes (about $0.69 compute,
 and below $1.25 estimated total, excluding ongoing fixture storage). The instance,
 root volume, key pair, and security group were deleted. No bucket writes or
 fixture cleanup were performed.
+
+## Round C21: search the staged checkpoint while validating the manifest
+
+Cold strong ANN queries on a provisioned node now start routing, local scanning,
+and exact reranking while the manifest and WAL checks are in flight. The staging
+manager retains an immutable, manifest-confirmed checkpoint without a WAL overlay,
+scoped and bounded by the existing 256 checkpoint hints. It survives query-cache
+eviction. A restart first takes the ordinary snapshot path to populate this
+process-local metadata; the next cold query can speculate. No bucket or local
+stage record format changes.
+
+A speculative reply is accepted only when the fresh snapshot confirms the same
+manifest generation, indexed-through sequence, and final WAL sequence. Observed
+WAL writes, row deletes, namespace tombstones, changed checkpoints, and speculative search
+errors discard the old result and use the confirmed snapshot. A manifest failure
+cancels the speculative search and returns the ordinary error. Search and snapshot
+prefetch do not duplicate the same cold work. The path requires healthy stages for
+the requested attribute, and applies only to cold single ANN queries with strong
+consistency, including filtered queries. Warm, eventual, exact, multi-query, and
+pure-S3 searches retain their existing plans.
+
+Speculative staged blocking continuations, and their staging-enabled reactor
+continuation, cancel their async plans when the caller drops them, releasing worker
+permits, active stage readers, and pending I/O. Deterministic
+tests gate the manifest and WAL reads around real staged ANN files. They cover
+routing before manifest completion, changed generations, independently changed
+checkpoint hints, acknowledged and concurrent upserts, row deletes, filters,
+namespace tombstones, deleted manifests, manifest failures, speculative search
+errors, storage scopes, unhealthy stages, and cancellation while searching or
+waiting for a worker slot.
+
+WAL probes begin after the query starts. Every write acknowledged before the query
+is replayed; a concurrent write committed after a probe misses can follow that
+snapshot, as in C20. No negative probe survives a query.
+
+
+### Final paired replay
+
+One on-demand c7gd.4xlarge, eight pinned CPUs and Rayon workers, release
+`neoverse-v1`, probes64, top10, strong consistency, and the default IDs-only
+request with no `include_attributes` field. Both builds read the same retained
+10M, 1,024-dimensional, 55-slab fixture. The control is v0.1.38. The host uses
+Ubuntu 24.04 and ext4 on local NVMe; Rust 1.100.0 and Clang 19 build both binaries,
+with the Clang runtime archive included at link time. Every measured query drops
+process caches, and staged queries also evict stage pages. Provisioning finishes
+before timing. No compiler or workload preparation runs beside timed queries.
+
+| Staged path, 200 paired cold queries | p50 | p90 |
+| --- | ---: | ---: |
+| v0.1.38 control | 52.7 ms | 61.8 ms |
+| Speculative staged search | **32.1 ms** | **35.9 ms** |
+
+**The staged gate passes**, below 42 ms p50 and 58 ms p90. Every query makes
+exactly three GETs in one wave, with no hedges, and reads zero remote vector or
+document bytes. Recall@10 is 0.9700 in both arms. The paired-bootstrap 95% p90
+ratio interval is **0.516–0.613** (10,000 resamples, seed 21). Both stages contain
+all 10M vectors in 59 files: **20,935,704,576 allocated bytes** for control, and
+**20,935,659,520** for candidate, below the unchanged 20 GiB cap.
+
+Routing finishes before the manifest GET ends on **200/200 candidate queries**,
+and zero control queries. Candidate scans finish before that GET on 44 queries,
+exact reranks on 27, and hydration on 26; backend GET endpoints have 1 ms
+precision. Control completes none of those stages before the GET. Manifest GET
+p50 / p90 is 24 / 30.1 ms for control and 27 / 31 ms for candidate. Elapsed time
+through the local scan is 15.75 / 17.11 ms for control and 21.47 / 23.13 ms for
+candidate. The overlap saves whole-query time despite the longer local work.
+Exact rerank after scan remains similar at 1.49 / 3.19 versus 1.55 / 3.05 ms.
+
+### Final pure-S3 ABBA control
+
+Four fresh processes run 200 balanced query groups with no staging or disk
+cache. The startup order is control, candidate, candidate, and control.
+
+| Pure-S3 process | p50 | p90 |
+| --- | ---: | ---: |
+| Control A | 277.9 ms | 384.6 ms |
+| Candidate A | 278.4 ms | 377.6 ms |
+| Candidate B | 278.8 ms | 381.9 ms |
+| Control B | 273.8 ms | 404.2 ms |
+| Control, pooled 400 replies | 275.5 ms | 391.3 ms |
+| Candidate, pooled 400 replies | 278.7 ms | 378.6 ms |
+
+Candidate median increases **1.2%**, while p90 decreases **3.2%**. The paired
+95% p90 ratio interval is **0.876–1.067**, resampling the 200 query groups with
+both processes of each build together. The control processes' 19.6 ms p90 spread
+exceeds the pooled build difference of 12.7 ms. Pure S3 is approximately flat
+within this measured variation; a strict no-increase claim at both quantiles is
+**not established**. Ordinary remote search dispatch and warm search
+continuations use the original implementation.
+
+All **1,200 final replies** have identical ordered rows, distance bits, and
+per-query scan counts. The same audit across every earlier replay confirms all
+**3,200 measured replies** match. No requests, responses, or outliers were dropped.
+The staged latency target is demonstrated. The overall no-regression gate remains
+qualified by the pure-S3 uncertainty above. No 100M projection is made.
+
+### Earlier controls and path isolation
+
+The first implementation also wrapped generic blocking continuations in an
+`Abortable` future. Its staged 200-pair replay measured control **52.8 / 59.8 ms**,
+versus candidate **31.3 / 37.3 ms** p50 / p90, with p90 ratio interval
+**0.568–0.729**. Its pure-S3 controls are retained below.
+
+| Initial pure-S3 control | Control p50 / p90 | Candidate p50 / p90 |
+| --- | ---: | ---: |
+| ABBA, 400 replies per build | 250.4 / 326.4 ms | 248.2 / 334.4 ms |
+| Reversed BAAB, 400 replies per build | 265.2 / 354.2 ms | 259.7 / 362.8 ms |
+| Both, 800 replies per build | 256.7 / 342.6 ms | 253.9 / 350.4 ms |
+
+The initial ABBA p90 ratio interval is **0.960–1.099**. The reversed run was
+declared before inspecting its results, and its interval is **0.939–1.082**.
+Pooling both gives **0.975–1.073**, with candidate median -1.1% and p90 +2.3%.
+All 2,000 replies in these initial replays match the final replay.
+
+The final implementation restores generic `run_io`, and opts into cancellation
+for staged speculative searches and the staging-enabled outer reactor
+continuation. A source audit confirms the worker-dispatch file matches v0.1.38
+exactly apart from the opt-in helper. The wrapper has not been established as the
+cause of the earlier tail difference; restricting it enforces the intended path
+isolation. The final replay above uses the isolated binary throughout.
+
+An initial provisioning attempt supplied explicit `include_attributes: false`.
+It was canceled before timing because an absent field and explicit false can
+select different snapshot prefetch work. Its caches were removed, and it
+contributes no measured samples. Every measured replay uses the exact C18/C20
+default request shape.
+
+Formatting, Clippy, and all **305 engine tests** pass, with 13 ignored. The
+19 deterministic cold manifest/WAL tests include cancellation from the HTTP
+reactor, and verify both nested blocking futures release their resources.
+
+One on-demand c7gd.4xlarge ran for at most **49.0 minutes**, about **$0.60 compute**
+and below **$1.50 estimated total**, excluding ongoing fixture storage. The
+instance was terminated, and its root volume, key pair, and security group were
+deleted. No bucket objects or benchmark prefixes were created or deleted.
