@@ -1577,9 +1577,12 @@ impl Manager {
         }
         written = flush_pack(&pack, &mut buffer, written).await?;
         let handle = pack.clone();
-        tokio::task::spawn_blocking(move || handle.sync_all())
-            .await
-            .map_err(io::Error::other)??;
+        tokio::task::spawn_blocking(move || {
+            handle.set_len(written)?;
+            handle.sync_all()
+        })
+        .await
+        .map_err(io::Error::other)??;
         let records = files
             .iter()
             .map(|(key, f)| {
@@ -1738,14 +1741,27 @@ impl Manager {
         // No range task remains when files are synced and their identities rechecked.
         let syncing = files
             .iter()
-            .map(|(key, file)| (key.clone(), file.identity.clone(), file.file.clone()))
+            .map(|(key, file)| {
+                (
+                    key.clone(),
+                    file.identity.clone(),
+                    file.file.clone(),
+                    file.stored_len(),
+                )
+            })
             .collect::<Vec<_>>();
-        futures::stream::iter(syncing.into_iter().map(|(key, identity, handle)| {
+        futures::stream::iter(syncing.into_iter().map(|(key, identity, handle, len)| {
             let store = store.clone();
             async move {
-                tokio::task::spawn_blocking(move || handle.sync_all())
-                    .await
-                    .map_err(io::Error::other)??;
+                tokio::task::spawn_blocking(move || {
+                    // XFS can retain speculative allocation beyond EOF on an open
+                    // streamed file. Even truncating to the current length releases it,
+                    // keeping the physical footprint within the stage's reservation.
+                    handle.set_len(len)?;
+                    handle.sync_all()
+                })
+                .await
+                .map_err(io::Error::other)??;
                 let after = store
                     .object_identity(&key)
                     .await
@@ -1796,6 +1812,7 @@ impl Manager {
             crc.extend(bytes.chunks(BLOCK).map(crc32fast::hash));
             tokio::task::yield_now().await;
         }
+        file.set_len(len).await?;
         file.sync_all().await?;
         if before
             != store

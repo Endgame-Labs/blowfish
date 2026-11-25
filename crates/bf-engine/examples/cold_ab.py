@@ -309,7 +309,11 @@ def evict_staging(work):
         with path.open("rb") as stream:
             os.fsync(stream.fileno())
             os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-    return {"files": len(files), "bytes": sum(p.stat().st_size for p in files)}
+    return {
+        "files": len(files),
+        "bytes": sum(p.stat().st_size for p in files),
+        "allocated_bytes": sum(p.stat().st_blocks * 512 for p in files),
+    }
 
 
 def staged(text, two_phase):
