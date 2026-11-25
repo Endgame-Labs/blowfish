@@ -593,3 +593,81 @@ async fn tail_of_nothing_is_empty() {
     assert!(wal.tail(1).await.unwrap().is_empty());
     assert_eq!(wal.tail(0).await.unwrap().len(), 1);
 }
+
+/// Reads a slot's JSON record (after the version byte).
+async fn slot_json(store: &Storage, wal: &Wal, seq: u64) -> serde_json::Value {
+    let bytes = store.get(&wal.key(seq)).await.unwrap();
+    serde_json::from_slice(&bytes[1..]).unwrap()
+}
+
+/// A new slot records its payload's stored size; inline slots record none.
+#[tokio::test]
+async fn slots_record_the_stored_payload_size() {
+    let (store, wal) = memory_wal("sizes").await;
+    wal.append(1, &external_entry(1)).await.unwrap();
+    wal.append(2, &document_entry("tiny".into())).await.unwrap();
+    let payload = store.list("ns/sizes/wal-data/").await.unwrap();
+    assert_eq!(payload.len(), 1);
+    let recorded = slot_json(&store, &wal, 1).await["payload_bytes"].as_u64();
+    // The object carries a small storage envelope beyond the encoded payload.
+    let recorded = recorded.unwrap();
+    assert!(recorded <= payload[0].size && payload[0].size - recorded <= 64);
+    assert!(
+        slot_json(&store, &wal, 2)
+            .await
+            .get("payload_bytes")
+            .is_none()
+    );
+}
+
+/// Records written before sizes existed (no field) still replay, in order, one fetch at a time.
+#[tokio::test]
+async fn tail_reads_records_without_payload_sizes() {
+    let (store, wal) = memory_wal("nosize").await;
+    for seq in 1..=12u64 {
+        wal.append(seq, &external_entry(seq as usize))
+            .await
+            .unwrap();
+    }
+    for seq in 1..=12u64 {
+        let mut record = slot_json(&store, &wal, seq).await;
+        record.as_object_mut().unwrap().remove("payload_bytes");
+        let mut bytes = vec![3];
+        bytes.extend(serde_json::to_vec(&record).unwrap());
+        store.put(&wal.key(seq), bytes).await.unwrap();
+    }
+    let tail = wal.tail(0).await.unwrap();
+    assert_eq!(tail.len(), 12);
+    for (i, (_, entry)) in tail.iter().enumerate() {
+        assert_eq!(tag_of(entry), i + 1);
+    }
+}
+
+/// One payload larger than the in-flight budget, between small ones, replays in order.
+#[tokio::test]
+async fn tail_with_a_payload_over_the_budget_keeps_order() {
+    let (_store, wal) = memory_wal("huge").await;
+    // Incompressible text: the stored payload exceeds the 64 MiB budget.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let noise: String = (0..80 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (b'a' + (state % 26) as u8) as char
+        })
+        .collect();
+    for seq in 1..=5u64 {
+        let entry = if seq == 3 {
+            document_entry(format!("3-{noise}"))
+        } else {
+            external_entry(seq as usize)
+        };
+        wal.append(seq, &entry).await.unwrap();
+    }
+    let tail = wal.tail(0).await.unwrap();
+    assert_eq!(
+        tail.iter().map(|(_, e)| tag_of(e)).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+}

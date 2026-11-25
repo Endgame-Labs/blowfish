@@ -141,8 +141,11 @@ fn encode_payload(json: &[u8], version: u8) -> Result<Vec<u8>, Error> {
 const SLOT_VERSION: u8 = 3;
 /// Maximum uncompressed entry size stored directly in a commit slot (64 KiB).
 pub const INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
-/// Out-of-line payloads `tail_bounded` fetches at once.
+/// Out-of-line payloads `tail_bounded` fetches at once, at most.
 const TAIL_FETCH_CONCURRENCY: usize = 8;
+/// Stored (compressed) payload bytes `tail_bounded` keeps in flight. A single payload larger than
+/// this still proceeds, alone.
+const TAIL_FETCH_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitRecord {
     write_id: Uuid,
@@ -156,6 +159,42 @@ struct CommitRecord {
     inline: Option<WalEntry>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     redacted: bool,
+    /// Stored size of the out-of-line payload. Absent in records written by older releases,
+    /// which older readers also ignore (this struct does not deny unknown fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_bytes: Option<u64>,
+}
+/// Bytes a record's fetch holds in flight: zero when nothing is fetched, its recorded stored size,
+/// or the whole budget when the size is unknown.
+fn fetch_cost(record: &CommitRecord) -> u64 {
+    if record.tombstone || record.redacted || record.inline.is_some() {
+        0
+    } else {
+        record.payload_bytes.unwrap_or(TAIL_FETCH_BYTES)
+    }
+}
+/// Admission control for concurrent payload fetches: bounded by count and by summed stored bytes.
+#[derive(Default)]
+struct FetchWindow {
+    count: usize,
+    bytes: u64,
+}
+impl FetchWindow {
+    /// Admit a fetch of `cost` bytes if it fits; the first fetch always does.
+    fn admit(&mut self, cost: u64) -> bool {
+        let fits = self.count == 0
+            || (self.count < TAIL_FETCH_CONCURRENCY
+                && self.bytes.saturating_add(cost) <= TAIL_FETCH_BYTES);
+        if fits {
+            self.count += 1;
+            self.bytes = self.bytes.saturating_add(cost);
+        }
+        fits
+    }
+    fn finish(&mut self, cost: u64) {
+        self.count -= 1;
+        self.bytes = self.bytes.saturating_sub(cost);
+    }
 }
 impl CommitRecord {
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -472,6 +511,7 @@ fn record_stage(stage: &'static str, since: std::time::Instant) {
 pub struct Staged {
     inline: bool,
     uploaded: bool,
+    payload_bytes: Option<u64>,
 }
 impl Staged {
     /// A completed upload with an unknown outcome: `discard` attempts the delete regardless.
@@ -480,6 +520,7 @@ impl Staged {
         Self {
             inline: false,
             uploaded: true,
+            payload_bytes: None,
         }
     }
 }
@@ -548,11 +589,13 @@ impl Wal {
         metrics::histogram!("blowfish_wal_uncompressed_bytes").record(json.len() as f64);
         let inline = !entry.tombstone && json.len() <= INLINE_PAYLOAD_BYTES;
         let mut uploaded = false;
+        let mut payload_bytes = None;
         if !entry.tombstone && !inline {
             let started = std::time::Instant::now();
             let payload = encode_payload(&json, version)?;
             record_stage("compress", started);
             let len = payload.len();
+            payload_bytes = Some(len as u64);
             // The key carries this attempt's UUID, so no other writer can use it: a large
             // payload goes up as concurrent parts (one PUT stream moves about 5 MB/s).
             let started = std::time::Instant::now();
@@ -571,7 +614,11 @@ impl Wal {
             }
             uploaded = true;
         }
-        Ok(Staged { inline, uploaded })
+        Ok(Staged {
+            inline,
+            uploaded,
+            payload_bytes,
+        })
     }
     /// Delete a staged payload that will never be committed (a failed or abandoned pipeline slot).
     pub async fn discard(&self, seq: u64, entry: &WalEntry, staged: &Staged) -> Result<(), Error> {
@@ -656,6 +703,7 @@ impl Wal {
             tombstone: entry.tombstone,
             inline: inline.then(|| entry.clone()),
             redacted: false,
+            payload_bytes: staged.payload_bytes,
         };
         let started = std::time::Instant::now();
         let record = record.encode()?;
@@ -774,14 +822,29 @@ impl Wal {
             let mut pruned = false;
             let mut included_bytes = 0u64;
             // Out-of-line payloads are fetched concurrently (a cold reader of n of them paid n
-            // serial round trips), but `buffered` yields them in WAL order, so entries are
-            // applied, budgeted, and failed exactly as the serial loop did. Concurrency is
-            // bounded by count; a payload's size is unknown until it is read. Stopping early
-            // (budget, pruned, or error) drops the fetches still in flight.
-            let mut fetched = futures::stream::iter(records.into_iter().skip(start))
-                .map(|(seq, record)| async move { (seq, self.materialize(&record).await) })
-                .buffered(TAIL_FETCH_CONCURRENCY);
-            while let Some((seq, materialized)) = fetched.next().await {
+            // serial round trips), yielded in WAL order, so entries are applied, budgeted, and
+            // failed exactly as the serial loop did. A fetch is admitted while the summed stored
+            // sizes in flight stay under `TAIL_FETCH_BYTES` (and at most `TAIL_FETCH_CONCURRENCY`
+            // run); the first always proceeds. A record without a size (older releases) counts as
+            // the whole budget, so it fetches alone. Inline entries and tombstones cost nothing.
+            // Stopping early (budget, pruned, or error) drops the fetches still in flight.
+            let mut pending = records.into_iter().skip(start).peekable();
+            let mut in_flight = futures::stream::FuturesOrdered::new();
+            let mut window = FetchWindow::default();
+            loop {
+                while let Some((_, record)) = pending.peek() {
+                    let cost = fetch_cost(record);
+                    if !window.admit(cost) {
+                        break;
+                    }
+                    let (seq, record) = pending.next().expect("peeked");
+                    in_flight
+                        .push_back(async move { (seq, cost, self.materialize(&record).await) });
+                }
+                let Some((seq, cost, materialized)) = in_flight.next().await else {
+                    break;
+                };
+                window.finish(cost);
                 match materialized {
                     Ok(entry) => {
                         let size = serde_json::to_vec(&entry)?.len() as u64;
@@ -1374,5 +1437,46 @@ mod manifest_codec_tests {
         assert_eq!(written["ann_tiers"]["vector"][0]["covered"][0]["rows"], 5);
         let again = decode_manifest(&serde_json::to_vec(&written).unwrap()).unwrap();
         assert_eq!(again.ann_tiers["vector"][0].format, 1);
+    }
+}
+
+#[cfg(test)]
+mod fetch_window_tests {
+    use super::*;
+
+    #[test]
+    fn small_payloads_run_together_up_to_the_count_cap() {
+        let mut w = FetchWindow::default();
+        for _ in 0..TAIL_FETCH_CONCURRENCY {
+            assert!(w.admit(150 * 1024));
+        }
+        assert!(!w.admit(150 * 1024));
+        w.finish(150 * 1024);
+        assert!(w.admit(150 * 1024));
+    }
+
+    #[test]
+    fn bytes_bound_admission_and_an_oversized_payload_runs_alone() {
+        let mut w = FetchWindow::default();
+        let big = TAIL_FETCH_BYTES / 2 + 1;
+        assert!(w.admit(big));
+        assert!(!w.admit(big), "two halves plus one exceed the budget");
+        w.finish(big);
+        let huge = TAIL_FETCH_BYTES * 4;
+        assert!(w.admit(1024));
+        assert!(!w.admit(huge), "an oversized payload waits for others");
+        w.finish(1024);
+        assert!(w.admit(huge), "and proceeds when alone");
+        w.finish(huge);
+    }
+
+    #[test]
+    fn unknown_sizes_fetch_one_at_a_time() {
+        let mut w = FetchWindow::default();
+        assert!(w.admit(TAIL_FETCH_BYTES));
+        assert!(!w.admit(TAIL_FETCH_BYTES));
+        assert!(!w.admit(1));
+        w.finish(TAIL_FETCH_BYTES);
+        assert!(w.admit(TAIL_FETCH_BYTES));
     }
 }
