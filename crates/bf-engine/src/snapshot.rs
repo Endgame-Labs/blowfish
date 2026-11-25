@@ -21,6 +21,9 @@ pub(crate) struct OpenHint {
     /// BM25 clauses `(attribute, query value, last_as_prefix)`: their terms are looked up (the
     /// dictionary chunks, term records, and corpus statistics chunks) in the snapshot wave.
     bm25: Vec<(String, serde_json::Value, bool)>,
+    /// Required phrases `(attribute, value)` from filters: their terms' dictionary chunks and term
+    /// records are read in the same wave as the BM25 terms, so the filter finds them cached.
+    phrases: Vec<(String, serde_json::Value)>,
     docs: bool,
     /// Every sub-query can return text hits using only compact row-to-ID maps.
     only_text_ids: bool,
@@ -90,6 +93,7 @@ impl OpenHint {
             ann: BTreeSet::new(),
             text: BTreeSet::new(),
             bm25: Vec::new(),
+            phrases: Vec::new(),
             docs: false,
             only_text_ids: true,
             filters: Vec::new(),
@@ -128,6 +132,9 @@ impl OpenHint {
                     }
                 }
                 None => {}
+            }
+            if let Some(filter) = &q.filters {
+                phrase_terms(filter, &mut hint.phrases);
             }
             let text_ids = crate::indexed::text_ids_only(q);
             hint.only_text_ids &= text_ids;
@@ -186,6 +193,17 @@ impl OpenHint {
                         .entry(attribute)
                         .or_default()
                         .push(bf_text::Query::new(tokens, *prefix));
+                }
+            }
+            let mut phrase_attributes = BTreeSet::new();
+            for (attribute, value) in &self.phrases {
+                if let Some(cfg) = schema.get(attribute).and_then(|s| s.text_config()) {
+                    // Only the lookups: phrase terms take no part in BM25 statistics.
+                    queries
+                        .entry(attribute)
+                        .or_default()
+                        .push(bf_text::Query::new(crate::text::tokens(value, &cfg), false));
+                    phrase_attributes.insert(attribute.as_str());
                 }
             }
             let queries = &queries;
@@ -312,13 +330,19 @@ impl OpenHint {
                         timed("text_keys", crate::text_keys::load(store, seg).map_ok(drop)).boxed(),
                     );
                 }
-                for attribute in self.text.iter().filter(|_| with_text) {
+                let attributes = self
+                    .text
+                    .iter()
+                    .map(String::as_str)
+                    .chain(phrase_attributes.iter().copied())
+                    .collect::<BTreeSet<_>>();
+                for attribute in attributes.into_iter().filter(|_| with_text) {
                     if let Some(file) = seg.files.get(&format!("fts:{attribute}")) {
                         tasks.push(
                             timed("text_index", async move {
                                 let reader = segment::text_index(store, file).await?;
                                 // The query's dictionary chunks and term records.
-                                for q in queries.get(attribute.as_str()).into_iter().flatten() {
+                                for q in queries.get(attribute).into_iter().flatten() {
                                     reader
                                         .prefetch_plan(q, None)
                                         .await
@@ -373,6 +397,22 @@ impl OpenHint {
             futures::future::join_all(tasks).await;
         })
         .await;
+    }
+}
+
+/// Collect the required phrases (`ContainsTokenSequence`) of a filter. Phrases under `Not` and
+/// `Or` are included: prefetching a term record that turns out unneeded costs less than a wave.
+fn phrase_terms(filter: &Filter, out: &mut Vec<(String, serde_json::Value)>) {
+    match filter {
+        Filter::And(fs) | Filter::Or(fs) => fs.iter().for_each(|f| phrase_terms(f, out)),
+        Filter::Not(f) => phrase_terms(f, out),
+        Filter::Compare {
+            attribute,
+            op: bf_types::FilterOp::ContainsTokenSequence,
+            value,
+            ..
+        } => out.push((attribute.clone(), value.clone())),
+        Filter::Compare { .. } => {}
     }
 }
 
