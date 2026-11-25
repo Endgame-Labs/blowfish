@@ -10,6 +10,8 @@ futures = "=0.3.34"
 metrics = "=0.24.6"
 bf-types = { path = "../bf-types" }
 bf-storage = { path = "../bf-storage" }
+base64 = "0.22.1"
+half = "=2.7.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -19,5 +21,4 @@ uuid = { version = "1.29.2", features = ["v4", "serde"] }
 zstd = "0.13.3"
 
 [dev-dependencies]
-half = "=2.7.1"
 tempfile = "3.27.0"
