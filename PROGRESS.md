@@ -4,6 +4,8 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-25
 
+- **C9 packed staging companions (merged).** One local pack per tier for docs directories and row-to-ID maps, identity-checked whole-object GETs, and two-phase publication (codes first). 100M: codes usable 154.5 -> 79.1 s, fully ready 88.5 s (78-97 s run to run), staged descriptors 4,217 -> 325. Live queries during staging equal; identical results. Steady p50 10M +1.1%, 100M +3.2% (edge of noise, one repetition).
+
 - **G5 warm graph navigation (merged).** Cached norms, bitset plus contiguous beam, four-accumulator ARM int8 dot (567 -> 275 instructions per dot), neighbor-code prefetch (160 -> 55 ns per dot), dense locations, `/status` hot_graphs. M4 production binary, matched recall 0.944: 8,720 vs Qdrant 8,407 q/s (+3.7%), +9-11% over main controls, 2.65M vs 1.96M instr/q (G4 3.57M). RSS ~4.4 GB vs Qdrant ~5.6 GB. Untried: graph-walk packing, progressive precision.
 
 - **BW6 per-window posting offsets (merged).** Decoded posting blocks carry a per-window offset table (no per-window binary search), offset-keyed maps use a cheap hasher, and the span cache is compact. 1M MS MARCO, paired A/B/B/A on one c7g.4xlarge: 16 clients 1,100 -> 1,258 q/s (1.14x), p50 12.2 -> 10.9 ms; 1 client 531 -> 582 q/s, p50 1.29 -> 1.24 ms. Bit-identical; the frozen 4,000-query check passes. BW4 and BW5 (docs only) showed global window scheduling and setup cuts were not material.

@@ -28,14 +28,21 @@ use std::{
 
 const MAX_BYTES: u64 = 20 << 30;
 const MAX_FILES: usize = 4096;
-const MAX_STAGES: usize = 128;
+const MAX_STAGES: usize = 256;
+/// Concurrent small GETs while gathering companions into a pack.
+const COMPANION_FETCHES: usize = 32;
+/// Buffered companion bytes before one positional write to the pack.
+const PACK_FLUSH: usize = 4 << 20;
 const BLOCK: usize = 16 << 10;
 const PIECE: u64 = 8 << 20;
 const DOWNLOADS: usize = 4;
 const RETRY: Duration = Duration::from_secs(60);
 
 struct StagedFile {
-    file: File,
+    /// Shared by every companion of a pack, each at its own `offset`.
+    file: Arc<File>,
+    /// Where the stored bytes start in `file`: zero unless this is a section of a pack.
+    offset: u64,
     /// Object offset of the first stored byte: zero for a prefix, or where a staged tail starts.
     base: u64,
     len: u64,
@@ -92,7 +99,7 @@ impl StagedFile {
         #[cfg(target_os = "linux")]
         for range in ranges {
             let (Ok(start), Ok(len)) = (
-                libc::off_t::try_from(range.start),
+                libc::off_t::try_from(range.start + self.offset),
                 libc::off_t::try_from(range.end - range.start),
             ) else {
                 continue;
@@ -122,7 +129,8 @@ impl StagedFile {
                 .map_err(|_| io::Error::other("staged range exceeds address space"))?;
             let mut data = vec![0; len];
             let at = trace.then(Instant::now);
-            self.file.read_exact_at(&mut data, range.start)?;
+            self.file
+                .read_exact_at(&mut data, range.start + self.offset)?;
             if let Some(at) = at {
                 read_ns += at.elapsed().as_nanos();
             }
@@ -217,6 +225,8 @@ struct State {
     pending: HashSet<String>,
     failed: HashMap<String, Instant>,
     cancelled: HashSet<String>,
+    /// Tiers whose companion phase has finished (or had nothing to add) in this process.
+    settled: HashSet<String>,
     hints: HashMap<String, Hint>,
 }
 
@@ -228,7 +238,21 @@ struct Record {
     set: SlabSet,
     hints: BTreeMap<String, (Option<String>, u64)>,
     files: BTreeMap<String, FileRecord>,
+    /// Whether this record holds only the tier's companions (a pack). Records written before
+    /// packs hold one stage that includes any companions, and never set this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    companions: bool,
 }
+fn stage_key(scope: &str, dir_key: &str, companions: bool) -> String {
+    format!(
+        "{scope}stage:{dir_key}{}",
+        if companions { COMPANIONS } else { "" }
+    )
+}
+/// Suffix of the key a tier's companion pack is stored under.
+const COMPANIONS: &str = "#companions";
+/// The local file holding a tier's companions.
+const PACK: &str = "pack";
 #[derive(Serialize, Deserialize)]
 struct FileRecord {
     name: String,
@@ -239,9 +263,16 @@ struct FileRecord {
     /// tails were staged) start at zero.
     #[serde(default)]
     base: u64,
+    /// Where the bytes start in the local file. Companions share one pack file, and records
+    /// written before packs name one file per entry (offset zero).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    offset: u64,
     /// The object these bytes were derived from, when the key names a derived file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -537,7 +568,8 @@ impl Manager {
                     let result = self.stop.run(self.adopt(store, &path)).await;
                     match result {
                         Some(Ok((record, stage))) => {
-                            let key = format!("{}stage:{}", record.scope, record.set.dir.key);
+                            let key =
+                                stage_key(&record.scope, &record.set.dir.key, record.companions);
                             let mut state = self.state.lock().expect("ANN staging lock");
                             for (hint, (object, len)) in record.hints {
                                 state.hints.insert(hint, Hint { object, len });
@@ -627,8 +659,9 @@ impl Manager {
                 sum.checked_add(f.len)
             })
             .ok_or_else(|| io::Error::other("ANN size overflow"))?;
+        let physical: HashSet<_> = record.files.values().map(|f| f.name.as_str()).collect();
         let lease = self
-            .reserve(bytes, record.files.len())
+            .reserve(bytes, physical.len())
             .ok_or_else(|| io::Error::other("ANN adoption capacity"))?;
         let mut stage = Stage {
             path: path.to_owned(),
@@ -637,22 +670,43 @@ impl Manager {
             _lease: lease,
             durable: false,
         };
+        // Entries of a pack share one local file, so each file is opened and measured once,
+        // and must be exactly as long as its furthest section ends.
+        let mut ends: HashMap<&str, u64> = HashMap::new();
+        for f in record.files.values() {
+            let end = f
+                .offset
+                .checked_add(f.len)
+                .ok_or_else(|| io::Error::other("ANN size overflow"))?;
+            let slot = ends.entry(f.name.as_str()).or_default();
+            *slot = (*slot).max(end);
+        }
+        let mut opened: HashMap<&str, Arc<File>> = HashMap::new();
+        for (name, end) in ends {
+            if name.contains('/') || name.contains('\\') {
+                return Err(io::Error::other("invalid ANN file metadata"));
+            }
+            let handle = File::open(path.join(name))?;
+            if !handle.metadata()?.is_file() || handle.metadata()?.len() != end {
+                return Err(io::Error::other("incomplete ANN staged file"));
+            }
+            opened.insert(name, Arc::new(handle));
+        }
         for (key, f) in &record.files {
-            if !f.name.starts_with("object-")
+            let packed = record.companions && f.name == PACK;
+            if !(f.name.starts_with("object-") || packed)
                 || f.name.contains('/')
                 || f.name.contains('\\')
+                || (f.offset != 0 && !packed)
                 || f.crc.len() as u64 != f.len.div_ceil(BLOCK as u64)
             {
                 return Err(io::Error::other("invalid ANN file metadata"));
             }
-            let file = File::open(path.join(&f.name))?;
-            if !file.metadata()?.is_file() || file.metadata()?.len() != f.len {
-                return Err(io::Error::other("incomplete ANN staged file"));
-            }
             stage.files.insert(
                 key.clone(),
                 StagedFile {
-                    file,
+                    file: opened[f.name.as_str()].clone(),
+                    offset: f.offset,
                     base: f.base,
                     len: f.len,
                     crc: f.crc.clone(),
@@ -720,7 +774,12 @@ impl Manager {
         let live: HashSet<_> = tiers
             .values()
             .flatten()
-            .map(|s| format!("{scope}stage:{}", s.dir.key))
+            .flat_map(|s| {
+                [
+                    stage_key(scope, &s.dir.key, false),
+                    stage_key(scope, &s.dir.key, true),
+                ]
+            })
             .collect();
         let mut state = self.state.lock().expect("ANN staging lock");
         let obsolete: Vec<_> = state
@@ -826,29 +885,60 @@ impl Manager {
         if self.stop.stopping() {
             return;
         }
-        let key = format!("{scope}stage:{}", set.dir.key);
-        {
+        let key = stage_key(scope, &set.dir.key, false);
+        let ckey = stage_key(scope, &set.dir.key, true);
+        let mut doomed = Vec::new();
+        let (go, companion_only) = {
             let mut state = self.state.lock().expect("ANN staging lock");
-            if let Some((_, stage)) = state.ready.get(&key) {
-                if !stage.bad.load(Ordering::Relaxed) {
-                    return;
+            for k in [&key, &ckey] {
+                if state
+                    .ready
+                    .get(k)
+                    .is_some_and(|(_, s)| s.bad.load(Ordering::Relaxed))
+                {
+                    let (_, bad) = state.ready.remove(k).expect("present stage");
+                    let weak = Arc::downgrade(&bad);
+                    state.files.retain(|_, value| !Weak::ptr_eq(value, &weak));
+                    state.settled.remove(&key);
+                    doomed.push(bad);
                 }
-                let (_, bad) = state.ready.remove(&key).expect("present stage");
-                let weak = Arc::downgrade(&bad);
-                state.files.retain(|_, value| !Weak::ptr_eq(value, &weak));
-                drop(state);
-                drop(bad);
-                state = self.state.lock().expect("ANN staging lock");
             }
-            if !state.pending.is_empty()
-                || state
+            let main = state.ready.contains_key(&key);
+            let retry = if main { &ckey } else { &key };
+            let go = !(main && state.settled.contains(&key))
+                && state.pending.is_empty()
+                && !state
                     .failed
-                    .get(&key)
-                    .is_some_and(|at| at.elapsed() < RETRY)
-            {
+                    .get(retry)
+                    .is_some_and(|at| at.elapsed() < RETRY);
+            if go {
+                state.pending.insert(key.clone());
+            }
+            (go, main)
+        };
+        drop(doomed);
+        if !go {
+            return;
+        }
+        let (manager, store, scope, set) =
+            (self.clone(), store.clone(), scope.to_owned(), set.clone());
+        if companion_only {
+            // The code stage is already published (adopted after a restart, or from a version
+            // that staged no pack). Add whichever companions no stage holds yet.
+            let mut lease = self.empty_lease();
+            let extras = self.plan_companions(&scope, extras(), &|_| false, &mut lease);
+            if extras.is_empty() {
+                let mut state = self.state.lock().expect("ANN staging lock");
+                state.pending.remove(&key);
+                state.settled.insert(key);
                 return;
             }
-            state.pending.insert(key.clone());
+            tokio::spawn(async move {
+                manager
+                    .finish_companions(&store, &scope, &set, key, Some((lease, extras)))
+                    .await;
+            });
+            return;
         }
         let estimate = set
             .rows()
@@ -867,40 +957,149 @@ impl Manager {
                 .remove(&key);
             return;
         };
-        let (manager, store, scope, set) =
-            (self.clone(), store.clone(), scope.to_owned(), set.clone());
         let extras = extras();
         tokio::spawn(async move {
+            // Phase one: routing, codes, and any exact vectors. Queries use it at once.
             let result = manager
                 .stop
                 .run(manager.build(&store, &scope, &set, lease, extras))
                 .await;
-            let mut state = manager.state.lock().expect("ANN staging lock");
-            state.pending.remove(&key);
-            let cancelled = state.cancelled.remove(&key);
-            match result {
-                Some(Ok(stage)) if cancelled => {
-                    stage.bad.store(true, Ordering::Relaxed);
-                    drop(state);
-                    drop(stage);
-                }
-                Some(Ok(stage)) => {
-                    Self::install(&mut state, key, &scope, stage);
-                    metrics::counter!("blowfish_ann_staging_total", "outcome" => "ready")
-                        .increment(1);
-                }
-                Some(Err(error)) => {
-                    if state.failed.len() >= 128 {
-                        state.failed.clear();
+            let job = {
+                let mut state = manager.state.lock().expect("ANN staging lock");
+                let cancelled = state.cancelled.contains(&key);
+                let mut doomed = None;
+                let job = match result {
+                    Some(Ok((stage, _))) if cancelled => {
+                        stage.bad.store(true, Ordering::Relaxed);
+                        doomed = Some(stage);
+                        None
                     }
-                    state.failed.insert(key, Instant::now());
-                    metrics::counter!("blowfish_ann_staging_total", "outcome" => "error")
-                        .increment(1);
-                    tracing::debug!(%error, "ANN staging unavailable; using object storage");
+                    Some(Ok((stage, job))) => {
+                        Self::install(&mut state, key.clone(), &scope, stage);
+                        metrics::counter!("blowfish_ann_staging_total", "outcome" => "ready")
+                            .increment(1);
+                        Some(job)
+                    }
+                    Some(Err(error)) => {
+                        if state.failed.len() >= 128 {
+                            state.failed.clear();
+                        }
+                        state.failed.insert(key.clone(), Instant::now());
+                        metrics::counter!("blowfish_ann_staging_total", "outcome" => "error")
+                            .increment(1);
+                        tracing::debug!(%error, "ANN staging unavailable; using object storage");
+                        None
+                    }
+                    None => None,
+                };
+                if job.is_none() {
+                    state.pending.remove(&key);
+                    state.cancelled.remove(&key);
                 }
-                None => {}
-            }
+                drop(state);
+                drop(doomed);
+                job
+            };
+            let Some(job) = job else { return };
+            manager
+                .finish_companions(&store, &scope, &set, key, job)
+                .await;
         });
+    }
+    fn empty_lease(self: &Arc<Self>) -> Lease {
+        Lease {
+            manager: Arc::downgrade(self),
+            bytes: 0,
+            files: 0,
+        }
+    }
+    /// Phase two: gather the tier's companions into one pack and publish it beside the code
+    /// stage. The pending marker taken for the tier is released here.
+    async fn finish_companions(
+        self: &Arc<Self>,
+        store: &Storage,
+        scope: &str,
+        set: &SlabSet,
+        key: String,
+        job: Option<(Lease, Vec<Extra>)>,
+    ) {
+        let ckey = stage_key(scope, &set.dir.key, true);
+        let result = match job {
+            Some((lease, extras)) => {
+                if self
+                    .state
+                    .lock()
+                    .expect("ANN staging lock")
+                    .cancelled
+                    .contains(&key)
+                {
+                    None
+                } else {
+                    self.stop
+                        .run(self.build_companions(store, scope, set, lease, extras))
+                        .await
+                }
+            }
+            None => Some(Ok(None)),
+        };
+        let mut state = self.state.lock().expect("ANN staging lock");
+        state.pending.remove(&key);
+        let cancelled = state.cancelled.remove(&key);
+        match result {
+            Some(Ok(Some(stage))) if cancelled => {
+                stage.bad.store(true, Ordering::Relaxed);
+                drop(state);
+                drop(stage);
+            }
+            Some(Ok(stage)) if !cancelled => {
+                if let Some(stage) = stage {
+                    Self::install(&mut state, ckey, scope, stage);
+                }
+                metrics::counter!("blowfish_ann_staging_total", "outcome" => "companions")
+                    .increment(1);
+                if state.settled.len() >= 1024 {
+                    state.settled.clear();
+                }
+                state.settled.insert(key);
+            }
+            Some(Err(error)) => {
+                if state.failed.len() >= 128 {
+                    state.failed.clear();
+                }
+                state.failed.insert(ckey, Instant::now());
+                tracing::debug!(%error, "ANN companions unavailable; using object storage");
+            }
+            _ => {}
+        }
+    }
+    /// Admit companions that no stage holds yet, smallest first (the column directories
+    /// before the ID maps), charging `lease` without evicting anything. They are far smaller
+    /// than the vectors they serve alongside, and are admitted first.
+    fn plan_companions(
+        &self,
+        scope: &str,
+        mut extras: Vec<Extra>,
+        skip: &dyn Fn(&Extra) -> bool,
+        lease: &mut Lease,
+    ) -> Vec<Extra> {
+        extras.sort_by_key(|e| (e.len(), e.key()));
+        let mut planned: Vec<Extra> = Vec::new();
+        for extra in extras {
+            let staged = self
+                .file(&format!("{scope}{}", extra.key()))
+                .is_some_and(|s| s.files.contains_key(&extra.key()));
+            if staged || skip(&extra) {
+                continue;
+            }
+            let len = extra.len();
+            let cost = len + len.div_ceil(BLOCK as u64) * 11 + extra.key().len() as u64 + 1024;
+            // The pack is a single descriptor, however many companions it holds.
+            if (planned.is_empty() && !self.extend_files(lease, 1)) || !self.extend(lease, cost) {
+                break;
+            }
+            planned.push(extra);
+        }
+        planned
     }
     /// Optional vectors cannot evict another tier's codes. Keep the original reservation
     /// on refusal, and charge the extra bytes for the entire active-reader lifetime.
@@ -924,71 +1123,6 @@ impl Manager {
         lease.bytes = bytes;
         true
     }
-    /// Build each segment's row-to-ID map from its ID index. A segment with any string ID gets
-    /// none, and its IDs are read from the object as before.
-    async fn derive_row_ids(
-        &self,
-        store: &Storage,
-        maps: &[Extra],
-        path: &Path,
-    ) -> io::Result<HashMap<String, StagedFile>> {
-        futures::stream::iter(maps.iter().cloned().map(|extra| {
-            let (store, path) = (store.clone(), path.to_owned());
-            async move {
-                let ExtraKind::NumericIds(rows) = extra.kind else {
-                    return Ok(None);
-                };
-                let before = store
-                    .object_identity(&extra.file.key)
-                    .await
-                    .map_err(io::Error::other)?;
-                let bytes = store
-                    .range_reader_with_length(&extra.file.key, extra.file.size, true)
-                    .map_err(io::Error::other)?
-                    .bypass_cache()
-                    .read_direct(0..extra.file.size)
-                    .await
-                    .map_err(io::Error::other)?;
-                let (derived, source, size) = (extra.key(), extra.file.clone(), extra.file.size);
-                let target = path.join(format!("source-{}", digest(derived.as_bytes())));
-                let staged = tokio::task::spawn_blocking(move || {
-                    debug_assert_eq!(bytes.len() as u64, size);
-                    let Some(packed) =
-                        crate::segment::packed_numeric_ids(&store, &source, rows, bytes)
-                            .map_err(|e| io::Error::other(format!("{e:?}")))?
-                    else {
-                        return Ok::<_, io::Error>(None);
-                    };
-                    let file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(target)?;
-                    file.write_all_at(&packed, 0)?;
-                    file.sync_all()?;
-                    Ok(Some((
-                        derived,
-                        StagedFile {
-                            file,
-                            base: 0,
-                            len: packed.len() as u64,
-                            crc: packed.chunks(BLOCK).map(crc32fast::hash).collect(),
-                            identity: Some(before),
-                            source: Some(source.key),
-                        },
-                    )))
-                })
-                .await
-                .map_err(io::Error::other)??;
-                Ok::<_, io::Error>(staged)
-            }
-        }))
-        .buffer_unordered(DOWNLOADS)
-        .try_filter_map(|staged| async move { Ok(staged) })
-        .try_collect()
-        .await
-    }
     /// Reserve descriptors for optional files, within the manager's file limit.
     fn extend_files(&self, lease: &mut Lease, files: usize) -> bool {
         let mut state = self.state.lock().expect("ANN staging lock");
@@ -1006,7 +1140,7 @@ impl Manager {
         set: &SlabSet,
         lease: Lease,
         extras: Vec<Extra>,
-    ) -> io::Result<Stage> {
+    ) -> io::Result<(Stage, Option<(Lease, Vec<Extra>)>)> {
         let path = self.path.join(uuid::Uuid::new_v4().to_string());
         fs::create_dir(&path)?;
         let mut stage = Stage {
@@ -1068,28 +1202,15 @@ impl Manager {
             stage._lease.bytes = code_reservation;
         }
         // Hydration reads follow the vector rerank on every query, and are far smaller than
-        // the vectors: admit them first, smallest (the column directories) before IDs.
-        let mut companions: Vec<Extra> = Vec::new();
-        let mut hydration = extras;
-        hydration.sort_by_key(|e| (e.len(), e.key()));
-        for extra in hydration {
-            let len = extra.len();
-            let cost = len + len.div_ceil(BLOCK as u64) * 11 + extra.key().len() as u64 + 1024;
-            if limits.contains_key(&extra.file.key) || !self.extend_files(&mut stage._lease, 1) {
-                continue;
-            }
-            if self.extend(&mut stage._lease, cost) {
-                companions.push(extra);
-            } else {
-                // Return the descriptor. Larger objects will not fit either.
-                let mut state = self.state.lock().expect("ANN staging lock");
-                state.files_used -= 1;
-                stage._lease.files -= 1;
-                break;
-            }
-        }
-        let companion_files = companions.len();
-        let companion_bytes: u64 = companions.iter().map(Extra::len).sum();
+        // the vectors: reserve them first. They are fetched into a pack after this stage
+        // is published, so queries never wait for them.
+        let mut comp_lease = self.empty_lease();
+        let companions = self.plan_companions(
+            scope,
+            extras,
+            &|e| limits.contains_key(&e.file.key),
+            &mut comp_lease,
+        );
         let mut extras: Vec<_> = exact
             .into_iter()
             .filter_map(|(key, len)| {
@@ -1114,7 +1235,7 @@ impl Manager {
                 <= stage
                     ._lease
                     .files
-                    .saturating_sub(companion_files + 1 + usize::from(set.pages.is_some()))
+                    .saturating_sub(1 + usize::from(set.pages.is_some()))
                 && self.extend(&mut stage._lease, extra)
             {
                 limits.insert(key, len);
@@ -1139,7 +1260,7 @@ impl Manager {
         let actual = limits
             .values()
             .try_fold(
-                set.dir.size + set.pages.as_ref().map_or(0, |p| p.size) + companion_bytes,
+                set.dir.size + set.pages.as_ref().map_or(0, |p| p.size),
                 |sum, n| sum.checked_add(*n),
             )
             .ok_or_else(|| io::Error::other("ANN stage size overflow"))?;
@@ -1164,27 +1285,14 @@ impl Manager {
                 }
                 Ok(((*source).clone(), 0, len))
             })
-            .chain(companions.iter().filter_map(|e| match e.kind {
-                ExtraKind::Tail(base) => Some(Ok((e.file.clone(), base, e.len()))),
-                ExtraKind::NumericIds(_) => None,
-            }))
             .collect::<io::Result<Vec<_>>>()?;
         stage.files.extend(
             self.download_many(store, &sources_to_copy, &stage.path)
                 .await?,
         );
-        let maps: Vec<_> = companions
-            .iter()
-            .filter(|e| matches!(e.kind, ExtraKind::NumericIds(_)))
-            .cloned()
-            .collect();
-        stage
-            .files
-            .extend(self.derive_row_ids(store, &maps, &stage.path).await?);
         let sources: HashMap<_, _> = std::iter::once(&set.dir)
             .chain(set.pages.iter())
             .chain(set.slabs.iter().flat_map(|s| s.files.values()))
-            .chain(companions.iter().map(|e| &e.file))
             .map(|f| (f.key.as_str(), f))
             .collect();
         let identities: Vec<_> = stage
@@ -1243,6 +1351,7 @@ impl Manager {
                 key.clone(),
                 FileRecord {
                     name,
+                    offset: 0,
                     base: f.base,
                     len: f.len,
                     crc: f.crc.clone(),
@@ -1277,9 +1386,24 @@ impl Manager {
             set: set.clone(),
             hints,
             files,
+            companions: false,
         };
-        let raw = serde_json::to_vec(&record).map_err(io::Error::other)?;
-        let actual = actual
+        let descriptors = stage.files.len();
+        self.seal(&mut stage, &record, actual, descriptors)?;
+        let job = (!companions.is_empty()).then_some((comp_lease, companions));
+        Ok((stage, job))
+    }
+    /// Write the completion record, publish the stage directory under its digest, and
+    /// shrink the reservation to the bytes and descriptors actually used.
+    fn seal(
+        &self,
+        stage: &mut Stage,
+        record: &Record,
+        payload: u64,
+        descriptors: usize,
+    ) -> io::Result<()> {
+        let raw = serde_json::to_vec(record).map_err(io::Error::other)?;
+        let actual = payload
             .checked_add(raw.len() as u64 + 32)
             .filter(|n| *n <= stage._lease.bytes)
             .ok_or_else(|| io::Error::other("ANN completion exceeds reservation"))?;
@@ -1301,13 +1425,108 @@ impl Manager {
         let released = stage._lease.bytes - actual;
         let mut state = self.state.lock().expect("ANN staging lock");
         state.used -= released;
-        state.files_used -= stage._lease.files - stage.files.len();
+        state.files_used -= stage._lease.files - descriptors;
         drop(state);
         stage._lease.bytes = actual;
-        stage._lease.files = stage.files.len();
+        stage._lease.files = descriptors;
         metrics::histogram!("blowfish_ann_staging_bytes").record(actual as f64);
-        Ok(stage)
+        Ok(())
     }
+    /// Fetch a tier's companions with bounded parallel GETs, each carrying the identity of
+    /// the object it was served from, and append them to one local pack: one descriptor,
+    /// one `fsync`, and no HEAD requests. Returns `None` when nothing qualifies.
+    async fn build_companions(
+        self: &Arc<Self>,
+        store: &Storage,
+        scope: &str,
+        set: &SlabSet,
+        lease: Lease,
+        extras: Vec<Extra>,
+    ) -> io::Result<Option<Stage>> {
+        let path = self.path.join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&path)?;
+        let mut stage = Stage {
+            path: path.clone(),
+            files: HashMap::new(),
+            bad: AtomicBool::new(false),
+            _lease: lease,
+            durable: false,
+        };
+        let pack = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path.join(PACK))?,
+        );
+        let mut fetched = futures::stream::iter(extras.into_iter().map(|extra| {
+            let store = store.clone();
+            async move { fetch_companion(&store, extra).await }
+        }))
+        .buffer_unordered(COMPANION_FETCHES);
+        let (mut buffer, mut written) = (Vec::<u8>::new(), 0u64);
+        let mut files = HashMap::new();
+        while let Some(item) = fetched.try_next().await? {
+            let Some(item) = item else { continue };
+            files.insert(
+                item.key,
+                StagedFile {
+                    file: pack.clone(),
+                    offset: written + buffer.len() as u64,
+                    base: item.base,
+                    len: item.bytes.len() as u64,
+                    crc: item.crc,
+                    identity: Some(item.identity),
+                    source: item.source,
+                },
+            );
+            buffer.extend_from_slice(&item.bytes);
+            if buffer.len() >= PACK_FLUSH {
+                written = flush_pack(&pack, &mut buffer, written).await?;
+            }
+        }
+        drop(fetched);
+        if files.is_empty() {
+            return Ok(None);
+        }
+        written = flush_pack(&pack, &mut buffer, written).await?;
+        let handle = pack.clone();
+        tokio::task::spawn_blocking(move || handle.sync_all())
+            .await
+            .map_err(io::Error::other)??;
+        let records = files
+            .iter()
+            .map(|(key, f)| {
+                Ok((
+                    key.clone(),
+                    FileRecord {
+                        name: PACK.to_owned(),
+                        offset: f.offset,
+                        base: f.base,
+                        len: f.len,
+                        crc: f.crc.clone(),
+                        identity: f
+                            .identity
+                            .clone()
+                            .ok_or_else(|| io::Error::other("missing ANN identity"))?,
+                        source: f.source.clone(),
+                    },
+                ))
+            })
+            .collect::<io::Result<BTreeMap<_, _>>>()?;
+        let record = Record {
+            scope: scope.to_owned(),
+            set: set.clone(),
+            hints: BTreeMap::new(),
+            files: records,
+            companions: true,
+        };
+        stage.files = files;
+        self.seal(&mut stage, &record, written, 1)?;
+        Ok(Some(stage))
+    }
+
     /// One range pool spans every slab. A slot includes its positional write and CRC,
     /// bounding payload memory to DOWNLOADS * PIECE without per-slab queues of bytes.
     async fn download_many(
@@ -1358,7 +1577,9 @@ impl Manager {
             files.insert(
                 source.key.clone(),
                 StagedFile {
-                    file: file.try_clone()?,
+                    // One descriptor per source: the staged file shares the download handle.
+                    file: file.clone(),
+                    offset: 0,
                     base,
                     len,
                     crc: vec![0; len.div_ceil(BLOCK as u64) as usize],
@@ -1390,8 +1611,8 @@ impl Manager {
         // No range task remains when files are synced and their identities rechecked.
         let syncing = files
             .iter()
-            .map(|(key, file)| Ok((key.clone(), file.identity.clone(), file.file.try_clone()?)))
-            .collect::<io::Result<Vec<_>>>()?;
+            .map(|(key, file)| (key.clone(), file.identity.clone(), file.file.clone()))
+            .collect::<Vec<_>>();
         futures::stream::iter(syncing.into_iter().map(|(key, identity, handle)| {
             let store = store.clone();
             async move {
@@ -1458,7 +1679,8 @@ impl Manager {
             return Err(io::Error::other("ANN source changed during download"));
         }
         Ok(StagedFile {
-            file: file.into_std().await,
+            file: Arc::new(file.into_std().await),
+            offset: 0,
             base: 0,
             len,
             crc,
@@ -1466,6 +1688,79 @@ impl Manager {
             source: None,
         })
     }
+}
+
+/// One companion, fetched whole and checksummed, ready to append to a pack.
+struct Fetched {
+    key: String,
+    bytes: Bytes,
+    crc: Vec<u32>,
+    identity: ObjectIdentity,
+    base: u64,
+    source: Option<String>,
+}
+/// Fetch one companion with a single GET, taking its identity from that response. An ID map is
+/// derived from the whole ID index; `None` means that segment has non-numeric IDs.
+async fn fetch_companion(store: &Storage, extra: Extra) -> io::Result<Option<Fetched>> {
+    let reader = store
+        .range_reader_with_length(&extra.file.key, extra.file.size, true)
+        .map_err(io::Error::other)?
+        .bypass_cache();
+    let (base, range) = match extra.kind {
+        ExtraKind::Tail(base) => (base, base..extra.file.size),
+        ExtraKind::NumericIds(_) => (0, 0..extra.file.size),
+    };
+    let (bytes, identity) = reader
+        .read_direct_identified(range)
+        .await
+        .map_err(io::Error::other)?;
+    if identity.etag.is_none() && identity.version.is_none() {
+        return Err(io::Error::other("backend has no immutable object identity"));
+    }
+    let key = extra.key();
+    match extra.kind {
+        ExtraKind::Tail(_) => Ok(Some(Fetched {
+            crc: bytes.chunks(BLOCK).map(crc32fast::hash).collect(),
+            key,
+            bytes,
+            identity,
+            base,
+            source: None,
+        })),
+        ExtraKind::NumericIds(rows) => {
+            let (store, source) = (store.clone(), extra.file.clone());
+            let packed = tokio::task::spawn_blocking(move || {
+                debug_assert_eq!(bytes.len() as u64, source.size);
+                crate::segment::packed_numeric_ids(&store, &source, rows, bytes)
+                    .map_err(|e| io::Error::other(format!("{e:?}")))
+                    .map(|packed| {
+                        packed.map(|p| {
+                            let crc = p.chunks(BLOCK).map(crc32fast::hash).collect();
+                            (Bytes::from(p), crc)
+                        })
+                    })
+            })
+            .await
+            .map_err(io::Error::other)??;
+            Ok(packed.map(|(bytes, crc)| Fetched {
+                key,
+                bytes,
+                crc,
+                identity,
+                base: 0,
+                source: Some(extra.file.key),
+            }))
+        }
+    }
+}
+/// Write buffered pack bytes at `at`, returning the offset after them.
+async fn flush_pack(file: &Arc<File>, buffer: &mut Vec<u8>, at: u64) -> io::Result<u64> {
+    let (chunk, file) = (std::mem::take(buffer), file.clone());
+    let end = at + chunk.len() as u64;
+    tokio::task::spawn_blocking(move || file.write_all_at(&chunk, at))
+        .await
+        .map_err(io::Error::other)??;
+    Ok(end)
 }
 
 pub(crate) fn observe(
@@ -1641,7 +1936,8 @@ mod tests {
             .collect();
         temporary.as_file().write_all_at(&data, 0).unwrap();
         let staged = StagedFile {
-            file: temporary.as_file().try_clone().unwrap(),
+            file: Arc::new(temporary.as_file().try_clone().unwrap()),
+            offset: 0,
             base: 0,
             len: data.len() as u64,
             crc: data.chunks(BLOCK).map(crc32fast::hash).collect(),
@@ -2169,7 +2465,7 @@ mod tests {
     async fn derived_row_ids_answer_from_the_stage_and_skip_string_ids() {
         let work = scratch();
         let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
-        let (store, _, _, _) = fixture(1).await;
+        let (store, set, _, _) = fixture(1).await;
         let numeric: Vec<bf_types::Id> = (0..5000u64)
             .map(|n| bf_types::Id::Uint(n * 7 + 3))
             .collect();
@@ -2192,10 +2488,14 @@ mod tests {
                 kind: ExtraKind::NumericIds(10),
             },
         ];
-        let files = manager
-            .derive_row_ids(&store, &maps, work.path())
+        let mut lease = manager.empty_lease();
+        assert!(manager.extend_files(&mut lease, 1) && manager.extend(&mut lease, 1 << 20));
+        let stage = manager
+            .build_companions(&store, "", &set, lease, maps.to_vec())
             .await
+            .unwrap()
             .unwrap();
+        let files = &stage.files;
         assert_eq!(files.len(), 1);
         let staged = &files[&rowid_key("ids-a")];
         assert_eq!(staged.source.as_deref(), Some("ids-a"));
@@ -2213,6 +2513,116 @@ mod tests {
             staged
                 .read(std::slice::from_ref(&(5000 * 8..5000 * 8 + 8)))
                 .is_err()
+        );
+    }
+
+    async fn companion_stage(manager: &Arc<Manager>, set: &SlabSet) -> Arc<Stage> {
+        let key = stage_key("", &set.dir.key, true);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((_, stage)) = manager.state.lock().unwrap().ready.get(&key) {
+                    return stage.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn companions_pack_into_one_file_after_the_code_stage_and_survive_restart() {
+        let work = scratch();
+        let (store, set, _, _) = fixture(31).await;
+        publish(&store, &set, false, 1).await;
+        let numeric: Vec<bf_types::Id> = (0..5000u64).map(bf_types::Id::Uint).collect();
+        let a = crate::segment::put_ids(&store, "ids-a".into(), numeric)
+            .await
+            .unwrap();
+        let tail = a.size - 100;
+        let extras = vec![
+            Extra {
+                file: a.clone(),
+                kind: ExtraKind::Tail(tail),
+            },
+            Extra {
+                file: a.clone(),
+                kind: ExtraKind::NumericIds(5000),
+            },
+        ];
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        let main = ready(&manager, "", &set).await;
+        let pack = companion_stage(&manager, &set).await;
+        assert_eq!(pack.files.len(), 2);
+        let (docs, map) = (&pack.files["ids-a"], &pack.files["ids-a#rowid"]);
+        assert!(Arc::ptr_eq(&docs.file, &map.file));
+        assert_ne!(docs.offset, map.offset);
+        assert_eq!(
+            manager.state.lock().unwrap().files_used,
+            main.files.len() + 1
+        );
+        let raw = store.get("ids-a").await.unwrap();
+        let want = raw[tail as usize + 10..tail as usize + 20].to_vec();
+        let range = tail + 10..tail + 20;
+        let got = manager.read("stage:ids-a", "ids-a", std::slice::from_ref(&range));
+        // The scoped lookup key is the scope followed by the object name.
+        assert!(got.is_none());
+        let got = manager
+            .read("ids-a", "ids-a", std::slice::from_ref(&range))
+            .unwrap();
+        assert_eq!(&got[0][..], &want[..]);
+        let row = manager
+            .read(
+                "ids-a#rowid",
+                "ids-a#rowid",
+                std::slice::from_ref(&(8 * 7..8 * 8)),
+            )
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(row[0].as_ref().try_into().unwrap()), 7);
+        // Everything is settled: another observation starts nothing.
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        assert!(manager.state.lock().unwrap().pending.is_empty());
+        drop((main, pack, got, row));
+        drop(manager);
+
+        // A restart adopts both stages and then finds nothing left to stage.
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        manager.recover(&store).await;
+        assert!(
+            manager
+                .read("ids-a#rowid", "ids-a#rowid", std::slice::from_ref(&(0..8)))
+                .is_some()
+        );
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        assert!(manager.state.lock().unwrap().pending.is_empty());
+        assert!(
+            manager
+                .read("ids-a", "ids-a", std::slice::from_ref(&range))
+                .is_some()
+        );
+        drop(manager);
+
+        // Losing only the pack leaves the code stage adoptable, and the pack is rebuilt.
+        for entry in fs::read_dir(work.path().join("ann-staging-v2/test")).unwrap() {
+            let dir = entry.unwrap().path();
+            if dir.join(PACK).exists() {
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        manager.recover(&store).await;
+        assert!(
+            manager
+                .read("ids-a#rowid", "ids-a#rowid", std::slice::from_ref(&(0..8)))
+                .is_none()
+        );
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        companion_stage(&manager, &set).await;
+        assert!(
+            manager
+                .read("ids-a#rowid", "ids-a#rowid", std::slice::from_ref(&(0..8)))
+                .is_some()
         );
     }
 

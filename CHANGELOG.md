@@ -4,9 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-11-25
+
 ### Changed
 
 - **Faster warm graph search:** The resident graph index caches vector norms, keeps its beam in a contiguous buffer with a bitset of visited nodes, prefetches neighbor codes, stores locations densely, and uses a four-accumulator int8 dot product on ARM. On an Apple M4 with the Natural Questions benchmark and the production server, 16-client throughput at recall 0.944 is 8,720 queries/s versus Qdrant's 8,407 on the same machine, 9 to 11 percent above v0.1.28, at 2.65M instructions per query (was 3.57M). Memory is unchanged (about 4.4 GB versus Qdrant's 5.6 GB). `/status` now reports each cached namespace's resident graph state.
+- **Faster, lighter local ANN staging:** A tier's staged companions (document directories and row-to-ID maps) now live in one local pack file with an offset table, fetched with whole-object GETs whose identity is checked against the recorded segment. The stage publishes in two phases, so scan codes are usable before companions finish. On a cold 100M-vector S3 namespace, scan codes are usable after 79 s instead of 155 s and the stage is complete after about 89 s, with 325 open staging files instead of about 3,900. Live queries during staging and results are unchanged. Stages written by v0.1.27 and v0.1.28 are adopted as they are.
 
 ## [0.1.28] - 2026-11-25
 
@@ -229,7 +232,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.28...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.29...HEAD
+[0.1.29]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.29
 [0.1.28]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.28
 [0.1.27]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.27
 [0.1.26]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.26

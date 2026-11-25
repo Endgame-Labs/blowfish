@@ -452,11 +452,22 @@ impl RangeReader {
     /// and neither consults nor fills the block caches. It issues no hedge requests.
     /// Callers copying several objects must also bound their own buffered payloads.
     pub async fn read_direct(&self, range: Range<u64>) -> Result<Bytes, Error> {
-        if range.start > range.end || range.end > self.len() {
-            return Err(Error::Config("invalid object range"));
-        }
-        if range.is_empty() {
+        if range.is_empty() && range.start <= range.end && range.end <= self.len() {
             return Ok(Bytes::new());
+        }
+        Ok(self.read_direct_identified(range).await?.0)
+    }
+    /// [`RangeReader::read_direct`] that also returns the identity of the object the same
+    /// response was served from (its `ETag` or version, and physical length), with no HEAD.
+    /// A single response is served from one object generation, so the returned identity
+    /// covers every returned byte. The range must be nonempty.
+    pub async fn read_direct_identified(
+        &self,
+        range: Range<u64>,
+    ) -> Result<(Bytes, crate::ObjectIdentity), Error> {
+        use object_store::{GetOptions, GetRange, ObjectStore};
+        if range.start >= range.end || range.end > self.len() {
+            return Err(Error::Config("invalid object range"));
         }
         let _permit = self
             .storage
@@ -466,19 +477,27 @@ impl RangeReader {
             .acquire()
             .await
             .expect("cache semaphore stays open");
-        let bytes = self
+        let result = self
             .storage
             .0
             .backend
-            .get_range(
+            .get_opts(
                 &self.storage.path(&self.key),
-                range.start + self.layout.offset..range.end + self.layout.offset,
+                GetOptions::new().with_range(Some(GetRange::Bounded(
+                    range.start + self.layout.offset..range.end + self.layout.offset,
+                ))),
             )
             .await?;
+        let identity = crate::ObjectIdentity {
+            size: result.meta.size,
+            etag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
+        let bytes = result.bytes().await?;
         if bytes.len() as u64 != range.end - range.start {
             return Err(Error::Config("short object-store range response"));
         }
-        Ok(bytes)
+        Ok((bytes, identity))
     }
     /// Read one range and charge the provided query accumulator.
     pub async fn read_with_stats(
