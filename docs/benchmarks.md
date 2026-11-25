@@ -11492,6 +11492,51 @@ deleted, and the `tmp/c13/` test objects (1.5 GB copy, 1.5 GB single-part, 64 Mi
 No writes to the 100M prefix. The harness (a 250-line Rust binary using hyper, rustls, and `object_store`'s presigned URLs)
 was scratch code and is not kept.
 
+## Round C16: keeping each query's rerank reads inside a small span (stopped, reordering cannot narrow them)
+
+Hypothesis: if exact vectors were laid out so that spatially close leaves are close in the bucket, one query's
+rerank reads would fall in a narrow byte range, and C13's span effect (25 to 50 ms per GET in a 1 GiB span instead
+of 80 to 100 ms) would cut the 100M cold rerank wave. Gate (step 1, offline): stop if a reordering cannot put the
+median query's reads inside about 1 to 2 GiB.
+
+**Result: the gate fails. A query's reads are in about 15 different slab objects, so no leaf order can bring them
+inside 1 to 2 GiB, and the best reorderings I tried cut distinct 64 MiB windows by only 4 percent. No engine code changed.**
+
+### Today's layout
+
+Each slab's `.bfv` already puts the leaves' exact vectors in a greedy nearest-neighbor tour of the leaf centers (the
+order the fragment's blobs use), not in cluster-ID order. At 100M: 160 slabs, 499,920 leaves (3,260 per slab at
+median, about 0.33 MiB each, about 162 rows), and each slab's vector region is about 1.4 GiB.
+
+### Method
+
+One on-demand c7gd.4xlarge (us-west-2), the read-only 100M layout (`v014/big`), C10's 200 oracle queries traced
+cold with `cold_ab.py` (no staging, so every rerank vector read is remote and traced; 91 reads per query at median).
+`c16_layout.rs` dumped every leaf's vector range and exact rotated center; `c16_span.py` maps each traced read to its
+leaf, then to a new offset under a candidate leaf order inside the same slab (every leaf's vectors move, the vector
+region keeps its start), and counts per query the slabs hit and the distinct windows of each size.
+
+| Order inside each slab | Slabs hit p50 / p90 | Distinct 64 MiB windows p50 / p90 | Distinct 1 GiB regions p50 / p90 | Summed per-slab span p50 (GiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Today (nearest-neighbor tour) | 15.0 / 26.1 | 37.0 / 66.0 | 19.0 / 34.0 | 4.67 |
+| Recursive 2-means, depth first | 15.0 / 26.1 | 35.5 / 66.2 | 18.5 / 32.1 | 3.60 |
+| Order along the first principal axis | 15.0 / 26.1 | 46.0 / 79.1 | 18.0 / 31.1 | 3.46 |
+
+The median query reranks 72 distinct leaves (p90 137), about 4.9 per slab it touches, so about one read per leaf.
+Those leaves are a query's best candidates from a neighborhood in 1,024 dimensions, and a one-dimensional order cannot
+keep several of them together: the tour already averages 2.5 windows of 64 MiB per slab, and the best order here 2.4.
+The floor for any order is one window per slab, 15 for the median query (about C13's 16 by 64 MiB row, 41 ms), against
+35 to 37 today, so only a layout that also reduced the number of slabs a query touches could approach it. That is a
+coarse-cell change (more probing in fewer slabs), not a leaf order, and it was not tried.
+
+Steps 2 and 3 (the latency microbenchmark and the recluster change plus a 10M `cold_ab.py` run) were not attempted.
+
+### Cost
+
+c7gd.4xlarge from 12:15 to 12:45 UTC on 2026-11-25, about 0.5 hours (about $0.4, under the $6 cap). The instance, key
+pair, and security group are deleted, and nothing was written to any bucket prefix. `c16_layout.rs` and `c16_span.py`
+(in `crates/bf-engine/examples/`) are kept so the analysis can be rerun on another layout.
+
 ## Round BW11: dense-term frequency arrays as the one serving path (shipped)
 
 BW10 (`04e91eb`) measured 1.275x warm 16-client with arrays chosen from a training split. BW11 removes the setting and the
