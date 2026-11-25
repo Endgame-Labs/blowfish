@@ -1117,7 +1117,12 @@ impl Engine {
         metrics::gauge!("blowfish_recluster_running").set(1.0);
         let _gauge = scopeguard(|| metrics::gauge!("blowfish_recluster_running").set(0.0));
         let job = self.start_job(ns, target.kind, &target.segments).await?;
-        let built = self.build_tier(ns, manifest, target, opts, &job).await?;
+        let mut built = self.build_tier(ns, manifest, target, opts, &job).await?;
+        // Slab bytes staged locally wait, inert, for the commit; dropping the handle discards them.
+        let prestage = built.prestage.take();
+        if let Some(prestage) = &prestage {
+            prestage.publish(&built.set);
+        }
         let mut rx = self.0.jobs.stage(ns, &opts.attribute, built.set, target);
         let deadline = Instant::now() + INSTALL_TIMEOUT;
         let mut failures = 0;
@@ -1146,6 +1151,9 @@ impl Engine {
             }
         };
         // Installed, the manifest protects the tier's objects; dropped, they are orphans.
+        if installed && let Some(prestage) = prestage {
+            prestage.activate();
+        }
         job.finish(&self.0.store, ns).await;
         let seconds = started.elapsed().as_secs_f64();
         metrics::histogram!("blowfish_recluster_build_seconds").record(seconds);

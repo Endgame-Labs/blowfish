@@ -108,6 +108,8 @@ pub(crate) fn target_leaf_rows(rows: u64) -> usize {
 pub(crate) struct Built {
     pub set: SlabSet,
     pub report: ReclusterReport,
+    /// The slab bytes written locally beside the upload, awaiting the manifest commit.
+    pub prestage: Option<crate::local_ann::Prestage>,
 }
 
 /// The pool builds run on: half the cores (at least one), so queries keep the rest.
@@ -490,6 +492,9 @@ impl Engine {
         let mut slabs: Vec<Segment> = Vec::new();
         let mut clusters = 0usize;
         let mut pending: Option<tokio::task::JoinHandle<Result<(), ApiError>>> = None;
+        // Slab bytes that this node's stage will want are written locally while they upload.
+        let prestage = crate::local_ann::Prestage::begin(dims);
+        let mut rows_left = present.len() as u64;
         let uploads = Arc::new(tokio::sync::Mutex::new(Vec::<Segment>::new()));
         for (
             n,
@@ -507,7 +512,8 @@ impl Engine {
             let rows_n = rows.len() as u32;
             // Between slabs, let a queued flush or compaction run first.
             job.pause().await;
-            let blob = on_pool(move || -> Result<(Vec<u8>, u64), ApiError> {
+            let staging = prestage.is_some();
+            let blob = on_pool(move || -> Result<BuiltSlab, ApiError> {
                 let reading = Stage::new("spill_read");
                 // Rows stay packed at the stored precision (about 2 KB each at 1,024 dims in f16).
                 let mut data = vec![0u8; rows.len() * width];
@@ -529,18 +535,27 @@ impl Engine {
                 let blob = builder
                     .build_packed_assigned(rows, data, centers, assignment)
                     .map_err(segment::index_error)?;
-                bf_vector::Fragment::build_ann(&blob).map_err(segment::index_error)
+                let (blob, meta) =
+                    bf_vector::Fragment::build_ann(&blob).map_err(segment::index_error)?;
+                let lens = if staging {
+                    stage_lengths(&blob, meta)
+                } else {
+                    (0, 0)
+                };
+                Ok((blob, meta, lens))
             })
             .await??;
-            let (blob, meta) = blob;
+            let (blob, meta, lens) = blob;
+            rows_left -= u64::from(rows_n);
             // Under the job's prefix, which its build record protects from GC until published.
             let id = format!("{}{n:05}", job.slab_prefix());
-            let (store2, ns2, attr2, id2, uploads2) = (
+            let (store2, ns2, attr2, id2, uploads2, prestage2) = (
                 store.clone(),
                 ns.clone(),
                 attr.to_string(),
                 id.clone(),
                 uploads.clone(),
+                prestage.as_ref().map(|p| p.writer()),
             );
             // Upload while the next slab builds; at most one upload is outstanding.
             if let Some(p) = pending.take() {
@@ -549,13 +564,17 @@ impl Engine {
             pending = Some(tokio::spawn(async move {
                 let _upload = Stage::new("upload");
                 let prefix = format!("ns/{ns2}/slabs/{id2}");
-                let ann = segment::put_file(
-                    &store2,
-                    format!("{prefix}/ann.{}.bfa", uuid::Uuid::new_v4()),
-                    blob,
-                    meta,
-                )
-                .await?;
+                let key = format!("{prefix}/ann.{}.bfa", uuid::Uuid::new_v4());
+                let blob = bytes::Bytes::from(blob);
+                let put = segment::put_bytes(&store2, key.clone(), blob.clone(), meta);
+                let ann = match (&prestage2, lens) {
+                    (Some(pre), lens) if lens.0 > 0 => {
+                        // Beside the upload, a local copy of what a stage of this node holds.
+                        pre.upload(&store2, &key, blob, lens, rows_left, put)
+                            .await?
+                    }
+                    _ => put.await?,
+                };
                 let mut files = std::collections::BTreeMap::new();
                 files.insert(format!("annv2:{attr2}"), ann);
                 uploads2.lock().await.push(Segment {
@@ -608,6 +627,7 @@ impl Engine {
             seconds: 0.0,
         };
         Ok(Built {
+            prestage,
             set: SlabSet {
                 covered,
                 slabs,
@@ -695,6 +715,34 @@ async fn segment_index(
     .await
     .map(Arc::new)
     .map_err(segment::index_error)
+}
+
+/// A slab's object bytes, its metadata length, and the lengths a stage holds of it.
+type BuiltSlab = (Vec<u8>, u64, (u64, u64));
+
+/// How many bytes of a slab object a stage holds: through its codes, and through its exact
+/// vectors. Zero for both when the layout is unfamiliar (the slab then simply is not staged).
+pub(crate) fn stage_lengths(blob: &[u8], metadata_len: u64) -> (u64, u64) {
+    let measure = || -> Option<(u64, u64)> {
+        let fragment =
+            bf_vector::Fragment::decode(blob.get(..usize::try_from(metadata_len).ok()?)?).ok()?;
+        let raw = bf_vector::Directory::build(&[("s".into(), "k".into(), "k".into(), fragment)])
+            .ok()??;
+        let dir = bf_vector::Directory::decode(&raw).ok()?;
+        let codes = dir
+            .entries()
+            .iter()
+            .map(|e| e.blob_range().end.max(e.codes_range().end))
+            .max()?;
+        let vectors = dir
+            .entries()
+            .iter()
+            .map(|e| e.vectors_range().end)
+            .max()?
+            .max(codes);
+        Some((codes, vectors))
+    };
+    measure().unwrap_or((0, 0))
 }
 
 /// Consecutive slabs merged while they fit in `max` rows together (a delta's cells are small).
