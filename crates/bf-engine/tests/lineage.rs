@@ -209,6 +209,7 @@ fn referenced(m: &bf_wal::Manifest) -> Vec<String> {
                 .flat_map(|l| l.parts.iter().map(|p| &p.map)),
         )
         .chain(m.ann_dirs.values())
+        .chain(m.text_stats.iter())
         .map(|f| f.key.clone())
         .collect();
     out.sort();
@@ -387,5 +388,45 @@ async fn a_merge_that_fails_at_any_publication_point_keeps_the_tier_answering_an
             assert_eq!(indexed_top(&fresh, q).await, json!(q), "{pattern} {after}");
         }
         assert_ne!(indexed_top(&fresh, 15).await, json!(15));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tier_removal_failures_leave_one_complete_vector_source_reachable() {
+    for (pattern, skip, after) in [
+        ("ann.restored.", 0, false),
+        ("ann.restored.", 0, true),
+        ("ns/t/manifest/", 1, false),
+        ("ns/t/manifest/", 1, true),
+    ] {
+        let (faults, store, engine, _scratch) = setup().await;
+        // Simulate the prior retirement before making one covered source disappear.
+        let wal = bf_wal::Wal::new(store.clone(), "t").unwrap();
+        let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+        let old: Vec<_> = m
+            .segments
+            .iter_mut()
+            .filter_map(|s| s.files.remove("annv2:vector"))
+            .collect();
+        m.ann_dirs.clear();
+        m.segments.remove(0);
+        wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+        for file in old {
+            store.delete(&file.key).await.unwrap();
+        }
+        upsert(&engine, 10_000..10_001, 0).await;
+        faults.arm(pattern, skip, after);
+        let _ = engine.index_namespace("t", true).await;
+        faults.disarm();
+        let fresh = Engine::with_config(store.clone(), config());
+        assert_eq!(top(&fresh, 2107).await, json!(2107));
+        all_present(&store, &manifest(&store).await).await;
+        fresh.index_namespace("t", true).await.unwrap();
+        fresh.collect_garbage("t").await.unwrap();
+        assert_eq!(
+            indexed_top(&Engine::with_config(store.clone(), config()), 2107).await,
+            json!(2107)
+        );
+        all_present(&store, &manifest(&store).await).await;
     }
 }

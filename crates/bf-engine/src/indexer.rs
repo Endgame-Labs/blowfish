@@ -959,13 +959,22 @@ impl Engine {
         };
         manifest.deleted = false;
         manifest.segments = segments;
+        let old_vectors = crate::vector_locator::Sources::new(&state);
         retire_stale_tiers(&mut manifest);
+        crate::vector_locator::restore_uncovered(store, ns, &mut manifest, &old_vectors).await?;
         // Rewrite bounded batches under this publication's epoch claim. A failed or fenced
         // pass leaves only unreferenced objects for GC; it never deletes uncertain uploads.
         let old = crate::text_upgrade::upgrade(store, ns, &mut manifest.segments).await?;
         for key in old {
             retire(&mut manifest, key);
         }
+        // A finished recluster tier joins this publication if its segments are still here.
+        let installed = self.0.jobs.install(ns, &mut manifest);
+        if installed.is_some() {
+            // A new base covers the merged segments' targets itself: their lineage goes.
+            crate::lineage::prune(&mut manifest);
+        }
+        crate::vector_locator::restore_uncovered(store, ns, &mut manifest, &old_vectors).await?;
         crate::slab_rows::ensure(store, &mut manifest, 1).await?;
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest
@@ -1057,12 +1066,6 @@ impl Engine {
             && state.docs.len() as f64 / age.as_secs_f64().max(1.0) >= BULK_LOAD_ROWS_PER_SEC
         {
             manifest.bulk_load_at = Some(Utc::now());
-        }
-        // A finished recluster tier joins this publication if its segments are still here.
-        let installed = self.0.jobs.install(ns, &mut manifest);
-        if installed.is_some() {
-            // A new base covers the merged segments' targets itself: their lineage goes.
-            crate::lineage::prune(&mut manifest);
         }
         let generation = match wal
             .publish_fenced(claim, manifest.indexer_epoch, &manifest)

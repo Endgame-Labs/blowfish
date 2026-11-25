@@ -275,3 +275,66 @@ pub(crate) async fn exact(
     }
     Ok(hits)
 }
+
+/// Recreate independent ANN ownership before the publication drops the last covering tier.
+/// Uploads precede the manifest CAS; failures leave the old tier authoritative.
+pub(crate) async fn restore_uncovered(
+    store: &Storage,
+    ns: &str,
+    manifest: &mut bf_wal::Manifest,
+    old: &Sources,
+) -> Result<(), ApiError> {
+    let remaining = Sources::from_manifest(manifest);
+    for seg in &mut manifest.segments {
+        for (attr, cfg) in &seg.schema {
+            let Some((dims, dtype)) = segment::dense_type(cfg) else {
+                continue;
+            };
+            if crate::upgrade::files(seg, attr).is_some() || remaining.covers(seg, attr) {
+                continue;
+            }
+            if !old.covers(seg, attr) {
+                return Err(segment::index_error(
+                    "segment lost its authoritative vector source",
+                ));
+            }
+            let live = segment::live(store, seg).await?;
+            let mut rows = Vec::new();
+            let mut packed = Vec::new();
+            let mut scan = live.iter();
+            loop {
+                let chunk: RoaringBitmap = scan.by_ref().take(4096).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                let (present, data) = old.read(store, seg, &chunk, attr, true).await?;
+                rows.extend(present);
+                packed.extend(data);
+            }
+            let metric = segment::vector_metric(manifest.distance_metric);
+            let bytes = tokio::task::spawn_blocking(move || {
+                bf_vector::IndexBuilder::new(dims, metric)?
+                    .vector_type(dtype)
+                    .build_packed(rows, packed)
+            })
+            .await
+            .map_err(segment::index_error)?
+            .map_err(segment::index_error)?;
+            let (bytes, metadata_len) =
+                bf_vector::Fragment::build_ann(&bytes).map_err(segment::index_error)?;
+            let file = segment::put_bytes(
+                store,
+                format!(
+                    "ns/{ns}/segments/{}/ann.restored.{}.bfa",
+                    seg.id,
+                    uuid::Uuid::new_v4()
+                ),
+                bytes.into(),
+                metadata_len,
+            )
+            .await?;
+            seg.files.insert(format!("annv2:{attr}"), file);
+        }
+    }
+    Ok(())
+}

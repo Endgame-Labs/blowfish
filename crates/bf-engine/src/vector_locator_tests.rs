@@ -767,3 +767,120 @@ async fn branches_and_copies_pin_covering_tiers_and_lineage_across_source_gc() {
         assert!(!manifest.lineage.is_empty());
     }
 }
+
+#[tokio::test]
+async fn dropping_a_stale_tier_restores_surviving_segment_vectors_before_publication() {
+    let (store, _, _) = fixture_rows(2000).await;
+    retire_test_sources(&store).await;
+    let before = maintenance_engine(&store)
+        .query_exhaustive("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap();
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    let removed = manifest.segments.remove(0);
+    let gone = segment::ids(&store, &removed).await.unwrap();
+    let expected: Vec<_> = before
+        .into_iter()
+        .filter(|r| !gone.contains(&serde_json::from_value(r["id"].clone()).unwrap()))
+        .collect();
+    // A stale tier can retain surviving segments even when one source disappeared.
+    wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
+        .await
+        .unwrap();
+    let engine = maintenance_engine(&store);
+    engine.write("locator", serde_json::from_value(json!({"upsert_rows": [{"id": 100_000, "category": 0, "vector": [1.0, 0.0, -0.5]}]})).unwrap()).await.unwrap();
+    engine.index_namespace("locator", true).await.unwrap();
+    let (_, manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    assert!(manifest.ann_tiers.is_empty());
+    assert!(
+        manifest
+            .segments
+            .iter()
+            .all(|s| s.files.contains_key("annv2:vector"))
+    );
+    engine.collect_garbage("locator").await.unwrap();
+    let mut actual = maintenance_engine(&store)
+        .query_exhaustive("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap();
+    actual.retain(|r| r["id"] != 100_000);
+    assert_eq!(actual, expected);
+}
+#[tokio::test]
+async fn schema_rebuild_reads_covering_vectors_before_retiring_tiers() {
+    let (store, _, _) = fixture_rows(2000).await;
+    retire_test_sources(&store).await;
+    let engine = maintenance_engine(&store);
+    let before = engine
+        .query_exhaustive("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    engine
+        .write(
+            "locator",
+            serde_json::from_value(json!({"schema": {"category": {"filterable": false}}})).unwrap(),
+        )
+        .await
+        .unwrap();
+    engine.index_namespace("locator", true).await.unwrap();
+    engine.collect_garbage("locator").await.unwrap();
+    assert_eq!(
+        maintenance_engine(&store)
+            .query_exhaustive("locator", reference_request())
+            .await
+            .unwrap()
+            .result
+            .rows,
+        before
+    );
+}
+
+#[tokio::test]
+async fn last_tier_removal_after_compaction_restores_sparse_stored_precision() {
+    let (store, _, _) = fixture_rows(2000).await;
+    retire_test_sources(&store).await;
+    let engine = maintenance_engine(&store);
+    engine.index_namespace("locator", true).await.unwrap();
+    retire_test_sources(&store).await;
+    let before = maintenance_engine(&store)
+        .query_exhaustive("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    let sources = Sources::from_manifest(&manifest);
+    manifest.ann_tiers.clear();
+    crate::vector_locator::restore_uncovered(&store, "locator", &mut manifest, &sources)
+        .await
+        .unwrap();
+    assert!(
+        manifest
+            .segments
+            .iter()
+            .all(|s| s.files.contains_key("annv2:vector"))
+    );
+    wal.publish_fenced(seq, manifest.indexer_epoch, &manifest)
+        .await
+        .unwrap();
+    engine.collect_garbage("locator").await.unwrap();
+    assert_eq!(
+        maintenance_engine(&store)
+            .query_exhaustive("locator", reference_request())
+            .await
+            .unwrap()
+            .result
+            .rows,
+        before
+    );
+}
