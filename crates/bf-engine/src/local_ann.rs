@@ -238,6 +238,9 @@ struct State {
     hints: HashMap<String, Hint>,
     /// Columns that queries have projected, by namespace, in the order first seen.
     columns: HashMap<String, Vec<String>>,
+    /// Column packs the budget had no room for, with the bytes in use when refused. Refusals
+    /// stand until something is freed, so a full cap is not probed again by every query.
+    refused: HashMap<String, u64>,
 }
 
 /// A completion record binds the manifest's tier, scoped object identities, local lengths,
@@ -374,7 +377,8 @@ struct ColumnJob {
 #[derive(Default)]
 struct Follow {
     companions: Option<(Lease, Vec<Extra>)>,
-    columns: Vec<ColumnJob>,
+    /// The tier's docs objects, whose requested columns are planned once the stage is published.
+    docs: Vec<SegmentFile>,
 }
 fn rowid_key(ids_key: &str) -> String {
     format!("{ids_key}#rowid")
@@ -990,10 +994,9 @@ impl Manager {
                 .map(|e| e.file)
                 .collect();
             tokio::spawn(async move {
-                let columns = manager.plan_columns(&store, &scope, &set, &docs).await;
                 let follow = Follow {
                     companions: None,
-                    columns,
+                    docs,
                 };
                 manager
                     .finish_companions(&store, &scope, &set, key, follow)
@@ -1021,7 +1024,7 @@ impl Manager {
                         key,
                         Follow {
                             companions: Some((lease, extras)),
-                            columns: Vec::new(),
+                            docs: Vec::new(),
                         },
                     )
                     .await;
@@ -1159,7 +1162,21 @@ impl Manager {
                 _ => {}
             }
         }
-        for job in follow.columns {
+        // Document columns that queries project take what the cap still has after the exact
+        // vectors and companions. They never displace vectors: round C15 measured that each
+        // displaced vector row moves the wait from hydration to the rerank.
+        let cancelled = self
+            .state
+            .lock()
+            .expect("ANN staging lock")
+            .cancelled
+            .contains(&key);
+        let columns = if cancelled {
+            Vec::new()
+        } else {
+            self.plan_columns(store, scope, set, &follow.docs).await
+        };
+        for job in columns {
             let name = job.name.clone();
             let cancelled = self
                 .state
@@ -1235,7 +1252,11 @@ impl Manager {
                 .failed
                 .get(&key)
                 .is_some_and(|at| at.elapsed() < RETRY);
-            if !staged && !recent && !names.contains(name) {
+            let refused = state
+                .refused
+                .get(&key)
+                .is_some_and(|used| state.used >= *used);
+            if !staged && !recent && !refused && !names.contains(name) {
                 names.push(name.clone());
             }
         }
@@ -1263,7 +1284,7 @@ impl Manager {
             self.capacity.saturating_sub(state.used)
         };
         if room < COLUMN_MIN_ROOM {
-            self.fail_columns(scope, set, &names);
+            self.refuse_columns(scope, set, &names);
             return Vec::new();
         }
         let extents: Vec<_> = futures::stream::iter(docs.iter().cloned().map(|file| {
@@ -1308,8 +1329,24 @@ impl Manager {
             }
             jobs.push(ColumnJob { name, lease, parts });
         }
-        self.fail_columns(scope, set, &missed);
+        self.refuse_columns(scope, set, &missed);
         jobs
+    }
+    /// Remember that the budget had no room for these columns until some of it is freed.
+    fn refuse_columns(&self, scope: &str, set: &SlabSet, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().expect("ANN staging lock");
+        if state.refused.len() >= 1024 {
+            state.refused.clear();
+        }
+        let used = state.used;
+        for name in names {
+            state
+                .refused
+                .insert(column_stage_key(scope, &set.dir.key, name), used);
+        }
     }
     /// Remember that these columns could not be staged, so they are not planned again at once.
     fn fail_columns(&self, scope: &str, set: &SlabSet, names: &[String]) {
@@ -1641,10 +1678,6 @@ impl Manager {
                 limits.insert(key, len);
             }
         }
-        // Document columns that queries already project take what the cap still allows after
-        // the exact vectors. They never displace vectors: round C15 measured that each
-        // displaced vector row moves the wait from hydration to the rerank.
-        let columns = self.plan_columns(store, scope, set, &docs).await;
         if crate::ann::trace_stages() {
             let staged_rows: u64 = dir
                 .entries()
@@ -1797,7 +1830,7 @@ impl Manager {
         self.seal(&mut stage, &record, actual, descriptors)?;
         let follow = Follow {
             companions: (!companions.is_empty()).then_some((comp_lease, companions)),
-            columns,
+            docs,
         };
         Ok((stage, follow))
     }
@@ -3291,9 +3324,16 @@ mod tests {
             );
         }
         assert!(Arc::strong_count(&main) >= 1);
-        // With room again (after the retry delay), the same column is staged.
+        // The refusal stands while nothing is freed: another observation plans nothing.
+        let probes = || {
+            manager.observe(&store, "", &set, 32, 16, &|| {
+                panic!("a refused column was planned again")
+            });
+        };
+        probes();
+        assert!(manager.state.lock().unwrap().pending.is_empty());
+        // With room again, the same column is staged.
         manager.state.lock().unwrap().used = used;
-        manager.state.lock().unwrap().failed.clear();
         manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
         column_stage(&manager, &set, "text").await;
     }
