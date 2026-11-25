@@ -1796,9 +1796,7 @@ pub(crate) async fn search(
                     );
                     early.spawn(async move {
                         let work = async move {
-                            let _ =
-                                segment::projected_rows(&store, &segment, &rows, Some(&columns))
-                                    .await;
+                            let _ = segment::hydrated_rows(&store, &segment, &rows, &columns).await;
                         };
                         match context {
                             Some(context) => read_cache::scope(context, work).await,
@@ -1917,7 +1915,7 @@ pub(crate) async fn search(
         );
         early.spawn(async move {
             let work = async move {
-                let _ = segment::projected_rows(&store, &segment, &rows, Some(&columns)).await;
+                let _ = segment::hydrated_rows(&store, &segment, &rows, &columns).await;
             };
             match context {
                 Some(context) => read_cache::scope(context, work).await,
@@ -1994,8 +1992,7 @@ async fn hydrate(
         futures::future::try_join_all(rows_by_segment.iter().map(|(&i, rows)| async move {
             Ok::<_, ApiError>((
                 i,
-                segment::projected_rows(store, &docs_state.segments[i], rows, Some(columns))
-                    .await?,
+                segment::hydrated_rows(store, &docs_state.segments[i], rows, columns).await?,
             ))
         }))
         .await?
@@ -2143,6 +2140,7 @@ pub(crate) async fn slab_directory(
     vector: &[f32],
     config: &EngineConfig,
     attribute: &str,
+    segments: &[bf_wal::Segment],
 ) -> Result<(Arc<Directory>, bool), ApiError> {
     let Some(file) = set.pages.as_ref() else {
         let cached = read_cache::get::<Directory>(&set.dir.key, set.dir.metadata_len).is_some();
@@ -2153,13 +2151,21 @@ pub(crate) async fn slab_directory(
             dir.dims(),
             dir.entries().len() as u64,
             attribute,
+            &|| crate::local_ann::hydration_extras(set, segments),
         );
         return Ok((dir, cached));
     };
     let t0 = std::time::Instant::now();
     let warm = read_cache::get::<PagedDirectory>(&file.key, file.metadata_len).is_some();
     let paged = load_paged(store, file, prefetched).await?;
-    crate::local_ann::observe(store, set, paged.dims(), paged.entry_count(), attribute);
+    crate::local_ann::observe(
+        store,
+        set,
+        paged.dims(),
+        paged.entry_count(),
+        attribute,
+        &|| crate::local_ann::hydration_extras(set, segments),
+    );
     crate::ann::stage(t0, "directory header");
     paged_view(store, file, &paged, vector, config, warm).await
 }

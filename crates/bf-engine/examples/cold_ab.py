@@ -65,6 +65,11 @@ P.add_argument(
 )
 P.add_argument("--oracle", choices=["100k", "1m", "10m", "100m"], default="10m")
 P.add_argument(
+    "--include-attributes",
+    type=json.loads,
+    help='JSON include_attributes value, for example false or ["title", "text"]',
+)
+P.add_argument(
     "--nq-data",
     type=Path,
     help="prepared NQ queries.npy and truth.npy instead of the scale oracle",
@@ -94,6 +99,7 @@ items = [
             "top_k": 10,
             "consistency": {"level": "strong"},
             **({"include_attributes": ["id"]} if a.nq_data else {}),
+            **({"include_attributes": a.include_attributes} if a.include_attributes is not None else {}),
         },
     }
     for i in range(len(truth["vector"]))
@@ -131,11 +137,12 @@ def stats(client):
 def trace_summary(log):
     """Completed read waves and bytes by object kind, separate from attempted GETs."""
     reads, kinds, stages, timeline, local, slots, stage_times, lookups = [], {}, {}, [], [], [], [], []
+    hydration = []
     # Provisioning can still be appending a trace when an HTTP query completes.
     # Read only complete records; a partial trailing write is not a query failure.
     for line in log.rpartition("\n")[0].splitlines():
         if line.startswith("TRACE_READ "):
-            _, path, _, _, size, end, elapsed = line.split()
+            _, path, offset, limit, size, end, elapsed = line.split()
             reads.append((int(end) - int(elapsed), int(end)))
             kind = (
                 "routing"
@@ -155,11 +162,16 @@ def trace_summary(log):
                 {
                     "kind": kind,
                     "object": path,
+                    "offset": int(offset),
+                    "limit": int(limit),
                     "bytes": int(size),
                     "start_us": (int(end) - int(elapsed)) * 1000,
                     "end_us": int(end) * 1000,
                 }
             )
+        elif line.startswith("HYDRATION "):
+            _, key, phase, count, elapsed, end = line.split()
+            hydration.append({"object": key, "phase": phase, "rows": int(count), "start_us": int(end) - int(elapsed), "end_us": int(end)})
         elif line.startswith("LOCAL_READ "):
             local.append(
                 {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", line)}
@@ -192,6 +204,7 @@ def trace_summary(log):
         "fetch_slots": slots,
         "stage_timeline": stage_times,
         "cache_lookups": lookups,
+        "hydration_timeline": hydration,
     }
 
 
@@ -334,6 +347,7 @@ def query(name, item, client, work, proc):
         "recall": len(set(map(int, got)) & set(item["truth"])) / 10,
         "ids": got,
         "distances": [r.get("$dist") for r in res.get("rows", [])],
+        "documents": res.get("rows", []),
         "gets": sum(delta.get("attempts_" + op, 0) for op in ["get", "get_range"])
         if any(k.startswith("attempts_") for k in after)
         else None,
@@ -361,6 +375,8 @@ def query(name, item, client, work, proc):
                     "fetch_slots",
                     "stage_timeline",
                     "cache_lookups",
+                    "hydration_timeline",
+                    "documents",
                 ]
             }
         ),

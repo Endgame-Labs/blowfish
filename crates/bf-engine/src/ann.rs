@@ -558,9 +558,16 @@ async fn from_slabs(
     let (mut scores, mut docs) = match accelerated {
         Some(found) => found,
         None => {
-            let Ok((dir, _)) =
-                crate::ann_dir::slab_directory(store, set, prefetched, vector, config, attribute)
-                    .await
+            let Ok((dir, _)) = crate::ann_dir::slab_directory(
+                store,
+                set,
+                prefetched,
+                vector,
+                config,
+                attribute,
+                &state.segments,
+            )
+            .await
             else {
                 return Ok(None);
             };

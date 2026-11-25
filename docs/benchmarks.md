@@ -10498,3 +10498,100 @@ chunks (`segment.rs`, the `row_bounds.chunks(BLOCK)` loop) with its touched list
 sort with a lazy partial order, since only about 12 percent of windows are ever scored. Neither is attempted here.
 
 No EC2 cost and no bucket writes. The fixture was copied to `.scratch/` and deleted.
+
+## Round C8: faster cold hydration
+
+Round C7 left hydration on the cold critical path: with exact vectors staged, the rerank finished at
+about 58 ms (request-relative median), and the response then waited on hydration until about 125 ms.
+`BF_TRACE_STAGES` plus a new `HYDRATION` trace line split hydration into its dependent storage
+rounds on the 10M layout (24 cold queries, C7 build):
+
+| Round | Starts (p50) | Per-segment elapsed (p50) | Reads and bytes per query |
+| --- | ---: | ---: | ---: |
+| Column directory (`docs.bfc` tail) | 53 ms | 29 ms | 19 reads, 2.96 MB |
+| Column blocks (IDs-only: the `id` column) | 74 ms | 30 ms | 18 reads, 0.11 MB |
+
+The two rounds are serial, so an ID-only response paid two object-storage round trips after the
+vector work even though it returns nothing but IDs. The attribute round is the same two rounds with
+larger data reads. The directory round was the larger half in bytes, and both halves were in latency.
+
+### Change
+
+Each cold stage now also holds, for every source segment its slabs cover (admitted before any exact
+vector, smallest first, under the same cap, completion records, source-identity checks, and CRCs):
+
+- the segment's `docs.bfc` column directory (its last `max(metadata_len, 64 KiB)` bytes, staged as a
+  tail: a stored object offset plus bytes, with the offset recorded in the completion record), and
+- a derived row-to-ID map, 8 bytes per row, built from the segment's `ids.bfi` when every ID is an
+  unsigned integer. The map is bound to the ID index's identity, so a replaced index invalidates it.
+
+Hydration reads the directory from the stage through the existing `ObjectReader` hook, so attribute
+queries skip the directory round trip. An ID-only projection reads the winners' 8-byte entries from
+the map and makes no storage request. Segments with string IDs have no map and use the old path. The
+bucket format, wire format, and settings are unchanged, and completion records from C7 stay valid.
+A first attempt staged the raw `ids.bfi` instead (91.0 / 145.0 ms p50 / p90 at 10M): it removed the
+requests but spent about 28 ms decoding 70 JSON ID lists per query, so the compact map replaced it.
+
+### 10M, paired on one host
+
+One on-demand c7gd.4xlarge, CPUs 0–7, `-C target-cpu=neoverse-v1`, original 10M layout
+(`tmp/c5/10m/`, read-only), both arms staged and run alternately with caches and staging pages
+evicted before each query (`cold_ab.py --stage-arm`, C7's protocol). Control is the C7 release code
+(`90189b1`); candidate is C8.
+
+| Query | Queries | C7 p50 / p90 ms | C8 p50 / p90 ms | p50 speedup | GETs per query C7 → C8 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| IDs-only, run 1 | 100 | 126.85 / 196.27 | 58.02 / 92.96 | 2.19× | 37.9 → 4.5 |
+| IDs-only, run 2 | 200 | 130.85 / 178.11 | 58.20 / 110.60 | 2.25× | 37.8 → 4.8 |
+| `include_attributes: ["title", "text"]` | 100 | 139.62 / 193.61 | 101.55 / 164.96 | 1.37× | 75.7 → 61.5 |
+
+All 400 IDs-only and 100 attribute pairs return identical ordered IDs, distances, documents,
+planned rows, and recall (0.969). The remaining attribute time is one storage round for the column
+blocks, which start about 54 ms in (speculative rows) and finish at about 100 ms; text is far too
+large to stage. IDs-only now has no hydration wait: its stage ends 0.1 ms after the rerank
+(57.1 ms versus 57.2 ms request-relative).
+
+Staging cost at 10M: footprint **21,093,562,465 → 21,185,867,592 bytes** (+92,305,127: 12.2 MB of
+directories and 80 MB of maps), the same **9,504,006 vector rows (95.04%)**, ready in **94.0 s versus
+95.2 s**, and 197 versus 57 files. A real process restart adopts the stage with zero staged-tier payload
+GETs and the same footprint; 40 cold queries after restart have p50 / p90 **59.4 / 156.0 ms** against
+62.7 / 160.2 ms steady.
+
+### 100M
+
+Original 100M prefix (read-only), 60 queries, IDs-only, one repetition:
+
+| Arm | p50 / p90 ms | GETs per query | Staged vector rows | Ready after first query | Files | Footprint bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| C7 | 396.44 / 444.37 | 130.8 | 1,132,999 | 91.6 s | 323 | 21,126,141,716 |
+| C8 | 309.38 / 379.84 | 87.6 | 712,354 | 171.7 s | 3,897 | 21,135,885,140 |
+
+That is **1.28× at p50**, identical IDs, distances, and planned rows, and a hydration wait that falls
+from about 99 ms after the rerank to 0.3 ms. Under the unchanged cap the 100M companions (about
+0.9 GB) displace 37% of the 1.13M staged vector rows, which moves the rerank a little later (307 versus
+295 ms) and is still a net win. Provisioning takes longer because it parses about 700 JSON ID lists
+and issues about 3,570 more HEAD checks. At this scale the staged file count approaches the 4,096
+descriptor budget, so a larger layout admits fewer companions rather than refusing codes. Most 100M
+time is still scan and remote rerank reads.
+
+### Verification and cost
+
+`cargo fmt`, scoped strict clippy, and the full `bf-engine` and `bf-storage` suites pass. New tests
+cover tail offsets, bounds, and CRC verification, pooled downloads with a tail source, and derived
+row-to-ID maps (including a segment with string IDs).
+
+One on-demand c7gd.4xlarge ran from 03:17:46 to about 04:09 UTC on 2026-11-25, roughly 0.9 hours (about
+$0.65 compute, and well under the $6 cap with requests and storage). The instance, key pair, and
+security group are deleted, and no bucket object was written. To reproduce, build the C7 release
+(`90189b1`) and the C8 release with the same flags, then run:
+
+```sh
+taskset -c 0-7 uv run crates/bf-engine/examples/cold_ab.py \
+  --binary C8_BINARY --config CONFIG.local \
+  --arms '{"c7":{"BINARY":"C7_BINARY"},"c8":{}}' \
+  --stage-arm c7 --stage-arm c8 --scratch .scratch/c8-check --label ids \
+  --oracle 10m --queries 100
+```
+
+Add `--include-attributes '["title","text"]'` for the attribute comparison. `cold_ab.py` now records
+each query's documents and a `HYDRATION` timeline for this analysis.

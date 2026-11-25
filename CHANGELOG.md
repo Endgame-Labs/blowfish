@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-11-25
+
+### Changed
+
+- **Faster cold result hydration:** Local ANN stages now also hold each covered segment's document column directory and, for numeric IDs, an 8-byte-per-row row-to-ID map, admitted before exact vectors under the same staging limit, CRC checks, and adoption records. IDs-only queries finish without any storage request after the scan, and attribute queries read the directory locally and fetch only data blocks. On a cold, staged 10M-vector S3 namespace, IDs-only p50 fell from 127 to 58 ms (2.2x) with GETs per query down from 38 to 4.5, and queries returning title and text fell from 140 to 102 ms; at 100M, IDs-only p50 fell from 396 to 309 ms. Results are identical. The extra files make first staging of the 100M namespace take about 172 s instead of 92 s; scan codes are still staged first. String-ID segments keep the previous path. There is no setting.
+
 ## [0.1.26] - 2026-11-25
 
 ### Changed
@@ -213,7 +219,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.26...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.27...HEAD
+[0.1.27]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.27
 [0.1.26]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.26
 [0.1.25]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.25
 [0.1.24]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.24

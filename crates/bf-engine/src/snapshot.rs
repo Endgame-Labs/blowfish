@@ -225,6 +225,7 @@ impl OpenHint {
                                 vector,
                                 config,
                                 attribute,
+                                segments,
                             )
                             .await?;
                             // Everything this query touches is already in memory: the scan's
