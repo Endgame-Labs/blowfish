@@ -39,6 +39,8 @@ const DOWNLOADS: usize = 4;
 const RETRY: Duration = Duration::from_secs(60);
 /// Columns staged per namespace: the first this many names that queries project.
 const COLUMN_NAMES: usize = 8;
+/// Free staging budget below which no column is planned.
+const COLUMN_MIN_ROOM: u64 = 32 << 20;
 /// Bytes per ranged GET while gathering a column.
 const COLUMN_PIECE: u64 = PIECE;
 /// Concurrent ranged GETs while gathering a column.
@@ -1253,6 +1255,15 @@ impl Manager {
             Self::wanted_columns(&state, scope, set)
         };
         if names.is_empty() || docs.is_empty() {
+            return Vec::new();
+        }
+        // A full cap cannot hold a column: skip reading directories to size one.
+        let room = {
+            let state = self.state.lock().expect("ANN staging lock");
+            self.capacity.saturating_sub(state.used)
+        };
+        if room < COLUMN_MIN_ROOM {
+            self.fail_columns(scope, set, &names);
             return Vec::new();
         }
         let extents: Vec<_> = futures::stream::iter(docs.iter().cloned().map(|file| {
