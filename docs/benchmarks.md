@@ -12426,3 +12426,29 @@ c7gd.4xlarge from 14:01 to about 15:24 UTC on 2026-11-25 (about 1.4 hours, about
 taskset -c 0-7 uv run crates/bf-engine/examples/c17_ab.py --config CONFIG.local \
   --binary target/release/examples/c17_stage --scratch .scratch/c17 --label r2 --reps 2
 ```
+
+## Round C19: lossless compression of staged RaBitQ sign bits (killed)
+
+Hypothesis: within a leaf, rows' 1-bit codes are correlated enough that XOR prediction plus an entropy coder would cut the
+128-byte sign payload to about 80 bytes per row, freeing about 4.8 GB of the 100M local stage. Kill rule: best above 104
+bytes per row (under 1.23x), or decode over 1 microsecond per row.
+
+Method (`crates/bf-engine/examples/c19_signs.rs`, read-only ranged GETs from this VM): the 100M tier (`v014/big`,
+`wikipedia-100m`, 160 slabs, 1,024-d, 128 sign bytes per row). I took 3 leaves from each of 24 slabs (72 leaves, 17,738
+rows), un-transposed each leaf's fastscan code block to per-row sign bytes, and compressed in 16 KiB blocks (128 rows).
+
+| Scheme | Bytes per row | Ratio | Decode ns per row |
+|---|---:|---:|---:|
+| Raw | 128.00 | 1.00x | 0 |
+| Order-0 per-dimension entropy within the leaf (bound, not a codec) | 126.67 | 1.01x | n/a |
+| XOR previous row, then zstd 1 or 3 | 127.84 | 1.00x | 190 to 310 |
+| zstd 3 (stored fastscan layout) | 128.83 | 0.99x | n/a |
+| zstd 1 or 3, row-major | 128.10 | 1.00x | 60 to 90 |
+| XOR leaf majority pattern, then zstd 1 or 3 | 128.08 | 1.00x | 510 to 540 |
+| Bit-plane transpose, then zstd 1 or 3 | 128.90 | 0.99x | 5,500 to 6,200 |
+
+Result: **killed.** The best scheme saves 0.2 bytes per row (1.002x), far from the 104 threshold. The order-0 entropy bound,
+which is optimistic for leaves this small (about 246 rows), is still 126.7 bytes per row, so no per-dimension predictor can
+help either. Sign bits of a rotated residual are close to i.i.d. fair coins: the leaf center already absorbs the
+correlation, and that is what RaBitQ's rotation is for. Nothing to merge; the 100M stage still needs another way to make
+room for exact vectors (for example fewer routing bytes or the C18 vector codec).
