@@ -4,6 +4,16 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.50] - 2026-11-26
+
+### Changed
+
+- **The warm graph serves `top_k` up to 100:** Requests above 30 rows used the IVF tier. The graph now serves `top_k + offset` up to 100, widening its beam and exact-rerank shortlist with the request (beam about 2.56x `k`, never below the calibrated beam; shortlist 1.5x `k`). Requests of 30 rows or fewer are unchanged. On BEIR NQ (2.68M x 1024-d) on an Apple M4 at 16 clients, `top_k` 100 went from 883 to 2,806 q/s (3.2x) with recall@100 0.9523 to 0.9530.
+
+### Fixed
+
+- **Busy namespaces could never promote the warm graph:** The promotion cost test timed the IVF path, kept warm by ordinary traffic, against the graph's first, cold touch after a truth scan, so the busier the namespace, the more it favored IVF (measured on NQ: graph 3.3 ms against IVF 1.7 ms at 520 q/s, while at steady state the graph is faster). Both paths now run their trial block once untimed and are costed at steady state.
+
 ## [0.1.49] - 2026-11-26
 
 ### Changed
@@ -368,7 +378,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.49...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.50...HEAD
+[0.1.50]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.50
 [0.1.49]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.49
 [0.1.48]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.48
 [0.1.47]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.47
