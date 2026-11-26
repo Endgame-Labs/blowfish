@@ -1279,7 +1279,7 @@ async fn search_entry(
             let keep = if mode == 1 {
                 usize::MAX
             } else {
-                (per * k).max(1000)
+                5000 + per * k
             };
             entry
                 .graph
