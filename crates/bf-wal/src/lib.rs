@@ -187,20 +187,37 @@ fn fetch_cost(record: &CommitRecord) -> u64 {
     }
 }
 /// Admission control for concurrent payload fetches: bounded by count and by summed stored bytes.
-#[derive(Default)]
 struct FetchWindow {
     count: usize,
     bytes: u64,
+    /// Byte bound (`TAIL_FETCH_BYTES` unless a test narrows it).
+    limit: u64,
+    /// Most bytes ever held at once.
+    peak: u64,
+}
+impl Default for FetchWindow {
+    fn default() -> Self {
+        Self::with_limit(TAIL_FETCH_BYTES)
+    }
 }
 impl FetchWindow {
+    fn with_limit(limit: u64) -> Self {
+        Self {
+            count: 0,
+            bytes: 0,
+            limit,
+            peak: 0,
+        }
+    }
     /// Admit a fetch of `cost` bytes if it fits; the first fetch always does.
     fn admit(&mut self, cost: u64) -> bool {
         let fits = self.count == 0
             || (self.count < TAIL_FETCH_CONCURRENCY
-                && self.bytes.saturating_add(cost) <= TAIL_FETCH_BYTES);
+                && self.bytes.saturating_add(cost) <= self.limit);
         if fits {
             self.count += 1;
             self.bytes = self.bytes.saturating_add(cost);
+            self.peak = self.peak.max(self.bytes);
         }
         fits
     }
@@ -216,23 +233,37 @@ struct FetchBudget {
     window: std::sync::Mutex<FetchWindow>,
     freed: tokio::sync::Notify,
 }
-/// Holds a fetch's share of the budget until dropped (finished, failed, or cancelled).
+/// Holds a fetch's share of the budget until dropped. A permit lives as long as the bytes it paid
+/// for: it travels with the fetched body and is dropped only once the ordered replay has consumed
+/// the decoded entry (or the fetch is abandoned), so fetched-but-unconsumed bodies stay in budget.
 struct FetchPermit {
     budget: std::sync::Arc<FetchBudget>,
     cost: u64,
 }
 impl FetchBudget {
+    fn with_limit(limit: u64) -> Self {
+        Self {
+            window: std::sync::Mutex::new(FetchWindow::with_limit(limit)),
+            freed: tokio::sync::Notify::default(),
+        }
+    }
+    /// A permit now, or `None` when the budget has no room.
+    fn try_acquire(self: &std::sync::Arc<Self>, cost: u64) -> Option<FetchPermit> {
+        let mut window = self.window.lock().expect("fetch window");
+        let cost = cost.min(window.limit);
+        window.admit(cost).then(|| FetchPermit {
+            budget: self.clone(),
+            cost,
+        })
+    }
     async fn acquire(self: &std::sync::Arc<Self>, cost: u64) -> FetchPermit {
         loop {
             let freed = self.freed.notified();
             let mut freed = std::pin::pin!(freed);
             // Register before checking, so a permit dropped in between is not missed.
             freed.as_mut().enable();
-            if self.window.lock().expect("fetch window").admit(cost) {
-                return FetchPermit {
-                    budget: self.clone(),
-                    cost,
-                };
+            if let Some(permit) = self.try_acquire(cost) {
+                return permit;
             }
             freed.await;
         }
@@ -252,7 +283,8 @@ impl Drop for FetchPermit {
 /// by a record naming exactly this key, and aborted when dropped.
 struct Speculative {
     size: u64,
-    task: tokio::task::JoinHandle<Result<bytes::Bytes, bf_storage::Error>>,
+    /// Resolves to the body and the permit paying for it; dropping this drops both at once.
+    task: tokio::task::JoinHandle<(Result<bytes::Bytes, bf_storage::Error>, FetchPermit)>,
 }
 impl Drop for Speculative {
     fn drop(&mut self) {
@@ -260,7 +292,9 @@ impl Drop for Speculative {
     }
 }
 /// Speculative bodies by payload key.
-type Speculation = std::collections::HashMap<String, Speculative>;
+/// Ordered by key, so by slot: permits are requested in slot order and unused bodies are dropped
+/// by slot.
+type Speculation = std::collections::BTreeMap<String, Speculative>;
 /// Listed payloads started at most, so a huge listed run does not spawn a task per slot.
 const SPECULATIVE_BODIES: usize = 256;
 impl CommitRecord {
@@ -811,12 +845,11 @@ impl Wal {
         }
     }
     /// Decode a record's entry. `prefetched` is a body already fetched from this record's own
-    /// payload key; otherwise the body is fetched, under `budget` when one is given.
+    /// payload key; otherwise the body is fetched here (the caller holds any budget permit).
     async fn materialize(
         &self,
         record: &CommitRecord,
         prefetched: Option<bytes::Bytes>,
-        budget: Option<&std::sync::Arc<FetchBudget>>,
     ) -> Result<WalEntry, Error> {
         if record.tombstone {
             return Ok(WalEntry {
@@ -840,17 +873,11 @@ impl Wal {
         }
         let bytes = match prefetched {
             Some(bytes) => bytes,
-            None => {
-                let _permit = match budget {
-                    Some(budget) => Some(budget.acquire(fetch_cost(record)).await),
-                    None => None,
-                };
-                match self.store.get(&self.record_payload_key(record)).await {
-                    Ok(bytes) => bytes,
-                    Err(bf_storage::Error::NotFound) => return Err(Error::Pruned),
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            None => match self.store.get(&self.record_payload_key(record)).await {
+                Ok(bytes) => bytes,
+                Err(bf_storage::Error::NotFound) => return Err(Error::Pruned),
+                Err(e) => return Err(e.into()),
+            },
         };
         let entry = WalEntry::decode(&bytes)?;
         if entry.write_id != record.write_id || entry.tombstone {
@@ -861,7 +888,7 @@ impl Wal {
     /// Read a slot. A reclaimed pre-tombstone payload returns `Error::Pruned`.
     pub async fn read(&self, seq: u64) -> Result<Option<WalEntry>, Error> {
         match self.record(seq).await? {
-            Some(record) => Ok(Some(self.materialize(&record, None, None).await?)),
+            Some(record) => Ok(Some(self.materialize(&record, None).await?)),
             None => Ok(None),
         }
     }
@@ -892,6 +919,7 @@ impl Wal {
     ) -> Result<(Vec<(u64, CommitRecord)>, Speculation), Error> {
         use futures::StreamExt;
         let mut speculation = Speculation::new();
+        let mut previous: Option<tokio::sync::oneshot::Receiver<()>> = None;
         let mut records = vec![];
         let mut seq = after + 1;
         let mut window = 2u64;
@@ -957,9 +985,19 @@ impl Wal {
                     }
                     let (wal, budget, key) = (self.clone(), budget.clone(), object.key.clone());
                     let size = object.size;
+                    // Permits are requested in slot order (each task waits until the previous one
+                    // has its permit, or was dropped): the bodies holding the budget are always a
+                    // prefix of the unconsumed ones, so the replay's next body is never starved
+                    // by later ones waiting to be consumed.
+                    let (acquired, next) = tokio::sync::oneshot::channel();
+                    let before = previous.replace(next);
                     let task = tokio::spawn(async move {
-                        let _permit = budget.acquire(size).await;
-                        wal.store.get(&key).await
+                        if let Some(before) = before {
+                            let _ = before.await;
+                        }
+                        let permit = budget.acquire(size).await;
+                        let _ = acquired.send(());
+                        (wal.store.get(&key).await, permit)
                     });
                     speculation.insert(object.key, Speculative { size, task });
                 }
@@ -994,11 +1032,35 @@ impl Wal {
         after: u64,
         max_bytes: u64,
     ) -> Result<Vec<(u64, WalEntry)>, Error> {
+        let budget = std::sync::Arc::new(FetchBudget::default());
+        self.tail_with_budget(after, max_bytes, &budget).await
+    }
+
+    /// `tail_bounded` with a narrower byte budget for fetched payloads, also returning the most
+    /// bytes the budget ever held at once. For tests of the memory bound.
+    #[doc(hidden)]
+    pub async fn tail_bounded_measured(
+        &self,
+        after: u64,
+        max_bytes: u64,
+        fetch_bytes: u64,
+    ) -> Result<(Vec<(u64, WalEntry)>, u64), Error> {
+        let budget = std::sync::Arc::new(FetchBudget::with_limit(fetch_bytes));
+        let entries = self.tail_with_budget(after, max_bytes, &budget).await?;
+        let peak = budget.window.lock().expect("fetch window").peak;
+        Ok((entries, peak))
+    }
+
+    async fn tail_with_budget(
+        &self,
+        after: u64,
+        max_bytes: u64,
+        budget: &std::sync::Arc<FetchBudget>,
+    ) -> Result<Vec<(u64, WalEntry)>, Error> {
         use futures::StreamExt;
         let mut previous_head = None;
-        let budget = std::sync::Arc::new(FetchBudget::default());
         loop {
-            let (records, mut speculation) = self.scan_slots(after, &budget).await?;
+            let (records, mut speculation) = self.scan_slots(after, budget).await?;
             let seq = after + 1 + records.len() as u64;
             let start = records.iter().rposition(|(_, r)| r.tombstone).unwrap_or(0);
             let mut entries = vec![];
@@ -1007,40 +1069,73 @@ impl Wal {
             // Out-of-line payloads are fetched concurrently (a cold reader of n of them paid n
             // serial round trips), yielded in WAL order, so entries are applied, budgeted, and
             // failed exactly as the serial loop did. Every fetch, including the speculative ones
-            // `scan_slots` started, holds a share of one `FetchBudget` while it runs: at most
+            // `scan_slots` started, holds a share of one `FetchBudget`: at most
             // `TAIL_FETCH_CONCURRENCY` of them, and their summed stored sizes under
             // `TAIL_FETCH_BYTES` (the first always proceeds). A record without a size (older
             // releases) counts as the whole budget, so it fetches alone. Inline entries and
-            // tombstones cost nothing. Stopping early (budget, pruned, or error) drops the
-            // fetches still in flight, speculative ones included.
+            // tombstones cost nothing.
+            //
+            // A share is held until the replay has consumed the entry (not merely until the GET
+            // finishes), so fetched bodies waiting for their turn count against the budget.
+            // Ordinary fetches are admitted here in WAL order, and the loop waits for the replay
+            // to free room rather than admitting a later fetch ahead of an earlier one, so the
+            // next entry to be consumed is never starved. Stopping early (budget, pruned, or
+            // error) drops the fetches still in flight, speculative ones included, and with them
+            // their bodies and shares.
             let mut pending = records.into_iter().skip(start).peekable();
             let mut in_flight = futures::stream::FuturesOrdered::new();
             loop {
                 while in_flight.len() < TAIL_FETCH_LOOKAHEAD {
-                    let Some((seq, record)) = pending.next() else {
+                    let Some((seq, record)) = pending.peek() else {
                         break;
                     };
+                    let seq = *seq;
+                    let key = self.record_payload_key(record);
+                    let cost = fetch_cost(record);
+                    // Speculative bodies of this slot or an earlier one that this record does not
+                    // use (a losing write, a size mismatch) go now, freeing their shares.
+                    let claimed = speculation.remove(&key);
+                    while speculation
+                        .first_key_value()
+                        .is_some_and(|(k, _)| payload_slot(k).is_none_or(|slot| slot <= seq))
+                    {
+                        speculation.pop_first();
+                    }
                     // A speculative body counts only for a record whose payload key is exactly
                     // the listed one, and whose recorded size (when it has one) agrees.
-                    let speculative = if fetch_cost(&record) == 0 {
+                    let speculative = (cost > 0)
+                        .then_some(claimed)
+                        .flatten()
+                        .filter(|s| record.payload_bytes.is_none_or(|n| n == s.size));
+                    let permit = if cost == 0 || speculative.is_some() {
                         None
                     } else {
-                        speculation
-                            .remove(&self.record_payload_key(&record))
-                            .filter(|s| record.payload_bytes.is_none_or(|n| n == s.size))
+                        // This record fetches on its own, so later speculative bodies must not
+                        // hold budget it may need: drop them (a later record then fetches too).
+                        speculation.clear();
+                        match budget.try_acquire(cost) {
+                            Some(permit) => Some(permit),
+                            None if in_flight.is_empty() => Some(budget.acquire(cost).await),
+                            // Wait for the replay to consume entries and free room.
+                            None => break,
+                        }
                     };
-                    let budget = &budget;
+                    let (_, record) = pending.next().expect("peeked");
                     in_flight.push_back(async move {
-                        let body = match speculative {
-                            // A failed or cancelled speculative GET (including a payload deleted
-                            // since the listing) falls back to the record's own fetch.
-                            Some(mut s) => (&mut s.task).await.ok().and_then(Result::ok),
-                            None => None,
+                        let (body, permit) = match speculative {
+                            // A failed speculative GET (including a payload deleted since the
+                            // listing) falls back to the record's own fetch, under the same share.
+                            Some(mut s) => match (&mut s.task).await {
+                                Ok((Ok(body), permit)) => (Some(body), Some(permit)),
+                                Ok((Err(_), permit)) => (None, Some(permit)),
+                                Err(_) => (None, None),
+                            },
+                            None => (None, permit),
                         };
-                        (seq, self.materialize(&record, body, Some(budget)).await)
+                        (seq, self.materialize(&record, body).await, permit)
                     });
                 }
-                let Some((seq, materialized)) = in_flight.next().await else {
+                let Some((seq, materialized, _permit)) = in_flight.next().await else {
                     break;
                 };
                 match materialized {

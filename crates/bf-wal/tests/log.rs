@@ -982,6 +982,8 @@ mod speculative {
         peak: AtomicUsize,
         hide: Mutex<Option<Hide>>,
         fail: bool,
+        /// Payload keys containing this text take 200 ms (a slow first slot makes later bodies wait).
+        slow: Mutex<Option<String>>,
     }
     impl std::fmt::Debug for Spy {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1015,7 +1017,14 @@ mod speculative {
                 self.gets.lock().unwrap().push(p.to_string());
                 let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let slow = self
+                    .slow
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|n| p.as_ref().contains(n.as_str()));
+                let ms = if slow { 200 } else { 5 };
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 let result = self.inner.get_opts(p, o).await;
                 self.active.fetch_sub(1, Ordering::SeqCst);
                 return result;
@@ -1072,6 +1081,7 @@ mod speculative {
             peak: AtomicUsize::new(0),
             hide: Mutex::new(hide),
             fail,
+            slow: Mutex::new(None),
         });
         let store = Storage::from_backend(spy.clone(), Path::from(""), false, false)
             .await
@@ -1244,5 +1254,76 @@ mod speculative {
         f.spy.gets.lock().unwrap().clear();
         assert_eq!(f.wal.tail(0).await.unwrap().len(), 25);
         assert!(gets_of(&f, "wal-data/0000000000000000000") <= 25 + 1);
+    }
+
+    /// The largest stored size of a payload body, from the listing.
+    async fn body_size(f: &Fixture) -> u64 {
+        let listed: Vec<_> = f
+            .inner
+            .list(Some(&Path::from("ns/ns/wal-data")))
+            .collect()
+            .await;
+        listed
+            .iter()
+            .map(|m| m.as_ref().unwrap().size)
+            .max()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fetched_bodies_waiting_for_the_replay_stay_inside_the_byte_budget() {
+        let f = fixture(false, None).await;
+        append_external(&f.wal, 1..=60).await;
+        let size = body_size(&f).await;
+        // Slot 1's body is slow, so every later body finishes first and waits for its turn.
+        *f.spy.slow.lock().unwrap() = Some("wal-data/00000000000000000001-".into());
+        for bodies in [1u64, 3, 8] {
+            let limit = bodies * size;
+            let (tail, peak) = f
+                .wal
+                .tail_bounded_measured(0, u64::MAX, limit)
+                .await
+                .unwrap();
+            assert_eq!(tail.len(), 60);
+            assert!(tail.iter().all(|(s, e)| tag_of(e) == *s as usize));
+            assert!(peak <= limit, "peak {peak} over the budget {limit}");
+            if bodies > 1 {
+                assert!(peak > size / 2 * 3, "bodies fetched together: {peak}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_budget_holds_with_unused_speculative_bodies_and_never_stalls() {
+        let f = fixture(false, None).await;
+        append_external(&f.wal, 1..=4).await;
+        // Losing writes' bodies under slots later committed by others, and a wrong-size record.
+        for slot in [5u64, 6, 7] {
+            f.wal
+                .stage(slot, &external_entry(900 + slot as usize))
+                .await
+                .unwrap();
+        }
+        append_external(&f.wal, 5..=30).await;
+        put_sizeless_slot(&f, 31, &external_entry(31), Some(1)).await;
+        append_external(&f.wal, 32..=40).await;
+        let size = body_size(&f).await;
+        *f.spy.slow.lock().unwrap() = Some("wal-data/00000000000000000005-".into());
+        for bodies in [1u64, 2, 4] {
+            let limit = bodies * size;
+            let (tail, peak) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                f.wal.tail_bounded_measured(0, u64::MAX, limit),
+            )
+            .await
+            .expect("no stall")
+            .unwrap();
+            assert_eq!(tail.len(), 40);
+            assert!(tail.iter().all(|(s, e)| tag_of(e) == *s as usize));
+            assert!(
+                peak <= limit.max(size),
+                "peak {peak} over the budget {limit}"
+            );
+        }
     }
 }
