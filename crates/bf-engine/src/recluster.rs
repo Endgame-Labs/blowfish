@@ -174,7 +174,10 @@ impl Engine {
             let context = crate::read_cache::ReadContext::new(self.0.read_cache.clone());
             crate::read_cache::scope(
                 context,
-                self.build_tier_inner(ns, manifest, target, opts, job),
+                crate::vector_locator::scope_manifest(
+                    manifest,
+                    self.build_tier_inner(ns, manifest, target, opts, job),
+                ),
             )
             .await
         })
@@ -193,13 +196,16 @@ impl Engine {
         let store = &self.0.store;
         let attr = opts.attribute.as_str();
         let wal = Wal::new(store.clone(), ns).map_err(log_error)?;
-        let ann_key = format!("annv2:{attr}");
+        let sources = crate::vector_locator::Sources::from_manifest(manifest);
         if segments.is_empty()
             || segments
                 .iter()
-                .any(|s| crate::upgrade::files(s, attr).is_none())
+                .any(|s| crate::upgrade::files(s, attr).is_none() && !sources.covers(s, attr))
         {
-            return Err(ApiError::new(400, "every segment needs an ANN index"));
+            return Err(ApiError::new(
+                400,
+                "every segment needs an authoritative vector source",
+            ));
         }
 
         // Global row numbers: segment bases in manifest order.
@@ -217,12 +223,20 @@ impl Engine {
         if total >= u64::from(u32::MAX) {
             return Err(ApiError::new(400, "too many rows for one recluster"));
         }
-        let first = segment_index(store, &segments[0], &ann_key).await?;
-        let (dims, width) = (first.dims(), first.vector_row_bytes());
-        let (dtype, metric) = (
-            first.vector_type(),
-            segment::vector_metric(manifest.distance_metric),
-        );
+        let (dims, dtype) = segments[0]
+            .schema
+            .get(attr)
+            .and_then(segment::dense_type)
+            .ok_or_else(segment::corrupt)?;
+        if segments
+            .iter()
+            .any(|s| s.schema.get(attr).and_then(segment::dense_type) != Some((dims, dtype)))
+        {
+            return Err(segment::corrupt());
+        }
+        let width = dims * dtype.width();
+        let metric = segment::vector_metric(manifest.distance_metric);
+        let inputs = crate::vector_locator::inputs::inputs(store, manifest, segments, attr).await?;
 
         // Pass 1: copy every live row's vector into a spill file indexed by global row.
         // Keep the owner in this future: dropping it unlinks the spill even if a blocking
@@ -230,13 +244,13 @@ impl Engine {
         let spill = spill::Spill::create(&opts.scratch, total * width as u64)
             .map_err(segment::index_error)?;
         self.recluster_with_spill(
-            target,
             &wal,
             opts,
             covered,
             spill.file.clone(),
             (dims, width, dtype, metric),
-            first,
+            inputs,
+            target,
             t0,
             job,
         )
@@ -246,21 +260,19 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn recluster_with_spill(
         &self,
-        target: &Target,
         wal: &Wal,
         opts: &ReclusterOptions,
         covered: Vec<SlabCover>,
         spill: Arc<std::fs::File>,
         (dims, width, dtype, metric): (usize, usize, bf_vector::VectorType, bf_vector::Metric),
-        first: Arc<bf_vector::Index<segment::ObjectReader>>,
+        inputs: Vec<crate::vector_locator::inputs::Input>,
+        target: &Target,
         t0: std::time::Instant,
         job: &Job,
     ) -> Result<Built, ApiError> {
         let store = &self.0.store;
         let (attr, ns) = (opts.attribute.as_str(), wal.namespace().to_string());
-        let ann_key = format!("annv2:{attr}");
-        let segments = target.segments.clone();
-        let bases: Vec<u32> = covered.iter().map(|c| c.base).collect();
+
         // Cluster payloads arrive contiguously. Keep that order on disk instead of scattering
         // millions of tiny writes by global row; a four-byte address per row preserves identity.
         let total_rows: usize = covered.iter().map(|c| c.rows as usize).sum();
@@ -270,70 +282,75 @@ impl Engine {
         let next_spill_row = std::sync::atomic::AtomicU32::new(0);
         let copy_stage = Stage::new("copy");
         let spill_write_nanos = std::sync::atomic::AtomicU64::new(0);
-        let copied: Vec<Vec<u32>> = futures::stream::iter(segments.into_iter().zip(bases).map(
-            |(seg, base): (Segment, u32)| {
-                let spill = spill.clone();
-                let ann_key = ann_key.clone();
-                let spill_write_nanos = &spill_write_nanos;
-                let spill_offsets = &spill_offsets;
-                let next_spill_row = &next_spill_row;
-                async move {
-                    job.pause().await;
-                    let index = segment_index(store, &seg, &ann_key).await?;
-                    let live = if seg.live_generation == 0 {
-                        None
-                    } else {
-                        Some(segment::live(store, &seg).await?)
-                    };
-                    let mut present = Vec::new();
-                    let clusters = index.cluster_count();
-                    let mut reads = futures::stream::iter((0..clusters).map(|c| {
-                        let index = index.clone();
-                        async move { index.read_cluster_rows(c).await }
-                    }))
-                    .buffer_unordered(32);
-                    while let Some((rows, bytes)) =
-                        reads.try_next().await.map_err(segment::index_error)?
-                    {
-                        // Dead rows never reach the spill: compact the live rows of this
-                        // cluster, keeping their order, and address them by global row below.
-                        let is_live = |row: u32| live.as_ref().is_none_or(|l| l.contains(row));
-                        let kept = rows.iter().filter(|r| is_live(**r)).count();
-                        if kept == 0 {
-                            continue;
-                        }
-                        let writing = std::time::Instant::now();
-                        let start = next_spill_row
-                            .fetch_add(kept as u32, std::sync::atomic::Ordering::Relaxed);
-                        if kept == rows.len() {
-                            spill
-                                .write_all_at(&bytes, u64::from(start) * width as u64)
-                                .map_err(segment::index_error)?;
-                        } else {
-                            let mut packed = Vec::with_capacity(kept * width);
-                            for (i, row) in rows.iter().enumerate() {
-                                if is_live(*row) {
-                                    packed.extend_from_slice(&bytes[i * width..(i + 1) * width]);
-                                }
-                            }
-                            spill
-                                .write_all_at(&packed, u64::from(start) * width as u64)
-                                .map_err(segment::index_error)?;
-                        }
-                        for (slot, row) in rows.iter().filter(|r| is_live(**r)).enumerate() {
-                            spill_offsets[(base + *row) as usize]
-                                .store(start + slot as u32, std::sync::atomic::Ordering::Relaxed);
-                            present.push(base + *row);
-                        }
-                        spill_write_nanos.fetch_add(
-                            writing.elapsed().as_nanos() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
-                    Ok::<_, ApiError>(present)
+        let copied: Vec<Vec<u32>> = futures::stream::iter(inputs.into_iter().map(|input| {
+            let spill = spill.clone();
+            let spill_write_nanos = &spill_write_nanos;
+            let spill_offsets = &spill_offsets;
+            let next_spill_row = &next_spill_row;
+            async move {
+                job.pause().await;
+                let index = Arc::new(
+                    bf_vector::Index::open_with_metadata_len(
+                        segment::ObjectReader::new(store, &input.file).bypass_cache(),
+                        input.file.metadata_len,
+                    )
+                    .await
+                    .map_err(segment::index_error)?,
+                );
+                if index.dims() != dims || index.vector_type() != dtype {
+                    return Err(segment::corrupt());
                 }
-            },
-        ))
+                let mut present = Vec::new();
+                let clusters = index.cluster_count();
+                let mut reads = futures::stream::iter((0..clusters).map(|c| {
+                    let index = index.clone();
+                    async move { index.read_cluster_rows(c).await }
+                }))
+                .buffer_unordered(32);
+                while let Some((rows, bytes)) =
+                    reads.try_next().await.map_err(segment::index_error)?
+                {
+                    // Dead rows never reach the spill: compact the live rows of this
+                    // cluster, keeping their order, and address them by global row below.
+                    let globals: Vec<Option<u32>> = rows
+                        .iter()
+                        .map(|r| input.global(*r))
+                        .collect::<Result<_, _>>()?;
+                    let kept = globals.iter().flatten().count();
+                    if kept == 0 {
+                        continue;
+                    }
+                    let writing = std::time::Instant::now();
+                    let start =
+                        next_spill_row.fetch_add(kept as u32, std::sync::atomic::Ordering::Relaxed);
+                    if kept == rows.len() {
+                        spill
+                            .write_all_at(&bytes, u64::from(start) * width as u64)
+                            .map_err(segment::index_error)?;
+                    } else {
+                        let mut packed = Vec::with_capacity(kept * width);
+                        for (i, row) in globals.iter().enumerate() {
+                            if row.is_some() {
+                                packed.extend_from_slice(&bytes[i * width..(i + 1) * width]);
+                            }
+                        }
+                        spill
+                            .write_all_at(&packed, u64::from(start) * width as u64)
+                            .map_err(segment::index_error)?;
+                    }
+                    for (slot, row) in globals.iter().flatten().enumerate() {
+                        spill_offsets[*row as usize]
+                            .store(start + slot as u32, std::sync::atomic::Ordering::Relaxed);
+                        present.push(*row);
+                    }
+                    spill_write_nanos.fetch_add(
+                        writing.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                Ok::<_, ApiError>(present)
+            }
+        }))
         .buffer_unordered(6)
         .try_collect()
         .await?;
@@ -371,7 +388,6 @@ impl Engine {
         let spill_read_nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let read_row = {
             let spill = spill.clone();
-            let first = first.clone();
             let spill_read_nanos = spill_read_nanos.clone();
             let spill_offsets = spill_offsets.clone();
             move |g: u32, buf: &mut Vec<u8>| -> Vec<f32> {
@@ -384,7 +400,7 @@ impl Engine {
                     reading.elapsed().as_nanos() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                bf_vector::prepare_vector(&first.decode_stored(buf), metric)
+                bf_vector::prepare_vector(&crate::vector_locator::decode(dtype, buf), metric)
             }
         };
         let reused = match &target.coarse {
@@ -590,6 +606,11 @@ impl Engine {
                 let prefix = format!("ns/{ns2}/slabs/{id2}");
                 let key = format!("{prefix}/ann.{}.bfa", uuid::Uuid::new_v4());
                 let blob = bytes::Bytes::from(blob);
+                let member = bf_vector::Index::open_with_metadata_len(blob.clone(), meta)
+                    .await
+                    .map_err(segment::index_error)?
+                    .membership()
+                    .map_err(segment::index_error)?;
                 let put = segment::put_bytes(&store2, key.clone(), blob.clone(), meta);
                 let ann = match (&prestage2, lens) {
                     (Some(pre), lens) if lens.0 > 0 => {
@@ -600,6 +621,8 @@ impl Engine {
                     _ => put.await?,
                 };
                 let mut files = std::collections::BTreeMap::new();
+                let rows = crate::slab_rows::write(&store2, &ns2, &ann, &member).await?;
+                files.insert(crate::slab_rows::role(&attr2), rows);
                 files.insert(format!("annv2:{attr2}"), ann);
                 uploads2.lock().await.push(Segment {
                     id: id2,
@@ -716,29 +739,6 @@ async fn read_coarse(
                 .collect()
         })
         .collect())
-}
-
-/// Open a segment's index directly (not through the decoded cache: a recluster reads each once).
-async fn segment_index(
-    store: &bf_storage::Storage,
-    seg: &Segment,
-    key: &str,
-) -> Result<Arc<bf_vector::Index<segment::ObjectReader>>, ApiError> {
-    // Training reads stored vectors, not the code layout or the old slab tier. The vector
-    // reader already understands old indexes, so a rebuild need not first rewrite them.
-    let legacy = key.strip_prefix("annv2:").map(|attr| format!("ann:{attr}"));
-    let file = seg
-        .files
-        .get(key)
-        .or_else(|| legacy.as_ref().and_then(|key| seg.files.get(key)))
-        .ok_or_else(|| segment::index_error("recluster source has no ANN index"))?;
-    bf_vector::Index::open_with_metadata_len(
-        segment::ObjectReader::new(store, file).bypass_cache(),
-        file.metadata_len,
-    )
-    .await
-    .map(Arc::new)
-    .map_err(segment::index_error)
 }
 
 /// A slab's object bytes, its metadata length, and the lengths a stage holds of it.

@@ -844,6 +844,21 @@ impl PackedColumn {
         Ok(())
     }
 }
+/// One deterministic ANN recipe for new segments and restored independent ownership.
+pub(crate) fn ann_builder(
+    dims: usize,
+    metric: bf_vector::Metric,
+    dtype: bf_vector::VectorType,
+    rows: usize,
+) -> Result<bf_vector::IndexBuilder, bf_vector::Error> {
+    Ok(bf_vector::IndexBuilder::new(dims, metric)?
+        .params(bf_vector::BuildParams {
+            clusters: Some(((rows as f64).sqrt().ceil() as usize).max(1)),
+            ..Default::default()
+        })
+        .vector_type(dtype))
+}
+
 /// The dimensions and stored precision of a dense vector attribute (None for any other type).
 pub(crate) fn dense_type(
     config: &bf_types::AttributeSchema,
@@ -912,13 +927,7 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
         let metric = vector_metric(metric);
         // Leaf clusters: sqrt(rows).
         let job = tokio::task::spawn_blocking(move || {
-            let params = bf_vector::BuildParams {
-                clusters: Some(((packed.rows.len() as f64).sqrt().ceil() as usize).max(1)),
-                ..Default::default()
-            };
-            bf_vector::IndexBuilder::new(dimensions, metric)?
-                .params(params)
-                .vector_type(dtype)
+            ann_builder(dimensions, metric, dtype, packed.rows.len())?
                 .build_packed(packed.rows, packed.data)
         });
         ann_jobs.push((name.clone(), column, job));
@@ -1547,6 +1556,23 @@ pub(crate) async fn projection_directory(
 }
 
 async fn read_ann_packed(
+    store: &Storage,
+    segment: &Segment,
+    rows: &RoaringBitmap,
+    attribute: &str,
+    bypass: bool,
+) -> Result<(Vec<u32>, Vec<u8>), ApiError> {
+    if crate::upgrade::files(segment, attribute).is_none()
+        && let Some(sources) = read_cache::context()
+            .and_then(|c| c.vectors)
+            .filter(|s| s.covers(segment, attribute))
+    {
+        return sources.read(store, segment, rows, attribute, bypass).await;
+    }
+    read_own_ann_packed(store, segment, rows, attribute, bypass).await
+}
+
+pub(crate) async fn read_own_ann_packed(
     store: &Storage,
     segment: &Segment,
     rows: &RoaringBitmap,

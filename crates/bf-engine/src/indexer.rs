@@ -476,7 +476,29 @@ impl Engine {
         // covers (compaction leaves them alone).
         let protected = self.0.jobs.protected(ns);
         let installing = self.0.jobs.has_pending(ns);
-        let state = {
+        // Object existence is advisory until this pass claims its publication epoch. Probe
+        // outside the namespace lock, so an idle survey never stalls queries or commits.
+        let (tiers, probe_due) = {
+            let state = handle.state.load();
+            (
+                state.ann_tiers.clone(),
+                force || state.refreshed.elapsed() >= self.0.config.index_age,
+            )
+        };
+        let missing_map = if probe_due {
+            self.0.store.cached_bucket_format().map_err(storage_error)?;
+            crate::slab_rows::missing(
+                &self.0.store,
+                &tiers,
+                handle
+                    .row_map_probe
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+            .await?
+        } else {
+            None
+        };
+        let (state, row_maps) = {
             let mut state = handle.state.lock().await;
             if state.root_only {
                 // Queries keep the compact manifest copy; a build must publish the segments' text
@@ -487,11 +509,14 @@ impl Engine {
             // writers at the configured maximum tail age while idle, rather than
             // holding this lock across two object-store calls on every tick.
             if !force
+                && missing_map.is_none()
                 && state.seq > 0
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
                 && tier(&state, &self.0.config, force, &protected, bulk(&state)).is_empty()
-                && !needs_text_upgrade(&state)
+                && !(needs_text_upgrade(&state)
+                    || (crate::slab_rows::needs(&state.ann_tiers)
+                        || crate::vector_locator::needs_retirement(&state, &protected)))
                 && !installing
             {
                 return Ok(false);
@@ -503,6 +528,7 @@ impl Engine {
             if !state.exists {
                 return Ok(false);
             }
+            let row_maps = crate::slab_rows::needs(&state.ann_tiers) || missing_map.is_some();
             let will_rebuild = state.segments.iter().any(|seg| {
                 state
                     .schema
@@ -519,7 +545,9 @@ impl Engine {
                     })
             });
             let will_compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
-            let upgrade = needs_text_upgrade(&state) || installing;
+            let upgrade = needs_text_upgrade(&state)
+                || (row_maps || crate::vector_locator::needs_retirement(&state, &protected))
+                || installing;
             if state.seq == state.indexed_through
                 && will_compact.is_empty()
                 && !will_rebuild
@@ -542,7 +570,7 @@ impl Engine {
             {
                 return Ok(false);
             }
-            state.clone()
+            (state.clone(), row_maps)
         };
         if !state.exists {
             return Ok(false);
@@ -581,7 +609,9 @@ impl Engine {
         }
         crate::ann::stage(t0, "idx hydrate");
         let compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
-        let upgrade = needs_text_upgrade(&state) || installing;
+        let upgrade = needs_text_upgrade(&state)
+            || (row_maps || crate::vector_locator::needs_retirement(&state, &protected))
+            || installing;
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
         }
@@ -614,12 +644,12 @@ impl Engine {
             indexed_through: 0,
             indexer_epoch: 0,
             deleted: false,
-            segments: vec![],
+            segments: state.segments.to_vec(),
             stats: Default::default(),
             text_stats: None,
             ann_dirs: Default::default(),
-            ann_tiers: Default::default(),
-            lineage: Default::default(),
+            ann_tiers: (*state.ann_tiers).clone(),
+            lineage: (*state.lineage).clone(),
             updated_at: None,
             retired: vec![],
             checkpoints: vec![],
@@ -690,7 +720,9 @@ impl Engine {
             manifest.stats = NamespaceStats::default();
             for seg in &state.segments {
                 let live = snapshot::allowed(store, &state, seg, None).await?;
-                let mut docs = segment::documents(store, seg, &live).await?;
+                let mut docs =
+                    crate::vector_locator::scope(&state, segment::documents(store, seg, &live))
+                        .await?;
                 for doc in docs.values_mut() {
                     doc.retain(|name, _| state.schema.contains_key(name));
                 }
@@ -738,8 +770,11 @@ impl Engine {
             crate::ann::stage(t0, "idx pre-live");
             let mut covered = covered_segments(&manifest);
             covered.extend(protected.iter().cloned());
-            let (masks, removed) =
-                crate::statistics::removals(store, &state, self.0.config.build_concurrency).await?;
+            let (masks, removed) = crate::vector_locator::scope(
+                &state,
+                crate::statistics::removals(store, &state, self.0.config.build_concurrency),
+            )
+            .await?;
             if external {
                 removed_stats = removed;
             } else {
@@ -792,8 +827,11 @@ impl Engine {
                                 segment::ids(store, &seg).await?,
                             ));
                         }
-                        let (docs, vectors) =
-                            segment::compaction_rows(store, &seg, &live, &strip).await?;
+                        let (docs, vectors) = crate::vector_locator::scope(
+                            &state,
+                            segment::compaction_rows(store, &seg, &live, &strip),
+                        )
+                        .await?;
                         compact_docs.extend(crate::shared(docs));
                         for (name, part) in vectors {
                             compact_vectors.entry(name).or_default().push(part);
@@ -948,13 +986,24 @@ impl Engine {
         };
         manifest.deleted = false;
         manifest.segments = segments;
+        let old_vectors = crate::vector_locator::Sources::new(&state);
         retire_stale_tiers(&mut manifest);
+        crate::vector_locator::restore_uncovered(store, ns, &mut manifest, &old_vectors).await?;
         // Rewrite bounded batches under this publication's epoch claim. A failed or fenced
         // pass leaves only unreferenced objects for GC; it never deletes uncertain uploads.
         let old = crate::text_upgrade::upgrade(store, ns, &mut manifest.segments).await?;
         for key in old {
             retire(&mut manifest, key);
         }
+        // A finished recluster tier joins this publication if its segments are still here.
+        let installed = self.0.jobs.install(ns, &mut manifest);
+        if installed.is_some() {
+            // A new base covers the merged segments' targets itself: their lineage goes.
+            crate::lineage::prune(&mut manifest);
+        }
+        crate::vector_locator::restore_uncovered(store, ns, &mut manifest, &old_vectors).await?;
+        crate::slab_rows::ensure(store, ns, &mut manifest, 1, missing_map.as_deref()).await?;
+        crate::vector_locator::retire_covered(&mut manifest, &protected);
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest
             .segments
@@ -965,12 +1014,18 @@ impl Engine {
         let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
         for attr in attributes {
             // The two layouts are independent objects: write them at the same time.
+            let sources = manifest
+                .segments
+                .iter()
+                .filter(|s| crate::upgrade::files(s, &attr).is_some())
+                .cloned()
+                .collect::<Vec<_>>();
             let layouts = [crate::ann_dir::Layout::Segments];
             let built = futures::future::try_join_all(layouts.iter().map(|layout| {
                 crate::ann_dir::build(
                     store,
                     ns,
-                    &manifest.segments,
+                    &sources,
                     &attr,
                     *layout,
                     previous_dirs.get(&layout.dir_key(&attr)),
@@ -983,7 +1038,10 @@ impl Engine {
                 }
             }
         }
-        for old in previous_dirs.values() {
+        for (role, old) in &previous_dirs {
+            if !manifest.ann_dirs.contains_key(role) {
+                retire(&mut manifest, crate::ann_dir::hint_key(ns, role));
+            }
             if !manifest.ann_dirs.values().any(|f| f.key == old.key) {
                 retire(&mut manifest, old.key.clone());
             }
@@ -1039,12 +1097,6 @@ impl Engine {
             && state.docs.len() as f64 / age.as_secs_f64().max(1.0) >= BULK_LOAD_ROWS_PER_SEC
         {
             manifest.bulk_load_at = Some(Utc::now());
-        }
-        // A finished recluster tier joins this publication if its segments are still here.
-        let installed = self.0.jobs.install(ns, &mut manifest);
-        if installed.is_some() {
-            // A new base covers the merged segments' targets itself: their lineage goes.
-            crate::lineage::prune(&mut manifest);
         }
         let generation = match wal
             .publish_fenced(claim, manifest.indexer_epoch, &manifest)
@@ -1209,7 +1261,10 @@ impl Engine {
         // Reread durable pins AFTER the epoch claim. A new copier either pinned
         // before this read, or observes the new epoch and retries its snapshot.
         let shared = crate::branch::protected(&self.0.store).await?;
-        candidates.retain(|key| !shared.contains(key));
+        let fresh_builds = crate::auto_recluster::building_prefixes(&self.0.store, ns).await?;
+        candidates.retain(|key| {
+            !shared.contains(key) && !fresh_builds.iter().any(|p| key.starts_with(p))
+        });
         // The winner owns no reusable file names. Repeating deletes after a crash is safe.
         // Deletes are independent round trips; run them concurrently so reclaiming
         // thousands of retired objects does not stall indexing for minutes.

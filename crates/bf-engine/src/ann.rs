@@ -36,14 +36,21 @@ pub(crate) async fn search(
     }
     // A recluster's tiers answer unfiltered queries for the rows they cover, and the namespace
     // directory for the rest (segments written since).
-    if q.filters.is_none()
-        && let Some(tiers) = state.ann_tiers.get(attribute)
-        && let Some(found) = from_tiers(
+    if let Some(tiers) = state.ann_tiers.get(attribute) {
+        if let Some(found) = from_tiers(
             store, state, q, attribute, vector, config, k, columns, tiers,
         )
         .await?
-    {
-        return Ok(Some(found));
+        {
+            return Ok(Some(found));
+        }
+        // Incomplete coverage and tail shadowing can still decline a tier plan. Expose every
+        // such query, including filtered locator scans, instead of hiding it as ordinary ANN.
+        metrics::counter!(
+            "blowfish_ann_tier_fallbacks_total",
+            "filtered" => if q.filters.is_some() { "true" } else { "false" }
+        )
+        .increment(1);
     }
     if state
         .segments
@@ -232,7 +239,7 @@ pub(crate) fn tiers_usable(
 
 type TierResult = Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError>;
 
-/// Unfiltered ANN over a recluster's tiers and the segments no tier covers, as one plan: each
+/// ANN over a recluster's tiers and the segments no tier covers, as one plan: each
 /// tier's slabs and the uncovered segments (through the namespace directory, with the covered
 /// segments left out of its probe plan) are searched at the same time, and their exactly
 /// reranked winners merged. `None` when some part cannot answer, so the caller falls back.
@@ -264,6 +271,10 @@ fn from_tiers<'a>(
             positions.push(at);
         }
         let uncovered = covered.iter().any(|c| !c);
+        let allowed = match q.filters.as_ref() {
+            Some(filter) => Some(crate::ann_dir::live_masks(store, state, Some(filter)).await?),
+            None => None,
+        };
         // A base and its delta rank their leaves as one list.
         let graph_k = if state.shadowed.is_empty() {
             k
@@ -272,7 +283,9 @@ fn from_tiers<'a>(
         };
         let mut graph_tiers = Vec::with_capacity(tiers.len());
         for (set, at) in tiers.iter().zip(&positions) {
-            let enabled = if crate::warm_graph::available(state, attribute, set, vector, graph_k) {
+            let enabled = if allowed.is_none()
+                && crate::warm_graph::available(state, attribute, set, vector, graph_k)
+            {
                 let mask = tier_mask(store, state, set, at).await?;
                 crate::warm_graph::mask_eligible(state, attribute, set, mask.as_ref(), graph_k)
             } else {
@@ -299,6 +312,7 @@ fn from_tiers<'a>(
             .zip(graph_tiers)
             .map(|(((set, at), seat), expected)| {
                 let declined = &declined;
+                let allowed = &allowed;
                 async move {
                     from_slabs(
                         store,
@@ -310,6 +324,7 @@ fn from_tiers<'a>(
                         columns,
                         set,
                         at,
+                        allowed.as_deref(),
                         None,
                         seat.as_ref(),
                         expected,
@@ -324,27 +339,54 @@ fn from_tiers<'a>(
             && state
                 .segments
                 .iter()
-                .any(|s| crate::upgrade::files(s, attribute).is_none())
+                .zip(&covered)
+                .any(|(s, c)| !c && crate::upgrade::files(s, attribute).is_none())
         {
             return Ok(None);
         }
         let rest = uncovered.then(|| {
-            let covered = &covered;
+            let mut view = state.without_docs();
+            view.segments = state
+                .segments
+                .iter()
+                .zip(&covered)
+                .filter(|(_, c)| !**c)
+                .map(|(s, _)| s.clone())
+                .collect::<Vec<_>>()
+                .into();
             async move {
                 let file =
                     crate::upgrade::directory_file(&state.ann_dirs, attribute).map(|(f, _)| f);
+                if file.is_some()
+                    && let Some(found) = from_directory(
+                        store,
+                        &view,
+                        q,
+                        attribute,
+                        vector,
+                        config,
+                        k,
+                        columns,
+                        file,
+                        Layout::Segments,
+                        &[],
+                    )
+                    .await?
+                {
+                    return Ok(Some(found));
+                }
                 from_directory(
                     store,
-                    state,
+                    &view,
                     q,
                     attribute,
                     vector,
                     config,
                     k,
                     columns,
-                    file,
+                    None,
                     Layout::Segments,
-                    covered,
+                    &[],
                 )
                 .await
             }
@@ -515,7 +557,7 @@ pub(crate) async fn tier_mask(
     Ok(mask)
 }
 
-/// Unfiltered ANN from one tier's slabs: the same directory search, over slabs as pseudo
+/// ANN from one tier's slabs: the same directory search, over slabs as pseudo
 /// segments, with winners mapped back to the segments holding them now (`at`) for hydration.
 #[allow(clippy::too_many_arguments)]
 async fn from_slabs(
@@ -528,29 +570,40 @@ async fn from_slabs(
     columns: &BTreeSet<String>,
     set: &bf_wal::SlabSet,
     at: &crate::lineage::Placement,
+    allowed: Option<&[Option<Arc<RoaringBitmap>>]>,
     prefetched: Option<&crate::ann_dir::Prefetched>,
     seat: Option<&crate::ann_dir::Seat>,
     graph_expected: bool,
     declined: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    let mask = tier_mask(store, state, set, at).await?;
+    let mask = match allowed {
+        Some(allowed) => Some(filtered_tier_mask(set, at, allowed)),
+        None => tier_mask(store, state, set, at).await?,
+    };
+    if mask.as_ref().is_some_and(|m| m.is_empty()) {
+        return Ok(Some((BTreeMap::new(), BTreeMap::new())));
+    }
     let slack = if state.shadowed.is_empty() {
         0
     } else {
         (2 * k).max(20)
     };
-    let accelerated = crate::warm_graph::search(
-        store,
-        state,
-        attribute,
-        set,
-        at,
-        vector,
-        mask.clone(),
-        k + slack,
-        columns,
-    )
-    .await?;
+    let accelerated = if allowed.is_none() {
+        crate::warm_graph::search(
+            store,
+            state,
+            attribute,
+            set,
+            at,
+            vector,
+            mask.clone(),
+            k + slack,
+            columns,
+        )
+        .await?
+    } else {
+        None
+    };
     if graph_expected && accelerated.is_none() {
         declined.store(true, std::sync::atomic::Ordering::Relaxed);
         return Ok(None);
@@ -558,26 +611,62 @@ async fn from_slabs(
     let (mut scores, mut docs) = match accelerated {
         Some(found) => found,
         None => {
-            let Ok((dir, _)) = crate::ann_dir::slab_directory(
-                store,
-                set,
-                prefetched,
-                vector,
-                config,
-                attribute,
-                &state.segments,
-            )
-            .await
-            else {
-                return Ok(None);
+            let directory = if allowed.is_some() {
+                crate::ann_dir::load(store, &set.dir, None)
+                    .await
+                    .map(|d| (d, false))
+            } else {
+                crate::ann_dir::slab_directory(
+                    store,
+                    set,
+                    prefetched,
+                    vector,
+                    config,
+                    attribute,
+                    &state.segments,
+                )
+                .await
             };
             let mut view = state.without_docs();
             view.segments = set.slabs.clone().into();
-            if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
-                return Ok(None);
-            }
+            let dir = match directory {
+                Ok((dir, _))
+                    if crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) =>
+                {
+                    dir
+                }
+                result => {
+                    // Complete tiers have all immutable inputs to reconstruct their directory.
+                    // A missing or stale advisory directory must not turn filtered ANN into a scan.
+                    metrics::counter!("blowfish_ann_tier_directory_rebuilds_total", "reason" => if result.is_err() { "read" } else { "coverage" }).increment(1);
+                    crate::upgrade::directory(store, &view.segments, attribute).await?
+                }
+            };
             let warm_eligible = mask.is_none() && seat.is_none();
-            let lives = vec![mask; view.segments.len()];
+            let members = if allowed.is_some() {
+                Some(crate::ann_dir::memberships(store, &view.segments, &dir, attribute).await?)
+            } else {
+                None
+            };
+            let lives = match (&members, &mask) {
+                (Some(members), Some(global)) => members
+                    .iter()
+                    .zip(&view.segments)
+                    .map(|(member, slab)| {
+                        Some(member.as_ref().map_or_else(
+                            || global.clone(),
+                            |m| {
+                                let key = &crate::upgrade::files(slab, attribute)
+                                    .expect("directory checked above")
+                                    .0
+                                    .key;
+                                slab_predicate(key, m, global)
+                            },
+                        ))
+                    })
+                    .collect(),
+                _ => vec![mask; view.segments.len()],
+            };
 
             let warm = warm_eligible
                 .then(|| crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone()))
@@ -596,7 +685,7 @@ async fn from_slabs(
                 k + slack,
                 columns,
                 attribute,
-                None,
+                members,
                 Layout::Slabs,
                 Some((state, &set.covered, at)),
                 &[],
@@ -617,4 +706,100 @@ async fn from_slabs(
         return Ok(None);
     }
     Ok(Some((scores, docs)))
+}
+
+/// A cached translated predicate pins its immutable inputs, preventing pointer-key reuse.
+struct PredicateMask {
+    _inputs: Vec<Option<Arc<RoaringBitmap>>>,
+    rows: Arc<RoaringBitmap>,
+}
+fn bitmap_bytes(rows: &RoaringBitmap) -> u64 {
+    let s = rows.statistics();
+    s.n_bytes_array_containers
+        + s.n_bytes_bitset_containers
+        + s.n_bytes_run_containers
+        + u64::from(s.n_containers) * 64
+}
+fn cache_predicate(
+    key: &str,
+    inputs: Vec<Option<Arc<RoaringBitmap>>>,
+    rows: RoaringBitmap,
+) -> Arc<RoaringBitmap> {
+    let bytes = bitmap_bytes(&rows)
+        + inputs
+            .iter()
+            .flatten()
+            .map(|r| bitmap_bytes(r))
+            .sum::<u64>()
+        + (inputs.len() * 16 + key.len() * 2 + 256) as u64;
+    let rows = Arc::new(rows);
+    crate::read_cache::insert(
+        key,
+        bytes,
+        PredicateMask {
+            _inputs: inputs,
+            rows: rows.clone(),
+        },
+    );
+    rows
+}
+fn filtered_tier_mask(
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+    allowed: &[Option<Arc<RoaringBitmap>>],
+) -> Arc<RoaringBitmap> {
+    let mut key = format!("tier-filter:{}", set.dir.key);
+    for map in &at.maps {
+        key.push('|');
+        key.push_str(map);
+    }
+    let positions: BTreeSet<_> = at.positions().collect();
+    let mut inputs = Vec::with_capacity(positions.len());
+    for i in positions {
+        match &allowed[i] {
+            Some(rows) => key.push_str(&format!("|{i}:{:p}", Arc::as_ptr(rows))),
+            None => key.push_str(&format!("|{i}:all")),
+        }
+        inputs.push(allowed[i].clone());
+    }
+    if let Some(cached) = crate::read_cache::get::<PredicateMask>(&key, 0) {
+        return cached.rows.clone();
+    }
+    let mut mask = RoaringBitmap::new();
+    for (cover, place) in set.covered.iter().zip(&at.places) {
+        match place {
+            crate::lineage::Place::Here(i) => {
+                if let Some(rows) = &allowed[*i] {
+                    mask.extend(rows.iter().map(|r| cover.base + r));
+                } else {
+                    mask.insert_range(cover.base..cover.base + cover.rows);
+                }
+            }
+            crate::lineage::Place::Moved(parts) => {
+                for (i, map) in parts {
+                    mask.extend(
+                        map.pairs()
+                            .filter(|(_, to)| allowed[*i].as_ref().is_none_or(|a| a.contains(*to)))
+                            .map(|(from, _)| cover.base + from),
+                    );
+                }
+            }
+        }
+    }
+    cache_predicate(&key, inputs, mask)
+}
+fn slab_predicate(
+    key: &str,
+    member: &bf_vector::Membership,
+    global: &Arc<RoaringBitmap>,
+) -> Arc<RoaringBitmap> {
+    let key = format!("slab-filter:{key}:{:p}", Arc::as_ptr(global));
+    if let Some(cached) = crate::read_cache::get::<PredicateMask>(&key, 0) {
+        return cached.rows.clone();
+    }
+    cache_predicate(
+        &key,
+        vec![Some(global.clone())],
+        member.intersection(global),
+    )
 }

@@ -118,7 +118,21 @@ pub(crate) fn explain(
         if let Some(RankBy::Filter(f)) = &q.rank_by {
             filter_files(f, &state.schema, &mut needed);
         }
+        let sources = crate::vector_locator::Sources::new(state);
         for seg in &state.segments {
+            let tiered: BTreeSet<String> = needed
+                .iter()
+                .filter_map(|file| file.strip_prefix("annv2:"))
+                .filter(|a| sources.covers(seg, a))
+                .map(|a| format!("annv2:{a}"))
+                .collect();
+            for file in &tiered {
+                let _ = writeln!(
+                    plan,
+                    "  covering tier: {}",
+                    file.trim_start_matches("annv2:")
+                );
+            }
             let used: Vec<_> = needed
                 .iter()
                 .filter(|file| seg.files.contains_key(*file))
@@ -126,7 +140,7 @@ pub(crate) fn explain(
                 .collect();
             let fallback: Vec<_> = needed
                 .iter()
-                .filter(|file| !seg.files.contains_key(*file))
+                .filter(|file| !seg.files.contains_key(*file) && !tiered.contains(*file))
                 .cloned()
                 .collect();
             let _ = writeln!(

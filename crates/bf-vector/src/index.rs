@@ -1100,6 +1100,30 @@ impl<R: RangeRead> Index<R> {
         self.rerank_recorded(query, k, locations, recorder).await
     }
 
+    /// Resident membership for present global rows and their cluster-local vector ordinals.
+    /// Partial indexes include only installed clusters, so callers needing complete membership
+    /// must first open or install every cluster.
+    pub fn membership(&self) -> Result<crate::Membership> {
+        crate::Membership::from_sparse_rows(
+            self.metadata
+                .clusters
+                .iter()
+                .enumerate()
+                .flat_map(|(cluster, c)| c.rows.iter().map(move |row| (row, cluster as u32))),
+            self.cluster_count(),
+        )
+    }
+
+    /// Present row IDs in ascending order. A partial index includes only installed leaves.
+    /// Tier vector locators retain this four-byte-per-row address list without vector payloads.
+    pub fn row_ids(&self) -> Vec<u32> {
+        let mut rows = RoaringBitmap::new();
+        for cluster in &self.metadata.clusters {
+            rows |= &cluster.rows;
+        }
+        rows.iter().collect()
+    }
+
     /// Every `(cluster, ordinal)` location whose row passes `filter`.
     pub fn locations(&self, filter: Option<&RoaringBitmap>) -> Vec<(u32, u32)> {
         let mut out = Vec::new();

@@ -125,6 +125,7 @@ async fn legacyize(
 ) {
     for seg in segments {
         let file = seg.files.remove(&format!("annv2:{attr}")).unwrap();
+        seg.files.remove(&crate::slab_rows::role(attr));
         let bytes = store.get(&file.key).await.unwrap();
         let old = bf_vector::downgrade_layout(&bytes).unwrap().unwrap();
         let old = if row_major {

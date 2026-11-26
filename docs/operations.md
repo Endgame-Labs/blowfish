@@ -234,6 +234,36 @@ search, full-text search, and filter through the proxy; restart, wait for readin
 queries before deleting the test namespace. Check the object-store prefix directly as well.
 Namespace deletion can retain permanent WAL fences; do not remove these manually.
 
+## Upgrading to bucket format 6
+
+Round D4b makes covering ANN tiers authoritative vector owners. Writable startup raises the
+append-only deployment marker to generation 6; the next namespace publication writes manifest
+format 5. Stop older writers and background maintenance first, and back up the entire deployment
+prefix if rollback may be needed. Generation-5 binaries refuse an upgraded prefix, including on
+read-only startup. Never remove a format marker or lower a manifest version: there is no in-place
+downgrade.
+
+The indexer automatically backfills each slab's small `annrows:<attribute>` object, one slab per
+publication. These checksummed sparse row and cluster maps identify the exact immutable ANN object.
+Backfill preserves every center, code, and vector. Once a tier fully covers a segment, directly or
+through compaction lineage, an index pass removes that segment's `annv2:` reference and records its
+retirement in the same fenced publication. Ordinary GC deletes the old object after retention;
+uncovered segments keep their own ANN objects. Covered legacy ANN indexes and fragments retire
+directly, avoiding a full conversion into another redundant copy. Their document-v1 columns still
+complete the ordinary document upgrade through the tier. A running rebuild keeps its inputs pinned.
+
+Projection, exact search, filtered ANN, patches, statistics, compaction, and reclustering read through
+covering tiers when the segment copy is absent. Vectors retain their declared f16, f32, or i8 precision.
+Branches and copies pin the covering tiers and lineage maps as well as document segments. A tier can
+be dropped only after its surviving uncovered segments regain independent ANN objects. Failed or
+ambiguous publications leave one complete source reachable, and retrying maintenance is safe.
+
+The settled reduction appears after the retention window and GC, rather than immediately at startup.
+Resident slab maps cost about six stored bytes per present vector (four for its global row and two
+for its leaf below 65,536 leaves), with no duplicated vector or code payload. Older slab layouts remain
+readable during their automatic upgrade. Existing `reindex`, retention, and background-indexing
+controls keep their meanings; there is no storage-layout selector.
+
 ## Upgrading to bucket format 5
 
 The release after v0.1.29 stores the vectors of f16 attributes as f16 base64 inside large WAL payloads
@@ -420,10 +450,9 @@ After the ANN upgrade, I rewrite `docs.bfc` as version 2, one segment per fenced
 records dense-vector dimensions and stored precision, and its payload contains only other attributes.
 String and string-array columns use zstd level 3 per 256-row block, with a checksum over the compressed
 bytes. I batch up to 64 source column ranges during a rewrite, while bypassing cache admission and
-checking every source block. Projection, filtered/exhaustive queries, and compaction obtain dense vectors from the segment's
-ANN object at the declared f16, f32, or i8 precision. The returned vector encoding and values are unchanged.
-Sparse and multi-vector attributes retain their existing JSON representation. I retain segment ANN objects
-after reclustering; retiring them requires the separate tier-lineage work.
+checking every source block. Projection, filtered/exhaustive queries, and compaction obtain dense vectors from the authoritative
+segment or covering tier at the declared f16, f32, or i8 precision. The returned vector encoding and values are unchanged.
+Sparse and multi-vector attributes retain their existing JSON representation. Generation 6 automatically retires covered segment ANN objects after their tier metadata is ready.
 
 I also rewrite `ids.bfi` without its redundant Bloom filter in the document publication. The small,
 24-bit-per-ID `idfilter.bff` still screens existence checks before the full ID list is opened. Each document

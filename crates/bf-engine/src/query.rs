@@ -998,10 +998,13 @@ pub(crate) async fn recall(engine: &Engine, ns: &str, request: Value) -> Result<
             let live = crate::snapshot::allowed(engine.storage(), &state, seg, None).await?;
             let rows = live.iter().take(num - samples.len()).collect();
             samples.extend(
-                crate::segment::documents(engine.storage(), seg, &rows)
-                    .await?
-                    .into_values()
-                    .map(std::sync::Arc::new),
+                crate::vector_locator::scope(
+                    &state,
+                    crate::segment::documents(engine.storage(), seg, &rows),
+                )
+                .await?
+                .into_values()
+                .map(std::sync::Arc::new),
             );
         }
         for doc in samples

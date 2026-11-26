@@ -386,6 +386,9 @@ pub fn membership<R: RangeRead>(index: &Index<R>) -> Option<Membership> {
         }
     }
     Some(Membership {
+        row_ids: None,
+        row_set: None,
+        clusters: m.clusters.len(),
         cluster_of,
         ordinal_of,
     })

@@ -486,6 +486,7 @@ impl DecodedCache {
 #[derive(Clone)]
 pub(crate) struct ReadContext {
     pub cache: Arc<DecodedCache>,
+    pub vectors: Option<Arc<crate::vector_locator::Sources>>,
     pub(crate) hot_graph: Option<crate::warm_graph::Scope>,
     pub(crate) cpu_nanos: Arc<std::sync::atomic::AtomicU64>,
     pub stats: Arc<CacheStats>,
@@ -528,6 +529,7 @@ impl ReadContext {
         Self {
             cache,
             hot_graph: None,
+            vectors: None,
             cpu_nanos: Arc::default(),
             stats: Arc::default(),
             backend: Arc::default(),
