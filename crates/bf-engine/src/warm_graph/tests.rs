@@ -224,10 +224,23 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
     assert_eq!(query(&e, "hot", request(17)).await[0]["id"], 17);
     assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
+    // Round G8: requests up to 100 rows (k plus offset) are served by the graph with an automatic
+    // beam and shortlist, and return the same rows as the IVF control.
+    for body in [
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":100}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":40,"offset":50}),
+    ] {
+        let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
+        same_rows(
+            query(&e, "hot", body.clone()).await,
+            query(&control, "hot", body).await,
+        );
+        assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
+    }
     for body in [
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
-        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":100}),
-        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":1,"offset":30}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":101}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":1,"offset":100}),
         json!({"rank_by":["vector","ANN",vec![0.;16]],"top_k":10}),
         json!({"rank_by":["vector","kNN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
     ] {
