@@ -15368,3 +15368,146 @@ key pair, and security group deleted and verified. The fixture was read-only, an
 Reproduction: `warm_graph_bench`-style export with `examples/g3/export_ivf.py`, then
 `gb1_bench NQ_DATA WORKERS 100000000 1 EXPORTED_IVF` for build and recall, and
 `gb1_load NQ_DATA EXPORTED_IVF BUILD_THREADS 16 1 48` for the foreground run.
+
+## Round G12: top_k 100 on the warm graph, 1.7 times faster at identical results
+
+**Setup:** Apple M4 (10 cores, 16 GB, shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries, exact top-100 truth),
+the frozen v0.1.19 fixture, 16 client processes, one keep-alive connection each, IDs only (`include_attributes: false`), blowfish release
+binaries with production defaults (64 probes, the production sampler), the graph promoted the ordinary way (`g11_promote.py`). Qdrant is the official
+1.20.0 macOS arm64 binary (f16 vectors in RAM, M=16, ef_construct=100, one indexed segment). Latency is client-side; recall is against the exact top k.
+Every comparison inside this round is on one promoted server, so the graph, the beam, and the data are the same for both sides.
+
+### Step 0: GB1's build against main's
+
+| | main (a6f257f) | GB1 (e07931b, merged with main) |
+|---|---:|---:|
+| Graph build, wall | 1,034 s (17.2 min) | 285 s (4.8 min) |
+| Build CPU | 1,879 s | 673 s |
+| Graph first visible | 27.5 min | 15.0 min |
+| Promoted | 46.5 min | 25.0 min |
+| Samples to promote | 1,249 | 746 |
+| Serving beam after settling | 125 | 100 |
+| top_k 10: q/s, recall@10, p99 | 8,104, 0.9647, 4.50 ms | 8,439, 0.9621, 4.34 ms |
+| top_k 100: q/s, recall@100, p99 | 2,685, 0.9537, 12.4 ms | 2,765, 0.9556, 12.2 ms |
+
+Each point is one run. The GB1 run used the candidate binary of this round with every switch off, which reads one atomic and is otherwise
+main plus GB1. GB1 serves equally fast or slightly faster, builds 3.6 times faster, and was merged (v0.1.55).
+
+### Where the CPU goes (main, profile at 16 clients)
+
+Graph phase CPU per search (thread CPU counters over a 60 s pass, microseconds):
+
+| | navigation | rerank | projection (ID hydration) |
+|---|---:|---:|---:|
+| top_k 10 | 367 | 104 | 63 |
+| top_k 100 | 637 | 435 | 740 |
+
+At top_k 100 the projection and the rerank cost 1.8 times the walk. G11 had read the navigation as the biggest gap; the thread CPU counters
+say the work around it is. `sample` call graphs agree: under a top_k 100 graph query, projection is 2.2K samples (1.5K of them the decoded-column
+cache lookups for the `id` column, 32 segments per query), rerank 2.1K, navigation 5.8K. The sampler's own exact searches (checksums over every
+vector) share that profile and are not part of these counts. At top_k 10 the walk is 76% of the graph path; `clock_gettime` is about 2% and
+`RaBitQ::rotate` about 1%.
+
+### The five hypotheses, each measured alone
+
+One promoted server (GB1 graph), a switch file the server re-read every half second, variants alternated A B, B A across rounds so drift on the
+shared machine hits all alike. Medians of 2 to 7 passes of 20 (top_k 10) or 10 (top_k 100); recall is identical to seven digits in every row.
+
+| Switch | top_k 10 q/s | top_k 100 q/s | top_k 100 p99 | Verdict |
+|---|---:|---:|---:|---|
+| none (baseline) | 8,512 | 2,733 | 11.6 ms | |
+| 1. graph queries up to 100 rows stay on the HTTP reactor | 8,470 | 3,039 (+11%) | 11.1 ms | ships |
+| 2. sample the per-query thread CPU clock | 8,575 (+0.7%) | 2,791 (+2%) | 11.2 ms | no gain with 1 and 5 on; dropped |
+| 3. one RaBitQ transform per thread, no allocation | 8,550 (+0.4%) | 2,758 (+0.9%) | 11.8 ms | no gain; dropped |
+| 4. fused f16 rerank (bit-identical NEON kernel) | 8,477 (-0.4%) | 2,615 (-4.3%) | 11.9 ms | slower in time with fewer instructions; dropped |
+| 5. resident row-to-ID table (IDs resolved once, for the final rows) | **9,839 (+16%)** | **4,366 (+60%)** | 9.6 ms | **ships** |
+| 1 + 5 | 9,796 (+15%) | 4,627 (+69%) | 8.3 ms | **the shipped change** |
+| 1 + 2 + 3 + 5 | 9,748 | 4,623 | 8.5 ms | same as 1 + 5 |
+| all five | 9,815 | 4,585 | 7.9 ms | same as 1 + 5 |
+
+The ID resolution (hypothesis 5) was the whole story: at top_k 100 the projection was 740 us of a 3.4 ms query, because each query looked up the
+decoded `id` column blocks of up to 32 segments through the decoded cache and built a document map per segment. The switch also cut 1M
+instructions per query (8.04M to 7.04M) but the time fell by far more, because the lookups were stalls, not instructions. Hypotheses 2 and 3 are
+real costs (2% and 1% of top_k 10 CPU in the profile) that the paired runs cannot resolve from run-to-run noise once the larger change is in; they
+are not shipped, so there is one way to do each thing. Hypothesis 4's fused kernel agrees with the decode-then-dot path to the bit (tested on
+aarch64 for every dimension from 1 to 1,099) and saves 1.1M instructions at top_k 100, yet ran 4% slower. I did not find out why (a guess: the row
+checksum is the first touch of each row, so the widening is not what the rerank waits for). The per-row CRC check stays on every read, and its measured
+cost on the serving path is 2.4% of top_k 100 CPU.
+
+Dispatch, from the server's `blowfish_query_cpu_dispatch_total`: before, top_k 10 ran 99.9% inline on the reactor and top_k 100 100% on the
+worker pool; with switch 1, both run inline (99.9%).
+
+Mixed load (one query in ten asks for 100 rows, the rest 10), same server: baseline 7,326 q/s, p50/p90/p99 1.62/3.40/7.82 ms; all five 8,686 q/s,
+1.41/2.74/4.59 ms; 1 + 2 + 3 + 5 8,686 q/s, 1.39/2.70/4.50 ms. Keeping top_k 100 on the reactors did not hurt p99 under mixed load: it fell by 41%.
+
+### The shipped change against Qdrant 1.20 (final binary, promoted the ordinary way)
+
+The final binary (main v0.1.55 plus switches 1 and 5, the others removed) was promoted from cold on the M4: graph visible after 15.5 minutes, promoted after
+21.0 minutes (370 samples, build 327 s wall), serving beam 80. Qdrant was loaded once and queried without a restart; its ef sweep brackets blowfish's recall
+and "matched" rows interpolate linearly between the two bracketing points.
+
+| Engine, top_k 10 | recall@10 | q/s | p50 | p90 | p99 (ms) |
+|---|---:|---:|---:|---:|---:|
+| **blowfish, graph (beam 80)** | **0.9530** | **9,776** | **1.28** | **2.53** | **3.80** |
+| Qdrant ef 64 | 0.9496 | 8,895 | 1.46 | 2.84 | 5.50 |
+| Qdrant ef 80 | 0.9582 | 8,065 | 1.57 | 3.18 | 6.20 |
+| Qdrant ef 96 | 0.9637 | 7,281 | 1.71 | 3.52 | 7.34 |
+| Qdrant ef 112 | 0.9685 | 6,673 | 1.87 | 3.86 | 8.00 |
+| Qdrant ef 144 | 0.9729 | 5,668 | 2.16 | 4.58 | 10.59 |
+| Qdrant default (no `hnsw_ef`) | 0.9647 | 7,050 | 1.79 | 3.63 | 7.59 |
+| **Qdrant interpolated to 0.9530** | 0.9530 | **about 8,566** | 1.50 | 2.97 | 5.78 |
+
+At matched recall blowfish serves **14% more q/s** at top_k 10 (G11: 9%) and its p99 is **34% lower** (3.80 against 5.78 ms).
+
+| Engine, top_k 100 | recall@100 | q/s | p50 | p90 | p99 (ms) |
+|---|---:|---:|---:|---:|---:|
+| **blowfish, graph (beam 256, shortlist 150)** | **0.9559** | **4,511** | **3.00** | **5.16** | **8.34** |
+| Qdrant ef 128 | 0.9091 | 5,909 | 2.10 | 4.35 | 9.52 |
+| Qdrant ef 192 | 0.9385 | 4,433 | 2.63 | 6.09 | 14.48 |
+| Qdrant ef 256 | 0.9532 | 3,661 | 3.15 | 7.91 | 16.50 |
+| Qdrant ef 320 | 0.9617 | 3,125 | 3.66 | 9.57 | 19.33 |
+| Qdrant default (ef 100) | 0.8835 | 6,865 | 1.84 | 3.77 | 7.46 |
+| **Qdrant interpolated to 0.9559** | 0.9559 | **about 3,491** | 3.31 | 8.43 | 17.4 |
+
+At matched recall blowfish now serves **29% more q/s** than Qdrant at top_k 100 (G11: 24 to 39% fewer), with p50 9% lower, p90 39% lower, and p99 **52% lower**
+(8.34 against 17.4 ms). Per query it costs 6.83M instructions (main this round: 7.96M) against Qdrant's 4.0M at ef 256, and the graph phases take 783 us of
+navigation and 297 us of rerank, with no projection phase left (main this round: 637, 435, and 740 us). Mixed load on the same server (one query in ten asks for 100
+rows): 8,508 q/s, recall 0.957, p50/p90/p99 1.39/2.77/4.89 ms.
+
+The like-for-like measure of the change is the paired table above (GB1's graph, beam 100, one server): top_k 10 8,512 to 9,796 q/s (+15%) and top_k 100 2,733 to
+4,627 q/s (+69%), recall identical to seven digits. The final run settled a lower top_k 10 beam (80, recall 0.9530) than the paired server (100, 0.9586), so its
+q/s is not comparable to the paired baseline; against Qdrant at the same recall it is a win either way (at 0.9586 Qdrant interpolates to 8,011 q/s, p99 6.28 ms).
+Peak physical footprint is unchanged at 5.35 GB (G11: 5.35 GB); the ID table is 8 bytes per row (21 MB for NQ).
+
+### What changed in the code
+
+- **ID-only graph queries resolve IDs from a resident table** (`warm_graph.rs`). The first ID-only query that a ready graph answers starts one background task that
+  reads every tier row's unsigned ID from the same documents the query path hydrates, and publishes a `Vec<u64>` on the graph. From then on, an ID-only query
+  (no attributes requested) takes the final rows from the rerank, checks each against the live mask and its placement exactly as before, and reads their IDs from
+  the table: no per-segment document reads, no decoded-column lookups, no per-segment maps. Until the table exists, and for any namespace with a string ID, the old path runs
+  unchanged. Queries that ask for attributes still hydrate documents.
+- **Graph queries up to 100 rows stay on the HTTP reactor when the graph will answer them** (`warm_ann.rs`, `lib.rs`). The inline gate was `top_k + offset <= 10`; it is now
+  10, or 100 when a ready, usable graph exists for the tier (a graph query costs the same CPU inline as on a worker, without the thread hand-off). Everything else keeps the
+  old gate.
+- **`include_attributes: false` means no attributes** (`indexed.rs`). It used to hydrate every scalar column of the result rows and drop them afterward, while leaving the field out
+  read none. The NQ fixture has only IDs and vectors, so this round's numbers do not move; namespaces with text columns do less work.
+
+Tests: the ID-only identity check in `warm_graph/tests.rs` compares the table path with the document path (the same queries before the table exists) and with the IVF control
+for top_k 1, 10, 37, and 100, requiring equal rows and equal score bits. Live, the quality pass over all 3,452 queries gave the same recall to seven digits with and without
+the table. Debug `cargo test --workspace`: 629 passed, 0 failed, 27 ignored; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+### Notes
+
+- **A Qdrant restart after the load went wrong once.** On the first restart, a second, unindexed segment holding all 2.68M vectors appeared beside the indexed one
+  (consistent with replaying a write-ahead log whose applied position was still from the load, but I did not confirm the cause). Searches scanned that copy: recall 0.9987
+  at ef 64 and about 20 q/s. G11 did not hit it, and its Qdrant numbers match this round's within 1.5%. I discarded those runs, reloaded Qdrant, and ran every sweep in the
+  same server process as the load.
+- **The M4 profile includes the recall sampler.** Its exact searches checksum and scan every vector, and they showed up as 15% "CRC" in the first top_k 100 profile; the
+  graph query's own CRC is about 2.5%.
+- **Not measured:** top_k 100 with attributes requested, namespaces with string IDs (unchanged path), and graphs on hosts other than the M4. Each point is one run on a shared machine; the
+  paired medians spread at most 2%.
+- **Switches were temporary.** The five hypotheses were measured through a file-read switch (`BF_G12_FLAGS`) in a candidate binary, then deleted: the shipped code has no settings
+  and no old path for the two changes that ship.
+
+Costs: no EC2 and no bucket writes. The 25.5 GiB NQ fixture was copied from the measurement bucket to the M4 through short-lived presigned URLs (about $2.3 of S3
+transfer), because the direct copy ran at 3 to 5 MB/s. The M4 run directory (fixture, builds, Qdrant) is deleted, and nothing of mine is running there.
