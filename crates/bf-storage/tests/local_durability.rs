@@ -191,24 +191,28 @@ fn local_publications_sync_files_and_directories_before_acknowledgment() {
         );
     }
     let mut start = open;
+    // The libc wrapper picks the syscall: x86_64 issues rename(2), while arm64 has only
+    // renameat(2) and renameat2(2). Any of them publishes the file atomically.
+    const LINK: &[&str] = &["linkat("];
+    const RENAME: &[&str] = &["rename(", "renameat(", "renameat2("];
     for (name, key, publish) in [
-        ("create", "ns/a/wal/slot", Some("linkat(")),
+        ("create", "ns/a/wal/slot", Some(LINK)),
         ("retry", "ns/a/wal/slot", None),
-        ("put", "ns/a/manifest/latest", Some("rename(")),
-        ("overwrite", "ns/a/manifest/latest", Some("rename(")),
-        ("multipart", "ns/a/segments/data", Some("rename(")),
-        ("redact", "ns/a/wal/slot", Some("rename(")),
+        ("put", "ns/a/manifest/latest", Some(RENAME)),
+        ("overwrite", "ns/a/manifest/latest", Some(RENAME)),
+        ("multipart", "ns/a/segments/data", Some(RENAME)),
+        ("redact", "ns/a/wal/slot", Some(RENAME)),
         ("redact_retry", "ns/a/wal/slot", None),
     ] {
         let end = marker(&lines, name);
         let window = &lines[start + 1..end];
         let file = format!("{root}/{key}");
         let parent = Path::new(&file).parent().unwrap().display().to_string();
-        if let Some(call) = publish {
+        if let Some(calls) = publish {
             let at = window
                 .iter()
                 .rposition(|line| {
-                    line.contains(call)
+                    calls.iter().any(|call| line.contains(call))
                         && line.contains(&format!("\"{file}\""))
                         && line.ends_with("= 0")
                 })
