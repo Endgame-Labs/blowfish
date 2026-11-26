@@ -13697,6 +13697,81 @@ Costs: no EC2, no bucket writes (a 25 GB fixture copy was downloaded from the sh
 directory).
 
 
+## Round G10: calibration samples without an exhaustive scan (graph promoted 4.5 minutes after it is built, not days)
+
+Main's sampler measured each calibration sample's recall against an exhaustive scan of the namespace (5.49 GB of f16 on NQ, one core).
+The sampler then waited 50 times as long as the scan, so the paired controller got about one sample every 10 minutes.
+
+**Setup:** Apple M4 (shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), 64 probes, the real
+`blowfish` binary with the production sampler defaults (1 percent of queries, 60 s interval), and `graph_heat.py` at 800 q/s from 16
+paced clients, with nothing paused and no manual samples (`g10_promote.py`). Release builds of main v0.1.50 and of this branch.
+
+### Change (`bf-engine`, no setting, no format change)
+
+While a warm graph is calibrating, a sample runs the graph's answer, the IVF tier's answer, and the IVF tier at twice the probes
+(all three rerank with exact distances), and takes the **exact-distance top k of their union** as the truth (`indexed::union_truth`).
+Only a true neighbor that all three missed is absent from it. The controller sees `(recall(graph, union), recall(ivf, union))`
+instead of recall against an exhaustive scan. One sample in 16 still runs the exhaustive scan, feeds the controller its exact
+truth, and records the union's overstatement in the `blowfish_ann_union_recall_gap` histogram, so drift is visible. The two kinds
+have separate pacing clocks (a cheap sample waits 50 times its own duration, an exhaustive one keeps the old 60 s interval and
+50 times its duration), so an audit cannot stall the cheap samples. A namespace with no graph calibrating still uses the
+exhaustive scan, as before. `blowfish_ann_calibration_samples_total{truth}` counts both.
+
+### Offline: does the union truth settle where the exhaustive truth does? (`g10_offline.rs`, `g10_ivf_dump.py`)
+
+Full NQ, the production graph, the production server's IVF answers at 64 and 128 probes (recall@10 0.9611 and 0.9791,
+recall@100 0.9523 and 0.9745), the engine's own `effort.rs` controller, and 100 random query streams, each run once with each truth.
+
+| | k 10 | k 100 |
+|---|---:|---:|
+| True graph recall at the settled beam within 0.001 of the exhaustive-driven result | 69 of 100 | 100 of 100 |
+| Settled beam within one controller step (ratio of 1.25 or less) | 90 of 100 | 98 of 100 |
+| Control: exhaustive against itself, on a different query stream, within 0.001 | 17 of 100 | 100 of 100 |
+| Control: within one step | 78 of 100 | 96 of 100 |
+
+The brief's bar (95 of 100 within 0.001) is **not met at k 10, and the exhaustive controller does not meet it against itself** (17
+of 100): one controller step moves true recall by 0.001 to 0.002 and 512-sample windows are noisy. At k 100 the graph serves at
+a beam of at least 256 whatever the controller picks, so the answers never differ. The union truth is biased the safe way: its paired
+gap (graph minus IVF) is 0.001 to 0.002 lower than the exhaustive gap at beams 64 to 128 (at beam 100, -0.0025 against -0.0013),
+so it settles slightly higher. Mean true recall@10 at the settled beam: 0.9539 (union) against 0.9527 (exhaustive), +0.0012, and
+770 samples against 683 to settle.
+
+### Time to promote (M4, ordinary heat)
+
+| | Heat gate and build | Graph ready | Calibration | Promoted | Samples |
+|---|---:|---:|---:|---:|---:|
+| main v0.1.50 | 630 s to 1,710 s (build 1,082 s) | 28.5 min | 2 samples in 1,290 s, then stopped | **about 107 hours (estimate)** | 640 needed |
+| this branch | about 600 s to 1,650 s (build 1,030 to 1,054 s) | 27.5 min | **270 s** (4.5 min) | **32 min** (1,920 s) | 266 |
+| this branch, earlier run (sampler parked behind an exhaustive wait) | | 28 min | 660 s | 39 min (2,340 s) | 389 |
+
+Main's estimate: one sample about every 10 minutes (the scan plus 50 times its duration), 640 samples. The run was stopped at
+1,290 s of calibration. This branch's cheap samples arrive at about 0.9 a second. The beam went 64 to 80 (accepted) and the lower trial
+(72) was already running when `usable` turned true. Time to promote is bound by the 10-minute heat gate and the graph build (1,050 s on
+the M4 at idle priority under load), which this round does not touch; **the calibration phase is 4.5 minutes, 150 times faster than
+main's estimate** (the brief's 15-minute target for the whole path is not reachable while the build alone is 17 minutes). The
+earlier run found a bug the second fixed: a sample that compared nothing (no graph yet) waited out the exhaustive clock, so the
+first cheap samples came 4.5 minutes after the graph was ready.
+
+### Steady state, 16 client processes, graph serving
+
+| | top_k | q/s | recall | Instructions/query | Peak footprint |
+|---|---:|---:|---:|---:|---:|
+| main IVF (G9 table, same M4 and fixture) | 10 | 2,792 | 0.9611 | 24.1M | 1,222 MiB |
+| this branch, graph (beam 80) | 10 | 8,106 | 0.9552 | 3.2M | 5,352,002,888 B (5.0 GiB) |
+| main IVF (G9 table) | 100 | 879 | 0.9523 | 65.2M | 1,190 MiB |
+| this branch, graph | 100 | 2,799 | 0.9533 | 9.2M | 5.0 GiB |
+
+Settled beam 80 against G9's 100 (calibrated against the exhaustive scan by hand): recall@10 0.9552 against 0.9572, **0.0020
+lower**, right at the bar and inside what one beam step moves; the k 100 recall is the same (0.9533 against 0.9530). Main IVF was
+not re-measured in this session, so its rows are G9's (same machine and fixture; the M4 is shared, so compare the 2.9x and 3.2x, not
+the last digit). **Not measured: p50 and p99 latency, Qdrant 1.20 at matched recall, and peak RSS for main's IVF in this session.**
+The round ran out of its 4-hour cap after the second build (each promotion run is 40 minutes). One earlier run served top_k 100
+from IVF (857 q/s) after serving top_k 10 from the graph in the same process (graph status was not captured, so the cause
+is unknown); the final run, which measured top_k 100 first, served it from the graph. Run top_k 100 after top_k 10 before
+trusting a promoted graph for it.
+
+Costs: no EC2, no bucket writes (a 25 GB fixture copy, deleted). The M4 run directory is deleted and nothing of mine is running.
+
 ## Round W6/W7: cold queries fetch committed WAL payloads one at a time (concurrent fetch, 3.2x at 32 payloads; bounded by bytes in W7)
 
 Hypothesis (Sol, `briefs/ideas/2225-sol.md` #1): `tail_bounded` discovers WAL slots concurrently but then calls `materialize` on each record in
