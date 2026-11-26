@@ -1733,3 +1733,65 @@ async fn d4c_row_map_survey_is_bounded_and_rotates_to_missing_objects() {
         store.get(&slab.files["annrows:vector"].key).await.unwrap();
     }
 }
+
+/// Round IN1: removal accounting over tier-covered segments (annv2 retired) must equal the
+/// stats of the materialized documents, with sparse vectors, and must not read vector payloads.
+#[tokio::test]
+async fn in1_removal_accounting_counts_covered_vectors_without_reading_them() {
+    for sparse in [true, false] {
+        let (store, _engine, _) = fixture_rows_parts_kind(2000, 2, sparse).await;
+        retire_test_sources(&store).await;
+        let state = maintenance_engine(&store)
+            .snapshot("locator", &Consistency::Strong)
+            .await
+            .unwrap()
+            .0;
+        let mut covered = 0;
+        for seg in &state.segments {
+            if !seg.files.contains_key("annv2:vector") && Sources::new(&state).covers(seg, "vector")
+            {
+                covered += 1;
+            }
+        }
+        assert!(covered > 0, "fixture must have tier-covered segments");
+        for seg in &state.segments {
+            for selected in [
+                (0..seg.row_count).collect::<RoaringBitmap>(),
+                (0..seg.row_count).filter(|r| r % 5 == 0).collect(),
+            ] {
+                let (docs, old_reads) = measure(scope(&state, async {
+                    segment::documents(&store, seg, &selected).await.unwrap()
+                }))
+                .await;
+                let mut expected = bf_wal::NamespaceStats::default();
+                for doc in docs.values() {
+                    expected.rows += 1;
+                    expected.logical_bytes += serde_json::to_vec(doc).unwrap().len() as u64;
+                }
+                let (actual, new_reads) = measure(scope(&state, async {
+                    crate::statistics::rows(&store, seg, &selected, &state.schema, true)
+                        .await
+                        .unwrap()
+                }))
+                .await;
+                assert_eq!(
+                    (actual.rows, actual.logical_bytes),
+                    (expected.rows, expected.logical_bytes)
+                );
+                eprintln!(
+                    "IN1 sparse={sparse} rows={} old={old_reads:?} new={new_reads:?}",
+                    selected.len()
+                );
+            }
+        }
+    }
+}
+
+async fn measure<T>(
+    fut: impl std::future::Future<Output = T>,
+) -> (T, bf_storage::CacheStatsSnapshot) {
+    let ctx = read_cache::ReadContext::new(Arc::new(read_cache::DecodedCache::new(0, 1)));
+    let stats = ctx.stats.clone();
+    let out = read_cache::scope(ctx, fut).await;
+    (out, stats.snapshot())
+}
