@@ -1418,6 +1418,56 @@ async fn d4c_missing_published_map_recovers_queries_and_repairs_without_a_tail()
     engine.query("locator", reference_request()).await.unwrap();
 }
 
+/// Round C27: a quiet writable namespace (no writes, no force) must publish its missing slab
+/// row maps from the background loop alone, one bounded slab per pass, with readers picking
+/// the maps up as soon as they exist.
+#[tokio::test]
+async fn c27_quiet_namespace_publishes_row_maps_from_the_background_loop() {
+    let (store, _, _) = fixture_rows(2000).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    let slabs = m.ann_tiers["vector"][0].slabs.len();
+    for slab in &mut m.ann_tiers.get_mut("vector").unwrap()[0].slabs {
+        let map = slab.files.remove("annrows:vector").unwrap();
+        store.delete(&map.key).await.unwrap();
+    }
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+    assert!(crate::slab_rows::needs(
+        &wal.latest_manifest().await.unwrap().unwrap().1.ann_tiers
+    ));
+    store.drop_caches();
+    let engine = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: true,
+            index_interval: std::time::Duration::from_millis(20),
+            recall_sample_rate: 0.0,
+            compaction_segments: usize::MAX,
+            ..Default::default()
+        },
+    );
+    // Opening the namespace is a read, never a write.
+    engine.query("locator", reference_request()).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (_, m) = wal.latest_manifest().await.unwrap().unwrap();
+        if !crate::slab_rows::needs(&m.ann_tiers) {
+            assert_eq!(m.ann_tiers["vector"][0].slabs.len(), slabs);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a quiet namespace never published its row maps"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (_, m) = wal.latest_manifest().await.unwrap().unwrap();
+    for slab in &m.ann_tiers["vector"][0].slabs {
+        store.get(&slab.files["annrows:vector"].key).await.unwrap();
+    }
+    engine.query("locator", reference_request()).await.unwrap();
+}
+
 #[tokio::test]
 async fn d4c_document_only_legacy_segment_does_not_wedge_publication() {
     let (store, _, _) = fixture_rows(2000).await;
