@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.57] - 2026-11-26
+
+### Changed
+
+- **Cold filtered vector queries are 1.4 to 15 times faster:** Filters on `id` seek the sorted per-segment IDs instead of decoding every segment's full ID dictionary, filtered queries use the parallel, coalesced, nearest-first slab scan that unfiltered queries already used, a filter that matches nothing reads no slab row maps, and lineage and filter translation touch only the rows that match. On 10M x 1024-d vectors in pure S3, cold, single client, with identical ordered IDs and distances, p50 went from 6,177 to 397 ms for `id < 1000`, 1,669 to 843 ms for a broad numeric filter (`text_length >= 300`), 1,867 to 1,369 ms for a 0.4% equality filter, and 803 to 202 ms for a filter matching nothing. Throughput with 16 clients and unfiltered latency are unchanged within measurement noise. See Rounds C26, C27, and C28 in `docs/benchmarks.md`.
+
 ## [0.1.56] - 2026-11-26
 
 ### Changed
@@ -431,7 +437,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.56...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.57...HEAD
+[0.1.57]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.57
 [0.1.56]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.56
 [0.1.55]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.55
 [0.1.54]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.54
