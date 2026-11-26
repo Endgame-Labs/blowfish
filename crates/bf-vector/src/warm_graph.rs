@@ -32,6 +32,9 @@ pub struct HotGraph {
     entries: Vec<u32>,
     codes: quant::Codes,
     norms: Vec<crate::CosineNorm>,
+    /// Graph node of each tier row (`u32::MAX` where the tier row is not a node), or empty when
+    /// the tier's row numbers are too sparse for a dense table. Serves [`HotGraph::scan`].
+    nodes: Vec<u32>,
 }
 /// Reusable per-query exact visitation and bounded beam.
 pub struct HotScratch(navigation::Scratch);
@@ -56,7 +59,8 @@ impl HotGraph {
             + self.entries.capacity() * 4
             + self.codes.values.capacity()
             + self.codes.scales.capacity() * 4
-            + self.norms.capacity() * 4) as u64
+            + self.norms.capacity() * 4
+            + self.nodes.capacity() * 4) as u64
     }
     /// Conservative construction/load reservation, excluding source-index metadata.
     /// `workers` is the maximum number of simultaneous query scratch arrays.
@@ -69,6 +73,58 @@ impl HotGraph {
     /// Number of source rows still eligible in the supplied tier mask.
     pub fn live_count(&self, mask: &RoaringBitmap) -> usize {
         self.rows.iter().filter(|row| mask.contains(**row)).count()
+    }
+    /// Whether [`Self::scan`] can serve this graph (its tier row numbers are dense enough).
+    pub fn can_scan(&self) -> bool {
+        !self.nodes.is_empty()
+    }
+    /// Score only the rows of `allowed` against the SQ8 codes, and return the `count` nearest
+    /// by that score (ascending, ties by tier row) with their cached norms for exact reranking,
+    /// plus the number of rows scored. Rows of `allowed` that are not graph nodes are skipped.
+    pub fn scan(
+        &self,
+        query: &[f32],
+        count: usize,
+        allowed: &RoaringBitmap,
+    ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
+        crate::distance::validate(query, self.dims)?;
+        if count == 0 || self.nodes.is_empty() || query.iter().all(|x| *x == 0.) {
+            return Err(Error::InvalidInput("unsupported graph query shape".into()));
+        }
+        let q = vectors::normalized(query);
+        let (code, scale) = self.codes.prepare(&q);
+        let mut ids: Vec<u32> = allowed
+            .iter()
+            .filter_map(|row| self.nodes.get(row as usize).copied())
+            .filter(|node| *node != u32::MAX)
+            .collect();
+        // Ascending nodes read the code array in order, which the prefetcher follows.
+        ids.sort_unstable();
+        const AHEAD: usize = 8;
+        let mut scored: Vec<(f32, u32)> = Vec::with_capacity(ids.len());
+        for (i, &id) in ids.iter().enumerate() {
+            if let Some(&next) = ids.get(i + AHEAD) {
+                self.codes.prefetch(next);
+            }
+            scored.push((self.codes.score(&code, scale, id), id));
+        }
+        let order = |a: &(f32, u32), b: &(f32, u32)| {
+            a.0.total_cmp(&b.0)
+                .then(self.rows[a.1 as usize].cmp(&self.rows[b.1 as usize]))
+        };
+        if scored.len() > count {
+            scored.select_nth_unstable_by(count - 1, order);
+            scored.truncate(count);
+        }
+        scored.sort_unstable_by(order);
+        let scanned = ids.len();
+        Ok((
+            scored
+                .into_iter()
+                .map(|(_, id)| (self.rows[id as usize], self.norms[id as usize]))
+                .collect(),
+            scanned,
+        ))
     }
     /// Allocate cache-sized visitation state. Callers bound and reserve the number retained.
     pub fn scratch(&self) -> HotScratch {

@@ -287,13 +287,29 @@ fn from_tiers<'a>(
         };
         let mut graph_tiers = Vec::with_capacity(tiers.len());
         for (set, at) in tiers.iter().zip(&positions) {
-            let enabled = if allowed.is_none()
-                && crate::warm_graph::available(state, attribute, set, vector, graph_k)
-            {
-                let mask = tier_mask(store, state, set, at).await?;
-                crate::warm_graph::mask_eligible(state, attribute, set, mask.as_ref(), graph_k)
-            } else {
-                false
+            let enabled = match &allowed {
+                None => {
+                    if crate::warm_graph::available(state, attribute, set, vector, graph_k) {
+                        let mask = tier_mask(store, state, set, at).await?;
+                        crate::warm_graph::mask_eligible(
+                            state,
+                            attribute,
+                            set,
+                            mask.as_ref(),
+                            graph_k,
+                        )
+                    } else {
+                        false
+                    }
+                }
+                Some(allowed) => crate::warm_graph::scan_eligible(
+                    state,
+                    attribute,
+                    set,
+                    vector,
+                    graph_k,
+                    &filtered_tier_mask(set, at, allowed),
+                ),
             };
             graph_tiers.push(enabled);
         }
@@ -600,7 +616,20 @@ async fn from_slabs(
     } else {
         (2 * k).max(20)
     };
-    let accelerated = if allowed.is_none() {
+    let accelerated = if let (true, Some(mask)) = (graph_expected && allowed.is_some(), &mask) {
+        crate::warm_graph::scan(
+            store,
+            state,
+            attribute,
+            set,
+            at,
+            vector,
+            mask.clone(),
+            k + slack,
+            columns,
+        )
+        .await?
+    } else if allowed.is_none() {
         crate::warm_graph::search(
             store,
             state,

@@ -54,8 +54,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     STANDARD.encode(values)
                 })
                 .collect();
-            let mut body =
-                json!({"upsert_columns":{"id":(first..end).collect::<Vec<_>>(),"vector":encoded}});
+            // `bucket` is Round D4's SplitMix64 bucket (0..10000), for hash-distributed filters.
+            let bucket: Vec<u64> = (first..end)
+                .map(|id| {
+                    let mut x = (id as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    (x ^ (x >> 31)) % 10_000
+                })
+                .collect();
+            let mut body = json!({"upsert_columns":{"id":(first..end).collect::<Vec<_>>(),"vector":encoded,"bucket":bucket}});
             if first == 0 {
                 body["distance_metric"] = json!("cosine_distance");
                 body["schema"] =

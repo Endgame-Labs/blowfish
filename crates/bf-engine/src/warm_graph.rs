@@ -1031,6 +1031,112 @@ impl Drop for ScratchLoan<'_> {
         }
     }
 }
+/// Rows kept by SQ8 distance for the exact rerank of a filtered scan, for `k` wanted rows.
+fn scan_shortlist(k: usize) -> usize {
+    (k * 3).max(30)
+}
+/// The most allowed rows a filtered query scans, as a share of the graph's rows (1 in
+/// `SCAN_SHARE`). Above it the IVF tier answers.
+const SCAN_SHARE: usize = 20;
+/// Whether a ready graph answers a filtered query by scanning the codes of its `allowed` rows.
+pub(crate) fn scan_eligible(
+    state: &NamespaceState,
+    attribute: &str,
+    set: &SlabSet,
+    vector: &[f32],
+    k: usize,
+    allowed: &RoaringBitmap,
+) -> bool {
+    if overcommitted() {
+        return false;
+    }
+    // G14 EXPERIMENT SWITCH (temporary): "ivf", or "scan N" for a 1-in-N share.
+    let mut share = SCAN_SHARE;
+    if let Ok(path) = std::env::var("BF_G14_SWITCH") {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut words = text.split_whitespace();
+        match words.next() {
+            Some("ivf") => return false,
+            Some("scan") => share = words.next().and_then(|n| n.parse().ok()).unwrap_or(share),
+            _ => {}
+        }
+    }
+    let Some(scope) = current() else {
+        return false;
+    };
+    let entries = scope
+        .cache
+        .entries
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    entries
+        .get(&Key::new(&scope.namespace, state, attribute, set))
+        .and_then(|h| h.ready.as_ref())
+        .is_some_and(|e| {
+            k > 0
+                && k <= MAX_K
+                && e.graph.can_scan()
+                && vector.len() == e.graph.dims()
+                && vector.iter().any(|x| *x != 0.)
+                && !allowed.is_empty()
+                && allowed.len().saturating_mul(share as u64) <= e.graph.len() as u64
+        })
+}
+/// Answer a filtered query from the ready graph's codes: score only the `mask` rows, keep the
+/// best few by SQ8 distance, and rerank them exactly. `None` when the graph cannot answer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan(
+    store: &Storage,
+    state: &NamespaceState,
+    attribute: &str,
+    set: &SlabSet,
+    at: &Placement,
+    vector: &[f32],
+    mask: Arc<RoaringBitmap>,
+    k: usize,
+    columns: &BTreeSet<String>,
+) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+    if !scan_eligible(state, attribute, set, vector, k, &mask) {
+        return Ok(None);
+    }
+    let Some(scope) = current() else {
+        return Ok(None);
+    };
+    let entry = scope
+        .cache
+        .entries
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&Key::new(&scope.namespace, state, attribute, set))
+        .and_then(|h| h.ready.clone());
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    let Ok(_permit) = entry.slots.try_acquire() else {
+        return Ok(None);
+    };
+    match search_entry(
+        store,
+        state,
+        set,
+        at,
+        vector,
+        Some(mask),
+        k,
+        columns,
+        &entry,
+        0,
+        true,
+    )
+    .await
+    {
+        Ok(found) => Ok(found),
+        Err(error) => {
+            tracing::debug!(%error, "warm graph scan declined; using IVF");
+            Ok(None)
+        }
+    }
+}
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search(
     store: &Storage,
@@ -1095,7 +1201,10 @@ pub(crate) async fn search(
             entry.clone(),
         ));
     }
-    let result = search_entry(store, state, set, at, vector, mask, k, columns, &entry, ef).await;
+    let result = search_entry(
+        store, state, set, at, vector, mask, k, columns, &entry, ef, false,
+    )
+    .await;
     match result {
         Ok(Some(found)) => {
             if let Some(used) = scope
@@ -1128,6 +1237,7 @@ async fn search_entry(
     columns: &BTreeSet<String>,
     entry: &Entry,
     ef: usize,
+    scan: bool,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     entry.searches.fetch_add(1, Ordering::Relaxed);
     let navigation_started = thread_cpu();
@@ -1144,16 +1254,23 @@ async fn search_entry(
         scratch: Some(scratch),
     };
     let (ef, shortlist) = plan(k, ef);
-    let (hits, evaluations) = entry
-        .graph
-        .candidates_with_norms(
-            vector,
-            ef,
-            shortlist,
-            mask.as_deref(),
-            loan.scratch.as_mut().unwrap(),
-        )
-        .map_err(segment::index_error)?;
+    let (hits, evaluations) = match (scan, mask.as_deref()) {
+        (true, Some(allowed)) => entry
+            .graph
+            .scan(vector, scan_shortlist(k), allowed)
+            .map_err(segment::index_error)?,
+        (true, None) => return Ok(None),
+        (false, _) => entry
+            .graph
+            .candidates_with_norms(
+                vector,
+                ef,
+                shortlist,
+                mask.as_deref(),
+                loan.scratch.as_mut().unwrap(),
+            )
+            .map_err(segment::index_error)?,
+    };
     drop(loan);
     #[cfg(all(test, target_os = "macos"))]
     nav_probe::end(
@@ -1196,7 +1313,12 @@ async fn search_entry(
     .collect::<Vec<_>>();
     exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     exact.truncate(k);
-    if exact.len() < k {
+    // A scan sees every allowed row, so fewer than `k` answers is the complete answer.
+    let need = match (scan, mask.as_deref()) {
+        (true, Some(allowed)) => k.min(allowed.len() as usize),
+        _ => k,
+    };
+    if exact.len() < need {
         return Ok(None);
     }
     if columns.is_empty()
@@ -1236,7 +1358,7 @@ async fn search_entry(
             documents.insert(id, doc);
         }
     }
-    if scores.len() < k {
+    if scores.len() < need {
         return Ok(None);
     }
     Ok(Some((scores, documents)))
