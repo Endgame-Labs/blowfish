@@ -1340,17 +1340,21 @@ pub(crate) async fn projected_rows_with(
                         .iter()
                         .map(|n| col.blocks.get(indices[*n]).ok_or_else(corrupt))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let data = reader
-                        // Hydration asks for scattered column blocks, not the megabytes
-                        // around them. The decoded cache still retains complete columns.
-                        .read_batch_sparse(
-                            descriptors
-                                .iter()
-                                .map(|b| b.offset..b.offset + b.length)
-                                .collect(),
-                        )
-                        .await
-                        .map_err(index_error)?;
+                    let ranges = descriptors
+                        .iter()
+                        .map(|b| b.offset..b.offset + b.length)
+                        .collect();
+                    // Maintenance scans are dense. ID blocks also share a compact column,
+                    // so the ordinary cache coalesces nearby
+                    // ID lookups into one GET on the unstaged path. Returned attributes are
+                    // sparse in the document object, and must not fetch the megabytes around
+                    // their blocks. Both paths retain decoded blocks and validate every CRC.
+                    let data = if bypass || name == "id" {
+                        reader.read_batch(ranges).await
+                    } else {
+                        reader.read_batch_sparse(ranges).await
+                    }
+                    .map_err(index_error)?;
                     for ((&n, b), data) in batch.iter().zip(descriptors).zip(data) {
                         let i = indices[n];
                         if crc32fast::hash(&data) != b.crc {

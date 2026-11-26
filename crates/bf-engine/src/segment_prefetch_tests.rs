@@ -10,7 +10,7 @@ use std::{
     fmt,
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -23,16 +23,19 @@ struct Delayed {
     started: tokio::sync::Notify,
     resume: tokio::sync::Notify,
     canceled: AtomicUsize,
+    active: AtomicUsize,
+    delay_docs: AtomicBool,
 }
 impl fmt::Display for Delayed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("delayed columns")
     }
 }
-struct Pending<'a>(&'a AtomicUsize);
+struct Pending<'a>(&'a Delayed);
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.0.canceled.fetch_add(1, Ordering::SeqCst);
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 struct Release(Arc<Delayed>);
@@ -75,7 +78,8 @@ impl ObjectStore for Delayed {
                 let resumed = self.resume.notified();
                 tokio::pin!(resumed);
                 resumed.as_mut().enable();
-                let _pending = Pending(&self.canceled);
+                self.active.fetch_add(1, Ordering::SeqCst);
+                let _pending = Pending(self);
                 self.started.notify_one();
                 if self.blocked.lock().unwrap().is_some() {
                     resumed.await;
@@ -84,6 +88,9 @@ impl ObjectStore for Delayed {
             // Let the speculative tasks start while the query awaits its exact vectors.
             if armed && p.as_ref().ends_with(".bfa") {
                 tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if self.delay_docs.load(Ordering::Relaxed) && p.as_ref().ends_with("docs.bfc") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
         self.inner.get_opts(p, opts).await
@@ -234,11 +241,19 @@ async fn scattered_column_blocks_use_small_reads_and_keep_decoded_cache_and_crc_
         {
             let reads = backend.reads.lock().unwrap();
             assert!(!reads.is_empty());
+            let attributes: Vec<_> = reads
+                .iter()
+                .filter(|(_, r)| {
+                    r.start < title_block.offset + title_block.length + 24
+                        && title_block.offset + 24 < r.end
+                })
+                .collect();
+            assert!(!attributes.is_empty());
             assert!(
-                reads.iter().all(|(_, r)| r.end - r.start <= 128 << 10),
-                "small column blocks must not fetch 1 MiB"
+                attributes.iter().all(|(_, r)| r.end - r.start <= 128 << 10),
+                "small attribute blocks must not fetch 1 MiB"
             );
-            assert!(reads.iter().map(|(_, r)| r.end - r.start).sum::<u64>() < 256 << 10);
+            assert!(attributes.iter().map(|(_, r)| r.end - r.start).sum::<u64>() < 256 << 10);
         }
         backend.reads.lock().unwrap().clear();
         let warm = read_cache::scope(context, hydrated_rows(&store, &segment, &rows, &columns))
@@ -266,7 +281,7 @@ async fn scattered_column_blocks_use_small_reads_and_keep_decoded_cache_and_crc_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn staged_reranks_hydrate_only_the_winning_attribute_block() {
+async fn staged_reranks_bound_attribute_prefetch_to_exact_early_winners() {
     let parent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
     std::fs::create_dir_all(&parent).unwrap();
     let work = tempfile::Builder::new()
@@ -297,10 +312,11 @@ async fn staged_reranks_hydrate_only_the_winning_attribute_block() {
         crate::EngineConfig {
             indexing: false,
             recall_sample_rate: 0.0,
+            query_concurrency: 1,
             ..Default::default()
         },
     );
-    let rows: Vec<_> = (0..4096u32)
+    let rows: Vec<_> = (0..100_000u32)
         .map(|id| {
             serde_json::json!({
                 "id":id, "vector":vector(id), "title":title(id)
@@ -389,14 +405,28 @@ async fn staged_reranks_hydrate_only_the_winning_attribute_block() {
     })
     .await;
     assert!(ready.is_ok(), "stage coverage: {coverage:?}");
+    // Retain a manifest-confirmed snapshot after provisioning, so the measured query
+    // exercises cold staged speculation rather than the initial snapshot-warming path.
+    engine.drop_caches().await;
+    engine.query("t", request.clone()).await.unwrap();
+    assert!(
+        engine
+            .0
+            .read_cache
+            .staging
+            .as_ref()
+            .unwrap()
+            .snapshot("", "t", "vector")
+            .is_some()
+    );
     let segment = &manifest.segments[0];
     let docs = &segment.files["docs"];
     let directory = directory(&ObjectReader::new(&store, docs)).await.unwrap();
-    let winner = &directory.columns["title"].blocks[1007 / BLOCK_ROWS];
     let id = &directory.columns["id"].blocks[1007 / BLOCK_ROWS];
     let metadata = docs.size.saturating_sub(docs.metadata_len.max(65536));
     engine.drop_caches().await;
     backend.reads.lock().unwrap().clear();
+    backend.delay_docs.store(true, Ordering::Relaxed);
     let got = engine
         .query("t", request.clone())
         .await
@@ -412,15 +442,37 @@ async fn staged_reranks_hydrate_only_the_winning_attribute_block() {
             .filter(|(path, _)| path.as_ref() == docs.key)
             .collect();
         assert!(!docs_reads.is_empty(), "the winning column is not staged");
+        let mut blocks = std::collections::BTreeSet::new();
         for (_, range) in docs_reads {
-            assert!(
-                [winner, id]
-                    .iter()
-                    .any(|b| range.start < b.offset + b.length + 24 && b.offset + 24 < range.end)
-                    || range.end > metadata + 24,
-                "a local rerank fetched a nonwinning column block: {range:?}"
-            );
+            if range.end > metadata + 24 || range.start < id.offset + id.length + 24 {
+                continue;
+            }
+            // Ignore the small alignment overlap with adjacent blocks; the main extent
+            // identifies the column block that caused this GET.
+            if let Some((i, _)) = directory.columns["title"]
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    (
+                        i,
+                        range
+                            .end
+                            .min(b.offset + b.length + 24)
+                            .saturating_sub(range.start.max(b.offset + 24)),
+                    )
+                })
+                .filter(|(_, overlap)| *overlap > 0)
+                .max_by_key(|(_, overlap)| *overlap)
+            {
+                blocks.insert(i);
+            }
         }
+        assert!(blocks.contains(&(1007 / BLOCK_ROWS)));
+        assert!(
+            blocks.len() <= 2,
+            "at most one exact early winner, plus the final winner: {blocks:?}"
+        );
         assert!(
             !reads
                 .iter()
@@ -428,6 +480,28 @@ async fn staged_reranks_hydrate_only_the_winning_attribute_block() {
             "exact vectors must come from the local stage"
         );
     }
+    // Cancellation must reach both the final hydration and nested exact-prefix tasks.
+    engine.drop_caches().await;
+    *backend.blocked.lock().unwrap() = Some((Path::from(docs.key.as_str()), 0..docs.size + 24));
+    let release = Release(backend.clone());
+    let permits = engine.0.queries.available_permits();
+    let (reader, query_request) = (engine.clone(), request.clone());
+    let query = tokio::spawn(async move { reader.query("t", query_request).await });
+    tokio::time::timeout(Duration::from_secs(10), backend.started.notified())
+        .await
+        .unwrap();
+    query.abort();
+    assert!(query.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while backend.active.load(Ordering::SeqCst) != 0
+            || engine.0.queries.available_permits() != permits
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled hydration retained a read or query permit");
+    drop(release);
     // Removing the stage retains the remote speculation path and identical results.
     engine
         .0
