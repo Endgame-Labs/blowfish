@@ -1844,16 +1844,16 @@ async fn graph_mask_hides_exactly_the_shadowed_tier_rows_in_place_and_after_line
         for stage in 0..2 {
             if stage == 1 {
                 engine
-                .write(
-                    "locator",
-                    serde_json::from_value(json!({
-                        "deletes": [6],
-                        "upsert_rows": (0..4).map(|n| json!({"id": [100, 2500, 5000, 7][n], "category": 0, "vector": [3.0, 2.0, 1.0]})).collect::<Vec<_>>()
-                    }))
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
+                    .write(
+                        "locator",
+                        serde_json::from_value(json!({
+                            "deletes": [6],
+                            "upsert_rows": more
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
             }
             let (state, _) = engine
                 .snapshot("locator", &Consistency::Strong)
