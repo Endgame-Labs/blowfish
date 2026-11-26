@@ -13432,3 +13432,64 @@ starts a fresh server on the same store with the OS cache dropped. Cells show th
 Costs: WC1 used one c7i.2xlarge for about 55 minutes, an estimated $0.45 with the 120 GB volume. WC2 used one for
 about 1 hour 25 minutes, an estimated $0.55. The instances, key pairs, and security groups are deleted, and no S3
 prefix was written.
+
+## Round G8: serve top_k 100 from the warm graph
+
+Before this round the warm graph served only requests with `k + offset` of 30 or fewer. Anything larger fell back to the
+IVF warm tier, which scans 48 to 64 probes and exact-reranks about 800 rows for a top_k 100 query. The hypothesis was that
+a wider beam plus an exact rerank of 150 to 400 graph candidates serves top_k 100 at the same recall@100 for less work.
+
+**Setup:** Apple M4 (shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the production
+R32/L64 graph, and exact top-100 truth. The frozen v0.1.19 fixture was re-exported to slabs; the IVF tier was built by
+that fixture, not rebuilt. Offline numbers are single thread, the minimum of three passes, and cover navigation plus an
+exact f16 rerank (no HTTP, no hydration). HTTP numbers are the real `blowfish` binary with 16 client processes, and
+instructions and cycles come from the server's task counters.
+
+### Kill test: passed
+
+Today's path at top_k 100 (IVF, over HTTP): **recall@100 0.9523 at 64 probes** (620 q/s, 73.9M instructions and 35.3M
+cycles per query) and 0.9398 at 48 probes (833 q/s, 62.9M instructions and 36.0M cycles per query).
+
+Graph sweep (`crates/bf-vector/examples/g8_sweep.rs`), recall@100 and offline microseconds per query:
+
+| Beam | Shortlist | Scores/query | recall@100 | Navigation | Rerank | Total |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 100 | 2,122 | 0.8953 | 188 | 78 | 266 |
+| 200 | 100 | 3,641 | 0.9409 | 289 | 73 | 362 |
+| 256 | 100 | 4,456 | 0.9517 | 353 | 73 | 426 |
+| **256** | **150** | **4,456** | **0.9533** | **353** | **108** | **460** |
+| 320 | 150 | 5,362 | 0.9615 | 429 | 112 | 540 |
+| 400 | 150 | 6,469 | 0.9683 | 524 | 118 | 641 |
+| 512 | 150 | 7,976 | 0.9747 | 655 | 111 | 766 |
+| 768 | 150 | 11,276 | 0.9824 | 939 | 119 | 1,058 |
+
+The shortlist is capped by the beam, and a shortlist beyond 1.5 times k adds no recall (beam 400: 0.9683 at 150, 200,
+300, and 400). The beam buys recall. Beam 256 with shortlist 150 matches the 64-probe IVF path (0.9533 against 0.9523,
+inside the 0.002 bar) at 460 microseconds, about 2M cycles against 35.3M for the IVF path: roughly 17 times less per
+query before server overhead, and an estimated 5 to 7 times with the server overhead G5 measured for graph top_k 10
+(2.65M instructions per query). The bar was 1.2 times. The top_k 10 graph point costs 126 to 147 microseconds
+(beam 48 to 64, shortlist 30) in the same harness.
+
+### Change
+
+`crates/bf-engine/src/warm_graph.rs` now serves `k + offset` up to 100. For `k` of 30 or fewer nothing changes: the
+calibrated beam and a shortlist of 30. Above 30 there is no setting: the shortlist is 1.5 times k and the beam is 2.56
+times k, never below the calibrated beam (k 100 gives beam 256 and shortlist 150). Requests above 100 still use the IVF
+tier. Heat observation counts requests up to 100 rows too, since they are the expensive ones. No format change.
+
+### Replay over HTTP: not completed
+
+The HTTP replay (16 clients against current blowfish and Qdrant, pass: 1.3 times top_k 100 throughput at matched recall,
+top_k 10 within 5 percent, identical top_k 10 results) was **not finished inside the round's four hours**. Graph
+promotion is the ordinary lifecycle (heat for 10 minutes, a build of about 18 minutes, then paired recall calibration),
+and on this fixture calibration did not become usable within about 45 minutes in either of two runs (main at 64 probes
+reached 444 samples with a paired difference of -0.004 and an interval of -0.018 to +0.009; the candidate at 48 probes
+reached about 270). I did not add a promotion override. So there is **no measured graph top_k 100 throughput, no Qdrant
+comparison, and no HTTP identical-results check** for this change. What backs it is the offline sweep above, the
+unchanged code path for k of 30 or fewer (the unit test pins the beam and shortlist there), and the engine test that
+top_k 100 and `top_k 40 offset 50` are graph-served and return the control's rows.
+
+The next step is to run the candidate where calibration can finish (a longer window, or more calibration samples per
+loop) and then measure 16 clients at top_k 100 and top_k 10 against the IVF numbers above.
+
+Costs: no EC2 and no bucket writes. The M4 run directory is deleted.
