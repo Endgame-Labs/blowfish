@@ -622,8 +622,8 @@ async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan
         after_stats.cache_hit_ratio() > 0.,
         "ANN's sparse vector must remain cached after the larger exhaustive pass"
     );
-    // Eight truth observations produce one cost block. Its eight graph plans run
-    // together, while IVF cost plans and exact truth never select the graph.
+    // Eight truth observations produce one cost block. Its graph plans run twice (an untimed
+    // warm-up pass, then the timed one), while IVF cost plans and exact truth never select the graph.
     assert_eq!(entry.calibration.lock().unwrap().trial_seconds, 0.);
     for i in 1..8 {
         e.recall(
@@ -633,8 +633,8 @@ async fn recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan
         .await
         .unwrap();
     }
-    assert_eq!(entry.searches.load(Ordering::Relaxed), 16);
-    assert_eq!(e.0.hot_graph.answers.load(Ordering::Relaxed), answered + 16);
+    assert_eq!(entry.searches.load(Ordering::Relaxed), 24);
+    assert_eq!(e.0.hot_graph.answers.load(Ordering::Relaxed), answered + 24);
     assert!(entry.calibration.lock().unwrap().trial_seconds > 0.);
     assert!(entry.pending_cost.lock().unwrap().queries.is_empty());
     e.shutdown(Duration::from_secs(3)).await;
