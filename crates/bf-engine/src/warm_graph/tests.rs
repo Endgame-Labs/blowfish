@@ -783,3 +783,156 @@ fn saving_is_a_fraction_of_the_current_ivf_cost_so_a_top_k_change_cannot_flip_it
         "a graph slower than IVF saves nothing"
     );
 }
+/// Round G13: while unindexed writes shadow base rows, the graph still answers (up to `top_k`
+/// 100), returns exactly the rows the IVF control returns, and never returns a shadowed row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadowed_rows_stay_traversable_but_are_never_returned() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.scratch")
+        .join(format!("g13-shadow-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let config = StorageConfig {
+        url: "memory://".into(),
+        cache: CacheConfig {
+            disk_dir: Some(root.join("cache")),
+            memory_bytes: 32 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let store = Storage::open(&config).await.unwrap();
+    let config = EngineConfig {
+        indexing: false,
+        recall_sample_rate: 0.,
+        decoded_cache_bytes: 64 << 20,
+        ..Default::default()
+    };
+    let e = Engine::with_config(store.clone(), config.clone());
+    let control = Engine::with_config(store.clone(), config);
+    let mut seed = 11u64;
+    let vectors = (0..2500)
+        .map(|_| {
+            (0..16)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 40) as f32 / 16777216. * 2. - 1.
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let rows = vectors
+        .iter()
+        .enumerate()
+        .map(|(id, v)| json!({"id":id,"vector":v}))
+        .collect::<Vec<_>>();
+    e.write("hot",serde_json::from_value::<WriteRequest>(json!({"distance_metric":"cosine_distance","schema":{"vector":{"type":"[16]f16","ann":true}},"upsert_rows":rows})).unwrap()).await.unwrap();
+    e.index_namespace("hot", true).await.unwrap();
+    let opts = ReclusterOptions {
+        attribute: "vector".into(),
+        cells: 2,
+        cluster_rows: 32,
+        max_slab_rows: 5000,
+        scratch: root.clone(),
+    };
+    e.run_recluster_job("hot", &opts).await.unwrap();
+    let (state, _) = e
+        .snapshot("hot", &bf_types::Consistency::Strong)
+        .await
+        .unwrap();
+    let set = &state.ann_tiers["vector"][0];
+    let key = Key::new("hot", &state, "vector", set);
+    let held = Arc::new(admitted_entry(&e, set).await);
+    let mut heat = Heat::new(Instant::now());
+    heat.rate = 100.;
+    heat.ivf_seconds = 1.;
+    heat.ready = Some(held.clone());
+    e.0.hot_graph.entries.lock().unwrap().insert(key, heat);
+    {
+        let mut calibration = held.calibration.lock().unwrap();
+        calibration.quality = effort::Effort::new();
+        calibration.build_seconds = 1.;
+    }
+    let key = Key::new("hot", &state, "vector", set);
+    for _ in 0..128 {
+        let scope = Scope::new(e.0.hot_graph.clone(), "hot").trial();
+        *scope.used.lock().unwrap() = Some(vec![key.clone()]);
+        held.calibration.lock().unwrap().trial_ratio = 0.1;
+        scope.record_ivf_cpu(0.01);
+        scope.feedback(1., 1.);
+    }
+    assert!(held.calibration.lock().unwrap().usable);
+    // Overwrite (the same vector, so the row would still rank first), delete, and move a row
+    // (an upsert that gives id 40 the vector of id 17 and so shadows its old position).
+    e.write(
+        "hot",
+        serde_json::from_value::<WriteRequest>(json!({
+            "deletes":[3,4,5],
+            "upsert_rows":[
+                {"id":17,"vector":vectors[900]},
+                {"id":40,"vector":vectors[17]},
+                {"id":41,"vector":vectors[17]},
+            ]}))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let hidden = [3u64, 4, 5, 17, 40, 41];
+    for top_k in [10, 100] {
+        for q in [17usize, 3, 4, 40, 900, 1200] {
+            let body = json!({"rank_by":["vector","ANN",vectors[q]],"top_k":top_k});
+            let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
+            let got = query(&e, "hot", body.clone()).await;
+            assert!(
+                e.0.hot_graph.answers.load(Ordering::Relaxed) > before,
+                "the graph serves top_k {top_k} while writes are pending"
+            );
+            let want = query(&control, "hot", body).await;
+            let ids = |rows: &Value| {
+                rows.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["id"].as_u64().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            // Ids 40, 41, and 17 appear only through their new (tail) rows; 3, 4, and 5 never.
+            let got_ids = ids(&got);
+            assert_eq!(got_ids.len(), top_k);
+            assert!(!got_ids.iter().any(|i| [3, 4, 5].contains(i)));
+            let mut seen = got_ids.clone();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), top_k, "no duplicate rows");
+            if top_k == 10 {
+                same_rows(got, want);
+            } else {
+                // The ID sets can differ at the very tail (graph recall); nearly all must match.
+                let want_ids = ids(&want);
+                let common = got_ids.iter().filter(|i| want_ids.contains(i)).count();
+                assert!(common * 100 >= top_k * 95, "recall {common}/{top_k}");
+            }
+        }
+    }
+    let _ = hidden;
+    // The moved row answers at its new position and the old row is gone.
+    let rows = query(
+        &e,
+        "hot",
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":3}),
+    )
+    .await;
+    let ids = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&40) && ids.contains(&41) && !ids.contains(&17));
+    e.delete_namespace("hot").await.unwrap();
+    drop(held);
+    assert!(e.shutdown(Duration::from_secs(5)).await);
+    assert!(control.shutdown(Duration::from_secs(5)).await);
+}

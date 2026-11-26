@@ -279,12 +279,8 @@ fn from_tiers<'a>(
             None => None,
         };
         stage(t0, "tiers_filter_masks");
-        // A base and its delta rank their leaves as one list.
-        let graph_k = if state.shadowed.is_empty() {
-            k
-        } else {
-            k + (2 * k).max(20)
-        };
+        // The graph hides shadowed rows during navigation, so it needs no extra shortlist.
+        let graph_k = k;
         let mut graph_tiers = Vec::with_capacity(tiers.len());
         for (set, at) in tiers.iter().zip(&positions) {
             let enabled = if allowed.is_none()
@@ -561,6 +557,102 @@ pub(crate) async fn tier_mask(
     Ok(mask)
 }
 
+/// Cached `graph_mask` results by tier, snapshot, and tier mask.
+type ShadowMask = (Option<Arc<RoaringBitmap>>, Arc<RoaringBitmap>);
+static SHADOW_MASKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ShadowMask>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The rows the warm graph may return for this snapshot: the tier's live rows (`mask`, `None`
+/// for all) minus the rows the unindexed tail shadows (overwritten or deleted IDs). The graph
+/// still walks through hidden rows, so recall does not suffer, but it never shortlists them and
+/// `k` results are `k` live rows. Resolved once per snapshot and tier, then cached.
+pub(crate) async fn graph_mask(
+    store: &Storage,
+    state: &NamespaceState,
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+    mask: Option<&Arc<RoaringBitmap>>,
+) -> Result<Option<Arc<RoaringBitmap>>, ApiError> {
+    use crate::lineage::Place;
+    if state.shadowed.is_empty() {
+        return Ok(mask.cloned());
+    }
+    let mut key = format!(
+        "{}|{}|{}|{}|{}|{:p}",
+        set.dir.key,
+        state.seq,
+        state.indexed_through,
+        state.manifest_seq,
+        state.shadowed.len(),
+        mask.map_or(std::ptr::null(), Arc::as_ptr)
+    );
+    for map in &at.maps {
+        key.push('|');
+        key.push_str(map);
+    }
+    if let Some((input, hidden)) = SHADOW_MASKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        && match (input, mask) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    {
+        return Ok(Some(hidden.clone()));
+    }
+    let positions: Vec<usize> = at
+        .positions()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let found = futures::future::try_join_all(
+        positions
+            .iter()
+            .map(|i| segment::lookup_many(store, &state.segments[*i], &state.shadowed)),
+    )
+    .await?;
+    let shadow_of = |i: usize| &found[positions.binary_search(&i).expect("looked up above")];
+    let mut hidden = RoaringBitmap::new();
+    for (cover, place) in set.covered.iter().zip(&at.places) {
+        match place {
+            Place::Here(i) => {
+                hidden.extend(shadow_of(*i).iter().map(|r| cover.base + r));
+            }
+            Place::Moved(parts) => {
+                for (i, map) in parts {
+                    let shadow = shadow_of(*i);
+                    hidden.extend(
+                        map.pairs()
+                            .filter(|(_, to)| shadow.contains(*to))
+                            .map(|(from, _)| cover.base + from),
+                    );
+                }
+            }
+        }
+    }
+    let mut live = match mask {
+        Some(m) => RoaringBitmap::clone(m),
+        None => {
+            let mut all = RoaringBitmap::new();
+            for c in &set.covered {
+                all.insert_range(c.base..c.base + c.rows);
+            }
+            all
+        }
+    };
+    live -= &hidden;
+    let live = Arc::new(live);
+    let mut masks = SHADOW_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+    if masks.len() >= 64 {
+        masks.clear();
+    }
+    masks.insert(key, (mask.cloned(), live.clone()));
+    Ok(Some(live))
+}
+
 /// ANN from one tier's slabs: the same directory search, over slabs as pseudo
 /// segments, with winners mapped back to the segments holding them now (`at`) for hydration.
 #[allow(clippy::too_many_arguments)]
@@ -595,27 +687,33 @@ async fn from_slabs(
     if mask.as_ref().is_some_and(|m| m.is_empty()) {
         return Ok(Some((BTreeMap::new(), BTreeMap::new())));
     }
+    // The graph keeps shadowed rows traversable but out of its shortlist (`graph_mask`), so it
+    // returns `k` live rows. The IVF path drops them afterwards and asks for a few extra.
     let slack = if state.shadowed.is_empty() {
         0
     } else {
         (2 * k).max(20)
     };
-    let accelerated = if allowed.is_none() {
-        crate::warm_graph::search(
-            store,
-            state,
-            attribute,
-            set,
-            at,
-            vector,
-            mask.clone(),
-            k + slack,
-            columns,
-        )
-        .await?
-    } else {
-        None
-    };
+    let accelerated =
+        if allowed.is_none() && crate::warm_graph::available(state, attribute, set, vector, k) {
+            let navigate = graph_mask(store, state, set, at, mask.as_ref()).await?;
+            crate::warm_graph::search(
+                store,
+                state,
+                attribute,
+                set,
+                at,
+                vector,
+                mask.clone(),
+                navigate,
+                k,
+                columns,
+            )
+            .await?
+        } else {
+            None
+        };
+    let graph_served = accelerated.is_some();
     if graph_expected && accelerated.is_none() {
         declined.store(true, std::sync::atomic::Ordering::Relaxed);
         return Ok(None);
@@ -711,7 +809,7 @@ async fn from_slabs(
         }
     };
 
-    if slack > 0 {
+    if slack > 0 && !graph_served {
         let pooled = scores.len();
         scores.retain(|id, _| !state.shadowed.contains(id));
         docs.retain(|id, _| !state.shadowed.contains(id));

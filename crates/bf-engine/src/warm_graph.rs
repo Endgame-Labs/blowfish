@@ -999,6 +999,7 @@ pub(crate) async fn search(
     at: &Placement,
     vector: &[f32],
     mask: Option<Arc<RoaringBitmap>>,
+    navigate: Option<Arc<RoaringBitmap>>,
     k: usize,
     columns: &BTreeSet<String>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
@@ -1042,7 +1043,10 @@ pub(crate) async fn search(
     let Ok(_permit) = entry.slots.try_acquire() else {
         return Ok(None);
     };
-    let result = search_entry(store, state, set, at, vector, mask, k, columns, &entry, ef).await;
+    let result = search_entry(
+        store, state, set, at, vector, navigate, k, columns, &entry, ef,
+    )
+    .await;
     match result {
         Ok(Some(found)) => {
             if let Some(used) = scope
