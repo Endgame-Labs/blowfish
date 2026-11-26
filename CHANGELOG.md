@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.51] - 2026-11-26
+
+### Changed
+
+- **Cold S3 queries hedge their slowest reads:** A cold query's parallel read wave ends when its slowest GET does. Hedging used to fire only after a per-store p90 learned from at least 24 samples, and never for reads over 1 MiB, so it rarely helped cold scans (which coalesce into reads of up to 8 MiB). A read is now duplicated once 70 percent of the reads that started within 50 ms of it have finished and it has outlasted their latencies, at any size; the p90 timer remains for reads with too few siblings. The bookkeeping is a lock-free ring of 10 ms slots, so it stays cheap under concurrency. On 10M x 1024-d pure-S3 cold queries on same-region S3, p90 improved 1.32x for IDs-only and 1.34x with attributes (single client, 8 fresh process pairs), with 16-client throughput unchanged. Server CPU per query rises about 6 percent from the extra GETs. The default `storage.cache.hedge_budget` rises from 0.10 to 0.15 extra requests per request.
+
 ## [0.1.50] - 2026-11-26
 
 ### Changed
@@ -378,7 +384,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.50...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.51...HEAD
+[0.1.51]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.51
 [0.1.50]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.50
 [0.1.49]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.49
 [0.1.48]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.48
