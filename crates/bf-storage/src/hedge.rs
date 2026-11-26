@@ -2,7 +2,10 @@
 //! straggler policy looks at what a read's own siblings are doing right now:
 //!
 //! * **Siblings.** The reads that started within [`SIBLING_WINDOW`] either side of a read are its
-//!   siblings (a scan's reads rarely start in lockstep, so the window is wide). Once at least
+//!   siblings (a scan's reads rarely start in lockstep, so the window is wide). Starts are bucketed into
+//!   [`SLOT`]-wide slots in a fixed ring, each holding counts and a log-scale latency histogram, so a
+//!   check reads a few dozen atomics (no lock, no scan of reads) and memory is fixed whatever the
+//!   arrival rate or a stuck read does. A slot is reused once it is older than the ring. Once at least
 //!   [`MIN_WAVE`] siblings exist, [`WAVE_DONE`] (70 percent) of them have finished, and the read has outlasted
 //!   [`WAVE_DONE`] of the finished siblings' latencies, it is a straggler and is duplicated
 //!   (first response wins, the loser is dropped). No history is needed, so a fresh process hedges
@@ -19,7 +22,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -34,10 +37,18 @@ const MIN_SAMPLES: usize = 24;
 const PRIOR: Duration = Duration::from_millis(250);
 /// The timer never hedges sooner than this.
 const FLOOR: Duration = Duration::from_millis(60);
+/// The timer's p90 is recomputed after this many new samples.
+const P90_EVERY: usize = 16;
 /// Token bucket capacity, which bounds a burst of hedges.
 const BURST: f64 = 64.0;
-/// Reads that started this close to a read (before or after) are its siblings.
+/// Reads that started this close to a read (before or after) are its siblings, to within one slot.
 const SIBLING_WINDOW: Duration = Duration::from_millis(50);
+/// Width of one start-time slot, in microseconds.
+const SLOT_US: u64 = 10_000;
+/// Slots on each side of a read's own slot that count as its siblings.
+const SPAN: u64 = SIBLING_WINDOW.as_micros() as u64 / SLOT_US;
+/// Slots in the ring: 2.56 s of history, longer than any window needs.
+const SLOTS: usize = 256;
 /// Fewest siblings (the read included) for sibling-based hedging.
 const MIN_WAVE: usize = 4;
 /// Share of siblings that must have finished, and the latency quantile a straggler must exceed.
@@ -46,43 +57,67 @@ const MIN_WAVE: usize = 4;
 const WAVE_DONE: f64 = 0.7;
 /// How often a read re-checks its siblings.
 const TICK: Duration = Duration::from_millis(5);
-/// Finished reads older than this leave the sibling list.
-const RETAIN: Duration = Duration::from_secs(2);
+/// Latency histogram: `BUCKETS` log-scale buckets, `PER_OCTAVE` per doubling, from `MIN_US` up.
+const BUCKETS: usize = 128;
+const PER_OCTAVE: f64 = 8.0;
+const MIN_US: f64 = 256.0;
 
-const FLYING: u8 = 0;
-const FINISHED: u8 = 1;
-const GONE: u8 = 2;
+/// Histogram bucket of a latency in microseconds.
+fn bucket(us: u64) -> usize {
+    if (us as f64) < MIN_US {
+        return 0;
+    }
+    (((us as f64 / MIN_US).log2() * PER_OCTAVE) as usize).min(BUCKETS - 1)
+}
+/// Upper edge of a bucket, in microseconds: a latency above it beats every read in the bucket.
+fn bucket_top(b: usize) -> f64 {
+    MIN_US * ((b + 1) as f64 / PER_OCTAVE).exp2()
+}
 
-/// One primary read, visible to its siblings.
-struct Entry {
-    start: Instant,
-    state: AtomicU8,
-    /// Latency in microseconds, set when the read finishes.
-    latency_us: AtomicU32,
+/// Reads that started in one `SLOT_US` slot.
+struct Slot {
+    /// Absolute slot number (`start_us / SLOT_US` plus one; zero means never used).
+    tag: AtomicU64,
+    started: AtomicU32,
+    finished: AtomicU32,
+    hist: [AtomicU32; BUCKETS],
+}
+impl Slot {
+    fn new() -> Self {
+        Self {
+            tag: AtomicU64::new(0),
+            started: AtomicU32::new(0),
+            finished: AtomicU32::new(0),
+            hist: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
 }
 
 #[derive(Default)]
 struct State {
     samples: VecDeque<f32>,
+    since_p90: usize,
     tokens: f64,
-    recent: VecDeque<Arc<Entry>>,
 }
 
 /// A registered read. Dropping it unfinished (a cancelled read) removes it from its siblings.
-struct Member(Arc<Entry>);
-impl Member {
-    fn finish(&self) {
-        let us = self.0.start.elapsed().as_micros().min(u32::MAX as u128) as u32;
-        self.0.latency_us.store(us, Ordering::SeqCst);
-        self.0.state.store(FINISHED, Ordering::SeqCst);
+struct Member<'a> {
+    hedger: &'a Hedger,
+    /// Start time in microseconds since the hedger was made.
+    start_us: u64,
+    done: bool,
+}
+impl Member<'_> {
+    fn finish(&mut self) {
+        self.done = true;
+        self.hedger.finish_at(self.start_us, self.hedger.now_us());
     }
 }
-impl Drop for Member {
+impl Drop for Member<'_> {
     fn drop(&mut self) {
-        let _ = self
-            .0
-            .state
-            .compare_exchange(FLYING, GONE, Ordering::SeqCst, Ordering::SeqCst);
+        if !self.done {
+            self.hedger.cancel_at(self.start_us);
+        }
     }
 }
 
@@ -98,25 +133,34 @@ enum Verdict {
 /// Adaptive hedging policy shared by every reader of one store.
 pub(crate) struct Hedger {
     budget: f64,
+    epoch: Instant,
     state: Mutex<State>,
+    /// The single-read timer's threshold in microseconds, zero until enough samples exist.
+    p90_us: AtomicU64,
+    ring: Box<[Slot]>,
+    /// Serializes a slot's reuse; reads of the ring never take it.
+    rotate: Mutex<()>,
 }
 impl Hedger {
     /// `budget` is the extra-request fraction; zero disables hedging.
     pub(crate) fn new(budget: f64) -> Self {
         Self {
             budget: budget.clamp(0.0, 1.0),
+            epoch: Instant::now(),
             state: Mutex::default(),
+            p90_us: AtomicU64::new(0),
+            ring: (0..SLOTS).map(|_| Slot::new()).collect(),
+            rotate: Mutex::new(()),
         }
     }
+    fn now_us(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64
+    }
     fn threshold(&self) -> Duration {
-        let s = self.state.lock().unwrap();
-        if s.samples.len() < MIN_SAMPLES {
-            return PRIOR;
+        match self.p90_us.load(Ordering::Relaxed) {
+            0 => PRIOR,
+            us => Duration::from_micros(us).max(FLOOR),
         }
-        let mut v: Vec<f32> = s.samples.iter().copied().collect();
-        let i = (v.len() * 9 / 10).min(v.len() - 1);
-        let (_, p90, _) = v.select_nth_unstable_by(i, |a, b| a.total_cmp(b));
-        Duration::from_secs_f32(*p90 / 1e3).max(FLOOR)
     }
     fn record(&self, elapsed: Duration) {
         let mut s = self.state.lock().unwrap();
@@ -124,60 +168,107 @@ impl Hedger {
             s.samples.pop_front();
         }
         s.samples.push_back(elapsed.as_secs_f32() * 1e3);
-    }
-    /// Count a primary read: earn a token and become visible to siblings.
-    fn join(&self) -> Member {
-        let mut s = self.state.lock().unwrap();
-        s.tokens = (s.tokens + self.budget).min(BURST);
-        while s
-            .recent
-            .front()
-            .is_some_and(|e| e.state.load(Ordering::SeqCst) != FLYING && e.start.elapsed() > RETAIN)
+        s.since_p90 += 1;
+        if s.samples.len() >= MIN_SAMPLES
+            && (s.since_p90 >= P90_EVERY || s.samples.len() == MIN_SAMPLES)
         {
-            s.recent.pop_front();
+            s.since_p90 = 0;
+            let mut v: Vec<f32> = s.samples.iter().copied().collect();
+            let i = (v.len() * 9 / 10).min(v.len() - 1);
+            let (_, p90, _) = v.select_nth_unstable_by(i, |a, b| a.total_cmp(b));
+            self.p90_us.store((*p90 * 1e3) as u64, Ordering::Relaxed);
         }
-        let entry = Arc::new(Entry {
-            start: Instant::now(),
-            state: AtomicU8::new(FLYING),
-            latency_us: AtomicU32::new(0),
-        });
-        s.recent.push_back(entry.clone());
-        Member(entry)
     }
-    /// Compare one in-flight read with the reads that started around it.
-    fn verdict(&self, me: &Entry) -> Verdict {
-        let s = self.state.lock().unwrap();
-        let mut flying = 0usize;
-        let mut done = Vec::new();
-        for e in s.recent.iter() {
-            let apart = if e.start > me.start {
-                e.start - me.start
-            } else {
-                me.start - e.start
-            };
-            if apart > SIBLING_WINDOW {
-                continue;
-            }
-            match e.state.load(Ordering::SeqCst) {
-                FLYING => flying += 1,
-                FINISHED => done.push(e.latency_us.load(Ordering::SeqCst)),
-                _ => {}
+    /// The ring slot for absolute slot `abs`, if it still holds that slot.
+    fn slot(&self, abs: u64) -> Option<&Slot> {
+        let s = &self.ring[(abs % SLOTS as u64) as usize];
+        (s.tag.load(Ordering::Acquire) == abs + 1).then_some(s)
+    }
+    /// Count a primary read that starts at `start_us`: earn a token and become visible to siblings.
+    fn join_at(&self, start_us: u64) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.tokens = (st.tokens + self.budget).min(BURST);
+        }
+        let abs = start_us / SLOT_US;
+        let s = &self.ring[(abs % SLOTS as u64) as usize];
+        if s.tag.load(Ordering::Acquire) != abs + 1 {
+            let _g = self.rotate.lock().unwrap();
+            if s.tag.load(Ordering::Acquire) < abs + 1 {
+                // Reuse the slot of a read that began a ring ago. Its reads, if any are still in
+                // flight, drop out of every count: that is what bounds memory.
+                s.started.store(0, Ordering::Relaxed);
+                s.finished.store(0, Ordering::Relaxed);
+                for h in &s.hist {
+                    h.store(0, Ordering::Relaxed);
+                }
+                s.tag.store(abs + 1, Ordering::Release);
             }
         }
-        let total = flying + done.len();
-        if total < MIN_WAVE {
+        s.started.fetch_add(1, Ordering::AcqRel);
+    }
+    fn join(&self) -> Member<'_> {
+        let start_us = self.now_us();
+        self.join_at(start_us);
+        Member {
+            hedger: self,
+            start_us,
+            done: false,
+        }
+    }
+    /// A read that started at `start_us` finished at `now_us`.
+    fn finish_at(&self, start_us: u64, now_us: u64) {
+        if let Some(s) = self.slot(start_us / SLOT_US) {
+            s.hist[bucket(now_us.saturating_sub(start_us))].fetch_add(1, Ordering::AcqRel);
+            s.finished.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    /// A read that started at `start_us` was dropped unfinished.
+    fn cancel_at(&self, start_us: u64) {
+        if let Some(s) = self.slot(start_us / SLOT_US) {
+            let _ = s
+                .started
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        }
+    }
+    /// Compare an in-flight read that started at `start_us` with the reads that started around it.
+    fn verdict_at(&self, start_us: u64, now_us: u64) -> Verdict {
+        let abs = start_us / SLOT_US;
+        let slots: Vec<&Slot> = (abs.saturating_sub(SPAN)..=abs + SPAN)
+            .filter_map(|a| self.slot(a))
+            .collect();
+        let total: u64 = slots
+            .iter()
+            .map(|s| s.started.load(Ordering::Acquire) as u64)
+            .sum();
+        let done: u64 = slots
+            .iter()
+            .map(|s| s.finished.load(Ordering::Acquire) as u64)
+            .sum();
+        if (total as usize) < MIN_WAVE {
             return Verdict::Alone;
         }
-        if done.is_empty() || (done.len() as f64) < WAVE_DONE * total as f64 {
+        if done == 0 || (done as f64) < WAVE_DONE * total as f64 {
             return Verdict::Waiting;
         }
-        done.sort_unstable();
-        let i = ((done.len() as f64 * WAVE_DONE).ceil() as usize).clamp(1, done.len()) - 1;
-        if me.start.elapsed().as_micros() > done[i] as u128 {
-            Verdict::Straggler
-        } else {
-            Verdict::Waiting
+        // The WAVE_DONE quantile of the finished latencies, to the histogram's resolution.
+        let want = ((done as f64 * WAVE_DONE).ceil() as u64).clamp(1, done);
+        let mut seen = 0u64;
+        for b in 0..BUCKETS {
+            seen += slots
+                .iter()
+                .map(|s| s.hist[b].load(Ordering::Acquire) as u64)
+                .sum::<u64>();
+            if seen >= want {
+                return if (now_us.saturating_sub(start_us)) as f64 > bucket_top(b) {
+                    Verdict::Straggler
+                } else {
+                    Verdict::Waiting
+                };
+            }
         }
+        // Counts raced a slot's reuse: nothing to compare with yet.
+        Verdict::Waiting
     }
     fn spend(&self) -> bool {
         let mut s = self.state.lock().unwrap();
@@ -199,12 +290,12 @@ impl Hedger {
         if self.budget <= 0.0 {
             return backend.get_range(path, range).await;
         }
-        let member = self.join();
-        let start = member.0.start;
+        let mut member = self.join();
+        let start = Instant::now();
         let mut primary = Box::pin(backend.get_range(path, range.clone()));
         let len = range.end - range.start;
         loop {
-            let verdict = self.verdict(&member.0);
+            let verdict = self.verdict_at(member.start_us, self.now_us());
             let timer = verdict == Verdict::Alone
                 && len <= MAX_TIMER_HEDGE_BYTES
                 && start.elapsed() >= self.threshold();
@@ -241,7 +332,7 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     /// An in-memory store whose first `slow` reads take `delay`, then answer normally.
     #[derive(Debug)]
@@ -450,8 +541,117 @@ mod tests {
         assert_eq!(s.calls.load(Ordering::SeqCst), 3);
         // A dropped read leaves its siblings' count and never counts as finished.
         let m = hedger.join();
-        let entry = m.0.clone();
+        let start_us = m.start_us;
+        let abs = start_us / SLOT_US;
+        assert_eq!(hedger.slot(abs).unwrap().started.load(Ordering::SeqCst), 1);
         drop(m);
-        assert_eq!(entry.state.load(Ordering::SeqCst), GONE);
+        assert_eq!(hedger.slot(abs).unwrap().started.load(Ordering::SeqCst), 0);
+    }
+
+    /// The pre-ring rule, on an explicit list of (start, latency) reads: siblings are the reads that
+    /// started within 50 ms, and a read straggles once 70 percent finished and it outlasts their
+    /// 70th-percentile latency. `None` latency means still in flight.
+    fn old_rule(reads: &[(u64, Option<u64>)], me: u64, elapsed: u64) -> Verdict {
+        let sib: Vec<_> = reads
+            .iter()
+            .filter(|(s, _)| s.abs_diff(me) <= 50_000)
+            .collect();
+        let mut done: Vec<u64> = sib.iter().filter_map(|(_, l)| *l).collect();
+        if sib.len() < MIN_WAVE {
+            return Verdict::Alone;
+        }
+        if done.is_empty() || (done.len() as f64) < WAVE_DONE * sib.len() as f64 {
+            return Verdict::Waiting;
+        }
+        done.sort_unstable();
+        let i = ((done.len() as f64 * WAVE_DONE).ceil() as usize).clamp(1, done.len()) - 1;
+        if elapsed > done[i] {
+            Verdict::Straggler
+        } else {
+            Verdict::Waiting
+        }
+    }
+
+    #[test]
+    fn the_ring_matches_the_old_rule_on_synthetic_waves() {
+        // A tiny deterministic generator keeps the test reproducible.
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for _ in 0..200 {
+            let hedger = Hedger::new(1.0);
+            // Starts inside one 30 ms span that sits in the middle of the window of every member, so
+            // slot rounding cannot change who counts as a sibling.
+            let base = 1_000_000u64;
+            let n = 4 + rnd(40) as usize;
+            let mut reads = Vec::new();
+            for _ in 0..n {
+                let start = base + rnd(30_000);
+                let lat = 5_000 + rnd(200_000);
+                let finished = rnd(10) < 8;
+                hedger.join_at(start);
+                if finished {
+                    hedger.finish_at(start, start + lat);
+                }
+                reads.push((start, finished.then_some(lat)));
+            }
+            let me = base + 15_000;
+            for elapsed in [1_000u64, 20_000, 60_000, 120_000, 190_000, 250_000] {
+                let new = hedger.verdict_at(me, me + elapsed);
+                let old = old_rule(&reads, me, elapsed);
+                match new {
+                    // Bucket edges round the quantile up (by under 10 percent), so the ring is never
+                    // sooner than the exact rule, and never later than one bucket.
+                    Verdict::Straggler => assert_eq!(old, Verdict::Straggler),
+                    Verdict::Alone => assert_eq!(old, Verdict::Alone),
+                    Verdict::Waiting => {
+                        if old == Verdict::Straggler {
+                            let late = old_rule(&reads, me, (elapsed as f64 / 1.1) as u64);
+                            assert_ne!(late, Verdict::Straggler, "ring waited past one bucket");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stuck_read_does_not_grow_the_ring_and_reads_expire() {
+        let hedger = Hedger::new(1.0);
+        // One read never finishes, then 20 seconds of arrivals, 50 reads per slot.
+        hedger.join_at(0);
+        for slot in 1..2_000u64 {
+            for k in 0..50 {
+                let s = slot * SLOT_US + k;
+                hedger.join_at(s);
+                hedger.finish_at(s, s + 3_000);
+            }
+        }
+        // The ring is fixed-size, the stuck read's slot was reused (its count did not survive), and
+        // a read that started long ago sees nothing.
+        assert_eq!(hedger.ring.len(), SLOTS);
+        assert!(hedger.slot(0).is_none());
+        assert_eq!(hedger.verdict_at(0, 100_000_000), Verdict::Alone);
+        // Current reads still see their siblings.
+        let t = 1_999 * SLOT_US;
+        assert_ne!(hedger.verdict_at(t, t + 1), Verdict::Alone);
+    }
+
+    #[test]
+    fn a_late_straggler_is_called_once_it_outlasts_the_wave() {
+        let hedger = Hedger::new(1.0);
+        for i in 0..10u64 {
+            hedger.join_at(i * 1_000);
+        }
+        for i in 0..9u64 {
+            hedger.finish_at(i * 1_000, i * 1_000 + 40_000);
+        }
+        // Nine of ten finished in about 40 ms; the tenth is not a straggler at 30 ms but is at 60 ms.
+        assert_eq!(hedger.verdict_at(9_000, 9_000 + 30_000), Verdict::Waiting);
+        assert_eq!(hedger.verdict_at(9_000, 9_000 + 60_000), Verdict::Straggler);
     }
 }
