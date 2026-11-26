@@ -2646,49 +2646,79 @@ impl SegmentReader {
         let dense_bounds = bounds.clone();
         // Known sparse terms must co-occur at a row, rather than at unrelated
         // maxima in the same window. This tightens the bound before any dense read.
-        for (w, scores) in row_bounds.chunks(BLOCK).enumerate() {
-            bounds[w] += f64::from(scores.iter().copied().fold(0.0, f32::max));
+        if !row_bounds.is_empty() {
+            // Only touched rows can be nonzero: fold those instead of every row.
+            let mut maxima = crate::scratch::Windows::take(windows);
+            for &row in row_bounds.touched() {
+                let w = row as usize / BLOCK;
+                maxima[w] = maxima[w].max(f64::from(row_bounds[row as usize]));
+            }
+            for &row in row_bounds.touched() {
+                let w = row as usize / BLOCK;
+                bounds[w] += std::mem::take(&mut maxima[w]);
+            }
         }
-        let mut order: Vec<_> = bounds
-            .into_iter()
-            .enumerate()
-            .map(|(w, b)| (w, (b + f64::from(prefix_windows[w])) * margin))
-            .filter(|(_, b)| *b > 0.0)
-            .collect();
-        order.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut order = Ranked::new(
+            bounds
+                .into_iter()
+                .enumerate()
+                .map(|(w, b)| (w, (b + f64::from(prefix_windows[w])) * margin))
+                .filter(|(_, b)| *b > 0.0)
+                .collect(),
+        );
         let mut next = 0;
         let mut batch_size = if prefetch { FIRST_WINDOWS } else { usize::MAX };
         let mut by_bound = Vec::with_capacity(terms.len());
         let mut essential = vec![true; terms.len()];
         let mut dense_candidates = Vec::with_capacity(32);
         while next < order.len() {
-            let mut batch = Vec::new();
-            while next < order.len() && batch.len() < batch_size {
-                let (window, bound) = order[next];
-                if search_floor(&heap, k, threshold).is_some_and(|floor| bound < floor) {
-                    // Bounds descend, and the heap threshold only rises.
-                    metrics.windows_pruned += order.len() - next;
-                    next = order.len();
-                    break;
+            let mut batch = if batch_size == usize::MAX {
+                // Everything left is one batch: keep what the floor allows without
+                // ordering it. Scoring takes windows in descending order lazily.
+                let floor = search_floor(&heap, k, threshold);
+                let mut kept = Vec::new();
+                for &(window, bound) in &order.items[next..] {
+                    if floor.is_some_and(|floor| bound < floor) {
+                        metrics.windows_pruned += 1;
+                        continue;
+                    }
+                    let start = (window * BLOCK) as u32;
+                    let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
+                    if allowed.is_some_and(|rows| rows.range(start..end).next().is_none()) {
+                        continue;
+                    }
+                    kept.push((window, bound));
                 }
-                next += 1;
-                let start = (window * BLOCK) as u32;
-                let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
-                if allowed.is_some_and(|rows| rows.range(start..end).next().is_none()) {
-                    continue;
+                next = order.len();
+                Ranked::new(kept)
+            } else {
+                let mut kept = Vec::new();
+                while next < order.len() && kept.len() < batch_size {
+                    let (window, bound) = order.get(next);
+                    if search_floor(&heap, k, threshold).is_some_and(|floor| bound < floor) {
+                        // Bounds descend, and the heap threshold only rises.
+                        metrics.windows_pruned += order.len() - next;
+                        next = order.len();
+                        break;
+                    }
+                    next += 1;
+                    let start = (window * BLOCK) as u32;
+                    let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
+                    if allowed.is_some_and(|rows| rows.range(start..end).next().is_none()) {
+                        continue;
+                    }
+                    kept.push((window, bound));
                 }
-                batch.push((window, bound));
-            }
-            if batch.is_empty() {
+                Ranked::sorted(kept)
+            };
+            if batch.len() == 0 {
                 break;
             }
             if std::env::var_os("BF_TRACE_STAGES").is_some() {
                 eprintln!(
-                    "FTS batch windows={} of {} first_bound={:.2} last_bound={:.2} heap_min={:?}",
+                    "FTS batch windows={} of {} heap_min={:?}",
                     batch.len(),
                     order.len(),
-                    batch[0].1,
-                    batch.last().unwrap().1,
                     heap.peek().map(|h| h.0.score)
                 );
             }
@@ -2699,7 +2729,7 @@ impl SegmentReader {
                 // row order, requesting each frame once, without sorting a much
                 // larger vector of duplicate term/frame pairs. Scoring retains
                 // the original descending-bound window order.
-                let mut windows: Vec<_> = batch.iter().map(|&(w, _)| w).collect();
+                let mut windows: Vec<_> = batch.items.iter().map(|&(w, _)| w).collect();
                 windows.sort_unstable();
                 for (t, term) in terms.iter().enumerate() {
                     if term.dense.is_some() {
@@ -2724,10 +2754,14 @@ impl SegmentReader {
                 self.read_search_blocks(&mut terms, wanted, &saturation, &mut metrics)
                     .await?;
             }
-            for (window, bound) in batch {
+            let mut taken = 0;
+            while taken < batch.len() {
+                let (window, bound) = batch.get(taken);
+                taken += 1;
                 if search_floor(&heap, k, threshold).is_some_and(|floor| bound < floor) {
-                    metrics.windows_pruned += 1;
-                    continue;
+                    // Bounds descend, and the heap threshold only rises.
+                    metrics.windows_pruned += batch.len() - taken + 1;
+                    break;
                 }
                 let start = (window * BLOCK) as u32;
                 let end = ((window + 1) * BLOCK).min(self.num_docs() as usize) as u32;
@@ -2752,7 +2786,9 @@ impl SegmentReader {
                         .await?;
                 }
                 let floor = search_floor(&heap, k, threshold);
-                let mut candidates = [true; BLOCK];
+                let width = (end - start) as usize;
+                // Bit i set: row `start + i` may still compete.
+                let mut candidates = [u64::MAX; BLOCK / 64];
                 dense_candidates.clear();
                 if let Some(floor) = floor {
                     // Block-max MaxScore: low-impact terms cannot create a hit on
@@ -2780,7 +2816,7 @@ impl SegmentReader {
                         skipped += 1;
                     }
                     if skipped > 0 {
-                        candidates.fill(false);
+                        candidates = [0; BLOCK / 64];
                         for (t, term) in terms.iter().enumerate().filter(|(t, _)| essential[*t]) {
                             if term.dense.is_some() {
                                 dense_candidates.push(t);
@@ -2791,7 +2827,8 @@ impl SegmentReader {
                                     continue;
                                 };
                                 for &(row, _) in postings.window(window) {
-                                    candidates[(row - start) as usize] = true;
+                                    let i = (row - start) as usize;
+                                    candidates[i / 64] |= 1 << (i % 64);
                                 }
                             }
                         }
@@ -2799,13 +2836,31 @@ impl SegmentReader {
                 }
                 // Test the sparse bound and allowed mask once per candidate, not
                 // again for every term that hits it.
-                let competitive: Vec<_> = (start..end)
-                    .filter(|&row| {
-                        (candidates[(row - start) as usize]
-                            || dense_candidates.iter().any(|&t| {
+                let mut competitive = [0u32; BLOCK];
+                let mut count = 0;
+                let mut kept = [0u64; BLOCK / 64];
+                for (lane, &bits) in candidates.iter().enumerate() {
+                    if lane * 64 >= width {
+                        break;
+                    }
+                    let mut bits = bits;
+                    if bits == u64::MAX && lane * 64 + 64 > width {
+                        bits &= (1u64 << (width - lane * 64)) - 1;
+                    }
+                    if !dense_candidates.is_empty() {
+                        for (bit, row) in (start + lane as u32 * 64..end).take(64).enumerate() {
+                            if dense_candidates.iter().any(|&t| {
                                 terms[t].dense.as_ref().unwrap().values[row as usize] != 0
-                            }))
-                            && allowed.is_none_or(|rows| rows.contains(row))
+                            }) {
+                                bits |= 1 << bit;
+                            }
+                        }
+                    }
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros();
+                        bits &= bits - 1;
+                        let row = start + lane as u32 * 64 + bit;
+                        if allowed.is_none_or(|rows| rows.contains(row))
                             && floor.is_none_or(|floor| {
                                 row_bounds.is_empty()
                                     || (f64::from(row_bounds[row as usize])
@@ -2814,20 +2869,23 @@ impl SegmentReader {
                                         * margin
                                         >= floor
                             })
-                    })
-                    .collect();
+                        {
+                            competitive[count] = row;
+                            count += 1;
+                            kept[lane] |= 1 << bit;
+                        }
+                    }
+                }
+                let competitive = &competitive[..count];
                 if competitive.is_empty() {
                     continue;
                 }
-                candidates.fill(false);
-                for &row in &competitive {
-                    candidates[(row - start) as usize] = true;
-                }
+                let candidates = kept;
                 let mut scores = [0.0f32; BLOCK];
                 let mut prefix_matches = [false; BLOCK];
                 for term in &terms {
                     if let Some(dense) = &term.dense {
-                        for &row in &competitive {
+                        for &row in competitive {
                             let tf = dense.get(row);
                             if tf > 0 {
                                 let i = (row - start) as usize;
@@ -2857,21 +2915,22 @@ impl SegmentReader {
                             // A common-word frame can have 128 entries but only one
                             // rare-term candidate. Seek those rows instead of scanning
                             // the entire frame and testing the same mask repeatedly.
-                            for &row in &competitive {
+                            for &row in competitive {
                                 if let Ok(i) = postings.binary_search_by_key(&row, |&(r, _)| r) {
                                     add(row, postings[i].1);
                                 }
                             }
                         } else {
                             for &(row, tf) in postings {
-                                if candidates[(row - start) as usize] {
+                                let i = (row - start) as usize;
+                                if candidates[i / 64] >> (i % 64) & 1 != 0 {
                                     add(row, tf);
                                 }
                             }
                         }
                     }
                 }
-                for row in competitive {
+                for &row in competitive {
                     let i = (row - start) as usize;
                     let score = scores[i] + f32::from(prefix_matches[i]);
                     if score <= 0.0 {
@@ -3283,9 +3342,71 @@ async fn read_exact(source: &dyn RangeRead, range: Range<u64>) -> io::Result<Byt
     Ok(data)
 }
 
+/// Window candidates `(window, bound)` that are visited in descending-bound order
+/// (ties by window) but sorted only as far as the visit reaches. The order is
+/// strict and total, so every visit sequence matches a full sort.
+struct Ranked {
+    items: Vec<(usize, f64)>,
+    sorted: usize,
+}
+
+impl Ranked {
+    fn new(items: Vec<(usize, f64)>) -> Self {
+        Self { items, sorted: 0 }
+    }
+
+    fn sorted(items: Vec<(usize, f64)>) -> Self {
+        let sorted = items.len();
+        Self { items, sorted }
+    }
+
+    fn cmp(a: &(usize, f64), b: &(usize, f64)) -> std::cmp::Ordering {
+        b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// The `i`th window in visit order.
+    fn get(&mut self, i: usize) -> (usize, f64) {
+        if i >= self.sorted {
+            let target = (self.sorted * 2).max(i + 1).max(64).min(self.items.len());
+            let tail = &mut self.items[self.sorted..];
+            let count = target - self.sorted;
+            if count < tail.len() {
+                tail.select_nth_unstable_by(count - 1, Self::cmp);
+            }
+            tail[..count].sort_unstable_by(Self::cmp);
+            self.sorted = target;
+        }
+        self.items[i]
+    }
+}
+
 #[cfg(test)]
 mod posting_cache_tests {
     use super::*;
+
+    #[test]
+    fn ranked_visits_windows_like_a_full_sort() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for len in [0usize, 1, 5, 63, 64, 65, 200, 1_000, 5_000] {
+            let items: Vec<(usize, f64)> = (0..len)
+                .map(|w| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (w, ((state >> 40) % 50) as f64 / 4.0)
+                })
+                .collect();
+            let mut expected = items.clone();
+            expected.sort_unstable_by(Ranked::cmp);
+            let mut ranked = Ranked::new(items);
+            let visited: Vec<_> = (0..len).map(|i| ranked.get(i)).collect();
+            assert_eq!(visited, expected);
+        }
+    }
 
     #[test]
     fn memo_reports_its_actual_charge_as_it_grows_and_shrinks() {

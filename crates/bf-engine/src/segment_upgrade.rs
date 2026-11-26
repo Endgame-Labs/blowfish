@@ -59,7 +59,7 @@ pub(crate) async fn needs_upgrade(store: &Storage, segment: &Segment) -> Result<
 }
 
 /// Copy non-vector columns into document-v2, without decoding a namespace or retraining ANN.
-/// ANN must already be current, and its object remains referenced by the same segment.
+/// A current segment ANN or a covering tier must retain the authoritative vector bytes.
 pub(crate) async fn rewrite(
     store: &Storage,
     ns: &str,
@@ -72,7 +72,11 @@ pub(crate) async fn rewrite(
     let mut body = Vec::new();
     for (name, column) in &old.columns {
         if let Some((dims, f16)) = column.vector {
-            if !segment.files.contains_key(&format!("annv2:{name}")) {
+            if !segment.files.contains_key(&format!("annv2:{name}"))
+                && !crate::read_cache::context()
+                    .and_then(|c| c.vectors)
+                    .is_some_and(|s| s.covers(segment, name))
+            {
                 return Err(index_error(
                     "document upgrade requires the current ANN object",
                 ));

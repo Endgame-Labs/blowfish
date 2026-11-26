@@ -49,7 +49,20 @@ fn filter_columns(filter: &Filter, columns: &mut BTreeSet<String>) {
     }
 }
 
-pub(crate) async fn execute(
+pub(crate) fn execute<'a>(
+    store: &'a Storage,
+    state: &'a NamespaceState,
+    request: &'a QueryRequest,
+    config: &'a EngineConfig,
+    force_exact: bool,
+) -> futures::future::BoxFuture<'a, Result<QueryResponse, ApiError>> {
+    crate::vector_locator::scope(
+        state,
+        execute_inner(store, state, request, config, force_exact),
+    )
+}
+
+async fn execute_inner(
     store: &Storage,
     state: &NamespaceState,
     request: &QueryRequest,
@@ -69,11 +82,7 @@ pub(crate) async fn execute(
         let results = futures::future::try_join_all(queries.iter().map(|q| async move {
             let mut q = q.clone();
             q.vector_encoding = request.vector_encoding;
-            Ok::<_, ApiError>(
-                Box::pin(execute(store, state, &q, config, force_exact))
-                    .await?
-                    .result,
-            )
+            Ok::<_, ApiError>(execute(store, state, &q, config, force_exact).await?.result)
         }))
         .await?;
         return Ok(QueryResponse {
@@ -520,6 +529,31 @@ async fn prepare_one(
             continue;
         }
         let Some(index) = index else {
+            if crate::read_cache::context()
+                .and_then(|c| c.vectors)
+                .is_some_and(|s| s.covers(seg, attribute))
+            {
+                let top = if all { allowed.len() as usize } else { k };
+                let hits = crate::vector_locator::exact(
+                    store,
+                    seg,
+                    &allowed,
+                    attribute,
+                    vector,
+                    top,
+                    state.metric,
+                )
+                .await?;
+                let rows = hits.iter().map(|(row, _)| *row).collect();
+                for (row, score) in hits {
+                    scores.insert(ids[row as usize].clone(), score as f64);
+                }
+                out.docs.extend(crate::shared(
+                    segment::projected_documents(store, seg, &rows, Some(&columns)).await?,
+                ));
+                continue;
+            }
+
             // Version-one document-only segments remain readable during rollout.
             if let Some(context) = crate::read_cache::context() {
                 context

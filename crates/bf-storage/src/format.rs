@@ -8,7 +8,7 @@ use std::{
 };
 
 /// Highest bucket generation this binary can safely write or garbage-collect.
-pub const BUCKET_FORMAT_VERSION: u64 = 5;
+pub const BUCKET_FORMAT_VERSION: u64 = 6;
 const PREFIX: &str = "_system/format/";
 
 pub(crate) async fn check(backend: &dyn ObjectStore, root: &Path) -> Result<u64, Error> {

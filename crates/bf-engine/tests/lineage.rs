@@ -8,7 +8,8 @@ use bf_storage::Storage;
 use futures::stream::BoxStream;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult, path::Path,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
+    path::Path,
 };
 use serde_json::{Value, json};
 use std::{
@@ -21,7 +22,8 @@ use std::{
 /// or (`after`) after writing, the ambiguous case of a crash between the write and its reply.
 #[derive(Debug, Default)]
 struct Faults {
-    inner: object_store::memory::InMemory,
+    inner: Arc<object_store::memory::InMemory>,
+    delete_crash: Arc<std::sync::atomic::AtomicUsize>,
     rule: Mutex<Option<(String, usize, bool)>>,
 }
 impl Faults {
@@ -93,7 +95,30 @@ impl ObjectStore for Faults {
         &self,
         paths: BoxStream<'static, StoreResult<Path>>,
     ) -> BoxStream<'static, StoreResult<Path>> {
-        self.inner.delete_stream(paths)
+        use futures::StreamExt;
+        let inner = self.inner.clone();
+        let crash = self.delete_crash.clone();
+        paths
+            .then(move |path| {
+                let inner = inner.clone();
+                let crash = crash.clone();
+                async move {
+                    let path = path?;
+                    let mode = if path.as_ref().contains("/segments/")
+                        && path.as_ref().ends_with(".bfa")
+                    {
+                        crash.swap(0, std::sync::atomic::Ordering::AcqRel)
+                    } else {
+                        0
+                    };
+                    if mode == 1 {
+                        return failure();
+                    }
+                    inner.delete(&path).await?;
+                    if mode == 2 { failure() } else { Ok(path) }
+                }
+            })
+            .boxed()
     }
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
         self.inner.list(prefix)
@@ -209,6 +234,7 @@ fn referenced(m: &bf_wal::Manifest) -> Vec<String> {
                 .flat_map(|l| l.parts.iter().map(|p| &p.map)),
         )
         .chain(m.ann_dirs.values())
+        .chain(m.text_stats.iter())
         .map(|f| f.key.clone())
         .collect();
     out.sort();
@@ -387,5 +413,112 @@ async fn a_merge_that_fails_at_any_publication_point_keeps_the_tier_answering_an
             assert_eq!(indexed_top(&fresh, q).await, json!(q), "{pattern} {after}");
         }
         assert_ne!(indexed_top(&fresh, 15).await, json!(15));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tier_removal_failures_leave_one_complete_vector_source_reachable() {
+    for (pattern, skip, after) in [
+        ("ann.restored.", 0, false),
+        ("ann.restored.", 0, true),
+        ("ns/t/manifest/", 1, false),
+        ("ns/t/manifest/", 1, true),
+    ] {
+        let (faults, store, engine, _scratch) = setup().await;
+        // Simulate the prior retirement before making one covered source disappear.
+        let wal = bf_wal::Wal::new(store.clone(), "t").unwrap();
+        let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+        let old: Vec<_> = m
+            .segments
+            .iter_mut()
+            .filter_map(|s| s.files.remove("annv2:vector"))
+            .collect();
+        m.ann_dirs.clear();
+        m.segments.remove(0);
+        wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+        for file in old {
+            store.delete(&file.key).await.unwrap();
+        }
+        upsert(&engine, 10_000..10_001, 0).await;
+        faults.arm(pattern, skip, after);
+        let _ = engine.index_namespace("t", true).await;
+        faults.disarm();
+        let fresh = Engine::with_config(store.clone(), config());
+        assert_eq!(top(&fresh, 2107).await, json!(2107));
+        all_present(&store, &manifest(&store).await).await;
+        fresh.index_namespace("t", true).await.unwrap();
+        fresh.collect_garbage("t").await.unwrap();
+        assert_eq!(
+            indexed_top(&Engine::with_config(store.clone(), config()), 2107).await,
+            json!(2107)
+        );
+        all_present(&store, &manifest(&store).await).await;
+    }
+}
+
+/// Retirement is its own fenced publication; no physical vector is deleted by that pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retirement_publication_and_gc_crashes_preserve_authoritative_vectors() {
+    for (phase, skip, after) in [
+        ("retire", 0, false),
+        ("retire", 1, false),
+        ("retire", 1, true),
+        ("gc", 0, false),
+        ("gc", 0, true),
+        ("gc", 1, false),
+        ("gc", 1, true),
+        ("delete", 0, false),
+        ("delete", 0, true),
+    ] {
+        let (faults, store, engine, _scratch) = setup().await;
+        let before = manifest(&store).await;
+        assert!(
+            before
+                .segments
+                .iter()
+                .all(|s| s.files.contains_key("annv2:vector"))
+        );
+        if phase == "retire" {
+            faults.arm("ns/t/manifest/", skip, after);
+        }
+        let _ = engine.index_namespace("t", true).await;
+        faults.disarm();
+        let restart = Engine::with_config(store.clone(), config());
+        assert_eq!(indexed_top(&restart, 107).await, 107);
+        all_present(&store, &manifest(&store).await).await;
+        restart.index_namespace("t", true).await.unwrap();
+        let retired = manifest(&store).await;
+        assert!(
+            retired
+                .segments
+                .iter()
+                .all(|s| !s.files.contains_key("annv2:vector"))
+        );
+        if phase == "gc" {
+            faults.arm("ns/t/manifest/", skip, after);
+        }
+        if phase == "delete" {
+            faults.delete_crash.store(
+                if after { 2 } else { 1 },
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        let result = restart.collect_garbage("t").await;
+        if phase == "delete" {
+            assert!(result.is_err());
+        }
+        faults.disarm();
+        let fresh = Engine::with_config(store.clone(), config());
+        assert_eq!(indexed_top(&fresh, 107).await, 107);
+        all_present(&store, &manifest(&store).await).await;
+        fresh.collect_garbage("t").await.unwrap();
+        all_present(&store, &manifest(&store).await).await;
+        assert_eq!(
+            indexed_top(&Engine::with_config(store.clone(), config()), 2107).await,
+            2107
+        );
+        for seg in before.segments {
+            assert!(store.get(&seg.files["annv2:vector"].key).await.is_err());
+        }
     }
 }

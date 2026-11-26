@@ -4,6 +4,35 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.47] - 2026-11-26
+
+### Changed
+
+- **Cold queries find a long WAL tail faster:** A cold reader found committed but unindexed writes by probing slots in growing waves (2, 4, 8, 16, then 32), one round trip each. When the first two waves are full, it now also lists the WAL prefix and reads the whole listed run in one wave. Conditional slot reads still decide where the tail ends, so a stale listing only falls back to probing. On same-region S3, a cold strong query with 32 pending external payloads went from 325 to 255 ms (1.27x), and with 32 inline entries 1.5x faster. Empty and short tails are unchanged.
+
+## [0.1.46] - 2026-11-26
+
+### Changed
+
+- **Faster warm BM25:** The scoring loop no longer allocates a candidate list per window, orders windows only as far as the score threshold needs, and folds row bounds over touched rows only. Results are identical (ordered IDs and score bits). On 1M MS MARCO on a 16-vCPU Graviton host, warm throughput went from 2,654 to 3,264 q/s at 16 clients (1.23x) and from 918 to 1,012 q/s at one client (1.10x). Cold queries are unchanged.
+
+## [0.1.45] - 2026-11-26
+
+**Bucket format change: generation 6 (manifest format 5).** The upgrade is automatic and one way: the first publication by v0.1.45 upgrades the bucket, after which older releases refuse to open it. Stop every older server against a bucket before you start v0.1.45 on it.
+
+### Changed
+
+- **Every vector is stored once:** After a recluster, each covered row's vector used to live both in its segment's ANN object and in the namespace-wide tier. Covered segments' ANN objects are now retired in a fenced publication, and the tier becomes the only copy. Projection, exact search, filtered search, writes, recluster, compaction, branches, and copies all read covered vectors through the tier. On 2.68M BEIR NQ, the settled store went from 16.9 GB to 8.3 GB, with identical results on all 3,452 test queries, unchanged recall, and unchanged warm and cold latency.
+- **Filtered vector search runs on the tier:** Each slab gets a small resident row map (about 6 bytes a row), so a filtered query probes the tier instead of falling back to the segments' own indexes. On a 10M pure-S3 cold run, selective filters went from 2.94 s to 2.32 s p50 (recall 1.000), and broad filters from 2.63 s to 1.83 s, with recall up from 0.950 to 0.992.
+- **Branches and copies pin the tiers they depend on,** and a tier is never dropped before the segments it covers get their own vector objects back.
+
+## [0.1.44] - 2026-11-26
+
+### Changed
+
+- **Cold queries read pending writes in parallel:** A strong-consistency query on a cold node fetched each committed but not yet indexed write payload one at a time. With 32 such payloads in S3, cold p50 was about 1,013 ms, about 800 ms of it in serial fetches. Payloads are now fetched concurrently and applied strictly in WAL order: the same case takes about 300 ms (3.2x faster), with identical results, and empty or small WAL tails are unchanged.
+- **The concurrency is bounded by bytes:** At most 8 payloads and 64 MiB of stored payload bytes are in flight. A larger payload still proceeds, alone. New commit records carry their payload's stored size. Records from older releases have no size and are fetched one at a time. With 8 payloads of 64 MiB each, peak memory is 397 MiB, down from 720 MiB with a count-only bound. Older binaries ignore the new field.
+
 ## [0.1.43] - 2026-11-26
 
 ### Fixed
@@ -327,7 +356,11 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.43...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.47...HEAD
+[0.1.47]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.47
+[0.1.46]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.46
+[0.1.45]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.45
+[0.1.44]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.44
 [0.1.43]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.43
 [0.1.42]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.42
 [0.1.41]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.41

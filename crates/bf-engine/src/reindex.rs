@@ -310,7 +310,9 @@ impl Engine {
             if !segment::upgrade::needs_upgrade(store, seg).await? {
                 continue;
             }
-            let converted = convert_documents(store, ns, seg).await?;
+            let converted =
+                crate::vector_locator::scope_manifest(&latest, convert_documents(store, ns, seg))
+                    .await?;
             let bytes = converted.bytes;
             report.bytes_written += bytes;
             // One segment per publication bounds memory and makes interrupted upgrades resumable.
@@ -715,12 +717,18 @@ async fn apply_segments(
         .collect();
     let previous_dirs = std::mem::take(&mut manifest.ann_dirs);
     for attr in attributes {
+        let sources = manifest
+            .segments
+            .iter()
+            .filter(|s| crate::upgrade::files(s, &attr).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
         let layouts = [ann_dir::Layout::Segments];
         let built = futures::future::try_join_all(layouts.iter().map(|layout| {
             ann_dir::build(
                 store,
                 ns,
-                &manifest.segments,
+                &sources,
                 &attr,
                 *layout,
                 previous_dirs.get(&layout.dir_key(&attr)),

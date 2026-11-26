@@ -13,10 +13,10 @@ pub const FORMAT_VERSION: u8 = 1;
 /// (half the bytes, losslessly). Written for large payloads whose every such vector is exactly
 /// f16; readers accept both encodings.
 pub const PACKED_FORMAT_VERSION: u8 = 2;
-/// Current manifest generation. Formats 1 to 3 are accepted only for automatic upgrade (format 3
-/// replaced format 2's single `ann_slabs` layout with `ann_tiers`; format 4 added `lineage`, and
-/// segments a tier covers no longer need an ANN object of their own).
-pub const MANIFEST_FORMAT_VERSION: u8 = 4;
+/// Current manifest generation. Formats 1 to 4 are accepted only for automatic upgrade (format 3
+/// replaced format 2's single `ann_slabs` layout with `ann_tiers`; format 4 added `lineage`).
+/// Format 5 allows covering tiers to own a segment's vectors after its ANN objects are retired.
+pub const MANIFEST_FORMAT_VERSION: u8 = 5;
 /// Current format of a tier's slabs and directory. A tier written in an older one is rebuilt by
 /// the automatic recluster.
 pub const TIER_FORMAT_VERSION: u32 = 1;
@@ -141,6 +141,11 @@ fn encode_payload(json: &[u8], version: u8) -> Result<Vec<u8>, Error> {
 const SLOT_VERSION: u8 = 3;
 /// Maximum uncompressed entry size stored directly in a commit slot (64 KiB).
 pub const INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Out-of-line payloads `tail_bounded` fetches at once, at most.
+const TAIL_FETCH_CONCURRENCY: usize = 8;
+/// Stored (compressed) payload bytes `tail_bounded` keeps in flight. A single payload larger than
+/// this still proceeds, alone.
+const TAIL_FETCH_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitRecord {
     write_id: Uuid,
@@ -154,6 +159,42 @@ struct CommitRecord {
     inline: Option<WalEntry>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     redacted: bool,
+    /// Stored size of the out-of-line payload. Absent in records written by older releases,
+    /// which older readers also ignore (this struct does not deny unknown fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_bytes: Option<u64>,
+}
+/// Bytes a record's fetch holds in flight: zero when nothing is fetched, its recorded stored size,
+/// or the whole budget when the size is unknown.
+fn fetch_cost(record: &CommitRecord) -> u64 {
+    if record.tombstone || record.redacted || record.inline.is_some() {
+        0
+    } else {
+        record.payload_bytes.unwrap_or(TAIL_FETCH_BYTES)
+    }
+}
+/// Admission control for concurrent payload fetches: bounded by count and by summed stored bytes.
+#[derive(Default)]
+struct FetchWindow {
+    count: usize,
+    bytes: u64,
+}
+impl FetchWindow {
+    /// Admit a fetch of `cost` bytes if it fits; the first fetch always does.
+    fn admit(&mut self, cost: u64) -> bool {
+        let fits = self.count == 0
+            || (self.count < TAIL_FETCH_CONCURRENCY
+                && self.bytes.saturating_add(cost) <= TAIL_FETCH_BYTES);
+        if fits {
+            self.count += 1;
+            self.bytes = self.bytes.saturating_add(cost);
+        }
+        fits
+    }
+    fn finish(&mut self, cost: u64) {
+        self.count -= 1;
+        self.bytes = self.bytes.saturating_sub(cost);
+    }
 }
 impl CommitRecord {
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -470,6 +511,7 @@ fn record_stage(stage: &'static str, since: std::time::Instant) {
 pub struct Staged {
     inline: bool,
     uploaded: bool,
+    payload_bytes: Option<u64>,
 }
 impl Staged {
     /// A completed upload with an unknown outcome: `discard` attempts the delete regardless.
@@ -478,6 +520,7 @@ impl Staged {
         Self {
             inline: false,
             uploaded: true,
+            payload_bytes: None,
         }
     }
 }
@@ -546,11 +589,13 @@ impl Wal {
         metrics::histogram!("blowfish_wal_uncompressed_bytes").record(json.len() as f64);
         let inline = !entry.tombstone && json.len() <= INLINE_PAYLOAD_BYTES;
         let mut uploaded = false;
+        let mut payload_bytes = None;
         if !entry.tombstone && !inline {
             let started = std::time::Instant::now();
             let payload = encode_payload(&json, version)?;
             record_stage("compress", started);
             let len = payload.len();
+            payload_bytes = Some(len as u64);
             // The key carries this attempt's UUID, so no other writer can use it: a large
             // payload goes up as concurrent parts (one PUT stream moves about 5 MB/s).
             let started = std::time::Instant::now();
@@ -569,7 +614,11 @@ impl Wal {
             }
             uploaded = true;
         }
-        Ok(Staged { inline, uploaded })
+        Ok(Staged {
+            inline,
+            uploaded,
+            payload_bytes,
+        })
     }
     /// Delete a staged payload that will never be committed (a failed or abandoned pipeline slot).
     pub async fn discard(&self, seq: u64, entry: &WalEntry, staged: &Staged) -> Result<(), Error> {
@@ -654,6 +703,7 @@ impl Wal {
             tombstone: entry.tombstone,
             inline: inline.then(|| entry.clone()),
             redacted: false,
+            payload_bytes: staged.payload_bytes,
         };
         let started = std::time::Instant::now();
         let record = record.encode()?;
@@ -737,26 +787,71 @@ impl Wal {
     pub async fn tail(&self, after: u64) -> Result<Vec<(u64, WalEntry)>, Error> {
         self.tail_bounded(after, u64::MAX).await
     }
-    /// Replay at most `max_bytes` of decoded logical WAL entries. Atomic entries
-    /// are never split; an entry that exceeds the remaining budget stays in the tail.
-    pub async fn tail_bounded(
-        &self,
-        after: u64,
-        max_bytes: u64,
-    ) -> Result<Vec<(u64, WalEntry)>, Error> {
-        let mut previous_head = None;
-        loop {
-            let mut records = vec![];
-            let mut seq = after + 1;
-            // Probe growing windows of consecutive slots concurrently: a cold reader with
-            // a tail of n entries needs about log2(n) round trips instead of n + 1.
-            let mut window = 2u64;
-            'scan: loop {
-                let found =
-                    futures::future::try_join_all((seq..seq + window).map(|s| self.record(s)))
-                        .await?;
+    /// Read the committed slot records after `after`, in order, stopping at the first missing slot.
+    ///
+    /// Slots are probed with conditional reads, which alone decide where the tail ends: a read
+    /// finding no object is the stop, whatever any listing says. A short tail costs at most a
+    /// couple of probe waves. When the first wave (2 slots) is full the tail is probably long, so the
+    /// prefix is also listed, concurrently with the second wave (4 slots, so a short tail pays no extra
+    /// round trip; a tail of none or one slot never lists). If the second wave is full too, every
+    /// listed slot of the contiguous run is read in one wave, plus the slot after it. A listing that is stale or missing the newest slots only makes that wave end early:
+    /// if its last read finds a slot, probing continues in growing waves exactly as without a
+    /// listing. A failed listing is ignored.
+    async fn scan_slots(&self, after: u64) -> Result<Vec<(u64, CommitRecord)>, Error> {
+        use futures::StreamExt;
+        let mut records = vec![];
+        let mut seq = after + 1;
+        let mut window = 2u64;
+        let mut listed = None;
+        'scan: loop {
+            let slots = seq..seq + window;
+            let found = if window == 4 && records.len() == 2 {
+                let prefix = format!("ns/{}/wal/", self.namespace);
+                let (found, listing) = futures::future::join(
+                    futures::future::try_join_all(slots.map(|s| self.record(s))),
+                    self.store.list_after(&prefix, &self.key(after)),
+                )
+                .await;
+                listed = listing.ok();
+                found?
+            } else {
+                futures::future::try_join_all(slots.map(|s| self.record(s))).await?
+            };
+            for record in found {
+                match record {
+                    Some(record) => {
+                        records.push((seq, record));
+                        seq += 1;
+                    }
+                    None => break 'scan,
+                }
+            }
+            if let Some(listing) = listed.take() {
+                // Keys sort by zero-padded sequence, so the contiguous run is a walk from `seq`.
+                let mut run_end = seq.saturating_sub(1);
+                for object in &listing {
+                    let listed_seq = object
+                        .key
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.strip_suffix(".wal"))
+                        .and_then(|n| n.parse::<u64>().ok());
+                    match listed_seq {
+                        Some(n) if n == run_end + 1 => run_end = n,
+                        Some(n) if n <= run_end => {}
+                        _ => break,
+                    }
+                }
+                // The run's slots, then one more: it confirms where the tail ends or, when the
+                // listing was stale, finds a slot the listing missed.
+                let slots = seq..=run_end + 1;
+                let found = futures::stream::iter(slots)
+                    .map(|s| self.record(s))
+                    .buffered(64)
+                    .collect::<Vec<_>>()
+                    .await;
                 for record in found {
-                    match record {
+                    match record? {
                         Some(record) => {
                             records.push((seq, record));
                             seq += 1;
@@ -764,14 +859,54 @@ impl Wal {
                         None => break 'scan,
                     }
                 }
-                window = (window * 2).min(32);
+                window = 32;
+                continue;
             }
+            window = (window * 2).min(32);
+        }
+        Ok(records)
+    }
+    /// Replay at most `max_bytes` of decoded logical WAL entries. Atomic entries
+    /// are never split; an entry that exceeds the remaining budget stays in the tail.
+    pub async fn tail_bounded(
+        &self,
+        after: u64,
+        max_bytes: u64,
+    ) -> Result<Vec<(u64, WalEntry)>, Error> {
+        use futures::StreamExt;
+        let mut previous_head = None;
+        loop {
+            let records = self.scan_slots(after).await?;
+            let seq = after + 1 + records.len() as u64;
             let start = records.iter().rposition(|(_, r)| r.tombstone).unwrap_or(0);
             let mut entries = vec![];
             let mut pruned = false;
             let mut included_bytes = 0u64;
-            for (seq, record) in records.into_iter().skip(start) {
-                match self.materialize(&record).await {
+            // Out-of-line payloads are fetched concurrently (a cold reader of n of them paid n
+            // serial round trips), yielded in WAL order, so entries are applied, budgeted, and
+            // failed exactly as the serial loop did. A fetch is admitted while the summed stored
+            // sizes in flight stay under `TAIL_FETCH_BYTES` (and at most `TAIL_FETCH_CONCURRENCY`
+            // run); the first always proceeds. A record without a size (older releases) counts as
+            // the whole budget, so it fetches alone. Inline entries and tombstones cost nothing.
+            // Stopping early (budget, pruned, or error) drops the fetches still in flight.
+            let mut pending = records.into_iter().skip(start).peekable();
+            let mut in_flight = futures::stream::FuturesOrdered::new();
+            let mut window = FetchWindow::default();
+            loop {
+                while let Some((_, record)) = pending.peek() {
+                    let cost = fetch_cost(record);
+                    if !window.admit(cost) {
+                        break;
+                    }
+                    let (seq, record) = pending.next().expect("peeked");
+                    in_flight
+                        .push_back(async move { (seq, cost, self.materialize(&record).await) });
+                }
+                let Some((seq, cost, materialized)) = in_flight.next().await else {
+                    break;
+                };
+                window.finish(cost);
+                match materialized {
                     Ok(entry) => {
                         let size = serde_json::to_vec(&entry)?.len() as u64;
                         if included_bytes.saturating_add(size) > max_bytes {
@@ -1363,5 +1498,68 @@ mod manifest_codec_tests {
         assert_eq!(written["ann_tiers"]["vector"][0]["covered"][0]["rows"], 5);
         let again = decode_manifest(&serde_json::to_vec(&written).unwrap()).unwrap();
         assert_eq!(again.ann_tiers["vector"][0].format, 1);
+    }
+    #[test]
+    fn format_four_tiers_and_lineage_upgrade_without_changing_their_objects() {
+        assert_eq!(MANIFEST_FORMAT_VERSION, 5);
+        let mut value = serde_json::to_value(manifest_with_terms(3)).unwrap();
+        value["format_version"] = serde_json::json!(4);
+        let file = serde_json::json!({"key": "ns/a/slabs/source", "size": 1, "metadata_len": 0});
+        value["ann_tiers"] = serde_json::json!({"vector": [{
+            "covered": [{"segment": "s1", "base": 0, "rows": 5, "live_generation": 0}],
+            "slabs": [], "dir": file, "format": 1
+        }]});
+        value["lineage"] = serde_json::json!([{"source": "s1", "parts": [
+            {"target": "s2", "rows": 5, "map": file}
+        ]}]);
+        let old = decode_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(old.format_version, 4);
+        let encoded = encode_manifest(&old).unwrap();
+        let upgraded = decode_manifest(&encoded).unwrap();
+        assert_eq!(upgraded.format_version, 5);
+        assert_eq!(upgraded.ann_tiers["vector"][0].dir.key, "ns/a/slabs/source");
+        assert_eq!(upgraded.lineage[0].parts[0].map.key, "ns/a/slabs/source");
+        assert_eq!(upgraded.lineage[0].parts[0].target, "s2");
+    }
+}
+
+#[cfg(test)]
+mod fetch_window_tests {
+    use super::*;
+
+    #[test]
+    fn small_payloads_run_together_up_to_the_count_cap() {
+        let mut w = FetchWindow::default();
+        for _ in 0..TAIL_FETCH_CONCURRENCY {
+            assert!(w.admit(150 * 1024));
+        }
+        assert!(!w.admit(150 * 1024));
+        w.finish(150 * 1024);
+        assert!(w.admit(150 * 1024));
+    }
+
+    #[test]
+    fn bytes_bound_admission_and_an_oversized_payload_runs_alone() {
+        let mut w = FetchWindow::default();
+        let big = TAIL_FETCH_BYTES / 2 + 1;
+        assert!(w.admit(big));
+        assert!(!w.admit(big), "two halves plus one exceed the budget");
+        w.finish(big);
+        let huge = TAIL_FETCH_BYTES * 4;
+        assert!(w.admit(1024));
+        assert!(!w.admit(huge), "an oversized payload waits for others");
+        w.finish(1024);
+        assert!(w.admit(huge), "and proceeds when alone");
+        w.finish(huge);
+    }
+
+    #[test]
+    fn unknown_sizes_fetch_one_at_a_time() {
+        let mut w = FetchWindow::default();
+        assert!(w.admit(TAIL_FETCH_BYTES));
+        assert!(!w.admit(TAIL_FETCH_BYTES));
+        assert!(!w.admit(1));
+        w.finish(TAIL_FETCH_BYTES);
+        assert!(w.admit(TAIL_FETCH_BYTES));
     }
 }

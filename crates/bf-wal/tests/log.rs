@@ -460,3 +460,498 @@ async fn compact_reader_copy_omits_text_headers_and_full_reads_ignore_it() {
 fn rand_crc(i: u64) -> u32 {
     (i.wrapping_mul(2_654_435_761) & 0xffff_ffff) as u32
 }
+
+async fn memory_wal(name: &str) -> (Storage, Wal) {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let wal = Wal::new(store.clone(), name).unwrap();
+    (store, wal)
+}
+
+fn external_entry(tag: usize) -> WalEntry {
+    document_entry(format!("{tag}-{}", "x".repeat(INLINE_PAYLOAD_BYTES + 1)))
+}
+
+fn tag_of(entry: &WalEntry) -> usize {
+    let text = entry.batches[0].upserts[0]["text"].as_str().unwrap();
+    text.split('-').next().unwrap().parse().unwrap()
+}
+
+/// More out-of-line payloads than the fetch window still come back in WAL order, mixed with inline ones.
+#[tokio::test]
+async fn tail_returns_many_external_payloads_in_wal_order() {
+    let (store, wal) = memory_wal("ordered").await;
+    let total = 40u64;
+    for seq in 1..=total {
+        let entry = if seq % 5 == 0 {
+            document_entry(format!("{seq}-small"))
+        } else {
+            external_entry(seq as usize)
+        };
+        assert_eq!(
+            wal.append(seq, &entry).await.unwrap(),
+            CreateResult::Created
+        );
+    }
+    assert_eq!(store.list("ns/ordered/wal-data/").await.unwrap().len(), 32);
+    let tail = wal.tail(0).await.unwrap();
+    assert_eq!(tail.len(), total as usize);
+    for (i, (seq, entry)) in tail.iter().enumerate() {
+        assert_eq!(*seq, i as u64 + 1);
+        assert_eq!(tag_of(entry), i + 1);
+    }
+    let from = wal.tail(30).await.unwrap();
+    assert_eq!(from.first().unwrap().0, 31);
+    assert_eq!(from.len(), 10);
+}
+
+/// The replay starts at the last tombstone; payloads before it are never needed.
+#[tokio::test]
+async fn tail_starts_at_a_tombstone_in_the_middle() {
+    let (_store, wal) = memory_wal("middle").await;
+    for seq in 1..=12u64 {
+        let entry = if seq == 6 {
+            let mut t = WalEntry::new(vec![]);
+            t.tombstone = true;
+            t
+        } else {
+            external_entry(seq as usize)
+        };
+        wal.append(seq, &entry).await.unwrap();
+    }
+    // Reclaim the payloads before the tombstone, as deletion cleanup does.
+    wal.cleanup_deleted(6).await.unwrap();
+    let tail = wal.tail(0).await.unwrap();
+    let seqs: Vec<u64> = tail.iter().map(|(s, _)| *s).collect();
+    assert_eq!(seqs, (6..=12).collect::<Vec<_>>());
+    assert!(tail[0].1.tombstone);
+    for (seq, entry) in &tail[1..] {
+        assert_eq!(tag_of(entry), *seq as usize);
+    }
+}
+
+/// A reclaimed payload without a tombstone is still reported as corruption, and a budget still
+/// stops the replay at the same entry, as before fetches ran concurrently.
+#[tokio::test]
+async fn tail_reports_reclaimed_payloads_and_honors_the_byte_budget() {
+    let (_store, wal) = memory_wal("reclaimed").await;
+    for seq in 1..=12u64 {
+        wal.append(seq, &external_entry(seq as usize))
+            .await
+            .unwrap();
+    }
+    wal.prune_payloads(6).await.unwrap();
+    assert!(matches!(wal.tail(0).await, Err(Error::Format)));
+    let tail = wal.tail(6).await.unwrap();
+    assert_eq!(tail.len(), 6);
+    // Entry sizes differ by a few bytes (`committed_at` serializes a variable number of
+    // fractional digits), so budget exactly the first two entries.
+    let size = |entry: &bf_wal::WalEntry| serde_json::to_vec(entry).unwrap().len() as u64;
+    let bounded = wal
+        .tail_bounded(6, size(&tail[0].1) + size(&tail[1].1))
+        .await
+        .unwrap();
+    assert_eq!(
+        bounded.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![7, 8]
+    );
+}
+
+/// Cleanup racing a reader: the reader either sees every payload or restarts at the tombstone.
+#[tokio::test]
+async fn tail_survives_payloads_reclaimed_mid_read() {
+    for round in 0..10 {
+        let (_store, wal) = memory_wal(&format!("race{round}")).await;
+        for seq in 1..=12u64 {
+            wal.append(seq, &external_entry(seq as usize))
+                .await
+                .unwrap();
+        }
+        let mut tombstone = WalEntry::new(vec![]);
+        tombstone.tombstone = true;
+        let deleter = async {
+            wal.append(13, &tombstone).await.unwrap();
+            wal.cleanup_deleted(13).await.unwrap();
+        };
+        let (tail, ()) = tokio::join!(wal.tail(0), deleter);
+        let tail = tail.unwrap();
+        let first = tail.first().unwrap().0;
+        assert!(first == 1 || first == 13, "{first}");
+        let seqs: Vec<u64> = tail.iter().map(|(s, _)| *s).collect();
+        // A reader that scanned before the tombstone committed ends at 12.
+        let last = *seqs.last().unwrap();
+        assert!(last == 12 || last == 13, "{last}");
+        assert_eq!(seqs, (first..=last).collect::<Vec<_>>());
+    }
+}
+
+/// An empty or fully indexed tail is cheap and empty.
+#[tokio::test]
+async fn tail_of_nothing_is_empty() {
+    let (_store, wal) = memory_wal("empty").await;
+    assert!(wal.tail(0).await.unwrap().is_empty());
+    wal.append(1, &external_entry(1)).await.unwrap();
+    assert!(wal.tail(1).await.unwrap().is_empty());
+    assert_eq!(wal.tail(0).await.unwrap().len(), 1);
+}
+
+/// Reads a slot's JSON record (after the version byte).
+async fn slot_json(store: &Storage, wal: &Wal, seq: u64) -> serde_json::Value {
+    let bytes = store.get(&wal.key(seq)).await.unwrap();
+    serde_json::from_slice(&bytes[1..]).unwrap()
+}
+
+/// A new slot records its payload's stored size; inline slots record none.
+#[tokio::test]
+async fn slots_record_the_stored_payload_size() {
+    let (store, wal) = memory_wal("sizes").await;
+    wal.append(1, &external_entry(1)).await.unwrap();
+    wal.append(2, &document_entry("tiny".into())).await.unwrap();
+    let payload = store.list("ns/sizes/wal-data/").await.unwrap();
+    assert_eq!(payload.len(), 1);
+    let recorded = slot_json(&store, &wal, 1).await["payload_bytes"].as_u64();
+    // The object carries a small storage envelope beyond the encoded payload.
+    let recorded = recorded.unwrap();
+    assert!(recorded <= payload[0].size && payload[0].size - recorded <= 64);
+    assert!(
+        slot_json(&store, &wal, 2)
+            .await
+            .get("payload_bytes")
+            .is_none()
+    );
+}
+
+/// Records written before sizes existed (no field) still replay, in order, one fetch at a time.
+#[tokio::test]
+async fn tail_reads_records_without_payload_sizes() {
+    let (store, wal) = memory_wal("nosize").await;
+    for seq in 1..=12u64 {
+        wal.append(seq, &external_entry(seq as usize))
+            .await
+            .unwrap();
+    }
+    for seq in 1..=12u64 {
+        let mut record = slot_json(&store, &wal, seq).await;
+        record.as_object_mut().unwrap().remove("payload_bytes");
+        let mut bytes = vec![3];
+        bytes.extend(serde_json::to_vec(&record).unwrap());
+        store.put(&wal.key(seq), bytes).await.unwrap();
+    }
+    let tail = wal.tail(0).await.unwrap();
+    assert_eq!(tail.len(), 12);
+    for (i, (_, entry)) in tail.iter().enumerate() {
+        assert_eq!(tag_of(entry), i + 1);
+    }
+}
+
+/// One payload larger than the in-flight budget, between small ones, replays in order.
+#[tokio::test]
+async fn tail_with_a_payload_over_the_budget_keeps_order() {
+    let (_store, wal) = memory_wal("huge").await;
+    // Incompressible text: the stored payload exceeds the 64 MiB budget.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let noise: String = (0..80 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (b'a' + (state % 26) as u8) as char
+        })
+        .collect();
+    for seq in 1..=5u64 {
+        let entry = if seq == 3 {
+            document_entry(format!("3-{noise}"))
+        } else {
+            external_entry(seq as usize)
+        };
+        wal.append(seq, &entry).await.unwrap();
+    }
+    let tail = wal.tail(0).await.unwrap();
+    assert_eq!(
+        tail.iter().map(|(_, e)| tag_of(e)).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+}
+
+mod listing {
+    //! `tail` finds a long tail with one listing plus one read wave. The listing only guides the
+    //! reads: the conditional slot reads still decide where the tail ends.
+    use super::*;
+    use async_trait::async_trait;
+    use futures::stream::{self, BoxStream, StreamExt};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+        path::Path,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    type Hide = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+    type After = Box<dyn FnOnce() + Send>;
+
+    /// An in-memory store whose WAL listings can hide keys (a stale listing), fail, or run a
+    /// side effect after the listing was taken (a write racing the listing). Counts listings.
+    struct Listing {
+        inner: Arc<InMemory>,
+        lists: AtomicUsize,
+        hide: Mutex<Option<Hide>>,
+        fail: bool,
+        after: Mutex<Option<After>>,
+    }
+    impl std::fmt::Debug for Listing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("listing")
+        }
+    }
+    impl std::fmt::Display for Listing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("listing")
+        }
+    }
+    #[async_trait]
+    impl ObjectStore for Listing {
+        async fn put_opts(
+            &self,
+            p: &Path,
+            b: PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(p, b, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &Path,
+            o: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(p, o).await
+        }
+        async fn get_opts(&self, p: &Path, o: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            l: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(l)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let is_wal = p.is_some_and(|p| p.as_ref().ends_with("/wal"));
+            let (inner, prefix) = (self.inner.clone(), p.cloned());
+            let (fail, hide) = (self.fail && is_wal, self.hide.lock().unwrap().clone());
+            let after = if is_wal {
+                self.lists.fetch_add(1, Ordering::SeqCst);
+                self.after.lock().unwrap().take()
+            } else {
+                None
+            };
+            stream::once(async move {
+                if fail {
+                    return stream::iter(vec![Err(object_store::Error::Generic {
+                        store: "listing",
+                        source: "listing failed".into(),
+                    })])
+                    .boxed();
+                }
+                let mut all: Vec<_> = inner.list(prefix.as_ref()).collect().await;
+                if let (true, Some(h)) = (is_wal, hide) {
+                    all.retain(|m| !m.as_ref().is_ok_and(|m| h(m.location.as_ref())));
+                }
+                if let Some(after) = after {
+                    after();
+                }
+                stream::iter(all).boxed()
+            })
+            .flatten()
+            .boxed()
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+    }
+
+    struct Fixture {
+        inner: Arc<InMemory>,
+        backend: Arc<Listing>,
+        wal: Wal,
+    }
+
+    async fn fixture(fail: bool, hide: Option<Hide>) -> Fixture {
+        let inner = Arc::new(InMemory::new());
+        let backend = Arc::new(Listing {
+            inner: inner.clone(),
+            lists: AtomicUsize::new(0),
+            hide: Mutex::new(hide),
+            fail,
+            after: Mutex::new(None),
+        });
+        let store = Storage::from_backend(backend.clone(), Path::from(""), false, false)
+            .await
+            .unwrap();
+        let wal = Wal::new(store, "ns").unwrap();
+        Fixture {
+            inner,
+            backend,
+            wal,
+        }
+    }
+
+    async fn append(wal: &Wal, range: std::ops::RangeInclusive<u64>) {
+        for seq in range {
+            let entry = if seq % 3 == 0 {
+                external_entry(seq as usize)
+            } else {
+                document_entry(format!("{seq}-small"))
+            };
+            assert_eq!(
+                wal.append(seq, &entry).await.unwrap(),
+                CreateResult::Created
+            );
+        }
+    }
+
+    fn assert_contiguous(tail: &[(u64, WalEntry)], first: u64, last: u64) {
+        let seqs: Vec<u64> = tail.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, (first..=last).collect::<Vec<_>>());
+        for (seq, entry) in tail {
+            assert_eq!(tag_of(entry), *seq as usize);
+        }
+    }
+
+    fn slot_number(key: &str) -> u64 {
+        key.rsplit('/')
+            .next()
+            .and_then(|n| n.strip_suffix(".wal"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_long_tail_is_listed_once_and_a_tiny_one_not_at_all() {
+        let f = fixture(false, None).await;
+        append(&f.wal, 1..=40).await;
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 40);
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 1);
+        // A tail after slot 10 lists once; a tail of none or one slot never lists.
+        assert_contiguous(&f.wal.tail(10).await.unwrap(), 11, 40);
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 2);
+        assert_contiguous(&f.wal.tail(39).await.unwrap(), 40, 40);
+        assert!(f.wal.tail(40).await.unwrap().is_empty());
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 2);
+        // Two to five slots start a listing alongside the second wave, but the reads decide.
+        for after in [35, 36, 37, 38] {
+            assert_contiguous(&f.wal.tail(after).await.unwrap(), after + 1, 40);
+        }
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn an_empty_tail_never_lists() {
+        let f = fixture(false, None).await;
+        assert!(f.wal.tail(0).await.unwrap().is_empty());
+        append(&f.wal, 1..=1).await;
+        assert!(f.wal.tail(1).await.unwrap().is_empty());
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_gap_ends_the_tail_even_when_later_slots_are_listed() {
+        let f = fixture(false, None).await;
+        append(&f.wal, 1..=40).await;
+        f.inner
+            .delete(&Path::from(f.wal.key(20).as_str()))
+            .await
+            .unwrap();
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 19);
+        // A gap right after the second wave.
+        f.inner
+            .delete(&Path::from(f.wal.key(7).as_str()))
+            .await
+            .unwrap();
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 6);
+        // A gap on the very first slot.
+        f.inner
+            .delete(&Path::from(f.wal.key(1).as_str()))
+            .await
+            .unwrap();
+        assert!(f.wal.tail(0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_listing_missing_the_newest_slots_loses_nothing() {
+        let hide: Hide = Arc::new(|k| slot_number(k) > 33);
+        let f = fixture(false, Some(hide)).await;
+        append(&f.wal, 1..=40).await;
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 40);
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_listing_with_holes_or_nothing_loses_nothing() {
+        let hide: Hide = Arc::new(|k| slot_number(k).is_multiple_of(7));
+        let f = fixture(false, Some(hide)).await;
+        append(&f.wal, 1..=45).await;
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 45);
+        *f.backend.hide.lock().unwrap() = Some(Arc::new(|_| true));
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 45);
+        assert_contiguous(&f.wal.tail(5).await.unwrap(), 6, 45);
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_falls_back_to_probing() {
+        let f = fixture(true, None).await;
+        append(&f.wal, 1..=40).await;
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 40);
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn slots_appended_during_the_listing_are_read() {
+        let f = fixture(false, None).await;
+        append(&f.wal, 1..=40).await;
+        // The listing was taken with 40 slots; two more commit before the tail's reads finish.
+        let inner = f.inner.clone();
+        let late = {
+            let store = Storage::from_backend(
+                Arc::new(Listing {
+                    inner: inner.clone(),
+                    lists: AtomicUsize::new(0),
+                    hide: Mutex::new(None),
+                    fail: false,
+                    after: Mutex::new(None),
+                }),
+                Path::from(""),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            Wal::new(store, "ns").unwrap()
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *f.backend.after.lock().unwrap() = Some(Box::new(move || tx.send(()).unwrap()));
+        let tail = tokio::spawn({
+            let wal = f.wal.clone();
+            async move { wal.tail(0).await.unwrap() }
+        });
+        // Commit 41 and 42 as soon as the listing has been taken.
+        tokio::task::spawn_blocking(move || rx.recv().unwrap())
+            .await
+            .unwrap();
+        append(&late, 41..=42).await;
+        let tail = tail.await.unwrap();
+        // Whatever the interleaving, the replay is a gapless prefix that holds all 40 slots.
+        assert!(tail.len() >= 40 && tail.len() <= 42, "{}", tail.len());
+        assert_contiguous(&tail, 1, tail.len() as u64);
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 42);
+    }
+}

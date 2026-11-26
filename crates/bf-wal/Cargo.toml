@@ -22,3 +22,6 @@ zstd = "0.13.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
+async-trait = "0.1.92"
+object_store = { version = "=0.14.2", features = ["aws", "fs"] }

@@ -12994,6 +12994,166 @@ unfiltered top 64, which is the condition that at least 10 of the 64 match.
 - **Cost:** one c7g.4xlarge for about 45 minutes, an estimated under $0.60 with the volume. The instance, key pair, and security group are
   deleted, and no S3 prefix was written.
 
+## Round D4b: authoritative covering tiers and vector retirement
+
+Measured 2026-11-25/26 on one on-demand x86 m7i.2xlarge in us-west-2
+(8 vCPUs, 32 GiB RAM, and 250 GiB gp3). Baseline `eb85d53` and candidate
+`79ffeea` use the same host and immutable ANN geometry. The candidate adds sparse
+resident row maps and retires covered segment ANN objects; it does not retrain
+centers, codes, or vectors. Bucket generation 6 and manifest format 5 fence the
+ownership change. The frozen generation-5 executable refused even read-only
+startup after upgrade (`required: 6, supported: 5`).
+
+### Full BEIR NQ: inventory, quality, and parity
+
+The store holds all 2,681,468 NQ rows, with title and text, BM25, and
+1,024-dimensional f16 cosine vectors. Both arms keep 32 document segments and one
+tier with 32 slabs. Maintenance disables compaction to preserve that geometry,
+uses zero retention for a settled post-GC inventory, and runs without query load.
+All sizes below are decimal GB, including deployment metadata and permanent WAL
+fences, rather than logical API bytes.
+
+| Object group | Baseline GB | Candidate GB |
+| --- | ---: | ---: |
+| Segment ANN | 8.684867 | 0 |
+| Slab ANN and resident row maps | 5.982056 | 5.998146 |
+| Documents | 0.778405 | 0.778405 |
+| Text indexes | 1.118812 | 1.118812 |
+| Other objects and metadata | 0.346354 | 0.404543 |
+| Total | 16.910495 | 8.299907 |
+
+The final store is below the 8.5 GB target. Resident maps add 16.09 MB, six bytes
+per present vector plus slab framing. Permanent publication metadata grows during
+bounded backfill, so the total reduction is slightly smaller than the removed
+ANN bytes. Backfill, retirement, GC, and inventory took 5.40 seconds, with
+90.2 MiB maximum RSS in the maintenance process.
+
+This is a conservative size check against the requested target, not a reproduction
+of I3's 14.18 GB baseline: an interrupted loader replayed an acknowledged prefix
+idempotently, leaving extra obsolete physical segment versions. The live dataset
+is still exactly NQ, and the paired arms preserve those same segments and slabs.
+The earlier shared vector-only fixture was not used for the full-text inventory.
+
+All 3,452 ordered ANN result sets, exact returned distances, and three extra
+requests (full vector projection, filtered exact ranking, and BM25 with vector
+projection) are byte-identical after canonical JSON encoding. Both hashes are
+`e7a133ebfcaa8b222f8b48c1cbeea94df10c0201ae3863bd3a50a3a00171fccf`.
+Recall@10 against exact neighbors is 0.9591 in both arms; NDCG@10 is 0.6073,
+and F1@10 is 0.1690.
+
+### NQ latency protocol and results
+
+`bench/nq/` drives the production HTTP server with 64 probes, ID-only top-10
+queries, strong consistency, 3 GiB raw memory cache, no disk cache, no recall
+sampling, and background indexing disabled. The server uses CPUs 0–5 in a
+12 GiB cgroup; clients use CPUs 6–7. Each cold pass restarts the server, drops
+filesystem pages, and measures the first 1,000 requests without warm-up. Its
+cache grows during that pass, so these are first-pass distributions. Each warm
+pass warms 1,000 queries, then measures 1,000. Two repetitions use the same input
+order and configuration. No compiler, tests, loader, or maintenance runs during
+timing.
+
+| Run | Baseline p50 / p90 / p99 ms | Candidate p50 / p90 / p99 ms |
+| --- | ---: | ---: |
+| Cold first pass 1 | 58.2 / 155.5 / 383.6 | 56.9 / 155.5 / 371.9 |
+| Cold first pass 2 | 57.1 / 154.4 / 367.0 | 57.6 / 152.1 / 362.8 |
+| Warm 1 | 4.1 / 4.5 / 4.8 | 3.9 / 4.2 / 4.4 |
+| Warm 2 | 4.2 / 4.6 / 4.9 | 4.1 / 4.4 / 4.7 |
+
+No latency regression is observed in these two repetitions. Sixteen-client
+throughput is 1,449–1,497 q/s before and 1,530–1,563 q/s after. The throughput
+phase uses 2,000 requests, including queries outside the latency warm-up set;
+its single-client rate is about 32 q/s in both arms and is not a resident-only
+throughput claim. These runs do not establish a formal confidence interval.
+
+### Owned 10M scratch copy: filtered cold ANN
+
+The retained 10M fixture was copied into an owned round prefix. Its source
+segments predate document-v2 and use legacy independent ANN files, while its
+recluster tier is current. The candidate finishes the automatic document upgrade
+and retires covered legacy ANN and fragments directly, avoiding a redundant
+full ANN conversion. Thus its inventory reduction includes earlier format
+upgrades; the NQ pair above isolates D4b.
+
+The cold test uses 50 fixed oracle vectors for each filter: `title_initial == z`
+and `text_length >= 300`, top 10, strong consistency, and ID-only projection.
+Every request starts a fresh production process with empty engine and storage
+caches, 3 GiB raw memory capacity, no disk cache or staging, and 64 probes. The
+server uses CPUs 0–5; the serial Python HTTP driver is unpinned. Startup and
+readiness are excluded, while snapshot validation, filter loading, planning,
+scanning, and result hydration are included. These pure-S3 measurements use the
+host's 32 GiB limit, and are separate from NQ's file-store first-pass protocol.
+
+| Filter | Baseline p50 / p90 ms | Candidate p50 / p90 ms | Recall@10 before / after |
+| --- | ---: | ---: | ---: |
+| `title_initial == z` | 2,944.8 / 3,244.6 | 2,320.3 / 2,759.8 | 1.000 / 1.000 |
+| `text_length >= 300` | 2,625.2 / 2,957.9 | 1,830.0 / 2,301.8 | 0.950 / 0.992 |
+
+The candidate is 27.732 GB after GC, versus 77.337 GB in the retained source
+layout. Its 70 rewritten document objects total 1.632 GB, and no independent
+segment ANN objects remain. The final legacy retirement, document upgrade, GC,
+and inventory pass took 330.62 seconds, with 553.5 MiB maximum RSS. The earlier
+bounded slab-row backfill is a separate pass. These figures describe this mixed
+legacy upgrade, without attributing all savings to D4b alone.
+
+Only the owned copies were writable. Original fixtures and `scale/` were left
+untouched. Cleanup and cost are recorded in the worker report. No 100M or
+compaction-throughput claim is made.
+
+
+### D4c review fixes (2026-11-26)
+
+D4c merges main through `92e1486`, including WC2. Row-map backfill now writes into the
+writing namespace, and covers legacy `ann:` slabs as well as current containers. Missing
+maps reconstruct from immutable ANN metadata for reads, and a rotating, one-object survey
+outside the namespace lock schedules durable repair without requiring another write.
+The locator and filtered planner share that reader, replacing their separate row-ID fallbacks.
+Corrupt maps still fail closed. Tests branch and copy during backfill, recluster the source,
+collect past retention, and then exercise filtered queries and patches after restart.
+
+Legacy document-only segments retain their document-v1 vector source instead of blocking
+every index publication. Current documents with a genuinely missing vector owner still fail.
+Restoration and new segment builds share one ANN recipe; the earlier default already chose
+the same square-root leaf count, confirmed by identical serialized ANN bytes before this change.
+Complete tiers rebuild missing or stale directories from their slab fragments. Remaining
+plan declines increment `blowfish_ann_tier_fallbacks_total{filtered=...}`; directory and
+row-map reconstruction have separate counters, documented in `docs/design/disk-footprint.md`.
+
+The quick NQ check uses one on-demand m7i.2xlarge in us-west-2, with 8 vCPUs, 32 GiB RAM,
+and a 160 GiB gp3 root volume. Both arms use the retained v0.1.19 fixture, with all
+2,681,468 rows and 32 slabs, after bounded D4b row-map backfill and segment ANN retirement.
+Compaction is disabled, and no vectors are retrained. The merged D4b control is `6521998`, and the D4c candidate is `dedef49`.
+Both arms run on the same immutable prepared copy, with 64 probes, strong consistency,
+ID-only top 10, a 3 GiB raw cache, the default 4 GiB decoded-cache budget, and no disk cache
+or recall sampling. The server uses CPUs 0–5, and one persistent HTTP client uses CPUs 6–7.
+The host's memory limit is 32 GiB. Builds, preparation, and timing do not overlap.
+
+Cold is the first 200 queries after a process restart and dropped filesystem pages. Warm is
+1,000 measured queries after a 1,000-query warm-up. HTTP, request encoding, and response
+reading are included. There are two repetitions per arm, without a formal confidence interval.
+
+| Arm | Cold first-200 p50 / p90 (ms) | Warm 1,000 p50 / p90 (ms) |
+|---|---:|---:|
+| Merged D4b, repetition 1 | 86.3 / 247.9 | 3.55 / 3.79 |
+| Merged D4b, repetition 2 | 85.7 / 289.2 | 3.54 / 3.78 |
+| D4c, repetition 1 | 89.3 / 272.7 | 3.54 / 3.79 |
+| D4c, repetition 2 | 88.9 / 252.4 | 3.30 / 3.54 |
+| Merged D4b, late latency control | 90.0 / 262.5 | 3.48 / 3.75 |
+
+The late baseline control reaches a cold p50 of 90.0 ms, covering the candidate's
+88.9–89.3 ms within the baseline's own observed variation. Warm medians remain comparable.
+This small check supports parity, without establishing a statistically significant latency change.
+
+All four full runs have recall@10 **0.961095** over all 3,452 queries,
+and identical ordered IDs and returned distances. Their canonical row SHA-256 is
+`cdc6950a38b29fbd2c2a0a0155c3c7834618ecafdb4196a68fb3291c8041556e`.
+The same arms also match on 100 selective (`id < 10,000`) queries, 100 broad
+(`id < 1,000,000`) queries, 20 full-attribute projections, and a filtered exact kNN
+query repeated twice. All unfiltered quality requests report zero `exhaustive_search_count`.
+
+This quick check uses the retained fixture's geometry; the full-load D4b pair above uses its
+own freshly loaded checkpoint. No new 10M, 100M, or compaction-throughput measurement was run.
+
 ## Round T8: exact BF16 screening on Arm
 
 Measured 2026-11-25 with NumKong 7.8.7 on an Apple M4 (Rust 1.99.1) and an
@@ -13493,3 +13653,199 @@ The next step is to run the candidate where calibration can finish (a longer win
 loop) and then measure 16 clients at top_k 100 and top_k 10 against the IVF numbers above.
 
 Costs: no EC2 and no bucket writes. The M4 run directory is deleted.
+
+## Round W6/W7: cold queries fetch committed WAL payloads one at a time (concurrent fetch, 3.2x at 32 payloads; bounded by bytes in W7)
+
+Hypothesis (Sol, `briefs/ideas/2225-sol.md` #1): `tail_bounded` discovers WAL slots concurrently but then calls `materialize` on each record in
+turn, so every out-of-line payload (over 64 KiB, `INLINE_PAYLOAD_BYTES`) costs one serial object-store round trip on a cold strong query.
+Inline payloads, tombstones, and checkpointed slots cost none. Gate: cold strong p50 at least 1.3x lower with 32 payloads, identical replies,
+no regression with an empty or small tail. Kill line: serial fetch under 30% of cold query time.
+
+### Method
+
+One on-demand c7g.2xlarge (Ubuntu 24.04 arm64, Clang 19) in us-west-2, same region as the bucket. Server built at v0.1.42 (baseline) and with the
+change, both on the same box. Each sample is a fresh `serve --read-only` process (read-only so no startup pass opens namespaces), one strong
+`rank_by id asc, limit 10` query, 15 samples per cell, run A/B/B/A. Indexing was never run, so every write is an unindexed tail. Namespaces:
+`ext32` (32 writes of one 150 KB document, so 32 external payloads), `ext1` (one such write), and `inl32` (32 tiny inline writes).
+
+### Kill test (baseline only)
+
+| Namespace | Cold p50 ms | p90 ms |
+| --- | ---: | ---: |
+| ext32 | 1,013 | 1,045 |
+| inl32 | 186 | 196 |
+| ext1 | 68 | 78 |
+
+The 32 payload reads were about 800 of 1,013 ms (about 80%), far above the 30% line. The remaining 190 ms is slot discovery and the query.
+
+### Change (no format change)
+
+`tail_bounded` streams the records after the last tombstone through `futures::stream::buffered(8)`. Payloads are fetched up to 8 at a time, but
+results arrive in WAL order, so the byte budget, the `Pruned` rescan, the corruption check, and errors behave exactly as the serial loop did.
+Stopping early (budget, pruned, or error) drops fetches still in flight. W6 bounded concurrency by count only (8), which with the 512 MiB body
+limit could hold several GiB in flight; W7 below fixes that.
+
+### Results (cold p50 ms, A/B/B/A)
+
+| Namespace | Base | New | Speedup |
+| --- | ---: | ---: | ---: |
+| ext32 | 1,040 / 1,026 | 320 / 318 | 3.2x |
+| inl32 (empty-ish tail, no external payloads) | 177 / 208 | 192 / 165 | noise |
+| ext1 | 73 / 71 | 67 / 67 | noise |
+
+p90 for ext32 was 1,207 to 2,157 ms (base) against 360 to 419 ms (new). Rows from all three namespaces (50 rows, all attributes) hashed identically
+on both binaries. Tests added in `crates/bf-wal/tests/log.rs`: 40-entry order with mixed inline and external payloads, a tombstone in the middle,
+reclaimed payloads (still `Format`, byte budget unchanged), cleanup racing a reader, and an empty tail.
+
+### Conclusion
+
+**Passes** (3.2x on the 1.3x gate). What is left at 32 payloads is about 130 ms over the inline case: 32 payloads at 8 in flight is four waves of
+about 25 to 30 ms (150 KB each). A larger window would cut that further but is unbounded in bytes. Cost: one c7g.2xlarge for about 1.2 hours
+(under $0.50); instance, key pair, security group, and the `tmp/w6-20261125/` prefix deleted.
+
+### Round W7: in-flight payload bytes bounded (64 MiB window, no new setting)
+
+`CommitRecord` gains an optional `payload_bytes` (serde default, skipped when absent): the stored size of the out-of-line payload, written by
+`stage` and carried to `commit`. The struct does not use `deny_unknown_fields`, so old binaries ignore the field and new binaries read old
+records; the slot version stays 3 and no format fence is needed. `tail_bounded` admits a fetch while the summed stored sizes in flight stay under
+64 MiB and at most 8 run; the first always proceeds, so a payload over the budget fetches alone. Inline entries and tombstones cost nothing. A
+record without a size (older releases) counts as the whole budget, so it fetches one at a time, as before W6. Results still arrive in WAL order.
+The size is known with no extra round trip because it sits in the slot record already read during discovery.
+
+Tests: `FetchWindow` unit tests (count cap, byte cap, oversized alone, unknown sizes serial), and `crates/bf-wal/tests/log.rs` for sizes recorded in
+new slots, old records without sizes replaying in order, an 80 MiB payload among small ones, plus the W6 order, tombstone, GC-race, error, and
+empty-tail tests.
+
+Measured on one on-demand c7g.2xlarge in us-west-2 (same region as the bucket), W6 (`5b3e2f3`) against W7 built on the same box, via
+`crates/bf-wal/examples/tail_rss.rs` (`Wal::tail_bounded` straight against S3, one fresh process per sample, so these times exclude the query):
+
+| Case | W6 (count only) | W7 (bytes) |
+| --- | ---: | ---: |
+| 32 x 150 KB payloads, p50 ms (32 samples, interleaved A/B/B/A) | 305 | 291 |
+| 32 x 150 KB payloads, peak RSS | 40 MiB | 40 MiB |
+| 8 x 64 MiB payloads, budget 150 MiB (2 entries returned), p50 ms | 2,039 to 2,325 | 2,068 to 2,073 |
+| 8 x 64 MiB payloads, peak RSS | 716 to 728 MiB | 395 to 399 MiB |
+
+The small case is unchanged (150 KB payloads fit 8 at once in 64 MiB). The large case halves peak RSS now (W6 had 8 in flight, W7 one at a time since two
+64 MiB payloads exceed the window), at the same latency (the downloads are bandwidth-bound). The ceiling with W6 grows with the payload size
+(8 x 512 MiB is over 4 GiB); with W7 it is the window plus the one oversized payload being fetched. Cost: one c7g.2xlarge for about 0.5 hour
+(under $0.20); instance, key pair, security group, and the `tmp/w7-20261125/` prefix deleted.
+
+## Round W8: find a long WAL tail with one listing instead of growing probe waves (1.27x at 32 entries)
+
+Hypothesis (Sol, `briefs/ideas/0225-sol.md` #1): `tail_bounded` discovers committed slots by probing in growing waves of 2, 4, 8, 16, and 32 conditional
+reads, so a 32-entry tail costs five serial round trips before any payload is fetched. One LIST of the commit prefix, then one parallel read wave, could
+replace three of them. Gate: cold strong p50 at least 1.25x lower at 32 entries, no regression with an empty or 4-entry tail, identical replies.
+Kill line: discovery under 20% of cold time at 32 entries, or a LIST slow enough to lose on short tails.
+
+### Method
+
+One on-demand c7g.2xlarge (Ubuntu 24.04 arm64) in us-west-2, same region as the bucket. Baseline (v0.1.46) and candidate were built on the same box and
+run A/B/B/A. Each sample is a fresh process calling `Wal::tail_bounded(0, ..)` straight against S3 (`crates/bf-wal/examples/tail_rss.rs`, 30 samples
+per cell), so times exclude the query, and include a new connection. Namespaces: `e32` and `e4` (32 and 4 external 150 KB payloads), `inl32`, `inl6`,
+`inl4`, and `inl3` (that many tiny inline writes, so pure discovery), and an empty tail.
+
+### Kill test (baseline)
+
+| Case | p50 ms |
+| --- | ---: |
+| 32 external payloads | 301 / 334 |
+| 32 inline entries (discovery and one wave only) | 175 / 174 |
+| 4 external payloads | 98 / 98 |
+| empty tail | 22 / 22 |
+| LIST of the WAL prefix (32 slots) | about 15 |
+
+Discovery of 32 entries is about 175 of 300 ms (well over the 20% line), and a LIST is about as cheap as a probe wave. Not killed.
+
+### Change (no format change, no setting)
+
+The slot reads still decide where the tail ends. The first wave probes two slots as before. If both are full, the prefix is listed (`list_after` the
+last replayed slot) concurrently with the second wave of four, so a short tail does not wait on the listing, and a tail of none or one slot never lists. If
+the second wave is full too, the listing gives the contiguous run of slots from there; one wave (64 at a time) reads that whole run plus the slot after it.
+A missing slot ends the tail whatever the listing says: a gap in the listing stops the run, a stale listing that lacks the newest slots just ends the run
+early, and when the extra read finds a slot anyway, probing continues in growing waves as before. A failed listing is ignored. Three serial rounds instead
+of five at 32 entries, and the saving grows with the tail.
+
+Tests (`crates/bf-wal/tests/log.rs`, module `listing`, over a store whose listings can hide keys, fail, or run code after the listing): a 40-slot tail lists
+once and a tail of none or one slot never lists; a gap in the middle, after the second wave, and at the first slot; a stale listing missing the newest 7
+slots; a listing with every seventh slot missing and one that is empty; a failed listing; and two slots committed while the listing is taken.
+
+### Results (cold `tail_bounded` p50 ms, A/B/B/A)
+
+| Case | Base | New | Speedup |
+| --- | ---: | ---: | ---: |
+| 32 external payloads | 316 / 334 | 260 / 250 | 1.27x |
+| 32 inline entries | 177 / 168 | 111 / 118 | 1.5x |
+| 6 inline entries | 93 / 97 | 81 / 85 | 1.1x |
+| 4 external payloads | 97 / 99 | 101 / 98 | noise |
+| 4 inline entries | 59 / 63 | 66 / 65 | within noise (p90 equal) |
+| 3 inline entries | 60 / 65 | 65 / 63 | noise |
+| empty tail | 22 / 21 | 22 / 20 | none |
+
+**Passes** (1.27x on the 1.25x gate at 32 external payloads, with no regression for empty and 4-entry tails). What remains at 32 payloads is the payload
+fetch (about 140 ms, four waves of 8 in flight), which a wider window could cut now that W7 bounds the bytes; that is a separate change. The entries
+returned are the same as the baseline's, and the tests check order and content for each shape. Cost: one c7g.2xlarge for about 1.5 hours (under $0.60);
+instance, key pair, security group, and the `tmp/w8-20261126/` prefix deleted.
+
+## Round BW20: cut the warm BM25 scoring loop's own costs (three items kept, 1.23x, below the 1.3x bar)
+
+Four changes to `search_internal` (BW19's profile: `Range<u32>` filtered into a `Vec<u32>` 13.6%, `(usize, f64)` sort 6.6%).
+Three help and stay, one was dropped. Every reply is exact: ordered IDs and f32 score bits match the fixture truth on every
+query of every timed pass. No setting, no format change. **Warm 16-client q/s is 1.23x, short of the 1.3x bar**; 1-client is
+1.10x faster, and cold first queries are unchanged.
+
+### What changed
+
+1. **Candidate mask on the stack (kept).** A per-window `[bool; 128]` and a fresh `Vec<u32>` of competitive rows became a
+   `[u64; 2]` mask walked with `trailing_zeros` and a stack array of at most 128 rows. No allocation per unpruned window.
+2. **Lazy window order (kept).** A full sort of every window per segment became incremental `select_nth_unstable` plus a sort
+   of only as many windows as the visit reaches (64, then doubling). The order is strict (bound descending, then window), so
+   the visit sequence is identical to a full sort, and a unit test checks that for several sizes. The second batch (everything
+   the first batch's floor leaves) is filtered by the floor without ordering, then ordered lazily during scoring.
+   `windows_pruned` counts the same windows as before.
+3. **Fold only touched rows (kept).** The per-window maximum of the sparse-term row bounds read every row of the segment;
+   it now reads only the rows that were touched (`Rows::touched`). The maximum is exact, so bounds are unchanged.
+4. **Smaller saturation table (dropped).** A per-length `norm` array in place of the 139 KB `values` table computes the same
+   f64 arithmetic, and an exhaustive test over lengths 0 to 1,027 and frequencies 0 to 599 proved bit equality, but it made
+   warm 16-client throughput **0.8% slower** (a division per posting costs more than an L2 hit) and 1-client unchanged. Removed.
+
+A fifth idea tried while chasing the bar, touching the next window's row lengths and dense frequency bytes during the current
+window, changed nothing (+0.4%, inside noise) and was removed.
+
+### Measurement
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Rust 1.100.0, Clang 19, NumKong `__arm_get_current_vg` link stub), about 1.9
+hours, an estimated $1.2. Fixture `tmp/msmarco-1m-v021/` (read-only), a fresh local copy per arm, 2 GiB raw cache, 4,000-byte
+blocks, server on CPUs 0 to 5 with two Rayon and two Tokio workers, client (`concurrent_bm25`) on CPUs 14 and 15, BW19's setup.
+The workload is the held-out odd-indexed 500 queries, repeated eight times per pass. Two 1-client prewarm passes, then three
+1-client and six 16-client passes per arm. Paired A/B/B/A, both binaries built on the same host.
+
+| Arm | 1 client q/s | 1 client p50 / p90 ms | 1-client CPU ms/query | 16 clients q/s | 16 clients p50 / p90 ms | 16-client CPU ms/query | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline (`41ddbcd`), 4 arms | 918 | 0.95 / 1.50 | 2.89 | 2,654 | 5.28 / 9.69 | 2.24 | 1,036 to 1,077 |
+| Items 1 to 3, 4 arms | 1,012 | 0.88 / 1.28 | 2.49 | 3,264 | 4.28 / 7.93 | 1.82 | 1,043 to 1,054 |
+
+**16-client 1.23x, 1-client 1.10x**, with lower p50 and p90 and 19% less server CPU per query at 16 clients. Each arm's
+six 16-client passes agree within 0.7%.
+
+Each item's own effect, from a first round on a build with all four behind a temporary switch (baseline 2,650 q/s at 16
+clients, 915 at one; all items 3,160 and 999). Items 2 to 4 are the effect of switching one off from the full build;
+item 1 is the build with items 2 to 4 off against the baseline:
+
+| Item | 16-client q/s without it | Its effect | 1-client q/s without it |
+| --- | ---: | ---: | ---: |
+| 1. Candidate mask (items 2 to 4 off versus baseline) | 2,940 (against 2,650) | +10.9% | 961 (against 915) |
+| 2. Lazy window order | 2,988 | +5.8% | 971 |
+| 3. Touched-row fold | 3,082 | +2.5% | 974 |
+| 4. Smaller saturation table | 3,187 | -0.8% (dropped) | 1,002 |
+
+**Cold:** a fresh server per sample (empty process caches, local files), the first query and the first six, 12 samples per
+arm in A/B/B/A order: first query median 21.6 ms (baseline) versus 21.5 ms, six queries 39.1 versus 38.5 ms. No regression.
+
+### Where the rest of the CPU is
+
+Profile of the final build at 16 clients (`perf`, DWARF): 48% self in `search_internal`'s body, then posting-frame decode into
+`Vec<(u32, u32)>` 3.3%, `Postings::window` 2.8%, atomics about 3.5% (relaxed `fetch_add`, one per query-term site),
+CRC32 1.6%, per-term span building 2.5%, the remaining sorts 2.5%. The largest single line is the dense frequency byte read
+(`DenseFrequencies::get`, 7.5%), a cache miss on a 1 MiB array that a prefetch did not hide. Nothing is left that is
+obviously worth 8% on its own; reaching 1.3x would take a change in what is scored, not in how it is looped.

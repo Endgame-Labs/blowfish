@@ -975,6 +975,10 @@ impl<R: RangeRead> PartialIndex<R> {
 
 /// A segment's row-to-cluster map (decoded from the fragment's membership area).
 pub struct Membership {
+    /// Ascending global IDs for a sparse slab; absent for a dense segment.
+    row_ids: Option<Vec<u32>>,
+    row_set: Option<RoaringBitmap>,
+    clusters: usize,
     cluster_of: Vec<u32>,
     /// Position of each row among its cluster's rows, in ascending row order.
     ordinal_of: Vec<u32>,
@@ -1016,18 +1020,165 @@ impl Membership {
         Ok(Self {
             cluster_of,
             ordinal_of,
+            row_ids: None,
+            row_set: None,
+            clusters,
         })
     }
     /// Approximate resident bytes.
     pub fn resident_bytes(&self) -> u64 {
         self.cluster_of.len() as u64 * 8
+            + self.row_ids.as_ref().map_or(0, |r| r.len() as u64 * 4)
+            + self
+                .row_set
+                .as_ref()
+                .map_or(0, |r| r.serialized_size() as u64 * 2 + 128)
+    }
+    /// Build resident membership for sparse global row IDs, without allocating by the largest ID.
+    /// Each pair is `(row, cluster)`; duplicate rows and out-of-range clusters are rejected.
+    pub fn from_sparse_rows(
+        rows: impl IntoIterator<Item = (u32, u32)>,
+        clusters: usize,
+    ) -> Result<Self> {
+        let mut rows: Vec<_> = rows.into_iter().collect();
+        rows.sort_unstable();
+        if rows.windows(2).any(|w| w[0].0 == w[1].0)
+            || rows.iter().any(|(_, c)| *c as usize >= clusters)
+        {
+            return Err(bad("invalid sparse membership"));
+        }
+        let mut next = vec![0u32; clusters.min(rows.len())];
+        let mut overflow = std::collections::BTreeMap::<u32, u32>::new();
+        let mut ordinal_of = Vec::with_capacity(rows.len());
+        for (_, cluster) in &rows {
+            let ordinal = match next.get_mut(*cluster as usize) {
+                Some(ordinal) => ordinal,
+                None => overflow.entry(*cluster).or_default(),
+            };
+            ordinal_of.push(*ordinal);
+            *ordinal += 1;
+        }
+        let row_ids: Vec<u32> = rows.iter().map(|(r, _)| *r).collect();
+        let row_set = row_ids.iter().copied().collect();
+        Ok(Self {
+            cluster_of: rows.into_iter().map(|(_, c)| c).collect(),
+            ordinal_of,
+            row_ids: Some(row_ids),
+            row_set: Some(row_set),
+            clusters,
+        })
+    }
+    /// Ascending global row IDs for a sparse map; `None` for a dense segment map.
+    pub fn row_ids(&self) -> Option<&[u32]> {
+        self.row_ids.as_deref()
+    }
+    /// Cluster count, including empty leaves.
+    pub fn cluster_count(&self) -> usize {
+        self.clusters
+    }
+    /// Intersect a global predicate with this slab's present vectors.
+    pub fn intersection(&self, allowed: &RoaringBitmap) -> RoaringBitmap {
+        match &self.row_set {
+            Some(rows) => rows & allowed,
+            None => allowed
+                .iter()
+                .take_while(|r| (*r as usize) < self.cluster_of.len())
+                .collect(),
+        }
+    }
+    /// Encode resident sparse membership, with a checksum and no vector or code bytes.
+    /// Global rows use four bytes, and clusters use two bytes until 65,535 leaves.
+    pub fn encode_sparse(&self) -> Result<Vec<u8>> {
+        let rows = self
+            .row_ids
+            .as_ref()
+            .ok_or_else(|| bad("expected sparse membership"))?;
+        let clusters =
+            u32::try_from(self.clusters).map_err(|_| bad("too many membership clusters"))?;
+        let count = u32::try_from(rows.len()).map_err(|_| bad("too many membership rows"))?;
+        let mut out = b"BFR1".to_vec();
+        out.extend(clusters.to_le_bytes());
+        out.extend(count.to_le_bytes());
+        for (row, cluster) in rows.iter().zip(&self.cluster_of) {
+            out.extend(row.to_le_bytes());
+            if clusters <= u32::from(u16::MAX) {
+                out.extend((*cluster as u16).to_le_bytes());
+            } else {
+                out.extend(cluster.to_le_bytes());
+            }
+        }
+        out.extend(crc32fast::hash(&out).to_le_bytes());
+        Ok(out)
+    }
+    /// Decode and verify an immutable sparse resident map, without opening its ANN payloads.
+    pub fn decode_sparse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 16 || &bytes[..4] != b"BFR1" {
+            return Err(bad("invalid sparse membership header"));
+        }
+        let clusters = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let width = if clusters <= u16::MAX as usize { 2 } else { 4 };
+        if count.checked_mul(4 + width).and_then(|n| n.checked_add(16)) != Some(bytes.len()) {
+            return Err(bad("invalid sparse membership length"));
+        }
+        check_crc(
+            &bytes[..bytes.len() - 4],
+            u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap()),
+        )?;
+        let rows: Vec<_> = bytes[12..bytes.len() - 4]
+            .chunks_exact(4 + width)
+            .map(|row| {
+                let cluster = if width == 2 {
+                    u32::from(u16::from_le_bytes(row[4..6].try_into().unwrap()))
+                } else {
+                    u32::from_le_bytes(row[4..8].try_into().unwrap())
+                };
+                (u32::from_le_bytes(row[..4].try_into().unwrap()), cluster)
+            })
+            .collect();
+        if rows.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err(bad("unordered sparse membership rows"));
+        }
+        Self::from_sparse_rows(rows, clusters)
+    }
+    fn slot(&self, row: u32) -> Option<usize> {
+        match &self.row_ids {
+            Some(rows) => rows.binary_search(&row).ok(),
+            None => ((row as usize) < self.cluster_of.len()).then_some(row as usize),
+        }
     }
     /// Rows of `allowed` in each of the segment's `clusters` clusters.
     pub fn counts(&self, allowed: &RoaringBitmap, clusters: usize) -> Vec<u32> {
         let mut counts = vec![0u32; clusters];
-        for row in allowed {
-            if let Some(c) = self.cluster_of.get(row as usize) {
-                counts[*c as usize] += 1;
+        if let Some(rows) = &self.row_ids {
+            if allowed.len().saturating_mul(64) < rows.len() as u64 {
+                // Sparse projections locate only requested addresses.
+                for row in allowed {
+                    if let Ok(at) = rows.binary_search(&row) {
+                        counts[self.cluster_of[at] as usize] += 1;
+                    }
+                }
+            } else {
+                // Dense predicates merge ascending lists in one sequential pass.
+                let mut at = 0;
+                for row in allowed {
+                    while rows.get(at).is_some_and(|r| *r < row) {
+                        at += 1;
+                    }
+                    if rows.get(at) == Some(&row) {
+                        counts[self.cluster_of[at] as usize] += 1;
+                        at += 1;
+                    }
+                    if at == rows.len() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            for row in allowed {
+                if let Some(c) = self.cluster_of.get(row as usize) {
+                    counts[*c as usize] += 1;
+                }
             }
         }
         counts
@@ -1043,8 +1194,9 @@ impl Membership {
         allowed
             .iter()
             .filter_map(|row| {
-                let cluster = *self.cluster_of.get(row as usize)?;
-                keep(cluster).then(|| (cluster, self.ordinal_of[row as usize], row))
+                let slot = self.slot(row)?;
+                let cluster = self.cluster_of[slot];
+                keep(cluster).then(|| (cluster, self.ordinal_of[slot], row))
             })
             .collect()
     }
@@ -1059,5 +1211,46 @@ impl<R: RangeRead> PartialIndex<R> {
         locations: Vec<(u32, u32, u32)>,
     ) -> Result<Vec<(u32, f32)>> {
         self.0.exact_at(query, k, locations).await
+    }
+}
+
+#[cfg(test)]
+mod sparse_membership_tests {
+    use super::*;
+    #[test]
+    fn sparse_global_rows_round_trip_counts_ordinals_and_checksums() {
+        for clusters in [3, 65_536] {
+            let m =
+                Membership::from_sparse_rows([(u32::MAX, 2), (7, 2), (1, 0)], clusters).unwrap();
+            let bytes = m.encode_sparse().unwrap();
+            assert_eq!(bytes.len(), 16 + 3 * if clusters == 3 { 6 } else { 8 });
+            let decoded = Membership::decode_sparse(&bytes).unwrap();
+            let allowed: RoaringBitmap = [1, 7, 17, u32::MAX].into_iter().collect();
+            assert_eq!(decoded.row_ids().unwrap(), [1, 7, u32::MAX]);
+            assert_eq!(&decoded.counts(&allowed, clusters)[..3], [1, 0, 2]);
+            assert_eq!(
+                decoded.locations(&allowed, |_| true),
+                [(0, 0, 1), (2, 0, 7), (2, 1, u32::MAX)]
+            );
+            assert_eq!(
+                decoded.intersection(&allowed).iter().collect::<Vec<_>>(),
+                [1, 7, u32::MAX]
+            );
+            assert!(decoded.resident_bytes() < 4096);
+            let mut corrupt = bytes.clone();
+            corrupt[12] ^= 1;
+            assert!(Membership::decode_sparse(&corrupt).is_err());
+            assert!(Membership::decode_sparse(&bytes[..bytes.len() - 1]).is_err());
+        }
+        let sparse =
+            Membership::from_sparse_rows([(u32::MAX, u32::MAX - 1)], u32::MAX as usize).unwrap();
+        assert!(
+            Membership::decode_sparse(&sparse.encode_sparse().unwrap())
+                .unwrap()
+                .resident_bytes()
+                < 4096
+        );
+        assert!(Membership::from_sparse_rows([(1, 0), (1, 1)], 2).is_err());
+        assert!(Membership::from_sparse_rows([(1, 2)], 2).is_err());
     }
 }

@@ -90,7 +90,7 @@ async fn selective_distributed_masks_preserve_recall_and_format_four() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(manifest.format_version, 4);
+    assert_eq!(manifest.format_version, bf_wal::MANIFEST_FORMAT_VERSION);
     assert_eq!(manifest.segments.len(), 8);
     assert!(manifest.ann_tiers.is_empty());
     assert!(

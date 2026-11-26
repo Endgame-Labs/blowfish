@@ -1,6 +1,6 @@
 # Disk footprint: one copy of every vector
 
-Status: proposed (2026-11-23). Answers SPEC decision 24 ("disk footprint (vectors stored twice)"). Follows
+Status: implemented through D4c review fixes (2026-11-26). Answers SPEC decision 24 ("disk footprint (vectors stored twice)"). Follows
 decision 25: one layout, reached by automatic upgrade.
 
 ## The problem, in numbers
@@ -212,3 +212,70 @@ through the tier first:
 
 Every bullet is a path where a missed case loses vectors, not just speed, so D4 needs a round of its own. Lineage
 and the fence (format 4) are in place for it.
+
+
+### Round D4b: authoritative tier ownership
+
+D4b completes the paths listed above. The vector locator binds coverage and reverse lineage to an
+immutable reader snapshot. It maps a segment row to its tier-global row and then its slab-local
+ordinal, preserving sparse holes and stored precision. Projection, exact ranking, write hydration,
+statistics, compaction, and document upgrade use that source when no independent segment ANN exists.
+A base rebuild streams each predecessor slab once, translating its global rows through lineage into
+the new build's row space; uncovered segments still stream their own ANN objects.
+
+Filtered ANN shifts each immutable segment predicate into tier-global rows and intersects it with
+resident sparse slab membership. The existing selectivity-scaled planner chooses leaves from that
+intersection. A namespace directory describes only independent segment indexes beside the tiers.
+Trigger evaluation, delta targets, plans, and snapshot warming recognize covering ownership.
+
+Each slab has an `annrows:<attribute>` descriptor naming a deterministic
+`ns/<writing-namespace>/<ANN-relative-key>.rows-v1.bfr` object. The relative key excludes the
+ANN object's source namespace. A branch or copy therefore backfills inside its destination,
+even when its authoritative ANN objects remain in the source's prefix. Its `BFR1` encoding stores the leaf count, present row count, ascending
+global row IDs, leaf IDs, and a CRC. Leaf IDs use u16 below 65,536 leaves and u32 otherwise. Thus the
+usual stored cost is six bytes per present row, rather than a dense map over every global row for
+each slab. The decoded cache retains the sparse map and its ordinal information. Existing slabs
+backfill one at a time without rewriting their codes or vectors; retirement waits for complete maps.
+Both current `annv2:` containers and legacy `ann:` slabs participate in this backfill. The locator
+and filtered planner share this sparse metadata reader; their separate whole-index row-ID paths
+are removed.
+
+Version-2 branch pins include covering tiers and lineage, and GC protects every pinned object.
+Version-1 pins remain readable for older independent segment copies. Dropping a
+stale or overlapping tier first restores independent ANN ownership for surviving segments that no
+remaining tier covers. Build records pin predecessor inputs as well as outputs, GC rereads records
+after claiming its epoch, and a builder checks its snapshot epoch after pinning inputs.
+
+Retirement removes fully covered segment ANN references and enqueues their immutable keys in one
+fenced manifest publication. Covered legacy ANN indexes and fragments retire directly instead of
+copying their full payload into a new container first; document upgrade uses the retained tier. GC
+deletes them only after retention. Restart, publication failure,
+ambiguous success, and partial GC tests verify tier-backed answers and every manifest reference.
+Generation 6 and manifest format 5 fence this ownership change, accepting older layouts only for
+automatic upgrade. Older binaries refuse the prefix; there is no downgrade path. Measurements and
+limits are recorded in the Round D4b section of `docs/benchmarks.md`.
+
+
+#### D4c review fixes
+
+A missing published row-map object is reconstructed from its immutable ANN metadata into the
+bounded decoded cache. Readers write no objects. Each refreshed index pass probes one rotating
+map outside the namespace lock, and a missing object schedules a bounded fenced repair even
+without new WAL entries. The survey performs at most one HEAD, rather than checking every slab
+on every pass. Corrupt map bytes and unavailable authoritative ANN objects remain errors.
+Branch and copy tests remove maps before pinning, backfill destinations, recluster the source,
+collect past retention, and then run filtered queries and patches against cold destinations.
+
+Restoration distinguishes document-v1 segments that never delegated vector ownership from
+current documents that have lost an owner. The former retain their legacy document source;
+the latter still fail closed. New segments and restored independent indexes use one ANN builder
+recipe, including the same square-root leaf count and stored precision. A byte-for-byte test
+confirms that the earlier default and explicit recipes already produced identical objects.
+
+A complete tier reconstructs a missing or stale routing directory from its immutable slab
+fragments, keeping filtered queries on ANN. `blowfish_ann_tier_directory_rebuilds_total`
+records these repairs by `reason` (`read` or `coverage`). Remaining tier-plan declines, such as
+incomplete coverage or insufficient unshadowed candidates, increment
+`blowfish_ann_tier_fallbacks_total`, labeled by `filtered`. Sparse map reconstruction increments
+`blowfish_ann_row_map_rebuilds_total`, with `unpublished`, `missing`, or `backfill` as its reason.
+The generation-6 and manifest-5 fence is unchanged.

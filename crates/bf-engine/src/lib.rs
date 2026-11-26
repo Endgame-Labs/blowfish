@@ -38,10 +38,12 @@ mod query_worker;
 use published::Published;
 mod recluster;
 mod reindex;
+mod slab_rows;
 mod text;
 mod text_keys;
 mod text_tail;
 mod upgrade;
+mod vector_locator;
 mod warm_ann;
 mod write;
 
@@ -356,6 +358,7 @@ struct Handle {
     state: Arc<Published<NamespaceState>>,
     commits: GroupCommit<Operation, Result<WriteResponse, ApiError>>,
     backpressure: Arc<auto_recluster::LoadBackpressure>,
+    row_map_probe: std::sync::atomic::AtomicUsize,
 }
 struct Inner {
     store: Storage,
@@ -593,6 +596,7 @@ impl Engine {
             state: state.clone(),
             commits,
             backpressure: backpressure.clone(),
+            row_map_probe: std::sync::atomic::AtomicUsize::new(0),
         });
         handles.insert(ns.into(), handle.clone());
         let context = read_cache::ReadContext::new(self.0.read_cache.clone());
@@ -1213,7 +1217,11 @@ impl Engine {
         let (s, _) = self
             .snapshot_hinted(ns, &Consistency::Strong, None, true)
             .await?;
-        let totals = snapshot::statistics(&self.0.store, &s).await?;
+        let totals = read_cache::scope(
+            read_cache::ReadContext::new(self.0.read_cache.clone()),
+            snapshot::statistics(&self.0.store, &s),
+        )
+        .await?;
         let mut metadata = json!({"schema":s.schema,"approx_logical_bytes":totals.logical_bytes,"approx_row_count":totals.rows,"created_at":s.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"updated_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"last_write_at":s.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),"encryption":{"mode":"default"},"index":{"status":"up-to-date"}});
         // Every live tail row is searched exhaustively, including scalar-only namespaces.
         // Deletes and schema-only writes leave bytes to checkpoint even with zero tail rows.

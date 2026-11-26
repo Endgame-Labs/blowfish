@@ -85,6 +85,7 @@ async fn downgrade(store: &Storage) {
         };
 
         seg.files.remove("annv2:vector");
+        seg.files.remove("annrows:vector");
         let meta = bf_vector::metadata_len(&blob).unwrap();
         let put = async |name: &str, data: Vec<u8>, meta: u64| {
             let key = format!("ns/t/test/{}.{name}", uuid::Uuid::new_v4());

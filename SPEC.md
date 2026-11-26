@@ -91,8 +91,10 @@ log entry in the same commit.
 - **Automatic recluster** (decision 21, rounds R1 and R2 of `docs/design/auto-recluster.md`): the indexer builds a
   namespace's base tier of slabs in the background when its layout would gain from it, and installs it in its own
   fenced publication. Unfiltered ANN runs one plan over the tier and the segments written since, so new writes keep
-  slab-speed queries; compaction leaves covered segments alone. Manifest and bucket format 3 (`ann_tiers` replaces
-  `ann_slabs`, which is read once and rewritten). `examples/recluster.rs`, `examples/repage.rs`, and the recluster's
+  slab-speed queries; compaction follows their tier lineage. Manifest format 3 replaced `ann_slabs` with
+  `ann_tiers`, and format 4 added compaction lineage. Bucket generation 6 and manifest format 5 fence Round D4b's
+  tier-owned vectors and resident slab row maps. A writable open raises the bucket fence automatically; older
+  binaries refuse the bucket, older manifests upgrade on publication, and there is no downgrade path. `examples/recluster.rs`, `examples/repage.rs`, and the recluster's
   epoch claim are gone.
 - **Delta tier** (round R3 of `docs/design/auto-recluster.md`): rows written after the base get a delta tier, built on
   the base's coarse cells once they reach 4% of the base (and a quarter of the delta), and merged into a new base at
@@ -275,3 +277,6 @@ S3 until the run is cleaned up.
     beat Qdrant. The bucket's IVF tiers stay authoritative; graphs are disposable accelerators built and promoted
     automatically. On the M4 at matched recall, blowfish's self-built graph reached 8,133 vs. Qdrant's 8,183 q/s
     (0.9575) and 8,558 vs. 8,907 q/s (0.9516), 2.4 to 2.8 times blowfish's IVF throughput, with 22% less memory.
+30. 2026-11-25: Round D4b uses bucket generation 6 and manifest format 5 for tier-owned vectors and resident slab row
+    maps. Both advance one generation, following decisions 25 and 26: the upgrade is automatic, and older binaries
+    must refuse the upgraded bucket before writing or collecting garbage.

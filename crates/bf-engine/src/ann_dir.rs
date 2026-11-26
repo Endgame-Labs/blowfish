@@ -663,6 +663,14 @@ pub(crate) async fn memberships(
             .iter()
             .zip(segments)
             .map(|(d, seg)| async move {
+                if let Some(member) = crate::slab_rows::load(store, seg, attr).await? {
+                    if member.row_ids().is_none_or(|r| r.len() != d.rows)
+                        || member.cluster_count() != d.clusters
+                    {
+                        return Err(segment::corrupt());
+                    }
+                    return Ok(Some(member));
+                }
                 let (Some(range), Some(file)) = (
                     d.membership.clone(),
                     seg.files.values().find(|f| f.key == d.fragment),
