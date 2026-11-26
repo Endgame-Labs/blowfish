@@ -397,6 +397,10 @@ pub(crate) fn fan_out() -> bool {
     QUERIES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) <= limit
 }
 
+pub(crate) fn queries_in_flight() -> usize {
+    QUERIES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 struct InFlight;
 impl InFlight {
     fn enter() -> Self {

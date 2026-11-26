@@ -1304,3 +1304,109 @@ fn selective_masks_score_allowed_rows_with_the_same_bits_as_the_unfiltered_ranki
         }
     }
 }
+
+/// Round BW21 tried seeding window scores from the small terms' partial sums and skipping
+/// small-term postings below a shared floor, and measured neither worth keeping. This test
+/// stays as the exactness guard they needed: terms add in dictionary order and float addition
+/// is not associative, so every mix of small and dense terms (small first, interleaved, dense
+/// first) must match the reference scorer bit for bit, alone and under a shared floor, including
+/// after the dense arrays are earned on a second use.
+#[test]
+fn mixed_small_and_dense_terms_match_the_reference_bit_for_bit_alone_and_under_a_shared_floor() {
+    let params = FtsParams::default();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let docs: Vec<_> = (0..40_000u64)
+        .map(|_| {
+            let mut text = String::new();
+            let mut add = |word: &str, n: u64| {
+                for _ in 0..n {
+                    text.push_str(word);
+                    text.push(' ');
+                }
+            };
+            if next() % 100 == 0 {
+                add("alpha", 1 + next() % 4);
+            }
+            if next() % 150 == 0 {
+                add("zebra", 1 + next() % 3);
+            }
+            if next() % 3 != 0 {
+                add("mango", 1 + next() % 6);
+            }
+            if next() % 6 == 0 {
+                add("kiwi", 1 + next() % 2);
+            }
+            add("filler", 1 + next() % 40);
+            tokenize(&text, &params)
+        })
+        .collect();
+    let reader = open(build(&docs, false, params.tokenizer));
+    let stats = CorpusStats::from_documents(&docs);
+    for text in [
+        "alpha mango",
+        "alpha zebra mango",
+        "alpha mango zebra",
+        "alpha zebra kiwi mango",
+        "mango zebra",
+        "kiwi mango alpha zebra",
+        "alpha alpha kiwi",
+        "alpha mango zebra filler",
+    ] {
+        let query = Query::new(tokenize(text, &params), false);
+        for k in [10, 100] {
+            for _ in 0..4 {
+                let hits =
+                    block_on(reader.search_prefetched(&query, &stats, &params, k, None)).unwrap();
+                assert_eq!(
+                    hits,
+                    expected(&docs, &query, &stats, &params, k, None),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    // Segments searched one after another under a shared floor: the merged top k is exact in any order.
+    let parts: Vec<_> = docs
+        .chunks(10_000)
+        .map(|part| open(build(part, false, params.tokenizer)))
+        .collect();
+    for text in [
+        "alpha mango",
+        "alpha zebra kiwi mango",
+        "zebra kiwi",
+        "alpha mango zebra",
+    ] {
+        let query = Query::new(tokenize(text, &params), false);
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1], [1, 3, 0, 2]] {
+            for _ in 0..3 {
+                let threshold = SearchThreshold::new(10);
+                let mut hits = Vec::new();
+                for part in order {
+                    let found = block_on(
+                        parts[part]
+                            .search_prefetched_shared(&query, &stats, &params, None, &threshold),
+                    )
+                    .unwrap();
+                    hits.extend(found.into_iter().map(|mut hit| {
+                        hit.row += part as u32 * 10_000;
+                        hit
+                    }));
+                }
+                hits.sort_unstable_by(|a, b| b.cmp(a));
+                hits.truncate(10);
+                assert_eq!(
+                    hits,
+                    expected(&docs, &query, &stats, &params, 10, None),
+                    "{text}"
+                );
+            }
+        }
+    }
+}

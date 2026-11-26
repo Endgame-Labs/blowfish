@@ -13788,3 +13788,100 @@ Profile of the final build at 16 clients (`perf`, DWARF): 48% self in `search_in
 CRC32 1.6%, per-term span building 2.5%, the remaining sorts 2.5%. The largest single line is the dense frequency byte read
 (`DenseFrequencies::get`, 7.5%), a cache miss on a 1 MiB array that a prefetch did not hide. Nothing is left that is
 obviously worth 8% on its own; reaching 1.3x would take a change in what is scored, not in how it is looped.
+
+## Round BW21: double scoring, late threshold, reactor hops (1.00x at 16 clients, below the 1.25x bar; only a light-load inline path kept)
+
+Three hypotheses (Neon, idea #3) about warm exact BM25 on 1M MS MARCO. Each was built behind a temporary switch, measured on
+its own, and judged against the profile. **None moves warm 16-client q/s**: the shipped candidate is 3,004 q/s against a
+baseline of 3,032 (0.99x, inside noise), far below the 1.25x bar. Two items cost throughput and were removed. One (inline
+execution on the HTTP reactor) helps at light load (**+4.8% q/s and -6% p50 at one client**) and hurts tails under load, so
+it is gated to light load. Every reply of every timed pass matched the fixture truth in ordered IDs and f32 score bits. No
+setting, no format change.
+
+### Measurement
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Rust 1.100.0, Clang 19, NumKong `__arm_get_current_vg` link stub), about
+1.0 hour, an estimated $0.6. BW19's and BW20's setup: fixture `tmp/msmarco-1m-v021/` (read-only; eight text segments), a fresh
+local copy per arm, 2 GiB raw cache, 4,000-byte blocks, server on CPUs 0 to 5 with two Rayon and two Tokio workers (six HTTP
+reactors), `concurrent_bm25` on CPUs 14 and 15 over the held-out odd-indexed 500 queries repeated eight times (it now also
+prints p99). Two 1-client prewarm passes, then three 1-client, four 4-client, and four or six 16-client passes per arm. Arms
+ran in A/B/B/A order, baseline built from `a82621c` on the same host. The switchable build read `BW21_OFF`; the final numbers
+below are from the final code with no switches.
+
+### What the profile says first
+
+`perf` on the baseline at 16 clients: 48.5% self in `search_internal`'s body, the saturation-table lookup (`scoring.rs`
+`Saturation::get`) 10.4%, the dense frequency byte read 7.2%, `Rows::add` 3.4%, decode of posting frames 3.2%, atomics 3.3%.
+It is the same diffuse profile BW20 ended on. Counters over 88,000 segment calls (11,000 queries, eight segments each):
+
+| Counter | Calls | Share |
+| --- | ---: | ---: |
+| Shared floor already established when the segment starts | 75,979 | 86% |
+| Segment skippable because the sum of its per-term maxima is below the floor | 153 | **0.17%** |
+| Every term small (the early single-pass path) | 11,671 | 13% |
+| A leading run of small terms exists (dictionary order) | 40,587 | 46% |
+| ... and that run is every small term (its partial sum is `row_bounds` itself) | 11,043 | 12.5% |
+
+### Item 1: double-scored small terms (dropped)
+
+Window scoring starts from the already computed partial sum for the leading run of small terms in dictionary order (float
+addition is not associative, so only a *leading* run is exact), skipping those terms in the window loop. Bit-identical, shown
+by the existing exhaustive tests plus a new one (`mixed_small_and_dense_terms_match_the_reference_bit_for_bit_alone_and_under_a_shared_floor`,
+which fails under a deliberately wrong seed). **It does not help.** Seeding reads `row_bounds[row]` (a random access into a 4 MiB array)
+for each competitive row, the same cost class as the lookup it replaces, and the candidate rows are few. Seeding only when the
+run is every small term (no extra accumulator) is +1.1% at 16 clients and +0.7% at one client, inside noise. Seeding through
+a second accumulator for partial runs costs **4.5%**.
+
+### Item 2: late threshold (dropped, two variants)
+
+(a) Skip a segment when the sum of its per-term maxima (the blocks' existing upper bounds, times the existing rounding margin)
+is below the floor, ties kept. It fires on **0.17%** of calls, because maxima of different terms sit at different rows, so
+the sum is far above the true best score. Net **-1.0%** (the bound costs a pass over each dense term's blocks).
+(b) Bound each window from the non-small terms plus the small terms' block maxima first, and score small-term postings only in
+windows that can still reach the floor (exact: those windows would be pruned under the tighter row bounds too, and a test
+checks all segment orders against the reference). **-2.2% at 16 clients, -2.0% at four, 0% at one.** The extra pass costs more than
+the pruned scoring saves.
+
+### Item 3: warm BM25 on the HTTP reactor (kept, gated to light load)
+
+Warm, tail-free, unfiltered BM25 (plain `["text","BM25",string]`, no prefix, at most 12 words and 256 bytes, `top_k` plus offset
+at most 10, at most 16 segments, every segment's text index resident with its lengths loaded, no deletes) now takes its first
+poll on the connection's reactor like the warm vector path, in `warm_ann::inline_plan`. It falls back exactly as the vector path
+does: any cache miss yields the future to shared I/O. A dense-frequency array build (the one multi-millisecond step on a
+warm path, earned on a term's second use) yields first when polled inline (`bf_text::InlineGuard`), so the rest runs on a worker.
+
+Ungated, it adds throughput at every load but costs tails, because a reactor serves its own connections only and loses the
+pool's balancing:
+
+| Arm (switchable build) | 1 client q/s | 4 clients q/s / p99 ms | 16 clients q/s / p99 ms |
+| --- | ---: | ---: | ---: |
+| Baseline | 920 | 1,930 / 7.5 | 3,013 / 15.0 |
+| Inline, ungated | 972 (+5.6%) | 2,055 (+6.5%) / 8.8 (+17%) | 3,105 (+3.1%) / 20.7 (+38%) |
+| Inline, fewer than 4 queries in flight | 976 | 2,056 / 8.8 | 2,998 / 15.0 |
+| Inline, fewer than 2 queries in flight (kept) | 968 | 1,922 / 8.0 | 2,993 / 14.8 |
+
+Mixed load (16 BM25 clients plus four vector clients on a 10,000-vector namespace added to the same store, 6-second passes),
+ungated inline: BM25 2,684 against 2,534 q/s (+6%), but the **vector queries' p99 rose 8.0 to 10.3 ms (+28%)** and BM25 p99
+17 to 22 ms. A long BM25 query on a reactor holds up the vector queries sharing it. So inline BM25 is allowed only while at
+most one other query is in flight (`QUERIES_IN_FLIGHT`, the counter the fan-out policy already uses).
+
+### Final, paired A/B/B/A (final code against baseline `a82621c`)
+
+| Arm | 1 client q/s | p50 / p90 / p99 ms | 4 clients q/s | p50 / p99 ms | 16 clients q/s | p50 / p90 / p99 ms | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline, 2 arms | 932 | 0.96 / 1.41 / 3.13 | 1,945 | 1.71 / 7.87 | 3,032 | 4.77 / 8.28 / 14.52 | 1,043 to 1,045 |
+| Final, 2 arms | 977 | 0.90 / 1.37 / 3.17 | 1,922 | 1.73 / 8.08 | 3,004 | 4.83 / 8.52 / 14.82 | 1,090 to 1,097 |
+
+1-client **+4.8%**, 4 and 16 clients unchanged within 1.3%. Mixed load (16 BM25 plus four vector clients, A/B/B/A, three
+passes per arm): BM25 2,703 (baseline) against 2,689 q/s, vector p50 1.037 against 1.039 ms, vector p99 7.33 against 7.20 ms:
+no regression. **Cold** (fresh server per sample, local files, first query and first six, six samples per arm in A/B/B/A
+order): first query median 21.5 ms (baseline) against 21.0 ms, six queries 38.6 against 37.9 ms: no regression. **Resident memory
+is +50 MiB (about 5%)** on this fixture: inline queries run on the six reactor threads, and each keeps its own thread-local
+scoring scratch (a 4 MiB row accumulator for a 1M-row segment plus window buffers) where only the Rayon pool held it before.
+
+### Verdict
+
+The brief's bar (1.25x at 16 clients) is not met and these hypotheses cannot meet it: at saturation the CPU is the scoring
+and memory-access loop itself, which none of them shortens. The kept change is a one-client latency gain, neutral at load.
+Whether +4.8% at one client is worth +50 MiB and a new reactor path is the coordinator's call. Dropping it is safe: the code is
+one `inline_bm25` function, a thread-local flag, and one early `yield` in dense-array building.

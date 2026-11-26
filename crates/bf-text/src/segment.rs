@@ -932,6 +932,41 @@ impl SearchThreshold {
     }
 }
 
+thread_local! {
+    static INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the current thread's poll as an inline poll on an HTTP reactor. While the guard
+/// lives, work that can cost milliseconds of CPU (building a dense-frequency array) yields
+/// first, so the caller's dispatcher moves the rest of the query to a worker.
+pub struct InlineGuard(bool);
+impl InlineGuard {
+    /// Mark this thread's current poll as inline until the guard drops.
+    pub fn enter() -> Self {
+        Self(INLINE.with(|flag| flag.replace(true)))
+    }
+}
+impl Drop for InlineGuard {
+    fn drop(&mut self) {
+        INLINE.with(|flag| flag.set(self.0));
+    }
+}
+
+/// Pending once (waking itself), then ready.
+async fn yield_inline() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 enum SearchMode<'a> {
     Demand,
     Prefetched,
@@ -1712,6 +1747,9 @@ impl SegmentReader {
                 }
             }
         }
+        if !earned.is_empty() && INLINE.with(std::cell::Cell::get) {
+            yield_inline().await;
+        }
         for id in earned {
             let built = self.build_dense(&metas[&id]).await;
             let mut select = self.dense_select.lock().unwrap();
@@ -1796,6 +1834,10 @@ impl SegmentReader {
     /// The decoded lengths. Callers that read postings or score call `ensure_lengths` first.
     fn lens(&self) -> &[u32] {
         self.lengths.get().map_or(&[], Vec::as_slice)
+    }
+    /// Whether the document lengths are already resident, so a search needs no read for them.
+    pub fn lengths_loaded(&self) -> bool {
+        self.lengths.get().is_some()
     }
     /// Read the per-row lengths of a reader opened from a header (a no-op after the first call).
     pub async fn ensure_lengths(&self) -> io::Result<()> {

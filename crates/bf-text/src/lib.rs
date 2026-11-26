@@ -15,8 +15,8 @@ pub use analysis::{
 pub use scoring::{CorpusStats, DocumentTerms, PreparedQuery, Query, score_document};
 mod segment;
 pub use segment::{
-    MemoryRangeRead, RangeRead, SearchHit, SearchMetrics, SearchThreshold, SegmentBuilder,
-    SegmentReader, TextHeader, text_header, upgrade_segment,
+    InlineGuard, MemoryRangeRead, RangeRead, SearchHit, SearchMetrics, SearchThreshold,
+    SegmentBuilder, SegmentReader, TextHeader, text_header, upgrade_segment,
 };
 
 mod fuzzy;

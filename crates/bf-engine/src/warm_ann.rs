@@ -99,6 +99,14 @@ pub(crate) fn inline_plan(
     request: &bf_types::QueryRequest,
     config: &crate::EngineConfig,
 ) -> bool {
+    if let Some(bf_types::RankBy::Bm25 {
+        attribute,
+        query,
+        params,
+    }) = &request.rank_by
+    {
+        return inline_bm25(cache, state, request, attribute, query, params.as_ref());
+    }
     let Some(bf_types::RankBy::Vector {
         attribute,
         exact: false,
@@ -143,6 +151,67 @@ pub(crate) fn inline_plan(
                             .map(|segment| u64::from(segment.row_count))
                             .sum::<u64>()
             })
+}
+
+/// A warm, tail-free, unfiltered BM25 query of a few short terms over resident text indexes
+/// can poll on its HTTP reactor. The bound on query width caps the inline CPU; every read
+/// still goes through the normal async paths, so a miss yields the plan to shared I/O. A
+/// dense-term array build yields too (`bf_text::InlineGuard`).
+fn inline_bm25(
+    cache: &read_cache::DecodedCache,
+    state: &crate::NamespaceState,
+    request: &bf_types::QueryRequest,
+    attribute: &str,
+    query: &serde_json::Value,
+    params: Option<&serde_json::Value>,
+) -> bool {
+    /// Query text longer than this (bytes) or with more words than `MAX_WORDS` stays off the reactor.
+    const MAX_BYTES: usize = 256;
+    const MAX_WORDS: usize = 12;
+    const MAX_SEGMENTS: usize = 16;
+    const INLINE_BM25_MAX_IN_FLIGHT: usize = 2;
+    // Under load the shared pool balances CPU better than connection-pinned reactors: the
+    // round that measured it (BW21) saw 16-client p99 rise 40% and a sharing vector query's
+    // p99 rise 28%. Inline only while at most one other query is in flight.
+    if crate::queries_in_flight() >= INLINE_BM25_MAX_IN_FLIGHT {
+        return false;
+    }
+    let Some(text) = query.as_str() else {
+        return false;
+    };
+    if text.len() > MAX_BYTES
+        || text.split_whitespace().count() > MAX_WORDS
+        || crate::text::prefix(params)
+        || request.compute_attributes.is_some()
+        || request.limit.is_some()
+        || request.filters.is_some()
+        || request.queries.is_some()
+        || request.aggregate_by.is_some()
+        || request.group_by.is_some()
+        || request.rerank_by.is_some()
+        || request.total().unwrap_or(10).saturating_add(request.offset) > 10
+        || !crate::indexed::text_ids_only(request)
+        || state.tail_bytes != 0
+        || !state.docs.is_empty()
+        || state.segments.is_empty()
+        || state.segments.len() > MAX_SEGMENTS
+        || state
+            .segments
+            .iter()
+            .any(|segment| segment.live_generation != 0)
+    {
+        return false;
+    }
+    state.segments.iter().all(|segment| {
+        segment
+            .files
+            .get(&format!("fts:{attribute}"))
+            .is_some_and(|file| {
+                cache
+                    .get::<bf_text::SegmentReader>(&file.key)
+                    .is_some_and(|reader| reader.lengths_loaded())
+            })
+    })
 }
 
 impl WarmTier {
@@ -542,6 +611,135 @@ mod tests {
             assert!(WarmTier::for_tier(&key, directory).is_some());
         })
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_bm25_polls_inline_only_when_resident_and_answers_identically() {
+        let store = Storage::open(&StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let writer = engine(&store, 64 << 20);
+        let words = ["amber", "birch", "cedar", "dune", "ember", "fjord", "grove"];
+        let docs: Vec<_> = (0..6000usize)
+            .map(|id| {
+                let mut text = String::new();
+                if id % 5 != 0 {
+                    text.push_str("the the ");
+                }
+                for w in 0..4 {
+                    text.push_str(words[(id * 7 + w * 3 + id / 11) % words.len()]);
+                    text.push(' ');
+                }
+                if id % 97 == 0 {
+                    text.push_str("zebra ");
+                }
+                json!({"id": id, "text": text})
+            })
+            .collect();
+        writer
+            .write(
+                "bm",
+                serde_json::from_value::<WriteRequest>(json!({
+                    "schema":{"text":{"type":"string","full_text_search":true}},
+                    "upsert_rows":docs,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.index_namespace("bm", true).await.unwrap();
+        let reader = engine(&store, 64 << 20);
+        let body = |text: &str| json!({"rank_by":["text","BM25",text],"top_k":10,"include_attributes":["id"]});
+        let run = |engine: Engine, text: String| async move {
+            Box::pin(engine.query(
+                "bm",
+                serde_json::from_value::<QueryRequest>(body(&text)).unwrap(),
+            ))
+            .await
+            .unwrap()
+            .result
+            .rows
+            .unwrap()
+        };
+        let queries = [
+            "the zebra",
+            "amber cedar the",
+            "zebra",
+            "grove the the dune",
+        ];
+        let mut wanted = Vec::new();
+        for text in queries {
+            wanted.push(run(reader.clone(), text.into()).await);
+        }
+        for _ in 0..3 {
+            for (text, want) in queries.iter().zip(&wanted) {
+                assert_eq!(&run(reader.clone(), (*text).into()).await, want);
+            }
+        }
+        let state = reader.handle("bm").await.unwrap().state.load();
+        let request: QueryRequest = serde_json::from_value(body("the zebra")).unwrap();
+        let plan = |state: &crate::NamespaceState, request: &QueryRequest| {
+            inline_plan(&reader.0.read_cache, state, request, &reader.0.config)
+        };
+        assert!(plan(&state, &request), "a warm plain BM25 query is inline");
+        let mut wide = request.clone();
+        wide.top_k = Some(11);
+        assert!(!plan(&state, &wide));
+        let mut filtered = request.clone();
+        filtered.filters = Some(serde_json::from_value(json!(["id", "Gt", 5])).unwrap());
+        assert!(!plan(&state, &filtered));
+        let long: QueryRequest = serde_json::from_value(body(&"word ".repeat(13))).unwrap();
+        assert!(!plan(&state, &long));
+        let prefixed: QueryRequest = serde_json::from_value(json!({
+            "rank_by":["text","BM25","the zeb",{"last_as_prefix":true}],"top_k":10
+        }))
+        .unwrap();
+        assert!(!plan(&state, &prefixed));
+        let mut tail = (*state).clone();
+        tail.tail_bytes = 1;
+        assert!(
+            !plan(&tail, &request),
+            "a WAL tail keeps the plan off the reactor"
+        );
+        let cold = engine(&store, 64 << 20);
+        let cold_state = cold.handle("bm").await.unwrap().state.load();
+        assert!(
+            !inline_plan(&cold.0.read_cache, &cold_state, &request, &cold.0.config),
+            "an engine that has not opened the text index must not poll inline"
+        );
+        // Polled on an HTTP reactor, replies match, including after dense arrays are earned,
+        // and a cold engine's misses yield to shared I/O instead of blocking the reactor.
+        let io = tokio::runtime::Handle::current();
+        for engine in [reader.clone(), cold] {
+            let (io, wanted) = (io.clone(), wanted.clone());
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::on_query_reactor(io, async move {
+                        for _ in 0..3 {
+                            for (text, want) in queries.iter().zip(&wanted) {
+                                let got = Box::pin(engine.query(
+                                    "bm",
+                                    serde_json::from_value::<QueryRequest>(body(text)).unwrap(),
+                                ))
+                                .await
+                                .unwrap()
+                                .result
+                                .rows
+                                .unwrap();
+                                assert_eq!(&got, want, "{text}");
+                            }
+                        }
+                    }));
+            })
+            .await
+            .unwrap();
+        }
     }
 
     // Keep the build future on the heap so the driver has room for compaction and queries.

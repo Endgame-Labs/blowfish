@@ -171,6 +171,7 @@ fn main() {
         "qps": results.len() as f64 / elapsed,
         "p50_ms": results[results.len() / 2],
         "p90_ms": results[results.len() * 9 / 10],
+        "p99_ms": results[results.len() * 99 / 100],
         "sum_request_seconds": results.iter().sum::<f64>() / 1000.0,
         "validated": results.len(),
     });

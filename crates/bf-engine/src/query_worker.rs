@@ -78,6 +78,7 @@ where
     if inline && let Some(runtime) = IO_RUNTIME.with(|slot| slot.borrow().clone()) {
         let mut future = Box::pin(future);
         let work = catch_unwind(AssertUnwindSafe(|| {
+            let _inline = bf_text::InlineGuard::enter();
             let mut context = Context::from_waker(futures::task::noop_waker_ref());
             future.as_mut().poll(&mut context)
         }));
