@@ -244,11 +244,20 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         let bodies = |i: usize| {
             [10, 100, 37].map(|k| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k,"include_attributes":["group"]}))
         };
+        let id_bodies = |i: usize| {
+            [10, 100, 37, 1].map(|k| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k}))
+        };
         FLAGS.store(0, Ordering::Relaxed);
         let mut want = Vec::new();
         for i in [17, 400, 1999] {
             for body in bodies(i) {
                 want.push(query(&e, "hot", body).await);
+            }
+        }
+        let mut want_ids = Vec::new();
+        for i in [17, 400, 1999] {
+            for body in id_bodies(i) {
+                want_ids.push(query(&e, "hot", body).await);
             }
         }
         for flags in [1, 2, 4, 8, 16, 31] {
@@ -262,6 +271,32 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
             }
             for (a, b) in want.iter().zip(got) {
                 same_rows(a.clone(), b);
+            }
+            let ids_run = |e: &Engine| {
+                let e = e.clone();
+                async move {
+                    let mut got = Vec::new();
+                    for i in [17, 400, 1999] {
+                        for body in id_bodies(i) {
+                            got.push(query(&e, "hot", body).await);
+                        }
+                    }
+                    got
+                }
+            };
+            // The first ID-only query starts the background table build; wait for it, then
+            // compare again so both the document path and the table path are checked.
+            for pass in 0..2 {
+                if pass == 1 && flags & 16 != 0 {
+                    let started = Instant::now();
+                    while held.ids.get().is_none() && started.elapsed() < Duration::from_secs(30) {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    assert!(held.ids.get().is_some(), "the ID table was never built");
+                }
+                for (a, b) in want_ids.iter().zip(ids_run(&e).await) {
+                    same_rows(a.clone(), b);
+                }
             }
         }
         FLAGS.store(0, Ordering::Relaxed);

@@ -195,6 +195,11 @@ struct Entry {
     phase_cpu: [AtomicU64; 3],
     searches: AtomicU64,
     pending_cost: Mutex<cost::Pending>,
+    /// Round G12 item 5: the unsigned ID of every tier row (`u64::MAX` where the row has none
+    /// now), built once in the background by the first ID-only query. Absent when any ID is a
+    /// string, and until built, queries hydrate IDs from the documents as before.
+    ids: std::sync::OnceLock<Vec<u64>>,
+    ids_started: std::sync::atomic::AtomicBool,
 }
 struct Heat {
     first: Instant,
@@ -915,6 +920,8 @@ impl Engine {
             build_reservation_bytes: estimate,
             phase_cpu: Default::default(),
             searches: AtomicU64::new(0),
+            ids: std::sync::OnceLock::new(),
+            ids_started: std::sync::atomic::AtomicBool::new(false),
             pending_cost: Mutex::default(),
         }))
     }
@@ -1072,6 +1079,19 @@ pub(crate) async fn search(
     let Ok(_permit) = entry.slots.try_acquire() else {
         return Ok(None);
     };
+    if columns.is_empty()
+        && bf_vector::g12_flags::on(bf_vector::g12_flags::LATE_IDS)
+        && entry.ids.get().is_none()
+        && !entry.ids_started.swap(true, Ordering::AcqRel)
+    {
+        tokio::spawn(build_id_table(
+            store.clone(),
+            state.clone(),
+            set.clone(),
+            at.clone(),
+            entry.clone(),
+        ));
+    }
     let result = search_entry(store, state, set, at, vector, mask, k, columns, &entry, ef).await;
     match result {
         Ok(Some(found)) => {
@@ -1185,6 +1205,13 @@ async fn search_entry(
     if exact.len() < k {
         return Ok(None);
     }
+    if columns.is_empty()
+        && bf_vector::g12_flags::on(bf_vector::g12_flags::LATE_IDS)
+        && let Some(table) = entry.ids.get()
+        && let Some(found) = ids_from_table(table, &exact, mask.as_deref(), set, at, k)
+    {
+        return Ok(found);
+    }
     let mut by_segment: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
     let mut distances = BTreeMap::new();
     for (row, distance) in exact {
@@ -1221,6 +1248,82 @@ async fn search_entry(
         return Ok(None);
     }
     Ok(Some((scores, documents)))
+}
+type Found = (BTreeMap<Id, f64>, BTreeMap<Id, Document>);
+/// The answer for an ID-only query from the resident table, carrying `(row, distance)` to the end
+/// and resolving each ID once, for the final rows only. `None` when the table cannot answer (a row
+/// without an ID, say), so the caller takes the document path. `Some(None)` is the same decline the
+/// document path gives when a row has no live home.
+fn ids_from_table(
+    table: &[u64],
+    exact: &[(u32, f32)],
+    mask: Option<&RoaringBitmap>,
+    set: &SlabSet,
+    at: &Placement,
+    k: usize,
+) -> Option<Option<Found>> {
+    let mut scores = BTreeMap::new();
+    let mut documents = BTreeMap::new();
+    for &(row, distance) in exact {
+        if mask.is_some_and(|m| !m.contains(row)) {
+            continue;
+        }
+        if at.real(&set.covered, row).is_none() {
+            return Some(None);
+        }
+        let id = *table.get(row as usize).filter(|id| **id != u64::MAX)?;
+        let mut doc = Document::new();
+        doc.insert("id".into(), serde_json::Value::from(id));
+        scores.insert(Id::Uint(id), f64::from(distance));
+        documents.insert(Id::Uint(id), doc);
+    }
+    Some((scores.len() >= k).then_some((scores, documents)))
+}
+/// Read every tier row's unsigned ID once, from the same documents the query path hydrates, and
+/// publish the table on the entry. Any failure or non-numeric ID leaves the entry without one.
+async fn build_id_table(
+    store: Storage,
+    state: NamespaceState,
+    set: SlabSet,
+    at: Placement,
+    entry: Arc<Entry>,
+) {
+    let total = set
+        .covered
+        .iter()
+        .map(|c| u64::from(c.base) + u64::from(c.rows))
+        .max()
+        .unwrap_or(0) as usize;
+    let mut wanted: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
+    for row in 0..total as u32 {
+        if let Some((segment, local)) = at.real(&set.covered, row) {
+            wanted.entry(segment).or_default().push((local, row));
+        }
+    }
+    let mut table = vec![u64::MAX; total];
+    let none = BTreeSet::new();
+    for (segment, pairs) in wanted {
+        let rows: RoaringBitmap = pairs.iter().map(|(local, _)| *local).collect();
+        let Some(segment) = state.segments.get(segment) else {
+            return;
+        };
+        let Ok(docs) =
+            segment::projected_rows_with(&store, segment, &rows, Some(&none), true).await
+        else {
+            return;
+        };
+        for (local, row) in pairs {
+            let Some(id) = docs
+                .get(&local)
+                .and_then(|d| d.get("id"))
+                .and_then(serde_json::Value::as_u64)
+            else {
+                return;
+            };
+            table[row as usize] = id;
+        }
+    }
+    let _ = entry.ids.set(table);
 }
 /// Run a calibration ANN plan through the same CPU dispatch as an ordinary warm query.
 /// Exhaustive truth retains its separate blocking worker and nonadmitting context.
