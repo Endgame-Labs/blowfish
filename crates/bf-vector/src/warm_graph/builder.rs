@@ -159,6 +159,7 @@ impl HotGraphBuilder {
             links.push(row);
             degrees.push(count as u8);
         }
+        let screen = super::screen::Screen::new(&codes, cancelled)?;
         let rows = std::mem::take(&mut self.rows);
         // A dense row-to-node table when tier row numbers are within 4x the node count.
         let top = rows.iter().max().map_or(0, |m| *m as usize + 1);
@@ -177,6 +178,7 @@ impl HotGraphBuilder {
             degrees,
             entries: vec![best.0],
             codes,
+            screen,
             norms: std::mem::take(&mut self.norms),
         })
     }

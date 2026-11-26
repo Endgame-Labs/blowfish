@@ -1043,6 +1043,24 @@ fn scan_shortlist(k: usize) -> usize {
 /// nearly flat. Below this share the scan wins everywhere that matters (throughput by 4x or more, with
 /// serial latency within 10%); above it the IVF tier answers.
 const SCAN_SHARE: usize = 64;
+/// G15 EXPERIMENT SWITCH (temporary): the file named by `BF_G15_SWITCH` holds "ivf", "sq8 N", or
+/// "screen N KEEP_PER_K", for a 1-in-N share. Returns (mode, share, keep per k); mode 0 = screen.
+fn switch() -> (u8, usize, usize) {
+    let mut out = (0, SCAN_SHARE, 100);
+    if let Ok(path) = std::env::var("BF_G15_SWITCH") {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut words = text.split_whitespace();
+        let mode = words.next();
+        out.1 = words.next().and_then(|n| n.parse().ok()).unwrap_or(out.1);
+        out.2 = words.next().and_then(|n| n.parse().ok()).unwrap_or(out.2);
+        out.0 = match mode {
+            Some("ivf") => 2,
+            Some("sq8") => 1,
+            _ => 0,
+        };
+    }
+    out
+}
 /// Whether a ready graph answers a filtered query by scanning the codes of its `allowed` rows.
 pub(crate) fn scan_eligible(
     state: &NamespaceState,
@@ -1053,6 +1071,10 @@ pub(crate) fn scan_eligible(
     allowed: &RoaringBitmap,
 ) -> bool {
     if overcommitted() {
+        return false;
+    }
+    let (mode, share, _) = switch();
+    if mode == 2 {
         return false;
     }
     let Some(scope) = current() else {
@@ -1073,7 +1095,7 @@ pub(crate) fn scan_eligible(
                 && vector.len() == e.graph.dims()
                 && vector.iter().any(|x| *x != 0.)
                 && !allowed.is_empty()
-                && allowed.len().saturating_mul(SCAN_SHARE as u64) <= e.graph.len() as u64
+                && allowed.len().saturating_mul(share as u64) <= e.graph.len() as u64
         })
 }
 /// Answer a filtered query from the ready graph's codes: score only the `mask` rows, keep the
@@ -1252,10 +1274,22 @@ async fn search_entry(
     };
     let (ef, shortlist) = plan(k, ef);
     let (hits, evaluations) = match (scan, mask.as_deref()) {
-        (true, Some(allowed)) => entry
-            .graph
-            .scan(vector, scan_shortlist(k), allowed)
-            .map_err(segment::index_error)?,
+        (true, Some(allowed)) => {
+            let (mode, _, per) = switch();
+            if mode == 1 {
+                entry.graph.scan(vector, scan_shortlist(k), allowed)
+            } else {
+                entry.graph.scan_screened(
+                    vector,
+                    scan_shortlist(k),
+                    (per * k).max(1000),
+                    1,
+                    3.,
+                    allowed,
+                )
+            }
+            .map_err(segment::index_error)?
+        }
         (true, None) => return Ok(None),
         (false, _) => entry
             .graph

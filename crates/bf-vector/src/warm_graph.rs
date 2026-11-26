@@ -7,6 +7,7 @@ mod binary;
 mod builder;
 mod navigation;
 mod quant;
+mod screen;
 mod vamana;
 mod vectors;
 use crate::{Error, Result, RoaringBitmap, rabitq};
@@ -35,6 +36,8 @@ pub struct HotGraph {
     /// Graph node of each tier row (`u32::MAX` where the tier row is not a node), or empty when
     /// the tier's row numbers are too sparse for a dense table. Serves [`HotGraph::scan`].
     nodes: Vec<u32>,
+    /// One-bit screening codes for [`HotGraph::scan_screened`].
+    screen: screen::Screen,
 }
 /// Reusable per-query exact visitation and bounded beam.
 pub struct HotScratch(navigation::Scratch);
@@ -60,7 +63,8 @@ impl HotGraph {
             + self.codes.values.capacity()
             + self.codes.scales.capacity() * 4
             + self.norms.capacity() * 4
-            + self.nodes.capacity() * 4) as u64
+            + self.nodes.capacity() * 4
+            + self.screen.bytes()) as u64
     }
     /// Conservative construction/load reservation, excluding source-index metadata.
     /// `workers` is the maximum number of simultaneous query scratch arrays.
@@ -117,6 +121,73 @@ impl HotGraph {
         }
         scored.sort_unstable_by(order);
         let scanned = ids.len();
+        Ok((
+            scored
+                .into_iter()
+                .map(|(_, id)| (self.rows[id as usize], self.norms[id as usize]))
+                .collect(),
+            scanned,
+        ))
+    }
+    /// Experiment (Round G15): screen the rows of `allowed` with the one-bit codes, keep the best
+    /// `keep` by the screen score, rescore those with SQ8, and return the best `count`.
+    pub fn scan_screened(
+        &self,
+        query: &[f32],
+        count: usize,
+        keep: usize,
+        bits: usize,
+        clip: f32,
+        allowed: &RoaringBitmap,
+    ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
+        crate::distance::validate(query, self.dims)?;
+        if count == 0 || self.nodes.is_empty() || query.iter().all(|x| *x == 0.) {
+            return Err(Error::InvalidInput("unsupported graph query shape".into()));
+        }
+        let q = vectors::normalized(query);
+        let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
+        let (code, scale) = (quant::encode(&rotated).0, quant::encode(&rotated).1);
+        let screen_query = self.screen.query(
+            &rotated.iter().map(|x| *x as f32).collect::<Vec<_>>(),
+            bits,
+            clip,
+        );
+        let mut ids: Vec<u32> = allowed
+            .iter()
+            .filter_map(|row| self.nodes.get(row as usize).copied())
+            .filter(|node| *node != u32::MAX)
+            .collect();
+        let scanned = ids.len();
+        const AHEAD: usize = 24;
+        if ids.len() > keep.max(count) {
+            let mut scored: Vec<(f32, u32)> = Vec::with_capacity(ids.len());
+            for (i, &id) in ids.iter().enumerate() {
+                if let Some(&next) = ids.get(i + AHEAD) {
+                    self.screen.prefetch(next);
+                }
+                scored.push((self.screen.score(&screen_query, id), id));
+            }
+            let keep = keep.max(count);
+            scored.select_nth_unstable_by(keep - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            scored.truncate(keep);
+            ids = scored.into_iter().map(|(_, id)| id).collect();
+        }
+        let mut scored: Vec<(f32, u32)> = Vec::with_capacity(ids.len());
+        for (i, &id) in ids.iter().enumerate() {
+            if let Some(&next) = ids.get(i + AHEAD) {
+                self.codes.prefetch(next);
+            }
+            scored.push((self.codes.score(&code, scale, id), id));
+        }
+        let order = |a: &(f32, u32), b: &(f32, u32)| {
+            a.0.total_cmp(&b.0)
+                .then(self.rows[a.1 as usize].cmp(&self.rows[b.1 as usize]))
+        };
+        if scored.len() > count {
+            scored.select_nth_unstable_by(count - 1, order);
+            scored.truncate(count);
+        }
+        scored.sort_unstable_by(order);
         Ok((
             scored
                 .into_iter()
