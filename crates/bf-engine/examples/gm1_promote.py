@@ -3,7 +3,8 @@
 # ///
 """Round GM1 (from g11_promote.py): promote the warm graph under a cgroup memory cap and record the memory profile.
 
-Extra environment: GM1_CAP_GIB (server cgroup cap; wraps the server in systemd-run --user --scope, default 8),
+Extra environment: GM1_HOLD (keep the promoted server until RUN_DIR/release exists, with RUN_DIR/held touched),
+GM1_CAP_GIB (server cgroup cap; wraps the server in systemd-run --user --scope, default 8),
 GM1_DECODED (set to override the decoded cache bytes; unset keeps the production default of limit/4).
 Adds RUN_DIR/LABEL-memory.jsonl: once a second, the server cgroup's memory.current, memory.peak, anon, file,
 swap, and OOM counters, plus the graph status (building, reserved bytes). The original G11 text follows.
@@ -194,7 +195,8 @@ try:
         threading.Thread(target=poll, daemon=True).start()
 
         def run_http(k, repeats, stem):
-            e = dict(os.environ, G3_CLIENT_PROCESSES="16", G3_CLIENT_THREADS="1", G8_K=str(k))
+            e = dict(os.environ, G3_CLIENT_PROCESSES="16", G3_CLIENT_THREADS="1", G8_K=str(k),
+                     G3_CLIENT_CPU_BASE=os.environ.get("G3_CLIENT_CPU_BASE", "24"))
             subprocess.run(["uv", "run", "--python", "3.12", "--no-project", "--with", "numpy", "python",
                             str(here / "g11_http.py"), str(run / "fixture/data"), "bf", "18443", "0",
                             str(repeats), str(run / stem), str(server.pid)], env=e, check=True)
@@ -217,6 +219,16 @@ try:
         while not (run / "release").exists():
             if server.poll() is not None:
                 break
+            time.sleep(2)
+    elif promoted is not None and os.environ.get("GM1_HOLD"):
+        # Round GM1: stop the heater and hold the promoted server for an external measurement
+        # (bench/nq/measure.py) until RUN_DIR/release exists.
+        (run / "pause").touch()
+        os.killpg(heater.pid, signal.SIGTERM)
+        heater.wait(timeout=20)
+        heater = None
+        (run / "held").touch()
+        while not (run / "release").exists() and server.poll() is None:
             time.sleep(2)
 finally:
     for p in (heater, server):

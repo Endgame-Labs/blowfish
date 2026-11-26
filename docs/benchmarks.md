@@ -15511,3 +15511,67 @@ the table. Debug `cargo test --workspace`: 629 passed, 0 failed, 27 ignored; `ca
 
 Costs: no EC2 and no bucket writes. The 25.5 GiB NQ fixture was copied from the measurement bucket to the M4 through short-lived presigned URLs (about $2.3 of S3
 transfer), because the direct copy ran at 3 to 5 MB/s. The M4 run directory (fixture, builds, Qdrant) is deleted, and nothing of mine is running there.
+
+## Round GM1: the warm graph on a memory-capped host
+
+**Setup:** Apple M4 (10 cores, 16 GB, shared Mac mini), the MEM2 matched-limit setup: a disposable arm64 Linux VM under the run-local uncached Lima 2.3.0 (VZ), ext4 data in the guest, guest RAM equal to the cap plus 1 GiB (9 GiB for the 8 GiB cap, 13 GiB for 12 GiB), cgroup v2 with `MemorySwapMax=0`, 10 vCPUs, 10 Tokio and Rayon threads, and the production decoded-cache default (a quarter of the limit). Data are the frozen v0.1.19 NQ fixture (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries, exact truth), built from main plus this round, promoted the ordinary way under 16 paced heat clients (`crates/bf-engine/examples/gm1_promote.py`, which also records the server cgroup's `memory.current`, `memory.peak`, `anon`, and OOM counters once a second). I deleted the VM and its directory when the round ended.
+
+### Why the graph never admitted at 8 GiB
+
+All three hypotheses held. The finished NQ graph is 3.145 GB, but:
+
+1. `vamana::reservation` multiplied a per-row sum that was too large (1,520 B/row, including 96 B/row of scratch that is really per thread) by 5/4: **5.18 GB** (4.82 GiB), plus source metadata, for a build that really peaks at **1,445 B/row = 3.87 GB**.
+2. The gate subtracted the decoded cache's static 2 GiB share from `4/5 * 8 GiB` (leaving 4.4 GiB, against the 4.9 GiB asked), and separately demanded `estimate + limit/5` free in the cgroup, counting `memory.current`, which includes reclaimable page cache (5.7 GiB in the baseline run), so a warm host looked full.
+3. G12's 8-byte-per-row ID table was built later and charged to nothing.
+
+Baseline v0.1.56 at 8 GiB (Linux VM, systemd scope, identical production heat): **no build in 23 minutes**, with 0.45 GiB anonymous memory and 1.4 GiB charged at rest.
+
+### What changed
+
+One path, no settings.
+
+- **The reservation is the real peak plus a stated 1/16 margin.** `peak_bytes_per_row` is the larger of the construction peak (codes, scale, tier row, and norm; the build-time adjacency; the one-bit navigation codes; the insertion permutation) and the publication peak (build adjacency and flat links together), plus 64 MiB fixed. A test (`crates/bf-vector/tests/graph_peak.rs`) counts the heap with a global allocator while a 30,000-row graph builds, and the model's slope matches it within 0.2% (**677.0 modeled against 678.0 measured B/row**). The serving shrink uses the same margin instead of 5/4.
+- **Reclaimable page cache is not memory in use.** The cgroup headroom is `memory.max - (memory.current - inactive_file - active_file)`: file pages, mapped ones included, come back under pressure and swap is off, so only anonymous memory can cause an OOM. The admission margin is `limit/16` instead of `limit/5` on top of the reservation, and a running build cancels below `limit/32`. The reservation itself is still counted once, against `4/5 * limit` less the caches' share, and `overcommitted()` cancellation is unchanged.
+- **The ID table is charged to the graph's reservation** (8 bytes per row, kept when the build's charge shrinks).
+
+I did not shrink the elastic caches: after the fix the NQ build fits beside the full decoded budget at 8 GiB (2 GiB + 3.96 GiB < 6.4 GiB), so there was nothing to lend.
+
+### What the build costs at 8 and 12 GiB
+
+| | 8 GiB cap | 12 GiB cap |
+|---|---:|---:|
+| Reservation asked | 4.251 GB (3.96 GiB) | 4.251 GB |
+| Cgroup anonymous memory before the build | 0.459 GiB | 1.239 GiB |
+| Peak anonymous memory during the build | 4.209 GiB | 4.976 GiB |
+| Build's own share of that peak | 3.75 GiB (4.03 GB), reservation 5.5% above it | 3.74 GiB |
+| Reservation after construction (3.145 GB graph, 3.255 GB with sources and locations) | 3.540 GB | 3.540 GB |
+| Anonymous memory serving | 3.50 GiB | 4.35 GiB |
+| Graph build, wall and CPU | 399 s, 696 s | 306 s, 735 s |
+| Graph visible, promoted (ordinary heat) | 17.0 min, 28.0 min | 15.5 min, 27.0 min |
+| OOM kills, swap | 0, 0 | 0, 0 |
+
+`memory.peak` reads 8.0 and 12.0 GiB, the caps: that is page cache the kernel reclaims, not a build overshoot (`ev_max` counts thousands of reclaim events, as with IVF in MEM2). The 16 paced heat clients (about 600 q/s) ran throughout every build. Two more 8 GiB promotions repeated the profile (4.207 and 4.215 GiB peak anon; builds of 510 s and 450 s).
+
+Admission still refuses when memory is short: at **6 GiB** (cap 4.8 GiB, caches 1.5 GiB, leaving 3.3 GiB against 3.96 GiB asked) the same heat for 22 minutes produced no build and no OOM, and unit tests check the headroom arithmetic (page cache excluded, no underflow), that a reservation above the cap is refused, and that `overcommitted()` flips when a cache's claim grows during a build.
+
+### Throughput against IVF and Qdrant at 8 GiB
+
+16 client processes, one connection each, IDs only, 64 IVF probes, graph promoted at beam 100 (the serving beam the calibration chose). Each row pools three passes of 3,452 queries. The IVF rows are the same VM, same cap, same binary before promotion.
+
+| 8 GiB cap | q/s | recall | p50 / p90 / p99 ms |
+|---|---:|---:|---|
+| IVF, top_k 10 | 2,020 | 0.9611 | 7.48 / 10.99 / 15.4 |
+| **Graph, top_k 10** | **8,882** | **0.9613** | **1.53 / 2.78 / 4.69** |
+| IVF, top_k 100 | 1,438 | 0.9523 | 10.49 / 14.82 / 22.9 |
+| **Graph, top_k 100** | **4,986** | **0.9562** | **2.80 / 4.93 / 7.65** |
+
+The graph serves 4.4 times IVF's top_k 10 q/s (3.5 times at top_k 100) at the same recall. At 12 GiB: top_k 10 **10,583 q/s** (recall 0.9603, p50/p90/p99 1.15/2.27/3.60 ms) and top_k 100 **5,082 q/s** (0.9558, 2.41/4.56/6.61 ms).
+
+The MEM2 protocol (`bench/nq/measure.py`, three fresh passes on a promoted 8 GiB server; the empty `qrels.json` it requires leaves only exact recall@10) gives **7,822 / 8,045 / 7,829 q/s at 16 clients** (mean 7,899), 1,954 / 1,928 / 1,940 at one client, and serial p50/p90/p99 0.5/0.6/0.7 ms, at recall@10 **0.9606** at `top_k` 10. MEM2 measured Qdrant 1.20.0 (f16 vectors on disk, HNSW in RAM, `ef` 64) under the same 8 GiB cap at **6,023 q/s, recall@10 0.9436**, and blowfish's IVF at 2,702 q/s. So the graph at 8 GiB is **1.31 times Qdrant's q/s at 1.7 points higher recall**, and 2.9 times MEM2's IVF. **Pass.**
+
+I did not re-run Qdrant: its index build crashed once in this VM, after the host began to swap at 13 GiB of guest RAM, and the round's time was fixed, so the Qdrant figure is MEM2's, from the same hardware, VM runtime, cap, and `measure.py` protocol. The pooled-pass table above uses another client (16 Python processes, `g11_http.py`) and reads lower than `measure.py`, so compare only within a table.
+
+### Notes
+
+- `g11_http.py` pinned its clients to CPUs 24 and up and required `perf`; `G3_CLIENT_CPU_BASE=-1` and `G11_NO_PERF=1` now skip both for the 10-vCPU guest.
+- The x86 Linux VM's builds are slower than the M4's under its shared load (1,967 s wall for the same graph), but its memory profile was the same: 4.20 GiB peak anonymous memory, 0 OOM.

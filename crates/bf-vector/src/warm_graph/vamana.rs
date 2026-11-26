@@ -74,7 +74,7 @@ impl Neighbors {
 }
 /// Fixed allowance on top of the per-row peak: per-thread visitation bitsets and construction
 /// scratch for the largest build pool (six threads), the beam and neighbor scratch, and allocator
-/// slack. Round GM1 measured the real fixed part under 16 MiB.
+/// slack. Round GM1 measured the real fixed part far below it.
 const FIXED: u64 = 64 << 20;
 /// Safety margin on the per-row peak, as a fraction: 1/16, covering allocator rounding of the
 /// large arrays and the capacities the build's vectors grow to. Round GM1 measured the true peak
