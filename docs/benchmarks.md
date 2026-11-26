@@ -12993,3 +12993,109 @@ unfiltered top 64, which is the condition that at least 10 of the 64 match.
   documents, which is the same cold cost the filter pays; it was out of scope for the 64-row hypothesis and not measured.
 - **Cost:** one c7g.4xlarge for about 45 minutes, an estimated under $0.60 with the volume. The instance, key pair, and security group are
   deleted, and no S3 prefix was written.
+
+## Round D4b: authoritative covering tiers and vector retirement
+
+Measured 2026-11-25/26 on one on-demand x86 m7i.2xlarge in us-west-2
+(8 vCPUs, 32 GiB RAM, and 250 GiB gp3). Baseline `eb85d53` and candidate
+`79ffeea` use the same host and immutable ANN geometry. The candidate adds sparse
+resident row maps and retires covered segment ANN objects; it does not retrain
+centers, codes, or vectors. Bucket generation 6 and manifest format 5 fence the
+ownership change. The frozen generation-5 executable refused even read-only
+startup after upgrade (`required: 6, supported: 5`).
+
+### Full BEIR NQ: inventory, quality, and parity
+
+The store holds all 2,681,468 NQ rows, with title and text, BM25, and
+1,024-dimensional f16 cosine vectors. Both arms keep 32 document segments and one
+tier with 32 slabs. Maintenance disables compaction to preserve that geometry,
+uses zero retention for a settled post-GC inventory, and runs without query load.
+All sizes below are decimal GB, including deployment metadata and permanent WAL
+fences, rather than logical API bytes.
+
+| Object group | Baseline GB | Candidate GB |
+| --- | ---: | ---: |
+| Segment ANN | 8.684867 | 0 |
+| Slab ANN and resident row maps | 5.982056 | 5.998146 |
+| Documents | 0.778405 | 0.778405 |
+| Text indexes | 1.118812 | 1.118812 |
+| Other objects and metadata | 0.346354 | 0.404543 |
+| Total | 16.910495 | 8.299907 |
+
+The final store is below the 8.5 GB target. Resident maps add 16.09 MB, six bytes
+per present vector plus slab framing. Permanent publication metadata grows during
+bounded backfill, so the total reduction is slightly smaller than the removed
+ANN bytes. Backfill, retirement, GC, and inventory took 5.40 seconds, with
+90.2 MiB maximum RSS in the maintenance process.
+
+This is a conservative size check against the requested target, not a reproduction
+of I3's 14.18 GB baseline: an interrupted loader replayed an acknowledged prefix
+idempotently, leaving extra obsolete physical segment versions. The live dataset
+is still exactly NQ, and the paired arms preserve those same segments and slabs.
+The earlier shared vector-only fixture was not used for the full-text inventory.
+
+All 3,452 ordered ANN result sets, exact returned distances, and three extra
+requests (full vector projection, filtered exact ranking, and BM25 with vector
+projection) are byte-identical after canonical JSON encoding. Both hashes are
+`e7a133ebfcaa8b222f8b48c1cbeea94df10c0201ae3863bd3a50a3a00171fccf`.
+Recall@10 against exact neighbors is 0.9591 in both arms; NDCG@10 is 0.6073,
+and F1@10 is 0.1690.
+
+### NQ latency protocol and results
+
+`bench/nq/` drives the production HTTP server with 64 probes, ID-only top-10
+queries, strong consistency, 3 GiB raw memory cache, no disk cache, no recall
+sampling, and background indexing disabled. The server uses CPUs 0–5 in a
+12 GiB cgroup; clients use CPUs 6–7. Each cold pass restarts the server, drops
+filesystem pages, and measures the first 1,000 requests without warm-up. Its
+cache grows during that pass, so these are first-pass distributions. Each warm
+pass warms 1,000 queries, then measures 1,000. Two repetitions use the same input
+order and configuration. No compiler, tests, loader, or maintenance runs during
+timing.
+
+| Run | Baseline p50 / p90 / p99 ms | Candidate p50 / p90 / p99 ms |
+| --- | ---: | ---: |
+| Cold first pass 1 | 58.2 / 155.5 / 383.6 | 56.9 / 155.5 / 371.9 |
+| Cold first pass 2 | 57.1 / 154.4 / 367.0 | 57.6 / 152.1 / 362.8 |
+| Warm 1 | 4.1 / 4.5 / 4.8 | 3.9 / 4.2 / 4.4 |
+| Warm 2 | 4.2 / 4.6 / 4.9 | 4.1 / 4.4 / 4.7 |
+
+No latency regression is observed in these two repetitions. Sixteen-client
+throughput is 1,449–1,497 q/s before and 1,530–1,563 q/s after. The throughput
+phase uses 2,000 requests, including queries outside the latency warm-up set;
+its single-client rate is about 32 q/s in both arms and is not a resident-only
+throughput claim. These runs do not establish a formal confidence interval.
+
+### Owned 10M scratch copy: filtered cold ANN
+
+The retained 10M fixture was copied into an owned round prefix. Its source
+segments predate document-v2 and use legacy independent ANN files, while its
+recluster tier is current. The candidate finishes the automatic document upgrade
+and retires covered legacy ANN and fragments directly, avoiding a redundant
+full ANN conversion. Thus its inventory reduction includes earlier format
+upgrades; the NQ pair above isolates D4b.
+
+The cold test uses 50 fixed oracle vectors for each filter: `title_initial == z`
+and `text_length >= 300`, top 10, strong consistency, and ID-only projection.
+Every request starts a fresh production process with empty engine and storage
+caches, 3 GiB raw memory capacity, no disk cache or staging, and 64 probes. The
+server uses CPUs 0–5; the serial Python HTTP driver is unpinned. Startup and
+readiness are excluded, while snapshot validation, filter loading, planning,
+scanning, and result hydration are included. These pure-S3 measurements use the
+host's 32 GiB limit, and are separate from NQ's file-store first-pass protocol.
+
+| Filter | Baseline p50 / p90 ms | Candidate p50 / p90 ms | Recall@10 before / after |
+| --- | ---: | ---: | ---: |
+| `title_initial == z` | 2,944.8 / 3,244.6 | 2,320.3 / 2,759.8 | 1.000 / 1.000 |
+| `text_length >= 300` | 2,625.2 / 2,957.9 | 1,830.0 / 2,301.8 | 0.950 / 0.992 |
+
+The candidate is 27.732 GB after GC, versus 77.337 GB in the retained source
+layout. Its 70 rewritten document objects total 1.632 GB, and no independent
+segment ANN objects remain. The final legacy retirement, document upgrade, GC,
+and inventory pass took 330.62 seconds, with 553.5 MiB maximum RSS. The earlier
+bounded slab-row backfill is a separate pass. These figures describe this mixed
+legacy upgrade, without attributing all savings to D4b alone.
+
+Only the owned copies were writable. Original fixtures and `scale/` were left
+untouched. Cleanup and cost are recorded in the worker report. No 100M or
+compaction-throughput claim is made.
