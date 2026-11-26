@@ -14222,14 +14222,17 @@ the timer only for lone reads. There is no new storage API, dependency, or forma
 
 The completion share was swept on the same host with paired alternating arms, 60 queries each:
 
-| Setting | p50 / p90, ms | GETs per query | Hedges per query |
-|---|---:|---:|---:|
-| Baseline | 342 / 485 | 229.6 | 16.5 |
-| 85 percent, 0.15 budget | 306 / 400 (earlier run) | 235.4 | 20.4 |
-| 85 percent, 0.20 budget | 293 / 368 | 233.6 | 18.3 |
-| **70 percent, 0.15 budget** | **283 / 359** | 242.2 | 30.9 |
-| 70 percent, 0.20 budget | 290 / 362 | 256.5 | 41.0 |
-| 60 percent, 0.20 budget | 290 / 377 | 258.2 | 42.3 |
+| Setting | p50 / p90, ms | Baseline/arm p50 / p90 | GETs per query | Hedges per query |
+|---|---:|---:|---:|---:|
+| Baseline | 342 / 485 | 1 / 1 | 229.6 | 16.5 |
+| 85 percent, 0.20 budget | 293 / 368 | 1.17 / 1.32 | 233.6 | 18.3 |
+| **70 percent, 0.15 budget** | **283 / 359** | 1.21 / 1.35 | 242.2 | 30.9 |
+| 70 percent, 0.20 budget | 290 / 362 | 1.18 / 1.34 | 256.5 | 41.0 |
+| 60 percent, 0.20 budget | 290 / 377 | 1.18 / 1.29 | 258.2 | 42.3 |
+
+All five arms ran in one process set (one run, 60 queries per arm, paired alternation). Earlier,
+smaller runs agree: 85 percent at 0.15 budget gave 1.25x / 1.24x against its own baseline (20.4
+hedges), and 50 or 60 percent at 0.15 budget hit the same budget ceiling as 70 percent (about 32 hedges).
 
 At 85 percent most of the budget goes unspent, so 70 percent at the default budget was chosen. It is
 the cheapest setting that performs as well as the costly ones.
