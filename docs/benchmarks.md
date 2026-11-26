@@ -15403,10 +15403,10 @@ the candidate is the final commit of this round.
 Latency under writes (p50 / p99, ms): top_k 10, baseline 4.4 / 20.6 and 4.3 / 20.8, candidate 4.2 / 20.7; top_k 100,
 baseline 28.0 / 67.1 and 28.5 / 68.4, candidate 13.0 / 32.1. Write latency (p50 / p99, ms), baseline then candidate:
 beside top_k 10 queries 7.5 / 21.9 and 7.9 / 20.8, then 7.8 / 22.3; beside top_k 100 queries 11.7 / 33.6 and 12.1 /
-34, then 9.9 / 28.2. No write failed, and the writer held 50.6 writes per second in every phase.
+33.7, then 9.9 / 28.2. No write failed, and the writer held 50.6 writes per second in every phase.
 
-Without writes the two builds match (the differences are run-to-run noise: the three candidate runs gave 14,409 to
-16,463 q/s at top_k 10 and 5,613 to 5,686 at top_k 100).
+Without writes the two builds match (the differences are run-to-run noise: the six candidate runs, three of them earlier
+versions with the same read path, gave 14,408 to 16,463 q/s at top_k 10 and 5,582 to 5,686 at top_k 100).
 
 ### What it took
 
