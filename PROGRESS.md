@@ -4,6 +4,7 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-26
 
+- **W9/W9b speculative WAL body reads (merged).** Bodies from the payload listing start during slot confirmation; accepted only on exact payload key and size; permits held until consumed (W9b fixed a review finding that released them at GET end). Concurrency 8 -> 16, same byte budget. 32 x 150 KB cold 1.28x vs v0.1.47; short tails unchanged.
 - **C23 cold staged attribute hydration (merged).** Exact-size column reads, IDs from the staged map, one early exact top-k prefix instead of 3k speculative rows, concurrent winner hydration. 10M staged attrs 92.7/128.3 -> 66.5/93.9 ms (1.39x/1.37x) on production 1 MiB blocks; C21's 4 KB harness config 1.05x (its 1.3x target unmet). Pure-S3 IDs neutral (16-process control).
 - **W8 WAL tail discovery by listing (merged).** One LIST (concurrent with the second probe wave) plus one read wave replaces waves 3-5; conditional reads still fence the tail. 32 external payloads 325 -> 255 ms cold (1.27x); 32 inline 1.5x; short tails unchanged.
 - **BW20 warm BM25 scoring loop (merged).** Stack candidate mask, lazy window order, touched-row bounds: 1.23x warm 16-client, 1.10x one client, exact. The merge gate caught a last-lane bound overflow in debug builds (release wrapped harmlessly); fixed at merge. The compact saturation table was bit-identical but 0.8% slower and was dropped.

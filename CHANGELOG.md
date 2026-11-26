@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.49] - 2026-11-26
+
+### Changed
+
+- **Cold queries read a long WAL tail's payloads sooner:** When a cold reader finds a long tail, it now also lists the payload prefix and starts reading payload bodies while the commit slots are still being confirmed. A body is used only when its confirmed commit record names exactly that payload (sequence and write ID) and, when recorded, the same size; anything else is dropped. Every body, speculative or not, counts against the in-flight byte budget until the replay has consumed it, so memory stays bounded. Up to 16 payload reads run at once (was 8), within the same byte budget. On same-region S3, a cold read of 32 pending 150 KB payloads is 1.28x faster than v0.1.47; empty and short tails are unchanged.
+
 ## [0.1.48] - 2026-11-26
 
 ### Changed
@@ -362,7 +368,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.48...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.49...HEAD
+[0.1.49]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.49
 [0.1.48]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.48
 [0.1.47]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.47
 [0.1.46]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.46
