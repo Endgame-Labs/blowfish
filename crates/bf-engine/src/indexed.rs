@@ -457,7 +457,8 @@ fn projection_columns(
     // The attributes the response projects: none, or the named ones. Any other projection
     // (all attributes, exclusions, computed values, or per-group limits) keeps every column.
     let projected: Option<BTreeSet<&String>> = match &q.include_attributes {
-        None => Some(BTreeSet::new()),
+        // `false` asks for no attributes, the same as leaving the field out.
+        None | Some(IncludeAttributes::All(false)) => Some(BTreeSet::new()),
         Some(IncludeAttributes::Names(names)) => Some(names.iter().collect()),
         Some(_) => None,
     };
@@ -1174,7 +1175,10 @@ mod rank_key_tests {
         .unwrap();
         let mut named = default.clone();
         named.include_attributes = Some(IncludeAttributes::Names(vec!["id".into()]));
+        let mut none = default.clone();
+        none.include_attributes = Some(IncludeAttributes::All(false));
         for narrow in [false, true] {
+            assert!(projection_columns(&state, &none, narrow).is_empty());
             assert!(projection_columns(&state, &default, narrow).is_empty());
             assert_eq!(
                 projection_columns(&state, &default, narrow),
