@@ -10,9 +10,11 @@
 //! global row numbers (`SlabCover::base` plus the segment-local row), so a winner maps back to its
 //! segment and row without a lookup table, and documents and attributes stay where they are.
 //!
-//! The job streams: segment vectors are copied once into a local spill file (never more than a
-//! slab's rows are in memory at a time), the coarse partition is trained on a sample, and the
-//! slabs are built and uploaded one after another.
+//! The job streams: segment vectors are copied once into a local spill file as 8-bit codes (SQ8,
+//! one byte per dimension), the coarse partition and the leaves are trained and assigned from
+//! those codes, and then each slab reads the exact stored vectors of its rows back from their
+//! source segments (never more than a slab's rows are in memory at a time) and is built and
+//! uploaded, one after another. Every fetched vector is checked against its spilled row.
 //!
 //! The build runs as the automatic recluster's job (`auto_recluster.rs`): it reads a manifest
 //! snapshot, claims nothing, and hands the finished tier to the indexer, which installs it in its
@@ -34,7 +36,9 @@ mod assignment;
 #[cfg(test)]
 mod experiment;
 mod math;
+mod source;
 pub(crate) mod spill;
+mod sq8;
 
 /// Wall time within one build stage. Concurrent uploads overlap CPU stages; aggregate I/O times
 /// across workers are service time, so neither is added to the total build's wall time.
@@ -241,7 +245,7 @@ impl Engine {
         // Pass 1: copy every live row's vector into a spill file indexed by global row.
         // Keep the owner in this future: dropping it unlinks the spill even if a blocking
         // worker still has the open file. Unix keeps that worker's descriptor valid.
-        let spill = spill::Spill::create(&opts.scratch, total * width as u64)
+        let spill = spill::Spill::create(&opts.scratch, total * dims as u64)
             .map_err(segment::index_error)?;
         self.recluster_with_spill(
             &wal,
@@ -275,19 +279,30 @@ impl Engine {
 
         // Cluster payloads arrive contiguously. Keep that order on disk instead of scattering
         // millions of tiny writes by global row; a four-byte address per row preserves identity.
+        // Each row also remembers where its exact vector lives (input, leaf, and place in it).
         let total_rows: usize = covered.iter().map(|c| c.rows as usize).sum();
-        let spill_offsets: Vec<std::sync::atomic::AtomicU32> = (0..total_rows)
-            .map(|_| std::sync::atomic::AtomicU32::new(0))
-            .collect();
+        let inputs = Arc::new(inputs);
+        let sq8 = Arc::new(sample_codes(store, &inputs, dims, dtype).await?);
+        let zeros = || -> Vec<std::sync::atomic::AtomicU32> {
+            (0..total_rows)
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect()
+        };
+        let spill_offsets = zeros();
+        let locations = source::Locations::new(total_rows);
         let next_spill_row = std::sync::atomic::AtomicU32::new(0);
         let copy_stage = Stage::new("copy");
         let spill_write_nanos = std::sync::atomic::AtomicU64::new(0);
-        let copied: Vec<Vec<u32>> = futures::stream::iter(inputs.into_iter().map(|input| {
+        let copied: Vec<Vec<u32>> = futures::stream::iter((0..inputs.len()).map(|n| {
             let spill = spill.clone();
+            let inputs = inputs.clone();
+            let sq8 = sq8.clone();
             let spill_write_nanos = &spill_write_nanos;
             let spill_offsets = &spill_offsets;
             let next_spill_row = &next_spill_row;
+            let locations = &locations;
             async move {
+                let input = &inputs[n];
                 job.pause().await;
                 let index = Arc::new(
                     bf_vector::Index::open_with_metadata_len(
@@ -304,10 +319,15 @@ impl Engine {
                 let clusters = index.cluster_count();
                 let mut reads = futures::stream::iter((0..clusters).map(|c| {
                     let index = index.clone();
-                    async move { index.read_cluster_rows(c).await }
+                    async move {
+                        index
+                            .read_cluster_rows(c)
+                            .await
+                            .map(|(rows, bytes)| (c, rows, bytes))
+                    }
                 }))
                 .buffer_unordered(32);
-                while let Some((rows, bytes)) =
+                while let Some((cluster, rows, bytes)) =
                     reads.try_next().await.map_err(segment::index_error)?
                 {
                     // Dead rows never reach the spill: compact the live rows of this
@@ -323,25 +343,40 @@ impl Engine {
                     let writing = std::time::Instant::now();
                     let start =
                         next_spill_row.fetch_add(kept as u32, std::sync::atomic::Ordering::Relaxed);
-                    if kept == rows.len() {
-                        spill
-                            .write_all_at(&bytes, u64::from(start) * width as u64)
-                            .map_err(segment::index_error)?;
-                    } else {
-                        let mut packed = Vec::with_capacity(kept * width);
-                        for (i, row) in globals.iter().enumerate() {
-                            if row.is_some() {
-                                packed.extend_from_slice(&bytes[i * width..(i + 1) * width]);
+                    let packed = {
+                        let (sq8, live) = (sq8.clone(), globals.clone());
+                        on_pool(move || {
+                            let mut packed = vec![0u8; kept * dims];
+                            let live_rows = live
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, g)| g.is_some())
+                                .map(|(i, _)| i);
+                            for (out, i) in packed.chunks_exact_mut(dims).zip(live_rows) {
+                                sq8.encode(
+                                    &crate::vector_locator::decode(
+                                        dtype,
+                                        &bytes[i * width..(i + 1) * width],
+                                    ),
+                                    out,
+                                );
                             }
-                        }
-                        spill
-                            .write_all_at(&packed, u64::from(start) * width as u64)
-                            .map_err(segment::index_error)?;
-                    }
-                    for (slot, row) in globals.iter().flatten().enumerate() {
-                        spill_offsets[*row as usize]
+                            packed
+                        })
+                        .await?
+                    };
+                    spill
+                        .write_all_at(&packed, u64::from(start) * dims as u64)
+                        .map_err(segment::index_error)?;
+                    let live = globals
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, g)| g.map(|g| (i, g)));
+                    for (slot, (ordinal, row)) in live.enumerate() {
+                        spill_offsets[row as usize]
                             .store(start + slot as u32, std::sync::atomic::Ordering::Relaxed);
-                        present.push(*row);
+                        locations.set(row, n as u32, cluster as u32, ordinal as u32);
+                        present.push(row);
                     }
                     spill_write_nanos.fetch_add(
                         writing.elapsed().as_nanos() as u64,
@@ -370,6 +405,16 @@ impl Engine {
                 .map(std::sync::atomic::AtomicU32::into_inner)
                 .collect(),
         );
+        let source = Arc::new(source::Source::new(
+            store.clone(),
+            inputs,
+            locations,
+            spill.clone(),
+            spill_offsets.clone(),
+            sq8.clone(),
+            dims,
+            dtype,
+        ));
         let mut present: Vec<u32> = copied.into_iter().flatten().collect();
         present.sort_unstable();
         if present.is_empty() {
@@ -390,17 +435,18 @@ impl Engine {
             let spill = spill.clone();
             let spill_read_nanos = spill_read_nanos.clone();
             let spill_offsets = spill_offsets.clone();
+            let sq8 = sq8.clone();
             move |g: u32, buf: &mut Vec<u8>| -> Vec<f32> {
-                buf.resize(width, 0);
+                buf.resize(dims, 0);
                 let reading = std::time::Instant::now();
                 spill
-                    .read_exact_at(buf, u64::from(spill_offsets[g as usize]) * width as u64)
+                    .read_exact_at(buf, u64::from(spill_offsets[g as usize]) * dims as u64)
                     .expect("spill file read");
                 spill_read_nanos.fetch_add(
                     reading.elapsed().as_nanos() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                bf_vector::prepare_vector(&crate::vector_locator::decode(dtype, buf), metric)
+                bf_vector::prepare_vector(&sq8.decode(buf), metric)
             }
         };
         let reused = match &target.coarse {
@@ -545,22 +591,16 @@ impl Engine {
         {
             let k = centers.len();
             clusters += k;
-            let spill = spill.clone();
-            let spill_offsets = spill_offsets.clone();
             let rows_n = rows.len() as u32;
             // Between slabs, let a queued flush or compaction run first.
             job.pause().await;
             let staging = prestage.is_some();
+            // The slab's exact vectors, at the stored precision (about 2 KB each at 1,024 dims
+            // in f16), read back from their source segments and checked against the spill.
+            let reading = Stage::new("source_read");
+            let data = source.rows(&rows).await?;
+            drop(reading);
             let blob = on_pool(move || -> Result<BuiltSlab, ApiError> {
-                let reading = Stage::new("spill_read");
-                // Rows stay packed at the stored precision (about 2 KB each at 1,024 dims in f16).
-                let mut data = vec![0u8; rows.len() * width];
-                for (g, chunk) in rows.iter().zip(data.chunks_exact_mut(width)) {
-                    spill
-                        .read_exact_at(chunk, u64::from(spill_offsets[*g as usize]) * width as u64)
-                        .map_err(segment::index_error)?;
-                }
-                drop(reading);
                 let encoding = Stage::new("encoding");
                 let params = bf_vector::BuildParams {
                     clusters: Some(k),
@@ -690,6 +730,59 @@ impl Engine {
             },
         })
     }
+}
+
+/// Leaves sampled across all inputs to fit the spill's per-dimension scale.
+const SCALE_LEAVES: usize = 256;
+
+/// Fit the spill's 8-bit codes: the range of every dimension over evenly spaced leaves of every
+/// input. Stored `i8` vectors need no fit, since their codes are exact.
+async fn sample_codes(
+    store: &bf_storage::Storage,
+    inputs: &Arc<Vec<crate::vector_locator::inputs::Input>>,
+    dims: usize,
+    dtype: bf_vector::VectorType,
+) -> Result<sq8::Sq8, ApiError> {
+    if dtype == bf_vector::VectorType::I8 {
+        return Ok(sq8::Sq8::identity(dims));
+    }
+    let per_input = (SCALE_LEAVES / inputs.len().max(1)).clamp(1, 16);
+    let ranges: Vec<sq8::Range> = futures::stream::iter((0..inputs.len()).map(|n| {
+        let inputs = inputs.clone();
+        async move {
+            let file = &inputs[n].file;
+            let index = bf_vector::Index::open_with_metadata_len(
+                segment::ObjectReader::new(store, file).bypass_cache(),
+                file.metadata_len,
+            )
+            .await
+            .map_err(segment::index_error)?;
+            if index.dims() != dims || index.vector_type() != dtype {
+                return Err(segment::corrupt());
+            }
+            let leaves = index.cluster_count();
+            let picks = per_input.min(leaves);
+            let mut range = sq8::Range::new(dims);
+            for j in 0..picks {
+                let (_, bytes) = index
+                    .read_cluster_rows(j * leaves / picks)
+                    .await
+                    .map_err(segment::index_error)?;
+                for row in bytes.chunks_exact(dims * dtype.width()) {
+                    range.add(&crate::vector_locator::decode(dtype, row));
+                }
+            }
+            Ok::<_, ApiError>(range)
+        }
+    }))
+    .buffer_unordered(6)
+    .try_collect()
+    .await?;
+    let mut all = sq8::Range::new(dims);
+    for range in &ranges {
+        all.merge(range);
+    }
+    Ok(all.fit())
 }
 
 /// Write the directory over `slabs`, and for a large one its paged copy; then the hint a cold
