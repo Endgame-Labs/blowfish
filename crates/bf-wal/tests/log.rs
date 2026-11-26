@@ -1127,7 +1127,7 @@ mod speculative {
         assert_eq!(f.spy.gets.lock().unwrap().len(), 40);
         // And the bound on fetches in flight holds with them.
         let peak = f.spy.peak.load(Ordering::SeqCst);
-        assert!((2..=8).contains(&peak), "peak {peak}");
+        assert!((2..=16).contains(&peak), "peak {peak}");
         assert_same_as_serial(&f.wal, 40).await;
     }
 

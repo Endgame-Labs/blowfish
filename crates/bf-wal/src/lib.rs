@@ -142,7 +142,7 @@ const SLOT_VERSION: u8 = 3;
 /// Maximum uncompressed entry size stored directly in a commit slot (64 KiB).
 pub const INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Out-of-line payloads `tail_bounded` fetches at once, at most.
-const TAIL_FETCH_CONCURRENCY: usize = 8;
+const TAIL_FETCH_CONCURRENCY: usize = 16;
 /// Stored (compressed) payload bytes `tail_bounded` keeps in flight. A single payload larger than
 /// this still proceeds, alone.
 const TAIL_FETCH_BYTES: u64 = 64 * 1024 * 1024;
