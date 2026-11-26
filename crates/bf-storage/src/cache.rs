@@ -36,9 +36,10 @@ pub struct CacheConfig {
     /// Stable identity of the bucket/backend. `Storage::open` supplies one automatically.
     /// Custom backends must supply a distinct identity when disk caching is enabled.
     pub namespace: Option<String>,
-    /// Logical block size in bytes (default 1 MiB).
+    /// Logical block size in bytes (default 256 KiB). A miss fetches whole blocks, so a smaller
+    /// block wastes fewer bytes around scattered reads; coalescing keeps dense reads in large GETs.
     pub block_size: usize,
-    /// Maximum blocks coalesced into one backend GET (default 8).
+    /// Maximum blocks coalesced into one backend GET (default 32, which is 8 MiB of default blocks).
     pub max_coalesce_blocks: usize,
     /// Missing blocks separated by at most this many unrequested blocks share one GET; the
     /// gap bytes are fetched and discarded. Trades bytes for fewer requests (default 0).
@@ -60,8 +61,8 @@ impl Default for CacheConfig {
             disk_bytes: 64 << 30,
             disk_dir: None,
             namespace: None,
-            block_size: 1 << 20,
-            max_coalesce_blocks: 8,
+            block_size: 256 << 10,
+            max_coalesce_blocks: 32,
             coalesce_gap_blocks: 0,
             fetch_concurrency: 512,
             prefetch_concurrency: 4,
@@ -705,11 +706,18 @@ impl RangeReader {
                             .load(std::sync::atomic::Ordering::SeqCst)
                             < MAX_SPILLS;
                     let mut spill = Vec::new();
+                    let keep_apart = admit && indices.len() > 1;
                     for index in indices {
                         let begin = ((index - first) * size) as usize;
                         let end = bytes.len().min(begin + size as usize);
-                        // Independent allocations keep a single cached block from pinning a whole GET.
-                        let value = Bytes::copy_from_slice(&bytes[begin..end]);
+                        // A block that the cache keeps must not pin the other blocks of its GET, so
+                        // it is copied out; a block that is the whole response, or that no cache
+                        // keeps, shares the response buffer instead.
+                        let value = if keep_apart {
+                            Bytes::copy_from_slice(&bytes[begin..end])
+                        } else {
+                            bytes.slice(begin..end)
+                        };
                         let key = reader.block_key(index);
                         if spilling {
                             spill.push((cache.disk_key(&key), value.clone()));

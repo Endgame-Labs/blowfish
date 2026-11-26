@@ -12,7 +12,7 @@ Example: uv run crates/bf-engine/examples/cold_ab.py --config CONFIG.local \
     --binary CANDIDATE --arms '{"base":{"BINARY":"BASELINE"},"stream":{}}' \
     --scratch .scratch/cold-ab --label run-1 --queries 200
 
-Each arm can set CONFIG to a private config for a copied layout with the same
+Each arm can set BLOCK and COALESCE (cache block bytes and coalesced blocks per GET) and CONFIG to a private config for a copied layout with the same
 namespace name, and BF_ANN_NPROBE to match recall at a different probe budget.
 Both builds need blowfish_object_store_attempts_total for physical GET accounting.
 ANN row counts require BF_TRACE_STAGES output containing PLAN rows= records.
@@ -255,6 +255,9 @@ def server(name, index):
         raise ValueError("paired arms must query the same namespace name")
     work = RUN / name
     work.mkdir(exist_ok=True)
+    # An arm can set its own cache geometry (BLOCK, COALESCE); Round C25 compares block sizes.
+    block_size = int(arm_env.pop("BLOCK", a.block_size))
+    coalesce_blocks = int(arm_env.pop("COALESCE", a.coalesce_blocks))
     storage = {
         "url": arm_config["storage_url"],
         "region": arm_config.get("region"),
@@ -265,8 +268,8 @@ def server(name, index):
             "memory_bytes": 8 * 2**30,
             "disk_bytes": 0 if name in a.s3_only_arm else 48 * 2**30,
             "disk_dir": str(work / "cache"),
-            "block_size": a.block_size,
-            "max_coalesce_blocks": a.coalesce_blocks,
+            "block_size": block_size,
+            "max_coalesce_blocks": coalesce_blocks,
             "fetch_concurrency": 512,
         },
     }
