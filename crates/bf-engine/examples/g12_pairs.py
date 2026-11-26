@@ -6,8 +6,10 @@ measured with g11_http.py (16 client processes), in an order that alternates by 
 that drift on the shared machine hits every variant alike. Results: RUN_DIR/pairs.jsonl, and a table of
 medians over rounds on stdout.
 """
+import http.client
 import json
 import os
+import re
 import pathlib
 import statistics
 import subprocess
@@ -19,6 +21,17 @@ run, rounds, repeats = pathlib.Path(run), int(rounds), int(repeats)
 variants = [(v.split("=")[0], int(v.split("=")[1])) for v in variants]
 here = pathlib.Path(__file__).resolve().parent
 rows = []
+
+
+def dispatch():
+    c = http.client.HTTPConnection("127.0.0.1", 18443, timeout=60)
+    c.request("GET", "/metrics")
+    text = c.getresponse().read().decode()
+    c.close()
+    return {m.group(1): float(m.group(2)) for m in re.finditer(
+        r'^blowfish_query_cpu_dispatch_total\{[^}]*path="([^"]+)"[^}]*\} (\S+)', text, re.M)}
+
+
 with (run / "pairs.jsonl").open("a") as log:
     for r in range(rounds):
         order = variants if r % 2 == 0 else variants[::-1]
@@ -26,8 +39,11 @@ with (run / "pairs.jsonl").open("a") as log:
             for name, bits in order:
                 pathlib.Path(flags).write_text(str(bits))
                 time.sleep(2)
-                env = dict(os.environ, G3_CLIENT_PROCESSES="16", G3_CLIENT_THREADS="1", G8_K=str(k))
-                stem = run / f"pair-{name}-r{r}-k{k}"
+                env = dict(os.environ, G3_CLIENT_PROCESSES="16", G3_CLIENT_THREADS="1", G8_K=str(abs(k)))
+                if k < 0:  # a negative K means the mixed load: one query in ten asks for 100 rows
+                    env["G12_MIX"] = "1"
+                stem = run / f"pair-{name}-r{r}-k{k}".replace("-k-", "-kmix")
+                before = dispatch()
                 out = subprocess.run(
                     ["uv", "run", "--python", "3.12", "--no-project", "--with", "numpy", "python",
                      str(here / "g11_http.py"), str(run / "fixture/data"), "bf", "18443", "0",
@@ -38,6 +54,10 @@ with (run / "pairs.jsonl").open("a") as log:
                        "recall": m["recall_at_k"], "p50": m["p50_ms"], "p90": m["p90_ms"], "p99": m["p99_ms"],
                        "cpu_ms": m["cpu_seconds_per_query"] * 1e3,
                        "ins_m": m.get("instructions_per_query", 0) / 1e6}
+                after = dispatch()
+                total = sum(after.values()) - sum(before.values()) or 1
+                row["paths"] = {p: round((after[p] - before.get(p, 0)) / total, 3) for p in after
+                                if after[p] - before.get(p, 0) > 0}
                 rows.append(row)
                 log.write(json.dumps(row) + "\n")
                 log.flush()
