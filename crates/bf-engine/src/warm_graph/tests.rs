@@ -853,7 +853,7 @@ async fn selective_filters_scan_the_graph_and_match_the_ivf_control() {
     let rows = vectors
         .iter()
         .enumerate()
-        .map(|(id, v)| json!({"id":id,"vector":v,"bucket":id%50}))
+        .map(|(id, v)| json!({"id":id,"vector":v,"bucket":id%100}))
         .collect::<Vec<_>>();
     e.write("hot",serde_json::from_value::<WriteRequest>(json!({"distance_metric":"cosine_distance","schema":{"vector":{"type":"[16]f16","ann":true}},"upsert_rows":rows})).unwrap()).await.unwrap();
     e.index_namespace("hot", true).await.unwrap();
@@ -882,13 +882,13 @@ async fn selective_filters_scan_the_graph_and_match_the_ivf_control() {
     e.0.hot_graph.entries.lock().unwrap().insert(key, heat);
     let ask = |i: usize, filter: Value, k: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k,"filters":filter,"include_attributes":["bucket"]});
     let answers = || e.0.hot_graph.answers.load(Ordering::Relaxed);
-    // 2% of the rows (50), a single row, fewer rows than k, and no rows at all.
+    // 1% of the rows (25), a single row, fewer rows than k, and no rows at all.
     for (filter, rows, k) in [
-        (json!(["bucket", "Eq", 7]), 50, 10),
-        (json!(["bucket", "Eq", 7]), 50, 100),
+        (json!(["bucket", "Eq", 7]), 25, 10),
+        (json!(["bucket", "Eq", 7]), 25, 100),
         (json!(["id", "Eq", 17]), 1, 10),
         (json!(["id", "Lt", 4]), 4, 10),
-        (json!(["bucket", "Eq", 99]), 0, 10),
+        (json!(["bucket", "Eq", 150]), 0, 10),
     ] {
         let before = answers();
         let got = query(&e, "hot", ask(7, filter.clone(), k)).await;
@@ -897,9 +897,9 @@ async fn selective_filters_scan_the_graph_and_match_the_ivf_control() {
         // A filter that matches nothing needs no graph answer; the others must have used it.
         assert_eq!(answers() > before, rows > 0, "rows={rows} k={k}");
     }
-    // Above the crossover (here 1 row in 20), the IVF tier answers.
+    // Above the crossover (1 row in 64), the IVF tier answers.
     let before = answers();
-    let wide = json!(["bucket", "Lt", 25]);
+    let wide = json!(["bucket", "Lt", 10]);
     same_rows(
         query(&e, "hot", ask(7, wide.clone(), 10)).await,
         query(&control, "hot", ask(7, wide, 10)).await,
@@ -913,16 +913,16 @@ async fn selective_filters_scan_the_graph_and_match_the_ivf_control() {
         serde_json::from_value::<WriteRequest>(json!({
             "upsert_rows":[
                 {"id":7,"vector":moved,"bucket":7},
-                {"id":57,"vector":vectors[7],"bucket":8},
-                {"id":107,"vector":vectors[7],"bucket":7},
+                {"id":107,"vector":vectors[7],"bucket":8},
                 {"id":2600,"vector":vectors[7],"bucket":7}],
-            "deletes":[157]
+            "deletes":[207]
         }))
         .unwrap(),
     )
     .await
     .unwrap();
-    for filter in [json!(["bucket", "Eq", 7]), json!(["bucket", "Eq", 8])] {
+    for bucket in [7, 8] {
+        let filter = json!(["bucket", "Eq", bucket]);
         let before = answers();
         let got = query(&e, "hot", ask(7, filter.clone(), 10)).await;
         same_rows(
@@ -935,7 +935,9 @@ async fn selective_filters_scan_the_graph_and_match_the_ivf_control() {
             .iter()
             .map(|r| r["id"].as_u64().unwrap())
             .collect::<Vec<_>>();
-        assert!(!ids.contains(&157));
+        assert!(!ids.contains(&207));
+        // 107 left bucket 7 and joined bucket 8.
+        assert_eq!(ids.contains(&107), bucket == 8);
         assert!(ids.iter().filter(|id| **id == 7).count() <= 1);
         assert!(answers() > before, "shadowed rows still use the graph");
     }

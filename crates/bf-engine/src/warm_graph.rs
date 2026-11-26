@@ -1036,8 +1036,13 @@ fn scan_shortlist(k: usize) -> usize {
     (k * 3).max(30)
 }
 /// The most allowed rows a filtered query scans, as a share of the graph's rows (1 in
-/// `SCAN_SHARE`). Above it the IVF tier answers.
-const SCAN_SHARE: usize = 20;
+/// `SCAN_SHARE`, 1.56%). Round G14 measured the scan against the IVF tier on full NQ with hash
+/// filters: with 16 clients it is 5.9x, 4.6x, 3.7x, and 2.4x faster at 0.5%, 1%, 2%, and 5%, and equal
+/// at about 10%; with one client it matches IVF at about 1% and is slower beyond. The scan reads each
+/// allowed row's 1 KiB code from memory, so its cost grows with the allowed rows while IVF's stays
+/// nearly flat. Below this share the scan wins everywhere that matters (throughput by 4x or more, with
+/// serial latency within 10%); above it the IVF tier answers.
+const SCAN_SHARE: usize = 64;
 /// Whether a ready graph answers a filtered query by scanning the codes of its `allowed` rows.
 pub(crate) fn scan_eligible(
     state: &NamespaceState,
@@ -1049,17 +1054,6 @@ pub(crate) fn scan_eligible(
 ) -> bool {
     if overcommitted() {
         return false;
-    }
-    // G14 EXPERIMENT SWITCH (temporary): "ivf", or "scan N" for a 1-in-N share.
-    let mut share = SCAN_SHARE;
-    if let Ok(path) = std::env::var("BF_G14_SWITCH") {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let mut words = text.split_whitespace();
-        match words.next() {
-            Some("ivf") => return false,
-            Some("scan") => share = words.next().and_then(|n| n.parse().ok()).unwrap_or(share),
-            _ => {}
-        }
     }
     let Some(scope) = current() else {
         return false;
@@ -1079,7 +1073,7 @@ pub(crate) fn scan_eligible(
                 && vector.len() == e.graph.dims()
                 && vector.iter().any(|x| *x != 0.)
                 && !allowed.is_empty()
-                && allowed.len().saturating_mul(share as u64) <= e.graph.len() as u64
+                && allowed.len().saturating_mul(SCAN_SHARE as u64) <= e.graph.len() as u64
         })
 }
 /// Answer a filtered query from the ready graph's codes: score only the `mask` rows, keep the
@@ -1110,9 +1104,6 @@ pub(crate) async fn scan(
         .get(&Key::new(&scope.namespace, state, attribute, set))
         .and_then(|h| h.ready.clone());
     let Some(entry) = entry else {
-        return Ok(None);
-    };
-    let Ok(_permit) = entry.slots.try_acquire() else {
         return Ok(None);
     };
     match search_entry(

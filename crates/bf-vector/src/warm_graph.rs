@@ -93,14 +93,13 @@ impl HotGraph {
         }
         let q = vectors::normalized(query);
         let (code, scale) = self.codes.prepare(&q);
-        let mut ids: Vec<u32> = allowed
+        let ids: Vec<u32> = allowed
             .iter()
             .filter_map(|row| self.nodes.get(row as usize).copied())
             .filter(|node| *node != u32::MAX)
             .collect();
-        // Ascending nodes read the code array in order, which the prefetcher follows.
-        ids.sort_unstable();
-        const AHEAD: usize = 8;
+        // Prefetching a fixed distance ahead overlaps the row-sized random reads.
+        const AHEAD: usize = 24;
         let mut scored: Vec<(f32, u32)> = Vec::with_capacity(ids.len());
         for (i, &id) in ids.iter().enumerate() {
             if let Some(&next) = ids.get(i + AHEAD) {
