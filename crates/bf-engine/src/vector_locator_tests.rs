@@ -1843,6 +1843,10 @@ async fn graph_mask_hides_exactly_the_shadowed_tier_rows_in_place_and_after_line
         // The second stage adds shadowed IDs to the same tail: only those are resolved.
         for stage in 0..2 {
             if stage == 1 {
+                let more: Vec<_> = [100, 2500, 5000, 7]
+                    .iter()
+                    .map(|id| json!({"id": id, "category": 0, "vector": [3.0, 2.0, 1.0]}))
+                    .collect();
                 engine
                     .write(
                         "locator",
