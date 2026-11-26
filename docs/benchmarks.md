@@ -13670,6 +13670,62 @@ The small case is unchanged (150 KB payloads fit 8 at once in 64 MiB). The large
 (8 x 512 MiB is over 4 GiB); with W7 it is the window plus the one oversized payload being fetched. Cost: one c7g.2xlarge for about 0.5 hour
 (under $0.20); instance, key pair, security group, and the `tmp/w7-20261125/` prefix deleted.
 
+## Round W8: find a long WAL tail with one listing instead of growing probe waves (1.27x at 32 entries)
+
+Hypothesis (Sol, `briefs/ideas/0225-sol.md` #1): `tail_bounded` discovers committed slots by probing in growing waves of 2, 4, 8, 16, and 32 conditional
+reads, so a 32-entry tail costs five serial round trips before any payload is fetched. One LIST of the commit prefix, then one parallel read wave, could
+replace three of them. Gate: cold strong p50 at least 1.25x lower at 32 entries, no regression with an empty or 4-entry tail, identical replies.
+Kill line: discovery under 20% of cold time at 32 entries, or a LIST slow enough to lose on short tails.
+
+### Method
+
+One on-demand c7g.2xlarge (Ubuntu 24.04 arm64) in us-west-2, same region as the bucket. Baseline (v0.1.46) and candidate were built on the same box and
+run A/B/B/A. Each sample is a fresh process calling `Wal::tail_bounded(0, ..)` straight against S3 (`crates/bf-wal/examples/tail_rss.rs`, 30 samples
+per cell), so times exclude the query, and include a new connection. Namespaces: `e32` and `e4` (32 and 4 external 150 KB payloads), `inl32`, `inl6`,
+`inl4`, and `inl3` (that many tiny inline writes, so pure discovery), and an empty tail.
+
+### Kill test (baseline)
+
+| Case | p50 ms |
+| --- | ---: |
+| 32 external payloads | 301 / 334 |
+| 32 inline entries (discovery and one wave only) | 175 / 174 |
+| 4 external payloads | 98 / 98 |
+| empty tail | 22 / 22 |
+| LIST of the WAL prefix (32 slots) | about 15 |
+
+Discovery of 32 entries is about 175 of 300 ms (well over the 20% line), and a LIST is about as cheap as a probe wave. Not killed.
+
+### Change (no format change, no setting)
+
+The slot reads still decide where the tail ends. The first wave probes two slots as before. If both are full, the prefix is listed (`list_after` the
+last replayed slot) concurrently with the second wave of four, so a short tail does not wait on the listing, and a tail of none or one slot never lists. If
+the second wave is full too, the listing gives the contiguous run of slots from there; one wave (64 at a time) reads that whole run plus the slot after it.
+A missing slot ends the tail whatever the listing says: a gap in the listing stops the run, a stale listing that lacks the newest slots just ends the run
+early, and when the extra read finds a slot anyway, probing continues in growing waves as before. A failed listing is ignored. Three serial rounds instead
+of five at 32 entries, and the saving grows with the tail.
+
+Tests (`crates/bf-wal/tests/log.rs`, module `listing`, over a store whose listings can hide keys, fail, or run code after the listing): a 40-slot tail lists
+once and a tail of none or one slot never lists; a gap in the middle, after the second wave, and at the first slot; a stale listing missing the newest 7
+slots; a listing with every seventh slot missing and one that is empty; a failed listing; and two slots committed while the listing is taken.
+
+### Results (cold `tail_bounded` p50 ms, A/B/B/A)
+
+| Case | Base | New | Speedup |
+| --- | ---: | ---: | ---: |
+| 32 external payloads | 316 / 334 | 260 / 250 | 1.27x |
+| 32 inline entries | 177 / 168 | 111 / 118 | 1.5x |
+| 6 inline entries | 93 / 97 | 81 / 85 | 1.1x |
+| 4 external payloads | 97 / 99 | 101 / 98 | noise |
+| 4 inline entries | 59 / 63 | 66 / 65 | within noise (p90 equal) |
+| 3 inline entries | 60 / 65 | 65 / 63 | noise |
+| empty tail | 22 / 21 | 22 / 20 | none |
+
+**Passes** (1.27x on the 1.25x gate at 32 external payloads, with no regression for empty and 4-entry tails). What remains at 32 payloads is the payload
+fetch (about 140 ms, four waves of 8 in flight), which a wider window could cut now that W7 bounds the bytes; that is a separate change. The entries
+returned are the same as the baseline's, and the tests check order and content for each shape. Cost: one c7g.2xlarge for about 1.5 hours (under $0.60);
+instance, key pair, security group, and the `tmp/w8-20261126/` prefix deleted.
+
 ## Round BW20: cut the warm BM25 scoring loop's own costs (three items kept, 1.23x, below the 1.3x bar)
 
 Four changes to `search_internal` (BW19's profile: `Range<u32>` filtered into a `Vec<u32>` 13.6%, `(usize, f64)` sort 6.6%).
