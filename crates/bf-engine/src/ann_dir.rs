@@ -1868,9 +1868,21 @@ pub(crate) async fn search(
     if crate::ann::trace_stages() {
         eprintln!("RERANK pool={} cap={rerank_cap}", pool.len());
     }
+    // A local exact rerank finishes before speculative document GETs can help. Check
+    // selected vector extents, independently of whether codes alone were staged, and
+    // reuse the same coverage decision for the cold rerank's worker dispatch below.
+    let local_rerank = {
+        let sources: BTreeSet<_> = pool.iter().map(|(n, _)| sources[*n]).collect();
+        sources.into_iter().all(|i| {
+            chosen
+                .get(&i)
+                .and_then(|cs| cs.iter().map(|&n| entries[n].vectors_range().end).max())
+                .is_some_and(|end| crate::local_ann::covers(&dir.segments()[i].key, 0..end))
+        })
+    };
     // Start reading the likeliest winners' documents while their vectors are reranked.
     let mut speculative: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
-    if !pool.is_empty() {
+    if !local_rerank && !pool.is_empty() {
         let mut best: Vec<&(usize, Candidate)> = pool.iter().collect();
         let keep = (k * 3).min(best.len());
         if best.len() > keep {
@@ -1884,9 +1896,11 @@ pub(crate) async fn search(
     }
     // Exactly scanned segments already know their best rows.
     winners.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for (_, i, row) in winners.iter().take(k * 2) {
-        if let Some((i, row)) = to_real(*i, *row) {
-            speculative.entry(i).or_default().insert(row);
+    if !local_rerank {
+        for (_, i, row) in winners.iter().take(k * 2) {
+            if let Some((i, row)) = to_real(*i, *row) {
+                speculative.entry(i).or_default().insert(row);
+            }
         }
     }
     let mut by_segment: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
@@ -1902,18 +1916,7 @@ pub(crate) async fn search(
     let parallel_local = by_segment.len() > 1
         && crate::fan_out()
         && read_cache::context().is_some_and(|c| c.cold)
-        && {
-            // Streamed batches can install several partial indexes for one slab. Check
-            // each source once, through its last selected vector (the object footer is
-            // deliberately not staged, and is irrelevant to the rerank).
-            let sources: BTreeSet<_> = by_segment.keys().map(|&n| sources[n]).collect();
-            sources.into_iter().all(|i| {
-                chosen
-                    .get(&i)
-                    .and_then(|cs| cs.iter().map(|&n| entries[n].vectors_range().end).max())
-                    .is_some_and(|end| crate::local_ann::covers(&dir.segments()[i].key, 0..end))
-            })
-        };
+        && local_rerank;
     if parallel_local {
         crate::ann::stage(t0, "local rerank dispatched");
     }

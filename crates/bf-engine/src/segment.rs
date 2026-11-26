@@ -1243,25 +1243,14 @@ pub(crate) fn packed_numeric_ids(
     }
     Ok(Some(packed))
 }
-/// Rows for hydrating search winners. An ID-only projection reads a few bytes of the segment's
-/// staged row-to-ID map when a local stage holds one, so the response costs no storage request;
-/// otherwise this is [`projected_rows`].
+/// Rows for hydrating search winners. Verified staged row-to-ID maps supply IDs for
+/// every projection; absent or unhealthy maps retain the ordinary document-column fallback.
 pub(crate) async fn hydrated_rows(
     store: &Storage,
     segment: &Segment,
     rows: &RoaringBitmap,
     columns: &std::collections::BTreeSet<String>,
 ) -> Result<BTreeMap<u32, Document>, ApiError> {
-    if columns.iter().all(|name| name == "id")
-        && let Some(file) = segment.files.get("ids")
-        && let Some(ids) = crate::local_ann::staged_row_ids(&file.key, rows)
-    {
-        return rows
-            .iter()
-            .zip(ids)
-            .map(|(row, id)| Ok((row, Document::from_iter([("id".into(), Value::from(id))]))))
-            .collect();
-    }
     projected_rows(store, segment, rows, Some(columns)).await
 }
 pub(crate) async fn projected_rows(
@@ -1283,6 +1272,22 @@ pub(crate) async fn projected_rows_with(
     if rows.is_empty() {
         return Ok(BTreeMap::new());
     }
+    let staged_ids = (!bypass)
+        .then(|| {
+            let file = segment.files.get("ids")?;
+            crate::local_ann::staged_row_ids(&file.key, rows)
+        })
+        .flatten();
+    let have_ids = staged_ids.is_some();
+    let mut docs: BTreeMap<u32, Document> = rows.iter().map(|row| (row, Document::new())).collect();
+    if let Some(ids) = staged_ids {
+        for (doc, id) in docs.values_mut().zip(ids) {
+            doc.insert("id".into(), Value::from(id));
+        }
+        if columns.is_some_and(|c| c.iter().all(|name| name == "id")) {
+            return Ok(docs);
+        }
+    }
     let docs_file = segment.files.get("docs").ok_or_else(corrupt)?;
     let docs_key = &docs_file.key;
     let mut reader = ObjectReader::new(store, docs_file);
@@ -1293,7 +1298,6 @@ pub(crate) async fn projected_rows_with(
     let dir = directory(&reader).await?;
     trace_hydration(trace_start, docs_key, "directory", rows.len());
     let trace_start = crate::ann::trace_stages().then(std::time::Instant::now);
-    let mut docs: BTreeMap<u32, Document> = rows.iter().map(|row| (row, Document::new())).collect();
     let blocks: std::collections::BTreeSet<_> =
         rows.iter().map(|row| row as usize / BLOCK_ROWS).collect();
     let indices: Vec<_> = blocks.iter().copied().collect();
@@ -1303,7 +1307,13 @@ pub(crate) async fn projected_rows_with(
     let fetched = futures::future::try_join_all(
         dir.columns
             .iter()
-            .filter(|(name, _)| *name == "id" || columns.is_none_or(|c| c.contains(*name)))
+            .filter(|(name, _)| {
+                if *name == "id" {
+                    !have_ids
+                } else {
+                    columns.is_none_or(|c| c.contains(*name))
+                }
+            })
             .map(|(name, col)| async move {
                 let mut found: Vec<(u32, Value)> = Vec::new();
                 // Decoded column blocks are kept in the decoded cache: a warm top-10 query
@@ -1331,7 +1341,9 @@ pub(crate) async fn projected_rows_with(
                         .map(|n| col.blocks.get(indices[*n]).ok_or_else(corrupt))
                         .collect::<Result<Vec<_>, _>>()?;
                     let data = reader
-                        .read_batch(
+                        // Hydration asks for scattered column blocks, not the megabytes
+                        // around them. The decoded cache still retains complete columns.
+                        .read_batch_sparse(
                             descriptors
                                 .iter()
                                 .map(|b| b.offset..b.offset + b.length)
