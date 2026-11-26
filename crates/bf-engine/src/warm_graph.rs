@@ -692,11 +692,20 @@ fn background_priority() {
     }
 }
 
+/// Construction workers: a third of the cores, between two and six. The build is bound by random
+/// reads of main memory, so each worker adds bandwidth pressure that idle scheduling cannot
+/// remove. Round GB1 measured a 16-core host serving 16 IVF clients: up to six workers left
+/// foreground p99 within 5% of the old two-worker build, and eight raised it by half.
+fn build_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, |n| n.get() / 3)
+        .clamp(2, 6)
+}
 fn pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(build_threads())
             .thread_name(|n| format!("warm-graph-{n}"))
             .start_handler(|_| {
                 #[cfg(not(all(test, target_os = "linux")))]

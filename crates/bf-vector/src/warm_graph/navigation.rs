@@ -56,6 +56,8 @@ impl Visited {
         }
     }
 }
+/// Largest adjacency list a search can read: construction keeps up to twice the final degree.
+pub const MAX_LINKS: usize = 64;
 #[derive(Clone, Copy)]
 struct BeamHit {
     hit: Hit,
@@ -90,9 +92,36 @@ impl Scratch {
         degrees: &[u8],
         entry: u32,
         ef: usize,
+        score: impl FnMut(u32) -> f32,
+        prefetch: impl FnMut(u32),
+    ) -> (Vec<Hit>, usize) {
+        let evaluations = self.search_with(
+            |id, out| {
+                let degree = degrees[id as usize] as usize;
+                out[..degree].copy_from_slice(&links[id as usize][..degree]);
+                degree
+            },
+            entry,
+            ef,
+            score,
+            prefetch,
+            |_| {},
+        );
+        (self.beam.iter().map(|b| b.hit).collect(), evaluations)
+    }
+    /// The shared beam search, for serving and for graph construction. `adjacent` copies one
+    /// node's neighbors into the buffer and returns their count (at most [`MAX_LINKS`]).
+    /// `expanded` sees every node in the order the search expands it, with its score. Returns
+    /// the number of scores. The sorted beam remains in the scratch until the next search.
+    pub fn search_with(
+        &mut self,
+        mut adjacent: impl FnMut(u32, &mut [u32; MAX_LINKS]) -> usize,
+        entry: u32,
+        ef: usize,
         mut score: impl FnMut(u32) -> f32,
         mut prefetch: impl FnMut(u32),
-    ) -> (Vec<Hit>, usize) {
+        mut expanded: impl FnMut(Hit),
+    ) -> usize {
         self.visited.begin();
         self.beam.clear();
         self.visited.insert(entry);
@@ -105,6 +134,7 @@ impl Scratch {
         });
         let mut evaluations = 1;
         let mut next = 0;
+        let mut pending = [0u32; MAX_LINKS];
         loop {
             while next < self.beam.len() && self.beam[next].expanded {
                 next += 1;
@@ -115,11 +145,13 @@ impl Scratch {
             let current = self.beam[next].hit;
             self.beam[next].expanded = true;
             next += 1;
+            expanded(current);
             // Every unseen neighbor is scored before selecting another expansion. Collecting
-            // that same ordered batch lets two future code rows arrive while scoring this one.
-            let mut pending = [0u32; 34];
+            // that same ordered batch lets future code rows arrive while scoring this one.
+            let degree = adjacent(current.id, &mut pending);
             let mut count = 0;
-            for &id in &links[current.id as usize][..degrees[current.id as usize] as usize] {
+            for position in 0..degree {
+                let id = pending[position];
                 if self.visited.insert(id) {
                     pending[count] = id;
                     count += 1;
@@ -154,7 +186,7 @@ impl Scratch {
                 }
             }
         }
-        (self.beam.iter().map(|b| b.hit).collect(), evaluations)
+        evaluations
     }
 }
 
