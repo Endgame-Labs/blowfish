@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **Selective filtered vector queries are 3.7 to 5.9 times faster at 16 clients, with the same recall:** When a warm graph is ready, a filtered query whose filter leaves at most 1 row in 64 of the tier (1.56 percent) no longer runs IVF. It scores only the allowed rows' resident SQ8 codes, keeps the best `max(3k, 30)`, and reranks them exactly, with the same shadowed-row and deletion handling as the graph path. On an on-demand Graviton3 host with full BEIR NQ (2.68M x 1024-d), 16 clients, hash-distributed filters: 502 to 2,954 q/s at 0.5 percent, 388 to 1,807 at 1 percent, and 304 to 1,121 at 2 percent (p99 66.5 to 19.6 ms), recall@10 1.000 in both. Above 1.56 percent IVF answers: the scan reads every allowed row's 1 KiB code, so its cost grows with the filter while IVF's stays flat, and the two tie near 8 percent. A single client sees little change below 1 percent. See Round G14 in `docs/benchmarks.md`.
+
 ## [0.1.56] - 2026-11-26
 
 ### Changed
