@@ -118,7 +118,7 @@ def run(name, binary, rnd, port, perf):
                         lat.append((time.perf_counter() - t) * 1000)
         pp = None
         if perf:
-            pp = subprocess.Popen(["perf", "record", "-F", "499", "-g", "-p", str(proc.pid), "-o", str(RUN / f"{name}.perf.data")],
+            pp = subprocess.Popen(["sudo", "perf", "record", "-F", "499", "-g", "-p", str(proc.pid), "-o", str(RUN / f"{name}.perf.data")],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(1)
         t0 = time.perf_counter()
@@ -127,7 +127,7 @@ def run(name, binary, rnd, port, perf):
         wall = time.perf_counter() - t0
         cpu1, after = cpu_s(proc.pid), counters(c0)
         if pp:
-            pp.send_signal(2); pp.wait()
+            subprocess.run(["sudo", "kill", "-INT", str(pp.pid)]); pp.wait()
         n = len(lat)
         return {"build": name, "round": rnd, "n": n, "qps": n / wall, "p50": float(np.percentile(lat, 50)),
                 "p90": float(np.percentile(lat, 90)), "cpu_ms_per_query": 1000 * (cpu1 - cpu0) / n,

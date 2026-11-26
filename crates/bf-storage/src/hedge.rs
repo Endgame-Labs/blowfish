@@ -55,8 +55,10 @@ const MIN_WAVE: usize = 4;
 /// Round C24 swept 0.5 to 0.85 with 15 percent of budget: 0.7 was the best of the cheap settings, since
 /// 0.85 left most of the budget unspent.
 const WAVE_DONE: f64 = 0.7;
-/// How often a read re-checks its siblings.
-const TICK: Duration = Duration::from_millis(5);
+/// Shortest and longest wait before a read re-checks its siblings. Each wake re-polls the read, so
+/// the wait adapts: it is as long as the verdict allows, to keep polling off the CPU.
+const TICK_MIN: Duration = Duration::from_millis(5);
+const TICK_MAX: Duration = Duration::from_millis(20);
 /// Latency histogram: `BUCKETS` log-scale buckets, `PER_OCTAVE` per doubling, from `MIN_US` up.
 const BUCKETS: usize = 128;
 const PER_OCTAVE: f64 = 8.0;
@@ -232,7 +234,13 @@ impl Hedger {
         }
     }
     /// Compare an in-flight read that started at `start_us` with the reads that started around it.
+    #[cfg(test)]
     fn verdict_at(&self, start_us: u64, now_us: u64) -> Verdict {
+        self.check_at(start_us, now_us).0
+    }
+    /// The verdict, and how long to wait before asking again: until the quantile the read must
+    /// outlast when that is known, else a coarse tick for siblings to arrive or finish.
+    fn check_at(&self, start_us: u64, now_us: u64) -> (Verdict, Duration) {
         let abs = start_us / SLOT_US;
         let slots: Vec<&Slot> = (abs.saturating_sub(SPAN)..=abs + SPAN)
             .filter_map(|a| self.slot(a))
@@ -246,10 +254,10 @@ impl Hedger {
             .map(|s| s.finished.load(Ordering::Acquire) as u64)
             .sum();
         if (total as usize) < MIN_WAVE {
-            return Verdict::Alone;
+            return (Verdict::Alone, TICK_MAX);
         }
         if done == 0 || (done as f64) < WAVE_DONE * total as f64 {
-            return Verdict::Waiting;
+            return (Verdict::Waiting, TICK_MIN * 2);
         }
         // The WAVE_DONE quantile of the finished latencies, to the histogram's resolution.
         let want = ((done as f64 * WAVE_DONE).ceil() as u64).clamp(1, done);
@@ -260,15 +268,18 @@ impl Hedger {
                 .map(|s| s.hist[b].load(Ordering::Acquire) as u64)
                 .sum::<u64>();
             if seen >= want {
-                return if (now_us.saturating_sub(start_us)) as f64 > bucket_top(b) {
-                    Verdict::Straggler
+                let top = bucket_top(b);
+                let elapsed = now_us.saturating_sub(start_us) as f64;
+                return if elapsed > top {
+                    (Verdict::Straggler, TICK_MIN)
                 } else {
-                    Verdict::Waiting
+                    let left = Duration::from_micros((top - elapsed) as u64 + 1);
+                    (Verdict::Waiting, left.clamp(TICK_MIN, TICK_MAX))
                 };
             }
         }
         // Counts raced a slot's reuse: nothing to compare with yet.
-        Verdict::Waiting
+        (Verdict::Waiting, TICK_MIN)
     }
     fn spend(&self) -> bool {
         let mut s = self.state.lock().unwrap();
@@ -295,10 +306,13 @@ impl Hedger {
         let mut primary = Box::pin(backend.get_range(path, range.clone()));
         let len = range.end - range.start;
         loop {
-            let verdict = self.verdict_at(member.start_us, self.now_us());
-            let timer = verdict == Verdict::Alone
-                && len <= MAX_TIMER_HEDGE_BYTES
-                && start.elapsed() >= self.threshold();
+            let (verdict, mut wait) = self.check_at(member.start_us, self.now_us());
+            let mut timer = false;
+            if verdict == Verdict::Alone && len <= MAX_TIMER_HEDGE_BYTES {
+                let left = self.threshold().saturating_sub(start.elapsed());
+                timer = left.is_zero();
+                wait = left.clamp(TICK_MIN, TICK_MAX);
+            }
             if (verdict == Verdict::Straggler || timer) && self.spend() {
                 break;
             }
@@ -308,7 +322,7 @@ impl Hedger {
                     member.finish();
                     return r;
                 }
-                _ = tokio::time::sleep(TICK) => {}
+                _ = tokio::time::sleep(wait) => {}
             }
         }
         metrics::counter!("blowfish_object_store_hedges_total", "outcome" => "issued").increment(1);
