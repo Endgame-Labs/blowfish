@@ -15368,3 +15368,84 @@ key pair, and security group deleted and verified. The fixture was read-only, an
 Reproduction: `warm_graph_bench`-style export with `examples/g3/export_ivf.py`, then
 `gb1_bench NQ_DATA WORKERS 100000000 1 EXPORTED_IVF` for build and recall, and
 `gb1_load NQ_DATA EXPORTED_IVF BUILD_THREADS 16 1 48` for the foreground run.
+
+## Round G13: the warm graph under writes
+
+**Before.** While any unindexed write shadowed base rows, the graph was asked for `k + max(2k, 20)` rows and the
+shadowed ones were dropped afterwards. The graph serves at most 100 rows, so `top_k` above 33 fell back to IVF
+whenever a write was pending, and smaller `top_k` paid a three times larger shortlist and rerank.
+
+**After.** `ann::graph_mask` resolves the snapshot's shadowed IDs to the tier's global rows and removes them from
+the set of rows the graph may return. The graph still walks through those rows, so navigation is unchanged, but its
+shortlist holds only live rows: it is asked for exactly `k`. The result is computed once per snapshot and tier
+(concurrent queries share one computation), and a newer snapshot of the same tier resolves only the IDs shadowed
+since the previous one. Rows that moved in a compaction (lineage) are found by walking the shadowed rows through the
+map's reverse side, not the whole map. No setting; the IVF path keeps its own over-fetch.
+
+**Protocol.** One on-demand c7g.4xlarge (16 vCPUs), NQ 2,681,468 x 1,024 f16 cosine from the retained fixture,
+copied to local disk, `blowfish serve` with indexing off (so writes stay in the tail and shadow base rows) and the
+production lifecycle: heat, build, calibration, `usable` (about 18 to 31 minutes). Then 16 single-connection HTTP
+clients, 90 seconds per phase after an 8-second warm-up, the 3,452 NQ queries cycled, at `top_k` 10 and 100, without
+and with a writer doing 50 single-row upserts per second of existing IDs, each carrying the stored vector so the
+exhaustive truth does not change (`examples/g13_writes.py`). Recall is against the recorded truth. Graph share is
+the delta of the graph's answer counter over the queries sent; it can exceed 100 percent because the recall sampler
+also searches the graph. The first write phases run on a store with about 4,500 shadowed IDs, the second about 9,000.
+Each build ran the whole protocol, including promotion, on the same host. Baseline is main `8ef5c9a`, run twice;
+the candidate is the final commit of this round.
+
+| top_k | writes | Baseline q/s (two runs) | Candidate q/s | Baseline graph share | Candidate graph share | Baseline recall | Candidate recall |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 10 | no | 15,065 / 16,013 | 15,157 | 100% | 100% | 0.9525 / 0.9475 | 0.9525 |
+| 100 | no | 5,547 / 5,510 | 5,582 | 100% | 100% | 0.9561 / 0.9561 | 0.9562 |
+| 10 | yes | 2,825 / 2,816 | **2,825** | 100% | 100% | 0.9520 / 0.9470 | 0.9520 |
+| 100 | yes | 494 / 485 | **1,038** | **0%** (IVF) | **100%** | 0.9507 / 0.9507 | 0.9545 |
+
+Latency under writes (p50 / p99, ms): top_k 10, baseline 4.4 / 20.6 and 4.3 / 20.8, candidate 4.2 / 20.7; top_k 100,
+baseline 28.0 / 67.1 and 28.5 / 68.4, candidate 13.0 / 32.1. Write latency (p50 / p99, ms), baseline then candidate:
+beside top_k 10 queries 7.5 / 21.9 and 7.9 / 20.8, then 7.8 / 22.3; beside top_k 100 queries 11.7 / 33.6 and 12.1 /
+34, then 9.9 / 28.2. No write failed, and the writer held 50.6 writes per second in every phase.
+
+Without writes the two builds match (the differences are run-to-run noise: the three candidate runs gave 14,409 to
+16,463 q/s at top_k 10 and 5,613 to 5,686 at top_k 100).
+
+### What it took
+
+The first version (resolve the shadowed IDs on every query) kept top_k 100 on the graph but was no faster than the
+IVF fallback (about 500 q/s) and halved top_k 10 (about 1,200 q/s): perf showed 35 percent of the server's CPU in
+one closure of `graph_mask`. Two things caused it: a merged tier's lineage map was walked whole (every row of the
+source) to find a handful of shadowed rows, and with a new snapshot every 20 ms, all 16 clients resolved the same
+snapshot at once. Walking only the shadowed rows and sharing one computation per snapshot gave 2,566 and 896 q/s;
+resolving only the IDs added since the previous snapshot removed the last 9 percent at top_k 10 (2,825) and gave
+1,038 at top_k 100.
+
+### Pass criteria
+
+| Criterion | Result |
+|---|---|
+| top_k 100 under writes served by the graph | **Yes**, 100% (baseline 0%) |
+| At least 1.5 times the q/s of the IVF fallback | **2.1 times** (1,038 against 494 and 485) |
+| top_k 10 under writes not slower | **Equal** (2,825 against 2,825 and 2,816) |
+| No write path slower | **Yes**, write p50 and p99 within noise at top_k 10, lower beside top_k 100 |
+| Recall equal or better | **Yes** (top_k 100 under writes 0.9545 against 0.9507; the others equal) |
+
+### What remains
+
+Under writes, the server spends about 65 percent of its CPU scoring the unindexed tail (`merge_tail`, one distance per
+tail document per query), in both builds. That is why top_k 10 under writes runs at 2,825 q/s against 15,157 without
+them, and top_k 100 at 1,038 against 5,582. It does not depend on the graph, and a tail with an index of its own (or
+batched distance kernels over the cached tail vectors) is the next lever for steady write streams.
+
+### Tests
+
+`warm_graph::tests::shadowed_rows_stay_traversable_but_are_never_returned`: a graph-served namespace with an overwrite
+that keeps the row's old vector away, deletes, and two upserts that move a row's vector to other IDs; at top_k 10 and
+100 the graph answers (the counter rises), no deleted or overwritten row is returned, no ID repeats, top_k 10 equals the
+IVF control bit for bit, and top_k 100 shares at least 95 percent of its rows with the control.
+`vector_locator::tests::graph_mask_hides_exactly_the_shadowed_tier_rows_in_place_and_after_lineage_merges`: for a tier
+whose segments are in place and one whose segments were merged (with deletes, so a tier mask exists), the hidden rows
+equal resolving every tier row to its ID one by one, and a second stage that shadows more IDs takes the incremental
+path and still agrees.
+
+Resources: one on-demand c7g.4xlarge, 18:58 to 23:35 UTC (4.6 hours, about $2.7 compute plus a 150 GB gp3 volume).
+Instance, volume, key pair, and security group deleted and verified. The fixture was read-only and copied to the
+instance's disk; no bucket prefix was created.
