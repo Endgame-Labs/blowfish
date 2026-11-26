@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.47] - 2026-11-26
+
+### Changed
+
+- **Cold queries find a long WAL tail faster:** A cold reader found committed but unindexed writes by probing slots in growing waves (2, 4, 8, 16, then 32), one round trip each. When the first two waves are full, it now also lists the WAL prefix and reads the whole listed run in one wave. Conditional slot reads still decide where the tail ends, so a stale listing only falls back to probing. On same-region S3, a cold strong query with 32 pending external payloads went from 325 to 255 ms (1.27x), and with 32 inline entries 1.5x faster. Empty and short tails are unchanged.
+
 ## [0.1.46] - 2026-11-26
 
 ### Changed
@@ -350,7 +356,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.46...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.47...HEAD
+[0.1.47]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.47
 [0.1.46]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.46
 [0.1.45]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.45
 [0.1.44]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.44

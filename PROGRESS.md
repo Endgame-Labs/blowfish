@@ -4,6 +4,7 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-26
 
+- **W8 WAL tail discovery by listing (merged).** One LIST (concurrent with the second probe wave) plus one read wave replaces waves 3-5; conditional reads still fence the tail. 32 external payloads 325 -> 255 ms cold (1.27x); 32 inline 1.5x; short tails unchanged.
 - **BW20 warm BM25 scoring loop (merged).** Stack candidate mask, lazy window order, touched-row bounds: 1.23x warm 16-client, 1.10x one client, exact. The merge gate caught a last-lane bound overflow in debug builds (release wrapped harmlessly); fixed at merge. The compact saturation table was bit-identical but 0.8% slower and was dropped.
 - **D4b/D4c one copy of every vector (merged, bucket generation 6).** Covered segments' ANN objects retired in a fenced publication; locator, filtered tier ANN with resident slab row maps, tier-aware maintenance, copy pins, restore-before-drop. NQ settled 16.91 -> 8.30 GB with identical results; 10M filtered cold 1.27-1.44x faster. Independent review findings (branch row maps in the source prefix, legacy wedge, fallbacks) fixed in D4c and re-reviewed. Issue #3's disk target met.
 - **W6/W7 concurrent WAL payload fetch (merged).** Cold strong query with 32 external payloads 1,033 -> about 300 ms (3.2x); in flight bounded by 8 payloads and 64 MiB stored bytes (commit records carry `payload_bytes`; old records fetch serially). Peak RSS at 8 x 64 MiB 720 -> 397 MiB.
