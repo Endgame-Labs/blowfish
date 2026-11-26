@@ -13806,8 +13806,8 @@ Time to promote is 33 to 41 minutes, in line with G10 (32 minutes). The settled 
 | **Qdrant interpolated to 0.9584** | 0.9584 | **about 7,740** | 1.64 | 3.3 | 6.6 | |
 
 At matched recall blowfish serves **about 9 percent more q/s** (2 percent on the short run) and its **p99 is 29 percent lower** (4.7 against 6.6 ms);
-p50 and p90 are within noise (1.55 against 1.64 ms). Qdrant needs fewer instructions per query (2.1M against 3.0M) but takes the same
-CPU time per query, so its instructions run slower. Blowfish's per-query CPU is 0.89 ms; its p99 benefits from its own reactor model. Each point is a
+p50 and p90 are within noise (1.55 against 1.64 ms). Qdrant needs fewer instructions per query (2.1M against 3.0M) but takes about the same
+CPU time per query (1.0 against 0.89 ms). Each point is a
 single run (Qdrant 15 timed passes, blowfish 30), on a shared machine.
 
 ### Head to head, top_k 100 (blowfish loses)
@@ -13873,7 +13873,7 @@ resident). The cause is in `warm_graph::feedback`: the test "the graph pays back
 3.6 ms after a top_k 10 phase at 0.4 ms) and `ivf_seconds` was an average over calibration blocks (one query at a time, the sampled top_k)
 that moves by a fifth once per eight samples. After a top_k change the two sides measure different workloads for minutes: graph cost jumps at once,
 the IVF baseline lags at its top_k 10 value, the saving clamps to zero, and the request rate (which decays with a 15-minute time constant after
-heavy traffic stops) no longer covers the build cost. G10's run, where traffic came in bursts after the heater stopped, hit the same condition.
+heavy traffic stops) no longer covers the build cost. G10's run (traffic in bursts after the heater stopped) probably hit the same condition, but its status was not captured, so that is an inference.
 
 **Fix (`bf-engine`, no setting, no format change):** the graph's cost is now a ratio, graph CPU over warm IVF CPU for the same calibration block
 (`trial_ratio`, copied to `graph_ratio` when an effort is accepted), and the saving is `ivf_seconds x (1 - ratio)`. The ordinary-query CPU
