@@ -4,6 +4,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.56] - 2026-11-26
+
 ### Changed
 
 - **`top_k` 100 on the warm graph is 1.7 times faster, and `top_k` 10 15 percent faster, with identical results:** An ID-only query answered by the warm graph used to hydrate each result row's ID from the document files, 32 segments at a time; the first such query now builds a resident row-to-ID table in the background (8 bytes per row, unsigned IDs only), and later queries read the final rows' IDs from it. Graph queries up to 100 rows also stay on the HTTP reactor now (the gate was 10). On an Apple M4 with BEIR NQ (2.68M x 1024-d), 16 clients, IDs only, one promoted server: `top_k` 100 went from 2,733 to 4,627 q/s with p99 11.6 to 8.3 ms, and `top_k` 10 from 8,512 to 9,796 q/s with p99 4.3 to 3.5 ms, at the same recall to seven digits. Against Qdrant 1.20 at matched recall, blowfish now serves 29 percent more q/s at `top_k` 100 (p99 8.3 against 17.4 ms) and 14 percent more at `top_k` 10. See Round G12 in `docs/benchmarks.md`.
@@ -11,6 +13,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 ### Fixed
 
 - **`include_attributes: false` no longer hydrates every attribute:** Asking for no attributes read all scalar columns of the result rows and then dropped them, while leaving the field out read none. Both now read none.
+
+### Benchmarks
+
+- **Against Qdrant on an Apple M4, now at both `top_k` 10 and 100:** On BEIR NQ (2.68M x 1024-d), 16 clients, IDs only, at matched recall, blowfish served `top_k` 100 at 4,511 q/s against about 3,491 for Qdrant 1.20 (p99 8.3 against 17.4 ms), and `top_k` 10 at 9,776 against about 8,566 (p99 3.8 against 5.8 ms). See Round G12 in `docs/benchmarks.md`.
 
 ## [0.1.55] - 2026-11-26
 
@@ -425,7 +431,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.55...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.56...HEAD
+[0.1.56]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.56
 [0.1.55]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.55
 [0.1.54]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.54
 [0.1.53]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.53
