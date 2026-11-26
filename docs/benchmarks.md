@@ -13773,6 +13773,37 @@ ordinary fetches share one budget.
 inseparable at 32 payloads because each is bounded by the other. Cost: one c7g.2xlarge for about 1.5 hours (under $0.60); instance, key pair, security
 group, and the `tmp/w9-20261126/` prefix deleted.
 
+### Round W9b: a share of the byte budget lives as long as its body (review fix)
+
+Review finding: a fetch's share of `TAIL_FETCH_BYTES` was released when its GET finished, not when its entry was consumed, so up to 256
+completed speculative bodies and 64 materialized entries could sit in memory beyond the budget (with payloads up to the request limit, the
+hazard W7 fixed). Fix: the share travels with the body (a speculative task returns `(body, permit)`) and is dropped only after the ordered
+replay has consumed the entry, as in W7, so fetched-but-unconsumed bytes never exceed `TAIL_FETCH_BYTES` (the first fetch always proceeds).
+To keep that from deadlocking, shares are requested in slot order (speculative tasks queue behind the previous one; ordinary fetches are
+admitted in the replay loop in WAL order, and the loop waits for the replay to free room), and when a record does not use a speculative body
+(a losing write, a size mismatch, a record that fetches on its own) the unused speculative bodies at or before its slot, or all later ones for a
+record that fetches on its own, are dropped at once, freeing their shares and memory.
+
+Tests: with the first body slow so every later body finishes first, a budget narrowed to 1, 3, and 8 bodies is never exceeded (measured as
+the budget's peak held bytes, not RSS), and the replay is unchanged; with losing writes' bodies, a wrong-size record, and a slow slot under budgets
+of 1, 2, and 4 bodies, the tail completes without stalling and stays in budget.
+
+Re-measured on one on-demand c7g.2xlarge (us-west-2, Amazon Linux 2023), A/B/B/A against v0.1.47, 30 fresh-handle samples per cell,
+p50 ms (base / new):
+
+| Case | Base (v0.1.47) | New (W9 + W9b) | Speedup |
+| --- | ---: | ---: | ---: |
+| 32 external 150 KB payloads | 236 / 249 | 189 / 191 | 1.28x |
+| 4 external payloads | 103 / 101 | 98 / 102 | within 3% |
+| 4 inline entries | 72 / 68 | 74 / 74 | noise (within 8%) |
+| 3 inline entries | 73 / 72 | 71 / 66 | noise |
+| empty tail | 21 / 20 | 21 / 20 | equal |
+
+The 32-entry gain is 1.28x (it was 1.4x before the fix): in-order consumption and in-order admission cost a little overlap, still above the 1.2x bar.
+The 4-inline case is 6 ms slower in this pair (72, 68 vs 74, 74), where W9 measured equal; it has no payloads, so the code path it takes is
+unchanged, and the cell's samples ranged 47 to 669 ms. Cost: about 0.6 hours of a c7g.2xlarge (about $0.25); instance, key pair, security
+group, and the `tmp/w9b-20261126/` prefix deleted.
+
 ## Round BW20: cut the warm BM25 scoring loop's own costs (three items kept, 1.23x, below the 1.3x bar)
 
 Four changes to `search_internal` (BW19's profile: `Range<u32>` filtered into a `Vec<u32>` 13.6%, `(usize, f64)` sort 6.6%).
