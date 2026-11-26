@@ -13772,6 +13772,132 @@ trusting a promoted graph for it.
 
 Costs: no EC2, no bucket writes (a 25 GB fixture copy, deleted). The M4 run directory is deleted and nothing of mine is running.
 
+## Round G11: blowfish with the graph promoted against Qdrant on the M4, and why a promoted graph stopped serving top_k 100
+
+**Setup:** Apple M4 (10 cores, 16 GB, shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries, exact top-100
+truth), the frozen v0.1.19 fixture. Blowfish is the v0.1.52 release binary with production defaults (64 probes, the production sampler);
+the graph was promoted the ordinary way (`g11_promote.py`: 16 paced clients at about 700 q/s, no pause, no manual samples). Qdrant is the
+official 1.20.0 macOS arm64 binary (f16 vectors in RAM, M=16, ef_construct=100, one indexed segment after the load, the G5 setup).
+Both are driven by the same client (`g11_http.py`: 16 client processes, one keep-alive connection each, IDs only, one quality pass over all
+queries, one warm-up pass, then the timed passes), one server at a time. Latency is client-side. Recall is against the exact top k.
+Qdrant's `ef` sweep brackets blowfish's recall at each k; "matched" rows are linear interpolations between the two bracketing points.
+
+### Promotion on v0.1.52 (ordinary heat)
+
+| Run | Graph ready | Promoted | Samples | Settled beam |
+|---|---:|---:|---:|---:|
+| 1 (the harness crashed after promoting, on my own bug) | 27.5 min | 33.5 min | 345 | 80 |
+| 2 (the run measured below) | 27.5 min | 38 min | 623 | 100 |
+| 3 (with the fix below) | 28 min | 40.5 min | 771 | 80 |
+
+Time to promote is 33 to 41 minutes, in line with G10 (32 minutes). The settled beam varies run to run (80 or 100) with recall@10 moving 0.955 to 0.9595.
+
+### Head to head, top_k 10 (blowfish wins)
+
+| Engine | recall@10 | q/s | p50 | p90 | p99 (ms) | CPU per query |
+|---|---:|---:|---:|---:|---:|---:|
+| **blowfish, graph (beam 100)** | **0.9584** | **8,417** (103,560 queries; 7,916 in a 10,356-query run) | **1.55** | **2.90** | **4.70** | 0.89 ms, 2.97M instructions |
+| Qdrant ef 64 | 0.9475 | 8,994 | 1.45 | 2.80 | 5.33 | 0.89 ms, 1.94M |
+| Qdrant ef 80 | 0.9557 | 8,109 | 1.57 | 3.16 | 6.20 | 1.00 ms, 2.10M |
+| Qdrant ef 96 | 0.9614 | 7,322 | 1.71 | 3.53 | 7.00 | 1.12 ms, 2.26M |
+| Qdrant ef 112 | 0.9657 | 6,684 | 1.86 | 3.87 | 7.87 | 1.23 ms, 2.42M |
+| Qdrant ef 144 | 0.9707 | 5,687 | 2.16 | 4.56 | 10.80 | 1.47 ms, 2.72M |
+| Qdrant default (no `hnsw_ef`) | 0.9628 | 7,136 | 1.75 | 3.60 | 7.89 | 1.14 ms, 2.30M |
+| **Qdrant interpolated to 0.9584** | 0.9584 | **about 7,740** | 1.64 | 3.3 | 6.6 | |
+
+At matched recall blowfish serves **about 9 percent more q/s** (2 percent on the short run) and its **p99 is 29 percent lower** (4.7 against 6.6 ms);
+p50 and p90 are within noise (1.55 against 1.64 ms). Qdrant needs fewer instructions per query (2.1M against 3.0M) but takes the same
+CPU time per query, so its instructions run slower. Blowfish's per-query CPU is 0.89 ms; its p99 benefits from its own reactor model. Each point is a
+single run (Qdrant 15 timed passes, blowfish 30), on a shared machine.
+
+### Head to head, top_k 100 (blowfish loses)
+
+| Engine | recall@100 | q/s | p50 | p90 | p99 (ms) | CPU per query |
+|---|---:|---:|---:|---:|---:|---:|
+| **blowfish, graph (beam 256, shortlist 150)** | **0.9534** | **2,218 to 2,754** (three runs: 2,218, 2,621, 2,754) | **5.6 to 6.0** | **7.9 to 9.5** | **11.5 to 30.8** | 3.4 to 3.8 ms, 8.1M to 11.5M instructions |
+| Qdrant ef 128 | 0.9078 | 5,890 | 2.07 | 4.36 | 9.68 | 1.40 ms, 2.88M |
+| Qdrant ef 192 | 0.9379 | 4,404 | 2.60 | 6.38 | 14.56 | 1.86 ms, 3.46M |
+| Qdrant ef 256 | 0.9524 | 3,683 | 3.13 | 7.73 | 16.13 | 2.29 ms, 4.04M |
+| Qdrant ef 320 | 0.9614 | 3,164 | 3.65 | 9.30 | 18.64 | 2.72 ms, 4.60M |
+| Qdrant default (ef 100) | 0.8833 | 6,691 | 1.85 | 3.90 | 8.01 | 1.20 ms, 2.61M |
+| **Qdrant interpolated to 0.9534** | 0.9534 | **about 3,625** | 3.2 | 7.9 | 16.4 | |
+
+At matched recall blowfish serves **24 to 39 percent fewer q/s** than Qdrant and its p50 is about 1.8 times higher (5.6 to 6.0 ms against 3.2 ms);
+p99 is lower only in the best run. The long blowfish run (2,218 q/s, p99 30.8 ms) grew the server's resident set to 9.2 GB on a
+16 GB machine, so part of that spread is memory pressure on the M4, not the engine; the other two runs are the better estimate.
+Blowfish's query path costs 8.1M instructions and 3.4 ms of CPU for top_k 100 against Qdrant's 4.0M and 2.3 ms.
+
+### Memory
+
+| | Peak physical footprint | Resident set during the runs |
+|---|---:|---:|
+| blowfish (graph promoted) | 4.98 GiB (5,351,085,144 B) | 6.2 GiB, growing to 7.6 to 9.8 GiB over the top_k 10 and top_k 100 passes |
+| Qdrant 1.20.0 | 0.2 GiB (its vectors are memory-mapped, which the footprint does not count) | 5.55 to 5.57 GiB |
+
+The two columns are not comparable row to row. Qdrant's resident set is the fair figure for it (5.6 GiB). Blowfish's footprint is the figure the
+G5 and G10 tables use; its resident set includes mapped slab pages the OS can drop.
+
+### Where blowfish's CPU goes (profile, 16 clients, graph serving)
+
+Sources: `sample` of the server for 10 s under load (on-CPU samples only, top of stack, grouped by function), and the graph's own phase
+counters (`phase_cpu_seconds` in the admin status, thread CPU, and slightly inflated while `sample` runs).
+
+| Phase | top_k 10 (share of on-CPU samples) | top_k 100 (share) |
+|---|---:|---:|
+| Navigation (graph walk, SQ8 dot products) | 68.7% | 50.6% |
+| Allocation and memory copies | 7.2% | 13.6% |
+| HTTP parse and JSON serialization | 6.1% | 8.0% |
+| Rerank (exact f16 distances and checksums) | 6.0% | 10.8% |
+| Planning, projection, and sorting | 1.7% | 3.8% |
+| Other | 10.2% | 13.1% |
+
+Phase counters, CPU per search: top_k 10 navigation 470 us, rerank 133 us, projection 82 us (of 890 us per query in total); top_k 100 navigation
+1,140 us, rerank 370 us, projection 260 us (of 3.4 to 3.8 ms).
+
+**The biggest gap is navigation at top_k 100.** At beam 256 the SQ8 walk scores about 4,500 vectors per query (`dot_neon` alone is 38% of all
+on-CPU samples at top_k 100), which is 1.1 to 1.7 ms of the 3.4 ms, and Qdrant's whole query costs 2.3 ms. The second gap is allocation and
+copying (13.6%), then the rerank of 150 candidates with a checksum per row (10.8%). At top_k 10 the profile is the same shape at a quarter of the size, and
+blowfish already wins there. The next round should look at a narrower beam for top_k 100 (the 2.56 times k rule from G8 was set against IVF's recall,
+not against Qdrant's), cheaper candidate scoring, and the per-query allocations. Nothing in this round optimizes that.
+
+### The anomaly: a promoted graph stops serving top_k 100 after a lull (found and fixed)
+
+**Not reproduced the way G10 saw it.** After promotion I ran top_k 10 for 1 minute and then for 5 more minutes of back-to-back passes, then
+top_k 100 at full rate: the graph served all of it (8.1M instructions per query, recall 0.9534), `usable` true in the 5-second status poll
+throughout.
+
+**Reproduced with paced traffic.** With the same promoted graph, a single client sending top_k 100 at 30 q/s (one sampler sample every few
+seconds) flipped `usable` to false after 195 s and the answered counter stopped moving: every query went to IVF from then on (the graph stayed
+resident). The cause is in `warm_graph::feedback`: the test "the graph pays back its build" was `rate x 86,400 x (ivf_seconds - graph_seconds)
+>= 2 x build_seconds`, where `graph_seconds` was an average of thread CPU over every ordinary graph query (any top_k, any load, so top_k 100 at
+3.6 ms after a top_k 10 phase at 0.4 ms) and `ivf_seconds` was an average over calibration blocks (one query at a time, the sampled top_k)
+that moves by a fifth once per eight samples. After a top_k change the two sides measure different workloads for minutes: graph cost jumps at once,
+the IVF baseline lags at its top_k 10 value, the saving clamps to zero, and the request rate (which decays with a 15-minute time constant after
+heavy traffic stops) no longer covers the build cost. G10's run, where traffic came in bursts after the heater stopped, hit the same condition.
+
+**Fix (`bf-engine`, no setting, no format change):** the graph's cost is now a ratio, graph CPU over warm IVF CPU for the same calibration block
+(`trial_ratio`, copied to `graph_ratio` when an effort is accepted), and the saving is `ivf_seconds x (1 - ratio)`. The ordinary-query CPU
+averaging (`Scope::record_cpu`) is gone. A ratio measured on the same blocks as the IVF cost follows the IVF baseline as the traffic's top_k
+changes. The three places that used `graph_seconds` (usability, the memory-pressure eviction order, and the admission comparison) all use the saving
+from the ratio. The status field `graph_cpu_seconds` is now `graph_cost_ratio`. Test:
+`saving_is_a_fraction_of_the_current_ivf_cost_so_a_top_k_change_cannot_flip_it`.
+
+**Verified on the M4** with a freshly promoted graph (run 3 above) under the same 30 q/s top_k 100 lull: `usable` stayed true for all 420 s
+(about 1,826 graph-answered queries a minute, 30 q/s, with the measured ratio 0.164). The unfixed binary flipped at 195 s. The fixed binary's
+top_k 100 and top_k 10 numbers right after promotion were 2,754 q/s (recall@100 0.9537) and 8,295 q/s (recall@10 0.9595).
+
+### Notes and costs
+
+- A single run per point, on a shared Mac mini with 16 GB; p99 and the long top_k 100 blowfish run in particular are noisy. The k10 win is about
+  9 percent at matched recall, which is inside the spread I saw between blowfish runs (7,916 to 8,417 q/s), so call it a tie to a small win; the p99
+  advantage and the k100 loss are larger than the noise.
+- `g11_http.py` reports process CPU from `proc_pid_rusage`, whose time fields are Mach ticks (41.67 ns each on Apple silicon), not nanoseconds;
+  the table above converts them. Instructions and cycles are the task counters.
+- Harness: `g11_promote.py` (promotes under ordinary heat, then measures each K with latency and a 5-second status poll),
+  `g11_qdrant.py` (loads and sweeps Qdrant), `g11_http.py`, and `g11_lull.py` (the paced anomaly probe).
+- Costs: no EC2 and no bucket writes. A 27 GB fixture was downloaded to the M4 from the shared fixture with presigned URLs and deleted with the run
+  directory; nothing of mine is running on the M4.
+
 ## Round W6/W7: cold queries fetch committed WAL payloads one at a time (concurrent fetch, 3.2x at 32 payloads; bounded by bytes in W7)
 
 Hypothesis (Sol, `briefs/ideas/2225-sol.md` #1): `tail_bounded` discovers WAL slots concurrently but then calls `materialize` on each record in
