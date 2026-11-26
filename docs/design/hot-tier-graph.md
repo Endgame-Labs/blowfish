@@ -61,7 +61,7 @@ process's active build alone. It uses the disk-cache directory when available, a
 temporary directory otherwise. Measurement processes place temporary files in their owned run.
 
 One process-wide construction slot prevents competing graph builders. A dedicated Rayon pool has
-every core but one (at least two) as workers, using Linux idle scheduling with nice 19 (nice 19 alone when idle scheduling is denied), or macOS utility QoS. CPU passes check cancellation at source-row, graph-point, and bounded-phase boundaries, and periodically check process memory headroom. Automatic recluster construction takes priority;
+a third of the cores (at least two, at most six) as workers, using Linux idle scheduling with nice 19 (nice 19 alone when idle scheduling is denied), or macOS utility QoS. CPU passes check cancellation at source-row, graph-point, and bounded-phase boundaries, and periodically check process memory headroom. Automatic recluster construction takes priority;
 it also subtracts existing graph reservations when sizing its own work.
 
 Source decoding, local I/O, and construction all run on that pool. The blocking job retains the

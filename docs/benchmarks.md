@@ -14555,3 +14555,143 @@ fixture was read-only and no bucket prefix was created.
 Reproduction: `crates/bf-engine/examples/conc_ab.py --config CONFIG --scratch .scratch/RUN
 --label L --builds '{"base":"<bin>","cand":"<bin>"}' --clients 16 --queries 400 --rounds 7 [--perf]`,
 and the paired `cold_ab.py` command above with `--s3-only-arm` for both arms.
+
+## Round GB1: build the warm graph 2.3 times cheaper and 5.8 times sooner
+
+The warm graph's build was most of the time to promotion: 1,229 s on 2 idle-priority threads for full NQ
+(1,259 s in Round G4). This round makes it **2.32 times less CPU at 2 threads** (2,454.7 to 1,057.2 CPU s) and
+**5.8 times faster wall** with the new default pool (1,229 to 212.8 s idle, 1,658.5 to 342.8 s under 16-client
+IVF load), at recall that is the same or slightly higher, and with foreground q/s and p99 within 1.5 percent of
+the old build's. It changes only construction and the pool size: the graph format, serving path, and
+calibration are untouched.
+
+**Setup:** one on-demand c7g.4xlarge (Graviton3, 16 vCPU, 32 GB, Ubuntu 24.04, ARM like the M4), release build.
+Rows arrive in slab and cluster order, as in the engine, from the retained v0.1.19 fixture
+(`tmp/nq-fixture-v019/`, read-only; slabs exported with `examples/g3/export_ivf.py`): 2,681,468 NQ rows,
+1,024-d f16 cosine, R32 graph. Recall is against the recorded exact top-100 truth for all 3,452 queries, with
+exact f16 rerank of 30 (k 10) or 200 (k 100) graph candidates. Build CPU is `getrusage` around
+`HotGraphBuilder::finish`; source decoding (41 s on one thread) is separate and unchanged. Harnesses:
+`crates/bf-vector/examples/gb1_bench.rs` (build, CPU, recall) and `gb1_load.rs` (foreground IVF clients while
+a build runs on an idle-priority pool). The baseline is `215eaa7`'s build, measured on the same host.
+
+### Profile of the old build (`gb1-profile`)
+
+perf at 499 Hz on the first 300,000 NQ rows at 2 threads (222.9 CPU s): **about 85 percent of CPU is
+`Scratch::search`**, 60 points of it in the SQ8 dot kernel stalled on code rows, 24 in the search loop itself.
+`prune` was about 8 percent (the retain loop 2.8, plus its dots) and heap pops 2. So Neon's hypothesis 2
+(return distances instead of recomputing them) could give at most 1.07 times alone. A search scores about
+1,222 nodes and expands 69 of them, and the dot over a random 1,024-byte row costs **133 ns even with
+prefetch, against 21 ns when cached** (micro-benchmark on the same host, and the same 8 GB/s per thread
+whether the prefetch runs 2 or 16 rows ahead, at L1 or L2, or the 128 MB array sits on transparent huge
+pages). The build is bound by random row reads from main memory, not by arithmetic or by prefetch distance.
+
+### What was kept
+
+| Step | CPU at 2 threads, 300K rows | Note |
+|---|---:|---|
+| Old build | 222.9 s | |
+| Same beam core as serving (`navigation.rs`: packed bitset, flat sorted beam), search scratch reused, distances carried from search into prune | 171.5 s (1.30 times) | hypotheses 1 and 2 |
+| Prefetch two rows versus 8 versus all, L1 versus L2 | 171 to 198 s | no gain, so none kept |
+| **One-bit Hamming steering, exact distances only for expanded nodes** | 88.8 s, then 68 s at beam 48 | the lever |
+
+Construction now keeps one sign bit per coordinate, after the rotation and centered on the corpus mean
+(128 bytes per row instead of 1,024; `warm_graph/binary.rs`, built in parallel in about 6 s and dropped before
+publication). Each insertion beam-searches by Hamming distance, then measures only the expanded nodes
+(about 70, versus about 1,222 scored) exactly with the SQ8 kernel, because the prune test needs true distances.
+The reservation adds the bit codes to the construction peak (`padded / 8` bytes per row); peak RSS did not
+move (3,832,908 versus 3,825,880 KiB) because the construction peak was the conversion to compact links.
+
+### Build cost, full NQ
+
+| Build | Threads | Wall, s | CPU, s |
+|---|---:|---:|---:|
+| Old | 2 | 1,229.2 | 2,454.7 |
+| **New (beam 64)** | 2 | **531.4** | **1,057.2** (2.32 times less) |
+| Old | 15 | 189.9 | 2,829.3 |
+| New | 15 | 74.9 and 74.9 | 1,102.2 and 1,102.6 (2.57 times less) |
+| **New, shipped pool** | 5 | **212.8** | 1,053.6 |
+
+Wall time at the shipped five threads is **5.8 times** the old two-thread build's. Against the old build at the
+same 15 threads it is 2.5 times, because the pass bar is CPU: 15 threads cost more CPU than 2 (memory pressure),
+for both builds. The new build's search is now 57 percent of samples, the exact distances 20, and the prune
+retain loop 7.
+
+### Recall
+
+Recall@10 (rerank 30) and recall@100 (rerank 200) of the finished graph, same beams. The old build's two runs
+(2 and 15 threads) differ by at most 0.001; the three new runs (2 threads, then 15 threads twice) are listed by
+difference from the old 2-thread run.
+
+| Beam | Old | New, 2 threads | New, 15 threads (two runs) |
+|---|---:|---:|---:|
+| k 10, ef 48 | 0.932155 | 0.933720 (+0.0016) | 0.930852, 0.930214 (-0.0013, -0.0019) |
+| k 10, ef 64 | 0.944699 | 0.947827 (+0.0031) | 0.945539, 0.945162 (+0.0008, +0.0005) |
+| k 10, ef 128 | 0.965324 | 0.967642 (+0.0023) | 0.965643, 0.966338 (+0.0003, +0.0010) |
+| k 10, ef 256 | 0.977375 | 0.980504 (+0.0031) | 0.977868, 0.978273 (+0.0005, +0.0009) |
+| k 100, ef 256 | 0.953702 | 0.956286 (+0.0026) | 0.955814, 0.955214 (+0.0021, +0.0015) |
+| k 100, ef 400 | 0.969041 | 0.970591 (+0.0016) | 0.970322, 0.970200 (+0.0013, +0.0012) |
+
+From ef 64 up, recall is the same or higher in all 15 comparisons (+0.0003 to +0.0031). At k 10 ef 48, the smallest beam measured, the two 15-thread builds are 0.0013 and 0.0019 lower: the new graph scores about 2
+percent more nodes per beam (1,293 versus 1,268), so it has not lost reach, but its curve sits slightly lower at the
+very smallest beam. Two builds of the same code differ by about 0.001 (parallel insertion order). The first full
+run, at beam 48, was 0.0025 lower at ef 64; the shipped beam 64 removes that.
+
+### Why beam 64, and what did not work
+
+| Variant, full NQ | Threads | CPU, s | Recall@10, ef 64 / 128 |
+|---|---:|---:|---:|
+| Old: exact steering, beam 64 | 15 | 2,829 | 0.9448 / 0.9647 |
+| Hamming, beam 40, plus the 32 closest scored nodes as extra candidates | 15 | 804 | 0.9414 / 0.9612 |
+| Hamming, beam 48 | 2 | 845 | 0.9422 / 0.9633 |
+| Hamming, beam 48, plus the 16, 32, or 64 closest scored nodes | 15 | 928, 925, 1,013 | 0.9425, 0.9434 to 0.9445, 0.9420 / 0.9625 to 0.9648 |
+| Hamming, beam 56 | 15 | 989 to 994 | 0.9444 to 0.9460 / 0.9651 to 0.9669 |
+| **Hamming, beam 64 (shipped)** | 15 | **1,102 to 1,107** | **0.9452 to 0.9482 / 0.9656 to 0.9687** |
+| Hamming, beam 80 | 15 | 1,341 | 0.9456 / 0.9670 |
+| Hamming, beam 48, then exact steering in pass 2 at beam 32 or 48 | 15 | 1,067, 1,312 | 0.9429, 0.9433 / 0.9629, 0.9617 |
+| Closest 48, 96, or 160 scored nodes as the only prune candidates (beam 48) | 15 | 820, 1,096, 1,411 | 0.9379, 0.9353, 0.9343 / 0.9600 |
+
+Beam 56 is 10 percent cheaper and within noise of the old recall. Beam 64 is the shipped choice because its
+recall is above the old build's at every beam from ef 64, and because a small test tier (2.3K rows, top-40
+exact identity with IVF) differed once in five runs at beam 56, and in none of the runs at beam 64. Beam 48
+costs 0.002 to 0.003 of recall. Replacing the expanded nodes by the closest scored ones as prune candidates loses
+the long-range path nodes that robust pruning needs, and recall falls as that list grows. Exact steering in pass 2
+costs more and does no better.
+
+### Pool size, and foreground interference
+
+The brief suggested cores minus one. That fails the foreground bar: the build is memory-bound, and each worker
+adds bandwidth pressure that idle scheduling (SCHED_IDLE, nice 19) cannot remove. 16 clients (one per
+thread, each sleeping as long as its query took, about half the cores) ran IVF 48-probe queries over all of NQ
+while a build ran on the idle-priority pool, whole build including source decoding:
+
+| Build threads | Build wall under load, s | Foreground q/s during | p99 during, us | p99 versus old build |
+|---|---:|---:|---:|---:|
+| none (alone) | | 2,664 to 2,691 | 3,365 to 3,406 | |
+| Old, 2 | 1,658.5 | 2,657.2 | 3,448 | |
+| 4 | 416.1 | 2,624.6 | 3,474 | +0.8% |
+| **5** | **342.8** | **2,616.4 (-1.5%)** | **3,498** | **+1.4%** |
+| 6 | 297.8 | 2,599.3 (-2.2%) | 3,585 | +4.0% |
+| 8 | 247.0 | 2,556.4 (-3.8%) | 5,109 | +48% |
+| 15 | 207.4 | 2,461.8 (-7.4%) | 6,178 | +79% |
+
+The pool is therefore **a third of the cores, between two and six**: five threads on this 16-core host (an
+8-core host stays at two). Under load the build finishes 4.8 times sooner than the old one, with q/s down 1.5
+percent and p99 up 1.4 percent from the old build's. The six-worker cap is where this host's p99 stayed within 5
+percent; larger hosts have not been measured. These are in-process IVF clients, not HTTP; the M4 and an HTTP gate
+are not repeated here.
+
+### Pass criteria
+
+| Criterion | Result |
+|---|---|
+| At least 1.8 times less build CPU at 2 threads | **2.32 times** (1,057.2 versus 2,454.7 s) |
+| At least 4 times faster wall on the 16-core host | **5.8 times idle** (212.8 versus 1,229.2 s at five threads), 4.8 times under load. At the same 15 threads, 2.5 times |
+| Recall within 0.001 at the calibrated beams | same or higher from ef 64 up (+0.0003 to +0.0031 in 15 of 15 comparisons); ef 48 is -0.0013 and -0.0019 in the two 15-thread builds |
+| Foreground within 5 percent of today's build | q/s -1.5 percent, p99 +1.4 percent at five threads |
+
+Resources: one on-demand c7g.4xlarge, 10:55 to 14:30 UTC (3.6 hours, about $2.1 compute). Instance, volume,
+key pair, and security group deleted and verified. The fixture was read-only, and no bucket prefix was created.
+
+Reproduction: `warm_graph_bench`-style export with `examples/g3/export_ivf.py`, then
+`gb1_bench NQ_DATA WORKERS 100000000 1 EXPORTED_IVF` for build and recall, and
+`gb1_load NQ_DATA EXPORTED_IVF BUILD_THREADS 16 1 48` for the foreground run.
