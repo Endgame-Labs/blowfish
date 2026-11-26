@@ -58,6 +58,19 @@ async fn main() {
                 wal.append(seq, &entry(seq, bytes)).await.unwrap();
             }
         }
+        "list" => {
+            // LIST latency: `tail_rss list URL NS REPS` lists the WAL prefix REPS times.
+            let reps: usize = a[4].parse().unwrap();
+            let wal = open(&a[2], &a[3]).await;
+            let mut ms = vec![];
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                wal.head().await.unwrap();
+                ms.push(t.elapsed().as_micros());
+            }
+            ms.sort();
+            println!("list_p50_us={} min_us={}", ms[ms.len() / 2], ms[0]);
+        }
         _ => {
             let max: u64 = a[4].parse().unwrap();
             let reps: usize = a[5].parse().unwrap();

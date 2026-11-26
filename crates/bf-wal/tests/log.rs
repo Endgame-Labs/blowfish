@@ -676,3 +676,282 @@ async fn tail_with_a_payload_over_the_budget_keeps_order() {
         vec![1, 2, 3, 4, 5]
     );
 }
+
+mod listing {
+    //! `tail` finds a long tail with one listing plus one read wave. The listing only guides the
+    //! reads: the conditional slot reads still decide where the tail ends.
+    use super::*;
+    use async_trait::async_trait;
+    use futures::stream::{self, BoxStream, StreamExt};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+        path::Path,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    type Hide = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+    type After = Box<dyn FnOnce() + Send>;
+
+    /// An in-memory store whose WAL listings can hide keys (a stale listing), fail, or run a
+    /// side effect after the listing was taken (a write racing the listing). Counts listings.
+    struct Listing {
+        inner: Arc<InMemory>,
+        lists: AtomicUsize,
+        hide: Mutex<Option<Hide>>,
+        fail: bool,
+        after: Mutex<Option<After>>,
+    }
+    impl std::fmt::Debug for Listing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("listing")
+        }
+    }
+    impl std::fmt::Display for Listing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("listing")
+        }
+    }
+    #[async_trait]
+    impl ObjectStore for Listing {
+        async fn put_opts(
+            &self,
+            p: &Path,
+            b: PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(p, b, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &Path,
+            o: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(p, o).await
+        }
+        async fn get_opts(&self, p: &Path, o: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            l: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(l)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let is_wal = p.is_some_and(|p| p.as_ref().ends_with("/wal"));
+            let (inner, prefix) = (self.inner.clone(), p.cloned());
+            let (fail, hide) = (self.fail && is_wal, self.hide.lock().unwrap().clone());
+            let after = if is_wal {
+                self.lists.fetch_add(1, Ordering::SeqCst);
+                self.after.lock().unwrap().take()
+            } else {
+                None
+            };
+            stream::once(async move {
+                if fail {
+                    return stream::iter(vec![Err(object_store::Error::Generic {
+                        store: "listing",
+                        source: "listing failed".into(),
+                    })])
+                    .boxed();
+                }
+                let mut all: Vec<_> = inner.list(prefix.as_ref()).collect().await;
+                if let (true, Some(h)) = (is_wal, hide) {
+                    all.retain(|m| !m.as_ref().is_ok_and(|m| h(m.location.as_ref())));
+                }
+                if let Some(after) = after {
+                    after();
+                }
+                stream::iter(all).boxed()
+            })
+            .flatten()
+            .boxed()
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+    }
+
+    struct Fixture {
+        inner: Arc<InMemory>,
+        backend: Arc<Listing>,
+        wal: Wal,
+    }
+
+    async fn fixture(fail: bool, hide: Option<Hide>) -> Fixture {
+        let inner = Arc::new(InMemory::new());
+        let backend = Arc::new(Listing {
+            inner: inner.clone(),
+            lists: AtomicUsize::new(0),
+            hide: Mutex::new(hide),
+            fail,
+            after: Mutex::new(None),
+        });
+        let store = Storage::from_backend(backend.clone(), Path::from(""), false, false)
+            .await
+            .unwrap();
+        let wal = Wal::new(store, "ns").unwrap();
+        Fixture {
+            inner,
+            backend,
+            wal,
+        }
+    }
+
+    async fn append(wal: &Wal, range: std::ops::RangeInclusive<u64>) {
+        for seq in range {
+            let entry = if seq % 3 == 0 {
+                external_entry(seq as usize)
+            } else {
+                document_entry(format!("{seq}-small"))
+            };
+            assert_eq!(
+                wal.append(seq, &entry).await.unwrap(),
+                CreateResult::Created
+            );
+        }
+    }
+
+    fn assert_contiguous(tail: &[(u64, WalEntry)], first: u64, last: u64) {
+        let seqs: Vec<u64> = tail.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, (first..=last).collect::<Vec<_>>());
+        for (seq, entry) in tail {
+            assert_eq!(tag_of(entry), *seq as usize);
+        }
+    }
+
+    fn slot_number(key: &str) -> u64 {
+        key.rsplit('/')
+            .next()
+            .and_then(|n| n.strip_suffix(".wal"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_long_tail_is_listed_once_and_a_tiny_one_not_at_all() {
+        let f = fixture(false, None).await;
+        append(&f.wal, 1..=40).await;
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 40);
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 1);
+        // A tail after slot 10 lists once; a tail of none or one slot never lists.
+        assert_contiguous(&f.wal.tail(10).await.unwrap(), 11, 40);
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 2);
+        assert_contiguous(&f.wal.tail(39).await.unwrap(), 40, 40);
+        assert!(f.wal.tail(40).await.unwrap().is_empty());
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 2);
+        // Two to five slots start a listing alongside the second wave, but the reads decide.
+        for after in [35, 36, 37, 38] {
+            assert_contiguous(&f.wal.tail(after).await.unwrap(), after + 1, 40);
+        }
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn an_empty_tail_never_lists() {
+        let f = fixture(false, None).await;
+        assert!(f.wal.tail(0).await.unwrap().is_empty());
+        append(&f.wal, 1..=1).await;
+        assert!(f.wal.tail(1).await.unwrap().is_empty());
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_gap_ends_the_tail_even_when_later_slots_are_listed() {
+        let f = fixture(false, None).await;
+        append(&f.wal, 1..=40).await;
+        f.inner
+            .delete(&Path::from(f.wal.key(20).as_str()))
+            .await
+            .unwrap();
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 19);
+        // A gap right after the second wave.
+        f.inner
+            .delete(&Path::from(f.wal.key(7).as_str()))
+            .await
+            .unwrap();
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 6);
+        // A gap on the very first slot.
+        f.inner
+            .delete(&Path::from(f.wal.key(1).as_str()))
+            .await
+            .unwrap();
+        assert!(f.wal.tail(0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_listing_missing_the_newest_slots_loses_nothing() {
+        let hide: Hide = Arc::new(|k| slot_number(k) > 33);
+        let f = fixture(false, Some(hide)).await;
+        append(&f.wal, 1..=40).await;
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 40);
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_listing_with_holes_or_nothing_loses_nothing() {
+        let hide: Hide = Arc::new(|k| slot_number(k).is_multiple_of(7));
+        let f = fixture(false, Some(hide)).await;
+        append(&f.wal, 1..=45).await;
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 45);
+        *f.backend.hide.lock().unwrap() = Some(Arc::new(|_| true));
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 45);
+        assert_contiguous(&f.wal.tail(5).await.unwrap(), 6, 45);
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_falls_back_to_probing() {
+        let f = fixture(true, None).await;
+        append(&f.wal, 1..=40).await;
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 40);
+        assert_eq!(f.backend.lists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn slots_appended_during_the_listing_are_read() {
+        let f = fixture(false, None).await;
+        append(&f.wal, 1..=40).await;
+        // The listing was taken with 40 slots; two more commit before the tail's reads finish.
+        let inner = f.inner.clone();
+        let late = {
+            let store = Storage::from_backend(
+                Arc::new(Listing {
+                    inner: inner.clone(),
+                    lists: AtomicUsize::new(0),
+                    hide: Mutex::new(None),
+                    fail: false,
+                    after: Mutex::new(None),
+                }),
+                Path::from(""),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            Wal::new(store, "ns").unwrap()
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *f.backend.after.lock().unwrap() = Some(Box::new(move || tx.send(()).unwrap()));
+        let tail = tokio::spawn({
+            let wal = f.wal.clone();
+            async move { wal.tail(0).await.unwrap() }
+        });
+        // Commit 41 and 42 as soon as the listing has been taken.
+        tokio::task::spawn_blocking(move || rx.recv().unwrap())
+            .await
+            .unwrap();
+        append(&late, 41..=42).await;
+        let tail = tail.await.unwrap();
+        // Whatever the interleaving, the replay is a gapless prefix that holds all 40 slots.
+        assert!(tail.len() >= 40 && tail.len() <= 42, "{}", tail.len());
+        assert_contiguous(&tail, 1, tail.len() as u64);
+        assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 42);
+    }
+}

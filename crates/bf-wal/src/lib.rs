@@ -787,6 +787,85 @@ impl Wal {
     pub async fn tail(&self, after: u64) -> Result<Vec<(u64, WalEntry)>, Error> {
         self.tail_bounded(after, u64::MAX).await
     }
+    /// Read the committed slot records after `after`, in order, stopping at the first missing slot.
+    ///
+    /// Slots are probed with conditional reads, which alone decide where the tail ends: a read
+    /// finding no object is the stop, whatever any listing says. A short tail costs at most a
+    /// couple of probe waves. When the first wave (2 slots) is full the tail is probably long, so the
+    /// prefix is also listed, concurrently with the second wave (4 slots, so a short tail pays no extra
+    /// round trip; a tail of none or one slot never lists). If the second wave is full too, every
+    /// listed slot of the contiguous run is read in one wave, plus the slot after it. A listing that is stale or missing the newest slots only makes that wave end early:
+    /// if its last read finds a slot, probing continues in growing waves exactly as without a
+    /// listing. A failed listing is ignored.
+    async fn scan_slots(&self, after: u64) -> Result<Vec<(u64, CommitRecord)>, Error> {
+        use futures::StreamExt;
+        let mut records = vec![];
+        let mut seq = after + 1;
+        let mut window = 2u64;
+        let mut listed = None;
+        'scan: loop {
+            let slots = seq..seq + window;
+            let found = if window == 4 && records.len() == 2 {
+                let prefix = format!("ns/{}/wal/", self.namespace);
+                let (found, listing) = futures::future::join(
+                    futures::future::try_join_all(slots.map(|s| self.record(s))),
+                    self.store.list_after(&prefix, &self.key(after)),
+                )
+                .await;
+                listed = listing.ok();
+                found?
+            } else {
+                futures::future::try_join_all(slots.map(|s| self.record(s))).await?
+            };
+            for record in found {
+                match record {
+                    Some(record) => {
+                        records.push((seq, record));
+                        seq += 1;
+                    }
+                    None => break 'scan,
+                }
+            }
+            if let Some(listing) = listed.take() {
+                // Keys sort by zero-padded sequence, so the contiguous run is a walk from `seq`.
+                let mut run_end = seq.saturating_sub(1);
+                for object in &listing {
+                    let listed_seq = object
+                        .key
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.strip_suffix(".wal"))
+                        .and_then(|n| n.parse::<u64>().ok());
+                    match listed_seq {
+                        Some(n) if n == run_end + 1 => run_end = n,
+                        Some(n) if n <= run_end => {}
+                        _ => break,
+                    }
+                }
+                // The run's slots, then one more: it confirms where the tail ends or, when the
+                // listing was stale, finds a slot the listing missed.
+                let slots = seq..=run_end + 1;
+                let found = futures::stream::iter(slots)
+                    .map(|s| self.record(s))
+                    .buffered(64)
+                    .collect::<Vec<_>>()
+                    .await;
+                for record in found {
+                    match record? {
+                        Some(record) => {
+                            records.push((seq, record));
+                            seq += 1;
+                        }
+                        None => break 'scan,
+                    }
+                }
+                window = 32;
+                continue;
+            }
+            window = (window * 2).min(32);
+        }
+        Ok(records)
+    }
     /// Replay at most `max_bytes` of decoded logical WAL entries. Atomic entries
     /// are never split; an entry that exceeds the remaining budget stays in the tail.
     pub async fn tail_bounded(
@@ -797,26 +876,8 @@ impl Wal {
         use futures::StreamExt;
         let mut previous_head = None;
         loop {
-            let mut records = vec![];
-            let mut seq = after + 1;
-            // Probe growing windows of consecutive slots concurrently: a cold reader with
-            // a tail of n entries needs about log2(n) round trips instead of n + 1.
-            let mut window = 2u64;
-            'scan: loop {
-                let found =
-                    futures::future::try_join_all((seq..seq + window).map(|s| self.record(s)))
-                        .await?;
-                for record in found {
-                    match record {
-                        Some(record) => {
-                            records.push((seq, record));
-                            seq += 1;
-                        }
-                        None => break 'scan,
-                    }
-                }
-                window = (window * 2).min(32);
-            }
+            let records = self.scan_slots(after).await?;
+            let seq = after + 1 + records.len() as u64;
             let start = records.iter().rposition(|(_, r)| r.tombstone).unwrap_or(0);
             let mut entries = vec![];
             let mut pruned = false;
