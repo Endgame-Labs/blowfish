@@ -1089,9 +1089,6 @@ impl Engine {
                 .await?;
             (state, response, execution, elapsed)
         };
-        if let Some(scope) = &graph_scope {
-            scope.record_cpu(cpu_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
-        }
         warm_graph::Cache::observe(
             self,
             ns,

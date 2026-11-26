@@ -199,7 +199,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     for _ in 0..128 {
         let scope = Scope::new(e.0.hot_graph.clone(), "hot").trial();
         *scope.used.lock().unwrap() = Some(vec![key.clone()]);
-        scope.record_cpu(0.001);
+        held.calibration.lock().unwrap().trial_ratio = 0.1;
         scope.record_ivf_cpu(0.01);
         scope.feedback(1., 1.);
     }
@@ -331,7 +331,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
             "discarded plans cannot calibrate recall"
         );
         assert_eq!(
-            calibration.graph_seconds, 0.,
+            calibration.graph_ratio, 0.,
             "discarded plans cannot calibrate CPU savings"
         );
     }
@@ -340,14 +340,13 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     let scope = Scope::new(e.0.hot_graph.clone(), "hot").trial();
     *scope.used.lock().unwrap() = Some(vec![delta_key.clone()]);
     scope.abandon();
-    scope.record_cpu(1.);
     scope.record_ivf_cpu(1.);
     scope.feedback(0., 1.);
     assert_eq!(
         delta.calibration.lock().unwrap().quality.len(),
         before_samples
     );
-    assert_eq!(delta.calibration.lock().unwrap().graph_seconds, 0.);
+    assert_eq!(delta.calibration.lock().unwrap().graph_ratio, 0.);
     drop(permit);
     e.0.hot_graph.entries.lock().unwrap().remove(&delta_key);
     drop(delta);
@@ -751,4 +750,36 @@ async fn unsupported_metric_and_precision_keep_identical_ivf_answers() {
         assert!(engine.shutdown(Duration::from_secs(5)).await);
         assert!(control.shutdown(Duration::from_secs(5)).await);
     }
+}
+
+#[test]
+fn saving_is_a_fraction_of_the_current_ivf_cost_so_a_top_k_change_cannot_flip_it() {
+    // Round G11: the graph stopped serving `top_k` 100 queries three minutes after a `top_k` 10
+    // soak, because graph CPU timed on `top_k` 100 queries was compared with a `top_k` 10 IVF
+    // baseline. A ratio measured on the same blocks as the IVF cost follows the baseline instead.
+    let c = Calibration {
+        quality: effort::Effort::new(),
+        trial_seconds: 0.,
+        trial_ratio: 0.,
+        usable: false,
+        graph_ratio: 0.2,
+        build_seconds: 1.,
+    };
+    assert!(
+        (c.saving(0.0017) - 0.00136).abs() < 1e-9,
+        "top_k 10 IVF baseline"
+    );
+    assert!(
+        (c.saving(0.0100) - 0.00800).abs() < 1e-9,
+        "top_k 100 IVF baseline"
+    );
+    let slower = Calibration {
+        graph_ratio: 1.3,
+        ..c
+    };
+    assert_eq!(
+        slower.saving(0.0017),
+        0.,
+        "a graph slower than IVF saves nothing"
+    );
 }

@@ -128,9 +128,21 @@ impl Drop for BuildSlot {
 struct Calibration {
     quality: effort::Effort,
     trial_seconds: f64,
+    /// Graph CPU as a fraction of warm IVF CPU over the same query blocks, at the trial effort.
+    trial_ratio: f64,
     usable: bool,
-    graph_seconds: f64,
+    /// The same fraction for the serving effort (0 until one is accepted). A ratio, not seconds:
+    /// graph CPU timed on ordinary queries (any `top_k`, under load) compared with IVF CPU timed on
+    /// calibration blocks (the sampled `top_k`, one query at a time) made a `top_k` 100 workload look
+    /// like a loss against a `top_k` 10 baseline, and the graph stopped serving.
+    graph_ratio: f64,
     build_seconds: f64,
+}
+impl Calibration {
+    /// CPU seconds a graph query saves against IVF, given the warm IVF cost.
+    fn saving(&self, ivf_seconds: f64) -> f64 {
+        (ivf_seconds * (1. - self.graph_ratio)).max(0.)
+    }
 }
 enum Locations {
     Dense(Vec<[u32; 3]>),
@@ -296,27 +308,6 @@ impl Scope {
     pub(crate) fn abandon(&self) {
         *self.used.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
-    pub(crate) fn record_cpu(&self, seconds: f64) {
-        let Some(used) = self.used.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
-            return;
-        };
-        let entries = self.cache.entries.lock().unwrap_or_else(|e| e.into_inner());
-        for key in used {
-            if let Some(entry) = entries.get(&key).and_then(|h| h.ready.as_ref()) {
-                let mut c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
-                let measured = if self.trial {
-                    &mut c.trial_seconds
-                } else {
-                    &mut c.graph_seconds
-                };
-                *measured = if *measured == 0. {
-                    seconds
-                } else {
-                    *measured * 0.8 + seconds * 0.2
-                };
-            }
-        }
-    }
     pub(crate) fn used_graph(&self) -> bool {
         self.used
             .lock()
@@ -367,14 +358,15 @@ impl Scope {
                 }
                 let update = c.quality.observe(recall, reference);
                 if update.accepted {
-                    c.graph_seconds = c.trial_seconds;
+                    c.graph_ratio = c.trial_ratio;
                 }
                 if update.changed {
                     c.trial_seconds = 0.;
+                    c.trial_ratio = 0.;
                 }
-                let saving = (h.ivf_seconds - c.graph_seconds).max(0.);
+                let saving = c.saving(h.ivf_seconds);
                 c.usable = c.quality.serving.is_some()
-                    && c.graph_seconds > 0.
+                    && c.graph_ratio > 0.
                     && h.rate_at(Instant::now()) * 86400. * saving >= 2. * c.build_seconds;
                 let reject = update.exhausted
                     || (c.quality.settled() && c.quality.len() >= 128 && !c.usable);
@@ -871,8 +863,9 @@ impl Engine {
             calibration: Mutex::new(Calibration {
                 quality: effort::Effort::new(),
                 trial_seconds: 0.,
+                trial_ratio: 0.,
                 usable: false,
-                graph_seconds: 0.,
+                graph_ratio: 0.,
                 // Include a conservative allowance for source metadata and CRC decoding.
                 build_seconds: (built.build_cpu + built.source_cpu) * 1.1,
             }),
@@ -1308,7 +1301,7 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let graphs=entries.iter().filter(|(k,_)|k.namespace==namespace).map(|(k,h)|{
-            let calibration=h.ready.as_ref().map(|e|{let c=e.calibration.lock().unwrap_or_else(|e|e.into_inner());serde_json::json!({"ef":c.quality.serving.unwrap_or(c.quality.trial),"trial_ef":c.quality.trial,"usable":c.usable,"samples":c.quality.len(),"paired_quality":c.quality.statistics(),"trial_cpu_seconds":c.trial_seconds,"build_cpu_seconds":e.measured_cpu_seconds,"build_wall_seconds":e.build_wall_seconds,"build_reservation_bytes":e.build_reservation_bytes,"reserved_bytes":e._reservation.0,"promotion_cpu_cost_seconds":c.build_seconds,"graph_cpu_seconds":c.graph_seconds,"resident_bytes":e.graph.resident_bytes(),"phase_searches":e.searches.load(Ordering::Relaxed),"phase_cpu_seconds":e.phase_cpu.iter().map(|v|v.load(Ordering::Relaxed) as f64/1e9).collect::<Vec<_>>()})});
+            let calibration=h.ready.as_ref().map(|e|{let c=e.calibration.lock().unwrap_or_else(|e|e.into_inner());serde_json::json!({"ef":c.quality.serving.unwrap_or(c.quality.trial),"trial_ef":c.quality.trial,"usable":c.usable,"samples":c.quality.len(),"paired_quality":c.quality.statistics(),"trial_cpu_seconds":c.trial_seconds,"build_cpu_seconds":e.measured_cpu_seconds,"build_wall_seconds":e.build_wall_seconds,"build_reservation_bytes":e.build_reservation_bytes,"reserved_bytes":e._reservation.0,"promotion_cpu_cost_seconds":c.build_seconds,"graph_cost_ratio":c.graph_ratio,"resident_bytes":e.graph.resident_bytes(),"phase_searches":e.searches.load(Ordering::Relaxed),"phase_cpu_seconds":e.phase_cpu.iter().map(|v|v.load(Ordering::Relaxed) as f64/1e9).collect::<Vec<_>>()})});
             serde_json::json!({"attribute":k.attribute,"building":h.building.is_some(),"calibration":calibration,"heat_seconds":h.first.elapsed().as_secs_f64(),"query_rate":h.rate_at(Instant::now()),"ivf_cpu_seconds":h.ivf_seconds,"retry_seconds":h.retry.saturating_duration_since(Instant::now()).as_secs_f64()})
         }).collect::<Vec<_>>();
         serde_json::json!({"graphs":graphs,"answered":self.0.hot_graph.answers.load(Ordering::Relaxed),"process_reserved_bytes":RESERVED.load(Ordering::Relaxed)})
@@ -1376,7 +1369,7 @@ fn trim() {
         for (key, heat) in entries.iter() {
             let benefit = heat.ready.as_ref().map_or(0., |entry| {
                 let c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
-                heat.rate_at(Instant::now()) * (heat.ivf_seconds - c.graph_seconds).max(0.)
+                heat.rate_at(Instant::now()) * c.saving(heat.ivf_seconds)
                     / entry._reservation.0.max(1) as f64
             });
             choices.push((benefit, key.clone(), cache.clone()));
@@ -1430,10 +1423,10 @@ fn make_room(bytes: u64, benefit_per_byte: f64) {
                 && e.installed_at.elapsed() >= Duration::from_secs(600)
             {
                 let c = e.calibration.lock().unwrap_or_else(|e| e.into_inner());
-                let saving = if c.graph_seconds == 0. {
+                let saving = if c.graph_ratio == 0. {
                     h.ivf_seconds * 0.5
                 } else {
-                    (h.ivf_seconds - c.graph_seconds).max(0.)
+                    c.saving(h.ivf_seconds)
                 };
                 let old = h.rate_at(Instant::now()) * saving / e._reservation.0.max(1) as f64;
                 if benefit_per_byte > old * 2. {

@@ -141,6 +141,14 @@ pub(crate) async fn measure(
         } else {
             c.trial_seconds * 0.8 + seconds * 0.2
         };
+        if ivf_cpu > 0. {
+            let ratio = graph_cpu / ivf_cpu;
+            c.trial_ratio = if c.trial_ratio == 0. {
+                ratio
+            } else {
+                c.trial_ratio * 0.8 + ratio * 0.2
+            };
+        }
     }
     scope.record_ivf_cpu(ivf_cpu / batch.len() as f64);
 }

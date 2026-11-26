@@ -223,8 +223,9 @@ async fn same_graph_navigation_cpu() {
         calibration: Mutex::new(Calibration {
             quality,
             trial_seconds: 0.,
+            trial_ratio: 0.,
             usable: false,
-            graph_seconds: 0.,
+            graph_ratio: 0.,
             build_seconds: 0.,
         }),
         _reservation: reservation,
