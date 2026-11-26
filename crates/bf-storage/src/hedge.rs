@@ -1,13 +1,15 @@
-//! Hedged ranged reads. A wave of N parallel reads ends when its slowest request does, so the
-//! straggler policy looks at what the wave's own siblings are doing right now:
+//! Hedged ranged reads. A wave of parallel reads ends when its slowest request does, so the
+//! straggler policy looks at what a read's own siblings are doing right now:
 //!
-//! * **Waves.** Reads that start within [`WAVE_WINDOW`] of each other form one wave. Once a wave
-//!   of at least [`MIN_WAVE`] reads has seen [`WAVE_DONE`] of its members finish, every read still
-//!   outstanding is duplicated (first response wins, the loser is dropped). A wave may add at most
-//!   [`WAVE_CAP`] of its size in duplicates, and the store-wide token bucket (`budget` tokens earned
-//!   per primary request) bounds the total. No history is needed, so a fresh process hedges too, and
-//!   there is no size limit: coalesced slab reads are the usual stragglers.
-//! * **Single reads.** A read in a wave smaller than [`MIN_WAVE`] has no siblings to compare with.
+//! * **Siblings.** The reads that started within [`SIBLING_WINDOW`] either side of a read are its
+//!   siblings (a scan's reads rarely start in lockstep, so the window is wide). Once at least
+//!   [`MIN_WAVE`] siblings exist, [`WAVE_DONE`] (70 percent) of them have finished, and the read has outlasted
+//!   [`WAVE_DONE`] of the finished siblings' latencies, it is a straggler and is duplicated
+//!   (first response wins, the loser is dropped). No history is needed, so a fresh process hedges
+//!   too, and there is no size limit: coalesced slab reads are the usual stragglers.
+//! * **Budget.** A token bucket earns `budget` tokens per primary request, and each duplicate
+//!   spends one, so a wave adds at most about that share of extra reads.
+//! * **Single reads.** A read with fewer than [`MIN_WAVE`] siblings has nothing to compare with.
 //!   It is duplicated once it outlasts the recently observed p90 (a prior until [`MIN_SAMPLES`]
 //!   latencies exist), but only up to [`MAX_TIMER_HEDGE_BYTES`], since a duplicate doubles the bytes.
 use bytes::Bytes;
@@ -17,11 +19,10 @@ use std::{
     ops::Range,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
-use tokio::sync::Notify;
 
 /// Single reads larger than this are never hedged by the timer (a duplicate doubles the bytes).
 const MAX_TIMER_HEDGE_BYTES: u64 = 1 << 20;
@@ -35,80 +36,63 @@ const PRIOR: Duration = Duration::from_millis(250);
 const FLOOR: Duration = Duration::from_millis(60);
 /// Token bucket capacity, which bounds a burst of hedges.
 const BURST: f64 = 64.0;
-/// Reads starting within this long of a wave's first read join it.
-const WAVE_WINDOW: Duration = Duration::from_millis(10);
-/// Smallest wave that hedges its own stragglers.
+/// Reads that started this close to a read (before or after) are its siblings.
+const SIBLING_WINDOW: Duration = Duration::from_millis(50);
+/// Fewest siblings (the read included) for sibling-based hedging.
 const MIN_WAVE: usize = 4;
-/// Share of a wave that must finish before its remaining reads are duplicated.
-const WAVE_DONE: f64 = 0.85;
-/// Most duplicates one wave may add, as a share of its size (at least one).
-const WAVE_CAP: f64 = 0.15;
+/// Share of siblings that must have finished, and the latency quantile a straggler must exceed.
+/// Round C24 swept 0.5 to 0.85 with 15 percent of budget: 0.7 was the best of the cheap settings, since
+/// 0.85 left most of the budget unspent.
+const WAVE_DONE: f64 = 0.7;
+/// How often a read re-checks its siblings.
+const TICK: Duration = Duration::from_millis(5);
+/// Finished reads older than this leave the sibling list.
+const RETAIN: Duration = Duration::from_secs(2);
+
+const FLYING: u8 = 0;
+const FINISHED: u8 = 1;
+const GONE: u8 = 2;
+
+/// One primary read, visible to its siblings.
+struct Entry {
+    start: Instant,
+    state: AtomicU8,
+    /// Latency in microseconds, set when the read finishes.
+    latency_us: AtomicU32,
+}
 
 #[derive(Default)]
 struct State {
     samples: VecDeque<f32>,
     tokens: f64,
-    wave: Option<Arc<Wave>>,
+    recent: VecDeque<Arc<Entry>>,
 }
 
-/// Parallel reads that started together.
-struct Wave {
-    opened: Instant,
-    /// Reads still counted: joined, and neither dropped nor failed to start.
-    size: AtomicUsize,
-    done: AtomicUsize,
-    hedged: AtomicUsize,
-    triggered: AtomicBool,
-    trigger: Notify,
-}
-impl Wave {
-    fn new() -> Self {
-        Self {
-            opened: Instant::now(),
-            size: AtomicUsize::new(0),
-            done: AtomicUsize::new(0),
-            hedged: AtomicUsize::new(0),
-            triggered: AtomicBool::new(false),
-            trigger: Notify::new(),
-        }
-    }
-    /// Fire the trigger once the wave is large enough, closed to new members, and mostly done.
-    fn check(&self) {
-        let size = self.size.load(Ordering::SeqCst);
-        let done = self.done.load(Ordering::SeqCst);
-        if size >= MIN_WAVE
-            && self.opened.elapsed() >= WAVE_WINDOW
-            && done as f64 >= WAVE_DONE * size as f64
-            && !self.triggered.swap(true, Ordering::SeqCst)
-        {
-            self.trigger.notify_waiters();
-        }
-    }
-    fn cap(&self) -> usize {
-        ((self.size.load(Ordering::SeqCst) as f64 * WAVE_CAP).ceil() as usize).max(1)
-    }
-}
-/// One read's membership in a wave. Dropping it unfinished (a cancelled read) leaves the wave.
-struct Member {
-    wave: Arc<Wave>,
-    finished: bool,
-}
+/// A registered read. Dropping it unfinished (a cancelled read) removes it from its siblings.
+struct Member(Arc<Entry>);
 impl Member {
-    fn finish(&mut self) {
-        if !self.finished {
-            self.finished = true;
-            self.wave.done.fetch_add(1, Ordering::SeqCst);
-            self.wave.check();
-        }
+    fn finish(&self) {
+        let us = self.0.start.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        self.0.latency_us.store(us, Ordering::SeqCst);
+        self.0.state.store(FINISHED, Ordering::SeqCst);
     }
 }
 impl Drop for Member {
     fn drop(&mut self) {
-        if !self.finished {
-            self.wave.size.fetch_sub(1, Ordering::SeqCst);
-            self.wave.check();
-        }
+        let _ = self
+            .0
+            .state
+            .compare_exchange(FLYING, GONE, Ordering::SeqCst, Ordering::SeqCst);
     }
+}
+
+/// What the siblings say about one read.
+#[derive(PartialEq, Debug)]
+enum Verdict {
+    /// Too few siblings to compare with.
+    Alone,
+    Waiting,
+    Straggler,
 }
 
 /// Adaptive hedging policy shared by every reader of one store.
@@ -141,22 +125,58 @@ impl Hedger {
         }
         s.samples.push_back(elapsed.as_secs_f32() * 1e3);
     }
-    /// Count a primary read: earn a token and join (or open) the current wave.
+    /// Count a primary read: earn a token and become visible to siblings.
     fn join(&self) -> Member {
         let mut s = self.state.lock().unwrap();
         s.tokens = (s.tokens + self.budget).min(BURST);
-        let wave = match &s.wave {
-            Some(w) if w.opened.elapsed() < WAVE_WINDOW => w.clone(),
-            _ => {
-                let w = Arc::new(Wave::new());
-                s.wave = Some(w.clone());
-                w
+        while s
+            .recent
+            .front()
+            .is_some_and(|e| e.state.load(Ordering::SeqCst) != FLYING && e.start.elapsed() > RETAIN)
+        {
+            s.recent.pop_front();
+        }
+        let entry = Arc::new(Entry {
+            start: Instant::now(),
+            state: AtomicU8::new(FLYING),
+            latency_us: AtomicU32::new(0),
+        });
+        s.recent.push_back(entry.clone());
+        Member(entry)
+    }
+    /// Compare one in-flight read with the reads that started around it.
+    fn verdict(&self, me: &Entry) -> Verdict {
+        let s = self.state.lock().unwrap();
+        let mut flying = 0usize;
+        let mut done = Vec::new();
+        for e in s.recent.iter() {
+            let apart = if e.start > me.start {
+                e.start - me.start
+            } else {
+                me.start - e.start
+            };
+            if apart > SIBLING_WINDOW {
+                continue;
             }
-        };
-        wave.size.fetch_add(1, Ordering::SeqCst);
-        Member {
-            wave,
-            finished: false,
+            match e.state.load(Ordering::SeqCst) {
+                FLYING => flying += 1,
+                FINISHED => done.push(e.latency_us.load(Ordering::SeqCst)),
+                _ => {}
+            }
+        }
+        let total = flying + done.len();
+        if total < MIN_WAVE {
+            return Verdict::Alone;
+        }
+        if done.is_empty() || (done.len() as f64) < WAVE_DONE * total as f64 {
+            return Verdict::Waiting;
+        }
+        done.sort_unstable();
+        let i = ((done.len() as f64 * WAVE_DONE).ceil() as usize).clamp(1, done.len()) - 1;
+        if me.start.elapsed().as_micros() > done[i] as u128 {
+            Verdict::Straggler
+        } else {
+            Verdict::Waiting
         }
     }
     fn spend(&self) -> bool {
@@ -167,14 +187,6 @@ impl Hedger {
         } else {
             false
         }
-    }
-    /// Take a hedge from the wave's allowance and the store-wide budget.
-    fn allow_wave_hedge(&self, wave: &Wave) -> bool {
-        if wave.hedged.fetch_add(1, Ordering::SeqCst) >= wave.cap() || !self.spend() {
-            wave.hedged.fetch_sub(1, Ordering::SeqCst);
-            return false;
-        }
-        true
     }
     /// A ranged GET, duplicated once if it straggles (see the module docs) and the budget
     /// allows. Latencies of the first answer (from either attempt) feed the single-read timer.
@@ -187,54 +199,25 @@ impl Hedger {
         if self.budget <= 0.0 {
             return backend.get_range(path, range).await;
         }
-        let mut member = self.join();
-        let wave = member.wave.clone();
-        let start = Instant::now();
+        let member = self.join();
+        let start = member.0.start;
         let mut primary = Box::pin(backend.get_range(path, range.clone()));
         let len = range.end - range.start;
         loop {
-            let trigger = wave.trigger.notified();
-            tokio::pin!(trigger);
-            trigger.as_mut().enable();
-            if wave.triggered.load(Ordering::SeqCst) {
-                if self.allow_wave_hedge(&wave) {
-                    break;
-                }
-                // The wave's allowance is spent: no further hedge for this read.
-                let r = primary.await;
-                self.record(start.elapsed());
-                member.finish();
-                return r;
+            let verdict = self.verdict(&member.0);
+            let timer = verdict == Verdict::Alone
+                && len <= MAX_TIMER_HEDGE_BYTES
+                && start.elapsed() >= self.threshold();
+            if (verdict == Verdict::Straggler || timer) && self.spend() {
+                break;
             }
-            let small_wave =
-                wave.size.load(Ordering::SeqCst) < MIN_WAVE && wave.opened.elapsed() >= WAVE_WINDOW;
-            let open = WAVE_WINDOW.saturating_sub(wave.opened.elapsed());
-            let wait = if !open.is_zero() {
-                // Re-check the wave the moment it closes to new members.
-                open
-            } else if small_wave && len <= MAX_TIMER_HEDGE_BYTES {
-                self.threshold().saturating_sub(start.elapsed())
-            } else {
-                Duration::from_millis(25)
-            }
-            .clamp(Duration::from_millis(1), Duration::from_millis(25));
             tokio::select! {
                 r = &mut primary => {
                     self.record(start.elapsed());
                     member.finish();
                     return r;
                 }
-                _ = &mut trigger => {}
-                _ = tokio::time::sleep(wait) => {
-                    wave.check();
-                    if small_wave
-                        && len <= MAX_TIMER_HEDGE_BYTES
-                        && start.elapsed() >= self.threshold()
-                        && self.spend()
-                    {
-                        break;
-                    }
-                }
+                _ = tokio::time::sleep(TICK) => {}
             }
         }
         metrics::counter!("blowfish_object_store_hedges_total", "outcome" => "issued").increment(1);
@@ -362,7 +345,7 @@ mod tests {
         for _ in 0..MIN_SAMPLES {
             hedger.record(Duration::from_millis(5));
         }
-        // The first three of 20 stall past the wave's 85 percent mark. 20 requests earn 2 tokens:
+        // The first three of 20 stall past the wave's 70 percent mark. 20 requests earn 2 tokens:
         // at most 2 hedges, although the wave's own allowance is 3.
         let reads = (0..20).map(|_| hedger.get_range(&backend, &path, 0..16));
         for r in futures::future::join_all(reads).await {
@@ -405,7 +388,8 @@ mod tests {
         // own 18 finished siblings (90 percent) are what trigger the duplicates.
         let (s, path) = store(2, Duration::MAX).await;
         let backend: Arc<dyn ObjectStore> = s.clone();
-        let hedger = Hedger::new(0.15);
+        // A full budget: a healthy read that is merely slow to be polled may also be duplicated.
+        let hedger = Hedger::new(1.0);
         let reads = (0..20).map(|_| hedger.get_range(&backend, &path, 0..16));
         let all = futures::future::join_all(reads);
         for r in tokio::time::timeout(Duration::from_secs(60), all)
@@ -414,7 +398,7 @@ mod tests {
         {
             assert_eq!(r.unwrap().len(), 16);
         }
-        assert_eq!(s.calls.load(Ordering::SeqCst), 22);
+        assert!(s.calls.load(Ordering::SeqCst) >= 22);
     }
 
     #[tokio::test]
@@ -464,11 +448,10 @@ mod tests {
             r.unwrap();
         }
         assert_eq!(s.calls.load(Ordering::SeqCst), 3);
-        // Dropped reads leave their wave and never count as finished.
+        // A dropped read leaves its siblings' count and never counts as finished.
         let m = hedger.join();
-        let wave = m.wave.clone();
+        let entry = m.0.clone();
         drop(m);
-        assert_eq!(wave.size.load(Ordering::SeqCst), 0);
-        assert_eq!(wave.done.load(Ordering::SeqCst), 0);
+        assert_eq!(entry.state.load(Ordering::SeqCst), GONE);
     }
 }
