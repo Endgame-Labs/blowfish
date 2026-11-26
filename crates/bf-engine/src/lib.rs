@@ -489,9 +489,10 @@ impl Drop for Sampling {
                 *exhaustive = paced.max(self.started + self.interval);
                 now
             }
-            // Nothing to compare cheaply and the exhaustive clock was not ready: try again
-            // when it is.
-            SampleKind::Skipped => paced.max(*exhaustive),
+            // Nothing to compare cheaply and the exhaustive clock was not ready. Retry soon, not
+            // when that clock opens: a graph may arrive meanwhile, and its cheap samples must not
+            // wait behind a long exhaustive wait. The retry costs one ANN query a second.
+            SampleKind::Skipped => paced.max(now + std::time::Duration::from_secs(1)),
         };
         drop(exhaustive);
         *self.not_before.lock().unwrap_or_else(|e| e.into_inner()) = next;
@@ -2307,7 +2308,7 @@ mod recall_sampler_tests {
     }
 
     #[test]
-    fn a_sample_that_compared_nothing_waits_for_the_exhaustive_clock() {
+    fn a_sample_that_compared_nothing_retries_soon_and_never_parks_behind_the_exhaustive_clock() {
         let sampler = RecallSampler::new(Duration::ZERO);
         let mut first = sampler.start(Duration::from_secs(3600)).expect("starts");
         assert!(first.try_exhaustive());

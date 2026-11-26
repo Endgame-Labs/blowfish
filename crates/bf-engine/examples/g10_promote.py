@@ -119,12 +119,14 @@ try:
         heater.wait(timeout=20)
         heater = None
         time.sleep(2)
+        (run / f"{label}-status-before.json").write_text(json.dumps(status()))
         for k in ks:
             e = dict(os.environ, G3_CLIENT_PROCESSES="16", G3_CLIENT_THREADS="1", G8_K=k)
             subprocess.run(["uv", "run", "--python", "3.12", "--no-project", "--with", "numpy", "python",
                             str(here / "g8_http.py"), str(run / "fixture/data"), "bf", "18443", "0",
                             os.environ.get("G8_REPEATS", "2"), str(run / f"{label}-graph-k{k}"),
                             str(server.pid)], env=e, check=True)
+            (run / f"{label}-status-after-k{k}.json").write_text(json.dumps(status()))
 finally:
     for p in (heater, server):
         if p and p.poll() is None:
