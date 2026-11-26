@@ -14456,7 +14456,7 @@ shows the extra samples in the network path (kernel copy to user, TLS decryption
 polling, the shared-read futures), which tracks the +5.2 hedges and +3.1 attempted GETs per query
 (the losing duplicate downloads some bytes before it is dropped). The adaptive wait recovered about
 7 ms of the 33 ms the 5 ms tick had added. The hedge budget is the lever if this cost matters:
-`hedge_budget` 0.10 spends fewer duplicates for a smaller p90 gain.
+a lower `hedge_budget` spends fewer duplicates (not measured here).
 
 **Single client, eight paired process pairs** (200 queries per pair, alternating order, IDs-only and
 `title`/`text` projections with independent cache drops, 1,600 samples per build and projection,
