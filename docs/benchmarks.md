@@ -12994,7 +12994,7 @@ unfiltered top 64, which is the condition that at least 10 of the 64 match.
 - **Cost:** one c7g.4xlarge for about 45 minutes, an estimated under $0.60 with the volume. The instance, key pair, and security group are
   deleted, and no S3 prefix was written.
 
-## Round WC1: a top-100 pass no longer leaves warm vector queries twice as slow
+## Rounds WC1 and WC2: a top-100 pass no longer leaves warm vector queries twice as slow
 
 Round I3 found that the protocol's 3,452-query `top_k` 100 pass leaves later warm `top_k` 10 queries at about half
 speed, and that only about half of a fresh server's queries stayed on the compiled path. I suspected the warm tier's
@@ -13029,44 +13029,76 @@ New counters (`/metrics`): `blowfish_warm_exact_lookups_total{result}`, `blowfis
   that it is compiled. A fresh server fell back on exactly 2,000 queries in all, those 1,000 and the 1,000 warm-up ones,
   and then on none across the 4-client and 16-client passes. So the 999 of 2,000 figure is the learning pass, not a defect.
 
-### Fix
+### Fix (WC1) and why it changed (WC2)
 
-A sparse tier (one whose exact rows cannot all be resident) now keeps two caches. Rows recorded by queries asking for
-at most 10 results go to the ordinary cache, as before. Rows recorded by queries asking for more go to a **bulk
-cache** of a quarter of its size, charged to the tier's reservation, so a pass of large `top_k` queries churns the bulk
-cache and never evicts what keeps ordinary queries compiled. Lookups check both. A tier that holds every row keeps one
-cache, as before. No setting, no format change, and the results are unchanged (the same rows, from the same checksummed
-reads).
+WC1 gave a sparse tier (one whose exact rows cannot all be resident) a second, quarter-size cache for queries
+asking for more than 10 results, charged on top of the reservation. It fixed the pass, but review found two problems.
+An application whose queries all ask for 20, 50, or 100 results would send every row to the quarter-size cache and
+lose three quarters of its warm path, and a sparse tier reserved 25% more memory than before.
 
-### Results
+WC2 replaces it with **one byte budget, the same one as before, shared by two kinds of reader**. There is no setting
+and no format change.
 
-p50 is the 1-client latency pass; q/s is 16 clients, first and repeat passes. Paired runs on the same host and store.
+- **Ordinary readers** record into the ordinary cache and may take any of the budget.
+- **Bulk readers** record into a second cache only while the two caches together are under the budget, so a pass of
+  bulk queries fills free space and never evicts what ordinary queries keep resident. When an ordinary insert pushes
+  the total over the budget, the room comes out of the bulk cache first.
+- A query is a **bulk reader** when it asks for at least 4 times the median `top_k` of the tier's last 64 queries, or
+  when its shortlist (about `top_k` x 8 exact rows) would fill more than 1/512 of the budget (about `top_k` 47 and up
+  on this fixture). A workload that is uniform at a smaller `top_k` is never bulk and has the whole budget, as on main.
+  A workload that is uniform and bulk has the whole budget too, because nothing else competes for it.
+- **Memory:** the reservation is the code bytes plus the vector budget, as on main. The bulk cache is carved out of
+  that budget, so a sparse tier reserves nothing extra.
 
-| Run | p50 ms | 16 clients q/s |
-| --- | ---: | ---: |
-| main, fresh server (1st, 2nd run) | 4.2, 4.0 | 1,110 and 1,105; 1,161 and 1,152 |
-| main, after the top-100 pass (1st, 2nd run) | **7.7**, 7.8 | **592 and 593**; 601 and 600 |
-| fix, fresh server | 4.0 | 1,108 and 1,059 |
-| fix, after the top-100 pass (1st, 2nd run) | 4.1, 4.2 | **1,148 and 1,142**; 1,146 and 1,112 |
+### Results (WC2)
 
-- After the top-100 pass, the fix serves 1,112 to 1,148 q/s against main's 592 to 601 (1.9x), at p50 4.1 to 4.2 ms
-  against 7.7 to 7.8. Against main's fresh-server rate of 1,105 to 1,161, that is within 4% on throughput and 5% on p50.
-- Compiled queries after the pass: the fix falls back on 1,957 queries across the main and repeat passes (the first-seen
-  ones, as on a fresh server), where main falls back on over 80% of them.
-- Fresh server, fix against main: p50 4.0 against 4.0 to 4.2, and 1,059 to 1,108 against 1,105 to 1,161 q/s. The runs
-  vary by about 5% between repeats, so I read this as no regression, but I did not run enough pairs to resolve a 2%
-  difference.
-- **Identical results:** the top 10 ids of the first 2,000 queries are the same in the six runs I compared, main and fix, fresh and after the pass (0 differences).
+The same c7i.2xlarge protocol as WC1, with main (v0.1.42, 0b2ea46) and this branch built on the host and run in
+pairs, twice each (20 runs). p50 and p90 are the 1-client latency pass (1,000 warm-up queries, then 1,000 timed);
+q/s is the second 16-client pass over the first 2,000 queries (the first pass includes first-seen queries). Each run
+starts a fresh server on the same store with the OS cache dropped. Cells show the two repetitions.
+
+| Workload | Binary | p50 ms | p90 ms | 16 clients q/s |
+| --- | --- | ---: | ---: | ---: |
+| (a) top-100 pass, then top_k 10 | main | 6.7, 6.8 | 7.7, 7.8 | 666, 672 |
+| | this branch | **3.5, 3.8** | 3.9, 4.1 | **1,279, 1,260** |
+| fresh server, top_k 10 | main | 3.6, 3.4 | 3.8, 3.6 | 1,307, 1,220 |
+| | this branch | 3.5, 3.9 | 3.6, 4.1 | 1,239, 1,253 |
+| (b) fresh, pure top_k 20 | main | 4.5, 4.6 | 4.8, 4.9 | 1,053, 1,046 |
+| | this branch | 4.4, 4.4 | 4.9, 4.8 | 1,006, 1,005 |
+| (c) fresh, pure top_k 100 | main | 10.1, 10.3 | 14.2, 14.4 | 405, 404 |
+| | this branch | **8.6, 8.5** | 10.0, 10.0 | **535, 541** |
+| (d) fresh, 90% top_k 10 and 10% top_k 100 | main | 3.7, 3.8 | 4.7, 4.4 | 1,128, 1,133 |
+| | this branch | 3.8, 3.8 | 4.7, 5.1 | 1,149, 1,119 |
+
+- **(a)** After the top-100 pass, this branch serves 1,260 to 1,279 q/s at p50 3.5 to 3.8 ms, within 4% of main's
+  fresh server (1,220 to 1,307 q/s), where main serves 666 to 672. WC1's fixed split reached the same place.
+- **(b)** Pure top_k 20 is equal on latency (p50 4.4 against 4.5 to 4.6) and 4% lower on throughput in both pairs
+  (1,005 to 1,006 against 1,046 to 1,053). Main alone varies by 7% between repeats of the fresh top_k 10 run (1,307 and
+  1,220), so I read this as inside the noise but did not resolve it. A pure top_k 20 workload is never bulk, so it
+  takes the same ordinary path as main. One cost I know of and did not remove: every query copies the last 64 `top_k`
+  values to find the median, once per segment, and it allocates.
+- **(c)** Pure top_k 100 is better than main, 1.3x on throughput and 15% on p50, because it fills the free budget once
+  and stops churning it. The warm counters show 0 evictions at 185,770 entries, 413,152,480 of 413,153,216 bytes.
+- **(d)** The mixed stream is equal to main.
+- **Identical results:** the top 10 ids of the first 2,000 queries hash to the same value in all 20 runs (0
+  differences, any binary, any `top_k` of 10, 20, or 100).
+- **Memory:** the reservation is identical to main's. Peak RSS is equal to main in the fresh runs (2.44 GB, 3.12 GB,
+  5.03 GB, and 3.12 GB for this branch against 2.44 to 2.51, 3.12, 5.06, and 3.15 to 3.29) but **0.8% (about 50 MB)
+  higher after the pass** (5.78 GB against 5.73 GB, in both repeats). In that case this branch serves compiled queries
+  where main falls back to the cold path; I did not isolate what the extra 50 MB is.
 
 ### Not done
 
 - **Fetching only the missing exact rows.** A compiled query that misses one exact row still falls back to the whole
   planner. Fetching just the missing rows needs `CompiledTier::try_search` (in `bf-vector`) to return the missing
   candidates' slab, cluster, and ordinal, and an async reader for the slab's vectors inside the compiled branch. Both are
-  outside `bf-engine`, so I did not build them; with the bulk cache in place the remaining misses are first-seen
+  outside `bf-engine`, so I did not build them; with the bulk split in place the remaining misses are first-seen
   queries, which need the I/O anyway.
-- A unit test for the split: at the fixture's size the window in which a tier is admitted and still sparse is so narrow
-  that the test's own queries evict the tier. The end-to-end measurement above is the proof.
+- **A test of the budget sharing end to end.** Unit tests cover the classification (uniform at any `top_k` is never
+  bulk, a pass of very large queries is, a rare large query in an ordinary stream is). At the fixture's size the window in
+  which a tier is admitted and still sparse is so narrow that a test's own queries evict the tier, so the sharing is
+  proved by the measurement above.
 
-Cost: one c7i.2xlarge for about 55 minutes, an estimated $0.45 with the 120 GB volume. The instance, key pair, and
-security group are deleted, and no S3 prefix was written.
+Costs: WC1 used one c7i.2xlarge for about 55 minutes, an estimated $0.45 with the 120 GB volume. WC2 used one for
+about 1 hour 25 minutes, an estimated $0.55. The instances, key pairs, and security groups are deleted, and no S3
+prefix was written.
