@@ -66,6 +66,10 @@ impl HotGraph {
         }
         vamana::reservation(rows as u64, dims.next_power_of_two() as u64, workers as u64)
     }
+    /// `bytes` plus the one stated safety margin (1/16) every graph reservation carries.
+    pub fn with_margin(bytes: u64) -> u64 {
+        vamana::with_margin(bytes)
+    }
     /// Number of source rows still eligible in the supplied tier mask.
     pub fn live_count(&self, mask: &RoaringBitmap) -> usize {
         self.rows.iter().filter(|row| mask.contains(**row)).count()

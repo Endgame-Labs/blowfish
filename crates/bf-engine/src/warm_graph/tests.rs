@@ -809,3 +809,50 @@ fn saving_is_a_fraction_of_the_current_ivf_cost_so_a_top_k_change_cannot_flip_it
         "a graph slower than IVF saves nothing"
     );
 }
+#[test]
+fn headroom_counts_anonymous_memory_but_not_reclaimable_page_cache() {
+    let stat = "anon 1000\nfile 5000\ninactive_file 3000\nactive_file 1500\nshmem 10\n";
+    // A cgroup of 10,000 bytes charged 6,500 (1,000 anonymous, 4,500 of file pages and 1,000
+    // more): only the 4,500 reclaimable file bytes come back.
+    assert_eq!(cgroup_headroom(10_000, 6_500, stat), 8_000);
+    // A cgroup full of page cache is not full: refusing here would refuse every warm host's build.
+    assert_eq!(cgroup_headroom(10_000, 10_000, stat), 4_500);
+    // Without file pages in the stat, the whole charge counts.
+    assert_eq!(cgroup_headroom(10_000, 6_500, "anon 6500\n"), 3_500);
+    // A charge above the limit, or below its own page cache, never underflows.
+    assert_eq!(cgroup_headroom(1_000, 9_000, "anon 9000\n"), 0);
+    assert_eq!(cgroup_headroom(10_000, 100, stat), 10_000);
+}
+#[tokio::test]
+async fn admission_refuses_when_memory_is_truly_short_and_overcommit_cancels() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    // Memory that does not exist is never available; nothing is needed when nothing is asked.
+    #[cfg(target_os = "linux")]
+    assert!(!memory_available(u64::MAX));
+    assert!(memory_available(0));
+    assert_eq!(build_floor(8 << 30), 512 << 20);
+    let limit = bf_alloc::memory_limit_bytes();
+    let cap = limit.saturating_mul(4) / 5;
+    let before = RESERVED.load(Ordering::Acquire);
+    // The reservation gate admits what fits under the cap and refuses anything beyond it,
+    // so a build can never claim more than the process budget.
+    let room = cap.saturating_sub(before + FOREGROUND.load(Ordering::Acquire));
+    assert!(
+        Reservation::new(
+            room + 1,
+            cap.saturating_sub(FOREGROUND.load(Ordering::Acquire))
+        )
+        .is_none()
+    );
+    let held = Reservation::new(room, cap.saturating_sub(FOREGROUND.load(Ordering::Acquire)))
+        .expect("the exact remaining room is admitted");
+    assert!(!overcommitted());
+    // A cache that grows its foreground claim while a build runs makes the build's cancellation
+    // check (`overcommitted`) fire, and shrinking the claim again clears it.
+    let grown = Foreground::new(1 << 20);
+    assert!(overcommitted());
+    drop(grown);
+    assert!(!overcommitted());
+    drop(held);
+    assert_eq!(RESERVED.load(Ordering::Acquire), before);
+}
