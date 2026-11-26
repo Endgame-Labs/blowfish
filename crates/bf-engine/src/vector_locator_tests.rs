@@ -1795,3 +1795,94 @@ async fn measure<T>(
     let out = read_cache::scope(ctx, fut).await;
     (out, stats.snapshot())
 }
+
+/// Round G13: the rows `graph_mask` hides are exactly the tier rows whose IDs the tail shadows,
+/// whether a covered segment is still in place or was merged (lineage), with and without a
+/// tier mask from deletes. Compared with resolving every tier row to its ID one by one.
+#[tokio::test]
+async fn graph_mask_hides_exactly_the_shadowed_tier_rows_in_place_and_after_lineage_merges() {
+    for merged in [false, true] {
+        let (store, mut engine, _) = fixture_rows(4000).await;
+        if merged {
+            // Deletes first, so the merge leaves a tier mask behind as well.
+            engine
+                .write(
+                    "locator",
+                    serde_json::from_value(json!({"deletes": (10..20).collect::<Vec<_>>()}))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            engine.index_namespace("locator", true).await.unwrap();
+            let merger = Engine::with_config(
+                store.clone(),
+                EngineConfig {
+                    indexing: false,
+                    compaction_segments: 2,
+                    max_segment_rows: 16000,
+                    recall_sample_rate: 0.0,
+                    ..Default::default()
+                },
+            );
+            merger.index_namespace("locator", true).await.unwrap();
+            engine = merger;
+        }
+        // Overwrite, delete, and add rows in the unindexed tail.
+        let shadow: Vec<u64> = vec![0, 7, 63, 1999, 2000, 3999, 4000, 6500, 7999];
+        engine
+            .write(
+                "locator",
+                serde_json::from_value(json!({
+                    "deletes": [1, 2, 5],
+                    "upsert_rows": shadow.iter().map(|id| json!({"id": id, "category": 0, "vector": [1.0, 2.0, 3.0]})).collect::<Vec<_>>()
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (state, _) = engine
+            .snapshot("locator", &Consistency::Strong)
+            .await
+            .unwrap();
+        assert_eq!(!state.lineage.is_empty(), merged);
+        assert!(!state.shadowed.is_empty());
+        for set in &state.ann_tiers["vector"] {
+            let at = crate::lineage::place(&store, &state.segments, &state.lineage, set)
+                .await
+                .unwrap()
+                .unwrap();
+            let mask = crate::ann::tier_mask(&store, &state, set, &at)
+                .await
+                .unwrap();
+            let got = crate::ann::graph_mask(&store, &state, set, &at, mask.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            // The second call is the cached one.
+            let again = crate::ann::graph_mask(&store, &state, set, &at, mask.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&got, &again));
+            let mut ids = BTreeMap::new();
+            for i in at.positions() {
+                ids.insert(i, segment::ids(&store, &state.segments[i]).await.unwrap());
+            }
+            let mut expected = RoaringBitmap::new();
+            for c in &set.covered {
+                for row in c.base..c.base + c.rows {
+                    let Some((i, local)) = at.real(&set.covered, row) else {
+                        continue;
+                    };
+                    if mask.as_ref().is_none_or(|m| m.contains(row))
+                        && !state.shadowed.contains(&ids[&i][local as usize])
+                    {
+                        expected.insert(row);
+                    }
+                }
+            }
+            assert_eq!(*got, expected, "merged={merged}");
+            assert!(got.len() < set.covered.iter().map(|c| u64::from(c.rows)).sum::<u64>());
+        }
+    }
+}

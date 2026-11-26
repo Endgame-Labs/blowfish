@@ -870,12 +870,12 @@ async fn shadowed_rows_stay_traversable_but_are_never_returned() {
     e.write(
         "hot",
         serde_json::from_value::<WriteRequest>(json!({
-            "deletes":[3,4,5],
-            "upsert_rows":[
-                {"id":17,"vector":vectors[900]},
-                {"id":40,"vector":vectors[17]},
-                {"id":41,"vector":vectors[17]},
-            ]}))
+        "deletes":[3,4,5],
+        "upsert_rows":[
+            {"id":17,"vector":vectors[900]},
+            {"id":40,"vector":vectors[17]},
+            {"id":41,"vector":vectors[17]},
+        ]}))
         .unwrap(),
     )
     .await

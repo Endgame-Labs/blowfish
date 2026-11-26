@@ -557,10 +557,12 @@ pub(crate) async fn tier_mask(
     Ok(mask)
 }
 
-/// Cached `graph_mask` results by tier, snapshot, and tier mask.
-type ShadowMask = (Option<Arc<RoaringBitmap>>, Arc<RoaringBitmap>);
+/// `graph_mask` results by tier, snapshot, and tier mask. Each is computed once even when many
+/// queries on the same snapshot ask at the same time (a write stream makes a new snapshot every
+/// few milliseconds, and 16 clients would otherwise each resolve it).
+type ShadowCell = Arc<tokio::sync::OnceCell<Arc<RoaringBitmap>>>;
 static SHADOW_MASKS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, ShadowMask>>,
+    std::sync::Mutex<std::collections::HashMap<String, (TierMask, ShadowCell)>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// The rows the warm graph may return for this snapshot: the tier's live rows (`mask`, `None`
@@ -574,7 +576,6 @@ pub(crate) async fn graph_mask(
     at: &crate::lineage::Placement,
     mask: Option<&Arc<RoaringBitmap>>,
 ) -> Result<Option<Arc<RoaringBitmap>>, ApiError> {
-    use crate::lineage::Place;
     if state.shadowed.is_empty() {
         return Ok(mask.cloned());
     }
@@ -591,18 +592,42 @@ pub(crate) async fn graph_mask(
         key.push('|');
         key.push_str(map);
     }
-    if let Some((input, hidden)) = SHADOW_MASKS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        && match (input, mask) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
+    let cell = {
+        let mut masks = SHADOW_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+        match masks.get(&key) {
+            Some((input, cell))
+                if match (input, mask) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                } =>
+            {
+                cell.clone()
+            }
+            _ => {
+                // Older snapshots' entries are dropped wholesale; queries still holding one finish.
+                if masks.len() >= 64 {
+                    masks.clear();
+                }
+                let cell = ShadowCell::default();
+                masks.insert(key, (mask.cloned(), cell.clone()));
+                cell
+            }
         }
-    {
-        return Ok(Some(hidden.clone()));
-    }
+    };
+    let live = cell
+        .get_or_try_init(|| shadow_free_rows(store, state, set, at, mask))
+        .await?;
+    Ok(Some(live.clone()))
+}
+async fn shadow_free_rows(
+    store: &Storage,
+    state: &NamespaceState,
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+    mask: Option<&Arc<RoaringBitmap>>,
+) -> Result<Arc<RoaringBitmap>, ApiError> {
+    use crate::lineage::Place;
     let positions: Vec<usize> = at
         .positions()
         .collect::<BTreeSet<_>>()
@@ -622,12 +647,13 @@ pub(crate) async fn graph_mask(
                 hidden.extend(shadow_of(*i).iter().map(|r| cover.base + r));
             }
             Place::Moved(parts) => {
+                // Walk the shadowed rows, not the whole map: a map holds every row of the source.
                 for (i, map) in parts {
-                    let shadow = shadow_of(*i);
                     hidden.extend(
-                        map.pairs()
-                            .filter(|(_, to)| shadow.contains(*to))
-                            .map(|(from, _)| cover.base + from),
+                        shadow_of(*i)
+                            .iter()
+                            .filter_map(|to| map.back(to))
+                            .map(|from| cover.base + from),
                     );
                 }
             }
@@ -644,13 +670,7 @@ pub(crate) async fn graph_mask(
         }
     };
     live -= &hidden;
-    let live = Arc::new(live);
-    let mut masks = SHADOW_MASKS.lock().unwrap_or_else(|e| e.into_inner());
-    if masks.len() >= 64 {
-        masks.clear();
-    }
-    masks.insert(key, (mask.cloned(), live.clone()));
-    Ok(Some(live))
+    Ok(Arc::new(live))
 }
 
 /// ANN from one tier's slabs: the same directory search, over slabs as pseudo
