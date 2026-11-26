@@ -203,12 +203,21 @@ impl OpenHint {
             });
             // Share predicate completion with tier warming. An empty filter never needs
             // memberships, and the query reuses these same immutable predicates.
-            let predicates = async {
+            let (positive, present) = tokio::sync::watch::channel(false);
+            let predicates = async move {
                 let mut matching = false;
+                let positive = &positive;
                 let rows = futures::future::try_join_all(segments.iter().flat_map(|seg| {
                     self.filters.iter().map(move |f| async move {
                         let result = segment::filter_live(store, seg, f, schema).await;
                         crate::ann::stage(trace_t0, "warm_filter");
+                        if result.as_ref().is_ok_and(|rows| !rows.is_empty()) {
+                            positive.send_if_modified(|present| {
+                                let changed = !*present;
+                                *present = true;
+                                changed
+                            });
+                        }
                         result
                     })
                 }))
@@ -237,14 +246,50 @@ impl OpenHint {
                     let config = &self.config;
                     let name = crate::ann_dir::Layout::Slabs.dir_key(attribute);
                     let predicates = predicates.clone();
+                    let mut present = present.clone();
                     tasks.push(
                         async move {
                             if filtered || scan.is_none() {
-                                let dir = crate::ann_dir::load(store, &set.dir, None).await?;
+                                let (dir, _) = tokio::try_join!(
+                                    crate::ann_dir::load(store, &set.dir, None),
+                                    async {
+                                        if filtered {
+                                            // Translation needs these immutable maps too. Open
+                                            // them alongside the directory and predicates.
+                                            crate::lineage::place(store, segments, lineage, set)
+                                                .await?;
+                                        }
+                                        Ok::<_, ApiError>(())
+                                    }
+                                )?;
                                 crate::ann::stage(trace_t0, "warm_slab_directory");
-                                if filtered && predicates.await? {
-                                    crate::ann_dir::memberships(store, &set.slabs, &dir, attribute)
-                                        .await?;
+                                // One positive segment proves the query is nonempty. Start
+                                // memberships then, while the other predicates finish; only
+                                // an empty query must wait for every segment before deciding.
+                                let matching = if filtered {
+                                    tokio::select! {
+                                        all = predicates => all?,
+                                        first = present.wait_for(|found| *found) => first.is_ok(),
+                                    }
+                                } else {
+                                    false
+                                };
+                                if matching {
+                                    let members = crate::ann_dir::memberships(
+                                        store, &set.slabs, &dir, attribute,
+                                    )
+                                    .await?;
+                                    if crate::ann_dir::covers(
+                                        &dir,
+                                        &set.slabs,
+                                        attribute,
+                                        crate::ann_dir::Layout::Slabs,
+                                    ) {
+                                        crate::read_cache::retain_memberships(
+                                            &set.dir.key,
+                                            members,
+                                        );
+                                    }
                                     crate::ann::stage(trace_t0, "warm_slab_memberships");
                                 }
                                 return Ok(());

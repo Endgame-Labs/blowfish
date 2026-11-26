@@ -657,7 +657,12 @@ async fn from_slabs(
             };
             let warm_eligible = mask.is_none() && seat.is_none();
             let members = if allowed.is_some() {
-                Some(crate::ann_dir::memberships(store, &view.segments, &dir, attribute).await?)
+                Some(match crate::read_cache::query_memberships(&set.dir.key) {
+                    Some(members) => members,
+                    None => {
+                        crate::ann_dir::memberships(store, &view.segments, &dir, attribute).await?
+                    }
+                })
             } else {
                 None
             };
@@ -796,6 +801,19 @@ fn filtered_tier_mask(
             }
             crate::lineage::Place::Moved(parts) => {
                 for (i, map) in parts {
+                    if let Some(rows) = &allowed[*i]
+                        && rows.len().saturating_mul(64) < map.to.len()
+                    {
+                        // A sparse predicate should visit its matching target rows, rather
+                        // than every source row of a compaction. Both sides of a lineage map
+                        // are ascending, so reverse translation preserves this order.
+                        let selected = rows.as_ref() & &map.to;
+                        mask |= RoaringBitmap::from_sorted_iter(selected.iter().map(|to| {
+                            cover.base + map.back(to).expect("intersected lineage target")
+                        }))
+                        .expect("reverse lineage rows stay sorted");
+                        continue;
+                    }
                     mask |= RoaringBitmap::from_sorted_iter(
                         map.pairs()
                             .filter(|(_, to)| allowed[*i].as_ref().is_none_or(|a| a.contains(*to)))

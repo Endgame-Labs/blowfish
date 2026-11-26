@@ -151,29 +151,40 @@ async fn adjust_bounded(
         return Ok(());
     }
     let mut columns: BTreeSet<String> = seg.schema.keys().cloned().collect();
-    let mut vector_bytes = 0u64;
+    // Per vector column: the JSON bytes one present vector adds to a document, and which
+    // of the requested rows hold one (`None`: all of them).
+    let mut vector_bytes: Vec<(u64, Option<RoaringBitmap>)> = Vec::new();
+    let sources = read_cache::context().and_then(|c| c.vectors);
     for (name, cfg) in &seg.schema {
         let Some(AttributeType::Vector { dimensions, .. }) = &cfg.data_type else {
             continue;
         };
-        let Some(file) = seg.files.get(&format!("annv2:{name}")) else {
-            continue;
-        };
-        let dir = segment::projection_directory(store, seg, file, true).await?;
-        let d = &dir.segments()[0];
-        // Sparse and flat indexes can omit rows. They use the ordinary, bounded decoder.
-        if d.membership.is_none() || d.rows != seg.row_count as usize {
-            continue;
-        }
-        columns.remove(name);
         // Comma, quoted field name, colon, quotes, and base64 of canonical f32 bytes.
-        vector_bytes += 1
+        let width = 1
             + serde_json::to_vec(name)
                 .map_err(segment::index_error)?
                 .len() as u64
             + 1
             + 2
             + (dimensions * 4).div_ceil(3) as u64 * 4;
+        if let Some(file) = seg.files.get(&format!("annv2:{name}")) {
+            let dir = segment::projection_directory(store, seg, file, true).await?;
+            let d = &dir.segments()[0];
+            // Sparse and flat indexes can omit rows. They use the ordinary, bounded decoder.
+            if d.membership.is_none() || d.rows != seg.row_count as usize {
+                continue;
+            }
+            vector_bytes.push((width, None));
+        } else if crate::upgrade::files(seg, name).is_none()
+            && let Some(sources) = sources.as_ref().filter(|s| s.covers(seg, name))
+        {
+            // A covering tier retired this segment's own index. Its slab row lists, which are
+            // resident, say which rows hold a vector, so the payloads need not be read.
+            vector_bytes.push((width, Some(sources.present(store, seg, rows, name).await?)));
+        } else {
+            continue;
+        }
+        columns.remove(name);
     }
     let mut remaining = rows.iter();
     loop {
@@ -182,12 +193,16 @@ async fn adjust_bounded(
             break;
         }
         let docs = segment::projected_rows_with(store, seg, &chunk, Some(&columns), true).await?;
-        for doc in docs.values() {
+        for (row, doc) in &docs {
             if with_text {
                 text::adjust(stats, doc, schema, add);
             }
-            let bytes =
-                serde_json::to_vec(doc).map_err(segment::index_error)?.len() as u64 + vector_bytes;
+            let extra: u64 = vector_bytes
+                .iter()
+                .filter(|(_, present)| present.as_ref().is_none_or(|p| p.contains(*row)))
+                .map(|(width, _)| width)
+                .sum();
+            let bytes = serde_json::to_vec(doc).map_err(segment::index_error)?.len() as u64 + extra;
             if add {
                 stats.rows += 1;
                 stats.logical_bytes += bytes;

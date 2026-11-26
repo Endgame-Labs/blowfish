@@ -506,7 +506,11 @@ pub(crate) struct ReadContext {
     pub text_shadowed: Option<Arc<std::collections::BTreeMap<String, roaring::RoaringBitmap>>>,
     /// WAL summaries gathered for this query's immutable snapshot and schema.
     pub text_tail: Option<Arc<crate::text_tail::PreparedTail>>,
+    /// Parsed tier maps handed from snapshot warming to this request's ANN plans. General
+    /// cache eviction must not make the same request decode these large maps a second time.
+    pub(crate) ann_memberships: Arc<Mutex<HashMap<String, Memberships>>>,
 }
+pub(crate) type Memberships = Vec<Option<Arc<bf_vector::Membership>>>;
 impl ReadContext {
     /// Exhaustive reference work reads through existing caches without admitting its scan.
     /// It cannot select an approximate graph or contribute graph CPU measurements.
@@ -540,6 +544,7 @@ impl ReadContext {
             cold: false,
             text_shadowed: None,
             text_tail: None,
+            ann_memberships: Arc::default(),
         }
     }
 }
@@ -548,6 +553,29 @@ tokio::task_local! {
 }
 pub(crate) fn context() -> Option<ReadContext> {
     CURRENT.try_with(Clone::clone).ok()
+}
+
+/// Keep validated, immutable tier memberships for the current request, including subqueries.
+pub(crate) fn retain_memberships(key: &str, members: Memberships) {
+    if let Some(context) = context() {
+        let old = context
+            .ann_memberships
+            .lock()
+            .expect("request memberships lock")
+            .insert(context.cache.key(key), members);
+        drop(old);
+    }
+}
+
+/// Reuse snapshot warming's maps even if filter dictionaries evicted their shared cache entries.
+pub(crate) fn query_memberships(key: &str) -> Option<Memberships> {
+    let context = context()?;
+    context
+        .ann_memberships
+        .lock()
+        .expect("request memberships lock")
+        .get(&context.cache.key(key))
+        .cloned()
 }
 /// Skip context cloning when this storage view has no ANN staging manager.
 pub(crate) fn staging_context() -> Option<ReadContext> {
@@ -624,6 +652,39 @@ pub(crate) fn insert_predicate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn warmed_memberships_belong_to_one_request_and_storage_scope() {
+        let cache = Arc::new(DecodedCache::new(1024, 1));
+        let first = ReadContext::new(cache.clone());
+        let member =
+            Arc::new(bf_vector::Membership::from_sparse_rows([(1, 0), (7, 1)], 2).unwrap());
+        let weak = Arc::downgrade(&member);
+        scope(first.clone(), async {
+            retain_memberships("tier", vec![Some(member.clone())]);
+            cache.clear();
+            let reused = query_memberships("tier").unwrap();
+            assert!(Arc::ptr_eq(reused[0].as_ref().unwrap(), &member));
+        })
+        .await;
+        let another_scope = ReadContext {
+            cache: Arc::new(cache.scoped("other")),
+            ..first.clone()
+        };
+        scope(another_scope, async {
+            assert!(query_memberships("tier").is_none());
+        })
+        .await;
+        scope(ReadContext::new(cache), async {
+            assert!(query_memberships("tier").is_none());
+        })
+        .await;
+        drop(member);
+        assert!(weak.upgrade().is_some());
+        drop(first);
+        assert!(weak.upgrade().is_none());
+    }
+
     #[test]
     fn recharge_resizes_one_entry_and_evicts_the_oldest_others() {
         // The general pool is a little over a third of 800 bytes.

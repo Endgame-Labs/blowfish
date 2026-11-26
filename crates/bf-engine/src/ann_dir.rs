@@ -81,6 +81,24 @@ fn vector_pieces(
     out
 }
 
+/// Seeding needs cached blocks, not assembled cluster buffers. Splitting on small aligned
+/// boundaries lets the range cache return borrowed block slices instead of copying every
+/// large code range into a buffer that the seed task immediately discards. The cache still
+/// coalesces the same missing blocks into the same backend reads.
+fn seed_pieces(ranges: Vec<std::ops::Range<u64>>) -> Vec<std::ops::Range<u64>> {
+    const PIECE: u64 = 64 << 10;
+    let mut out = Vec::new();
+    for range in ranges {
+        let mut start = range.start;
+        while start < range.end {
+            let end = start.saturating_add(PIECE - start % PIECE).min(range.end);
+            out.push(start..end);
+            start = end;
+        }
+    }
+    out
+}
+
 type Reader = segment::ObjectReader;
 /// Exact hits `(distance, row)` and estimated candidates from one segment.
 type Found = (Vec<(f32, u32)>, Vec<Candidate>);
@@ -1496,6 +1514,11 @@ pub(crate) async fn search(
                     continue;
                 }
                 locally_staged = false;
+                let ranges = if filtered {
+                    seed_pieces(ranges)
+                } else {
+                    ranges
+                };
                 let reader = store
                     .range_reader_with_length(&file.key, file.size, true)
                     .map_err(segment::index_error)?;
@@ -1756,7 +1779,7 @@ pub(crate) async fn search(
             });
         }
         let mut results: Vec<(Probed, Found)> = Vec::new();
-        let mut launched = false;
+        let mut prefetch_at = 0;
         let early_exact_docs = locally_staged
             && context.as_ref().is_some_and(|c| c.cold)
             && columns.iter().any(|name| name != "id")
@@ -1768,9 +1791,20 @@ pub(crate) async fn search(
             });
         while let Some(result) = scans.join_next().await {
             results.push(result.map_err(segment::index_error)??);
-            let ready_parts = if early_exact_docs { 1 } else { 2 };
-            if !launched && results.len() * 5 >= count * ready_parts && !scans.is_empty() {
-                launched = true;
+            let ordinary = [if early_exact_docs { 4 } else { 8 }];
+            // Selective filters can probe most leaves: their eventual winners may arrive
+            // after the first speculative read. Refresh the same bounded prefetch while
+            // later scans are still in flight, rather than waiting for the last scan.
+            let milestones = if filtered {
+                &[8, 12, 16, 18, 19][..]
+            } else {
+                &ordinary[..]
+            };
+            if prefetch_at < milestones.len()
+                && results.len() * 20 >= count * milestones[prefetch_at]
+                && !scans.is_empty()
+            {
+                prefetch_at += 1;
                 let mut leading: Vec<_> = results
                     .iter()
                     .enumerate()

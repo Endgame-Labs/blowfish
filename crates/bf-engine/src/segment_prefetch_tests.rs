@@ -706,3 +706,115 @@ async fn disjoint_id_ranges_read_only_the_bounds_header() {
         "{reads:?}"
     );
 }
+
+/// A slow segment's predicate must not hold membership reads behind the complete mask wave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_matching_segment_starts_memberships_before_a_slow_predicate_finishes() {
+    let backend = Arc::new(Delayed::default());
+    let store = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let config = crate::EngineConfig {
+        indexing: false,
+        recall_sample_rate: 0.0,
+        ..Default::default()
+    };
+    let writer = crate::Engine::with_config(store.clone(), config.clone());
+    let vector = |id: u32| -> Vec<f32> {
+        (0..16)
+            .map(|d| ((u64::from(id) * 7919 + d * 104729) as f64).sin() as f32)
+            .collect()
+    };
+    for batch in 0..2 {
+        let docs: Vec<_> = (batch * 3000..(batch + 1) * 3000)
+            .map(|id| serde_json::json!({"id":id,"vector":vector(id),"tag":id % 2}))
+            .collect();
+        writer
+            .write(
+                "mask-progress",
+                serde_json::from_value(serde_json::json!({
+                    "schema":{"tag":{"type":"uint","filterable":true}},
+                    "distance_metric":"cosine_distance", "upsert_rows":docs,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.index_namespace("mask-progress", true).await.unwrap();
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
+    std::fs::create_dir_all(&root).unwrap();
+    let scratch = tempfile::Builder::new()
+        .prefix("mask-progress-")
+        .tempdir_in(root)
+        .unwrap();
+    writer
+        .recluster(
+            "mask-progress",
+            &crate::ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 2,
+                cluster_rows: 100,
+                max_slab_rows: 3000,
+                scratch: scratch.path().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let (_, manifest) = bf_wal::Wal::new(store, "mask-progress")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.segments.len(), 2);
+    let slow = &manifest.segments[1].files["filters"];
+    let storage = Storage::from_backend(backend.clone(), Path::default(), true, false)
+        .await
+        .unwrap();
+    let reader = crate::Engine::with_config(storage, config);
+    backend.reads.lock().unwrap().clear();
+    *backend.blocked.lock().unwrap() = Some((Path::from(slow.key.as_str()), 0..slow.size));
+    let release = Release(backend.clone());
+    let query = tokio::spawn(async move {
+        reader
+            .query(
+                "mask-progress",
+                serde_json::from_value(serde_json::json!({
+                    "rank_by":["vector","ANN",vector(123)],"filters":["tag","Eq",1],"top_k":10,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), backend.started.notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if backend
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _)| p.as_ref().ends_with(".rows-v1.bfr"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("memberships waited for the blocked predicate despite another segment matching");
+    assert!(
+        !query.is_finished(),
+        "the complete predicate still needs its slow segment"
+    );
+    drop(release);
+    let result = tokio::time::timeout(Duration::from_secs(10), query)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.result.rows.unwrap().len(), 10);
+}

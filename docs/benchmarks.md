@@ -15113,6 +15113,7 @@ request/truth preparation checks pass using uv. The full debug workspace test
 and repeated workspace clippy on the final commit are recorded in the worker
 report; no failing performance gate is represented as a passing optimization.
 
+
 ## Round C27: quiet namespaces repair row maps, and the cold filtered baseline on a repaired 10M layout
 
 Measured 2026-11-26 on one on-demand c7gd.4xlarge (us-west-2), v0.1.54 (`a6f257f`) plus the C26
@@ -15201,3 +15202,328 @@ alone takes 6.1 s (a full ID dictionary decode), which no old hypothesis address
 One c7gd.4xlarge on demand for about 0.6 h (roughly $0.45), plus a 77 GB prefix that lived for
 about 35 minutes. The prefix was deleted and verified empty with no multipart uploads; the instance,
 key pair, and security group were deleted, and no tagged instance remains.
+
+## Round IN1: removal accounting no longer reads covered vectors
+
+**Finding.** Once a covering ANN tier retires a segment's own `annv2:{name}` file, the old accounting path
+(`statistics::adjust_bounded`) kept the vector column in its projection. Every overwrite or delete that
+removed rows from such a segment read the old vectors through the slab row maps and cluster blobs, only to
+measure a per-row JSON length that is a constant.
+
+**Change.** For a segment a tier covers, `vector_locator::Sources::present` now decides which rows hold a vector
+from the resident slab row lists and the lineage maps alone, and the accounting adds the constant vector width
+for those rows. Sparse columns stay exact, because presence comes from the row lists. `rows` and `logical_bytes`
+are bit-identical: the test `in1_removal_accounting_counts_covered_vectors_without_reading_them` compares
+the result with the byte length of the materialized documents, for dense and sparse vectors, whole segments and
+every fifth row.
+
+**Reads** (test fixture, 2 segments of 2,000 rows, cache off, requested bytes that missed):
+
+| Rows accounted | Before, missed bytes | After, missed bytes |
+|---:|---:|---:|
+| 2,000 (dense) | 41,836 | 0 |
+| 400 (dense) | 12,042 | 0 |
+| 2,000 (sparse) | 38,404 | 0 |
+| 400 (sparse) | 10,302 | 0 |
+
+**Gap.** The 1M-row paired wall-time A/B was not run; the evidence is the read counts above. The saving grows
+with vector width and with the number of slabs touched, since the old path was serial across slabs.
+
+## Round GB1: build the warm graph 2.3 times cheaper and 5.8 times sooner
+
+The warm graph's build was most of the time to promotion: 1,229 s on 2 idle-priority threads for full NQ
+(1,259 s in Round G4). This round makes it **2.32 times less CPU at 2 threads** (2,454.7 to 1,057.2 CPU s) and
+**5.8 times faster wall** with the new default pool (1,229 to 212.8 s idle, 1,658.5 to 342.8 s under 16-client
+IVF load), at recall that is the same or slightly higher, and with foreground q/s and p99 within 1.5 percent of
+the old build's. It changes only construction and the pool size: the graph format, serving path, and
+calibration are untouched.
+
+**Setup:** one on-demand c7g.4xlarge (Graviton3, 16 vCPU, 32 GB, Ubuntu 24.04, ARM like the M4), release build.
+Rows arrive in slab and cluster order, as in the engine, from the retained v0.1.19 fixture
+(`tmp/nq-fixture-v019/`, read-only; slabs exported with `examples/g3/export_ivf.py`): 2,681,468 NQ rows,
+1,024-d f16 cosine, R32 graph. Recall is against the recorded exact top-100 truth for all 3,452 queries, with
+exact f16 rerank of 30 (k 10) or 200 (k 100) graph candidates. Build CPU is `getrusage` around
+`HotGraphBuilder::finish`; source decoding (41 s on one thread) is separate and unchanged. Harnesses:
+`crates/bf-vector/examples/gb1_bench.rs` (build, CPU, recall) and `gb1_load.rs` (foreground IVF clients while
+a build runs on an idle-priority pool). The baseline is `215eaa7`'s build, measured on the same host.
+
+### Profile of the old build (`gb1-profile`)
+
+perf at 499 Hz on the first 300,000 NQ rows at 2 threads (222.9 CPU s): **about 85 percent of CPU is
+`Scratch::search`**, 60 points of it in the SQ8 dot kernel stalled on code rows, 24 in the search loop itself.
+`prune` was about 8 percent (the retain loop 2.8, plus its dots) and heap pops 2. So Neon's hypothesis 2
+(return distances instead of recomputing them) could give at most 1.07 times alone. A search scores about
+1,222 nodes and expands 69 of them, and the dot over a random 1,024-byte row costs **133 ns even with
+prefetch, against 21 ns when cached** (micro-benchmark on the same host, and the same 8 GB/s per thread
+whether the prefetch runs 2 or 16 rows ahead, at L1 or L2, or the 128 MB array sits on transparent huge
+pages). The build is bound by random row reads from main memory, not by arithmetic or by prefetch distance.
+
+### What was kept
+
+| Step | CPU at 2 threads, 300K rows | Note |
+|---|---:|---|
+| Old build | 222.9 s | |
+| Same beam core as serving (`navigation.rs`: packed bitset, flat sorted beam), search scratch reused, distances carried from search into prune | 171.5 s (1.30 times) | hypotheses 1 and 2 |
+| Prefetch two rows versus 8 versus all, L1 versus L2 | 171 to 198 s | no gain, so none kept |
+| **One-bit Hamming steering, exact distances only for expanded nodes** | 88.8 s, then 68 s at beam 48 | the lever |
+
+Construction now keeps one sign bit per coordinate, after the rotation and centered on the corpus mean
+(128 bytes per row instead of 1,024; `warm_graph/binary.rs`, built in parallel in about 6 s and dropped before
+publication). Each insertion beam-searches by Hamming distance, then measures only the expanded nodes
+(about 70, versus about 1,222 scored) exactly with the SQ8 kernel, because the prune test needs true distances.
+The reservation adds the bit codes to the construction peak (`padded / 8` bytes per row); peak RSS did not
+move (3,832,908 versus 3,825,880 KiB) because the construction peak was the conversion to compact links.
+
+### Build cost, full NQ
+
+| Build | Threads | Wall, s | CPU, s |
+|---|---:|---:|---:|
+| Old | 2 | 1,229.2 | 2,454.7 |
+| **New (beam 64)** | 2 | **531.4** | **1,057.2** (2.32 times less) |
+| Old | 15 | 189.9 | 2,829.3 |
+| New | 15 | 74.9 and 74.9 | 1,102.2 and 1,102.6 (2.57 times less) |
+| **New, shipped pool** | 5 | **212.8** | 1,053.6 |
+
+Wall time at the shipped five threads is **5.8 times** the old two-thread build's. Against the old build at the
+same 15 threads it is 2.5 times, because the pass bar is CPU: 15 threads cost more CPU than 2 (memory pressure),
+for both builds. The new build's search is now 57 percent of samples, the exact distances 20, and the prune
+retain loop 7.
+
+### Recall
+
+Recall@10 (rerank 30) and recall@100 (rerank 200) of the finished graph, same beams. The old build's two runs
+(2 and 15 threads) differ by at most 0.001; the three new runs (2 threads, then 15 threads twice) are listed by
+difference from the old 2-thread run.
+
+| Beam | Old | New, 2 threads | New, 15 threads (two runs) |
+|---|---:|---:|---:|
+| k 10, ef 48 | 0.932155 | 0.933720 (+0.0016) | 0.930852, 0.930214 (-0.0013, -0.0019) |
+| k 10, ef 64 | 0.944699 | 0.947827 (+0.0031) | 0.945539, 0.945162 (+0.0008, +0.0005) |
+| k 10, ef 128 | 0.965324 | 0.967642 (+0.0023) | 0.965643, 0.966338 (+0.0003, +0.0010) |
+| k 10, ef 256 | 0.977375 | 0.980504 (+0.0031) | 0.977868, 0.978273 (+0.0005, +0.0009) |
+| k 100, ef 256 | 0.953702 | 0.956286 (+0.0026) | 0.955814, 0.955214 (+0.0021, +0.0015) |
+| k 100, ef 400 | 0.969041 | 0.970591 (+0.0016) | 0.970322, 0.970200 (+0.0013, +0.0012) |
+
+From ef 64 up, recall is the same or higher in all 15 comparisons (+0.0003 to +0.0031). At k 10 ef 48, the smallest beam measured, the two 15-thread builds are 0.0013 and 0.0019 lower: the new graph scores about 2
+percent more nodes per beam (1,293 versus 1,268), so it has not lost reach, but its curve sits slightly lower at the
+very smallest beam. Two builds of the same code differ by about 0.001 (parallel insertion order). The first full
+run, at beam 48, was 0.0025 lower at ef 64; the shipped beam 64 removes that.
+
+### Why beam 64, and what did not work
+
+| Variant, full NQ | Threads | CPU, s | Recall@10, ef 64 / 128 |
+|---|---:|---:|---:|
+| Old: exact steering, beam 64 | 15 | 2,829 | 0.9448 / 0.9647 |
+| Hamming, beam 40, plus the 32 closest scored nodes as extra candidates | 15 | 804 | 0.9414 / 0.9612 |
+| Hamming, beam 48 | 2 | 845 | 0.9422 / 0.9633 |
+| Hamming, beam 48, plus the 16, 32, or 64 closest scored nodes | 15 | 928, 925, 1,013 | 0.9425, 0.9434 to 0.9445, 0.9420 / 0.9625 to 0.9648 |
+| Hamming, beam 56 | 15 | 989 to 994 | 0.9444 to 0.9460 / 0.9651 to 0.9669 |
+| **Hamming, beam 64 (shipped)** | 15 | **1,102 to 1,107** | **0.9452 to 0.9482 / 0.9656 to 0.9687** |
+| Hamming, beam 80 | 15 | 1,341 | 0.9456 / 0.9670 |
+| Hamming, beam 48, then exact steering in pass 2 at beam 32 or 48 | 15 | 1,067, 1,312 | 0.9429, 0.9433 / 0.9629, 0.9617 |
+| Closest 48, 96, or 160 scored nodes as the only prune candidates (beam 48) | 15 | 820, 1,096, 1,411 | 0.9379, 0.9353, 0.9343 / 0.9600 |
+
+Beam 56 is 10 percent cheaper and within noise of the old recall. Beam 64 is the shipped choice because its
+recall is above the old build's at every beam from ef 64, and because a small test tier (2.3K rows, top-40
+exact identity with IVF) differed once in five runs at beam 56, and in none of the runs at beam 64. Beam 48
+costs 0.002 to 0.003 of recall. Replacing the expanded nodes by the closest scored ones as prune candidates loses
+the long-range path nodes that robust pruning needs, and recall falls as that list grows. Exact steering in pass 2
+costs more and does no better.
+
+### Pool size, and foreground interference
+
+The brief suggested cores minus one. That fails the foreground bar: the build is memory-bound, and each worker
+adds bandwidth pressure that idle scheduling (SCHED_IDLE, nice 19) cannot remove. 16 clients (one per
+thread, each sleeping as long as its query took, about half the cores) ran IVF 48-probe queries over all of NQ
+while a build ran on the idle-priority pool, whole build including source decoding:
+
+| Build threads | Build wall under load, s | Foreground q/s during | p99 during, us | p99 versus old build |
+|---|---:|---:|---:|---:|
+| none (alone) | | 2,664 to 2,691 | 3,365 to 3,406 | |
+| Old, 2 | 1,658.5 | 2,657.2 | 3,448 | |
+| 4 | 416.1 | 2,624.6 | 3,474 | +0.8% |
+| **5** | **342.8** | **2,616.4 (-1.5%)** | **3,498** | **+1.4%** |
+| 6 | 297.8 | 2,599.3 (-2.2%) | 3,585 | +4.0% |
+| 8 | 247.0 | 2,556.4 (-3.8%) | 5,109 | +48% |
+| 15 | 207.4 | 2,461.8 (-7.4%) | 6,178 | +79% |
+
+The pool is therefore **a third of the cores, between two and six**: five threads on this 16-core host (an
+8-core host stays at two). Under load the build finishes 4.8 times sooner than the old one, with q/s down 1.5
+percent and p99 up 1.4 percent from the old build's. The six-worker cap is where this host's p99 stayed within 5
+percent; larger hosts have not been measured. These are in-process IVF clients, not HTTP; the M4 and an HTTP gate
+are not repeated here.
+
+### Pass criteria
+
+| Criterion | Result |
+|---|---|
+| At least 1.8 times less build CPU at 2 threads | **2.32 times** (1,057.2 versus 2,454.7 s) |
+| At least 4 times faster wall on the 16-core host | **5.8 times idle** (212.8 versus 1,229.2 s at five threads), 4.8 times under load. At the same 15 threads, 2.5 times |
+| Recall within 0.001 at the calibrated beams | same or higher from ef 64 up (+0.0003 to +0.0031 in 15 of 15 comparisons); ef 48 is -0.0013 and -0.0019 in the two 15-thread builds |
+| Foreground within 5 percent of today's build | q/s -1.5 percent, p99 +1.4 percent at five threads |
+
+Resources: one on-demand c7g.4xlarge, 10:55 to 14:30 UTC (3.6 hours, about $2.1 compute). Instance, volume,
+key pair, and security group deleted and verified. The fixture was read-only, and no bucket prefix was created.
+
+Reproduction: `warm_graph_bench`-style export with `examples/g3/export_ivf.py`, then
+`gb1_bench NQ_DATA WORKERS 100000000 1 EXPORTED_IVF` for build and recall, and
+`gb1_load NQ_DATA EXPORTED_IVF BUILD_THREADS 16 1 48` for the foreground run.
+
+## Round C28: cold filtered queries on the repaired 10M layout
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge in us-west-2. The comparison uses the
+v0.1.54 baseline with C26/C27 diagnostics, and the C28 changes integrated with v0.1.55.
+The retained C5 fixture was copied server-side into an owned prefix: 693 objects and
+77.34 GB. A writable baseline server published all 55 resident row maps, upgraded old
+segment text, and compacted source segments, as in C27. The final manifest stabilized
+with 61 source segments. No recluster was requested, and the retained fixture was never
+written. Every timed request recorded zero membership rebuilds.
+
+Protocol follows C27: a fresh read-only process per filter and build, one untimed q199
+warm-up, oracle query vectors 0–19, top ten, IDs only, strong consistency, and 64 probes.
+Before every measured request, the harness clears all engine caches; connections stay
+warm. These are process-fresh, **cache-cold** query series, not a new process per query.
+The two builds alternate A/B, then B/A, for paired comparisons. Server and client
+use CPUs 0–7. The server has eight Rayon workers, 8 GiB raw cache, 512 MiB decoded
+cache, zero disk cache, 256 KiB blocks, 32-block coalescing, and fetch concurrency 512. Both release
+binaries target `neoverse-v1`, using Rust 1.100.0, Clang 19 for C compilation, and
+Clang 22 with compiler-rt builtins for linking. No compiler or competing load runs
+during timing.
+
+### What the trace supported
+
+The ID predicate decoded the entire per-ID bitmap dictionary. Scalar ID comparisons
+now read the existing segment bounds header and seek the sorted document ID column.
+Whole segments outside the range need no ID-column read. The resulting row interval is
+intersected with live rows, including holes from deletes. The same implementation
+handles u64 IDs, string IDs, UUIDs, null operands, and older segments without bounds.
+`In` and `NotIn` still use the existing dictionary evaluator.
+
+The first implementation reduced `id Lt 1000` from 6,211 to 509 ms, and the empty
+filter from 794 to 261 ms. It cut length-filter p50 from 1,732 to 883 ms. Title only
+improved from 1,997 to 1,549 ms (1.29×), despite parallel streaming: the query still
+read about 1.65 GB and spent about one second scanning. All 100 initial pairs retained
+identical ordered IDs and f64 distance bits, with zero rebuilds. Empty queries read
+zero row-map bytes, versus 60.0 MB before.
+
+The planner already excludes every leaf whose exact membership count is zero. Title
+visits all 9,335 nonempty leaves: 44,129 matching rows among 6,856,537 source rows.
+The directory has no per-leaf maximum row radius or certified lower bound for all of
+its rows, so stopping after finding ten matches based on center distance would not
+preserve the required results. Probe coverage is unchanged.
+
+Eight-query reference experiments rejected smaller alignment alone and a larger
+exact-fetch budget:
+
+| Reference experiment | Control p50 / p90, ms | Experimental p50 / p90, ms |
+| --- | ---: | ---: |
+| 64 KiB blocks, 32-block coalescing | 1,542 / 1,631 | 1,577 / 2,819 |
+| 16 KiB blocks, 32-block coalescing | 1,542 / 1,631 | 1,618 / 7,412 |
+| Exact fetch of all 44,129 matching vectors | 1,492 / 1,654 | 2,365 / 9,784 |
+
+Smaller blocks saved 14–22% of bytes but increased GETs 2.5–4.7×. Exact fetch read
+less data but issued about 25,000 GETs. Another eight-query reference combined smaller
+blocks with gap coalescing: 64 KiB with one gap block reached 1,372 ms, two gap blocks
+1,409 ms, and 128 KiB without gaps 1,343 ms, against a 1,493 ms control. The gap references kept an 8 MiB maximum coalesced read
+(128 blocks at 64 KiB, and 64 blocks at 128 KiB). These were exploratory references, not selected product settings or final pass claims. Production
+read geometry and the exact-fetch threshold remain unchanged.
+
+The remaining changes preserve one query plan and its candidates. Cold dictionary,
+lineage, and row-map decoding use the bounded search pool when available. A saturated
+pool finishes nested decoding on its caller, avoiding a permit deadlock in exact
+reference searches. Snapshot warming loads lineage with the directory, starts
+memberships at the first positive segment while the other masks finish, and skips
+memberships when every mask is empty. Sparse predicates reverse-map only selected
+lineage targets. Validated warmed memberships stay with the request, so dictionary
+cache eviction cannot make that request decode them again. Filtered slab scans use
+the existing coalesced streaming path with each slab's mask, refresh bounded
+speculative rerank reads as the scan progresses, and seed raw-cache blocks without
+assembling large code buffers that the prefetch task would immediately discard.
+No product setting, storage format, or wire API was added.
+
+### Final paired results
+
+The final integrated candidate and baseline each ran 20 cold requests per filter.
+Latency percentiles are computed over those 20 requests, without excluding outliers.
+
+| Predicate | Baseline p50 / p90, ms | C28 p50 / p90, ms | p50 speedup |
+| --- | ---: | ---: | ---: |
+| `title_initial Eq z` | 1,975 / 2,187 | 1,447 / 1,544 | 1.37× |
+| `text_length Gte 300` | 1,719 / 1,788 | 761 / 832 | 2.26× |
+| `id Lt 1000` | 6,219 / 6,314 | 387 / 422 | 16.08× |
+| Empty filter | 803 / 832 | 194 / 227 | 4.15× |
+| Unfiltered | 250 / 326 | 273 / 339 | 0.92× |
+
+All 100 paired queries returned identical ordered IDs and identical f64 distance
+bits. All 200 requests read exclusively from object storage, with zero membership
+rebuilds. The canonical ordered-result digest was
+`8812a3875d08d01f824604966734cf8e70c44a168ec40e46c4b6bb9f8522ee6d`.
+Mean recall against the available exact truth was 1.000 for title, 0.995 for length,
+and 0.965 unfiltered, in both builds. The ID and empty predicates had no separate
+truth set; their claim is result parity with the baseline.
+
+The final title trace reaches completed predicates at a median 366 ms instead of
+820 ms, but finishes scanning at 1,359 ms instead of 1,797 ms. It still reads
+1.65 GB. Length reaches predicates at 410 ms instead of 1,240 ms. The ID query
+reads no full filter dictionaries and reduces total median bytes from 650 MB to
+146 MB. Empty queries read zero membership bytes and skip ANN, reducing total
+median bytes from 146 MB to 86 MB. Nonempty queries still read all 60.0 MB of
+published slab membership maps; selective per-slab map loading remains a gap.
+
+### Concurrent controls
+
+Each filter ran four alternating A/B and B/A rounds, with 16 clients and 128 measured
+requests per build per round: 512 measured requests per build and filter. The
+concurrency harness uses a 64 MiB raw cache, a 512 MiB decoded cache, and no disk
+cache. Reported latency is the mean of the four round percentiles; throughput is
+the harness's aggregate request rate. These controls follow the final single-client
+series, without concurrent compilation.
+
+| Predicate | Baseline q/s | C28 q/s | Change | Baseline p50 / p90, ms | C28 p50 / p90, ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Title | 5.155 | 4.966 | −3.7% | 2,991 / 3,932 | 3,048 / 3,928 |
+| Length | 6.970 | 6.025 | −13.6% | 2,046 / 4,179 | 2,338 / 4,974 |
+
+CPU time per request increased from 1,209 to 1,270 ms for title, and from 742 to
+771 ms for length. GETs per request increased from 220 to 235 for title, and from
+283 to 291 for length. Round variability does not establish equivalence: both
+throughput point estimates fail the no-slower gate. This round also misses the
+title 1.5× target. Length and ID latency meet their respective 1.5× and 3× targets;
+the round as a whole does **not** pass its performance acceptance criteria.
+
+### Unfiltered confirmation and validation
+
+Because the initial 20-query unfiltered control was slower, a separate confirmation
+ran 40 paired query vectors, with a fresh process for every request: 80 processes,
+interleaved A/B, then B/A, with no untimed query in each process. This is colder
+than the main cache-cold series and must be compared within this confirmation.
+All other server settings, CPU affinity, and read geometry were unchanged.
+
+| Statistic | Baseline, ms | C28, ms | C28 / baseline | Paired bootstrap 95% interval |
+| --- | ---: | ---: | ---: | ---: |
+| p50 | 339.16 | 331.44 | 0.977 | 0.915–1.074 |
+| p90 | 440.30 | 466.08 | 1.059 | 0.560–1.537 |
+
+The percentile bootstrap resamples the same 40 query-pair indices in both arms,
+50,000 times, with NumPy's default RNG seeded with 28. Each resample computes the
+ratio of the arm percentiles, rather than a percentile of per-query ratios. Both
+intervals include 1.0; this confirmation does not establish a regression or
+equivalence. All 40 pairs preserve ordered IDs and distance bits, with zero
+membership rebuilds and zero local reads.
+
+Lineage preloading, mask translation, membership retention, seed splitting, and
+the extra rerank refreshes apply only to filtered queries. Generic immutable-value
+decoding and the bounded worker helper can also affect unfiltered queries. The
+helper now falls back to its caller when all permits are occupied, preventing
+nested exact-query decoding from deadlocking. Unfiltered requests also create an
+empty request-local membership map and an unused predicate notification channel.
+No additional scheduling change was selected after the confirmation.
+
+The integrated source passed formatting, workspace all-target Clippy with warnings
+denied, and the full default-profile workspace tests: 635 passed, zero failed, and
+27 ignored, across 81 test suites. Checks used `nice -n 19`, three Cargo jobs, and
+one test thread on the measurement host. New coverage includes scalar ID semantics
+for all ID types, live-row holes, legacy headers, bounded disjoint-range I/O,
+streaming result bits, sparse and dense predicates after composed compaction,
+request-scoped membership lifetime, and a held-read test proving that one positive
+segment can start memberships before another segment's predicate completes.

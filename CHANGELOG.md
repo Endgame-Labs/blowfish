@@ -4,6 +4,17 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.55] - 2026-11-26
+
+### Changed
+
+- **The warm graph builds 3.6 times faster:** Graph construction steers its beam search with one-bit codes and shares one beam core with serving, and its build pool is a third of the cores (two to six). On an Apple M4 with BEIR NQ (2.68M x 1024-d), the build took 4.8 minutes instead of 17.2, used 2.8 times less CPU, and the graph began serving after 25 minutes instead of 46.5. Serving speed and recall are unchanged or slightly better (`top_k` 10: 8,439 q/s against 8,104; `top_k` 100: 2,765 against 2,685; recall within 0.003). See Round GB1 and Round G12 in `docs/benchmarks.md`.
+
+### Fixed
+
+- **Overwrites and deletes no longer read old vectors just to count them:** Since v0.1.45, removing rows from a segment whose vectors live in a reclustered tier projected each removed row's vector out of the slabs to compute its size for namespace statistics. The size is now computed from the slab row lists that are already resident, with no vector reads, and the statistics are unchanged.
+- **Quiet namespaces publish missing slab row maps:** A test now proves that a writable namespace with no new writes still publishes row maps that a bucket written before v0.1.45 lacks, so cold filtered queries stop rebuilding them. Read-only servers never repair; open the namespace once with a writer. On a repaired 10M layout, cold filtered vector queries took about 1.8 to 2.0 s at p50 instead of 3.4 to 3.6 s (Rounds C26 and C27 in `docs/benchmarks.md`).
+
 ## [0.1.54] - 2026-11-26
 
 ### Fixed
@@ -406,7 +417,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.54...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.55...HEAD
+[0.1.55]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.55
 [0.1.54]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.54
 [0.1.53]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.53
 [0.1.52]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.52

@@ -566,7 +566,8 @@ pub(crate) async fn get_value<T: DeserializeOwned + Send + Sync + 'static>(
         .get("value")
         .and_then(|c| c.blocks.first())
         .ok_or_else(corrupt)?;
-    let value = decode(&read_block(&reader, b).await?)?;
+    let data = read_block(&reader, b).await?;
+    let value = crate::ann_dir::on_worker(async move { decode::<T>(&data) }).await?;
     Ok(read_cache::insert(
         &file.key,
         file.size.saturating_mul(16),
