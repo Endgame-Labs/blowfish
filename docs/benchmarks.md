@@ -15511,3 +15511,258 @@ the table. Debug `cargo test --workspace`: 629 passed, 0 failed, 27 ignored; `ca
 
 Costs: no EC2 and no bucket writes. The 25.5 GiB NQ fixture was copied from the measurement bucket to the M4 through short-lived presigned URLs (about $2.3 of S3
 transfer), because the direct copy ran at 3 to 5 MB/s. The M4 run directory (fixture, builds, Qdrant) is deleted, and nothing of mine is running there.
+
+## Round C28: cold filtered queries on the repaired 10M layout
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge in us-west-2. The comparison uses the
+v0.1.54 baseline with C26/C27 diagnostics, and the C28 changes integrated with v0.1.55.
+The retained C5 fixture was copied server-side into an owned prefix: 693 objects and
+77.34 GB. A writable baseline server published all 55 resident row maps, upgraded old
+segment text, and compacted source segments, as in C27. The final manifest stabilized
+with 61 source segments. No recluster was requested, and the retained fixture was never
+written. Every timed request recorded zero membership rebuilds.
+
+Protocol follows C27: a fresh read-only process per filter and build, one untimed q199
+warm-up, oracle query vectors 0–19, top ten, IDs only, strong consistency, and 64 probes.
+Before every measured request, the harness clears all engine caches; connections stay
+warm. These are process-fresh, **cache-cold** query series, not a new process per query.
+The two builds alternate A/B, then B/A, for paired comparisons. Server and client
+use CPUs 0–7. The server has eight Rayon workers, 8 GiB raw cache, 512 MiB decoded
+cache, zero disk cache, 256 KiB blocks, 32-block coalescing, and fetch concurrency 512. Both release
+binaries target `neoverse-v1`, using Rust 1.100.0, Clang 19 for C compilation, and
+Clang 22 with compiler-rt builtins for linking. No compiler or competing load runs
+during timing.
+
+### What the trace supported
+
+The ID predicate decoded the entire per-ID bitmap dictionary. Scalar ID comparisons
+now read the existing segment bounds header and seek the sorted document ID column.
+Whole segments outside the range need no ID-column read. The resulting row interval is
+intersected with live rows, including holes from deletes. The same implementation
+handles u64 IDs, string IDs, UUIDs, null operands, and older segments without bounds.
+`In` and `NotIn` still use the existing dictionary evaluator.
+
+The first implementation reduced `id Lt 1000` from 6,211 to 509 ms, and the empty
+filter from 794 to 261 ms. It cut length-filter p50 from 1,732 to 883 ms. Title only
+improved from 1,997 to 1,549 ms (1.29×), despite parallel streaming: the query still
+read about 1.65 GB and spent about one second scanning. All 100 initial pairs retained
+identical ordered IDs and f64 distance bits, with zero rebuilds. Empty queries read
+zero row-map bytes, versus 60.0 MB before.
+
+The planner already excludes every leaf whose exact membership count is zero. Title
+visits all 9,335 nonempty leaves: 44,129 matching rows among 6,856,537 source rows.
+The directory has no per-leaf maximum row radius or certified lower bound for all of
+its rows, so stopping after finding ten matches based on center distance would not
+preserve the required results. Probe coverage is unchanged.
+
+Eight-query reference experiments rejected smaller alignment alone and a larger
+exact-fetch budget:
+
+| Reference experiment | Control p50 / p90, ms | Experimental p50 / p90, ms |
+| --- | ---: | ---: |
+| 64 KiB blocks, 32-block coalescing | 1,542 / 1,631 | 1,577 / 2,819 |
+| 16 KiB blocks, 32-block coalescing | 1,542 / 1,631 | 1,618 / 7,412 |
+| Exact fetch of all 44,129 matching vectors | 1,492 / 1,654 | 2,365 / 9,784 |
+
+Smaller blocks saved 14–22% of bytes but increased GETs 2.5–4.7×. Exact fetch read
+less data but issued about 25,000 GETs. Another eight-query reference combined smaller
+blocks with gap coalescing: 64 KiB with one gap block reached 1,372 ms, two gap blocks
+1,409 ms, and 128 KiB without gaps 1,343 ms, against a 1,493 ms control. The gap references kept an 8 MiB maximum coalesced read
+(128 blocks at 64 KiB, and 64 blocks at 128 KiB). These were exploratory references, not selected product settings or final pass claims. Production
+read geometry and the exact-fetch threshold remain unchanged.
+
+The remaining changes preserve one query plan and its candidates. Cold dictionary,
+lineage, and row-map decoding use the bounded search pool when available. A saturated
+pool finishes nested decoding on its caller, avoiding a permit deadlock in exact
+reference searches. Snapshot warming loads lineage with the directory, starts
+memberships at the first positive segment while the other masks finish, and skips
+memberships when every mask is empty. Sparse predicates reverse-map only selected
+lineage targets. Validated warmed memberships stay with the request, so dictionary
+cache eviction cannot make that request decode them again. Filtered slab scans use
+the existing coalesced streaming path with each slab's mask and seed raw-cache blocks without
+assembling large code buffers that the prefetch task would immediately discard.
+No product setting, storage format, or wire API was added.
+
+### Speculative candidate paired results
+
+The first integrated candidate also refreshed speculative rerank reads at 40%,
+60%, 80%, 90%, and 95% scan completion. That candidate and the baseline each ran
+20 cold requests per filter.
+Latency percentiles are computed over those 20 requests, without excluding outliers.
+
+| Predicate | Baseline p50 / p90, ms | C28 p50 / p90, ms | p50 speedup |
+| --- | ---: | ---: | ---: |
+| `title_initial Eq z` | 1,975 / 2,187 | 1,447 / 1,544 | 1.37× |
+| `text_length Gte 300` | 1,719 / 1,788 | 761 / 832 | 2.26× |
+| `id Lt 1000` | 6,219 / 6,314 | 387 / 422 | 16.08× |
+| Empty filter | 803 / 832 | 194 / 227 | 4.15× |
+| Unfiltered | 250 / 326 | 273 / 339 | 0.92× |
+
+All 100 paired queries returned identical ordered IDs and identical f64 distance
+bits. All 200 requests read exclusively from object storage, with zero membership
+rebuilds. The canonical ordered-result digest was
+`8812a3875d08d01f824604966734cf8e70c44a168ec40e46c4b6bb9f8522ee6d`.
+Mean recall against the available exact truth was 1.000 for title, 0.995 for length,
+and 0.965 unfiltered, in both builds. The ID and empty predicates had no separate
+truth set; their claim is result parity with the baseline.
+
+That candidate's title trace reaches completed predicates at a median 366 ms instead of
+820 ms, but finishes scanning at 1,359 ms instead of 1,797 ms. It still reads
+1.65 GB. Length reaches predicates at 410 ms instead of 1,240 ms. The ID query
+reads no full filter dictionaries and reduces total median bytes from 650 MB to
+146 MB. Empty queries read zero membership bytes and skip ANN, reducing total
+median bytes from 146 MB to 86 MB. Nonempty queries still read all 60.0 MB of
+published slab membership maps; selective per-slab map loading remains a gap.
+
+### Speculative candidate concurrent controls
+
+Each filter ran four alternating A/B and B/A rounds, with 16 clients and 128 measured
+requests per build per round: 512 measured requests per build and filter. The
+concurrency harness uses a 64 MiB raw cache, a 512 MiB decoded cache, and no disk
+cache. Reported latency is the mean of the four round percentiles; throughput is
+the arithmetic mean of the four round request rates. These controls follow the first single-client
+series, without concurrent compilation.
+
+| Predicate | Baseline q/s | C28 q/s | Change | Baseline p50 / p90, ms | C28 p50 / p90, ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Title | 5.155 | 4.966 | −3.7% | 2,991 / 3,932 | 3,048 / 3,928 |
+| Length | 6.970 | 6.025 | −13.6% | 2,046 / 4,179 | 2,338 / 4,974 |
+
+CPU time per request increased from 1,209 to 1,270 ms for title, and from 742 to
+771 ms for length. GETs per request increased from 220 to 235 for title, and from
+283 to 291 for length. Round variability does not establish equivalence: both
+throughput point estimates fail the no-slower gate. This round also misses the
+title 1.5× target. Length and ID latency meet their respective 1.5× and 3× targets;
+this candidate does **not** pass the round's performance acceptance criteria.
+The original concurrency harness retained GET and CPU counters but did not record
+object-store byte deltas. Those missing byte values cannot be reconstructed from
+these runs. The follow-up harness records bytes and retains both metrics snapshots.
+
+### Unfiltered confirmation and validation
+
+Because the initial 20-query unfiltered control was slower, a separate confirmation
+ran 40 paired query vectors, with a fresh process for every request: 80 processes,
+interleaved A/B, then B/A, with no untimed query in each process. This is colder
+than the main cache-cold series and must be compared within this confirmation.
+All other server settings, CPU affinity, and read geometry were unchanged.
+
+| Statistic | Baseline, ms | C28, ms | C28 / baseline | Paired bootstrap 95% interval |
+| --- | ---: | ---: | ---: | ---: |
+| p50 | 339.16 | 331.44 | 0.977 | 0.915–1.074 |
+| p90 | 440.30 | 466.08 | 1.059 | 0.560–1.537 |
+
+The percentile bootstrap resamples the same 40 query-pair indices in both arms,
+50,000 times, with NumPy's default RNG seeded with 28. Each resample computes the
+ratio of the arm percentiles, rather than a percentile of per-query ratios. Both
+intervals include 1.0; this confirmation does not establish a regression or
+equivalence. All 40 pairs preserve ordered IDs and distance bits, with zero
+membership rebuilds and zero local reads.
+
+Lineage preloading, mask translation, membership retention, seed splitting, and
+the extra rerank refreshes apply only to filtered queries. Generic immutable-value
+decoding and the bounded worker helper can also affect unfiltered queries. The
+helper now falls back to its caller when all permits are occupied, preventing
+nested exact-query decoding from deadlocking. Unfiltered requests also create an
+empty request-local membership map and an unused predicate notification channel.
+No additional scheduling change was selected after the confirmation.
+
+The first integrated source passed formatting, workspace all-target Clippy with warnings
+denied, and the full default-profile workspace tests: 635 passed, zero failed, and
+27 ignored, across 81 test suites. Checks used `nice -n 19`, three Cargo jobs, and
+one test thread on the measurement host. New coverage includes scalar ID semantics
+for all ID types, live-row holes, legacy headers, bounded disjoint-range I/O,
+streaming result bits, sparse and dense predicates after composed compaction,
+request-scoped membership lifetime, and a held-read test proving that one positive
+segment can start memberships before another segment's predicate completes.
+
+### Final candidate without filtered speculation
+
+The final runtime change disables early rerank prefetch for filtered scans. Before
+this round, the filtered `run_parallel` branch never issued those speculative
+reads; enabling streaming had introduced them. Filtered queries now perform their
+final rerank after scanning, sharing already requested scan data. Unfiltered
+queries retain their original single early prefetch. Candidate selection, masks,
+probe coverage, final reranking, and ordered results are unchanged.
+
+The follow-up concurrency run compares baseline, the speculative candidate, and
+the final candidate in six rotating rounds. Every build occupies each position
+twice, with 128 requests per round and 16 clients: 768 requests per build per
+filter. Other cache, affinity, and read settings match the earlier concurrent
+controls. Throughput and resource counters below are arithmetic round means.
+Bytes count completed object-store payloads; they exclude protocol overhead and
+partially received canceled reads. CPU is server process user plus system time.
+
+| Predicate | Build | q/s | MB/request | GET attempts/request | CPU seconds/request |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Title | Baseline | 5.032 | 189.678 | 219.880 | 1.203 |
+| Title | Speculative | 5.260 | 203.777 | 226.992 | 1.236 |
+| Title | Final | 5.407 | 199.934 | 226.632 | 1.213 |
+| Length | Baseline | 6.090 | 95.038 | 277.910 | 0.751 |
+| Length | Speculative | 7.090 | 108.339 | 297.207 | 0.762 |
+| Length | Final | 6.550 | 101.421 | 288.917 | 0.760 |
+
+Title final/baseline throughput is 1.075×, with a paired-round bootstrap 95%
+interval of 0.954–1.208. Final/speculative is 1.028×, interval 0.968–1.096.
+The bootstrap uses 50,000 resamples of the same six round indices across arms,
+with RNG seed 28, and ratios of arithmetic mean round rates. Six rounds give
+limited precision; these intervals establish neither a regression nor equivalence.
+All 1,536 title candidate-versus-baseline comparisons preserve ordered IDs and
+distance bits. Membership rebuild counters remain zero.
+
+Removing speculative reranks reduces title bytes by 1.9% and CPU by 1.9% relative
+to the speculative arm in this sample. It still reads 5.4% more completed bytes
+than baseline. The speculative arm itself is faster than baseline here, reversing
+the earlier point estimate, so speculation alone cannot explain the original
+throughput loss. The final title throughput estimate is 7.5% higher than baseline,
+with no statistically established difference in either direction.
+
+Length final/baseline throughput is 1.076×, interval 0.928–1.282. Its
+final/speculative ratio is 0.924×, interval 0.845–1.029. Final length bytes are
+6.4% lower than the speculative arm, but 6.7% above baseline. Removing speculation
+does not improve its throughput point estimate relative to the speculative arm;
+the measured differences remain within these broad intervals. The final title
+and length throughput estimates are both about 7.5% above baseline. Neither
+establishes equivalence or rules out a smaller regression.
+
+Final concurrent p50/p90 is 2,843/3,698 ms for title versus 2,981/4,493 ms for
+baseline, and 2,127/3,781 ms for length versus 2,501/4,673 ms for baseline. Across
+both filters, all 3,072 candidate-versus-baseline comparisons preserve ordered IDs
+and f64 distance bits. All three builds retain zero membership rebuild counters.
+
+The final candidate then repeated the original five-case single-client protocol:
+20 paired cache-cold requests per filter, alternating A/B and B/A, with fresh
+processes per build and case, and an untimed q199 warm-up. No compiler or concurrent
+benchmark ran during either final measurement series.
+
+| Predicate | Baseline p50 / p90, ms | Final p50 / p90, ms | p50 speedup |
+| --- | ---: | ---: | ---: |
+| `title_initial Eq z` | 1,867 / 1,945 | 1,369 / 1,469 | 1.36× |
+| `text_length Gte 300` | 1,669 / 1,801 | 843 / 946 | 1.98× |
+| `id Lt 1000` | 6,177 / 6,239 | 397 / 436 | 15.56× |
+| Empty filter | 803 / 821 | 202 / 248 | 3.97× |
+| Unfiltered | 239 / 268 | 248 / 293 | 0.96× |
+
+All 100 final pairs preserve ordered IDs and exact f64 distance bits. All 200
+requests retain zero membership rebuilds and zero local reads. Title and length
+recall remain 1.000 and 0.995 in both builds; unfiltered recall remains 0.965.
+Mean title payload bytes are 1,644.615/1,644.712 MB for baseline/final, with
+927.60/930.20 GET attempts. Mean length payload bytes are 390.462/390.682 MB,
+with 760.90/761.75 GET attempts. Removing speculative filtered I/O keeps these
+single-client read costs close to baseline while retaining most latency gains.
+
+Length and ID meet their latency targets, and the final concurrent throughput
+point estimates exceed baseline within the measured noise. Title misses its
+1.5× target. The final cache-cold unfiltered p50 and p90 point estimates are 4.0%
+and 9.3% slower. The separately reported 40-pair fresh-process confirmation has
+intervals including 1.0 and applies to the same unfiltered runtime behavior; its
+colder protocol does not establish equivalence for this cache-cold series. The
+round therefore does **not** establish all acceptance criteria. No additional
+runtime tuning or measurement was selected after this series.
+
+The final engine package passed 357 tests, with zero failures and 13 ignored,
+plus all-target Clippy with warnings denied. Full debug workspace validation is
+run after the final documentation commit, separately from timing, using
+`RUST_TEST_THREADS=1 nice -n 19 cargo test --workspace -j 3` and
+`nice -n 19 cargo clippy --workspace --all-targets -j 3 -- -D warnings`.
+All tracked source files are compared by SHA-256 with the committed local tree
+before and after those remote checks.

@@ -275,6 +275,26 @@ async fn check(e: &Engine, live: &[usize], gone: &[usize], rewritten: &[usize]) 
     }
 }
 
+/// Sparse and dense predicates translate through compaction without losing deleted holes.
+async fn check_filtered_lineage(store: &Storage) {
+    for filter in [
+        json!(["id", "Lt", 40]),
+        json!(["id", "Eq", 2110]),
+        json!(["id", "Gte", 1000]),
+    ] {
+        let mut answers = Vec::new();
+        for rank in ["ANN", "kNN"] {
+            let fresh = Engine::with_config(store.clone(), config());
+            let request = serde_json::from_value(json!({
+                "rank_by":["vector",rank,vector(2110)], "filters":filter, "top_k":10,
+            }))
+            .unwrap();
+            answers.push(fresh.query("t", request).await.unwrap().result.rows);
+        }
+        assert_eq!(answers[0], answers[1], "{filter}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compaction_merges_covered_segments_and_the_tier_answers_through_lineage() {
     let (_faults, store, engine, scratch) = setup().await;
@@ -307,6 +327,7 @@ async fn compaction_merges_covered_segments_and_the_tier_answers_through_lineage
         &rewritten,
     )
     .await;
+    check_filtered_lineage(&store).await;
 
     // Deletes after the merge reach the tier through the target's live rows.
     delete(&engine, [0usize, 2000, 3999].into_iter()).await;
@@ -321,6 +342,7 @@ async fn compaction_merges_covered_segments_and_the_tier_answers_through_lineage
     let target = &again.lineage[0].parts[0].target;
     assert!(again.lineage.iter().all(|l| &l.parts[0].target == target));
     let fresh = Engine::with_config(store.clone(), config());
+    check_filtered_lineage(&store).await;
     check(
         &fresh,
         &[9, 20, 1999, 2099, 4000, 5999],

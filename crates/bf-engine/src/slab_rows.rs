@@ -65,7 +65,10 @@ pub(crate) async fn load(
         }
         Err(error) => return Err(segment::index_error(error)),
     };
-    let member = Membership::decode_sparse(&bytes).map_err(segment::index_error)?;
+    let member = crate::ann_dir::on_worker(async move {
+        Membership::decode_sparse(&bytes).map_err(segment::index_error)
+    })
+    .await?;
     validate(slab, &member)?;
     Ok(Some(read_cache::insert(
         &file.key,

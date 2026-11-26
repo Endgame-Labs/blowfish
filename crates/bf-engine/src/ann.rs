@@ -657,28 +657,36 @@ async fn from_slabs(
             };
             let warm_eligible = mask.is_none() && seat.is_none();
             let members = if allowed.is_some() {
-                Some(crate::ann_dir::memberships(store, &view.segments, &dir, attribute).await?)
+                Some(match crate::read_cache::query_memberships(&set.dir.key) {
+                    Some(members) => members,
+                    None => {
+                        crate::ann_dir::memberships(store, &view.segments, &dir, attribute).await?
+                    }
+                })
             } else {
                 None
             };
             stage(t0, "slabs_memberships");
             let lives = match (&members, &mask) {
-                (Some(members), Some(global)) => members
-                    .iter()
-                    .zip(&view.segments)
-                    .map(|(member, slab)| {
-                        Some(member.as_ref().map_or_else(
-                            || global.clone(),
-                            |m| {
-                                let key = &crate::upgrade::files(slab, attribute)
-                                    .expect("directory checked above")
-                                    .0
-                                    .key;
-                                slab_predicate(key, m, global)
-                            },
-                        ))
-                    })
-                    .collect(),
+                (Some(members), Some(global)) => {
+                    futures::future::try_join_all(members.iter().zip(&view.segments).map(
+                        |(member, slab)| {
+                            let (member, global) = (member.clone(), global.clone());
+                            let key = crate::upgrade::files(slab, attribute)
+                                .expect("directory checked above")
+                                .0
+                                .key
+                                .clone();
+                            crate::ann_dir::on_worker(async move {
+                                Ok(Some(match member {
+                                    Some(member) => slab_predicate(&key, &member, &global),
+                                    None => global,
+                                }))
+                            })
+                        },
+                    ))
+                    .await?
+                }
                 _ => vec![mask; view.segments.len()],
             };
             stage(t0, "slabs_predicates");
@@ -785,18 +793,33 @@ fn filtered_tier_mask(
         match place {
             crate::lineage::Place::Here(i) => {
                 if let Some(rows) = &allowed[*i] {
-                    mask.extend(rows.iter().map(|r| cover.base + r));
+                    mask |= RoaringBitmap::from_sorted_iter(rows.iter().map(|r| cover.base + r))
+                        .expect("translated segment rows stay sorted");
                 } else {
                     mask.insert_range(cover.base..cover.base + cover.rows);
                 }
             }
             crate::lineage::Place::Moved(parts) => {
                 for (i, map) in parts {
-                    mask.extend(
+                    if let Some(rows) = &allowed[*i]
+                        && rows.len().saturating_mul(64) < map.to.len()
+                    {
+                        // A sparse predicate should visit its matching target rows, rather
+                        // than every source row of a compaction. Both sides of a lineage map
+                        // are ascending, so reverse translation preserves this order.
+                        let selected = rows.as_ref() & &map.to;
+                        mask |= RoaringBitmap::from_sorted_iter(selected.iter().map(|to| {
+                            cover.base + map.back(to).expect("intersected lineage target")
+                        }))
+                        .expect("reverse lineage rows stay sorted");
+                        continue;
+                    }
+                    mask |= RoaringBitmap::from_sorted_iter(
                         map.pairs()
                             .filter(|(_, to)| allowed[*i].as_ref().is_none_or(|a| a.contains(*to)))
                             .map(|(from, _)| cover.base + from),
-                    );
+                    )
+                    .expect("lineage source rows stay sorted");
                 }
             }
         }

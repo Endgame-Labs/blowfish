@@ -81,6 +81,24 @@ fn vector_pieces(
     out
 }
 
+/// Seeding needs cached blocks, not assembled cluster buffers. Splitting on small aligned
+/// boundaries lets the range cache return borrowed block slices instead of copying every
+/// large code range into a buffer that the seed task immediately discards. The cache still
+/// coalesces the same missing blocks into the same backend reads.
+fn seed_pieces(ranges: Vec<std::ops::Range<u64>>) -> Vec<std::ops::Range<u64>> {
+    const PIECE: u64 = 64 << 10;
+    let mut out = Vec::new();
+    for range in ranges {
+        let mut start = range.start;
+        while start < range.end {
+            let end = start.saturating_add(PIECE - start % PIECE).min(range.end);
+            out.push(start..end);
+            start = end;
+        }
+    }
+    out
+}
+
 type Reader = segment::ObjectReader;
 /// Exact hits `(distance, row)` and estimated candidates from one segment.
 type Found = (Vec<(f32, u32)>, Vec<Candidate>);
@@ -328,19 +346,19 @@ async fn run_parallel<T: Send + 'static>(
     Ok(out)
 }
 
-async fn on_worker<T: Send + 'static>(
+/// Run cold decoding or scanning on the query's bounded worker pool when cores are available.
+pub(crate) async fn on_worker<T: Send + 'static>(
     fut: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {
     let Some(context) = read_cache::context().filter(|_| crate::fan_out()) else {
         return fut.await;
     };
-    let permit = context
-        .cache
-        .workers
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(segment::index_error)?;
+    // Exact segment queries can already hold a search permit when they decode a filter.
+    // Waiting here would let every outer task wait for a permit held by its peers. When
+    // workers are occupied, finish on the caller, which already has its share of the CPU.
+    let Ok(permit) = context.cache.workers.clone().try_acquire_owned() else {
+        return fut.await;
+    };
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -1446,7 +1464,7 @@ pub(crate) async fn search(
     let scan_upper = Arc::new(std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()));
     // Native mappings are resident even when the block cache has no retention budget.
     // Otherwise, sample a selected code range per slab without starting I/O.
-    let parallel_slab_scan = stream_scan(&dir, layout) && !filtered && joint.is_none();
+    let parallel_slab_scan = stream_scan(&dir, layout) && joint.is_none();
     let resident = parallel_slab_scan
         && (store.has_mapped_reads()
             || chosen.iter().all(|(&i, cs)| {
@@ -1496,6 +1514,11 @@ pub(crate) async fn search(
                     continue;
                 }
                 locally_staged = false;
+                let ranges = if filtered {
+                    seed_pieces(ranges)
+                } else {
+                    ranges
+                };
                 let reader = store
                     .range_reader_with_length(&file.key, file.size, true)
                     .map_err(segment::index_error)?;
@@ -1769,7 +1792,14 @@ pub(crate) async fn search(
         while let Some(result) = scans.join_next().await {
             results.push(result.map_err(segment::index_error)??);
             let ready_parts = if early_exact_docs { 1 } else { 2 };
-            if !launched && results.len() * 5 >= count * ready_parts && !scans.is_empty() {
+            // Filtered scans may visit most leaves, so early winners can change repeatedly.
+            // Their final rerank shares scan reads without fetching speculative losers;
+            // additional early reranks otherwise consume throughput under concurrent load.
+            if !filtered
+                && !launched
+                && results.len() * 5 >= count * ready_parts
+                && !scans.is_empty()
+            {
                 launched = true;
                 let mut leading: Vec<_> = results
                     .iter()

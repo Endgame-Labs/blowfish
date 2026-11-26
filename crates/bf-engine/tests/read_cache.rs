@@ -1544,3 +1544,129 @@ async fn strong_head_latency_benchmark() {
         "qps":times.len() as f64/elapsed,"p50":times[times.len()/2],"p90":times[times.len()*9/10]})
     );
 }
+
+/// A cold empty predicate must not load any slab row maps. Nonempty predicates use the same
+/// ordered IDs and distance bits with retained streaming reads and with uncached reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_slab_streaming_preserves_results_and_empty_filters_skip_memberships() {
+    let backend = Arc::new(Counting::default());
+    let writable = Storage::from_backend(backend.clone(), Path::default(), false, false)
+        .await
+        .unwrap();
+    let writer = Engine::with_config(writable.clone(), config());
+    let vector = |id: usize| -> Vec<f32> {
+        (0..16)
+            .map(|d| ((id * 7919 + d * 104729) as f64).sin() as f32)
+            .collect()
+    };
+    for batch in 0..2 {
+        let rows: Vec<_> = (batch * 50_000..(batch + 1) * 50_000)
+            .map(|id| json!({"id":id,"vector":vector(id),"tag":id % 20}))
+            .collect();
+        writer.write("filtered-stream", serde_json::from_value(json!({
+            "schema":{"vector":{"type":"[16]f16","ann":true},"tag":{"type":"uint","filterable":true}},
+            "distance_metric":"cosine_distance","upsert_rows":rows,
+        })).unwrap()).await.unwrap();
+        writer
+            .index_namespace("filtered-stream", true)
+            .await
+            .unwrap();
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
+    std::fs::create_dir_all(&root).unwrap();
+    let scratch = tempfile::Builder::new()
+        .prefix("filtered-stream-")
+        .tempdir_in(root)
+        .unwrap();
+    writer
+        .recluster(
+            "filtered-stream",
+            &bf_engine::ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 4,
+                cluster_rows: 128,
+                max_slab_rows: 25_000,
+                scratch: scratch.path().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let (_, manifest) = bf_wal::Wal::new(writable, "filtered-stream")
+        .unwrap()
+        .latest_manifest()
+        .await
+        .unwrap()
+        .unwrap();
+    let maps: Vec<_> = manifest.ann_tiers["vector"]
+        .iter()
+        .flat_map(|t| &t.slabs)
+        .map(|s| s.files["annrows:vector"].key.clone())
+        .collect();
+    assert!(maps.len() >= 4);
+    let tune = EngineConfig {
+        exact_fetch_rows: 0,
+        ..config()
+    };
+    let reader = Engine::with_config(store(backend.clone()).await, tune.clone());
+    backend.paths.lock().unwrap().clear();
+    let empty = reader
+        .query(
+            "filtered-stream",
+            serde_json::from_value(json!({
+                "rank_by":["vector","ANN",vector(123)],"top_k":10,"filters":["tag","Eq",99],
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(empty.result.rows.unwrap().is_empty());
+    let paths = backend.paths.lock().unwrap().clone();
+    assert!(
+        !paths
+            .iter()
+            .any(|(p, _)| maps.iter().any(|m| p.ends_with(m))),
+        "{paths:?}"
+    );
+    for filter in [
+        json!(["tag", "Eq", 7]),
+        json!(["tag", "Lt", 10]),
+        json!(["id", "Lt", 1000]),
+    ] {
+        let request = json!({"rank_by":["vector","ANN",vector(123)],"top_k":10,"filters":filter});
+        let mut results = Vec::new();
+        for memory_bytes in [64 << 20, 0] {
+            let storage = Storage::from_backend_with_cache(
+                backend.clone(),
+                Path::default(),
+                true,
+                false,
+                CacheConfig {
+                    memory_bytes,
+                    block_size: 4096,
+                    max_coalesce_blocks: 32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let e = Engine::with_config(storage, tune.clone());
+            let rows = e
+                .query(
+                    "filtered-stream",
+                    serde_json::from_value(request.clone()).unwrap(),
+                )
+                .await
+                .unwrap()
+                .result
+                .rows
+                .unwrap();
+            assert_eq!(rows.len(), 10);
+            results.push(
+                rows.into_iter()
+                    .map(|r| (r["id"].clone(), r["$dist"].as_f64().unwrap().to_bits()))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(results[0], results[1], "{filter}");
+    }
+}

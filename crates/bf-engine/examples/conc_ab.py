@@ -6,8 +6,8 @@
 
 Round C24b: N client threads each send queries back to back to a read-only server with no disk
 cache and a small memory cache (production 1 MiB blocks, 8-block coalescing). Reports q/s,
-p50/p90 latency, server CPU seconds per query (utime + stime from /proc), and GETs and hedges per
-query. Builds run in rotating rounds so every build sees the same host conditions.
+p50/p90 latency, server CPU seconds per query (utime + stime from /proc), and object-store
+bytes, GETs, and hedges per query. Builds run in rotating rounds so every build sees the same host conditions.
 With --perf, also records a perf profile of the server for the first round's measured window.
 
 uv run crates/bf-engine/examples/conc_ab.py --config CONFIG --scratch .scratch/RUN --label L \
@@ -27,6 +27,7 @@ P.add_argument("--clients", type=int, default=16)
 P.add_argument("--queries", type=int, default=400, help="measured queries per build per round")
 P.add_argument("--rounds", type=int, default=3)
 P.add_argument("--oracle", default="10m")
+P.add_argument("--filters", type=json.loads, help="JSON filter applied to warm-up and measured queries")
 P.add_argument("--scratch", type=Path, required=True)
 P.add_argument("--label", required=True)
 P.add_argument("--port", type=int, default=8500)
@@ -48,16 +49,20 @@ def cpu_s(pid):
     return (int(f[11]) + int(f[12])) / CLK
 
 
-def counters(client):
-    out = {"gets": 0.0, "hedges": 0.0}
-    for line in client.get("/metrics").text.splitlines():
-        m = re.match(r"blowfish_object_store_(attempts|hedges)_total\{(.*)\} (\S+)", line)
+def counters(client, destination):
+    out = {"gets": 0.0, "hedges": 0.0, "bytes": 0.0}
+    metrics = client.get("/metrics").text
+    destination.write_text(metrics)
+    for line in metrics.splitlines():
+        m = re.match(r"blowfish_object_store_(attempts|hedges|bytes)_total\{(.*)\} (\S+)", line)
         if m:
             op = re.search(r'(?:op|outcome)="([^"]+)"', m[2])[1]
             if m[1] == "attempts" and op in ("get", "get_range"):
                 out["gets"] += float(m[3])
             if m[1] == "hedges":
                 out["hedges"] += float(m[3])
+            if m[1] == "bytes" and op in ("get", "get_range"):
+                out["bytes"] += float(m[3])
     return out
 
 
@@ -97,7 +102,8 @@ def server(name, binary, port):
 
 def request(i):
     return {"rank_by": ["vector", "ANN", VEC[i % n_items].astype("f4").tolist()],
-            "top_k": 10, "consistency": {"level": "strong"}, "include_attributes": ["id"]}
+            "top_k": 10, "consistency": {"level": "strong"}, "include_attributes": ["id"],
+            **({"filters": a.filters} if a.filters is not None else {})}
 
 
 def run(name, binary, rnd, port, perf):
@@ -105,8 +111,8 @@ def run(name, binary, rnd, port, perf):
         url = f"/v2/namespaces/{config['namespace']}/query"
         for w in range(4):  # warm the process: connections, directory, centroids
             c0.post(url, json=request(900 + w)).raise_for_status()
-        before, cpu0 = counters(c0), cpu_s(proc.pid)
-        lat, nxt, lock = [], [rnd * 1000], threading.Lock()
+        before, cpu0 = counters(c0, RUN / f"{name}-{rnd}-before.metrics"), cpu_s(proc.pid)
+        lat, results, nxt, lock = [], [], [rnd * 1000], threading.Lock()
         end_i = rnd * 1000 + a.queries
         def worker():
             with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=300) as c:
@@ -115,9 +121,14 @@ def run(name, binary, rnd, port, perf):
                         i = nxt[0]; nxt[0] += 1
                     if i >= end_i: return
                     t = time.perf_counter()
-                    c.post(url, json=request(i)).raise_for_status()
+                    response = c.post(url, json=request(i))
+                    response.raise_for_status()
+                    elapsed = (time.perf_counter() - t) * 1000
+                    rows = response.json().get("rows", [])
                     with lock:
-                        lat.append((time.perf_counter() - t) * 1000)
+                        lat.append(elapsed)
+                        results.append({"query": i, "ids": [r["id"] for r in rows],
+                                        "distances": [r.get("$dist") for r in rows]})
         pp = None
         if perf:
             pp = subprocess.Popen(["sudo", "perf", "record", "-F", "499", "-g", "-p", str(proc.pid), "-o", str(RUN / f"{name}.perf.data")],
@@ -127,13 +138,17 @@ def run(name, binary, rnd, port, perf):
         ts = [threading.Thread(target=worker) for _ in range(a.clients)]
         [t.start() for t in ts]; [t.join() for t in ts]
         wall = time.perf_counter() - t0
-        cpu1, after = cpu_s(proc.pid), counters(c0)
+        cpu1, after = cpu_s(proc.pid), counters(c0, RUN / f"{name}-{rnd}-after.metrics")
         if pp:
             subprocess.run(["sudo", "kill", "-INT", str(pp.pid)]); pp.wait()
         n = len(lat)
+        if n != a.queries:
+            raise RuntimeError(f"expected {a.queries} successful requests, got {n}; inspect client errors")
+        (RUN / f"{name}-{rnd}-results.json").write_text(json.dumps(sorted(results, key=lambda r: r["query"])))
         return {"build": name, "round": rnd, "n": n, "qps": n / wall, "p50": float(np.percentile(lat, 50)),
                 "p90": float(np.percentile(lat, 90)), "cpu_ms_per_query": 1000 * (cpu1 - cpu0) / n,
-                "gets_per_query": (after["gets"] - before["gets"]) / n, "hedges_per_query": (after["hedges"] - before["hedges"]) / n}
+                "gets_per_query": (after["gets"] - before["gets"]) / n, "hedges_per_query": (after["hedges"] - before["hedges"]) / n,
+                "bytes_per_query": (after["bytes"] - before["bytes"]) / n}
 
 names = list(builds)
 rows = []
@@ -147,7 +162,7 @@ summ = {}
 for name in names:
     part = [r for r in rows if r["build"] == name]
     summ[name] = {k: float(np.mean([r[k] for r in part])) for k in
-                  ["qps", "p50", "p90", "cpu_ms_per_query", "gets_per_query", "hedges_per_query"]}
+                  ["qps", "p50", "p90", "cpu_ms_per_query", "gets_per_query", "hedges_per_query", "bytes_per_query"]}
     summ[name]["n"] = sum(r["n"] for r in part)
 (RUN / "summary.json").write_text(json.dumps(summ, indent=2))
 print(json.dumps(summ, indent=2))
