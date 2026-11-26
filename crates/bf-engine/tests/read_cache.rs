@@ -924,7 +924,14 @@ async fn directory_cost_and_publication_do_not_grow_with_segment_count() {
             .iter()
             .map(|(p, _)| p.rsplit('/').next().unwrap().to_string())
             .collect();
-        let count = |ext: &str| reads.iter().filter(|p| p.contains(ext)).count();
+        // Count objects, not GETs: how many requests an object takes depends on the cache block.
+        let count = |ext: &str| {
+            reads
+                .iter()
+                .filter(|p| p.contains(ext))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
         // Publishing opens no existing segment's index, and reads only new fragments.
         publish_reads.push((batch, count(".bfa"), count(".bfd")));
         if batch + 1 == 6 || batch + 1 == 60 {

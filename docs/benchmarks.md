@@ -14480,3 +14480,142 @@ fixture was read-only and no bucket prefix was created.
 Reproduction: `crates/bf-engine/examples/conc_ab.py --config CONFIG --scratch .scratch/RUN
 --label L --builds '{"base":"<bin>","cand":"<bin>"}' --clients 16 --queries 400 --rounds 7 [--perf]`,
 and the paired `cold_ab.py` command above with `--s3-only-arm` for both arms.
+
+## Round C25: where 450 ms of CPU go in a cold pure-S3 query (the cache block was 4.9 times too coarse)
+
+C24b left a cold 10M pure-S3 query at about 450 ms of server CPU under 16 clients, on a machine with
+eight cores. The vector scan is about 3 percent of that. Round C25 profiled it and fixed the largest
+proven cost.
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge in us-west-2 (Ubuntu 24.04 arm64, Clang 19,
+release `neoverse-v1` builds, eight pinned CPUs and Rayon workers), the retained 10M fixture
+(`tmp/c5/10m`) read-only, pure S3 (no disk cache, 64 MiB memory cache), probes64, top ten. Baseline
+is v0.1.51 with its 1 MiB blocks and eight-block coalescing.
+
+### Profile before changes
+
+`perf record` at 499 Hz with call graphs, 16 clients (this host ran the baseline at 18.5 q/s and
+357 ms CPU per query in the profiled round; the pooled rounds below are 17.3 q/s and 335 ms):
+
+| Where the samples are | Share |
+|---|---:|
+| Kernel network receive (copy to user, softirq) | 22% |
+| Hyper, reqwest, and tokio polling | 11% |
+| TLS decryption (aws-lc AES-GCM) and rustls | 10% |
+| Cache planning, `Shared` and `FuturesUnordered` polling | 10% |
+| Scheduler, futex, and wakeups | 9.5% |
+| Page faults and page clearing | 9% |
+| libc `memcpy` and malloc | 7.5% |
+| Vector scan and decode | 3% and 2% |
+| Locks | 0.6% |
+
+Unavoidable TLS plus kernel networking on the useful bytes is at most 32%, under the 75% kill
+threshold, so the round went on.
+
+The three hypotheses:
+
+1. **Block rounding is the large one, and it is worse than guessed.** Ten cold queries, each on a
+   fresh server, with the requested ranges and every GET traced: **216 GETs and 205 MB fetched per
+   query for 42 MB of unique requested bytes (4.9x)**. Scan ranges are tens of kilobytes spread
+   over objects, and every miss fetched whole 1 MiB blocks. Replaying the same requests offline
+   (coalescing capped at 8 MiB):
+
+   | Block | GETs per query | MB per query |
+   |---:|---:|---:|
+   | 1 MiB | 157 | 259 |
+   | 256 KiB | 220 | 112 |
+   | 128 KiB | 259 | 80 |
+   | 64 KiB | 307 | 62 |
+   | 16 KiB | 528 | 47 |
+
+2. **The per-block copy is real but small:** `memcpy` in the block copy was 1.6% of samples, plus
+   about 0.4% in page faults on the fresh allocations. `Observed::get_opts` builds each GET's one
+   buffer, which stays.
+3. **Planning-lock contention is not visible:** locks are 0.6% of samples.
+
+### Change
+
+- The default cache block is **256 KiB** (was 1 MiB) and `max_coalesce_blocks` is **32** (was 8), so a
+  dense read still makes GETs of up to 8 MiB. This is a default change, not a second path: the
+  `storage.cache.block_size` and `max_coalesce_blocks` settings are unchanged.
+- A block that is the whole GET response, or that no cache keeps, now slices the response buffer
+  instead of copying it. A multi-block response that the cache keeps still copies each block, so a
+  kept block never pins its neighbors (sharing one buffer would need accounting that charges the
+  whole buffer until its last block is evicted; not built).
+- `conc_ab.py` and `cold_ab.py` take per-build cache geometry (`block`/`coalesce` and
+  `BLOCK`/`COALESCE`).
+
+### Choosing the size (16 clients, the same host, 300-400 queries per build per round)
+
+| Block / coalesce | q/s | p50 / p90, ms | CPU per query, ms | GETs per query |
+|---|---:|---:|---:|---:|
+| 1 MiB / 8 (baseline) | 16.8 | 907 / 1,279 | 326 | 119 |
+| 256 KiB / 32 | 25.3 | 593 / 824 | 222 | 173 |
+| 128 KiB / 64 | 30.6 | 486 / 694 | 189 | 201 |
+| 64 KiB / 128 | 35.0 | 418 / 559 | 166 | 230 |
+| 32 KiB / 256 | 39.9 | 365 / 496 | 165 | 248 |
+| 16 KiB / 512 | 37.5 | 349 / 538 | 161 | 270 |
+
+Smaller blocks help until about 32 KiB, but they cost the warm path. A range that spans blocks is
+rebuilt by copying, and with 64 KiB blocks about half of the scan's ranges span two. Warm repeat
+queries (same host, cache hits only, block cache only, six alternating rounds) used 35.3 ms of CPU
+per query at 1 MiB, 36.5 at 256 KiB (+3%), and about +11% at 128 KiB and +14% at 64 KiB. The disk
+tier writes one file per block, so 64 KiB would also mean four times the files of 256 KiB. 256 KiB
+is the largest gain that leaves the warm path within noise.
+
+### Result (v0.1.51 against the 256 KiB default, one host, rounds 1 to 6 of 7 pooled)
+
+**Sixteen clients** (`conc_ab.py`, 400 queries per build per round):
+
+| Build | q/s | p50 / p90, ms | CPU per query, ms | GETs per query | Hedges per query |
+|---|---:|---:|---:|---:|---:|
+| v0.1.51 | 17.28 | 887 / 1,267 | 335 | 117 | 12.3 |
+| **C25** | **25.61** | **592 / 823** | **224** | 171 | 18.5 |
+
+Throughput is **1.48x** and CPU per query **1.50x lower**; every C25 round (25.3 to 25.9 q/s, 221 to
+227 ms) is outside every baseline round (16.6 to 17.9 q/s, 323 to 352 ms). Both pass the 1.3x bar.
+The profile after the change is the same shape with fewer bytes: kernel receive 21.6%, TLS 9.5%,
+polling 22%, `memcpy` 7.9%, the scan 3.3%.
+
+**Single client, eight paired process pairs** (200 queries per pair, alternating order, IDs-only and
+`title`/`text` projections with independent cache drops, 1,600 samples per build and projection,
+bootstrap intervals over queries, baseline/candidate):
+
+| Path | Baseline p50 / p90, ms | C25 p50 / p90, ms | Ratio p50 / p90 | 95% interval p50 | 95% interval p90 |
+|---|---:|---:|---:|---:|---:|
+| Pure-S3 IDs | 284.3 / 360.0 | 234.3 / 311.3 | 1.213 / 1.157 | 1.197-1.230 | 1.117-1.196 |
+| Pure-S3 attributes | 284.0 / 362.8 | 234.9 / 313.3 | 1.209 / 1.158 | 1.192-1.225 | 1.125-1.203 |
+
+Every pair's p90 ratio is above 1.09. **All 3,200 reply pairs match** (ordered documents and exact
+distances), and recall@10 is 0.9700 in both arms. Bytes per query fall from 199 to 96 MB (IDs) and
+from 203 to 101 MB (attributes); GETs rise from 250 to 291 and from 326 to 370. A single client
+is latency-bound, so it gains less than the loaded server does.
+
+**Warm repeat queries** (20 queries cold, then the same 20 three times, six alternating rounds):
+
+| Path | Baseline p50, ms | C25 p50, ms | Baseline CPU per query | C25 CPU per query |
+|---|---:|---:|---:|---:|
+| Block cache only (decoded cache off) | 12.9 | 13.5 | 35.3 ms | 36.5 ms |
+| With the decoded cache | 12.3 | 12.3 | 10.8 ms | 12.9 ms |
+
+The repeats hit the cache (zero cache misses in the repeats; the later checks that counted a few
+GETs were stragglers from the cold phase). The decoded-cache row is +2 ms of CPU, from rebuilding
+ranges that now span blocks. It is the one cost of the change.
+
+**Gaps.** The disk tier was not run (pure S3 only); its block count goes up four times, and a disk-cache
+run belongs in the next round. "No spill for blocks seen once" was not built: with the disk off it
+cannot show up in these numbers. A buffer shared by a multi-block response, with whole-buffer
+charging, would remove the warm range copies and the remaining cold block copies; it is the next
+step if the warm cost matters.
+
+Resources: one on-demand c7gd.4xlarge, 11:49 to 13:52 UTC (2.05 hours, about $1.20 compute, plus
+about 1.5 million GETs). Instance, key pair, and security group deleted and verified. The fixture
+was read-only and no bucket prefix was created.
+
+Reproduction: build `crates/bf-engine/examples/scale-server` at v0.1.51 and at C25, then
+`conc_ab.py --config CONFIG --scratch .scratch/RUN --label L --builds
+'{"base":{"bin":"<v0.1.51>"},"cand":{"bin":"<c25>","block":262144,"coalesce":32}}' --clients 16
+--queries 400 --rounds 7 [--perf]`, and eight times `cold_ab.py --oracle 10m --queries 200
+--paired-projections --binary <c25> --arms
+'{"base":{"BINARY":"<v0.1.51>","BLOCK":"1048576","COALESCE":"8"},"cand":{"BLOCK":"262144","COALESCE":"32"}}'
+--s3-only-arm base --s3-only-arm cand` with the arm order swapped on odd runs.

@@ -568,7 +568,7 @@ mod tests {
         let config: Config =
             toml::from_str(include_str!("../../../blowfish.example.toml")).unwrap();
         assert_eq!(config.engine.index_rows, Some(1000));
-        assert_eq!(config.storage.cache.block_size, 1 << 20);
+        assert_eq!(config.storage.cache.block_size, 256 << 10);
     }
 
     #[test]
