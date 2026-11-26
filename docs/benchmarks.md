@@ -13432,3 +13432,80 @@ starts a fresh server on the same store with the OS cache dropped. Cells show th
 Costs: WC1 used one c7i.2xlarge for about 55 minutes, an estimated $0.45 with the 120 GB volume. WC2 used one for
 about 1 hour 25 minutes, an estimated $0.55. The instances, key pairs, and security groups are deleted, and no S3
 prefix was written.
+
+## Round W6/W7: cold queries fetch committed WAL payloads one at a time (concurrent fetch, 3.2x at 32 payloads; bounded by bytes in W7)
+
+Hypothesis (Sol, `briefs/ideas/2225-sol.md` #1): `tail_bounded` discovers WAL slots concurrently but then calls `materialize` on each record in
+turn, so every out-of-line payload (over 64 KiB, `INLINE_PAYLOAD_BYTES`) costs one serial object-store round trip on a cold strong query.
+Inline payloads, tombstones, and checkpointed slots cost none. Gate: cold strong p50 at least 1.3x lower with 32 payloads, identical replies,
+no regression with an empty or small tail. Kill line: serial fetch under 30% of cold query time.
+
+### Method
+
+One on-demand c7g.2xlarge (Ubuntu 24.04 arm64, Clang 19) in us-west-2, same region as the bucket. Server built at v0.1.42 (baseline) and with the
+change, both on the same box. Each sample is a fresh `serve --read-only` process (read-only so no startup pass opens namespaces), one strong
+`rank_by id asc, limit 10` query, 15 samples per cell, run A/B/B/A. Indexing was never run, so every write is an unindexed tail. Namespaces:
+`ext32` (32 writes of one 150 KB document, so 32 external payloads), `ext1` (one such write), and `inl32` (32 tiny inline writes).
+
+### Kill test (baseline only)
+
+| Namespace | Cold p50 ms | p90 ms |
+| --- | ---: | ---: |
+| ext32 | 1,013 | 1,045 |
+| inl32 | 186 | 196 |
+| ext1 | 68 | 78 |
+
+The 32 payload reads were about 800 of 1,013 ms (about 80%), far above the 30% line. The remaining 190 ms is slot discovery and the query.
+
+### Change (no format change)
+
+`tail_bounded` streams the records after the last tombstone through `futures::stream::buffered(8)`. Payloads are fetched up to 8 at a time, but
+results arrive in WAL order, so the byte budget, the `Pruned` rescan, the corruption check, and errors behave exactly as the serial loop did.
+Stopping early (budget, pruned, or error) drops fetches still in flight. W6 bounded concurrency by count only (8), which with the 512 MiB body
+limit could hold several GiB in flight; W7 below fixes that.
+
+### Results (cold p50 ms, A/B/B/A)
+
+| Namespace | Base | New | Speedup |
+| --- | ---: | ---: | ---: |
+| ext32 | 1,040 / 1,026 | 320 / 318 | 3.2x |
+| inl32 (empty-ish tail, no external payloads) | 177 / 208 | 192 / 165 | noise |
+| ext1 | 73 / 71 | 67 / 67 | noise |
+
+p90 for ext32 was 1,207 to 2,157 ms (base) against 360 to 419 ms (new). Rows from all three namespaces (50 rows, all attributes) hashed identically
+on both binaries. Tests added in `crates/bf-wal/tests/log.rs`: 40-entry order with mixed inline and external payloads, a tombstone in the middle,
+reclaimed payloads (still `Format`, byte budget unchanged), cleanup racing a reader, and an empty tail.
+
+### Conclusion
+
+**Passes** (3.2x on the 1.3x gate). What is left at 32 payloads is about 130 ms over the inline case: 32 payloads at 8 in flight is four waves of
+about 25 to 30 ms (150 KB each). A larger window would cut that further but is unbounded in bytes. Cost: one c7g.2xlarge for about 1.2 hours
+(under $0.50); instance, key pair, security group, and the `tmp/w6-20261125/` prefix deleted.
+
+### Round W7: in-flight payload bytes bounded (64 MiB window, no new setting)
+
+`CommitRecord` gains an optional `payload_bytes` (serde default, skipped when absent): the stored size of the out-of-line payload, written by
+`stage` and carried to `commit`. The struct does not use `deny_unknown_fields`, so old binaries ignore the field and new binaries read old
+records; the slot version stays 3 and no format fence is needed. `tail_bounded` admits a fetch while the summed stored sizes in flight stay under
+64 MiB and at most 8 run; the first always proceeds, so a payload over the budget fetches alone. Inline entries and tombstones cost nothing. A
+record without a size (older releases) counts as the whole budget, so it fetches one at a time, as before W6. Results still arrive in WAL order.
+The size is known with no extra round trip because it sits in the slot record already read during discovery.
+
+Tests: `FetchWindow` unit tests (count cap, byte cap, oversized alone, unknown sizes serial), and `crates/bf-wal/tests/log.rs` for sizes recorded in
+new slots, old records without sizes replaying in order, an 80 MiB payload among small ones, plus the W6 order, tombstone, GC-race, error, and
+empty-tail tests.
+
+Measured on one on-demand c7g.2xlarge in us-west-2 (same region as the bucket), W6 (`5b3e2f3`) against W7 built on the same box, via
+`crates/bf-wal/examples/tail_rss.rs` (`Wal::tail_bounded` straight against S3, one fresh process per sample, so these times exclude the query):
+
+| Case | W6 (count only) | W7 (bytes) |
+| --- | ---: | ---: |
+| 32 x 150 KB payloads, p50 ms (32 samples, interleaved A/B/B/A) | 305 | 291 |
+| 32 x 150 KB payloads, peak RSS | 40 MiB | 40 MiB |
+| 8 x 64 MiB payloads, budget 150 MiB (2 entries returned), p50 ms | 2,039 to 2,325 | 2,068 to 2,073 |
+| 8 x 64 MiB payloads, peak RSS | 716 to 728 MiB | 395 to 399 MiB |
+
+The small case is unchanged (150 KB payloads fit 8 at once in 64 MiB). The large case halves peak RSS now (W6 had 8 in flight, W7 one at a time since two
+64 MiB payloads exceed the window), at the same latency (the downloads are bandwidth-bound). The ceiling with W6 grows with the payload size
+(8 x 512 MiB is over 4 GiB); with W7 it is the window plus the one oversized payload being fetched. Cost: one c7g.2xlarge for about 0.5 hour
+(under $0.20); instance, key pair, security group, and the `tmp/w7-20261125/` prefix deleted.
