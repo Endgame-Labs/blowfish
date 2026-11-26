@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.43] - 2026-11-26
+
+### Fixed
+
+- **A pass of large `top_k` queries no longer halves warm vector speed:** On a tier whose exact vectors do not all fit in memory, a run of top_k 100 queries filled the exact-vector cache and evicted the rows ordinary queries need, and the cache kept the large-query rows afterwards. On 2.68M BEIR NQ, warm top_k 10 fell from about 1,400 to about 600 q/s at 16 clients and did not recover. Large queries are now recognized relative to the tier's recent workload and fill only free space in the same memory budget, so ordinary queries keep their rows. After a top_k 100 pass, warm top_k 10 stays within 4% of a fresh server, a workload of only top_k 100 queries is about 1.3x faster, and memory use is unchanged. New metrics count exact-row cache lookups, inserts, evictions, and the reasons a query leaves the compiled warm path.
+
 ## [0.1.42] - 2026-11-25
 
 ### Fixed
@@ -321,7 +327,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.42...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.43...HEAD
+[0.1.43]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.43
 [0.1.42]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.42
 [0.1.41]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.41
 [0.1.40]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.40
