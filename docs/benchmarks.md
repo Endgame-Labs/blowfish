@@ -15112,3 +15112,93 @@ profile, with `RUST_TEST_THREADS=1`. Harness syntax, help, and four real-oracle
 request/truth preparation checks pass using uv. The full debug workspace test
 and repeated workspace clippy on the final commit are recorded in the worker
 report; no failing performance gate is represented as a passing optimization.
+
+
+## Round C27: quiet namespaces repair row maps, and the cold filtered baseline on a repaired 10M layout
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge (us-west-2), v0.1.54 (`a6f257f`) plus the C26
+stage diagnostics. No product code changed: the answer to the first question is that repair already
+works without writes, and this round adds a test that proves it.
+
+### Does a quiet writable namespace repair?
+
+Yes. The background loop (`indexer::index_loop`) calls `index_namespace(ns, false)` for every known
+namespace on every `index_interval`. `slab_rows::needs` (and the probed `slab_rows::missing`) are
+part of the condition that skips the "nothing to do" early return, so a pass with no writes still
+reaches `slab_rows::ensure`, which backfills one slab per pass under the manifest fence. The new
+test `c27_quiet_namespace_publishes_row_maps_from_the_background_loop` deletes every published map,
+starts an engine with indexing on, issues one query (a read), never writes or forces a pass, and
+asserts that every map reappears. It takes about 30 s only because the fixture's engine still holds
+its 30 s advisory lease. Strong-consistency readers re-read the manifest per query, so they use the
+maps as soon as they are published. A read-only server never repairs: some writer must open the
+namespace once.
+
+### Repair cost on the retained 10M layout
+
+I copied the C5 fixture server-side into my own prefix (693 objects, 77.3 GB), then served the copy
+writable with the scale server and no writes. The first writable pass found work beyond row maps:
+the fixture also predates the current segment text format, so each pass rewrote segments
+(`text_upgrade`, 6.97 M rows rebuilt, 35 lineage merges) as well as publishing one map. Published
+maps went from 0 to 55 (60.0 MB in all; the layout has 55 slabs) in about 13 minutes, after which
+manifests stopped changing. Maps appeared in bursts (3 in the first six minutes, then 55 by minute twelve) while the
+segment rewrites ran; I did not trace why. Counter
+`blowfish_ann_row_map_rebuilds_total{reason="backfill"}` ended at 55.
+
+### Cold filtered baseline on the repaired copy
+
+Protocol as C26: fresh read-only process per case, oracle queries 0-19, top 10, IDs only, 64 probes,
+strong consistency, engine caches cleared before every query, 8 Rayon workers on CPUs 0-7, 8 GiB
+raw cache, no disk cache, 256 KiB blocks, 32-block coalescing. Twenty measured queries per case after
+one untimed warm-up. **Every measured query recorded zero row-map rebuilds** (new `rowmap_rebuilds`
+field in `cold_ab.py`).
+
+| Filter | Matching tier rows | C27 HTTP p50 / p90, ms | C26 (unrepaired) p50, ms | Median GETs | Median MB read |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `title_initial Eq z` | 44,129 | 2,014.148 / 2,052.594 | 3,641.440 | 916.5 | 1,645.8 |
+| `text_length Gte 300` | 4,808,218 | 1,836.613 / 1,997.986 | 3,395.188 | 772.0 | 389.3 |
+| `id Lt 1000` | 998 | 6,696.710 / 6,836.317 | 8,546.506 | 1,095.5 | 650.2 |
+| `title_initial Eq __c26_no_match__` | 0 | 840.972 / 863.065 | 2,442.289 | 293.0 | 145.7 |
+| unfiltered | - | 313.132 / 391.149 | - | 331.5 | 103.3 |
+
+Unfiltered recall and results were not compared, since nothing about ranking changed.
+
+### Stage trace on the repaired copy (median request-relative ms)
+
+| Endpoint | Title | Length | Tiny | Empty |
+| --- | ---: | ---: | ---: | ---: |
+| Snapshot warming starts | 54.272 | 53.085 | 53.450 | 53.799 |
+| Slab directory available | 111.296 | 126.119 | 121.958 | 117.983 |
+| All filter masks available | 454.769 | 703.140 | 6,168.270 | 439.340 |
+| Snapshot warm done (memberships) | 716.374 | 1,036.166 | 6,504.976 | 795.505 |
+| Main tier plan starts | 716.548 | 1,036.336 | 6,505.184 | 795.692 |
+| Slab predicates translated | 833.813 | 1,306.324 | 6,555.574 | - |
+| Scan complete | 1,814.314 | 1,646.008 | 6,670.297 | - |
+
+### Are the old hypotheses worth fixing now?
+
+Using C26's generous credit (the whole interval from main tier start through scan completion, plus
+the snapshot's initial directory wait; ratios of separate medians):
+
+| Filter | Credit, ms | Share of p50 | Optimistic residual p50, ms | Ceiling speedup |
+| --- | ---: | ---: | ---: | ---: |
+| title | 1,220.8 | 60.6% | 771.2 | 2.61x |
+| length | 761.0 | 41.4% | 1,059.2 | 1.73x |
+| tiny | 286.0 | 4.3% | 6,394.1 | 1.05x |
+| empty | 162.4 | 19.3% | 677.7 | 1.24x |
+
+With the rebuild gone, the removable share for both original filters is above C26's 30% screen
+(it was 29.5% and 14.7% before), and the ceilings now clear 1.5x. Hypothesis 3 (the disabled
+streaming path) is the one that now matters: scan time after plan is 973 ms for title and 291 ms
+for length. The trace does not support the serial-wave hypothesis as stated, because the
+directory, masks, and memberships are already overlapped in snapshot warming. What remains in front
+of the plan is the snapshot's membership wave: 594 ms (29.5% of p50) after the directory for
+title, 885 ms (48.2%) for length, and 677 ms (80.5%) for the empty filter, which then returns
+nothing. Two things stand out for the next round: the published-map and filter-mask reads that
+still gate the plan even when the filter matches nothing, and the `id Lt` filter, whose mask
+alone takes 6.1 s (a full ID dictionary decode), which no old hypothesis addresses.
+
+### Resources
+
+One c7gd.4xlarge on demand for about 0.6 h (roughly $0.45), plus a 77 GB prefix that lived for
+about 35 minutes. The prefix was deleted and verified empty with no multipart uploads; the instance,
+key pair, and security group were deleted, and no tagged instance remains.
