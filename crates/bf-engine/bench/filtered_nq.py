@@ -24,10 +24,12 @@ def prepare(data, output):
     queries = np.load(data / "queries.npy")[:64].astype("f4")
     normalized = queries / np.maximum(np.linalg.norm(queries, axis=1, keepdims=True), 1e-30)
     cases = [(attribute, percent) for attribute in ["id", "bucket"] for percent in [1, 10, 50]]
+    # Round G14 adds the selective hash filters and the crossover points.
+    cases += [("bucket", p) for p in [0.5, 2, 5, 20]] + [("id", 5)]
     best = {}
     for attribute, percent in cases:
         name = f"{attribute}-{percent}"
-        limit = math.ceil(len(corpus) * percent / 100) if attribute == "id" else 100 * percent
+        limit = math.ceil(len(corpus) * percent / 100) if attribute == "id" else round(100 * percent)
         workloads = [{"rank_by": ["vector", "ANN", vector.tolist()],
                       "filters": [attribute, "Lt", limit], "top_k": 10,
                       "include_attributes": False} for vector in queries]
@@ -43,7 +45,7 @@ def prepare(data, output):
         for attribute, percent in cases:
             name = f"{attribute}-{percent}"
             mask = (ids < math.ceil(len(corpus) * percent / 100) if attribute == "id"
-                    else buckets < 100 * percent)
+                    else buckets < round(100 * percent))
             if not mask.any():
                 continue
             scores = similarities[:, mask]

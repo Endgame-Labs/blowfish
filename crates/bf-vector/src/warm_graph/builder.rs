@@ -159,9 +159,20 @@ impl HotGraphBuilder {
             links.push(row);
             degrees.push(count as u8);
         }
+        let rows = std::mem::take(&mut self.rows);
+        // A dense row-to-node table when tier row numbers are within 4x the node count.
+        let top = rows.iter().max().map_or(0, |m| *m as usize + 1);
+        let mut nodes = Vec::new();
+        if top <= self.count.saturating_mul(4) {
+            nodes = vec![u32::MAX; top];
+            for (node, row) in rows.iter().enumerate() {
+                nodes[*row as usize] = node as u32;
+            }
+        }
         Ok(HotGraph {
             dims: self.dims,
-            rows: std::mem::take(&mut self.rows),
+            rows,
+            nodes,
             links,
             degrees,
             entries: vec![best.0],

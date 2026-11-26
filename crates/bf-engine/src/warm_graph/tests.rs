@@ -809,3 +809,138 @@ fn saving_is_a_fraction_of_the_current_ivf_cost_so_a_top_k_change_cannot_flip_it
         "a graph slower than IVF saves nothing"
     );
 }
+
+// Round G14: a selective filter is answered by scanning the ready graph's codes for the allowed
+// rows, then the usual exact rerank, with the IVF engine (no graph) as the control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selective_filters_scan_the_graph_and_match_the_ivf_control() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.scratch")
+        .join(format!("g14-scan-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        cache: CacheConfig {
+            memory_bytes: 32 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let config = EngineConfig {
+        indexing: false,
+        recall_sample_rate: 0.,
+        decoded_cache_bytes: 64 << 20,
+        ..Default::default()
+    };
+    let e = Engine::with_config(store.clone(), config.clone());
+    let control = Engine::with_config(store.clone(), config);
+    let mut seed = 11u64;
+    let mut vector = || {
+        (0..16)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 40) as f32 / 16777216. * 2. - 1.
+            })
+            .collect::<Vec<_>>()
+    };
+    let vectors = (0..2500).map(|_| vector()).collect::<Vec<_>>();
+    let rows = vectors
+        .iter()
+        .enumerate()
+        .map(|(id, v)| json!({"id":id,"vector":v,"bucket":id%100}))
+        .collect::<Vec<_>>();
+    e.write("hot",serde_json::from_value::<WriteRequest>(json!({"distance_metric":"cosine_distance","schema":{"vector":{"type":"[16]f16","ann":true}},"upsert_rows":rows})).unwrap()).await.unwrap();
+    e.index_namespace("hot", true).await.unwrap();
+    e.run_recluster_job(
+        "hot",
+        &ReclusterOptions {
+            attribute: "vector".into(),
+            cells: 2,
+            cluster_rows: 32,
+            max_slab_rows: 5000,
+            scratch: root.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let (state, _) = e
+        .snapshot("hot", &bf_types::Consistency::Strong)
+        .await
+        .unwrap();
+    let set = &state.ann_tiers["vector"][0];
+    let key = Key::new("hot", &state, "vector", set);
+    let held = Arc::new(admitted_entry(&e, set).await);
+    // Ready, but not calibrated: a scan does not depend on the beam, so it needs neither.
+    let mut heat = Heat::new(Instant::now());
+    heat.ready = Some(held.clone());
+    e.0.hot_graph.entries.lock().unwrap().insert(key, heat);
+    let ask = |i: usize, filter: Value, k: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k,"filters":filter,"include_attributes":["bucket"]});
+    let answers = || e.0.hot_graph.answers.load(Ordering::Relaxed);
+    // 1% of the rows (25), a single row, fewer rows than k, and no rows at all.
+    for (filter, rows, k) in [
+        (json!(["bucket", "Eq", 7]), 25, 10),
+        (json!(["bucket", "Eq", 7]), 25, 100),
+        (json!(["id", "Eq", 17]), 1, 10),
+        (json!(["id", "Lt", 4]), 4, 10),
+        (json!(["bucket", "Eq", 150]), 0, 10),
+    ] {
+        let before = answers();
+        let got = query(&e, "hot", ask(7, filter.clone(), k)).await;
+        same_rows(got.clone(), query(&control, "hot", ask(7, filter, k)).await);
+        assert_eq!(got.as_array().unwrap().len(), rows.min(k));
+        // A filter that matches nothing needs no graph answer; the others must have used it.
+        assert_eq!(answers() > before, rows > 0, "rows={rows} k={k}");
+    }
+    // Above the crossover (1 row in 64), the IVF tier answers.
+    let before = answers();
+    let wide = json!(["bucket", "Lt", 10]);
+    same_rows(
+        query(&e, "hot", ask(7, wide.clone(), 10)).await,
+        query(&control, "hot", ask(7, wide, 10)).await,
+    );
+    assert_eq!(answers(), before);
+    // Rows rewritten, moved to another bucket, and deleted since the tier was built are shadowed:
+    // the scan must not return their old versions.
+    let moved = vector();
+    e.write(
+        "hot",
+        serde_json::from_value::<WriteRequest>(json!({
+            "upsert_rows":[
+                {"id":7,"vector":moved,"bucket":7},
+                {"id":107,"vector":vectors[7],"bucket":8},
+                {"id":2600,"vector":vectors[7],"bucket":7}],
+            "deletes":[207]
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    for bucket in [7, 8] {
+        let filter = json!(["bucket", "Eq", bucket]);
+        let before = answers();
+        let got = query(&e, "hot", ask(7, filter.clone(), 10)).await;
+        same_rows(
+            got.clone(),
+            query(&control, "hot", ask(7, filter, 10)).await,
+        );
+        let ids = got
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&207));
+        // 107 left bucket 7 and joined bucket 8.
+        assert_eq!(ids.contains(&107), bucket == 8);
+        assert!(ids.iter().filter(|id| **id == 7).count() <= 1);
+        assert!(answers() > before, "shadowed rows still use the graph");
+    }
+    e.shutdown(Duration::from_secs(3)).await;
+    control.shutdown(Duration::from_secs(3)).await;
+}

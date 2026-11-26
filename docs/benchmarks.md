@@ -15766,3 +15766,47 @@ run after the final documentation commit, separately from timing, using
 `nice -n 19 cargo clippy --workspace --all-targets -j 3 -- -D warnings`.
 All tracked source files are compared by SHA-256 with the committed local tree
 before and after those remote checks.
+
+## Round G14: selective filtered vector queries scan the warm graph's codes, 3.7 to 5.9 times faster at 16 clients
+
+Filtered vector queries never used the warm graph: its tiers required no filter, so every filtered query ran IVF (F1 measured hash-filter workloads at 168 q/s for 1 percent). The ready graph already holds every row's SQ8 code in memory. A filter that leaves a few rows can instead score only those rows' codes, keep the best `max(3k, 30)` by SQ8 distance, and rerank them with the exact f16 rerank the graph path already uses.
+
+**What ships** (`bf-vector` `HotGraph::scan`, `bf-engine` `warm_graph::scan` and `scan_eligible`, and the filtered planner in `ann.rs`): when a graph is ready for a tier and a filtered query's allowed rows in that tier number at most 1 in 64 of the graph's rows (1.56 percent), the query is answered from the codes; otherwise the IVF tier answers as before. The graph keeps a dense tier-row-to-node table (4 bytes per row, charged to its resident bytes), and the scan iterates the allowed bitmap, prefetches 24 rows ahead, and selects the shortlist. The exact rerank, the live and filter masks, the shadowed-row slack, and the ID-table and document paths are the graph path's own. A scan does not feed the beam calibration, takes no scratch slot, and needs a ready graph but not a calibrated one. If the scan cannot answer, the whole query falls back to IVF as an unfiltered graph query does. Filters that match nothing return empty without touching the graph; fewer allowed rows than `k` return all of them.
+
+### Method
+
+One on-demand c7g.4xlarge (16 Graviton3 vCPU, 32 GiB), Ubuntu 24.04, Rust 1.100.0. Full BEIR NQ (2,681,468 x 1,024-d f16 cosine) loaded fresh through the write API with a `bucket` column (D4's SplitMix64 bucket, 0 to 9,999), indexed, and reclustered (32 cells, 250,000-row slabs, 6.2 minutes). `ann_nprobe` 64, 4 GiB block and decoded caches, a read-only local store, 12 Rayon and Tokio workers. The graph was built by ordinary heat (800 q/s of unfiltered queries, the 10-minute dwell, then a 263-second build; 3.2 GB resident). Heat stopped before measuring. The workloads are `crates/bf-engine/bench/filtered_nq.py`'s: 64 query vectors, `top_k` 10, `include_attributes: false`, `bucket < 50/100/200/500/1000/2000` (hash 0.5, 1, 2, 5, 10, and 20 percent) and `id < 1/5/10/50 percent`, with recall@10 against exhaustive truth over the allowed rows from the stored f16 vectors.
+
+The comparison ran both arms inside one server process on the same graph and snapshot, switched per run through a file the server read (a temporary switch in a candidate binary, since deleted), in the order IVF, scan, scan, IVF; the switch also set the scan arm's share limit (5 percent for the 0.5 to 5 percent and id 1 and 5 percent runs, 50 percent for the 10 and 20 percent runs, so the crossover could be measured). The IVF arm is the v0.1.56 filtered path unchanged. One client is one serial connection (600 or 200 requests); 16 clients are eight processes of two threads each (4,000 or 800 requests) on the same host. Two runs per arm are averaged.
+
+### Results
+
+| Filter | Allowed rows | Recall@10 IVF / scan | 1 client q/s, IVF to scan | 16 clients q/s, IVF to scan | 16-client p50 ms | 16-client p99 ms |
+|---|---:|---|---|---|---|---|
+| hash 0.5% | 13,400 | 1.000 / 1.000 | 151 to 230 | 502 to 2,954 (5.9x) | 30.0 to 4.8 | 42.0 to 9.2 |
+| hash 1% | 26,700 | 1.000 / 1.000 | 125 to 133 | 388 to 1,807 (4.7x) | 38.9 to 8.0 | 53.4 to 13.4 |
+| hash 2% | 53,500 | 1.000 / 1.000 | 103 to 83 | 304 to 1,121 (3.7x) | 50.2 to 13.3 | 66.5 to 19.6 |
+| hash 5% | 134,000 | 1.000 / 1.000 | 82 to 41 | 232 to 558 (2.4x) | 65.7 to 27.2 | 88.2 to 39.3 |
+| id 1% | 26,800 | 1.000 / 1.000 | 192 to 193 | 714 to 2,867 (4.0x) | 21.0 to 4.9 | 27.3 to 9.3 |
+| id 10% | 268,000 | 1.000 / 1.000 | 120 to 25 | 362 to 444 (1.2x) | 42.1 to 33.5 | 57.7 to 54.5 |
+| hash 10% | 268,000 | 1.000 / 1.000 | 114 to 22 | 360 to 305 (0.85x) | 42.4 to 49.2 | 57.7 to 73.7 |
+| hash 20% | 536,000 | 0.998 / 1.000 | 167 to 12 | 630 to 167 (0.26x) | 24.0 to 88.9 | 33.9 to 139 |
+
+(id 5%, with 134,074 allowed rows, is just above the 5 percent line this run's scan arm allowed, so both arms ran IVF: 330 and 334 q/s at 16 clients.) Recall is identical or better at every point. The scan reads each allowed row's 1 KiB code, so its cost grows with the filter while IVF's cost, bounded by the F1 coverage planner, stays nearly flat. The 16-client throughput ties near 8 percent. Single-client latency ties near 1.2 percent: one client is dominated by a fixed per-query cost of about 3 to 6 ms (snapshot check, filter masks, rerank reads, HTTP) that both paths pay.
+
+**Where the time goes, scan alone** (`bf-vector/examples/g14_scan.rs`, first 1M NQ rows, hash masks, no HTTP): about 155 ns per allowed row serially (1 KiB per row, 6.5 GB/s per thread) and 3,400 q/s at 16 threads for 2 percent (20,000 rows), about 70 GB/s across the host. It is bound by memory bandwidth, not by the dot product or by latency: prefetching 8, 24, or 48 rows ahead and sorting the node IDs first change it by under 10 percent, so the shipped scan does not sort.
+
+**The crossover** is 1 row in 64 (1.56 percent). Below it the scan is 4x or more faster at 16 clients and within about 10 percent of IVF serially; above it IVF is the better path. It is one rule with no setting (SPEC 25). It is fixed in terms of the graph's rows rather than a wall-clock estimate because the scan's cost is proportional to the allowed rows. A host with more memory bandwidth per core would put the crossover higher, and one with less would put it lower; I measured only Graviton3.
+
+**The final binary.** After removing the switch and the tuning variables (and the scratch slot the scan does not need), I rebuilt, promoted a new graph the same way, and re-ran with the shipped rule. Both runs, 16 clients, recall@10 1.000: hash 0.5 percent 3,333 and 3,373 q/s (p99 8.0 ms; 1 client 290 q/s), hash 1 percent 1,967 and 1,966 q/s (p99 12.1 ms; 1 client 155 q/s), id 1 percent 2,894 and 2,949 q/s (p99 9.0 and 9.5 ms). At 2, 5, and 10 percent the IVF tier answers and matches the earlier IVF arm: hash 2 percent 308 q/s, hash 5 percent 232 q/s, id 10 percent 369 and 372 q/s.
+
+### Tests
+
+`bf-vector` `scan_scores_only_allowed_rows_and_matches_a_brute_force_order` covers a sparse tier-row map (node order is not row order, with a gap), a third of the rows, one row, rows outside the graph, all rows, and the zero-query and zero-count errors. The engine test `selective_filters_scan_the_graph_and_match_the_ivf_control` builds a 2,500-row tier with a ready graph and compares the answer with an engine that has no graph (the IVF control), equal rows and score bits, for a filter matching 25 rows at `top_k` 10 and 100, one row, fewer rows than `k`, and no rows; it requires a graph answer for each filter that has rows, and IVF above the crossover. It then rewrites a row, moves one into and out of the filtered bucket, adds a row, and deletes one without reindexing (shadowed rows), and requires the same rows as the control, no stale or deleted row, and still a graph answer.
+
+### Notes
+
+- **A filtered-only workload never builds a graph.** The graph is built from unfiltered query heat, as before, so this speeds up filtered queries for a namespace that also serves unfiltered ones, or until its graph is evicted. The filtered path does not feed heat. I did not change that.
+- **Not measured:** Qdrant on the M4 (left for a later round), filters on other columns than the ones above, string-ID namespaces (unchanged path), and hardware other than Graviton3. Each point is two runs on one host; paired runs agree within 3 percent.
+
+Costs: one on-demand c7g.4xlarge for 76 minutes, about $0.75 of compute plus a 250 GB gp3 root volume for the same time. The 5.5 GB NQ corpus was copied from the measurement bucket to the host (same region); no bucket writes. The instance, key pair, and security group are deleted, and `describe-instances` shows nothing of mine.
