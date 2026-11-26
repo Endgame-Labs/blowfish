@@ -419,27 +419,41 @@ impl Drop for InFlight {
 struct RecallSampler {
     busy: Arc<std::sync::atomic::AtomicBool>,
     not_before: Arc<std::sync::Mutex<Instant>>,
+    /// Samples taken that could use a cheap comparison; every [`AUDIT_EVERY`]th is exhaustive.
+    cheap: Arc<std::sync::atomic::AtomicU64>,
 }
+/// Of the samples that calibrate a warm graph, one in this many reads every vector, so the cheap
+/// union truth (see [`indexed::union_truth`]) is checked against the real one and cannot drift.
+const AUDIT_EVERY: u64 = 16;
 const RECALL_SAMPLE_DUTY: u32 = 50;
 impl Default for RecallSampler {
     fn default() -> Self {
         Self {
             busy: Arc::default(),
             not_before: Arc::new(std::sync::Mutex::new(Instant::now())),
+            cheap: Arc::default(),
         }
     }
 }
-/// Held while one recall comparison runs.
+/// Held while one recall comparison runs. A sample is exhaustive unless it says otherwise: only
+/// those wait out the interval, while a cheap sample is paced by its duty cycle alone.
 struct Sampling {
     busy: Arc<std::sync::atomic::AtomicBool>,
     not_before: Arc<std::sync::Mutex<Instant>>,
     started: Instant,
+    interval: std::time::Duration,
+    exhaustive: bool,
 }
 impl Drop for Sampling {
     fn drop(&mut self) {
         let took = self.started.elapsed();
         let mut not_before = self.not_before.lock().unwrap_or_else(|e| e.into_inner());
-        *not_before = (*not_before).max(Instant::now() + took * RECALL_SAMPLE_DUTY);
+        let floor = if self.exhaustive {
+            self.started + self.interval
+        } else {
+            self.started
+        };
+        *not_before = floor.max(Instant::now() + took * RECALL_SAMPLE_DUTY);
         self.busy.store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -452,7 +466,7 @@ impl RecallSampler {
     }
     fn start(&self, interval: std::time::Duration) -> Option<Sampling> {
         use std::sync::atomic::Ordering;
-        let mut not_before = self.not_before.lock().unwrap_or_else(|e| e.into_inner());
+        let not_before = self.not_before.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         if now < *not_before {
             return None;
@@ -460,11 +474,12 @@ impl RecallSampler {
         if self.busy.swap(true, Ordering::AcqRel) {
             return None;
         }
-        *not_before = now + interval;
         Some(Sampling {
             busy: self.busy.clone(),
             not_before: self.not_before.clone(),
             started: now,
+            interval,
+            exhaustive: true,
         })
     }
 }
@@ -1057,6 +1072,14 @@ impl Engine {
             let cache = self.0.read_cache.clone();
             let queries = self.0.queries.clone();
             let stop = self.0.stop.clone();
+            let audit = trial.is_some()
+                && self
+                    .0
+                    .recall_sampler
+                    .cheap
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % AUDIT_EVERY
+                    == AUDIT_EVERY - 1;
             query_worker::shared_runtime().spawn(async move {
                 let Ok(permit) = queries.acquire_owned().await else {
                     return;
@@ -1068,7 +1091,7 @@ impl Engine {
                 };
                 let _ = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    let _sampling = sampling;
+                    let mut sampling = sampling;
                     let exact_context = context.exhaustive();
                     let ivf_context = context.ivf_reference();
                     runtime.block_on(read_cache::scope(context, async move {
@@ -1082,34 +1105,86 @@ impl Engine {
                         .await;
                         let ann = ann.map(|(ann, _)| ann);
                         let ivf = if ann.is_ok() && trial.as_ref().is_some_and(|s| s.used_graph()) {
-                            warm_graph::trial_plan(&store, &sample, &request, &config, ivf_context)
-                                .await
-                                .ok()
-                                .map(|(answer, _)| answer)
+                            warm_graph::trial_plan(
+                                &store,
+                                &sample,
+                                &request,
+                                &config,
+                                ivf_context.clone(),
+                            )
+                            .await
+                            .ok()
+                            .map(|(answer, _)| answer)
                         } else {
                             None
                         };
-                        if let (Some(Ok(exact)), Ok(ann)) = (
-                            stop.run(read_cache::scope(
-                                exact_context,
-                                indexed::execute(&store, &sample, &request, &exact_config, true),
-                            ))
-                            .await,
-                            ann,
-                        ) {
-                            let recall = indexed::recall(&ann, &exact);
-                            if let (Some(scope), Some(ivf)) = (trial, ivf) {
-                                warm_graph::cost::measure(
-                                    &scope,
-                                    &store,
-                                    &sample,
-                                    &request,
-                                    &config,
-                                    read_cache::context().expect("sample read context"),
-                                )
-                                .await;
-                                scope.feedback(recall, indexed::recall(&ivf, &exact));
+                        // The cheap truth: the exact-distance top k of what the graph, the IVF
+                        // tier, and the IVF tier at twice the probes found. All three rerank with
+                        // exact distances, so only a neighbor that all of them missed is absent.
+                        // It replaces the exhaustive scan, which costs seconds of one core on a
+                        // large namespace, except for a periodic audit (and when it declines).
+                        let union = if let (Ok(ann), Some(ivf)) = (&ann, &ivf) {
+                            let mut wide = config.clone();
+                            wide.ann_nprobe = config.ann_nprobe.saturating_mul(2);
+                            match warm_graph::trial_plan(
+                                &store,
+                                &sample,
+                                &request,
+                                &wide,
+                                ivf_context,
+                            )
+                            .await
+                            {
+                                Ok((wide, _)) => indexed::union_truth(&[ann, ivf, &wide]),
+                                Err(_) => None,
                             }
+                        } else {
+                            None
+                        };
+                        let (Ok(ann), ivf) = (ann, ivf) else {
+                            return;
+                        };
+                        let truth = match union {
+                            Some(truth) if !audit => {
+                                sampling.exhaustive = false;
+                                metrics::counter!("blowfish_ann_calibration_samples_total", "truth" => "union").increment(1);
+                                Some(truth)
+                            }
+                            cheap => {
+                                let exact = stop
+                                    .run(read_cache::scope(
+                                        exact_context,
+                                        indexed::execute(&store, &sample, &request, &exact_config, true),
+                                    ))
+                                    .await;
+                                let Some(Ok(exact)) = exact else {
+                                    return;
+                                };
+                                metrics::counter!("blowfish_ann_calibration_samples_total", "truth" => "exhaustive").increment(1);
+                                if let Some(cheap) = cheap {
+                                    // How far the cheap truth overstates the graph's recall.
+                                    metrics::histogram!("blowfish_ann_union_recall_gap").record(
+                                        indexed::recall(&ann, &cheap) - indexed::recall(&ann, &exact),
+                                    );
+                                }
+                                Some(exact)
+                            }
+                        };
+                        let Some(truth) = truth else { return };
+                        let recall = indexed::recall(&ann, &truth);
+                        if let (Some(scope), Some(ivf)) = (trial, ivf) {
+                            warm_graph::cost::measure(
+                                &scope,
+                                &store,
+                                &sample,
+                                &request,
+                                &config,
+                                read_cache::context().expect("sample read context"),
+                            )
+                            .await;
+                            scope.feedback(recall, indexed::recall(&ivf, &truth));
+                        }
+                        if sampling.exhaustive {
                             metrics::histogram!("blowfish_ann_recall").record(recall);
                         }
                     }));
@@ -2156,6 +2231,21 @@ mod recall_sampler_tests {
         );
         *sampler.not_before.lock().unwrap() = Instant::now();
         assert!(sampler.start(Duration::ZERO).is_some());
+    }
+
+    #[test]
+    fn a_cheap_comparison_waits_only_its_duty_cycle_not_the_interval() {
+        let sampler = RecallSampler::new(Duration::ZERO);
+        let mut cheap = sampler.start(Duration::from_secs(3600)).expect("starts");
+        cheap.exhaustive = false;
+        drop(cheap);
+        // Took almost no time: the next may start at once, though the interval is an hour.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(sampler.start(Duration::from_secs(3600)).is_some());
+        // An exhaustive one waits out the interval.
+        let sampler = RecallSampler::new(Duration::ZERO);
+        drop(sampler.start(Duration::from_secs(3600)).expect("starts"));
+        assert!(sampler.start(Duration::from_secs(3600)).is_none());
     }
 }
 
