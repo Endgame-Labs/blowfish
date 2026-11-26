@@ -13882,11 +13882,12 @@ bytes, and 20,935,692,288 allocated bytes.
 
 **The full acceptance gate is not met.** Production-block staged attributes improve
 by 1.393x at p50 and 1.366x at p90. C21's tuned 4,000-byte configuration improves
-only 1.052x at p50, and its p90 is 0.5% slower. Production-block pure-S3 IDs are
+only 1.052x at p50, and its p90 is 0.5% slower. In this four-process cohort, production-block pure-S3 IDs are
 8.4% slower at p50 and 2.7% slower at p90. Restoring ordinary ID-column coalescing
 removed the earlier request-fragmentation issue, but did not establish the required
 latency nonregression. That final median difference is mainly in scanning
-(151.265 to 175.275 ms), before the hydration changes; its cause is unresolved.
+(151.265 to 175.275 ms), before the hydration changes; its cause is unresolved in this cohort. The
+sixteen-process control below does not reproduce that regression.
 The candidate must not be presented as having passed all requested performance gates.
 
 For uncertainty, paired bootstrap resamples all four process results together for
@@ -13924,7 +13925,7 @@ The 4,000-byte candidate still transfers 0.876 MB median document bytes and
 spends 34.543 ms median in hydration, explaining why its already-small-block
 control has much less room to improve. No connection-contention claim is made.
 
-Across all controls, **17,600 measured replies** match ordered documents, exact
+Across these first controls, **17,600 measured replies** match ordered documents, exact
 f64 distance bits, and planned row counts, including cross-replay comparisons.
 Recall@10 is 0.9700 in every arm. Package formatting, Clippy with warnings denied,
 and engine tests pass: **343 passed, zero failed, and 13 ignored across 35 suites**.
@@ -13959,10 +13960,94 @@ coalesced blocks. The measured driver's seed adoption changes only untimed stage
 preparation. Reproductions without that seed should wait for complete fresh
 staging and verify footprint before timing. No product settings are added.
 
-The single host ran from 03:59:38 through no later than 05:43:28 UTC, at most
+The first host ran from 03:59:38 through no later than 05:43:28 UTC, at most
 1.731 hours. Compute is about $1.26 at the historical $0.7258/hour rate. Measured
 controls issued 2,280,374 attempted GETs (about $0.91 at $0.40/million), plus
 untimed setup, HEADs, and profiles; this is a usage estimate, not an invoice.
 The run remained within the $8 cap. The instance, root volume, key pair, and
 security group were deleted and verified absent. No bucket prefixes, fixture
 objects, or multipart uploads were created. No 100M claim is made.
+
+### Additional sixteen-process pure-S3 IDs control
+
+The four-process production-block IDs result above prompted a separate control
+on a new on-demand c7gd.4xlarge, with an additional $3 cap. Both native release
+binaries reproduce their earlier SHA-256 values exactly, ruling out a changed
+compiler output between the two hosts. Production source hashes also match
+`c2bb6b9`. The configuration, read-only fixture, 200-query set, eight pinned CPUs,
+Rayon worker count, probes64, strong consistency, top ten, and trace collection
+are unchanged. Only IDs-only queries with 1 MiB blocks and eight coalesced blocks
+are measured; there is no staging, and disk caching is disabled.
+
+Eight successive pairs each start a fresh baseline process followed by a fresh
+candidate process, giving sixteen server processes total in A/B/A/B startup order.
+Within each pair, the same 200 queries run in strict alternating AB/BA query order,
+with both engine caches cleared before every request. Both processes exit before
+the next pair starts. This yields 1,600 samples per build, and permits inspection
+of process-level connection-state variability rather than pooling only two
+processes per build. Preparation, native builds, and result compression occur
+outside timed queries.
+
+
+| Pair | Baseline p50 / p90, ms | Candidate p50 / p90, ms |
+|---|---:|---:|
+| 1 | 343.605 / 472.200 | 337.493 / 491.059 |
+| 2 | 359.106 / 509.553 | 349.559 / 497.923 |
+| 3 | 361.100 / 498.644 | 337.995 / 481.568 |
+| 4 | 346.776 / 459.634 | 329.571 / 459.769 |
+| 5 | 355.271 / 479.459 | 317.800 / 452.966 |
+| 6 | 302.140 / 445.657 | 333.044 / 447.688 |
+| 7 | 326.975 / 476.443 | 339.532 / 446.430 |
+| 8 | 313.184 / 453.606 | 335.988 / 462.422 |
+
+Pooled p50/p90 is **338.673 / 477.195 ms baseline**, versus
+**335.435 / 467.413 ms candidate**, or candidate/baseline ratios
+**0.990 / 0.980**. A hierarchical paired bootstrap
+resamples eight matched process pairs and then 200 matched queries within each
+selected pair, 10,000 times with seed 23. Its 95% candidate/baseline intervals are
+**0.9323–1.0546 at p50**, and **0.9488–1.0171 at p90**.
+A separate paired bootstrap of process-median geometric-mean ratios gives
+0.9479–1.0388.
+All three intervals include equality.
+
+Baseline process medians range from 302.140 to
+361.100 ms (range 58.960 ms,
+sample SD 22.061 ms). Candidate medians range from
+317.800 to 349.559 ms
+(range 31.759 ms, sample SD
+9.084 ms). Both ranges exceed the 3.238 ms
+pooled median difference. Candidate wins the first five pairs' medians, while
+baseline wins the last three. The original 8.4% median slowdown does not reproduce
+with these bit-identical binaries. This meets the coordinator's process-variability
+check; it does not prove a zero-margin performance guarantee in every environment.
+The original four-process measurement remains above rather than being discarded.
+
+The best-supported explanation is process-dependent slab-read tail variability:
+in the original cohort, 24.010 ms of a 25.347 ms HTTP median increase occurs during
+scanning. Per-query slowest slab GET medians are about 147–153 ms in the baseline
+processes, versus 160.5 and 188.5 ms in the candidate processes, with nearly
+unchanged bytes and individual GET medians. These timings precede the full rerank
+and hydration changes. The unstaged IDs-only path keeps its 40% early threshold,
+ordinary speculation, dense ID reader, and final hydration dispatcher. The traces
+and replication do not distinguish S3 service tails, connection state, and
+poll-scheduling effects; no specific transport cause is claimed as proven.
+
+All **3,200 additional replies** match the original host's ordered documents,
+exact f64 distance bits, and planned row counts. Together, **20,800 measured
+replies** match across all controls, and recall@10 remains 0.9700 in every arm.
+The **C21 4,000-byte 1.3x attribute target remains unmet**. Production-block
+attribute point estimates improve 1.393x/1.366x; the larger pure-S3 control does
+not establish a reproducible IDs-only slowdown. No new source change was made
+for this replication.
+
+The second host ran from 06:21:20 through no later than 06:47:53 UTC, at most
+0.4425 hours. Historical-rate compute is about
+$0.321; 742,646 timed attempted GETs
+add about $0.297 at $0.40/million, before setup, HEADs,
+and short-lived storage. This stays within the additional $3 cap. The instance,
+root volume, key pair, and security group were deleted and verified absent.
+Across both hosts, historical-rate compute plus all 3,023,020 recorded attempted
+GETs subtotal about **$2.786**, excluding those small untimed costs and
+shared retained-fixture storage. No fixture objects, bucket prefixes, or uploads
+were created. The final full-debug workspace result is recorded in the worker
+report on the final documentation commit.
