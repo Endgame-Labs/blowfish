@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.52] - 2026-11-26
+
+### Changed
+
+- **Busy namespaces reach the warm graph in minutes, not days:** Every recall sample used to compare the graph and IVF answers against an exhaustive scan, paced at 50 times its own duration, so on BEIR NQ (2.68M x 1024-d) a sample came about every 10 minutes and calibration would have needed about 107 hours. A sample now compares both answers against the exact-distance top-k of the union of the graph's answer, IVF's answer, and IVF at twice the probes (all reranked exactly), which costs milliseconds. One sample in 16 is still checked against an exhaustive scan. Offline over all NQ queries, the union-driven controller settles at least as close to exhaustive calibration as exhaustive calibration does against itself on a different query stream, and on the high side (+0.0012 recall on average). On an Apple M4 under ordinary 16-client load, the graph was serving 32 minutes after load (calibration 4.5 minutes), at 8,106 q/s for `top_k` 10 and 2,799 q/s for `top_k` 100.
+
 ## [0.1.51] - 2026-11-26
 
 ### Changed
@@ -384,7 +390,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.51...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.52...HEAD
+[0.1.52]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.52
 [0.1.51]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.51
 [0.1.50]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.50
 [0.1.49]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.49
