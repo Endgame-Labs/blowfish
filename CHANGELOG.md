@@ -4,6 +4,14 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **`top_k` 100 on the warm graph is 1.7 times faster, and `top_k` 10 15 percent faster, with identical results:** An ID-only query answered by the warm graph used to hydrate each result row's ID from the document files, 32 segments at a time; the first such query now builds a resident row-to-ID table in the background (8 bytes per row, unsigned IDs only), and later queries read the final rows' IDs from it. Graph queries up to 100 rows also stay on the HTTP reactor now (the gate was 10). On an Apple M4 with BEIR NQ (2.68M x 1024-d), 16 clients, IDs only, one promoted server: `top_k` 100 went from 2,733 to 4,627 q/s with p99 11.6 to 8.3 ms, and `top_k` 10 from 8,512 to 9,796 q/s with p99 4.3 to 3.5 ms, at the same recall to seven digits. Against Qdrant 1.20 at matched recall, blowfish now serves 29 percent more q/s at `top_k` 100 (p99 8.3 against 17.4 ms) and 14 percent more at `top_k` 10. See Round G12 in `docs/benchmarks.md`.
+
+### Fixed
+
+- **`include_attributes: false` no longer hydrates every attribute:** Asking for no attributes read all scalar columns of the result rows and then dropped them, while leaving the field out read none. Both now read none.
+
 ## [0.1.55] - 2026-11-26
 
 ### Changed

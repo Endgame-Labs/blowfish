@@ -899,6 +899,16 @@ impl Engine {
         }
         Ok(response)
     }
+    /// Rows a query may ask for and still run on the HTTP reactor: ten, or the graph's limit
+    /// when a ready graph will answer it (a graph query costs the same CPU inline as on a worker,
+    /// without the hand-off between threads).
+    fn inline_rows(&self, ns: &str, state: &NamespaceState, request: &QueryRequest) -> usize {
+        if self.0.hot_graph.serves(ns, state, request) {
+            100
+        } else {
+            10
+        }
+    }
     /// Search a consistent segment-and-tail snapshot, including multi-query RRF.
     pub async fn query(&self, ns: &str, request: QueryRequest) -> Result<QueryResponse, ApiError> {
         self.query_with_diagnostics(ns, request)
@@ -925,6 +935,7 @@ impl Engine {
                             &state,
                             &request,
                             &self.0.config,
+                            self.inline_rows(ns, &state, &request),
                         )
                 });
             if !resident {
@@ -1289,7 +1300,17 @@ impl Engine {
         let config = self.0.config.clone();
         let t_clone = Instant::now();
         let inline = query_worker::is_reactor()
-            && warm_ann::inline_plan(&self.0.read_cache, state, request, &config);
+            && warm_ann::inline_plan(
+                &self.0.read_cache,
+                state,
+                request,
+                &config,
+                self.inline_rows(
+                    context.hot_graph.as_ref().map_or("", |s| s.namespace()),
+                    state,
+                    request,
+                ),
+            );
         let state = state.clone();
         if crate::ann::trace_stages() {
             eprintln!("CLONE {}us", t_clone.elapsed().as_micros());

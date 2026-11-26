@@ -237,6 +237,32 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         );
         assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
     }
+    // Round G12: an ID-only query is answered from the resident row-to-ID table once the
+    // background build finishes, with the same ordered rows and score bits as IVF and as the
+    // document path (the first pass, before the table exists).
+    {
+        let ids_only =
+            |i: usize, k: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k});
+        let mut first = Vec::new();
+        for i in [17, 400, 1999] {
+            for k in [10, 100, 37, 1] {
+                first.push(query(&e, "hot", ids_only(i, k)).await);
+            }
+        }
+        let started = Instant::now();
+        while held.ids.get().is_none() && started.elapsed() < Duration::from_secs(30) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(held.ids.get().is_some(), "the ID table was never built");
+        let mut want = first.into_iter();
+        for i in [17, 400, 1999] {
+            for k in [10, 100, 37, 1] {
+                let table = query(&e, "hot", ids_only(i, k)).await;
+                same_rows(want.next().unwrap(), table.clone());
+                same_rows(query(&control, "hot", ids_only(i, k)).await, table);
+            }
+        }
+    }
     for body in [
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":101}),
