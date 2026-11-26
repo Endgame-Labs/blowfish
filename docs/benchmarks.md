@@ -13323,3 +13323,66 @@ Throughput scales 2.0x for 2.3x the CPUs, with CPU per query flat. There is no s
 `SegmentReader::search_internal` is 80% inclusive: 38.8% self, 13.6% in one `Range<u32>` filter that builds a `Vec<u32>`
 (closure 29, 10% self), 6.6% sorting `(usize, f64)` pairs, and 2.9% building window caches (`cache_windows`). Cutting CPU per
 query there, not locks, is what would raise warm 16-client q/s.
+
+## Round BW20: cut the warm BM25 scoring loop's own costs (three items kept, 1.23x, below the 1.3x bar)
+
+Four changes to `search_internal` (BW19's profile: `Range<u32>` filtered into a `Vec<u32>` 13.6%, `(usize, f64)` sort 6.6%).
+Three help and stay, one was dropped. Every reply is exact: ordered IDs and f32 score bits match the fixture truth on every
+query of every timed pass. No setting, no format change. **Warm 16-client q/s is 1.23x, short of the 1.3x bar**; 1-client is
+1.10x faster, and cold first queries are unchanged.
+
+### What changed
+
+1. **Candidate mask on the stack (kept).** A per-window `[bool; 128]` and a fresh `Vec<u32>` of competitive rows became a
+   `[u64; 2]` mask walked with `trailing_zeros` and a stack array of at most 128 rows. No allocation per unpruned window.
+2. **Lazy window order (kept).** A full sort of every window per segment became incremental `select_nth_unstable` plus a sort
+   of only as many windows as the visit reaches (64, then doubling). The order is strict (bound descending, then window), so
+   the visit sequence is identical to a full sort, and a unit test checks that for several sizes. The second batch (everything
+   the first batch's floor leaves) is filtered by the floor without ordering, then ordered lazily during scoring.
+   `windows_pruned` counts the same windows as before.
+3. **Fold only touched rows (kept).** The per-window maximum of the sparse-term row bounds read every row of the segment;
+   it now reads only the rows that were touched (`Rows::touched`). The maximum is exact, so bounds are unchanged.
+4. **Smaller saturation table (dropped).** A per-length `norm` array in place of the 139 KB `values` table computes the same
+   f64 arithmetic, and an exhaustive test over lengths 0 to 1,027 and frequencies 0 to 599 proved bit equality, but it made
+   warm 16-client throughput **0.8% slower** (a division per posting costs more than an L2 hit) and 1-client unchanged. Removed.
+
+A fifth idea tried while chasing the bar, touching the next window's row lengths and dense frequency bytes during the current
+window, changed nothing (+0.4%, inside noise) and was removed.
+
+### Measurement
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Rust 1.100.0, Clang 19, NumKong `__arm_get_current_vg` link stub), about 1.9
+hours, an estimated $1.2. Fixture `tmp/msmarco-1m-v021/` (read-only), a fresh local copy per arm, 2 GiB raw cache, 4,000-byte
+blocks, server on CPUs 0 to 5 with two Rayon and two Tokio workers, client (`concurrent_bm25`) on CPUs 14 and 15, BW19's setup.
+The workload is the held-out odd-indexed 500 queries, repeated eight times per pass. Two 1-client prewarm passes, then three
+1-client and six 16-client passes per arm. Paired A/B/B/A, both binaries built on the same host.
+
+| Arm | 1 client q/s | 1 client p50 / p90 ms | 1-client CPU ms/query | 16 clients q/s | 16 clients p50 / p90 ms | 16-client CPU ms/query | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline (`41ddbcd`), 4 arms | 918 | 0.95 / 1.50 | 2.89 | 2,654 | 5.28 / 9.69 | 2.24 | 1,036 to 1,077 |
+| Items 1 to 3, 4 arms | 1,012 | 0.88 / 1.28 | 2.49 | 3,264 | 4.28 / 7.93 | 1.82 | 1,043 to 1,054 |
+
+**16-client 1.23x, 1-client 1.10x**, with lower p50 and p90 and 19% less server CPU per query at 16 clients. Each arm's
+six 16-client passes agree within 0.7%.
+
+Each item's own effect, from a first round on a build with all four behind a temporary switch (baseline 2,650 q/s at 16
+clients, 915 at one; all items 3,160 and 999). Items 2 to 4 are the effect of switching one off from the full build;
+item 1 is the build with items 2 to 4 off against the baseline:
+
+| Item | 16-client q/s without it | Its effect | 1-client q/s without it |
+| --- | ---: | ---: | ---: |
+| 1. Candidate mask (items 2 to 4 off versus baseline) | 2,940 (against 2,650) | +10.9% | 961 (against 915) |
+| 2. Lazy window order | 2,988 | +5.8% | 971 |
+| 3. Touched-row fold | 3,082 | +2.5% | 974 |
+| 4. Smaller saturation table | 3,187 | -0.8% (dropped) | 1,002 |
+
+**Cold:** a fresh server per sample (empty process caches, local files), the first query and the first six, 12 samples per
+arm in A/B/B/A order: first query median 21.6 ms (baseline) versus 21.5 ms, six queries 39.1 versus 38.5 ms. No regression.
+
+### Where the rest of the CPU is
+
+Profile of the final build at 16 clients (`perf`, DWARF): 48% self in `search_internal`'s body, then posting-frame decode into
+`Vec<(u32, u32)>` 3.3%, `Postings::window` 2.8%, atomics about 3.5% (relaxed `fetch_add`, one per query-term site),
+CRC32 1.6%, per-term span building 2.5%, the remaining sorts 2.5%. The largest single line is the dense frequency byte read
+(`DenseFrequencies::get`, 7.5%), a cache miss on a 1 MiB array that a prefetch did not hide. Nothing is left that is
+obviously worth 8% on its own; reaching 1.3x would take a change in what is scored, not in how it is looped.
