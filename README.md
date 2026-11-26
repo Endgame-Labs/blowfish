@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/art/blowfish.dark.gif">
+    <img width="276" alt="A puffed-up pufferfish, turned to the side with one big eye and a smile, hovering just above a bucket of water." src="docs/art/blowfish.light.gif">
+  </picture>
+</p>
+
 # blowfish
 
 [![CI](https://github.com/endgame-labs/blowfish/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/endgame-labs/blowfish/actions/workflows/ci.yml)
