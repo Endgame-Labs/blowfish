@@ -142,7 +142,7 @@ try:
         phase = ["start"]
         threading.Thread(target=poll, daemon=True).start()
 
-        def http(k, repeats, stem):
+        def run_http(k, repeats, stem):
             e = dict(os.environ, G3_CLIENT_PROCESSES="16", G3_CLIENT_THREADS="1", G8_K=str(k))
             subprocess.run(["uv", "run", "--python", "3.12", "--no-project", "--with", "numpy", "python",
                             str(here / "g11_http.py"), str(run / "fixture/data"), "bf", "18443", "0",
@@ -151,14 +151,14 @@ try:
 
         for k in ks:
             phase[0] = f"k{k}"
-            http(k, os.environ.get("G8_REPEATS", "3"), f"{label}-graph-k{k}")
+            run_http(k, os.environ.get("G8_REPEATS", "3"), f"{label}-graph-k{k}")
             if k == ks[0] and os.environ.get("G11_SOAK_SECONDS"):
                 # Anomaly reproduction: keep serving the first K for several minutes before the next.
                 phase[0] = f"soak-k{k}"
                 t0 = time.monotonic()
                 n = 0
                 while time.monotonic() - t0 < float(os.environ["G11_SOAK_SECONDS"]):
-                    http(k, 1, f"{label}-soak-k{k}-{n}")
+                    run_http(k, 1, f"{label}-soak-k{k}-{n}")
                     n += 1
         phase[0] = "hold"
         stop_poll.set()
