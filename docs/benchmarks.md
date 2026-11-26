@@ -13100,6 +13100,60 @@ Only the owned copies were writable. Original fixtures and `scale/` were left
 untouched. Cleanup and cost are recorded in the worker report. No 100M or
 compaction-throughput claim is made.
 
+
+### D4c review fixes (2026-11-26)
+
+D4c merges main through `92e1486`, including WC2. Row-map backfill now writes into the
+writing namespace, and covers legacy `ann:` slabs as well as current containers. Missing
+maps reconstruct from immutable ANN metadata for reads, and a rotating, one-object survey
+outside the namespace lock schedules durable repair without requiring another write.
+The locator and filtered planner share that reader, replacing their separate row-ID fallbacks.
+Corrupt maps still fail closed. Tests branch and copy during backfill, recluster the source,
+collect past retention, and then exercise filtered queries and patches after restart.
+
+Legacy document-only segments retain their document-v1 vector source instead of blocking
+every index publication. Current documents with a genuinely missing vector owner still fail.
+Restoration and new segment builds share one ANN recipe; the earlier default already chose
+the same square-root leaf count, confirmed by identical serialized ANN bytes before this change.
+Complete tiers rebuild missing or stale directories from their slab fragments. Remaining
+plan declines increment `blowfish_ann_tier_fallbacks_total{filtered=...}`; directory and
+row-map reconstruction have separate counters, documented in `docs/design/disk-footprint.md`.
+
+The quick NQ check uses one on-demand m7i.2xlarge in us-west-2, with 8 vCPUs, 32 GiB RAM,
+and a 160 GiB gp3 root volume. Both arms use the retained v0.1.19 fixture, with all
+2,681,468 rows and 32 slabs, after bounded D4b row-map backfill and segment ANN retirement.
+Compaction is disabled, and no vectors are retrained. The merged D4b control is `6521998`, and the D4c candidate is `dedef49`.
+Both arms run on the same immutable prepared copy, with 64 probes, strong consistency,
+ID-only top 10, a 3 GiB raw cache, the default 4 GiB decoded-cache budget, and no disk cache
+or recall sampling. The server uses CPUs 0–5, and one persistent HTTP client uses CPUs 6–7.
+The host's memory limit is 32 GiB. Builds, preparation, and timing do not overlap.
+
+Cold is the first 200 queries after a process restart and dropped filesystem pages. Warm is
+1,000 measured queries after a 1,000-query warm-up. HTTP, request encoding, and response
+reading are included. There are two repetitions per arm, without a formal confidence interval.
+
+| Arm | Cold first-200 p50 / p90 (ms) | Warm 1,000 p50 / p90 (ms) |
+|---|---:|---:|
+| Merged D4b, repetition 1 | 86.3 / 247.9 | 3.55 / 3.79 |
+| Merged D4b, repetition 2 | 85.7 / 289.2 | 3.54 / 3.78 |
+| D4c, repetition 1 | 89.3 / 272.7 | 3.54 / 3.79 |
+| D4c, repetition 2 | 88.9 / 252.4 | 3.30 / 3.54 |
+| Merged D4b, late latency control | 90.0 / 262.5 | 3.48 / 3.75 |
+
+The late baseline control reaches a cold p50 of 90.0 ms, covering the candidate's
+88.9–89.3 ms within the baseline's own observed variation. Warm medians remain comparable.
+This small check supports parity, without establishing a statistically significant latency change.
+
+All four full runs have recall@10 **0.961095** over all 3,452 queries,
+and identical ordered IDs and returned distances. Their canonical row SHA-256 is
+`cdc6950a38b29fbd2c2a0a0155c3c7834618ecafdb4196a68fb3291c8041556e`.
+The same arms also match on 100 selective (`id < 10,000`) queries, 100 broad
+(`id < 1,000,000`) queries, 20 full-attribute projections, and a filtered exact kNN
+query repeated twice. All unfiltered quality requests report zero `exhaustive_search_count`.
+
+This quick check uses the retained fixture's geometry; the full-load D4b pair above uses its
+own freshly loaded checkpoint. No new 10M, 100M, or compaction-throughput measurement was run.
+
 ## Round T8: exact BF16 screening on Arm
 
 Measured 2026-11-25 with NumKong 7.8.7 on an Apple M4 (Rust 1.99.1) and an
