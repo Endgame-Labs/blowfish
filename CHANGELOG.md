@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.46] - 2026-11-26
+
+### Changed
+
+- **Faster warm BM25:** The scoring loop no longer allocates a candidate list per window, orders windows only as far as the score threshold needs, and folds row bounds over touched rows only. Results are identical (ordered IDs and score bits). On 1M MS MARCO on a 16-vCPU Graviton host, warm throughput went from 2,654 to 3,264 q/s at 16 clients (1.23x) and from 918 to 1,012 q/s at one client (1.10x). Cold queries are unchanged.
+
 ## [0.1.45] - 2026-11-26
 
 **Bucket format change: generation 6 (manifest format 5).** The upgrade is automatic and one way: the first publication by v0.1.45 upgrades the bucket, after which older releases refuse to open it. Stop every older server against a bucket before you start v0.1.45 on it.
@@ -344,7 +350,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.45...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.46...HEAD
+[0.1.46]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.46
 [0.1.45]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.45
 [0.1.44]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.44
 [0.1.43]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.43
