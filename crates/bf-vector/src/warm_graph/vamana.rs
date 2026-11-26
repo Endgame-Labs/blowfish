@@ -83,7 +83,10 @@ pub(super) fn reservation(rows: u64, padded: u64, queries: u64) -> Option<u64> {
         .checked_add(16 + 2 * 40)?
         .checked_add(padded.div_ceil(8).next_multiple_of(8))?;
     let publication = padded.checked_add(lock)?.checked_add(4 + 4 + 4 + 136 + 1)?;
-    let retained = padded.checked_add(4 + 4 + 4 + 136 + 1)?;
+    // The one-bit codes stay resident for filtered scans.
+    let retained = padded
+        .checked_add(4 + 4 + 4 + 136 + 1)?
+        .checked_add(padded.div_ceil(8).next_multiple_of(8))?;
     let construction = rows
         .checked_mul(building.max(publication))?
         .checked_add(64 << 20)?;
@@ -94,6 +97,7 @@ pub(super) fn reservation(rows: u64, padded: u64, queries: u64) -> Option<u64> {
 }
 pub fn build(
     v: &Codes,
+    bits: &super::binary::Bits,
     entry: u32,
     cancelled: &(impl Fn() -> bool + Sync),
 ) -> crate::Result<Vec<RwLock<Neighbors>>> {
@@ -126,7 +130,6 @@ pub fn build(
         seed ^= seed << 17;
         ids.swap(i, seed as usize % (i + 1));
     }
-    let bits = super::binary::Bits::new(v, cancelled)?;
     for alpha in [1., 1.2] {
         ids.par_iter().for_each_init(
             || Work::new(n),
@@ -253,8 +256,9 @@ mod tests {
             .build()
             .unwrap();
         let checks = AtomicUsize::new(0);
+        let bits = super::super::binary::Bits::new(&codes, &|| false).unwrap();
         let result = pool.install(|| {
-            build(&codes, 0, &|| {
+            build(&codes, &bits, 0, &|| {
                 checks.fetch_add(1, Ordering::Relaxed) >= 2000
             })
         });
@@ -262,7 +266,7 @@ mod tests {
             matches!(result, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted)
         );
         assert!(checks.load(Ordering::Relaxed) >= 2000);
-        let nodes = pool.install(|| build(&codes, 0, &|| false)).unwrap();
+        let nodes = pool.install(|| build(&codes, &bits, 0, &|| false)).unwrap();
         assert_eq!(nodes.len(), n);
         assert!(std::mem::size_of::<RwLock<Neighbors>>() <= 280);
         for (id, row) in nodes.into_iter().enumerate() {

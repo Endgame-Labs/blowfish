@@ -1276,19 +1276,15 @@ async fn search_entry(
     let (hits, evaluations) = match (scan, mask.as_deref()) {
         (true, Some(allowed)) => {
             let (mode, _, per) = switch();
-            if mode == 1 {
-                entry.graph.scan(vector, scan_shortlist(k), allowed)
+            let keep = if mode == 1 {
+                usize::MAX
             } else {
-                entry.graph.scan_screened(
-                    vector,
-                    scan_shortlist(k),
-                    (per * k).max(1000),
-                    1,
-                    3.,
-                    allowed,
-                )
-            }
-            .map_err(segment::index_error)?
+                (per * k).max(1000)
+            };
+            entry
+                .graph
+                .scan(vector, scan_shortlist(k), keep, allowed)
+                .map_err(segment::index_error)?
         }
         (true, None) => return Ok(None),
         (false, _) => entry

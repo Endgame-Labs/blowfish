@@ -1,4 +1,4 @@
-//! Round G15: one-bit screening vs the SQ8 scan on the first ROWS rows of NQ, for hash masks.
+//! Round G15: the one-bit screen (`HotGraph::scan`) vs the SQ8-only scan on the first ROWS rows of NQ, for hash masks.
 //! Usage: g15_screen CORPUS_F16_NPY QUERIES_F32_NPY ROWS [threads=8] [seconds=2]
 //! Recall@10 is measured against exhaustive exact cosine over the allowed rows.
 use bf_vector::{RoaringBitmap, warm_graph::HotGraphBuilder};
@@ -63,30 +63,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let r = &corpus[row as usize * DIMS..(row as usize + 1) * DIMS];
         r.iter().zip(q).map(|(a, b)| a * b).sum::<f32>() / norms[row as usize]
     };
-    // Variants: (name, bits, clip, keep); keep 0 means the SQ8-only scan with count 30.
-    let variants: Vec<(String, usize, f32, usize)> = std::env::var("VARIANTS")
-        .unwrap_or("sq8:0:0:0,b4:4:3:300,b4:4:3:1000,b2:2:3:1000,b1:1:3:1000".into())
+    // Variants: (name, keep); keep 0 means the SQ8-only scan (no screen) with count 30.
+    let variants: Vec<(String, usize)> = std::env::var("VARIANTS")
+        .unwrap_or("sq8:0,k500:500,k2000:2000,k5000:5000".into())
         .split(',')
         .map(|v| {
             let p: Vec<&str> = v.split(':').collect();
-            (
-                p[0].to_string(),
-                p[1].parse().unwrap(),
-                p[2].parse().unwrap(),
-                p[3].parse().unwrap(),
-            )
+            (p[0].to_string(), p[1].parse().unwrap())
         })
         .collect();
-    let run = |g: &bf_vector::warm_graph::HotGraph,
-               v: &(String, usize, f32, usize),
-               q: &[f32],
-               m: &RoaringBitmap| {
-        if v.3 == 0 {
-            g.scan(q, 30, m).unwrap().0
-        } else {
-            g.scan_screened(q, 30, v.3, v.1, v.2, m).unwrap().0
-        }
-    };
+    let run =
+        |g: &bf_vector::warm_graph::HotGraph, v: &(String, usize), q: &[f32], m: &RoaringBitmap| {
+            g.scan(q, 30, if v.1 == 0 { usize::MAX } else { v.1 }, m)
+                .unwrap()
+                .0
+        };
     let per_mille: Vec<u64> = std::env::var("MILLES")
         .unwrap_or("5,10,20,50,100,200".into())
         .split(',')

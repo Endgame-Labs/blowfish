@@ -7,7 +7,6 @@ mod binary;
 mod builder;
 mod navigation;
 mod quant;
-mod screen;
 mod vamana;
 mod vectors;
 use crate::{Error, Result, RoaringBitmap, rabitq};
@@ -36,8 +35,8 @@ pub struct HotGraph {
     /// Graph node of each tier row (`u32::MAX` where the tier row is not a node), or empty when
     /// the tier's row numbers are too sparse for a dense table. Serves [`HotGraph::scan`].
     nodes: Vec<u32>,
-    /// One-bit screening codes for [`HotGraph::scan_screened`].
-    screen: screen::Screen,
+    /// One-bit codes, which screen the rows of a filtered scan.
+    bits: binary::Bits,
 }
 /// Reusable per-query exact visitation and bounded beam.
 pub struct HotScratch(navigation::Scratch);
@@ -64,7 +63,7 @@ impl HotGraph {
             + self.codes.scales.capacity() * 4
             + self.norms.capacity() * 4
             + self.nodes.capacity() * 4
-            + self.screen.bytes()) as u64
+            + self.bits.bytes()) as u64
     }
     /// Conservative construction/load reservation, excluding source-index metadata.
     /// `workers` is the maximum number of simultaneous query scratch arrays.
@@ -82,95 +81,65 @@ impl HotGraph {
     pub fn can_scan(&self) -> bool {
         !self.nodes.is_empty()
     }
-    /// Score only the rows of `allowed` against the SQ8 codes, and return the `count` nearest
-    /// by that score (ascending, ties by tier row) with their cached norms for exact reranking,
-    /// plus the number of rows scored. Rows of `allowed` that are not graph nodes are skipped.
+    /// Answer a filtered query from the codes of the `allowed` rows alone, in two stages. The
+    /// one-bit codes screen every allowed row by Hamming distance to the query's signs, keeping
+    /// the `keep` nearest; the SQ8 codes then rescore those, and the `count` nearest (ascending,
+    /// ties by tier row) are returned with their cached norms for exact reranking, plus the
+    /// number of rows screened. Rows of `allowed` that are not graph nodes are skipped. A `keep`
+    /// of at least the allowed rows skips the screen.
     pub fn scan(
         &self,
         query: &[f32],
         count: usize,
-        allowed: &RoaringBitmap,
-    ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
-        crate::distance::validate(query, self.dims)?;
-        if count == 0 || self.nodes.is_empty() || query.iter().all(|x| *x == 0.) {
-            return Err(Error::InvalidInput("unsupported graph query shape".into()));
-        }
-        let q = vectors::normalized(query);
-        let (code, scale) = self.codes.prepare(&q);
-        let ids: Vec<u32> = allowed
-            .iter()
-            .filter_map(|row| self.nodes.get(row as usize).copied())
-            .filter(|node| *node != u32::MAX)
-            .collect();
-        // Prefetching a fixed distance ahead overlaps the row-sized random reads.
-        const AHEAD: usize = 24;
-        let mut scored: Vec<(f32, u32)> = Vec::with_capacity(ids.len());
-        for (i, &id) in ids.iter().enumerate() {
-            if let Some(&next) = ids.get(i + AHEAD) {
-                self.codes.prefetch(next);
-            }
-            scored.push((self.codes.score(&code, scale, id), id));
-        }
-        let order = |a: &(f32, u32), b: &(f32, u32)| {
-            a.0.total_cmp(&b.0)
-                .then(self.rows[a.1 as usize].cmp(&self.rows[b.1 as usize]))
-        };
-        if scored.len() > count {
-            scored.select_nth_unstable_by(count - 1, order);
-            scored.truncate(count);
-        }
-        scored.sort_unstable_by(order);
-        let scanned = ids.len();
-        Ok((
-            scored
-                .into_iter()
-                .map(|(_, id)| (self.rows[id as usize], self.norms[id as usize]))
-                .collect(),
-            scanned,
-        ))
-    }
-    /// Experiment (Round G15): screen the rows of `allowed` with the one-bit codes, keep the best
-    /// `keep` by the screen score, rescore those with SQ8, and return the best `count`.
-    pub fn scan_screened(
-        &self,
-        query: &[f32],
-        count: usize,
         keep: usize,
-        bits: usize,
-        clip: f32,
         allowed: &RoaringBitmap,
     ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
         crate::distance::validate(query, self.dims)?;
         if count == 0 || self.nodes.is_empty() || query.iter().all(|x| *x == 0.) {
             return Err(Error::InvalidInput("unsupported graph query shape".into()));
         }
-        let q = vectors::normalized(query);
-        let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
-        let (code, scale) = (quant::encode(&rotated).0, quant::encode(&rotated).1);
-        let screen_query = self.screen.query(
-            &rotated.iter().map(|x| *x as f32).collect::<Vec<_>>(),
-            bits,
-            clip,
-        );
+        let rotated = rabitq::RaBitQ::new(query.len(), 42)?.rotate(&vectors::normalized(query));
+        let (code, scale) = quant::encode(&rotated);
         let mut ids: Vec<u32> = allowed
             .iter()
             .filter_map(|row| self.nodes.get(row as usize).copied())
             .filter(|node| *node != u32::MAX)
             .collect();
         let scanned = ids.len();
+        let keep = keep.max(count);
+        // Prefetching a fixed distance ahead overlaps the row-sized random reads.
         const AHEAD: usize = 24;
-        if ids.len() > keep.max(count) {
-            let mut scored: Vec<(f32, u32)> = Vec::with_capacity(ids.len());
+        if ids.len() > keep {
+            let signs = self.bits.query(&rotated);
+            let mut distance = Vec::with_capacity(ids.len());
             for (i, &id) in ids.iter().enumerate() {
                 if let Some(&next) = ids.get(i + AHEAD) {
-                    self.screen.prefetch(next);
+                    self.bits.prefetch(next);
                 }
-                scored.push((self.screen.score(&screen_query, id), id));
+                distance.push(self.bits.hamming(&signs, id));
             }
-            let keep = keep.max(count);
-            scored.select_nth_unstable_by(keep - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            scored.truncate(keep);
-            ids = scored.into_iter().map(|(_, id)| id).collect();
+            // Hamming distances are small integers: find the cutoff from a histogram, then keep
+            // every row below it and the first rows (in row order) at it.
+            let mut histogram = vec![0usize; self.codes.dims + 1];
+            for d in &distance {
+                histogram[*d as usize] += 1;
+            }
+            let (mut cutoff, mut below) = (0, 0);
+            while below + histogram[cutoff] < keep {
+                below += histogram[cutoff];
+                cutoff += 1;
+            }
+            let mut ties = keep - below;
+            let mut at = 0;
+            ids.retain(|_| {
+                let d = distance[at] as usize;
+                at += 1;
+                d < cutoff
+                    || (d == cutoff && ties > 0 && {
+                        ties -= 1;
+                        true
+                    })
+            });
         }
         let mut scored: Vec<(f32, u32)> = Vec::with_capacity(ids.len());
         for (i, &id) in ids.iter().enumerate() {
@@ -398,23 +367,80 @@ mod tests {
         let outside = RoaringBitmap::from_iter([0, 1, 100_000]);
         let all = (0..n).map(row).collect::<RoaringBitmap>();
         for allowed in [&thirds, &one, &outside, &all] {
-            let (hits, scanned) = graph.scan(query, 12, allowed).unwrap();
+            let (hits, scanned) = graph.scan(query, 12, usize::MAX, allowed).unwrap();
             let inside = allowed.iter().filter(|r| ids.contains(r)).count();
             assert_eq!(scanned, inside);
             assert_eq!(hits.len(), inside.min(12));
             assert!(hits.iter().all(|(r, _)| allowed.contains(*r)));
             // With the whole allowed set shortlisted, the scan equals a full ranking.
-            let (full, _) = graph.scan(query, n, allowed).unwrap();
+            let (full, _) = graph.scan(query, n, usize::MAX, allowed).unwrap();
             assert_eq!(
                 full[..hits.len()].iter().map(|h| h.0).collect::<Vec<_>>(),
                 hits.iter().map(|h| h.0).collect::<Vec<_>>()
             );
         }
         // The nearest allowed row to a stored vector is that row when it is allowed.
-        assert_eq!(graph.scan(query, 3, &all).unwrap().0[0].0, row(41));
+        assert_eq!(
+            graph.scan(query, 3, usize::MAX, &all).unwrap().0[0].0,
+            row(41)
+        );
         // Zero queries and zero counts are refused like graph navigation.
-        assert!(graph.scan(&vec![0.; dims], 3, &all).is_err());
-        assert!(graph.scan(query, 0, &all).is_err());
+        assert!(graph.scan(&vec![0.; dims], 3, usize::MAX, &all).is_err());
+        assert!(graph.scan(query, 0, usize::MAX, &all).is_err());
+    }
+    #[test]
+    fn one_bit_screen_keeps_the_nearest_rows_and_the_exact_shortlist_size() {
+        let (dims, n) = (64, 3000);
+        let mut seed = 17u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / 16777216. * 2. - 1.
+        };
+        // Clustered rows: each is a cluster centre plus noise, so near neighbors exist.
+        let centres = (0..30)
+            .map(|_| (0..dims).map(|_| next()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let source = (0..n)
+            .map(|i| {
+                (0..dims)
+                    .map(|d| centres[i % 30][d] + next() * 0.4)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let packed = source
+            .iter()
+            .flatten()
+            .flat_map(|x| f16::from_f32(*x).to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut b = HotGraphBuilder::new(dims, n).unwrap();
+        b.append(&(0..n as u32).collect::<Vec<_>>(), &packed, &|| false)
+            .unwrap();
+        let graph = b.finish(&|| false).unwrap();
+        let allowed = (0..n as u32)
+            .filter(|r| r % 2 == 0)
+            .collect::<RoaringBitmap>();
+        let mut hit = 0;
+        for q in (0..40).map(|i| &source[i * 37]) {
+            let (full, scanned) = graph.scan(q, 10, usize::MAX, &allowed).unwrap();
+            assert_eq!(scanned, 1500);
+            let (screened, _) = graph.scan(q, 10, 300, &allowed).unwrap();
+            assert_eq!(screened.len(), 10);
+            assert!(screened.iter().all(|(r, _)| allowed.contains(*r)));
+            hit += screened
+                .iter()
+                .filter(|s| full.iter().any(|f| f.0 == s.0))
+                .count();
+        }
+        // A 300-row shortlist of 1,500 rows keeps nearly every true top-10 row.
+        assert!(hit >= 380, "{hit} of 400");
+        // A shortlist as large as the request returns exactly that many distinct rows.
+        let (hits, _) = graph.scan(&source[0], 50, 50, &allowed).unwrap();
+        let mut rows = hits.iter().map(|h| h.0).collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows.dedup();
+        assert_eq!(rows.len(), 50);
     }
     #[test]
     fn cancellation_and_invalid_input_leave_no_spills() {
