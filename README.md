@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-2024_edition-orange.svg?logo=rust)](https://www.rust-lang.org)
 [![turbopuffer API compatible](https://img.shields.io/badge/turbopuffer_API-compatible-6f42c1.svg)](compat/README.md)
-[![Website](https://img.shields.io/badge/website-endgame--labs.github.io%2Fblowfish-0b0d12.svg)](https://endgame-labs.github.io/blowfish/)
+[![Website](https://img.shields.io/badge/website-open.endgame.io%2Fblowfish-0b0d12.svg)](https://open.endgame.io/blowfish)
 
 blowfish is a self-hostable search engine that implements the [turbopuffer](https://turbopuffer.com) HTTP API in a single Rust binary. Point it at any S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, or SeaweedFS) or a local directory; the bucket is the only source of truth, with no separate database and no dedicated WAL disk. The official turbopuffer SDKs work against it unchanged by setting the base URL and API key.
 
@@ -143,6 +143,8 @@ Use blowfish to:
 
 - develop, test, and run CI against the turbopuffer API without a turbopuffer account or network access;
 - self-host modest workloads, or keep search indexes inside your own cloud or on-premises bucket.
+
+blowfish works with [Factoid](https://open.endgame.io/factoid), our framework that turns documents into facts and entities. Set Factoid's `TURBOPUFFER_BASE_URL` to a blowfish server, and its projects keep their turbopuffer search on their own bucket.
 
 For production at scale, I recommend [turbopuffer](https://turbopuffer.com) itself. Because the APIs match, moving from blowfish to turbopuffer is a base-URL and API-key change.
 

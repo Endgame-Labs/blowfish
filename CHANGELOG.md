@@ -4,6 +4,25 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.43] - 2026-11-26
+
+### Fixed
+
+- **A pass of large `top_k` queries no longer halves warm vector speed:** On a tier whose exact vectors do not all fit in memory, a run of top_k 100 queries filled the exact-vector cache and evicted the rows ordinary queries need, and the cache kept the large-query rows afterwards. On 2.68M BEIR NQ, warm top_k 10 fell from about 1,400 to about 600 q/s at 16 clients and did not recover. Large queries are now recognized relative to the tier's recent workload and fill only free space in the same memory budget, so ordinary queries keep their rows. After a top_k 100 pass, warm top_k 10 stays within 4% of a fresh server, a workload of only top_k 100 queries is about 1.3x faster, and memory use is unchanged. New metrics count exact-row cache lookups, inserts, evictions, and the reasons a query leaves the compiled warm path.
+
+## [0.1.42] - 2026-11-25
+
+### Fixed
+
+- **Leftover recluster spill files are cleaned up:** Releases before the locked spill directories wrote loose `spill-<uuid>.bin` files into the system temporary directory, and an interrupted build left them behind (one test machine had 25 GB of them). Startup now deletes loose spill files that have been untouched for an hour. `docs/operations.md` describes where spills live and how they are recovered.
+
+## [0.1.41] - 2026-11-25
+
+### Fixed
+
+- **Recluster on Apple M-series (SME) no longer corrupts assignments:** The BF16 matrix kernel that NumKong 7.8.7 selects on CPUs with SME (Apple M4) writes whole output tiles even when the last tile is partial. It overwrote the next row's first distances and wrote past the end of the output buffer, so recluster could assign rows to the wrong center. blowfish now selects reviewed BF16 kernels itself (x86 Haswell, Skylake, and Genoa, Arm NEON BFDOT, and a portable fallback) and never uses SME or AMX, without changing NumKong's global dispatch. Graviton and x86 were not affected by the overwrite.
+- **BF16 subnormals are flushed explicitly in the screening bound:** A tiny BF16 input multiplied by a large one could exceed the certified error bound on x86. Conversion now flushes subnormals to zero and counts the loss in the bound, so screening stays exact.
+
 ## [0.1.40] - 2026-11-25
 
 ### Fixed
@@ -308,7 +327,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.40...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.43...HEAD
+[0.1.43]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.43
+[0.1.42]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.42
+[0.1.41]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.41
 [0.1.40]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.40
 [0.1.39]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.39
 [0.1.38]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.38

@@ -24,11 +24,32 @@ fn root_lock(root: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Sweep only directories whose ownership lock can be acquired. Missing locks, unexpected names,
-/// symlinks, and legacy loose spills are left alone: their ownership cannot be proved here.
+/// Older releases wrote loose `spill-<uuid>.bin` files with no lock. A live build writes
+/// constantly, so one untouched for this long belongs to a dead process.
+const LEGACY_IDLE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+fn stale_legacy(entry: &fs::DirEntry) -> bool {
+    let name = entry.file_name();
+    let name = name.to_string_lossy();
+    name.starts_with("spill-")
+        && name.ends_with(".bin")
+        && entry.file_type().is_ok_and(|t| t.is_file())
+        && entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age >= LEGACY_IDLE))
+}
+
+/// Sweep only directories whose ownership lock can be acquired, plus legacy loose spills idle
+/// for an hour. Missing locks, unexpected names, and symlinks are left alone: their ownership
+/// cannot be proved here.
 fn sweep_locked(root: &Path) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
+        if stale_legacy(&entry) {
+            fs::remove_file(entry.path())?;
+            continue;
+        }
         if !entry.file_type()?.is_dir()
             || !entry.file_name().to_string_lossy().starts_with("process-")
         {
@@ -153,6 +174,26 @@ mod tests {
         loop {
             std::thread::park();
         }
+    }
+
+    #[test]
+    fn sweep_removes_only_idle_legacy_loose_spills() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("spill-old.bin");
+        let fresh = root.path().join("spill-fresh.bin");
+        let other = root.path().join("keep.bin");
+        for f in [&old, &fresh, &other] {
+            fs::write(f, b"x").unwrap();
+        }
+        let aged = std::time::SystemTime::now() - 2 * LEGACY_IDLE;
+        File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+        sweep(root.path()).unwrap();
+        assert!(!old.exists() && fresh.exists() && other.exists());
     }
 
     #[test]

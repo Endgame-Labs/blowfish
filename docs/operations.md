@@ -595,7 +595,11 @@ on, and there is no setting to turn it off. The design is `docs/design/auto-recl
   and the unindexed limit), at 12 KB per row of a slab, and defers when fewer than 50,000 rows fit. Its spill file
   (every row's vector at stored precision: about 2 KB a row at 1,024 dimensions in f16) goes in the disk cache's
   directory, or the system's temporary directory without one, and the build defers unless 1.1 times its size is
-  free. Deferrals are counted in `blowfish_recluster_deferred_total`.
+  free. Each build owns `blowfish-recluster/process-<pid>-<uuid>/` there (`blowfish-warm-graph/` for warm
+  graphs), holding a locked `owner.lock`. The directory is removed when the build ends, is cancelled, or
+  panics. After a kill, OOM, or crash the OS drops the lock, and the next build or engine startup deletes the
+  directory; a live process's directory is never touched, even when two processes share the cache directory.
+  Startup also deletes loose `spill-*.bin` files left by older releases once they are an hour idle. Deferrals are counted in `blowfish_recluster_deferred_total`.
 - **Safety.** A build reads a snapshot of the manifest and never stops indexing. It writes a create-only build
   record (`ns/<ns>/indexer/build-*.json`), refreshed every 10 minutes, and GC keeps the build's objects while a
   record is less than 20 minutes old. The finished tier is installed by the indexer's next publication, under its

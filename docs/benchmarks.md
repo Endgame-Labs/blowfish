@@ -13099,3 +13099,442 @@ legacy upgrade, without attributing all savings to D4b alone.
 Only the owned copies were writable. Original fixtures and `scale/` were left
 untouched. Cleanup and cost are recorded in the worker report. No 100M or
 compaction-throughput claim is made.
+
+## Round T8: exact BF16 screening on Arm
+
+Measured 2026-11-25 with NumKong 7.8.7 on an Apple M4 (Rust 1.99.1) and an
+on-demand c7g.xlarge, Graviton3 (Rust 1.100.0, Clang 19, and LLVM 22 builtins).
+The M4's nearest-center index identity test fails both alone and in the complete
+vector suite. The unmodified Graviton suite passes, including that identity test.
+
+The cause is a partial-output-tile overwrite in NumKong's **SME** matrix kernel,
+not a demonstrated shortfall in the roundoff allowance. Runtime kernel lookup
+for packing size, packing, and multiplication selects `*_bf16_sme` on M4;
+Graviton selects `*_bf16_neonbfdot`. Checking NEON BF16 capability did not constrain
+the matrix dispatcher to NEON. In `dots/sme.h`, the three-column-tile fast path
+stores all three tiles with an all-true predicate, including a partial final tile.
+At 90 columns and M4's 16-column tiles, it stores columns 48–95 into a 90-column
+row stride. The padding zeros replace centers 0–5 of the following row, and the
+last row writes six floats beyond the output allocation. Increasing the numerical
+error bound cannot repair this memory overwrite.
+
+A guarded diagnostic uses 64 rows, 96 dimensions, deterministic sine/cosine inputs
+scaled by 0.1, and extra allocation space after the logical output. Its largest
+observed errors against f64 sums of the original f32 products are:
+
+| Runtime kernel and width | Largest absolute dot error | Corresponding `dot_error` | Row, center | Floats written after logical output |
+| --- | ---: | ---: | --- | ---: |
+| M4 SME, 81 | 0.008201443786 | 0.001668448670 | 2, 14 | 15 |
+| M4 SME, 90 | 0.008091095486 | 0.001669338413 | 2, 0 | 6 |
+| M4 SME, 95 | 0.008091095486 | 0.001669338413 | 2, 0 | 1 |
+| Graviton NEON BFDOT, 90 | 0.000370660581 | 0.001615619162 | 56, 25 | 0 |
+| x86 Genoa BF16, 90 | 0.000370660581 | 0.001615619162 | 56, 25 | 0 |
+
+Widths 9, 48, 61, 80, 96, and 97 have no guard writes on either Arm host. Across
+these shapes, Graviton's maximum error/bound ratio is 0.229730. During the failing
+normalized index build, the largest observed absolute error before the first
+missing-winner assertion is **0.534292734535**, against **0.003665320294**
+(145.77 times the bound). The first captured dropped winner is input row **1771**
+(seed 1848, base 7), block lane 1, center **4**, in the existing 6,000-row,
+96-dimensional test. Its exact f64 dot is approximately **0.5323289123**; the
+returned dot is zero. Its approximate distance is **2.0000000007**, outside the
+**1.0998839308** survivor threshold; its own `dot_error` is **0.003474498636**.
+
+### Fix and certificate
+
+`Bf16DotCenters` selects and retains matching size, pack, and multiply function
+pointers through NumKong's kernel lookup API. Its allowlist is serial, Haswell,
+Skylake, Genoa BF16, and NEON BFDOT. SME, AMX, and future families require review
+before admission. The packed allocation remains 64-byte aligned. This changes
+neither NumKong's global dispatch nor other callers' kernels. M4 now uses NEON
+BFDOT, and Graviton retains the same NEON BFDOT family.
+
+The arithmetic allowance is unchanged. BF16 products have at most 16 significant
+bits and fit exactly in normal f32. The reviewed accumulation paths have fewer
+than `dimensions + 32` rounding steps from any product to the result. Using
+`f32::EPSILON`, rather than half epsilon, also bounds round-to-odd pair sums and
+accumulation on Arm. Cauchy–Schwarz bounds the sum of absolute products by the
+product of the operand norms. The existing gamma, magnitude guards, reference-L2
+allowance, and intermediate-underflow allowance therefore remain conservative
+for the selected families.
+
+Separately, conversion now explicitly flushes BF16 subnormal operands to signed
+zero and charges their full values to the conversion-error norms. An additive
+intermediate-underflow allowance alone cannot bound an input flushed before
+multiplication by a large value. This makes input behavior independent of the
+selected hardware's flush policy. Normal NQ inputs, the gamma formula, and the
+Graviton kernel are unchanged; there is no widened normal-data certificate whose
+recluster speed effect needs measurement.
+
+Regression coverage compares all matrix dots with their certificates across
+partial row and column tiles, checks nearest winners directly across the failing
+widths, rejects unreviewed capabilities even when injected on x86, and checks
+subnormal conversion and large multipliers independently of architecture.
+
+The x86 regression was verified by restoring the old conversion while retaining
+the new test: the observed dot error is **2.0000032332e-21**, versus a certified
+bound of **2.9408549768e-23**, and the test fails. Restoring explicit subnormal
+flushing makes it pass. This exposes a numerical issue on x86 independently of
+the M4-specific memory overwrite.
+
+The fixed M4's diagnostic has the same maximum absolute error as
+Graviton's NEON result (**0.000370660581**) at width 90, within the
+**0.001615619162** bound. Its selected family is `0x200` (NEON BFDOT).
+
+The complete `bf-vector` suite passes on M4 and Graviton: **62 passed, zero failed,
+and four ignored** on each. The existing ignored real-corpus test additionally
+compares byte-identical blobs on the first **100,000 NQ rows**, at 1,024 f16
+cosine dimensions and 317 centers, on both Arm hosts. The 8,100-row/90-center
+real-corpus check also passes, directly covering the failing partial-tile shape.
+The 100,000-row checks retain **1.14 centers per screened row** on average.
+Single observations of plain/screened build time are 0.975/0.609 seconds on M4
+and 3.246/1.443 seconds on Graviton. These compare two scoring modes within the
+fixed binary; they are identity diagnostics, not paired before/after recluster
+performance measurements. `BF_TRACE_STAGES=1` also records the RR7 vector-build
+stages during these runs.
+
+On x86, `cargo fmt --all --check`, strict all-target workspace Clippy, and
+`cargo test --workspace` pass: **544 passed, zero failed, and 27 ignored across
+81 suites**. Cargo builds and tests use `nice -n 19` and `-j 3` on the shared VM.
+The additional release-mode 100,000-row real-corpus identity check passes on x86
+as well, completing that check on all three platforms.
+
+## Round I3: issue #3 (BEIR NQ on one machine) on v0.1.39
+
+[Issue #3](https://github.com/Endgame-Labs/blowfish/issues/3) tracks four targets from an outside benchmark of v0.1.13: at least 400 q/s at
+16 clients, warm p99 of 50 ms or less at one client (with p50 no worse), recall@10 against exact of at least 0.95 at default settings,
+and a disk footprint near the other engines' (29 GB against about 6 GB). Its last number was for v0.1.16. I reran
+[Iteration 19](#iteration-19-beir-natural-questions-on-one-machine)'s protocol on `main` at `4d13669` (v0.1.39), a release build, to see where
+each one stands. Nothing was fixed in this round.
+
+### Method
+
+Iteration 19's setup and harness (`bench/nq/`, `run.sh` and `measure.py` at their defaults): this 8-vCPU VM, the server pinned to CPUs 0 to 5 in a
+12 GB cgroup with swap off, clients on CPUs 6 and 7, a 3 GiB block cache, no disk cache, a `file://` store, and the 2,681,468 BEIR NQ passages
+with id, vector (`[1024]f16`, cosine), title, and text (BM25). Defaults everywhere: 64 probes, no tuning. I loaded with `load.py`, left the server
+running so that its automatic recluster ran on its own, and recorded when it installed. Timed passes ran only with the load average under 1.5 and
+no other cargo, rustc, or blowfish process from other worktrees; each started after four consecutive quiet checks 15 s apart. The
+load and the recluster did not get that: other workers were building on the VM at the time (load average 9 to 10 during the first part of the load),
+so their durations below are upper bounds.
+
+### Recall
+
+Recall@10 is against the exact top 10; F1@10, nDCG@10, and recall@100 are against the qrels (top_k 100 requests).
+
+| Layout (64 probes, default) | Recall@10 | F1@10 | nDCG@10 | Recall@100 |
+|---|---:|---:|---:|---:|
+| As loaded (26 segments; measured while the recluster was building, before it installed) | 0.9604 | 0.1677 | 0.6032 | 0.9270 |
+| After the automatic recluster | 0.9621 | 0.1692 | 0.6082 | 0.9356 |
+| Iteration 19, v0.1.13, as loaded (scaled 2.6x) / reclustered | 0.960 / 0.955 | 0.168 / 0.168 | 0.604 / 0.606 | 0.929 / 0.929 |
+| Issue, v0.1.13 as loaded with no scaling / v0.1.16 reclustered | 0.907 / about 0.961 | | | |
+
+- Load took 544 s (4,930 rows/s; Iteration 19: 287 s). The recluster started within a minute of the load ending
+  and installed 319 s later (32 slabs, 13,390 leaves, one tier). Iteration 19's manual `recluster` took 162 s, and v0.1.15's automatic
+  build 231 s on an otherwise idle VM. The stages that took longest were leaf k-means (39 s) and the spill random read (58 s). I did not
+  separate the contention from any real change.
+- The as-loaded quality pass ran while the build was in flight, so its latency is not reported. Recall does not depend on it.
+
+### Warm latency and throughput
+
+Protocol as in Iteration 19 and `measure.py`: quality pass first (3,452 queries at top_k 100), then one warm-up pass and 1,000 queries at one
+client, then 2,000 queries at 1, 4, and 16 clients. Two full runs on a fresh server each, both on a quiet VM, reclustered, default probes:
+
+| Run | p50 / p95 / p99 ms | q/s at 1 / 4 / 16 |
+|---|---|---|
+| 1 | 6.7 / 10.6 / 16.4 | 128.0 / 315.3 / 512.5 |
+| 2 | 6.7 / 9.3 / 10.7 | 149.2 / 386.6 / 510.5 |
+| Iteration 19, v0.1.13 baseline (reclustered, 64 probes) | 28.7 / 457 / 732 | 19.8 / 23.8 / 27.1 |
+| Iteration 19, after (v0.1.13 plus its fixes) | 8.3 / 13.3 / 18.1 | 111.3 / 311.4 / 444.2 |
+| Issue, v0.1.14 session | 5.3 / 8.2 / 9.7 | 616 at 16 clients |
+| Issue, v0.1.15 session | | 587 at 16 clients |
+
+**The order of the passes matters, by a factor of 2 to 3.** With the same binary, store, and settings, I measured on a fresh server:
+
+| Passes run, in order | p50 / p95 / p99 ms | q/s at 1 / 4 / 16 |
+|---|---|---|
+| throughput only | | 163.1 / 1,009 / 1,319 |
+| throughput only (second run) | | 158.1 / 1,052 / 1,337 |
+| latency, then throughput | 2.8 / 3.6 / 4.9 | 216.1 / 1,081 / 1,465 |
+| quality (top_k 100), then latency, then throughput (the protocol above) | 6.7 / 10.6 / 16.4 | 128 / 315 / 513 |
+
+The clean-start numbers are the warm numbers of a server answering top-10 queries; the protocol's numbers are what a server gives after it has
+answered 3,452 top-100 queries. Evidence for the mechanism:
+
+- `blowfish_ann_compiled_queries_total` counts queries served by the compiled resident tier. A latency pass of 2,000 queries (warm-up plus measured)
+  compiled 999 on a fresh server, but only 535 to 556 after the top-100 quality pass, and the same ratio held over three repeated passes
+  (535, 547, and 556 compiled), so the warm-up does not recover it. Mapped reads for the same 2,000 queries rose from 17.7 GB to 25.8 GB, and
+  cache misses from 580,000 to 817,000.
+- The quality pass at top_k 10 instead (`NQ_QUALITY_K=10`, same 3,452 queries) leaves nothing behind: 2,000 of 2,000 queries compiled in each
+  following pass, and p50 2.9 ms. So the cause is the top-100 pass specifically (3,200 reranked rows a query instead of 320), not the number
+  of distinct queries.
+- Raising `BF_DECODED_CACHE_BYTES` to 8 GiB changed nothing (538 and 547 compiled), but the configuration page lists its range as 512 MiB to 4 GiB and I did not check whether larger values are clamped.
+- In the code, a compiled query falls back to the general path when any exact row it needs is missing from the tier's exact-vector cache
+  (`WarmTier::search`, `crates/bf-engine/src/warm_ann.rs`). For a tier whose vectors do not all fit (5.5 GB here), that cache is a `moka` cache
+  bounded to about the size of the codes. My reading is that the top-100 pass's rerank rows crowd out the working set and keep it out, but I did
+  not isolate moka's admission policy. Treat the mechanism as likely, not proven. The effect is real and measured either way.
+
+### Disk footprint
+
+Bytes under the store, by object kind (`du -b` and `find -printf %s`; 2,681,468 rows; the vectors alone are 5.49 GB as f16):
+
+| Kind | After load, before recluster | After recluster, before GC | After recluster and GC settled | Bytes a row (settled) |
+|---|---:|---:|---:|---:|
+| WAL (`wal-data/`, `wal/`) | 5.96 GB | 5.96 GB | 0 | 0 |
+| Segment ANN objects (`ann.*.bfa`: blobs, codes, vectors) | | 6.50 GB | 6.50 GB | 2,422 |
+| Segment documents (`docs.bfc`: id, title, text) | | 0.58 GB | 0.58 GB | 217 |
+| Text index and stats (`fts.*.bft`, `text-stats.*.bfs`) | | 0.95 GB | 0.86 GB | 319 |
+| Filters, ID filters, directories, lineage, live masks | | 0.25 GB | 0.23 GB | 86 |
+| Slab ANN objects (`slab-*/ann.*.bfa`, 32 slabs) | 0 | 5.98 GB | 5.98 GB | 2,231 |
+| Manifests | | 0.02 GB | 0.03 GB | 12 |
+| **Total** | about 13 GB (`du -h`, sampled as the recluster was building, before any slab was written) | **20.24 GB** | **14.18 GB (5,287 B/row)** | 5,287 |
+
+- **Settled:** I waited past the one-hour retention (`engine.retention_ms`), and GC deleted the WAL and the superseded objects. The as-loaded layout alone
+  (everything except the slabs) is 8.20 GB, 3,056 bytes a row (the v0.1.15 changelog reports 3,581 B/row for this data, down from 5,945 in v0.1.14).
+- **Vectors are still stored twice, once as stored data and once more beside it, and the codes with them.** The segment `.bfa` objects (2,422 B/row)
+  and the slab `.bfa` objects (2,231 B/row) each hold every row's f16 vector (2,048 B/row) plus its code. Recluster builds the slabs beside the segments
+  and the covered segments stay in place, so after the recluster a second full copy exists. `docs.bfc` no longer carries vectors (217 B/row of
+  id, title, and text), and the WAL copy is gone after GC, so the two ANN copies are the whole duplication.
+  `docs/design/disk-footprint.md` option 4 ("slabs replace segment ANN objects") is the unbuilt part; it needs filtered ANN on slabs first.
+- **Peak** is 20.24 GB, 1.43 times the settled size, and lasts until the one-hour retention passes (WAL copy of every vector, plus the superseded objects).
+
+| | Issue (v0.1.13) | v0.1.39 reclustered, settled | v0.1.39 as loaded, settled | Others in the issue |
+|---|---:|---:|---:|---|
+| Store on disk | 29 GB | 14.18 GB | 8.20 GB | about 6 GB |
+
+### Where each target stands
+
+| Target | Result on v0.1.39 | Met |
+|---|---|---|
+| 16-client throughput of at least 400 q/s | 512.5 and 510.5 q/s in the protocol; 1,319 to 1,465 q/s from a clean start | yes |
+| Warm p99 at one client of 50 ms or less, p50 no worse | p99 16.4 and 10.7 ms, p50 6.7 ms (28.7 ms before); 4.9 and 2.8 ms from a clean start | yes |
+| Recall@10 vs exact at default settings of at least 0.95 | 0.9604 as loaded, 0.9621 reclustered | yes |
+| Disk footprint near the others' (about 6 GB) | 14.18 GB reclustered, 8.20 GB as loaded; two copies of every vector | no (down from 29 GB) |
+
+### Caveats
+
+- The 16-client rate varies by 5 to 15% between sessions on this VM, and the earlier issue numbers (616, 587) came from other sessions. The
+  protocol's 512 q/s is below those, and the pass-order effect above is the reason I know of; a v0.1.14 or v0.1.15 binary run through the same
+  protocol would settle whether anything else changed. I did not run one.
+- The warm graph (v0.1.21) needs ten minutes of sustained eligible queries, so none of these one-minute passes used it.
+- The clean-start runs used `--parts throughput` and `--parts latency,throughput` with the same harness; the protocol rows used the defaults.
+- The Mac and EC2 were not used. `/tmp/blowfish-recluster/` holds 25 GB of spill files from 2026-11-24 that are not mine; I left them.
+
+## Round BW18: cold phrase queries pay serial waves (fewer waves, exact, misses the 1.3x gate)
+
+Hypothesis (Neon, `briefs/ideas/2125-neon.md` #2): phrase-filtered BM25 serializes extra cold I/O waves. Gate: cold phrase p50 at least
+1.3x faster on either phrase set, with no regression on plain cold or warm BM25, paired A/B/B/A on one host.
+
+### Method
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Clang 19, `__arm_get_current_vg` stub), BW17's setup and workloads exactly (`tmp/msmarco-1m-v021/`
+on S3 us-west-2, 500 held-out queries, `first` and `long` adjacent-pair phrase filters, server on CPUs 0 to 5, client on 14 and 15, 2 GiB
+cache, one sequential cold pass per fresh server). Profile: `BF_TRACE_READS=1` on a fresh server per set, reads assigned to each query by
+wall-clock window; **serial depth** is the deepest chain of dependent backend reads within one segment (the eight segments run side by side).
+
+### Profile (baseline v0.1.41)
+
+| Set | p50 ms | Reads (p50) | KB (p50) | Serial depth p50 / p90 |
+| --- | ---: | ---: | ---: | ---: |
+| plain | 40.9 | 10 | 144 | 2 / 3 |
+| phrase, first pair | 81.4 | 16 | 252 | 3 / 5 |
+| phrase, longest pair | 115.7 | 21 | 280 | 4 / 7 |
+
+All three hypotheses held in the code: `contains_token_sequence` looked up and read every posting block of each token in turn, then ran a
+second per-term pass with uncoalesced position reads, and `OpenHint` ignored phrase terms. In this workload the phrase words are also BM25
+words, so the missing prefetch mattered little here.
+
+### Change (no format change, exact)
+
+- `OpenHint` collects `ContainsTokenSequence` terms from filters and prefetches their dictionary chunks and term records with the BM25 terms.
+- `contains_token_sequence`: one batched dictionary lookup and one batched term-record load for all distinct terms; the rarest term (by
+  document frequency) bounds the candidates; rows outside every block of another term are dropped without a read (so a segment with an
+  empty conjunction ends early); then all needed posting blocks and position streams are read in **one coalesced, address-sorted batch**.
+  When metadata shows at most 64 blocks of the other terms inside the rarest term's block ranges, the rarest-postings wave is merged into
+  that batch too (one wave). A unit test forces both paths against brute force.
+- Every reply matched the baseline's ordered IDs and f32 score bits on all 500 queries of each set (warm, `filtered_bm25 record`/`check`).
+
+### Results (cold, p50 ms, A/B/B/A on one host; baseline then candidate)
+
+| Set | Base | Candidate | Speedup |
+| --- | ---: | ---: | ---: |
+| plain (unchanged path) | 34.4, 36.2 | 41.6, 40.7 | noise: code path identical |
+| phrase, first pair | 78.3, 70.2 | 72.7, 70.6 | 1.04x |
+| phrase, longest pair | 106.9, 106.1 | 89.2, 95.2 | 1.15x |
+
+An earlier two-wave-only build measured first 83.1 to 73.1 ms and long 115 to 99 ms (about 1.14x and 1.16x); p90 improved about 1.2x
+(193 to 160 ms first, 243 to 193 ms long). Candidate serial depth was 3 (first) and 3 (long) at p50, down from 3 and 4.
+
+### Conclusion
+
+**Misses the 1.3x gate** (best 1.15x on the longest pair). The remaining depth is one wave above plain: the phrase filter must finish before
+the masked BM25 search can pick its blocks, and the masked search reaches deeper blocks than the unmasked one because most top-ranked rows
+do not match the phrase (BW17). Lazy score-gated verification was not added: the profile shows the cost is a dependent wave, not bytes.
+The change is exact and small, so it is committed, but whether to keep it for a 1.04x to 1.16x cold gain is the coordinator's call.
+Plain cold p50 differed by 4 to 6 ms between arms on a path this change does not touch, so treat that as host or S3 noise; warm BM25
+was not re-measured. Cost: one c7g.4xlarge for about 1.5 hours (under $1.50); instance, key pair, and security group deleted, no S3 writes.
+
+**Coordinator decision (BW18):** not merged. The gain (1.04x and 1.15x cold phrase p50) is below the round's 1.3x bar for about 230 added lines, and warm phrase throughput was not re-measured. The code is kept on the `bw18-phrase-waves` branch. The remaining cost is the dependent wave (the phrase filter finishes before masked BM25 picks its blocks), so the next attempt should overlap the two, not shave the filter's own reads.
+
+## Round BW19: warm BM25 scaling on shared state (killed at the kill test)
+
+The four suspected shared-state costs total about **3% of 16-client CPU time**, far below the 20% kill line. Nothing ships:
+no code, setting, or format change.
+
+### Measurement
+
+One on-demand c7g.4xlarge (Ubuntu 24.04 arm64, Clang 19, Rust 1.100.0), about 0.25 hours, an estimated $0.15. Baseline is
+`cbb7224` built with frame pointers and debug info. BW11's setup: fixture `tmp/msmarco-1m-v021/` copied locally, server on CPUs
+0 to 5 with two Rayon and two Tokio workers, a 2 GiB raw cache, 4,000-byte blocks, and T4's `concurrent_bm25` on CPUs 14 and
+15 with the held-out odd-indexed 500 queries (every reply checked against truth). `perf record -F 999 -g` on the server CPUs
+during 60 passes at 16 clients and 30 passes at one client. Server CPU is `utime + stime` from `/proc` divided by queries.
+
+### Share of 16-client CPU time in the four suspects
+
+| Suspect | Inclusive share of 16-client samples |
+| --- | ---: |
+| 1. `DecodedCache` mutex and clock bump (`DecodedCache::get`, `read_cache::get`, and all lock and futex symbols) | about 0.3% (futex syscalls 1.0% in total, mostly pool wakeups) |
+| 2. `corpus_for` (FST chunk read, CRC32, `fst::Map` rebuild) | 1.2% (CRC32 1.5% of samples, FST lookups 0.9%, shared with other callers) |
+| 3. `RoaringBitmap` clone and full-coverage check | 0.4% |
+| 4. `SegmentReader` `decoded` mutex and `RwLock`s | 0.25% (all lock symbols together) |
+| **Together** | **about 3%** |
+
+Other items that could grow from one to 16 clients also stay small: the allocator is 3.2% at 16 clients (7.7% at one),
+atomics 3.7% (3.9% at one), and the kernel 2.9% (12.3% at one, mostly idle and task switching). Six `bf-query` threads hold
+93% of the 16-client CPU.
+
+### The premise does not hold: it is CPU-bound, not contended
+
+The "5.1x on 16 cores" figure compares 16-client q/s with a single client on a server **pinned to six CPUs**, and one client
+already fans out over about 2.8 of them. Server CPU per query does not grow with load:
+
+| Clients | q/s | p50 / p90 ms | Server CPU per query |
+| ---: | ---: | ---: | ---: |
+| 1 | 839 | 1.07 / 1.57 | 3.34 ms |
+| 4 | 1,588 | 2.10 / 3.97 | 2.96 ms |
+| 16 | 2,376 | 6.01 / 10.32 | 2.49 ms |
+
+Six CPUs at 2.5 ms per query is a 2,400 q/s ceiling, which is where it sits. Giving the server more CPUs at 16 clients
+(client still on CPUs 14 and 15):
+
+| Server CPUs | q/s | p50 / p90 ms | Server CPU per query |
+| ---: | ---: | ---: | ---: |
+| 6 (0 to 5) | 2,226 | 6.05 / 10.87 | 2.50 ms |
+| 10 (0 to 9) | 3,441 | 3.98 / 7.29 | 2.53 ms |
+| 14 (0 to 13) | 4,483 | 2.90 / 5.59 | 2.62 ms |
+
+Throughput scales 2.0x for 2.3x the CPUs, with CPU per query flat. There is no shared-state wall to remove.
+
+### Where the CPU is (16 clients, for a later round)
+
+`SegmentReader::search_internal` is 80% inclusive: 38.8% self, 13.6% in one `Range<u32>` filter that builds a `Vec<u32>`
+(closure 29, 10% self), 6.6% sorting `(usize, f64)` pairs, and 2.9% building window caches (`cache_windows`). Cutting CPU per
+query there, not locks, is what would raise warm 16-client q/s.
+
+## Rounds WC1 and WC2: a top-100 pass no longer leaves warm vector queries twice as slow
+
+Round I3 found that the protocol's 3,452-query `top_k` 100 pass leaves later warm `top_k` 10 queries at about half
+speed, and that only about half of a fresh server's queries stayed on the compiled path. I suspected the warm tier's
+bounded exact-vector cache. This round proves it with counters and fixes it.
+
+**Setup.** One c7i.2xlarge (8 vCPUs, 16 GB, x86), on demand, in us-west-2. The warm NQ fixture (2,681,468 x 1,024 f16,
+cosine, 32 slabs; the store settles with seven compactions on first start, so I let one idle server finish those before
+measuring) and the Iteration 19 limits: server pinned to CPUs 0-5 in a 12 GB cgroup, 3 GiB cache, disk cache off, 64
+probes, recall sampling off, clients on CPUs 6-7. Each run starts a fresh server with an empty OS cache, optionally runs
+the top-100 quality pass first, then the protocol's latency pass (1,000 warm-up queries, then 1,000 timed) and the
+throughput passes at 1, 4, and 16 clients, then a repeat 16-client pass. The fixture has no qrels, so the quality pass
+ran against an empty qrels file: its scores are meaningless, but its load is the same 3,452 `top_k` 100 queries.
+
+### Cause
+
+New counters (`/metrics`): `blowfish_warm_exact_lookups_total{result}`, `blowfish_warm_exact_inserted_total`,
+`blowfish_warm_exact_evicted_total`, `blowfish_warm_exact_entries` / `_bytes` / `_capacity_bytes`,
+`blowfish_warm_declined_total{reason}` (`not_ready`, `leaf_missing`, `exact_row_missing`, `no_tier`), and
+`blowfish_warm_fallback_queries_total`.
+
+- The exact-vector cache holds 413 MB, the size of the tier's code bytes: 185,770 rows of 2.2 KB, 6.9% of the corpus.
+- A `top_k` 100 query reranks about 800 rows and records every one. The quality pass inserted **2.77 million** rows and
+  evicted **1.80 million**, so the cache was full after about 250 queries. 3,451 of its 3,452 queries fell back.
+- Afterwards, `top_k` 10 queries could not get their rows back. By the end of the next 8,000 queries, 9,333 lookups had missed
+  (counting the pass), and every miss ended a compiled attempt (`exact_row_missing`): only 1,361 of those 8,000 queries stayed compiled (17%),
+  and the repeat 16-client pass was still at 600 q/s. Each fallback re-records its rows, but eviction continued (2.1
+  million evictions by the end of the main pass) because the cache's admission policy keeps the rows the top-100 pass
+  hit most often.
+- **Why half of a fresh server's queries leave the compiled path.** They are first-seen queries. The protocol warms 1,000
+  queries and then times the first 2,000, so the first 1,000 of the 2,000 are being seen for the first time. A first-seen
+  query has no admitted leaf (686 of the declines) or exact rows (1,313) yet, falls back once, and records them; after
+  that it is compiled. A fresh server fell back on exactly 2,000 queries in all, those 1,000 and the 1,000 warm-up ones,
+  and then on none across the 4-client and 16-client passes. So the 999 of 2,000 figure is the learning pass, not a defect.
+
+### Fix (WC1) and why it changed (WC2)
+
+WC1 gave a sparse tier (one whose exact rows cannot all be resident) a second, quarter-size cache for queries
+asking for more than 10 results, charged on top of the reservation. It fixed the pass, but review found two problems.
+An application whose queries all ask for 20, 50, or 100 results would send every row to the quarter-size cache and
+lose three quarters of its warm path, and a sparse tier reserved 25% more memory than before.
+
+WC2 replaces it with **one byte budget, the same one as before, shared by two kinds of reader**. There is no setting
+and no format change.
+
+- **Ordinary readers** record into the ordinary cache and may take any of the budget.
+- **Bulk readers** record into a second cache only while the two caches together are under the budget, so a pass of
+  bulk queries fills free space and never evicts what ordinary queries keep resident. When an ordinary insert pushes
+  the total over the budget, the room comes out of the bulk cache first.
+- A query is a **bulk reader** when it asks for at least 4 times the median `top_k` of the tier's last 64 queries, or
+  when its shortlist (about `top_k` x 8 exact rows) would fill more than 1/512 of the budget (about `top_k` 47 and up
+  on this fixture). A workload that is uniform at a smaller `top_k` is never bulk and has the whole budget, as on main.
+  A workload that is uniform and bulk has the whole budget too, because nothing else competes for it.
+- **Memory:** the reservation is the code bytes plus the vector budget, as on main. The bulk cache is carved out of
+  that budget, so a sparse tier reserves nothing extra.
+
+### Results (WC2)
+
+The same c7i.2xlarge protocol as WC1, with main (v0.1.42, 0b2ea46) and this branch built on the host and run in
+pairs, twice each (20 runs). p50 and p90 are the 1-client latency pass (1,000 warm-up queries, then 1,000 timed);
+q/s is the second 16-client pass over the first 2,000 queries (the first pass includes first-seen queries). Each run
+starts a fresh server on the same store with the OS cache dropped. Cells show the two repetitions.
+
+| Workload | Binary | p50 ms | p90 ms | 16 clients q/s |
+| --- | --- | ---: | ---: | ---: |
+| (a) top-100 pass, then top_k 10 | main | 6.7, 6.8 | 7.7, 7.8 | 666, 672 |
+| | this branch | **3.5, 3.8** | 3.9, 4.1 | **1,279, 1,260** |
+| fresh server, top_k 10 | main | 3.6, 3.4 | 3.8, 3.6 | 1,307, 1,220 |
+| | this branch | 3.5, 3.9 | 3.6, 4.1 | 1,239, 1,253 |
+| (b) fresh, pure top_k 20 | main | 4.5, 4.6 | 4.8, 4.9 | 1,053, 1,046 |
+| | this branch | 4.4, 4.4 | 4.9, 4.8 | 1,006, 1,005 |
+| (c) fresh, pure top_k 100 | main | 10.1, 10.3 | 14.2, 14.4 | 405, 404 |
+| | this branch | **8.6, 8.5** | 10.0, 10.0 | **535, 541** |
+| (d) fresh, 90% top_k 10 and 10% top_k 100 | main | 3.7, 3.8 | 4.7, 4.4 | 1,128, 1,133 |
+| | this branch | 3.8, 3.8 | 4.7, 5.1 | 1,149, 1,119 |
+
+- **(a)** After the top-100 pass, this branch serves 1,260 to 1,279 q/s at p50 3.5 to 3.8 ms, within 4% of main's
+  fresh server (1,220 to 1,307 q/s), where main serves 666 to 672. WC1's fixed split reached the same place.
+- **(b)** Pure top_k 20 is equal on latency (p50 4.4 against 4.5 to 4.6) and 4% lower on throughput in both pairs
+  (1,005 to 1,006 against 1,046 to 1,053). Main alone varies by 7% between repeats of the fresh top_k 10 run (1,307 and
+  1,220), so I read this as inside the noise but did not resolve it. A pure top_k 20 workload is never bulk, so it
+  takes the same ordinary path as main. One cost I know of and did not remove: every query copies the last 64 `top_k`
+  values to find the median, once per segment, and it allocates.
+- **(c)** Pure top_k 100 is better than main, 1.3x on throughput and 15% on p50, because it fills the free budget once
+  and stops churning it. The warm counters show 0 evictions at 185,770 entries, 413,152,480 of 413,153,216 bytes.
+- **(d)** The mixed stream is equal to main.
+- **Identical results:** the top 10 ids of the first 2,000 queries hash to the same value in all 20 runs (0
+  differences, any binary, any `top_k` of 10, 20, or 100).
+- **Memory:** the reservation is identical to main's. Peak RSS is equal to main in the fresh runs (2.44 GB, 3.12 GB,
+  5.03 GB, and 3.12 GB for this branch against 2.44 to 2.51, 3.12, 5.06, and 3.15 to 3.29) but **0.8% (about 50 MB)
+  higher after the pass** (5.78 GB against 5.73 GB, in both repeats). In that case this branch serves compiled queries
+  where main falls back to the cold path; I did not isolate what the extra 50 MB is.
+
+### Not done
+
+- **Fetching only the missing exact rows.** A compiled query that misses one exact row still falls back to the whole
+  planner. Fetching just the missing rows needs `CompiledTier::try_search` (in `bf-vector`) to return the missing
+  candidates' slab, cluster, and ordinal, and an async reader for the slab's vectors inside the compiled branch. Both are
+  outside `bf-engine`, so I did not build them; with the bulk split in place the remaining misses are first-seen
+  queries, which need the I/O anyway.
+- **A test of the budget sharing end to end.** Unit tests cover the classification (uniform at any `top_k` is never
+  bulk, a pass of very large queries is, a rare large query in an ordinary stream is). At the fixture's size the window in
+  which a tier is admitted and still sparse is so narrow that a test's own queries evict the tier, so the sharing is
+  proved by the measurement above.
+
+Costs: WC1 used one c7i.2xlarge for about 55 minutes, an estimated $0.45 with the 120 GB volume. WC2 used one for
+about 1 hour 25 minutes, an estimated $0.55. The instances, key pairs, and security groups are deleted, and no S3
+prefix was written.

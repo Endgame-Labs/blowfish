@@ -656,6 +656,10 @@ async fn from_slabs(
             let warm = warm_eligible
                 .then(|| crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone()))
                 .flatten();
+            if warm_eligible && warm.is_none() {
+                metrics::counter!("blowfish_warm_declined_total", "reason" => "no_tier")
+                    .increment(1);
+            }
             crate::ann_dir::search(
                 store,
                 &view,

@@ -2,7 +2,18 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-26
+
+- **WC1/WC2 warm exact-vector cache (merged).** A top_k 100 pass flooded the sparse tier's exact cache (2.77M inserts, 1.80M evictions) and TinyLFU kept those rows. Bulk queries (k at least 4x the recent median, or a shortlist over 1/512 of the budget) now fill only free space in one shared budget. Issue #3 protocol: 592-601 -> 1,112-1,148 q/s; pure top_k 100 1.3x; memory-neutral.
+- **BW18 (not merged), BW19 (killed).** Cold phrase waves 1.04-1.15x; warm BM25 shared-state costs about 3% of CPU.
+
 ## 2026-11-25
+
+- **T9 legacy spill sweep (merged).** Startup deletes loose spill files from older releases once idle for an hour; locked per-process spill directories were already on main.
+
+- **T8 BF16 kernel pinning (merged).** NumKong's SME matrix kernel overwrote partial tiles on the M4 (observed error 145.8x the bound); recluster now pins reviewed kernels and excludes SME and AMX. BF16 subnormals flushed explicitly. Full suite passes on x86, the M4, and Graviton.
+- **I3 issue #3 re-measure (docs).** v0.1.39 on BEIR NQ: 16 clients 512 q/s, warm p99 10.7 to 16.4 ms, recall 0.962, disk 14.18 GB settled (not met: vectors stored twice). Follow-ups D4b, WC1, and T9.
+- **BW17 (negative).** Phrase shortlist holds 10 matches for only 24 to 27% of queries.
 
 - **T7 query cancellation (merged).** `run_io` aborts a plan's I/O continuation when its caller is dropped, for every caller; C21's separate cancellable helper and flag are removed (one way). Warm A/B within noise.
 - **BW16 (negative).** Ideal precomputed shadow masks under 1,000 upserts/s give only 1.15x BM25 p50.

@@ -1224,6 +1224,10 @@ pub(crate) async fn search(
         }
         return hydrate(store, state, real, columns, k, winners, t0).await;
     }
+    if warm.is_some() {
+        // Any reason: the plan gate above, or a decline counted by `WarmTier::search`.
+        metrics::counter!("blowfish_warm_fallback_queries_total").increment(1);
+    }
     // A missing compiled code or exact row can still find all its bytes in a lower cache.
     // Yield before the general planner spends CPU: the reactor's saved future continues on
     // shared I/O, rather than running an unexpectedly expensive fallback on this connection.
@@ -1923,12 +1927,15 @@ pub(crate) async fn search(
         let i = sources[i];
         async move {
             let work = async move {
+                let recorder = warm.as_deref().map(|w| w.recorder(k));
                 let hits = index
                     .rerank_candidates_recorded(
                         &vector,
                         k,
                         locations,
-                        warm.as_deref().map(|w| w as &dyn bf_vector::VectorRecorder),
+                        recorder
+                            .as_ref()
+                            .map(|r| r as &dyn bf_vector::VectorRecorder),
                     )
                     .await
                     .map_err(segment::index_error)?;
