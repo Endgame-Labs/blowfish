@@ -14820,3 +14820,29 @@ Reproduction: build `crates/bf-engine/examples/scale-server` at v0.1.51 and at C
 --paired-projections --binary <c25> --arms
 '{"base":{"BINARY":"<v0.1.51>","BLOCK":"1048576","COALESCE":"8"},"cand":{"BLOCK":"262144","COALESCE":"32"}}'
 --s3-only-arm base --s3-only-arm cand` with the arm order swapped on odd runs.
+
+## Round IN1: removal accounting no longer reads covered vectors
+
+**Finding.** Once a covering ANN tier retires a segment's own `annv2:{name}` file, the old accounting path
+(`statistics::adjust_bounded`) kept the vector column in its projection. Every overwrite or delete that
+removed rows from such a segment read the old vectors through the slab row maps and cluster blobs, only to
+measure a per-row JSON length that is a constant.
+
+**Change.** For a segment a tier covers, `vector_locator::Sources::present` now decides which rows hold a vector
+from the resident slab row lists and the lineage maps alone, and the accounting adds the constant vector width
+for those rows. Sparse columns stay exact, because presence comes from the row lists. `rows` and `logical_bytes`
+are bit-identical: the test `in1_removal_accounting_counts_covered_vectors_without_reading_them` compares
+the result with the byte length of the materialized documents, for dense and sparse vectors, whole segments and
+every fifth row.
+
+**Reads** (test fixture, 2 segments of 2,000 rows, cache off, requested bytes that missed):
+
+| Rows accounted | Before, missed bytes | After, missed bytes |
+|---:|---:|---:|
+| 2,000 (dense) | 41,836 | 0 |
+| 400 (dense) | 12,042 | 0 |
+| 2,000 (sparse) | 38,404 | 0 |
+| 400 (sparse) | 10,302 | 0 |
+
+**Gap.** The 1M-row paired wall-time A/B was not run; the evidence is the read counts above. The saving grows
+with vector width and with the number of slabs touched, since the old path was serial across slabs.
