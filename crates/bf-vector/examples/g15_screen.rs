@@ -26,10 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut qb = vec![0u8; nq * DIMS * 4];
     q.read_exact(&mut qb)?;
     let queries: Vec<Vec<f32>> = qb
-        .chunks_exact(DIMS * 4)
+        .as_chunks::<{ DIMS * 4 }>()
+        .0
+        .iter()
         .map(|r| {
-            r.chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            r.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect()
         })
         .collect();
@@ -40,7 +44,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|b| half::f16::from_le_bytes(*b).to_f32())
         .collect();
     let norms: Vec<f32> = corpus
-        .chunks_exact(DIMS)
+        .as_chunks::<DIMS>()
+        .0
+        .iter()
         .map(|r| r.iter().map(|x| x * x).sum::<f32>().sqrt())
         .collect();
     let pool = rayon::ThreadPoolBuilder::new()
