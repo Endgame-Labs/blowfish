@@ -175,6 +175,9 @@ def stats(client):
             op = re.search(r'(?:op|outcome)="([^"]+)"', m[2])[1]
             key = m[1] + "_" + op
             out[key] = out.get(key, 0) + float(m[3])
+    # Round C27: slab row-map reconstructions (published maps keep this at zero).
+    rebuilds = re.findall(r"^blowfish_ann_row_map_rebuilds_total\{.*\} (\S+)$", text, re.MULTILINE)
+    out["rowmap_rebuilds"] = sum(float(v) for v in rebuilds)
     return out
 
 
@@ -440,6 +443,7 @@ def query(name, item, client, work, proc):
             delta.get("requests_" + op, 0) for op in ["get", "get_range"]
         ),
         "hedges": delta.get("hedges_issued", 0),
+        "rowmap_rebuilds": delta.get("rowmap_rebuilds", 0),
         "bytes": sum(delta.get("bytes_" + op, 0) for op in ["get", "get_range"]),
         **trace_summary(log),
     }
