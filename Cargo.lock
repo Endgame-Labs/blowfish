@@ -438,6 +438,7 @@ dependencies = [
  "base64 0.22.1",
  "bf-storage",
  "bf-types",
+ "bytes",
  "chrono",
  "futures",
  "half",

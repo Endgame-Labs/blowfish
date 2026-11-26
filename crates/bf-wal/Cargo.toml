@@ -11,17 +11,18 @@ metrics = "=0.24.6"
 bf-types = { path = "../bf-types" }
 bf-storage = { path = "../bf-storage" }
 base64 = "0.22.1"
+bytes = "1.11.1"
 half = "=2.7.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["sync"] }
+tokio = { version = "1.54.1", features = ["sync", "rt"] }
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
 zstd = "0.13.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
 async-trait = "0.1.92"
 object_store = { version = "=0.14.2", features = ["aws", "fs"] }
