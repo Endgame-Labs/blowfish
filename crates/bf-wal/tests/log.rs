@@ -548,8 +548,13 @@ async fn tail_reports_reclaimed_payloads_and_honors_the_byte_budget() {
     assert!(matches!(wal.tail(0).await, Err(Error::Format)));
     let tail = wal.tail(6).await.unwrap();
     assert_eq!(tail.len(), 6);
-    let one = serde_json::to_vec(&tail[0].1).unwrap().len() as u64;
-    let bounded = wal.tail_bounded(6, one * 2 + 1).await.unwrap();
+    // Entry sizes differ by a few bytes (`committed_at` serializes a variable number of
+    // fractional digits), so budget exactly the first two entries.
+    let size = |entry: &bf_wal::WalEntry| serde_json::to_vec(entry).unwrap().len() as u64;
+    let bounded = wal
+        .tail_bounded(6, size(&tail[0].1) + size(&tail[1].1))
+        .await
+        .unwrap();
     assert_eq!(
         bounded.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
         vec![7, 8]
