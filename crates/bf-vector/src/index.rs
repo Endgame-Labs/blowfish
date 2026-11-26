@@ -1393,20 +1393,35 @@ impl<R: RangeRead> Index<R> {
                 if !whole {
                     check_crc(vbytes, c.row_crcs[i])?;
                 }
-                decoded.clear();
-                match self.vector_type() {
-                    VectorType::I8 => decoded.extend(vbytes.iter().map(|x| *x as i8 as f32)),
-                    VectorType::F32 => decoded.extend(
-                        vbytes
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|x| f32::from_le_bytes(*x)),
-                    ),
-                    VectorType::F16 => extend_f16(vbytes, &mut decoded),
-                }
-                if decoded.iter().any(|x| !x.is_finite()) {
-                    return Err(bad("non-finite stored vector"));
+                // Round G12 item 4: a cosine rerank of f16 rows scores the stored bytes directly.
+                let fused = match prepared {
+                    Some(prepared)
+                        if self.vector_type() == VectorType::F16
+                            && crate::g12_flags::on(crate::g12_flags::FUSED_RERANK) =>
+                    {
+                        let p = norms
+                            .binary_search_by_key(&(cid, i), |c| (c.0, c.1))
+                            .expect("prepared rerank norm");
+                        prepared.distance_f16_bytes(vbytes, norms[p].2)
+                    }
+                    _ => None,
+                };
+                if fused.is_none() {
+                    decoded.clear();
+                    match self.vector_type() {
+                        VectorType::I8 => decoded.extend(vbytes.iter().map(|x| *x as i8 as f32)),
+                        VectorType::F32 => decoded.extend(
+                            vbytes
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|x| f32::from_le_bytes(*x)),
+                        ),
+                        VectorType::F16 => extend_f16(vbytes, &mut decoded),
+                    }
+                    if decoded.iter().any(|x| !x.is_finite()) {
+                        return Err(bad("non-finite stored vector"));
+                    }
                 }
                 let row = match &c.ids {
                     Some(ids) => ids.get(i).copied(),
@@ -1421,7 +1436,9 @@ impl<R: RangeRead> Index<R> {
                         vbytes,
                     ));
                 }
-                let distance = if let Some(prepared) = prepared {
+                let distance = if let Some(distance) = fused {
+                    distance
+                } else if let Some(prepared) = prepared {
                     let p = norms
                         .binary_search_by_key(&(cid, i), |c| (c.0, c.1))
                         .expect("prepared rerank norm");

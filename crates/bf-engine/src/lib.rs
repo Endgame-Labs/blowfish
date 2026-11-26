@@ -899,6 +899,17 @@ impl Engine {
         }
         Ok(response)
     }
+    /// Rows a query may ask for and still run on the HTTP reactor: ten, or the graph's limit
+    /// when a ready graph will answer it (Round G12 item 1).
+    fn inline_rows(&self, ns: &str, state: &NamespaceState, request: &QueryRequest) -> usize {
+        if bf_vector::g12_flags::on(bf_vector::g12_flags::INLINE_BIG)
+            && self.0.hot_graph.serves(ns, state, request)
+        {
+            100
+        } else {
+            10
+        }
+    }
     /// Search a consistent segment-and-tail snapshot, including multi-query RRF.
     pub async fn query(&self, ns: &str, request: QueryRequest) -> Result<QueryResponse, ApiError> {
         self.query_with_diagnostics(ns, request)
@@ -925,6 +936,7 @@ impl Engine {
                             &state,
                             &request,
                             &self.0.config,
+                            self.inline_rows(ns, &state, &request),
                         )
                 });
             if !resident {
@@ -1289,7 +1301,18 @@ impl Engine {
         let config = self.0.config.clone();
         let t_clone = Instant::now();
         let inline = query_worker::is_reactor()
-            && warm_ann::inline_plan(&self.0.read_cache, state, request, &config);
+            && warm_ann::inline_plan(
+                &self.0.read_cache,
+                state,
+                request,
+                &config,
+                self.inline_rows(
+                    context.hot_graph.as_ref().map_or("", |s| s.namespace()),
+                    state,
+                    request,
+                ),
+            );
+        let measure = warm_graph::measure_this_query();
         let state = state.clone();
         if crate::ann::trace_stages() {
             eprintln!("CLONE {}us", t_clone.elapsed().as_micros());
@@ -1309,6 +1332,7 @@ impl Engine {
             let _in_flight = InFlight::enter();
             warm_graph::measure_cpu(
                 context.cpu_nanos.clone(),
+                measure,
                 read_cache::scope(
                     context,
                     indexed::execute(&store, &state, &request, &config, false),

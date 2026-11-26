@@ -98,6 +98,7 @@ pub(crate) fn inline_plan(
     state: &crate::NamespaceState,
     request: &bf_types::QueryRequest,
     config: &crate::EngineConfig,
+    max_rows: usize,
 ) -> bool {
     let Some(bf_types::RankBy::Vector {
         attribute,
@@ -118,7 +119,7 @@ pub(crate) fn inline_plan(
         || request.aggregate_by.is_some()
         || request.group_by.is_some()
         || request.rerank_by.is_some()
-        || request.total().unwrap_or(10).saturating_add(request.offset) > 10
+        || request.total().unwrap_or(10).saturating_add(request.offset) > max_rows
         || state.tail_bytes != 0
         || !state.docs.is_empty()
         || state
@@ -637,14 +638,16 @@ mod tests {
             &warm.0.read_cache,
             &state,
             &eligible,
-            &warm.0.config
+            &warm.0.config,
+            10
         ));
         eligible.top_k = Some(11);
         assert!(!inline_plan(
             &warm.0.read_cache,
             &state,
             &eligible,
-            &warm.0.config
+            &warm.0.config,
+            10
         ));
         eligible.top_k = Some(10);
         let mut expensive = warm.0.config.clone();
@@ -653,14 +656,16 @@ mod tests {
             &warm.0.read_cache,
             &state,
             &eligible,
-            &expensive
+            &expensive,
+            10
         ));
         eligible.filters = Some(serde_json::from_value(json!(["tag", "Eq", 0])).unwrap());
         assert!(!inline_plan(
             &warm.0.read_cache,
             &state,
             &eligible,
-            &warm.0.config
+            &warm.0.config,
+            10
         ));
         assert!(
             compiled.hits.load(Ordering::Relaxed) > 0,

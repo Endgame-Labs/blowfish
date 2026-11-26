@@ -108,6 +108,35 @@ impl<'a> CosineQuery<'a> {
     pub(crate) fn vector(&self) -> &[f32] {
         self.vector
     }
+    /// The distance to a stored little-endian `f16` row, computed straight from its bytes with
+    /// the exact rounding of [`Self::distance`] on the decoded row (same lanes, same order).
+    /// `None` means "decode and use [`Self::distance`]": the platform has no fused kernel, the
+    /// row holds a non-finite value (the caller reports it), or an edge case such as a zero or
+    /// overflowing norm needs the wider fallback.
+    pub(crate) fn distance_f16_bytes(&self, bytes: &[u8], norm: CosineNorm) -> Option<f32> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if bytes.len() != self.vector.len() * 2 {
+                return None;
+            }
+            // SAFETY: NEON is mandatory on aarch64, and the kernel bounds every load by the
+            // equal slice lengths checked above.
+            let (ab, finite) = unsafe { dot_f16_bytes_neon(self.vector, bytes) };
+            if !finite {
+                return None;
+            }
+            let (aa, bb, ab) = (self.norm.0 as f64, norm.0 as f64, ab as f64);
+            if !aa.is_finite() || !bb.is_finite() || !ab.is_finite() || aa == 0. || bb == 0. {
+                return None;
+            }
+            Some((1. - ab / (aa.sqrt() * bb.sqrt())).clamp(0., 2.) as f32)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (bytes, norm);
+            None
+        }
+    }
     pub(crate) fn distance(&self, vector: &[f32], norm: CosineNorm) -> f32 {
         let (aa, bb, ab) = (
             self.norm.0 as f64,
@@ -718,6 +747,111 @@ unsafe fn cosine_sums_neon<const NORMS: bool>(a: &[f32], b: &[f32]) -> (f32, f32
             }
         }
         (saa, sbb, sab)
+    }
+}
+
+/// `a . decode(b)` with `cosine_sums_neon::<false>`'s exact lane layout and rounding, reading
+/// `f16` bytes directly, and whether every stored value was finite.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_f16_bytes_neon(a: &[f32], b: &[u8]) -> (f32, bool) {
+    use std::arch::aarch64::*;
+    use std::arch::asm;
+    debug_assert_eq!(a.len() * 2, b.len());
+    // f16 -> f32 widening is exact, so these agree with `half`'s conversion bit for bit.
+    #[inline(always)]
+    unsafe fn low(h: uint16x8_t) -> float32x4_t {
+        let r: float32x4_t;
+        // SAFETY: a register-only widening conversion.
+        unsafe {
+            asm!("fcvtl {r:v}.4s, {h:v}.4h", r = out(vreg) r, h = in(vreg) h, options(pure, nomem, nostack));
+        }
+        r
+    }
+    #[inline(always)]
+    unsafe fn high(h: uint16x8_t) -> float32x4_t {
+        let r: float32x4_t;
+        // SAFETY: a register-only widening conversion.
+        unsafe {
+            asm!("fcvtl2 {r:v}.4s, {h:v}.8h", r = out(vreg) r, h = in(vreg) h, options(pure, nomem, nostack));
+        }
+        r
+    }
+    let n = a.len();
+    let end = n / 16 * 16;
+    let mut ab = [vdupq_n_f32(0.); 4];
+    let exponent = vdupq_n_u16(0x7c00);
+    let mut special = vdupq_n_u16(0);
+    // SAFETY: each load reads inside the complete sixteen-value blocks of both slices.
+    unsafe {
+        for offset in (0..end).step_by(16) {
+            let h0 = vld1q_u16(b.as_ptr().add(offset * 2).cast());
+            let h1 = vld1q_u16(b.as_ptr().add(offset * 2 + 16).cast());
+            special = vorrq_u16(special, vceqq_u16(vandq_u16(h0, exponent), exponent));
+            special = vorrq_u16(special, vceqq_u16(vandq_u16(h1, exponent), exponent));
+            let y = [low(h0), high(h0), low(h1), high(h1)];
+            for j in 0..4 {
+                let x = vld1q_f32(a.as_ptr().add(offset + j * 4));
+                ab[j] = vaddq_f32(ab[j], vmulq_f32(x, y[j]));
+            }
+        }
+        let mut lanes = [0f32; 16];
+        for (j, value) in ab.into_iter().enumerate() {
+            vst1q_f32(lanes.as_mut_ptr().add(j * 4), value);
+        }
+        let mut sab = lanes.iter().sum::<f32>();
+        let mut finite = vmaxvq_u16(special) == 0;
+        for i in end..n {
+            let h = u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
+            finite &= h & 0x7c00 != 0x7c00;
+            sab += a[i] * half::f16::from_bits(h).to_f32();
+        }
+        (sab, finite)
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod fused_f16_tests {
+    use super::*;
+    #[test]
+    fn fused_f16_distance_matches_decoded_distance_bit_for_bit() {
+        for dims in 1..1100 {
+            let q = (0..dims)
+                .map(|i| ((i + 1) as f32 * 1.7).sin())
+                .collect::<Vec<_>>();
+            let stored = (0..dims)
+                .map(|i| half::f16::from_f32(((i + 1) as f32 * 1.3).cos() * 3.))
+                .collect::<Vec<_>>();
+            let bytes = stored
+                .iter()
+                .flat_map(|h| h.to_le_bytes())
+                .collect::<Vec<_>>();
+            let decoded = stored.iter().map(|h| h.to_f32()).collect::<Vec<_>>();
+            let query = CosineQuery::new(&q).unwrap();
+            let norm = CosineNorm::new(&decoded).unwrap();
+            let want = query.distance(&decoded, norm);
+            let got = query.distance_f16_bytes(&bytes, norm).expect("fused");
+            assert_eq!(got.to_bits(), want.to_bits(), "dims={dims}");
+        }
+    }
+    #[test]
+    fn fused_f16_declines_non_finite_rows_and_zero_norms() {
+        let q = vec![0.5f32; 40];
+        let query = CosineQuery::new(&q).unwrap();
+        let mut bytes = (0..40)
+            .flat_map(|i| half::f16::from_f32(i as f32).to_le_bytes())
+            .collect::<Vec<_>>();
+        let decoded = bytes
+            .chunks(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect::<Vec<_>>();
+        let norm = CosineNorm::new(&decoded).unwrap();
+        assert!(query.distance_f16_bytes(&bytes, norm).is_some());
+        bytes[70..72].copy_from_slice(&half::f16::INFINITY.to_le_bytes());
+        assert!(query.distance_f16_bytes(&bytes, norm).is_none());
+        let zero = CosineNorm::new(&[0.; 40]).unwrap();
+        let zeros = vec![0u8; 80];
+        assert!(query.distance_f16_bytes(&zeros, zero).is_none());
     }
 }
 

@@ -108,7 +108,22 @@ impl Codes {
             .max(0.)
     }
     pub fn prepare(&self, q: &[f32]) -> (Vec<i8>, f32) {
-        encode(&RaBitQ::new(q.len(), 42).unwrap().rotate(q))
+        if !crate::g12_flags::on(crate::g12_flags::ROTATE_ONCE) {
+            return encode(&RaBitQ::new(q.len(), 42).unwrap().rotate(q));
+        }
+        thread_local! {
+            static ROTATION: std::cell::RefCell<Option<(RaBitQ, Vec<f64>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        ROTATION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_none_or(|(r, _)| r.dims != q.len()) {
+                *slot = Some((RaBitQ::new(q.len(), 42).unwrap(), Vec::new()));
+            }
+            let (rotation, buffer) = slot.as_mut().unwrap();
+            rotation.rotate_into(q, buffer);
+            encode(buffer)
+        })
     }
     pub fn score(&self, q: &[i8], scale: f32, id: u32) -> f32 {
         let start = id as usize * self.dims;

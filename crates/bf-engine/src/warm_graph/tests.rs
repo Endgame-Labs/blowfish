@@ -237,6 +237,35 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         );
         assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
     }
+    // Round G12: each experiment switch, alone and all together, returns the same ordered rows
+    // and the same score bits as the old paths, for small and large result sets.
+    {
+        use bf_vector::g12_flags::{FLAGS, on};
+        let bodies = |i: usize| {
+            [10, 100, 37].map(|k| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k,"include_attributes":["group"]}))
+        };
+        FLAGS.store(0, Ordering::Relaxed);
+        let mut want = Vec::new();
+        for i in [17, 400, 1999] {
+            for body in bodies(i) {
+                want.push(query(&e, "hot", body).await);
+            }
+        }
+        for flags in [1, 2, 4, 8, 16, 31] {
+            FLAGS.store(flags, Ordering::Relaxed);
+            assert_eq!(on(flags), flags != 0);
+            let mut got = Vec::new();
+            for i in [17, 400, 1999] {
+                for body in bodies(i) {
+                    got.push(query(&e, "hot", body).await);
+                }
+            }
+            for (a, b) in want.iter().zip(got) {
+                same_rows(a.clone(), b);
+            }
+        }
+        FLAGS.store(0, Ordering::Relaxed);
+    }
     for body in [
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":101}),
@@ -460,7 +489,7 @@ async fn migrated_query_polls_charge_cpu_without_charging_io_waits() {
     let cpu = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
     let name = crate::query_worker::run(
-        measure_cpu(cpu.clone(), async {
+        measure_cpu(cpu.clone(), true, async {
             tokio::time::sleep(Duration::from_millis(40)).await;
             std::thread::current()
                 .name()
