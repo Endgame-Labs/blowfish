@@ -58,7 +58,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
     );
     let before = fingerprint(&store, ns).await?;
-    eprintln!("RD1 before rows={} keyed={} free={}", before.2, before.0, before.1);
+    eprintln!(
+        "RD1 before rows={} keyed={} free={}",
+        before.2, before.0, before.1
+    );
     let start = std::time::Instant::now();
     let report = engine
         .recluster(
@@ -74,7 +77,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
     let seconds = start.elapsed().as_secs_f64();
     let after = fingerprint(&store, ns).await?;
-    eprintln!("RD1 after rows={} keyed={} free={}", after.2, after.0, after.1);
+    eprintln!(
+        "RD1 after rows={} keyed={} free={}",
+        after.2, after.0, after.1
+    );
     std::fs::write(
         &args[4],
         serde_json::json!({
@@ -85,6 +91,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
         .to_string(),
     )?;
-    println!("RD1 installed seconds={seconds:.3} rows={} slabs={}", report.rows, report.slabs);
+    println!(
+        "RD1 installed seconds={seconds:.3} rows={} slabs={}",
+        report.rows, report.slabs
+    );
     Ok(())
 }

@@ -580,14 +580,22 @@ impl Engine {
         let prestage = crate::local_ann::Prestage::begin(dims);
         let mut rows_left = present.len() as u64;
         let uploads = Arc::new(tokio::sync::Mutex::new(Vec::<Segment>::new()));
-        for (
+        // Each slab's exact vectors are read while the slab before it builds, so at most two
+        // slabs' vectors are in memory. Dropping the handle on an error ends the read.
+        let fetch = |rows: Vec<u32>| {
+            let source = source.clone();
+            AbortOnDrop(tokio::spawn(async move { source.rows(&rows).await }))
+        };
+        let mut jobs = jobs.into_iter().enumerate().peekable();
+        let mut fetching = jobs.peek().map(|(_, j)| fetch(j.rows.clone()));
+        while let Some((
             n,
             SlabJob {
                 rows,
                 centers,
                 assignment,
             },
-        ) in jobs.into_iter().enumerate()
+        )) = jobs.next()
         {
             let k = centers.len();
             clusters += k;
@@ -598,8 +606,13 @@ impl Engine {
             // The slab's exact vectors, at the stored precision (about 2 KB each at 1,024 dims
             // in f16), read back from their source segments and checked against the spill.
             let reading = Stage::new("source_read");
-            let data = source.rows(&rows).await?;
+            let data = fetching
+                .take()
+                .expect("a fetch for every slab")
+                .join()
+                .await??;
             drop(reading);
+            fetching = jobs.peek().map(|(_, j)| fetch(j.rows.clone()));
             let blob = on_pool(move || -> Result<BuiltSlab, ApiError> {
                 let encoding = Stage::new("encoding");
                 let params = bf_vector::BuildParams {
@@ -729,6 +742,19 @@ impl Engine {
                 ..report
             },
         })
+    }
+}
+
+/// A spawned task that stops with its owner.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+impl<T> AbortOnDrop<T> {
+    async fn join(mut self) -> Result<T, ApiError> {
+        (&mut self.0).await.map_err(segment::index_error)
+    }
+}
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

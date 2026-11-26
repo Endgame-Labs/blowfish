@@ -15,7 +15,7 @@ use std::{
 };
 
 /// Source leaves read at once. A leaf is about 1.3 MB at 640 rows of 1,024 f16 dimensions.
-const LEAVES_IN_FLIGHT: usize = 16;
+const LEAVES_IN_FLIGHT: usize = 64;
 /// Attempts for one leaf's read before the build fails (a slab then restarts with the next build).
 const ATTEMPTS: u32 = 3;
 /// Open source indexes kept between slabs. Past this, the cache starts over.
