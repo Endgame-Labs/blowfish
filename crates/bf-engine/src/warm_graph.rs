@@ -18,7 +18,23 @@ use std::{
 const DWELL: Duration = Duration::from_secs(600);
 const IDLE: Duration = Duration::from_secs(1800);
 const RETRY: Duration = Duration::from_secs(1800);
+/// Exact-rerank shortlist for the largest request the original graph path served.
 const RERANK: usize = 30;
+/// The largest `k + offset` the graph serves; larger requests use the IVF tier.
+const MAX_K: usize = 100;
+
+/// Beam width and exact-rerank shortlist for a request of `k` rows, given the calibrated beam.
+///
+/// Up to [`RERANK`] rows nothing changes. Beyond that the shortlist is 1.5 x `k` and the beam
+/// 2.56 x `k` (never below the calibrated beam). Round G8 measured on NQ at `k` 100: beam 256 with
+/// shortlist 150 matches the IVF tier's recall@100 (0.9533 against 0.9523) at about 1/17 of its cost,
+/// and a shortlist beyond 1.5 x `k` adds no recall because the beam bounds the candidates.
+fn plan(k: usize, calibrated: usize) -> (usize, usize) {
+    if k <= RERANK {
+        return (calibrated, RERANK);
+    }
+    (calibrated.max((k * 128).div_ceil(50)), (k * 3).div_ceil(2))
+}
 pub(crate) mod cost;
 mod effort;
 #[cfg(all(test, target_os = "macos"))]
@@ -457,7 +473,7 @@ impl Cache {
         };
         if q.filters.is_some()
             || q.total().unwrap_or(10) == 0
-            || q.total().unwrap_or(10).saturating_add(q.offset) > RERANK
+            || q.total().unwrap_or(10).saturating_add(q.offset) > MAX_K
             || vector.iter().all(|x| *x == 0.)
             || state.metric != DistanceMetric::CosineDistance
         {
@@ -895,7 +911,7 @@ pub(crate) fn available(
         .and_then(|h| h.ready.as_ref())
         .is_some_and(|e| {
             k > 0
-                && k <= RERANK
+                && k <= MAX_K
                 && e.graph.len() >= k
                 && vector.len() == e.graph.dims()
                 && vector.iter().any(|x| *x != 0.)
@@ -1011,7 +1027,7 @@ pub(crate) async fn search(
         }
     };
     if k == 0
-        || k > RERANK
+        || k > MAX_K
         || entry.graph.len() < k
         || vector.len() != entry.graph.dims()
         || vector.iter().all(|x| *x == 0.)
@@ -1072,12 +1088,13 @@ async fn search_entry(
         entry,
         scratch: Some(scratch),
     };
+    let (ef, shortlist) = plan(k, ef);
     let (hits, evaluations) = entry
         .graph
         .candidates_with_norms(
             vector,
             ef,
-            RERANK,
+            shortlist,
             mask.as_deref(),
             loan.scratch.as_mut().unwrap(),
         )
@@ -1444,3 +1461,29 @@ fn make_room(bytes: u64, benefit_per_byte: f64) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn small_requests_keep_the_calibrated_beam_and_shortlist() {
+        for k in 1..=RERANK {
+            assert_eq!(plan(k, 64), (64, RERANK));
+            assert_eq!(plan(k, 48), (48, RERANK));
+        }
+    }
+
+    #[test]
+    fn large_requests_scale_with_k_and_never_narrow() {
+        assert_eq!(plan(100, 64), (256, 150));
+        assert_eq!(plan(31, 64), (80, 47));
+        assert_eq!(plan(100, 400), (400, 150));
+        let mut last = plan(RERANK + 1, 64);
+        for k in RERANK + 2..=MAX_K {
+            let now = plan(k, 64);
+            assert!(now.0 >= last.0 && now.1 >= last.1 && now.0 >= now.1);
+            last = now;
+        }
+    }
+}

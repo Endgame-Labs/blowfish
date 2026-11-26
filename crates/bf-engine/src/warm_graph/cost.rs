@@ -59,8 +59,8 @@ impl Pending {
 
 /// Quality observations retain their original exact comparison. Cost uses eight distinct
 /// samples together (or a smaller block at the byte boundary): streaming truth between every timed graph trial otherwise measures a
-/// cold CPU working set, even when ordinary serving has sustained heat. The first query's
-/// cold cost remains in the average; no identical-query warmup is excluded from measurement.
+/// cold CPU working set, even when ordinary serving has sustained heat. Each path then runs the block
+/// twice and only the second, steady-state pass is timed, for graph and IVF alike.
 pub(crate) async fn measure(
     scope: &Scope,
     store: &Storage,
@@ -95,30 +95,40 @@ pub(crate) async fn measure(
         .unwrap_or_else(|e| e.into_inner())
         .push((state.seq, state.manifest_seq, ef), query);
     let Some(batch) = batch else { return };
+    // Ordinary traffic keeps the IVF path's working set warm, while a graph that is not serving
+    // yet is cold after every exhaustive truth scan. Timing each path's first touch compared warm
+    // IVF with a cold graph, and the busier the server, the more it favored IVF. Both paths run
+    // the block once untimed, so each is costed at the steady state it would serve from.
     let mut graph_cpu = 0.;
-    for request in &batch {
-        let trial = scope.trial();
-        let trial_context = read_cache::ReadContext {
-            hot_graph: Some(trial.clone()),
-            ..context.clone()
-        };
-        let Ok((_, seconds)) = trial_plan(store, state, request, config, trial_context).await
-        else {
-            return;
-        };
-        if !trial.used_graph() {
-            return;
+    for _ in 0..2 {
+        graph_cpu = 0.;
+        for request in &batch {
+            let trial = scope.trial();
+            let trial_context = read_cache::ReadContext {
+                hot_graph: Some(trial.clone()),
+                ..context.clone()
+            };
+            let Ok((_, seconds)) = trial_plan(store, state, request, config, trial_context).await
+            else {
+                return;
+            };
+            if !trial.used_graph() {
+                return;
+            }
+            graph_cpu += seconds;
         }
-        graph_cpu += seconds;
     }
     let mut ivf_cpu = 0.;
-    for request in &batch {
-        let Ok((_, seconds)) =
-            trial_plan(store, state, request, config, context.ivf_reference()).await
-        else {
-            return;
-        };
-        ivf_cpu += seconds;
+    for _ in 0..2 {
+        ivf_cpu = 0.;
+        for request in &batch {
+            let Ok((_, seconds)) =
+                trial_plan(store, state, request, config, context.ivf_reference()).await
+            else {
+                return;
+            };
+            ivf_cpu += seconds;
+        }
     }
     {
         let mut c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());

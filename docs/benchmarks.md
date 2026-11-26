@@ -13593,6 +13593,110 @@ Costs: WC1 used one c7i.2xlarge for about 55 minutes, an estimated $0.45 with th
 about 1 hour 25 minutes, an estimated $0.55. The instances, key pairs, and security groups are deleted, and no S3
 prefix was written.
 
+## Rounds G8 and G9: serve top_k 100 from the warm graph (3.2 times faster over HTTP, and why calibration never settled)
+
+Before this round the warm graph served only requests with `k + offset` of 30 or fewer. Anything larger fell back to the
+IVF warm tier, which scans 48 to 64 probes and exact-reranks about 800 rows for a top_k 100 query. The hypothesis was that
+a wider beam plus an exact rerank of 150 to 400 graph candidates serves top_k 100 at the same recall@100 for less work.
+
+**Setup:** Apple M4 (shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the production
+R32/L64 graph, and exact top-100 truth. The frozen v0.1.19 fixture was re-exported to slabs; the IVF tier was built by
+that fixture, not rebuilt. Offline numbers are single thread, the minimum of three passes, and cover navigation plus an
+exact f16 rerank (no HTTP, no hydration). HTTP numbers are the real `blowfish` binary with 16 client processes, and
+instructions and cycles come from the server's task counters.
+
+### Kill test: passed
+
+Today's path at top_k 100 (IVF, over HTTP): **recall@100 0.9523 at 64 probes** (620 q/s, 73.9M instructions and 35.3M
+cycles per query) and 0.9398 at 48 probes (833 q/s, 62.9M instructions and 36.0M cycles per query).
+
+Graph sweep (`crates/bf-vector/examples/g8_sweep.rs`), recall@100 and offline microseconds per query:
+
+| Beam | Shortlist | Scores/query | recall@100 | Navigation | Rerank | Total |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 100 | 2,122 | 0.8953 | 188 | 78 | 266 |
+| 200 | 100 | 3,641 | 0.9409 | 289 | 73 | 362 |
+| 256 | 100 | 4,456 | 0.9517 | 353 | 73 | 426 |
+| **256** | **150** | **4,456** | **0.9533** | **353** | **108** | **460** |
+| 320 | 150 | 5,362 | 0.9615 | 429 | 112 | 540 |
+| 400 | 150 | 6,469 | 0.9683 | 524 | 118 | 641 |
+| 512 | 150 | 7,976 | 0.9747 | 655 | 111 | 766 |
+| 768 | 150 | 11,276 | 0.9824 | 939 | 119 | 1,058 |
+
+The shortlist is capped by the beam, and a shortlist beyond 1.5 times k adds no recall (beam 400: 0.9683 at 150, 200,
+300, and 400). The beam buys recall. Beam 256 with shortlist 150 matches the 64-probe IVF path (0.9533 against 0.9523,
+inside the 0.002 bar) at 460 microseconds, about 2M cycles against 35.3M for the IVF path: roughly 17 times less per
+query before server overhead, and an estimated 5 to 7 times with the server overhead G5 measured for graph top_k 10
+(2.65M instructions per query). The bar was 1.2 times. The top_k 10 graph point costs 126 to 147 microseconds
+(beam 48 to 64, shortlist 30) in the same harness.
+
+### Change
+
+`crates/bf-engine/src/warm_graph.rs` now serves `k + offset` up to 100. For `k` of 30 or fewer nothing changes: the
+calibrated beam and a shortlist of 30. Above 30 there is no setting: the shortlist is 1.5 times k and the beam is 2.56
+times k, never below the calibrated beam (k 100 gives beam 256 and shortlist 150). Requests above 100 still use the IVF
+tier. Heat observation counts requests up to 100 rows too, since they are the expensive ones. No format change.
+
+### Replay over HTTP (Round G9)
+
+**Setup:** the same Apple M4 and NQ fixture (2,681,468 rows, 1,024-d f16, 3,452 queries, exact top-100 truth), the real
+`blowfish` binary, 64 probes, 16 client processes, two timed passes over all queries. The v0.1.19 fixture needed no
+rebuild: the first writable start upgraded it to bucket generation 6. The candidate is this branch before the G9 cost fix
+(G8 code); the graph was promoted by the ordinary lifecycle (heat, a 1,110 s build, paired recall calibration).
+
+| Binary and path | top_k | q/s | recall | Instructions/query | Peak footprint |
+|---|---:|---:|---:|---:|---:|
+| main v0.1.47, IVF | 100 | 879 | recall@100 0.9523 | 65.2M | 1,190 MiB |
+| G8 branch, IVF (graph not built) | 100 | 883 | recall@100 0.9523 | 65.1M | 1,191 MiB |
+| **G8 branch, graph (beam 256, shortlist 150)** | **100** | **2,806 (3.2x)** | **recall@100 0.9530** | **8.1M** | 5,007 MiB |
+| main v0.1.47, IVF | 10 | 2,792 | recall@10 0.9611 | 24.1M | 1,222 MiB |
+| G8 branch, graph (calibrated beam 100) | 10 | 7,532 | recall@10 0.9572 | 3.1M | 5,007 MiB |
+
+A separate 16-process Python latency probe (client-bound, so its q/s is lower than the table; compare rows only): top_k 100
+p50 and p99 were 18.3 and 37.7 ms on main's IVF path against 4.8 and 15.8 ms on the graph, and top_k 10 were 4.6 and
+13.5 ms against 1.6 and 4.8 ms.
+
+Against the pass bar: top_k 100 reaches 3.2 times the q/s at recall@100 0.0007 *above* IVF (bar: 1.3 times, within 0.002). The
+extra footprint is the resident graph (3.1 GiB), which exists for top_k 10 on main too once it promotes.
+
+**Not measured.** Main never promoted its graph in the second M4 run (see below), so there is **no main graph-served top_k 10
+number, no identical-top_k-10-results check against main's graph, and no like-for-like RSS comparison.** What backs those:
+the code path for k of 30 or fewer is unchanged (the unit test pins the beam and shortlist), and the graph-served top_k 10
+recall@10 above (0.9572) is what a calibrated beam of 100 gives. **No Qdrant run** (time).
+
+### Why calibration never settled (Round G9)
+
+Two separate causes.
+
+1. **Sample throughput, not a bug.** Calibration samples are sampled exact-recall queries. G8's harness sent one at a
+time, about 10 a minute on NQ. The paired controller does nothing while the paired recall difference is inside the noise
+until its window holds 512 samples: G8 sat at a delta of -0.004 with 444 samples, 68 short. With 4 concurrent samples
+(24 a minute) the candidate went from beam 64 (delta -0.027) to 80 (512 samples, delta -0.004) to 100 (accepted at about
+128 samples, delta +0.011). The production sampler (1 percent of queries, one at a time, at least 50 times each sample's
+duration between samples, about 2 percent of one core) is far slower on NQ-sized data: hours per 100 samples. That is by design
+and I left it alone.
+2. **A real bug: the promotion cost test compared warm IVF with a cold graph.** A graph is usable only when the measured
+IVF cost exceeds the graph's cost (and the build pays back). The IVF figure stays warm because ordinary IVF traffic keeps its
+working set resident; the graph's figure came from `cost::measure`, which timed each path's first touch right after an
+exhaustive truth scan, so the graph was cold. At 520 q/s of heat the M4 measured graph 3.3 ms against IVF 1.7 ms, the saving
+clamped to zero, and `usable` stayed false with the beam already accepted at 100. With the heater paused and one sample at a
+time, IVF measured 4.8 ms against 4.1 ms and `usable` turned true on the next sample. The busier a namespace, the worse the
+bias, so it blocked exactly the namespaces promotion is for.
+
+**Fix (`warm_graph/cost.rs`, no new setting):** each path now runs the eight-query block twice and only the second pass is
+timed, for graph and IVF alike, so both are costed at the steady state they would serve from. The unit test counts the extra
+untimed plans. This fix is **not verified on the M4**: the G8-code candidate above promoted only after I quieted the load by
+hand. Verify with an ordinary run (heat, build, calibrate under traffic) before relying on it.
+
+**Harness notes.** `g8_server.py` was two scripts pasted together; it is one now, with `G8_SAMPLERS` and `G8_QUIET`. Do not use
+`G8_QUIET` for more than a few minutes: pausing the heater lets the 30-minute idle rule drop the graph, which is what
+happened to main's second run (it was calibrating at beam 80 when the graph was retired, so main was not promoted in the
+4-hour cap).
+
+Costs: no EC2, no bucket writes (a 25 GB fixture copy was downloaded from the shared fixture and deleted, as was the M4 run
+directory).
+
+
 ## Round W6/W7: cold queries fetch committed WAL payloads one at a time (concurrent fetch, 3.2x at 32 payloads; bounded by bytes in W7)
 
 Hypothesis (Sol, `briefs/ideas/2225-sol.md` #1): `tail_bounded` discovers WAL slots concurrently but then calls `materialize` on each record in
