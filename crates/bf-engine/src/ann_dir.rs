@@ -675,11 +675,6 @@ pub(crate) async fn memberships(
                     d.membership.clone(),
                     seg.files.values().find(|f| f.key == d.fragment),
                 ) else {
-                    if !d.flat
-                        && let Some((file, _)) = crate::upgrade::files(seg, attr)
-                    {
-                        return crate::upgrade::slab_membership(store, file).await.map(Some);
-                    }
                     return crate::upgrade::membership(store, seg, attr).await;
                 };
                 let key = format!("member:{}", file.key);

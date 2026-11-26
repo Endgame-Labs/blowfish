@@ -245,19 +245,3 @@ pub(crate) fn hint_files(
     ]
     .into()
 }
-
-/// Reconstruct sparse slab membership only until the resident-map backfill publishes.
-pub(crate) async fn slab_membership(
-    store: &Storage,
-    file: &SegmentFile,
-) -> Result<Arc<Membership>, ApiError> {
-    let key = format!("upgrade-sparse-member:{}", file.key);
-    if let Some(member) = read_cache::get(&key, 0) {
-        return Ok(member);
-    }
-    let member = segment::vector_index(store, file)
-        .await?
-        .membership()
-        .map_err(segment::index_error)?;
-    Ok(read_cache::insert(&key, member.resident_bytes(), member))
-}

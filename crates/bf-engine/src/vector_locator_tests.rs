@@ -453,13 +453,13 @@ async fn resident_row_map_backfill_is_bounded_preserves_ann_and_rejects_corrupti
     }
     assert!(crate::slab_rows::needs(&manifest.ann_tiers));
     assert_eq!(
-        crate::slab_rows::ensure(&store, &mut manifest, 1)
+        crate::slab_rows::ensure(&store, "locator", &mut manifest, 1, None)
             .await
             .unwrap(),
         1
     );
     assert!(crate::slab_rows::needs(&manifest.ann_tiers));
-    crate::slab_rows::ensure(&store, &mut manifest, usize::MAX)
+    crate::slab_rows::ensure(&store, "locator", &mut manifest, usize::MAX, None)
         .await
         .unwrap();
     assert!(!crate::slab_rows::needs(&manifest.ann_tiers));
@@ -1279,4 +1279,407 @@ async fn covered_legacy_indexes_and_fragments_retire_without_rewriting_vector_pa
             .rows,
         before
     );
+}
+fn d4c_engine(store: &Storage) -> Engine {
+    Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            compaction_segments: usize::MAX,
+            retention: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn d4c_branch_during_backfill_survives_source_recluster_and_gc() {
+    let (store, _, _) = fixture_rows(2000).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    for slab in &mut m.ann_tiers.get_mut("vector").unwrap()[0].slabs {
+        let map = slab.files.remove("annrows:vector").unwrap();
+        store.delete(&map.key).await.unwrap();
+    }
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+    let engine = d4c_engine(&store);
+    let request: bf_types::QueryRequest = serde_json::from_value(json!({
+        "rank_by": ["vector", "ANN", [1.0, 13.0, -0.5]], "top_k": 10,
+        "filters": ["category", "Eq", 1], "include_attributes": true
+    }))
+    .unwrap();
+    let expected = engine
+        .query("locator", request.clone())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    for (dest, body) in [
+        ("branch", json!({"branch_from_namespace": "locator"})),
+        (
+            "copy",
+            json!({"copy_from_namespace": {"source_namespace": "locator"}}),
+        ),
+    ] {
+        engine
+            .write(dest, serde_json::from_value(body).unwrap())
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            if !engine.index_namespace(dest, true).await.unwrap() {
+                break;
+            }
+        }
+    }
+    let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/d4c");
+    std::fs::create_dir_all(&parent).unwrap();
+    let scratch = tempfile::tempdir_in(parent).unwrap();
+    engine
+        .recluster(
+            "locator",
+            &ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 2,
+                cluster_rows: 16,
+                max_slab_rows: 8000,
+                scratch: scratch.path().into(),
+            },
+        )
+        .await
+        .unwrap();
+    engine.collect_garbage("locator").await.unwrap();
+    for dest in ["branch", "copy"] {
+        let cold = d4c_engine(&store);
+        assert_eq!(
+            cold.query(dest, request.clone()).await.unwrap().result.rows,
+            expected
+        );
+        let m = bf_wal::Wal::new(store.clone(), dest)
+            .unwrap()
+            .latest_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        for slab in &m.ann_tiers["vector"][0].slabs {
+            let map = &slab.files["annrows:vector"];
+            assert!(
+                map.key.starts_with(&format!("ns/{dest}/slabs/")),
+                "{}",
+                map.key
+            );
+            store.get(&map.key).await.unwrap();
+        }
+        cold.write(
+            dest,
+            serde_json::from_value(json!({"patch_rows": [{"id": 10, "category": 9}]})).unwrap(),
+        )
+        .await
+        .unwrap();
+        let patched: bf_types::QueryRequest = serde_json::from_value(json!({
+            "rank_by": ["id", "asc"], "filters": ["id", "Eq", 10], "top_k": 1, "include_attributes": true
+        })).unwrap();
+        let rows = cold
+            .query(dest, patched)
+            .await
+            .unwrap()
+            .result
+            .rows
+            .unwrap();
+        assert_eq!(rows[0]["category"], 9);
+        assert_eq!(
+            bf_types::decode_vector(&rows[0]["vector"]).unwrap(),
+            vec![1.0, 0.625, -0.5]
+        );
+        cold.index_namespace(dest, true).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn d4c_missing_published_map_recovers_queries_and_repairs_without_a_tail() {
+    let (store, _, _) = fixture_rows(2000).await;
+    retire_test_sources(&store).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (_, m) = wal.latest_manifest().await.unwrap().unwrap();
+    let map = &m.ann_tiers["vector"][0].slabs[0].files["annrows:vector"];
+    store.delete(&map.key).await.unwrap();
+    store.drop_caches();
+    let engine = d4c_engine(&store);
+    engine.query("locator", reference_request()).await.unwrap();
+    assert!(
+        engine.index_namespace("locator", true).await.unwrap(),
+        "missing objects must schedule repair without new writes"
+    );
+    let m = wal.latest_manifest().await.unwrap().unwrap().1;
+    for slab in &m.ann_tiers["vector"][0].slabs {
+        store.get(&slab.files["annrows:vector"].key).await.unwrap();
+    }
+    engine.query("locator", reference_request()).await.unwrap();
+}
+
+#[tokio::test]
+async fn d4c_document_only_legacy_segment_does_not_wedge_publication() {
+    let (store, _, _) = fixture_rows(2000).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    m.ann_tiers.clear();
+    m.ann_dirs.clear();
+    for seg in &mut m.segments {
+        segment::upgrade::make_legacy(&store, seg).await.unwrap();
+        seg.files.remove("annv2:vector");
+    }
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+    let engine = d4c_engine(&store);
+    let before = engine
+        .query("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows;
+    engine.write("locator", serde_json::from_value(json!({"upsert_rows": [{"id": 100_000, "category": 0, "vector": [1.0, 0.0, -0.5]}]})).unwrap()).await.unwrap();
+    assert!(engine.index_namespace("locator", true).await.unwrap());
+    let m = wal.latest_manifest().await.unwrap().unwrap().1;
+    assert_eq!(
+        m.indexed_through,
+        m.segments.iter().map(|s| s.wal_end).max().unwrap()
+    );
+    let mut after = engine
+        .query("locator", reference_request())
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap();
+    after.retain(|r| r["id"] != 100_000);
+    assert_eq!(Some(after), before);
+}
+
+#[tokio::test]
+async fn d4c_legacy_slab_backfill_is_automatic_and_bounded() {
+    let (store, _, _) = fixture_rows(2000).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    let set = &mut m.ann_tiers.get_mut("vector").unwrap()[0];
+    let mut originals = Vec::new();
+    for slab in &mut set.slabs {
+        let current = slab.files.remove("annv2:vector").unwrap();
+        slab.files.remove("annrows:vector");
+        let bytes = store.get(&current.key).await.unwrap();
+        let index = bf_vector::Index::open_with_metadata_len(bytes, current.metadata_len)
+            .await
+            .unwrap();
+        let rows: RoaringBitmap = index.row_ids().into_iter().collect();
+        let (rows, packed) = index.read_packed_rows(&rows).await.unwrap();
+        let legacy = bf_vector::IndexBuilder::new(3, bf_vector::Metric::EuclideanSquared)
+            .unwrap()
+            .vector_type(bf_vector::VectorType::F16)
+            .build_packed(rows, packed)
+            .unwrap();
+        let legacy = bf_vector::downgrade_layout(&legacy)
+            .unwrap()
+            .unwrap_or(legacy);
+        let metadata = bf_vector::metadata_len(&legacy).unwrap();
+        let file = segment::put_file(
+            &store,
+            format!("ns/locator/slabs/{}/legacy.bfv", slab.id),
+            legacy.clone(),
+            metadata,
+        )
+        .await
+        .unwrap();
+        originals.push((file.key.clone(), legacy));
+        slab.files.insert("ann:vector".into(), file);
+    }
+    set.dir = crate::ann_dir::build(
+        &store,
+        "locator",
+        &set.slabs,
+        "vector",
+        crate::ann_dir::Layout::Slabs,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    set.pages = None;
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+    assert!(
+        crate::slab_rows::needs(&m.ann_tiers),
+        "legacy slabs must schedule row-map backfill"
+    );
+    let engine = d4c_engine(&store);
+    assert!(engine.index_namespace("locator", true).await.unwrap());
+    let m = wal.latest_manifest().await.unwrap().unwrap().1;
+    assert_eq!(
+        m.ann_tiers["vector"][0]
+            .slabs
+            .iter()
+            .filter(|s| s.files.contains_key("annrows:vector"))
+            .count(),
+        1
+    );
+    for _ in 0..16 {
+        if !engine.index_namespace("locator", true).await.unwrap() {
+            break;
+        }
+    }
+    let m = wal.latest_manifest().await.unwrap().unwrap().1;
+    assert!(!crate::slab_rows::needs(&m.ann_tiers));
+    for (key, bytes) in originals {
+        assert_eq!(store.get(&key).await.unwrap().as_ref(), bytes);
+    }
+    assert!(
+        m.segments
+            .iter()
+            .all(|s| crate::upgrade::files(s, "vector").is_none())
+    );
+    engine.query("locator", reference_request()).await.unwrap();
+}
+
+#[tokio::test]
+async fn d4c_filtered_complete_tier_rebuilds_a_missing_or_stale_directory() {
+    let (store, _, _) = fixture_rows(2000).await;
+    retire_test_sources(&store).await;
+    let engine = d4c_engine(&store);
+    let request: bf_types::QueryRequest = serde_json::from_value(json!({
+        "rank_by": ["vector", "ANN", [1.0, 13.0, -0.5]], "top_k": 10,
+        "filters": ["category", "Eq", 1], "include_attributes": true
+    }))
+    .unwrap();
+    let state = engine
+        .snapshot("locator", &Consistency::Strong)
+        .await
+        .unwrap()
+        .0;
+    let expected = d4c_ann(&store, &engine, &state, &request).await.unwrap();
+    for stale in [false, true] {
+        let mut changed = state.clone();
+        let set = &mut Arc::make_mut(&mut changed.ann_tiers)
+            .get_mut("vector")
+            .unwrap()[0];
+        if stale {
+            let mut slabs = set.slabs.clone();
+            slabs[0].id = "stale-slab".into();
+            set.dir = crate::ann_dir::build(
+                &store,
+                "locator",
+                &slabs,
+                "vector",
+                crate::ann_dir::Layout::Slabs,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        } else {
+            set.dir.key = "ns/locator/slabs/missing-directory.bfd".into();
+        }
+        assert_eq!(
+            d4c_ann(&store, &engine, &changed, &request).await,
+            Some(expected.clone()),
+            "a complete filtered tier must answer through ANN, stale={stale}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn d4c_restored_ann_has_the_same_recipe_as_a_new_segment() {
+    let (store, _, _) = fixture_rows_parts_kind(3000, 1, false).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (_, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    let original = store
+        .get(&m.segments[0].files["annv2:vector"].key)
+        .await
+        .unwrap();
+    m.segments[0].files.remove("annv2:vector");
+    let sources = Sources::from_manifest(&m);
+    m.ann_tiers.clear();
+    restore_uncovered(&store, "locator", &mut m, &sources)
+        .await
+        .unwrap();
+    let restored = store
+        .get(&m.segments[0].files["annv2:vector"].key)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored, original,
+        "identical rows and stored precision must produce the same ANN bytes"
+    );
+}
+
+async fn d4c_ann(
+    store: &Storage,
+    engine: &Engine,
+    state: &NamespaceState,
+    request: &bf_types::QueryRequest,
+) -> Option<(
+    BTreeMap<bf_types::Id, f64>,
+    BTreeMap<bf_types::Id, bf_types::Document>,
+)> {
+    crate::ann::search(
+        store,
+        state,
+        request,
+        "vector",
+        &[1.0, 13.0, -0.5],
+        &engine.0.config,
+        10,
+        &std::collections::BTreeSet::new(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn d4c_current_documents_without_any_vector_owner_still_fail_closed() {
+    let (store, _, _) = fixture().await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (_, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    manifest.ann_tiers.clear();
+    for seg in &mut manifest.segments {
+        assert!(!segment::upgrade::needs_upgrade(&store, seg).await.unwrap());
+        seg.files.remove("annv2:vector");
+    }
+    let sources = Sources::from_manifest(&manifest);
+    let error = restore_uncovered(&store, "locator", &mut manifest, &sources)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, 503);
+}
+
+#[tokio::test]
+async fn d4c_row_map_survey_is_bounded_and_rotates_to_missing_objects() {
+    let (store, _, _) = fixture().await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (_, mut manifest) = wal.latest_manifest().await.unwrap().unwrap();
+    let slabs = &manifest.ann_tiers["vector"][0].slabs;
+    assert!(slabs.len() > 1);
+    let last = slabs.len() - 1;
+    let missing = slabs[last].files["annrows:vector"].key.clone();
+    store.delete(&missing).await.unwrap();
+    for probe in 0..last {
+        assert!(
+            crate::slab_rows::missing(&store, &manifest.ann_tiers, probe)
+                .await
+                .unwrap()
+                .is_none(),
+            "a healthy probe must not scan ahead to another slab"
+        );
+    }
+    assert_eq!(
+        crate::slab_rows::missing(&store, &manifest.ann_tiers, last)
+            .await
+            .unwrap(),
+        Some(missing.clone())
+    );
+    assert_eq!(
+        crate::slab_rows::ensure(&store, "locator", &mut manifest, 1, Some(&missing))
+            .await
+            .unwrap(),
+        1
+    );
+    for slab in &manifest.ann_tiers["vector"][0].slabs {
+        store.get(&slab.files["annrows:vector"].key).await.unwrap();
+    }
 }

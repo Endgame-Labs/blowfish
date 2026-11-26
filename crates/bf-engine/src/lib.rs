@@ -358,6 +358,7 @@ struct Handle {
     state: Arc<Published<NamespaceState>>,
     commits: GroupCommit<Operation, Result<WriteResponse, ApiError>>,
     backpressure: Arc<auto_recluster::LoadBackpressure>,
+    row_map_probe: std::sync::atomic::AtomicUsize,
 }
 struct Inner {
     store: Storage,
@@ -595,6 +596,7 @@ impl Engine {
             state: state.clone(),
             commits,
             backpressure: backpressure.clone(),
+            row_map_probe: std::sync::atomic::AtomicUsize::new(0),
         });
         handles.insert(ns.into(), handle.clone());
         let context = read_cache::ReadContext::new(self.0.read_cache.clone());

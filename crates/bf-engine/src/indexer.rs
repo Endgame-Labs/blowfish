@@ -476,7 +476,29 @@ impl Engine {
         // covers (compaction leaves them alone).
         let protected = self.0.jobs.protected(ns);
         let installing = self.0.jobs.has_pending(ns);
-        let state = {
+        // Object existence is advisory until this pass claims its publication epoch. Probe
+        // outside the namespace lock, so an idle survey never stalls queries or commits.
+        let (tiers, probe_due) = {
+            let state = handle.state.load();
+            (
+                state.ann_tiers.clone(),
+                force || state.refreshed.elapsed() >= self.0.config.index_age,
+            )
+        };
+        let missing_map = if probe_due {
+            self.0.store.cached_bucket_format().map_err(storage_error)?;
+            crate::slab_rows::missing(
+                &self.0.store,
+                &tiers,
+                handle
+                    .row_map_probe
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+            .await?
+        } else {
+            None
+        };
+        let (state, row_maps) = {
             let mut state = handle.state.lock().await;
             if state.root_only {
                 // Queries keep the compact manifest copy; a build must publish the segments' text
@@ -487,6 +509,7 @@ impl Engine {
             // writers at the configured maximum tail age while idle, rather than
             // holding this lock across two object-store calls on every tick.
             if !force
+                && missing_map.is_none()
                 && state.seq > 0
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
@@ -505,6 +528,7 @@ impl Engine {
             if !state.exists {
                 return Ok(false);
             }
+            let row_maps = crate::slab_rows::needs(&state.ann_tiers) || missing_map.is_some();
             let will_rebuild = state.segments.iter().any(|seg| {
                 state
                     .schema
@@ -522,8 +546,7 @@ impl Engine {
             });
             let will_compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
             let upgrade = needs_text_upgrade(&state)
-                || (crate::slab_rows::needs(&state.ann_tiers)
-                    || crate::vector_locator::needs_retirement(&state, &protected))
+                || (row_maps || crate::vector_locator::needs_retirement(&state, &protected))
                 || installing;
             if state.seq == state.indexed_through
                 && will_compact.is_empty()
@@ -547,7 +570,7 @@ impl Engine {
             {
                 return Ok(false);
             }
-            state.clone()
+            (state.clone(), row_maps)
         };
         if !state.exists {
             return Ok(false);
@@ -587,8 +610,7 @@ impl Engine {
         crate::ann::stage(t0, "idx hydrate");
         let compact = tier(&state, &self.0.config, force, &protected, bulk(&state));
         let upgrade = needs_text_upgrade(&state)
-            || (crate::slab_rows::needs(&state.ann_tiers)
-                || crate::vector_locator::needs_retirement(&state, &protected))
+            || (row_maps || crate::vector_locator::needs_retirement(&state, &protected))
             || installing;
         if state.seq == state.indexed_through && compact.is_empty() && !rebuild && !upgrade {
             return Ok(false);
@@ -980,7 +1002,7 @@ impl Engine {
             crate::lineage::prune(&mut manifest);
         }
         crate::vector_locator::restore_uncovered(store, ns, &mut manifest, &old_vectors).await?;
-        crate::slab_rows::ensure(store, &mut manifest, 1).await?;
+        crate::slab_rows::ensure(store, ns, &mut manifest, 1, missing_map.as_deref()).await?;
         crate::vector_locator::retire_covered(&mut manifest, &protected);
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest

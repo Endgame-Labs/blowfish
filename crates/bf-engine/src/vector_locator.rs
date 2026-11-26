@@ -118,34 +118,9 @@ impl Sources {
                 continue;
             }
             for slab in &set.slabs {
-                let file = crate::upgrade::files(slab, attr)
-                    .ok_or_else(segment::corrupt)?
-                    .0;
                 let member = crate::slab_rows::load(store, slab, attr).await?;
-                let fallback = if member.is_none() {
-                    let key = format!("slab-rows:{}", file.key);
-                    let fallback: Arc<Vec<u32>> = if let Some(rows) = read_cache::get(&key, 0) {
-                        rows
-                    } else {
-                        let index = segment::vector_index(store, file).await?;
-                        if index.dims() != dims || index.vector_type() != dtype {
-                            return Err(segment::corrupt());
-                        }
-                        let rows = index.row_ids();
-                        if rows.len() != slab.row_count as usize {
-                            return Err(segment::corrupt());
-                        }
-                        read_cache::insert(&key, (rows.len() * 4) as u64, rows)
-                    };
-                    Some(fallback)
-                } else {
-                    None
-                };
-                let resident = member
-                    .as_ref()
-                    .and_then(|m| m.row_ids())
-                    .or_else(|| fallback.as_deref().map(Vec::as_slice))
-                    .ok_or_else(segment::corrupt)?;
+                let member = member.ok_or_else(segment::corrupt)?;
+                let resident = member.row_ids().ok_or_else(segment::corrupt)?;
                 let wanted: RoaringBitmap = global_to_row
                     .keys()
                     .filter(|r| resident.binary_search(r).is_ok())
@@ -294,6 +269,11 @@ pub(crate) async fn restore_uncovered(
                 continue;
             }
             if !old.covers(seg, attr) {
+                // Legacy document-only segments have never delegated vector ownership. Their
+                // v1 document column stays authoritative until the automatic rewrite builds ANN.
+                if segment::upgrade::needs_upgrade(store, seg).await? {
+                    continue;
+                }
                 return Err(segment::index_error(
                     "segment lost its authoritative vector source",
                 ));
@@ -313,9 +293,7 @@ pub(crate) async fn restore_uncovered(
             }
             let metric = segment::vector_metric(manifest.distance_metric);
             let bytes = tokio::task::spawn_blocking(move || {
-                bf_vector::IndexBuilder::new(dims, metric)?
-                    .vector_type(dtype)
-                    .build_packed(rows, packed)
+                segment::ann_builder(dims, metric, dtype, rows.len())?.build_packed(rows, packed)
             })
             .await
             .map_err(segment::index_error)?

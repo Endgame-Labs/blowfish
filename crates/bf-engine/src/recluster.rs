@@ -621,7 +621,7 @@ impl Engine {
                     _ => put.await?,
                 };
                 let mut files = std::collections::BTreeMap::new();
-                let rows = crate::slab_rows::write(&store2, &ann, &member).await?;
+                let rows = crate::slab_rows::write(&store2, &ns2, &ann, &member).await?;
                 files.insert(crate::slab_rows::role(&attr2), rows);
                 files.insert(format!("annv2:{attr2}"), ann);
                 uploads2.lock().await.push(Segment {

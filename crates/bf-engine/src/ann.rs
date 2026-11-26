@@ -36,13 +36,21 @@ pub(crate) async fn search(
     }
     // A recluster's tiers answer unfiltered queries for the rows they cover, and the namespace
     // directory for the rest (segments written since).
-    if let Some(tiers) = state.ann_tiers.get(attribute)
-        && let Some(found) = from_tiers(
+    if let Some(tiers) = state.ann_tiers.get(attribute) {
+        if let Some(found) = from_tiers(
             store, state, q, attribute, vector, config, k, columns, tiers,
         )
         .await?
-    {
-        return Ok(Some(found));
+        {
+            return Ok(Some(found));
+        }
+        // Incomplete coverage and tail shadowing can still decline a tier plan. Expose every
+        // such query, including filtered locator scans, instead of hiding it as ordinary ANN.
+        metrics::counter!(
+            "blowfish_ann_tier_fallbacks_total",
+            "filtered" => if q.filters.is_some() { "true" } else { "false" }
+        )
+        .increment(1);
     }
     if state
         .segments
@@ -619,14 +627,21 @@ async fn from_slabs(
                 )
                 .await
             };
-            let Ok((dir, _)) = directory else {
-                return Ok(None);
-            };
             let mut view = state.without_docs();
             view.segments = set.slabs.clone().into();
-            if !crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) {
-                return Ok(None);
-            }
+            let dir = match directory {
+                Ok((dir, _))
+                    if crate::ann_dir::covers(&dir, &view.segments, attribute, Layout::Slabs) =>
+                {
+                    dir
+                }
+                result => {
+                    // Complete tiers have all immutable inputs to reconstruct their directory.
+                    // A missing or stale advisory directory must not turn filtered ANN into a scan.
+                    metrics::counter!("blowfish_ann_tier_directory_rebuilds_total", "reason" => if result.is_err() { "read" } else { "coverage" }).increment(1);
+                    crate::upgrade::directory(store, &view.segments, attribute).await?
+                }
+            };
             let warm_eligible = mask.is_none() && seat.is_none();
             let members = if allowed.is_some() {
                 Some(crate::ann_dir::memberships(store, &view.segments, &dir, attribute).await?)
