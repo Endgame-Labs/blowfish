@@ -955,3 +955,375 @@ mod listing {
         assert_contiguous(&f.wal.tail(0).await.unwrap(), 1, 42);
     }
 }
+
+mod speculative {
+    //! `tail` starts payload body reads from a listing of the payload prefix while the slot reads
+    //! are still confirming the run. A body counts only for the slot record that names its key.
+    use super::*;
+    use async_trait::async_trait;
+    use futures::stream::{self, BoxStream, StreamExt};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    type Hide = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+    /// An in-memory store that logs payload reads, tracks how many run at once (each takes a few
+    /// milliseconds), and can hide keys from, or fail, the payload listing.
+    struct Spy {
+        inner: Arc<InMemory>,
+        gets: Mutex<Vec<String>>,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        hide: Mutex<Option<Hide>>,
+        fail: bool,
+        /// Payload keys containing this text take 200 ms (a slow first slot makes later bodies wait).
+        slow: Mutex<Option<String>>,
+    }
+    impl std::fmt::Debug for Spy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("spy")
+        }
+    }
+    impl std::fmt::Display for Spy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("spy")
+        }
+    }
+    #[async_trait]
+    impl ObjectStore for Spy {
+        async fn put_opts(
+            &self,
+            p: &Path,
+            b: PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(p, b, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &Path,
+            o: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(p, o).await
+        }
+        async fn get_opts(&self, p: &Path, o: GetOptions) -> object_store::Result<GetResult> {
+            if p.as_ref().contains("/wal-data/") {
+                self.gets.lock().unwrap().push(p.to_string());
+                let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                let slow = self
+                    .slow
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|n| p.as_ref().contains(n.as_str()));
+                let ms = if slow { 200 } else { 5 };
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                let result = self.inner.get_opts(p, o).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                return result;
+            }
+            self.inner.get_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            l: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(l)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let is_payloads = p.is_some_and(|p| p.as_ref().ends_with("/wal-data"));
+            let (inner, prefix) = (self.inner.clone(), p.cloned());
+            let (fail, hide) = (self.fail && is_payloads, self.hide.lock().unwrap().clone());
+            stream::once(async move {
+                if fail {
+                    return stream::iter(vec![Err(object_store::Error::Generic {
+                        store: "spy",
+                        source: "listing failed".into(),
+                    })])
+                    .boxed();
+                }
+                let mut all: Vec<_> = inner.list(prefix.as_ref()).collect().await;
+                if let (true, Some(h)) = (is_payloads, hide) {
+                    all.retain(|m| !m.as_ref().is_ok_and(|m| h(m.location.as_ref())));
+                }
+                stream::iter(all).boxed()
+            })
+            .flatten()
+            .boxed()
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+    }
+
+    struct Fixture {
+        inner: Arc<InMemory>,
+        spy: Arc<Spy>,
+        wal: Wal,
+    }
+
+    async fn fixture(fail: bool, hide: Option<Hide>) -> Fixture {
+        let inner = Arc::new(InMemory::new());
+        let spy = Arc::new(Spy {
+            inner: inner.clone(),
+            gets: Mutex::new(vec![]),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            hide: Mutex::new(hide),
+            fail,
+            slow: Mutex::new(None),
+        });
+        let store = Storage::from_backend(spy.clone(), Path::from(""), false, false)
+            .await
+            .unwrap();
+        Fixture {
+            inner,
+            spy,
+            wal: Wal::new(store, "ns").unwrap(),
+        }
+    }
+
+    async fn append_external(wal: &Wal, range: std::ops::RangeInclusive<u64>) {
+        for seq in range {
+            let created = wal.append(seq, &external_entry(seq as usize)).await;
+            assert_eq!(created.unwrap(), CreateResult::Created);
+        }
+    }
+
+    /// The tail must equal what reading slot by slot (no speculation) returns.
+    async fn assert_same_as_serial(wal: &Wal, last: u64) -> Vec<(u64, WalEntry)> {
+        let tail = wal.tail(0).await.unwrap();
+        let mut serial = vec![];
+        for seq in 1..=last {
+            let entry = wal.read(seq).await.unwrap().unwrap();
+            if entry.tombstone {
+                serial.clear();
+            }
+            serial.push((seq, entry));
+        }
+        assert_eq!(tail.len(), serial.len());
+        for ((a, x), (b, y)) in tail.iter().zip(&serial) {
+            assert_eq!((a, x.write_id, x.tombstone), (b, y.write_id, y.tombstone));
+        }
+        tail
+    }
+
+    fn gets_of(f: &Fixture, needle: &str) -> usize {
+        let gets = f.spy.gets.lock().unwrap();
+        gets.iter().filter(|k| k.contains(needle)).count()
+    }
+
+    #[tokio::test]
+    async fn every_listed_body_is_fetched_once_and_the_tail_is_unchanged() {
+        let f = fixture(false, None).await;
+        append_external(&f.wal, 1..=40).await;
+        f.spy.gets.lock().unwrap().clear();
+        let tail = f.wal.tail(0).await.unwrap();
+        assert_eq!(tail.len(), 40);
+        for (seq, entry) in &tail {
+            assert_eq!(tag_of(entry), *seq as usize);
+        }
+        // The speculative GETs were used: no payload was read twice.
+        assert_eq!(f.spy.gets.lock().unwrap().len(), 40);
+        // And the bound on fetches in flight holds with them.
+        let peak = f.spy.peak.load(Ordering::SeqCst);
+        assert!((2..=16).contains(&peak), "peak {peak}");
+        assert_same_as_serial(&f.wal, 40).await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_or_failed_payload_listing_loses_nothing() {
+        for (fail, hide) in [
+            (
+                false,
+                Some(Arc::new(|k: &str| k.contains("0000000000000000003")) as Hide),
+            ),
+            (false, Some(Arc::new(|_: &str| true) as Hide)),
+            (true, None),
+        ] {
+            let f = fixture(fail, hide).await;
+            append_external(&f.wal, 1..=40).await;
+            f.spy.gets.lock().unwrap().clear();
+            let tail = f.wal.tail(0).await.unwrap();
+            assert_eq!(tail.len(), 40);
+            assert!(tail.iter().all(|(s, e)| tag_of(e) == *s as usize));
+            assert_eq!(f.spy.gets.lock().unwrap().len(), 40, "once each");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_losing_writes_body_under_a_reused_slot_is_never_accepted() {
+        let f = fixture(false, None).await;
+        append_external(&f.wal, 1..=4).await;
+        // A loser staged a body for slot 5 (and 9) that never committed; the winner took the slot.
+        let loser = external_entry(999);
+        let staged = f.wal.stage(5, &loser).await.unwrap();
+        f.wal.stage(9, &loser).await.unwrap();
+        append_external(&f.wal, 5..=40).await;
+        let tail = f.wal.tail(0).await.unwrap();
+        assert_eq!(tail.len(), 40);
+        for (seq, entry) in &tail {
+            assert_eq!(tag_of(entry), *seq as usize, "slot {seq}");
+            assert_ne!(entry.write_id, loser.write_id);
+        }
+        // The loser's own writer discards it; the tail is the same.
+        f.wal.discard(5, &loser, &staged).await.unwrap();
+        assert_eq!(f.wal.tail(0).await.unwrap().len(), 40);
+    }
+
+    #[tokio::test]
+    async fn a_body_staged_for_an_empty_slot_is_not_an_entry() {
+        let f = fixture(false, None).await;
+        append_external(&f.wal, 1..=40).await;
+        f.wal.stage(41, &external_entry(41)).await.unwrap();
+        f.wal.stage(60, &external_entry(60)).await.unwrap();
+        let tail = f.wal.tail(0).await.unwrap();
+        assert_eq!(tail.len(), 40);
+        assert_eq!(tail.last().unwrap().0, 40);
+    }
+
+    /// Slot bytes in the record shape older releases wrote: no `payload_bytes`.
+    async fn put_sizeless_slot(f: &Fixture, seq: u64, entry: &WalEntry, size: Option<u64>) {
+        let mut record = vec![3u8];
+        let mut json = serde_json::json!({"write_id":entry.write_id,"payload_seq":seq,"committed_at":entry.committed_at,"tombstone":false});
+        if let Some(size) = size {
+            json["payload_bytes"] = size.into();
+        }
+        record.extend(serde_json::to_vec(&json).unwrap());
+        f.wal.stage(seq, entry).await.unwrap();
+        f.inner
+            .put_opts(
+                &Path::from(f.wal.key(seq).as_str()),
+                PutPayload::from(record),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn records_without_a_size_are_accepted_by_key_and_a_wrong_size_is_not() {
+        let f = fixture(false, None).await;
+        for seq in 1..=40u64 {
+            let entry = external_entry(seq as usize);
+            // Slot 7 claims a size its listed body does not have.
+            let size = (seq == 7).then_some(1);
+            put_sizeless_slot(&f, seq, &entry, size).await;
+        }
+        f.spy.gets.lock().unwrap().clear();
+        let tail = f.wal.tail(0).await.unwrap();
+        assert_eq!(tail.len(), 40);
+        assert!(tail.iter().all(|(s, e)| tag_of(e) == *s as usize));
+        let gets = f.spy.gets.lock().unwrap().len();
+        // Sizeless slots use their listed bodies. Slot 7's was dropped for its size, so it is read
+        // again (its dropped speculative read may or may not have reached the store first).
+        assert!((40..=41).contains(&gets), "{gets} reads");
+    }
+
+    #[tokio::test]
+    async fn tombstones_and_conflicts_replay_like_serial_reads() {
+        let f = fixture(false, None).await;
+        append_external(&f.wal, 1..=20).await;
+        let mut tombstone = WalEntry::new(vec![]);
+        tombstone.tombstone = true;
+        assert_eq!(
+            f.wal.append(21, &tombstone).await.unwrap(),
+            CreateResult::Created
+        );
+        // A losing attempt at the occupied slot leaves nothing behind that the replay accepts.
+        let loser = external_entry(777);
+        assert_eq!(
+            f.wal.append(21, &loser).await.unwrap(),
+            CreateResult::Conflict
+        );
+        append_external(&f.wal, 22..=45).await;
+        let tail = assert_same_as_serial(&f.wal, 45).await;
+        assert_eq!(tail.len(), 25);
+        assert!(tail[0].1.tombstone);
+        // Reclaimed payloads before the tombstone are never fetched.
+        f.spy.gets.lock().unwrap().clear();
+        assert_eq!(f.wal.tail(0).await.unwrap().len(), 25);
+        assert!(gets_of(&f, "wal-data/0000000000000000000") <= 25 + 1);
+    }
+
+    /// The largest stored size of a payload body, from the listing.
+    async fn body_size(f: &Fixture) -> u64 {
+        let listed: Vec<_> = f
+            .inner
+            .list(Some(&Path::from("ns/ns/wal-data")))
+            .collect()
+            .await;
+        listed
+            .iter()
+            .map(|m| m.as_ref().unwrap().size)
+            .max()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fetched_bodies_waiting_for_the_replay_stay_inside_the_byte_budget() {
+        let f = fixture(false, None).await;
+        append_external(&f.wal, 1..=60).await;
+        let size = body_size(&f).await;
+        // Slot 1's body is slow, so every later body finishes first and waits for its turn.
+        *f.spy.slow.lock().unwrap() = Some("wal-data/00000000000000000001-".into());
+        for bodies in [1u64, 3, 8] {
+            let limit = bodies * size;
+            let (tail, peak) = f
+                .wal
+                .tail_bounded_measured(0, u64::MAX, limit)
+                .await
+                .unwrap();
+            assert_eq!(tail.len(), 60);
+            assert!(tail.iter().all(|(s, e)| tag_of(e) == *s as usize));
+            assert!(peak <= limit, "peak {peak} over the budget {limit}");
+            if bodies > 1 {
+                assert!(peak > size / 2 * 3, "bodies fetched together: {peak}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_budget_holds_with_unused_speculative_bodies_and_never_stalls() {
+        let f = fixture(false, None).await;
+        append_external(&f.wal, 1..=4).await;
+        // Losing writes' bodies under slots later committed by others, and a wrong-size record.
+        for slot in [5u64, 6, 7] {
+            f.wal
+                .stage(slot, &external_entry(900 + slot as usize))
+                .await
+                .unwrap();
+        }
+        append_external(&f.wal, 5..=30).await;
+        put_sizeless_slot(&f, 31, &external_entry(31), Some(1)).await;
+        append_external(&f.wal, 32..=40).await;
+        let size = body_size(&f).await;
+        *f.spy.slow.lock().unwrap() = Some("wal-data/00000000000000000005-".into());
+        for bodies in [1u64, 2, 4] {
+            let limit = bodies * size;
+            let (tail, peak) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                f.wal.tail_bounded_measured(0, u64::MAX, limit),
+            )
+            .await
+            .expect("no stall")
+            .unwrap();
+            assert_eq!(tail.len(), 40);
+            assert!(tail.iter().all(|(s, e)| tag_of(e) == *s as usize));
+            assert!(
+                peak <= limit.max(size),
+                "peak {peak} over the budget {limit}"
+            );
+        }
+    }
+}

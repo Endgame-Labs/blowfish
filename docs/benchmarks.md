@@ -13726,6 +13726,84 @@ fetch (about 140 ms, four waves of 8 in flight), which a wider window could cut 
 returned are the same as the baseline's, and the tests check order and content for each shape. Cost: one c7g.2xlarge for about 1.5 hours (under $0.60);
 instance, key pair, security group, and the `tmp/w8-20261126/` prefix deleted.
 
+## Round W9: start WAL body reads while commit slots are still being confirmed (1.4x at 32 entries)
+
+Hypothesis (Sol, `briefs/ideas/0525-sol.md` #1): staged payload keys carry their slot (`wal-data/<slot>-<write id>.wal`), so a listing of that prefix
+names the bodies a long tail needs before the slot reads have confirmed them. Start those GETs early, and accept a body only when its slot's commit
+record names the same key. Gate: 32-entry external p50 at least 1.2x better than v0.1.47, the 0, 3, and 4 entry cases within 5%. Kill line: overlap
+saves under 15% of the 32-entry p50.
+
+### Kill test (v0.1.47, phase timestamps in a scratch-only patch)
+
+c7g.2xlarge, us-west-2, 32 x 150 KB external payloads, fresh process per sample. The second wave and the WAL listing finish about 55 ms in; the
+slot reads are confirmed at about 90 to 125 ms; the bodies finish at about 205 to 290 ms (median about 240), so the body phase is 110 to 180 ms. A
+body GET needs only the payload listing (about 55 ms), not the confirmation, so overlapping saves about 45 to 50 ms of 240 (about 19%). Not killed.
+
+### Change (no format change, no setting)
+
+In the same moment `scan_slots` lists the WAL prefix (the first two slots were full), it also lists the payload prefix after the last replayed slot.
+Once the WAL listing shows the contiguous run, a task starts for each listed payload whose slot is in that run (at most 256), while the confirming
+slot reads are still in flight. A record uses a speculative body only if its own payload key is the listed key and, when the record has a size, the
+size equals the listed size; a body from a losing write has a different key and is never used, and a body for a slot that stays empty is dropped.
+A failed, stale, or empty payload listing means fewer or no speculative bodies. A failed speculative GET falls back to the record's own fetch.
+
+All fetches of one `tail_bounded` call, speculative or not, now draw from one shared budget (`FetchBudget`: the count cap and `TAIL_FETCH_BYTES`),
+and stopping early aborts the speculative tasks still in flight. **The count cap rises from 8 to 16.** At 8, overlap alone measured 1.09x (238 and
+259 ms to 227 and 227 ms) because the body phase is four waves of 8; the extra width is what makes the gate. The byte budget is unchanged (64 MiB),
+so memory stays bounded by it.
+
+Tests (`crates/bf-wal/tests/log.rs`, module `speculative`, over a store that logs payload reads, delays them, and can hide or fail the payload
+listing): every listed body is read exactly once and in-flight reads stay within the cap; a stale (hidden key), empty, or failed payload listing
+loses nothing; a losing write's body under a reused slot is never accepted; bodies staged for empty slots are not entries; sizeless records are accepted
+by key and a wrong size is rejected; tombstones and a lost conflict replay identically to serial reads. A unit test checks that speculative and
+ordinary fetches share one budget.
+
+### Results (cold `tail_bounded` p50 ms, c7g.2xlarge, A/B/B/A, 30 fresh-process samples per cell)
+
+| Case | Base (v0.1.47) | New | Speedup |
+| --- | ---: | ---: | ---: |
+| 32 external payloads | 267 / 250 | 172 / 198 | 1.4x |
+| 32 external payloads (second run, 2 x A/B/B/A) | 262, 314, 259, 289 | 189, 204, 179, 191 | 1.45x |
+| 4 external payloads | 96 / 96 | 97 / 100 | within 3% |
+| 4 inline entries | 65 / 62 | 62 / 63 | noise |
+| 3 inline entries | 61 / 60 | 63 / 59 | noise |
+| empty tail | 17 / 17 (then 18 to 20) | 19 / 19 (then 18 to 19) | noise: 60-sample repeat is equal |
+
+**Passes.** Overlap alone (cap 8) is 1.09x, so most of the gain comes from starting bodies early *and* running 16 at once; the two are
+inseparable at 32 payloads because each is bounded by the other. Cost: one c7g.2xlarge for about 1.5 hours (under $0.60); instance, key pair, security
+group, and the `tmp/w9-20261126/` prefix deleted.
+
+### Round W9b: a share of the byte budget lives as long as its body (review fix)
+
+Review finding: a fetch's share of `TAIL_FETCH_BYTES` was released when its GET finished, not when its entry was consumed, so up to 256
+completed speculative bodies and 64 materialized entries could sit in memory beyond the budget (with payloads up to the request limit, the
+hazard W7 fixed). Fix: the share travels with the body (a speculative task returns `(body, permit)`) and is dropped only after the ordered
+replay has consumed the entry, as in W7, so fetched-but-unconsumed bytes never exceed `TAIL_FETCH_BYTES` (the first fetch always proceeds).
+To keep that from deadlocking, shares are requested in slot order (speculative tasks queue behind the previous one; ordinary fetches are
+admitted in the replay loop in WAL order, and the loop waits for the replay to free room), and when a record does not use a speculative body
+(a losing write, a size mismatch, a record that fetches on its own) the unused speculative bodies at or before its slot, or all later ones for a
+record that fetches on its own, are dropped at once, freeing their shares and memory.
+
+Tests: with the first body slow so every later body finishes first, a budget narrowed to 1, 3, and 8 bodies is never exceeded (measured as
+the budget's peak held bytes, not RSS), and the replay is unchanged; with losing writes' bodies, a wrong-size record, and a slow slot under budgets
+of 1, 2, and 4 bodies, the tail completes without stalling and stays in budget.
+
+Re-measured on one on-demand c7g.2xlarge (us-west-2, Amazon Linux 2023), A/B/B/A against v0.1.47, 30 fresh-handle samples per cell,
+p50 ms (base / new):
+
+| Case | Base (v0.1.47) | New (W9 + W9b) | Speedup |
+| --- | ---: | ---: | ---: |
+| 32 external 150 KB payloads | 236 / 249 | 189 / 191 | 1.28x |
+| 4 external payloads | 103 / 101 | 98 / 102 | within 3% |
+| 4 inline entries | 72 / 68 | 74 / 74 | noise (within 8%) |
+| 3 inline entries | 73 / 72 | 71 / 66 | noise |
+| empty tail | 21 / 20 | 21 / 20 | equal |
+
+The 32-entry gain is 1.28x (it was 1.4x before the fix): in-order consumption and in-order admission cost a little overlap, still above the 1.2x bar.
+The 4-inline case is 6 ms slower in this pair (72, 68 vs 74, 74), where W9 measured equal; it has no payloads, so the code path it takes is
+unchanged, and the cell's samples ranged 47 to 669 ms. Cost: about 0.6 hours of a c7g.2xlarge (about $0.25); instance, key pair, security
+group, and the `tmp/w9b-20261126/` prefix deleted.
+
 ## Round BW20: cut the warm BM25 scoring loop's own costs (three items kept, 1.23x, below the 1.3x bar)
 
 Four changes to `search_internal` (BW19's profile: `Range<u32>` filtered into a `Vec<u32>` 13.6%, `(usize, f64)` sort 6.6%).
