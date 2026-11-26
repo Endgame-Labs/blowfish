@@ -13269,7 +13269,7 @@ was not re-measured. Cost: one c7g.4xlarge for about 1.5 hours (under $1.50); in
 
 **Coordinator decision (BW18):** not merged. The gain (1.04x and 1.15x cold phrase p50) is below the round's 1.3x bar for about 230 added lines, and warm phrase throughput was not re-measured. The code is kept on the `bw18-phrase-waves` branch. The remaining cost is the dependent wave (the phrase filter finishes before masked BM25 picks its blocks), so the next attempt should overlap the two, not shave the filter's own reads.
 
-## Round W6: cold queries fetch committed WAL payloads one at a time (concurrent fetch, 3.2x at 32 payloads)
+## Round W6/W7: cold queries fetch committed WAL payloads one at a time (concurrent fetch, 3.2x at 32 payloads; bounded by bytes in W7)
 
 Hypothesis (Sol, `briefs/ideas/2225-sol.md` #1): `tail_bounded` discovers WAL slots concurrently but then calls `materialize` on each record in
 turn, so every out-of-line payload (over 64 KiB, `INLINE_PAYLOAD_BYTES`) costs one serial object-store round trip on a cold strong query.
@@ -13297,8 +13297,8 @@ The 32 payload reads were about 800 of 1,013 ms (about 80%), far above the 30% l
 
 `tail_bounded` streams the records after the last tombstone through `futures::stream::buffered(8)`. Payloads are fetched up to 8 at a time, but
 results arrive in WAL order, so the byte budget, the `Pruned` rescan, the corruption check, and errors behave exactly as the serial loop did.
-Stopping early (budget, pruned, or error) drops fetches still in flight. Concurrency is bounded by count only: a payload's size is not in its slot
-record, so bytes in flight cannot be known before the read (at most 8 entries).
+Stopping early (budget, pruned, or error) drops fetches still in flight. W6 bounded concurrency by count only (8), which with the 512 MiB body
+limit could hold several GiB in flight; W7 below fixes that.
 
 ### Results (cold p50 ms, A/B/B/A)
 
@@ -13317,3 +13317,31 @@ reclaimed payloads (still `Format`, byte budget unchanged), cleanup racing a rea
 **Passes** (3.2x on the 1.3x gate). What is left at 32 payloads is about 130 ms over the inline case: 32 payloads at 8 in flight is four waves of
 about 25 to 30 ms (150 KB each). A larger window would cut that further but is unbounded in bytes. Cost: one c7g.2xlarge for about 1.2 hours
 (under $0.50); instance, key pair, security group, and the `tmp/w6-20261125/` prefix deleted.
+
+### Round W7: in-flight payload bytes bounded (64 MiB window, no new setting)
+
+`CommitRecord` gains an optional `payload_bytes` (serde default, skipped when absent): the stored size of the out-of-line payload, written by
+`stage` and carried to `commit`. The struct does not use `deny_unknown_fields`, so old binaries ignore the field and new binaries read old
+records; the slot version stays 3 and no format fence is needed. `tail_bounded` admits a fetch while the summed stored sizes in flight stay under
+64 MiB and at most 8 run; the first always proceeds, so a payload over the budget fetches alone. Inline entries and tombstones cost nothing. A
+record without a size (older releases) counts as the whole budget, so it fetches one at a time, as before W6. Results still arrive in WAL order.
+The size is known with no extra round trip because it sits in the slot record already read during discovery.
+
+Tests: `FetchWindow` unit tests (count cap, byte cap, oversized alone, unknown sizes serial), and `crates/bf-wal/tests/log.rs` for sizes recorded in
+new slots, old records without sizes replaying in order, an 80 MiB payload among small ones, plus the W6 order, tombstone, GC-race, error, and
+empty-tail tests.
+
+Measured on one on-demand c7g.2xlarge in us-west-2 (same region as the bucket), W6 (`5b3e2f3`) against W7 built on the same box, via
+`crates/bf-wal/examples/tail_rss.rs` (`Wal::tail_bounded` straight against S3, one fresh process per sample, so these times exclude the query):
+
+| Case | W6 (count only) | W7 (bytes) |
+| --- | ---: | ---: |
+| 32 x 150 KB payloads, p50 ms (32 samples, interleaved A/B/B/A) | 305 | 291 |
+| 32 x 150 KB payloads, peak RSS | 40 MiB | 40 MiB |
+| 8 x 64 MiB payloads, budget 150 MiB (2 entries returned), p50 ms | 2,039 to 2,325 | 2,068 to 2,073 |
+| 8 x 64 MiB payloads, peak RSS | 716 to 728 MiB | 395 to 399 MiB |
+
+The small case is unchanged (150 KB payloads fit 8 at once in 64 MiB). The large case halves peak RSS now (W6 had 8 in flight, W7 one at a time since two
+64 MiB payloads exceed the window), at the same latency (the downloads are bandwidth-bound). The ceiling with W6 grows with the payload size
+(8 x 512 MiB is over 4 GiB); with W7 it is the window plus the one oversized payload being fetched. Cost: one c7g.2xlarge for about 0.5 hour
+(under $0.20); instance, key pair, security group, and the `tmp/w7-20261125/` prefix deleted.
