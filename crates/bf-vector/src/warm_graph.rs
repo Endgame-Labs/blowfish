@@ -2,7 +2,8 @@
 //!
 //! Source rows fill the final code arrays directly. Construction retains global SQ8
 //! and fixed-capacity adjacency, without a full f16 corpus or spatial partitions. Nothing here
-//! defines a bucket format. The caller supplies a pool with at most two construction workers.
+//! defines a bucket format. Construction runs on the caller's rayon pool.
+mod binary;
 mod builder;
 mod navigation;
 mod quant;

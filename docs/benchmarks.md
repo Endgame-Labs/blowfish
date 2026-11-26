@@ -14820,3 +14820,551 @@ Reproduction: build `crates/bf-engine/examples/scale-server` at v0.1.51 and at C
 --paired-projections --binary <c25> --arms
 '{"base":{"BINARY":"<v0.1.51>","BLOCK":"1048576","COALESCE":"8"},"cand":{"BLOCK":"262144","COALESCE":"32"}}'
 --s3-only-arm base --s3-only-arm cand` with the arm order swapped on odd runs.
+
+
+## Round C26: filtered cold-query profile stops the proposed fast-path work
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge in us-west-2, using the retained
+10M fixture from C5 without modifying it. Baseline is v0.1.54 (`a6f257f`) plus
+stage diagnostics. **The requested 30% profile screen stops this experiment.**
+No planner, streaming eligibility, predicate execution, or exact-fetch threshold
+was changed, and no performance improvement is claimed.
+
+The broad filter spends most of its time reconstructing missing sparse slab row
+maps before ANN starts. The proposed serial-wave and streaming changes cannot
+meet the requested 1.5x median gain on this layout. The retained fixture predates
+D4b's published resident row maps, so these numbers are not a reproduction of
+D4b's upgraded-layout measurements, nor proof that streaming cannot help that
+layout. A follow-up needs a retained, upgraded 10M fixture before testing those
+hypotheses again.
+
+### Workload and measurements
+
+Each filter uses oracle query vectors 0–19, top ten, IDs only, 64 probes, and
+strong consistency. Each filter gets a fresh process, with one untimed q199
+warm-up, followed by twenty measured cache-cold queries. Engine caches are
+cleared before every query; connections remain warm. There is no disk cache,
+automatic staging, compiler, or competing benchmark during timing. The server
+and client use CPUs 0–7, eight Rayon workers, 8 GiB raw memory cache, 512 MiB
+decoded cache, 256 KiB blocks, 32-block coalescing, and fetch concurrency 512.
+Rust 1.100.0 targets `neoverse-v1`, with Clang 19 C compilation and Clang 20
+linking plus compiler-rt builtins.
+
+| Filter | Matching tier rows | HTTP p50 / p90, ms | Median attempted GETs | Median completed bytes, GB |
+| --- | ---: | ---: | ---: | ---: |
+| `title_initial Eq z` | 44,129 | 3,641.440 / 3,909.150 | 1,234.5 | 3.215853 |
+| `text_length Gte 300` | 4,808,218 | 3,395.188 / 3,610.683 | 1,095.0 | 1.963081 |
+| `id Lt 1000` | 998 | 8,546.506 / 8,767.774 | 1,423.0 | 2.222507 |
+| `title_initial Eq __c26_no_match__` | 0 | 2,442.289 / 2,586.089 | 617.0 | 1.716584 |
+
+The title filter plans 6,856,537 scanned rows for every vector. The broad filter
+plans 569,917–670,528 rows. The tiny filter plans exactly 998 vector rows and
+uses the existing exact-fetch switch after counting them. The empty filter
+returns zero rows before ANN planning, after snapshot warming has already
+reconstructed the memberships. Match counts above are tier predicates; the
+planner still uses actual vector membership counts for its exact-fetch decision.
+
+Against the oracle's matching `selective_ids` and `broad_ids` arrays, measured
+recall@10 is 1.000 and 0.995, respectively. Those arrays were used in offline
+analysis of the recorded IDs. The initial harness's generic `recall` field used
+unfiltered truth and is unsuitable for these requests; the harness now accepts
+`--truth-key` and omits filtered recall when no matching truth is provided. No
+truth or recall claim is made for the tiny filter, and empty results are checked
+directly. There is no A/B result-parity claim because no query behavior changed.
+
+### What the stage trace establishes
+
+Times below are median request-relative endpoints in milliseconds. Filter
+completion is the latest per-segment filter endpoint, not the sum of those
+concurrent tasks. Individual medians do not add to a median total.
+
+| Endpoint | Title | Length | Tiny | Empty |
+| --- | ---: | ---: | ---: | ---: |
+| Snapshot warming starts | 29.000 | 29.355 | 27.370 | 29.180 |
+| Tier directory available | 97.282 | 104.940 | 117.382 | 106.453 |
+| All filter masks available | 419.347 | 683.846 | 6,099.364 | 418.762 |
+| All slab memberships available | 2,434.622 | 2,798.586 | 8,234.328 | 2,440.477 |
+| Main tier plan starts | 2,434.903 | 2,798.880 | 8,234.632 | 2,440.795 |
+| Slab predicates translated | 2,450.587 | 2,873.255 | 8,237.962 | — |
+| Probe plan ready | 2,459.666 | 2,922.698 | 8,238.641 | — |
+| Scan complete | 3,449.145 | 3,230.931 | 8,485.774 | — |
+| Exact vectors reranked | 3,596.532 | 3,354.707 | 8,485.922 | — |
+| Winning documents hydrated | 3,639.691 | 3,389.075 | 8,545.464 | — |
+
+The four proposed mechanisms resolve as follows:
+
+1. `snapshot::OpenHint::warm` already polls per-segment filter reads alongside
+   the tier directory and its subsequent memberships. The main tier's filter
+   masks take about 0.5 ms, and directory plus memberships are warm cache hits.
+   There are not three cold serial read waves at the cited `ann.rs` awaits.
+2. Filtered snapshot opening prefetches the segment hint. It does not prefetch
+   the slab hint that the main filtered slab path could reuse. The trace has
+   one actual tier-directory read during snapshot warming, followed by cache
+   reuse; it does not establish a redundant slab-directory GET. Choosing a
+   paged directory also needs a filter-aware probe budget, since selective
+   queries can expand far beyond the unfiltered probe population.
+3. The streaming gate does exclude filtered scans. Scan wall time after tasks
+   are built is 977.854 ms for title and 295.853 ms for length. Even eliminating
+   every scan read and all its CPU cannot remove the preceding membership work.
+4. Serial slab predicate translation costs only 12.037 / 16.659 ms for the two
+   original filters. The broad global tier mask costs about 55 ms, and its
+   rank-to-plan interval costs about 49 ms. They are included in the generous
+   screen below, although the proposed changes would not remove all of them.
+
+For the screen, each query is credited with removing the entire interval from
+main tier start through scan completion, plus the snapshot's initial directory
+wait. That deliberately includes all tier setup and all scan I/O, and assumes
+that the complete directory wait is on the critical path despite overlapping
+filter reads. Median credited removals are **1,072.278 ms (29.45% of HTTP p50)**
+for title and **498.444 ms (14.68%)** for length. These are ratios of separately
+computed medians, not predicted changes to HTTP latency.
+
+Subtracting that credit from each recorded query before recomputing p50 gives
+an optimistic residual p50 of **2,537.606 / 2,868.604 ms**, or ceiling speedups
+of **1.435x / 1.184x**. This is an arithmetic ceiling under the observed
+membership work, not an A/B measurement. The broad case is below the 30% kill
+threshold under either accounting, and neither case reaches the required 1.5x.
+Consequently no implementation experiment, paired A/B/B/A comparison, unfiltered
+control, or sixteen-client filtered throughput run was started.
+
+### The dominant dependency on this retained layout
+
+The retained manifest has no published sparse resident row maps. The filtered
+snapshot calls `ann_dir::memberships`, which calls `slab_rows::load`. For these
+slabs, `slab_rows::rebuild` opens the full ANN index, and
+`bf_vector::Index::open_with_metadata_len` installs every cluster blob before
+constructing membership. That reconstructs all slabs even when a filter will
+match nothing. Before ANN starts, the completed slab reads total
+**1,636,314,116 bytes per query**; the empty case makes the unnecessary work
+especially visible. This is a reconstruction/format cost, not three main-query
+read waves. Read-only opening cannot publish the missing maps.
+
+The tiny ID filter has an additional expensive full ID dictionary decode. Its
+last filter finishes around 6.10 seconds, and memberships finish around 8.23
+seconds while sharing the runtime. The trace shows overlap and delayed
+completion; it does not separately identify CPU scheduling, decode time, and
+network time in that contention. Avoid inferring that this filter's entire
+8.5-second latency is vector I/O.
+
+### Reproduction and diagnostics
+
+`crates/bf-engine/examples/cold_ab.py` now accepts `--filters`, `--truth-key`,
+and records `filter_matching`. Existing `BF_TRACE_STAGES` output now includes
+snapshot, directory, membership, filter, tier-mask, and slab-predicate endpoints.
+No product configuration, public Rust API, dependency, storage format, ranking
+rule, or threshold changed. The ordinary query path remains the only path.
+
+```bash
+source ~/.cargo/env
+taskset -c 0-7 uv run crates/bf-engine/examples/cold_ab.py \
+  --config CONFIG.local --binary INSTRUMENTED_V154_SERVER \
+  --arms '{"base":{}}' --s3-only-arm base --queries 20 \
+  --block-size 262144 --coalesce-blocks 32 --include-attributes '["id"]' \
+  --filters '["title_initial","Eq","z"]' --truth-key selective_ids \
+  --scratch .scratch/c26 --label profile-title
+```
+
+Use `broad_ids` for the length filter. Omit `--truth-key` for filters without
+recorded truth. The original sample collection used the same command before
+`--truth-key` was added, with its filtered recall recomputed offline as above.
+Temporary configurations stay private. The retained fixture was only read; those profiles created, modified, or removed
+no bucket objects or prefixes. Final checks, compute
+lifetime, resource deletion, and the commit are recorded in the worker report.
+
+### All eighty measured stage timelines
+
+The following CSV preserves every measured query's endpoints in request-relative
+milliseconds, rounded to three decimals. `filters` is the latest completed
+filter task, `members` is all memberships ready, `tier` is main tier start,
+`predicates` is slab translation complete, and `vectors` is exact rerank complete.
+Blank entries mean that the empty predicate returned before that stage. Query
+199 is untimed warm-up and is excluded. Absolute epoch endpoints and completed
+read intervals were used for analysis; overlapping interval counts are not
+interpreted as dependency depths.
+
+```csv
+case,q,http,warm_start,directory,filters,members,tier,predicates,plan,scan,vectors,hydrate
+title,0,3607.149,53.646,131.290,445.791,2505.079,2505.390,2523.061,2531.764,3460.274,3605.173,3605.347
+title,1,3668.783,28.692,108.753,440.588,2516.634,2516.930,2534.821,2543.474,3496.577,3628.730,3666.999
+title,2,3525.787,26.733,89.146,418.281,2373.961,2374.248,2391.580,2399.988,3377.598,3512.326,3524.066
+title,3,3560.343,33.914,100.651,400.980,2380.097,2380.363,2395.961,2404.311,3386.872,3558.146,3558.382
+title,4,3583.658,33.865,100.124,418.309,2434.662,2434.949,2450.590,2459.293,3438.780,3581.454,3581.769
+title,5,3652.846,28.833,96.381,409.003,2376.942,2377.294,2393.256,2402.104,3434.541,3597.174,3651.118
+title,6,3530.544,30.776,83.649,411.808,2329.691,2329.954,2345.560,2353.936,3353.150,3517.754,3528.765
+title,7,3661.504,31.268,85.597,420.384,2441.707,2441.984,2457.698,2466.125,3465.099,3659.382,3659.624
+title,8,3630.034,27.858,91.317,401.646,2442.219,2442.511,2458.484,2467.345,3437.597,3628.028,3628.264
+title,9,3710.079,29.167,94.483,429.357,2508.072,2508.388,2524.207,2533.173,3483.841,3609.971,3708.252
+title,10,3568.340,34.500,102.411,422.497,2423.006,2423.311,2439.061,2447.837,3426.709,3566.460,3566.618
+title,11,3927.435,29.810,97.287,431.661,2391.799,2392.084,2408.020,2416.874,3725.799,3865.940,3925.455
+title,12,3667.200,34.896,97.278,499.226,2395.240,2395.533,2411.060,2420.166,3385.974,3561.648,3665.401
+title,13,3556.331,27.959,97.488,411.958,2430.632,2430.919,2446.894,2455.528,3398.378,3554.073,3554.364
+title,14,3907.118,42.204,168.317,441.441,2578.774,2579.018,2595.108,2604.095,3568.023,3713.951,3905.051
+title,15,3606.363,26.125,100.887,445.993,2449.970,2450.306,2466.293,2475.547,3459.509,3576.862,3604.342
+title,16,4145.367,23.548,96.347,402.320,2434.581,2434.857,2450.584,2460.039,4022.370,4143.663,4143.790
+title,17,3758.438,23.493,194.861,405.132,2542.300,2542.594,2559.168,2568.105,3537.426,3756.303,3756.546
+title,18,3653.974,26.039,90.902,424.037,2400.561,2400.846,2416.940,2425.932,3409.924,3595.890,3652.114
+title,19,3587.900,28.201,82.863,411.073,2476.073,2476.350,2491.756,2500.322,3462.427,3585.891,3586.105
+length,0,3369.376,28.275,108.645,682.879,2820.929,2821.227,2895.396,2944.777,3240.510,3357.365,3361.651
+length,1,3421.000,30.334,97.301,669.852,2733.727,2734.034,2814.627,2863.905,3156.841,3343.905,3416.499
+length,2,3610.612,34.174,631.083,699.082,3044.137,3044.455,3119.119,3168.394,3451.008,3603.726,3603.974
+length,3,3334.497,30.190,99.969,695.048,2697.959,2698.260,2772.313,2821.703,3161.492,3269.807,3322.707
+length,4,3261.040,26.942,105.290,696.072,2730.427,2730.702,2804.515,2853.834,3130.429,3251.148,3251.515
+length,5,3466.095,25.351,110.821,684.813,2887.205,2887.522,2962.294,3011.590,3317.311,3457.897,3458.177
+length,6,3587.871,50.001,130.353,706.966,2877.552,2877.856,2951.606,3001.055,3360.400,3516.962,3581.976
+length,7,3362.630,49.996,115.450,678.920,2800.295,2800.599,2875.543,2925.019,3221.352,3352.049,3352.275
+length,8,3302.878,31.176,98.379,679.032,2744.638,2744.919,2819.205,2868.876,3178.514,3295.050,3295.289
+length,9,3611.783,33.504,350.665,678.527,2929.946,2930.232,3003.883,3052.864,3357.370,3516.255,3605.756
+length,10,3321.615,27.267,99.250,653.047,2726.725,2727.015,2800.293,2849.720,3191.530,3316.430,3316.818
+length,11,3557.196,27.019,102.090,718.019,3015.642,3015.913,3089.467,3138.853,3433.429,3546.350,3546.523
+length,12,3544.273,50.640,128.162,685.131,2796.876,2797.160,2870.967,2920.378,3243.109,3394.431,3538.461
+length,13,3460.567,67.238,182.481,721.768,2921.876,2922.154,2996.049,3045.361,3357.161,3454.772,3454.924
+length,14,3611.322,28.521,106.860,713.519,2964.612,2964.969,3039.132,3089.115,3379.759,3536.621,3606.442
+length,15,3248.777,23.343,92.363,673.572,2707.396,2707.706,2782.230,2831.491,3115.011,3229.101,3242.903
+length,16,3325.392,21.459,80.953,678.233,2790.485,2790.768,2864.873,2914.099,3195.109,3313.674,3313.876
+length,17,3573.792,32.146,104.589,709.263,3019.354,3019.612,3093.280,3142.958,3444.403,3566.992,3567.177
+length,18,3260.534,27.798,98.539,649.780,2673.669,2673.950,2748.159,2797.740,3083.041,3255.333,3255.561
+length,19,3240.262,24.583,96.459,648.902,2722.343,2722.607,2795.838,2845.123,3132.769,3233.328,3234.262
+tiny,0,8821.381,24.546,92.625,6220.824,8524.510,8524.811,8529.464,8530.108,8764.950,8765.120,8820.357
+tiny,1,8355.071,27.323,86.815,6093.996,8052.897,8053.232,8056.157,8056.779,8278.779,8278.935,8353.974
+tiny,2,8483.212,28.723,112.016,6102.743,8217.876,8218.174,8221.550,8222.179,8436.360,8436.532,8482.178
+tiny,3,8392.172,32.587,120.636,6025.095,8093.625,8093.944,8096.721,8097.396,8334.269,8334.439,8391.064
+tiny,4,8604.588,31.583,161.377,6122.206,8311.890,8312.246,8315.052,8315.690,8535.245,8535.405,8603.588
+tiny,5,8452.848,27.872,423.160,6080.110,8104.684,8105.004,8109.420,8110.140,8399.515,8399.671,8451.775
+tiny,6,8761.818,26.436,147.471,6176.886,8496.028,8496.372,8499.105,8499.740,8697.286,8697.438,8760.792
+tiny,7,8411.068,26.054,106.747,6097.669,8144.970,8145.266,8147.992,8148.617,8360.226,8360.375,8409.990
+tiny,8,8752.170,27.417,651.040,6183.737,8452.060,8452.385,8455.322,8455.982,8696.208,8696.364,8751.111
+tiny,9,8761.056,26.658,111.761,6061.858,8468.635,8468.946,8471.702,8472.367,8701.282,8701.446,8760.007
+tiny,10,8614.632,28.993,108.242,6177.224,8342.543,8342.857,8346.569,8347.257,8556.105,8556.257,8613.546
+tiny,11,8499.501,28.936,114.128,6079.394,8102.097,8102.400,8105.724,8106.359,8443.085,8443.247,8498.442
+tiny,12,9182.642,21.029,101.779,5884.869,8250.779,8251.090,8254.374,8255.103,9131.533,9131.689,9181.616
+tiny,13,8672.035,33.558,509.294,6251.735,8418.188,8418.493,8421.064,8421.697,8610.447,8610.613,8670.980
+tiny,14,8717.463,24.996,131.142,6178.495,8450.341,8450.666,8453.544,8454.198,8658.238,8658.383,8716.433
+tiny,15,8557.072,27.741,172.876,6028.998,8297.185,8297.518,8300.114,8300.794,8494.786,8494.932,8555.996
+tiny,16,8432.229,21.686,330.998,6101.058,8121.808,8122.151,8124.964,8125.580,8383.232,8383.384,8431.155
+tiny,17,8268.763,20.843,111.329,6068.171,8071.991,8072.295,8075.041,8075.704,8220.099,8220.255,8267.761
+tiny,18,8535.940,24.736,96.688,6026.750,8134.611,8134.918,8137.755,8138.433,8476.762,8476.912,8534.932
+tiny,19,8414.670,34.802,123.056,6115.440,8169.559,8169.899,8172.586,8173.268,8358.202,8358.359,8413.606
+empty,0,2775.369,24.985,119.630,456.778,2773.609,2773.902,,,,,
+empty,1,2552.967,30.534,386.863,397.436,2551.340,2551.554,,,,,
+empty,2,2600.367,29.812,95.498,442.302,2598.607,2598.932,,,,,
+empty,3,2456.607,24.653,105.290,428.181,2454.813,2455.136,,,,,
+empty,4,2552.200,27.978,212.293,447.803,2550.347,2550.684,,,,,
+empty,5,2414.665,22.703,100.514,421.124,2412.913,2413.206,,,,,
+empty,6,2471.620,30.662,92.997,429.934,2469.758,2470.082,,,,,
+empty,7,2427.970,33.514,110.080,407.567,2426.141,2426.453,,,,,
+empty,8,2556.754,32.351,112.763,418.368,2554.960,2555.269,,,,,
+empty,9,2391.010,19.567,80.432,379.430,2389.217,2389.541,,,,,
+empty,10,2363.727,54.004,112.960,422.398,2361.886,2362.206,,,,,
+empty,11,2364.705,24.531,99.078,394.912,2362.932,2363.230,,,,,
+empty,12,2410.332,31.081,105.378,398.639,2408.598,2408.852,,,,,
+empty,13,2572.491,28.027,88.502,419.157,2570.778,2571.101,,,,,
+empty,14,2417.080,28.739,107.529,404.960,2415.279,2415.596,,,,,
+empty,15,2415.738,34.353,114.555,402.403,2414.081,2414.306,,,,,
+empty,16,2364.953,25.224,134.624,408.793,2363.160,2363.432,,,,,
+empty,17,2514.720,29.621,100.459,438.681,2513.012,2513.263,,,,,
+empty,18,2413.292,21.271,87.050,414.018,2411.543,2411.833,,,,,
+empty,19,2584.503,60.121,122.364,461.987,2582.376,2582.790,,,,,
+```
+
+
+### Small fresh namespace with published maps
+
+At the coordinator's request after accepting the kill decision, one supplementary
+probe built a fresh, owned namespace: 100,000 deterministic synthetic vectors,
+32-dimensional f16 cosine, ten source segments, and twelve installed slabs.
+`title_initial` cycles through a–z, and `text_length` is `id % 600`. Every slab has
+a published sparse row map; query traces read all twelve `.rows-v1.bfr` objects
+and **600,192 map bytes per query**, without reconstructing memberships from
+cluster blobs. The original 10M fixture was never copied.
+
+This is a direct engine API probe, not an HTTP or 10M comparison. Each of the
+same four filters gets five cache-cold samples, with strong consistency, top
+ten, IDs only, 64 probes, the same cache geometry, and no staging. A fresh
+read-only engine serves the samples after the writable builder exits. No build
+or other test runs during timing. The initial preparation timeout expired while
+waiting for the package gate and compiling, before any write or query; resumed
+preparation and the only actual measurement finished within the coordinator's
+20-minute allowance.
+
+| Filter | Matching rows | Engine p50 / p90, ms | Median snapshot, ms | Median completed bytes, MB |
+| --- | ---: | ---: | ---: | ---: |
+| `title_initial Eq z` | 3,846 | 201.510 / 205.484 | 104.607 | 9.580330 |
+| `text_length Gte 300` | 49,900 | 230.214 / 238.781 | 118.093 | 14.342314 |
+| `id Lt 1000` | 1,000 | 221.118 / 226.925 | 150.869 | 14.146227 |
+| `title_initial Eq __c26_no_match__` | 0 | 82.287 / 94.834 | 81.915 | 2.380622 |
+
+Title and tiny use the existing count-gated exact-fetch plan (3,846 and 1,000
+vector rows); broad uses ANN and plans 53,646–54,354 rows. All nonempty responses
+return ten rows, and every empty response returns none. The owned prefix was
+deleted after the process exited, with zero current objects and zero multipart
+uploads verified. Historical object versions are unverified. These five-sample,
+small-population timings establish that the published maps are used; their
+size, dimensions, projection wrapper, and query plans prevent interpreting them
+as a measured speedup over the original 10M profiles. No paired repair or recall
+claim is made.
+
+### Validation before the diagnostic commit
+
+`cargo fmt --all -- --check`, workspace/all-target clippy with warnings denied,
+and `cargo test -p bf-engine -j 3` pass at nice 19: **350 passed, zero failed,
+and 13 ignored across 35 suites**. The package gate uses the default debug
+profile, with `RUST_TEST_THREADS=1`. Harness syntax, help, and four real-oracle
+request/truth preparation checks pass using uv. The full debug workspace test
+and repeated workspace clippy on the final commit are recorded in the worker
+report; no failing performance gate is represented as a passing optimization.
+
+
+## Round C27: quiet namespaces repair row maps, and the cold filtered baseline on a repaired 10M layout
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge (us-west-2), v0.1.54 (`a6f257f`) plus the C26
+stage diagnostics. No product code changed: the answer to the first question is that repair already
+works without writes, and this round adds a test that proves it.
+
+### Does a quiet writable namespace repair?
+
+Yes. The background loop (`indexer::index_loop`) calls `index_namespace(ns, false)` for every known
+namespace on every `index_interval`. `slab_rows::needs` (and the probed `slab_rows::missing`) are
+part of the condition that skips the "nothing to do" early return, so a pass with no writes still
+reaches `slab_rows::ensure`, which backfills one slab per pass under the manifest fence. The new
+test `c27_quiet_namespace_publishes_row_maps_from_the_background_loop` deletes every published map,
+starts an engine with indexing on, issues one query (a read), never writes or forces a pass, and
+asserts that every map reappears. It takes about 30 s only because the fixture's engine still holds
+its 30 s advisory lease. Strong-consistency readers re-read the manifest per query, so they use the
+maps as soon as they are published. A read-only server never repairs: some writer must open the
+namespace once.
+
+### Repair cost on the retained 10M layout
+
+I copied the C5 fixture server-side into my own prefix (693 objects, 77.3 GB), then served the copy
+writable with the scale server and no writes. The first writable pass found work beyond row maps:
+the fixture also predates the current segment text format, so each pass rewrote segments
+(`text_upgrade`, 6.97 M rows rebuilt, 35 lineage merges) as well as publishing one map. Published
+maps went from 0 to 55 (60.0 MB in all; the layout has 55 slabs) in about 13 minutes, after which
+manifests stopped changing. Maps appeared in bursts (3 in the first six minutes, then 55 by minute twelve) while the
+segment rewrites ran; I did not trace why. Counter
+`blowfish_ann_row_map_rebuilds_total{reason="backfill"}` ended at 55.
+
+### Cold filtered baseline on the repaired copy
+
+Protocol as C26: fresh read-only process per case, oracle queries 0-19, top 10, IDs only, 64 probes,
+strong consistency, engine caches cleared before every query, 8 Rayon workers on CPUs 0-7, 8 GiB
+raw cache, no disk cache, 256 KiB blocks, 32-block coalescing. Twenty measured queries per case after
+one untimed warm-up. **Every measured query recorded zero row-map rebuilds** (new `rowmap_rebuilds`
+field in `cold_ab.py`).
+
+| Filter | Matching tier rows | C27 HTTP p50 / p90, ms | C26 (unrepaired) p50, ms | Median GETs | Median MB read |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `title_initial Eq z` | 44,129 | 2,014.148 / 2,052.594 | 3,641.440 | 916.5 | 1,645.8 |
+| `text_length Gte 300` | 4,808,218 | 1,836.613 / 1,997.986 | 3,395.188 | 772.0 | 389.3 |
+| `id Lt 1000` | 998 | 6,696.710 / 6,836.317 | 8,546.506 | 1,095.5 | 650.2 |
+| `title_initial Eq __c26_no_match__` | 0 | 840.972 / 863.065 | 2,442.289 | 293.0 | 145.7 |
+| unfiltered | - | 313.132 / 391.149 | - | 331.5 | 103.3 |
+
+Unfiltered recall and results were not compared, since nothing about ranking changed.
+
+### Stage trace on the repaired copy (median request-relative ms)
+
+| Endpoint | Title | Length | Tiny | Empty |
+| --- | ---: | ---: | ---: | ---: |
+| Snapshot warming starts | 54.272 | 53.085 | 53.450 | 53.799 |
+| Slab directory available | 111.296 | 126.119 | 121.958 | 117.983 |
+| All filter masks available | 454.769 | 703.140 | 6,168.270 | 439.340 |
+| Snapshot warm done (memberships) | 716.374 | 1,036.166 | 6,504.976 | 795.505 |
+| Main tier plan starts | 716.548 | 1,036.336 | 6,505.184 | 795.692 |
+| Slab predicates translated | 833.813 | 1,306.324 | 6,555.574 | - |
+| Scan complete | 1,814.314 | 1,646.008 | 6,670.297 | - |
+
+### Are the old hypotheses worth fixing now?
+
+Using C26's generous credit (the whole interval from main tier start through scan completion, plus
+the snapshot's initial directory wait; ratios of separate medians):
+
+| Filter | Credit, ms | Share of p50 | Optimistic residual p50, ms | Ceiling speedup |
+| --- | ---: | ---: | ---: | ---: |
+| title | 1,220.8 | 60.6% | 771.2 | 2.61x |
+| length | 761.0 | 41.4% | 1,059.2 | 1.73x |
+| tiny | 286.0 | 4.3% | 6,394.1 | 1.05x |
+| empty | 162.4 | 19.3% | 677.7 | 1.24x |
+
+With the rebuild gone, the removable share for both original filters is above C26's 30% screen
+(it was 29.5% and 14.7% before), and the ceilings now clear 1.5x. Hypothesis 3 (the disabled
+streaming path) is the one that now matters: scan time after plan is 973 ms for title and 291 ms
+for length. The trace does not support the serial-wave hypothesis as stated, because the
+directory, masks, and memberships are already overlapped in snapshot warming. What remains in front
+of the plan is the snapshot's membership wave: 594 ms (29.5% of p50) after the directory for
+title, 885 ms (48.2%) for length, and 677 ms (80.5%) for the empty filter, which then returns
+nothing. Two things stand out for the next round: the published-map and filter-mask reads that
+still gate the plan even when the filter matches nothing, and the `id Lt` filter, whose mask
+alone takes 6.1 s (a full ID dictionary decode), which no old hypothesis addresses.
+
+### Resources
+
+One c7gd.4xlarge on demand for about 0.6 h (roughly $0.45), plus a 77 GB prefix that lived for
+about 35 minutes. The prefix was deleted and verified empty with no multipart uploads; the instance,
+key pair, and security group were deleted, and no tagged instance remains.
+
+## Round IN1: removal accounting no longer reads covered vectors
+
+**Finding.** Once a covering ANN tier retires a segment's own `annv2:{name}` file, the old accounting path
+(`statistics::adjust_bounded`) kept the vector column in its projection. Every overwrite or delete that
+removed rows from such a segment read the old vectors through the slab row maps and cluster blobs, only to
+measure a per-row JSON length that is a constant.
+
+**Change.** For a segment a tier covers, `vector_locator::Sources::present` now decides which rows hold a vector
+from the resident slab row lists and the lineage maps alone, and the accounting adds the constant vector width
+for those rows. Sparse columns stay exact, because presence comes from the row lists. `rows` and `logical_bytes`
+are bit-identical: the test `in1_removal_accounting_counts_covered_vectors_without_reading_them` compares
+the result with the byte length of the materialized documents, for dense and sparse vectors, whole segments and
+every fifth row.
+
+**Reads** (test fixture, 2 segments of 2,000 rows, cache off, requested bytes that missed):
+
+| Rows accounted | Before, missed bytes | After, missed bytes |
+|---:|---:|---:|
+| 2,000 (dense) | 41,836 | 0 |
+| 400 (dense) | 12,042 | 0 |
+| 2,000 (sparse) | 38,404 | 0 |
+| 400 (sparse) | 10,302 | 0 |
+
+**Gap.** The 1M-row paired wall-time A/B was not run; the evidence is the read counts above. The saving grows
+with vector width and with the number of slabs touched, since the old path was serial across slabs.
+
+## Round GB1: build the warm graph 2.3 times cheaper and 5.8 times sooner
+
+The warm graph's build was most of the time to promotion: 1,229 s on 2 idle-priority threads for full NQ
+(1,259 s in Round G4). This round makes it **2.32 times less CPU at 2 threads** (2,454.7 to 1,057.2 CPU s) and
+**5.8 times faster wall** with the new default pool (1,229 to 212.8 s idle, 1,658.5 to 342.8 s under 16-client
+IVF load), at recall that is the same or slightly higher, and with foreground q/s and p99 within 1.5 percent of
+the old build's. It changes only construction and the pool size: the graph format, serving path, and
+calibration are untouched.
+
+**Setup:** one on-demand c7g.4xlarge (Graviton3, 16 vCPU, 32 GB, Ubuntu 24.04, ARM like the M4), release build.
+Rows arrive in slab and cluster order, as in the engine, from the retained v0.1.19 fixture
+(`tmp/nq-fixture-v019/`, read-only; slabs exported with `examples/g3/export_ivf.py`): 2,681,468 NQ rows,
+1,024-d f16 cosine, R32 graph. Recall is against the recorded exact top-100 truth for all 3,452 queries, with
+exact f16 rerank of 30 (k 10) or 200 (k 100) graph candidates. Build CPU is `getrusage` around
+`HotGraphBuilder::finish`; source decoding (41 s on one thread) is separate and unchanged. Harnesses:
+`crates/bf-vector/examples/gb1_bench.rs` (build, CPU, recall) and `gb1_load.rs` (foreground IVF clients while
+a build runs on an idle-priority pool). The baseline is `215eaa7`'s build, measured on the same host.
+
+### Profile of the old build (`gb1-profile`)
+
+perf at 499 Hz on the first 300,000 NQ rows at 2 threads (222.9 CPU s): **about 85 percent of CPU is
+`Scratch::search`**, 60 points of it in the SQ8 dot kernel stalled on code rows, 24 in the search loop itself.
+`prune` was about 8 percent (the retain loop 2.8, plus its dots) and heap pops 2. So Neon's hypothesis 2
+(return distances instead of recomputing them) could give at most 1.07 times alone. A search scores about
+1,222 nodes and expands 69 of them, and the dot over a random 1,024-byte row costs **133 ns even with
+prefetch, against 21 ns when cached** (micro-benchmark on the same host, and the same 8 GB/s per thread
+whether the prefetch runs 2 or 16 rows ahead, at L1 or L2, or the 128 MB array sits on transparent huge
+pages). The build is bound by random row reads from main memory, not by arithmetic or by prefetch distance.
+
+### What was kept
+
+| Step | CPU at 2 threads, 300K rows | Note |
+|---|---:|---|
+| Old build | 222.9 s | |
+| Same beam core as serving (`navigation.rs`: packed bitset, flat sorted beam), search scratch reused, distances carried from search into prune | 171.5 s (1.30 times) | hypotheses 1 and 2 |
+| Prefetch two rows versus 8 versus all, L1 versus L2 | 171 to 198 s | no gain, so none kept |
+| **One-bit Hamming steering, exact distances only for expanded nodes** | 88.8 s, then 68 s at beam 48 | the lever |
+
+Construction now keeps one sign bit per coordinate, after the rotation and centered on the corpus mean
+(128 bytes per row instead of 1,024; `warm_graph/binary.rs`, built in parallel in about 6 s and dropped before
+publication). Each insertion beam-searches by Hamming distance, then measures only the expanded nodes
+(about 70, versus about 1,222 scored) exactly with the SQ8 kernel, because the prune test needs true distances.
+The reservation adds the bit codes to the construction peak (`padded / 8` bytes per row); peak RSS did not
+move (3,832,908 versus 3,825,880 KiB) because the construction peak was the conversion to compact links.
+
+### Build cost, full NQ
+
+| Build | Threads | Wall, s | CPU, s |
+|---|---:|---:|---:|
+| Old | 2 | 1,229.2 | 2,454.7 |
+| **New (beam 64)** | 2 | **531.4** | **1,057.2** (2.32 times less) |
+| Old | 15 | 189.9 | 2,829.3 |
+| New | 15 | 74.9 and 74.9 | 1,102.2 and 1,102.6 (2.57 times less) |
+| **New, shipped pool** | 5 | **212.8** | 1,053.6 |
+
+Wall time at the shipped five threads is **5.8 times** the old two-thread build's. Against the old build at the
+same 15 threads it is 2.5 times, because the pass bar is CPU: 15 threads cost more CPU than 2 (memory pressure),
+for both builds. The new build's search is now 57 percent of samples, the exact distances 20, and the prune
+retain loop 7.
+
+### Recall
+
+Recall@10 (rerank 30) and recall@100 (rerank 200) of the finished graph, same beams. The old build's two runs
+(2 and 15 threads) differ by at most 0.001; the three new runs (2 threads, then 15 threads twice) are listed by
+difference from the old 2-thread run.
+
+| Beam | Old | New, 2 threads | New, 15 threads (two runs) |
+|---|---:|---:|---:|
+| k 10, ef 48 | 0.932155 | 0.933720 (+0.0016) | 0.930852, 0.930214 (-0.0013, -0.0019) |
+| k 10, ef 64 | 0.944699 | 0.947827 (+0.0031) | 0.945539, 0.945162 (+0.0008, +0.0005) |
+| k 10, ef 128 | 0.965324 | 0.967642 (+0.0023) | 0.965643, 0.966338 (+0.0003, +0.0010) |
+| k 10, ef 256 | 0.977375 | 0.980504 (+0.0031) | 0.977868, 0.978273 (+0.0005, +0.0009) |
+| k 100, ef 256 | 0.953702 | 0.956286 (+0.0026) | 0.955814, 0.955214 (+0.0021, +0.0015) |
+| k 100, ef 400 | 0.969041 | 0.970591 (+0.0016) | 0.970322, 0.970200 (+0.0013, +0.0012) |
+
+From ef 64 up, recall is the same or higher in all 15 comparisons (+0.0003 to +0.0031). At k 10 ef 48, the smallest beam measured, the two 15-thread builds are 0.0013 and 0.0019 lower: the new graph scores about 2
+percent more nodes per beam (1,293 versus 1,268), so it has not lost reach, but its curve sits slightly lower at the
+very smallest beam. Two builds of the same code differ by about 0.001 (parallel insertion order). The first full
+run, at beam 48, was 0.0025 lower at ef 64; the shipped beam 64 removes that.
+
+### Why beam 64, and what did not work
+
+| Variant, full NQ | Threads | CPU, s | Recall@10, ef 64 / 128 |
+|---|---:|---:|---:|
+| Old: exact steering, beam 64 | 15 | 2,829 | 0.9448 / 0.9647 |
+| Hamming, beam 40, plus the 32 closest scored nodes as extra candidates | 15 | 804 | 0.9414 / 0.9612 |
+| Hamming, beam 48 | 2 | 845 | 0.9422 / 0.9633 |
+| Hamming, beam 48, plus the 16, 32, or 64 closest scored nodes | 15 | 928, 925, 1,013 | 0.9425, 0.9434 to 0.9445, 0.9420 / 0.9625 to 0.9648 |
+| Hamming, beam 56 | 15 | 989 to 994 | 0.9444 to 0.9460 / 0.9651 to 0.9669 |
+| **Hamming, beam 64 (shipped)** | 15 | **1,102 to 1,107** | **0.9452 to 0.9482 / 0.9656 to 0.9687** |
+| Hamming, beam 80 | 15 | 1,341 | 0.9456 / 0.9670 |
+| Hamming, beam 48, then exact steering in pass 2 at beam 32 or 48 | 15 | 1,067, 1,312 | 0.9429, 0.9433 / 0.9629, 0.9617 |
+| Closest 48, 96, or 160 scored nodes as the only prune candidates (beam 48) | 15 | 820, 1,096, 1,411 | 0.9379, 0.9353, 0.9343 / 0.9600 |
+
+Beam 56 is 10 percent cheaper and within noise of the old recall. Beam 64 is the shipped choice because its
+recall is above the old build's at every beam from ef 64, and because a small test tier (2.3K rows, top-40
+exact identity with IVF) differed once in five runs at beam 56, and in none of the runs at beam 64. Beam 48
+costs 0.002 to 0.003 of recall. Replacing the expanded nodes by the closest scored ones as prune candidates loses
+the long-range path nodes that robust pruning needs, and recall falls as that list grows. Exact steering in pass 2
+costs more and does no better.
+
+### Pool size, and foreground interference
+
+The brief suggested cores minus one. That fails the foreground bar: the build is memory-bound, and each worker
+adds bandwidth pressure that idle scheduling (SCHED_IDLE, nice 19) cannot remove. 16 clients (one per
+thread, each sleeping as long as its query took, about half the cores) ran IVF 48-probe queries over all of NQ
+while a build ran on the idle-priority pool, whole build including source decoding:
+
+| Build threads | Build wall under load, s | Foreground q/s during | p99 during, us | p99 versus old build |
+|---|---:|---:|---:|---:|
+| none (alone) | | 2,664 to 2,691 | 3,365 to 3,406 | |
+| Old, 2 | 1,658.5 | 2,657.2 | 3,448 | |
+| 4 | 416.1 | 2,624.6 | 3,474 | +0.8% |
+| **5** | **342.8** | **2,616.4 (-1.5%)** | **3,498** | **+1.4%** |
+| 6 | 297.8 | 2,599.3 (-2.2%) | 3,585 | +4.0% |
+| 8 | 247.0 | 2,556.4 (-3.8%) | 5,109 | +48% |
+| 15 | 207.4 | 2,461.8 (-7.4%) | 6,178 | +79% |
+
+The pool is therefore **a third of the cores, between two and six**: five threads on this 16-core host (an
+8-core host stays at two). Under load the build finishes 4.8 times sooner than the old one, with q/s down 1.5
+percent and p99 up 1.4 percent from the old build's. The six-worker cap is where this host's p99 stayed within 5
+percent; larger hosts have not been measured. These are in-process IVF clients, not HTTP; the M4 and an HTTP gate
+are not repeated here.
+
+### Pass criteria
+
+| Criterion | Result |
+|---|---|
+| At least 1.8 times less build CPU at 2 threads | **2.32 times** (1,057.2 versus 2,454.7 s) |
+| At least 4 times faster wall on the 16-core host | **5.8 times idle** (212.8 versus 1,229.2 s at five threads), 4.8 times under load. At the same 15 threads, 2.5 times |
+| Recall within 0.001 at the calibrated beams | same or higher from ef 64 up (+0.0003 to +0.0031 in 15 of 15 comparisons); ef 48 is -0.0013 and -0.0019 in the two 15-thread builds |
+| Foreground within 5 percent of today's build | q/s -1.5 percent, p99 +1.4 percent at five threads |
+
+Resources: one on-demand c7g.4xlarge, 10:55 to 14:30 UTC (3.6 hours, about $2.1 compute). Instance, volume,
+key pair, and security group deleted and verified. The fixture was read-only, and no bucket prefix was created.
+
+Reproduction: `warm_graph_bench`-style export with `examples/g3/export_ivf.py`, then
+`gb1_bench NQ_DATA WORKERS 100000000 1 EXPORTED_IVF` for build and recall, and
+`gb1_load NQ_DATA EXPORTED_IVF BUILD_THREADS 16 1 48` for the foreground run.

@@ -173,6 +173,8 @@ impl OpenHint {
         let (with_text, with_rest) = (part != Part::WithoutText, part != Part::OnlyText);
         let context = self.context.clone();
         crate::read_cache::scope(context, async {
+            let trace_t0 = std::time::Instant::now();
+            crate::ann::stage(trace_t0, "snapshot_warm_start");
             let mut queries: BTreeMap<&str, Vec<bf_text::Query>> = BTreeMap::new();
             let mut terms = crate::text::QueryTerms::new();
             for (attribute, value, prefix) in &self.bm25 {
@@ -216,9 +218,11 @@ impl OpenHint {
                         async move {
                             if filtered || scan.is_none() {
                                 let dir = crate::ann_dir::load(store, &set.dir, None).await?;
+                                crate::ann::stage(trace_t0, "warm_slab_directory");
                                 if filtered {
                                     crate::ann_dir::memberships(store, &set.slabs, &dir, attribute)
                                         .await?;
+                                    crate::ann::stage(trace_t0, "warm_slab_memberships");
                                 }
                                 return Ok(());
                             }
@@ -304,9 +308,9 @@ impl OpenHint {
                         // are removed afterward, rather than entering the cache key.
                         tasks.push(
                             async move {
-                                segment::filter_live(store, seg, f, schema)
-                                    .await
-                                    .map(drop)
+                                let result = segment::filter_live(store, seg, f, schema).await;
+                                crate::ann::stage(trace_t0, "warm_filter");
+                                result.map(drop)
                             }
                             .boxed(),
                         );
@@ -382,6 +386,7 @@ impl OpenHint {
                 );
             }
             futures::future::join_all(tasks).await;
+            crate::ann::stage(trace_t0, "snapshot_warm_done");
         })
         .await;
     }

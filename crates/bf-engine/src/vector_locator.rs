@@ -56,6 +56,91 @@ impl Sources {
         }
     }
 
+    /// Map the requested segment rows to the global rows a slab set addresses them by,
+    /// recording every row some cover owns in `addressed`.
+    async fn global_rows(
+        &self,
+        store: &Storage,
+        seg: &Segment,
+        set: &SlabSet,
+        rows: &RoaringBitmap,
+        addressed: &mut RoaringBitmap,
+    ) -> Result<BTreeMap<u32, u32>, ApiError> {
+        let mut global_to_row = BTreeMap::new();
+        for cover in &set.covered {
+            if cover.segment == seg.id {
+                for row in rows {
+                    if row >= cover.rows {
+                        return Err(segment::corrupt());
+                    }
+                    global_to_row.insert(
+                        cover.base.checked_add(row).ok_or_else(segment::corrupt)?,
+                        row,
+                    );
+                    addressed.insert(row);
+                }
+            } else if let Some(entry) = self.lineage.iter().find(|l| l.source == cover.segment) {
+                for part in entry.parts.iter().filter(|part| part.target == seg.id) {
+                    let map = lineage::load(store, part).await?;
+                    for row in rows & &map.to {
+                        let source = map.back(row).ok_or_else(segment::corrupt)?;
+                        if source >= cover.rows {
+                            return Err(segment::corrupt());
+                        }
+                        global_to_row.insert(
+                            cover
+                                .base
+                                .checked_add(source)
+                                .ok_or_else(segment::corrupt)?,
+                            row,
+                        );
+                        addressed.insert(row);
+                    }
+                }
+            }
+        }
+        Ok(global_to_row)
+    }
+
+    /// The requested rows that hold a vector, decided from the resident slab row lists and
+    /// lineage maps alone: no cluster or vector payload is read.
+    pub async fn present(
+        &self,
+        store: &Storage,
+        seg: &Segment,
+        rows: &RoaringBitmap,
+        attr: &str,
+    ) -> Result<RoaringBitmap, ApiError> {
+        let sets = self
+            .tiers
+            .get(attr)
+            .ok_or_else(|| segment::index_error("vector source has no covering tier"))?;
+        let mut addressed = RoaringBitmap::new();
+        let mut present = RoaringBitmap::new();
+        for set in sets {
+            let global_to_row = self
+                .global_rows(store, seg, set, rows, &mut addressed)
+                .await?;
+            if global_to_row.is_empty() {
+                continue;
+            }
+            for slab in &set.slabs {
+                let member = crate::slab_rows::load(store, slab, attr).await?;
+                let member = member.ok_or_else(segment::corrupt)?;
+                let resident = member.row_ids().ok_or_else(segment::corrupt)?;
+                for (global, row) in &global_to_row {
+                    if resident.binary_search(global).is_ok() && !present.insert(*row) {
+                        return Err(segment::index_error("vector row has multiple tier sources"));
+                    }
+                }
+            }
+        }
+        if rows - &addressed != RoaringBitmap::new() {
+            return Err(segment::index_error("vector rows are not fully covered"));
+        }
+        Ok(present)
+    }
+
     /// Resolve requested segment rows through coverage, reverse lineage, and the resident
     /// ascending slab row lists. Slabs address vectors by global row; their list ordinal is
     /// the slab-local row. Missing vectors remain absent, including sparse columns.
@@ -80,40 +165,9 @@ impl Sources {
         let mut found: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         let mut addressed = RoaringBitmap::new();
         for set in sets {
-            let mut global_to_row = BTreeMap::new();
-            for cover in &set.covered {
-                if cover.segment == seg.id {
-                    for row in rows {
-                        if row >= cover.rows {
-                            return Err(segment::corrupt());
-                        }
-                        global_to_row.insert(
-                            cover.base.checked_add(row).ok_or_else(segment::corrupt)?,
-                            row,
-                        );
-                        addressed.insert(row);
-                    }
-                } else if let Some(entry) = self.lineage.iter().find(|l| l.source == cover.segment)
-                {
-                    for part in entry.parts.iter().filter(|part| part.target == seg.id) {
-                        let map = lineage::load(store, part).await?;
-                        for row in rows & &map.to {
-                            let source = map.back(row).ok_or_else(segment::corrupt)?;
-                            if source >= cover.rows {
-                                return Err(segment::corrupt());
-                            }
-                            global_to_row.insert(
-                                cover
-                                    .base
-                                    .checked_add(source)
-                                    .ok_or_else(segment::corrupt)?,
-                                row,
-                            );
-                            addressed.insert(row);
-                        }
-                    }
-                }
-            }
+            let global_to_row = self
+                .global_rows(store, seg, set, rows, &mut addressed)
+                .await?;
             if global_to_row.is_empty() {
                 continue;
             }

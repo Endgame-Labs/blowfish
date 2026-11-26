@@ -1418,6 +1418,56 @@ async fn d4c_missing_published_map_recovers_queries_and_repairs_without_a_tail()
     engine.query("locator", reference_request()).await.unwrap();
 }
 
+/// Round C27: a quiet writable namespace (no writes, no force) must publish its missing slab
+/// row maps from the background loop alone, one bounded slab per pass, with readers picking
+/// the maps up as soon as they exist.
+#[tokio::test]
+async fn c27_quiet_namespace_publishes_row_maps_from_the_background_loop() {
+    let (store, _, _) = fixture_rows(2000).await;
+    let wal = bf_wal::Wal::new(store.clone(), "locator").unwrap();
+    let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+    let slabs = m.ann_tiers["vector"][0].slabs.len();
+    for slab in &mut m.ann_tiers.get_mut("vector").unwrap()[0].slabs {
+        let map = slab.files.remove("annrows:vector").unwrap();
+        store.delete(&map.key).await.unwrap();
+    }
+    wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+    assert!(crate::slab_rows::needs(
+        &wal.latest_manifest().await.unwrap().unwrap().1.ann_tiers
+    ));
+    store.drop_caches();
+    let engine = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: true,
+            index_interval: std::time::Duration::from_millis(20),
+            recall_sample_rate: 0.0,
+            compaction_segments: usize::MAX,
+            ..Default::default()
+        },
+    );
+    // Opening the namespace is a read, never a write.
+    engine.query("locator", reference_request()).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (_, m) = wal.latest_manifest().await.unwrap().unwrap();
+        if !crate::slab_rows::needs(&m.ann_tiers) {
+            assert_eq!(m.ann_tiers["vector"][0].slabs.len(), slabs);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a quiet namespace never published its row maps"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (_, m) = wal.latest_manifest().await.unwrap().unwrap();
+    for slab in &m.ann_tiers["vector"][0].slabs {
+        store.get(&slab.files["annrows:vector"].key).await.unwrap();
+    }
+    engine.query("locator", reference_request()).await.unwrap();
+}
+
 #[tokio::test]
 async fn d4c_document_only_legacy_segment_does_not_wedge_publication() {
     let (store, _, _) = fixture_rows(2000).await;
@@ -1682,4 +1732,66 @@ async fn d4c_row_map_survey_is_bounded_and_rotates_to_missing_objects() {
     for slab in &manifest.ann_tiers["vector"][0].slabs {
         store.get(&slab.files["annrows:vector"].key).await.unwrap();
     }
+}
+
+/// Round IN1: removal accounting over tier-covered segments (annv2 retired) must equal the
+/// stats of the materialized documents, with sparse vectors, and must not read vector payloads.
+#[tokio::test]
+async fn in1_removal_accounting_counts_covered_vectors_without_reading_them() {
+    for sparse in [true, false] {
+        let (store, _engine, _) = fixture_rows_parts_kind(2000, 2, sparse).await;
+        retire_test_sources(&store).await;
+        let state = maintenance_engine(&store)
+            .snapshot("locator", &Consistency::Strong)
+            .await
+            .unwrap()
+            .0;
+        let mut covered = 0;
+        for seg in &state.segments {
+            if !seg.files.contains_key("annv2:vector") && Sources::new(&state).covers(seg, "vector")
+            {
+                covered += 1;
+            }
+        }
+        assert!(covered > 0, "fixture must have tier-covered segments");
+        for seg in &state.segments {
+            for selected in [
+                (0..seg.row_count).collect::<RoaringBitmap>(),
+                (0..seg.row_count).filter(|r| r % 5 == 0).collect(),
+            ] {
+                let (docs, old_reads) = measure(scope(&state, async {
+                    segment::documents(&store, seg, &selected).await.unwrap()
+                }))
+                .await;
+                let mut expected = bf_wal::NamespaceStats::default();
+                for doc in docs.values() {
+                    expected.rows += 1;
+                    expected.logical_bytes += serde_json::to_vec(doc).unwrap().len() as u64;
+                }
+                let (actual, new_reads) = measure(scope(&state, async {
+                    crate::statistics::rows(&store, seg, &selected, &state.schema, true)
+                        .await
+                        .unwrap()
+                }))
+                .await;
+                assert_eq!(
+                    (actual.rows, actual.logical_bytes),
+                    (expected.rows, expected.logical_bytes)
+                );
+                eprintln!(
+                    "IN1 sparse={sparse} rows={} old={old_reads:?} new={new_reads:?}",
+                    selected.len()
+                );
+            }
+        }
+    }
+}
+
+async fn measure<T>(
+    fut: impl std::future::Future<Output = T>,
+) -> (T, bf_storage::CacheStatsSnapshot) {
+    let ctx = read_cache::ReadContext::new(Arc::new(read_cache::DecodedCache::new(0, 1)));
+    let stats = ctx.stats.clone();
+    let out = read_cache::scope(ctx, fut).await;
+    (out, stats.snapshot())
 }

@@ -257,6 +257,8 @@ fn from_tiers<'a>(
 ) -> futures::future::BoxFuture<'a, TierResult> {
     // Keep the entire tier plan off caller stacks, including its graph-to-IVF retry.
     async move {
+        let t0 = std::time::Instant::now();
+        stage(t0, "tiers_start");
         let mut covered = vec![false; state.segments.len()];
         let mut positions = Vec::with_capacity(tiers.len());
         for set in tiers {
@@ -271,10 +273,12 @@ fn from_tiers<'a>(
             positions.push(at);
         }
         let uncovered = covered.iter().any(|c| !c);
+        stage(t0, "tiers_placement");
         let allowed = match q.filters.as_ref() {
             Some(filter) => Some(crate::ann_dir::live_masks(store, state, Some(filter)).await?),
             None => None,
         };
+        stage(t0, "tiers_filter_masks");
         // A base and its delta rank their leaves as one list.
         let graph_k = if state.shadowed.is_empty() {
             k
@@ -576,10 +580,18 @@ async fn from_slabs(
     graph_expected: bool,
     declined: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+    let t0 = std::time::Instant::now();
+    stage(t0, "slabs_start");
     let mask = match allowed {
         Some(allowed) => Some(filtered_tier_mask(set, at, allowed)),
         None => tier_mask(store, state, set, at).await?,
     };
+    stage(t0, "slabs_mask");
+    if trace_stages()
+        && let Some(mask) = &mask
+    {
+        eprintln!("FILTER matching={}", mask.len());
+    }
     if mask.as_ref().is_some_and(|m| m.is_empty()) {
         return Ok(Some((BTreeMap::new(), BTreeMap::new())));
     }
@@ -628,6 +640,7 @@ async fn from_slabs(
                 .await
             };
             let mut view = state.without_docs();
+            stage(t0, "slabs_directory");
             view.segments = set.slabs.clone().into();
             let dir = match directory {
                 Ok((dir, _))
@@ -648,6 +661,7 @@ async fn from_slabs(
             } else {
                 None
             };
+            stage(t0, "slabs_memberships");
             let lives = match (&members, &mask) {
                 (Some(members), Some(global)) => members
                     .iter()
@@ -667,6 +681,7 @@ async fn from_slabs(
                     .collect(),
                 _ => vec![mask; view.segments.len()],
             };
+            stage(t0, "slabs_predicates");
 
             let warm = warm_eligible
                 .then(|| crate::warm_ann::WarmTier::for_tier(&set.dir.key, dir.clone()))

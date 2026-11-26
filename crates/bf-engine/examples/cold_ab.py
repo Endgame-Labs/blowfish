@@ -23,6 +23,8 @@ Use --stage-live-queries to measure cache-cold queries during first preparation;
 compare the same query IDs across arms, since faster staging can finish sooner.
 Use --paired-projections to measure IDs-only and title/text requests in every
 group, with independent cache drops, and separate projection summaries.
+Use --filters for a filtered workload and --truth-key for its oracle array
+(for example, selective_ids). Filtered recall is omitted without matching truth.
 Outputs, traces, and temporary storage configuration stay under --scratch. Cache
 files are removed on exit. Summarize the results, and remove the run directory
 when the experiment ends.
@@ -51,6 +53,8 @@ P.add_argument("--probes", type=int, default=64)
 P.add_argument("--label", required=True)
 P.add_argument("--binary", required=True)
 P.add_argument("--config", type=Path, required=True)
+P.add_argument("--filters", type=json.loads, help="JSON filter applied to every measured query")
+P.add_argument("--truth-key", help="oracle array containing exact IDs for this filter")
 P.add_argument("--scratch", type=Path, required=True)
 P.add_argument("--port", type=int, default=8400)
 P.add_argument(
@@ -78,8 +82,8 @@ P.add_argument(
     help="staging arm that publishes codes first and companions after (Round C9 and later)",
 )
 P.add_argument("--stage-timeout", type=int, default=600, help="seconds to wait for staging to publish")
-P.add_argument("--block-size", type=int, default=4000, help="cache block bytes (production: 1048576)")
-P.add_argument("--coalesce-blocks", type=int, default=512, help="max coalesced blocks per GET (production: 8)")
+P.add_argument("--block-size", type=int, default=4000, help="cache block bytes (production: 262144)")
+P.add_argument("--coalesce-blocks", type=int, default=512, help="max coalesced blocks per GET (production: 32)")
 P.add_argument(
     "--keep-cache",
     type=Path,
@@ -124,14 +128,18 @@ if a.nq_data:
     }
 else:
     truth = np.load(ROOT / f"bench/scale/data/oracle-{a.oracle}.npz")
+truth_key = a.truth_key or ("ann_ids" if a.filters is None else None)
+if truth_key is not None and truth_key not in truth:
+    P.error(f"oracle has no {truth_key!r} truth array")
 items = [
     {
         "query_id": i,
-        "truth": truth["ann_ids"][i].tolist(),
+        "truth": truth[truth_key][i].tolist() if truth_key else None,
         "request": {
             "rank_by": ["vector", "ANN", truth["vector"][i].astype("f4").tolist()],
             "top_k": 10,
             "consistency": {"level": "strong"},
+            **({"filters": a.filters} if a.filters is not None else {}),
             **({"include_attributes": ["id"]} if a.nq_data else {}),
             **({"include_attributes": a.include_attributes} if a.include_attributes is not None else {}),
         },
@@ -167,6 +175,9 @@ def stats(client):
             op = re.search(r'(?:op|outcome)="([^"]+)"', m[2])[1]
             key = m[1] + "_" + op
             out[key] = out.get(key, 0) + float(m[3])
+    # Round C27: slab row-map reconstructions (published maps keep this at zero).
+    rebuilds = re.findall(r"^blowfish_ann_row_map_rebuilds_total\{.*\} (\S+)$", text, re.MULTILINE)
+    out["rowmap_rebuilds"] = sum(float(v) for v in rebuilds)
     return out
 
 
@@ -234,6 +245,7 @@ def trace_summary(log):
             waves += 1
         active_until = max(active_until or end, end)
     return {
+        "filter_matching": [int(n) for n in re.findall(r"^FILTER matching=(\d+)$", log, re.MULTILINE)],
         "read_waves": waves,
         "read_bytes_by_kind": kinds,
         "stage_us": stages,
@@ -419,7 +431,8 @@ def query(name, item, client, work, proc):
         "q": item["query_id"],
         "ms": ms,
         "request_start_us": request_start_us,
-        "recall": len(set(map(int, got)) & set(item["truth"])) / 10,
+        "recall": len(set(map(int, got)) & set(item["truth"])) / 10
+        if item["truth"] is not None else None,
         "ids": got,
         "distances": [r.get("$dist") for r in res.get("rows", [])],
         "documents": res.get("rows", []),
@@ -430,6 +443,7 @@ def query(name, item, client, work, proc):
             delta.get("requests_" + op, 0) for op in ["get", "get_range"]
         ),
         "hedges": delta.get("hedges_issued", 0),
+        "rowmap_rebuilds": delta.get("rowmap_rebuilds", 0),
         "bytes": sum(delta.get("bytes_" + op, 0) for op in ["get", "get_range"]),
         **trace_summary(log),
     }

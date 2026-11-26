@@ -1,139 +1,52 @@
 //! Compact, disposable Vamana construction. Two passes, with reciprocal robust pruning.
 //! Locks protect only adjacency; a search copies one list before releasing its read lock.
-use super::quant::Codes;
+//! Construction searches with the same beam core as serving, and prunes from the distances
+//! that search already computed.
+use super::{
+    navigation::{Hit, Scratch},
+    quant::Codes,
+};
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use std::{
-    cmp::{Ordering, Reverse},
-    collections::BinaryHeap,
-};
-#[derive(Clone, Copy, Debug)]
-struct Hit {
-    id: u32,
-    distance: f32,
+
+/// Reusable per-thread construction state. Nothing here allocates after warm-up.
+struct Work {
+    search: Scratch,
+    /// Nodes the last search expanded, then their exact distances from the point being inserted.
+    expanded: Vec<Hit>,
+    /// Candidate pool being pruned, sorted by distance from the center.
+    pool: Vec<Hit>,
+    picked: Vec<u32>,
+    /// A copy of the point's new neighbors, which receive reverse edges while `picked` is reused.
+    targets: Vec<u32>,
 }
-impl PartialEq for Hit {
-    fn eq(&self, o: &Self) -> bool {
-        self.cmp(o) == Ordering::Equal
-    }
-}
-impl Eq for Hit {}
-impl PartialOrd for Hit {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for Hit {
-    fn cmp(&self, o: &Self) -> Ordering {
-        self.distance
-            .total_cmp(&o.distance)
-            .then(self.id.cmp(&o.id))
-    }
-}
-struct Scratch {
-    marks: Vec<u8>,
-    generation: u8,
-    frontier: BinaryHeap<Reverse<Hit>>,
-    nearest: BinaryHeap<Hit>,
-}
-impl Scratch {
+impl Work {
     fn new(n: usize) -> Self {
         Self {
-            marks: vec![0; n],
-            generation: 0,
-            frontier: BinaryHeap::new(),
-            nearest: BinaryHeap::new(),
+            search: Scratch::new(n),
+            expanded: Vec::with_capacity(256),
+            pool: Vec::with_capacity(256),
+            picked: Vec::with_capacity(DEGREE * 2),
+            targets: Vec::with_capacity(DEGREE * 2),
         }
     }
-    fn visit(&mut self, id: u32) -> bool {
-        let p = &mut self.marks[id as usize];
-        if *p == self.generation {
-            false
-        } else {
-            *p = self.generation;
-            true
+    /// Robust-prune `self.pool` (distances already measured from `center`) into `self.picked`.
+    fn prune(&mut self, v: &Codes, center: u32, degree: usize, alpha: f32) {
+        self.pool.retain(|p| p.id != center);
+        self.pool.sort_unstable();
+        self.picked.clear();
+        while !self.pool.is_empty() && self.picked.len() < degree {
+            let picked = self.pool[0];
+            self.picked.push(picked.id);
+            self.pool
+                .retain(|p| p.id != picked.id && alpha * v.between(picked.id, p.id) > p.distance);
         }
     }
-    fn search(
-        &mut self,
-        v: &Codes,
-        links: &[RwLock<Neighbors>],
-        entry: u32,
-        q: u32,
-        beam: usize,
-    ) -> Vec<u32> {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.marks.fill(0);
-            self.generation = 1;
-        }
-        self.frontier.clear();
-        self.nearest.clear();
-        self.visit(entry);
-        let start = Hit {
-            id: entry,
-            distance: v.between(q, entry),
-        };
-        self.frontier.push(Reverse(start));
-        self.nearest.push(start);
-        let mut expanded = Vec::with_capacity(beam * 2);
-        while let Some(Reverse(current)) = self.frontier.pop() {
-            if self.nearest.len() >= beam && current > *self.nearest.peek().unwrap() {
-                break;
-            }
-            expanded.push(current.id);
-            let neighbors = *links[current.id as usize].read();
-            for &id in neighbors.as_slice() {
-                if !self.visit(id) {
-                    continue;
-                }
-                let h = Hit {
-                    id,
-                    distance: v.between(q, id),
-                };
-                if self.nearest.len() < beam || h < *self.nearest.peek().unwrap() {
-                    self.frontier.push(Reverse(h));
-                    self.nearest.push(h);
-                    if self.nearest.len() > beam {
-                        self.nearest.pop();
-                    }
-                    if self.frontier.len() > beam * 4 {
-                        let threshold = *self.nearest.peek().unwrap();
-                        self.frontier.retain(|h| h.0 <= threshold);
-                    }
-                }
-            }
-        }
-        expanded
-    }
-}
-pub fn prune(
-    center: u32,
-    mut candidates: Vec<u32>,
-    degree: usize,
-    alpha: f32,
-    mut distance: impl FnMut(u32, u32) -> f32,
-) -> Vec<u32> {
-    candidates.sort_unstable();
-    candidates.dedup();
-    candidates.retain(|p| *p != center);
-    let mut pool = candidates
-        .into_iter()
-        .map(|id| Hit {
-            id,
-            distance: distance(center, id),
-        })
-        .collect::<Vec<_>>();
-    pool.sort_unstable();
-    let mut out = Vec::with_capacity(degree);
-    while !pool.is_empty() && out.len() < degree {
-        let picked = pool[0];
-        out.push(picked.id);
-        pool.retain(|p| p.id != picked.id && alpha * distance(picked.id, p.id) > p.distance);
-    }
-    out
 }
 pub(super) const DEGREE: usize = 32;
+/// Construction beam width, steered by one-bit Hamming distance. Round GB1 measured this
+/// matching or beating exact SQ8 steering at the same width on recall, with far fewer row reads.
+const BEAM: usize = 64;
 #[derive(Clone, Copy)]
 pub(super) struct Neighbors {
     ids: [u32; DEGREE * 2],
@@ -163,10 +76,12 @@ impl Neighbors {
 /// Include worst-case search/prune vectors, including geometrically grown capacities.
 pub(super) fn reservation(rows: u64, padded: u64, queries: u64) -> Option<u64> {
     let lock = std::mem::size_of::<RwLock<Neighbors>>() as u64;
-    // Codes/scales, row coordinates, insertion permutation, and two construction scratch sets.
-    // Each scratch set permits byte marks, expanded IDs, candidate IDs, and scored prune pools.
-    let building = padded.checked_add(lock)?.checked_add(16 + 2 * 40)?;
-    // Old construction adjacency and the final compact representation coexist during conversion.
+    // Codes/scales, row coordinates, insertion permutation, two construction scratch sets, and
+    // one-bit navigation codes. Each scratch set permits a visitation bitset and short vectors.
+    let building = padded
+        .checked_add(lock)?
+        .checked_add(16 + 2 * 40)?
+        .checked_add(padded.div_ceil(8).next_multiple_of(8))?;
     let publication = padded.checked_add(lock)?.checked_add(4 + 4 + 4 + 136 + 1)?;
     let retained = padded.checked_add(4 + 4 + 4 + 136 + 1)?;
     let construction = rows
@@ -184,7 +99,6 @@ pub fn build(
 ) -> crate::Result<Vec<RwLock<Neighbors>>> {
     let n = v.scales.len();
     let degree = DEGREE.min(n.saturating_sub(1));
-    let beam = 64;
     let mut links = Vec::with_capacity(n);
     for i in 0..n {
         super::check(cancelled)?;
@@ -212,22 +126,61 @@ pub fn build(
         seed ^= seed << 17;
         ids.swap(i, seed as usize % (i + 1));
     }
+    let bits = super::binary::Bits::new(v, cancelled)?;
     for alpha in [1., 1.2] {
         ids.par_iter().for_each_init(
-            || Scratch::new(n),
-            |s, &point| {
+            || Work::new(n),
+            |w, &point| {
                 if cancelled() {
                     return;
                 }
-                let mut candidates = s.search(v, &links, entry, point, beam);
-                let neighbors = {
-                    let mut current = links[point as usize].write();
-                    candidates.extend(current.as_slice().iter().copied());
-                    let neighbors = prune(point, candidates, degree, alpha, |a, b| v.between(a, b));
-                    current.replace(&neighbors);
-                    neighbors
-                };
-                for neighbor in neighbors {
+                w.expanded.clear();
+                let Work {
+                    search, expanded, ..
+                } = w;
+                let own = bits.row(point);
+                search.search_with(
+                    |id, out| {
+                        let row = links[id as usize].read();
+                        let row = row.as_slice();
+                        out[..row.len()].copy_from_slice(row);
+                        row.len()
+                    },
+                    entry,
+                    BEAM,
+                    |id| bits.distance(own, id),
+                    |id| bits.prefetch(id),
+                    |hit| expanded.push(hit),
+                );
+                // Steering used Hamming distance; the prune test needs true distances. Only the
+                // expanded nodes are measured, a small fraction of everything the search scored.
+                for i in 0..w.expanded.len() {
+                    if let Some(next) = w.expanded.get(i + 4) {
+                        v.prefetch(next.id);
+                    }
+                    let id = w.expanded[i].id;
+                    w.expanded[i].distance = v.between(point, id);
+                }
+                let mut current = links[point as usize].write();
+                // Candidates are unique, so only current neighbors they miss cost another score.
+                w.pool.clear();
+                w.pool.extend_from_slice(&w.expanded);
+                w.expanded.sort_unstable_by_key(|h| h.id);
+                for &id in current.as_slice() {
+                    if w.expanded.binary_search_by_key(&id, |h| h.id).is_err() {
+                        w.pool.push(Hit {
+                            id,
+                            distance: v.between(point, id),
+                        });
+                    }
+                }
+                w.prune(v, point, degree, alpha);
+                current.replace(&w.picked);
+                drop(current);
+                w.targets.clear();
+                w.targets.extend_from_slice(&w.picked);
+                for target in 0..w.targets.len() {
+                    let neighbor = w.targets[target];
                     let mut incoming = links[neighbor as usize].write();
                     if incoming.as_slice().contains(&point) {
                         continue;
@@ -235,31 +188,37 @@ pub fn build(
                     if incoming.as_slice().len() < degree * 2 {
                         incoming.push(point);
                     } else {
-                        let mut pool = incoming.as_slice().to_vec();
-                        pool.push(point);
-                        let pruned = prune(neighbor, pool, degree, alpha, |a, b| v.between(a, b));
-                        incoming.replace(&pruned);
+                        w.pool.clear();
+                        w.pool
+                            .extend(incoming.as_slice().iter().chain([&point]).map(|&id| Hit {
+                                id,
+                                distance: v.between(neighbor, id),
+                            }));
+                        w.prune(v, neighbor, degree, alpha);
+                        incoming.replace(&w.picked);
                     }
                 }
             },
         );
         super::check(cancelled)?;
-        links.par_iter().enumerate().for_each(|(point, row)| {
-            if cancelled() {
-                return;
-            }
-            let mut row = row.write();
-            if row.as_slice().len() > degree {
-                let pruned = prune(
-                    point as u32,
-                    row.as_slice().to_vec(),
-                    degree,
-                    alpha,
-                    |a, b| v.between(a, b),
-                );
-                row.replace(&pruned);
-            }
-        });
+        links.par_iter().enumerate().for_each_init(
+            || Work::new(0),
+            |w, (point, row)| {
+                if cancelled() {
+                    return;
+                }
+                let mut row = row.write();
+                if row.as_slice().len() > degree {
+                    w.pool.clear();
+                    w.pool.extend(row.as_slice().iter().map(|&id| Hit {
+                        id,
+                        distance: v.between(point as u32, id),
+                    }));
+                    w.prune(v, point as u32, degree, alpha);
+                    row.replace(&w.picked);
+                }
+            },
+        );
         super::check(cancelled)?;
     }
     Ok(links)
