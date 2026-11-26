@@ -11,7 +11,7 @@ query. Builds run in rotating rounds so every build sees the same host condition
 With --perf, also records a perf profile of the server for the first round's measured window.
 
 uv run crates/bf-engine/examples/conc_ab.py --config CONFIG --scratch .scratch/RUN --label L \
-    --builds '{"v050":"/path/bin","c24":"/path/bin","c24b":"/path/bin"}' --clients 16 --queries 400 --rounds 3
+    --builds '{"v050":"/path/bin","c24b":{"bin":"/path/bin","block":262144,"coalesce":32}}' --clients 16 --queries 400 --rounds 3
 """
 
 import argparse, contextlib, json, os, re, shutil, subprocess, threading, time
@@ -65,11 +65,13 @@ def counters(client):
 def server(name, binary, port):
     work = RUN / name
     work.mkdir(exist_ok=True)
+    spec = binary if isinstance(binary, dict) else {"bin": binary}
+    binary = spec["bin"]
     storage = {
         "url": config["storage_url"], "region": config.get("region"),
         "endpoint": config.get("endpoint"), "profile": config.get("profile"), "read_only": True,
         "cache": {"memory_bytes": 64 * 2**20, "disk_bytes": 0, "disk_dir": str(work / "cache"),
-                  "block_size": 1048576, "max_coalesce_blocks": 8, "fetch_concurrency": 512},
+                  "block_size": spec.get("block", 1048576), "max_coalesce_blocks": spec.get("coalesce", 8), "fetch_concurrency": 512},
     }
     (work / "storage.local").write_text(json.dumps(storage))
     env = dict(os.environ, RAYON_NUM_THREADS="8", BF_DECODED_CACHE_BYTES=str(512 * 2**20), BF_ANN_NPROBE="64")

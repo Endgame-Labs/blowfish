@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.53] - 2026-11-26
+
+### Changed
+
+- **Cold S3 queries fetch far fewer bytes:** The range cache filled misses in 1 MiB blocks, so a cold 10M-row vector query fetched about 205 MB to use 42 MB. The default block is now 256 KiB, and up to 32 blocks (still 8 MiB) coalesce into one GET, so dense reads stay large while scattered reads stop dragging in whole megabytes. A block that is the whole response, or that the cache does not keep, now shares the response buffer instead of being copied. On 10M x 1024-d pure-S3 cold queries on same-region S3 at 16 concurrent clients, throughput went from 17.3 to 25.6 q/s (1.48x), server CPU per query from 335 to 224 ms, and p50 / p90 from 887 / 1,267 to 592 / 823 ms. A single client is 1.21x faster at p50. Warm repeat queries still hit the cache (about 3 percent more CPU). The defaults `storage.cache.block_size` and `storage.cache.max_coalesce_blocks` change accordingly; disk-cache entries from older releases are keyed by block size, so they are not reused and age out under the disk budget.
+
 ## [0.1.52] - 2026-11-26
 
 ### Changed
@@ -390,7 +396,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.52...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.53...HEAD
+[0.1.53]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.53
 [0.1.52]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.52
 [0.1.51]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.51
 [0.1.50]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.50
