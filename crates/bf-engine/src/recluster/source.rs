@@ -153,17 +153,34 @@ impl Source {
             }
         }
         let mut data = vec![0u8; rows.len() * width];
+        let (leaf_count, started) = (leaves.len(), std::time::Instant::now());
+        let mut read_rows = 0usize;
         let mut stream = futures::stream::iter(
             leaves
                 .into_iter()
                 .map(|(input, cluster, wanted)| self.leaf(input, cluster, wanted)),
         )
         .buffer_unordered(LEAVES_IN_FLIGHT);
-        while let Some((slots, packed)) = stream.try_next().await? {
+        while let Some((slots, packed, leaf_rows)) = stream.try_next().await? {
+            read_rows += leaf_rows;
             for (slot, bytes) in slots.into_iter().zip(packed.chunks_exact(width)) {
                 data[slot * width..(slot + 1) * width].copy_from_slice(bytes);
             }
         }
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            eprintln!(
+                "RD1 slab_read rows={} leaves={leaf_count} leaf_rows={read_rows} seconds={:.3}",
+                rows.len(),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        tracing::info!(
+            rows = rows.len(),
+            leaves = leaf_count,
+            leaf_rows = read_rows,
+            seconds = started.elapsed().as_secs_f64(),
+            "recluster: slab source read"
+        );
         Ok(data)
     }
 
@@ -173,7 +190,7 @@ impl Source {
         input: u32,
         cluster: u32,
         wanted: Wanted,
-    ) -> Result<(Vec<usize>, Vec<u8>), ApiError> {
+    ) -> Result<(Vec<usize>, Vec<u8>, usize), ApiError> {
         let mut attempt = 1;
         let (ids, bytes) = loop {
             let read = async {
@@ -223,7 +240,7 @@ impl Source {
                 packed.extend_from_slice(exact);
                 slots.push(slot);
             }
-            Ok((slots, packed))
+            Ok((slots, packed, ids.len()))
         })
         .await
         .map_err(segment::index_error)?

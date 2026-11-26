@@ -57,7 +57,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ..EngineConfig::from_env()
         },
     );
-    let before = fingerprint(&store, ns).await?;
+    // The fingerprint of an untouched copy is the same every time; RD1_SKIP_BEFORE reuses one.
+    let before = if std::env::var_os("RD1_SKIP_BEFORE").is_some() {
+        (String::new(), String::new(), 0)
+    } else {
+        fingerprint(&store, ns).await?
+    };
     eprintln!(
         "RD1 before rows={} keyed={} free={}",
         before.2, before.0, before.1

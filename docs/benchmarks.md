@@ -13788,3 +13788,60 @@ Profile of the final build at 16 clients (`perf`, DWARF): 48% self in `search_in
 CRC32 1.6%, per-term span building 2.5%, the remaining sorts 2.5%. The largest single line is the dense frequency byte read
 (`DenseFrequencies::get`, 7.5%), a cache miss on a 1 MiB array that a prefetch did not hide. Nothing is left that is
 obviously worth 8% on its own; reaching 1.3x would take a change in what is scored, not in how it is looped.
+
+## Round RD1: recluster with an 8-bit training spill, then exact vectors for output
+
+The recluster spill held every live vector at its stored precision (f16 at 1,024 dimensions: 2,048 bytes a row, 20.48 GB at
+10M rows). RD1 spills one byte per dimension instead (SQ8, an affine scale per dimension fitted on 256 evenly spaced source
+leaves, with a 10% margin and clipping). Training and assignment read the SQ8 copy. Once slab membership is known, each slab
+reads the exact stored bytes of its rows back from their source leaves (64 leaves in flight, the next slab's read overlapping
+the current build) and checks every vector against its spilled row: the leaf position must map back to the row (`Input::global`),
+and re-quantizing the fetched vector must reproduce the spilled bytes exactly. A failed leaf read is retried three times.
+The f16 spill is gone (one way, no setting). Code: `recluster/sq8.rs`, `recluster/source.rs`.
+
+### Kill test (1M NQ prefix, 6 cores): passed
+
+Each arm was a fresh server load of the first 1,000,000 NQ rows that reclustered itself (32 slabs); recall@10 is against the
+exact top 10 over all 3,452 queries.
+
+| Probes | f16 spill (v0.1.47) | SQ8 spill | Change |
+|---:|---:|---:|---:|
+| 16 | 0.8975 | 0.8988 | +0.0013 |
+| 64 | 0.9638 | 0.9642 | +0.0004 |
+
+Install was 60.95 s against 58.66 s. The two loads were separate, so per-row leaf assignments were not diffed.
+
+### 10M on one on-demand c7gd.4xlarge (16 vCPU, local NVMe): fails the install gate
+
+Source: a copy of the retained 10M tier (`tmp/c5/10m`, 55 slabs, 10,000,000 live rows), reclustered to 55 slabs and 15,611
+leaves. Both arms ran on the same instance, baseline first.
+
+| | Baseline (f16 spill) | SQ8 spill, first version | SQ8 spill, prefetch and 64 leaves |
+|---|---:|---:|---:|
+| Install seconds | 355.1 | 502.6 (1.42x) | **462.5 (1.30x)** |
+| Peak scratch allocated | 20.48 GB | 10.24 GB | **10.24 GB (0.50x)** |
+| Exposed source-read seconds | n/a | about 160 | 160.3 |
+| Copy stage seconds | 27.8 | 20.5 | 19.9 |
+| Leaf assignment seconds (both passes) | 179.8 | not recorded | 176.2 |
+
+- **Exported vectors are bit-identical.** A fingerprint (the sum of SHA-256 over every leaf row's stored bytes, with and without
+  its row ID) of the source tier equals the fingerprint of both new tiers: `d4dfd8f2d86017015021799bd15ae7f0` (keyed by row ID) and
+  `e2f71ee24147ba1ad1221dd1e517bb97` (vectors alone), over 10,000,000 rows.
+- **Why it is slow.** A slab's rows are scattered across the source leaves: a slab of 185,100 rows touched 4,057 source leaves
+  holding 2,668,398 rows, so each source leaf is read by about 12 slabs and the job reads about 14x the data (roughly 240 GB
+  for a 22 GB tier). The read is fast (about 1.1 to 1.6 GB/s), but it cannot hide behind slab builds that take about a second.
+  Fresh segments (the usual source) are clustered independently of the new cells, so they scatter at least as much.
+- **Recall at 10M** (200 oracle queries, paired, cold caches, base arm built by the f16 spill, candidate arm by SQ8):
+  recall@10 0.9700 against 0.9665 at 64 probes (difference -0.0035, standard error 0.0045), and 0.920 against 0.910 at
+  24 probes (-0.010, standard error 0.006). Two hundred queries cannot resolve 0.001, and both differences lean negative, so
+  this does not show the 0.001 bar met at 10M.
+
+Result: **not met at 10M.** Scratch (10.24 GB against the 15.75 GB bar) and exact vectors pass; install time (1.30x against 1.10x)
+fails, and recall is unproven. The kill test at 1M passed, so the quantization itself is not the problem: the cost is the
+source re-read. Getting under 1.10x would need the source read about 4x cheaper, which a memory-bounded gather cannot do while
+leaves scatter this way (batching G slabs still reads each leaf once per batch). A bucketed exact copy on local disk brings the
+scratch back to the baseline. One instance, one baseline run, and a second SQ8 run are all the timing there is; no run was
+repeated for the baseline.
+
+Cost: one c7gd.4xlarge, about 1.5 hours (about $1.1 compute), plus about 310 GB of temporary S3 copies, deleted.
+`examples/rd1_install.rs` times a recluster and prints the fingerprints.
