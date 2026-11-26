@@ -564,6 +564,20 @@ type ShadowCell = Arc<tokio::sync::OnceCell<Arc<RoaringBitmap>>>;
 static SHADOW_MASKS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, (TierMask, ShadowCell)>>,
 > = std::sync::LazyLock::new(Default::default);
+/// The newest resolved snapshot per tier and set of immutable segments: its shadowed IDs and the
+/// rows left. While the tail only grows, the next snapshot resolves just the IDs added since.
+type ShadowLatest = (TierMask, Arc<BTreeSet<Id>>, Arc<RoaringBitmap>);
+static SHADOW_LATEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ShadowLatest>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn same_mask(a: &TierMask, b: Option<&Arc<RoaringBitmap>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
 
 /// The rows the warm graph may return for this snapshot: the tier's live rows (`mask`, `None`
 /// for all) minus the rows the unindexed tail shadows (overwritten or deleted IDs). The graph
@@ -579,31 +593,23 @@ pub(crate) async fn graph_mask(
     if state.shadowed.is_empty() {
         return Ok(mask.cloned());
     }
-    let mut key = format!(
-        "{}|{}|{}|{}|{}|{:p}",
+    // Everything that fixes the immutable rows: the tier, its segments, and the tier mask.
+    let mut base = format!(
+        "{}|{}|{}|{:p}",
         set.dir.key,
-        state.seq,
-        state.indexed_through,
         state.manifest_seq,
-        state.shadowed.len(),
+        state.indexed_through,
         mask.map_or(std::ptr::null(), Arc::as_ptr)
     );
     for map in &at.maps {
-        key.push('|');
-        key.push_str(map);
+        base.push('|');
+        base.push_str(map);
     }
+    let key = format!("{base}|{}|{}", state.seq, state.shadowed.len());
     let cell = {
         let mut masks = SHADOW_MASKS.lock().unwrap_or_else(|e| e.into_inner());
         match masks.get(&key) {
-            Some((input, cell))
-                if match (input, mask) {
-                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                    (None, None) => true,
-                    _ => false,
-                } =>
-            {
-                cell.clone()
-            }
+            Some((input, cell)) if same_mask(input, mask) => cell.clone(),
             _ => {
                 // Older snapshots' entries are dropped wholesale; queries still holding one finish.
                 if masks.len() >= 64 {
@@ -616,18 +622,59 @@ pub(crate) async fn graph_mask(
         }
     };
     let live = cell
-        .get_or_try_init(|| shadow_free_rows(store, state, set, at, mask))
+        .get_or_try_init(|| async {
+            let previous = SHADOW_LATEST
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&base)
+                .filter(|(input, ids, _)| {
+                    same_mask(input, mask)
+                        && ids.len() <= state.shadowed.len()
+                        && ids.is_subset(&state.shadowed)
+                })
+                .map(|(_, ids, live)| (ids.clone(), live.clone()));
+            let live = shadow_free_rows(store, state, set, at, mask, previous).await?;
+            let mut latest = SHADOW_LATEST.lock().unwrap_or_else(|e| e.into_inner());
+            if latest.len() >= 16 {
+                latest.clear();
+            }
+            if latest
+                .get(&base)
+                .is_none_or(|(_, ids, _)| ids.len() <= state.shadowed.len())
+            {
+                latest.insert(
+                    base,
+                    (
+                        mask.cloned(),
+                        Arc::new(state.shadowed.clone()),
+                        live.clone(),
+                    ),
+                );
+            }
+            Ok::<_, ApiError>(live)
+        })
         .await?;
     Ok(Some(live.clone()))
 }
+/// The tier rows left once the shadowed IDs are hidden. With `previous` (an earlier snapshot's
+/// shadowed IDs, a subset of this one's, and its result) only the added IDs are looked up.
 async fn shadow_free_rows(
     store: &Storage,
     state: &NamespaceState,
     set: &bf_wal::SlabSet,
     at: &crate::lineage::Placement,
     mask: Option<&Arc<RoaringBitmap>>,
+    previous: Option<(Arc<BTreeSet<Id>>, Arc<RoaringBitmap>)>,
 ) -> Result<Arc<RoaringBitmap>, ApiError> {
     use crate::lineage::Place;
+    let added: BTreeSet<Id>;
+    let wanted = match &previous {
+        Some((ids, _)) => {
+            added = state.shadowed.difference(ids).cloned().collect();
+            &added
+        }
+        None => &state.shadowed,
+    };
     let positions: Vec<usize> = at
         .positions()
         .collect::<BTreeSet<_>>()
@@ -636,7 +683,7 @@ async fn shadow_free_rows(
     let found = futures::future::try_join_all(
         positions
             .iter()
-            .map(|i| segment::lookup_many(store, &state.segments[*i], &state.shadowed)),
+            .map(|i| segment::lookup_many(store, &state.segments[*i], wanted)),
     )
     .await?;
     let shadow_of = |i: usize| &found[positions.binary_search(&i).expect("looked up above")];
@@ -659,9 +706,10 @@ async fn shadow_free_rows(
             }
         }
     }
-    let mut live = match mask {
-        Some(m) => RoaringBitmap::clone(m),
-        None => {
+    let mut live = match (&previous, mask) {
+        (Some((_, live)), _) => RoaringBitmap::clone(live),
+        (None, Some(m)) => RoaringBitmap::clone(m),
+        (None, None) => {
             let mut all = RoaringBitmap::new();
             for c in &set.covered {
                 all.insert_range(c.base..c.base + c.rows);

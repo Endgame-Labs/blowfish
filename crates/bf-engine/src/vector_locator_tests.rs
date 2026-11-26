@@ -1840,49 +1840,65 @@ async fn graph_mask_hides_exactly_the_shadowed_tier_rows_in_place_and_after_line
             )
             .await
             .unwrap();
-        let (state, _) = engine
-            .snapshot("locator", &Consistency::Strong)
-            .await
-            .unwrap();
-        assert_eq!(!state.lineage.is_empty(), merged);
-        assert!(!state.shadowed.is_empty());
-        for set in &state.ann_tiers["vector"] {
-            let at = crate::lineage::place(&store, &state.segments, &state.lineage, set)
+        // The second stage adds shadowed IDs to the same tail: only those are resolved.
+        for stage in 0..2 {
+            if stage == 1 {
+                engine
+                .write(
+                    "locator",
+                    serde_json::from_value(json!({
+                        "deletes": [6],
+                        "upsert_rows": vec![100, 2500, 5000, 7].iter().map(|id| json!({"id": id, "category": 0, "vector": [3.0, 2.0, 1.0]})).collect::<Vec<_>>()
+                    }))
+                    .unwrap(),
+                )
                 .await
-                .unwrap()
                 .unwrap();
-            let mask = crate::ann::tier_mask(&store, &state, set, &at)
-                .await
-                .unwrap();
-            let got = crate::ann::graph_mask(&store, &state, set, &at, mask.as_ref())
-                .await
-                .unwrap()
-                .unwrap();
-            // The second call is the cached one.
-            let again = crate::ann::graph_mask(&store, &state, set, &at, mask.as_ref())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(Arc::ptr_eq(&got, &again));
-            let mut ids = BTreeMap::new();
-            for i in at.positions() {
-                ids.insert(i, segment::ids(&store, &state.segments[i]).await.unwrap());
             }
-            let mut expected = RoaringBitmap::new();
-            for c in &set.covered {
-                for row in c.base..c.base + c.rows {
-                    let Some((i, local)) = at.real(&set.covered, row) else {
-                        continue;
-                    };
-                    if mask.as_ref().is_none_or(|m| m.contains(row))
-                        && !state.shadowed.contains(&ids[&i][local as usize])
-                    {
-                        expected.insert(row);
+            let (state, _) = engine
+                .snapshot("locator", &Consistency::Strong)
+                .await
+                .unwrap();
+            assert_eq!(!state.lineage.is_empty(), merged);
+            assert!(!state.shadowed.is_empty());
+            for set in &state.ann_tiers["vector"] {
+                let at = crate::lineage::place(&store, &state.segments, &state.lineage, set)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mask = crate::ann::tier_mask(&store, &state, set, &at)
+                    .await
+                    .unwrap();
+                let got = crate::ann::graph_mask(&store, &state, set, &at, mask.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                // The second call is the cached one.
+                let again = crate::ann::graph_mask(&store, &state, set, &at, mask.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(Arc::ptr_eq(&got, &again));
+                let mut ids = BTreeMap::new();
+                for i in at.positions() {
+                    ids.insert(i, segment::ids(&store, &state.segments[i]).await.unwrap());
+                }
+                let mut expected = RoaringBitmap::new();
+                for c in &set.covered {
+                    for row in c.base..c.base + c.rows {
+                        let Some((i, local)) = at.real(&set.covered, row) else {
+                            continue;
+                        };
+                        if mask.as_ref().is_none_or(|m| m.contains(row))
+                            && !state.shadowed.contains(&ids[&i][local as usize])
+                        {
+                            expected.insert(row);
+                        }
                     }
                 }
+                assert_eq!(*got, expected, "merged={merged}");
+                assert!(got.len() < set.covered.iter().map(|c| u64::from(c.rows)).sum::<u64>());
             }
-            assert_eq!(*got, expected, "merged={merged}");
-            assert!(got.len() < set.covered.iter().map(|c| u64::from(c.rows)).sum::<u64>());
         }
     }
 }
