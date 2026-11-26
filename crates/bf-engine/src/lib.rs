@@ -900,11 +900,10 @@ impl Engine {
         Ok(response)
     }
     /// Rows a query may ask for and still run on the HTTP reactor: ten, or the graph's limit
-    /// when a ready graph will answer it (Round G12 item 1).
+    /// when a ready graph will answer it (a graph query costs the same CPU inline as on a worker,
+    /// without the hand-off between threads).
     fn inline_rows(&self, ns: &str, state: &NamespaceState, request: &QueryRequest) -> usize {
-        if bf_vector::g12_flags::on(bf_vector::g12_flags::INLINE_BIG)
-            && self.0.hot_graph.serves(ns, state, request)
-        {
+        if self.0.hot_graph.serves(ns, state, request) {
             100
         } else {
             10
@@ -1312,7 +1311,6 @@ impl Engine {
                     request,
                 ),
             );
-        let measure = warm_graph::measure_this_query();
         let state = state.clone();
         if crate::ann::trace_stages() {
             eprintln!("CLONE {}us", t_clone.elapsed().as_micros());
@@ -1332,7 +1330,6 @@ impl Engine {
             let _in_flight = InFlight::enter();
             warm_graph::measure_cpu(
                 context.cpu_nanos.clone(),
-                measure,
                 read_cache::scope(
                     context,
                     indexed::execute(&store, &state, &request, &config, false),

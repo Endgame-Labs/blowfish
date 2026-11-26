@@ -22,8 +22,6 @@ const RETRY: Duration = Duration::from_secs(1800);
 const RERANK: usize = 30;
 /// The largest `k + offset` the graph serves; larger requests use the IVF tier.
 const MAX_K: usize = 100;
-/// With CPU sampling on, one query in this many reads the thread CPU clock.
-const SAMPLE_EVERY: u64 = 16;
 
 /// Beam width and exact-rerank shortlist for a request of `k` rows, given the calibrated beam.
 ///
@@ -195,9 +193,9 @@ struct Entry {
     phase_cpu: [AtomicU64; 3],
     searches: AtomicU64,
     pending_cost: Mutex<cost::Pending>,
-    /// Round G12 item 5: the unsigned ID of every tier row (`u64::MAX` where the row has none
-    /// now), built once in the background by the first ID-only query. Absent when any ID is a
-    /// string, and until built, queries hydrate IDs from the documents as before.
+    /// The unsigned ID of every tier row (`u64::MAX` where a row has none now), built once in the
+    /// background by the first ID-only query. Absent when any ID is a string, and until built,
+    /// queries hydrate IDs from the documents.
     ids: std::sync::OnceLock<Vec<u64>>,
     ids_started: std::sync::atomic::AtomicBool,
 }
@@ -233,10 +231,7 @@ impl Heat {
             self.first = now;
         }
         self.rate = self.rate_at(now) + 1. / 900.;
-        self.ivf_seconds = if seconds <= 0. {
-            // A query whose CPU clock was not read (sampled out) carries no cost sample.
-            self.ivf_seconds
-        } else if self.ivf_seconds == 0. {
+        self.ivf_seconds = if self.ivf_seconds == 0. {
             seconds
         } else {
             self.ivf_seconds * 0.99 + seconds * 0.01
@@ -1080,7 +1075,6 @@ pub(crate) async fn search(
         return Ok(None);
     };
     if columns.is_empty()
-        && bf_vector::g12_flags::on(bf_vector::g12_flags::LATE_IDS)
         && entry.ids.get().is_none()
         && !entry.ids_started.swap(true, Ordering::AcqRel)
     {
@@ -1126,14 +1120,8 @@ async fn search_entry(
     entry: &Entry,
     ef: usize,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    let searches = entry.searches.fetch_add(1, Ordering::Relaxed);
-    // Phase counters read the thread CPU clock, a kernel call on macOS. With sampling on, one
-    // search in SAMPLE_EVERY is timed and its counters are scaled to stand for all of them.
-    let sampled = bf_vector::g12_flags::on(bf_vector::g12_flags::SAMPLED_CPU);
-    let timed = !sampled || searches % SAMPLE_EVERY == 0;
-    let weight = if sampled { SAMPLE_EVERY } else { 1 };
-    let cpu_now = || if timed { thread_cpu() } else { 0. };
-    let navigation_started = cpu_now();
+    entry.searches.fetch_add(1, Ordering::Relaxed);
+    let navigation_started = thread_cpu();
     #[cfg(all(test, target_os = "macos"))]
     let counter_started = nav_probe::begin();
     let scratch = entry
@@ -1166,12 +1154,10 @@ async fn search_entry(
     );
     #[cfg(not(all(test, target_os = "macos")))]
     let _ = evaluations;
-    if timed {
-        entry.phase_cpu[0].fetch_add(
-            ((thread_cpu() - navigation_started).max(0.) * 1e9) as u64 * weight,
-            Ordering::Relaxed,
-        );
-    }
+    entry.phase_cpu[0].fetch_add(
+        ((thread_cpu() - navigation_started).max(0.) * 1e9) as u64,
+        Ordering::Relaxed,
+    );
     let mut by_source: BTreeMap<usize, Vec<(usize, usize, bf_vector::CosineNorm)>> =
         BTreeMap::new();
     for (row, norm) in hits {
@@ -1185,7 +1171,6 @@ async fn search_entry(
     let prepared = CosineQuery::new(vector).map_err(segment::index_error)?;
     let mut exact = measure_phase(
         &entry.phase_cpu[1],
-        timed.then_some(weight),
         futures::future::try_join_all(by_source.into_iter().map(|(slab, locations)| {
             let prepared = &prepared;
             async move {
@@ -1206,7 +1191,6 @@ async fn search_entry(
         return Ok(None);
     }
     if columns.is_empty()
-        && bf_vector::g12_flags::on(bf_vector::g12_flags::LATE_IDS)
         && let Some(table) = entry.ids.get()
         && let Some(found) = ids_from_table(table, &exact, mask.as_deref(), set, at, k)
     {
@@ -1229,7 +1213,6 @@ async fn search_entry(
     for (i, rows) in by_segment {
         for (row, doc) in measure_phase(
             &entry.phase_cpu[2],
-            timed.then_some(weight),
             segment::projected_rows(store, &state.segments[i], &rows, Some(columns)),
         )
         .await?
@@ -1343,7 +1326,6 @@ pub(crate) async fn trial_plan(
     let query = Box::pin(async move {
         measure_cpu(
             context.cpu_nanos.clone(),
-            true,
             read_cache::scope(
                 context,
                 crate::indexed::execute(&store, &state, &request, &config, false),
@@ -1356,18 +1338,14 @@ pub(crate) async fn trial_plan(
 }
 fn measure_phase<F: std::future::Future>(
     cpu: &AtomicU64,
-    weight: Option<u64>,
     future: F,
 ) -> impl std::future::Future<Output = F::Output> {
     let mut future = Box::pin(future);
     std::future::poll_fn(move |cx| {
-        let Some(weight) = weight else {
-            return future.as_mut().poll(cx);
-        };
         let started = thread_cpu();
         let result = future.as_mut().poll(cx);
         cpu.fetch_add(
-            ((thread_cpu() - started).max(0.) * 1e9) as u64 * weight,
+            ((thread_cpu() - started).max(0.) * 1e9) as u64,
             Ordering::Relaxed,
         );
         result
@@ -1377,52 +1355,18 @@ fn measure_phase<F: std::future::Future>(
 /// Async waiting and migration between worker threads do not become query CPU time.
 pub(crate) fn measure_cpu<F: std::future::Future>(
     cpu: Arc<AtomicU64>,
-    enabled: bool,
     future: F,
 ) -> impl std::future::Future<Output = F::Output> {
     // Pin the large query plan on the heap before constructing the small poll wrapper. Keeping
     // both the input and a pin! local in an async fn doubles its debug-build stack footprint.
     let mut future = Box::pin(future);
     std::future::poll_fn(move |cx| {
-        if !enabled {
-            return future.as_mut().poll(cx);
-        }
         let started = thread_cpu();
         let result = future.as_mut().poll(cx);
         let elapsed = (thread_cpu() - started).max(0.);
         cpu.fetch_add((elapsed * 1e9) as u64, Ordering::Relaxed);
         result
     })
-}
-
-/// Whether this ordinary query reads the thread CPU clock: always, or one in `SAMPLE_EVERY`
-/// when sampling is on. Only warm-IVF cost estimates need it, and they converge from a sample.
-pub(crate) fn measure_this_query() -> bool {
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    !bf_vector::g12_flags::on(bf_vector::g12_flags::SAMPLED_CPU)
-        || COUNT.fetch_add(1, Ordering::Relaxed) % SAMPLE_EVERY == 0
-}
-
-/// Round G12: read experiment switches from the file named by `BF_G12_FLAGS` (a decimal
-/// bitmask) once a second, so one process can compare paths on the same promoted graph.
-fn start_flag_poller() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let Some(path) = std::env::var_os("BF_G12_FLAGS") else {
-            return;
-        };
-        std::thread::spawn(move || {
-            loop {
-                if let Some(bits) = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|t| t.trim().parse::<u32>().ok())
-                {
-                    bf_vector::g12_flags::FLAGS.store(bits, Ordering::Relaxed);
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        });
-    });
 }
 
 pub(crate) fn thread_cpu() -> f64 {
@@ -1448,7 +1392,6 @@ fn scratch_dir(engine: &Engine) -> std::path::PathBuf {
         .join("blowfish-warm-graph")
 }
 pub(crate) fn start(engine: &Engine) {
-    start_flag_poller();
     if let Err(error) = crate::recluster::spill::sweep(&scratch_dir(engine)) {
         tracing::debug!(%error, "warm graph spill recovery deferred");
     }

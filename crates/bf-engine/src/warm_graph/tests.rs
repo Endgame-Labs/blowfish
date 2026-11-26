@@ -237,69 +237,31 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         );
         assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
     }
-    // Round G12: each experiment switch, alone and all together, returns the same ordered rows
-    // and the same score bits as the old paths, for small and large result sets.
+    // Round G12: an ID-only query is answered from the resident row-to-ID table once the
+    // background build finishes, with the same ordered rows and score bits as IVF and as the
+    // document path (the first pass, before the table exists).
     {
-        use bf_vector::g12_flags::{FLAGS, on};
-        let bodies = |i: usize| {
-            [10, 100, 37].map(|k| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k,"include_attributes":["group"]}))
-        };
-        let id_bodies = |i: usize| {
-            [10, 100, 37, 1].map(|k| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k}))
-        };
-        FLAGS.store(0, Ordering::Relaxed);
-        let mut want = Vec::new();
+        let ids_only =
+            |i: usize, k: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k});
+        let mut first = Vec::new();
         for i in [17, 400, 1999] {
-            for body in bodies(i) {
-                want.push(query(&e, "hot", body).await);
+            for k in [10, 100, 37, 1] {
+                first.push(query(&e, "hot", ids_only(i, k)).await);
             }
         }
-        let mut want_ids = Vec::new();
+        let started = Instant::now();
+        while held.ids.get().is_none() && started.elapsed() < Duration::from_secs(30) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(held.ids.get().is_some(), "the ID table was never built");
+        let mut want = first.into_iter();
         for i in [17, 400, 1999] {
-            for body in id_bodies(i) {
-                want_ids.push(query(&e, "hot", body).await);
+            for k in [10, 100, 37, 1] {
+                let table = query(&e, "hot", ids_only(i, k)).await;
+                same_rows(want.next().unwrap(), table.clone());
+                same_rows(query(&control, "hot", ids_only(i, k)).await, table);
             }
         }
-        for flags in [1, 2, 4, 8, 16, 31] {
-            FLAGS.store(flags, Ordering::Relaxed);
-            assert_eq!(on(flags), flags != 0);
-            let mut got = Vec::new();
-            for i in [17, 400, 1999] {
-                for body in bodies(i) {
-                    got.push(query(&e, "hot", body).await);
-                }
-            }
-            for (a, b) in want.iter().zip(got) {
-                same_rows(a.clone(), b);
-            }
-            let ids_run = |e: &Engine| {
-                let e = e.clone();
-                async move {
-                    let mut got = Vec::new();
-                    for i in [17, 400, 1999] {
-                        for body in id_bodies(i) {
-                            got.push(query(&e, "hot", body).await);
-                        }
-                    }
-                    got
-                }
-            };
-            // The first ID-only query starts the background table build; wait for it, then
-            // compare again so both the document path and the table path are checked.
-            for pass in 0..2 {
-                if pass == 1 && flags & 16 != 0 {
-                    let started = Instant::now();
-                    while held.ids.get().is_none() && started.elapsed() < Duration::from_secs(30) {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    assert!(held.ids.get().is_some(), "the ID table was never built");
-                }
-                for (a, b) in want_ids.iter().zip(ids_run(&e).await) {
-                    same_rows(a.clone(), b);
-                }
-            }
-        }
-        FLAGS.store(0, Ordering::Relaxed);
     }
     for body in [
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
@@ -524,7 +486,7 @@ async fn migrated_query_polls_charge_cpu_without_charging_io_waits() {
     let cpu = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
     let name = crate::query_worker::run(
-        measure_cpu(cpu.clone(), true, async {
+        measure_cpu(cpu.clone(), async {
             tokio::time::sleep(Duration::from_millis(40)).await;
             std::thread::current()
                 .name()

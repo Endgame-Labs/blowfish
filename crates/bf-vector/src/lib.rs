@@ -39,7 +39,6 @@ pub use reader::RangeRead;
 #[cfg(feature = "legacy-fixtures")]
 pub use relayout::downgrade_layout;
 pub use relayout::{CodeLayout, code_layout, upgrade_layout};
-pub mod g12_flags;
 mod rabitq;
 pub use rabitq::{DistanceEstimate, RaBitQ, RaBitQCode};
 
