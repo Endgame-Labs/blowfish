@@ -13788,3 +13788,322 @@ Profile of the final build at 16 clients (`perf`, DWARF): 48% self in `search_in
 CRC32 1.6%, per-term span building 2.5%, the remaining sorts 2.5%. The largest single line is the dense frequency byte read
 (`DenseFrequencies::get`, 7.5%), a cache miss on a 1 MiB array that a prefetch did not hide. Nothing is left that is
 obviously worth 8% on its own; reaching 1.3x would take a change in what is scored, not in how it is looped.
+
+## Round C23: hydrate staged ANN winners without redundant document reads
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge in us-west-2, with Ubuntu 24.04
+arm64, Rust 1.100.0, Clang 19, and release `neoverse-v1` builds. Baseline is
+`a8335ed` (v0.1.46). Both builds use the same host, eight pinned CPUs, eight Rayon
+workers, probes64, strong consistency, top ten, and the read-only C18/C21 10M,
+1,024-dimensional, 55-slab fixture. Each staged process covers all 10M exact
+vectors. No fixture or bucket objects are changed.
+
+### Profile before changes
+
+Twelve cache-cold queries per profile, after staging, with engine caches cleared,
+and stage files fsynced and evicted with `POSIX_FADV_DONTNEED` before each query:
+
+| Projection and cache blocks | HTTP p50 / p90, ms | Attempted GETs p50 / p90 | Completed document GETs p50 / p90 | Document bytes p50 / p90, MB |
+|---|---:|---:|---:|---:|
+| IDs only, C21's 4,000 bytes | 33.84 / 88.27 | 3 / 3 | 0 / 0 | 0 / 0 |
+| `title`, `text`, 4,000 bytes | 159.41 / 181.05 | 72.5 / 92.1 | 61.5 / 78.8 | 2.392 / 2.791 |
+| `title`, `text`, production 1 MiB | 180.08 / 231.66 | 64.5 / 84.3 | 54.5 / 68.0 | 62.390 / 73.191 |
+
+The small IDs-only profile includes manifest outliers; these twelve queries are
+diagnostic, not the final latency gate. Every IDs-only query makes exactly three
+GETs and transfers 46,706 bytes, with zero remote document or vector bytes.
+Traces show one observed read wave for IDs-only, versus p50/p90 of two for both
+attribute profiles. These are disjoint time intervals of overlapping completed
+reads, not proof of a full dependency graph: local search precedes column reads,
+and the manifest/WAL reads can overlap that search.
+
+With 4,000-byte blocks, task setup takes 5.96 / 7.74 ms p50/p90, scanning after
+setup takes 15.80 / 17.29 ms, exact reranking takes 1.77 / 3.84 ms, and hydration
+after reranking takes 124.39 / 151.14 ms. With 1 MiB blocks, the corresponding
+phases take 5.91 / 7.87, 15.61 / 17.24, 2.16 / 3.63, and 147.14 / 200.32 ms.
+The phases use cumulative ANN trace endpoints and do not add to HTTP latency:
+the cold staged search overlaps manifest validation.
+
+The three hypotheses resolve as follows:
+
+- Large-block overfetch is real with production's 1 MiB cache blocks. Every
+  completed document GET is at least 1 MiB, with a maximum of 2 MiB. This does not
+  explain C21's 4,000-byte-block harness. Column-directory samples have roughly
+  6 KB median, 102 KB p90, and 234 KB maximum block lengths, larger than the
+  original 2–40 KiB assumption, but still much smaller than these GETs.
+- Attribute projections read the `id` column despite having a verified staged
+  row-to-ID map. Sample queries have 18–28 physical reads intersecting that
+  column. Only IDs-only projections previously used the map.
+- Traces show hydration for about 30 guessed rows in addition to ten exact
+  winners while the exact vectors are local. Many speculative document GETs
+  begin after the roughly 2 ms rerank has already ended. Fetch-permit contention
+  is not established: p50/p90 wait is zero, and maximum wait is 10 microseconds.
+  The measured problems are unnecessary requests, bytes, and hydration work.
+
+### Change and correctness
+
+Returned attribute blocks now use the existing sparse reader, with 16 KiB blocks
+capped by the configured cache block size. CRC validation, decoded-column caching,
+coalescing, and single-flight misses remain in use. Compact ID fallback blocks and
+dense maintenance scans retain ordinary coalescing: fragmenting the compact ID
+column into small requests regressed the unstaged median in an initial control.
+There is no new storage API, dependency, product setting, or format change.
+
+Verified staged row IDs now supply the mandatory ID for attribute projections.
+Missing, retired, corrupt, nonnumeric, or insufficient maps retain the ordinary
+ID-column fallback. IDs-only replies still avoid opening the document object
+when the map supplies every requested row.
+
+The final candidate pool no longer speculates on `3*k` unreranked attribute
+documents when staging covers its selected exact-vector extents. IDs-only local
+map prefetch remains, so those small local reads overlap the rerank. Remote
+reranks retain their original speculative reads and cancellation.
+
+For fully staged cold attribute queries, one leading prefix at one fifth of scan
+completion is reranked exactly, and at most `k` exact prefix winners are prefetched
+while the remaining scans are uncertain. Final winning segments hydrate concurrently
+under the existing fan-out policy when all their directories are staged. Warm and
+pure-S3 hydration dispatch keep their original selection. Results still come only
+from the final ordinary rerank and validated snapshot.
+
+Tests cover compressed and uncompressed attribute blocks, nulls, small GETs,
+warm cache reuse, CRC rejection, staged ID reuse, and retired-map fallback. A real
+100,000-row fixture crosses the streaming threshold, bounds top-one prefetch to
+one exact early winner plus the final winner, verifies local vector reads and
+remote fallback, and cancels pending hydration while checking read and query-permit
+release. The existing stalled nonwinning remote-prefetch test also passes.
+Initial regression tests fail against the original implementation for their intended
+causes. The final source has no retained experimental scheduling switch.
+
+### Controls that did not meet the requested bar
+
+Each experiment has 200 paired groups, four fresh processes started A/B/B/A,
+balanced query order, and both projections with independent cache drops. Numbers
+pool the two processes of each build, giving 400 replies per projection/build.
+Every request and outlier is retained.
+
+| Revision and blocks | Path/projection | Baseline p50 / p90, ms | Candidate p50 / p90, ms |
+|---|---|---:|---:|
+| Initial suppression, 4,000 bytes | Staged attributes | 72.444 / 105.147 | 77.330 / 126.052 |
+| | Staged IDs | 32.671 / 36.633 | 33.282 / 36.894 |
+| | Pure-S3 attributes | 203.094 / 264.211 | 207.099 / 256.575 |
+| | Pure-S3 IDs | 213.871 / 288.995 | 211.184 / 279.773 |
+| Source-exact suppression, 1 MiB | Staged attributes | 91.868 / 120.738 | 75.051 / 96.482 |
+| | Staged IDs | 32.700 / 36.641 | 33.256 / 37.156 |
+| | Pure-S3 attributes | 332.988 / 453.957 | 302.823 / 432.622 |
+| | Pure-S3 IDs | 291.143 / 446.471 | 305.599 / 435.150 |
+| One exact prefix, 4,000 bytes | Staged attributes | 69.892 / 90.402 | 65.605 / 79.100 |
+| | Staged IDs | 32.800 / 37.175 | 32.775 / 36.676 |
+| Three exact prefixes, 4,000 bytes | Staged attributes | 69.894 / 90.101 | 67.939 / 86.630 |
+| | Staged IDs | 32.631 / 36.484 | 32.566 / 36.035 |
+| Immediate prefix/CPU dispatch, 4,000 bytes | Staged attributes | 70.812 / 93.646 | 67.490 / 83.188 |
+| | Staged IDs | 32.593 / 36.436 | 32.689 / 36.800 |
+
+Blanket suppression cuts median attempted attribute GETs from about 66 to 15,
+and document bytes from about 2.26 MB to 0.68 MB, but delays actual winner GETs.
+Their first/last starts move from roughly 30.9/37.1 to 33.8/39.8 ms after HTTP
+entry. Reading and decoding each staged column directory costs about 1.3 ms:
+`try_join_all` polls this local work serially, whereas the old speculative tasks
+perform it concurrently. Suppressing IDs-only prefetch also moves cold local ID
+reads after, rather than alongside, vector reranking.
+
+The one-prefix refinement is the best measured scheduler. More prefixes and eager
+CPU dispatch did not beat it, so they are removed. All **11,200 measured replies**
+in these controls match ordered documents, exact f64 distance bits, and planned
+row counts; recall@10 is **0.9700** in every arm. The initial native build preceded
+a rustfmt-only initialization-line change; the production-block control was rebuilt
+from exact commit `c07046d`. The following final controls use the selected source.
+
+### Final selected-source controls
+
+These controls use implementation commit `c2bb6b9`. There are 400 samples per
+projection/build in each cohort, pooled across the two fresh processes. Processes
+start A/B/B/A; balanced per-group query order is rotated and reversed, rather than
+being a strict A/B/B/A schedule on every individual group. IDs and attributes have
+independent cache drops. The same immutable stage files are adopted through local
+hard links, with copied lock files removed before each startup; preparation is
+outside the timed interval. All staged arms have 59 files, 20,935,497,226 logical
+bytes, and 20,935,692,288 allocated bytes.
+
+| Blocks | Path/projection | Baseline p50 / p90, ms | Candidate p50 / p90, ms | Baseline/candidate p50 / p90 |
+|---|---|---:|---:|---:|
+| 4,000 bytes | Staged attributes | 70.651 / 93.614 | 67.185 / 94.104 | 1.052 / 0.995 |
+| 4,000 bytes | Staged IDs | 32.738 / 36.408 | 32.644 / 35.978 | 1.003 / 1.012 |
+| 1 MiB | Staged attributes | 92.662 / 128.279 | 66.509 / 93.904 | 1.393 / 1.366 |
+| 1 MiB | Staged IDs | 32.678 / 35.615 | 32.643 / 36.325 | 1.001 / 0.980 |
+| 4,000 bytes | Pure-S3 attributes | 204.788 / 253.112 | 202.740 / 252.342 | 1.010 / 1.003 |
+| 4,000 bytes | Pure-S3 IDs | 205.572 / 260.976 | 206.163 / 271.360 | 0.997 / 0.962 |
+| 1 MiB | Pure-S3 attributes | 337.077 / 447.481 | 311.772 / 443.115 | 1.081 / 1.010 |
+| 1 MiB | Pure-S3 IDs | 302.075 / 437.745 | 327.422 / 449.692 | 0.923 / 0.973 |
+
+**The full acceptance gate is not met.** Production-block staged attributes improve
+by 1.393x at p50 and 1.366x at p90. C21's tuned 4,000-byte configuration improves
+only 1.052x at p50, and its p90 is 0.5% slower. In this four-process cohort, production-block pure-S3 IDs are
+8.4% slower at p50 and 2.7% slower at p90. Restoring ordinary ID-column coalescing
+removed the earlier request-fragmentation issue, but did not establish the required
+latency nonregression. That final median difference is mainly in scanning
+(151.265 to 175.275 ms), before the hydration changes; its cause is unresolved in this cohort. The
+sixteen-process control below does not reproduce that regression.
+The candidate must not be presented as having passed all requested performance gates.
+
+For uncertainty, paired bootstrap resamples all four process results together for
+each query, 10,000 times with seed 23. These are percentile 95% intervals for
+**candidate/baseline** latency, so smaller is better:
+
+| Blocks | Path/projection | p50 ratio interval | p90 ratio interval |
+|---|---|---:|---:|
+| 4,000 bytes | Staged attributes | 0.937–0.961 | 0.905–1.071 |
+| 4,000 bytes | Staged IDs | 0.989–1.006 | 0.960–1.025 |
+| 1 MiB | Staged attributes | 0.686–0.737 | 0.680–0.847 |
+| 1 MiB | Staged IDs | 0.993–1.009 | 0.980–1.086 |
+| 4,000 bytes | Pure-S3 attributes | 0.969–1.021 | 0.955–1.033 |
+| 4,000 bytes | Pure-S3 IDs | 0.974–1.025 | 0.991–1.076 |
+| 1 MiB | Pure-S3 attributes | 0.854–1.022 | 0.934–1.021 |
+| 1 MiB | Pure-S3 IDs | 1.004–1.154 | 0.982–1.093 |
+
+The production-block attribute p90 point estimate clears 1.3x, but its bootstrap
+interval does not establish that improvement at 95% confidence. Staged IDs remain
+about 32.6 ms at p50, with exactly three GETs, 46,706 bytes, and one observed read
+wave. Their production-block p90 is 2.0% higher; its interval includes equality.
+
+| Staged attributes | Build | Attempted GETs p50 / p90 | Completed document GETs p50 / p90 | Document MB p50 / p90 | Hydration after rerank p50 / p90, ms |
+|---|---|---:|---:|---:|---:|
+| 4,000 bytes | Baseline | 65.500 / 87.000 | 58.500 / 81.000 | 2.252 / 3.157 | 37.599 / 60.562 |
+| 4,000 bytes | Candidate | 19.000 / 27.100 | 16.000 / 24.000 | 0.876 / 1.364 | 34.543 / 60.016 |
+| 1 MiB | Baseline | 55.500 / 82.000 | 50.000 / 70.000 | 56.623 / 80.740 | 59.922 / 94.062 |
+| 1 MiB | Candidate | 19.000 / 29.000 | 16.000 / 25.000 | 1.065 / 1.688 | 34.258 / 61.448 |
+
+Both staged attribute cohorts retain two observed read waves. The production
+candidate starts its first/last document GETs at medians 29.997/32.402 ms after
+HTTP entry, versus 30.804/34.773 ms for baseline. Reducing bytes does not remove
+the roughly 30 ms before these requests, or the remaining remote-read tail.
+The 4,000-byte candidate still transfers 0.876 MB median document bytes and
+spends 34.543 ms median in hydration, explaining why its already-small-block
+control has much less room to improve. No connection-contention claim is made.
+
+Across these first controls, **17,600 measured replies** match ordered documents, exact
+f64 distance bits, and planned row counts, including cross-replay comparisons.
+Recall@10 is 0.9700 in every arm. Package formatting, Clippy with warnings denied,
+and engine tests pass: **343 passed, zero failed, and 13 ignored across 35 suites**.
+The final debug workspace result is recorded in the worker report and completion
+message after the documentation commit.
+
+The release binary SHA-256 values are:
+
+```text
+baseline a8335ed: aaeb686c5b17d5846ed643d4982ef4556b9813a72f98ca57d9019e97a664daf9
+candidate c2bb6b9: 514a460da01a17338cc8c2ce814b8e5fa26252574a1bddd02643c2110230dab6
+```
+
+### Reproduction and cleanup
+
+Build the standalone `crates/bf-engine/examples/scale-server/Cargo.toml` in release
+mode at each commit, with the same native compiler, and retain separate binaries.
+Use `crates/bf-engine/examples/cold_ab.py` with `--oracle 10m --queries 200
+--paired-projections`, and these arms:
+
+```json
+{"baseA":{"BINARY":".scratch/c23/baseline"},"newA":{},"newB":{},"baseB":{"BINARY":".scratch/c23/baseline"}}
+```
+
+Set `--binary` to the candidate, and supply a private `--config`, a new `--label`,
+and `--scratch` under the repository scratch directory. For staged cohorts, pass
+`--stage-arm` and `--two-phase-arm` once for each of the four arms. For pure-S3,
+pass `--s3-only-arm` for each arm. Pin the client and inherited server to CPUs 0–7.
+The committed driver uses C21's 4,000-byte blocks and 512 coalesced blocks; the
+production replay changes only the harness cache construction to 1 MiB and eight
+coalesced blocks. The measured driver's seed adoption changes only untimed stage
+preparation. Reproductions without that seed should wait for complete fresh
+staging and verify footprint before timing. No product settings are added.
+
+The first host ran from 03:59:38 through no later than 05:43:28 UTC, at most
+1.731 hours. Compute is about $1.26 at the historical $0.7258/hour rate. Measured
+controls issued 2,280,374 attempted GETs (about $0.91 at $0.40/million), plus
+untimed setup, HEADs, and profiles; this is a usage estimate, not an invoice.
+The run remained within the $8 cap. The instance, root volume, key pair, and
+security group were deleted and verified absent. No bucket prefixes, fixture
+objects, or multipart uploads were created. No 100M claim is made.
+
+### Additional sixteen-process pure-S3 IDs control
+
+The four-process production-block IDs result above prompted a separate control
+on a new on-demand c7gd.4xlarge, with an additional $3 cap. Both native release
+binaries reproduce their earlier SHA-256 values exactly, ruling out a changed
+compiler output between the two hosts. Production source hashes also match
+`c2bb6b9`. The configuration, read-only fixture, 200-query set, eight pinned CPUs,
+Rayon worker count, probes64, strong consistency, top ten, and trace collection
+are unchanged. Only IDs-only queries with 1 MiB blocks and eight coalesced blocks
+are measured; there is no staging, and disk caching is disabled.
+
+Eight successive pairs each start a fresh baseline process followed by a fresh
+candidate process, giving sixteen server processes total in A/B/A/B startup order.
+Within each pair, the same 200 queries run in strict alternating AB/BA query order,
+with both engine caches cleared before every request. Both processes exit before
+the next pair starts. This yields 1,600 samples per build, and permits inspection
+of process-level connection-state variability rather than pooling only two
+processes per build. Preparation, native builds, and result compression occur
+outside timed queries.
+
+
+| Pair | Baseline p50 / p90, ms | Candidate p50 / p90, ms |
+|---|---:|---:|
+| 1 | 343.605 / 472.200 | 337.493 / 491.059 |
+| 2 | 359.106 / 509.553 | 349.559 / 497.923 |
+| 3 | 361.100 / 498.644 | 337.995 / 481.568 |
+| 4 | 346.776 / 459.634 | 329.571 / 459.769 |
+| 5 | 355.271 / 479.459 | 317.800 / 452.966 |
+| 6 | 302.140 / 445.657 | 333.044 / 447.688 |
+| 7 | 326.975 / 476.443 | 339.532 / 446.430 |
+| 8 | 313.184 / 453.606 | 335.988 / 462.422 |
+
+Pooled p50/p90 is **338.673 / 477.195 ms baseline**, versus
+**335.435 / 467.413 ms candidate**, or candidate/baseline ratios
+**0.990 / 0.980**. A hierarchical paired bootstrap
+resamples eight matched process pairs and then 200 matched queries within each
+selected pair, 10,000 times with seed 23. Its 95% candidate/baseline intervals are
+**0.9323–1.0546 at p50**, and **0.9488–1.0171 at p90**.
+A separate paired bootstrap of process-median geometric-mean ratios gives
+0.9479–1.0388.
+All three intervals include equality.
+
+Baseline process medians range from 302.140 to
+361.100 ms (range 58.960 ms,
+sample SD 22.061 ms). Candidate medians range from
+317.800 to 349.559 ms
+(range 31.759 ms, sample SD
+9.084 ms). Both ranges exceed the 3.238 ms
+pooled median difference. Candidate wins the first five pairs' medians, while
+baseline wins the last three. The original 8.4% median slowdown does not reproduce
+with these bit-identical binaries. This meets the coordinator's process-variability
+check; it does not prove a zero-margin performance guarantee in every environment.
+The original four-process measurement remains above rather than being discarded.
+
+The best-supported explanation is process-dependent slab-read tail variability:
+in the original cohort, 24.010 ms of a 25.347 ms HTTP median increase occurs during
+scanning. Per-query slowest slab GET medians are about 147–153 ms in the baseline
+processes, versus 160.5 and 188.5 ms in the candidate processes, with nearly
+unchanged bytes and individual GET medians. These timings precede the full rerank
+and hydration changes. The unstaged IDs-only path keeps its 40% early threshold,
+ordinary speculation, dense ID reader, and final hydration dispatcher. The traces
+and replication do not distinguish S3 service tails, connection state, and
+poll-scheduling effects; no specific transport cause is claimed as proven.
+
+All **3,200 additional replies** match the original host's ordered documents,
+exact f64 distance bits, and planned row counts. Together, **20,800 measured
+replies** match across all controls, and recall@10 remains 0.9700 in every arm.
+The **C21 4,000-byte 1.3x attribute target remains unmet**. Production-block
+attribute point estimates improve 1.393x/1.366x; the larger pure-S3 control does
+not establish a reproducible IDs-only slowdown. No new source change was made
+for this replication.
+
+The second host ran from 06:21:20 through no later than 06:47:53 UTC, at most
+0.4425 hours. Historical-rate compute is about
+$0.321; 742,646 timed attempted GETs
+add about $0.297 at $0.40/million, before setup, HEADs,
+and short-lived storage. This stays within the additional $3 cap. The instance,
+root volume, key pair, and security group were deleted and verified absent.
+Across both hosts, historical-rate compute plus all 3,023,020 recorded attempted
+GETs subtotal about **$2.786**, excluding those small untimed costs and
+shared retained-fixture storage. No fixture objects, bucket prefixes, or uploads
+were created. The final full-debug workspace result is recorded in the worker
+report on the final documentation commit.

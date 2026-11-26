@@ -1757,9 +1757,19 @@ pub(crate) async fn search(
         }
         let mut results: Vec<(Probed, Found)> = Vec::new();
         let mut launched = false;
+        let early_exact_docs = locally_staged
+            && context.as_ref().is_some_and(|c| c.cold)
+            && columns.iter().any(|name| name != "id")
+            && chosen.iter().all(|(&i, cs)| {
+                cs.iter()
+                    .map(|&n| entries[n].vectors_range().end)
+                    .max()
+                    .is_some_and(|end| crate::local_ann::covers(&dir.segments()[i].key, 0..end))
+            });
         while let Some(result) = scans.join_next().await {
             results.push(result.map_err(segment::index_error)??);
-            if !launched && results.len() * 5 >= count * 2 && !scans.is_empty() {
+            let ready_parts = if early_exact_docs { 1 } else { 2 };
+            if !launched && results.len() * 5 >= count * ready_parts && !scans.is_empty() {
                 launched = true;
                 let mut leading: Vec<_> = results
                     .iter()
@@ -1767,12 +1777,14 @@ pub(crate) async fn search(
                     .flat_map(|(n, (_, (_, found)))| found.iter().map(move |c| (n, c)))
                     .collect();
                 leading.sort_unstable_by(|a, b| a.1.distance.total_cmp(&b.1.distance));
-                // Staged batches leave a short overlap window. Read only their best vector
-                // guesses, and leave document guesses to the complete candidate set below.
+                // Local scans leave only a short overlap window. Rerank their best guesses
+                // exactly before prefetching at most k documents; the unfinished scans are
+                // the only remaining uncertainty. Remote reranks retain their ordinary plan.
                 let early_vectors = if locally_staged { 4 } else { 8 };
                 leading.truncate(k.saturating_mul(early_vectors).min(early_vectors * 10));
                 let mut locations: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
                 let mut rows: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
+                let mut real_rows = BTreeMap::new();
                 let docs_limit = if locally_staged {
                     0
                 } else {
@@ -1780,18 +1792,88 @@ pub(crate) async fn search(
                 };
                 for (rank, (n, c)) in leading.into_iter().enumerate() {
                     locations.entry(n).or_default().push((c.cluster, c.ordinal));
+                    if early_exact_docs && let Some(real) = to_real(results[n].0.segment, c.row) {
+                        real_rows.insert((n, c.row), real);
+                    }
                     if rank < docs_limit
                         && let Some((i, row)) = to_real(results[n].0.segment, c.row)
                     {
                         rows.entry(i).or_default().insert(row);
                     }
                 }
+                let mut exact = Vec::new();
                 for (n, locations) in locations {
                     let (index, vector, context) =
                         (results[n].0.index.clone(), vector.clone(), context.clone());
+                    if early_exact_docs {
+                        exact.push(
+                            async move {
+                                let hits = index
+                                    .rerank_candidates(&vector, k, locations)
+                                    .await
+                                    .map_err(segment::index_error)?;
+                                Ok(hits
+                                    .into_iter()
+                                    .map(|(row, distance)| (distance, n, row))
+                                    .collect::<Vec<_>>())
+                            }
+                            .boxed(),
+                        );
+                    } else {
+                        early.spawn(async move {
+                            let work = async move {
+                                let _ = index.rerank_candidates(&vector, k, locations).await;
+                            };
+                            match context {
+                                Some(context) => read_cache::scope(context, work).await,
+                                None => work.await,
+                            }
+                        });
+                    }
+                }
+                if early_exact_docs {
+                    let (store, segments, columns, context) = (
+                        store.clone(),
+                        docs_state.segments.clone(),
+                        columns.clone(),
+                        context.clone(),
+                    );
                     early.spawn(async move {
                         let work = async move {
-                            let _ = index.rerank_candidates(&vector, k, locations).await;
+                            let Ok(parts) = run_parallel(exact).await else {
+                                return;
+                            };
+                            let mut hits: Vec<_> = parts.into_iter().flatten().collect();
+                            hits.sort_unstable_by(|a, b| {
+                                a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+                            });
+                            hits.truncate(k);
+                            let mut rows: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
+                            for (_, n, row) in hits {
+                                if let Some(&(i, row)) = real_rows.get(&(n, row)) {
+                                    rows.entry(i).or_default().insert(row);
+                                }
+                            }
+                            if crate::ann::trace_stages() {
+                                eprintln!(
+                                    "EARLY_EXACT_DOCS rows={}",
+                                    rows.values().map(RoaringBitmap::len).sum::<u64>()
+                                );
+                            }
+                            crate::ann::stage(t0, "early exact documents");
+                            let tasks = rows
+                                .into_iter()
+                                .map(|(i, rows)| {
+                                    let (store, segment, columns) =
+                                        (store.clone(), segments[i].clone(), columns.clone());
+                                    async move {
+                                        segment::hydrated_rows(&store, &segment, &rows, &columns)
+                                            .await
+                                    }
+                                    .boxed()
+                                })
+                                .collect();
+                            let _ = run_parallel(tasks).await;
                         };
                         match context {
                             Some(context) => read_cache::scope(context, work).await,
@@ -1868,9 +1950,24 @@ pub(crate) async fn search(
     if crate::ann::trace_stages() {
         eprintln!("RERANK pool={} cap={rerank_cap}", pool.len());
     }
+    // A local exact rerank finishes before speculative document GETs can help. Check
+    // selected vector extents, independently of whether codes alone were staged, and
+    // reuse the same coverage decision for the cold rerank's worker dispatch below.
+    let local_rerank = {
+        let sources: BTreeSet<_> = pool.iter().map(|(n, _)| sources[*n]).collect();
+        sources.into_iter().all(|i| {
+            chosen
+                .get(&i)
+                .and_then(|cs| cs.iter().map(|&n| entries[n].vectors_range().end).max())
+                .is_some_and(|end| crate::local_ann::covers(&dir.segments()[i].key, 0..end))
+        })
+    };
     // Start reading the likeliest winners' documents while their vectors are reranked.
     let mut speculative: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
-    if !pool.is_empty() {
+    // ID-only prefetch warms the derived local map while vectors are reranked, and
+    // does not read document payloads when that map is available.
+    let speculate = !local_rerank || columns.iter().all(|name| name == "id");
+    if speculate && !pool.is_empty() {
         let mut best: Vec<&(usize, Candidate)> = pool.iter().collect();
         let keep = (k * 3).min(best.len());
         if best.len() > keep {
@@ -1884,9 +1981,11 @@ pub(crate) async fn search(
     }
     // Exactly scanned segments already know their best rows.
     winners.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for (_, i, row) in winners.iter().take(k * 2) {
-        if let Some((i, row)) = to_real(*i, *row) {
-            speculative.entry(i).or_default().insert(row);
+    if speculate {
+        for (_, i, row) in winners.iter().take(k * 2) {
+            if let Some((i, row)) = to_real(*i, *row) {
+                speculative.entry(i).or_default().insert(row);
+            }
         }
     }
     let mut by_segment: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
@@ -1902,18 +2001,7 @@ pub(crate) async fn search(
     let parallel_local = by_segment.len() > 1
         && crate::fan_out()
         && read_cache::context().is_some_and(|c| c.cold)
-        && {
-            // Streamed batches can install several partial indexes for one slab. Check
-            // each source once, through its last selected vector (the object footer is
-            // deliberately not staged, and is irrelevant to the rerank).
-            let sources: BTreeSet<_> = by_segment.keys().map(|&n| sources[n]).collect();
-            sources.into_iter().all(|i| {
-                chosen
-                    .get(&i)
-                    .and_then(|cs| cs.iter().map(|&n| entries[n].vectors_range().end).max())
-                    .is_some_and(|end| crate::local_ann::covers(&dir.segments()[i].key, 0..end))
-            })
-        };
+        && local_rerank;
     if parallel_local {
         crate::ann::stage(t0, "local rerank dispatched");
     }
@@ -2028,8 +2116,43 @@ async fn hydrate(
     for (_, i, row) in &winners {
         rows_by_segment.entry(*i).or_default().insert(*row);
     }
-    let mut hydrated: BTreeMap<(usize, u32), Document> = BTreeMap::new();
-    for (i, part) in
+    // Staged directory reads and decoding can complete without yielding. Polling all
+    // winning segments on one thread serialized that CPU work before their column GETs.
+    // Keep warm and remote plans unchanged, and use the existing fan-out policy here.
+    let parallel_local = rows_by_segment.len() > 1
+        && columns.iter().any(|name| name != "id")
+        && read_cache::context().is_some_and(|c| c.cold)
+        && rows_by_segment.keys().all(|&i| {
+            docs_state.segments[i]
+                .files
+                .get("docs")
+                .is_some_and(|file| {
+                    crate::local_ann::covers(
+                        &file.key,
+                        file.size.saturating_sub(file.metadata_len.max(65536))..file.size,
+                    )
+                })
+        });
+    let parts = if parallel_local {
+        let tasks = rows_by_segment
+            .into_iter()
+            .map(|(i, rows)| {
+                let (store, segment, columns) = (
+                    store.clone(),
+                    docs_state.segments[i].clone(),
+                    columns.clone(),
+                );
+                async move {
+                    Ok((
+                        i,
+                        segment::hydrated_rows(&store, &segment, &rows, &columns).await?,
+                    ))
+                }
+                .boxed()
+            })
+            .collect();
+        run_parallel(tasks).await?
+    } else {
         futures::future::try_join_all(rows_by_segment.iter().map(|(&i, rows)| async move {
             Ok::<_, ApiError>((
                 i,
@@ -2037,7 +2160,9 @@ async fn hydrate(
             ))
         }))
         .await?
-    {
+    };
+    let mut hydrated: BTreeMap<(usize, u32), Document> = BTreeMap::new();
+    for (i, part) in parts {
         hydrated.extend(part.into_iter().map(|(row, doc)| ((i, row), doc)));
     }
     let mut ranked = Vec::with_capacity(winners.len());

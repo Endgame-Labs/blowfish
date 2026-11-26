@@ -3438,6 +3438,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn projected_attributes_reuse_staged_ids_and_fall_back_when_the_map_is_retired() {
+        let work = scratch();
+        let manager = Manager::open(work.path(), Some(64 << 20), Arc::default()).unwrap();
+        let (store, set, _, _) = fixture(47).await;
+        let schema = serde_json::from_value(serde_json::json!({
+            "id": {"type": "uint"}, "title": {"type": "string"}
+        }))
+        .unwrap();
+        let docs = (0..2048u64)
+            .map(|n| {
+                let id = n * 7 + 3;
+                (
+                    bf_types::Id::Uint(id),
+                    serde_json::from_value(
+                        serde_json::json!({"id":id, "title":format!("title {n}")}),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, bf_types::Document>>();
+        let segment = crate::segment::build_with(
+            &store,
+            "test",
+            &schema,
+            bf_types::DistanceMetric::CosineDistance,
+            &docs,
+            Default::default(),
+            0,
+            1,
+        )
+        .await
+        .unwrap();
+        let extras = vec![Extra {
+            file: segment.files["ids"].clone(),
+            kind: ExtraKind::NumericIds(2048),
+        }];
+        manager.observe(&store, "", &set, 32, 16, &|| extras.clone());
+        let _main = ready(&manager, "", &set).await;
+        let pack = companion_stage(&manager, &set).await;
+        let mut cache = read_cache::DecodedCache::new(8 << 20, 1);
+        cache.staging = Some(manager);
+        let cache = Arc::new(cache);
+        let context = read_cache::ReadContext::new(cache.clone());
+        let rows = roaring::RoaringBitmap::from_iter([0, 1024, 2047]);
+        let columns =
+            std::collections::BTreeSet::from(["id".into(), "title".into(), "absent".into()]);
+        let expected = crate::segment::hydrated_rows(&store, &segment, &rows, &columns)
+            .await
+            .unwrap();
+        let got = read_cache::scope(
+            context.clone(),
+            crate::segment::hydrated_rows(&store, &segment, &rows, &columns),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, expected);
+        for block in [0, 4, 7] {
+            assert!(
+                cache
+                    .column(&format!("{}#id#{block}", segment.files["docs"].key))
+                    .is_none(),
+                "the ID column was decoded despite a verified staged map"
+            );
+        }
+        pack.bad.store(true, Ordering::Release);
+        cache.clear();
+        let fallback = read_cache::scope(
+            context,
+            crate::segment::hydrated_rows(&store, &segment, &rows, &columns),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fallback, expected);
+        for block in [0, 4, 7] {
+            assert!(
+                cache
+                    .column(&format!("{}#id#{block}", segment.files["docs"].key))
+                    .is_some(),
+                "a retired map must read the authoritative ID column"
+            );
+        }
+    }
+
     async fn companion_stage(manager: &Arc<Manager>, set: &SlabSet) -> Arc<Stage> {
         let key = stage_key("", &set.dir.key, true);
         tokio::time::timeout(Duration::from_secs(10), async {

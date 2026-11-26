@@ -21,6 +21,8 @@ records its first query and provisioning cost, waits for publication, and evicts
 the staged files from the filesystem page cache before every measured query.
 Use --stage-live-queries to measure cache-cold queries during first preparation;
 compare the same query IDs across arms, since faster staging can finish sooner.
+Use --paired-projections to measure IDs-only and title/text requests in every
+group, with independent cache drops, and separate projection summaries.
 Outputs, traces, and temporary storage configuration stay under --scratch. Cache
 files are removed on exit. Summarize the results, and remove the run directory
 when the experiment ends.
@@ -83,11 +85,18 @@ P.add_argument(
     help='JSON include_attributes value, for example false or ["title", "text"]',
 )
 P.add_argument(
+    "--paired-projections",
+    action="store_true",
+    help="measure both default IDs-only and title/text projections in every cold query group",
+)
+P.add_argument(
     "--nq-data",
     type=Path,
     help="prepared NQ queries.npy and truth.npy instead of the scale oracle",
 )
 a = P.parse_args()
+if a.paired_projections and a.include_attributes is not None:
+    P.error("paired projections supply their own include_attributes values")
 signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(143)))
 ROOT = Path(__file__).resolve().parents[3]
 RUN = (a.scratch / a.label).resolve()
@@ -378,6 +387,10 @@ def query(name, item, client, work, proc):
     row = {
         "ann_rows_scanned": sum(map(int, planned)) if planned else None,
         "arm": name,
+        **(
+            {"projection": "attrs" if item["request"].get("include_attributes") == ["title", "text"] else "ids"}
+            if a.paired_projections else {}
+        ),
         "q": item["query_id"],
         "ms": ms,
         "request_start_us": request_start_us,
@@ -451,21 +464,36 @@ try:
             # appears in each order equally often. Two arms retain strict AB/BA order.
             if len(names) > 2 and (qi // len(names)) % 2:
                 names.reverse()
-            for name in names:
+            for name, attrs in [
+                (name, attrs)
+                for name in names
+                for attrs in ((False, True) if a.paired_projections else (False,))
+            ]:
+                item = dict(items[qi])
+                item["request"] = dict(item["request"])
+                if attrs:
+                    item["request"]["include_attributes"] = ["title", "text"]
                 if a.mode == "cachecold":
                     c, w, p = servers[name]
                     c.post("/_bench/drop_caches").raise_for_status()
                     if name in a.stage_arm:
                         evict_staging(w)
                     (w / "server.log").write_text("")
-                    query(name, items[qi], c, w, p)
+                    query(name, item, c, w, p)
                 else:
                     with server(name, list(arms).index(name)) as (c, w, p):
-                        query(name, items[qi], c, w, p)
+                        query(name, item, c, w, p)
     summary = {}
-    for name in arms:
-        part = [r for r in rows if r["arm"] == name]
-        summary[name] = {
+    for name, projection in [
+        (name, projection)
+        for name in arms
+        for projection in (("ids", "attrs") if a.paired_projections else (None,))
+    ]:
+        part = [
+            r for r in rows
+            if r["arm"] == name and (projection is None or r["projection"] == projection)
+        ]
+        summary[name if projection is None else f"{name}/{projection}"] = {
             "n": len(part),
             "p50": float(np.percentile([r["ms"] for r in part], 50)),
             "p90": float(np.percentile([r["ms"] for r in part], 90)),
