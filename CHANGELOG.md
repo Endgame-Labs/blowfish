@@ -4,6 +4,13 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.44] - 2026-11-26
+
+### Changed
+
+- **Cold queries read pending writes in parallel:** A strong-consistency query on a cold node fetched each committed but not yet indexed write payload one at a time. With 32 such payloads in S3, cold p50 was about 1,013 ms, about 800 ms of it in serial fetches. Payloads are now fetched concurrently and applied strictly in WAL order: the same case takes about 300 ms (3.2x faster), with identical results, and empty or small WAL tails are unchanged.
+- **The concurrency is bounded by bytes:** At most 8 payloads and 64 MiB of stored payload bytes are in flight. A larger payload still proceeds, alone. New commit records carry their payload's stored size. Records from older releases have no size and are fetched one at a time. With 8 payloads of 64 MiB each, peak memory is 397 MiB, down from 720 MiB with a count-only bound. Older binaries ignore the new field.
+
 ## [0.1.43] - 2026-11-26
 
 ### Fixed
@@ -327,7 +334,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.43...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.44...HEAD
+[0.1.44]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.44
 [0.1.43]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.43
 [0.1.42]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.42
 [0.1.41]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.41

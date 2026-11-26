@@ -4,6 +4,7 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-26
 
+- **W6/W7 concurrent WAL payload fetch (merged).** Cold strong query with 32 external payloads 1,033 -> about 300 ms (3.2x); in flight bounded by 8 payloads and 64 MiB stored bytes (commit records carry `payload_bytes`; old records fetch serially). Peak RSS at 8 x 64 MiB 720 -> 397 MiB.
 - **WC1/WC2 warm exact-vector cache (merged).** A top_k 100 pass flooded the sparse tier's exact cache (2.77M inserts, 1.80M evictions) and TinyLFU kept those rows. Bulk queries (k at least 4x the recent median, or a shortlist over 1/512 of the budget) now fill only free space in one shared budget. Issue #3 protocol: 592-601 -> 1,112-1,148 q/s; pure top_k 100 1.3x; memory-neutral.
 - **BW18 (not merged), BW19 (killed).** Cold phrase waves 1.04-1.15x; warm BM25 shared-state costs about 3% of CPU.
 
