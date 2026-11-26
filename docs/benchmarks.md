@@ -14400,3 +14400,83 @@ with arms `{"base":{"BINARY":"<baseline>"},"cand":{}}`, `--s3-only-arm` for both
 fresh process pairs alternating the arm order. For staged arms, seed once with `--stage-arm s
 --two-phase-arm s --keep-cache DIR`, then pass `--stage-arm` and `--two-phase-arm` for both arms
 with `--seed-cache DIR`.
+
+### Round C24b: the verdict under sixteen concurrent clients
+
+Review found two faults in the first C24 hedger: every in-flight read woke every 5 ms, took the one
+global mutex, and scanned every read of the last two seconds (quadratic under load), and the list
+could only be pruned from its front, so one stuck read kept all later entries alive. The paired runs
+above sent one query at a time and could not see either.
+
+**Change.** `hedge.rs` keeps a fixed ring of 256 start-time slots of 10 ms. Each slot holds a started
+count, a finished count, and a log-scale latency histogram (128 buckets, eight per doubling from
+256 us). A read's siblings are the 11 slots around its own (about 50 ms either side, to within a
+slot). A check reads a few dozen atomics and takes no lock. A slot is reused when the ring wraps, so
+memory is fixed whatever the arrival rate, and a stuck read cannot hold anything. The rule is
+unchanged: at least four siblings, 70 percent finished, and the read has outlasted the 70th
+percentile latency of the finished ones (the histogram rounds that quantile up by under 9 percent).
+A read now waits as long as its verdict allows (up to 20 ms, down to 5) before it asks again, instead
+of a fixed 5 ms tick, and the single-read timer's p90 is recomputed every 16 samples instead of on
+every tick. Tests compare the ring with the old rule on 200 synthetic waves (never sooner, and never
+later than one bucket), and a stuck read leaves memory fixed.
+
+**Setup.** Same instance type and fixture as above: one on-demand c7gd.4xlarge, Ubuntu 24.04, release
+`neoverse-v1` builds, the retained 10M fixture read-only, pure S3 (no disk cache, 64 MiB memory
+cache), 1 MiB blocks with eight-block coalescing. Baseline is v0.1.50 (no sibling hedging).
+"C24" is the first C24 hedger (commit `ac754e9`, which is on the v0.1.49 base). Builds ran in
+rotating rounds on the same host.
+
+**Sixteen concurrent clients** (`conc_ab.py`, closed loop, 400 queries per build per round, rounds
+1 to 6 pooled; round 0 ran under `perf`):
+
+| Build | q/s | p50 / p90, ms | Server CPU per query, ms | GETs per query | Hedges per query |
+|---|---:|---:|---:|---:|---:|
+| v0.1.50 (baseline) | 17.26 | 860 / 1,328 | 427 | 113.9 | 7.0 |
+| C24 (scanned list) | 14.02 | 1,106 / 1,459 | 438 | 129.2 | 16.7 |
+| C24b, ring, 5 ms tick | 17.08 | 886 / 1,293 | 460 | 117.8 | 12.4 |
+| **C24b final** | **17.32** | **871 / 1,272** | **453** | 117.0 | 12.2 |
+
+(The C24 row is from a first run of six rounds against its own v0.1.50 control: 17.04 q/s,
+870 / 1,340 ms.) C24 under load lost 18 percent of throughput to its lock and scan. The ring has the
+baseline's throughput, and its p90 is 4 percent better.
+
+**Profile** (`perf record`, 499 Hz, call graphs on, the server only):
+
+| Build | `Hedger` functions | Mutex and futex | Other |
+|---|---:|---:|---|
+| C24 | 6.97% (`verdict`) | 0.6% | plus 3.5% in `Instant` subtraction and `Timespec`, all from the 5 ms polling |
+| C24b final | 0.23% | 1.5% | same as the baseline's 1.6% |
+| v0.1.50 | 0.22% (its timer) | 1.6% | |
+
+The lock's share is gone: the hedger is 0.23 percent of server CPU, the same as the old timer.
+
+**Server CPU per query is 6 percent above the baseline** (453 versus 427 ms; every round of C24b is
+within 442 to 466 and every baseline round within 419 to 435). It is not the verdict: the profile
+shows the extra samples in the network path (kernel copy to user, TLS decryption, hyper body
+polling, the shared-read futures), which tracks the +5.2 hedges and +3.1 attempted GETs per query
+(the losing duplicate downloads some bytes before it is dropped). The adaptive wait recovered about
+7 ms of the 33 ms the 5 ms tick had added. The hedge budget is the lever if this cost matters:
+`hedge_budget` 0.10 spends fewer duplicates for a smaller p90 gain.
+
+**Single client, eight paired process pairs** (200 queries per pair, alternating order, IDs-only and
+`title`/`text` projections with independent cache drops, 1,600 samples per build and projection,
+bootstrap intervals over queries, baseline/candidate so larger is better), v0.1.50 against C24b final:
+
+| Path | Baseline p50 / p90, ms | C24b p50 / p90, ms | Ratio p50 / p90 | 95% interval p50 | 95% interval p90 |
+|---|---:|---:|---:|---:|---:|
+| Pure-S3 IDs | 323.5 / 465.9 | 276.4 / 352.3 | 1.170 / **1.323** | 1.138-1.225 | 1.279-1.364 |
+| Pure-S3 attributes | 321.4 / 455.4 | 272.1 / 339.2 | 1.181 / **1.343** | 1.145-1.231 | 1.301-1.388 |
+
+Per-pair p90 ratios for IDs are all between 1.22 and 1.40, so every pair favors C24b. Attempted GETs
+per query go from 235.4 to 248.7 (IDs, +5.6 percent) and from 307.6 to 326.8 (attributes, +6.2
+percent), hedges from 19.7 to 34.7 and from 16.6 to 36.5. Response bytes are unchanged. **All 3,200
+reply pairs match** (ordered documents and exact distances), recall@10 is 0.9700 in both arms. The
+p90 gain meets the 1.2x requirement.
+
+Resources: one on-demand c7gd.4xlarge, 09:36 to 10:54 UTC (1.3 hours, about $0.95 compute, plus
+roughly 2 million GETs). Instance, volumes, key pair, and security group deleted and verified. The
+fixture was read-only and no bucket prefix was created.
+
+Reproduction: `crates/bf-engine/examples/conc_ab.py --config CONFIG --scratch .scratch/RUN
+--label L --builds '{"base":"<bin>","cand":"<bin>"}' --clients 16 --queries 400 --rounds 7 [--perf]`,
+and the paired `cold_ab.py` command above with `--s3-only-arm` for both arms.
