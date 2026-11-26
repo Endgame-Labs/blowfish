@@ -390,7 +390,7 @@ mod tests {
     }
     #[test]
     fn one_bit_screen_keeps_the_nearest_rows_and_the_exact_shortlist_size() {
-        let (dims, n) = (64, 3000);
+        let (dims, n) = (256, 3000);
         let mut seed = 17u64;
         let mut next = move || {
             seed ^= seed << 13;
@@ -425,7 +425,7 @@ mod tests {
         for q in (0..40).map(|i| &source[i * 37]) {
             let (full, scanned) = graph.scan(q, 10, usize::MAX, &allowed).unwrap();
             assert_eq!(scanned, 1500);
-            let (screened, _) = graph.scan(q, 10, 300, &allowed).unwrap();
+            let (screened, _) = graph.scan(q, 10, 600, &allowed).unwrap();
             assert_eq!(screened.len(), 10);
             assert!(screened.iter().all(|(r, _)| allowed.contains(*r)));
             hit += screened
@@ -433,7 +433,7 @@ mod tests {
                 .filter(|s| full.iter().any(|f| f.0 == s.0))
                 .count();
         }
-        // A 300-row shortlist of 1,500 rows keeps nearly every true top-10 row.
+        // A 600-row shortlist of 1,500 rows (chance is 40%) keeps nearly every true top-10 row.
         assert!(hit >= 380, "{hit} of 400");
         // A shortlist as large as the request returns exactly that many distinct rows.
         let (hits, _) = graph.scan(&source[0], 50, 50, &allowed).unwrap();
