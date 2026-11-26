@@ -731,6 +731,38 @@ pub(crate) fn recall(ann: &QueryResponse, exact: &QueryResponse) -> f64 {
     }
 }
 
+/// Calibration truth without an exhaustive scan: the exact-distance top `k` of the union of
+/// several approximate answers. Every answer was reranked with exact distances, so a row any of
+/// them found is ranked correctly against the others; only a true neighbor that every answer
+/// missed is absent. `None` when a row has no distance (the caller then falls back to the
+/// exhaustive scan).
+pub(crate) fn union_truth(answers: &[&QueryResponse]) -> Option<QueryResponse> {
+    let k = answers
+        .iter()
+        .map(|a| a.result.rows.as_ref().map_or(0, Vec::len))
+        .max()?;
+    let mut seen = BTreeMap::new();
+    for row in answers
+        .iter()
+        .filter_map(|a| a.result.rows.as_ref())
+        .flatten()
+    {
+        let dist = row.get("$dist")?.as_f64()?;
+        seen.entry(row["id"].to_string()).or_insert((dist, row));
+    }
+    let mut ranked = seen.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| a.1.0.total_cmp(&b.1.0).then_with(|| a.0.cmp(&b.0)));
+    let mut out = answers[0].clone();
+    out.result.rows = Some(
+        ranked
+            .into_iter()
+            .take(k)
+            .map(|(_, (_, r))| r.clone())
+            .collect(),
+    );
+    Some(out)
+}
+
 /// ID indexes above this size are not read whole by BM25 queries.
 pub(crate) const RANGED_IDS_BYTES: u64 = 128 << 10;
 /// A plain BM25 query whose response needs only IDs and scores.
@@ -1187,5 +1219,56 @@ mod rank_key_tests {
             .collect();
         assert_eq!(keys.len(), shapes.len());
         assert_eq!(rank_key(&rank.clone()), key);
+    }
+}
+
+#[cfg(test)]
+mod union_truth_tests {
+    use super::*;
+    fn answer(rows: &[(&str, f64)]) -> QueryResponse {
+        let mut r: QueryResponse = serde_json::from_value(serde_json::json!({
+            "rows": [], "performance": {"cache_hit_ratio":0.0,"cache_temperature":"cold",
+            "server_total_ms":0,"query_execution_ms":0,"exhaustive_search_count":0,
+            "approx_namespace_size":0},
+            "billing": {"billable_logical_bytes_queried":0,"billable_logical_bytes_returned":0}
+        }))
+        .unwrap();
+        r.result.rows = Some(
+            rows.iter()
+                .map(|(id, d)| {
+                    let mut row = Document::new();
+                    row.insert("id".into(), serde_json::json!(id));
+                    row.insert("$dist".into(), serde_json::json!(d));
+                    row
+                })
+                .collect(),
+        );
+        r
+    }
+    fn ids(r: &QueryResponse) -> Vec<String> {
+        r.result
+            .rows
+            .iter()
+            .flatten()
+            .map(|r| r["id"].to_string())
+            .collect()
+    }
+    #[test]
+    fn union_truth_is_the_exact_top_k_of_everything_any_answer_found() {
+        let graph = answer(&[("a", 0.1), ("c", 0.3), ("d", 0.4)]);
+        let ivf = answer(&[("a", 0.1), ("b", 0.2), ("e", 0.5)]);
+        let truth = union_truth(&[&graph, &ivf]).unwrap();
+        assert_eq!(ids(&truth), ["\"a\"", "\"b\"", "\"c\""]);
+        // The graph missed `b`, which the other answer found: it loses recall; IVF misses `c`.
+        assert!((recall(&graph, &truth) - 2. / 3.).abs() < 1e-12);
+        assert!((recall(&ivf, &truth) - 2. / 3.).abs() < 1e-12);
+    }
+    #[test]
+    fn ties_break_by_id_and_a_row_without_a_distance_declines() {
+        let a = answer(&[("b", 0.1), ("a", 0.1)]);
+        assert_eq!(ids(&union_truth(&[&a]).unwrap()), ["\"a\"", "\"b\""]);
+        let mut bad = answer(&[("a", 0.1)]);
+        bad.result.rows.as_mut().unwrap()[0].remove("$dist");
+        assert!(union_truth(&[&bad]).is_none());
     }
 }

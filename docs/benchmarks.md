@@ -13697,6 +13697,81 @@ Costs: no EC2, no bucket writes (a 25 GB fixture copy was downloaded from the sh
 directory).
 
 
+## Round G10: calibration samples without an exhaustive scan (graph promoted 4.5 minutes after it is built, not days)
+
+Main's sampler measured each calibration sample's recall against an exhaustive scan of the namespace (5.49 GB of f16 on NQ, one core).
+The sampler then waited 50 times as long as the scan, so the paired controller got about one sample every 10 minutes.
+
+**Setup:** Apple M4 (shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), 64 probes, the real
+`blowfish` binary with the production sampler defaults (1 percent of queries, 60 s interval), and `graph_heat.py` at 800 q/s from 16
+paced clients, with nothing paused and no manual samples (`g10_promote.py`). Release builds of main v0.1.50 and of this branch.
+
+### Change (`bf-engine`, no setting, no format change)
+
+While a warm graph is calibrating, a sample runs the graph's answer, the IVF tier's answer, and the IVF tier at twice the probes
+(all three rerank with exact distances), and takes the **exact-distance top k of their union** as the truth (`indexed::union_truth`).
+Only a true neighbor that all three missed is absent from it. The controller sees `(recall(graph, union), recall(ivf, union))`
+instead of recall against an exhaustive scan. One sample in 16 still runs the exhaustive scan, feeds the controller its exact
+truth, and records the union's overstatement in the `blowfish_ann_union_recall_gap` histogram, so drift is visible. The two kinds
+have separate pacing clocks (a cheap sample waits 50 times its own duration, an exhaustive one keeps the old 60 s interval and
+50 times its duration), so an audit cannot stall the cheap samples. A namespace with no graph calibrating still uses the
+exhaustive scan, as before. `blowfish_ann_calibration_samples_total{truth}` counts both.
+
+### Offline: does the union truth settle where the exhaustive truth does? (`g10_offline.rs`, `g10_ivf_dump.py`)
+
+Full NQ, the production graph, the production server's IVF answers at 64 and 128 probes (recall@10 0.9611 and 0.9791,
+recall@100 0.9523 and 0.9745), the engine's own `effort.rs` controller, and 100 random query streams, each run once with each truth.
+
+| | k 10 | k 100 |
+|---|---:|---:|
+| True graph recall at the settled beam within 0.001 of the exhaustive-driven result | 69 of 100 | 100 of 100 |
+| Settled beam within one controller step (ratio of 1.25 or less) | 90 of 100 | 98 of 100 |
+| Control: exhaustive against itself, on a different query stream, within 0.001 | 17 of 100 | 100 of 100 |
+| Control: within one step | 78 of 100 | 96 of 100 |
+
+The brief's bar (95 of 100 within 0.001) is **not met at k 10, and the exhaustive controller does not meet it against itself** (17
+of 100): one controller step moves true recall by 0.001 to 0.002 and 512-sample windows are noisy. At k 100 the graph serves at
+a beam of at least 256 whatever the controller picks, so the answers never differ. The union truth is biased the safe way: its paired
+gap (graph minus IVF) is 0.001 to 0.002 lower than the exhaustive gap at beams 64 to 128 (at beam 100, -0.0025 against -0.0013),
+so it settles slightly higher. Mean true recall@10 at the settled beam: 0.9539 (union) against 0.9527 (exhaustive), +0.0012, and
+770 samples against 683 to settle.
+
+### Time to promote (M4, ordinary heat)
+
+| | Heat gate and build | Graph ready | Calibration | Promoted | Samples |
+|---|---:|---:|---:|---:|---:|
+| main v0.1.50 | 630 s to 1,710 s (build 1,082 s) | 28.5 min | 2 samples in 1,290 s, then stopped | **about 107 hours (estimate)** | 640 needed |
+| this branch | about 600 s to 1,650 s (build 1,030 to 1,054 s) | 27.5 min | **270 s** (4.5 min) | **32 min** (1,920 s) | 266 |
+| this branch, earlier run (sampler parked behind an exhaustive wait) | | 28 min | 660 s | 39 min (2,340 s) | 389 |
+
+Main's estimate: one sample about every 10 minutes (the scan plus 50 times its duration), 640 samples. The run was stopped at
+1,290 s of calibration. This branch's cheap samples arrive at about 0.9 a second. The beam went 64 to 80 (accepted) and the lower trial
+(72) was already running when `usable` turned true. Time to promote is bound by the 10-minute heat gate and the graph build (1,050 s on
+the M4 at idle priority under load), which this round does not touch; **the calibration phase is 4.5 minutes, 150 times faster than
+main's estimate** (the brief's 15-minute target for the whole path is not reachable while the build alone is 17 minutes). The
+earlier run found a bug the second fixed: a sample that compared nothing (no graph yet) waited out the exhaustive clock, so the
+first cheap samples came 4.5 minutes after the graph was ready.
+
+### Steady state, 16 client processes, graph serving
+
+| | top_k | q/s | recall | Instructions/query | Peak footprint |
+|---|---:|---:|---:|---:|---:|
+| main IVF (G9 table, same M4 and fixture) | 10 | 2,792 | 0.9611 | 24.1M | 1,222 MiB |
+| this branch, graph (beam 80) | 10 | 8,106 | 0.9552 | 3.2M | 5,352,002,888 B (5.0 GiB) |
+| main IVF (G9 table) | 100 | 879 | 0.9523 | 65.2M | 1,190 MiB |
+| this branch, graph | 100 | 2,799 | 0.9533 | 9.2M | 5.0 GiB |
+
+Settled beam 80 against G9's 100 (calibrated against the exhaustive scan by hand): recall@10 0.9552 against 0.9572, **0.0020
+lower**, right at the bar and inside what one beam step moves; the k 100 recall is the same (0.9533 against 0.9530). Main IVF was
+not re-measured in this session, so its rows are G9's (same machine and fixture; the M4 is shared, so compare the 2.9x and 3.2x, not
+the last digit). **Not measured: p50 and p99 latency, Qdrant 1.20 at matched recall, and peak RSS for main's IVF in this session.**
+The round ran out of its 4-hour cap after the second build (each promotion run is 40 minutes). One earlier run served top_k 100
+from IVF (857 q/s) after serving top_k 10 from the graph in the same process (graph status was not captured, so the cause
+is unknown); the final run, which measured top_k 100 first, served it from the graph. Run top_k 100 after top_k 10 before
+trusting a promoted graph for it.
+
+Costs: no EC2, no bucket writes (a 25 GB fixture copy, deleted). The M4 run directory is deleted and nothing of mine is running.
+
 ## Round W6/W7: cold queries fetch committed WAL payloads one at a time (concurrent fetch, 3.2x at 32 payloads; bounded by bytes in W7)
 
 Hypothesis (Sol, `briefs/ideas/2225-sol.md` #1): `tail_bounded` discovers WAL slots concurrently but then calls `materialize` on each record in
@@ -14289,3 +14364,194 @@ GETs subtotal about **$2.786**, excluding those small untimed costs and
 shared retained-fixture storage. No fixture objects, bucket prefixes, or uploads
 were created. The final full-debug workspace result is recorded in the worker
 report on the final documentation commit.
+
+## Round C24: hedge a read's stragglers against the reads that started around it
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge in us-west-2 (Ubuntu 24.04 arm64, Rust 1.100.0,
+Clang 19, release `neoverse-v1` builds, eight pinned CPUs and Rayon workers). Baseline is v0.1.49
+(`814452e`). The retained 10M, 1,024-dimensional, 55-slab fixture (`tmp/c5/10m`) was read-only.
+Production 1 MiB cache blocks with eight-block coalescing, probes64, top ten, strong consistency.
+
+### Profile before changes
+
+Forty cache-cold pure-S3 IDs-only queries on the baseline: p50 / p90 417 / 505 ms, 234 attempted GETs
+per query, and 17.4 hedges per query (7 percent). Slab scan GETs have p50 / p90 / p99 latency of
+68 / 107 / 250 ms.
+
+- The gap between the 85th-percentile and the last scan completion is **148 ms p50** (220 ms p90),
+  far above the 30 ms kill threshold. The 85th percentile completes at 91 ms and the last at 250 ms.
+- Existing hedging fires, but only for GETs of at most 1 MiB. **18.5 percent of slab GETs are larger**
+  (up to 8 MiB) and were never hedged. The historical timer also starts from a 250 ms prior, so a
+  fresh process hedges late.
+- The scan is not one lockstep wave. Each slab runs a short chain of dependent GETs, so the last
+  GETs of a query start about 165 ms (p50) after the first. A cohort of reads that start within a
+  few milliseconds (the first design: 85 percent of a wave, 15 percent cap) found too few
+  stragglers, and gave only 1.10x.
+
+### Change
+
+`crates/bf-storage/src/hedge.rs` now judges a read against its **siblings**: the reads that started
+within 50 ms before or after it. With at least four siblings, once 70 percent of them have finished
+and the read has outlasted the 70th percentile of their latencies, it is duplicated, first response
+wins, and the loser is dropped. This needs no latency history, so a fresh process hedges, and it has
+no size limit. The existing token bucket still bounds the total (default `hedge_budget` raised from
+0.1 to 0.15 extra reads per primary read). A read with fewer than four siblings keeps the historical
+timer (observed p90, up to 1 MiB), so there is still one mechanism: sibling comparison for waves, and
+the timer only for lone reads. There is no new storage API, dependency, or format change.
+
+The completion share was swept on the same host with paired alternating arms, 60 queries each:
+
+| Setting | p50 / p90, ms | Baseline/arm p50 / p90 | GETs per query | Hedges per query |
+|---|---:|---:|---:|---:|
+| Baseline | 342 / 485 | 1 / 1 | 229.6 | 16.5 |
+| 85 percent, 0.20 budget | 293 / 368 | 1.17 / 1.32 | 233.6 | 18.3 |
+| **70 percent, 0.15 budget** | **283 / 359** | 1.21 / 1.35 | 242.2 | 30.9 |
+| 70 percent, 0.20 budget | 290 / 362 | 1.18 / 1.34 | 256.5 | 41.0 |
+| 60 percent, 0.20 budget | 290 / 377 | 1.18 / 1.29 | 258.2 | 42.3 |
+
+All five arms ran in one process set (one run, 60 queries per arm, paired alternation). Earlier,
+smaller runs agree: 85 percent at 0.15 budget gave 1.25x / 1.24x against its own baseline (20.4
+hedges), and 50 or 60 percent at 0.15 budget hit the same budget ceiling as 70 percent (about 32 hedges).
+
+At 85 percent most of the budget goes unspent, so 70 percent at the default budget was chosen. It is
+the cheapest setting that performs as well as the costly ones.
+
+### Sixteen-process paired control
+
+Eight fresh process pairs, 200 queries each, alternating baseline-first and candidate-first. Each
+group measures IDs-only and `title`/`text` projections with independent cache drops. Samples pool to
+1,600 per build and projection. Bootstrap intervals resample queries (2,000 times, seed 24), for
+baseline/candidate, so larger is better.
+
+| Path | Baseline p50 / p90, ms | Candidate p50 / p90, ms | Ratio p50 / p90 | 95% interval p50 | 95% interval p90 |
+|---|---:|---:|---:|---:|---:|
+| Pure-S3 IDs | 317.3 / 451.6 | 279.7 / 351.9 | **1.135 / 1.283** | 1.103–1.165 | 1.259–1.314 |
+| Pure-S3 attributes | 310.9 / 437.7 | 268.4 / 325.0 | 1.158 / 1.347 | 1.117–1.197 | 1.310–1.372 |
+| Staged attributes | 66.8 / 88.6 | 67.2 / 89.1 | 0.993 / 0.995 | 0.986–1.000 | 0.967–1.029 |
+| Staged IDs | 32.1 / 35.6 | 32.2 / 35.9 | 0.996 / 0.993 | 0.992–1.000 | 0.979–1.005 |
+
+Per-pair pure-S3 IDs p90 ratios are all between 1.22 and 1.37, and p50 ratios between 1.07 and 1.28,
+so every pair favors the candidate. Staged results are equal within noise (staged attributes p50 is
+at worst 1.4 percent slower in the interval). Staged runs adopt one hard-linked seed stage per arm
+(`--keep-cache`, `--seed-cache`; untimed preparation).
+
+Extra GETs per query (attempted, including hedges):
+
+| Path | Baseline | Candidate | Change | Hedges, baseline / candidate |
+|---|---:|---:|---:|---:|
+| Pure-S3 IDs | 238.4 | 249.7 | +4.7% | 22.6 / 35.0 |
+| Pure-S3 attributes | 304.3 | 327.8 | +7.7% | 14.9 / 39.0 |
+| Staged attributes | 19.3 | 21.6 | +12.2% | 0.1 / 2.4 |
+| Staged IDs | 3.0 | 3.0 | 0 | 0 / 0 |
+
+All stay under the 20 percent cap. Response bytes are unchanged (199.6 versus 199.1 MB for pure-S3
+IDs). **All 6,400 measured reply pairs match** ordered documents and exact distances, and recall@10 is
+0.9700 in every arm. The staged attribute path gains nothing and spends 2.4 extra GETs a query
+for it: those waves are small, local, and fast, so the hedges are wasted but harmless.
+
+**Pass:** pure-S3 IDs p90 improves 1.283x (p50 1.135x, short of 1.2x), nothing is slower beyond
+noise, extra GETs are 4.7 percent, and results are identical. The brief's 85 percent threshold under
+a 10 ms cohort was not the best design; the measured one is above.
+
+Release binary SHA-256 values:
+
+```text
+baseline 814452e: b62d29342bed460fca2c9f6987eb6da3ead462957a568bca6bbed7997f1fbce9
+candidate:        e60ec9ff3036752ec3c6d1ce2b1ec8b9b5ac236202b4842aa24c121a9223c837
+```
+
+### Resources and cleanup
+
+One on-demand c7gd.4xlarge, launched 07:55 UTC and terminated 09:17 UTC (1.37 hours, about $1.00
+compute at $0.7258/hour, plus roughly 2 to 3 million GETs at $0.40/million). The instance, volumes, key
+pair, and security group are deleted and verified. No bucket objects or prefixes were created or
+changed.
+
+### Reproduction
+
+Build `crates/bf-engine/examples/scale-server` in release at both commits. Run
+`cold_ab.py --oracle 10m --queries 200 --paired-projections --block-size 1048576 --coalesce-blocks 8`
+with arms `{"base":{"BINARY":"<baseline>"},"cand":{}}`, `--s3-only-arm` for both arms, and eight
+fresh process pairs alternating the arm order. For staged arms, seed once with `--stage-arm s
+--two-phase-arm s --keep-cache DIR`, then pass `--stage-arm` and `--two-phase-arm` for both arms
+with `--seed-cache DIR`.
+
+### Round C24b: the verdict under sixteen concurrent clients
+
+Review found two faults in the first C24 hedger: every in-flight read woke every 5 ms, took the one
+global mutex, and scanned every read of the last two seconds (quadratic under load), and the list
+could only be pruned from its front, so one stuck read kept all later entries alive. The paired runs
+above sent one query at a time and could not see either.
+
+**Change.** `hedge.rs` keeps a fixed ring of 256 start-time slots of 10 ms. Each slot holds a started
+count, a finished count, and a log-scale latency histogram (128 buckets, eight per doubling from
+256 us). A read's siblings are the 11 slots around its own (about 50 ms either side, to within a
+slot). A check reads a few dozen atomics and takes no lock. A slot is reused when the ring wraps, so
+memory is fixed whatever the arrival rate, and a stuck read cannot hold anything. The rule is
+unchanged: at least four siblings, 70 percent finished, and the read has outlasted the 70th
+percentile latency of the finished ones (the histogram rounds that quantile up by under 9 percent).
+A read now waits as long as its verdict allows (up to 20 ms, down to 5) before it asks again, instead
+of a fixed 5 ms tick, and the single-read timer's p90 is recomputed every 16 samples instead of on
+every tick. Tests compare the ring with the old rule on 200 synthetic waves (never sooner, and never
+later than one bucket), and a stuck read leaves memory fixed.
+
+**Setup.** Same instance type and fixture as above: one on-demand c7gd.4xlarge, Ubuntu 24.04, release
+`neoverse-v1` builds, the retained 10M fixture read-only, pure S3 (no disk cache, 64 MiB memory
+cache), 1 MiB blocks with eight-block coalescing. Baseline is v0.1.50 (no sibling hedging).
+"C24" is the first C24 hedger (commit `ac754e9`, which is on the v0.1.49 base). Builds ran in
+rotating rounds on the same host.
+
+**Sixteen concurrent clients** (`conc_ab.py`, closed loop, 400 queries per build per round, rounds
+1 to 6 pooled; round 0 ran under `perf`):
+
+| Build | q/s | p50 / p90, ms | Server CPU per query, ms | GETs per query | Hedges per query |
+|---|---:|---:|---:|---:|---:|
+| v0.1.50 (baseline) | 17.26 | 860 / 1,328 | 427 | 113.9 | 7.0 |
+| C24 (scanned list) | 14.02 | 1,106 / 1,459 | 438 | 129.2 | 16.7 |
+| C24b, ring, 5 ms tick | 17.08 | 886 / 1,293 | 460 | 117.8 | 12.4 |
+| **C24b final** | **17.32** | **871 / 1,272** | **453** | 117.0 | 12.2 |
+
+(The C24 row is from a first run of six rounds against its own v0.1.50 control: 17.04 q/s,
+870 / 1,340 ms.) C24 under load lost 18 percent of throughput to its lock and scan. The ring has the
+baseline's throughput, and its p90 is 4 percent better.
+
+**Profile** (`perf record`, 499 Hz, call graphs on, the server only):
+
+| Build | `Hedger` functions | Mutex and futex | Other |
+|---|---:|---:|---|
+| C24 | 6.97% (`verdict`) | 0.6% | plus 3.5% in `Instant` subtraction and `Timespec`, all from the 5 ms polling |
+| C24b final | 0.23% | 1.5% | same as the baseline's 1.6% |
+| v0.1.50 | 0.22% (its timer) | 1.6% | |
+
+The lock's share is gone: the hedger is 0.23 percent of server CPU, the same as the old timer.
+
+**Server CPU per query is 6 percent above the baseline** (453 versus 427 ms; every round of C24b is
+within 442 to 466 and every baseline round within 419 to 435). It is not the verdict: the profile
+shows the extra samples in the network path (kernel copy to user, TLS decryption, hyper body
+polling, the shared-read futures), which tracks the +5.2 hedges and +3.1 attempted GETs per query
+(the losing duplicate downloads some bytes before it is dropped). The adaptive wait recovered about
+7 ms of the 33 ms the 5 ms tick had added. The hedge budget is the lever if this cost matters:
+a lower `hedge_budget` spends fewer duplicates (not measured here).
+
+**Single client, eight paired process pairs** (200 queries per pair, alternating order, IDs-only and
+`title`/`text` projections with independent cache drops, 1,600 samples per build and projection,
+bootstrap intervals over queries, baseline/candidate so larger is better), v0.1.50 against C24b final:
+
+| Path | Baseline p50 / p90, ms | C24b p50 / p90, ms | Ratio p50 / p90 | 95% interval p50 | 95% interval p90 |
+|---|---:|---:|---:|---:|---:|
+| Pure-S3 IDs | 323.5 / 465.9 | 276.4 / 352.3 | 1.170 / **1.323** | 1.138-1.225 | 1.279-1.364 |
+| Pure-S3 attributes | 321.4 / 455.4 | 272.1 / 339.2 | 1.181 / **1.343** | 1.145-1.231 | 1.301-1.388 |
+
+Per-pair p90 ratios for IDs are all between 1.22 and 1.40, so every pair favors C24b. Attempted GETs
+per query go from 235.4 to 248.7 (IDs, +5.6 percent) and from 307.6 to 326.8 (attributes, +6.2
+percent), hedges from 19.7 to 34.7 and from 16.6 to 36.5. Response bytes are unchanged. **All 3,200
+reply pairs match** (ordered documents and exact distances), recall@10 is 0.9700 in both arms. The
+p90 gain meets the 1.2x requirement.
+
+Resources: one on-demand c7gd.4xlarge, 09:36 to 10:54 UTC (1.3 hours, about $0.95 compute, plus
+roughly 2 million GETs). Instance, volumes, key pair, and security group deleted and verified. The
+fixture was read-only and no bucket prefix was created.
+
+Reproduction: `crates/bf-engine/examples/conc_ab.py --config CONFIG --scratch .scratch/RUN
+--label L --builds '{"base":"<bin>","cand":"<bin>"}' --clients 16 --queries 400 --rounds 7 [--perf]`,
+and the paired `cold_ab.py` command above with `--s3-only-arm` for both arms.

@@ -48,7 +48,7 @@ pub struct CacheConfig {
     /// Maximum background warming tasks; excess hints are rejected (default 4).
     pub prefetch_concurrency: usize,
     /// Extra-request budget for hedged ranged reads, as a fraction of primary requests
-    /// (0 disables hedging; default 0.1). `BF_HEDGE_BUDGET` overrides it.
+    /// (0 disables hedging; default 0.15). `BF_HEDGE_BUDGET` overrides it.
     pub hedge_budget: f64,
 }
 impl Default for CacheConfig {
@@ -65,7 +65,7 @@ impl Default for CacheConfig {
             coalesce_gap_blocks: 0,
             fetch_concurrency: 512,
             prefetch_concurrency: 4,
-            hedge_budget: 0.1,
+            hedge_budget: 0.15,
         }
     }
 }
