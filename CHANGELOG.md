@@ -4,6 +4,16 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.45] - 2026-11-26
+
+**Bucket format change: generation 6 (manifest format 5).** The upgrade is automatic and one way: the first publication by v0.1.45 upgrades the bucket, after which older releases refuse to open it. Stop every older server against a bucket before you start v0.1.45 on it.
+
+### Changed
+
+- **Every vector is stored once:** After a recluster, each covered row's vector used to live both in its segment's ANN object and in the namespace-wide tier. Covered segments' ANN objects are now retired in a fenced publication, and the tier becomes the only copy. Projection, exact search, filtered search, writes, recluster, compaction, branches, and copies all read covered vectors through the tier. On 2.68M BEIR NQ, the settled store went from 16.9 GB to 8.3 GB, with identical results on all 3,452 test queries, unchanged recall, and unchanged warm and cold latency.
+- **Filtered vector search runs on the tier:** Each slab gets a small resident row map (about 6 bytes a row), so a filtered query probes the tier instead of falling back to the segments' own indexes. On a 10M pure-S3 cold run, selective filters went from 2.94 s to 2.32 s p50 (recall 1.000), and broad filters from 2.63 s to 1.83 s, with recall up from 0.950 to 0.992.
+- **Branches and copies pin the tiers they depend on,** and a tier is never dropped before the segments it covers get their own vector objects back.
+
 ## [0.1.44] - 2026-11-26
 
 ### Changed
@@ -334,7 +344,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.44...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.45...HEAD
+[0.1.45]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.45
 [0.1.44]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.44
 [0.1.43]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.43
 [0.1.42]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.42
