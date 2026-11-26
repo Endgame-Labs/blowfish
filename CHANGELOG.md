@@ -4,6 +4,16 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.54] - 2026-11-26
+
+### Fixed
+
+- **The warm graph could stop serving when the request mix changed:** The promotion test compared the graph's CPU, measured on whatever `top_k` recent queries used, with an IVF baseline measured on other requests. After a run of `top_k` 10 traffic, a later run of `top_k` 100 made the graph look more expensive than IVF, and it stopped serving after a few minutes. The saving is now a ratio of graph to IVF cost measured on the same calibration blocks. The status field `graph_cpu_seconds` is replaced by `graph_cost_ratio`.
+
+### Benchmarks
+
+- **Against Qdrant on an Apple M4:** On BEIR NQ (2.68M x 1024-d), 16 clients, IDs only, with the graph promoted the ordinary way, blowfish served `top_k` 10 at 8,417 q/s (recall 0.958, p99 4.7 ms) against about 7,740 q/s for Qdrant 1.20 at the same recall (p99 6.6 ms). At `top_k` 100 Qdrant is ahead (about 3,625 against 2,200-2,750 q/s at recall 0.953). See Round G11 in `docs/benchmarks.md`.
+
 ## [0.1.53] - 2026-11-26
 
 ### Changed
@@ -396,7 +406,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.53...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.54...HEAD
+[0.1.54]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.54
 [0.1.53]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.53
 [0.1.52]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.52
 [0.1.51]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.51
