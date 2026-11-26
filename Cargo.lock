@@ -434,6 +434,7 @@ dependencies = [
 name = "bf-wal"
 version = "0.1.46"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bf-storage",
  "bf-types",
@@ -441,6 +442,7 @@ dependencies = [
  "futures",
  "half",
  "metrics",
+ "object_store",
  "serde",
  "serde_json",
  "tempfile",
