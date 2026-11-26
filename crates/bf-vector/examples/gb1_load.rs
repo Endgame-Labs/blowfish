@@ -74,8 +74,12 @@ fn idle_priority() {
     // SAFETY: both calls affect only the calling worker, as in the engine's build pool.
     unsafe {
         libc::setpriority(libc::PRIO_PROCESS, 0, 19);
-        let p = libc::sched_param { sched_priority: 0 };
-        libc::sched_setscheduler(0, libc::SCHED_IDLE, &p);
+        // SCHED_IDLE exists only on Linux; elsewhere the nice value is the whole hint.
+        #[cfg(target_os = "linux")]
+        {
+            let p = libc::sched_param { sched_priority: 0 };
+            libc::sched_setscheduler(0, libc::SCHED_IDLE, &p);
+        }
     }
 }
 fn percentile(sorted: &[f64], p: f64) -> f64 {
