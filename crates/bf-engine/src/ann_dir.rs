@@ -1779,7 +1779,7 @@ pub(crate) async fn search(
             });
         }
         let mut results: Vec<(Probed, Found)> = Vec::new();
-        let mut prefetch_at = 0;
+        let mut launched = false;
         let early_exact_docs = locally_staged
             && context.as_ref().is_some_and(|c| c.cold)
             && columns.iter().any(|name| name != "id")
@@ -1791,20 +1791,16 @@ pub(crate) async fn search(
             });
         while let Some(result) = scans.join_next().await {
             results.push(result.map_err(segment::index_error)??);
-            let ordinary = [if early_exact_docs { 4 } else { 8 }];
-            // Selective filters can probe most leaves: their eventual winners may arrive
-            // after the first speculative read. Refresh the same bounded prefetch while
-            // later scans are still in flight, rather than waiting for the last scan.
-            let milestones = if filtered {
-                &[8, 12, 16, 18, 19][..]
-            } else {
-                &ordinary[..]
-            };
-            if prefetch_at < milestones.len()
-                && results.len() * 20 >= count * milestones[prefetch_at]
+            let ready_parts = if early_exact_docs { 1 } else { 2 };
+            // Filtered scans may visit most leaves, so early winners can change repeatedly.
+            // Their final rerank shares scan reads without fetching speculative losers;
+            // additional early reranks otherwise consume throughput under concurrent load.
+            if !filtered
+                && !launched
+                && results.len() * 5 >= count * ready_parts
                 && !scans.is_empty()
             {
-                prefetch_at += 1;
+                launched = true;
                 let mut leading: Vec<_> = results
                     .iter()
                     .enumerate()
