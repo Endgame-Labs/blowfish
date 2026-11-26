@@ -1,34 +1,116 @@
-//! Hedged ranged reads: when a GET has not answered by about the recently observed p90, send a
-//! duplicate and take whichever answers first. A wave of N parallel reads ends when its slowest
-//! request does, so cutting the tail cuts the wave. Extra requests are capped by a token bucket
-//! that earns `budget` tokens per primary request (default 10 percent).
+//! Hedged ranged reads. A wave of N parallel reads ends when its slowest request does, so the
+//! straggler policy looks at what the wave's own siblings are doing right now:
+//!
+//! * **Waves.** Reads that start within [`WAVE_WINDOW`] of each other form one wave. Once a wave
+//!   of at least [`MIN_WAVE`] reads has seen [`WAVE_DONE`] of its members finish, every read still
+//!   outstanding is duplicated (first response wins, the loser is dropped). A wave may add at most
+//!   [`WAVE_CAP`] of its size in duplicates, and the store-wide token bucket (`budget` tokens earned
+//!   per primary request) bounds the total. No history is needed, so a fresh process hedges too, and
+//!   there is no size limit: coalesced slab reads are the usual stragglers.
+//! * **Single reads.** A read in a wave smaller than [`MIN_WAVE`] has no siblings to compare with.
+//!   It is duplicated once it outlasts the recently observed p90 (a prior until [`MIN_SAMPLES`]
+//!   latencies exist), but only up to [`MAX_TIMER_HEDGE_BYTES`], since a duplicate doubles the bytes.
 use bytes::Bytes;
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use std::{
     collections::VecDeque,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
+use tokio::sync::Notify;
 
-/// Requests larger than this are never hedged (a duplicate would double the bytes).
-const MAX_HEDGE_BYTES: u64 = 1 << 20;
-/// Latency samples kept per size class.
+/// Single reads larger than this are never hedged by the timer (a duplicate doubles the bytes).
+const MAX_TIMER_HEDGE_BYTES: u64 = 1 << 20;
+/// Latency samples kept for the single-read timer.
 const WINDOW: usize = 512;
 /// Samples needed before the observed p90 replaces the prior.
 const MIN_SAMPLES: usize = 24;
-/// Threshold before enough samples exist.
+/// Timer threshold before enough samples exist.
 const PRIOR: Duration = Duration::from_millis(250);
-/// Never hedge sooner than this.
+/// The timer never hedges sooner than this.
 const FLOOR: Duration = Duration::from_millis(60);
-/// Token bucket capacity, which bounds a burst of hedges in one wave.
+/// Token bucket capacity, which bounds a burst of hedges.
 const BURST: f64 = 64.0;
+/// Reads starting within this long of a wave's first read join it.
+const WAVE_WINDOW: Duration = Duration::from_millis(10);
+/// Smallest wave that hedges its own stragglers.
+const MIN_WAVE: usize = 4;
+/// Share of a wave that must finish before its remaining reads are duplicated.
+const WAVE_DONE: f64 = 0.85;
+/// Most duplicates one wave may add, as a share of its size (at least one).
+const WAVE_CAP: f64 = 0.15;
 
 #[derive(Default)]
 struct State {
     samples: VecDeque<f32>,
     tokens: f64,
+    wave: Option<Arc<Wave>>,
 }
+
+/// Parallel reads that started together.
+struct Wave {
+    opened: Instant,
+    /// Reads still counted: joined, and neither dropped nor failed to start.
+    size: AtomicUsize,
+    done: AtomicUsize,
+    hedged: AtomicUsize,
+    triggered: AtomicBool,
+    trigger: Notify,
+}
+impl Wave {
+    fn new() -> Self {
+        Self {
+            opened: Instant::now(),
+            size: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+            hedged: AtomicUsize::new(0),
+            triggered: AtomicBool::new(false),
+            trigger: Notify::new(),
+        }
+    }
+    /// Fire the trigger once the wave is large enough, closed to new members, and mostly done.
+    fn check(&self) {
+        let size = self.size.load(Ordering::SeqCst);
+        let done = self.done.load(Ordering::SeqCst);
+        if size >= MIN_WAVE
+            && self.opened.elapsed() >= WAVE_WINDOW
+            && done as f64 >= WAVE_DONE * size as f64
+            && !self.triggered.swap(true, Ordering::SeqCst)
+        {
+            self.trigger.notify_waiters();
+        }
+    }
+    fn cap(&self) -> usize {
+        ((self.size.load(Ordering::SeqCst) as f64 * WAVE_CAP).ceil() as usize).max(1)
+    }
+}
+/// One read's membership in a wave. Dropping it unfinished (a cancelled read) leaves the wave.
+struct Member {
+    wave: Arc<Wave>,
+    finished: bool,
+}
+impl Member {
+    fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.wave.done.fetch_add(1, Ordering::SeqCst);
+            self.wave.check();
+        }
+    }
+}
+impl Drop for Member {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.wave.size.fetch_sub(1, Ordering::SeqCst);
+            self.wave.check();
+        }
+    }
+}
+
 /// Adaptive hedging policy shared by every reader of one store.
 pub(crate) struct Hedger {
     budget: f64,
@@ -59,9 +141,23 @@ impl Hedger {
         }
         s.samples.push_back(elapsed.as_secs_f32() * 1e3);
     }
-    fn earn(&self) {
+    /// Count a primary read: earn a token and join (or open) the current wave.
+    fn join(&self) -> Member {
         let mut s = self.state.lock().unwrap();
         s.tokens = (s.tokens + self.budget).min(BURST);
+        let wave = match &s.wave {
+            Some(w) if w.opened.elapsed() < WAVE_WINDOW => w.clone(),
+            _ => {
+                let w = Arc::new(Wave::new());
+                s.wave = Some(w.clone());
+                w
+            }
+        };
+        wave.size.fetch_add(1, Ordering::SeqCst);
+        Member {
+            wave,
+            finished: false,
+        }
     }
     fn spend(&self) -> bool {
         let mut s = self.state.lock().unwrap();
@@ -72,48 +168,83 @@ impl Hedger {
             false
         }
     }
-    /// A ranged GET, hedged once if the first attempt outlasts the observed p90 and the budget
-    /// allows. Latencies of the first answer (from either attempt) feed the threshold.
+    /// Take a hedge from the wave's allowance and the store-wide budget.
+    fn allow_wave_hedge(&self, wave: &Wave) -> bool {
+        if wave.hedged.fetch_add(1, Ordering::SeqCst) >= wave.cap() || !self.spend() {
+            wave.hedged.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+    /// A ranged GET, duplicated once if it straggles (see the module docs) and the budget
+    /// allows. Latencies of the first answer (from either attempt) feed the single-read timer.
     pub(crate) async fn get_range(
         &self,
         backend: &Arc<dyn ObjectStore>,
         path: &Path,
         range: Range<u64>,
     ) -> object_store::Result<Bytes> {
-        if self.budget <= 0.0 || range.end - range.start > MAX_HEDGE_BYTES {
+        if self.budget <= 0.0 {
             return backend.get_range(path, range).await;
         }
-        self.earn();
+        let mut member = self.join();
+        let wave = member.wave.clone();
         let start = Instant::now();
         let mut primary = Box::pin(backend.get_range(path, range.clone()));
+        let len = range.end - range.start;
         loop {
-            let wait = self
-                .threshold()
-                .saturating_sub(start.elapsed())
-                .clamp(Duration::from_millis(1), Duration::from_millis(25));
+            let trigger = wave.trigger.notified();
+            tokio::pin!(trigger);
+            trigger.as_mut().enable();
+            if wave.triggered.load(Ordering::SeqCst) {
+                if self.allow_wave_hedge(&wave) {
+                    break;
+                }
+                // The wave's allowance is spent: no further hedge for this read.
+                let r = primary.await;
+                self.record(start.elapsed());
+                member.finish();
+                return r;
+            }
+            let small_wave =
+                wave.size.load(Ordering::SeqCst) < MIN_WAVE && wave.opened.elapsed() >= WAVE_WINDOW;
+            let open = WAVE_WINDOW.saturating_sub(wave.opened.elapsed());
+            let wait = if !open.is_zero() {
+                // Re-check the wave the moment it closes to new members.
+                open
+            } else if small_wave && len <= MAX_TIMER_HEDGE_BYTES {
+                self.threshold().saturating_sub(start.elapsed())
+            } else {
+                Duration::from_millis(25)
+            }
+            .clamp(Duration::from_millis(1), Duration::from_millis(25));
             tokio::select! {
                 r = &mut primary => {
                     self.record(start.elapsed());
+                    member.finish();
                     return r;
                 }
-                _ = tokio::time::sleep(wait) => {}
+                _ = &mut trigger => {}
+                _ = tokio::time::sleep(wait) => {
+                    wave.check();
+                    if small_wave
+                        && len <= MAX_TIMER_HEDGE_BYTES
+                        && start.elapsed() >= self.threshold()
+                        && self.spend()
+                    {
+                        break;
+                    }
+                }
             }
-            if start.elapsed() >= self.threshold() {
-                break;
-            }
-        }
-        if !self.spend() {
-            let r = primary.await;
-            self.record(start.elapsed());
-            return r;
         }
         metrics::counter!("blowfish_object_store_hedges_total", "outcome" => "issued").increment(1);
         let second = Box::pin(backend.get_range(path, range));
-        let (r, _) = match futures::future::select_ok([primary, second]).await {
-            Ok((bytes, rest)) => (Ok(bytes), rest),
-            Err(e) => (Err(e), vec![]),
+        let r = match futures::future::select_ok([primary, second]).await {
+            Ok((bytes, _loser)) => Ok(bytes),
+            Err(e) => Err(e),
         };
         self.record(start.elapsed());
+        member.finish();
         r
     }
 }
@@ -225,13 +356,14 @@ mod tests {
 
     #[tokio::test]
     async fn the_budget_caps_extra_requests() {
-        let (s, path) = store(usize::MAX, Duration::from_millis(150)).await;
+        let (s, path) = store(3, Duration::from_millis(150)).await;
         let backend: Arc<dyn ObjectStore> = s.clone();
         let hedger = Hedger::new(0.1);
         for _ in 0..MIN_SAMPLES {
             hedger.record(Duration::from_millis(5));
         }
-        // Every request stalls past the threshold. 20 requests earn 2 tokens: at most 2 hedges.
+        // The first three of 20 stall past the wave's 85 percent mark. 20 requests earn 2 tokens:
+        // at most 2 hedges, although the wave's own allowance is 3.
         let reads = (0..20).map(|_| hedger.get_range(&backend, &path, 0..16));
         for r in futures::future::join_all(reads).await {
             r.unwrap();
@@ -253,7 +385,7 @@ mod tests {
         for _ in 0..MIN_SAMPLES {
             hedger.record(Duration::from_millis(5));
         }
-        // Larger than MAX_HEDGE_BYTES: allowed to exceed the object, in-memory clamps nothing
+        // Larger than MAX_TIMER_HEDGE_BYTES: allowed to exceed the object, in-memory clamps nothing
         // here, so use a store with a bigger object.
         let big = Path::from("big");
         s.inner
@@ -265,5 +397,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_hedger_duplicates_a_waves_stragglers() {
+        // Two of 20 simultaneous reads never answer. With no latency history at all, the wave's
+        // own 18 finished siblings (90 percent) are what trigger the duplicates.
+        let (s, path) = store(2, Duration::MAX).await;
+        let backend: Arc<dyn ObjectStore> = s.clone();
+        let hedger = Hedger::new(0.15);
+        let reads = (0..20).map(|_| hedger.get_range(&backend, &path, 0..16));
+        let all = futures::future::join_all(reads);
+        for r in tokio::time::timeout(Duration::from_secs(60), all)
+            .await
+            .expect("wave stragglers were never hedged")
+        {
+            assert_eq!(r.unwrap().len(), 16);
+        }
+        assert_eq!(s.calls.load(Ordering::SeqCst), 22);
+    }
+
+    #[tokio::test]
+    async fn a_wave_hedges_reads_of_any_size_within_its_allowance() {
+        let (s, path) = store(3, Duration::MAX).await;
+        let big = Path::from("big");
+        s.inner
+            .put(&big, PutPayload::from(vec![1u8; 3 << 20]))
+            .await
+            .unwrap();
+        let backend: Arc<dyn ObjectStore> = s.clone();
+        let hedger = Hedger::new(1.0);
+        let reads = (0..20).map(|i| {
+            let (hedger, backend) = (&hedger, &backend);
+            let (path, big) = (&path, &big);
+            async move {
+                if i < 3 {
+                    hedger.get_range(backend, big, 0..(3 << 20)).await
+                } else {
+                    hedger.get_range(backend, path, 0..16).await
+                }
+            }
+        });
+        let all = futures::future::join_all(reads);
+        for r in tokio::time::timeout(Duration::from_secs(60), all)
+            .await
+            .expect("a 3 MiB straggler was never hedged")
+        {
+            r.unwrap();
+        }
+        // Three stragglers fit the allowance (15 percent of 20), so all three were hedged.
+        let hedges = s.calls.load(Ordering::SeqCst) - 20;
+        assert!(hedges <= 3, "hedges {hedges}");
+    }
+
+    #[tokio::test]
+    async fn small_waves_and_cancelled_reads_do_not_trigger_wave_hedges() {
+        let (s, path) = store(usize::MAX, Duration::from_millis(80)).await;
+        let backend: Arc<dyn ObjectStore> = s.clone();
+        let hedger = Hedger::new(1.0);
+        for _ in 0..MIN_SAMPLES {
+            hedger.record(Duration::from_secs(5));
+        }
+        // Three reads are below MIN_WAVE, and the 5 s timer threshold never fires in 80 ms.
+        let reads = (0..3).map(|_| hedger.get_range(&backend, &path, 0..16));
+        for r in futures::future::join_all(reads).await {
+            r.unwrap();
+        }
+        assert_eq!(s.calls.load(Ordering::SeqCst), 3);
+        // Dropped reads leave their wave and never count as finished.
+        let m = hedger.join();
+        let wave = m.wave.clone();
+        drop(m);
+        assert_eq!(wave.size.load(Ordering::SeqCst), 0);
+        assert_eq!(wave.done.load(Ordering::SeqCst), 0);
     }
 }
