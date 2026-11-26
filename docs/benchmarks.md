@@ -14185,3 +14185,111 @@ GETs subtotal about **$2.786**, excluding those small untimed costs and
 shared retained-fixture storage. No fixture objects, bucket prefixes, or uploads
 were created. The final full-debug workspace result is recorded in the worker
 report on the final documentation commit.
+
+## Round C24: hedge a read's stragglers against the reads that started around it
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge in us-west-2 (Ubuntu 24.04 arm64, Rust 1.100.0,
+Clang 19, release `neoverse-v1` builds, eight pinned CPUs and Rayon workers). Baseline is v0.1.49
+(`814452e`). The retained 10M, 1,024-dimensional, 55-slab fixture (`tmp/c5/10m`) was read-only.
+Production 1 MiB cache blocks with eight-block coalescing, probes64, top ten, strong consistency.
+
+### Profile before changes
+
+Forty cache-cold pure-S3 IDs-only queries on the baseline: p50 / p90 417 / 505 ms, 234 attempted GETs
+per query, and 17.4 hedges per query (7 percent). Slab scan GETs have p50 / p90 / p99 latency of
+68 / 107 / 250 ms.
+
+- The gap between the 85th-percentile and the last scan completion is **148 ms p50** (220 ms p90),
+  far above the 30 ms kill threshold. The 85th percentile completes at 91 ms and the last at 250 ms.
+- Existing hedging fires, but only for GETs of at most 1 MiB. **18.5 percent of slab GETs are larger**
+  (up to 8 MiB) and were never hedged. The historical timer also starts from a 250 ms prior, so a
+  fresh process hedges late.
+- The scan is not one lockstep wave. Each slab runs a short chain of dependent GETs, so the last
+  GETs of a query start about 165 ms (p50) after the first. A cohort of reads that start within a
+  few milliseconds (the first design: 85 percent of a wave, 15 percent cap) found too few
+  stragglers, and gave only 1.10x.
+
+### Change
+
+`crates/bf-storage/src/hedge.rs` now judges a read against its **siblings**: the reads that started
+within 50 ms before or after it. With at least four siblings, once 70 percent of them have finished
+and the read has outlasted the 70th percentile of their latencies, it is duplicated, first response
+wins, and the loser is dropped. This needs no latency history, so a fresh process hedges, and it has
+no size limit. The existing token bucket still bounds the total (default `hedge_budget` raised from
+0.1 to 0.15 extra reads per primary read). A read with fewer than four siblings keeps the historical
+timer (observed p90, up to 1 MiB), so there is still one mechanism: sibling comparison for waves, and
+the timer only for lone reads. There is no new storage API, dependency, or format change.
+
+The completion share was swept on the same host with paired alternating arms, 60 queries each:
+
+| Setting | p50 / p90, ms | GETs per query | Hedges per query |
+|---|---:|---:|---:|
+| Baseline | 342 / 485 | 229.6 | 16.5 |
+| 85 percent, 0.15 budget | 306 / 400 (earlier run) | 235.4 | 20.4 |
+| 85 percent, 0.20 budget | 293 / 368 | 233.6 | 18.3 |
+| **70 percent, 0.15 budget** | **283 / 359** | 242.2 | 30.9 |
+| 70 percent, 0.20 budget | 290 / 362 | 256.5 | 41.0 |
+| 60 percent, 0.20 budget | 290 / 377 | 258.2 | 42.3 |
+
+At 85 percent most of the budget goes unspent, so 70 percent at the default budget was chosen. It is
+the cheapest setting that performs as well as the costly ones.
+
+### Sixteen-process paired control
+
+Eight fresh process pairs, 200 queries each, alternating baseline-first and candidate-first. Each
+group measures IDs-only and `title`/`text` projections with independent cache drops. Samples pool to
+1,600 per build and projection. Bootstrap intervals resample queries (2,000 times, seed 24), for
+baseline/candidate, so larger is better.
+
+| Path | Baseline p50 / p90, ms | Candidate p50 / p90, ms | Ratio p50 / p90 | 95% interval p50 | 95% interval p90 |
+|---|---:|---:|---:|---:|---:|
+| Pure-S3 IDs | 317.3 / 451.6 | 279.7 / 351.9 | **1.135 / 1.283** | 1.103–1.165 | 1.259–1.314 |
+| Pure-S3 attributes | 310.9 / 437.7 | 268.4 / 325.0 | 1.158 / 1.347 | 1.117–1.197 | 1.310–1.372 |
+| Staged attributes | 66.8 / 88.6 | 67.2 / 89.1 | 0.993 / 0.995 | 0.986–1.000 | 0.967–1.029 |
+| Staged IDs | 32.1 / 35.6 | 32.2 / 35.9 | 0.996 / 0.993 | 0.992–1.000 | 0.979–1.005 |
+
+Per-pair pure-S3 IDs p90 ratios are all between 1.22 and 1.37, and p50 ratios between 1.07 and 1.28,
+so every pair favors the candidate. Staged results are equal within noise (staged attributes p50 is
+at worst 1.4 percent slower in the interval). Staged runs adopt one hard-linked seed stage per arm
+(`--keep-cache`, `--seed-cache`; untimed preparation).
+
+Extra GETs per query (attempted, including hedges):
+
+| Path | Baseline | Candidate | Change | Hedges, baseline / candidate |
+|---|---:|---:|---:|---:|
+| Pure-S3 IDs | 238.4 | 249.7 | +4.7% | 22.6 / 35.0 |
+| Pure-S3 attributes | 304.3 | 327.8 | +7.7% | 14.9 / 39.0 |
+| Staged attributes | 19.3 | 21.6 | +12.2% | 0.1 / 2.4 |
+| Staged IDs | 3.0 | 3.0 | 0 | 0 / 0 |
+
+All stay under the 20 percent cap. Response bytes are unchanged (199.6 versus 199.1 MB for pure-S3
+IDs). **All 6,400 measured reply pairs match** ordered documents and exact distances, and recall@10 is
+0.9700 in every arm. The staged attribute path gains nothing and spends 2.4 extra GETs a query
+for it: those waves are small, local, and fast, so the hedges are wasted but harmless.
+
+**Pass:** pure-S3 IDs p90 improves 1.283x (p50 1.135x, short of 1.2x), nothing is slower beyond
+noise, extra GETs are 4.7 percent, and results are identical. The brief's 85 percent threshold under
+a 10 ms cohort was not the best design; the measured one is above.
+
+Release binary SHA-256 values:
+
+```text
+baseline 814452e: b62d29342bed460fca2c9f6987eb6da3ead462957a568bca6bbed7997f1fbce9
+candidate:        e60ec9ff3036752ec3c6d1ce2b1ec8b9b5ac236202b4842aa24c121a9223c837
+```
+
+### Resources and cleanup
+
+One on-demand c7gd.4xlarge, launched 07:55 UTC and terminated 09:17 UTC (1.37 hours, about $1.00
+compute at $0.7258/hour, plus roughly 2 to 3 million GETs at $0.40/million). The instance, volumes, key
+pair, and security group are deleted and verified. No bucket objects or prefixes were created or
+changed.
+
+### Reproduction
+
+Build `crates/bf-engine/examples/scale-server` in release at both commits. Run
+`cold_ab.py --oracle 10m --queries 200 --paired-projections --block-size 1048576 --coalesce-blocks 8`
+with arms `{"base":{"BINARY":"<baseline>"},"cand":{}}`, `--s3-only-arm` for both arms, and eight
+fresh process pairs alternating the arm order. For staged arms, seed once with `--stage-arm s
+--two-phase-arm s --keep-cache DIR`, then pass `--stage-arm` and `--two-phase-arm` for both arms
+with `--seed-cache DIR`.

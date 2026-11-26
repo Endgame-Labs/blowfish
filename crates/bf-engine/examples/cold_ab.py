@@ -80,6 +80,16 @@ P.add_argument(
 P.add_argument("--stage-timeout", type=int, default=600, help="seconds to wait for staging to publish")
 P.add_argument("--block-size", type=int, default=4000, help="cache block bytes (production: 1048576)")
 P.add_argument("--coalesce-blocks", type=int, default=512, help="max coalesced blocks per GET (production: 8)")
+P.add_argument(
+    "--keep-cache",
+    type=Path,
+    help="move the first staging arm's finished cache here at exit, as a seed for --seed-cache",
+)
+P.add_argument(
+    "--seed-cache",
+    type=Path,
+    help="hard-link this kept cache into every staging arm before it starts (untimed preparation)",
+)
 P.add_argument("--oracle", choices=["100k", "1m", "10m", "100m"], default="10m")
 P.add_argument(
     "--include-attributes",
@@ -274,6 +284,14 @@ def server(name, index):
     port = a.port + index
     # Fresh processes reuse an arm directory; traces must describe only this process.
     (work / "server.log").write_text("")
+    if a.seed_cache and name in a.stage_arm:
+        shutil.rmtree(work / "cache", ignore_errors=True)
+        # Stage files are immutable, so links are safe; each process takes its own locks.
+        # Only the staging area is seeded: the block cache starts empty, with its own lock.
+        shutil.copytree(
+            a.seed_cache / "ann-staging-v3", work / "cache" / "ann-staging-v3",
+            copy_function=os.link, ignore=shutil.ignore_patterns(".lock"),
+        )
     log = (work / "server.log").open("a")
     proc = subprocess.Popen(
         [str(ROOT / binary), str(work / "storage.local"), f"127.0.0.1:{port}"],
@@ -305,6 +323,8 @@ def server(name, index):
             proc.kill()
             proc.wait(timeout=5)
         log.close()
+        if a.keep_cache and name in a.stage_arm[:1] and not a.keep_cache.exists():
+            shutil.move(work / "cache", a.keep_cache)
         shutil.rmtree(work / "cache", ignore_errors=True)
 
 

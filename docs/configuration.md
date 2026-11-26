@@ -44,7 +44,7 @@ are errors. Nested storage settings currently follow `bf-storage`'s parser.
 | `storage.cache.coalesce_gap_blocks` | `--cache-coalesce-gap-blocks` | `BLOWFISH_CACHE_COALESCE_GAP_BLOCKS` | `0` |
 | `storage.cache.fetch_concurrency` | `--cache-fetch-concurrency` | `BLOWFISH_CACHE_FETCH_CONCURRENCY` | `512` |
 | `storage.cache.prefetch_concurrency` | `--cache-prefetch-concurrency` | `BLOWFISH_CACHE_PREFETCH_CONCURRENCY` | `4` |
-| `storage.cache.hedge_budget` | — | `BF_HEDGE_BUDGET` | `0.1` (`0` disables hedged ranged reads) |
+| `storage.cache.hedge_budget` | — | `BF_HEDGE_BUDGET` | `0.15` (`0` disables hedged ranged reads) |
 
 With a disk cache directory and an S3-compatible backend, `storage.cache.disk_dir` also holds staged recluster-tier routing and code files (`ann-staging-v1/`), budgeted at the smaller of 20 GiB and a quarter of free disk, separately from `disk_bytes`. See [operations](operations.md#running-under-systemd-with-caddy) (Local ANN staging).
 
@@ -253,7 +253,7 @@ These environment-only switches are read directly by the storage and engine crat
 | --- | --- | --- |
 | `BF_WARM_CONNECTIONS` | adaptive (starts at `storage.warm_connections`, `256`) | Fix the S3 warm connection pool size (`0` disables connection warming) |
 | `BF_WARM_FLOOR` | `16` | Minimum idle S3 connections kept warm after an idle window |
-| `BF_HEDGE_BUDGET` | `storage.cache.hedge_budget` (`0.1`) | Extra-request fraction for hedged ranged GETs up to 1 MiB (`0` disables) |
+| `BF_HEDGE_BUDGET` | `storage.cache.hedge_budget` (`0.15`) | Extra-request fraction for hedged ranged GETs (`0` disables). A read is duplicated when it lags the reads that started around it (any size), or, with too few siblings, when it outlasts the observed p90 (up to 1 MiB) |
 | `BF_READ_GAP_KB` | layout default | Override read range-merge gap in KiB |
 | `BF_TRACE_READS` | off | Print each backend read and its timing to stderr |
 | `BF_TRACE_STAGES` | off | Print per-stage query and indexer timings to stderr |
