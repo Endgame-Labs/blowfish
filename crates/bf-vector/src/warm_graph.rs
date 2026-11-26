@@ -290,6 +290,63 @@ mod tests {
         assert!(graph.resident_bytes() < HotGraph::reservation(n, dims, 2).unwrap());
     }
     #[test]
+    fn scan_scores_only_allowed_rows_and_matches_a_brute_force_order() {
+        let dims = 16;
+        let n = 160;
+        let mut seed = 5u64;
+        let source = (0..n)
+            .map(|_| {
+                (0..dims)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        (seed >> 40) as f32 / 16777216. * 2. - 1.
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut b = HotGraphBuilder::new(dims, n).unwrap();
+        // Tier rows are not node order: node i holds row (i * 7) % n + 5 (a permutation plus a gap).
+        let row = |i: usize| ((i * 7) % n) as u32 + 5;
+        let ids = (0..n).map(row).collect::<Vec<_>>();
+        let packed = source
+            .iter()
+            .flatten()
+            .flat_map(|x| f16::from_f32(*x).to_le_bytes())
+            .collect::<Vec<_>>();
+        b.append(&ids, &packed, &|| false).unwrap();
+        let graph = b.finish(&|| false).unwrap();
+        assert!(graph.can_scan());
+        let query = &source[41];
+        // Every third row, a single row, none of the graph's rows, and every row.
+        let thirds = (0..n)
+            .map(row)
+            .filter(|r| r % 3 == 0)
+            .collect::<RoaringBitmap>();
+        let one = RoaringBitmap::from_iter([row(41)]);
+        let outside = RoaringBitmap::from_iter([0, 1, 100_000]);
+        let all = (0..n).map(row).collect::<RoaringBitmap>();
+        for allowed in [&thirds, &one, &outside, &all] {
+            let (hits, scanned) = graph.scan(query, 12, allowed).unwrap();
+            let inside = allowed.iter().filter(|r| ids.contains(r)).count();
+            assert_eq!(scanned, inside);
+            assert_eq!(hits.len(), inside.min(12));
+            assert!(hits.iter().all(|(r, _)| allowed.contains(*r)));
+            // With the whole allowed set shortlisted, the scan equals a full ranking.
+            let (full, _) = graph.scan(query, n, allowed).unwrap();
+            assert_eq!(
+                full[..hits.len()].iter().map(|h| h.0).collect::<Vec<_>>(),
+                hits.iter().map(|h| h.0).collect::<Vec<_>>()
+            );
+        }
+        // The nearest allowed row to a stored vector is that row when it is allowed.
+        assert_eq!(graph.scan(query, 3, &all).unwrap().0[0].0, row(41));
+        // Zero queries and zero counts are refused like graph navigation.
+        assert!(graph.scan(&vec![0.; dims], 3, &all).is_err());
+        assert!(graph.scan(query, 0, &all).is_err());
+    }
+    #[test]
     fn cancellation_and_invalid_input_leave_no_spills() {
         let root = root();
         let _cleanup = Cleanup(root.clone());

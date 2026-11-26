@@ -1130,7 +1130,13 @@ pub(crate) async fn scan(
     )
     .await
     {
-        Ok(found) => Ok(found),
+        Ok(found) => {
+            // A scan never feeds the beam calibration: its recall does not depend on the beam.
+            if found.is_some() {
+                scope.cache.answers.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(found)
+        }
         Err(error) => {
             tracing::debug!(%error, "warm graph scan declined; using IVF");
             Ok(None)
