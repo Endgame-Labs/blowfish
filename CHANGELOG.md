@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.48] - 2026-11-26
+
+### Changed
+
+- **Cold staged vector queries that return attributes are about 1.4x faster:** When exact vectors are staged on local disk, a cold query returning attributes used to read each 2-200 KB column block as a whole 1 MiB cache block, fetch the `id` column even though the staged row-to-ID map already had it, and start speculative document reads for about three times `top_k` unreranked candidates before the roughly 2 ms local rerank named the winners. It now reads column blocks at their exact size, takes IDs from the verified staged map (falling back to the stored column if the map is retired), takes one exact top-k prefix early in the scan instead of guessing, and hydrates the winning segments concurrently. On a 10M x 1024-d cold staged setup on same-region S3, attribute queries went from 92.7 / 128.3 to 66.5 / 93.9 ms p50 / p90. IDs-only and unstaged cold queries are unchanged (a 16-process paired control: 0.99x, CI includes 1.0). Every measured reply matched exactly.
+
 ## [0.1.47] - 2026-11-26
 
 ### Changed
@@ -356,7 +362,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.47...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.48...HEAD
+[0.1.48]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.48
 [0.1.47]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.47
 [0.1.46]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.46
 [0.1.45]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.45
