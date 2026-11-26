@@ -37,8 +37,8 @@ RUN = (a.scratch / a.label).resolve()
 assert ".scratch" in RUN.parts
 RUN.mkdir(parents=True, exist_ok=True)
 config = json.loads(a.config.read_text())
-truth = np.load(ROOT / f"bench/scale/data/oracle-{a.oracle}.npz")
-n_items = len(truth["vector"])
+VEC = np.load(ROOT / f"bench/scale/data/oracle-{a.oracle}.npz")["vector"]
+n_items = len(VEC)
 builds = json.loads(a.builds)
 CLK = os.sysconf("SC_CLK_TCK")
 
@@ -94,7 +94,7 @@ def server(name, binary, port):
 
 
 def request(i):
-    return {"rank_by": ["vector", "ANN", truth["vector"][i % n_items].astype("f4").tolist()],
+    return {"rank_by": ["vector", "ANN", VEC[i % n_items].astype("f4").tolist()],
             "top_k": 10, "consistency": {"level": "strong"}, "include_attributes": ["id"]}
 
 
