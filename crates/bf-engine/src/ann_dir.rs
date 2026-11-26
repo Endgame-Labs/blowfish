@@ -328,19 +328,19 @@ async fn run_parallel<T: Send + 'static>(
     Ok(out)
 }
 
-async fn on_worker<T: Send + 'static>(
+/// Run cold decoding or scanning on the query's bounded worker pool when cores are available.
+pub(crate) async fn on_worker<T: Send + 'static>(
     fut: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {
     let Some(context) = read_cache::context().filter(|_| crate::fan_out()) else {
         return fut.await;
     };
-    let permit = context
-        .cache
-        .workers
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(segment::index_error)?;
+    // Exact segment queries can already hold a search permit when they decode a filter.
+    // Waiting here would let every outer task wait for a permit held by its peers. When
+    // workers are occupied, finish on the caller, which already has its share of the CPU.
+    let Ok(permit) = context.cache.workers.clone().try_acquire_owned() else {
+        return fut.await;
+    };
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -1446,7 +1446,7 @@ pub(crate) async fn search(
     let scan_upper = Arc::new(std::sync::atomic::AtomicU32::new(f32::INFINITY.to_bits()));
     // Native mappings are resident even when the block cache has no retention budget.
     // Otherwise, sample a selected code range per slab without starting I/O.
-    let parallel_slab_scan = stream_scan(&dir, layout) && !filtered && joint.is_none();
+    let parallel_slab_scan = stream_scan(&dir, layout) && joint.is_none();
     let resident = parallel_slab_scan
         && (store.has_mapped_reads()
             || chosen.iter().all(|(&i, cs)| {

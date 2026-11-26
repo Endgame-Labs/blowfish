@@ -27,6 +27,7 @@ P.add_argument("--clients", type=int, default=16)
 P.add_argument("--queries", type=int, default=400, help="measured queries per build per round")
 P.add_argument("--rounds", type=int, default=3)
 P.add_argument("--oracle", default="10m")
+P.add_argument("--filters", type=json.loads, help="JSON filter applied to warm-up and measured queries")
 P.add_argument("--scratch", type=Path, required=True)
 P.add_argument("--label", required=True)
 P.add_argument("--port", type=int, default=8500)
@@ -97,7 +98,8 @@ def server(name, binary, port):
 
 def request(i):
     return {"rank_by": ["vector", "ANN", VEC[i % n_items].astype("f4").tolist()],
-            "top_k": 10, "consistency": {"level": "strong"}, "include_attributes": ["id"]}
+            "top_k": 10, "consistency": {"level": "strong"}, "include_attributes": ["id"],
+            **({"filters": a.filters} if a.filters is not None else {})}
 
 
 def run(name, binary, rnd, port, perf):
@@ -131,6 +133,8 @@ def run(name, binary, rnd, port, perf):
         if pp:
             subprocess.run(["sudo", "kill", "-INT", str(pp.pid)]); pp.wait()
         n = len(lat)
+        if n != a.queries:
+            raise RuntimeError(f"expected {a.queries} successful requests, got {n}; inspect client errors")
         return {"build": name, "round": rnd, "n": n, "qps": n / wall, "p50": float(np.percentile(lat, 50)),
                 "p90": float(np.percentile(lat, 90)), "cpu_ms_per_query": 1000 * (cpu1 - cpu0) / n,
                 "gets_per_query": (after["gets"] - before["gets"]) / n, "hedges_per_query": (after["hedges"] - before["hedges"]) / n}

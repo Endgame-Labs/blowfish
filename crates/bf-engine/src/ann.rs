@@ -663,22 +663,25 @@ async fn from_slabs(
             };
             stage(t0, "slabs_memberships");
             let lives = match (&members, &mask) {
-                (Some(members), Some(global)) => members
-                    .iter()
-                    .zip(&view.segments)
-                    .map(|(member, slab)| {
-                        Some(member.as_ref().map_or_else(
-                            || global.clone(),
-                            |m| {
-                                let key = &crate::upgrade::files(slab, attribute)
-                                    .expect("directory checked above")
-                                    .0
-                                    .key;
-                                slab_predicate(key, m, global)
-                            },
-                        ))
-                    })
-                    .collect(),
+                (Some(members), Some(global)) => {
+                    futures::future::try_join_all(members.iter().zip(&view.segments).map(
+                        |(member, slab)| {
+                            let (member, global) = (member.clone(), global.clone());
+                            let key = crate::upgrade::files(slab, attribute)
+                                .expect("directory checked above")
+                                .0
+                                .key
+                                .clone();
+                            crate::ann_dir::on_worker(async move {
+                                Ok(Some(match member {
+                                    Some(member) => slab_predicate(&key, &member, &global),
+                                    None => global,
+                                }))
+                            })
+                        },
+                    ))
+                    .await?
+                }
                 _ => vec![mask; view.segments.len()],
             };
             stage(t0, "slabs_predicates");
@@ -785,18 +788,20 @@ fn filtered_tier_mask(
         match place {
             crate::lineage::Place::Here(i) => {
                 if let Some(rows) = &allowed[*i] {
-                    mask.extend(rows.iter().map(|r| cover.base + r));
+                    mask |= RoaringBitmap::from_sorted_iter(rows.iter().map(|r| cover.base + r))
+                        .expect("translated segment rows stay sorted");
                 } else {
                     mask.insert_range(cover.base..cover.base + cover.rows);
                 }
             }
             crate::lineage::Place::Moved(parts) => {
                 for (i, map) in parts {
-                    mask.extend(
+                    mask |= RoaringBitmap::from_sorted_iter(
                         map.pairs()
                             .filter(|(_, to)| allowed[*i].as_ref().is_none_or(|a| a.contains(*to)))
                             .map(|(from, _)| cover.base + from),
-                    );
+                    )
+                    .expect("lineage source rows stay sorted");
                 }
             }
         }

@@ -642,3 +642,67 @@ async fn stalled_nonwinning_projection_is_canceled_after_winner_hydration() {
     .unwrap();
     assert!(engine.shutdown(Duration::from_secs(5)).await);
 }
+
+#[tokio::test]
+async fn disjoint_id_ranges_read_only_the_bounds_header() {
+    let backend = Arc::new(Delayed::default());
+    let store = Storage::from_backend_with_cache(
+        backend.clone(),
+        Path::default(),
+        false,
+        false,
+        bf_storage::CacheConfig {
+            memory_bytes: 1 << 20,
+            block_size: 262_144,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let schema: Schema = serde_json::from_value(serde_json::json!({"id":{"type":"uint"}})).unwrap();
+    let docs: BTreeMap<Id, Document> = (100_000..200_000u64)
+        .map(|id| {
+            (
+                Id::Uint(id),
+                Document::from_iter([("id".into(), Value::from(id))]),
+            )
+        })
+        .collect();
+    let segment = build_with(
+        &store,
+        "id-bounds",
+        &schema,
+        bf_types::DistanceMetric::CosineDistance,
+        &docs,
+        BTreeMap::new(),
+        1,
+        1,
+    )
+    .await
+    .unwrap();
+    backend.reads.lock().unwrap().clear();
+    let live = (0..segment.row_count).collect();
+    let filter: Filter = serde_json::from_value(serde_json::json!(["id", "Lt", 1000])).unwrap();
+    assert!(
+        filter_rows(&store, &segment, &filter, &schema, &live)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let reads = backend.reads.lock().unwrap();
+    assert!(!reads.is_empty());
+    assert!(
+        reads
+            .iter()
+            .all(|(path, _)| path.as_ref().ends_with("idfilter.bff")),
+        "{reads:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .map(|(_, range)| range.end - range.start)
+            .sum::<u64>()
+            < 32_768,
+        "{reads:?}"
+    );
+}

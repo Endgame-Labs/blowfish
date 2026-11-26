@@ -12,6 +12,9 @@ use std::{collections::BTreeMap, io, ops::Range, sync::Arc};
 #[path = "segment_upgrade.rs"]
 pub(crate) mod upgrade;
 
+#[path = "segment_id_filter.rs"]
+mod id_predicate;
+
 const MAGIC: &[u8; 8] = b"BFSEG001";
 const FOOTER: usize = 32;
 const BLOCK_ROWS: usize = 256;
@@ -1796,6 +1799,12 @@ pub(crate) fn filter_rows<'a>(
                 value,
                 params,
             } => {
+                if attribute == "id"
+                    && let Some(rows) =
+                        id_predicate::evaluate(store, segment, *op, value, schema, live).await?
+                {
+                    return Ok(rows);
+                }
                 if matches!(
                     op,
                     bf_types::FilterOp::ContainsAllTokens
@@ -1872,13 +1881,17 @@ pub(crate) fn filter_rows<'a>(
                     return Ok(out);
                 };
                 let key = format!("{}:{attribute}", reader.file.key);
-                let values: Arc<Vec<(Value, RoaringBitmap)>> =
-                    if let Some(values) = read_cache::get(&key, col.blocks[0].length) {
-                        values
-                    } else {
-                        let value = decode(&read_block(&reader, &col.blocks[0]).await?)?;
-                        read_cache::insert(&key, col.blocks[0].length.saturating_mul(32), value)
-                    };
+                let values: Arc<Vec<(Value, RoaringBitmap)>> = if let Some(values) =
+                    read_cache::get(&key, col.blocks[0].length)
+                {
+                    values
+                } else {
+                    let bytes = read_block(&reader, &col.blocks[0]).await?;
+                    // Keep reads concurrent, and bound only their CPU-heavy dictionary
+                    // decodes. Busy queries perform their own work without a handoff.
+                    let value = crate::ann_dir::on_worker(async move { decode(&bytes) }).await?;
+                    read_cache::insert(&key, col.blocks[0].length.saturating_mul(32), value)
+                };
                 let mut out = RoaringBitmap::new();
                 // Sorted dictionary runs permit binary seeks for scalar ranges.
                 // Canonicalization preserves datetime, UUID, and exact integer ordering.

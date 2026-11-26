@@ -201,6 +201,28 @@ impl OpenHint {
                         .get(a)
                         .is_some_and(|sets| tiers_cover_all(segments, lineage, sets))
             });
+            // Share predicate completion with tier warming. An empty filter never needs
+            // memberships, and the query reuses these same immutable predicates.
+            let predicates = async {
+                let mut matching = false;
+                let rows = futures::future::try_join_all(segments.iter().flat_map(|seg| {
+                    self.filters.iter().map(move |f| async move {
+                        let result = segment::filter_live(store, seg, f, schema).await;
+                        crate::ann::stage(trace_t0, "warm_filter");
+                        result
+                    })
+                }))
+                .await?;
+                for rows in rows {
+                    matching |= !rows.is_empty();
+                }
+                Ok::<_, ApiError>(matching)
+            }
+            .boxed()
+            .shared();
+            if by_dir && with_rest && !self.filters.is_empty() {
+                tasks.push(predicates.clone().map_ok(drop).boxed());
+            }
             for attribute in self.ann.iter().filter(|_| with_rest) {
                 // A lone unfiltered ANN query reads the block-layout directory when there is one.
                 // A recluster's tiers take the scan of the rows they cover; the block-layout
@@ -214,12 +236,13 @@ impl OpenHint {
                     let filtered = !self.filters.is_empty();
                     let config = &self.config;
                     let name = crate::ann_dir::Layout::Slabs.dir_key(attribute);
+                    let predicates = predicates.clone();
                     tasks.push(
                         async move {
                             if filtered || scan.is_none() {
                                 let dir = crate::ann_dir::load(store, &set.dir, None).await?;
                                 crate::ann::stage(trace_t0, "warm_slab_directory");
-                                if filtered {
+                                if filtered && predicates.await? {
                                     crate::ann_dir::memberships(store, &set.slabs, &dir, attribute)
                                         .await?;
                                     crate::ann::stage(trace_t0, "warm_slab_memberships");
@@ -302,20 +325,6 @@ impl OpenHint {
                 }
             }
             for seg in segments {
-                if by_dir && with_rest {
-                    for f in &self.filters {
-                        // Share the immutable live predicate with query planning; WAL shadows
-                        // are removed afterward, rather than entering the cache key.
-                        tasks.push(
-                            async move {
-                                let result = segment::filter_live(store, seg, f, schema).await;
-                                crate::ann::stage(trace_t0, "warm_filter");
-                                result.map(drop)
-                            }
-                            .boxed(),
-                        );
-                    }
-                }
                 for attribute in self.ann.iter().filter(|_| !by_dir && with_rest) {
                     if let Some(file) = seg.files.get(&format!("annv2:{attribute}")) {
                         tasks.push(segment::vector_index(store, file).map_ok(drop).boxed());
