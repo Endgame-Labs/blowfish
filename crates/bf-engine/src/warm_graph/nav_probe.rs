@@ -3,7 +3,8 @@ use super::*;
 use bf_types::QueryRequest;
 use std::{collections::BTreeMap, process::Command, sync::atomic::AtomicU32};
 
-#[allow(dead_code)]
+// recluster::experiment loads the same reader under another name; both are test-only.
+#[allow(dead_code, clippy::duplicate_mod)]
 #[path = "../../../bf-vector/examples/g3/data.rs"]
 mod data;
 
@@ -236,6 +237,8 @@ async fn same_graph_navigation_cpu() {
         phase_cpu: Default::default(),
         searches: AtomicU64::new(0),
         pending_cost: Mutex::default(),
+        ids: std::sync::OnceLock::new(),
+        ids_started: std::sync::atomic::AtomicBool::new(false),
     });
     let key = Key::new("nq", &state, "vector", set);
     let mut heat = Heat::new(Instant::now());
