@@ -14,7 +14,9 @@ mod index;
 mod nearest;
 mod policy;
 mod reader;
+mod row_locations;
 pub use policy::tier_probe_budget;
+pub use row_locations::RowLocations;
 mod resident;
 pub use resident::{
     CompiledHits, CompiledTier, ResidentIndex, ResidentQueryScratch, ValidatedVector,

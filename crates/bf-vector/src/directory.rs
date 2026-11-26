@@ -976,12 +976,12 @@ impl<R: RangeRead> PartialIndex<R> {
 /// A segment's row-to-cluster map (decoded from the fragment's membership area).
 pub struct Membership {
     /// Ascending global IDs for a sparse slab; absent for a dense segment.
-    row_ids: Option<Vec<u32>>,
+    pub(crate) row_ids: Option<Vec<u32>>,
     row_set: Option<RoaringBitmap>,
-    clusters: usize,
-    cluster_of: Vec<u32>,
+    pub(crate) clusters: usize,
+    pub(crate) cluster_of: Vec<u32>,
     /// Position of each row among its cluster's rows, in ascending row order.
-    ordinal_of: Vec<u32>,
+    pub(crate) ordinal_of: Vec<u32>,
 }
 impl Membership {
     /// Decode the membership bytes of a segment with `rows` rows and `clusters` clusters.
@@ -1068,6 +1068,46 @@ impl Membership {
             clusters,
         })
     }
+    /// Build a selective membership from ascending `(row, cluster, ordinal)` records.
+    /// Ordinals retain their positions in the full cluster; gaps are allowed, and repeated
+    /// or decreasing rows or ordinals are rejected. Allocation follows selected rows.
+    pub fn from_locations(
+        rows: impl IntoIterator<Item = (u32, u32, u32)>,
+        clusters: usize,
+    ) -> Result<Self> {
+        let rows = rows.into_iter();
+        let capacity = rows.size_hint().0;
+        let mut row_ids = Vec::with_capacity(capacity);
+        let mut cluster_of = Vec::with_capacity(capacity);
+        let mut ordinal_of = Vec::with_capacity(capacity);
+        let mut previous = vec![None; clusters.min(capacity)];
+        let mut overflow = std::collections::BTreeMap::new();
+        for (row, cluster, ordinal) in rows {
+            let last = match previous.get_mut(cluster as usize) {
+                Some(last) => last,
+                None => overflow.entry(cluster).or_default(),
+            };
+            if cluster as usize >= clusters
+                || row_ids.last().is_some_and(|last| *last >= row)
+                || last.is_some_and(|last| last >= ordinal)
+            {
+                return Err(bad("invalid selective membership"));
+            }
+            *last = Some(ordinal);
+            row_ids.push(row);
+            cluster_of.push(cluster);
+            ordinal_of.push(ordinal);
+        }
+        let row_set = RoaringBitmap::from_sorted_iter(row_ids.iter().copied())
+            .map_err(|_| bad("invalid selective membership rows"))?;
+        Ok(Self {
+            row_ids: Some(row_ids),
+            row_set: Some(row_set),
+            clusters,
+            cluster_of,
+            ordinal_of,
+        })
+    }
     /// Ascending global row IDs for a sparse map; `None` for a dense segment map.
     pub fn row_ids(&self) -> Option<&[u32]> {
         self.row_ids.as_deref()
@@ -1125,21 +1165,44 @@ impl Membership {
             &bytes[..bytes.len() - 4],
             u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap()),
         )?;
-        let rows: Vec<_> = bytes[12..bytes.len() - 4]
-            .chunks_exact(4 + width)
-            .map(|row| {
-                let cluster = if width == 2 {
-                    u32::from(u16::from_le_bytes(row[4..6].try_into().unwrap()))
-                } else {
-                    u32::from_le_bytes(row[4..8].try_into().unwrap())
-                };
-                (u32::from_le_bytes(row[..4].try_into().unwrap()), cluster)
-            })
-            .collect();
-        if rows.windows(2).any(|w| w[0].0 >= w[1].0) {
-            return Err(bad("unordered sparse membership rows"));
+        // Published rows are already strictly ordered. Decode straight into the resident
+        // columns, avoiding an intermediate pair vector, a sort, and repeated validation.
+        let mut row_ids = Vec::with_capacity(count);
+        let mut cluster_of = Vec::with_capacity(count);
+        let mut ordinal_of = Vec::with_capacity(count);
+        let mut next = vec![0u32; clusters.min(count)];
+        let mut overflow = std::collections::BTreeMap::<u32, u32>::new();
+        for bytes in bytes[12..bytes.len() - 4].chunks_exact(4 + width) {
+            let row = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            let cluster = if width == 2 {
+                u32::from(u16::from_le_bytes(bytes[4..6].try_into().unwrap()))
+            } else {
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap())
+            };
+            if row_ids.last().is_some_and(|last| *last >= row) {
+                return Err(bad("unordered sparse membership rows"));
+            }
+            if cluster as usize >= clusters {
+                return Err(bad("invalid sparse membership"));
+            }
+            let ordinal = match next.get_mut(cluster as usize) {
+                Some(ordinal) => ordinal,
+                None => overflow.entry(cluster).or_default(),
+            };
+            ordinal_of.push(*ordinal);
+            *ordinal += 1;
+            row_ids.push(row);
+            cluster_of.push(cluster);
         }
-        Self::from_sparse_rows(rows, clusters)
+        let row_set = RoaringBitmap::from_sorted_iter(row_ids.iter().copied())
+            .map_err(|_| bad("unordered sparse membership rows"))?;
+        Ok(Self {
+            row_ids: Some(row_ids),
+            row_set: Some(row_set),
+            clusters,
+            cluster_of,
+            ordinal_of,
+        })
     }
     fn slot(&self, row: u32) -> Option<usize> {
         match &self.row_ids {
@@ -1252,5 +1315,31 @@ mod sparse_membership_tests {
         );
         assert!(Membership::from_sparse_rows([(1, 0), (1, 1)], 2).is_err());
         assert!(Membership::from_sparse_rows([(1, 2)], 2).is_err());
+    }
+
+    #[test]
+    fn sparse_decoder_rejects_valid_checksum_with_invalid_rows_or_clusters() {
+        let empty = Membership::from_sparse_rows([], u32::MAX as usize).unwrap();
+        let empty = Membership::decode_sparse(&empty.encode_sparse().unwrap()).unwrap();
+        assert!(empty.row_ids().unwrap().is_empty());
+        assert!(empty.resident_bytes() < 4096);
+        let original = Membership::from_sparse_rows([(1, 0), (7, 2)], 3)
+            .unwrap()
+            .encode_sparse()
+            .unwrap();
+        for (offset, replacement) in [(18, 1u32.to_le_bytes()), (12, 9u32.to_le_bytes())] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + 4].copy_from_slice(&replacement);
+            let end = bytes.len() - 4;
+            let crc = crc32fast::hash(&bytes[..end]);
+            bytes[end..].copy_from_slice(&crc.to_le_bytes());
+            assert!(Membership::decode_sparse(&bytes).is_err());
+        }
+        let mut bytes = original;
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+        let end = bytes.len() - 4;
+        let crc = crc32fast::hash(&bytes[..end]);
+        bytes[end..].copy_from_slice(&crc.to_le_bytes());
+        assert!(Membership::decode_sparse(&bytes).is_err());
     }
 }
