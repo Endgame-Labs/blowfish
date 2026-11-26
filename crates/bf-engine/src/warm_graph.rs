@@ -700,11 +700,19 @@ fn background_priority() {
     }
 }
 
+/// Construction workers: every core but one, and never fewer than two. They run at idle
+/// priority, so foreground queries still win any contended core. Round GB1 measured this
+/// against the old fixed pair.
+fn build_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, |n| n.get().saturating_sub(1))
+        .max(2)
+}
 fn pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(build_threads())
             .thread_name(|n| format!("warm-graph-{n}"))
             .start_handler(|_| {
                 #[cfg(not(all(test, target_os = "linux")))]

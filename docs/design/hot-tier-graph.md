@@ -39,8 +39,10 @@ The initial partition-and-stitch implementation and its rejected controls are me
    alpha 1 then 1.2, using only SQ8 construction distances.
 4. Each construction row owns a fixed-capacity 64-neighbor array under a compact lock. Reverse
    additions prune on overflow, and each pass prunes every row back to 32. Searches copy a bounded
-   array before releasing its lock. The constructor frontier periodically removes stale nodes
-   outside the monotonically improving beam threshold.
+   array before releasing its lock. Construction searches with the same sorted-beam core as serving,
+   but steers by one-bit Hamming distance over mean-centered sign codes (128 bytes per row at 1,024
+   dimensions) instead of 1,024-byte SQ8 rows. The pruner measures only the expanded nodes and the
+   closest few scored ones exactly, so each insertion reads about a tenth of the code rows (Round GB1).
 5. Convert construction adjacency into fixed-width immutable links, append two connectivity-ring
    edges, and retain the original tier-row map. Release all construction adjacency and owned spool
    files. Only ordinary queries read original f16 rows, for exact reranking of the top 30.
@@ -48,7 +50,7 @@ The initial partition-and-stitch implementation and its rejected controls are me
 There are no spatial partitions to overflow or subdivide in this constructor. Oversized tiers are
 refused by the process reservation and continue on IVF. Reservation accounts separately for the
 source, construction, publication, and retained-query peaks, including simultaneous old adjacency
-and new compact links, two construction scratch sets, query scratch, and allocator allowance. Fixed
+and new compact links, two construction scratch sets, one-bit construction codes, query scratch, and allocator allowance. Fixed
 neighbor arrays and compact locks avoid a hidden per-node allocator or operating-system lock budget.
 
 The SQ8 spool is a disposable implementation detail, not a persisted index format. Linux releases
@@ -59,7 +61,7 @@ process's active build alone. It uses the disk-cache directory when available, a
 temporary directory otherwise. Measurement processes place temporary files in their owned run.
 
 One process-wide construction slot prevents competing graph builders. A dedicated Rayon pool has
-at most two workers, using Linux idle scheduling with nice 19 (nice 19 alone when idle scheduling is denied), or macOS utility QoS. CPU passes check cancellation at source-row, graph-point, and bounded-phase boundaries, and periodically check process memory headroom. Automatic recluster construction takes priority;
+every core but one (at least two) as workers, using Linux idle scheduling with nice 19 (nice 19 alone when idle scheduling is denied), or macOS utility QoS. CPU passes check cancellation at source-row, graph-point, and bounded-phase boundaries, and periodically check process memory headroom. Automatic recluster construction takes priority;
 it also subtracts existing graph reservations when sizing its own work.
 
 Source decoding, local I/O, and construction all run on that pool. The blocking job retains the
