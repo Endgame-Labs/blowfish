@@ -4,6 +4,7 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-26
 
+- **C25 256 KiB cache blocks (merged).** 1 MiB blocks fetched 205 MB for 42 MB per cold 10M query. 256 KiB x 32 coalescing: 16-client pure-S3 17.3 -> 25.6 q/s (1.48x), CPU/query 335 -> 224 ms, p90 1,267 -> 823 ms; single client p50 1.21x. 64 KiB was faster cold (2.1x) but +14% warm CPU and 4x disk-tier files.
 - **G10 union-truth graph calibration (merged).** Samples use exact top-k of graph + IVF + IVF 2x probes; 1-in-16 exhaustive audit; separate clocks. M4 NQ ordinary heat: promoted at 32 min (calibration 4.5 min) vs ~107 h estimated on v0.1.51. top_k 10 8,106 q/s (recall 0.9552), top_k 100 2,799 q/s (0.9533). Remaining time to promote is the heat gate and the 17-minute build (GB1).
 - **C24/C24b sibling hedging (merged).** Hedge a read once 70% of reads started within 50 ms finished and it outlasts them, any size; lock-free 10 ms slot ring (review caught C24's O(n) mutex verdict: 16-client 17.3 -> 14.0 q/s; C24b back to 17.3). Pure-S3 cold p90 1.32x IDs / 1.34x attrs; CPU/query +6%; hedge_budget default 0.15.
 - **G8/G9 graph top_k 100 and promotion fix (merged).** Graph serves k+offset <= 100 (beam max(cal, 2.56k), shortlist 1.5k); M4 NQ top_k 100 883 -> 2,806 q/s, recall@100 0.9523 -> 0.9530. Promotion cost test now compares graph and IVF at steady state (busy servers never promoted before). Calibration speed is G10.
