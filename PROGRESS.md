@@ -4,6 +4,7 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-26
 
+- **C26 cold filtered ANN profile (merged, no release).** On the retained 10M fixture (served read-only, so its slab row maps were never published), every cold filtered query rebuilds memberships from 1.64 GB of slabs (2.4-2.8 s), even for an empty filter. The proposed overlap fixes are worth under 30%. With published maps a small namespace answers in 82-230 ms. Stage tracing kept. C27 measures the repaired 10M baseline.
 - **G11 Qdrant head to head on the M4 (merged).** NQ, 16 clients, ordinary promotion: top_k 10 blowfish 8,417 q/s vs Qdrant ~7,740 at matched recall (p99 4.7 vs 6.6 ms), blowfish ahead; top_k 100 Qdrant ahead (~3,625 vs 2,200-2,750). Fixed: graph stopped serving when top_k mix changed (cost saving now a ratio on calibration blocks). Next: G12 top_k 100.
 - **C25 256 KiB cache blocks (merged).** 1 MiB blocks fetched 205 MB for 42 MB per cold 10M query. 256 KiB x 32 coalescing: 16-client pure-S3 17.3 -> 25.6 q/s (1.48x), CPU/query 335 -> 224 ms, p90 1,267 -> 823 ms; single client p50 1.21x. 64 KiB was faster cold (2.1x) but +14% warm CPU and 4x disk-tier files.
 - **G10 union-truth graph calibration (merged).** Samples use exact top-k of graph + IVF + IVF 2x probes; 1-in-16 exhaustive audit; separate clocks. M4 NQ ordinary heat: promoted at 32 min (calibration 4.5 min) vs ~107 h estimated on v0.1.51. top_k 10 8,106 q/s (recall 0.9552), top_k 100 2,799 q/s (0.9533). Remaining time to promote is the heat gate and the 17-minute build (GB1).
