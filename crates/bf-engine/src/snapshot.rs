@@ -204,23 +204,45 @@ impl OpenHint {
             // Share predicate completion with tier warming. An empty filter never needs
             // memberships, and the query reuses these same immutable predicates.
             let (positive, present) = tokio::sync::watch::channel(false);
+            let partial = std::sync::Arc::new(std::sync::Mutex::new(if self.filters.is_empty() { Vec::new() } else { vec![
+                Some(
+                    std::sync::Arc::new(RoaringBitmap::new())
+                );
+                segments.len()
+            ] }));
+            let (changed, progress) = tokio::sync::watch::channel(0u64);
+            let known = partial.clone();
             let predicates = async move {
                 let mut matching = false;
                 let positive = &positive;
-                let rows = futures::future::try_join_all(segments.iter().flat_map(|seg| {
-                    self.filters.iter().map(move |f| async move {
-                        let result = segment::filter_live(store, seg, f, schema).await;
-                        crate::ann::stage(trace_t0, "warm_filter");
-                        if result.as_ref().is_ok_and(|rows| !rows.is_empty()) {
-                            positive.send_if_modified(|present| {
-                                let changed = !*present;
-                                *present = true;
-                                changed
-                            });
-                        }
-                        result
-                    })
-                }))
+                let changed = &changed;
+                let known = &known;
+                let rows = futures::future::try_join_all(segments.iter().enumerate().flat_map(
+                    |(i, seg)| {
+                        self.filters.iter().map(move |f| async move {
+                            let result = segment::filter_live(store, seg, f, schema).await;
+                            crate::ann::stage(trace_t0, "warm_filter");
+                            if let Ok(rows) = &result {
+                                {
+                                    let mut known = known.lock().expect("partial predicates");
+                                    let previous = known[i].as_ref().expect("partial predicate");
+                                    known[i] = Some(if previous.is_empty() || std::sync::Arc::ptr_eq(previous, rows) {
+                                        rows.clone()
+                                    } else {
+                                        std::sync::Arc::new(previous.as_ref() | rows.as_ref())
+                                    });
+                                }
+                                changed.send_modify(|version| *version += 1);
+                                if !rows.is_empty() { positive.send_if_modified(|present| {
+                                    let changed = !*present;
+                                    *present = true;
+                                    changed
+                                }); }
+                            }
+                            result
+                        })
+                    },
+                ))
                 .await?;
                 for rows in rows {
                     matching |= !rows.is_empty();
@@ -247,19 +269,23 @@ impl OpenHint {
                     let name = crate::ann_dir::Layout::Slabs.dir_key(attribute);
                     let predicates = predicates.clone();
                     let mut present = present.clone();
+                    let partial = partial.clone();
+                    let mut progress = progress.clone();
                     tasks.push(
                         async move {
                             if filtered || scan.is_none() {
-                                let (dir, _) = tokio::try_join!(
+                                let (dir, placement) = tokio::try_join!(
                                     crate::ann_dir::load(store, &set.dir, None),
                                     async {
                                         if filtered {
                                             // Translation needs these immutable maps too. Open
                                             // them alongside the directory and predicates.
-                                            crate::lineage::place(store, segments, lineage, set)
-                                                .await?;
+                                            return crate::lineage::place(
+                                                store, segments, lineage, set,
+                                            )
+                                            .await;
                                         }
-                                        Ok::<_, ApiError>(())
+                                        Ok::<_, ApiError>(None)
                                     }
                                 )?;
                                 crate::ann::stage(trace_t0, "warm_slab_directory");
@@ -268,13 +294,74 @@ impl OpenHint {
                                 // an empty query must wait for every segment before deciding.
                                 let matching = if filtered {
                                     tokio::select! {
-                                        all = predicates => all?,
+                                        all = predicates.clone() => all?,
                                         first = present.wait_for(|found| *found) => first.is_ok(),
                                     }
                                 } else {
                                     false
                                 };
                                 if matching {
+                                    if crate::tier_rows::has(set, attribute)
+                                        && let Some(placement) = placement.as_ref()
+                                    {
+                                        if let Some(done) = predicates.peek() {
+                                            done.clone()?;
+                                            let known = partial.lock().expect("partial predicates").clone();
+                                            let mask = crate::ann::filtered_tier_mask(set, placement, &known);
+                                            if let Some(members) = crate::tier_rows::cached(set, attribute, &mask) {
+                                                crate::read_cache::retain_memberships(&set.dir.key, members);
+                                                return Ok(());
+                                            }
+                                        }
+                                        let empty = std::sync::Arc::new(RoaringBitmap::new());
+                                        let mut previous: Vec<Option<std::sync::Arc<RoaringBitmap>>> = vec![None; segments.len()];
+                                        let mut aggregate = RoaringBitmap::new();
+                                        let mut projected = Vec::new();
+                                        loop {
+                                            let warmed_version = *progress.borrow_and_update();
+                                            let known =
+                                                partial.lock().expect("partial predicates").clone();
+                                            let delta: Vec<_> = known.iter().zip(&previous).map(|(now, before)| {
+                                                if now.as_ref().zip(before.as_ref()).is_some_and(|(a, b)| std::sync::Arc::ptr_eq(a, b)) {
+                                                    Some(empty.clone())
+                                                } else { now.clone() }
+                                            }).collect();
+                                            previous = known.clone();
+                                            let mask = crate::ann::filtered_tier_mask(
+                                                set, placement, &delta,
+                                            );
+                                            let selected = std::sync::Arc::new(mask.as_ref() - &aggregate);
+                                            aggregate |= mask.as_ref();
+                                            if !crate::tier_rows::warm(store, set, attribute, &aggregate)
+                                                .await?
+                                            {
+                                                break;
+                                            }
+                                            if !selected.is_empty() {
+                                                let Some(members) = crate::tier_rows::project(store, set, attribute, &dir, &selected).await? else { break; };
+                                                projected.push(members);
+                                            }
+                                            if let Some(done) = predicates.peek() {
+                                                done.clone()?;
+                                                if *progress.borrow() == warmed_version {
+                                                    let mask = crate::ann::seed_tier_predicate(set, placement, &known, aggregate);
+                                                    if !projected.is_empty() {
+                                                        let members = crate::tier_rows::merge(projected).await?;
+                                                        crate::read_cache::retain_memberships(&set.dir.key, members.clone());
+                                                        crate::tier_rows::seed(set, attribute, mask, members);
+                                                    }
+                                                    return Ok(());
+                                                }
+                                                continue;
+                                            }
+                                            tokio::select! {
+                                                done = predicates.clone() => { done?; },
+                                                changed = progress.changed() => {
+                                                    if changed.is_err() { predicates.clone().await?; }
+                                                },
+                                            }
+                                        }
+                                    }
                                     let members = crate::ann_dir::memberships(
                                         store, &set.slabs, &dir, attribute,
                                     )

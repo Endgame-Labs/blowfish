@@ -156,13 +156,17 @@ async fn direct_provisioning_ranges_are_exact_uncached_and_bounded() {
     backend.ranges.lock().unwrap().clear();
     backend.max_active.store(0, Ordering::SeqCst);
     backend.delay.store(true, Ordering::SeqCst);
-    let output = futures::future::try_join_all((0..8).map(|_| reader.read_direct(7..93)))
-        .await
-        .unwrap();
+    let stats = bf_storage::CacheStats::default();
+    let output =
+        futures::future::try_join_all((0..8).map(|_| reader.read_direct_with_stats(7..93, &stats)))
+            .await
+            .unwrap();
     assert!(output.iter().all(|b| b == &data.slice(7..93)));
     assert_eq!(ranges(&backend), vec![31..117; 8]);
     assert_eq!(backend.max_active.load(Ordering::SeqCst), 2);
     assert!(!reader.is_memory_resident(7..93));
+    assert_eq!(stats.snapshot().missed_bytes, 8 * 86);
+    assert_eq!(stats.cache_hit_ratio(), 0.0);
     assert!(
         reader
             .read_direct(Range { start: 9, end: 8 })
@@ -171,6 +175,14 @@ async fn direct_provisioning_ranges_are_exact_uncached_and_bounded() {
     );
     assert!(reader.read_direct(0..data.len() as u64 + 1).await.is_err());
     assert!(reader.read_direct(5..5).await.unwrap().is_empty());
+    assert!(
+        reader
+            .read_direct_with_stats(5..5, &stats)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(stats.snapshot().missed_bytes, 8 * 86);
     assert_eq!(ranges(&backend).len(), 8);
     // The identity comes from the same response, matching a HEAD, with no extra request.
     let (bytes, identity) = reader.read_direct_identified(7..93).await.unwrap();

@@ -104,7 +104,7 @@ async fn downgrade(store: &Storage) {
             ("annfrag:vector", "bff", false),
             ("annfrag2:vector", "bfb", true),
         ] {
-            if !blocks && seg.files.is_empty() {
+            if !blocks && !seg.files.contains_key("docs") {
                 continue;
             }
             let (fragment, resident) = bf_vector::Fragment::legacy_fragment(&blob, blocks).unwrap();

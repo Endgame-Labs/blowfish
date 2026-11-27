@@ -1108,6 +1108,59 @@ impl Membership {
             ordinal_of,
         })
     }
+    /// Merge disjoint selective memberships from the same slab generation. Input rows
+    /// and original cluster ordinals remain ordered, and conflicting locations are rejected.
+    pub fn merge_locations(parts: &[&Self]) -> Result<Self> {
+        let Some(first) = parts.first() else {
+            return Err(bad("empty selective membership merge"));
+        };
+        if parts
+            .iter()
+            .any(|p| p.clusters != first.clusters || p.row_ids.is_none())
+        {
+            return Err(bad("incompatible selective memberships"));
+        }
+        let count = parts
+            .iter()
+            .try_fold(0usize, |n, p| n.checked_add(p.cluster_of.len()))
+            .ok_or_else(|| bad("too many selective membership rows"))?;
+        // Most predicate waves contain one or two parts. A small head array avoids a
+        // heap allocation per row, while the constructor verifies merged ordinals too.
+        struct Merge<'a> {
+            parts: &'a [&'a Membership],
+            positions: Vec<usize>,
+            remaining: usize,
+        }
+        impl Iterator for Merge<'_> {
+            type Item = (u32, u32, u32);
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (self.remaining, Some(self.remaining))
+            }
+            fn next(&mut self) -> Option<Self::Item> {
+                let (part, row) = self
+                    .parts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| {
+                        p.row_ids.as_ref()?.get(self.positions[i]).map(|&r| (i, r))
+                    })
+                    .min_by_key(|(_, row)| *row)?;
+                let position = self.positions[part];
+                self.positions[part] += 1;
+                self.remaining -= 1;
+                let p = self.parts[part];
+                Some((row, p.cluster_of[position], p.ordinal_of[position]))
+            }
+        }
+        Self::from_locations(
+            Merge {
+                parts,
+                positions: vec![0; parts.len()],
+                remaining: count,
+            },
+            first.clusters,
+        )
+    }
     /// Ascending global row IDs for a sparse map; `None` for a dense segment map.
     pub fn row_ids(&self) -> Option<&[u32]> {
         self.row_ids.as_deref()
@@ -1280,6 +1333,31 @@ impl<R: RangeRead> PartialIndex<R> {
 #[cfg(test)]
 mod sparse_membership_tests {
     use super::*;
+    #[test]
+    fn disjoint_location_waves_merge_without_changing_ordinals() {
+        let a = Membership::from_locations([(1, 0, 0), (3, 1, 2), (8, 0, 4)], 2).unwrap();
+        let b = Membership::from_locations([(2, 1, 0), (6, 0, 3), (9, 1, 5)], 2).unwrap();
+        let empty = Membership::from_locations([], 2).unwrap();
+        let m = Membership::merge_locations(&[&a, &b, &empty]).unwrap();
+        let all = (0..10).collect();
+        assert_eq!(
+            m.locations(&all, |_| true),
+            [
+                (0, 0, 1),
+                (1, 0, 2),
+                (1, 2, 3),
+                (0, 3, 6),
+                (0, 4, 8),
+                (1, 5, 9)
+            ]
+        );
+        assert!(Membership::merge_locations(&[&a, &a]).is_err());
+        let conflict = Membership::from_locations([(7, 0, 0)], 2).unwrap();
+        assert!(Membership::merge_locations(&[&a, &conflict]).is_err());
+        assert!(Membership::merge_locations(&[]).is_err());
+        let other = Membership::from_locations([], 3).unwrap();
+        assert!(Membership::merge_locations(&[&a, &other]).is_err());
+    }
     #[test]
     fn sparse_global_rows_round_trip_counts_ordinals_and_checksums() {
         for clusters in [3, 65_536] {

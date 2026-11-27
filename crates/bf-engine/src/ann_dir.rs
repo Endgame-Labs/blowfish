@@ -12,6 +12,8 @@ use std::{
     sync::Arc,
 };
 
+mod direct;
+
 /// Maximum merged read of leaf blobs and codes.
 const BLOB_MERGE_MAX: u64 = 8 << 20;
 /// Exact-scan vector prefetch is split into concurrent reads of this size.
@@ -1481,6 +1483,29 @@ pub(crate) async fn search(
     // Streaming seeds the raw cache before its scan readers start. With no retention budget,
     // completed seed reads are discarded, and fast backends fetch them again for the scans.
     let streaming = store.cache_limits().0 > 0 && parallel_slab_scan && !resident;
+    // A cold filtered scan benefits from exact, unaligned runs rather than fetching every
+    // cache block touched by its leaves. Warm and busy queries retain shared cache misses;
+    // their overlapping scans can reuse substantially more bytes than a single cold query.
+    let direct: BTreeSet<_> =
+        if streaming && filtered && read_cache::context().is_some_and(|c| c.cold) {
+            chosen
+                .iter()
+                .filter_map(|(&i, cs)| {
+                    let seg = &dir.segments()[i];
+                    (!exact_segments.contains(&i)
+                        && direct::supports(seg)
+                        && !crate::local_ann::prefetch(
+                            &seg.fragment,
+                            &cs.iter()
+                                .map(|&n| entries[n].codes_range())
+                                .collect::<Vec<_>>(),
+                        ))
+                    .then_some(i)
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
     let mut locally_staged = streaming && exact_segments.is_empty() && exact_rows.is_empty();
     let mut bulk = tokio::task::JoinSet::new();
     if streaming {
@@ -1491,6 +1516,10 @@ pub(crate) async fn search(
         order.sort_unstable_by(|a, b| distances[a.1[0]].total_cmp(&distances[b.1[0]]));
         let mut reservations = Vec::new();
         for (&i, cs) in order {
+            if direct.contains(&i) {
+                locally_staged = false;
+                continue;
+            }
             let seg = &dir.segments()[i];
             let files = &state.segments[i].files;
             let index = files
@@ -1554,7 +1583,12 @@ pub(crate) async fn search(
     });
     let mut batches = Vec::new();
     for (&i, cs) in &chosen {
-        if streaming && !exact_segments.contains(&i) {
+        if direct.contains(&i) {
+            batches.extend(direct::batches(entries, cs).into_iter().map(|mut cs| {
+                cs.sort_unstable_by(|&a, &b| distances[a].total_cmp(&distances[b]));
+                (i, cs)
+            }));
+        } else if streaming && !exact_segments.contains(&i) {
             let mut ranked = cs.clone();
             ranked.sort_unstable_by(|&a, &b| distances[a].total_cmp(&distances[b]));
             for chunk in ranked.chunks(4) {
@@ -1586,7 +1620,11 @@ pub(crate) async fn search(
             nearest(&a.1).total_cmp(&nearest(&b.1))
         });
     }
+    let direct_budget = (!direct.is_empty())
+        .then(|| Arc::new(tokio::sync::Semaphore::new(direct::IN_FLIGHT_BYTES)));
     for (i, cs) in batches {
+        let direct = direct.contains(&i);
+        let direct_budget = direct_budget.clone();
         let scan_upper = scan_upper.clone();
         let (dir, vector, rotated) = (dir.clone(), vector.clone(), rotated.clone());
         let exact = exact_segments.contains(&i);
@@ -1667,10 +1705,21 @@ pub(crate) async fn search(
                     })
                     .collect();
                 let cached: Vec<bool> = decoded.iter().map(Option::is_some).collect();
+                let _direct_permit = if direct {
+                    Some(direct::reserve(&entry_refs, direct_budget.expect("direct scan budget")).await?)
+                } else {
+                    None
+                };
                 // Documents' footers are warmed only for the segments holding likely winners (and
                 // for exactly scanned ones); the speculative document read reads the rest.
                 let (read, (), ()) = tokio::try_join!(
-                    read_clusters(&entry_refs, exact, &dir_reader, &partial, dir.segments()[i].codes_in_fragment, Some(&cached)),
+                    async {
+                        if direct {
+                            direct::read(&entry_refs, &dir_reader, &cached).await
+                        } else {
+                            read_clusters(&entry_refs, exact, &dir_reader, &partial, dir.segments()[i].codes_in_fragment, Some(&cached)).await
+                        }
+                    },
                     prefetch,
                     async {
                         if warm_docs {
@@ -1714,6 +1763,7 @@ pub(crate) async fn search(
                 };
                 let install_done = trace_t0.elapsed().as_micros();
                 let found = on_worker(async move {
+                    let _direct_permit = _direct_permit;
                     if exact {
                         let hits = index
                             .exact_search(&vector, k, live.as_deref())
@@ -1791,11 +1841,17 @@ pub(crate) async fn search(
             });
         while let Some(result) = scans.join_next().await {
             results.push(result.map_err(segment::index_error)??);
-            let ready_parts = if early_exact_docs { 1 } else { 2 };
-            // Filtered scans may visit most leaves, so early winners can change repeatedly.
-            // Their final rerank shares scan reads without fetching speculative losers;
-            // additional early reranks otherwise consume throughput under concurrent load.
-            if !filtered
+            let ready_parts = if filtered {
+                4
+            } else if early_exact_docs {
+                1
+            } else {
+                2
+            };
+            // Direct cold runs do not retain aligned scan padding for the final rerank.
+            // Warm a single late vector shortlist while their last runs finish. Busy filtered
+            // queries retain the cache-backed plan and issue no speculative rerank reads.
+            if (!filtered || !direct.is_empty())
                 && !launched
                 && results.len() * 5 >= count * ready_parts
                 && !scans.is_empty()
@@ -1815,7 +1871,7 @@ pub(crate) async fn search(
                 let mut locations: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
                 let mut rows: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
                 let mut real_rows = BTreeMap::new();
-                let docs_limit = if locally_staged {
+                let docs_limit = if locally_staged || filtered {
                     0
                 } else {
                     k.saturating_mul(3).min(30)

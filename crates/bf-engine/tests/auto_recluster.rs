@@ -289,7 +289,16 @@ async fn a_build_that_dies_midway_leaves_the_layout_and_its_objects_become_orpha
         store.delete(&record).await.unwrap();
     }
     engine.collect_garbage("t").await.unwrap();
-    assert_eq!(keys(&store, "ns/t/slabs/").await, installed);
+    let installed_slabs: Vec<_> = installed
+        .iter()
+        .filter(|k| k.starts_with("ns/t/slabs/"))
+        .cloned()
+        .collect();
+    assert_eq!(keys(&store, "ns/t/slabs/").await, installed_slabs);
+    // The tier's global row-location metadata lives beside its directory, outside /slabs/.
+    for key in &installed {
+        assert!(store.get(key).await.is_ok(), "{key} survives GC");
+    }
     assert_eq!(top(&Engine::new(store.clone()), 4321).await, json!(4321));
     assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
 }

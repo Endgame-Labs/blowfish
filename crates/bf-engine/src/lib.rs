@@ -42,6 +42,7 @@ mod slab_rows;
 mod text;
 mod text_keys;
 mod text_tail;
+mod tier_rows;
 mod upgrade;
 mod vector_locator;
 mod warm_ann;

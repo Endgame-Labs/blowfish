@@ -793,13 +793,9 @@ async fn first_matching_segment_starts_memberships_before_a_slow_predicate_finis
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if backend
-                .reads
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(p, _)| p.as_ref().ends_with(".rows-v1.bfr"))
-            {
+            if backend.reads.lock().unwrap().iter().any(|(p, _)| {
+                p.as_ref().ends_with(".rows-v1.bfr") || p.as_ref().contains(".locations-v1-")
+            }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

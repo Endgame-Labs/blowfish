@@ -498,6 +498,18 @@ impl Engine {
         } else {
             None
         };
+        let missing_locations = if probe_due {
+            crate::tier_rows::missing(
+                &self.0.store,
+                &tiers,
+                handle
+                    .row_map_probe
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .await?
+        } else {
+            None
+        };
         let (state, row_maps) = {
             let mut state = handle.state.lock().await;
             if state.root_only {
@@ -510,12 +522,14 @@ impl Engine {
             // holding this lock across two object-store calls on every tick.
             if !force
                 && missing_map.is_none()
+                && missing_locations.is_none()
                 && state.seq > 0
                 && state.seq == state.indexed_through
                 && state.refreshed.elapsed() < self.0.config.index_age
                 && tier(&state, &self.0.config, force, &protected, bulk(&state)).is_empty()
                 && !(needs_text_upgrade(&state)
                     || (crate::slab_rows::needs(&state.ann_tiers)
+                        || crate::tier_rows::needs(ns, &state.ann_tiers)
                         || crate::vector_locator::needs_retirement(&state, &protected)))
                 && !installing
             {
@@ -528,7 +542,10 @@ impl Engine {
             if !state.exists {
                 return Ok(false);
             }
-            let row_maps = crate::slab_rows::needs(&state.ann_tiers) || missing_map.is_some();
+            let row_maps = crate::slab_rows::needs(&state.ann_tiers)
+                || missing_map.is_some()
+                || crate::tier_rows::needs(ns, &state.ann_tiers)
+                || missing_locations.is_some();
             let will_rebuild = state.segments.iter().any(|seg| {
                 state
                     .schema
@@ -1003,6 +1020,7 @@ impl Engine {
         }
         crate::vector_locator::restore_uncovered(store, ns, &mut manifest, &old_vectors).await?;
         crate::slab_rows::ensure(store, ns, &mut manifest, 1, missing_map.as_deref()).await?;
+        crate::tier_rows::ensure(store, ns, &mut manifest, missing_locations.as_deref()).await?;
         crate::vector_locator::retire_covered(&mut manifest, &protected);
         // Rebuild each vector attribute's ANN directories only when their segment list changed.
         let attributes: std::collections::BTreeSet<String> = manifest

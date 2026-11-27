@@ -140,7 +140,7 @@ async fn legacyize(
                 continue;
             }
             // Sparse global slab rows have no dense plain membership map.
-            if !blocks && seg.files.is_empty() {
+            if !blocks && !seg.files.contains_key("docs") {
                 continue;
             }
             let (bytes, meta) = bf_vector::Fragment::legacy_fragment(&old, blocks).unwrap();

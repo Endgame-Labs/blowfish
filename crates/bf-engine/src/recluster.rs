@@ -673,17 +673,19 @@ impl Engine {
             directory_bytes: dir.size,
             seconds: 0.0,
         };
+        let mut set = SlabSet {
+            covered,
+            slabs,
+            dir,
+            pages,
+            format: bf_wal::TIER_FORMAT_VERSION,
+            coarse_rows: coarse_file.as_ref().map_or(0, |(_, rows)| *rows),
+            coarse: coarse_file.map(|(file, _)| file),
+        };
+        crate::tier_rows::build(store, &ns, attr, &mut set).await?;
         Ok(Built {
             prestage,
-            set: SlabSet {
-                covered,
-                slabs,
-                dir,
-                pages,
-                format: bf_wal::TIER_FORMAT_VERSION,
-                coarse_rows: coarse_file.as_ref().map_or(0, |(_, rows)| *rows),
-                coarse: coarse_file.map(|(file, _)| file),
-            },
+            set,
             report: ReclusterReport {
                 seconds: t0.elapsed().as_secs_f64(),
                 ..report

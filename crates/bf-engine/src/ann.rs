@@ -656,7 +656,16 @@ async fn from_slabs(
                 }
             };
             let warm_eligible = mask.is_none() && seat.is_none();
-            let members = if allowed.is_some() {
+            let projected = match (&mask, allowed) {
+                (Some(mask), Some(_)) => match crate::read_cache::query_memberships(&set.dir.key) {
+                    Some(held) => Some(held),
+                    None => crate::tier_rows::load(store, set, attribute, &dir, mask).await?,
+                },
+                _ => None,
+            };
+            let members = if let Some(projected) = projected {
+                Some(projected)
+            } else if allowed.is_some() {
                 Some(match crate::read_cache::query_memberships(&set.dir.key) {
                     Some(members) => members,
                     None => {
@@ -766,11 +775,25 @@ fn cache_predicate(
     );
     rows
 }
-fn filtered_tier_mask(
+pub(crate) fn filtered_tier_mask(
     set: &bf_wal::SlabSet,
     at: &crate::lineage::Placement,
     allowed: &[Option<Arc<RoaringBitmap>>],
 ) -> Arc<RoaringBitmap> {
+    let (key, inputs) = tier_predicate_inputs(set, at, allowed);
+    if let Some(cached) = crate::read_cache::get::<PredicateMask>(&key, 0) {
+        return cached.rows.clone();
+    }
+    let mut mask = RoaringBitmap::new();
+    append_tier_predicate(set, at, allowed, &mut mask);
+    cache_predicate(&key, inputs, mask)
+}
+
+fn tier_predicate_inputs(
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+    allowed: &[Option<Arc<RoaringBitmap>>],
+) -> (String, Vec<Option<Arc<RoaringBitmap>>>) {
     let mut key = format!("tier-filter:{}", set.dir.key);
     for map in &at.maps {
         key.push('|');
@@ -785,15 +808,33 @@ fn filtered_tier_mask(
         }
         inputs.push(allowed[i].clone());
     }
+    (key, inputs)
+}
+
+pub(crate) fn seed_tier_predicate(
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+    allowed: &[Option<Arc<RoaringBitmap>>],
+    mask: RoaringBitmap,
+) -> Arc<RoaringBitmap> {
+    let (key, inputs) = tier_predicate_inputs(set, at, allowed);
     if let Some(cached) = crate::read_cache::get::<PredicateMask>(&key, 0) {
         return cached.rows.clone();
     }
-    let mut mask = RoaringBitmap::new();
+    cache_predicate(&key, inputs, mask)
+}
+
+fn append_tier_predicate(
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+    allowed: &[Option<Arc<RoaringBitmap>>],
+    mask: &mut RoaringBitmap,
+) {
     for (cover, place) in set.covered.iter().zip(&at.places) {
         match place {
             crate::lineage::Place::Here(i) => {
                 if let Some(rows) = &allowed[*i] {
-                    mask |= RoaringBitmap::from_sorted_iter(rows.iter().map(|r| cover.base + r))
+                    *mask |= RoaringBitmap::from_sorted_iter(rows.iter().map(|r| cover.base + r))
                         .expect("translated segment rows stay sorted");
                 } else {
                     mask.insert_range(cover.base..cover.base + cover.rows);
@@ -808,13 +849,13 @@ fn filtered_tier_mask(
                         // than every source row of a compaction. Both sides of a lineage map
                         // are ascending, so reverse translation preserves this order.
                         let selected = rows.as_ref() & &map.to;
-                        mask |= RoaringBitmap::from_sorted_iter(selected.iter().map(|to| {
+                        *mask |= RoaringBitmap::from_sorted_iter(selected.iter().map(|to| {
                             cover.base + map.back(to).expect("intersected lineage target")
                         }))
                         .expect("reverse lineage rows stay sorted");
                         continue;
                     }
-                    mask |= RoaringBitmap::from_sorted_iter(
+                    *mask |= RoaringBitmap::from_sorted_iter(
                         map.pairs()
                             .filter(|(_, to)| allowed[*i].as_ref().is_none_or(|a| a.contains(*to)))
                             .map(|(from, _)| cover.base + from),
@@ -824,7 +865,6 @@ fn filtered_tier_mask(
             }
         }
     }
-    cache_predicate(&key, inputs, mask)
 }
 fn slab_predicate(
     key: &str,

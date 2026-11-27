@@ -411,7 +411,9 @@ impl RangeReader {
         self.small = if size >= full { 0 } else { size as u32 };
         self
     }
-    fn block_size(&self) -> u64 {
+    /// Byte alignment of this reader's cache blocks, including a sparse-read hint.
+    /// This is an I/O planning hint; native mapped readers may bypass block caching.
+    pub fn block_size(&self) -> u64 {
         if self.small > 0 {
             self.small as u64
         } else {
@@ -457,6 +459,19 @@ impl RangeReader {
             return Ok(Bytes::new());
         }
         Ok(self.read_direct_identified(range).await?.0)
+    }
+    /// Read an exact range without block-cache alignment or admission, accounting for
+    /// successfully returned logical bytes as misses in the query accumulator.
+    pub async fn read_direct_with_stats(
+        &self,
+        range: Range<u64>,
+        stats: &CacheStats,
+    ) -> Result<Bytes, Error> {
+        let bytes = self.read_direct(range).await?;
+        if !bytes.is_empty() {
+            stats.record(Tier::Miss, bytes.len() as u64);
+        }
+        Ok(bytes)
     }
     /// [`RangeReader::read_direct`] that also returns the identity of the object the same
     /// response was served from (its `ETag` or version, and physical length), with no HEAD.
