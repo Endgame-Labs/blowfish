@@ -1736,7 +1736,18 @@ fn cgroup_headroom(max: u64, current: u64, stat: &str) -> u64 {
         .sum::<u64>();
     max.saturating_sub(current.saturating_sub(reclaimable))
 }
+/// Memory the host is pretended to have free in unit tests. Admission reads the real cgroup in
+/// production, so a busy machine (another build, other workers) would refuse test graphs that
+/// the tests did not size against it; a fixed headroom makes admission independent of the host.
+#[cfg(test)]
+const TEST_HOST_HEADROOM: u64 = 1 << 50;
 /// Whether `bytes` more can be allocated without exhausting memory the kernel cannot reclaim.
+#[cfg(test)]
+fn memory_available(bytes: u64) -> bool {
+    bytes <= TEST_HOST_HEADROOM
+}
+/// Whether `bytes` more can be allocated without exhausting memory the kernel cannot reclaim.
+#[cfg(not(test))]
 fn memory_available(bytes: u64) -> bool {
     #[cfg(target_os = "linux")]
     {

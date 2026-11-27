@@ -24,6 +24,7 @@ mod sparse;
 mod statistics;
 mod stop;
 mod streaming;
+mod sum_text;
 mod tail;
 #[cfg(test)]
 mod tail_benchmark;
