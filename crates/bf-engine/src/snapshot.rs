@@ -1024,8 +1024,37 @@ async fn materialize_inner(
     }
     Ok(full)
 }
-/// Patches and conditions hydrate named rows; unconditional replacements need no old documents.
-/// By-filter writes still use a namespace scan.
+/// IDs of the live rows matching any of `filters` in `state`: tail documents by direct evaluation
+/// and segment rows through the query engine's filter evaluation (indexes and live-row masks),
+/// with tail-shadowed rows excluded. No document is read.
+async fn filter_candidates(
+    store: &Storage,
+    state: &NamespaceState,
+    filters: &[&Filter],
+) -> Result<BTreeSet<Id>, ApiError> {
+    let mut out = BTreeSet::new();
+    for f in filters {
+        filter::validate(f, &state.schema, false)?;
+        for (id, doc) in &state.docs {
+            if filter::matches(f, Some(doc), None, &state.schema)? {
+                out.insert(id.clone());
+            }
+        }
+        for seg in &state.segments {
+            let rows = allowed(store, state, seg, Some(f)).await?;
+            if rows.is_empty() {
+                continue;
+            }
+            let ids = segment::ids(store, seg).await?;
+            for row in rows {
+                out.insert(ids.get(row as usize).ok_or_else(segment::corrupt)?.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+/// Patches, conditions, and filtered writes hydrate only the rows they name or match;
+/// unconditional replacements need no old documents.
 pub(crate) async fn for_writes(
     store: &Storage,
     state: &NamespaceState,
@@ -1043,12 +1072,17 @@ async fn for_writes_inner(
 ) -> Result<NamespaceState, ApiError> {
     let mut wanted = BTreeSet::new();
     let mut hydrate = BTreeSet::new();
+    let mut filters: Vec<&Filter> = vec![];
     for p in pending {
         let Operation::Write(req, _, _activity) = &p.request else {
             continue;
         };
-        if req.delete_by_filter.is_some() || req.patch_by_filter.is_some() {
-            return materialize(store, state).await;
+        for f in req
+            .delete_by_filter
+            .iter()
+            .chain(req.patch_by_filter.iter().map(|p| &p.filters))
+        {
+            filters.push(f);
         }
         for row in req
             .upsert_rows
@@ -1115,6 +1149,21 @@ async fn for_writes_inner(
         }
         hydrate.extend(req.deletes.iter().flatten().cloned());
         wanted.extend(req.deletes.iter().flatten().cloned());
+    }
+    if !filters.is_empty() {
+        // A filtered write may touch any row that matches in the committed state, plus any row an
+        // earlier write in this group names (already in `wanted`): every other row keeps its
+        // stored values, so it matches exactly when it matches now. Filtered writes are commit
+        // barriers (`is_barrier`), so no in-flight group (overlay) exists and the group is a single
+        // request, but the state is still re-read on every commit retry, so the filter is never
+        // resolved against a stale state. If the filter cannot be resolved, the full scan decides.
+        match filter_candidates(store, state, &filters).await {
+            Ok(ids) => {
+                wanted.extend(ids.iter().cloned());
+                hydrate.extend(ids);
+            }
+            Err(_) => return materialize(store, state).await,
+        }
     }
     if state.schema.get("id").and_then(|s| s.data_type.as_ref())
         == Some(&AttributeType::Scalar(ScalarType::Uuid))

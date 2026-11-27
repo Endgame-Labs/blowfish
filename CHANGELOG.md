@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.72] - 2026-11-27
+
+### Changed
+
+- **Filtered deletes and patches load only the rows they change, 20 times faster and 15 times less memory at 0.1 percent selectivity:** `delete_by_filter` and `patch_by_filter` loaded every document of the namespace, vectors included, to test the predicate. They now find the matching IDs with the query engine's filter evaluation (indexes, live-row masks, and the WAL tail) and load only those rows. On a 1M-row namespace with 128-dimension vectors, a 0.1 percent delete went from 4.5 s and 2.5 GB peak RSS to 0.18 s and 166 MB, a patch from 4.7 s to 0.23 s. Responses, counts, limits, and retry behavior are unchanged. See Round DF1 in [docs/benchmarks.md](docs/benchmarks.md).
+
 ## [0.1.71] - 2026-11-27
 
 ### Changed
@@ -521,7 +527,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.71...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.72...HEAD
+[0.1.72]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.72
 [0.1.71]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.71
 [0.1.70]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.70
 [0.1.69]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.69
