@@ -11,7 +11,14 @@ mod vamana;
 mod vectors;
 use crate::{Error, Result, RoaringBitmap, rabitq};
 pub use builder::HotGraphBuilder;
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Rows of one scan chunk: the allowed rows split over two chunks per pool thread, but never
+/// below 8,192 rows, so a small scan stays on one thread and pays no fan-out.
+fn scan_chunk(allowed: usize, threads: usize) -> usize {
+    allowed.div_ceil(threads.max(1) * 2).max(8192)
+}
 
 fn check(cancelled: &(impl Fn() -> bool + Sync)) -> Result<()> {
     if cancelled() {
@@ -102,64 +109,129 @@ impl HotGraph {
         if count == 0 || self.nodes.is_empty() || query.iter().all(|x| *x == 0.) {
             return Err(Error::InvalidInput("unsupported graph query shape".into()));
         }
+        let chunk = scan_chunk(allowed.len() as usize, rayon::current_num_threads());
+        self.scan_chunked(query, count, keep, allowed, chunk)
+    }
+    /// [`Self::scan`] with the allowed rows split into chunks of `chunk` rows, screened and
+    /// rescored on the current rayon pool. The result does not depend on `chunk`: the screen's
+    /// cutoff comes from the merged histograms, ties at the cutoff go to the earliest rows, and
+    /// every chunk's local best `count` merge under the same total order.
+    fn scan_chunked(
+        &self,
+        query: &[f32],
+        count: usize,
+        keep: usize,
+        allowed: &RoaringBitmap,
+        chunk: usize,
+    ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
         let rotated = rabitq::RaBitQ::new(query.len(), 42)?.rotate(&vectors::normalized(query));
         let (code, scale) = quant::encode(&rotated);
-        let mut ids: Vec<u32> = allowed
+        let ids: Vec<u32> = allowed
             .iter()
             .filter_map(|row| self.nodes.get(row as usize).copied())
             .filter(|node| *node != u32::MAX)
             .collect();
         let scanned = ids.len();
         let keep = keep.max(count);
+        let chunk = chunk.max(1);
         // Prefetching a fixed distance ahead overlaps the row-sized random reads.
         const AHEAD: usize = 24;
-        if ids.len() > keep {
+        let screen = ids.len() > keep;
+        // Stage one: Hamming distance of every allowed row, with a histogram per chunk.
+        let (distances, histograms): (Vec<Vec<u16>>, Vec<Vec<usize>>) = if screen {
             let signs = self.bits.query(&rotated);
-            let mut distance = Vec::with_capacity(ids.len());
-            for (i, &id) in ids.iter().enumerate() {
-                if let Some(&next) = ids.get(i + AHEAD) {
-                    self.bits.prefetch(next);
-                }
-                distance.push(self.bits.hamming(&signs, id));
-            }
-            // Hamming distances are small integers: find the cutoff from a histogram, then keep
-            // every row below it and the first rows (in row order) at it.
-            let mut histogram = vec![0usize; self.codes.dims + 1];
-            for d in &distance {
-                histogram[*d as usize] += 1;
+            ids.par_chunks(chunk)
+                .map(|part| {
+                    let mut distance = Vec::with_capacity(part.len());
+                    let mut histogram = vec![0usize; self.codes.dims + 1];
+                    for (i, &id) in part.iter().enumerate() {
+                        if let Some(&next) = part.get(i + AHEAD) {
+                            self.bits.prefetch(next);
+                        }
+                        let d = self.bits.hamming(&signs, id);
+                        histogram[d as usize] += 1;
+                        distance.push(d);
+                    }
+                    (distance, histogram)
+                })
+                .unzip()
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        // Hamming distances are small integers: find the cutoff from the merged histogram, then
+        // keep every row below it and the first rows (in row order) at it. Each chunk gets the
+        // share of those ties that fall inside it.
+        let (cutoff, quotas) = if screen {
+            let mut total = vec![0usize; self.codes.dims + 1];
+            for h in &histograms {
+                total.iter_mut().zip(h).for_each(|(t, x)| *t += x);
             }
             let (mut cutoff, mut below) = (0, 0);
-            while below + histogram[cutoff] < keep {
-                below += histogram[cutoff];
+            while below + total[cutoff] < keep {
+                below += total[cutoff];
                 cutoff += 1;
             }
             let mut ties = keep - below;
-            let mut at = 0;
-            ids.retain(|_| {
-                let d = distance[at] as usize;
-                at += 1;
-                d < cutoff
-                    || (d == cutoff && ties > 0 && {
-                        ties -= 1;
-                        true
-                    })
-            });
-        }
-        let mut scored: Vec<(f32, u32)> = Vec::with_capacity(ids.len());
-        for (i, &id) in ids.iter().enumerate() {
-            if let Some(&next) = ids.get(i + AHEAD) {
-                self.codes.prefetch(next);
-            }
-            scored.push((self.codes.score(&code, scale, id), id));
-        }
+            let quotas = histograms
+                .iter()
+                .map(|h| {
+                    let q = ties.min(h[cutoff]);
+                    ties -= q;
+                    q
+                })
+                .collect::<Vec<_>>();
+            (cutoff, quotas)
+        } else {
+            (0, Vec::new())
+        };
         let order = |a: &(f32, u32), b: &(f32, u32)| {
             a.0.total_cmp(&b.0)
                 .then(self.rows[a.1 as usize].cmp(&self.rows[b.1 as usize]))
         };
-        if scored.len() > count {
-            scored.select_nth_unstable_by(count - 1, order);
-            scored.truncate(count);
-        }
+        // Stage two: rescore each chunk's survivors with SQ8 and keep its best `count`.
+        let best = |mut scored: Vec<(f32, u32)>| {
+            if scored.len() > count {
+                scored.select_nth_unstable_by(count - 1, order);
+                scored.truncate(count);
+            }
+            scored
+        };
+        let mut locals: Vec<Vec<(f32, u32)>> = ids
+            .par_chunks(chunk)
+            .enumerate()
+            .map(|(c, part)| {
+                let survivors: Vec<u32> = if screen {
+                    let mut ties = quotas[c];
+                    part.iter()
+                        .zip(&distances[c])
+                        .filter(|(_, d)| {
+                            let d = **d as usize;
+                            d < cutoff
+                                || (d == cutoff && ties > 0 && {
+                                    ties -= 1;
+                                    true
+                                })
+                        })
+                        .map(|(id, _)| *id)
+                        .collect()
+                } else {
+                    part.to_vec()
+                };
+                let mut scored = Vec::with_capacity(survivors.len());
+                for (i, &id) in survivors.iter().enumerate() {
+                    if let Some(&next) = survivors.get(i + AHEAD) {
+                        self.codes.prefetch(next);
+                    }
+                    scored.push((self.codes.score(&code, scale, id), id));
+                }
+                best(scored)
+            })
+            .collect();
+        let mut scored = if locals.len() == 1 {
+            locals.pop().unwrap()
+        } else {
+            best(locals.into_iter().flatten().collect())
+        };
         scored.sort_unstable_by(order);
         Ok((
             scored
@@ -439,6 +511,22 @@ mod tests {
         }
         // A 600-row shortlist of 1,500 rows (chance is 40%) keeps nearly every true top-10 row.
         assert!(hit >= 380, "{hit} of 400");
+        // Splitting the scan into chunks changes nothing: same cutoff, ties, and ranking.
+        for q in (0..10).map(|i| &source[i * 211]) {
+            for keep in [10, 50, 600, 1100] {
+                let whole = graph
+                    .scan_chunked(q, 10, keep, &allowed, usize::MAX)
+                    .unwrap();
+                for chunk in [1, 7, 64, 333, 1499] {
+                    let split = graph.scan_chunked(q, 10, keep, &allowed, chunk).unwrap();
+                    assert_eq!(whole.1, split.1);
+                    assert_eq!(whole.0.len(), split.0.len());
+                    for (a, b) in whole.0.iter().zip(&split.0) {
+                        assert_eq!(a.0, b.0, "keep {keep} chunk {chunk}");
+                    }
+                }
+            }
+        }
         // A shortlist as large as the request returns exactly that many distinct rows.
         let (hits, _) = graph.scan(&source[0], 50, 50, &allowed).unwrap();
         let mut rows = hits.iter().map(|h| h.0).collect::<Vec<_>>();
