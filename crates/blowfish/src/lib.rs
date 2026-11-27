@@ -626,8 +626,29 @@ async fn query(
     input: Result<FastJson<QueryRequest>, JsonRejection>,
 ) -> Result<Response, HttpError> {
     let request = body(input.map(|FastJson(v)| Json(v)))?;
-    let response = s.engine.query(&ns, request.clone()).await?;
-    record_query(&request);
+    // A plain ID-only vector query that the warm graph serves skips the documents and the
+    // general result assembly; every other query (and any decline) takes the general path.
+    if let Some(answer) = s.engine.query_ids(&ns, &request).await? {
+        let mut out = Vec::with_capacity(512 + 40 * answer.rows().len());
+        if answer.write_json(&mut out) {
+            // The typed path takes only plain approximate vector queries.
+            metrics::counter!("blowfish_query_requests_total", "kind" => "ann").increment(1);
+            return Ok((
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                )],
+                out,
+            )
+                .into_response());
+        }
+    }
+    let mut kinds = Vec::new();
+    query_kinds(&request, &mut kinds);
+    let response = s.engine.query(&ns, request).await?;
+    for kind in kinds {
+        metrics::counter!("blowfish_query_requests_total", "kind" => kind).increment(1);
+    }
     metrics::counter!("blowfish_query_rows_scanned_total")
         .increment(response.performance.exhaustive_search_count);
     let started = std::time::Instant::now();
@@ -637,14 +658,15 @@ async fn query(
     }
     Ok(response)
 }
-fn record_query(request: &QueryRequest) {
+/// The metric kind of the request, or of each subquery of a multi-query.
+fn query_kinds(request: &QueryRequest, kinds: &mut Vec<&'static str>) {
     if let Some(queries) = &request.queries {
         for query in queries {
-            record_query(query);
+            query_kinds(query, kinds);
         }
         return;
     }
-    let kind = if request.aggregate_by.is_some() {
+    kinds.push(if request.aggregate_by.is_some() {
         "aggregate"
     } else {
         match &request.rank_by {
@@ -654,8 +676,7 @@ fn record_query(request: &QueryRequest) {
             Some(RankBy::Order(_)) | None => "order",
             _ => "score",
         }
-    };
-    metrics::counter!("blowfish_query_requests_total", "kind" => kind).increment(1);
+    });
 }
 async fn delete_namespace(
     Extension(s): Extension<AppState>,

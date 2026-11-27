@@ -113,6 +113,9 @@ pub(crate) struct Placement {
     /// `ann::tier_mask`), once computed: it is a function of the placement, the segments' live
     /// objects, and the maps, all fixed for the life of the placement.
     pub mask: std::sync::OnceLock<Option<Arc<RoaringBitmap>>>,
+    /// Whether the placement holds rows in every segment of the list it was resolved against
+    /// (see [`Placement::covers_all`]), once computed.
+    covers: std::sync::OnceLock<bool>,
 }
 
 /// Find a covered segment among `segments`, from position `from` on first: segments keep their
@@ -191,6 +194,7 @@ pub(crate) async fn place(
         places,
         maps,
         mask: std::sync::OnceLock::new(),
+        covers: std::sync::OnceLock::new(),
     }))
 }
 
@@ -255,6 +259,19 @@ impl Placement {
                 .iter()
                 .find_map(|(at, map)| map.forward(local).map(|r| (*at, r))),
         }
+    }
+    /// Whether every one of `segments` holds some of the tier's rows, so no segment is left to the
+    /// namespace directory. Fixed for the life of the placement, whose segment list is fixed.
+    pub fn covers_all(&self, segments: usize) -> bool {
+        *self.covers.get_or_init(|| {
+            let mut covered = vec![false; segments];
+            for i in self.positions() {
+                if let Some(c) = covered.get_mut(i) {
+                    *c = true;
+                }
+            }
+            covered.iter().all(|c| *c)
+        })
     }
     /// Positions of every segment holding some of the tier's rows.
     pub fn positions(&self) -> impl Iterator<Item = usize> + '_ {

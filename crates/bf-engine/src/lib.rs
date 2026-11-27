@@ -7,6 +7,7 @@ mod branch;
 mod drain;
 mod filter;
 mod highlight;
+mod ids_path;
 mod indexed;
 mod indexer;
 #[cfg(test)]
@@ -28,6 +29,7 @@ mod tail;
 mod tail_benchmark;
 mod text_upgrade;
 mod wal_probe;
+pub use ids_path::IdsAnswer;
 pub use indexer::EngineConfig;
 pub use recluster::{ReclusterOptions, ReclusterReport};
 pub use reindex::{LayoutCounts, ReindexOptions, ReindexReport};
@@ -1143,6 +1145,52 @@ impl Engine {
             &request,
             cpu_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
         );
+        self.sample_recall(&state, &request, || graph_scope);
+        let mut cache_stats = stats.snapshot();
+        cache_stats.disk_bytes += local_ann_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        response.performance = QueryPerformance {
+            cache_hit_ratio: cache_stats.cache_hit_ratio(),
+            cache_temperature: cache_stats.temperature().into(),
+            server_total_ms: start.elapsed().as_millis() as u64,
+            query_execution_ms: execution_elapsed.as_millis() as u64,
+            exhaustive_search_count: state.docs.len() as u64,
+            approx_namespace_size: state.stats.rows + state.docs.len() as u64,
+            last_included_write_at: Some(
+                state
+                    .updated_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            ),
+            embedding_tokens: None,
+            embedding_ms: None,
+            rerank_ms: None,
+        };
+        if crate::ann::trace_stages() {
+            eprintln!(
+                "QUERY snapshot={}us exec={}us total={}us",
+                snapshot_elapsed.as_micros(),
+                execution_elapsed.as_micros(),
+                start.elapsed().as_micros()
+            );
+        }
+        let diagnostics = QueryDiagnostics {
+            snapshot_elapsed,
+            execution_elapsed,
+            backend: backend.snapshot(),
+            cache: cache_stats,
+            ann_rows_scanned: ann_rows.load(std::sync::atomic::Ordering::Relaxed),
+            document_scan_rows: document_scan_rows.load(std::sync::atomic::Ordering::Relaxed),
+        };
+        Ok((response, diagnostics))
+    }
+    /// Start a background recall comparison for a sampled approximate query: the graph's answer
+    /// against the exact one. `graph_scope` builds the query's graph scope, and runs only when
+    /// the query is sampled.
+    fn sample_recall(
+        &self,
+        state: &Arc<NamespaceState>,
+        request: &QueryRequest,
+        graph_scope: impl FnOnce() -> Option<warm_graph::Scope>,
+    ) {
         if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
             && self.0.config.recall_sample_rate > 0.0
             && sample_roll() < self.0.config.recall_sample_rate
@@ -1151,6 +1199,7 @@ impl Engine {
                 .recall_sampler
                 .start(self.0.config.recall_sample_interval)
         {
+            let request = request.clone();
             let store = self.0.store.clone();
             // The exhaustive search reads every vector: one segment at a time, so it holds one
             // core rather than all of them, and without filling the block caches, so it does not
@@ -1159,7 +1208,7 @@ impl Engine {
             let mut exact_config = config.clone();
             exact_config.search_concurrency = 1;
             let sample = state.clone();
-            let trial = graph_scope.map(|s| s.trial());
+            let trial = graph_scope().map(|s| s.trial());
             let cache = self.0.read_cache.clone();
             let queries = self.0.queries.clone();
             let stop = self.0.stop.clone();
@@ -1286,41 +1335,6 @@ impl Engine {
                 .await;
             });
         }
-        let mut cache_stats = stats.snapshot();
-        cache_stats.disk_bytes += local_ann_bytes.load(std::sync::atomic::Ordering::Relaxed);
-        response.performance = QueryPerformance {
-            cache_hit_ratio: cache_stats.cache_hit_ratio(),
-            cache_temperature: cache_stats.temperature().into(),
-            server_total_ms: start.elapsed().as_millis() as u64,
-            query_execution_ms: execution_elapsed.as_millis() as u64,
-            exhaustive_search_count: state.docs.len() as u64,
-            approx_namespace_size: state.stats.rows + state.docs.len() as u64,
-            last_included_write_at: Some(
-                state
-                    .updated_at
-                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            ),
-            embedding_tokens: None,
-            embedding_ms: None,
-            rerank_ms: None,
-        };
-        if crate::ann::trace_stages() {
-            eprintln!(
-                "QUERY snapshot={}us exec={}us total={}us",
-                snapshot_elapsed.as_micros(),
-                execution_elapsed.as_micros(),
-                start.elapsed().as_micros()
-            );
-        }
-        let diagnostics = QueryDiagnostics {
-            snapshot_elapsed,
-            execution_elapsed,
-            backend: backend.snapshot(),
-            cache: cache_stats,
-            ann_rows_scanned: ann_rows.load(std::sync::atomic::Ordering::Relaxed),
-            document_scan_rows: document_scan_rows.load(std::sync::atomic::Ordering::Relaxed),
-        };
-        Ok((response, diagnostics))
     }
     async fn search_snapshot(
         &self,
