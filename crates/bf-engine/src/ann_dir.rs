@@ -368,6 +368,57 @@ pub(crate) async fn on_worker<T: Send + 'static>(
     .map_err(segment::index_error)?
 }
 
+/// Start the nearest probed leaves' blob and code reads of a streamed (remote) scan while the
+/// WAL tail is still being checked. Each file's reads are one `read_batch_notifying` batch, the
+/// same batch the query's own streaming scan submits for those clusters, so the scan attaches
+/// to the flights in the range cache and nothing is transferred twice. The reads run detached:
+/// a tail that shadows rows, or a manifest that replaced the slabs, wastes only their bytes.
+fn speculate_leaf_reads(
+    store: &Storage,
+    segments: &[bf_wal::Segment],
+    dir: &Arc<Directory>,
+    picked: &[usize],
+    distances: &[f32],
+) -> Result<(), ApiError> {
+    let mut chosen: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for &p in picked {
+        chosen.entry(dir.entries()[p].segment).or_default().push(p);
+    }
+    let mut order: Vec<_> = chosen.iter().collect();
+    order.sort_unstable_by(|a, b| distances[a.1[0]].total_cmp(&distances[b.1[0]]));
+    let stats = read_cache::stats();
+    for (&i, cs) in order {
+        let seg = &dir.segments()[i];
+        let files = &segments[i].files;
+        let (Some(index), Some(fragment)) = (
+            files.values().find(|f| f.key == seg.key),
+            files.values().find(|f| f.key == seg.fragment),
+        ) else {
+            continue;
+        };
+        let mut blobs: Vec<_> = cs.iter().map(|&n| dir.entries()[n].blob_range()).collect();
+        let codes: Vec<_> = cs.iter().map(|&n| dir.entries()[n].codes_range()).collect();
+        let reads = if seg.codes_in_fragment {
+            blobs.extend(codes);
+            vec![(fragment, blobs)]
+        } else {
+            vec![(fragment, blobs), (index, codes)]
+        };
+        for (file, ranges) in reads {
+            let reader = store
+                .range_reader_with_length(&file.key, file.size, true)
+                .map_err(segment::index_error)?;
+            let stats = stats.clone();
+            tokio::spawn(async move {
+                let (ready, _) = tokio::sync::oneshot::channel();
+                let _ = reader.read_batch_notifying(&ranges, &stats, ready).await;
+            });
+        }
+    }
+    crate::ann::stage(std::time::Instant::now(), "speculative leaf reads started");
+    Ok(())
+}
+
 /// Start an unfiltered ANN query's scan reads (cluster blobs and code blocks) before the WAL tail
 /// is known, so that they overlap with it and land in the block cache: the query's own scan then
 /// finds them there. Advisory: a checkpoint with deletions, or one small enough to scan exactly,
@@ -387,12 +438,14 @@ pub(crate) async fn prefetch_scan(
     // submit its disk reads while the snapshot checks the WAL, without waiting for data or
     // starting speculative S3 requests.
     let streamed = stream_scan(dir, layout);
-    if streamed
-        && !dir
+    let local = streamed
+        && dir
             .segments()
             .first()
-            .is_some_and(|s| crate::local_ann::prefetch(&s.fragment, &[]))
-    {
+            .is_some_and(|s| crate::local_ann::prefetch(&s.fragment, &[]));
+    // A remote stream starts its leaf reads now (single-flighted, so the query's own scan
+    // attaches to them) only where the query would stream them too.
+    if streamed && !local && (store.cache_limits().0 == 0 || store.has_mapped_reads()) {
         return Ok(());
     }
     if segments.iter().any(|s| s.live_generation != 0) || !covers(dir, segments, attribute, layout)
@@ -456,6 +509,9 @@ pub(crate) async fn prefetch_scan(
             && matching * dir.vector_row_bytes() <= EXACT_BYTES)
     {
         return Ok(());
+    }
+    if streamed && !local {
+        return speculate_leaf_reads(store, segments, dir, &picked, &distances);
     }
     if streamed {
         let mut ranges: BTreeMap<&str, Vec<std::ops::Range<u64>>> = BTreeMap::new();
@@ -2517,6 +2573,7 @@ pub(crate) async fn speculate_slab_scan(
     let Ok((dir, _)) = paged_view(store, &file, &paged, vector, config, false).await else {
         return;
     };
+    crate::ann::stage(std::time::Instant::now(), "speculate directory known");
     let slabs: Option<Vec<bf_wal::Segment>> = paged
         .segments()
         .iter()

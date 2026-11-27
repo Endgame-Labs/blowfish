@@ -818,3 +818,143 @@ async fn first_matching_segment_starts_memberships_before_a_slow_predicate_finis
         .unwrap();
     assert_eq!(result.result.rows.unwrap().len(), 10);
 }
+
+/// Remote streamed scans start their leaf reads while the WAL tail is checked (Round C33). The
+/// query's own scan must attach to those flights: no object range is read twice, and a tail that
+/// overwrites and deletes the nearest rows gives the same answer as indexing that tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speculative_leaf_reads_never_duplicate_and_tail_shadowing_keeps_results() {
+    let parent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.scratch");
+    std::fs::create_dir_all(&parent).unwrap();
+    let work = tempfile::Builder::new()
+        .prefix("speculative-leaves-")
+        .tempdir_in(parent)
+        .unwrap();
+    let backend = Arc::new(Delayed::default());
+    let store = Storage::from_backend_with_cache(
+        backend.clone(),
+        Path::default(),
+        false,
+        false,
+        bf_storage::CacheConfig {
+            memory_bytes: 64 << 20,
+            disk_bytes: 0,
+            block_size: 4096,
+            max_coalesce_blocks: 256,
+            namespace: Some(uuid::Uuid::new_v4().to_string()),
+            hedge_budget: 0.0,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let engine = crate::Engine::with_config(
+        store.clone(),
+        crate::EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            query_concurrency: 1,
+            ..Default::default()
+        },
+    );
+    let rows: Vec<_> = (0..100_000u32)
+        .map(|id| serde_json::json!({"id":id, "vector":vector(id)}))
+        .collect();
+    engine
+        .write(
+            "t",
+            serde_json::from_value(serde_json::json!({
+                "distance_metric":"euclidean_squared", "upsert_rows":rows
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    engine.index_namespace("t", true).await.unwrap();
+    engine
+        .recluster(
+            "t",
+            &crate::ReclusterOptions {
+                attribute: "vector".into(),
+                cells: 4,
+                cluster_rows: 32,
+                max_slab_rows: 1024,
+                scratch: work.path().join("build"),
+            },
+        )
+        .await
+        .unwrap();
+    let request: bf_types::QueryRequest = serde_json::from_value(serde_json::json!({
+        "rank_by":["vector","ANN",vector(1007)], "top_k":10
+    }))
+    .unwrap();
+    let ids = |rows: Vec<serde_json::Map<String, serde_json::Value>>| -> Vec<u64> {
+        rows.iter().map(|r| r["id"].as_u64().unwrap()).collect()
+    };
+    let cold = |backend: &Arc<Delayed>| backend.reads.lock().unwrap().clear();
+    // Untailed: every ranged read of one query is distinct.
+    engine.drop_caches().await;
+    cold(&backend);
+    let before = ids(engine
+        .query("t", request.clone())
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap());
+    assert_eq!(before[0], 1007);
+    let duplicates = |backend: &Arc<Delayed>| {
+        let reads = backend.reads.lock().unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        reads
+            .iter()
+            .filter(|r| {
+                r.0.as_ref().contains("ann") && !seen.insert((r.0.to_string(), r.1.start, r.1.end))
+            })
+            .count()
+    };
+    assert_eq!(duplicates(&backend), 0, "an ANN range was read twice");
+    // A tail overwrites the nearest row with a far vector, deletes the second, and adds a
+    // row that lands exactly on the query.
+    engine
+        .write(
+            "t",
+            serde_json::from_value(serde_json::json!({
+                "upsert_rows":[
+                    {"id":1007, "vector":vec![9.0f32; 16]},
+                    {"id":500_000, "vector":vector(1007)},
+                ],
+                "deletes":[before[1]],
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    engine.drop_caches().await;
+    cold(&backend);
+    let tailed = ids(engine
+        .query("t", request.clone())
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap());
+    assert_eq!(
+        duplicates(&backend),
+        0,
+        "an ANN range was read twice with a tail"
+    );
+    assert_eq!(tailed[0], 500_000);
+    assert!(!tailed.contains(&1007) && !tailed.contains(&before[1]));
+    engine.index_namespace("t", true).await.unwrap();
+    engine.drop_caches().await;
+    let indexed = ids(engine
+        .query("t", request)
+        .await
+        .unwrap()
+        .result
+        .rows
+        .unwrap());
+    assert_eq!(tailed, indexed);
+    assert!(engine.shutdown(Duration::from_secs(5)).await);
+}

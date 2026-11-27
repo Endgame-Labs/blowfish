@@ -63,6 +63,7 @@ P.add_argument("--id-mode", choices=["random", "clustered"], default="random")
 P.add_argument("--id-max", type=int, default=10_000_000)
 P.add_argument("--id-span", type=int, default=0, help="clustered: width of the ID range (default 8 per ID, at least 4096)")
 P.add_argument("--id-seed", type=int, default=32)
+P.add_argument("--top-k", type=int, default=10, help="top_k of every measured query (Round C33)")
 P.add_argument("--truth-key", help="oracle array containing exact IDs for this filter")
 P.add_argument("--scratch", type=Path, required=True)
 P.add_argument("--port", type=int, default=8400)
@@ -162,7 +163,7 @@ items = [
         "truth": truth[truth_key][i].tolist() if truth_key else None,
         "request": {
             "rank_by": ["vector", "ANN", truth["vector"][i].astype("f4").tolist()],
-            "top_k": 10,
+            "top_k": a.top_k,
             "consistency": {"level": "strong"},
             **({"filters": a.filters} if a.filters is not None else {}),
             **({"filters": id_in_filter(i)} if a.id_in else {}),

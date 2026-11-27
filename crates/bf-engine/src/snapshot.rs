@@ -946,6 +946,7 @@ async fn catch_up_hinted_inner(
         };
         match tail {
             Ok(entries) => {
+                crate::ann::stage(Instant::now(), "snapshot tail and warm done");
                 for (seq, entry) in entries {
                     let size = serde_json::to_vec(&entry).expect("WAL serializes").len() as u64;
                     if cap.is_some_and(|cap| state.tail_bytes.saturating_add(size) > cap) {
