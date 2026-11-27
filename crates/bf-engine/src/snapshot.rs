@@ -423,8 +423,10 @@ impl OpenHint {
                             .boxed(),
                     );
                 }
-                if (with_rest && !self.ann.is_empty() && !by_dir)
-                    || (with_text && !self.text.is_empty())
+                // Generation 0 has every row live: nothing to fetch.
+                if seg.live_generation != 0
+                    && ((with_rest && !self.ann.is_empty() && !by_dir)
+                        || (with_text && !self.text.is_empty()))
                 {
                     tasks.push(
                         segment::get_value::<RoaringBitmap>(store, &seg.live)

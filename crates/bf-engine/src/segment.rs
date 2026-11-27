@@ -1106,7 +1106,17 @@ pub(crate) async fn build_with_delegation<D: std::borrow::Borrow<Document>>(
         live_generation: 0,
     })
 }
+/// Every row of a segment at live generation 0, which the segment's own build wrote as the full
+/// range: no object holds it, so no read is needed.
+pub(crate) fn all_live(segment: &Segment) -> RoaringBitmap {
+    let mut rows = RoaringBitmap::new();
+    rows.insert_range(0..segment.row_count);
+    rows
+}
 pub(crate) async fn live(store: &Storage, segment: &Segment) -> Result<RoaringBitmap, ApiError> {
+    if segment.live_generation == 0 {
+        return Ok(all_live(segment));
+    }
     let live: Arc<RoaringBitmap> = get_value(store, &segment.live).await?;
     if live.max().is_some_and(|row| row >= segment.row_count) {
         return Err(corrupt());
@@ -1807,22 +1817,21 @@ pub(crate) async fn filter_live(
         return Ok(rows);
     }
     let trace = crate::ann::trace_stages().then(std::time::Instant::now);
-    // An ID predicate's seek needs no live rows, so it overlaps their load. Other filters load
-    // them directly.
-    let live = if matches!(f, Filter::Compare { attribute, .. } if attribute == "id") {
-        futures::future::join(
-            live(store, segment),
-            Box::pin(id_predicate::prefetch(store, segment, f, schema)),
-        )
-        .await
-        .0?
+    // Generation 0 has every row live and needs no read. A later generation's set is one object:
+    // load it while the filter reads its own objects. The filter runs over every row and the
+    // result is intersected with the set, which gives the same rows for each operator (`Not` and
+    // `NotEq` subtract from the rows they are given).
+    let all = all_live(segment);
+    let rows = if segment.live_generation == 0 {
+        filter_rows(store, segment, f, schema, &all).await?
     } else {
-        live(store, segment).await?
+        let (live, rows) = futures::future::join(
+            live(store, segment),
+            filter_rows(store, segment, f, schema, &all),
+        )
+        .await;
+        rows? & live?
     };
-    if let Some(trace) = trace {
-        crate::ann::task_stage(trace, "filter_live_loaded", &segment.id);
-    }
-    let rows = filter_rows(store, segment, f, schema, &live).await?;
     if let Some(trace) = trace {
         crate::ann::task_stage(trace, "filter_evaluated", &segment.id);
     }
