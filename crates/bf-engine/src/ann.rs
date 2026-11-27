@@ -270,9 +270,7 @@ fn from_tiers<'a>(
         let mut covered = vec![false; state.segments.len()];
         let mut positions = Vec::with_capacity(tiers.len());
         for set in tiers {
-            let Some(at) =
-                crate::lineage::place(store, &state.segments, &state.lineage, set).await?
-            else {
+            let Some(at) = crate::lineage::place_memoized(store, state, set).await? else {
                 return Ok(None);
             };
             for i in at.positions() {
@@ -481,6 +479,19 @@ static TIER_MASKS: std::sync::LazyLock<
 /// holds is still live: rows deleted since the slabs were built, and rows dropped by a merge, are
 /// left out. Built once per tier and set of live objects and lineage maps (all immutable).
 pub(crate) async fn tier_mask(
+    store: &Storage,
+    state: &NamespaceState,
+    set: &bf_wal::SlabSet,
+    at: &crate::lineage::Placement,
+) -> Result<Option<Arc<RoaringBitmap>>, ApiError> {
+    if let Some(mask) = at.mask.get() {
+        return Ok(mask.clone());
+    }
+    let mask = tier_mask_uncached(store, state, set, at).await?;
+    let _ = at.mask.set(mask.clone());
+    Ok(mask)
+}
+async fn tier_mask_uncached(
     store: &Storage,
     state: &NamespaceState,
     set: &bf_wal::SlabSet,

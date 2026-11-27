@@ -109,6 +109,10 @@ pub(crate) struct Placement {
     pub places: Vec<Place>,
     /// Map object keys, in order (the tier's mask depends on them).
     pub maps: Vec<String>,
+    /// The tier's live-row mask for the segment list this placement was resolved against (see
+    /// `ann::tier_mask`), once computed: it is a function of the placement, the segments' live
+    /// objects, and the maps, all fixed for the life of the placement.
+    pub mask: std::sync::OnceLock<Option<Arc<RoaringBitmap>>>,
 }
 
 /// Find a covered segment among `segments`, from position `from` on first: segments keep their
@@ -183,7 +187,60 @@ pub(crate) async fn place(
         }
         maps.push(part.map.key.clone());
     }
-    Ok(Some(Placement { places, maps }))
+    Ok(Some(Placement {
+        places,
+        maps,
+        mask: std::sync::OnceLock::new(),
+    }))
+}
+
+/// `place` results for one segment list, by tier directory key. A query used to resolve every
+/// tier's placement itself, each map through the shared read cache's one lock; with thirty-two
+/// tiers and sixteen busy reactors that was a tenth of a graph query's CPU. A placement depends
+/// only on the segment list (which owns this memo), the lineage records, the tier's covered list,
+/// and the immutable map objects, so an entry is reused while the state's lineage and tier
+/// table are the very objects it was computed from (the entry keeps them alive, so their
+/// addresses cannot be reused by others).
+#[derive(Default)]
+pub(crate) struct PlacementMemo {
+    entries: arc_swap::ArcSwap<HashMap<String, Memoized>>,
+}
+#[derive(Clone)]
+struct Memoized {
+    lineage: Arc<Vec<Lineage>>,
+    tiers: Arc<BTreeMap<String, Vec<SlabSet>>>,
+    placement: Arc<Placement>,
+}
+
+/// [`place`] for a tier of `state`, reusing the answer the state's segment list already holds.
+/// Only a placement that can answer is kept.
+pub(crate) async fn place_memoized(
+    store: &Storage,
+    state: &crate::NamespaceState,
+    set: &SlabSet,
+) -> Result<Option<Arc<Placement>>, ApiError> {
+    let memo = state.segments.placements();
+    if let Some(hit) = memo.entries.load().get(set.dir.key.as_str())
+        && Arc::ptr_eq(&hit.lineage, &state.lineage)
+        && Arc::ptr_eq(&hit.tiers, &state.ann_tiers)
+    {
+        return Ok(Some(hit.placement.clone()));
+    }
+    let Some(placement) = place(store, &state.segments, &state.lineage, set).await? else {
+        return Ok(None);
+    };
+    let placement = Arc::new(placement);
+    let entry = Memoized {
+        lineage: state.lineage.clone(),
+        tiers: state.ann_tiers.clone(),
+        placement: placement.clone(),
+    };
+    memo.entries.rcu(|current| {
+        let mut next = HashMap::clone(current);
+        next.insert(set.dir.key.clone(), entry.clone());
+        next
+    });
+    Ok(Some(placement))
 }
 
 impl Placement {
@@ -466,5 +523,72 @@ mod tests {
         assert_eq!(parts[0].map.key, "m-t2");
         let map = load(&store, &parts[1]).await.unwrap();
         assert_eq!(map.pairs().collect::<Vec<_>>(), [(0, 5), (2, 7)]);
+    }
+
+    #[tokio::test]
+    async fn placements_are_memoized_for_one_segment_list_and_nothing_else() {
+        let store = Storage::from_backend(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            object_store::path::Path::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        // Source `s` (4 rows) was merged into `t`.
+        let map = Map {
+            from: (0u32..4).collect(),
+            to: (0u32..4).collect(),
+        };
+        let file = segment::put_value(&store, "m-t".to_owned(), &map)
+            .await
+            .unwrap();
+        let lineage = vec![Lineage {
+            source: "s".into(),
+            parts: vec![LineagePart {
+                target: "t".into(),
+                rows: 4,
+                map: file,
+            }],
+        }];
+        let set: SlabSet = serde_json::from_value(serde_json::json!({
+            "covered": [{"segment": "s", "base": 0, "rows": 4}],
+            "slabs": [],
+            "dir": {"key": "tier-1", "size": 0, "metadata_len": 0}
+        }))
+        .unwrap();
+        let mut state = crate::NamespaceState {
+            segments: vec![segment("t", 4)].into(),
+            lineage: Arc::new(lineage.clone()),
+            ..Default::default()
+        };
+        let first = place_memoized(&store, &state, &set).await.unwrap().unwrap();
+        assert!(matches!(first.places[0], Place::Moved(_)));
+        // The same list, and a clone of the state, share the answer.
+        let again = place_memoized(&store, &state, &set).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        let copy = state.clone();
+        let shared = place_memoized(&store, &copy, &set).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &shared));
+        // Other lineage records (even equal ones) or any change to the list start over.
+        let other = crate::NamespaceState {
+            lineage: Arc::new(lineage),
+            ..state.clone()
+        };
+        let recomputed = place_memoized(&store, &other, &set).await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &recomputed));
+        state.segments.push(segment("u", 1));
+        let changed = place_memoized(&store, &state, &set).await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        // The old list still gets its own answer (an entry for other lineage records is replaced,
+        // not reused).
+        let old = place_memoized(&store, &copy, &set).await.unwrap().unwrap();
+        assert_eq!(old.maps, first.maps);
+        // And the memoized answer is the one `place` computes.
+        let direct = place(&store, &copy.segments, &copy.lineage, &set)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct.maps, first.maps);
     }
 }
