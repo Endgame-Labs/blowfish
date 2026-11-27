@@ -238,6 +238,7 @@ async fn sum_falls_back_to_full_scoring_when_no_list_proves_the_answer() {
             "deletes": [4, 5, 6], "upsert_rows": batch_with(5200..5230, text)}),
     )
     .await;
+    let before = bf_engine::sum_outcomes();
     for (k, offset) in [(1, 0), (10, 0), (100, 7)] {
         for clauses in [&["red fox", "blue bird"][..], &["fox", "fox bird", "wolf"]] {
             let q = json!({"rank_by": ["Sum", clauses.iter().map(|c| clause(c)).collect::<Vec<_>>()],
@@ -245,4 +246,6 @@ async fn sum_falls_back_to_full_scoring_when_no_list_proves_the_answer() {
             identical(&e, q, &format!("{clauses:?} k={k} offset={offset}")).await;
         }
     }
+    let after = bf_engine::sum_outcomes();
+    assert!(after.fallback > before.fallback, "{before:?} {after:?}");
 }

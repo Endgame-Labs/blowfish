@@ -25,6 +25,7 @@ mod statistics;
 mod stop;
 mod streaming;
 mod sum_text;
+pub use sum_text::{SumOutcomes, sum_outcomes};
 mod tail;
 #[cfg(test)]
 mod tail_benchmark;

@@ -920,6 +920,20 @@ impl SearchThreshold {
         }
     }
 
+    /// The number of hits a query sharing this threshold needs.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Raise the floor to `score` when the caller knows `k` rows elsewhere that outrank any row
+    /// scoring strictly below it. Lower, negative, and non-finite values are ignored.
+    pub fn raise(&self, score: f32) {
+        if score.is_finite() && score > 0.0 {
+            self.score
+                .fetch_max(score.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn publish(&self, heap: &BinaryHeap<Reverse<SearchHit>>) {
         if self.k > 0 && heap.len() == self.k {
             // Nonnegative finite scores and positive infinity have ordered bits.

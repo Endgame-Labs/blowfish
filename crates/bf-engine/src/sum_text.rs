@@ -9,7 +9,49 @@ use crate::{NamespaceState, segment, snapshot};
 use bf_storage::Storage;
 use bf_types::*;
 use roaring::RoaringBitmap;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+/// How `Sum` queries have been decided since the process started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SumOutcomes {
+    /// The bound held at the first list length.
+    pub first: u64,
+    /// The bound held after the lists grew.
+    pub grown: u64,
+    /// No list length proved the answer, and the full scorer ran.
+    pub fallback: u64,
+}
+static FIRST: AtomicU64 = AtomicU64::new(0);
+static GROWN: AtomicU64 = AtomicU64::new(0);
+static FALLBACK: AtomicU64 = AtomicU64::new(0);
+/// Counts of `Sum` queries accepted at the first list length, accepted after growing, and sent
+/// to the full scorer, for benchmarks that report how often the bound holds.
+pub fn sum_outcomes() -> SumOutcomes {
+    SumOutcomes {
+        first: FIRST.load(Ordering::Relaxed),
+        grown: GROWN.load(Ordering::Relaxed),
+        fallback: FALLBACK.load(Ordering::Relaxed),
+    }
+}
+/// Record one query's outcome: `Some(round)` for the round (0 first) that accepted, `None` for
+/// the fallback. Also traced as a stage line when stage tracing is on.
+pub(crate) fn record(round: Option<usize>) {
+    let (counter, name) = match round {
+        Some(0) => (&FIRST, "first"),
+        Some(_) => (&GROWN, "grown"),
+        None => (&FALLBACK, "fallback"),
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    if crate::ann::trace_stages() {
+        eprintln!("STAGE sum outcome {name}");
+    }
+}
 
 /// Largest per-clause list a `Sum` query will try before it scores everything.
 const MAX_LIST: usize = 4096;
