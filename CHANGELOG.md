@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.69] - 2026-11-27
+
+### Changed
+
+- **`Max` of BM25 clauses no longer scores and hydrates every matching row:** `["Max", [["text","BM25",a],["text","BM25",b]]]` made each segment return every allowed row of every clause and read each row's document, about 3.5 CPU seconds per two-clause query on a million-passage corpus. Each clause now returns its own top `k + offset` rows (plus any rows tied with the cutoff) and the merge takes the per-row maximum, which is exact: a row outside every clause's list cannot reach the combined top. Two-clause queries went from 2.0 seconds to 2 ms at one client and from 1.4 to 680 q/s at 16 clients, three-clause from 2.7 seconds to 3 ms, and every reply (IDs and score bits) matches v0.1.66's. `Sum` and nested expressions are unchanged. See [docs/benchmarks.md](docs/benchmarks.md), Round BW22.
+
 ## [0.1.68] - 2026-11-27
 
 ### Changed
@@ -501,7 +507,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.68...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.69...HEAD
+[0.1.69]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.69
 [0.1.68]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.68
 [0.1.67]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.67
 [0.1.66]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.66
