@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **Warm graph navigation screens neighbors with the one-bit codes, 28 to 30 percent less walk time at 16 clients:** Once the beam is full, an unseen neighbor is now scored with its 1,024-byte SQ8 code only if the Hamming distance between its resident 128-byte one-bit code and the query's signs is at most the mean Hamming distance of the beam's eight worst members plus `sqrt(bits) / 2` (16 bits for 1,024-d). Neighbors the rule rejects are never scored. About 35 percent of the SQ8 reads remain, and recall moved by 0.0001 at `top_k` 10 and -0.0013 at `top_k` 100 with the beam unchanged. On full BEIR NQ (2.68M x 1024-d) on the M4 at 16 clients, paired on one server, `top_k` 10 went from 9,430 to 10,248 q/s and `top_k` 100 from 4,630 to 4,870 q/s; against Qdrant 1.20.0 at matched recall that is 1.29 and 1.36 times its q/s. The walk is now about a third of the CPU a query uses, so the gain at the server is smaller than the 1.56 times the walk and the rerank gain in isolation. See Round G16 in `docs/benchmarks.md`.
+
 ## [0.1.62] - 2026-11-27
 
 ### Changed
