@@ -74,7 +74,51 @@ async fn identical(e: &Engine, q: Value, label: &str) {
 fn clause(s: &str) -> Value {
     json!(["text", "BM25", s])
 }
+/// How each clause is wrapped: plain, one positive weight (on either side), or nested weights.
+fn wrap(scheme: usize, i: usize, s: &str) -> Value {
+    match scheme {
+        0 => clause(s),
+        1 => {
+            let w = [2.0, 0.5, 3.0][i % 3];
+            json!(["Product", w, clause(s)])
+        }
+        2 => {
+            let w = [0.3, 1.7, 1.0][i % 3];
+            json!(["Product", clause(s), w])
+        }
+        // Nested constants: 0.1 * (0.7 * s) differs in the last bit from (0.1 * 0.7) * s.
+        3 => json!(["Product", 0.1, ["Product", clause(s), 0.7]]),
+        // Zero weight keeps the full scorer for the whole query.
+        _ => {
+            let w = [0.0, 2.0][i % 2];
+            json!(["Product", w, clause(s)])
+        }
+    }
+}
 async fn compare(e: &Engine, tag: &str, sets: &[&[&str]]) {
+    for op in ["Sum", "Max"] {
+        for scheme in 1..=4 {
+            for clauses in sets {
+                for (k, offset) in [(1, 0), (10, 3), (100, 0), (10, 70)] {
+                    let q = json!({
+                        "rank_by": [op, clauses.iter().enumerate().map(|(i, c)| wrap(scheme, i, c)).collect::<Vec<_>>()],
+                        "top_k": k, "offset": offset, "include_attributes": ["n"],
+                        "filters": if k == 10 { json!(["n", "NotEq", 0]) } else { Value::Null }
+                    });
+                    let mut q = q;
+                    if q["filters"].is_null() {
+                        q.as_object_mut().unwrap().remove("filters");
+                    }
+                    identical(
+                        e,
+                        q,
+                        &format!("{tag} {op} w{scheme} {clauses:?} k={k} off={offset}"),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
     for clauses in sets {
         for k in [1, 10, 100] {
             for offset in [0, 3, 70] {

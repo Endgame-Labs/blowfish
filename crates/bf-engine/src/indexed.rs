@@ -800,12 +800,12 @@ pub(crate) fn text_ids_only(q: &QueryRequest) -> bool {
         && q.compute_attributes.is_none()
         && q.limit.as_ref().and_then(Limit::per).is_none()
 }
-/// `["Max", [...]]` whose clauses are all plain BM25. Each clause then needs only its own top
+/// `["Max", [...]]` whose clauses are all plain BM25, each under constant positive weights (a
+/// strictly increasing map, so each clause's order and ties are kept). Each clause then needs only its own top
 /// `k + offset` rows (plus ties at the cutoff): a row outside every clause's top list has a
 /// maximum below at least `k + offset` other rows' maxima. `Sum` has no such bound.
 pub(crate) fn max_of_text(rank: Option<&RankBy>) -> bool {
-    matches!(rank, Some(RankBy::Max(xs)) if !xs.is_empty()
-        && xs.iter().all(|x| matches!(x, RankBy::Bm25 { .. })))
+    matches!(rank, Some(RankBy::Max(_))) && sum_text::clause_weights(rank).is_some()
 }
 /// True when `hits` (best first, from a search for `top > k` rows) hold every row scoring at
 /// least the `k`th hit's score: the list is the whole result, or ends strictly below that score.
@@ -1048,7 +1048,7 @@ async fn sum_prepare(
     q: &QueryRequest,
     clauses: &[&RankBy],
 ) -> Result<Option<Vec<sum_text::SegmentSum>>, ApiError> {
-    let prepared = sum_clauses(state, clauses);
+    let prepared = sum_clauses(state, q, clauses);
     let opened = futures::future::try_join_all(
         state
             .segments
@@ -1058,12 +1058,18 @@ async fn sum_prepare(
     .await?;
     Ok(opened.into_iter().collect())
 }
-fn sum_clauses<'a>(state: &'a NamespaceState, clauses: &[&'a RankBy]) -> Vec<sum_text::Clause<'a>> {
+fn sum_clauses<'a>(
+    state: &'a NamespaceState,
+    q: &QueryRequest,
+    clauses: &[&'a RankBy],
+) -> Vec<sum_text::Clause<'a>> {
     static FALLBACK: std::sync::LazyLock<bf_text::CorpusStats> =
         std::sync::LazyLock::new(Default::default);
+    let weights = sum_text::clause_weights(q.rank_by.as_ref()).expect("weighted BM25 clauses");
     clauses
         .iter()
-        .map(|clause| {
+        .zip(weights)
+        .map(|(clause, weights)| {
             let RankBy::Bm25 {
                 attribute,
                 query,
@@ -1083,6 +1089,7 @@ fn sum_clauses<'a>(state: &'a NamespaceState, clauses: &[&'a RankBy]) -> Vec<sum
                     crate::text::prefix(params.as_ref()),
                 ),
                 cfg,
+                weights,
                 stats: state.corpus.get(attribute).unwrap_or(&FALLBACK),
             }
         })
@@ -1149,7 +1156,7 @@ async fn sum_finish(
     threshold: Option<&bf_text::SearchThreshold>,
     out: NamespaceState,
 ) -> Result<NamespaceState, ApiError> {
-    let prepared = sum_clauses(state, clauses);
+    let prepared = sum_clauses(state, q, clauses);
     // Tail documents are already scored (every clause, in `out`); their totals take part too.
     let tail: Vec<(Id, f64)> = clauses
         .first()
@@ -1158,12 +1165,14 @@ async fn sum_finish(
             first
                 .keys()
                 .map(|id| {
-                    let t = sum_text::total(clauses.iter().map(|c| {
-                        out.scores
+                    let t = sum_text::total(clauses.iter().zip(&prepared).map(|(c, p)| {
+                        let raw = out
+                            .scores
                             .get(&rank_key(c))
                             .and_then(|m| m.get(id))
                             .copied()
-                            .unwrap_or(0.0) as f32
+                            .unwrap_or(0.0);
+                        sum_text::scaled(&p.weights, raw as f32)
                     }));
                     (id.clone(), t)
                 })
