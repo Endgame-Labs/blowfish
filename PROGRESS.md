@@ -4,6 +4,7 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-27
 
+- **v0.1.61: TL1 merged.** Prepared tail vectors (validity, zero flag, norm in kernel order) and a per-snapshot prepared block; one dot per tail row per query, bit-identical. c7g.4xlarge NQ, 50 upserts/s, indexer off: top_k 10 2,730 -> 4,760 q/s, top_k 100 992 -> 2,046; indexer on within noise. Remaining tail cost is the dot over 4 KB per row (f16 storage is the next lever). C29 recorded (tests and docs only; the global row-location format was rejected).
 - **v0.1.60: G13 merged (via M13).** `ann::graph_mask` hides tail-shadowed rows from the warm graph's shortlist (per snapshot, incremental, single-flight), so `graph_k == k`; the G14 filtered scan takes the same mask. c7g.4xlarge NQ, 50 upserts/s, 16 clients: top_k 100 494 (IVF) -> 1,038 q/s on the graph, top_k 10 unchanged 2,825. Next bound: tail scoring (`merge_tail`) is ~80% of CPU under writes (Round T1).
 
 ## 2026-11-26

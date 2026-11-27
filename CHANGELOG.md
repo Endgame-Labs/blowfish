@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.61] - 2026-11-27
+
+### Changed
+
+- **Vector queries over a long unindexed tail are up to 2x faster:** Every query used to score the whole unindexed WAL tail with the reference distance kernel. That kernel re-validated both vectors, recomputed their norms, and took a lock, a hash lookup, and three reference-count updates per row. Each tail vector now gets its validity, zero flag, and norm prepared once, in the kernel's own accumulation order, so a query does one dot product per row. Each snapshot also gets one shared block of prepared rows. Results are bit-identical. On BEIR NQ (2.68M x 1024-d) on a 16-vCPU Graviton host, with 50 upserts per second and the indexer off (so the tail grows to about 9,000 rows), 16 clients went from 2,730 to 4,760 q/s at `top_k` 10 and from 992 to 2,046 q/s at `top_k` 100. With the indexer at its default interval the tail stays small, and throughput moved within noise (1.02 to 1.06x). Write latency is unchanged. See Round TL1 in `docs/benchmarks.md`.
+
 ## [0.1.60] - 2026-11-27
 
 ### Changed
@@ -452,7 +458,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.60...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.61...HEAD
+[0.1.61]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.61
 [0.1.60]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.60
 [0.1.59]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.59
 [0.1.58]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.58
