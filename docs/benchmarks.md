@@ -17924,3 +17924,88 @@ patches and deletes), a new attribute filtered on, an unknown attribute, and a p
 `rows_remaining` limits (5,000,000 and 50,000 rows) are unchanged code and are not exercised here. A second test submits five dependent writes together, and a third has a second engine commit
 between this engine's snapshot and its filtered delete (a real lost slot): the other writer's matching row is
 deleted, and a row it moved out of the filter is not.
+
+## Round BW25: `Saturate` of BM25 and weighted predicate bonuses
+
+At v0.1.71 two common expression shapes still scored and hydrated every allowed row: a `Saturate` of a BM25 clause (alone, or
+inside `Max` or `Sum`), and `["Sum", [BM25, ["Product", w, predicate]]]`. On the 1M MS MARCO fixture at one client they took
+1.4 s (`Saturate` alone), 2.2 s (two-clause `Saturate` in `Max` or `Sum`), 1.6 s (BM25 plus a predicate), and 2.3 s (two BM25
+clauses plus a predicate), against 2.8 ms for a plain clause.
+
+### What changed
+
+1. **Transform chains.** A clause is plain BM25 under up to four nested steps, each a constant positive `Product` (as in BW24) or
+   a `Saturate` with `midpoint` in `1e-6..=1e12` and `exponent` in `0.05..=20` (outside that: the old path). `Saturate` is
+   non-decreasing in the raw score, and is evaluated as the full scorer does (`1 - 1 / (1 + (max(s, 0) / m)^e)` in `f64`,
+   innermost step first), so totals and score bits are identical. A unit test sweeps adjacent `f32` scores for several
+   parameter sets and checks the transform never reverses their order. Rounding can make unequal scores equal, so a clause
+   list is trusted only where the transformed values are strictly separated:
+   - `Sum` (and a lone `Saturate` or weighted clause, treated as a one-term `Sum`): the existing strict bound, now the sum of the
+     transformed cutoffs (`kth > bound`; a tie at the bound grows the lists, then falls back).
+   - `Max`: a clause with a `Saturate` skips the ID-order shortcut and widens its list until it ends strictly below the
+     transformed `k`th score. Shared floors are not raised for such a clause (the transform cannot be undone safely); other
+     clauses of the same `Max` still use them.
+2. **Predicate bonuses.** `Sum` terms may include up to two predicates, each bare or under constant `Product`s, beside at least
+   one text clause. Each segment's allowed rows are split into classes by which predicates they match (one search class per
+   combination), every class is searched with the same corpus statistics under its own constant bonus, the lists and strict
+   bound work per class (the bound includes the class's bonus), and the largest bound counts. Terms are added in rank order, so
+   totals match the full scorer's bits. **Boosted rows with no text match** total the bare bonus and tie among themselves: when
+   every list of a positive-bonus class ends short, the class also contributes its `k` lowest-ID rows (row order is ID order,
+   proven by the validated ID list; a segment without that proof sends the query to the old path). The WAL tail evaluates the
+   predicates per document. Hydration scores predicates for the winning rows only, not every matching row.
+
+### Tests
+
+`tests/sum_text.rs` compares whole responses (IDs and score bits) with `query_exhaustive` for five `Saturate` wrappings (typical,
+collapsing every score to one value, tiny exponent, nested under and over a weight, out of range) alone, in `Sum`, and in `Max`,
+and for five bonus forms (a nonmatching predicate, huge and small weights, either operand order, bare, two predicates) in three
+positions, over tie-heavy and varied corpora, segments, a WAL tail with overwrites and deletes, a reindex, filters, and offsets.
+A test asserts the new shapes (including a rare term whose boosted rows mostly match no text) are accepted from lists, not by the
+fallback.
+
+### Measurement
+
+Local, no EC2: this VM, fixture `tmp/msmarco-1m-v021/` (eight text segments) on local disk, server (`blowfish-scale-server`) on CPUs
+0 to 5 with two Rayon workers, driver (`concurrent_bm25`) on CPUs 6 and 7, `top_k` 10 or 100, strong consistency, IDs only.
+Baseline is the v0.1.71 release build (HEAD before this round); the candidate is this round's commit. The fixture has no scalar
+attributes, so filters and predicates use `id` ranges. Five 200-query workloads, each built from the checked-in MS MARCO queries and
+cycling six pages (`top_k` 10 unfiltered, with `id >= 200000`, with `id < 50000`, offsets 7 and 20, and `top_k` 100): `sat1`
+(`Saturate` alone), `satmax` and `satsum` (two `Saturate` clauses), `bonus` (BM25 plus a `Product` of 2, 5, or 12 and an `id <`
+range), and `bonus2t` (two BM25 clauses plus a predicate). Saturate parameters cycle `{midpoint 10}`, `{midpoint 5, exponent 2}`, and
+`{midpoint 20, exponent 0.5}`, and **1 query in 25 forces ties** (`{midpoint 1e-6, exponent 20}` rounds every score to 1, so every
+matching row ties and no list can prove an answer). The baseline recorded the truth (ordered IDs, `f32` score bits) and the candidate
+matches it on every query of every pass (the driver asserts it). The baseline ran 50 queries at one client (each takes seconds) and
+all 200 at 16 clients; the candidate ran a prewarm, 2 passes at one client, and 3 at 16.
+
+| Workload (200 queries) | v0.1.71 1 client q/s | candidate 1 client q/s | v0.1.71 16 clients q/s | candidate 16 clients q/s | gain at 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `Saturate` alone (`sat1`) | 0.9 | 13.0 to 13.7 | 2.4 | 31.6 to 34.9 | 13x to 15x |
+| `Max` of two `Saturate` (`satmax`) | 0.6 | 8.3 | 1.6 | 20.0 to 23.3 | 12x to 14x |
+| `Sum` of two `Saturate` (`satsum`) | 0.6 | 2.7 | 1.5 | 8.0 to 8.2 | **5.2x to 5.4x** |
+| BM25 plus predicate (`bonus`) | 0.4 | 180 to 212 | 1.6 | 317 to 346 | 200x to 215x |
+| two BM25 plus predicate (`bonus2t`) | 0.4 | 37 to 41 | 1.2 | 67 to 75 | 57x to 64x |
+
+The `Saturate` rows are dominated by the 8 forced-tie queries of each workload (the full scorer, 2 to 3 s each, now slower
+for them by the failed list rounds: p99 2.4 to 8.9 s). Without them (192 queries, same baseline answers; the baseline reran them):
+
+| Workload (192 queries, no forced ties) | v0.1.71 1 client q/s (p50 ms) | candidate 1 client q/s (p50 ms) | v0.1.71 16 clients q/s | candidate 16 clients q/s (p50 ms) | gain at 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `sat1` | 0.72 (1,468) | 138 (5.8) | 2.06 | 335 to 415 (36 to 46) | 160x to 200x |
+| `satmax` | 0.56 (2,022) | 144 (5.2) | 1.51 | 518 to 694 (19 to 25) | 340x to 460x |
+| `satsum` | 0.45 (2,273) | 3.3 (21) | 1.25 | 8.2 to 8.5 (865 to 973) | 6.6x to 6.8x |
+
+**Plain `Max` and `Sum` are not slower** (200 two-clause queries, same pages, A/B pass pairs; q/s, baseline then candidate):
+`Max` 1 client 215 and 150 vs 164 and 160, 16 clients 910 and 1,000 vs 1,134 and 932; `Sum` 1 client 21 and 16 vs 21 and 20, 16
+clients 47 and 39 vs 41 and 42. Differences are within this shared VM's run-to-run drift.
+
+**Verdict.** Bonuses (57x to 215x), `Saturate` alone (160x to 200x without forced ties, 13x to 15x with them), and `Saturate` in
+`Max` (340x to 460x, 12x to 14x with ties) clear the 10x bar. **`Sum` of `Saturate` clauses does not (about 6x):** saturation
+compresses the high scores, so the sum of the two clauses' cutoffs sits above the `k`th total for roughly 40 percent of the
+queries with `{midpoint 10}` even at 4,096 rows, and those fall back to the full scorer after four wasted list rounds (about
+1.5x slower than before for them). A tighter bound needs a combined top-k search (WAND over the transformed sum), not tried here.
+
+### Not measured
+
+Cold reads; `limit.per`; `Saturate` over a `Sum` or `Max` (old path); predicates other than `id` ranges (the fixture has no scalar
+attribute; correctness is covered by the tests, which use an integer attribute); three or more predicates (old path); starting
+`Sum` lists at 256 rows; separate gains per class split; EC2.

@@ -61,44 +61,142 @@ const MIN_LIST: usize = 64;
 /// Weights outside this range could overflow or underflow the scaled scores, and then two
 /// different BM25 scores could map to one value, so such clauses keep the full scorer.
 const WEIGHT_RANGE: std::ops::RangeInclusive<f64> = 1e-9..=1e9;
-/// Deepest nest of `Product` constants around one clause that still takes the list paths.
+/// `Saturate` midpoints and exponents outside these ranges could overflow `powf` or collapse
+/// most scores to 0 or 1, so such clauses keep the full scorer.
+const MIDPOINT_RANGE: std::ops::RangeInclusive<f64> = 1e-6..=1e12;
+const EXPONENT_RANGE: std::ops::RangeInclusive<f64> = 0.05..=20.0;
+/// Deepest nest of transforms around one clause that still takes the list paths.
 const MAX_NEST: usize = 4;
 
-/// The constant weights around a plain BM25 clause, innermost first, or `None` when `x` is
-/// anything else (including a weight of 0 or one outside `WEIGHT_RANGE`). A positive weight
-/// scales every score by a strictly increasing map, so the clause keeps its order and ties.
-pub(crate) fn weights_of(x: &RankBy) -> Option<Vec<f64>> {
+/// One monotone transform applied to a clause's score by the full scorer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Step {
+    /// `weight * score` (a constant `Product`, weight in `WEIGHT_RANGE`).
+    Mul(f64),
+    /// `Saturate`: `1 - 1 / (1 + (max(score, 0) / midpoint) ^ exponent)`.
+    Saturate { midpoint: f64, exponent: f64 },
+}
+/// The transforms around a clause, innermost first. Each is non-decreasing in the score, so
+/// the clause keeps its order (rounding may make unequal scores equal, never reverse them).
+pub(crate) type Chain = Vec<Step>;
+
+impl Step {
+    fn apply(self, s: f64) -> f64 {
+        match self {
+            Step::Mul(w) => w * s,
+            Step::Saturate { midpoint, exponent } => {
+                // Exactly `query::score`: ratio first, then one minus it.
+                let ratio = 1.0 / (1.0 + (s.max(0.0) / midpoint).powf(exponent));
+                1.0 - ratio
+            }
+        }
+    }
+}
+/// True when scaling can map two different scores to one (so ties need a transformed check).
+pub(crate) fn lossy(chain: &[Step]) -> bool {
+    chain.iter().any(|s| matches!(s, Step::Saturate { .. }))
+}
+
+/// The transforms around a plain BM25 clause, innermost first, or `None` when `x` is anything
+/// else (including a weight of 0 or one outside its range, or odd `Saturate` parameters).
+pub(crate) fn weights_of(x: &RankBy) -> Option<Chain> {
     match x {
         RankBy::Bm25 { .. } => Some(vec![]),
         RankBy::Product { weight, expr, .. } if WEIGHT_RANGE.contains(weight) => {
             let mut inner = weights_of(expr)?;
-            inner.push(*weight);
+            inner.push(Step::Mul(*weight));
+            (inner.len() <= MAX_NEST).then_some(inner)
+        }
+        RankBy::Saturate { expr, params } => {
+            let midpoint = crate::query::parameter(params, "midpoint", 1.0).ok()?;
+            let exponent = crate::query::parameter(params, "exponent", 1.0).ok()?;
+            if !MIDPOINT_RANGE.contains(&midpoint) || !EXPONENT_RANGE.contains(&exponent) {
+                return None;
+            }
+            let mut inner = weights_of(expr)?;
+            inner.push(Step::Saturate { midpoint, exponent });
             (inner.len() <= MAX_NEST).then_some(inner)
         }
         _ => None,
     }
 }
 
-/// A clause's score after its weights, multiplying innermost first in `f64` exactly as
-/// `query::score` does (`weight * score`), so the result has the full scorer's bits.
-pub(crate) fn scaled(weights: &[f64], score: f32) -> f64 {
-    weights.iter().fold(f64::from(score), |s, w| w * s)
-}
-
-/// Each clause of a flat `Sum` or `Max` of weighted BM25 clauses, as its weights; `None` when
-/// the rank is another shape.
-pub(crate) fn clause_weights(rank: Option<&RankBy>) -> Option<Vec<Vec<f64>>> {
-    match rank {
-        Some(RankBy::Sum(xs) | RankBy::Max(xs)) if !xs.is_empty() => {
-            xs.iter().map(weights_of).collect()
+/// The transforms around a predicate, innermost first: constant positive `Product`s only.
+fn bonus_of(x: &RankBy) -> Option<(&Filter, Chain)> {
+    match x {
+        RankBy::Filter(f) => Some((f, vec![])),
+        RankBy::Product { weight, expr, .. } if WEIGHT_RANGE.contains(weight) => {
+            let (f, mut inner) = bonus_of(expr)?;
+            inner.push(Step::Mul(*weight));
+            (inner.len() <= MAX_NEST).then_some((f, inner))
         }
         _ => None,
     }
 }
 
-/// `["Sum", [...]]` whose clauses are all plain BM25, each under constant positive weights.
+/// A clause's score after its transforms, applied innermost first in `f64` exactly as
+/// `query::score` does, so the result has the full scorer's bits.
+pub(crate) fn scaled(chain: &[Step], score: f32) -> f64 {
+    chain.iter().fold(f64::from(score), |s, step| step.apply(s))
+}
+
+/// One term of a `Sum`, in rank order.
+pub(crate) enum Term<'a> {
+    /// The next plain BM25 clause (in `text_clauses` order) under its transforms.
+    Text(Chain),
+    /// A predicate that adds its transformed 1 to rows that match it, and 0 to the rest.
+    Bonus(&'a Filter, Chain),
+}
+
+/// The terms of a rank that the list paths can answer: a flat `Sum` of text clauses and at most
+/// `MAX_BONUSES` predicate bonuses (with at least one text clause), a flat `Max` of text
+/// clauses, or one transformed text clause alone (treated as a one-term `Sum`).
+pub(crate) fn terms_of(rank: Option<&RankBy>) -> Option<Vec<Term<'_>>> {
+    match rank? {
+        RankBy::Sum(xs) if !xs.is_empty() => {
+            let mut bonuses = 0;
+            let terms = xs
+                .iter()
+                .map(|x| {
+                    weights_of(x).map(Term::Text).or_else(|| {
+                        bonuses += 1;
+                        bonus_of(x).map(|(f, c)| Term::Bonus(f, c))
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (bonuses <= MAX_BONUSES && terms.iter().any(|t| matches!(t, Term::Text(_))))
+                .then_some(terms)
+        }
+        RankBy::Max(xs) if !xs.is_empty() => {
+            xs.iter().map(|x| weights_of(x).map(Term::Text)).collect()
+        }
+        x @ (RankBy::Product { .. } | RankBy::Saturate { .. }) => {
+            weights_of(x).map(|c| vec![Term::Text(c)])
+        }
+        _ => None,
+    }
+}
+/// Most predicate bonuses one `Sum` may carry (rows split into `2^n` classes, each searched).
+const MAX_BONUSES: usize = 2;
+
+/// The text clauses' transforms of a flat `Sum` or `Max` (or one transformed clause alone),
+/// in `text_clauses` order; `None` when the rank is another shape.
+pub(crate) fn clause_weights(rank: Option<&RankBy>) -> Option<Vec<Chain>> {
+    Some(
+        terms_of(rank)?
+            .into_iter()
+            .filter_map(|t| match t {
+                Term::Text(c) => Some(c),
+                Term::Bonus(..) => None,
+            })
+            .collect(),
+    )
+}
+
+/// A `Sum` (possibly one transformed clause alone, possibly with predicate bonuses) the list
+/// paths can answer.
 pub(crate) fn sum_of_text(rank: Option<&RankBy>) -> bool {
-    matches!(rank, Some(RankBy::Sum(_))) && clause_weights(rank).is_some()
+    !matches!(rank, Some(RankBy::Max(_))) && terms_of(rank).is_some()
 }
 
 /// First list length for a query that needs `k` rows, or `None` when the lists would be too long
@@ -119,15 +217,62 @@ pub(crate) struct Clause<'a> {
     pub key: Vec<u8>,
     pub query: bf_text::Query,
     pub cfg: FullTextConfig,
-    /// Constant weights around the clause, innermost first (empty for a plain clause).
-    pub weights: Vec<f64>,
+    /// Transforms around the clause, innermost first (empty for a plain clause).
+    pub weights: Chain,
     pub stats: &'a bf_text::CorpusStats,
 }
 
-/// A segment ready to answer list searches: its allowed rows and one text index per clause.
+/// A predicate bonus: rows matching `filter` gain `weights` applied to 1.
+pub(crate) struct Bonus<'a> {
+    pub filter: &'a Filter,
+    pub weights: Chain,
+}
+
+/// Where a term of the `Sum` sits: text clause `i`, or predicate bonus `j`.
+#[derive(Clone, Copy)]
+pub(crate) enum Slot {
+    Text(usize),
+    Bonus(usize),
+}
+
+/// A `Sum` ready to run: its text clauses, predicate bonuses, and their order in the rank (the
+/// order matters because `f64` addition is not associative and totals must match the full
+/// scorer's bits).
+pub(crate) struct SumPlan<'a> {
+    pub clauses: Vec<Clause<'a>>,
+    pub bonuses: Vec<Bonus<'a>>,
+    pub slots: Vec<Slot>,
+}
+
+impl SumPlan<'_> {
+    /// The total of one row: `text(i)` is the transformed score of clause `i`, and `bonus[j]`
+    /// the transformed value of bonus `j` for the row's class.
+    pub(crate) fn total(&self, text: impl Fn(usize) -> f64, bonus: &[f64]) -> f64 {
+        self.slots
+            .iter()
+            .map(|slot| match *slot {
+                Slot::Text(i) => text(i),
+                Slot::Bonus(j) => bonus[j],
+            })
+            .sum()
+    }
+}
+
+/// Rows that share one match pattern over the bonus predicates, so one bonus value each.
+pub(crate) struct Class {
+    pub rows: RoaringBitmap,
+    /// Transformed value of each bonus for these rows.
+    pub bonus: Vec<f64>,
+}
+
+/// A segment ready to answer list searches: its allowed rows split into classes by which bonus
+/// predicates they match (one class when there are none), and one text index per clause.
 pub(crate) struct SegmentSum {
-    pub allowed: RoaringBitmap,
+    pub classes: Vec<Class>,
     pub readers: Vec<Arc<bf_text::SegmentReader>>,
+    /// Row order is ID order (proven by a validated ID list), needed to pick the lowest-ID rows
+    /// among boosted rows that match no text.
+    pub id_ordered: bool,
 }
 
 /// Open a segment for `Sum` list searches. `None` when a clause has no usable text index in this
@@ -137,51 +282,113 @@ pub(crate) async fn open(
     state: &NamespaceState,
     q: &QueryRequest,
     seg: &bf_wal::Segment,
-    clauses: &[Clause<'_>],
+    plan: &SumPlan<'_>,
 ) -> Result<Option<SegmentSum>, ApiError> {
-    for clause in clauses {
+    for clause in &plan.clauses {
         if !segment::seg_text_matches(seg, &state.schema, clause.attribute) {
             return Ok(None);
         }
     }
-    let readers = futures::future::try_join_all(clauses.iter().map(|clause| async move {
+    let readers = futures::future::try_join_all(plan.clauses.iter().map(|clause| async move {
         match seg.files.get(&format!("fts:{}", clause.attribute)) {
             Some(file) => segment::text_index(store, file).await.map(Some),
             None => Ok(None),
         }
     }));
-    let (allowed, readers) = tokio::try_join!(
+    let matches = futures::future::try_join_all(
+        plan.bonuses
+            .iter()
+            .map(|b| segment::filter_live(store, seg, b.filter, &state.schema)),
+    );
+    let ordered = async {
+        if plan.bonuses.is_empty() {
+            Ok(false)
+        } else {
+            segment::ids(store, seg).await.map(|_| true)
+        }
+    };
+    let (allowed, readers, matches, id_ordered) = tokio::try_join!(
         snapshot::allowed(store, state, seg, q.filters.as_ref()),
-        readers
+        readers,
+        matches,
+        ordered
     )?;
     let Some(readers) = readers.into_iter().collect::<Option<Vec<_>>>() else {
         return Ok(None);
     };
-    Ok(Some(SegmentSum { allowed, readers }))
+    let mut classes = vec![Class {
+        rows: allowed,
+        bonus: vec![],
+    }];
+    for (bonus, matching) in plan.bonuses.iter().zip(&matches) {
+        let (yes, no) = (scaled(&bonus.weights, 1.0), scaled(&bonus.weights, 0.0));
+        classes = classes
+            .into_iter()
+            .flat_map(|class| {
+                let hit = &class.rows & &**matching;
+                let miss = &class.rows - &**matching;
+                let with = |rows: RoaringBitmap, v: f64| {
+                    let mut bonus = class.bonus.clone();
+                    bonus.push(v);
+                    (!rows.is_empty()).then_some(Class { rows, bonus })
+                };
+                [with(hit, yes), with(miss, no)]
+            })
+            .flatten()
+            .collect();
+    }
+    Ok(Some(SegmentSum {
+        classes,
+        readers,
+        id_ordered,
+    }))
 }
 
 /// One segment's union rows with exact totals, and the bound for rows outside every list.
 pub(crate) struct Candidates {
-    /// `(row, total)` for each row in some clause's list.
+    /// `(row, total)` for each row in some clause's list (and fill rows, see `candidates`).
     pub rows: Vec<(u32, f64)>,
-    /// Sum of every clause's `n`th score (0 for a clause whose list ended short).
+    /// The largest total a row outside `rows` can reach.
     pub bound: f64,
-    /// Every row with a positive score is in `rows`.
+    /// Every row with a positive score is in `rows`, or loses to `k` rows in it.
     pub exhaustive: bool,
 }
 
-/// Sum scaled scores in clause order, as `query::score` does, so totals are bit-identical.
-pub(crate) fn total(scores: impl Iterator<Item = f64>) -> f64 {
-    scores.sum()
-}
-
 impl SegmentSum {
-    /// Each clause's best `n` rows, then the union scored exactly under every clause.
+    /// Each clause's best `n` rows per class, then the union scored exactly under every clause.
+    /// A class whose bonus is positive also gets `k` fill rows when every list ended short: rows
+    /// that match no text still total the bonus, and the lowest IDs among them are the ones that
+    /// can win. `None` when that needs an ID order this segment cannot prove.
     pub(crate) async fn candidates(
         &self,
-        clauses: &[Clause<'_>],
+        plan: &SumPlan<'_>,
         n: usize,
-    ) -> Result<Candidates, ApiError> {
+        k: usize,
+    ) -> Result<Option<Candidates>, ApiError> {
+        let mut out = Candidates {
+            rows: vec![],
+            bound: 0.0,
+            exhaustive: true,
+        };
+        for class in &self.classes {
+            let Some(c) = self.class_candidates(plan, class, n, k).await? else {
+                return Ok(None);
+            };
+            out.rows.extend(c.rows);
+            out.bound = out.bound.max(c.bound);
+            out.exhaustive &= c.exhaustive;
+        }
+        Ok(Some(out))
+    }
+
+    async fn class_candidates(
+        &self,
+        plan: &SumPlan<'_>,
+        class: &Class,
+        n: usize,
+        k: usize,
+    ) -> Result<Option<Candidates>, ApiError> {
+        let clauses = &plan.clauses;
         let mut union = RoaringBitmap::new();
         let mut cutoffs = Vec::with_capacity(clauses.len());
         let mut lists = Vec::with_capacity(clauses.len());
@@ -192,7 +399,7 @@ impl SegmentSum {
                     clause.stats,
                     &clause.cfg,
                     n,
-                    Some(&self.allowed),
+                    Some(&class.rows),
                 )
                 .await
                 .map_err(segment::index_error)?;
@@ -203,12 +410,7 @@ impl SegmentSum {
             }
             lists.push((full, hits));
         }
-        let bound = total(
-            cutoffs
-                .iter()
-                .zip(clauses)
-                .map(|(c, clause)| scaled(&clause.weights, *c)),
-        );
+        let bound = plan.total(|i| scaled(&clauses[i].weights, cutoffs[i]), &class.bonus);
         let exhaustive = lists.iter().all(|(full, _)| !full);
         let mut exact: Vec<HashMap<u32, f32>> = Vec::with_capacity(clauses.len());
         for ((clause, reader), (full, hits)) in clauses.iter().zip(&self.readers).zip(lists) {
@@ -228,30 +430,53 @@ impl SegmentSum {
                 .map_err(segment::index_error)?;
             exact.push(all.into_iter().map(|h| (h.row, h.score)).collect());
         }
-        let rows = union
+        let mut rows: Vec<(u32, f64)> = union
             .iter()
             .map(|row| {
-                let t = total(exact.iter().zip(clauses).map(|(m, clause)| {
-                    scaled(&clause.weights, m.get(&row).copied().unwrap_or(0.0))
-                }));
+                let t = plan.total(
+                    |i| {
+                        scaled(
+                            &clauses[i].weights,
+                            exact[i].get(&row).copied().unwrap_or(0.0),
+                        )
+                    },
+                    &class.bonus,
+                );
                 (row, t)
             })
             .collect();
-        Ok(Candidates {
+        if exhaustive {
+            // Rows outside the union match no text at all and total the bare bonus.
+            let bare = plan.total(|_| 0.0, &class.bonus);
+            if bare > 0.0 {
+                if !self.id_ordered {
+                    return Ok(None);
+                }
+                rows.extend(
+                    class
+                        .rows
+                        .iter()
+                        .filter(|row| !union.contains(*row))
+                        .take(k)
+                        .map(|row| (row, bare)),
+                );
+            }
+        }
+        Ok(Some(Candidates {
             rows,
             bound,
             exhaustive,
-        })
+        }))
     }
 
     /// Per-clause hits for exactly `rows`, for hydration of the winners.
     pub(crate) async fn winners(
         &self,
-        clauses: &[Clause<'_>],
+        plan: &SumPlan<'_>,
         rows: &RoaringBitmap,
     ) -> Result<Vec<(Vec<u8>, Vec<bf_text::SearchHit>)>, ApiError> {
-        let mut out = Vec::with_capacity(clauses.len());
-        for (clause, reader) in clauses.iter().zip(&self.readers) {
+        let mut out = Vec::with_capacity(plan.clauses.len());
+        for (clause, reader) in plan.clauses.iter().zip(&self.readers) {
             let hits = if rows.is_empty() {
                 vec![]
             } else {
@@ -310,7 +535,7 @@ mod tests {
         assert_eq!(weights_of(&rank(bm())), Some(vec![]));
         assert_eq!(
             weights_of(&rank(serde_json::json!(["Product", 2.0, bm()]))),
-            Some(vec![2.0])
+            Some(vec![Step::Mul(2.0)])
         );
         assert_eq!(
             weights_of(&rank(serde_json::json!([
@@ -318,7 +543,7 @@ mod tests {
                 ["Product", bm(), 3.0],
                 2.0
             ]))),
-            Some(vec![3.0, 2.0])
+            Some(vec![Step::Mul(3.0), Step::Mul(2.0)])
         );
         for w in [0.0, 1e-12, 1e12] {
             assert_eq!(
@@ -328,7 +553,35 @@ mod tests {
         }
         // 2 * (3 * s) and (2 * 3) * s can differ in the last bit; the nest keeps the first.
         let s = 0.7f32;
-        assert_eq!(scaled(&[3.0, 2.0], s), 2.0 * (3.0 * f64::from(s)));
+        assert_eq!(
+            scaled(&[Step::Mul(3.0), Step::Mul(2.0)], s),
+            2.0 * (3.0 * f64::from(s))
+        );
+    }
+    #[test]
+    fn saturate_never_reverses_the_order_of_adjacent_scores() {
+        // The list paths rely on the transform being non-decreasing; sweep neighbors of f32 scores.
+        for (midpoint, exponent) in [
+            (3.0, 1.0),
+            (1e-6, 20.0),
+            (2.5, 0.3),
+            (1e12, 0.05),
+            (7.0, 2.0),
+        ] {
+            let chain = [Step::Saturate { midpoint, exponent }];
+            let mut x = 1e-3f32;
+            while x < 500.0 {
+                let mut prev = scaled(&chain, x);
+                let mut v = x;
+                for _ in 0..200 {
+                    v = f32::from_bits(v.to_bits() + 1);
+                    let next = scaled(&chain, v);
+                    assert!(next >= prev, "{midpoint} {exponent} {v}");
+                    prev = next;
+                }
+                x *= 1.37;
+            }
+        }
     }
     #[test]
     fn list_lengths_grow_to_a_cap() {

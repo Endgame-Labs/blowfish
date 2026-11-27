@@ -598,7 +598,7 @@ fn validate_score_child(
     }
     validate_rank(state, rank, guarded)
 }
-fn parameter(params: &Value, name: &str, default: f64) -> Result<f64, ApiError> {
+pub(crate) fn parameter(params: &Value, name: &str, default: f64) -> Result<f64, ApiError> {
     let Some(v) = params.get(name) else {
         return Ok(default);
     };
