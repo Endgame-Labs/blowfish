@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **Warm vector queries do less work outside the graph, 28 percent more `top_k` 10 queries at 16 clients, with the lead over Qdrant at 1.39x:** A profile of v0.1.64 on the M4 put about half of a query's CPU outside the graph walk and rerank, and two items were 15 points of it. Every strong query issued its own check that the next WAL entry does not exist, which on a local store is a task on tokio's blocking pool and, with sixteen busy HTTP reactors, a spin on that pool's one mutex. Concurrent queries now share one probe per namespace: a query that arrives while a probe is running joins the next one, which starts only after it arrived, so every answer still comes from a probe that began after its query did. A joiner waits at most 2 ms, and a store whose probes keep taking longer (an object store over a network) is recognized and probed per query as before. Every query also re-resolved the lineage placement of each recluster tier through the read cache's one lock; the placement and the tier's live-row mask are now kept with the checkpoint's segment list. With both on, one server and the same graph: `top_k` 10 went from 9,442 to 12,090 q/s (p99 3.80 to 2.66 ms) and `top_k` 100 from 4,692 to 5,315 q/s (p99 8.02 to 6.08 ms), the server's CPU per query fell from 896 to 537 us at `top_k` 10, and the rows of all 3,452 queries, IDs and distances, are identical. At matched recall that is 1.39x Qdrant 1.20.0's q/s at `top_k` 10 and 1.53x at `top_k` 100. The recall sampler's coin flip also stopped making a system call per query. A faster parse of the query vector, measured and found to give nothing at the server, is not included. See [docs/benchmarks.md](docs/benchmarks.md), Round G17.
+
 ## [0.1.64] - 2026-11-27
 
 ### Changed
