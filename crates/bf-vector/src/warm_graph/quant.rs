@@ -7,6 +7,13 @@ pub struct Codes {
     pub scales: Vec<f32>,
     pub dot: fn(&[i8], &[i8]) -> i32,
 }
+/// The exact integer dot product of two equal-length `i8` slices of at most 4,096 elements (so no
+/// partial sum overflows `i32`), with the fastest kernel this CPU has (`SDOT` where present).
+pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    type Kernel = fn(&[i8], &[i8]) -> i32;
+    static KERNEL: std::sync::OnceLock<Kernel> = std::sync::OnceLock::new();
+    (KERNEL.get_or_init(dot_kernel))(a, b)
+}
 pub(super) fn dot_kernel() -> fn(&[i8], &[i8]) -> i32 {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("dotprod") {

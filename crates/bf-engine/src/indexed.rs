@@ -690,12 +690,15 @@ pub(crate) fn score_tail(
                 state.docs.values(),
             )
         });
+    // `worst` is the distance the top `k` must beat. A row the eight-bit screen proves is
+    // farther than that is not scored exactly and is not offered, as it could not enter.
     let score = |index: usize,
                  doc: &std::sync::Arc<Document>,
-                 key: &std::sync::Arc<str>|
+                 key: &std::sync::Arc<str>,
+                 worst: Option<f64>|
      -> Result<Option<f64>, ApiError> {
         if let Some(row) = block.as_ref().and_then(|block| block.row(index, doc)) {
-            return Ok(row.map(|vector| scorer.resident(vector)));
+            return Ok(row.and_then(|vector| scorer.resident_below(vector, worst)));
         }
         doc.get(attribute)
             .map(|v| {
@@ -725,9 +728,16 @@ pub(crate) fn score_tail(
             .map(|(chunk, rows)| {
                 // Separate key allocations avoid a contended Arc counter on cache lookups.
                 let key = std::sync::Arc::<str>::from(attribute);
-                let mut local = BinaryHeap::new();
+                let mut local: BinaryHeap<HitKey> = BinaryHeap::new();
                 for (offset, (id, doc)) in rows.iter().enumerate() {
-                    if let Some(distance) = score(chunk * 512 + offset, doc, &key)?
+                    let local_worst = local.peek().filter(|_| local.len() == k);
+                    let worst = match (bound, local_worst) {
+                        (Some(a), Some(b)) => Some(a.score.min(b.score)),
+                        (Some(a), None) => Some(a.score),
+                        (None, Some(b)) => Some(b.score),
+                        (None, None) => None,
+                    };
+                    if let Some(distance) = score(chunk * 512 + offset, doc, &key, worst)?
                         && bound.is_none_or(|worst| improves(id, distance, false, worst))
                     {
                         offer(&mut local, id, distance, false, k);
@@ -743,11 +753,15 @@ pub(crate) fn score_tail(
         }
     } else {
         for (index, (id, doc)) in state.docs.iter().enumerate() {
+            let worst = (!all)
+                .then(|| heap.peek().filter(|_| heap.len() == k))
+                .flatten()
+                .map(|hit| hit.score);
             if filters
                 .map(|f| filter::matches(f, Some(doc), None, &state.schema))
                 .transpose()?
                 .unwrap_or(true)
-                && let Some(distance) = score(index, doc, &attribute_key)?
+                && let Some(distance) = score(index, doc, &attribute_key, worst)?
             {
                 if all {
                     scores.insert(id.clone(), distance);

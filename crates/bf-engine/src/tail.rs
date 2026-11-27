@@ -20,6 +20,58 @@ pub(crate) struct Vector {
     zero: bool,
     norm: Option<CosineNorm>,
     attribute_bytes: usize,
+    /// Eight-bit codes with the error bounds that let a scan skip the exact distance of a row
+    /// that cannot reach the top `k`.
+    screen: Option<Screen>,
+}
+/// The most coordinates a screened vector may have: `bf_vector::warm_graph::dot_i8` sums `i32`.
+const SCREEN_MAX_DIMS: usize = 4096;
+/// A float vector as `scale * codes`, with its real norm and the norm of the quantization error.
+/// Both are bounds, rounded up, so the lower bound on a distance below is never too high.
+struct Screen {
+    codes: Vec<i8>,
+    scale: f64,
+    norm: f64,
+    error: f64,
+}
+impl Screen {
+    /// `None` unless every coordinate is finite and some coordinate is nonzero.
+    fn new(values: &[f32]) -> Option<Self> {
+        if values.is_empty() || values.len() > SCREEN_MAX_DIMS {
+            return None;
+        }
+        let mut largest = 0f64;
+        for x in values {
+            if !x.is_finite() {
+                return None;
+            }
+            largest = largest.max(f64::from(x.abs()));
+        }
+        // A scale that is zero or subnormal would make the codes meaningless.
+        if largest < 1e-30 {
+            return None;
+        }
+        let scale = largest / 127.;
+        let codes: Vec<i8> = values
+            .iter()
+            .map(|x| (f64::from(*x) / scale).round().clamp(-127., 127.) as i8)
+            .collect();
+        let mut norm = 0f64;
+        let mut error = 0f64;
+        for (x, c) in values.iter().zip(&codes) {
+            let x = f64::from(*x);
+            norm += x * x;
+            let r = x - scale * f64::from(*c);
+            error += r * r;
+        }
+        // Summation in f64 is accurate to far better than this margin.
+        Some(Self {
+            codes,
+            scale,
+            norm: norm.sqrt() * (1. + 1e-9),
+            error: error.sqrt() * (1. + 1e-9) + 1e-300,
+        })
+    }
 }
 impl Vector {
     fn new(doc: &Arc<Document>, attribute: &str) -> Result<Self, ApiError> {
@@ -29,6 +81,7 @@ impl Vector {
             _source: Arc::downgrade(doc),
             zero: values.iter().all(|x| *x == 0.0),
             norm: valid.then(|| CosineNorm::new(&values).ok()).flatten(),
+            screen: valid.then(|| Screen::new(&values)).flatten(),
             valid,
             values,
             attribute_bytes: attribute.len(),
@@ -59,10 +112,32 @@ pub(crate) struct Scorer<'a> {
     cosine: Option<CosineQuery<'a>>,
     query_zero: bool,
     query_finite: bool,
+    screen: Option<Screen>,
 }
+/// How far below its true value, in cosine distance, a screen's bound may sit for reasons the
+/// bound itself does not cover: the exact kernel accumulates its dot product and norms in `f32`
+/// (relative error under 1e-4 at the supported sizes, and in practice about 1e-6).
+const SCREEN_SLACK: f64 = 2e-4;
+#[cfg(test)]
+thread_local! {
+    /// Makes this thread's [`Scorer::new`] build a scorer without the screen.
+    static NO_SCREEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Rows a screen skipped (tests check that it skips, not only that it is right).
+#[cfg(test)]
+static SCREENED_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 impl<'a> Scorer<'a> {
     pub(crate) fn new(metric: DistanceMetric, query: &'a [f32]) -> Self {
+        Self::build(metric, query, true)
+    }
+    fn build(metric: DistanceMetric, query: &'a [f32], screened: bool) -> Self {
+        // Tests can turn the screen off for this thread, to compare against the exact scan.
+        #[cfg(test)]
+        let screened = screened && !NO_SCREEN.with(std::cell::Cell::get);
         Self {
+            screen: (screened && metric == DistanceMetric::CosineDistance)
+                .then(|| Screen::new(query))
+                .flatten(),
             metric,
             query,
             cosine: (metric == DistanceMetric::CosineDistance)
@@ -77,6 +152,34 @@ impl<'a> Scorer<'a> {
             Values::Resident(vector) => self.resident(vector),
             Values::Transient(values) => crate::query::distance(values, self.query, self.metric),
         }
+    }
+    /// A value no greater than `resident(p)`, from the eight-bit codes, or `None` when this scorer
+    /// or vector has no screen. With `q'` and `p'` the decoded codes and `|.|` the real norms,
+    /// `q.p - q'.p' = (q - q').p + q'.(p - p')` is at most `|q - q'||p| + |q'||p - p'|` (Cauchy-
+    /// Schwarz), so `1 - (q'.p' + bound) / (|q||p|)` is a lower bound on the cosine distance.
+    fn lower_bound(&self, p: &Vector) -> Option<f64> {
+        let (q, v) = (self.screen.as_ref()?, p.screen.as_ref()?);
+        if p.values.len() != self.query.len() || !p.valid || p.zero {
+            return None;
+        }
+        let approx =
+            q.scale * v.scale * f64::from(bf_vector::warm_graph::dot_i8(&q.codes, &v.codes));
+        let bound = (q.error * v.norm + (q.norm + q.error) * v.error) * 1.001;
+        Some(1. - (approx + bound) / (q.norm * v.norm) - SCREEN_SLACK)
+    }
+    /// `resident(p)`, or `None` when the screen proves it is greater than `worst`, so a row at
+    /// that distance could not enter a top `k` whose current worst distance is `worst`. Rows at
+    /// exactly `worst` are always scored, so ties are untouched.
+    pub(crate) fn resident_below(&self, p: &Vector, worst: Option<f64>) -> Option<f64> {
+        if let Some(worst) = worst
+            && worst < 2.0
+            && self.lower_bound(p).is_some_and(|bound| bound > worst)
+        {
+            #[cfg(test)]
+            SCREENED_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        Some(self.resident(p))
     }
     pub(crate) fn resident(&self, p: &Vector) -> f64 {
         let comparable = p.valid && p.values.len() == self.query.len();
@@ -134,7 +237,8 @@ impl VectorCache {
             cache: Arc::new(crate::read_cache::ClockCache::new(
                 bytes,
                 |value: &Arc<Vector>| {
-                    (value.values.len() * size_of::<f32>() + value.attribute_bytes + 256) as u64
+                    (value.values.len() * (size_of::<f32>() + 1) + value.attribute_bytes + 256)
+                        as u64
                 },
             )),
             bytes,
@@ -325,6 +429,161 @@ mod tests {
                         let expected = crate::query::distance(candidate, query, metric);
                         let got = scorer.distance(&values);
                         assert_eq!(got.to_bits(), expected.to_bits(), "{metric:?} d={dims}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The screen's bound never exceeds the exact distance, for ordinary vectors, vectors with a
+    /// few huge coordinates, sparse and nearly duplicate vectors, tiny and large magnitudes.
+    #[test]
+    fn screen_lower_bound_never_exceeds_the_exact_distance() {
+        let attribute: Arc<str> = "vector".into();
+        let cache = VectorCache::new(64 << 20);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        let mut checked = 0;
+        for dims in [2usize, 7, 16, 64, 300, 1024, 4096] {
+            let shaped = |kind: usize, next: &mut dyn FnMut() -> f32| -> Vec<f32> {
+                (0..dims)
+                    .map(|i| match kind {
+                        0 => next(),
+                        1 => next() * 1e-6,
+                        2 => next() * 1e6,
+                        3 => {
+                            if i % 97 == 0 {
+                                next() * 1000.
+                            } else {
+                                next() * 0.01
+                            }
+                        }
+                        4 => {
+                            if i % 13 == 0 {
+                                next()
+                            } else {
+                                0.0
+                            }
+                        }
+                        _ => 1.0 + next() * 1e-3,
+                    })
+                    .collect()
+            };
+            let queries: Vec<Vec<f32>> = (0..6).map(|k| shaped(k, &mut next)).collect();
+            for q in &queries {
+                let scorer = Scorer::new(DistanceMetric::CosineDistance, q);
+                for kind in 0..6 {
+                    for _ in 0..8 {
+                        let mut v = shaped(kind, &mut next);
+                        if kind == 5 {
+                            // A nearly duplicate vector, so the distance is nearly zero.
+                            v = q.iter().map(|x| x + next() * 1e-4 * x.abs()).collect();
+                        }
+                        let doc: Arc<Document> =
+                            Arc::new(serde_json::from_value(json!({"id":1,"vector":v})).unwrap());
+                        let Values::Resident(p) = cache.get(&doc, &attribute, true).unwrap() else {
+                            unreachable!()
+                        };
+                        let exact = scorer.resident(&p);
+                        if let Some(bound) = scorer.lower_bound(&p) {
+                            assert!(
+                                bound <= exact,
+                                "d={dims} kind={kind}: bound {bound} above exact {exact}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "the screen declined too much: {checked}");
+    }
+
+    /// A screened scan of a tail returns exactly the rows and distance bits of an unscreened one,
+    /// in the serial and the parallel branch, with a seeded bound, and it skips most rows.
+    #[test]
+    fn screened_tail_scan_returns_the_same_top_k_as_the_exact_scan() {
+        use crate::indexed::{HitKey, offer, score_tail};
+        let attribute = "vector";
+        let cache = VectorCache::new(256 << 20);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        let dims = 96;
+        for rows in [300usize, 3000] {
+            let mut state = crate::NamespaceState {
+                metric: DistanceMetric::CosineDistance,
+                ..Default::default()
+            };
+            let query: Vec<f32> = (0..dims).map(|_| next()).collect();
+            for id in 0..rows as u64 {
+                // A fifth of the rows lie close to the query, with ties among copies.
+                let v: Vec<f32> = if id % 5 == 0 {
+                    query.iter().map(|x| x + next() * 0.2).collect()
+                } else if id % 50 == 1 {
+                    query.clone()
+                } else {
+                    (0..dims).map(|_| next()).collect()
+                };
+                state.docs.insert(
+                    bf_types::Id::Uint(id),
+                    Arc::new(serde_json::from_value(json!({"id":id,"vector":v})).unwrap()),
+                );
+            }
+            for k in [1usize, 10, 100] {
+                for seeded in [false, true] {
+                    let run = |screened: bool| {
+                        NO_SCREEN.with(|flag| flag.set(!screened));
+                        let mut heap: std::collections::BinaryHeap<HitKey> = Default::default();
+                        if seeded {
+                            // Rows from "the index", some better than any tail row.
+                            for i in 0..k as u64 {
+                                offer(
+                                    &mut heap,
+                                    &bf_types::Id::Uint(1_000_000 + i),
+                                    0.05 + i as f64 * 0.01,
+                                    false,
+                                    k,
+                                );
+                            }
+                        }
+                        score_tail(
+                            &state,
+                            None,
+                            attribute,
+                            &query,
+                            false,
+                            k,
+                            Some((&cache, true)),
+                            &mut heap,
+                            &mut Default::default(),
+                        )
+                        .unwrap();
+                        NO_SCREEN.with(|flag| flag.set(false));
+                        let mut out: Vec<_> = heap.into_vec();
+                        out.sort_unstable();
+                        out.into_iter()
+                            .map(|hit| (hit.id, hit.score.to_bits()))
+                            .collect::<Vec<_>>()
+                    };
+                    let before = SCREENED_OUT.load(std::sync::atomic::Ordering::Relaxed);
+                    let screened = run(true);
+                    let skipped = SCREENED_OUT.load(std::sync::atomic::Ordering::Relaxed) - before;
+                    assert_eq!(screened, run(false), "rows {rows} k {k} seeded {seeded}");
+                    if rows == 3000 && k <= 10 {
+                        assert!(
+                            skipped > rows as u64 / 2,
+                            "skipped only {skipped} of {rows}"
+                        );
                     }
                 }
             }

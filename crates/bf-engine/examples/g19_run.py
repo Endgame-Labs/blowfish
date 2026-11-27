@@ -34,6 +34,7 @@ import time
 
 import numpy as np
 
+mp.set_start_method("fork")
 run, binary, label, cap, *rest = sys.argv[1:]
 run, binary, cap = pathlib.Path(run).resolve(), pathlib.Path(binary).resolve(), float(cap) * 60
 seconds = float(rest[0]) if rest else 20.0
@@ -215,7 +216,8 @@ try:
                               stderr=subprocess.STDOUT, start_new_session=True)
     (run / "heater.pid").write_text(str(heater.pid))
     promoted = None
-    while time.monotonic() - begun < cap:
+    smoke = bool(os.environ.get("G19_SMOKE"))  # skip promotion: exercise every phase briefly
+    while not smoke and time.monotonic() - begun < cap:
         if server.poll() is not None or heater.poll() is not None:
             raise SystemExit("server or heater exited")
         s = status()
@@ -229,7 +231,7 @@ try:
             break
         time.sleep(30)
     result = {"label": label, "promoted_s": promoted}
-    if promoted is not None:
+    if promoted is not None or smoke:
         (run / "pause").touch()
         os.killpg(heater.pid, signal.SIGTERM)
         heater.wait(timeout=20)
@@ -241,6 +243,39 @@ try:
         total_rows = 2_681_468
         FILTER_BELOW = total_rows // 10
         pid = server.pid
+        if os.environ.get("G19_HOLD"):
+            # Interactive mode: hold the promoted server and run what RUN_DIR/cmd.json says (shape, k,
+            # seconds, bits, writes), writing RUN_DIR/cmd.out, until RUN_DIR/release exists.
+            stop_w, w_thread, corpus_h = threading.Event(), None, None
+            while not (run / "release").exists():
+                cmd_file = run / "cmd.json"
+                if not cmd_file.exists():
+                    time.sleep(1)
+                    continue
+                cmd = json.loads(cmd_file.read_text())
+                cmd_file.unlink()
+                if cmd.get("writes") and w_thread is None:
+                    corpus_h = np.memmap(data / "corpus.f16", dtype=np.float16, mode="r",
+                                         shape=((data / "corpus.f16").stat().st_size // (2 * dims), dims))
+                    stop_w.clear()
+                    w_thread = threading.Thread(target=writer, args=(stop_w, [], [], corpus_h, []))
+                    w_thread.start()
+                    time.sleep(2)
+                if cmd.get("writes") is False and w_thread is not None:
+                    stop_w.set()
+                    w_thread.join()
+                    w_thread = None
+                if "shape" in cmd:
+                    bodies = [body_for(cmd["shape"], cmd.get("k", 10), q) for q in queries]
+                    set_bits(cmd.get("bits", 0))
+                    r = timed(bodies, cmd.get("seconds", 30), pid)
+                else:
+                    r = {"ok": True}
+                (run / "cmd.out").write_text(json.dumps(r))
+            stop_w.set()
+            if w_thread:
+                w_thread.join()
+            raise SystemExit(0)
         # ---- Item 1: the general path, empty tail.
         result["item1"] = {}
         for shape in ("attr", "filter"):
