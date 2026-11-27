@@ -221,7 +221,7 @@ async fn sum_with_a_huge_page_and_in_the_tail_alone_matches_full_scoring() {
 }
 
 /// Past the longest list (4,096 rows) a tie-heavy corpus never proves the bound, so the lists
-/// grow to their cap and the full scorer answers: still exactly.
+/// grow to their cap and the last round asks for every matching row (no bound needed): still exactly.
 #[tokio::test]
 async fn sum_falls_back_to_full_scoring_when_no_list_proves_the_answer() {
     let e = node().await;
@@ -247,7 +247,7 @@ async fn sum_falls_back_to_full_scoring_when_no_list_proves_the_answer() {
         }
     }
     let after = bf_engine::sum_outcomes();
-    assert!(after.fallback > before.fallback, "{before:?} {after:?}");
+    assert!(after.grown > before.grown, "{before:?} {after:?}");
 }
 
 /// `Saturate` wrappers: a typical midpoint, a collapsing one (every score rounds to 1, so every

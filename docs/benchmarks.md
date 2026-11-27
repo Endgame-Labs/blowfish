@@ -18187,3 +18187,138 @@ Not attempted, and the bar cannot be met: G20 bounded all SQ8 work at 23 percent
 
 - Cleanup: the M4 run directory (data, store, binaries) is deleted and nothing of mine is running there; about $0.5 of S3 transfer for the corpus; no EC2; no bucket writes.
 - `native_drive` reads UUID IDs back to corpus rows for its recall check (the multiplier is odd, so the mapping inverts).
+
+## Round BW26: one monotone expression evaluator closes the remaining all-rows BM25 shapes
+
+At v0.1.74 every rank expression that held a BM25 clause but was not a flat `Max`, a flat `Sum` (with at most two predicates), a
+constant `Product`, or a `Saturate` still scored and hydrated every allowed row: 1.7 to 2.7 s on the 1M MS MARCO fixture at one
+client, against 2 to 5 ms for a plain clause.
+
+### Inventory (v0.1.74, one client)
+
+The fixture is a fresh load of the same 1M passages with three scalar columns the v021 fixture lacks (`pop` float, `ts` datetime,
+`cat` int), 13 text segments, `top_k` 10 and 100 with filters and offsets mixed. The first 12 queries of each shape (60 for the
+three fastest), p50 in ms. `Attribute` of a float, or outside `Max`, `Saturate`, and `Decay`, is a 400 today, so
+`Sum(BM25, w*Attribute)` cannot be written.
+
+| # | Rank shape | v0.1.74 path | p50 ms | Now |
+| --- | --- | --- | ---: | --- |
+| 1 | `BM25`; `Sum`, `Max` of clauses; `Product(w, BM25)`; `Saturate(BM25)` alone and in `Max` | list (BW22 to BW25) | 3 to 18 | unchanged |
+| 2 | `Sum(BM25, w*predicate)`, one or two predicates | list (BW25) | 5.8 | unchanged |
+| 3 | `Sum(Saturate(BM25), Saturate(BM25))` | list, about 40% fall back | 18.5 (p90 2,504) | list, last round scores matching rows only |
+| 4 | `Decay(BM25)`, default and with parameters | all rows | 1,894 and 1,784 | **list** |
+| 5 | `Sum(BM25, 0.1)`, `Max(BM25, 0.1)`, `Max(BM25, 5.0)` | all rows | 1,738 to 1,847 | **list** |
+| 6 | `Sum(BM25, w*Decay(Dist(Attribute(ts), now)))` (recency) | all rows | 2,188 | **list** |
+| 7 | `Sum(BM25, w*Saturate(Attribute(pop)))` (popularity) | all rows | 2,133 | **list** |
+| 8 | `Saturate(Sum(BM25, BM25))`, `Product(2, Sum(...))` | all rows | 2,116 and 2,428 | **list** |
+| 9 | `Sum(Max(BM25, BM25), BM25)`, `Max(Sum(BM25, BM25), BM25)` | all rows | 2,585 and 2,669 | **list** |
+| 10 | `Sum(BM25, 3 predicates)` | all rows | 2,720 | **list** (the third is a row-wise term) |
+| 11 | `Sum(BM25, 40*Saturate(Attribute(pop)))` (the boost dominates the text) | all rows | 2,292 | all rows (see below) |
+| 12 | `Dist(BM25, 10)` | all rows | 2,192 | all rows (see below) |
+| 13 | plain BM25 with `limit.per` | all rows | 2,466 | all rows (by design) |
+
+### What changed
+
+1. **One expression tree** (`Expr` in `sum_text.rs`). `Sum`, `Max` (starting from 0, as the full scorer does), constant `Product`,
+   and `Saturate` over BM25 clauses, constants, predicate bonuses, and row-wise terms, evaluated in `f64` in rank order exactly as
+   `query::score` does, so totals carry its bits. Every node is non-decreasing in each child, so a row outside every clause's list
+   totals at most the expression at the clauses' cutoffs, and the BW23 strict bound (`kth > bound`) holds for the whole tree. This
+   replaces the flat chain-and-slot `SumPlan`; a flat `Max` of clauses keeps its own path (shared floors, no tie widening), and a
+   bare clause keeps the plain path.
+2. **Constants.** A constant is a node. A positive bare total (`Sum(BM25, 0.1)`) is handled as the BW25 class bonus: rows that
+   match no text tie at the constant, so when every list ends short the segment adds its `k` lowest IDs. `Max(BM25, 0.1)` needs
+   nothing else, because the bound `max(cutoff, 0.1)` is strict when the `k`th row beats the floor. Negative constants keep the old
+   path.
+3. **Row-wise terms.** A term with no BM25 (`Decay(Dist(Attribute(ts), now))`, `Saturate(Attribute(pop))`, a product or sum of
+   those, or a third predicate) has a static upper bound (a `Saturate` or `Decay` is at most 1, a weight multiplies it, a sum adds
+   them, a bare `Attribute` has none and keeps the old path). The bound uses that upper bound for every row outside the lists, and
+   the listed rows' attributes are read (only the columns the term names) and evaluated with `query::score`, so a listed row's total
+   is exact. Because such terms give rows that match no text totals of their own, only the bound can accept (no fill rows).
+4. **`Decay` of text.** Every row that matches no text totals the same maximum (`Decay` is non-increasing, and a text expression
+   is least at zero), so the answer is the first `k` rows in ID order among those, plus any matching row that ties or beats them.
+   Each segment scores exactly the first `w` allowed rows (`w` starts at `4k` or 64, and grows 4x up to 262,144) until `k` of them
+   match no text, and keeps the best `k` by total, then row. Row order is ID order (the ID list is validated), and rows past the
+   window lose the tie-break to the unmatched rows in it. A segment with too few unmatched rows sends the query to the old path.
+5. **Last round, every matching row.** After the lists reach 4,096 rows, one more round asks for every matching row (`n` one more
+   than the allowed rows, so no list is full and no bound is needed). It scores only rows that match some clause, with dense score
+   arrays instead of hash maps, and replaces the full scorer for ties and compressed scores. When many rows tie at the floor
+   (a forced-tie query makes every matching row score alike), each segment hydrates only its `k` lowest IDs among them.
+6. **Loose bounds start at 256 rows.** A plan with a `Saturate` over text or a row-wise term starts its lists at 256 rows instead
+   of 64: in 100 `satsum` queries 26 percent were decided at 64, 9 at 256, 47 at 1,024, 15 at 4,096, and 2.5 at the last round, and
+   each failed round costs as much as the next. Measured at 16 clients (noisy VM): `Sum` of `Saturate` 34 to 49 q/s at 64, 55 to
+   65 at 256, and a plain two-clause `Sum` 90 at 64 against 115 at 256; plans with a tight bound keep 64.
+
+Not done: Neon's resumable per-clause cursors (`briefs/ideas/1825-neon.md` #5). `bf-text` searches a list of a given length and
+cannot continue one, so I replaced the restarts with fewer, larger rounds and a final scoring of matching rows only. A bound that
+saturation loosens (`Saturate` of two clauses) cannot be tightened by deeper lists alone: a row near the best in one clause and
+weak in the other can beat a row strong in only one, so the per-clause floors that would prune a combined search stay near zero.
+
+### Tests
+
+`tests/rank_shapes.rs` compares whole responses (IDs and score bits) with `query_exhaustive` for 27 shapes (plain, constants in
+`Sum` and `Max`, a zero constant, `Product`, `Saturate`, `Sum`, and `Max` of each other, recency, popularity, boost-dominated,
+recency plus popularity plus a predicate, a zero-weight boost, three predicates, `Decay` of text and of a `Sum` with three
+midpoints, `Dist` of text, and a bare `Attribute`) at four pages each (with filters, offsets 3 and 70, and `top_k` 100), over a
+tie-heavy and a varied corpus, two segments, a WAL tail with patches, overwrites, and deletes, and a reindex.
+`tests/rank_shapes_lists.rs` asserts the accepted shapes are decided from lists (accepted, none fell back), in its own process
+because the outcome counters are per process. A unit test lists what `shape_of` accepts and refuses. The BW22 to BW25 tests
+pass unchanged, except that the tie-heavy fallback test now expects the last round to accept, not the full scorer.
+
+### Measurement
+
+This VM, fixture as above on local disk (read only), server (`blowfish-scale-server`) on CPUs 0 to 5 with 6 Rayon workers, driver
+(`concurrent_bm25`) on CPUs 6 and 7. 100 queries per shape (not 200: the baseline takes 2 to 3 s each), the checked-in MS MARCO
+queries cycling six pages (`top_k` 10 unfiltered, `id >= 200000`, `id < 50000`, offsets 7 and 20, and `top_k` 100), with 1 query in
+25 forcing `Saturate` ties. The baseline is the v0.1.74 release build (HEAD `dfc6f2f`); it recorded the truth and the candidate
+matched it **exactly** on every query of every shape (ordered IDs and `f64` score values, compared as parsed JSON, plus the
+driver's `f32` bit check on every reply).
+
+**Memory rule.** The baseline holds every row, and at 4 clients one server passed 8 GB (the run was stopped at 8.16 GB), so the
+baseline ran at 1 client (first 12 queries) and **2 clients** (100 queries, up to 6.3 GB). The candidate ran 2 passes at 1 client
+and 3 at 16 clients (medians); **no baseline was run at 16 clients**. An all-rows query is CPU bound across the Rayon pool, so
+the baseline saturates at a few queries per second (BW25 measured 1.5 to 2.4 q/s at 16 clients for the same path). The gain
+column divides the candidate's 16-client q/s by the baseline's 2-client q/s, a conservative ratio for these shapes.
+
+| Shape (100 queries) | v0.1.74 1 client p50 ms | v0.1.74 2 clients q/s (p50 ms) | candidate 1 client q/s (p50 ms) | candidate 16 clients q/s (p50 / p90 ms) | gain at 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `Decay(BM25)` | 1,894 | 0.89 (2,271) | 335 (2.6) | 531 (29 / 34) | 595x |
+| `Decay(BM25)`, midpoint and exponent | 1,784 | 1.06 (2,195) | 286 (2.9) | 558 (26 / 35) | 529x |
+| `Sum(BM25, 0.1)` | 1,847 | 0.72 (2,677) | 195 (4.3) | 372 (40 / 50) | 514x |
+| `Max(BM25, 0.1)` | 1,738 | 0.97 (2,354) | 209 (3.8) | 342 (44 / 59) | 352x |
+| `Max(BM25, 5.0)` | 1,798 | 1.23 (1,873) | 190 (4.2) | 371 (41 / 51) | 303x |
+| recency boost | 2,188 | 0.83 (2,769) | 97 (6.2) | 175 (84 / 117) | 210x |
+| popularity boost | 2,133 | 0.89 (2,507) | 130 (5.9) | 206 (75 / 93) | 233x |
+| `Saturate(Sum(BM25, BM25))` | 2,116 | 0.78 (3,002) | 81 (10.2) | 128 (120 / 147) | 165x |
+| `Product(2, Sum(BM25, BM25))` | 2,428 | 0.76 (2,949) | 69 (12.0) | 117 (131 / 161) | 153x |
+| `Sum(Max(BM25, BM25), BM25)` | 2,585 | 0.68 (3,358) | 49 (18.3) | 78 (198 / 241) | 113x |
+| `Max(Sum(BM25, BM25), BM25)` | 2,669 | 0.69 (3,250) | 55 (15.7) | 87 (178 / 219) | 126x |
+| `Sum` of three predicates | 2,720 | 0.58 (3,844) | 79 (12.6) | 135 (116 / 138) | 233x |
+| `Sum` of two `Saturate` | 18.5 (p90 2,504) | 5.3 (29; p90 2,479) | 43 (19.0) | 75 (196 / 279) | 14x |
+| `Sum` of two weighted `Saturate` | 13.2 (p90 51) | 6.4 (20; p90 1,201) | 53 (15.3) | 86 (167 / 232) | 13x |
+
+For the last two rows the baseline already used lists and about 40 percent (4 percent for the weighted one) of queries fell back
+to a 2.4 s full scoring, so its throughput was capped near 5 to 8 q/s (BW25 measured 8.2 q/s at 16 clients for two `Saturate`
+clauses, against which the candidate's 75 is **9.2x**). The 4-client baseline for the first (40 queries, 6.2 GB) was 3.6 q/s.
+
+**Existing list paths are not slower** (A/B passes, q/s, baseline then candidate; this VM carried a load of 9 to 22 from other
+workers, so differences under about 20 percent are noise): plain BM25 407 and 410 at one client, 1,501 and 1,330 at 16; `Max` of two
+clauses 206 and 233, 852 and 912; BM25 plus one predicate 173 to 189 and 143 to 240 at one client, 313 to 317 and 278 to 350 at
+16 (two paired passes within a few percent); `Sum` of two clauses **37 and 72** at one client, **46 and 104 to 119** at 16, because
+queries that used to reach the full scorer now take the last round.
+
+### Verdict and what stays on the all-rows path
+
+Twelve of the fourteen closed shapes are 113x to 595x faster at 16 clients; two (`Sum` of two `Saturate` clauses, weighted or not)
+are 13x to 14x against the 2-client baseline and 9.2x against the 16-client throughput BW25 measured, so they clear the bar only
+on the conservative reading of the baseline I could run. The remaining shapes keep the old path:
+
+- **A boost that dominates the text** (`Sum(BM25, 40*Saturate(Attribute(pop)))`): the bound adds the boost's whole upper bound (40)
+  to the cutoffs, which exceeds the gap between the 10th and the 64th to 4,096th BM25 score, so no list length proves the answer and
+  the last round answers it (0.99 q/s baseline at 2 clients; candidate 1.4 q/s at one client, p50 306 ms, p90 2.3 s). Needs an
+  attribute-ordered index to enumerate the high-boost rows, not a larger list. Not run at 16 clients (the candidate server passed
+  7.9 GB there and was stopped).
+- **`Dist(BM25, c)`**: `|score - c|` is not monotone in the score, so no list bounds it, and the least-matching argument for `Decay`
+  does not apply (the minimum can sit anywhere). 1.05 q/s at 2 clients.
+- **A bare `Attribute`** (unbounded without per-segment statistics) and **a `Decay` or `Dist` over text mixed with other terms**.
+- **`limit.per`** (grouping needs every row).
+- **Cold reads and EC2** were not measured (local only).

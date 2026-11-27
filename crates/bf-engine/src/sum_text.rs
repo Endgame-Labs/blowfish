@@ -1,4 +1,10 @@
-//! Exact top-k of a `Sum` of plain BM25 clauses without scoring every allowed row.
+//! Exact top-k of a monotone expression over plain BM25 clauses without scoring every allowed row.
+//!
+//! The expression is a tree of `Sum`, `Max`, constant `Product`, and `Saturate` over BM25 clauses,
+//! constants, predicate bonuses, and row-wise terms with no BM25 (a recency decay, a saturated
+//! attribute). Every node is non-decreasing in each child, so a row outside every clause's list
+//! totals at most the expression at the clauses' cutoffs. A row-wise term is bounded by a static
+//! upper bound and evaluated exactly for the listed rows only.
 //!
 //! Each segment returns every clause's best `n` rows. The union of those rows is scored exactly
 //! under every clause (a search masked to just the union), and the answer is accepted when the
@@ -49,7 +55,10 @@ pub(crate) fn record(round: Option<usize>) {
     };
     counter.fetch_add(1, Ordering::Relaxed);
     if crate::ann::trace_stages() {
-        eprintln!("STAGE sum outcome {name}");
+        eprintln!(
+            "STAGE sum outcome {name} round {}",
+            round.map_or(-1, |r| r as i64)
+        );
     }
 }
 
@@ -57,6 +66,8 @@ pub(crate) fn record(round: Option<usize>) {
 const MAX_LIST: usize = 4096;
 /// Smallest per-clause list.
 const MIN_LIST: usize = 64;
+/// Most rows a `Decay` search scores exactly per segment while it looks for rows matching no text.
+const MAX_WINDOW: usize = 1 << 18;
 
 /// Weights outside this range could overflow or underflow the scaled scores, and then two
 /// different BM25 scores could map to one value, so such clauses keep the full scorer.
@@ -140,75 +151,48 @@ pub(crate) fn scaled(chain: &[Step], score: f32) -> f64 {
     chain.iter().fold(f64::from(score), |s, step| step.apply(s))
 }
 
-/// One term of a `Sum`, in rank order.
-pub(crate) enum Term<'a> {
-    /// The next plain BM25 clause (in `text_clauses` order) under its transforms.
-    Text(Chain),
-    /// A predicate that adds its transformed 1 to rows that match it, and 0 to the rest.
-    Bonus(&'a Filter, Chain),
-}
-
-/// The terms of a rank that the list paths can answer: a flat `Sum` of text clauses and at most
-/// `MAX_BONUSES` predicate bonuses (with at least one text clause), a flat `Max` of text
-/// clauses, or one transformed text clause alone (treated as a one-term `Sum`).
-pub(crate) fn terms_of(rank: Option<&RankBy>) -> Option<Vec<Term<'_>>> {
+/// The transforms of each clause of a flat `Max` of text clauses (or of one transformed clause
+/// alone), in `text_clauses` order; `None` when the rank is another shape. A flat `Max` takes
+/// each clause's own list, with shared floors (see `Floors`).
+pub(crate) fn clause_weights(rank: Option<&RankBy>) -> Option<Vec<Chain>> {
     match rank? {
-        RankBy::Sum(xs) if !xs.is_empty() => {
-            let mut bonuses = 0;
-            let terms = xs
-                .iter()
-                .map(|x| {
-                    weights_of(x).map(Term::Text).or_else(|| {
-                        bonuses += 1;
-                        bonus_of(x).map(|(f, c)| Term::Bonus(f, c))
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?;
-            (bonuses <= MAX_BONUSES && terms.iter().any(|t| matches!(t, Term::Text(_))))
-                .then_some(terms)
-        }
-        RankBy::Max(xs) if !xs.is_empty() => {
-            xs.iter().map(|x| weights_of(x).map(Term::Text)).collect()
-        }
-        x @ (RankBy::Product { .. } | RankBy::Saturate { .. }) => {
-            weights_of(x).map(|c| vec![Term::Text(c)])
-        }
+        RankBy::Max(xs) if !xs.is_empty() => xs.iter().map(weights_of).collect(),
         _ => None,
     }
 }
-/// Most predicate bonuses one `Sum` may carry (rows split into `2^n` classes, each searched).
+/// Most predicate bonuses one rank may carry (rows split into `2^n` classes, each searched).
 const MAX_BONUSES: usize = 2;
 
-/// The text clauses' transforms of a flat `Sum` or `Max` (or one transformed clause alone),
-/// in `text_clauses` order; `None` when the rank is another shape.
-pub(crate) fn clause_weights(rank: Option<&RankBy>) -> Option<Vec<Chain>> {
-    Some(
-        terms_of(rank)?
-            .into_iter()
-            .filter_map(|t| match t {
-                Term::Text(c) => Some(c),
-                Term::Bonus(..) => None,
-            })
-            .collect(),
-    )
+/// A rank the bound-and-list path can answer: any monotone expression over BM25 clauses (see
+/// `shape_of`), except a flat `Max` of clauses, which has its own, faster path.
+pub(crate) fn sum_of_text(rank: Option<&RankBy>) -> bool {
+    let flat_max = clause_weights(rank).is_some();
+    !flat_max && shape_of(rank).is_some()
 }
 
-/// A `Sum` (possibly one transformed clause alone, possibly with predicate bonuses) the list
-/// paths can answer.
-pub(crate) fn sum_of_text(rank: Option<&RankBy>) -> bool {
-    !matches!(rank, Some(RankBy::Max(_))) && terms_of(rank).is_some()
-}
+/// Smallest first list for a plan whose bound is loose (a `Saturate` compresses the scores, and
+/// a row-wise term adds slack): it rarely proves the answer at 64 rows, and each wasted round
+/// costs as much as the next, so these plans start here.
+const LOOSE_LIST: usize = 256;
 
 /// First list length for a query that needs `k` rows, or `None` when the lists would be too long
 /// to beat scoring everything.
-pub(crate) fn first_list(k: usize) -> Option<usize> {
-    (1..=MAX_LIST).contains(&k).then(|| k.max(MIN_LIST))
+pub(crate) fn first_list(k: usize, loose: bool) -> Option<usize> {
+    let start = if loose { LOOSE_LIST } else { MIN_LIST };
+    (1..=MAX_LIST).contains(&k).then(|| k.max(start))
 }
 
-/// The next list length after `n`, or `None` once lists stop paying for themselves.
+/// The list length that asks for every matching row: the last round before the full scorer.
+pub(crate) const ALL_MATCHES: usize = usize::MAX;
+
+/// The next list length after `n`: four times as long up to `MAX_LIST`, then every matching row
+/// (which scores only the rows that match some clause, and needs no bound), then `None`.
 pub(crate) fn next_list(n: usize) -> Option<usize> {
-    let next = n * 4;
-    (next <= MAX_LIST).then_some(next)
+    match n {
+        ALL_MATCHES => None,
+        n if n * 4 <= MAX_LIST => Some(n * 4),
+        _ => Some(ALL_MATCHES),
+    }
 }
 
 /// One clause with its tokens, parameters, and corpus statistics.
@@ -217,8 +201,6 @@ pub(crate) struct Clause<'a> {
     pub key: Vec<u8>,
     pub query: bf_text::Query,
     pub cfg: FullTextConfig,
-    /// Transforms around the clause, innermost first (empty for a plain clause).
-    pub weights: Chain,
     pub stats: &'a bf_text::CorpusStats,
 }
 
@@ -228,33 +210,306 @@ pub(crate) struct Bonus<'a> {
     pub weights: Chain,
 }
 
-/// Where a term of the `Sum` sits: text clause `i`, or predicate bonus `j`.
-#[derive(Clone, Copy)]
-pub(crate) enum Slot {
+/// A node of the expression. Children are evaluated and combined exactly as `query::score` does
+/// (`f64`, in rank order), so totals carry the full scorer's bits.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Expr {
+    /// The raw BM25 score of text clause `i`.
     Text(usize),
+    /// The transformed value of predicate bonus `j` for the row's class.
     Bonus(usize),
+    /// Row-wise term `j` (no BM25), evaluated per listed row.
+    Doc(usize),
+    Const(f64),
+    Sum(Vec<Expr>),
+    /// `Max` starts from 0, as the full scorer's does.
+    Max(Vec<Expr>),
+    Mul(f64, Box<Expr>),
+    Saturate {
+        midpoint: f64,
+        exponent: f64,
+        expr: Box<Expr>,
+    },
+    /// `Decay`: non-increasing in its child, so only the root may be one (see `Shape::decreasing`).
+    Decay {
+        midpoint: f64,
+        exponent: f64,
+        expr: Box<Expr>,
+    },
 }
 
-/// A `Sum` ready to run: its text clauses, predicate bonuses, and their order in the rank (the
-/// order matters because `f64` addition is not associative and totals must match the full
-/// scorer's bits).
+/// A term with no BM25 whose value depends on the row (attributes), with a static upper bound.
+pub(crate) struct DocTerm<'a> {
+    pub rank: &'a RankBy,
+    /// No row's value exceeds this (as the full scorer computes it).
+    pub upper: f64,
+    /// Attributes the term reads.
+    pub columns: std::collections::BTreeSet<String>,
+}
+
+/// A rank the list paths can answer: its expression and the pieces it refers to.
+pub(crate) struct Shape<'a> {
+    pub expr: Expr,
+    pub bonuses: Vec<(&'a Filter, Chain)>,
+    pub docs: Vec<DocTerm<'a>>,
+    /// Text clauses, in `text_clauses` order.
+    pub texts: usize,
+    /// The root is a `Decay` of an expression over text alone: the best rows are the ones that
+    /// match least, so the rows that match no text win and the bound-and-list search does not apply.
+    pub decreasing: bool,
+}
+
+fn has_text(x: &RankBy) -> bool {
+    match x {
+        RankBy::Bm25 { .. } => true,
+        RankBy::Sum(xs) | RankBy::Max(xs) => xs.iter().any(has_text),
+        RankBy::Product { expr, .. }
+        | RankBy::Saturate { expr, .. }
+        | RankBy::Decay { expr, .. }
+        | RankBy::Dist { expr, .. } => has_text(expr),
+        _ => false,
+    }
+}
+
+/// `Saturate` and `Decay` parameters that keep the result in `[0, 1]`.
+fn bounded_params(params: &serde_json::Value) -> Option<(f64, f64)> {
+    let midpoint = crate::query::parameter(params, "midpoint", 1.0).ok()?;
+    let exponent = crate::query::parameter(params, "exponent", 1.0).ok()?;
+    (MIDPOINT_RANGE.contains(&midpoint) && EXPONENT_RANGE.contains(&exponent))
+        .then_some((midpoint, exponent))
+}
+
+/// A static upper bound of a term with no BM25, or `None` when there is none (an attribute on its
+/// own is unbounded). Bounds are computed with the same `f64` operations as the full scorer, which
+/// are monotone, so no row's value exceeds them.
+fn upper_of(x: &RankBy, columns: &mut std::collections::BTreeSet<String>) -> Option<f64> {
+    match x {
+        RankBy::Constant(n) => n.as_f64().filter(|v| v.is_finite() && *v >= 0.0),
+        // A predicate beyond the classes' limit: 1 where it matches, 0 elsewhere.
+        RankBy::Filter(f) => {
+            filter_columns(f, columns);
+            Some(1.0)
+        }
+        RankBy::Saturate { expr, params } | RankBy::Decay { expr, params } => {
+            bounded_params(params)?;
+            // The inner value must be computable per row; its own bound is not needed.
+            inner_columns(expr, columns)?;
+            Some(1.0)
+        }
+        RankBy::Product { weight, expr, .. } if weight.is_finite() => {
+            Some(weight * upper_of(expr, columns)?)
+        }
+        RankBy::Sum(xs) if !xs.is_empty() => xs
+            .iter()
+            .map(|x| upper_of(x, columns))
+            .collect::<Option<Vec<_>>>()
+            .map(|v| v.into_iter().sum()),
+        RankBy::Max(xs) if !xs.is_empty() => xs
+            .iter()
+            .map(|x| upper_of(x, columns))
+            .collect::<Option<Vec<_>>>()
+            .map(|v| v.into_iter().fold(0.0, f64::max)),
+        _ => None,
+    }
+}
+
+/// The attributes a predicate reads (`id` is always in a row's document).
+fn filter_columns(f: &Filter, columns: &mut std::collections::BTreeSet<String>) {
+    match f {
+        Filter::And(fs) | Filter::Or(fs) => fs.iter().for_each(|f| filter_columns(f, columns)),
+        Filter::Not(f) => filter_columns(f, columns),
+        Filter::Compare { attribute, .. } => {
+            if attribute != "id" {
+                columns.insert(attribute.clone());
+            }
+        }
+    }
+}
+
+/// The attributes an unbounded inner term reads (`Attribute`, `Dist`, and arithmetic over them);
+/// `None` for anything else.
+fn inner_columns(x: &RankBy, columns: &mut std::collections::BTreeSet<String>) -> Option<()> {
+    match x {
+        RankBy::Constant(_) => Some(()),
+        RankBy::Attribute(name) => {
+            columns.insert(name.clone());
+            Some(())
+        }
+        RankBy::Dist { expr, .. } => inner_columns(expr, columns),
+        RankBy::Product { expr, .. }
+        | RankBy::Saturate { expr, .. }
+        | RankBy::Decay { expr, .. } => inner_columns(expr, columns),
+        RankBy::Sum(xs) | RankBy::Max(xs) => xs.iter().try_for_each(|x| inner_columns(x, columns)),
+        _ => None,
+    }
+}
+
+struct Build<'a> {
+    texts: usize,
+    bonuses: Vec<(&'a Filter, Chain)>,
+    docs: Vec<DocTerm<'a>>,
+}
+
+impl<'a> Build<'a> {
+    fn expr(&mut self, x: &'a RankBy) -> Option<Expr> {
+        if !has_text(x) {
+            return self.rowwise(x);
+        }
+        Some(match x {
+            RankBy::Bm25 { .. } => {
+                self.texts += 1;
+                Expr::Text(self.texts - 1)
+            }
+            RankBy::Sum(xs) if !xs.is_empty() => {
+                Expr::Sum(xs.iter().map(|x| self.expr(x)).collect::<Option<_>>()?)
+            }
+            RankBy::Max(xs) if !xs.is_empty() => {
+                Expr::Max(xs.iter().map(|x| self.expr(x)).collect::<Option<_>>()?)
+            }
+            RankBy::Product { weight, expr, .. } if WEIGHT_RANGE.contains(weight) => {
+                Expr::Mul(*weight, Box::new(self.expr(expr)?))
+            }
+            RankBy::Saturate { expr, params } => {
+                let (midpoint, exponent) = bounded_params(params)?;
+                Expr::Saturate {
+                    midpoint,
+                    exponent,
+                    expr: Box::new(self.expr(expr)?),
+                }
+            }
+            _ => return None,
+        })
+    }
+    /// A term with no BM25: a constant, a predicate bonus, or a row-wise term.
+    fn rowwise(&mut self, x: &'a RankBy) -> Option<Expr> {
+        if let RankBy::Constant(n) = x {
+            return n
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(Expr::Const);
+        }
+        // The first predicates split rows into classes (exact); later ones are row-wise terms.
+        if self.bonuses.len() < MAX_BONUSES
+            && let Some((filter, chain)) = bonus_of(x)
+        {
+            self.bonuses.push((filter, chain));
+            return Some(Expr::Bonus(self.bonuses.len() - 1));
+        }
+        let mut columns = Default::default();
+        let upper = upper_of(x, &mut columns)?;
+        self.docs.push(DocTerm {
+            rank: x,
+            upper,
+            columns,
+        });
+        Some(Expr::Doc(self.docs.len() - 1))
+    }
+}
+
+/// The expression of a rank the list paths can answer, or `None` for another shape.
+pub(crate) fn shape_of(rank: Option<&RankBy>) -> Option<Shape<'_>> {
+    let rank = rank?;
+    // A bare clause has its own, faster path.
+    if matches!(rank, RankBy::Bm25 { .. }) {
+        return None;
+    }
+    let mut build = Build {
+        texts: 0,
+        bonuses: vec![],
+        docs: vec![],
+    };
+    let mut decreasing = false;
+    let expr = match rank {
+        RankBy::Decay { expr, params } => {
+            let (midpoint, exponent) = bounded_params(params)?;
+            let inner = build.expr(expr)?;
+            // Bonuses and row-wise terms make rows that match no text differ from each other.
+            if !build.bonuses.is_empty() || !build.docs.is_empty() {
+                return None;
+            }
+            decreasing = true;
+            Expr::Decay {
+                midpoint,
+                exponent,
+                expr: Box::new(inner),
+            }
+        }
+        _ => build.expr(rank)?,
+    };
+    (build.texts > 0).then_some(Shape {
+        expr,
+        bonuses: build.bonuses,
+        docs: build.docs,
+        texts: build.texts,
+        decreasing,
+    })
+}
+
+/// A rank ready to run: its text clauses, predicate bonuses, row-wise terms, and expression.
 pub(crate) struct SumPlan<'a> {
     pub clauses: Vec<Clause<'a>>,
     pub bonuses: Vec<Bonus<'a>>,
-    pub slots: Vec<Slot>,
+    pub docs: Vec<DocTerm<'a>>,
+    pub expr: Expr,
+    /// See `Shape::decreasing`.
+    pub decreasing: bool,
 }
 
 impl SumPlan<'_> {
-    /// The total of one row: `text(i)` is the transformed score of clause `i`, and `bonus[j]`
-    /// the transformed value of bonus `j` for the row's class.
-    pub(crate) fn total(&self, text: impl Fn(usize) -> f64, bonus: &[f64]) -> f64 {
-        self.slots
-            .iter()
-            .map(|slot| match *slot {
-                Slot::Text(i) => text(i),
-                Slot::Bonus(j) => bonus[j],
-            })
-            .sum()
+    /// The total of one row: `text(i)` is clause `i`'s raw score, `bonus[j]` the transformed value
+    /// of bonus `j` for the row's class, and `doc(j)` row-wise term `j`.
+    pub(crate) fn total(
+        &self,
+        text: &dyn Fn(usize) -> f64,
+        bonus: &[f64],
+        doc: &dyn Fn(usize) -> f64,
+    ) -> f64 {
+        fn go(e: &Expr, t: &dyn Fn(usize) -> f64, b: &[f64], d: &dyn Fn(usize) -> f64) -> f64 {
+            match e {
+                Expr::Text(i) => t(*i),
+                Expr::Bonus(j) => b[*j],
+                Expr::Doc(j) => d(*j),
+                Expr::Const(c) => *c,
+                Expr::Sum(xs) => xs.iter().map(|x| go(x, t, b, d)).sum(),
+                Expr::Max(xs) => xs.iter().map(|x| go(x, t, b, d)).fold(0.0, f64::max),
+                Expr::Mul(w, x) => w * go(x, t, b, d),
+                Expr::Saturate {
+                    midpoint,
+                    exponent,
+                    expr,
+                } => {
+                    let x = go(expr, t, b, d).max(0.0);
+                    let ratio = 1.0 / (1.0 + (x / midpoint).powf(*exponent));
+                    1.0 - ratio
+                }
+                Expr::Decay {
+                    midpoint,
+                    exponent,
+                    expr,
+                } => {
+                    let x = go(expr, t, b, d).max(0.0);
+                    1.0 / (1.0 + (x / midpoint).powf(*exponent))
+                }
+            }
+        }
+        go(&self.expr, text, bonus, doc)
+    }
+    /// True when the strict bound is usually loose: a `Saturate` over text compresses scores, and a
+    /// row-wise term adds its whole upper bound to every row outside the lists.
+    pub(crate) fn loose(&self) -> bool {
+        fn saturates(e: &Expr) -> bool {
+            match e {
+                Expr::Saturate { .. } => true,
+                Expr::Sum(xs) | Expr::Max(xs) => xs.iter().any(saturates),
+                Expr::Mul(_, x) | Expr::Decay { expr: x, .. } => saturates(x),
+                _ => false,
+            }
+        }
+        !self.docs.is_empty() || saturates(&self.expr)
+    }
+    /// The largest total a row can reach when no text clause scores above `cutoffs`.
+    pub(crate) fn bound(&self, cutoffs: &[f32], bonus: &[f64]) -> f64 {
+        self.total(&|i| f64::from(cutoffs[i]), bonus, &|j| self.docs[j].upper)
     }
 }
 
@@ -268,6 +523,8 @@ pub(crate) struct Class {
 /// A segment ready to answer list searches: its allowed rows split into classes by which bonus
 /// predicates they match (one class when there are none), and one text index per clause.
 pub(crate) struct SegmentSum {
+    store: Storage,
+    seg: bf_wal::Segment,
     pub classes: Vec<Class>,
     pub readers: Vec<Arc<bf_text::SegmentReader>>,
     /// Row order is ID order (proven by a validated ID list), needed to pick the lowest-ID rows
@@ -301,7 +558,7 @@ pub(crate) async fn open(
             .map(|b| segment::filter_live(store, seg, b.filter, &state.schema)),
     );
     let ordered = async {
-        if plan.bonuses.is_empty() {
+        if plan.bonuses.is_empty() && !plan.decreasing {
             Ok(false)
         } else {
             segment::ids(store, seg).await.map(|_| true)
@@ -338,10 +595,40 @@ pub(crate) async fn open(
             .collect();
     }
     Ok(Some(SegmentSum {
+        store: store.clone(),
+        seg: seg.clone(),
         classes,
         readers,
         id_ordered,
     }))
+}
+
+/// A clause's exact scores by row: a map for a short list, a dense array for a long one (the
+/// last round holds every matching row, and hashing each one would cost more than scoring it).
+enum Scores {
+    Map(HashMap<u32, f32>),
+    Dense(Vec<f32>),
+}
+/// Lists longer than this use a dense array.
+const DENSE_AT: usize = 2048;
+impl Scores {
+    fn new(hits: Vec<bf_text::SearchHit>, rows: u32) -> Self {
+        if hits.len() <= DENSE_AT {
+            return Scores::Map(hits.into_iter().map(|h| (h.row, h.score)).collect());
+        }
+        let mut dense = vec![0.0; rows as usize];
+        for h in hits {
+            dense[h.row as usize] = h.score;
+        }
+        Scores::Dense(dense)
+    }
+    /// The row's score, 0 when it is not in the list.
+    fn get(&self, row: u32) -> f32 {
+        match self {
+            Scores::Map(m) => m.get(&row).copied().unwrap_or(0.0),
+            Scores::Dense(d) => d.get(row as usize).copied().unwrap_or(0.0),
+        }
+    }
 }
 
 /// One segment's union rows with exact totals, and the bound for rows outside every list.
@@ -361,6 +648,7 @@ impl SegmentSum {
     /// can win. `None` when that needs an ID order this segment cannot prove.
     pub(crate) async fn candidates(
         &self,
+        state: &NamespaceState,
         plan: &SumPlan<'_>,
         n: usize,
         k: usize,
@@ -371,7 +659,12 @@ impl SegmentSum {
             exhaustive: true,
         };
         for class in &self.classes {
-            let Some(c) = self.class_candidates(plan, class, n, k).await? else {
+            let c = if plan.decreasing {
+                self.least_matching(plan, class, k).await?
+            } else {
+                self.class_candidates(state, plan, class, n, k).await?
+            };
+            let Some(c) = c else {
                 return Ok(None);
             };
             out.rows.extend(c.rows);
@@ -383,12 +676,19 @@ impl SegmentSum {
 
     async fn class_candidates(
         &self,
+        state: &NamespaceState,
         plan: &SumPlan<'_>,
         class: &Class,
         n: usize,
         k: usize,
     ) -> Result<Option<Candidates>, ApiError> {
         let clauses = &plan.clauses;
+        // One more than the rows there are, so no list is ever full and none needs a bound.
+        let n = if n == ALL_MATCHES {
+            class.rows.len() as usize + 1
+        } else {
+            n
+        };
         let mut union = RoaringBitmap::new();
         let mut cutoffs = Vec::with_capacity(clauses.len());
         let mut lists = Vec::with_capacity(clauses.len());
@@ -405,17 +705,25 @@ impl SegmentSum {
                 .map_err(segment::index_error)?;
             let full = hits.len() >= n;
             cutoffs.push(if full { hits[n - 1].score } else { 0.0 });
-            for hit in &hits {
-                union.insert(hit.row);
+            if hits.len() > DENSE_AT {
+                let mut rows: Vec<u32> = hits.iter().map(|h| h.row).collect();
+                rows.sort_unstable();
+                union |= RoaringBitmap::from_sorted_iter(rows).expect("sorted rows");
+            } else {
+                for hit in &hits {
+                    union.insert(hit.row);
+                }
             }
             lists.push((full, hits));
         }
-        let bound = plan.total(|i| scaled(&clauses[i].weights, cutoffs[i]), &class.bonus);
-        let exhaustive = lists.iter().all(|(full, _)| !full);
-        let mut exact: Vec<HashMap<u32, f32>> = Vec::with_capacity(clauses.len());
+        let bound = plan.bound(&cutoffs, &class.bonus);
+        // Row-wise terms give rows that match no text a total of their own (not one shared value),
+        // so only the bound can prove that nothing outside the lists wins.
+        let exhaustive = plan.docs.is_empty() && lists.iter().all(|(full, _)| !full);
+        let mut exact: Vec<Scores> = Vec::with_capacity(clauses.len());
         for ((clause, reader), (full, hits)) in clauses.iter().zip(&self.readers).zip(lists) {
             if !full {
-                exact.push(hits.into_iter().map(|h| (h.row, h.score)).collect());
+                exact.push(Scores::new(hits, reader.num_docs()));
                 continue;
             }
             let all = reader
@@ -428,26 +736,21 @@ impl SegmentSum {
                 )
                 .await
                 .map_err(segment::index_error)?;
-            exact.push(all.into_iter().map(|h| (h.row, h.score)).collect());
+            exact.push(Scores::new(all, reader.num_docs()));
         }
+        let docs = self.row_terms(state, plan, &union).await?;
         let mut rows: Vec<(u32, f64)> = union
             .iter()
             .map(|row| {
-                let t = plan.total(
-                    |i| {
-                        scaled(
-                            &clauses[i].weights,
-                            exact[i].get(&row).copied().unwrap_or(0.0),
-                        )
-                    },
-                    &class.bonus,
-                );
+                let t = plan.total(&|i| f64::from(exact[i].get(row)), &class.bonus, &|j| {
+                    docs[&row][j]
+                });
                 (row, t)
             })
             .collect();
         if exhaustive {
             // Rows outside the union match no text at all and total the bare bonus.
-            let bare = plan.total(|_| 0.0, &class.bonus);
+            let bare = plan.total(&|_| 0.0, &class.bonus, &|_| 0.0);
             if bare > 0.0 {
                 if !self.id_ordered {
                     return Ok(None);
@@ -467,6 +770,106 @@ impl SegmentSum {
             bound,
             exhaustive,
         }))
+    }
+
+    /// A `Decay` of text: every row that matches no text totals the same maximum, so the answer is
+    /// the first `k` rows (in ID order) among those, plus any matching row that ties or beats
+    /// them. Scores the first `w` allowed rows exactly, growing `w` until `k` of them match no
+    /// text (or they are all the allowed rows), and keeps the best `k`. Rows past the window
+    /// total no more than the unmatched ones in it, which have lower IDs. `None` when row order
+    /// is not ID order here, or the window would grow past `MAX_WINDOW`.
+    async fn least_matching(
+        &self,
+        plan: &SumPlan<'_>,
+        class: &Class,
+        k: usize,
+    ) -> Result<Option<Candidates>, ApiError> {
+        if !self.id_ordered {
+            return Ok(None);
+        }
+        let allowed = &class.rows;
+        let mut w = (k * 4).max(MIN_LIST);
+        loop {
+            let window: RoaringBitmap = allowed.iter().take(w).collect();
+            let all = window.len() == allowed.len();
+            let mut exact: Vec<HashMap<u32, f32>> = Vec::with_capacity(plan.clauses.len());
+            for (clause, reader) in plan.clauses.iter().zip(&self.readers) {
+                let hits = reader
+                    .search_prefetched(
+                        &clause.query,
+                        clause.stats,
+                        &clause.cfg,
+                        window.len() as usize,
+                        Some(&window),
+                    )
+                    .await
+                    .map_err(segment::index_error)?;
+                exact.push(hits.into_iter().map(|h| (h.row, h.score)).collect());
+            }
+            let mut rows: Vec<(u32, f64)> = window
+                .iter()
+                .map(|row| {
+                    let t = plan.total(
+                        &|i| f64::from(exact[i].get(&row).copied().unwrap_or(0.0)),
+                        &class.bonus,
+                        &|_| 0.0,
+                    );
+                    (row, t)
+                })
+                .collect();
+            let unmatched = window
+                .iter()
+                .filter(|row| exact.iter().all(|e| !e.contains_key(row)))
+                .count();
+            if all || unmatched >= k {
+                rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                rows.truncate(k);
+                return Ok(Some(Candidates {
+                    rows,
+                    bound: 0.0,
+                    exhaustive: true,
+                }));
+            }
+            w *= 4;
+            if w > MAX_WINDOW {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Each row's row-wise terms, evaluated exactly as the full scorer would on the row's document.
+    async fn row_terms(
+        &self,
+        state: &NamespaceState,
+        plan: &SumPlan<'_>,
+        rows: &RoaringBitmap,
+    ) -> Result<HashMap<u32, Vec<f64>>, ApiError> {
+        if plan.docs.is_empty() || rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let columns: std::collections::BTreeSet<String> = plan
+            .docs
+            .iter()
+            .flat_map(|d| d.columns.iter().cloned())
+            .collect();
+        let docs = segment::projected_rows(&self.store, &self.seg, rows, Some(&columns)).await?;
+        let mut out = HashMap::with_capacity(docs.len());
+        for row in rows {
+            let doc = docs.get(&row).ok_or_else(segment::corrupt)?;
+            let values = plan
+                .docs
+                .iter()
+                .map(|d| crate::query::score(state, doc, d.rank))
+                .collect::<Result<Vec<_>, _>>()?;
+            out.insert(row, values);
+        }
+        Ok(out)
+    }
+
+    /// Proves that row order is ID order in this segment (loads and validates its ID list, cached).
+    /// Among rows that tie, the lowest rows are then the lowest IDs.
+    pub(crate) async fn ensure_id_order(&self) -> Result<(), ApiError> {
+        segment::ids(&self.store, &self.seg).await.map(|_| ())
     }
 
     /// Per-clause hits for exactly `rows`, for hydration of the winners.
@@ -507,8 +910,9 @@ pub(crate) fn accept(totals: &mut [f64], k: usize, bound: f64, exhaustive: bool)
         // Fewer than k positive rows in the union: all of them win only when nothing is outside.
         return exhaustive.then_some(0.0);
     }
-    totals.sort_unstable_by(|a, b| b.total_cmp(a));
-    let kth = totals[k - 1];
+    let kth = *totals
+        .select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a))
+        .1;
     (exhaustive || kth > bound).then_some(kth)
 }
 
@@ -559,6 +963,68 @@ mod tests {
         );
     }
     #[test]
+    fn shapes_are_accepted_only_when_every_node_is_monotone_and_bounded() {
+        let shape = |v: serde_json::Value| {
+            let rank: RankBy = serde_json::from_value(v).unwrap();
+            shape_of(Some(&rank)).map(|s| (s.texts, s.bonuses.len(), s.docs.len(), s.decreasing))
+        };
+        let bm = || serde_json::json!(["t", "BM25", "x"]);
+        let recency = serde_json::json!(["Product", 2.0,
+            ["Decay", ["Dist", ["Attribute", "ts"], "2026-01-01T00:00:00Z"], {"midpoint": "30d"}]]);
+        // Constants and nesting.
+        assert_eq!(
+            shape(serde_json::json!(["Sum", [bm(), 0.1]])),
+            Some((1, 0, 0, false))
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Max", [bm(), 0.1]])),
+            Some((1, 0, 0, false))
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Product", 2.0, ["Sum", [bm(), bm()]]])),
+            Some((2, 0, 0, false))
+        );
+        // A bounded row-wise term is one doc term; a negative constant has no bound.
+        assert_eq!(
+            shape(serde_json::json!(["Sum", [bm(), recency]])),
+            Some((1, 0, 1, false))
+        );
+        assert_eq!(shape(serde_json::json!(["Sum", [bm(), -1.0]])), None);
+        // An attribute on its own is unbounded.
+        assert_eq!(
+            shape(serde_json::json!([
+                "Sum",
+                [bm(), ["Max", [["Attribute", "n"], 0]]]
+            ])),
+            None
+        );
+        // Predicates: two are classes, a third is a row-wise term.
+        let pred = |n: i64| serde_json::json!(["Product", 2.0, ["n", "Eq", n]]);
+        assert_eq!(
+            shape(serde_json::json!([
+                "Sum",
+                [bm(), pred(1), pred(2), pred(3)]
+            ])),
+            Some((1, 2, 1, false))
+        );
+        // Only the root may decay, and only text alone.
+        assert_eq!(
+            shape(serde_json::json!(["Decay", bm(), {"midpoint": 10}])),
+            Some((1, 0, 0, true))
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Sum", [["Decay", bm(), {}], bm()]])),
+            None
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Decay", ["Sum", [bm(), pred(1)]], {}])),
+            None
+        );
+        assert_eq!(shape(serde_json::json!(["Dist", bm(), 5.0])), None);
+        // No text at all is not a text rank.
+        assert_eq!(shape(serde_json::json!(["Sum", [1.0, 2.0]])), None);
+    }
+    #[test]
     fn saturate_never_reverses_the_order_of_adjacent_scores() {
         // The list paths rely on the transform being non-decreasing; sweep neighbors of f32 scores.
         for (midpoint, exponent) in [
@@ -585,12 +1051,15 @@ mod tests {
     }
     #[test]
     fn list_lengths_grow_to_a_cap() {
-        assert_eq!(first_list(0), None);
-        assert_eq!(first_list(10), Some(64));
-        assert_eq!(first_list(100), Some(100));
-        assert_eq!(first_list(4097), None);
+        assert_eq!(first_list(0, false), None);
+        assert_eq!(first_list(10, false), Some(64));
+        assert_eq!(first_list(10, true), Some(256));
+        assert_eq!(first_list(100, false), Some(100));
+        assert_eq!(first_list(1000, true), Some(1000));
+        assert_eq!(first_list(4097, false), None);
         assert_eq!(next_list(64), Some(256));
         assert_eq!(next_list(1024), Some(4096));
-        assert_eq!(next_list(4096), None);
+        assert_eq!(next_list(4096), Some(ALL_MATCHES));
+        assert_eq!(next_list(ALL_MATCHES), None);
     }
 }
