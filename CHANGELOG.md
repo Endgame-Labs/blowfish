@@ -4,6 +4,13 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.66] - 2026-11-27
+
+### Changed
+
+- **Warm vector queries do less work outside the graph, 28 percent more `top_k` 10 queries at 16 clients, with the lead over Qdrant at 1.39x:** A profile of v0.1.64 on the M4 put about half of a query's CPU outside the graph walk and rerank, and two items were 15 points of it. Every strong query issued its own check that the next WAL entry does not exist, which on a local store is a task on tokio's blocking pool and, with sixteen busy HTTP reactors, a spin on that pool's one mutex. Concurrent queries now share one probe per namespace: a query that arrives while a probe is running joins the next one, which starts only after it arrived, so every answer still comes from a probe that began after its query did. A joiner waits at most 2 ms, and a store whose probes keep taking longer (an object store over a network) is recognized and probed per query as before. Every query also re-resolved the lineage placement of each recluster tier through the read cache's one lock; the placement and the tier's live-row mask are now kept with the checkpoint's segment list. With both on, one server and the same graph: `top_k` 10 went from 9,442 to 12,090 q/s (p99 3.80 to 2.66 ms) and `top_k` 100 from 4,692 to 5,315 q/s (p99 8.02 to 6.08 ms), the server's CPU per query fell from 896 to 537 us at `top_k` 10, and the rows of all 3,452 queries, IDs and distances, are identical. At matched recall that is 1.39x Qdrant 1.20.0's q/s at `top_k` 10 and 1.53x at `top_k` 100. The recall sampler's coin flip also stopped making a system call per query. A faster parse of the query vector, measured and found to give nothing at the server, is not included. See [docs/benchmarks.md](docs/benchmarks.md), Round G17.
+- **Compaction of indexed vectors is about 10 times faster and reads 98 percent fewer bytes:** When a vector index tier already owns every row being compacted, compaction used to read every vector back through the tier and build a segment ANN index, then throw it away. It now keeps the tier through lineage and skips both steps. On a 10M-row fixture, eight compactions took 98 s instead of 956 s, read 1.1 GB instead of 59 GB (1,253 GETs instead of 363,291), and peaked at 0.94 GB of memory instead of 1.69 GB. Query results are identical, including while row maps are still being backfilled. Segment sizes are unchanged: fewer, larger segments made cold ID filters 1.31 times slower in the same round. See Round CS1 in `docs/benchmarks.md`.
+
 ## [0.1.65] - 2026-11-27
 
 ### Changed
@@ -482,7 +489,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.65...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.66...HEAD
+[0.1.66]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.66
 [0.1.65]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.65
 [0.1.64]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.64
 [0.1.63]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.63

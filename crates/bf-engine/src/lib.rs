@@ -27,6 +27,7 @@ mod tail;
 #[cfg(test)]
 mod tail_benchmark;
 mod text_upgrade;
+mod wal_probe;
 pub use indexer::EngineConfig;
 pub use recluster::{ReclusterOptions, ReclusterReport};
 pub use reindex::{LayoutCounts, ReindexOptions, ReindexReport};
@@ -69,8 +70,12 @@ pub(crate) struct TailEntry {
 }
 /// A checkpoint's segments, shared: cloning a namespace state (a query does it several times)
 /// must not copy thousands of segment records. Mutation copies on write.
+///
+/// The list carries a memo of where each recluster tier's covered rows are now (see
+/// `lineage::place_memoized`), valid for exactly this list: any mutation or replacement starts a
+/// new, empty one.
 #[derive(Clone, Default)]
-pub(crate) struct Segments(Arc<Vec<bf_wal::Segment>>);
+pub(crate) struct Segments(Arc<Vec<bf_wal::Segment>>, Arc<lineage::PlacementMemo>);
 impl std::ops::Deref for Segments {
     type Target = Vec<bf_wal::Segment>;
     fn deref(&self) -> &Self::Target {
@@ -79,13 +84,18 @@ impl std::ops::Deref for Segments {
 }
 impl std::ops::DerefMut for Segments {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.1 = Arc::default();
         Arc::make_mut(&mut self.0)
     }
 }
 impl Segments {
     /// Drop every segment without copying the shared list.
     pub(crate) fn clear(&mut self) {
-        self.0 = Arc::default();
+        *self = Self::default();
+    }
+    /// The placement memo for exactly this list.
+    pub(crate) fn placements(&self) -> &lineage::PlacementMemo {
+        &self.1
     }
 }
 impl<'a> IntoIterator for &'a Segments {
@@ -97,7 +107,7 @@ impl<'a> IntoIterator for &'a Segments {
 }
 impl From<Vec<bf_wal::Segment>> for Segments {
     fn from(v: Vec<bf_wal::Segment>) -> Self {
-        Self(Arc::new(v))
+        Self(Arc::new(v), Arc::default())
     }
 }
 #[derive(Clone)]
@@ -359,6 +369,8 @@ struct Handle {
     commits: GroupCommit<Operation, Result<WriteResponse, ApiError>>,
     backpressure: Arc<auto_recluster::LoadBackpressure>,
     row_map_probe: std::sync::atomic::AtomicUsize,
+    /// Shares the strong-read "is the next WAL entry there" probe among concurrent queries.
+    wal_probe: wal_probe::WalProbe,
 }
 struct Inner {
     store: Storage,
@@ -395,6 +407,25 @@ pub(crate) fn fan_out() -> bool {
             })
     });
     QUERIES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) <= limit
+}
+
+/// A uniform draw in `[0, 1)` for the recall sampler's coin flip. Each thread keeps its own
+/// SplitMix64 stream, seeded once from the OS: a `Uuid::new_v4` per query was a `getentropy`
+/// system call on every query.
+fn sample_roll() -> f64 {
+    thread_local! {
+        static STREAM: std::cell::Cell<u64> =
+            std::cell::Cell::new(uuid::Uuid::new_v4().as_u128() as u64);
+    }
+    STREAM.with(|stream| {
+        let state = stream.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        stream.set(state);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    })
 }
 
 struct InFlight;
@@ -660,6 +691,7 @@ impl Engine {
             commits,
             backpressure: backpressure.clone(),
             row_map_probe: std::sync::atomic::AtomicUsize::new(0),
+            wal_probe: wal_probe::WalProbe::default(),
         });
         handles.insert(ns.into(), handle.clone());
         let context = read_cache::ReadContext::new(self.0.read_cache.clone());
@@ -794,8 +826,12 @@ impl Engine {
                 && state.checkpoint_refreshed.elapsed() < self.0.config.retention.div_f64(2.0)
             {
                 let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
-                match self.0.store.head(&wal.key(state.seq + 1)).await {
-                    Err(bf_storage::Error::NotFound) => {
+                match handle
+                    .wal_probe
+                    .exists(&self.0.store, &wal.key(state.seq + 1))
+                    .await
+                {
+                    Ok(false) => {
                         let current = handle.state.load();
                         if current.seq == state.seq
                             && current.manifest_seq == state.manifest_seq
@@ -805,7 +841,7 @@ impl Engine {
                             return Ok((current, true));
                         }
                     }
-                    Ok(_) => {}
+                    Ok(true) => {}
                     Err(error) => return Err(storage_error(error)),
                 }
             }
@@ -1109,8 +1145,7 @@ impl Engine {
         );
         if matches!(request.rank_by, Some(RankBy::Vector { exact: false, .. }))
             && self.0.config.recall_sample_rate > 0.0
-            && (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1_000_000.0
-                < self.0.config.recall_sample_rate
+            && sample_roll() < self.0.config.recall_sample_rate
             && let Some(sampling) = self
                 .0
                 .recall_sampler

@@ -17038,3 +17038,119 @@ gates. Its G12 checks now use the same near-row contract as G8, while document
 versus ID-table comparisons remain exact. The new kNN fixture uses the required
 explicit filter. Final-commit workspace validation is recorded in the worker
 handoff; overflow checks remain enabled.
+
+## Round G17: the server CPU outside the graph walk, top_k 10 is 1.28 times faster at 16 clients with identical results
+
+**Setup:** Apple M4 (10 cores, 16 GB, shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries, exact top-100 truth), the frozen v0.1.19 fixture copied from
+the measurement bucket, 16 client processes with one keep-alive connection each, IDs only (`include_attributes: false`), release binaries with production defaults, and the graph
+promoted the ordinary way (`g15_promote.py`: 27.5 minutes for v0.1.64, 23.5 minutes for the final binary). The arms below ran on **one promoted server**, so the graph, the beam, and the data
+are the same for both: "off" is v0.1.64's behavior for the two changed paths and "on" is this round's. A temporary switch file (read every half second, in a candidate binary only,
+now deleted) selected the arm. Order: on, off, off, on, on, off, off, on, 20 seconds each. Clients are `drive.py`: 16 processes, request bodies encoded before the clock starts.
+Qdrant is the official 1.20.0 macOS arm64 binary (f16 in RAM, M=16, ef_construct=100, indexed in 5.7 minutes to a green collection with every vector indexed), loaded once and driven by the same client
+code against its search route.
+
+### Profile: where v0.1.64 spends its CPU (macOS `sample` at 1 ms, all threads, idle threads excluded, release build with frame pointers)
+
+The sampler slows the server, so these are shares of active samples, not rates. The clean baseline is 9,511 q/s at `top_k` 10 (about 880 us of server CPU per query) and 4,686 q/s at
+`top_k` 100 (about 1,820 us).
+
+| Share of active samples | `top_k` 10 | `top_k` 100 |
+|---|---:|---:|
+| graph walk (`candidates_with_norms`, of which the SQ8 `dot_neon` is 13.9 and 12.8) | 39.5 | 37.8 |
+| exact rerank (the row CRC is 1.9 and 3.0) | 9.3 | 15.0 |
+| row-to-ID table | 1.0 | 3.8 |
+| **the WAL-next `head` of every strong query**, a `spawn_blocking` stat on tokio's blocking pool (6.7 and 4.9 of it is that pool's mutex, spinning in `swtch_pri`) | **8.5** | **6.8** |
+| **lineage placement of every query**: each recluster tier's placement re-resolved through the read cache's one lock | **6.7** | **4.8** |
+| request JSON parse (1,024 floats) | 4.4 | 1.9 |
+| response JSON, `Cache::observe`, metrics lookups, `Uuid::new_v4` (a `getentropy` system call) | about 3 | about 5 |
+| hyper `writev` and `recvfrom` | about 5 | about 3 |
+
+Everything outside the walk, the rerank, and the ID table was about 48 percent of the CPU at `top_k` 10, and two items, the `head` hop and the placement lookups, were 15 points of it. The top
+self-time frames (`top_k` 10) were `candidates_with_norms` 22.4, `dot_neon` 13.9, `swtch_pri` 10.7, `__psynch_mutexwait` 6.6, `memmove` 5.0 (mostly inside the walk), `writev` 3.5,
+`serde_json parse_number` 2.1, the row CRC 2.0, rerank 2.0, and jemalloc about 3.5. The inclusive leaders were the axum handler 86.4, `query_inner` 78.9, `indexed::prepare` 63.0, `search_entry` 51.7,
+`candidates_with_norms` 39.5, `rerank_with_norms` 9.3, the snapshot branch 8.9, and `lineage::place` 6.7.
+
+### What changed
+
+1. **Concurrent strong queries share one WAL-next probe** (`bf-engine` `wal_probe.rs`). A strong query may answer from the resident snapshot only once it knows the next WAL entry does not exist,
+   and each query issued its own `head`. At most one probe per namespace now runs at a time. A query that arrives while one is in flight cannot use it (it may have looked before the query began, and
+   a write acknowledged in between would be missed), so it joins the next round, which starts after the running one ends and so after every joiner arrived: every query is still answered by a probe
+   that began after it did. A joiner waits at most 2 ms, then probes on its own, and a store whose probes stay slower than 2 ms for 8 in a row (an object store over a network) is treated as
+   remote and every query probes alone until one probe is fast again, so a remote store sees no added latency. A probe whose caller went away hands the round to a joiner.
+2. **Lineage placements are resolved once per segment list** (`lineage::place_memoized`, `ann::tier_mask`). The segment list carries a lock-free memo of each tier's placement, valid while the
+   state's lineage records and tier table are the very objects it was computed from, and a new list (any mutation or replacement) starts an empty memo. The placement keeps its tier mask once computed,
+   so a query builds no mask key and takes no lock for it.
+3. The recall sampler's coin flip no longer draws a UUID (a system call) per query; each thread keeps a SplitMix64 stream seeded once.
+
+### Results
+
+Same server, 16 clients, 4 runs per arm (median; range in parentheses):
+
+| | q/s | p50 / p99 (ms) | server CPU per query | recall (both arms) |
+|---|---:|---|---:|---:|
+| `top_k` 10, off (v0.1.64 paths) | 9,442 (9,402 to 9,511) | 1.58 / 3.80 | 896 us | 0.9507 |
+| `top_k` 10, on | **12,090** (12,025 to 12,244) | **1.29 / 2.66** | 537 us | 0.9507 |
+| `top_k` 100, off | 4,692 (4,673 to 4,709) | 3.11 / 8.02 | 1,816 us | 0.9548 |
+| `top_k` 100, on | **5,315** (5,197 to 5,323) | **2.88 / 6.08** | 1,488 us | 0.9548 |
+
+**`top_k` 10 is 1.28 times v0.1.64's q/s (the bar was 1.2 times), with the results unchanged:** the rows of all 3,452 queries (IDs and distances) hash identically with the paths on, off, and on again,
+at both `top_k` 10 and 100. `top_k` 100 is 1.13 times. p99 is 30 and 24 percent lower. A separate v0.1.64 server (a different graph, settled at the same beam 80) measured 9,511, 9,601, and 9,511 q/s at
+`top_k` 10 and 4,686 at `top_k` 100, in line with the off arm. The effort controller moved the beam during the session (80 to 72), which is why recall differs from the profile server's 0.9554; both arms always
+shared it.
+
+The server's CPU per query fell 40 percent at `top_k` 10 but q/s rose 28 percent: the ten cores are shared with sixteen Python clients, so the clients' own CPU is now a larger part of the limit,
+and a faster client would show a larger gain.
+
+Where it came from, at `top_k` 10 on the candidate binary that also carried the two dropped changes below (the arms were measured one feature at a time, from 9,219 q/s with everything off):
+
+| Only this on | q/s | vs off |
+|---|---:|---:|
+| the shared `head` | 10,326 | +12.0% |
+| lineage placement and mask memo | 10,584 | +14.8% |
+| both (the shipped set, plus the dropped ones) | 12,087 | +31.1% |
+
+### Against Qdrant 1.20.0 (same client, matched recall by linear interpolation between `ef` points)
+
+| Engine, `top_k` 10 | recall@10 | q/s | p50 | p99 (ms) |
+|---|---:|---:|---:|---:|
+| **blowfish, this round (beam 72)** | **0.9507** | **12,090** | **1.29** | **2.66** |
+| blowfish, v0.1.64 paths (same server) | 0.9507 | 9,442 | 1.58 | 3.80 |
+| Qdrant ef 64 | 0.9471 | 9,150 | 1.48 | 5.53 |
+| Qdrant ef 80 | 0.9554 | 8,118 | 1.64 | 6.49 |
+| Qdrant ef 96 | 0.9602 | 7,272 | 1.79 | 7.60 |
+| Qdrant default (no `hnsw_ef`) | 0.9608 | 7,092 | 1.81 | 7.92 |
+| **Qdrant interpolated to 0.9507** | 0.9507 | **about 8,700** | 1.55 | 5.95 |
+
+| Engine, `top_k` 100 | recall@100 | q/s | p50 | p99 (ms) |
+|---|---:|---:|---:|---:|
+| **blowfish, this round (beam 256, shortlist 150)** | **0.9548** | **5,315** | **2.88** | **6.08** |
+| blowfish, v0.1.64 paths (same server) | 0.9548 | 4,692 | 3.11 | 8.02 |
+| Qdrant ef 192 | 0.9373 | 4,433 | 2.63 | 14.36 |
+| Qdrant ef 256 | 0.9517 | 3,667 | 3.19 | 16.46 |
+| Qdrant ef 320 | 0.9605 | 3,143 | 3.73 | 18.68 |
+| Qdrant default (ef 100) | 0.8827 | 6,823 | 1.88 | 8.44 |
+| **Qdrant interpolated to 0.9548** | 0.9548 | **about 3,480** | 3.38 | 17.3 |
+
+At matched recall blowfish serves **1.39 times** Qdrant's q/s at `top_k` 10 (round G16: 1.29 times) with p99 55 percent lower, and **1.53 times** at `top_k` 100 (G16: 1.36 times) with p99 65 percent lower.
+Qdrant's collection came up green with all 2,681,468 vectors indexed in two segments; its recall at a given `ef` reads 0.001 to 0.005 lower than G16's. Each point is one run of three
+20-second passes on a shared machine; Qdrant's three passes spread at most 1 percent.
+
+### Measured and not shipped
+
+- **A byte-level fast path for the query vector's numbers.** It read the 1,024 floats directly into `f32` with `serde_json`'s own algorithm (significand scaled by a power of ten, cast to `f32`) and was
+  tested against `serde_json` on two million random numbers, the limits of `f32`, and whole requests (identical requests, identical error text). In-process it took the parse of a 20 KB body from 22 us to 8 us on the M4,
+  yet the server did not get faster: with only that change on, q/s moved from 9,219 to 9,070 (-1.6%) and CPU per query from 909 to 920 us. Nothing measurable for about 400 lines, so it is not in the tree.
+- **Pruning the warm-graph heat map at most every 100 ms instead of on every query:** +0.1% (9,226 q/s). Not shipped.
+
+### Notes
+
+- **The "off" arm is v0.1.64's two paths in the candidate binary, not the v0.1.64 binary,** and the switch costs one relaxed load per use. The measured binary is the shipped code plus that switch.
+- **The profile above is taken under `sample`, which stalls the server and makes `head` slow,** so a profiled server turns the probe sharing off (the 2 ms rule) and still shows the old `head` cost. The clean
+  runs above are the evidence for the change; a profile taken without the sampler would need `perf`, which macOS lacks.
+- **Remaining server CPU** (from the clean arms): 537 us per query at `top_k` 10, of which the walk and rerank are about 350 us (G16's counters), leaving about 190 us for HTTP, parse, and response. Next in line by the profile: the
+  per-query global `Cache` lock taken by `serves` (twice), `available`, and `observe`, jemalloc, and the response `writev`.
+- **An unrelated server behavior seen along the way:** about 12 minutes after promotion, during heavy load, the effort controller widened the beam from 80 to 100 and the graph stopped being `usable` for the next 20 minutes (480 samples, the confidence interval still
+  straddling zero) while the server answered from IVF at about 2,900 q/s. All measurements above ran before that happened. It is a property of the controller, not of this round's changes.
+- **Not measured:** other hosts, remote object stores (the 2 ms rule is the only protection there; its test is a unit test), string-ID namespaces, filtered queries, and a mixed `top_k` load.
+
+Costs: no EC2 and no bucket writes. The 26.8 GB NQ fixture was copied to the M4 through presigned URLs (about $2.4 of S3 transfer) and deleted with the run directory, with the Qdrant store.
