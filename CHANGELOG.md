@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **Filtered vector queries up to 12.5 percent of the rows use the warm graph, and one client is up to 2.4 times faster than IVF there:** The scan of a filtered query's allowed rows now splits into chunks over the query worker pool while few queries are in flight (the same rule the IVF probes use), and runs on one core under load. The merged shortlist is identical to the single-core one. On an on-demand Graviton3 host with full BEIR NQ, one client at hash 10 percent went from 107 q/s (9.7 ms p50, IVF 145) to 291 (3.4 ms), and hash 5 percent from 158 to 339. At 16 clients throughput matches v0.1.62's scan at every filter, and is 3.4 times IVF at 10 percent. Recall@10 stays 1.000. The cutoff moves from 1 row in 16 to 1 in 8. See Round G15b in `docs/benchmarks.md`.
+
 ## [0.1.62] - 2026-11-27
 
 ### Changed

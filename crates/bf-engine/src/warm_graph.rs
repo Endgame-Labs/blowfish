@@ -1056,13 +1056,13 @@ fn scan_screen(k: usize) -> usize {
     5000 + 100 * k
 }
 /// The most allowed rows a filtered query scans, as a share of the graph's rows (1 in
-/// `SCAN_SHARE`, 6.25%). The scan screens each allowed row's 128-byte one-bit code, rescores the
-/// best few thousand with SQ8, and reranks the best few exactly. Round G15 measured it against the
-/// IVF tier on full NQ with hash and id filters: with 16 clients it is 7.6x to 8.0x faster from 0.5%
-/// to 5% and 3.5x at 10%, but with one client it matches IVF at about 7% and is 1.4x slower at 10%,
-/// because IVF spreads one query over every core while the scan runs on one. The share is set so
-/// that neither one client nor many is slower than IVF; above it the IVF tier answers.
-const SCAN_SHARE: usize = 16;
+/// `SCAN_SHARE`, 12.5%). The scan screens each allowed row's 128-byte one-bit code, rescores the
+/// best few thousand with SQ8, and reranks the best few exactly. While few queries are in flight
+/// (`fan_out`, the IVF probes' rule) it splits across the query pool, so one client is not held to
+/// one core. Round G15b measured it against the IVF tier on full NQ: one client is 1.9x to 2.4x
+/// faster at 10% and ties at 20%, and 16 clients match the serial scan at every filter (3.4x to
+/// 8x IVF up to 10%). Above the share the IVF tier answers.
+const SCAN_SHARE: usize = 8;
 /// Whether a ready graph answers a filtered query by scanning the codes of its `allowed` rows.
 pub(crate) fn scan_eligible(
     state: &NamespaceState,
