@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **Filtered vector queries up to 12.5 percent of the rows use the warm graph, 3.5 to 8 times faster than IVF at 16 clients, with the same recall:** The graph now keeps the one-bit codes it builds with (128 bytes per row, 10 percent more memory). A filtered query screens the allowed rows by Hamming distance to the query's signs, rescores the nearest `5,000 + 100k` with SQ8, and reranks exactly. That reads one eighth of the bytes per allowed row that v0.1.58's SQ8 scan did, so the cutoff moves from 1 row in 64 to 1 in 8. On an on-demand Graviton3 host with full BEIR NQ (2.68M x 1024-d), 16 clients, recall@10 1.000: hash 2 percent 323 to 2,577 q/s, hash 5 percent 244 to 1,872, and hash 10 percent 378 to 1,327 (p99 56 to 16 ms); below 2 percent 1.2 to 1.7 times faster than v0.1.58's scan. One client is faster below 7 percent and about 1.4 times slower at 10 percent, because IVF spreads one query over every core. See Round G15 in `docs/benchmarks.md`.
+
 ## [0.1.58] - 2026-11-26
 
 ### Changed

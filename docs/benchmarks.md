@@ -15810,3 +15810,62 @@ The comparison ran both arms inside one server process on the same graph and sna
 - **Not measured:** Qdrant on the M4 (left for a later round), filters on other columns than the ones above, string-ID namespaces (unchanged path), and hardware other than Graviton3. Each point is two runs on one host; paired runs agree within 3 percent.
 
 Costs: one on-demand c7g.4xlarge for 76 minutes, about $0.75 of compute plus a 250 GB gp3 root volume for the same time. The 5.5 GB NQ corpus was copied from the measurement bucket to the host (same region); no bucket writes. The instance, key pair, and security group are deleted, and `describe-instances` shows nothing of mine.
+
+## Round G15: filtered scans screen with one-bit codes, 3.5 to 8 times faster than IVF at 16 clients up to 10 percent
+
+Round G14's scan reads every allowed row's 1 KiB SQ8 code and is memory-bandwidth bound (about 155 ns per allowed row), so it lost to IVF above 1.56 percent. The graph's build already computes a one-bit code per row (the sign of each rotated, mean-centered coordinate, 128 bytes at 1,024-d) to steer construction, and then discards it. The graph now keeps those codes. A filtered scan screens the allowed rows by Hamming distance to the query's signs, keeps the nearest `5,000 + 100k` (a histogram cutoff, no sort), rescores them with SQ8, keeps `max(3k, 30)`, and reranks exactly as before. It reads one eighth of the bytes per allowed row.
+
+**What ships** (`bf-vector` `HotGraph::scan(query, count, keep, allowed)` and `Bits`, `bf-engine` `warm_graph::scan` and `scan_eligible`): the SQ8-only scan is gone, so there is one filtered-scan path. The rule is one number, `SCAN_SHARE = 8`: a ready graph answers a filtered query when the allowed rows are at most 1 in 8 of the graph's rows (12.5 percent); otherwise IVF answers (SPEC 25: no setting). The one-bit codes are 128 bytes per row (344 MB at 2.68M rows), added to the graph's `resident_bytes` and to the per-row retained bytes in `vamana::reservation`; I changed nothing else in the accounting, which GM1 is reworking. Construction output is identical: the same codes steer the build.
+
+### Method
+
+Same as Round G14: one on-demand c7g.4xlarge (16 Graviton3 vCPU, 32 GiB), Ubuntu 24.04, Rust 1.100.0, full BEIR NQ (2,681,468 x 1,024-d f16 cosine) loaded fresh through the write API with the `bucket` column, indexed, reclustered (32 cells, 250,000-row slabs), 64 probes, 4 GiB caches, a read-only local store, 12 Rayon and Tokio workers. The graph was promoted the ordinary way (`g15_promote.py`: 800 q/s of unfiltered heat, the dwell, a 275-second build, calibration; it stops the heat and holds the server). `g15_http.py` runs the G14 workloads (`filtered_nq.py`: 64 queries, `top_k` 10, `include_attributes: false`, hash `bucket < 50/100/200/500/1000/2000` and `id < 1/5/10 percent`) with recall@10 against exhaustive truth over the allowed rows. One client is one serial connection (600 or 200 requests); 16 clients are eight processes of two threads (4,000 or 800 requests).
+
+The arms ran in one server process on the same graph and snapshot, switched per run through a file the server read (a temporary switch, since deleted), in the order IVF, SQ8 scan, screen, screen, SQ8 scan, IVF (every filter could use either scan, to measure the crossover; the shipped rule of v0.1.58 is the SQ8 scan up to 1.56 percent and IVF above). Pairs are averaged. The IVF arm is v0.1.58's filtered path unchanged.
+
+### Standalone test (scan only, no HTTP)
+
+`bf-vector/examples/g15_screen.rs` on the same host, the graph built in-process from all 2,681,468 rows, hash masks, 64 NQ queries, recall@10 after the exact rerank of the 30-row SQ8 shortlist, 16 threads. Serial ns per allowed row, then q/s.
+
+| Filter | SQ8 scan | one-bit screen, keep 1,000 | keep 2,000 | keep 5,000 |
+|---|---|---|---|---|
+| hash 1% | 1.000, 177 ns, 2,138 | 1.000, 51 ns, 5,472 | 1.000, 57 ns, 4,970 | 1.000, 73 ns, 4,131 |
+| hash 5% | 1.000, 153 ns, 594 | 0.998, 31 ns, 2,790 | 1.000, 32 ns, 2,686 | 1.000, 36 ns, 2,515 |
+| hash 10% | 1.000, 142 ns, 346 | 0.998, 28 ns, 1,697 | 0.998, 29 ns, 1,768 | 1.000, 32 ns, 1,558 |
+| hash 20% | 1.000, 131 ns, 189 | 0.997, 32 ns, 913 | 0.997, 32 ns, 877 | 1.000, 33 ns, 883 |
+
+The screen is 4.5 to 5 times cheaper per allowed row than the SQ8 scan (28 to 36 ns against 130 to 177). A shortlist of 5,000 is the smallest tried that keeps recall@10 at 1.000 at every filter, and costs 6 to 8 percent of the screen's time at 10 percent, so I chose it (`5,000 + 100k` so a larger `k` keeps a proportional shortlist; only `k` 10 was measured). Two variants lost: a 4-bit query with 4 bit planes (the brief's example) costs 55 to 106 ns per row (popcount work grows with the planes) and gains no recall that a larger shortlist with the 1-bit query does not, and a first version that also stored a per-row magnitude and a 960-coordinate code (to make rows 128 bytes with metadata) ordered rows no better than pure Hamming distance on the 600,000-row subset and the full set, with the same speed or worse, so I dropped it for the graph's own codes.
+
+### Results through HTTP
+
+Recall@10, 1 client q/s, 16-client q/s, and 16-client p50 and p99 in ms, as IVF / SQ8 scan / screen. The last column is the screen against v0.1.58's own path for that filter (SQ8 scan to 1.56 percent, IVF above).
+
+| Filter | Allowed rows | Recall@10 | 1 client q/s | 16 clients q/s | 16-client p50 ms | 16-client p99 ms | Screen vs v0.1.58 |
+|---|---:|---|---|---|---|---|---|
+| hash 0.5% | 13,541 | 1.000 / 1.000 / 1.000 | 189 / 348 / 420 | 532 / 3,417 / 4,146 | 28.2 / 4.1 / 3.3 | 38.4 / 8.1 / 6.7 | 1.2x |
+| hash 1% | 26,702 | 1.000 / 1.000 / 1.000 | 155 / 164 / 308 | 413 / 1,986 / 3,196 | 36.6 / 7.3 / 4.4 | 52.6 / 12.9 / 8.8 | 1.6x |
+| id 1% | 26,800 | 1.000 / 1.000 / 1.000 | 233 / 311 / 504 | 761 / 3,222 / 5,331 | 19.3 / 4.4 / 2.6 | 29.4 / 8.2 / 5.2 | 1.7x |
+| hash 2% | 53,534 | 1.000 / 1.000 / 1.000 | 132 / 92 / 233 | 323 / 1,177 / 2,572 | 47.2 / 12.6 / 5.5 | 62.3 / 19.0 / 10.4 | 8.0x |
+| hash 5% | 134,001 | 1.000 / 1.000 / 1.000 | 111 / 44 / 150 | 244 / 544 / 1,866 | 62.0 / 27.9 / 7.9 | 95.7 / 37.5 / 12.9 | 7.7x |
+| id 5% | 134,074 | 1.000 / 1.000 / 1.000 | 143 / 65 / 202 | 346 / 804 / 2,494 | 43.3 / 18.8 / 5.8 | 70.4 / 27.2 / 9.9 | 7.2x |
+| id 10% | 268,147 | 1.000 / 1.000 / 1.000 | 158 / 33 / 120 | 381 / 410 / 1,587 | 40.0 / 37.4 / 9.5 | 55.1 / 49.3 / 14.1 | 4.2x |
+| hash 10% | 268,733 | 1.000 / 1.000 / 1.000 | 149 / 23 / 101 | 378 / 286 / 1,327 | 40.4 / 53.7 / 11.4 | 56.4 / 67.8 / 16.6 | 3.5x |
+| hash 20% | 536,500 | 0.998 / 1.000 / 1.000 | 216 / 12 / 58 | 677 / 150 / 773 | 22.1 / 102.1 / 19.8 | 30.7 / 129.7 / 26.6 | 1.1x |
+
+Recall is identical or better at every point. At 16 clients the screen beats IVF by 7.6 to 8.0 times from 0.5 to 5 percent, 3.5 to 4.2 times at 10 percent, and 1.14 times at 20 percent, where IVF's flat cost catches up; the screen's cost is proportional to the allowed rows. **The 16-client crossover is near 22 percent; the one-client crossover is near 7 percent**: one client waits on one core for the scan while IVF spreads a query over every core, so at 10 percent one client is 1.4 times slower (hash 10 percent: 101 against 149 q/s, p50 9.9 against 6.7 ms) and at 20 percent 3.7 times slower, while below 5 percent one client is faster too (1.6 to 2.2 times at 1 to 2 percent). I set the rule at 1 in 8: the 10 percent filters the brief names are served by the screen at 3.5 to 4.2 times the throughput, and above 12.5 percent the one-client regression (and the thin 16-client win) is not worth it. Filters between 7 and 12.5 percent trade 1.4 times slower serial latency for 3.5 times the throughput under load; scanning in parallel for large allowed sets would remove that, and I did not try it.
+
+**The final binary.** After removing the switch and fixing the rule, I rebuilt, promoted a new graph the same way, and re-ran, two runs each at 16 clients (recall@10 in every run 1.000, except hash 20 percent, where IVF answers: 0.998): hash 0.5 percent 4,109 and 4,154 q/s (p99 6.9 ms; 1 client 443), hash 1 percent 3,160 and 3,159 (8.7 ms; 312), id 1 percent 5,401 and 5,376 (5.1 ms; 514), hash 2 percent 2,577 and 2,631 (10.1 ms; 245), hash 5 percent 1,845 and 1,872 (12.7 ms; 152), id 5 percent 2,507 and 2,523 (10.0 ms; 204), id 10 percent 1,587 and 1,596 (14.0 ms; 123), hash 10 percent 1,328 and 1,327 (16.2 ms; 102), and hash 20 percent 705 and 705 (IVF; 28.9 ms; 224). Against v0.1.58's path on the same host: 1.2, 1.6, 1.7, 8.1, 7.6, 7.3, 4.2, 3.5, and 1.04 times. The brief's pass criteria hold: equal or better at every filter fraction (16 clients), recall within 0.005 of IVF's, and at least 1.5 times v0.1.58 at 5 and 10 percent (7.6 and 3.5 times).
+
+### Tests
+
+`bf-vector`: `scan_scores_only_allowed_rows_and_matches_a_brute_force_order` (the G14 test, now with the screen skipped) and `one_bit_screen_keeps_the_nearest_rows_and_the_exact_shortlist_size` (a 3,000-row, 256-d clustered tier: a 600-row shortlist of 1,500 allowed rows keeps at least 90 percent of the SQ8 top 10, every answer is an allowed row, and a shortlist the size of the request returns exactly that many distinct rows). The engine test `selective_filters_scan_the_graph_and_match_the_ivf_control` (G14) still compares the scan with the IVF control for 25-row, one-row, fewer-than-`k`, empty, and shadowed-row filters. Those tiers have fewer rows than the shortlist, so they exercise the rescore and the exact rerank but not the screen; the screen's selection is covered by the `bf-vector` test and by the HTTP recall above.
+
+### Notes
+
+- **Only `k` 10 was measured.** The shortlist grows as `5,000 + 100k`, which keeps 10 percent of 268,000 rows at `k` 100 about as generous, but recall at larger `k` is untested.
+- **A filtered-only namespace still never builds a graph** (heat comes from unfiltered queries), as in G14.
+- **Graviton3 only.** The screen is compute-bound (popcount over 128 bytes) rather than bandwidth-bound, so it should hold on other hosts better than the SQ8 scan, but I did not measure them. The crossover would move with the host's core count and IVF's per-query parallelism.
+- **Not measured:** 50 percent filters (IVF answers above 12.5 percent), string-ID namespaces, and the M4.
+- Memory: the codes add 344 MB to a 3.3 GB graph (10 percent).
+
+Costs: one on-demand c7g.4xlarge for 2.65 hours (about $1.55 of compute plus a 250 GB gp3 root volume for the same time). The 5.5 GB NQ corpus was copied from the measurement bucket to the host (same region); no bucket writes. The instance, key pair, and security group are deleted.
