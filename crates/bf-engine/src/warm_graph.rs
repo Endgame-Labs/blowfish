@@ -1591,7 +1591,8 @@ fn build_floor(limit: u64) -> u64 {
 /// Bytes the cgroup can still give without killing anything: its limit less its charge, where
 /// charged page cache (`inactive_file` and `active_file`, mapped file pages included) is
 /// reclaimable and so not counted. `memory.current` alone counts that cache, so on a warm host it
-/// sits near the limit and would refuse every build.
+/// sits near the limit and would refuse every build. Only Linux has cgroups.
+#[cfg(any(target_os = "linux", test))]
 fn cgroup_headroom(max: u64, current: u64, stat: &str) -> u64 {
     let reclaimable = stat
         .lines()
