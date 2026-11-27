@@ -57,10 +57,15 @@ impl Drop for Foreground {
     }
 }
 fn overcommitted() -> bool {
-    RESERVED
-        .load(Ordering::Acquire)
-        .saturating_add(FOREGROUND.load(Ordering::Acquire))
-        > bf_alloc::memory_limit_bytes().saturating_mul(4) / 5
+    overcommitted_at(
+        RESERVED.load(Ordering::Acquire),
+        FOREGROUND.load(Ordering::Acquire),
+        bf_alloc::memory_limit_bytes(),
+    )
+}
+/// Whether builds plus foreground caches claim more than four fifths of the memory limit.
+fn overcommitted_at(reserved: u64, foreground: u64, limit: u64) -> bool {
+    reserved.saturating_add(foreground) > limit.saturating_mul(4) / 5
 }
 
 /// Unit tests that need the process-global build slot, automatic-recluster flags, or the memory
@@ -813,7 +818,12 @@ impl Engine {
         let limit = bf_alloc::memory_limit_bytes();
         let foreground = FOREGROUND.load(Ordering::Acquire);
         let cap = limit.saturating_mul(4) / 5;
-        if !memory_available(estimate.saturating_add(limit / 5)) {
+        // The build's own reservation is counted once, against the process budget (`cap` less the
+        // caches' static `FOREGROUND` share), and once more against memory the cgroup can really
+        // give: that excludes reclaimable page cache, which the kernel evicts before it would
+        // kill anything. The only extra margin is `build_floor`, since the reservation already
+        // carries its own stated 1/16 margin.
+        if !memory_available(estimate.saturating_add(build_floor(limit))) {
             return Ok(None);
         }
         let mut reserved = Reservation::new(estimate, cap.saturating_sub(foreground));
@@ -863,7 +873,7 @@ impl Engine {
                 let before: f64 = pool().broadcast(|_| thread_cpu()).into_iter().sum();
                 let checks = AtomicU64::new(0);
                 let graph = builder.finish(&|| c.cancelled() || stop.stopping() || overcommitted()
-                    || (checks.fetch_add(1, Ordering::Relaxed).is_multiple_of(16384) && !memory_available(limit / 5))).map_err(segment::index_error)?;
+                    || (checks.fetch_add(1, Ordering::Relaxed).is_multiple_of(16384) && !memory_available(build_floor(limit) / 2))).map_err(segment::index_error)?;
                 let locations = Locations::new(locations);
                 let after: f64 = pool().broadcast(|_| thread_cpu()).into_iter().sum();
                 Ok::<_, ApiError>(Built { graph, sources, locations, source_cpu, build_cpu: (after-before).max(0.), reservation, _slot, _running: worker_running })
@@ -885,11 +895,14 @@ impl Engine {
         let resident = built.graph.resident_bytes()
             + built.sources.iter().map(Index::resident_bytes).sum::<u64>()
             + built.locations.resident_bytes();
-        let retained = (resident
-            + (count as u64).div_ceil(32) * 8 * workers as u64
-            + workers as u64 * (2 << 20))
-            .saturating_mul(5)
-            / 4;
+        // The resident row-to-ID table (8 bytes per row, built lazily by the first ID-only query)
+        // belongs to this graph's charge, so it is part of what the shrunken reservation keeps.
+        let retained = HotGraph::with_margin(
+            resident
+                + count as u64 * 8
+                + (count as u64).div_ceil(32) * 8 * workers as u64
+                + workers as u64 * (2 << 20),
+        );
         if retained > built.reservation.0 {
             return Ok(None);
         }
@@ -1571,6 +1584,27 @@ impl Engine {
     }
 }
 
+/// Memory a build must always leave unclaimed: a sixteenth of the limit.
+fn build_floor(limit: u64) -> u64 {
+    limit / 16
+}
+/// Bytes the cgroup can still give without killing anything: its limit less its charge, where
+/// charged page cache (`inactive_file` and `active_file`, mapped file pages included) is
+/// reclaimable and so not counted. `memory.current` alone counts that cache, so on a warm host it
+/// sits near the limit and would refuse every build.
+fn cgroup_headroom(max: u64, current: u64, stat: &str) -> u64 {
+    let reclaimable = stat
+        .lines()
+        .filter_map(|l| {
+            let (key, value) = l.split_once(' ')?;
+            matches!(key, "inactive_file" | "active_file")
+                .then(|| value.trim().parse::<u64>().ok())
+                .flatten()
+        })
+        .sum::<u64>();
+    max.saturating_sub(current.saturating_sub(reclaimable))
+}
+/// Whether `bytes` more can be allocated without exhausting memory the kernel cannot reclaim.
 fn memory_available(bytes: u64) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -1578,17 +1612,10 @@ fn memory_available(bytes: u64) -> bool {
             let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
             let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
             let base = format!("/sys/fs/cgroup{}", path.trim_end_matches('/'));
-            let max = std::fs::read_to_string(format!("{base}/memory.max"))
-                .ok()?
-                .trim()
-                .parse::<u64>()
-                .ok()?;
-            let current = std::fs::read_to_string(format!("{base}/memory.current"))
-                .ok()?
-                .trim()
-                .parse::<u64>()
-                .ok()?;
-            Some(max.saturating_sub(current))
+            let read = |name: &str| std::fs::read_to_string(format!("{base}/{name}")).ok();
+            let max = read("memory.max")?.trim().parse::<u64>().ok()?;
+            let current = read("memory.current")?.trim().parse::<u64>().ok()?;
+            Some(cgroup_headroom(max, current, &read("memory.stat")?))
         })();
         let available = charged.or_else(|| {
             let mem = std::fs::read_to_string("/proc/meminfo").ok()?;

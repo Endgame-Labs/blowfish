@@ -49,8 +49,10 @@ def request(connection, body):
 
 
 def worker(process, repeats, barrier):
-    if hasattr(os, "sched_setaffinity"):
-        os.sched_setaffinity(0, {24 + process})
+    # Round GM1: G3_CLIENT_CPU_BASE=-1 skips pinning (a 10-CPU guest has no CPUs 24 and up).
+    base = int(os.environ.get("G3_CLIENT_CPU_BASE", "24"))
+    if base >= 0 and hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, {base + process})
     count = len(BODIES) * repeats
 
     def thread(index):
@@ -140,6 +142,13 @@ if __name__ == '__main__':
             for key in ('instructions', 'cycles'):
                 measured[key] -= before[key]
                 measured[key + '_per_query'] = measured[key] / measured['queries']
+        measured.update(recall_at_k=quality, engine=engine, ef=ef, server_pid=pid)
+        Path(str(stem) + '.json').write_text(json.dumps(measured, indent=2) + '\n')
+        print(json.dumps(measured), flush=True)
+        raise SystemExit(0)
+    if os.environ.get('G11_NO_PERF'):
+        # Round GM1: no perf in the Lima guest; the same timed passes without instruction counters.
+        measured = run(repeats)
         measured.update(recall_at_k=quality, engine=engine, ef=ef, server_pid=pid)
         Path(str(stem) + '.json').write_text(json.dumps(measured, indent=2) + '\n')
         print(json.dumps(measured), flush=True)
