@@ -249,3 +249,127 @@ async fn sum_falls_back_to_full_scoring_when_no_list_proves_the_answer() {
     let after = bf_engine::sum_outcomes();
     assert!(after.fallback > before.fallback, "{before:?} {after:?}");
 }
+
+/// `Saturate` wrappers: a typical midpoint, a collapsing one (every score rounds to 1, so every
+/// row ties), a tiny exponent, and nested under and over a weight.
+fn sat(scheme: usize, s: &str) -> Value {
+    match scheme {
+        0 => json!(["Saturate", clause(s), {"midpoint": 3}]),
+        1 => json!(["Saturate", clause(s), {"midpoint": 1e-6, "exponent": 20}]),
+        2 => json!(["Saturate", clause(s), {"midpoint": 2.5, "exponent": 0.3}]),
+        3 => json!(["Product", 2.0, ["Saturate", ["Product", 0.5, clause(s)], {"midpoint": 1}]]),
+        // Outside the accepted parameter range: the old path, still exact.
+        _ => json!(["Saturate", clause(s), {"midpoint": 1e-12}]),
+    }
+}
+async fn compare_saturate(e: &Engine, tag: &str, sets: &[&[&str]]) {
+    for scheme in 0..5 {
+        for clauses in sets {
+            // One clause alone, inside `Sum`, and inside `Max`.
+            let alone = sat(scheme, clauses[0]);
+            let many: Vec<Value> = clauses.iter().map(|c| sat(scheme, c)).collect();
+            for rank in [alone, json!(["Sum", many]), json!(["Max", many])] {
+                for (k, offset) in [(1, 0), (10, 3), (100, 0), (10, 70)] {
+                    let mut q = json!({"rank_by": rank, "top_k": k, "offset": offset,
+                        "include_attributes": ["n"]});
+                    if k == 10 {
+                        q["filters"] = json!(["n", "NotEq", 0]);
+                    }
+                    identical(e, q, &format!("{tag} sat{scheme} {rank} k={k} off={offset}")).await;
+                }
+            }
+        }
+    }
+}
+/// A weighted predicate bonus beside text clauses, including rows that match no text at all.
+async fn compare_bonus(e: &Engine, tag: &str, sets: &[&[&str]]) {
+    let bonuses = [
+        json!(["Product", 2.0, ["n", "Eq", 2]]),
+        json!(["Product", ["n", "In", [1, 3]], 0.37]),
+        json!(["n", "Gte", 3]),
+        json!(["Product", 1e6, ["n", "Eq", 4]]),
+        json!(["Product", 5.0, ["n", "Eq", 99]]),
+    ];
+    for bonus in &bonuses {
+        for clauses in sets {
+            let texts: Vec<Value> = clauses.iter().map(|c| clause(c)).collect();
+            let mut front = texts.clone();
+            front.push(bonus.clone());
+            let mut middle = texts.clone();
+            middle.insert(1.min(middle.len()), bonus.clone());
+            let two = [bonus.clone(), json!(["Product", 3.0, ["n", "Eq", 1]])];
+            let mut both = texts.clone();
+            both.extend(two);
+            for terms in [front, middle, both] {
+                for (k, offset) in [(1, 0), (10, 3), (100, 0), (10, 70)] {
+                    let mut q = json!({"rank_by": ["Sum", terms], "top_k": k, "offset": offset,
+                        "include_attributes": ["n"]});
+                    if k == 10 {
+                        q["filters"] = json!(["n", "NotEq", 0]);
+                    }
+                    identical(e, q, &format!("{tag} bonus {terms:?} k={k} off={offset}")).await;
+                }
+            }
+        }
+    }
+}
+async fn shapes(e: &Engine, sets: &[&[&str]], f: fn(u64) -> String) {
+    compare_saturate(e, "segments", sets).await;
+    compare_bonus(e, "segments", sets).await;
+    write(
+        e,
+        json!({
+            "patch_rows": [{"id": 0, "text": "plain"}, {"id": 5, "text": "red fox red fox wolf w3 w3 w3"},
+                {"id": 77, "text": "blue bird w9 w9"}, {"id": 100, "text": "nothing"}],
+            "deletes": [1, 2, 9, 13, 64, 501, 600],
+            "upsert_rows": batch_with(900..960, f),
+        }),
+    )
+    .await;
+    compare_saturate(e, "tail", sets).await;
+    compare_bonus(e, "tail", sets).await;
+    e.index_namespace("t", true).await.unwrap();
+    compare_saturate(e, "reindexed", sets).await;
+    compare_bonus(e, "reindexed", sets).await;
+}
+#[tokio::test]
+async fn saturate_and_predicate_bonus_match_full_scoring_with_ties() {
+    let e = node().await;
+    corpus(&e, text).await;
+    shapes(&e, TIES, text).await;
+}
+#[tokio::test]
+async fn saturate_and_predicate_bonus_match_full_scoring_with_varied_scores() {
+    let e = node().await;
+    corpus(&e, varied).await;
+    shapes(&e, VARIED, varied).await;
+}
+
+/// The new shapes are answered from lists (accepted at some length), not by the full scorer.
+#[tokio::test]
+async fn saturate_and_bonus_queries_are_accepted_from_lists() {
+    let e = node().await;
+    corpus(&e, varied).await;
+    let run = |rank: Value| {
+        let e = &e;
+        async move {
+            let before = bf_engine::sum_outcomes();
+            let q = json!({"rank_by": rank, "top_k": 10});
+            identical(e, q, "accepted").await;
+            let after = bf_engine::sum_outcomes();
+            (
+                after.first + after.grown - before.first - before.grown,
+                after.fallback - before.fallback,
+            )
+        }
+    };
+    let (ok, fb) = run(sat(0, "w3 w9")).await;
+    assert!(ok > 0 && fb == 0, "saturate alone {ok} {fb}");
+    let (ok, fb) = run(json!(["Sum", [sat(0, "w3 w9"), sat(2, "w1 w40")]])).await;
+    assert!(ok > 0 && fb == 0, "saturate sum {ok} {fb}");
+    let (ok, fb) = run(json!(["Sum", [clause("w3 w9"), ["Product", 2.0, ["n", "Eq", 2]]]])).await;
+    assert!(ok > 0 && fb == 0, "bonus {ok} {fb}");
+    // A rare term: most boosted rows match no text, and still answer from fill rows.
+    let (ok, fb) = run(json!(["Sum", [clause("w600"), ["Product", 2.0, ["n", "Eq", 2]]]])).await;
+    assert!(ok > 0 && fb == 0, "rare bonus {ok} {fb}");
+}

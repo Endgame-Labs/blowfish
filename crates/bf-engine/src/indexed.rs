@@ -846,14 +846,14 @@ pub(crate) fn union_truth(answers: &[&QueryResponse]) -> Option<QueryResponse> {
 /// ahead of it, so each clause may skip rows below that score divided by its weight.
 pub(crate) struct Floors {
     clauses: Vec<bf_text::SearchThreshold>,
-    weights: Vec<Vec<f64>>,
+    weights: Vec<sum_text::Chain>,
     best: std::sync::Mutex<BinaryHeap<std::cmp::Reverse<ScoreBits>>>,
 }
 /// A nonnegative finite `f64` ordered by its bits.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct ScoreBits(u64);
 impl Floors {
-    fn new(k: usize, weights: Vec<Vec<f64>>) -> Self {
+    fn new(k: usize, weights: Vec<sum_text::Chain>) -> Self {
         Self {
             clauses: weights
                 .iter()
@@ -886,9 +886,17 @@ impl Floors {
         };
         let Some(kth) = kth else { return };
         for (clause, weights) in self.clauses.iter().zip(&self.weights) {
+            // A transform that rounds unequal scores together (`Saturate`) cannot be undone
+            // safely, so its clause keeps its own floor.
+            if sum_text::lossy(weights) {
+                continue;
+            }
             // Undo the weights outermost first, then back off two f32 steps so rounding can
             // never skip a row whose scaled score reaches the `k`th.
-            let raw = weights.iter().rev().fold(kth, |s, w| s / w) as f32;
+            let raw = weights.iter().rev().fold(kth, |s, step| match step {
+                sum_text::Step::Mul(w) => s / w,
+                sum_text::Step::Saturate { .. } => unreachable!("lossy chains are skipped"),
+            }) as f32;
             clause.raise(f32::from_bits(raw.to_bits().saturating_sub(2)));
         }
     }
@@ -918,12 +926,18 @@ pub(crate) fn max_of_text(rank: Option<&RankBy>) -> bool {
 }
 /// True when `hits` (best first, from a search for `top > k` rows) hold every row scoring at
 /// least the `k`th hit's score: the list is the whole result, or ends strictly below that score.
-fn ties_complete(hits: &[bf_text::SearchHit], k: usize, top: usize) -> bool {
+/// Scores are compared after the clause's transforms, which may round unequal scores together.
+fn ties_complete(
+    hits: &[bf_text::SearchHit],
+    k: usize,
+    top: usize,
+    chain: &[sum_text::Step],
+) -> bool {
     k == 0
         || hits.len() < top
-        || hits
-            .last()
-            .is_some_and(|last| last.score < hits[k - 1].score)
+        || hits.last().is_some_and(|last| {
+            sum_text::scaled(chain, last.score) < sum_text::scaled(chain, hits[k - 1].score)
+        })
 }
 pub(crate) fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) {
     match rank {
@@ -1018,6 +1032,11 @@ async fn prepare_segment(
     } else {
         whole_ids
     };
+    let chains = if clause_top {
+        sum_text::clause_weights(q.rank_by.as_ref()).unwrap_or_default()
+    } else {
+        vec![]
+    };
     let mut bm25_hits = Vec::new();
     let mut selected = if all {
         allowed.clone()
@@ -1026,13 +1045,11 @@ async fn prepare_segment(
     };
     // A `Sum` that already chose its winners hydrates just those rows.
     let searched: &[&RankBy] = if preset.is_some() { &[] } else { clauses };
-    if let Some(preset) = preset {
-        for (_, hits) in &preset {
-            for hit in hits {
-                selected.insert(hit.row);
-            }
-        }
-        bm25_hits = preset;
+    let chosen = preset.is_some();
+    if let Some((hits, rows)) = preset {
+        // The winners include rows that match no text (a bonus alone puts them in).
+        selected = rows;
+        bm25_hits = hits;
     }
     for (clause_index, &clause) in searched.iter().enumerate() {
         let RankBy::Bm25 {
@@ -1053,8 +1070,9 @@ async fn prepare_segment(
         let fallback = bf_text::CorpusStats::default();
         let stats = state.corpus.get(attribute).unwrap_or(&fallback);
         let top = if all { allowed.len() as usize } else { k };
+        let chain: &[sum_text::Step] = chains.get(clause_index).map_or(&[], Vec::as_slice);
         let hits = if let Some(reader) = indexes.get(attribute) {
-            if clause_top && id_ordered && k > 0 {
+            if clause_top && id_ordered && k > 0 && !sum_text::lossy(chain) {
                 // Rows are in ID order here, and a list keeps the lower row among equal scores:
                 // every row it drops loses the final ID tie-break to `k` rows in the list.
                 match threshold {
@@ -1085,7 +1103,7 @@ async fn prepare_segment(
                         .await;
                     if hits
                         .as_ref()
-                        .map_or(true, |hits| ties_complete(hits, k, top))
+                        .map_or(true, |hits| ties_complete(hits, k, top, chain))
                     {
                         break hits;
                     }
@@ -1145,8 +1163,11 @@ async fn prepare_segment(
         }
         floors.offer(best.into_values());
     }
+    // A `Sum` that chose its winners needs predicate scores for just those rows.
+    let predicate_rows = if chosen { &selected } else { &allowed };
     if let Some(rows) =
-        crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?
+        crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), predicate_rows, &mut out)
+            .await?
     {
         selected &= rows;
     }
@@ -1157,6 +1178,14 @@ async fn prepare_segment(
             for hit in hits {
                 let id = keys.id(hit.row)?;
                 scores.insert(id.clone(), hit.score as f64);
+                out.docs.entry(id.clone()).or_insert_with(|| {
+                    std::sync::Arc::new(Document::from_iter([("id".into(), id.value())]))
+                });
+            }
+        }
+        if chosen {
+            for row in &selected {
+                let id = keys.id(row)?;
                 out.docs.entry(id.clone()).or_insert_with(|| {
                     std::sync::Arc::new(Document::from_iter([("id".into(), id.value())]))
                 });
@@ -1203,55 +1232,68 @@ async fn sum_prepare(
     q: &QueryRequest,
     clauses: &[&RankBy],
 ) -> Result<Option<Vec<sum_text::SegmentSum>>, ApiError> {
-    let prepared = sum_clauses(state, q, clauses);
+    let plan = sum_clauses(state, q, clauses);
     let opened = futures::future::try_join_all(
         state
             .segments
             .iter()
-            .map(|seg| sum_text::open(store, state, q, seg, &prepared)),
+            .map(|seg| sum_text::open(store, state, q, seg, &plan)),
     )
     .await?;
     Ok(opened.into_iter().collect())
 }
 fn sum_clauses<'a>(
     state: &'a NamespaceState,
-    q: &QueryRequest,
+    q: &'a QueryRequest,
     clauses: &[&'a RankBy],
-) -> Vec<sum_text::Clause<'a>> {
+) -> sum_text::SumPlan<'a> {
     static FALLBACK: std::sync::LazyLock<bf_text::CorpusStats> =
         std::sync::LazyLock::new(Default::default);
-    let weights = sum_text::clause_weights(q.rank_by.as_ref()).expect("weighted BM25 clauses");
-    clauses
-        .iter()
-        .zip(weights)
-        .map(|(clause, weights)| {
-            let RankBy::Bm25 {
-                attribute,
-                query,
-                params,
-            } = clause
-            else {
-                unreachable!()
-            };
-            let cfg = state.schema[attribute]
-                .text_config()
-                .expect("validated FTS");
-            sum_text::Clause {
-                attribute,
-                key: rank_key(clause),
-                query: bf_text::Query::new(
-                    crate::text::tokens(query, &cfg),
-                    crate::text::prefix(params.as_ref()),
-                ),
-                cfg,
-                weights,
-                stats: state.corpus.get(attribute).unwrap_or(&FALLBACK),
+    let terms = sum_text::terms_of(q.rank_by.as_ref()).expect("list-path terms");
+    let mut text = clauses.iter();
+    let mut plan = sum_text::SumPlan {
+        clauses: vec![],
+        bonuses: vec![],
+        slots: vec![],
+    };
+    for term in terms {
+        match term {
+            sum_text::Term::Text(weights) => {
+                let clause = text.next().expect("one clause per text term");
+                let RankBy::Bm25 {
+                    attribute,
+                    query,
+                    params,
+                } = clause
+                else {
+                    unreachable!()
+                };
+                let cfg = state.schema[attribute]
+                    .text_config()
+                    .expect("validated FTS");
+                plan.slots.push(sum_text::Slot::Text(plan.clauses.len()));
+                plan.clauses.push(sum_text::Clause {
+                    attribute,
+                    key: rank_key(clause),
+                    query: bf_text::Query::new(
+                        crate::text::tokens(query, &cfg),
+                        crate::text::prefix(params.as_ref()),
+                    ),
+                    cfg,
+                    weights,
+                    stats: state.corpus.get(attribute).unwrap_or(&FALLBACK),
+                });
             }
-        })
-        .collect()
+            sum_text::Term::Bonus(filter, weights) => {
+                plan.slots.push(sum_text::Slot::Bonus(plan.bonuses.len()));
+                plan.bonuses.push(sum_text::Bonus { filter, weights });
+            }
+        }
+    }
+    plan
 }
 /// A segment's chosen winners: per clause, its rank key and the winning rows' hits.
-type Preset = Vec<(Vec<u8>, Vec<bf_text::SearchHit>)>;
+type Preset = (Vec<(Vec<u8>, Vec<bf_text::SearchHit>)>, RoaringBitmap);
 /// Score and hydrate every segment (`preset` carries a `Sum`'s chosen winners per segment).
 #[allow(clippy::too_many_arguments)]
 async fn hydrate_segments(
@@ -1311,35 +1353,47 @@ async fn sum_finish(
     threshold: Option<&Floors>,
     out: NamespaceState,
 ) -> Result<NamespaceState, ApiError> {
-    let prepared = sum_clauses(state, q, clauses);
+    let plan = sum_clauses(state, q, clauses);
     // Tail documents are already scored (every clause, in `out`); their totals take part too.
-    let tail: Vec<(Id, f64)> = clauses
-        .first()
-        .and_then(|c| out.scores.get(&rank_key(c)))
-        .map(|first| {
-            first
-                .keys()
-                .map(|id| {
-                    let t = sum_text::total(clauses.iter().zip(&prepared).map(|(c, p)| {
-                        let raw = out
-                            .scores
-                            .get(&rank_key(c))
-                            .and_then(|m| m.get(id))
-                            .copied()
-                            .unwrap_or(0.0);
-                        sum_text::scaled(&p.weights, raw as f32)
-                    }));
-                    (id.clone(), t)
+    let mut tail: Vec<(Id, f64)> = vec![];
+    if let Some(first) = clauses.first().and_then(|c| out.scores.get(&rank_key(c))) {
+        for id in first.keys() {
+            let bonus = plan
+                .bonuses
+                .iter()
+                .map(|b| {
+                    let hit = state.docs.get(id).map_or(Ok(false), |doc| {
+                        filter::matches(b.filter, Some(doc), None, &state.schema)
+                    })?;
+                    Ok::<_, ApiError>(sum_text::scaled(&b.weights, f32::from(u8::from(hit))))
                 })
-                .collect()
-        })
-        .unwrap_or_default();
+                .collect::<Result<Vec<_>, _>>()?;
+            let t = plan.total(
+                |i| {
+                    let raw = out
+                        .scores
+                        .get(&rank_key(clauses[i]))
+                        .and_then(|m| m.get(id))
+                        .copied()
+                        .unwrap_or(0.0);
+                    sum_text::scaled(&plan.clauses[i].weights, raw as f32)
+                },
+                &bonus,
+            );
+            tail.push((id.clone(), t));
+        }
+    }
     let mut n = sum_text::first_list(k);
     let mut round = 0;
     while let Some(list) = n {
-        let rounds =
-            futures::future::try_join_all(segments.iter().map(|s| s.candidates(&prepared, list)))
-                .await?;
+        let rounds = futures::future::try_join_all(
+            segments.iter().map(|s| s.candidates(&plan, list, k)),
+        )
+        .await?;
+        // A segment that cannot prove its boosted rows needs the full scorer.
+        let Some(rounds) = rounds.into_iter().collect::<Option<Vec<_>>>() else {
+            break;
+        };
         let mut totals: Vec<f64> = tail.iter().map(|(_, t)| *t).collect();
         let mut bound = 0f64;
         let mut exhaustive = true;
@@ -1358,8 +1412,8 @@ async fn sum_finish(
                         .filter(|(_, t)| *t > 0.0 && *t >= floor)
                         .map(|(row, _)| *row)
                         .collect();
-                    let prepared = &prepared;
-                    async move { s.winners(prepared, &rows).await }
+                    let plan = &plan;
+                    async move { Ok::<_, ApiError>((s.winners(plan, &rows).await?, rows)) }
                 }))
                 .await?;
             return hydrate_segments(
@@ -1568,12 +1622,13 @@ async fn prepare_scalar(
 
 #[cfg(test)]
 mod floors_tests {
+    use super::sum_text::Step::Mul;
     use super::*;
 
     #[test]
     fn combined_kth_raises_every_clause_floor_divided_by_its_weights_and_never_overshoots() {
         // Clause 0 is weighted 2 then 3 (scaled = 3 * (2 * s)), clause 1 is plain.
-        let floors = Floors::new(2, vec![vec![2.0, 3.0], vec![]]);
+        let floors = Floors::new(2, vec![vec![Mul(2.0), Mul(3.0)], vec![]]);
         floors.offer([9.0, 7.0].into_iter());
         assert!(floors.clause(1).floor() <= 7.0 && floors.clause(1).floor() > 6.99);
         assert!(floors.clause(0).floor() <= 7.0 / 6.0 && floors.clause(0).floor() > 1.16);
@@ -1588,7 +1643,7 @@ mod floors_tests {
         assert!(floors.clause(1).floor() > 19.9);
         // Every score that reaches the kth survives the floor (ties included).
         let f = floors.clause(0).floor();
-        assert!(sum_text::scaled(&[2.0, 3.0], f) <= 20.0);
+        assert!(sum_text::scaled(&[Mul(2.0), Mul(3.0)], f) <= 20.0);
     }
 }
 
@@ -1608,16 +1663,16 @@ mod ties_tests {
     #[test]
     fn cutoff_ties_are_complete_only_when_the_list_ends_below_the_kth_score() {
         // k = 2, asked for 3: the third hit ties the second, so more rows may tie too.
-        assert!(!ties_complete(&hits(&[5.0, 4.0, 4.0]), 2, 3));
+        assert!(!ties_complete(&hits(&[5.0, 4.0, 4.0]), 2, 3, &[]));
         // The third hit is strictly lower: every row tied with the second is already present.
-        assert!(ties_complete(&hits(&[5.0, 4.0, 3.0]), 2, 3));
+        assert!(ties_complete(&hits(&[5.0, 4.0, 3.0]), 2, 3, &[]));
         // Fewer hits than asked for: the clause is exhausted.
-        assert!(ties_complete(&hits(&[5.0, 4.0, 4.0]), 2, 4));
-        assert!(ties_complete(&hits(&[]), 2, 3));
+        assert!(ties_complete(&hits(&[5.0, 4.0, 4.0]), 2, 4, &[]));
+        assert!(ties_complete(&hits(&[]), 2, 3, &[]));
         // A widened list that ends below the tie is complete, and one that ends on it is not.
-        assert!(ties_complete(&hits(&[5.0, 4.0, 4.0, 4.0, 1.0, 1.0]), 2, 6));
-        assert!(!ties_complete(&hits(&[4.0; 6]), 2, 6));
-        assert!(ties_complete(&hits(&[4.0]), 0, 1));
+        assert!(ties_complete(&hits(&[5.0, 4.0, 4.0, 4.0, 1.0, 1.0]), 2, 6, &[]));
+        assert!(!ties_complete(&hits(&[4.0; 6]), 2, 6, &[]));
+        assert!(ties_complete(&hits(&[4.0]), 0, 1, &[]));
     }
 }
 
