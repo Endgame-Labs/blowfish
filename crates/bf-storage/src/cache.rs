@@ -190,7 +190,7 @@ pub(crate) struct RangeCache {
     planning: AsyncMutex<Planning>,
     fetches: Semaphore,
     prefetches: Arc<Semaphore>,
-    pub(crate) hedge: crate::hedge::Hedges,
+    pub(crate) hedge: crate::hedge::Hedger,
     /// Disk writes started behind reads and not yet finished.
     spills: Arc<Spills>,
 }
@@ -255,7 +255,7 @@ impl RangeCache {
         Ok(Self {
             fetches: Semaphore::new(config.fetch_concurrency),
             prefetches: Arc::new(Semaphore::new(config.prefetch_concurrency)),
-            hedge: crate::hedge::Hedges::new(
+            hedge: crate::hedge::Hedger::new(
                 std::env::var("BF_HEDGE_BUDGET")
                     .ok()
                     .and_then(|v| v.parse().ok())
