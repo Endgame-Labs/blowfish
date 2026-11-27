@@ -634,9 +634,26 @@ fn merge_tail(
         }
     }
     let scorer = crate::tail::Scorer::new(state.metric, vector);
-    let score = |doc: &std::sync::Arc<Document>,
+    // One prepared block per snapshot (built by the first query that needs it), so each row
+    // below costs a pointer comparison and a dot product instead of a cache lookup.
+    let block = context
+        .as_ref()
+        .filter(|_| admit && !state.docs.is_empty())
+        .and_then(|context| {
+            context.cache.tail_vectors.block(
+                std::sync::Arc::as_ptr(&state.stats) as usize,
+                state.seq,
+                &attribute_key,
+                state.docs.values(),
+            )
+        });
+    let score = |index: usize,
+                 doc: &std::sync::Arc<Document>,
                  key: &std::sync::Arc<str>|
      -> Result<Option<f64>, ApiError> {
+        if let Some(row) = block.as_ref().and_then(|block| block.row(index, doc)) {
+            return Ok(row.map(|vector| scorer.resident(vector)));
+        }
         doc.get(attribute)
             .map(|v| {
                 let values = match &context {
@@ -661,12 +678,13 @@ fn merge_tail(
         // The initial indexed bound can only improve as tail candidates are merged.
         let chunks: Result<Vec<_>, ApiError> = rows
             .par_chunks(512)
-            .map(|rows| {
+            .enumerate()
+            .map(|(chunk, rows)| {
                 // Separate key allocations avoid a contended Arc counter on cache lookups.
                 let key = std::sync::Arc::<str>::from(attribute);
                 let mut local = BinaryHeap::new();
-                for (id, doc) in rows {
-                    if let Some(distance) = score(doc, &key)?
+                for (offset, (id, doc)) in rows.iter().enumerate() {
+                    if let Some(distance) = score(chunk * 512 + offset, doc, &key)?
                         && bound.is_none_or(|worst| improves(id, distance, false, worst))
                     {
                         offer(&mut local, id, distance, false, k);
@@ -681,13 +699,13 @@ fn merge_tail(
             }
         }
     } else {
-        for (id, doc) in &state.docs {
+        for (index, (id, doc)) in state.docs.iter().enumerate() {
             if q.filters
                 .as_ref()
                 .map(|f| filter::matches(f, Some(doc), None, &state.schema))
                 .transpose()?
                 .unwrap_or(true)
-                && let Some(distance) = score(doc, &attribute_key)?
+                && let Some(distance) = score(index, doc, &attribute_key)?
             {
                 if all {
                     scores.insert(id.clone(), distance);
