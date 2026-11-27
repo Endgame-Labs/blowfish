@@ -15449,3 +15449,517 @@ path and still agrees.
 Resources: one on-demand c7g.4xlarge, 18:58 to 23:35 UTC (4.6 hours, about $2.7 compute plus a 150 GB gp3 volume).
 Instance, volume, key pair, and security group deleted and verified. The fixture was read-only and copied to the
 instance's disk; no bucket prefix was created.
+
+**Merged after G14.** This round was built on v0.1.55 and merged onto v0.1.59 (Round M13). The G14 filtered scan now takes
+the same shadow handling as the unfiltered graph path: its allowed rows come from `graph_mask` (the filter's allowed mask
+minus the rows the unindexed tail shadows), so it asks for `k` rows rather than `k + max(2k, 20)` and keeps the
+SQ8 shortlist at its usual size. The scan's work per query is unchanged (it still scores only the allowed rows' codes, and
+the mask is resolved once per snapshot and cached); only the over-fetch of survivors, and the exact reranks behind it,
+are gone when writes are pending. `filtered_scan_hides_shadowed_rows_inside_the_allowed_set` checks overwrites, deletes,
+and rows moving into and out of the filter against the IVF control.
+
+## Round G12: top_k 100 on the warm graph, 1.7 times faster at identical results
+
+**Setup:** Apple M4 (10 cores, 16 GB, shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries, exact top-100 truth),
+the frozen v0.1.19 fixture, 16 client processes, one keep-alive connection each, IDs only (`include_attributes: false`), blowfish release
+binaries with production defaults (64 probes, the production sampler), the graph promoted the ordinary way (`g11_promote.py`). Qdrant is the official
+1.20.0 macOS arm64 binary (f16 vectors in RAM, M=16, ef_construct=100, one indexed segment). Latency is client-side; recall is against the exact top k.
+Every comparison inside this round is on one promoted server, so the graph, the beam, and the data are the same for both sides.
+
+### Step 0: GB1's build against main's
+
+| | main (a6f257f) | GB1 (e07931b, merged with main) |
+|---|---:|---:|
+| Graph build, wall | 1,034 s (17.2 min) | 285 s (4.8 min) |
+| Build CPU | 1,879 s | 673 s |
+| Graph first visible | 27.5 min | 15.0 min |
+| Promoted | 46.5 min | 25.0 min |
+| Samples to promote | 1,249 | 746 |
+| Serving beam after settling | 125 | 100 |
+| top_k 10: q/s, recall@10, p99 | 8,104, 0.9647, 4.50 ms | 8,439, 0.9621, 4.34 ms |
+| top_k 100: q/s, recall@100, p99 | 2,685, 0.9537, 12.4 ms | 2,765, 0.9556, 12.2 ms |
+
+Each point is one run. The GB1 run used the candidate binary of this round with every switch off, which reads one atomic and is otherwise
+main plus GB1. GB1 serves equally fast or slightly faster, builds 3.6 times faster, and was merged (v0.1.55).
+
+### Where the CPU goes (main, profile at 16 clients)
+
+Graph phase CPU per search (thread CPU counters over a 60 s pass, microseconds):
+
+| | navigation | rerank | projection (ID hydration) |
+|---|---:|---:|---:|
+| top_k 10 | 367 | 104 | 63 |
+| top_k 100 | 637 | 435 | 740 |
+
+At top_k 100 the projection and the rerank cost 1.8 times the walk. G11 had read the navigation as the biggest gap; the thread CPU counters
+say the work around it is. `sample` call graphs agree: under a top_k 100 graph query, projection is 2.2K samples (1.5K of them the decoded-column
+cache lookups for the `id` column, 32 segments per query), rerank 2.1K, navigation 5.8K. The sampler's own exact searches (checksums over every
+vector) share that profile and are not part of these counts. At top_k 10 the walk is 76% of the graph path; `clock_gettime` is about 2% and
+`RaBitQ::rotate` about 1%.
+
+### The five hypotheses, each measured alone
+
+One promoted server (GB1 graph), a switch file the server re-read every half second, variants alternated A B, B A across rounds so drift on the
+shared machine hits all alike. Medians of 2 to 7 passes of 20 (top_k 10) or 10 (top_k 100); recall is identical to seven digits in every row.
+
+| Switch | top_k 10 q/s | top_k 100 q/s | top_k 100 p99 | Verdict |
+|---|---:|---:|---:|---|
+| none (baseline) | 8,512 | 2,733 | 11.6 ms | |
+| 1. graph queries up to 100 rows stay on the HTTP reactor | 8,470 | 3,039 (+11%) | 11.1 ms | ships |
+| 2. sample the per-query thread CPU clock | 8,575 (+0.7%) | 2,791 (+2%) | 11.2 ms | no gain with 1 and 5 on; dropped |
+| 3. one RaBitQ transform per thread, no allocation | 8,550 (+0.4%) | 2,758 (+0.9%) | 11.8 ms | no gain; dropped |
+| 4. fused f16 rerank (bit-identical NEON kernel) | 8,477 (-0.4%) | 2,615 (-4.3%) | 11.9 ms | slower in time with fewer instructions; dropped |
+| 5. resident row-to-ID table (IDs resolved once, for the final rows) | **9,839 (+16%)** | **4,366 (+60%)** | 9.6 ms | **ships** |
+| 1 + 5 | 9,796 (+15%) | 4,627 (+69%) | 8.3 ms | **the shipped change** |
+| 1 + 2 + 3 + 5 | 9,748 | 4,623 | 8.5 ms | same as 1 + 5 |
+| all five | 9,815 | 4,585 | 7.9 ms | same as 1 + 5 |
+
+The ID resolution (hypothesis 5) was the whole story: at top_k 100 the projection was 740 us of a 3.4 ms query, because each query looked up the
+decoded `id` column blocks of up to 32 segments through the decoded cache and built a document map per segment. The switch also cut 1M
+instructions per query (8.04M to 7.04M) but the time fell by far more, because the lookups were stalls, not instructions. Hypotheses 2 and 3 are
+real costs (2% and 1% of top_k 10 CPU in the profile) that the paired runs cannot resolve from run-to-run noise once the larger change is in; they
+are not shipped, so there is one way to do each thing. Hypothesis 4's fused kernel agrees with the decode-then-dot path to the bit (tested on
+aarch64 for every dimension from 1 to 1,099) and saves 1.1M instructions at top_k 100, yet ran 4% slower. I did not find out why (a guess: the row
+checksum is the first touch of each row, so the widening is not what the rerank waits for). The per-row CRC check stays on every read, and its measured
+cost on the serving path is 2.4% of top_k 100 CPU.
+
+Dispatch, from the server's `blowfish_query_cpu_dispatch_total`: before, top_k 10 ran 99.9% inline on the reactor and top_k 100 100% on the
+worker pool; with switch 1, both run inline (99.9%).
+
+Mixed load (one query in ten asks for 100 rows, the rest 10), same server: baseline 7,326 q/s, p50/p90/p99 1.62/3.40/7.82 ms; all five 8,686 q/s,
+1.41/2.74/4.59 ms; 1 + 2 + 3 + 5 8,686 q/s, 1.39/2.70/4.50 ms. Keeping top_k 100 on the reactors did not hurt p99 under mixed load: it fell by 41%.
+
+### The shipped change against Qdrant 1.20 (final binary, promoted the ordinary way)
+
+The final binary (main v0.1.55 plus switches 1 and 5, the others removed) was promoted from cold on the M4: graph visible after 15.5 minutes, promoted after
+21.0 minutes (370 samples, build 327 s wall), serving beam 80. Qdrant was loaded once and queried without a restart; its ef sweep brackets blowfish's recall
+and "matched" rows interpolate linearly between the two bracketing points.
+
+| Engine, top_k 10 | recall@10 | q/s | p50 | p90 | p99 (ms) |
+|---|---:|---:|---:|---:|---:|
+| **blowfish, graph (beam 80)** | **0.9530** | **9,776** | **1.28** | **2.53** | **3.80** |
+| Qdrant ef 64 | 0.9496 | 8,895 | 1.46 | 2.84 | 5.50 |
+| Qdrant ef 80 | 0.9582 | 8,065 | 1.57 | 3.18 | 6.20 |
+| Qdrant ef 96 | 0.9637 | 7,281 | 1.71 | 3.52 | 7.34 |
+| Qdrant ef 112 | 0.9685 | 6,673 | 1.87 | 3.86 | 8.00 |
+| Qdrant ef 144 | 0.9729 | 5,668 | 2.16 | 4.58 | 10.59 |
+| Qdrant default (no `hnsw_ef`) | 0.9647 | 7,050 | 1.79 | 3.63 | 7.59 |
+| **Qdrant interpolated to 0.9530** | 0.9530 | **about 8,566** | 1.50 | 2.97 | 5.78 |
+
+At matched recall blowfish serves **14% more q/s** at top_k 10 (G11: 9%) and its p99 is **34% lower** (3.80 against 5.78 ms).
+
+| Engine, top_k 100 | recall@100 | q/s | p50 | p90 | p99 (ms) |
+|---|---:|---:|---:|---:|---:|
+| **blowfish, graph (beam 256, shortlist 150)** | **0.9559** | **4,511** | **3.00** | **5.16** | **8.34** |
+| Qdrant ef 128 | 0.9091 | 5,909 | 2.10 | 4.35 | 9.52 |
+| Qdrant ef 192 | 0.9385 | 4,433 | 2.63 | 6.09 | 14.48 |
+| Qdrant ef 256 | 0.9532 | 3,661 | 3.15 | 7.91 | 16.50 |
+| Qdrant ef 320 | 0.9617 | 3,125 | 3.66 | 9.57 | 19.33 |
+| Qdrant default (ef 100) | 0.8835 | 6,865 | 1.84 | 3.77 | 7.46 |
+| **Qdrant interpolated to 0.9559** | 0.9559 | **about 3,491** | 3.31 | 8.43 | 17.4 |
+
+At matched recall blowfish now serves **29% more q/s** than Qdrant at top_k 100 (G11: 24 to 39% fewer), with p50 9% lower, p90 39% lower, and p99 **52% lower**
+(8.34 against 17.4 ms). Per query it costs 6.83M instructions (main this round: 7.96M) against Qdrant's 4.0M at ef 256, and the graph phases take 783 us of
+navigation and 297 us of rerank, with no projection phase left (main this round: 637, 435, and 740 us). Mixed load on the same server (one query in ten asks for 100
+rows): 8,508 q/s, recall 0.957, p50/p90/p99 1.39/2.77/4.89 ms.
+
+The like-for-like measure of the change is the paired table above (GB1's graph, beam 100, one server): top_k 10 8,512 to 9,796 q/s (+15%) and top_k 100 2,733 to
+4,627 q/s (+69%), recall identical to seven digits. The final run settled a lower top_k 10 beam (80, recall 0.9530) than the paired server (100, 0.9586), so its
+q/s is not comparable to the paired baseline; against Qdrant at the same recall it is a win either way (at 0.9586 Qdrant interpolates to 8,011 q/s, p99 6.28 ms).
+Peak physical footprint is unchanged at 5.35 GB (G11: 5.35 GB); the ID table is 8 bytes per row (21 MB for NQ).
+
+### What changed in the code
+
+- **ID-only graph queries resolve IDs from a resident table** (`warm_graph.rs`). The first ID-only query that a ready graph answers starts one background task that
+  reads every tier row's unsigned ID from the same documents the query path hydrates, and publishes a `Vec<u64>` on the graph. From then on, an ID-only query
+  (no attributes requested) takes the final rows from the rerank, checks each against the live mask and its placement exactly as before, and reads their IDs from
+  the table: no per-segment document reads, no decoded-column lookups, no per-segment maps. Until the table exists, and for any namespace with a string ID, the old path runs
+  unchanged. Queries that ask for attributes still hydrate documents.
+- **Graph queries up to 100 rows stay on the HTTP reactor when the graph will answer them** (`warm_ann.rs`, `lib.rs`). The inline gate was `top_k + offset <= 10`; it is now
+  10, or 100 when a ready, usable graph exists for the tier (a graph query costs the same CPU inline as on a worker, without the thread hand-off). Everything else keeps the
+  old gate.
+- **`include_attributes: false` means no attributes** (`indexed.rs`). It used to hydrate every scalar column of the result rows and drop them afterward, while leaving the field out
+  read none. The NQ fixture has only IDs and vectors, so this round's numbers do not move; namespaces with text columns do less work.
+
+Tests: the ID-only identity check in `warm_graph/tests.rs` compares the table path with the document path (the same queries before the table exists) and with the IVF control
+for top_k 1, 10, 37, and 100, requiring equal rows and equal score bits. Live, the quality pass over all 3,452 queries gave the same recall to seven digits with and without
+the table. Debug `cargo test --workspace`: 629 passed, 0 failed, 27 ignored; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+### Notes
+
+- **A Qdrant restart after the load went wrong once.** On the first restart, a second, unindexed segment holding all 2.68M vectors appeared beside the indexed one
+  (consistent with replaying a write-ahead log whose applied position was still from the load, but I did not confirm the cause). Searches scanned that copy: recall 0.9987
+  at ef 64 and about 20 q/s. G11 did not hit it, and its Qdrant numbers match this round's within 1.5%. I discarded those runs, reloaded Qdrant, and ran every sweep in the
+  same server process as the load.
+- **The M4 profile includes the recall sampler.** Its exact searches checksum and scan every vector, and they showed up as 15% "CRC" in the first top_k 100 profile; the
+  graph query's own CRC is about 2.5%.
+- **Not measured:** top_k 100 with attributes requested, namespaces with string IDs (unchanged path), and graphs on hosts other than the M4. Each point is one run on a shared machine; the
+  paired medians spread at most 2%.
+- **Switches were temporary.** The five hypotheses were measured through a file-read switch (`BF_G12_FLAGS`) in a candidate binary, then deleted: the shipped code has no settings
+  and no old path for the two changes that ship.
+
+Costs: no EC2 and no bucket writes. The 25.5 GiB NQ fixture was copied from the measurement bucket to the M4 through short-lived presigned URLs (about $2.3 of S3
+transfer), because the direct copy ran at 3 to 5 MB/s. The M4 run directory (fixture, builds, Qdrant) is deleted, and nothing of mine is running there.
+
+## Round C28: cold filtered queries on the repaired 10M layout
+
+Measured 2026-11-26 on one on-demand c7gd.4xlarge in us-west-2. The comparison uses the
+v0.1.54 baseline with C26/C27 diagnostics, and the C28 changes integrated with v0.1.55.
+The retained C5 fixture was copied server-side into an owned prefix: 693 objects and
+77.34 GB. A writable baseline server published all 55 resident row maps, upgraded old
+segment text, and compacted source segments, as in C27. The final manifest stabilized
+with 61 source segments. No recluster was requested, and the retained fixture was never
+written. Every timed request recorded zero membership rebuilds.
+
+Protocol follows C27: a fresh read-only process per filter and build, one untimed q199
+warm-up, oracle query vectors 0–19, top ten, IDs only, strong consistency, and 64 probes.
+Before every measured request, the harness clears all engine caches; connections stay
+warm. These are process-fresh, **cache-cold** query series, not a new process per query.
+The two builds alternate A/B, then B/A, for paired comparisons. Server and client
+use CPUs 0–7. The server has eight Rayon workers, 8 GiB raw cache, 512 MiB decoded
+cache, zero disk cache, 256 KiB blocks, 32-block coalescing, and fetch concurrency 512. Both release
+binaries target `neoverse-v1`, using Rust 1.100.0, Clang 19 for C compilation, and
+Clang 22 with compiler-rt builtins for linking. No compiler or competing load runs
+during timing.
+
+### What the trace supported
+
+The ID predicate decoded the entire per-ID bitmap dictionary. Scalar ID comparisons
+now read the existing segment bounds header and seek the sorted document ID column.
+Whole segments outside the range need no ID-column read. The resulting row interval is
+intersected with live rows, including holes from deletes. The same implementation
+handles u64 IDs, string IDs, UUIDs, null operands, and older segments without bounds.
+`In` and `NotIn` still use the existing dictionary evaluator.
+
+The first implementation reduced `id Lt 1000` from 6,211 to 509 ms, and the empty
+filter from 794 to 261 ms. It cut length-filter p50 from 1,732 to 883 ms. Title only
+improved from 1,997 to 1,549 ms (1.29×), despite parallel streaming: the query still
+read about 1.65 GB and spent about one second scanning. All 100 initial pairs retained
+identical ordered IDs and f64 distance bits, with zero rebuilds. Empty queries read
+zero row-map bytes, versus 60.0 MB before.
+
+The planner already excludes every leaf whose exact membership count is zero. Title
+visits all 9,335 nonempty leaves: 44,129 matching rows among 6,856,537 source rows.
+The directory has no per-leaf maximum row radius or certified lower bound for all of
+its rows, so stopping after finding ten matches based on center distance would not
+preserve the required results. Probe coverage is unchanged.
+
+Eight-query reference experiments rejected smaller alignment alone and a larger
+exact-fetch budget:
+
+| Reference experiment | Control p50 / p90, ms | Experimental p50 / p90, ms |
+| --- | ---: | ---: |
+| 64 KiB blocks, 32-block coalescing | 1,542 / 1,631 | 1,577 / 2,819 |
+| 16 KiB blocks, 32-block coalescing | 1,542 / 1,631 | 1,618 / 7,412 |
+| Exact fetch of all 44,129 matching vectors | 1,492 / 1,654 | 2,365 / 9,784 |
+
+Smaller blocks saved 14–22% of bytes but increased GETs 2.5–4.7×. Exact fetch read
+less data but issued about 25,000 GETs. Another eight-query reference combined smaller
+blocks with gap coalescing: 64 KiB with one gap block reached 1,372 ms, two gap blocks
+1,409 ms, and 128 KiB without gaps 1,343 ms, against a 1,493 ms control. The gap references kept an 8 MiB maximum coalesced read
+(128 blocks at 64 KiB, and 64 blocks at 128 KiB). These were exploratory references, not selected product settings or final pass claims. Production
+read geometry and the exact-fetch threshold remain unchanged.
+
+The remaining changes preserve one query plan and its candidates. Cold dictionary,
+lineage, and row-map decoding use the bounded search pool when available. A saturated
+pool finishes nested decoding on its caller, avoiding a permit deadlock in exact
+reference searches. Snapshot warming loads lineage with the directory, starts
+memberships at the first positive segment while the other masks finish, and skips
+memberships when every mask is empty. Sparse predicates reverse-map only selected
+lineage targets. Validated warmed memberships stay with the request, so dictionary
+cache eviction cannot make that request decode them again. Filtered slab scans use
+the existing coalesced streaming path with each slab's mask and seed raw-cache blocks without
+assembling large code buffers that the prefetch task would immediately discard.
+No product setting, storage format, or wire API was added.
+
+### Speculative candidate paired results
+
+The first integrated candidate also refreshed speculative rerank reads at 40%,
+60%, 80%, 90%, and 95% scan completion. That candidate and the baseline each ran
+20 cold requests per filter.
+Latency percentiles are computed over those 20 requests, without excluding outliers.
+
+| Predicate | Baseline p50 / p90, ms | C28 p50 / p90, ms | p50 speedup |
+| --- | ---: | ---: | ---: |
+| `title_initial Eq z` | 1,975 / 2,187 | 1,447 / 1,544 | 1.37× |
+| `text_length Gte 300` | 1,719 / 1,788 | 761 / 832 | 2.26× |
+| `id Lt 1000` | 6,219 / 6,314 | 387 / 422 | 16.08× |
+| Empty filter | 803 / 832 | 194 / 227 | 4.15× |
+| Unfiltered | 250 / 326 | 273 / 339 | 0.92× |
+
+All 100 paired queries returned identical ordered IDs and identical f64 distance
+bits. All 200 requests read exclusively from object storage, with zero membership
+rebuilds. The canonical ordered-result digest was
+`8812a3875d08d01f824604966734cf8e70c44a168ec40e46c4b6bb9f8522ee6d`.
+Mean recall against the available exact truth was 1.000 for title, 0.995 for length,
+and 0.965 unfiltered, in both builds. The ID and empty predicates had no separate
+truth set; their claim is result parity with the baseline.
+
+That candidate's title trace reaches completed predicates at a median 366 ms instead of
+820 ms, but finishes scanning at 1,359 ms instead of 1,797 ms. It still reads
+1.65 GB. Length reaches predicates at 410 ms instead of 1,240 ms. The ID query
+reads no full filter dictionaries and reduces total median bytes from 650 MB to
+146 MB. Empty queries read zero membership bytes and skip ANN, reducing total
+median bytes from 146 MB to 86 MB. Nonempty queries still read all 60.0 MB of
+published slab membership maps; selective per-slab map loading remains a gap.
+
+### Speculative candidate concurrent controls
+
+Each filter ran four alternating A/B and B/A rounds, with 16 clients and 128 measured
+requests per build per round: 512 measured requests per build and filter. The
+concurrency harness uses a 64 MiB raw cache, a 512 MiB decoded cache, and no disk
+cache. Reported latency is the mean of the four round percentiles; throughput is
+the arithmetic mean of the four round request rates. These controls follow the first single-client
+series, without concurrent compilation.
+
+| Predicate | Baseline q/s | C28 q/s | Change | Baseline p50 / p90, ms | C28 p50 / p90, ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Title | 5.155 | 4.966 | −3.7% | 2,991 / 3,932 | 3,048 / 3,928 |
+| Length | 6.970 | 6.025 | −13.6% | 2,046 / 4,179 | 2,338 / 4,974 |
+
+CPU time per request increased from 1,209 to 1,270 ms for title, and from 742 to
+771 ms for length. GETs per request increased from 220 to 235 for title, and from
+283 to 291 for length. Round variability does not establish equivalence: both
+throughput point estimates fail the no-slower gate. This round also misses the
+title 1.5× target. Length and ID latency meet their respective 1.5× and 3× targets;
+this candidate does **not** pass the round's performance acceptance criteria.
+The original concurrency harness retained GET and CPU counters but did not record
+object-store byte deltas. Those missing byte values cannot be reconstructed from
+these runs. The follow-up harness records bytes and retains both metrics snapshots.
+
+### Unfiltered confirmation and validation
+
+Because the initial 20-query unfiltered control was slower, a separate confirmation
+ran 40 paired query vectors, with a fresh process for every request: 80 processes,
+interleaved A/B, then B/A, with no untimed query in each process. This is colder
+than the main cache-cold series and must be compared within this confirmation.
+All other server settings, CPU affinity, and read geometry were unchanged.
+
+| Statistic | Baseline, ms | C28, ms | C28 / baseline | Paired bootstrap 95% interval |
+| --- | ---: | ---: | ---: | ---: |
+| p50 | 339.16 | 331.44 | 0.977 | 0.915–1.074 |
+| p90 | 440.30 | 466.08 | 1.059 | 0.560–1.537 |
+
+The percentile bootstrap resamples the same 40 query-pair indices in both arms,
+50,000 times, with NumPy's default RNG seeded with 28. Each resample computes the
+ratio of the arm percentiles, rather than a percentile of per-query ratios. Both
+intervals include 1.0; this confirmation does not establish a regression or
+equivalence. All 40 pairs preserve ordered IDs and distance bits, with zero
+membership rebuilds and zero local reads.
+
+Lineage preloading, mask translation, membership retention, seed splitting, and
+the extra rerank refreshes apply only to filtered queries. Generic immutable-value
+decoding and the bounded worker helper can also affect unfiltered queries. The
+helper now falls back to its caller when all permits are occupied, preventing
+nested exact-query decoding from deadlocking. Unfiltered requests also create an
+empty request-local membership map and an unused predicate notification channel.
+No additional scheduling change was selected after the confirmation.
+
+The first integrated source passed formatting, workspace all-target Clippy with warnings
+denied, and the full default-profile workspace tests: 635 passed, zero failed, and
+27 ignored, across 81 test suites. Checks used `nice -n 19`, three Cargo jobs, and
+one test thread on the measurement host. New coverage includes scalar ID semantics
+for all ID types, live-row holes, legacy headers, bounded disjoint-range I/O,
+streaming result bits, sparse and dense predicates after composed compaction,
+request-scoped membership lifetime, and a held-read test proving that one positive
+segment can start memberships before another segment's predicate completes.
+
+### Final candidate without filtered speculation
+
+The final runtime change disables early rerank prefetch for filtered scans. Before
+this round, the filtered `run_parallel` branch never issued those speculative
+reads; enabling streaming had introduced them. Filtered queries now perform their
+final rerank after scanning, sharing already requested scan data. Unfiltered
+queries retain their original single early prefetch. Candidate selection, masks,
+probe coverage, final reranking, and ordered results are unchanged.
+
+The follow-up concurrency run compares baseline, the speculative candidate, and
+the final candidate in six rotating rounds. Every build occupies each position
+twice, with 128 requests per round and 16 clients: 768 requests per build per
+filter. Other cache, affinity, and read settings match the earlier concurrent
+controls. Throughput and resource counters below are arithmetic round means.
+Bytes count completed object-store payloads; they exclude protocol overhead and
+partially received canceled reads. CPU is server process user plus system time.
+
+| Predicate | Build | q/s | MB/request | GET attempts/request | CPU seconds/request |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Title | Baseline | 5.032 | 189.678 | 219.880 | 1.203 |
+| Title | Speculative | 5.260 | 203.777 | 226.992 | 1.236 |
+| Title | Final | 5.407 | 199.934 | 226.632 | 1.213 |
+| Length | Baseline | 6.090 | 95.038 | 277.910 | 0.751 |
+| Length | Speculative | 7.090 | 108.339 | 297.207 | 0.762 |
+| Length | Final | 6.550 | 101.421 | 288.917 | 0.760 |
+
+Title final/baseline throughput is 1.075×, with a paired-round bootstrap 95%
+interval of 0.954–1.208. Final/speculative is 1.028×, interval 0.968–1.096.
+The bootstrap uses 50,000 resamples of the same six round indices across arms,
+with RNG seed 28, and ratios of arithmetic mean round rates. Six rounds give
+limited precision; these intervals establish neither a regression nor equivalence.
+All 1,536 title candidate-versus-baseline comparisons preserve ordered IDs and
+distance bits. Membership rebuild counters remain zero.
+
+Removing speculative reranks reduces title bytes by 1.9% and CPU by 1.9% relative
+to the speculative arm in this sample. It still reads 5.4% more completed bytes
+than baseline. The speculative arm itself is faster than baseline here, reversing
+the earlier point estimate, so speculation alone cannot explain the original
+throughput loss. The final title throughput estimate is 7.5% higher than baseline,
+with no statistically established difference in either direction.
+
+Length final/baseline throughput is 1.076×, interval 0.928–1.282. Its
+final/speculative ratio is 0.924×, interval 0.845–1.029. Final length bytes are
+6.4% lower than the speculative arm, but 6.7% above baseline. Removing speculation
+does not improve its throughput point estimate relative to the speculative arm;
+the measured differences remain within these broad intervals. The final title
+and length throughput estimates are both about 7.5% above baseline. Neither
+establishes equivalence or rules out a smaller regression.
+
+Final concurrent p50/p90 is 2,843/3,698 ms for title versus 2,981/4,493 ms for
+baseline, and 2,127/3,781 ms for length versus 2,501/4,673 ms for baseline. Across
+both filters, all 3,072 candidate-versus-baseline comparisons preserve ordered IDs
+and f64 distance bits. All three builds retain zero membership rebuild counters.
+
+The final candidate then repeated the original five-case single-client protocol:
+20 paired cache-cold requests per filter, alternating A/B and B/A, with fresh
+processes per build and case, and an untimed q199 warm-up. No compiler or concurrent
+benchmark ran during either final measurement series.
+
+| Predicate | Baseline p50 / p90, ms | Final p50 / p90, ms | p50 speedup |
+| --- | ---: | ---: | ---: |
+| `title_initial Eq z` | 1,867 / 1,945 | 1,369 / 1,469 | 1.36× |
+| `text_length Gte 300` | 1,669 / 1,801 | 843 / 946 | 1.98× |
+| `id Lt 1000` | 6,177 / 6,239 | 397 / 436 | 15.56× |
+| Empty filter | 803 / 821 | 202 / 248 | 3.97× |
+| Unfiltered | 239 / 268 | 248 / 293 | 0.96× |
+
+All 100 final pairs preserve ordered IDs and exact f64 distance bits. All 200
+requests retain zero membership rebuilds and zero local reads. Title and length
+recall remain 1.000 and 0.995 in both builds; unfiltered recall remains 0.965.
+Mean title payload bytes are 1,644.615/1,644.712 MB for baseline/final, with
+927.60/930.20 GET attempts. Mean length payload bytes are 390.462/390.682 MB,
+with 760.90/761.75 GET attempts. Removing speculative filtered I/O keeps these
+single-client read costs close to baseline while retaining most latency gains.
+
+Length and ID meet their latency targets, and the final concurrent throughput
+point estimates exceed baseline within the measured noise. Title misses its
+1.5× target. The final cache-cold unfiltered p50 and p90 point estimates are 4.0%
+and 9.3% slower. The separately reported 40-pair fresh-process confirmation has
+intervals including 1.0 and applies to the same unfiltered runtime behavior; its
+colder protocol does not establish equivalence for this cache-cold series. The
+round therefore does **not** establish all acceptance criteria. No additional
+runtime tuning or measurement was selected after this series.
+
+The final engine package passed 357 tests, with zero failures and 13 ignored,
+plus all-target Clippy with warnings denied. Full debug workspace validation is
+run after the final documentation commit, separately from timing, using
+`RUST_TEST_THREADS=1 nice -n 19 cargo test --workspace -j 3` and
+`nice -n 19 cargo clippy --workspace --all-targets -j 3 -- -D warnings`.
+All tracked source files are compared by SHA-256 with the committed local tree
+before and after those remote checks.
+
+## Round G14: selective filtered vector queries scan the warm graph's codes, 3.7 to 5.9 times faster at 16 clients
+
+Filtered vector queries never used the warm graph: its tiers required no filter, so every filtered query ran IVF (F1 measured hash-filter workloads at 168 q/s for 1 percent). The ready graph already holds every row's SQ8 code in memory. A filter that leaves a few rows can instead score only those rows' codes, keep the best `max(3k, 30)` by SQ8 distance, and rerank them with the exact f16 rerank the graph path already uses.
+
+**What ships** (`bf-vector` `HotGraph::scan`, `bf-engine` `warm_graph::scan` and `scan_eligible`, and the filtered planner in `ann.rs`): when a graph is ready for a tier and a filtered query's allowed rows in that tier number at most 1 in 64 of the graph's rows (1.56 percent), the query is answered from the codes; otherwise the IVF tier answers as before. The graph keeps a dense tier-row-to-node table (4 bytes per row, charged to its resident bytes), and the scan iterates the allowed bitmap, prefetches 24 rows ahead, and selects the shortlist. The exact rerank, the live and filter masks, the shadowed-row slack, and the ID-table and document paths are the graph path's own. A scan does not feed the beam calibration, takes no scratch slot, and needs a ready graph but not a calibrated one. If the scan cannot answer, the whole query falls back to IVF as an unfiltered graph query does. Filters that match nothing return empty without touching the graph; fewer allowed rows than `k` return all of them.
+
+### Method
+
+One on-demand c7g.4xlarge (16 Graviton3 vCPU, 32 GiB), Ubuntu 24.04, Rust 1.100.0. Full BEIR NQ (2,681,468 x 1,024-d f16 cosine) loaded fresh through the write API with a `bucket` column (D4's SplitMix64 bucket, 0 to 9,999), indexed, and reclustered (32 cells, 250,000-row slabs, 6.2 minutes). `ann_nprobe` 64, 4 GiB block and decoded caches, a read-only local store, 12 Rayon and Tokio workers. The graph was built by ordinary heat (800 q/s of unfiltered queries, the 10-minute dwell, then a 263-second build; 3.2 GB resident). Heat stopped before measuring. The workloads are `crates/bf-engine/bench/filtered_nq.py`'s: 64 query vectors, `top_k` 10, `include_attributes: false`, `bucket < 50/100/200/500/1000/2000` (hash 0.5, 1, 2, 5, 10, and 20 percent) and `id < 1/5/10/50 percent`, with recall@10 against exhaustive truth over the allowed rows from the stored f16 vectors.
+
+The comparison ran both arms inside one server process on the same graph and snapshot, switched per run through a file the server read (a temporary switch in a candidate binary, since deleted), in the order IVF, scan, scan, IVF; the switch also set the scan arm's share limit (5 percent for the 0.5 to 5 percent and id 1 and 5 percent runs, 50 percent for the 10 and 20 percent runs, so the crossover could be measured). The IVF arm is the v0.1.56 filtered path unchanged. One client is one serial connection (600 or 200 requests); 16 clients are eight processes of two threads each (4,000 or 800 requests) on the same host. Two runs per arm are averaged.
+
+### Results
+
+| Filter | Allowed rows | Recall@10 IVF / scan | 1 client q/s, IVF to scan | 16 clients q/s, IVF to scan | 16-client p50 ms | 16-client p99 ms |
+|---|---:|---|---|---|---|---|
+| hash 0.5% | 13,400 | 1.000 / 1.000 | 151 to 230 | 502 to 2,954 (5.9x) | 30.0 to 4.8 | 42.0 to 9.2 |
+| hash 1% | 26,700 | 1.000 / 1.000 | 125 to 133 | 388 to 1,807 (4.7x) | 38.9 to 8.0 | 53.4 to 13.4 |
+| hash 2% | 53,500 | 1.000 / 1.000 | 103 to 83 | 304 to 1,121 (3.7x) | 50.2 to 13.3 | 66.5 to 19.6 |
+| hash 5% | 134,000 | 1.000 / 1.000 | 82 to 41 | 232 to 558 (2.4x) | 65.7 to 27.2 | 88.2 to 39.3 |
+| id 1% | 26,800 | 1.000 / 1.000 | 192 to 193 | 714 to 2,867 (4.0x) | 21.0 to 4.9 | 27.3 to 9.3 |
+| id 10% | 268,000 | 1.000 / 1.000 | 120 to 25 | 362 to 444 (1.2x) | 42.1 to 33.5 | 57.7 to 54.5 |
+| hash 10% | 268,000 | 1.000 / 1.000 | 114 to 22 | 360 to 305 (0.85x) | 42.4 to 49.2 | 57.7 to 73.7 |
+| hash 20% | 536,000 | 0.998 / 1.000 | 167 to 12 | 630 to 167 (0.26x) | 24.0 to 88.9 | 33.9 to 139 |
+
+(id 5%, with 134,074 allowed rows, is just above the 5 percent line this run's scan arm allowed, so both arms ran IVF: 330 and 334 q/s at 16 clients.) Recall is identical or better at every point. The scan reads each allowed row's 1 KiB code, so its cost grows with the filter while IVF's cost, bounded by the F1 coverage planner, stays nearly flat. The 16-client throughput ties near 8 percent. Single-client latency ties near 1.2 percent: one client is dominated by a fixed per-query cost of about 3 to 6 ms (snapshot check, filter masks, rerank reads, HTTP) that both paths pay.
+
+**Where the time goes, scan alone** (`bf-vector/examples/g14_scan.rs`, first 1M NQ rows, hash masks, no HTTP): about 155 ns per allowed row serially (1 KiB per row, 6.5 GB/s per thread) and 3,400 q/s at 16 threads for 2 percent (20,000 rows), about 70 GB/s across the host. It is bound by memory bandwidth, not by the dot product or by latency: prefetching 8, 24, or 48 rows ahead and sorting the node IDs first change it by under 10 percent, so the shipped scan does not sort.
+
+**The crossover** is 1 row in 64 (1.56 percent). Below it the scan is 4x or more faster at 16 clients and within about 10 percent of IVF serially; above it IVF is the better path. It is one rule with no setting (SPEC 25). It is fixed in terms of the graph's rows rather than a wall-clock estimate because the scan's cost is proportional to the allowed rows. A host with more memory bandwidth per core would put the crossover higher, and one with less would put it lower; I measured only Graviton3.
+
+**The final binary.** After removing the switch and the tuning variables (and the scratch slot the scan does not need), I rebuilt, promoted a new graph the same way, and re-ran with the shipped rule. Both runs, 16 clients, recall@10 1.000: hash 0.5 percent 3,333 and 3,373 q/s (p99 8.0 ms; 1 client 290 q/s), hash 1 percent 1,967 and 1,966 q/s (p99 12.1 ms; 1 client 155 q/s), id 1 percent 2,894 and 2,949 q/s (p99 9.0 and 9.5 ms). At 2, 5, and 10 percent the IVF tier answers and matches the earlier IVF arm: hash 2 percent 308 q/s, hash 5 percent 232 q/s, id 10 percent 369 and 372 q/s.
+
+### Tests
+
+`bf-vector` `scan_scores_only_allowed_rows_and_matches_a_brute_force_order` covers a sparse tier-row map (node order is not row order, with a gap), a third of the rows, one row, rows outside the graph, all rows, and the zero-query and zero-count errors. The engine test `selective_filters_scan_the_graph_and_match_the_ivf_control` builds a 2,500-row tier with a ready graph and compares the answer with an engine that has no graph (the IVF control), equal rows and score bits, for a filter matching 25 rows at `top_k` 10 and 100, one row, fewer rows than `k`, and no rows; it requires a graph answer for each filter that has rows, and IVF above the crossover. It then rewrites a row, moves one into and out of the filtered bucket, adds a row, and deletes one without reindexing (shadowed rows), and requires the same rows as the control, no stale or deleted row, and still a graph answer.
+
+### Notes
+
+- **A filtered-only workload never builds a graph.** The graph is built from unfiltered query heat, as before, so this speeds up filtered queries for a namespace that also serves unfiltered ones, or until its graph is evicted. The filtered path does not feed heat. I did not change that.
+- **Not measured:** Qdrant on the M4 (left for a later round), filters on other columns than the ones above, string-ID namespaces (unchanged path), and hardware other than Graviton3. Each point is two runs on one host; paired runs agree within 3 percent.
+
+Costs: one on-demand c7g.4xlarge for 76 minutes, about $0.75 of compute plus a 250 GB gp3 root volume for the same time. The 5.5 GB NQ corpus was copied from the measurement bucket to the host (same region); no bucket writes. The instance, key pair, and security group are deleted, and `describe-instances` shows nothing of mine.
+
+## Round GM1: the warm graph on a memory-capped host
+
+**Setup:** Apple M4 (10 cores, 16 GB, shared Mac mini), the MEM2 matched-limit setup: a disposable arm64 Linux VM under the run-local uncached Lima 2.3.0 (VZ), ext4 data in the guest, guest RAM equal to the cap plus 1 GiB (9 GiB for the 8 GiB cap, 13 GiB for 12 GiB), cgroup v2 with `MemorySwapMax=0`, 10 vCPUs, 10 Tokio and Rayon threads, and the production decoded-cache default (a quarter of the limit). Data are the frozen v0.1.19 NQ fixture (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries, exact truth), built from main plus this round, promoted the ordinary way under 16 paced heat clients (`crates/bf-engine/examples/gm1_promote.py`, which also records the server cgroup's `memory.current`, `memory.peak`, `anon`, and OOM counters once a second). I deleted the VM and its directory when the round ended.
+
+### Why the graph never admitted at 8 GiB
+
+All three hypotheses held. The finished NQ graph is 3.145 GB, but:
+
+1. `vamana::reservation` multiplied a per-row sum that was too large (1,520 B/row, including 96 B/row of scratch that is really per thread) by 5/4: **5.18 GB** (4.82 GiB), plus source metadata, for a build that really peaks at **1,445 B/row = 3.87 GB**.
+2. The gate subtracted the decoded cache's static 2 GiB share from `4/5 * 8 GiB` (leaving 4.4 GiB, against the 4.9 GiB asked), and separately demanded `estimate + limit/5` free in the cgroup, counting `memory.current`, which includes reclaimable page cache (5.7 GiB in the baseline run), so a warm host looked full.
+3. G12's 8-byte-per-row ID table was built later and charged to nothing.
+
+Baseline v0.1.56 at 8 GiB (Linux VM, systemd scope, identical production heat): **no build in 23 minutes**, with 0.45 GiB anonymous memory and 1.4 GiB charged at rest.
+
+### What changed
+
+One path, no settings.
+
+- **The reservation is the real peak plus a stated 1/16 margin.** `peak_bytes_per_row` is the larger of the construction peak (codes, scale, tier row, and norm; the build-time adjacency; the one-bit navigation codes; the insertion permutation) and the publication peak (build adjacency and flat links together), plus 64 MiB fixed. A test (`crates/bf-vector/tests/graph_peak.rs`) counts the heap with a global allocator while a 30,000-row graph builds, and the model's slope matches it within 0.2% (**677.0 modeled against 678.0 measured B/row**). The serving shrink uses the same margin instead of 5/4.
+- **Reclaimable page cache is not memory in use.** The cgroup headroom is `memory.max - (memory.current - inactive_file - active_file)`: file pages, mapped ones included, come back under pressure and swap is off, so only anonymous memory can cause an OOM. The admission margin is `limit/16` instead of `limit/5` on top of the reservation, and a running build cancels below `limit/32`. The reservation itself is still counted once, against `4/5 * limit` less the caches' share, and `overcommitted()` cancellation is unchanged.
+- **The ID table is charged to the graph's reservation** (8 bytes per row, kept when the build's charge shrinks).
+
+I did not shrink the elastic caches: after the fix the NQ build fits beside the full decoded budget at 8 GiB (2 GiB + 3.96 GiB < 6.4 GiB), so there was nothing to lend.
+
+### What the build costs at 8 and 12 GiB
+
+| | 8 GiB cap | 12 GiB cap |
+|---|---:|---:|
+| Reservation asked | 4.251 GB (3.96 GiB) | 4.251 GB |
+| Cgroup anonymous memory before the build | 0.459 GiB | 1.239 GiB |
+| Peak anonymous memory during the build | 4.209 GiB | 4.976 GiB |
+| Build's own share of that peak | 3.75 GiB (4.03 GB), reservation 5.5% above it | 3.74 GiB |
+| Reservation after construction (3.145 GB graph, 3.255 GB with sources and locations) | 3.540 GB | 3.540 GB |
+| Anonymous memory serving | 3.50 GiB | 4.35 GiB |
+| Graph build, wall and CPU | 399 s, 696 s | 306 s, 735 s |
+| Graph visible, promoted (ordinary heat) | 17.0 min, 28.0 min | 15.5 min, 27.0 min |
+| OOM kills, swap | 0, 0 | 0, 0 |
+
+`memory.peak` reads 8.0 and 12.0 GiB, the caps: that is page cache the kernel reclaims, not a build overshoot (`ev_max` counts thousands of reclaim events, as with IVF in MEM2). The 16 paced heat clients (about 600 q/s) ran throughout every build. Two more 8 GiB promotions repeated the profile (4.207 and 4.215 GiB peak anon; builds of 510 s and 450 s).
+
+Admission still refuses when memory is short: at **6 GiB** (cap 4.8 GiB, caches 1.5 GiB, leaving 3.3 GiB against 3.96 GiB asked) the same heat for 22 minutes produced no build and no OOM, and unit tests check the headroom arithmetic (page cache excluded, no underflow), that a reservation above the cap is refused, and that `overcommitted()` flips when a cache's claim grows during a build.
+
+### Throughput against IVF and Qdrant at 8 GiB
+
+16 client processes, one connection each, IDs only, 64 IVF probes, graph promoted at beam 100 (the serving beam the calibration chose). Each row pools three passes of 3,452 queries. The IVF rows are the same VM, same cap, same binary before promotion.
+
+| 8 GiB cap | q/s | recall | p50 / p90 / p99 ms |
+|---|---:|---:|---|
+| IVF, top_k 10 | 2,020 | 0.9611 | 7.48 / 10.99 / 15.4 |
+| **Graph, top_k 10** | **8,882** | **0.9613** | **1.53 / 2.78 / 4.69** |
+| IVF, top_k 100 | 1,438 | 0.9523 | 10.49 / 14.82 / 22.9 |
+| **Graph, top_k 100** | **4,986** | **0.9562** | **2.80 / 4.93 / 7.65** |
+
+The graph serves 4.4 times IVF's top_k 10 q/s (3.5 times at top_k 100) at the same recall. At 12 GiB: top_k 10 **10,583 q/s** (recall 0.9603, p50/p90/p99 1.15/2.27/3.60 ms) and top_k 100 **5,082 q/s** (0.9558, 2.41/4.56/6.61 ms).
+
+The MEM2 protocol (`bench/nq/measure.py`, three fresh passes on a promoted 8 GiB server; the empty `qrels.json` it requires leaves only exact recall@10) gives **7,822 / 8,045 / 7,829 q/s at 16 clients** (mean 7,899), 1,954 / 1,928 / 1,940 at one client, and serial p50/p90/p99 0.5/0.6/0.7 ms, at recall@10 **0.9606** at `top_k` 10. MEM2 measured Qdrant 1.20.0 (f16 vectors on disk, HNSW in RAM, `ef` 64) under the same 8 GiB cap at **6,023 q/s, recall@10 0.9436**, and blowfish's IVF at 2,702 q/s. So the graph at 8 GiB is **1.31 times Qdrant's q/s at 1.7 points higher recall**, and 2.9 times MEM2's IVF. **Pass.**
+
+I did not re-run Qdrant: its index build crashed once in this VM, after the host began to swap at 13 GiB of guest RAM, and the round's time was fixed, so the Qdrant figure is MEM2's, from the same hardware, VM runtime, cap, and `measure.py` protocol. The pooled-pass table above uses another client (16 Python processes, `g11_http.py`) and reads lower than `measure.py`, so compare only within a table.
+
+### Notes
+
+- `g11_http.py` pinned its clients to CPUs 24 and up and required `perf`; `G3_CLIENT_CPU_BASE=-1` and `G11_NO_PERF=1` now skip both for the 10-vCPU guest.
+- The x86 Linux VM's builds are slower than the M4's under its shared load (1,967 s wall for the same graph), but its memory profile was the same: 4.20 GiB peak anonymous memory, 0 OOM.

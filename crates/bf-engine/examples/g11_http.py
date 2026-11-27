@@ -49,8 +49,10 @@ def request(connection, body):
 
 
 def worker(process, repeats, barrier):
-    if hasattr(os, "sched_setaffinity"):
-        os.sched_setaffinity(0, {24 + process})
+    # Round GM1: G3_CLIENT_CPU_BASE=-1 skips pinning (a 10-CPU guest has no CPUs 24 and up).
+    base = int(os.environ.get("G3_CLIENT_CPU_BASE", "24"))
+    if base >= 0 and hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, {base + process})
     count = len(BODIES) * repeats
 
     def thread(index):
@@ -110,21 +112,24 @@ if __name__ == '__main__':
     stem.parent.mkdir(parents=True, exist_ok=True)
     queries = np.load(Path(data) / 'queries.npy')
     K = int(os.environ.get('G8_K', '100'))
-    truth = np.load(Path(data) / 'truth.npy')[:, :K]
     ROUTE = '/v2/namespaces/nq/query' if engine == 'bf' else '/collections/nq/points/search'
+    # G12_MIX=1: one query in ten asks for 100 rows, the rest for K (a mixed load for p99).
+    KS = [100 if os.environ.get('G12_MIX') and i % 10 == 0 else K for i in range(len(queries))]
+    truth = np.load(Path(data) / 'truth.npy')
     BODIES = [json.dumps(
-        {'rank_by': ['vector', 'ANN', q.tolist()], 'top_k': K, 'include_attributes': False}
+        {'rank_by': ['vector', 'ANN', q.tolist()], 'top_k': KS[i], 'include_attributes': False}
         if engine == 'bf' else
-        {'vector': q.tolist(), 'limit': K, 'with_payload': False, 'with_vector': False,
-         **({'params': {'hnsw_ef': ef}} if ef else {})}, separators=(',', ':')).encode() for q in queries]
+        {'vector': q.tolist(), 'limit': KS[i], 'with_payload': False, 'with_vector': False,
+         **({'params': {'hnsw_ef': ef}} if ef else {})}, separators=(',', ':')).encode()
+        for i, q in enumerate(queries)]
     connection = http.client.HTTPConnection('127.0.0.1', PORT, timeout=120)
     overlap = 0
     for i, body in enumerate(BODIES):
         answer = json.loads(request(connection, body))
         rows = answer['rows'] if engine == 'bf' else answer['result']
-        overlap += len({int(row['id']) for row in rows} & set(map(int, truth[i])))
+        overlap += len({int(row['id']) for row in rows} & set(map(int, truth[i][:KS[i]])))
     connection.close()
-    quality = overlap / (len(queries) * K)
+    quality = overlap / sum(KS)
     print(json.dumps({'k': K, 'recall_at_k': quality, 'warmup': run(1)}), flush=True)
     if sys.platform == 'darwin':
         before = mac_counters(pid)
@@ -137,6 +142,13 @@ if __name__ == '__main__':
             for key in ('instructions', 'cycles'):
                 measured[key] -= before[key]
                 measured[key + '_per_query'] = measured[key] / measured['queries']
+        measured.update(recall_at_k=quality, engine=engine, ef=ef, server_pid=pid)
+        Path(str(stem) + '.json').write_text(json.dumps(measured, indent=2) + '\n')
+        print(json.dumps(measured), flush=True)
+        raise SystemExit(0)
+    if os.environ.get('G11_NO_PERF'):
+        # Round GM1: no perf in the Lima guest; the same timed passes without instruction counters.
+        measured = run(repeats)
         measured.update(recall_at_k=quality, engine=engine, ef=ef, server_pid=pid)
         Path(str(stem) + '.json').write_text(json.dumps(measured, indent=2) + '\n')
         print(json.dumps(measured), flush=True)

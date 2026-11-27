@@ -72,25 +72,56 @@ impl Neighbors {
         self.len += 1;
     }
 }
-/// Construction and publication peaks are disjoint from retained query scratch.
-/// Include worst-case search/prune vectors, including geometrically grown capacities.
-pub(super) fn reservation(rows: u64, padded: u64, queries: u64) -> Option<u64> {
+/// Fixed allowance on top of the per-row peak: per-thread visitation bitsets and construction
+/// scratch for the largest build pool (six threads), the beam and neighbor scratch, and allocator
+/// slack. Round GM1 measured the real fixed part far below it.
+const FIXED: u64 = 64 << 20;
+/// Safety margin on the per-row peak, as a fraction: 1/16, covering allocator rounding of the
+/// large arrays and the capacities the build's vectors grow to. Round GM1 measured the true peak
+/// within 1% of the per-row sum below, so this margin is real headroom, not a fudge.
+const MARGIN_DIVISOR: u64 = 16;
+
+/// Exact bytes per row at the construction peak. While `build` runs the graph holds the SQ8 codes
+/// and scale, the tier row coordinate and cosine norm, the build-time adjacency (`RwLock<Neighbors>`),
+/// the one-bit navigation codes, and the insertion permutation. The one-bit codes are freed before
+/// `finish` converts the adjacency, so the publication peak (build adjacency and the flat links
+/// together) is the other candidate; the larger of the two is the peak.
+pub(super) fn peak_bytes_per_row(padded: u64) -> Option<u64> {
     let lock = std::mem::size_of::<RwLock<Neighbors>>() as u64;
-    // Codes/scales, row coordinates, insertion permutation, two construction scratch sets, and
-    // one-bit navigation codes. Each scratch set permits a visitation bitset and short vectors.
-    let building = padded
+    // Codes (`padded` bytes) and scale (4), tier row (4), and norm (4).
+    let base = padded.checked_add(4 + 4 + 4)?;
+    let building = base
         .checked_add(lock)?
-        .checked_add(16 + 2 * 40)?
-        .checked_add(padded.div_ceil(8).next_multiple_of(8))?;
-    let publication = padded.checked_add(lock)?.checked_add(4 + 4 + 4 + 136 + 1)?;
-    let retained = padded.checked_add(4 + 4 + 4 + 136 + 1)?;
+        .checked_add(padded.div_ceil(8).next_multiple_of(8))?
+        .checked_add(4)?;
+    // Flat links (34 ids of 4 bytes) and the degree byte, while the build adjacency still exists.
+    let publication = base.checked_add(lock)?.checked_add(34 * 4 + 1)?;
+    Some(building.max(publication))
+}
+/// Bytes per row that the finished graph retains, as `HotGraph::resident_bytes` counts them.
+fn retained_bytes_per_row(padded: u64) -> Option<u64> {
+    padded.checked_add(4 + 4 + 4 + 34 * 4 + 1)
+}
+/// Reservation for building and then serving a graph: the construction peak with a stated 1/16
+/// margin, or the retained graph with `queries` simultaneous visitation arrays, whichever is
+/// larger. Round GM1 replaced a 25% surcharge on a doubled per-row estimate by this exact
+/// breakdown, which a test checks against a counting allocator.
+pub(super) fn reservation(rows: u64, padded: u64, queries: u64) -> Option<u64> {
     let construction = rows
-        .checked_mul(building.max(publication))?
-        .checked_add(64 << 20)?;
-    let serving = rows.checked_mul(retained)?.checked_add(
-        queries.checked_mul(rows.div_ceil(32).checked_mul(8)?.checked_add(2 << 20)?)?,
-    )?;
-    construction.max(serving).checked_mul(5).map(|n| n / 4)
+        .checked_mul(peak_bytes_per_row(padded)?)?
+        .checked_add(FIXED)?;
+    let serving = rows
+        .checked_mul(retained_bytes_per_row(padded)?)?
+        .checked_add(
+            queries.checked_mul(rows.div_ceil(32).checked_mul(8)?.checked_add(2 << 20)?)?,
+        )?;
+    construction
+        .max(serving)
+        .checked_add(construction.max(serving) / MARGIN_DIVISOR)
+}
+/// `bytes` with the stated 1/16 margin.
+pub(super) fn with_margin(bytes: u64) -> u64 {
+    bytes.saturating_add(bytes / MARGIN_DIVISOR)
 }
 pub fn build(
     v: &Codes,

@@ -4,6 +4,38 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.59] - 2026-11-26
+
+### Fixed
+
+- **The warm graph now builds and serves on an 8 GiB host:** Admission overstated a build's memory and refused it. The reservation charged both build-time adjacency forms for the whole build and then added a quarter. The memory gate counted reclaimable page cache as used, and it also demanded a fifth of the limit free on top of the reservation. The reservation is now the measured construction peak plus a stated sixteenth, the gate ignores reclaimable page cache, and the resident row-to-ID table is charged to the graph. On an Apple M4 with BEIR NQ (2.68M x 1024-d) in an 8 GiB cgroup, the graph built in 399 s under live load, peaking at 4.21 GiB of anonymous memory, with no OOM or swap. 16 clients then served 7,899 q/s at recall@10 0.961, against 2,702 q/s for IVF before, and against 6,023 q/s for Qdrant 1.20 in the same setup in Round MEM2. A 6 GiB cgroup still refuses the build. See Round GM1 in `docs/benchmarks.md`.
+
+## [0.1.58] - 2026-11-26
+
+### Changed
+
+- **Selective filtered vector queries are 3.7 to 5.9 times faster at 16 clients, with the same recall:** When a warm graph is ready, a filtered query whose filter leaves at most 1 row in 64 of the tier (1.56 percent) no longer runs IVF. It scores only the allowed rows' resident SQ8 codes, keeps the best `max(3k, 30)`, and reranks them exactly, with the same shadowed-row and deletion handling as the graph path. On an on-demand Graviton3 host with full BEIR NQ (2.68M x 1024-d), 16 clients, hash-distributed filters: 502 to 2,954 q/s at 0.5 percent, 388 to 1,807 at 1 percent, and 304 to 1,121 at 2 percent (p99 66.5 to 19.6 ms), recall@10 1.000 in both. Above 1.56 percent IVF answers: the scan reads every allowed row's 1 KiB code, so its cost grows with the filter while IVF's stays flat, and the two tie near 8 percent. A single client sees little change below 1 percent. See Round G14 in `docs/benchmarks.md`.
+
+## [0.1.57] - 2026-11-26
+
+### Changed
+
+- **Cold filtered vector queries are 1.4 to 15 times faster:** Filters on `id` seek the sorted per-segment IDs instead of decoding every segment's full ID dictionary, filtered queries use the parallel, coalesced, nearest-first slab scan that unfiltered queries already used, a filter that matches nothing reads no slab row maps, and lineage and filter translation touch only the rows that match. On 10M x 1024-d vectors in pure S3, cold, single client, with identical ordered IDs and distances, p50 went from 6,177 to 397 ms for `id < 1000`, 1,669 to 843 ms for a broad numeric filter (`text_length >= 300`), 1,867 to 1,369 ms for a 0.4% equality filter, and 803 to 202 ms for a filter matching nothing. Throughput with 16 clients and unfiltered latency are unchanged within measurement noise. See Rounds C26, C27, and C28 in `docs/benchmarks.md`.
+
+## [0.1.56] - 2026-11-26
+
+### Changed
+
+- **`top_k` 100 on the warm graph is 1.7 times faster, and `top_k` 10 15 percent faster, with identical results:** An ID-only query answered by the warm graph used to hydrate each result row's ID from the document files, 32 segments at a time; the first such query now builds a resident row-to-ID table in the background (8 bytes per row, unsigned IDs only), and later queries read the final rows' IDs from it. Graph queries up to 100 rows also stay on the HTTP reactor now (the gate was 10). On an Apple M4 with BEIR NQ (2.68M x 1024-d), 16 clients, IDs only, one promoted server: `top_k` 100 went from 2,733 to 4,627 q/s with p99 11.6 to 8.3 ms, and `top_k` 10 from 8,512 to 9,796 q/s with p99 4.3 to 3.5 ms, at the same recall to seven digits. Against Qdrant 1.20 at matched recall, blowfish now serves 29 percent more q/s at `top_k` 100 (p99 8.3 against 17.4 ms) and 14 percent more at `top_k` 10. See Round G12 in `docs/benchmarks.md`.
+
+### Fixed
+
+- **`include_attributes: false` no longer hydrates every attribute:** Asking for no attributes read all scalar columns of the result rows and then dropped them, while leaving the field out read none. Both now read none.
+
+### Benchmarks
+
+- **Against Qdrant on an Apple M4, now at both `top_k` 10 and 100:** On BEIR NQ (2.68M x 1024-d), 16 clients, IDs only, at matched recall, blowfish served `top_k` 100 at 4,511 q/s against about 3,491 for Qdrant 1.20 (p99 8.3 against 17.4 ms), and `top_k` 10 at 9,776 against about 8,566 (p99 3.8 against 5.8 ms). See Round G12 in `docs/benchmarks.md`.
+
 ## [0.1.55] - 2026-11-26
 
 ### Changed
@@ -258,20 +290,17 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **Automatic warm graphs:** When a cosine-f16 tier stays hot, blowfish builds an in-memory SQ8 Vamana graph for it in the background at idle priority, checks its recall against IVF on live traffic, and serves unfiltered vector queries from it once a serving effort passes. Nothing is written to the bucket; restarts, eviction, and refused builds fall back to IVF, and filtered, exact, and other-metric queries stay on IVF. On full BEIR NQ on an Apple M4, warm HTTP throughput rose from about 2,940 to 8,133 q/s at recall 0.9575 and from 3,502 to 8,558 q/s at 0.9516, within 0.6% and 3.9% of Qdrant at matched recall while using 22% less memory. Building the NQ graph reserves about 5.0 GB of RAM and 5.5 GB of temporary disk and slowed live queries by 1.6% on 8 Linux cores. There is no setting; see [docs/operations.md](docs/operations.md) and [docs/design/hot-tier-graph.md](docs/design/hot-tier-graph.md).
 
-
 ## [0.1.20] - 2026-11-24
 
 ### Added
 
 - **Profile-guided build recipe:** `scripts/pgo-build.sh` builds a profile-guided blowfish binary trained on a mixed workload (warm vector, filtered, BM25, writes, and cold queries) from public NQ data. On full NQ at 8 cores, warm HTTP vector search rises 5.4% (2,339 to 2,464 q/s), filtered search 105%, BM25 16%, and writes 4%, with identical results; instruction-cache refills drop 30%. Official release builds do not use it yet. See [docs/pgo.md](docs/pgo.md).
 
-
 ## [0.1.19] - 2026-11-24
 
 ### Performance
 
 - **Cheaper filtered vector search:** Filtered ANN scans now use fixed-width table chunks and a bounded per-scan membership bitset (at most 8 bytes per scanned row; widely spaced IDs fall back to bitmap merging). On full NQ, CPU per query drops 20 to 40% across ID and hash filters at 1%, 10%, and 50% selectivity. The hardest case, a 1% hash filter, goes from 67 to 40 ms and uses 61% fewer instructions, and its 16-client throughput rises from 99 to 168 q/s. All 768 per-query comparisons return identical rows and distances. Unfiltered queries cost about 2% more CPU. See [docs/benchmarks/filtered-ann.md](docs/benchmarks/filtered-ann.md).
-
 
 ## [0.1.18] - 2026-11-24
 
@@ -417,7 +446,11 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.55...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.59...HEAD
+[0.1.59]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.59
+[0.1.58]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.58
+[0.1.57]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.57
+[0.1.56]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.56
 [0.1.55]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.55
 [0.1.54]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.54
 [0.1.53]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.53

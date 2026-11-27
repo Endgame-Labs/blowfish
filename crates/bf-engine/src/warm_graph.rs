@@ -57,10 +57,15 @@ impl Drop for Foreground {
     }
 }
 fn overcommitted() -> bool {
-    RESERVED
-        .load(Ordering::Acquire)
-        .saturating_add(FOREGROUND.load(Ordering::Acquire))
-        > bf_alloc::memory_limit_bytes().saturating_mul(4) / 5
+    overcommitted_at(
+        RESERVED.load(Ordering::Acquire),
+        FOREGROUND.load(Ordering::Acquire),
+        bf_alloc::memory_limit_bytes(),
+    )
+}
+/// Whether builds plus foreground caches claim more than four fifths of the memory limit.
+fn overcommitted_at(reserved: u64, foreground: u64, limit: u64) -> bool {
+    reserved.saturating_add(foreground) > limit.saturating_mul(4) / 5
 }
 
 /// Unit tests that need the process-global build slot, automatic-recluster flags, or the memory
@@ -193,6 +198,11 @@ struct Entry {
     phase_cpu: [AtomicU64; 3],
     searches: AtomicU64,
     pending_cost: Mutex<cost::Pending>,
+    /// The unsigned ID of every tier row (`u64::MAX` where a row has none now), built once in the
+    /// background by the first ID-only query. Absent when any ID is a string, and until built,
+    /// queries hydrate IDs from the documents.
+    ids: std::sync::OnceLock<Vec<u64>>,
+    ids_started: std::sync::atomic::AtomicBool,
 }
 struct Heat {
     first: Instant,
@@ -289,6 +299,9 @@ pub(crate) struct Scope {
     used: Arc<Mutex<Option<Vec<Key>>>>,
 }
 impl Scope {
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
+    }
     pub(crate) fn new(cache: Arc<Cache>, namespace: &str) -> Self {
         Self {
             cache,
@@ -442,6 +455,37 @@ impl Cache {
                 }
                 !stale
             });
+    }
+    /// Whether a ready, usable graph would answer this plain vector query. Used to let a query
+    /// larger than the usual inline limit stay on the HTTP reactor.
+    pub(crate) fn serves(&self, ns: &str, state: &NamespaceState, q: &QueryRequest) -> bool {
+        let Some(RankBy::Vector {
+            attribute, vector, ..
+        }) = &q.rank_by
+        else {
+            return false;
+        };
+        let k = q.total().unwrap_or(10).saturating_add(q.offset);
+        let Some([set]) = state.ann_tiers.get(attribute).map(Vec::as_slice) else {
+            return false;
+        };
+        if overcommitted() {
+            return false;
+        }
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .get(&Key::new(ns, state, attribute, set))
+            .and_then(|h| h.ready.as_ref())
+            .is_some_and(|e| {
+                k > 0
+                    && k <= MAX_K
+                    && e.graph.len() >= k
+                    && vector.len() == e.graph.dims()
+                    && e.calibration
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .usable
+            })
     }
     pub(crate) fn observe(
         engine: &Engine,
@@ -774,7 +818,12 @@ impl Engine {
         let limit = bf_alloc::memory_limit_bytes();
         let foreground = FOREGROUND.load(Ordering::Acquire);
         let cap = limit.saturating_mul(4) / 5;
-        if !memory_available(estimate.saturating_add(limit / 5)) {
+        // The build's own reservation is counted once, against the process budget (`cap` less the
+        // caches' static `FOREGROUND` share), and once more against memory the cgroup can really
+        // give: that excludes reclaimable page cache, which the kernel evicts before it would
+        // kill anything. The only extra margin is `build_floor`, since the reservation already
+        // carries its own stated 1/16 margin.
+        if !memory_available(estimate.saturating_add(build_floor(limit))) {
             return Ok(None);
         }
         let mut reserved = Reservation::new(estimate, cap.saturating_sub(foreground));
@@ -824,7 +873,7 @@ impl Engine {
                 let before: f64 = pool().broadcast(|_| thread_cpu()).into_iter().sum();
                 let checks = AtomicU64::new(0);
                 let graph = builder.finish(&|| c.cancelled() || stop.stopping() || overcommitted()
-                    || (checks.fetch_add(1, Ordering::Relaxed).is_multiple_of(16384) && !memory_available(limit / 5))).map_err(segment::index_error)?;
+                    || (checks.fetch_add(1, Ordering::Relaxed).is_multiple_of(16384) && !memory_available(build_floor(limit) / 2))).map_err(segment::index_error)?;
                 let locations = Locations::new(locations);
                 let after: f64 = pool().broadcast(|_| thread_cpu()).into_iter().sum();
                 Ok::<_, ApiError>(Built { graph, sources, locations, source_cpu, build_cpu: (after-before).max(0.), reservation, _slot, _running: worker_running })
@@ -846,11 +895,14 @@ impl Engine {
         let resident = built.graph.resident_bytes()
             + built.sources.iter().map(Index::resident_bytes).sum::<u64>()
             + built.locations.resident_bytes();
-        let retained = (resident
-            + (count as u64).div_ceil(32) * 8 * workers as u64
-            + workers as u64 * (2 << 20))
-            .saturating_mul(5)
-            / 4;
+        // The resident row-to-ID table (8 bytes per row, built lazily by the first ID-only query)
+        // belongs to this graph's charge, so it is part of what the shrunken reservation keeps.
+        let retained = HotGraph::with_margin(
+            resident
+                + count as u64 * 8
+                + (count as u64).div_ceil(32) * 8 * workers as u64
+                + workers as u64 * (2 << 20),
+        );
         if retained > built.reservation.0 {
             return Ok(None);
         }
@@ -885,6 +937,8 @@ impl Engine {
             build_reservation_bytes: estimate,
             phase_cpu: Default::default(),
             searches: AtomicU64::new(0),
+            ids: std::sync::OnceLock::new(),
+            ids_started: std::sync::atomic::AtomicBool::new(false),
             pending_cost: Mutex::default(),
         }))
     }
@@ -990,6 +1044,109 @@ impl Drop for ScratchLoan<'_> {
         }
     }
 }
+/// Rows kept by SQ8 distance for the exact rerank of a filtered scan, for `k` wanted rows.
+fn scan_shortlist(k: usize) -> usize {
+    (k * 3).max(30)
+}
+/// The most allowed rows a filtered query scans, as a share of the graph's rows (1 in
+/// `SCAN_SHARE`, 1.56%). Round G14 measured the scan against the IVF tier on full NQ with hash
+/// filters: with 16 clients it is 5.9x, 4.6x, 3.7x, and 2.4x faster at 0.5%, 1%, 2%, and 5%, and equal
+/// at about 10%; with one client it matches IVF at about 1% and is slower beyond. The scan reads each
+/// allowed row's 1 KiB code from memory, so its cost grows with the allowed rows while IVF's stays
+/// nearly flat. Below this share the scan wins everywhere that matters (throughput by 4x or more, with
+/// serial latency within 10%); above it the IVF tier answers.
+const SCAN_SHARE: usize = 64;
+/// Whether a ready graph answers a filtered query by scanning the codes of its `allowed` rows.
+pub(crate) fn scan_eligible(
+    state: &NamespaceState,
+    attribute: &str,
+    set: &SlabSet,
+    vector: &[f32],
+    k: usize,
+    allowed: &RoaringBitmap,
+) -> bool {
+    if overcommitted() {
+        return false;
+    }
+    let Some(scope) = current() else {
+        return false;
+    };
+    let entries = scope
+        .cache
+        .entries
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    entries
+        .get(&Key::new(&scope.namespace, state, attribute, set))
+        .and_then(|h| h.ready.as_ref())
+        .is_some_and(|e| {
+            k > 0
+                && k <= MAX_K
+                && e.graph.can_scan()
+                && vector.len() == e.graph.dims()
+                && vector.iter().any(|x| *x != 0.)
+                && !allowed.is_empty()
+                && allowed.len().saturating_mul(SCAN_SHARE as u64) <= e.graph.len() as u64
+        })
+}
+/// Answer a filtered query from the ready graph's codes: score only the `mask` rows, keep the
+/// best few by SQ8 distance, and rerank them exactly. `None` when the graph cannot answer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan(
+    store: &Storage,
+    state: &NamespaceState,
+    attribute: &str,
+    set: &SlabSet,
+    at: &Placement,
+    vector: &[f32],
+    mask: Arc<RoaringBitmap>,
+    k: usize,
+    columns: &BTreeSet<String>,
+) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+    if !scan_eligible(state, attribute, set, vector, k, &mask) {
+        return Ok(None);
+    }
+    let Some(scope) = current() else {
+        return Ok(None);
+    };
+    let entry = scope
+        .cache
+        .entries
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&Key::new(&scope.namespace, state, attribute, set))
+        .and_then(|h| h.ready.clone());
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    match search_entry(
+        store,
+        state,
+        set,
+        at,
+        vector,
+        Some(mask),
+        k,
+        columns,
+        &entry,
+        0,
+        true,
+    )
+    .await
+    {
+        Ok(found) => {
+            // A scan never feeds the beam calibration: its recall does not depend on the beam.
+            if found.is_some() {
+                scope.cache.answers.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(found)
+        }
+        Err(error) => {
+            tracing::debug!(%error, "warm graph scan declined; using IVF");
+            Ok(None)
+        }
+    }
+}
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search(
     store: &Storage,
@@ -1043,8 +1200,20 @@ pub(crate) async fn search(
     let Ok(_permit) = entry.slots.try_acquire() else {
         return Ok(None);
     };
+    if columns.is_empty()
+        && entry.ids.get().is_none()
+        && !entry.ids_started.swap(true, Ordering::AcqRel)
+    {
+        tokio::spawn(build_id_table(
+            store.clone(),
+            state.clone(),
+            set.clone(),
+            at.clone(),
+            entry.clone(),
+        ));
+    }
     let result = search_entry(
-        store, state, set, at, vector, navigate, k, columns, &entry, ef,
+        store, state, set, at, vector, navigate, k, columns, &entry, ef, false,
     )
     .await;
     match result {
@@ -1079,6 +1248,7 @@ async fn search_entry(
     columns: &BTreeSet<String>,
     entry: &Entry,
     ef: usize,
+    scan: bool,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
     entry.searches.fetch_add(1, Ordering::Relaxed);
     let navigation_started = thread_cpu();
@@ -1095,16 +1265,23 @@ async fn search_entry(
         scratch: Some(scratch),
     };
     let (ef, shortlist) = plan(k, ef);
-    let (hits, evaluations) = entry
-        .graph
-        .candidates_with_norms(
-            vector,
-            ef,
-            shortlist,
-            mask.as_deref(),
-            loan.scratch.as_mut().unwrap(),
-        )
-        .map_err(segment::index_error)?;
+    let (hits, evaluations) = match (scan, mask.as_deref()) {
+        (true, Some(allowed)) => entry
+            .graph
+            .scan(vector, scan_shortlist(k), allowed)
+            .map_err(segment::index_error)?,
+        (true, None) => return Ok(None),
+        (false, _) => entry
+            .graph
+            .candidates_with_norms(
+                vector,
+                ef,
+                shortlist,
+                mask.as_deref(),
+                loan.scratch.as_mut().unwrap(),
+            )
+            .map_err(segment::index_error)?,
+    };
     drop(loan);
     #[cfg(all(test, target_os = "macos"))]
     nav_probe::end(
@@ -1147,8 +1324,19 @@ async fn search_entry(
     .collect::<Vec<_>>();
     exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     exact.truncate(k);
-    if exact.len() < k {
+    // A scan sees every allowed row, so fewer than `k` answers is the complete answer.
+    let need = match (scan, mask.as_deref()) {
+        (true, Some(allowed)) => k.min(allowed.len() as usize),
+        _ => k,
+    };
+    if exact.len() < need {
         return Ok(None);
+    }
+    if columns.is_empty()
+        && let Some(table) = entry.ids.get()
+        && let Some(found) = ids_from_table(table, &exact, mask.as_deref(), set, at, k)
+    {
+        return Ok(found);
     }
     let mut by_segment: BTreeMap<usize, RoaringBitmap> = BTreeMap::new();
     let mut distances = BTreeMap::new();
@@ -1181,10 +1369,86 @@ async fn search_entry(
             documents.insert(id, doc);
         }
     }
-    if scores.len() < k {
+    if scores.len() < need {
         return Ok(None);
     }
     Ok(Some((scores, documents)))
+}
+type Found = (BTreeMap<Id, f64>, BTreeMap<Id, Document>);
+/// The answer for an ID-only query from the resident table, carrying `(row, distance)` to the end
+/// and resolving each ID once, for the final rows only. `None` when the table cannot answer (a row
+/// without an ID, say), so the caller takes the document path. `Some(None)` is the same decline the
+/// document path gives when a row has no live home.
+fn ids_from_table(
+    table: &[u64],
+    exact: &[(u32, f32)],
+    mask: Option<&RoaringBitmap>,
+    set: &SlabSet,
+    at: &Placement,
+    k: usize,
+) -> Option<Option<Found>> {
+    let mut scores = BTreeMap::new();
+    let mut documents = BTreeMap::new();
+    for &(row, distance) in exact {
+        if mask.is_some_and(|m| !m.contains(row)) {
+            continue;
+        }
+        if at.real(&set.covered, row).is_none() {
+            return Some(None);
+        }
+        let id = *table.get(row as usize).filter(|id| **id != u64::MAX)?;
+        let mut doc = Document::new();
+        doc.insert("id".into(), serde_json::Value::from(id));
+        scores.insert(Id::Uint(id), f64::from(distance));
+        documents.insert(Id::Uint(id), doc);
+    }
+    Some((scores.len() >= k).then_some((scores, documents)))
+}
+/// Read every tier row's unsigned ID once, from the same documents the query path hydrates, and
+/// publish the table on the entry. Any failure or non-numeric ID leaves the entry without one.
+async fn build_id_table(
+    store: Storage,
+    state: NamespaceState,
+    set: SlabSet,
+    at: Placement,
+    entry: Arc<Entry>,
+) {
+    let total = set
+        .covered
+        .iter()
+        .map(|c| u64::from(c.base) + u64::from(c.rows))
+        .max()
+        .unwrap_or(0) as usize;
+    let mut wanted: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
+    for row in 0..total as u32 {
+        if let Some((segment, local)) = at.real(&set.covered, row) {
+            wanted.entry(segment).or_default().push((local, row));
+        }
+    }
+    let mut table = vec![u64::MAX; total];
+    let none = BTreeSet::new();
+    for (segment, pairs) in wanted {
+        let rows: RoaringBitmap = pairs.iter().map(|(local, _)| *local).collect();
+        let Some(segment) = state.segments.get(segment) else {
+            return;
+        };
+        let Ok(docs) =
+            segment::projected_rows_with(&store, segment, &rows, Some(&none), true).await
+        else {
+            return;
+        };
+        for (local, row) in pairs {
+            let Some(id) = docs
+                .get(&local)
+                .and_then(|d| d.get("id"))
+                .and_then(serde_json::Value::as_u64)
+            else {
+                return;
+            };
+            table[row as usize] = id;
+        }
+    }
+    let _ = entry.ids.set(table);
 }
 /// Run a calibration ANN plan through the same CPU dispatch as an ordinary warm query.
 /// Exhaustive truth retains its separate blocking worker and nonadmitting context.
@@ -1321,6 +1585,28 @@ impl Engine {
     }
 }
 
+/// Memory a build must always leave unclaimed: a sixteenth of the limit.
+fn build_floor(limit: u64) -> u64 {
+    limit / 16
+}
+/// Bytes the cgroup can still give without killing anything: its limit less its charge, where
+/// charged page cache (`inactive_file` and `active_file`, mapped file pages included) is
+/// reclaimable and so not counted. `memory.current` alone counts that cache, so on a warm host it
+/// sits near the limit and would refuse every build. Only Linux has cgroups.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_headroom(max: u64, current: u64, stat: &str) -> u64 {
+    let reclaimable = stat
+        .lines()
+        .filter_map(|l| {
+            let (key, value) = l.split_once(' ')?;
+            matches!(key, "inactive_file" | "active_file")
+                .then(|| value.trim().parse::<u64>().ok())
+                .flatten()
+        })
+        .sum::<u64>();
+    max.saturating_sub(current.saturating_sub(reclaimable))
+}
+/// Whether `bytes` more can be allocated without exhausting memory the kernel cannot reclaim.
 fn memory_available(bytes: u64) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -1328,17 +1614,10 @@ fn memory_available(bytes: u64) -> bool {
             let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
             let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
             let base = format!("/sys/fs/cgroup{}", path.trim_end_matches('/'));
-            let max = std::fs::read_to_string(format!("{base}/memory.max"))
-                .ok()?
-                .trim()
-                .parse::<u64>()
-                .ok()?;
-            let current = std::fs::read_to_string(format!("{base}/memory.current"))
-                .ok()?
-                .trim()
-                .parse::<u64>()
-                .ok()?;
-            Some(max.saturating_sub(current))
+            let read = |name: &str| std::fs::read_to_string(format!("{base}/{name}")).ok();
+            let max = read("memory.max")?.trim().parse::<u64>().ok()?;
+            let current = read("memory.current")?.trim().parse::<u64>().ok()?;
+            Some(cgroup_headroom(max, current, &read("memory.stat")?))
         })();
         let available = charged.or_else(|| {
             let mem = std::fs::read_to_string("/proc/meminfo").ok()?;
