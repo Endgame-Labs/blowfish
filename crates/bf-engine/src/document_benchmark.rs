@@ -252,10 +252,15 @@ async fn document_footprint_benchmark() {
         let mut docs = BTreeMap::new();
         let mut parts: BTreeMap<String, Vec<segment::PackedPart>> = BTreeMap::new();
         for seg in m.segments.iter().take(2) {
-            let (d, v) =
-                segment::compaction_rows(&store, seg, &(0..seg.row_count).collect(), &strip)
-                    .await
-                    .unwrap();
+            let (d, v) = segment::compaction_rows(
+                &store,
+                seg,
+                &(0..seg.row_count).collect(),
+                &strip,
+                &BTreeSet::new(),
+            )
+            .await
+            .unwrap();
             docs.extend(d);
             for (name, p) in v {
                 parts.entry(name).or_default().push(p);

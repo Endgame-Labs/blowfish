@@ -264,9 +264,10 @@ async fn vectors_are_absent_from_documents_and_projection_is_byte_identical_to_v
             );
         }
         let strip = BTreeSet::from(["f16".into(), "f32".into(), "i8".into(), "empty".into()]);
-        let (compacted_docs, parts) = compaction_rows(&store, &current, &rows, &strip)
-            .await
-            .unwrap();
+        let (compacted_docs, parts) =
+            compaction_rows(&store, &current, &rows, &strip, &BTreeSet::new())
+                .await
+                .unwrap();
         for name in &strip {
             let old = upgrade::read_packed(&store, &legacy, &rows, name)
                 .await

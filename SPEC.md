@@ -132,6 +132,12 @@ log entry in the same commit.
   bulk of a large manifest) and is flagged `root`. Cold ANN queries read it (375 KB against 3.4 MB at 100M); text queries,
   writers, and the indexer read the full manifest slot, which is unchanged, so older binaries and older namespaces work as
   before. `examples/readercopy.rs` rewrites the copy of an existing namespace.
+- **Compaction keeps tier-owned vectors in place** (Round CS1): when an ANN tier owns every row of every input for
+  a dense-vector attribute, compaction keeps that tier through lineage, and does not rehydrate the vectors or build a
+  replacement ANN index (which was then discarded). Shape metadata, filters, text indexes, and results are unchanged,
+  including while row maps are still being backfilled. On the 10M fixture that made eight compactions 9.8 times faster
+  with 98 percent fewer bytes read. The row cap stays memory-derived at today's size: six 1.3M-row segments made a cold
+  ID filter 1.31 times slower, because each segment's sorted-ID seek got deeper.
 
 **Open.**
 
@@ -280,3 +286,7 @@ S3 until the run is cleaned up.
 30. 2026-11-25: Round D4b uses bucket generation 6 and manifest format 5 for tier-owned vectors and resident slab row
     maps. Both advance one generation, following decisions 25 and 26: the upgrade is automatic, and older binaries
     must refuse the upgraded bucket before writing or collecting garbage.
+31. 2026-11-27: Compaction of tier-owned rows keeps the ANN tier through lineage and neither reads the vectors nor
+    builds a segment ANN index (Round CS1). Segment row caps stay as they are: fewer, larger segments were measured
+    1.31 times slower on cold ID filters, because the cost is the depth of each segment's ID seek, not the number
+    of segments.

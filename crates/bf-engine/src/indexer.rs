@@ -738,6 +738,7 @@ impl Engine {
                             BTreeMap::new(),
                             seg.wal_start,
                             seg.wal_end,
+                            &Default::default(),
                             &self.0.config,
                         )
                         .await?,
@@ -759,6 +760,7 @@ impl Engine {
                         BTreeMap::new(),
                         state.indexed_through + 1,
                         state.seq,
+                        &Default::default(),
                         &self.0.config,
                     )
                     .await?,
@@ -808,6 +810,20 @@ impl Engine {
                 .filter(|(_, c)| segment::dense_type(c).is_some() && c.filterable != Some(true))
                 .map(|(name, _)| name.clone())
                 .collect();
+            // Delegate an attribute only when its tier owns every row of every input.
+            // A partially covered merge still builds its own ANN.
+            let sources = crate::vector_locator::Sources::new(&state);
+            let delegated: std::collections::BTreeSet<String> = strip
+                .iter()
+                .filter(|attr| {
+                    state
+                        .segments
+                        .iter()
+                        .filter(|seg| compact.contains(&seg.id))
+                        .all(|seg| sources.covers(seg, attr))
+                })
+                .cloned()
+                .collect();
             let mut compact_vectors: BTreeMap<String, Vec<segment::PackedPart>> = BTreeMap::new();
             let mut start = u64::MAX;
             let mut end = 0;
@@ -829,7 +845,7 @@ impl Engine {
                         }
                         let (docs, vectors) = crate::vector_locator::scope(
                             &state,
-                            segment::compaction_rows(store, &seg, &live, &strip),
+                            segment::compaction_rows(store, &seg, &live, &strip, &delegated),
                         )
                         .await?;
                         compact_docs.extend(crate::shared(docs));
@@ -875,6 +891,7 @@ impl Engine {
                         BTreeMap::new(),
                         state.indexed_through + 1,
                         state.seq,
+                        &Default::default(),
                         &self.0.config,
                     )
                     .await
@@ -920,6 +937,7 @@ impl Engine {
                         compact_packed,
                         start,
                         end,
+                        &delegated,
                         &self.0.config,
                     )
                     .await
@@ -1429,6 +1447,7 @@ async fn build_segments<D: std::borrow::Borrow<bf_types::Document> + Clone>(
     mut vectors: BTreeMap<String, segment::PackedColumn>,
     start: u64,
     end: u64,
+    delegated: &std::collections::BTreeSet<String>,
     config: &EngineConfig,
 ) -> Result<Vec<bf_wal::Segment>, ApiError> {
     let mut batches = vec![];
@@ -1487,8 +1506,8 @@ async fn build_segments<D: std::borrow::Borrow<bf_types::Document> + Clone>(
         let mut builds = Vec::with_capacity(group.len());
         for batch in group {
             let vectors = batch_vectors.next().unwrap_or_default();
-            builds.push(segment::build_with(
-                store, ns, schema, metric, batch, vectors, start, end,
+            builds.push(segment::build_with_delegation(
+                store, ns, schema, metric, batch, vectors, start, end, delegated,
             ));
         }
         let started = std::time::Instant::now();
