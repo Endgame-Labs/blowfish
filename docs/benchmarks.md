@@ -16408,3 +16408,57 @@ indexer.
 
 Resources: one on-demand c7g.4xlarge, 23:51 to 02:10 UTC (about 2.3 hours, about $1.4 compute plus a 150 GB gp3
 volume). Instance, volume, key pair, and security group deleted and verified. No bucket prefix was created.
+
+## Round BC1: collapse the serial metadata waves of a cold BM25 query (killed at the profile)
+
+Hypothesis (Neon, `briefs/ideas/0225-neon.md` #4): a cold BM25 query pays serial object-store round trips before any posting read,
+because `indexed.rs` awaits `text::global_stats` before `prepare()`, and `search_internal` awaits `ensure_lengths()` before `lookup()`.
+Kill bar: the serial waits before the first posting read add up to under 15 ms at p50. No production change was made.
+
+### Method
+
+One on-demand c7g.2xlarge (Ubuntu 24.04 arm64, Clang 19, NumKong `__arm_get_current_vg` link stub), main at `b4ffd9a` (v0.1.61),
+the `scale-server` example binary. Fixture `tmp/msmarco-1m-v021/` (1M MS MARCO passages, eight text segments) on S3 in us-west-2,
+read only, instance-profile credentials, 2 GiB cache, 4,000-byte blocks. Cache-cold, as in `ab.py --cachecold`: one long-lived server,
+`POST /_bench/drop_caches` before every query, connections warm, one throwaway query first. 41 queries (`bm25-msmarco.json`, items
+100 to 140), `BF_TRACE_READS=1` and `BF_TRACE_STAGES=1`. A script split the server log per query and assigned each read to a phase
+(before the snapshot warm, during it, after it) and a dependency level (a read's level is one more than the deepest read that finished
+before it started). Tracing slows the queries: p50 was 153 ms with it on, against about 100 ms without it in the A/A smoke test, so
+read the table as proportions.
+
+### Profile (p50 over 41 cache-cold queries)
+
+| Stage | p50 ms |
+| --- | ---: |
+| Manifest read, then WAL tail check (two dependent reads) | 29.4 |
+| Snapshot warm: one concurrent wave of text keys, text stats, live bitmaps, lengths, dictionary chunks, and term records | 46.6 |
+| Gap from warm done to the first posting read | 0.8 |
+| `text::global_stats` (awaited before `prepare()`) | 0.15 |
+| Segment search, all eight segments (postings, then window refinement) | 68.5 |
+| Dependency depth over all reads | 5 (p90 7) |
+
+### Finding
+
+The two waits the hypothesis names cost almost nothing, because the snapshot open already hoists them. `OpenHint` makes the snapshot
+warm run `prefetch_plan` for every segment, and `prefetch_plan` already joins `ensure_lengths` with the dictionary and term-record
+reads. It runs beside the `text-keys`, `ids`, `live`, and `text-stats` reads in a single concurrent task set. By the time `global_stats`
+and `search_internal` run, every metadata read is a cache hit: `global_stats` takes **0.15 ms** at p50 (0.20 ms at p90), and the first
+posting read starts **0.8 ms** (p90 3.1 ms) after the warm ends. So `ensure_lengths` before `lookup` and `global_stats` before `prepare()`
+add about 1 ms, far under the 15 ms bar. Moving them into one `try_join!` inside the search path would not shorten the critical path.
+
+What the 5-deep chain does contain: the manifest (one read), the WAL tail check (dependent on it), one metadata wave (about 45 ms with
+42 to 76 reads, internally a dictionary chunk then a term record), and then 2 to 4 posting levels (first postings, then the window
+refinement reads that depend on the scores so far). Those are inherent to the format, or are posting waves the hypothesis did not
+target. The brief's third claim, a separate small-term wave ahead of `FIRST_WINDOWS`, also did not show up: in the traced queries the
+first posting level holds both (16 reads for a typical query), and the later levels are one or two score-dependent window reads.
+
+### Conclusion
+
+**Killed at the profile.** The serial metadata waits the idea removes add up to about 1 ms at p50, against the 15 ms bar, so there
+is nothing for a 1.3x cache-cold gain to come from. The paired A/B and the warm check were not run, since there was no candidate. A
+real next step for cold BM25 would be the posting levels (about 100 ms of the traced 153 ms), for example issuing the first-window
+posting reads from the warm task as soon as the term records arrive. That needs a profile of the posting levels' own dependencies
+first, and I did not start it.
+
+Resources: one on-demand c7g.2xlarge for about 1 hour (about $0.35), key pair and security group deleted, instance terminated. No
+bucket prefix was created.
