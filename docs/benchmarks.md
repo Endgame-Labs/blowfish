@@ -18122,3 +18122,20 @@ Not attempted, and the bar cannot be met: G20 bounded all SQ8 work at 23 percent
 
 - Cleanup: the M4 run directory (data, store, binaries) is deleted and nothing of mine is running there; about $0.5 of S3 transfer for the corpus; no EC2; no bucket writes.
 - `native_drive` reads UUID IDs back to corpus rows for its recall check (the multiplier is odd, so the mapping inverts).
+
+## Round G22: the kill test (the contention wall is not metrics or `Cache::observe`; round killed at the gate)
+
+**Setup:** Round G20's: the Apple M4 (shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture, the graph promoted the ordinary way (`g19_run.py` held, 30 minutes this time), indexing off, release binaries, `top_k` 10, IDs only, the native driver (`native_drive`, 16 connections, 20 seconds per arm). Every arm ran on **one promoted server** of a candidate binary (tree v0.1.74 plus a temporary switch file read every 500 ms, not in the tree): bit 1 swaps the Prometheus recorder for no-op handles (the `metrics` macros still build their keys), bit 2 skips `Cache::observe` on the typed ID path. Order 0, 1, 3, 2, three times. Responses were byte-identical in every arm (the same row SHA-256, recall 0.9600).
+
+| Arm | q/s, three runs | median | server CPU per query | p50 (ms) |
+|---|---|---:|---:|---:|
+| v0.1.74 (switch 0) | 17,046; 16,943; 17,021 | **17,021** | 459 us | 0.897 |
+| no-op metrics (1) | 17,948; 17,577; 18,004 | **17,948** (1.05x) | 428 us | 0.854 |
+| skip `Cache::observe` (2) | 16,972; 17,017; 17,020 | **17,017** (1.00x) | 458 us | 0.898 |
+| both (3) | 17,997; 18,014; 17,996 | **17,997** (1.06x) | 429 us | 0.851 |
+
+**Neither build reaches 18,500 q/s, so the round stops here, as the brief says.** All metrics together cost 5 to 6 percent (30 us of CPU per query); `Cache::observe` costs nothing measurable. Removing every metric would still leave the 1.2 times bar (20,425 q/s) out of reach, so a per-query aggregation of the metrics cannot pass it either. (This machine's v0.1.74 reads 17,021 today against G20's 16,610.)
+
+**What a profile says** (`sample` of the held server, 8 seconds under 16 connections, switch 0): of the non-idle samples, the graph walk (`search_prefetched`, 2,340) and the SQ8 dot kernel (1,033) lead by far; request parsing follows (`serde_json` number parsing, 482, plus the request AST, 319), then `memmove` (451), the CRC (232), and the RaBitQ transform (169). Lock frames are tiny: `__psynch_mutexwait` 42, `os_unfair_lock_trylock` 40, and the allocator's `malloc_mutex_lock_slow` 34, together about 1.5 percent of active samples. Most threads sit in `__psynch_cvwait` (parked pool threads) and `kevent`. There is no spinning lock to remove; the 16 percent CPU-per-query rise at the 8th core in G20 is more likely the efficiency cores and memory bandwidth on the walk and the rerank row reads than shared-state contention.
+
+Nothing shipped. Cleanup: gizmo run directory deleted (about 26 GB), nothing of mine running, `.scratch/g22` removed.
