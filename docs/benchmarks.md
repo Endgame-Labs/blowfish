@@ -18076,6 +18076,71 @@ shadowed ID, and that it equals the answer after indexing the tail.
 One c7gn.4xlarge on demand, 17:55 to 18:44 UTC (0.8 hours), 160 GB root volume: about $1. The instance, key pair, security group, and
 the owned S3 prefix (693 objects, 77 GB) are deleted.
 
+## Round C34: the cold rerank tail is S3's first-read latency, and a hedge cannot recover it (no engine change kept)
+
+The ~100-150 ms after a cold query's scan is not queueing and not a missing hedge: those 16 KB reads are the first read of cold bytes, and S3 serves
+those in about 75 ms at p50 and 110 ms at p90 whatever the size, then serves the same bytes again in about 28 ms. A duplicate request does not beat
+that, because it reads the same cold bytes. Nothing was kept in the engine or storage; the diagnostics (`TRACE_HEDGE` under `BF_TRACE_READS`,
+`c34_trace.py`, `c34_s3lat.py`) are.
+
+Measured 2026-11-27 on one on-demand c7gn.4xlarge (us-west-2, 20:17 to 20:50 UTC, about 0.5 h), a private server-side copy of the C5 10M fixture repaired by the
+baseline writer (55 row maps; the repair took about 13 minutes of writable serving), v0.1.74 (`b234bce`) plus the trace lines. Protocol as C33: read-only
+server, CPUs 0-7, 8 Rayon workers, 64 probes, strong consistency, IDs only, 256 KiB blocks, 32-block coalescing, no disk cache, full engine-cache drop before
+every request.
+
+### Trace (12 cold unfiltered `top_k` 10 queries)
+
+- **Hedge coverage.** Rerank reads take the same path as every other GET: the fetch semaphore, then `Hedger::get_range`. The semaphore is not a queue: its wait
+  was under 1 ms on every query (512 permits). The reads are hedged by the sibling rule (30-35 ms threshold in the trace, p70 of the finished siblings),
+  but in the base build only 0 to 2 rerank reads per query were duplicated and all of the 23-60 hedges per query went to the scan: the token bucket earns 0.15
+  per primary read, about 45 per query, and the scan's stragglers spend it first. Every slow rerank read in the base trace shows `hedge_after=-1`.
+- **Latency.** The wave starts at scan end (130-250 ms) and its last byte arrives 100-135 ms later (for example 187 to 290 ms). Reads are bimodal: a first one or
+  two at 18-30 ms, the rest at 60-120 ms, however many there are (7 reads: 20 to 118 ms; 14: 20 to 103 ms; 60: 17 to 129 ms).
+
+### Why a hedge cannot help: S3 measurements (`c34_s3lat.py`, 60 ranged GETs per line, 16 threads, warm connections)
+
+| Read | p10 / p50 / p90 / max, ms |
+| --- | ---: |
+| 16 KB, random offsets in the 20 largest ANN objects (first read) | 28 / 72 / 110 / 128 |
+| 16 KB, random offsets in one 549 MB object | 24 / 35-65 / 92 / 123 |
+| 256 KB, random offsets (first read) | 27 / 73-87 / 108-115 / 167-180 |
+| 16 KB, offsets in the first MB of the same objects | 22 / 28 / 37-91 / 50-117 |
+| 16 KB, the same random offsets read again | 22 / 28-30 / 48 / 68-74 |
+| 16 KB random, single request | 78 p50 / 111 p90 / 164 max |
+| same, duplicate after 60 ms, first answer wins | 73 / 101 / 136 |
+| same, duplicate after 40 ms | 72 / 102 / 150 |
+| same, duplicate after 25 ms | 75 / 99 / 142 |
+
+Latency follows how recently the bytes were read, not size: re-reading costs 28 ms and a random cold region 72 ms, for 16 KB and 256 KB alike. A duplicate sent
+after 25, 40, or 60 ms is no faster (p50 72-75 against 78, p90 99-102 against 111), so spending more of the hedge budget cannot shorten the wave. The scan's
+own reads are in the same state (cold 256 KB reads at 73-87 ms), so a cold query is three S3 rounds of about 75 ms (directory, scan, rerank) plus CPU.
+
+### Candidate tried and removed: a lane for small reads
+
+Hedging small reads (up to 64 KB) in their own lane, with their own sibling ring and a 0.5 budget, so the wave is judged against its own kind and the scan
+cannot spend its tokens, did issue the hedges (3 to 37 per query on rerank reads), and changed nothing, as the S3 table predicts. Paired, 40 cold `top_k` 10 pairs:
+
+| Case | Base p50 / p90, ms | Candidate p50 / p90, ms | Ratio (95%) | GETs base / cand | Exact |
+| --- | ---: | ---: | ---: | ---: | --- |
+| A/A control (base twice) | 214.2 / 279.7 | 212.3 / 297.2 | 0.991 (0.847-1.246) | 291 / 292 | yes |
+| Small-read lane | 197.1 / 234.4 | 191.5 / 247.2 | 0.972 (0.892-1.095) | 283 / 286 | yes |
+
+It fails the 1.2x bar, so the lane was reverted (SPEC 25: one path, no inferior one). The other cases (`top_k` 100, 10 percent filter, `id < 1000`) were not run
+for a candidate with no effect.
+
+### Sol's per-leaf exact reads: not attempted
+
+The trace's condition holds (the wave costs 100 ms, over 50 ms), but the S3 floor shows what the idea needs. Any read that starts after the scan ends costs one
+cold round of about 75-110 ms, and the wave's time is the maximum, not the sum: it does not shrink with fewer reads (7 reads took 118 ms). Only exact
+vectors read before the scan ends avoid it, and the final contenders are unknown until then, so every probed leaf's exact vectors would have to be read: 64
+more GETs (+23 percent against 283, the bar is 10) and about 83 MB more (+85 percent of 97 MB). A partial set (the nearest leaves only) buys nothing, since the
+rest of the wave still pays the full round. It would trade GETs and bytes for about 100 ms: a decision for Kyle, not a free fix, and it needs the rerank to
+find vectors in full-size cache blocks (it reads 16 KB blocks cached apart from the 256 KiB ones).
+
+### Cost
+
+One c7gn.4xlarge on demand for about 0.5 hours plus the 77 GB server-side copy (deleted): under $1. The instance, key pair, security group, and the S3 prefix are deleted.
+
 ## Round G21: the typed ID path serves UUID IDs (3.68 times at `top_k` 100) and engines with disk staging (item 3 not attempted)
 
 **Setup:** Round G18's machine (the Apple M4, shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), but **loaded with UUID IDs**: `bench/nq/load.py --vectors-only --uuid-ids` writes
