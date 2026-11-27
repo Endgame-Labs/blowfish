@@ -16924,7 +16924,7 @@ after it. Only ID comparisons do this.
 
 ### Design iterations, each against the baseline in the same session
 
-Cold sessions drifted (baseline `id` p50 ranged 387-554 ms across sessions on this host), so every
+Cold sessions drifted (baseline `id` p50 ranged 386-554 ms across sessions on this host), so every
 design choice below compares arms rotated within one session, 80-90 queries per arm.
 
 | Variant | `id < 1000` vs baseline p50 (95% interval) | `Eq` vs baseline p50 | GETs `id` / `Eq` (baseline 1,130 / 419) |
