@@ -17155,6 +17155,65 @@ Qdrant's collection came up green with all 2,681,468 vectors indexed in two segm
 
 Costs: no EC2 and no bucket writes. The 26.8 GB NQ fixture was copied to the M4 through presigned URLs (about $2.4 of S3 transfer) and deleted with the run directory, with the Qdrant store.
 
+## Round G19: the general path's waste, and an ID-only path that keeps its speed under writes (2.0 to 2.4 times v0.1.68 with a 3,000 to 12,000 row tail)
+
+**Setup:** Round G18's: the Apple M4 (shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture copied to a writable APFS clone, 16 client processes with one keep-alive connection each, release binaries with production defaults, indexing off (so writes stay in the unindexed tail and shadow base rows), and the graph promoted the ordinary way (`g19_run.py`, 22 minutes). Every comparison ran on **one promoted server**, with the arms selected by a temporary switch file (read every 500 ms, in a candidate binary only, not in the tree). The "v0.1.68" arm is the pre-round code kept alongside the new code in that binary: the empty-state validation, owned cache keys with separate prune and observe locks, `Wal::new` and key formatting per WAL probe, the typed path declining on any tail or shadowed row, and a tail scan with no screen. Each arm is 25 seconds (20 for item 1), after a serial pass over all 3,452 queries that hashes every response's rows.
+
+### 1. The general path
+
+What changed (one path, no setting): the request is validated by a rows-free pass of `query::execute` (`query::validate`) instead of building an empty copy of the state and executing against it, and then executing again; cache lookups use a borrowed key (`KeyRef`, compared through `Borrow<dyn KeyView>`) so no lookup allocates three `String`s; `Cache::observe` prunes and records heat under one lock instead of two, and allocates only for a tier it has not seen; the key of the next WAL slot is formatted once per sequence on the namespace handle instead of through `Wal::new` for every probe; `Scope` shares its namespace as an `Arc<str>`.
+
+Measured with a query the typed path declines (`top_k` 10 with `include_attributes: ["id"]`; the NQ store has no other attribute) and a filtered query (`id < 10%` of the rows, `top_k` 10, IDs only). Eight arms in the order L N N L L N N L (L is the old path, N the new):
+
+| | q/s (four runs, median) | p50 / p99 (ms) | server CPU per query | rows hash |
+|---|---:|---|---:|---|
+| attribute query, v0.1.68 | 11,500 (11,468 to 11,518) | 1.30 / 3.03 | 640 us | identical in all 8 arms |
+| attribute query, new | **12,094** (12,004 to 12,160) | 1.24 / 2.87 | 600 us | |
+| filtered 10%, v0.1.68 | 1,117 (1,115 to 1,119) | 14.0 / 22.2 | 8,030 us | identical in all 8 arms |
+| filtered 10%, new | 1,115 (1,105 to 1,118) | 14.1 / 22.4 | 8,030 us | |
+
+**The attribute query is 1.05 times faster (CPU 6 percent lower); the bar was 1.15 times, so this item did not pass.** A first promotion of the same candidate gave 12,010 to 12,213 against 11,491 to 11,542 (1.05 times) as well. The filtered query is unchanged: a filtered scan spends 8 ms of CPU, so 40 us of bookkeeping is invisible. The remaining 200 us between this path (600 us) and the typed one (393 us in Round G18) is spread over many small items (the per-query `ReadContext`, `Scope`, and request `Arc`s and clones, boxed futures per tier, the `BTreeMap` candidate and document assembly, `serde_json` row maps); finding the next layer needs a profile of this query shape, which this round did not take.
+
+### 2. The typed ID-only path under writes
+
+`Engine::query_ids` no longer declines for an unindexed tail or shadowed rows. It hides the shadowed rows from the graph walk the way the general path does (`ann::graph_mask`, with the tier mask deciding whether the graph may serve), scores every tail document with the general path's own routine (`indexed::score_tail`, now shared: the same prepared block, the same kernel, the same `(distance, ID)` order), merges them with the graph's rows in one heap, and declines only if a winner has a string ID, an ID repeats, or the tail scan returns an error (the general path then reports it). Consistency is the old rule: the answer is used only if the next WAL slot does not exist and the snapshot did not move while the search ran, so a write acknowledged before a strong query is visible to it.
+
+**A certified screen for the tail scan.** The first version of this item was no faster than v0.1.68 under writes (below), because a tail scan reads every tail vector (4 KB each, 12,000 vectors is 48 MB per query, against the memory bandwidth all 16 clients share). `tail::Vector` now also holds the vector's eight-bit codes (scale from its largest coordinate) with two numbers: its norm and the norm of the quantization error. Per query, the query is quantized the same way. For any row, `q.p - q'.p' = (q - q').p + q'.(p - p')`, so by Cauchy-Schwarz `|q.p - q'.p'| <= |q - q'||p| + |q'||p - p'|`; from the integer dot product of the codes (`bf_vector::warm_graph::dot_i8`, `SDOT` on the M4) this gives a lower bound on the cosine distance, less a slack of 2e-4 for the exact kernel's `f32` accumulation. A row whose bound exceeds the distance the top `k` must beat (the heap's worst, initially the graph's `k`-th row) cannot enter it and gets no exact distance; every other row, and every row at exactly that distance, is scored by the unchanged exact kernel, so winners keep their exact bits and ties keep their order. The scan is shared by the general path, so queries it serves under a tail get the screen too. It reads a quarter of the bytes (1 KB a row) and the exact vector only for rows that might win.
+
+**Protocol** (G13's, on the M4): after promotion, a writer upserts existing IDs with their stored vectors at 50 requests a second (15,220 writes, no error, p50 15.6 ms, p99 54 ms) and the same 3,452 queries cycle at `top_k` 10 and then 100, IDs only. The tail grows by 50 rows a second, so the arms ran in a palindrome (v0.1.68, merge without the screen, new, new, merge, v0.1.68) and are compared at the same tail size by interpolating the v0.1.68 arm's service time (1 / q/s) between its two points; the new arm's tails lie between them. A prober also wrote a fresh row whose vector equals a query's and queried for it five times a second: 1,320 probes, 0 missed.
+
+| `top_k`, tail rows | arm | q/s | p50 / p99 (ms) | CPU per query | v0.1.68 at that tail (interpolated) | ratio |
+|---|---|---:|---|---:|---:|---:|
+| 10, 669 | v0.1.68 | 6,659 | 1.9 / 7.7 | 1,111 us | | |
+| 10, 3,296 | **new** | **5,775** | 1.9 / 11.4 | 1,233 us | 2,491 | **2.32x** |
+| 10, 4,609 | **new** | **4,561** | 2.3 / 13.4 | 1,615 us | 1,899 | **2.40x** |
+| 10, 7,217 | v0.1.68 | 1,289 | 10.5 / 32.0 | 6,771 us | | |
+| 10, 1,983 and 5,923 | merge, no screen | 4,263 and 1,267 | 2.8 / 12.8 and 11.8 / 34.5 | 1,871 and 6,551 us | 3,627 and 1,534 | 1.18x and 0.83x |
+| 100, 8,900 | v0.1.68 | 924 | 14.8 / 42.3 | 9,536 us | | |
+| 100, 11,342 | **new** | **1,539** | 7.2 / 34.1 | 5,356 us | 757 | **2.03x** |
+| 100, 12,293 | **new** | **1,427** | 7.7 / 36.1 | 5,752 us | 708 | **2.02x** |
+| 100, 14,271 | v0.1.68 | 623 | 22.2 / 63.3 | 14,124 us | | |
+| 100, 10,091 and 13,196 | merge, no screen | 774 and 609 | 18.3 / 55.1 and 23.7 / 66.9 | 10,817 and 13,515 us | 835 and 667 | 0.93x and 0.91x |
+
+**Under steady writes with a tail of 3,000 to 12,000 rows, `top_k` 10 is 2.3 to 2.4 times and `top_k` 100 is 2.0 times v0.1.68 (the bar was 1.2 times), and a write acknowledged before a query is always visible to it.** The merge without the screen (the first version of this item) is no faster than v0.1.68 (0.83 to 1.18 times at `top_k` 10, 0.91 to 0.93 times at `top_k` 100): a tail scan on the HTTP reactor costs what it does on the query pool. The screen is what pays. Without writes the tail is empty and this item changes nothing (the typed path already served); the no-tail typed path was not re-measured this round beyond the byte-identity tests.
+
+**Frozen-tail identity:** after the writer stopped (15,220 overwrites and 1,320 fresh rows in the tail), all three arms answered all 3,452 queries at `top_k` 10 and 100: the SHA-256 of every response's rows (IDs and distances) is identical across v0.1.68, merge, and new, at both `top_k`. Recall against the recorded truth is 0.873 (`top_k` 10) and 0.934 (`top_k` 100) because the prober's 1,320 fresh rows sit at distance 0 from queries and displace recorded neighbors.
+
+### Tests
+
+- `warm_graph::tests::typed_ids_path_merges_the_tail_like_the_general_path`: a promoted-graph namespace with inserts (a copy of a query vector, near points), an overwrite that brings a row in, overwrites that move rows away, and deletes, all among the top `k`; after each stage the typed body equals the general path's body byte for byte for 36 queries (`top_k` 1, 2, 10, 33, 64, 100), the typed path serves (never declines), the first strong read after an acknowledged write sees it, and a deleted row never returns. `typed_ids_path_is_byte_identical_to_the_general_path` (Round G18) still passes on the refactored shared helpers.
+- `tail::tests::screen_lower_bound_never_exceeds_the_exact_distance`: about 2,000 vector pairs over 2 to 4,096 dimensions (uniform, 1e-6 and 1e6 magnitudes, a few huge coordinates, sparse, nearly duplicate) never put the bound above the exact distance. `tail::tests::screened_tail_scan_returns_the_same_top_k_as_the_exact_scan`: 300 and 3,000 row tails, `top_k` 1, 10, 100, with and without a seeded bound, serial and parallel branches: the same IDs and distance bits as an unscreened scan, and the screen skips more than half the rows.
+- Full debug `cargo test --workspace --no-fail-fast` (nice -n 19 -j 3): 666 passed, 0 failed, 27 ignored (two `warm_graph` tests, `filtered_scan_hides_shadowed_rows_inside_the_allowed_set` and `recall_trials_admit_sparse_graph_reads_without_admitting_the_exact_scan`, failed once under that load in an earlier run and passed alone and in the next full run, as Round G13 recorded for the second). `cargo clippy --workspace --all-targets -- -D warnings` is clean here and on the M4, and the new tests pass on the M4 (aarch64, where `dot_i8` runs `SDOT`).
+
+### Notes
+
+- **Switch:** the arms came from a temporary file-read switch in a candidate binary (bit 1 the old general path, bit 2 the typed path declining on a tail, bit 4 no screen); it is not in the tree. The code kept alongside for "v0.1.68" is the pre-round code, not the v0.1.68 binary.
+- **The NQ store has no attribute besides `id`,** so the attribute query asks for `["id"]`, which the typed path declines and the general path serves through the ID table. A query that reads a stored attribute spends more in document assembly and would show a different (probably smaller) saving.
+- **Item 3** (I8MM `SMMLA` paired-neighbor scoring in the graph walk) was not attempted: item 2 took the time.
+- Not measured: tails over 15,000 rows, strings IDs (the typed path does not serve them), Euclidean namespaces (no screen), `top_k` between 10 and 100, indexing on (tail flushes create uncovered segments), other hosts.
+
+Costs: no EC2 and no bucket writes. The 21 GB store and 5.5 GB corpus were copied from the measurement bucket to the M4 through presigned URLs (about $2.4 of S3 transfer; some of the first run's files stalled and were fetched again) and deleted with the run directory.
+
 ## Round C31: a cold ID-range seek in one wave instead of a binary search
 
 A cold `id < 1000` query on the repaired 10M fixture is **1.27× faster** (p50 405.4 → 319.7 ms),

@@ -7,14 +7,14 @@ Usage: uv run g19_run.py RUN_DIR BINARY LABEL CAP_MINUTES [SECONDS]
 RUN_DIR holds store/ (a writable clone of the NQ fixture store) and fixture/data/{queries.npy,truth.npy,
 corpus.f16}. The binary is a candidate with a temporary A/B switch (BF_G19_SWITCH names a file holding a
 number, read every 500 ms: bit 1 runs the v0.1.68 general path, bit 2 makes the typed ID path decline when
-a tail or shadowed rows exist). Starts the server with indexing off, promotes the graph under ordinary heat
+a tail or shadowed rows exist, bit 4 turns the tail scan's eight-bit screen off). Starts the server with indexing off, promotes the graph under ordinary heat
 (graph_heat.py), then on the same server runs:
 
   Item 1 (empty tail, 16 clients): shapes `attr` (top_k 10, include_attributes ["id"]) and `filter`
     (top_k 10, id < 10% of the rows), arms legacy/new in the order L N N L L N N L. Each arm runs one serial
     quality pass (SHA-256 of every response's rows) and a timed pass.
-  Item 2 (steady writes, 16 clients, IDs only): top_k 10 and 100, arms v0.1.68 (bits 3) and new (bits 0) in
-    the order O N N O, with a writer upserting existing IDs with their stored vectors at 50 a second and a
+  Item 2 (steady writes, 16 clients, IDs only): top_k 10 and 100, arms v0.1.68 (bits 7), the typed merge without the screen (bits 4), and new (bits 0) in the
+    order O M N N M O, with a writer upserting existing IDs with their stored vectors at 50 a second and a
     prober that writes a fresh row and immediately queries for it (read your writes). Then the writer stops
     and, on the frozen tail, both arms answer every query again: rows must hash the same.
 
@@ -303,12 +303,12 @@ try:
             set_bits(0)
             timed(bodies, 8, pid)
             runs = []
-            for name, bits in (("v0.1.68", 3), ("new", 0), ("new", 0), ("v0.1.68", 3)):
+            for name, bits in (("v0.1.68", 7), ("merge", 4), ("new", 0), ("new", 0), ("merge", 4), ("v0.1.68", 7)):
                 if k == 10 and not pt.is_alive() and not runs:
                     pt.start()
                 set_bits(bits)
                 r = {"arm": name, "bits": bits, "tail_writes": len(wrote)}
-                r.update(timed(bodies, max(seconds, 30), pid))
+                r.update(timed(bodies, seconds, pid))
                 s = status()
                 r["graph_answers_total"] = s.get("answered")
                 print(json.dumps(r), flush=True)
@@ -328,10 +328,11 @@ try:
         for k in (10, 100):
             bodies = [body_for("ids", k, q) for q in queries]
             hashes = {}
-            for name, bits in (("v0.1.68", 3), ("new", 0)):
+            for name, bits in (("v0.1.68", 7), ("merge", 4), ("new", 0)):
                 set_bits(bits)
                 hashes[name] = quality(bodies, truth, k)
-            result["frozen"][f"k{k}"] = {"hashes": hashes, "identical": hashes["v0.1.68"][0] == hashes["new"][0]}
+            result["frozen"][f"k{k}"] = {"hashes": hashes,
+                                         "identical": len({h[0] for h in hashes.values()}) == 1}
             print(json.dumps({"frozen": k, **result["frozen"][f"k{k}"]}), flush=True)
         result["final_status"] = status()
     (run / f"{label}-result.json").write_text(json.dumps(result, indent=1))
