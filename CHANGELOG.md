@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.73] - 2026-11-27
+
+### Changed
+
+- **Cold `id In` filters are 9 to 140 times faster:** A cold vector query filtered by a list of IDs decoded every segment's whole ID dictionary, which was 84 percent of the 639 MB it read for four IDs. A list of IDs now goes through the sorted-ID seek that range filters use since v0.1.67, with the IDs sharing the probe and region reads, and the planner keeps the dictionary only where it would read fewer bytes. On the 10M fixture at p50: 4 IDs went from 3.66 to 0.42 s, 32 IDs from 11.3 to 0.59 s, and 256 random IDs from 68.1 to 1.01 s (0.47 s when they are clustered), reading 110 to 180 MB instead of about 640 MB. Results are identical, and range and single-ID filters are unchanged. See Round C32 in `docs/benchmarks.md`.
+
 ## [0.1.72] - 2026-11-27
 
 ### Changed
@@ -527,7 +533,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.72...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.73...HEAD
+[0.1.73]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.73
 [0.1.72]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.72
 [0.1.71]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.71
 [0.1.70]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.70

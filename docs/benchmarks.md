@@ -17347,6 +17347,76 @@ One c7gn.4xlarge on demand from 07:54:37 to 10:14:51 UTC (2.34 hours), with a 12
 The estimate is $3, below the $6 cap. The instance, its key pair, and its security group are gone, and
 the owned S3 prefix (1,041 objects, 77 GB) was deleted, with no multipart uploads left.
 
+## Round C32: short `id In` lists through the sorted-ID seek
+
+A cold ANN query filtered by `["id","In",[4 IDs]]` on the repaired 10M fixture is **8.8x faster**
+(p50 3,658 -> 417 ms, 638 -> 115 MB read), with identical ordered IDs and distance values in every one of
+the 320 pairs. 1, 4, 32, and 256 IDs, random or clustered in one ID range, are all 7x to 140x faster,
+and C31's `id < 1000` and `Eq` controls are unchanged. No format or setting changed.
+
+Measured 2026-11-27 on one on-demand c7gn.4xlarge (us-west-2), baseline v0.1.70 (`7691c9a`) against the candidate on a
+private copy of the retained C5 checkpoint, repaired by the baseline writer (61 segments, 55 row maps, about 12 minutes).
+Same protocol as C31: read-only servers, 8 Rayon workers, 64 probes, strong consistency, top ten, IDs only, 256 KiB blocks,
+32-block coalescing, zero disk cache, a full engine-cache drop before every request, arms alternating AB/BA, one untimed
+warm-up per process, 40 pairs per case, 95% intervals from 20,000 paired resamples. Each query has its own ID list, the same
+in both arms.
+
+### Trace
+
+The `In` operator was not an ID-column operator: it fell to the general filter path, which loads the segment's "filters"
+ID column (every ID with its row bitmap) and tests each dictionary entry against the whole list. Cold 4-ID `In`: 638 MB and
+355 GETs, against 100 MB for a single-ID `Eq` through the seek (same ANN work), so the dictionary is about 538 MB, **84%**
+of the bytes (the stop threshold was 50%). CPU grows with the list: 256 IDs cost 68 s per query in the baseline, because
+every one of 10M dictionary entries is compared with every listed ID.
+
+### The change
+
+One path (SPEC 25). `lookup_in` in `segment_id_filter.rs` normalizes and sorts the list, drops duplicates, and drops IDs
+outside the segment's min/max (a segment whose range excludes every ID reads only its small bounds header). The rest share
+C31's first wave: the first ID of each probe block and the last block, one batch. Each ID is bracketed to a region by
+binary search over the probes, and IDs that land in the same region share it. Wave two reads every needed region in one
+batch, and each ID is found by binary search in memory and kept only if its row is live. Staged local row IDs keep the
+in-memory search. `Eq` already took the seek (C31).
+
+The planner compares the bytes wave two would read (the bracketing regions' block lengths) with the bytes of the segment's
+ID dictionary, which the filters directory reports (read concurrently with wave one), and keeps the dictionary path when the
+seek would read more, or when that dictionary is already decoded in the cache. There is no list-length setting. On this
+fixture the seek always won, even at 256 random IDs (180 MB against 650 MB).
+
+### Results (40 cold pairs per case, all exact)
+
+| Case | Baseline p50 / p90, ms | Candidate p50 / p90, ms | Candidate/base p50 (95%) | GETs base / cand | MB base / cand |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A/A control, 4 IDs (base twice) | 3,793 / 3,980 | 3,839 / 3,958 | 1.012 (0.988-1.023) | 354 / 355 | 638 / 638 |
+| `In` 1 ID | 2,734 / 2,978 | 382 / 450 | 0.140 (0.130-0.144) | 344 / 522 | 636 / 110 |
+| `In` 4 IDs, random | 3,658 / 3,805 | 417 / 488 | **0.114** (0.108-0.121) | 355 / 556 | 638 / 115 |
+| `In` 32 IDs, random | 11,336 / 11,465 | 593 / 670 | 0.052 (0.051-0.054) | 418 / 668 | 647 / 132 |
+| `In` 256 IDs, random | 68,129 / 68,384 | 1,012 / 1,126 | 0.015 (0.014-0.015) | 672 / 1,051 | 651 / 180 |
+| `In` 4 IDs, clustered | 3,652 / 3,841 | 417 / 478 | 0.114 (0.108-0.118) | 348 / 525 | 636 / 110 |
+| `In` 32 IDs, clustered | 11,249 / 11,456 | 436 / 507 | 0.039 (0.037-0.041) | 379 / 560 | 637 / 111 |
+| `In` 256 IDs, clustered | 67,582 / 68,035 | 468 / 541 | 0.007 (0.007-0.007) | 584 / 779 | 641 / 115 |
+| Control `id < 1000` | 303.5 / 330.8 | 309.1 / 331.8 | 1.018 (0.978-1.040) | 1,193 / 1,197 | 109.8 / 109.8 |
+| Control single-ID `Eq` | 333.9 / 365.9 | 333.4 / 360.0 | 0.999 (0.966-1.020) | 460 / 458 | 100.5 / 100.5 |
+
+Pass criteria: 4-ID `In` p50 at most 1.4 s (2.6x): 417 ms. Every case exact (ordered IDs and distance values equal in all
+400 pairs). No control slower: both intervals include parity. GETs rise about 50% for `In` (the probe wave, per segment), and
+bytes fall 5.6x or more. Queries return as many rows as the list holds, up to the top ten.
+
+### Tests
+
+`seeks_match_document_evaluation_for_every_id_type_and_live_holes` and `kary_seek_matches_document_evaluation_at_every_block_edge`
+now also run `In` lists against document evaluation: unsigned integer, string, and UUID IDs; duplicates; absent IDs between rows,
+before the first, and after the last; a list of every ID; block and region edges; live holes; with and without the ID-bounds
+header, and with the dictionary present (the planner chooses) and absent. `id_in_matches_the_reference_with_deletes_and_overwrites`
+runs the whole engine over an indexed segment plus WAL overwrites, deletes, and a new row, for `In` alone, duplicated, absent,
+deleted, and overwritten IDs, and under `And`, `Or`, and `Not` with other filters. `cold_ab.py` gained `--id-in N` (random or
+clustered per-query lists) and `c32_pairs.py` summarizes paired runs.
+
+### Cost
+
+One c7gn.4xlarge on demand, 14:58 to 17:29 UTC (2.5 hours), about $2.6, under the $6 cap. The instance, key pair, security group,
+and the S3 prefix are deleted.
+
 ## Round G18: a typed ID-only path from graph hits to response bytes, top_k 10 is 1.41 times faster at 16 clients with byte-identical responses
 
 **Setup:** the Round G17 setup on the Apple M4 (shared Mac mini): full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture, 16 client processes with one keep-alive connection each,
