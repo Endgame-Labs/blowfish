@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.59] - 2026-11-26
+
+### Fixed
+
+- **The warm graph now builds and serves on an 8 GiB host:** Admission overstated a build's memory and refused it. The reservation charged both build-time adjacency forms for the whole build and then added a quarter. The memory gate counted reclaimable page cache as used, and it also demanded a fifth of the limit free on top of the reservation. The reservation is now the measured construction peak plus a stated sixteenth, the gate ignores reclaimable page cache, and the resident row-to-ID table is charged to the graph. On an Apple M4 with BEIR NQ (2.68M x 1024-d) in an 8 GiB cgroup, the graph built in 399 s under live load, peaking at 4.21 GiB of anonymous memory, with no OOM or swap. 16 clients then served 7,899 q/s at recall@10 0.961, against 2,702 q/s for IVF before, and against 6,023 q/s for Qdrant 1.20 in the same setup in Round MEM2. A 6 GiB cgroup still refuses the build. See Round GM1 in `docs/benchmarks.md`.
+
 ## [0.1.58] - 2026-11-26
 
 ### Changed
@@ -440,7 +446,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.58...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.59...HEAD
+[0.1.59]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.59
 [0.1.58]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.58
 [0.1.57]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.57
 [0.1.56]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.56
