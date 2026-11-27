@@ -51,12 +51,17 @@ try:
             time.sleep(0.1)
     time.sleep(1.5)
 
+    def conns():
+        r = subprocess.run("ss -H -tn state established '( dport = :443 )' | wc -l", shell=True, capture_output=True, text=True)
+        return int(r.stdout.strip() or 0)
+
     def one(i):
         c.post("/_bench/drop_caches").raise_for_status()
         time.sleep(0.2)
         off = log_path.stat().st_size
         body = {"rank_by": ["vector", "ANN", vec[i].astype("f4").tolist()], "top_k": a.top_k,
                 "consistency": {"level": "strong"}, "include_attributes": ["id"]}
+        conns_before = conns()
         t0 = time.time_ns() // 1000
         t = time.perf_counter()
         c.post(f"/v2/namespaces/{a.namespace}/query", json=body).raise_for_status()
@@ -64,11 +69,11 @@ try:
         time.sleep(0.3)
         with log_path.open() as f:
             f.seek(off)
-            return t0, ms, f.read()
+            return t0, ms, f.read(), conns_before, conns()
 
     one(199)
     for i in range(a.queries):
-        t0, ms, text = one(i)
+        t0, ms, text, cb, ca = one(i)
         base = t0 / 1000.0  # request start, epoch ms
         stages = {}
         for m in re.finditer(r"^STAGE_TIME (.+) (\d+)$", text, re.M):
@@ -94,7 +99,7 @@ try:
             r["hedge"] = h
         out.append(dict(q=i, ms=ms, stages={k: [round(x, 1) for x in v] for k, v in stages.items()}, scan_end=scan_end,
                         n_reads=len(reads), rerank=rr, all_hedges=len(hedges), max_wait_ms=max(waits, default=0) / 1000))
-        print(json.dumps(dict(q=i, ms=round(ms, 1), scan_end=round(scan_end, 1), rerank_n=len(rr),
+        print(json.dumps(dict(q=i, conns=[cb, ca], ms=round(ms, 1), scan_end=round(scan_end, 1), rerank_n=len(rr),
                               rerank_first_start=round(min((r["start"] for r in rr), default=0), 1),
                               rerank_last_end=round(max((r["end"] for r in rr), default=0), 1),
                               rerank_lat_ms=sorted(round(r["end"] - r["start"]) for r in rr),
