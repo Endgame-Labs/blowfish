@@ -16523,3 +16523,184 @@ first, and I did not start it.
 
 Resources: one on-demand c7g.2xlarge for about 1 hour (about $0.35), key pair and security group deleted, instance terminated. No
 bucket prefix was created.
+
+## Round C30: bulk membership and cold snapshot warming
+
+Bulk membership construction and streaming sparse-map decoding pass the C30
+performance gate. At sixteen clients, title throughput improves **1.256×** and
+length improves **1.639×**. All five cold p50 point estimates are at or below
+baseline. All **1,424 acceptance pairs** retain identical ordered IDs and f64
+distance bits. Public APIs, BFR1 storage bytes, and settings are unchanged.
+The exact cause of C29's historical ID delay remains unresolved; the retained
+constructor passes an independent eighty-pair ID gate.
+
+Measured 2026-11-27 on one on-demand c7gn.4xlarge in us-west-2, against
+v0.1.60 (`df449f9`). A private copy of the retained C5 checkpoint was repaired
+by the baseline writer, reaching 61 source segments and 55 published row maps.
+The retained fixture was never written. Timing uses read-only servers, CPUs
+0–7 for server and client, eight Rayon workers, 64 probes, strong consistency,
+top ten, and IDs only. Cache geometry follows C29: 8 GiB raw, 512 MiB decoded,
+zero disk, 256 KiB blocks, 32-block coalescing, and fetch concurrency 512.
+Release builds target `neoverse-v1`, retain frame pointers for profiling, and
+use Rust 1.100.0 and Clang 19 with Clang 22/compiler-rt linking. Builds and timing
+do not overlap.
+
+### Acceptance controls
+
+Each cold case uses eighty paired requests, a fresh process per build and case,
+one untimed q199 warm-up, and a complete engine-cache drop before each measured
+request. Connections remain warm. The arms alternate AB/BA, using the same query
+IDs. This is pure-S3, engine-cache-cold timing, with no disk staging. Intervals are
+paired-query bootstrap intervals with 50,000 resamples and seed 30.
+
+| Predicate | Baseline p50 / p90, ms | Candidate p50 / p90, ms | Candidate/base p50 (95% interval) | Baseline / candidate MB |
+| --- | ---: | ---: | ---: | ---: |
+| ID < 1000 | 390.4 / 434.3 | 379.5 / 428.1 | 0.972 (0.950–0.995) | 145.728 / 145.728 |
+| Title initial = z | 876.4 / 1,020.5 | 861.1 / 1,061.3 | 0.983 (0.960–1.011) | 1644.634 / 1644.638 |
+| Text length >= 300 | 667.6 / 839.8 | 659.1 / 801.1 | 0.987 (0.964–1.046) | 385.882 / 385.935 |
+| Absent title | 215.2 / 306.3 | 204.9 / 243.3 | 0.952 (0.913–1.010) | 85.651 / 85.651 |
+| Unfiltered | 250.7 / 309.9 | 249.0 / 306.6 | 0.993 (0.910–1.048) | 98.293 / 98.323 |
+
+Every cold request records zero membership rebuilds and zero local reads. ID p50
+improves 2.8%. The title p90 point estimate rises 4.0%; its paired ratio interval
+is 0.884–1.140, including parity. All samples remain in the table. Empty and
+unfiltered queries do not decode sparse memberships, so their small point changes
+are not attributed to the new constructor.
+
+The concurrent controls use four balanced AB/BA rounds, sixteen clients, and 128
+measured queries per build and round after four untimed warm-ups. Each process has
+64 MiB raw cache, 512 MiB decoded cache, and no disk cache. Other geometry and CPU
+placement remain as above. Namespace state is warm; the small caches still cause
+object-store reads. Table values are arithmetic means of round rates, percentiles,
+and per-request counters, following C29's harness.
+
+| Predicate | Build | q/s | Mean round p50 / p90, ms | CPU seconds/request | MB/request |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Title | Baseline | 2.443 | 6,393.9 / 7,828.0 | 1.922 | 1024.612 |
+| Title | Candidate | 3.069 | 5,040.7 / 6,579.4 | 1.672 | 945.867 |
+| Length | Baseline | 7.088 | 1,817.0 / 3,771.4 | 0.709 | 167.153 |
+| Length | Candidate | 11.618 | 1,343.8 / 1,612.9 | 0.554 | 160.468 |
+
+Candidate/base throughput is **1.256×** for title (paired-round 95% interval
+1.228–1.288) and **1.639×** for length (1.498–1.803). Intervals resample the four
+matched round indices 50,000 times, seed 30, and take the ratio of mean round rates.
+Four rounds provide limited precision. All 512 matched requests per predicate
+retain exact ordered IDs and f64 bits. No rounds or slow requests are discarded.
+These meet the required 1.15× concurrent gain, alongside the cold p50 gate.
+
+The absolute title rates are lower than C29's published controls, with substantially
+more completed bytes per request. The table reports this run's observed bytes and
+CPU; gains are paired on the same c7gn host and checkpoint.
+
+### Initial control and profile
+
+Forty cache-cold ID pairs use byte-identical baseline binaries at the two arm
+paths, with one untimed q199 warm-up per process and alternating AB/BA order.
+P50 is 390.905 versus 389.956 ms, candidate/control ratio 0.99757 (paired-bootstrap
+95% interval 0.96912–1.01727; 50,000 resamples, seed 30). Every pair retains
+identical ordered IDs and f64 distance bits, with zero membership rebuilds and
+zero local reads. The initial control does not show an ordering or binary-path bias.
+
+Each build is profiled on twelve cold queries and the untimed warm-up at
+499 Hz, using hardware cycles and frame-pointer call stacks. These diagnostic
+queries are separate from acceptance measurements. No perf samples were lost.
+The construction share counts each sampled cycle once when its stack contains
+Roaring insertion or sorted append, including inlined construction work.
+
+| Workload | Baseline / candidate sampled cycles, billions | Baseline / candidate Roaring construction, % |
+| --- | ---: | ---: |
+| ID < 1000 | 27.922 / 21.757 | 24.351 / 3.295 |
+| Title initial = z | 133.850 / 122.854 | 5.179 / 0.587 |
+| Text length >= 300 | 59.329 / 53.962 | 12.091 / 2.111 |
+| Unfiltered | 9.705 / 9.946 | 0.184 / 0.145 |
+
+In baseline, every sampled ID and title insertion stack comes through
+`slab_rows::load` → `Membership::decode_sparse` → `from_sparse_rows` → generic
+Roaring collection → `Store::insert`, mostly on the bounded blocking workers.
+`Store::insert` alone has 22.841% self cycles in ID. Length spends 11.567% in
+that membership path and 0.524% in already sorted tier-mask builders. The tiny
+unfiltered construction stack comes through `ann::from_slabs`. The ID and
+length shares exceed the 10% stop threshold, so the bulk-build experiment proceeds.
+The candidate replaces that generic insertion with sorted append. ID's construction
+share falls from 24.351% to 3.295%, while total sampled cycles fall 22.1%. Length's
+remaining construction includes 0.681% in already sorted tier-mask builders.
+Unfiltered construction remains small. These diagnostic profiles are separate
+from the latency and throughput acceptance samples.
+
+The initial ID control locates the snapshot's critical path in the predicate
+wave: last filter, memberships ready, and snapshot done have p50 endpoints
+245.541, 184.829, and 245.553 ms after warming starts. Profiled length shows the
+same ordering: 256.636, 173.485, and 256.655 ms. An earlier membership endpoint
+therefore does not establish an earlier snapshot. Additional trace markers name
+each filter task, separate its live-row load from evaluation, distinguish lineage
+from directory completion, and separate map fetch, decode dispatch, decode, and
+join completion. They use the existing `BF_TRACE_STAGES` diagnostics and add no
+setting or query mode. The following controls investigate the snapshot wait.
+
+### Isolating the C29 delay
+
+The preserved C29 source was rebuilt with the same task traces and queried against
+the repaired checkpoint, which has only the older row maps. A second build records
+projection progress only when the new location object exists; this ablation changes
+no decoder. A closer reconstruction of C29's temporary runtime reference restores
+the original snapshot, indexer, recluster, and row-map reader, while retaining fused
+materialization, direct code runs, and late vector prefetch. These are reconstructions
+from preserved source, rather than the deleted temporary binaries from C29.
+
+Each row below is a separate forty-pair cold ID control, with matched query IDs and
+balanced AB/BA ordering. These diagnostic controls are not pooled with acceptance
+samples. Every pair retains ordered IDs and f64 bits, with identical completed bytes,
+zero row-map rebuilds, and zero local reads.
+
+| Control → experiment | Control / experiment p50, ms | Experiment/control (95% interval) |
+| --- | ---: | ---: |
+| Instrumented baseline → preserved C29 | 384.920 / 370.296 | 0.962 (0.946–0.988) |
+| Preserved C29 → progress guard | 374.052 / 371.566 | 0.993 (0.946–1.042) |
+| Instrumented baseline → runtime reconstruction | 383.950 / 389.679 | 1.015 (0.969–1.045) |
+| Instrumented baseline → bulk construction only | 383.808 / 374.973 | 0.977 (0.949–1.002) |
+| Bulk construction → fused columns | 396.748 / 389.748 | 0.982 (0.931–1.035) |
+
+The preserved full build is faster on ID in this control. The closer runtime
+reconstruction is 1.49% slower, with an interval including parity, and does not
+establish the historical regression. The progress guard also does not establish a
+fix, so it is not included in the candidate.
+
+Named task spans identify the last of 61 ID-predicate chains as the snapshot's
+critical path. The last segment varies across requests. Its directory and ID-column
+block reads form a sequential chain; in the first control, evaluation after live-row
+loading takes median 211.760 ms in baseline and 199.666 ms in preserved C29. Summed
+membership-decode task wall spans fall from 302.260 to 120.117 ms, while mean dispatch
+wait falls from 0.154 to 0.041 ms. Those sums overlap and are not query latency or
+CPU seconds. Memberships finish before the last predicate in both builds.
+
+The runtime reconstruction reproduces the ordering of the earlier observations:
+memberships finish earlier (188.266 → 176.066 ms), while snapshot warming finishes
+slightly later (244.065 → 247.686 ms), on the predicate wave. This locates the wait,
+but does not identify a particular historical read, allocation, or scheduling change
+as the cause of C29's 12.8 ms delay. That cause remains unresolved. The retained
+constructor is isolated from C29's format and direct-read changes and passes the independent
+eighty-pair cold gate above.
+
+### Implementation and validation
+
+`Membership::decode_sparse` streams validated BFR1 records into a single private
+sorted-row builder. It allocates the resident row IDs, clusters, and original
+cluster ordinals directly, removing the tuple vector, redundant sort, and separate
+validation passes. The arbitrary-input constructor sorts once and uses the same
+builder. Both sparse row sets and dense intersections use Roaring's sorted bulk
+constructor. There is one decoding path, with no caller-specific choice, format
+switch, or new setting. CRC, length, row ordering, and cluster bounds remain checked.
+
+New tests cover array/bitmap container boundaries, independent ordinal references,
+dense holes and out-of-range rows, both cluster widths, valid-checksum corruption,
+empty maps, and extreme IDs with bounded allocations. Scoped engine and vector
+Clippy and debug tests pass: 433 tests, zero failures, and 17 ignored. Existing
+engine coverage checks exact results through older bare indexes and blocked fragments.
+
+The first debug gate exposed a preexisting spill-test observation race: another
+recluster overwrote a process-global row counter between this test's copy and
+publication. Its observation is now task-local; production reclustering is unchanged.
+The benchmark lockfile updates ten workspace-package version records to v0.1.60,
+with registry packages unchanged. Final handoff is gated by full debug workspace
+tests and workspace all-target Clippy with warnings denied, using `nice -n 19` and
+three build jobs. Debug symbols are disabled to bound disk use; overflow checks remain on.

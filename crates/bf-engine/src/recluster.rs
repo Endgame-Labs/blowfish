@@ -356,10 +356,11 @@ impl Engine {
         .await?;
         drop(copy_stage);
         #[cfg(test)]
-        LAST_SPILL_ROWS.store(
-            u64::from(next_spill_row.load(std::sync::atomic::Ordering::Relaxed)),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let _ = SPILL_ROWS.try_with(|rows| {
+            rows.set(u64::from(
+                next_spill_row.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+        });
         Stage::record(
             "spill_write",
             std::time::Duration::from_nanos(spill_write_nanos.into_inner()),
@@ -1432,9 +1433,12 @@ fn assign_leaves(
     Some(jobs)
 }
 
-/// Rows the latest copy pass wrote to the spill (tests only).
+// A test observes only its own foreground build. Other reclusters can finish between
+// copying this spill and publishing its tier, so a process-global counter races them.
 #[cfg(test)]
-static LAST_SPILL_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+tokio::task_local! {
+    static SPILL_ROWS: std::cell::Cell<u64>;
+}
 
 #[cfg(test)]
 mod dead_row_tests {
@@ -1483,18 +1487,23 @@ mod dead_row_tests {
             .unwrap();
         e.index_namespace("t", true).await.unwrap();
         let scratch = tempfile::tempdir().unwrap();
-        e.recluster(
-            "t",
-            &ReclusterOptions {
-                attribute: "vector".into(),
-                cells: 4,
-                cluster_rows: 60,
-                max_slab_rows: 3000,
-                scratch: scratch.path().to_owned(),
-            },
-        )
-        .await
-        .unwrap();
+        let rows = SPILL_ROWS
+            .scope(std::cell::Cell::new(0), async {
+                e.recluster(
+                    "t",
+                    &ReclusterOptions {
+                        attribute: "vector".into(),
+                        cells: 4,
+                        cluster_rows: 60,
+                        max_slab_rows: 3000,
+                        scratch: scratch.path().to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+                SPILL_ROWS.with(std::cell::Cell::get)
+            })
+            .await;
         let mut keys: Vec<String> = store
             .list("")
             .await
@@ -1507,7 +1516,6 @@ mod dead_row_tests {
         for key in keys.iter().filter(|k| k.contains("slab")) {
             std::hash::Hash::hash(&store.get(key).await.unwrap().to_vec(), &mut digest);
         }
-        let rows = LAST_SPILL_ROWS.load(std::sync::atomic::Ordering::Relaxed);
         (rows, format!("{:x}", std::hash::Hasher::finish(&digest)))
     }
 

@@ -220,6 +220,14 @@ pub(crate) fn stage(t0: std::time::Instant, name: &str) {
     }
 }
 
+/// Identify concurrent warm tasks in the existing diagnostic timeline. Allocate the label
+/// only while tracing; timestamps share the request's wall clock with physical reads.
+pub(crate) fn task_stage(t0: std::time::Instant, phase: &str, key: &str) {
+    if trace_stages() {
+        stage(t0, &format!("{phase}:{key}"));
+    }
+}
+
 /// Queries the tiers answered (tests check the plan is used).
 #[cfg(test)]
 pub(crate) static TIER_ANSWERS: std::sync::atomic::AtomicUsize =

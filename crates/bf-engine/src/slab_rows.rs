@@ -48,6 +48,7 @@ pub(crate) async fn load(
     if let Some(member) = read_cache::get(&file.key, file.size) {
         return Ok(Some(member));
     }
+    let trace = crate::ann::trace_stages().then(|| (std::time::Instant::now(), file.key.clone()));
     let bytes = match segment::ObjectReader::new(store, file)
         .read(0..file.size)
         .await
@@ -65,10 +66,24 @@ pub(crate) async fn load(
         }
         Err(error) => return Err(segment::index_error(error)),
     };
+    if let Some((start, key)) = &trace {
+        crate::ann::task_stage(*start, "slab_map_read_done", key);
+    }
+    let decode_trace = trace.clone();
     let member = crate::ann_dir::on_worker(async move {
-        Membership::decode_sparse(&bytes).map_err(segment::index_error)
+        if let Some((start, key)) = &decode_trace {
+            crate::ann::task_stage(*start, "slab_map_decode_start", key);
+        }
+        let member = Membership::decode_sparse(&bytes).map_err(segment::index_error);
+        if let Some((start, key)) = &decode_trace {
+            crate::ann::task_stage(*start, "slab_map_decode_done", key);
+        }
+        member
     })
     .await?;
+    if let Some((start, key)) = &trace {
+        crate::ann::task_stage(*start, "slab_map_joined", key);
+    }
     validate(slab, &member)?;
     Ok(Some(read_cache::insert(
         &file.key,
