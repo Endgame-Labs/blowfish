@@ -219,7 +219,7 @@ impl QueryResponse {
     /// `out` truncated back; the general path reports that case as an error.
     pub fn write_id_rows(
         out: &mut Vec<u8>,
-        rows: &[(u64, f64)],
+        rows: &[(crate::IdRef, f64)],
         performance: &QueryPerformance,
     ) -> bool {
         let start = out.len();
@@ -235,7 +235,16 @@ impl QueryResponse {
             out.extend_from_slice(b"{\"$dist\":");
             serde_json::to_writer(&mut *out, distance).expect("a number serializes");
             out.extend_from_slice(b",\"id\":");
-            serde_json::to_writer(&mut *out, id).expect("a number serializes");
+            match id {
+                crate::IdRef::Uint(id) => {
+                    serde_json::to_writer(&mut *out, id).expect("a number serializes")
+                }
+                crate::IdRef::Uuid(id) => {
+                    out.push(b'"');
+                    out.extend_from_slice(&crate::IdRef::uuid_text(*id));
+                    out.push(b'"');
+                }
+            }
             out.push(b'}');
         }
         out.extend_from_slice(b"],\"performance\":");

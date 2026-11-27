@@ -1313,6 +1313,19 @@ async fn filtered_scan_hides_shadowed_rows_inside_the_allowed_set() {
 /// built; the unindexed tail is empty. Rows 1000 to 1049 copy rows 0 to 49, so equal distances
 /// exercise the tie order. The guard holds the admission gate and removes the scratch directory.
 async fn typed_fixture() -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
+    typed_fixture_with(false, false).await
+}
+/// A deterministic UUID for an integer ID, as the UUID fixtures write them.
+fn uuid_of(id: usize) -> String {
+    uuid::Uuid::from_u128((id as u128 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835))
+        .to_string()
+}
+/// [`typed_fixture`] with IDs that are UUIDs (`uuid_of` of the row number, declared in the schema),
+/// and/or an engine with disk staging configured.
+async fn typed_fixture_with(
+    uuids: bool,
+    staged: bool,
+) -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.scratch")
         .join(format!("g18-ids-{}", uuid::Uuid::new_v4()));
@@ -1321,6 +1334,8 @@ async fn typed_fixture() -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
         url: "memory://".into(),
         cache: CacheConfig {
             memory_bytes: 32 << 20,
+            disk_bytes: if staged { 256 << 20 } else { 0 },
+            disk_dir: staged.then(|| root.join("disk-cache")),
             ..Default::default()
         },
         ..Default::default()
@@ -1336,6 +1351,7 @@ async fn typed_fixture() -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
             ..Default::default()
         },
     );
+    assert_eq!(e.0.read_cache.staging.is_some(), staged);
     let mut seed = 11u64;
     let vectors = (0..2500)
         .map(|_| {
@@ -1359,10 +1375,27 @@ async fn typed_fixture() -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
             } else {
                 v
             };
-            json!({"id":id,"vector":v,"group":id%3})
+            if uuids {
+                json!({"id":uuid_of(id),"vector":v,"group":id%3})
+            } else {
+                json!({"id":id,"vector":v,"group":id%3})
+            }
         })
         .collect::<Vec<_>>();
-    e.write("hot",serde_json::from_value::<WriteRequest>(json!({"distance_metric":"cosine_distance","schema":{"vector":{"type":"[16]f16","ann":true}},"upsert_rows":rows})).unwrap()).await.unwrap();
+    let schema = if uuids {
+        json!({"id":{"type":"uuid"},"vector":{"type":"[16]f16","ann":true}})
+    } else {
+        json!({"vector":{"type":"[16]f16","ann":true}})
+    };
+    e.write(
+        "hot",
+        serde_json::from_value::<WriteRequest>(
+            json!({"distance_metric":"cosine_distance","schema":schema,"upsert_rows":rows}),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
     e.index_namespace("hot", true).await.unwrap();
     let opts = ReclusterOptions {
         attribute: "vector".into(),
@@ -1397,6 +1430,10 @@ async fn typed_fixture() -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(held.ids.get().is_some(), "the ID table was never built");
+    assert!(
+        matches!(held.ids.get(), Some(IdTable::Uuid(_))) == uuids,
+        "the table has the kind of the IDs"
+    );
     (e, vectors, held, Cleanup(root))
 }
 /// Round G18: the typed ID-only path writes the same JSON bytes as the general path (rows,
@@ -1637,4 +1674,169 @@ async fn typed_ids_path_merges_the_tail_like_the_general_path() {
 }
 fn ids_only_json(vector: &[f32]) -> Value {
     json!({"rank_by":["vector","ANN",vector],"top_k":10})
+}
+
+/// Runs `body` on a query reactor with the engine, the typed path's bytes (`None` when it
+/// declines), and the general path's bytes for a request, both with the two timings zeroed.
+async fn on_reactor_typed_and_general<F, Fut>(e: &Engine, body: F) -> Fut::Output
+where
+    F: FnOnce(
+            Engine,
+            Arc<dyn Fn(Value) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> + Send + Sync>,
+            Arc<dyn Fn(Value) -> futures::future::BoxFuture<'static, Vec<u8>> + Send + Sync>,
+        ) -> Fut
+        + Send
+        + 'static,
+    Fut: std::future::Future + 'static,
+    Fut::Output: Send + 'static,
+{
+    use futures::FutureExt;
+    let io = tokio::runtime::Handle::current();
+    let engine = e.clone();
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::query_worker::on_query_reactor(io, async move {
+                let typed_engine = engine.clone();
+                let typed = Arc::new(move |request: Value| {
+                    let engine = typed_engine.clone();
+                    async move {
+                        let request: QueryRequest = serde_json::from_value(request).unwrap();
+                        engine
+                            .query_ids("hot", &request)
+                            .await
+                            .unwrap()
+                            .map(|mut answer| {
+                                answer.performance.server_total_ms = 0;
+                                answer.performance.query_execution_ms = 0;
+                                let mut out = Vec::new();
+                                assert!(answer.write_json(&mut out));
+                                out
+                            })
+                    }
+                    .boxed()
+                });
+                let general_engine = engine.clone();
+                let general = Arc::new(move |request: Value| {
+                    let engine = general_engine.clone();
+                    async move {
+                        let request: QueryRequest = serde_json::from_value(request).unwrap();
+                        let mut response = engine.query("hot", request).await.unwrap();
+                        response.performance.server_total_ms = 0;
+                        response.performance.query_execution_ms = 0;
+                        serde_json::to_vec(&response).unwrap()
+                    }
+                    .boxed()
+                });
+                body(engine, typed, general).await
+            }))
+    })
+    .await
+    .unwrap()
+}
+/// Round G21: with UUID IDs the typed path serves from a 16-byte table and writes the same bytes
+/// as the general path, for every `top_k` shape, with and without an unindexed tail (inserts,
+/// overwrites that move a row away, and deletes among the top `k`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_ids_path_serves_uuid_ids_byte_identically() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let (e, vectors, held, _cleanup) = typed_fixture_with(true, false).await;
+    let table_bytes = held.ids.get().unwrap().resident_bytes();
+    assert!(table_bytes >= 2500 * 16, "the table's bytes are counted");
+    let queries = vectors.clone();
+    let compared = on_reactor_typed_and_general(&e, move |engine, typed, general| async move {
+        let check = |label: &'static str| {
+            let (typed, general, queries) = (typed.clone(), general.clone(), queries.clone());
+            async move {
+                let mut n = 0;
+                for i in [0, 17, 400, 1003, 1999, 2499] {
+                    for k in (1..=100).step_by(9).chain([1, 2, 10, 37, 64, 100]) {
+                        let body = json!({"rank_by":["vector","ANN",queries[i]],"top_k":k});
+                        let got = typed(body.clone()).await.unwrap_or_else(|| {
+                            panic!("{label}: typed path declined query {i} top_k {k}")
+                        });
+                        assert_eq!(got, general(body).await, "{label}: query {i} top_k {k}");
+                        n += 1;
+                    }
+                }
+                n
+            }
+        };
+        let mut compared = check("no tail").await;
+        // The response carries the UUID strings the writer sent.
+        let body = json!({"rank_by":["vector","ANN",queries[17]],"top_k":3});
+        let got: Value = serde_json::from_slice(&typed(body).await.unwrap()).unwrap();
+        assert_eq!(got["rows"][0]["id"], json!(uuid_of(17)));
+        let near = |v: &Vec<f32>, shift: f32| v.iter().map(|x| x + shift).collect::<Vec<_>>();
+        let write = |body: Value| {
+            let engine = engine.clone();
+            async move {
+                engine
+                    .write("hot", serde_json::from_value::<WriteRequest>(body).unwrap())
+                    .await
+                    .unwrap();
+            }
+        };
+        write(json!({"upsert_rows":[
+            {"id":uuid_of(9000),"vector":queries[0],"group":0},
+            {"id":uuid_of(9001),"vector":near(&queries[0], 0.01),"group":1},
+            {"id":uuid_of(9002),"vector":near(&queries[17], 0.01),"group":2},
+            {"id":uuid_of(2),"vector":queries[17],"group":2},
+        ]}))
+        .await;
+        compared += check("inserts").await;
+        let far = queries[400].iter().map(|x| -x).collect::<Vec<_>>();
+        write(json!({"upsert_rows":[
+            {"id":uuid_of(0),"vector":far,"group":0},
+            {"id":uuid_of(1003),"vector":queries[1999],"group":1},
+        ],"deletes":[uuid_of(3),uuid_of(4),uuid_of(1000)]}))
+        .await;
+        compared += check("overwrites and deletes").await;
+        let body = json!({"rank_by":["vector","ANN",queries[0]],"top_k":2});
+        let got = typed(body).await.expect("typed path serves under a tail");
+        assert!(
+            !String::from_utf8(got).unwrap().contains(&uuid_of(0)),
+            "the overwritten row 0 must not answer for query 0"
+        );
+        compared
+    })
+    .await;
+    assert_eq!(compared, 3 * 6 * 18);
+    e.delete_namespace("hot").await.unwrap();
+    drop(held);
+    assert!(e.shutdown(Duration::from_secs(5)).await);
+}
+/// Round G21: an engine with disk staging configured takes the typed path and answers the same
+/// bytes as the general path, with integer IDs and with UUIDs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_ids_path_serves_a_staged_engine_byte_identically() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    for uuids in [false, true] {
+        let (e, vectors, held, _cleanup) = typed_fixture_with(uuids, true).await;
+        let compared = on_reactor_typed_and_general(&e, move |_, typed, general| async move {
+            let mut n = 0;
+            for i in [0, 17, 400, 1003, 1999, 2499] {
+                for k in [1, 10, 33, 100] {
+                    let body = json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k});
+                    let got = typed(body.clone())
+                        .await
+                        .expect("a staged engine takes the typed path");
+                    assert_eq!(
+                        got,
+                        general(body).await,
+                        "uuids {uuids} query {i} top_k {k}"
+                    );
+                    n += 1;
+                }
+            }
+            n
+        })
+        .await;
+        assert_eq!(compared, 24);
+        e.delete_namespace("hot").await.unwrap();
+        drop(held);
+        assert!(e.shutdown(Duration::from_secs(5)).await);
+    }
 }

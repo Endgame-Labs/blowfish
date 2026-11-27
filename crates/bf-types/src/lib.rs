@@ -32,6 +32,72 @@ impl Id {
         serde_json::to_value(self).expect("ID serializes")
     }
 }
+/// A document ID in the typed ID-only answer: an unsigned integer, or a canonical UUID kept as its
+/// 16 bytes (big-endian, so the numeric order is the order of the canonical lowercase text).
+/// Orders as [`Id`] does: integers first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IdRef {
+    /// Unsigned integer ID.
+    Uint(u64),
+    /// UUID ID, formatted as 36 lowercase hexadecimal characters with hyphens.
+    Uuid(u128),
+}
+impl IdRef {
+    /// Parse a canonical (lowercase, hyphenated, 36 characters) UUID. Any other text is `None`,
+    /// because it would not format back to the same string.
+    pub fn parse_uuid(text: &str) -> Option<u128> {
+        let bytes = text.as_bytes();
+        if bytes.len() != 36 {
+            return None;
+        }
+        let mut value = 0u128;
+        for (i, b) in bytes.iter().enumerate() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                if *b != b'-' {
+                    return None;
+                }
+                continue;
+            }
+            let nibble = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                _ => return None,
+            };
+            value = (value << 4) | u128::from(nibble);
+        }
+        Some(value)
+    }
+    /// The canonical text of a UUID.
+    pub fn uuid_text(value: u128) -> [u8; 36] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [b'-'; 36];
+        let mut nibble = 32;
+        for (i, slot) in out.iter_mut().enumerate() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                continue;
+            }
+            nibble -= 1;
+            *slot = HEX[((value >> (nibble * 4)) & 0xf) as usize];
+        }
+        out
+    }
+    /// The general path's [`Id`] for this ID.
+    pub fn to_id(self) -> Id {
+        match self {
+            Self::Uint(id) => Id::Uint(id),
+            Self::Uuid(id) => Id::String(
+                String::from_utf8(Self::uuid_text(id).to_vec()).expect("UUID text is ASCII"),
+            ),
+        }
+    }
+    /// The typed ID of a general [`Id`], or `None` for a string that is not a canonical UUID.
+    pub fn from_id(id: &Id) -> Option<Self> {
+        match id {
+            Id::Uint(id) => Some(Self::Uint(*id)),
+            Id::String(text) => Self::parse_uuid(text).map(Self::Uuid),
+        }
+    }
+}
 /// Flat document, including its required `id` attribute.
 pub type Document = serde_json::Map<String, Value>;
 /// Nullable JSON attribute value; validation is driven by the namespace schema.

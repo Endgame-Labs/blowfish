@@ -6,20 +6,20 @@
 //! produces the same answer by the long way (the tests compare the two byte for byte).
 use crate::{Engine, NamespaceState, lineage, query_worker, storage_error, warm_graph};
 use bf_types::{
-    ApiError, Consistency, DistanceMetric, Id, IncludeAttributes, QueryPerformance, QueryRequest,
-    RankBy, VectorEncoding,
+    ApiError, Consistency, DistanceMetric, IdRef, IncludeAttributes, QueryPerformance,
+    QueryRequest, RankBy, VectorEncoding,
 };
 use std::{sync::Arc, time::Instant};
 
 /// The answer of [`Engine::query_ids`]: the rows and the measured performance. Write it with
 /// [`IdsAnswer::write_json`].
 pub struct IdsAnswer {
-    pub(crate) hits: Vec<(u64, f64)>,
+    pub(crate) hits: Vec<(IdRef, f64)>,
     pub(crate) performance: QueryPerformance,
 }
 impl IdsAnswer {
     /// The `(ID, distance)` of every row, nearest first.
-    pub fn rows(&self) -> &[(u64, f64)] {
+    pub fn rows(&self) -> &[(IdRef, f64)] {
         &self.hits
     }
     /// The measured performance.
@@ -69,19 +69,19 @@ fn plain_shape(request: &QueryRequest) -> Option<(&str, &[f32], usize)> {
 
 /// The best `k` of the graph's rows and the state's tail documents, as the general path's
 /// `merge_tail` and result evaluator order them (distance, then ID). `None` when the answer is
-/// not plain: a tail error (the general path reports it), a winner with a string ID, or an ID
+/// not plain: a tail error (the general path reports it), a winner whose ID is neither an integer nor a canonical UUID, or an ID
 /// twice.
 fn merge_tail(
     state: &NamespaceState,
     attribute: &str,
     vector: &[f32],
     k: usize,
-    hits: Vec<(u64, f64)>,
+    hits: Vec<(IdRef, f64)>,
     tail: &crate::tail::VectorCache,
-) -> Option<Vec<(u64, f64)>> {
+) -> Option<Vec<(IdRef, f64)>> {
     let mut heap = std::collections::BinaryHeap::new();
     for (id, distance) in hits {
-        crate::indexed::offer(&mut heap, &Id::Uint(id), distance, false, k);
+        crate::indexed::offer(&mut heap, &id.to_id(), distance, false, k);
     }
     crate::indexed::score_tail(
         state,
@@ -99,12 +99,9 @@ fn merge_tail(
     winners.sort_unstable();
     let merged = winners
         .into_iter()
-        .map(|hit| match hit.id {
-            Id::Uint(id) => Some((id, hit.score)),
-            Id::String(_) => None,
-        })
+        .map(|hit| IdRef::from_id(&hit.id).map(|id| (id, hit.score)))
         .collect::<Option<Vec<_>>>()?;
-    let mut ids: Vec<u64> = merged.iter().map(|(id, _)| *id).collect();
+    let mut ids: Vec<IdRef> = merged.iter().map(|(id, _)| *id).collect();
     ids.sort_unstable();
     (!ids.windows(2).any(|w| w[0] == w[1])).then_some(merged)
 }
@@ -144,10 +141,7 @@ impl Engine {
         let Some((attribute, vector, k)) = plain_shape(request) else {
             return Ok(None);
         };
-        if !query_worker::is_reactor()
-            || self.0.config.models.is_some()
-            || self.0.read_cache.staging.is_some()
-        {
+        if !query_worker::is_reactor() || self.0.config.models.is_some() {
             return Ok(None);
         }
         let start = Instant::now();
@@ -230,7 +224,7 @@ impl Engine {
         let (true, Some(hits)) = (probed?, found) else {
             return Ok(None);
         };
-        let hits: Vec<(u64, f64)> = hits
+        let hits: Vec<(IdRef, f64)> = hits
             .into_iter()
             .map(|(id, distance)| (id, f64::from(distance)))
             .collect();

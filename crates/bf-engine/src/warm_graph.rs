@@ -1,7 +1,7 @@
 //! Engine-owned, disposable warm graphs. Stored IVF remains the fallback and source of truth.
 use crate::{Engine, NamespaceState, lineage::Placement, read_cache, segment};
 use bf_storage::Storage;
-use bf_types::{ApiError, DistanceMetric, Document, Id, QueryRequest, RankBy};
+use bf_types::{ApiError, DistanceMetric, Document, Id, IdRef, QueryRequest, RankBy};
 use bf_vector::{
     CosineQuery, Index, RoaringBitmap, VectorType,
     warm_graph::{HotCancellation, HotGraph, HotGraphBuilder, HotScratch},
@@ -251,6 +251,35 @@ impl Locations {
         }
     }
 }
+/// The resident row-to-ID table: unsigned integers (8 bytes a row) or canonical UUIDs kept as
+/// their 16 bytes. A tier whose IDs are of any other kind, or of mixed kinds, has no table.
+pub(crate) enum IdTable {
+    Uint(Vec<u64>),
+    Uuid(Vec<u128>),
+}
+impl IdTable {
+    /// Bytes a row costs in the table's larger form: what a graph's reservation sets aside.
+    const MAX_ROW_BYTES: u64 = 16;
+    fn resident_bytes(&self) -> u64 {
+        match self {
+            Self::Uint(ids) => ids.capacity() as u64 * 8,
+            Self::Uuid(ids) => ids.capacity() as u64 * 16,
+        }
+    }
+    /// The ID of `row`, or `None` for a row without one.
+    fn get(&self, row: u32) -> Option<IdRef> {
+        match self {
+            Self::Uint(ids) => ids
+                .get(row as usize)
+                .filter(|id| **id != u64::MAX)
+                .map(|id| IdRef::Uint(*id)),
+            Self::Uuid(ids) => ids
+                .get(row as usize)
+                .filter(|id| **id != u128::MAX)
+                .map(|id| IdRef::Uuid(*id)),
+        }
+    }
+}
 struct Entry {
     graph: HotGraph,
     sources: Vec<Index<segment::ObjectReader>>,
@@ -270,7 +299,7 @@ struct Entry {
     /// The unsigned ID of every tier row (`u64::MAX` where a row has none now), built once in the
     /// background by the first ID-only query. Absent when any ID is a string, and until built,
     /// queries hydrate IDs from the documents.
-    ids: std::sync::OnceLock<Vec<u64>>,
+    ids: std::sync::OnceLock<IdTable>,
     ids_started: std::sync::atomic::AtomicBool,
 }
 struct Heat {
@@ -993,11 +1022,11 @@ impl Engine {
         let resident = built.graph.resident_bytes()
             + built.sources.iter().map(Index::resident_bytes).sum::<u64>()
             + built.locations.resident_bytes();
-        // The resident row-to-ID table (8 bytes per row, built lazily by the first ID-only query)
+        // The resident row-to-ID table (8 or 16 bytes per row, built lazily by the first ID-only query)
         // belongs to this graph's charge, so it is part of what the shrunken reservation keeps.
         let retained = HotGraph::with_margin(
             resident
-                + count as u64 * 8
+                + count as u64 * IdTable::MAX_ROW_BYTES
                 + (count as u64).div_ceil(32) * 8 * workers as u64
                 + workers as u64 * (2 << 20),
         );
@@ -1492,7 +1521,7 @@ type Found = (BTreeMap<Id, f64>, BTreeMap<Id, Document>);
 /// without an ID, say), so the caller takes the document path. `Some(None)` is the same decline the
 /// document path gives when a row has no live home.
 fn ids_from_table(
-    table: &[u64],
+    table: &IdTable,
     exact: &[(u32, f32)],
     mask: Option<&RoaringBitmap>,
     set: &SlabSet,
@@ -1507,10 +1536,11 @@ fn ids_from_table(
     let mut scores = BTreeMap::new();
     let mut documents = BTreeMap::new();
     for (id, distance) in hits {
+        let id = id.to_id();
         let mut doc = Document::new();
-        doc.insert("id".into(), serde_json::Value::from(id));
-        scores.insert(Id::Uint(id), f64::from(distance));
-        documents.insert(Id::Uint(id), doc);
+        doc.insert("id".into(), id.value());
+        scores.insert(id.clone(), f64::from(distance));
+        documents.insert(id, doc);
     }
     Some((scores.len() >= k).then_some((scores, documents)))
 }
@@ -1518,12 +1548,12 @@ fn ids_from_table(
 /// `None` means the table cannot answer (a row without an ID); `Some(None)` means a row has no
 /// live home, which declines the graph's answer.
 fn typed_ids(
-    table: &[u64],
+    table: &IdTable,
     exact: &[(u32, f32)],
     mask: Option<&RoaringBitmap>,
     set: &SlabSet,
     at: &Placement,
-) -> Option<Option<Vec<(u64, f32)>>> {
+) -> Option<Option<Vec<(IdRef, f32)>>> {
     let mut hits = Vec::with_capacity(exact.len());
     for &(row, distance) in exact {
         if mask.is_some_and(|m| !m.contains(row)) {
@@ -1532,7 +1562,7 @@ fn typed_ids(
         if at.real(&set.covered, row).is_none() {
             return Some(None);
         }
-        let id = *table.get(row as usize).filter(|id| **id != u64::MAX)?;
+        let id = table.get(row)?;
         hits.push((id, distance));
     }
     Some(Some(hits))
@@ -1557,7 +1587,7 @@ pub(crate) async fn search_ids(
     mask: Option<&Arc<RoaringBitmap>>,
     navigate: Option<&Arc<RoaringBitmap>>,
     k: usize,
-) -> Option<Vec<(u64, f32)>> {
+) -> Option<Vec<(IdRef, f32)>> {
     if overcommitted() {
         trim();
         return None;
@@ -1621,7 +1651,10 @@ async fn build_id_table(
             wanted.entry(segment).or_default().push((local, row));
         }
     }
-    let mut table = vec![u64::MAX; total];
+    let mut uints: Vec<u64> = Vec::new();
+    let mut uuids: Vec<u128> = Vec::new();
+    // The first row's ID decides the table's kind; a row of another kind abandons the table.
+    let mut kind: Option<bool> = None;
     let none = BTreeSet::new();
     for (segment, pairs) in wanted {
         let rows: RoaringBitmap = pairs.iter().map(|(local, _)| *local).collect();
@@ -1634,16 +1667,35 @@ async fn build_id_table(
             return;
         };
         for (local, row) in pairs {
-            let Some(id) = docs
-                .get(&local)
-                .and_then(|d| d.get("id"))
-                .and_then(serde_json::Value::as_u64)
-            else {
+            let Some(id) = docs.get(&local).and_then(|d| d.get("id")) else {
                 return;
             };
-            table[row as usize] = id;
+            let id = match (id, kind) {
+                (serde_json::Value::Number(n), None | Some(false)) => n.as_u64().map(IdRef::Uint),
+                (serde_json::Value::String(text), None | Some(true)) => {
+                    IdRef::parse_uuid(text).map(IdRef::Uuid)
+                }
+                _ => None,
+            };
+            let Some(id) = id else {
+                return;
+            };
+            if kind.is_none() {
+                kind = Some(matches!(id, IdRef::Uuid(_)));
+                uints = vec![u64::MAX; if kind == Some(false) { total } else { 0 }];
+                uuids = vec![u128::MAX; if kind == Some(true) { total } else { 0 }];
+            }
+            match id {
+                IdRef::Uint(id) => uints[row as usize] = id,
+                IdRef::Uuid(id) => uuids[row as usize] = id,
+            }
         }
     }
+    let table = if kind == Some(true) {
+        IdTable::Uuid(uuids)
+    } else {
+        IdTable::Uint(uints)
+    };
     let _ = entry.ids.set(table);
 }
 /// Run a calibration ANN plan through the same CPU dispatch as an ordinary warm query.
@@ -1774,7 +1826,7 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let graphs=entries.iter().filter(|(k,_)|k.namespace==namespace).map(|(k,h)|{
-            let calibration=h.ready.as_ref().map(|e|{let c=e.calibration.lock().unwrap_or_else(|e|e.into_inner());serde_json::json!({"ef":c.quality.serving.unwrap_or(c.quality.trial),"trial_ef":c.quality.trial,"usable":c.usable,"samples":c.quality.len(),"paired_quality":c.quality.statistics(),"trial_cpu_seconds":c.trial_seconds,"build_cpu_seconds":e.measured_cpu_seconds,"build_wall_seconds":e.build_wall_seconds,"build_reservation_bytes":e.build_reservation_bytes,"reserved_bytes":e._reservation.0,"promotion_cpu_cost_seconds":c.build_seconds,"graph_cost_ratio":c.graph_ratio,"resident_bytes":e.graph.resident_bytes(),"phase_searches":e.searches.load(Ordering::Relaxed),"phase_cpu_seconds":e.phase_cpu.iter().map(|v|v.load(Ordering::Relaxed) as f64/1e9).collect::<Vec<_>>()})});
+            let calibration=h.ready.as_ref().map(|e|{let c=e.calibration.lock().unwrap_or_else(|e|e.into_inner());serde_json::json!({"ef":c.quality.serving.unwrap_or(c.quality.trial),"trial_ef":c.quality.trial,"usable":c.usable,"samples":c.quality.len(),"paired_quality":c.quality.statistics(),"trial_cpu_seconds":c.trial_seconds,"build_cpu_seconds":e.measured_cpu_seconds,"build_wall_seconds":e.build_wall_seconds,"build_reservation_bytes":e.build_reservation_bytes,"reserved_bytes":e._reservation.0,"promotion_cpu_cost_seconds":c.build_seconds,"graph_cost_ratio":c.graph_ratio,"resident_bytes":e.graph.resident_bytes()+e.ids.get().map_or(0,IdTable::resident_bytes),"id_table_bytes":e.ids.get().map_or(0,IdTable::resident_bytes),"phase_searches":e.searches.load(Ordering::Relaxed),"phase_cpu_seconds":e.phase_cpu.iter().map(|v|v.load(Ordering::Relaxed) as f64/1e9).collect::<Vec<_>>()})});
             serde_json::json!({"attribute":k.attribute,"building":h.building.is_some(),"calibration":calibration,"heat_seconds":h.first.elapsed().as_secs_f64(),"query_rate":h.rate_at(Instant::now()),"ivf_cpu_seconds":h.ivf_seconds,"retry_seconds":h.retry.saturating_duration_since(Instant::now()).as_secs_f64()})
         }).collect::<Vec<_>>();
         serde_json::json!({"graphs":graphs,"answered":self.0.hot_graph.answers.load(Ordering::Relaxed),"process_reserved_bytes":RESERVED.load(Ordering::Relaxed)})
