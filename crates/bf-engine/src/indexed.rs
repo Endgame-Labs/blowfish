@@ -1,4 +1,5 @@
 //! Per-segment candidate search, tail scoring, and reference-compatible result assembly.
+use crate::sum_text::{self, sum_of_text};
 use crate::{EngineConfig, NamespaceState, filter, query, segment, snapshot};
 use bf_storage::Storage;
 use bf_types::*;
@@ -844,6 +845,7 @@ async fn prepare_segment(
     k: usize,
     columns: &BTreeSet<String>,
     threshold: Option<&bf_text::SearchThreshold>,
+    preset: Option<Preset>,
     mut out: NamespaceState,
 ) -> Result<NamespaceState, ApiError> {
     let open_text = async {
@@ -907,7 +909,17 @@ async fn prepare_segment(
     } else {
         RoaringBitmap::new()
     };
-    for &clause in clauses {
+    // A `Sum` that already chose its winners hydrates just those rows.
+    let searched: &[&RankBy] = if preset.is_some() { &[] } else { clauses };
+    if let Some(preset) = preset {
+        for (_, hits) in &preset {
+            for hit in hits {
+                selected.insert(hit.row);
+            }
+        }
+        bm25_hits = preset;
+    }
+    for &clause in searched {
         let RankBy::Bm25 {
             attribute,
             query,
@@ -1029,6 +1041,183 @@ async fn prepare_segment(
     out.docs.extend(crate::shared(docs));
     Ok(out)
 }
+/// Open every segment for a `Sum` of BM25 clauses. `None` when any cannot answer from lists.
+async fn sum_prepare(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+    clauses: &[&RankBy],
+) -> Result<Option<Vec<sum_text::SegmentSum>>, ApiError> {
+    let prepared = sum_clauses(state, clauses);
+    let opened = futures::future::try_join_all(
+        state
+            .segments
+            .iter()
+            .map(|seg| sum_text::open(store, state, q, seg, &prepared)),
+    )
+    .await?;
+    Ok(opened.into_iter().collect())
+}
+fn sum_clauses<'a>(state: &'a NamespaceState, clauses: &[&'a RankBy]) -> Vec<sum_text::Clause<'a>> {
+    static FALLBACK: std::sync::LazyLock<bf_text::CorpusStats> =
+        std::sync::LazyLock::new(Default::default);
+    clauses
+        .iter()
+        .map(|clause| {
+            let RankBy::Bm25 {
+                attribute,
+                query,
+                params,
+            } = clause
+            else {
+                unreachable!()
+            };
+            let cfg = state.schema[attribute]
+                .text_config()
+                .expect("validated FTS");
+            sum_text::Clause {
+                attribute,
+                key: rank_key(clause),
+                query: bf_text::Query::new(
+                    crate::text::tokens(query, &cfg),
+                    crate::text::prefix(params.as_ref()),
+                ),
+                cfg,
+                stats: state.corpus.get(attribute).unwrap_or(&FALLBACK),
+            }
+        })
+        .collect()
+}
+/// A segment's chosen winners: per clause, its rank key and the winning rows' hits.
+type Preset = Vec<(Vec<u8>, Vec<bf_text::SearchHit>)>;
+/// Score and hydrate every segment (`preset` carries a `Sum`'s chosen winners per segment).
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_segments(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+    clauses: &[&RankBy],
+    all: bool,
+    clause_top: bool,
+    k: usize,
+    columns: &BTreeSet<String>,
+    threshold: Option<&bf_text::SearchThreshold>,
+    mut out: NamespaceState,
+    mut preset: Option<Vec<Preset>>,
+) -> Result<NamespaceState, ApiError> {
+    let parts = futures::future::try_join_all(state.segments.iter().enumerate().map(|(i, seg)| {
+        let preset = preset.as_mut().map(|p| std::mem::take(&mut p[i]));
+        prepare_segment(
+            store,
+            state,
+            q,
+            seg,
+            clauses,
+            if preset.is_some() {
+                false
+            } else {
+                all && !clause_top
+            },
+            clause_top,
+            k,
+            columns,
+            threshold,
+            preset,
+            out.clone(),
+        )
+    }))
+    .await?;
+    for part in parts {
+        out.docs.extend(part.docs);
+        for (rank, scores) in part.scores {
+            out.scores.entry(rank).or_default().extend(scores);
+        }
+    }
+    Ok(out)
+}
+/// Decide a `Sum` from the lists (growing them a bounded number of times), and hydrate the
+/// winning rows. Falls back to scoring every row when no list length proves the answer.
+#[allow(clippy::too_many_arguments)]
+async fn sum_finish(
+    store: &Storage,
+    state: &NamespaceState,
+    q: &QueryRequest,
+    clauses: &[&RankBy],
+    segments: Vec<sum_text::SegmentSum>,
+    k: usize,
+    columns: &BTreeSet<String>,
+    threshold: Option<&bf_text::SearchThreshold>,
+    out: NamespaceState,
+) -> Result<NamespaceState, ApiError> {
+    let prepared = sum_clauses(state, clauses);
+    // Tail documents are already scored (every clause, in `out`); their totals take part too.
+    let tail: Vec<(Id, f64)> = clauses
+        .first()
+        .and_then(|c| out.scores.get(&rank_key(c)))
+        .map(|first| {
+            first
+                .keys()
+                .map(|id| {
+                    let t = sum_text::total(clauses.iter().map(|c| {
+                        out.scores
+                            .get(&rank_key(c))
+                            .and_then(|m| m.get(id))
+                            .copied()
+                            .unwrap_or(0.0) as f32
+                    }));
+                    (id.clone(), t)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut n = sum_text::first_list(k);
+    while let Some(list) = n {
+        let rounds =
+            futures::future::try_join_all(segments.iter().map(|s| s.candidates(&prepared, list)))
+                .await?;
+        let mut totals: Vec<f64> = tail.iter().map(|(_, t)| *t).collect();
+        let mut bound = 0f64;
+        let mut exhaustive = true;
+        for r in &rounds {
+            totals.extend(r.rows.iter().map(|(_, t)| *t));
+            bound = bound.max(r.bound);
+            exhaustive &= r.exhaustive;
+        }
+        if let Some(floor) = sum_text::accept(&mut totals, k, bound, exhaustive) {
+            let presets =
+                futures::future::try_join_all(segments.iter().zip(&rounds).map(|(s, r)| {
+                    let rows: RoaringBitmap = r
+                        .rows
+                        .iter()
+                        .filter(|(_, t)| *t > 0.0 && *t >= floor)
+                        .map(|(row, _)| *row)
+                        .collect();
+                    let prepared = &prepared;
+                    async move { s.winners(prepared, &rows).await }
+                }))
+                .await?;
+            return hydrate_segments(
+                store,
+                state,
+                q,
+                clauses,
+                false,
+                false,
+                k,
+                columns,
+                threshold,
+                out,
+                Some(presets),
+            )
+            .await;
+        }
+        n = sum_text::next_list(list);
+    }
+    hydrate_segments(
+        store, state, q, clauses, true, false, k, columns, threshold, out, None,
+    )
+    .await
+}
 async fn prepare_scalar(
     store: &Storage,
     state: &NamespaceState,
@@ -1073,27 +1262,18 @@ async fn prepare_scalar(
         out.scores.entry(rank_key(clause)).or_default();
     }
     let segment_started = std::time::Instant::now();
-    let parts = futures::future::try_join_all(state.segments.iter().map(|seg| {
-        prepare_segment(
-            store,
-            state,
-            q,
-            seg,
-            &clauses,
-            all && !clause_top,
-            clause_top,
-            k,
-            &columns,
-            threshold,
-            out.clone(),
+    // A `Sum` of BM25 clauses is decided from short per-clause lists when they prove the answer
+    // (see `sum_text`); the segments are hydrated after the tail has scored its documents.
+    let sum_plan = if sum_of_text(q.rank_by.as_ref()) && !per && sum_text::first_list(k).is_some() {
+        sum_prepare(store, state, q, &clauses).await?
+    } else {
+        None
+    };
+    if sum_plan.is_none() {
+        out = hydrate_segments(
+            store, state, q, &clauses, all, clause_top, k, &columns, threshold, out, None,
         )
-    }))
-    .await?;
-    for part in parts {
-        out.docs.extend(part.docs);
-        for (rank, scores) in part.scores {
-            out.scores.entry(rank).or_default().extend(scores);
-        }
+        .await?;
     }
     crate::ann::stage(segment_started, "bm25 segments+hydrate");
     if plain_text && state.docs.is_empty() {
@@ -1202,6 +1382,11 @@ async fn prepare_scalar(
             }
         }
         out.scores.insert(key, scores);
+    }
+    if let Some(plan) = sum_plan {
+        let started = std::time::Instant::now();
+        out = sum_finish(store, state, q, &clauses, plan, k, &columns, threshold, out).await?;
+        crate::ann::stage(started, "bm25 sum lists+hydrate");
     }
     crate::ann::stage(tail_started, "bm25 tail total");
     if crate::ann::trace_stages() {
