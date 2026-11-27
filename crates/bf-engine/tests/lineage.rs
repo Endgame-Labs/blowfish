@@ -24,6 +24,8 @@ use std::{
 struct Faults {
     inner: Arc<object_store::memory::InMemory>,
     delete_crash: Arc<std::sync::atomic::AtomicUsize>,
+    forbid_tier_reads: std::sync::atomic::AtomicBool,
+    forbid_ann_writes: std::sync::atomic::AtomicBool,
     rule: Mutex<Option<(String, usize, bool)>>,
 }
 impl Faults {
@@ -69,6 +71,14 @@ impl ObjectStore for Faults {
         payload: PutPayload,
         opts: PutOptions,
     ) -> StoreResult<PutResult> {
+        if path.as_ref().contains("/segments/")
+            && path.as_ref().ends_with(".bfa")
+            && self
+                .forbid_ann_writes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return failure();
+        }
         match self.check(path) {
             Some(false) => failure(),
             Some(true) => {
@@ -83,12 +93,29 @@ impl ObjectStore for Faults {
         path: &Path,
         opts: PutMultipartOptions,
     ) -> StoreResult<Box<dyn MultipartUpload>> {
+        if path.as_ref().contains("/segments/")
+            && path.as_ref().ends_with(".bfa")
+            && self
+                .forbid_ann_writes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return failure();
+        }
         if self.check(path).is_some() {
             return failure();
         }
         self.inner.put_multipart_opts(path, opts).await
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> StoreResult<GetResult> {
+        if !opts.head
+            && path.as_ref().contains("/slabs/")
+            && path.as_ref().ends_with(".bfa")
+            && self
+                .forbid_tier_reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return failure();
+        }
         self.inner.get_opts(path, opts).await
     }
     fn delete_stream(
@@ -541,6 +568,88 @@ async fn retirement_publication_and_gc_crashes_preserve_authoritative_vectors() 
         );
         for seg in before.segments {
             assert!(store.get(&seg.files["annv2:vector"].key).await.is_err());
+        }
+    }
+}
+
+/// Fully covered merges neither read slab vectors nor upload replacement ANN indexes.
+/// Missing row-map descriptors remain readable through the same tier after publication.
+#[tokio::test]
+async fn covered_compaction_never_rehydrates_tier_vectors() {
+    use std::sync::atomic::Ordering;
+    for ready in [true, false] {
+        let (faults, store, engine, _scratch) = setup().await;
+        if !ready {
+            let wal = bf_wal::Wal::new(store.clone(), "t").unwrap();
+            let (seq, mut m) = wal.latest_manifest().await.unwrap().unwrap();
+            for slab in m
+                .ann_tiers
+                .values_mut()
+                .flatten()
+                .flat_map(|set| &mut set.slabs)
+            {
+                slab.files.retain(|role, _| !role.starts_with("annrows:"));
+            }
+            wal.publish_fenced(seq, m.indexer_epoch, &m).await.unwrap();
+        }
+        let before = manifest(&store).await;
+        let requests = [
+            json!({"rank_by": ["id", "asc"], "top_k": 30,
+                "filters": ["id", "Lt", 30], "include_attributes": true}),
+            json!({"rank_by": ["vector", "ANN", vector(17)], "top_k": 25,
+                "filters": ["id", "Lt", 4000], "include_attributes": true}),
+            json!({"rank_by": ["vector", "kNN", vector(2107)], "top_k": 25,
+                "filters": ["id", "Gte", 0], "include_attributes": true}),
+            json!({"aggregate_by": {"count": ["Count"]}, "filters": ["id", "Lt", 30]}),
+        ];
+        let mut expected = vec![];
+        for request in &requests {
+            let result = engine
+                .query("t", serde_json::from_value(request.clone()).unwrap())
+                .await
+                .unwrap()
+                .result;
+            expected.push((result.rows, result.aggregations));
+        }
+        // A missing row map legitimately reconstructs membership from its slab. With all
+        // descriptors ready, even those reads are forbidden during compaction.
+        faults.forbid_tier_reads.store(ready, Ordering::Relaxed);
+        faults.forbid_ann_writes.store(true, Ordering::Relaxed);
+        let merger = merging(&store);
+        assert!(merger.index_namespace("t", true).await.unwrap());
+        faults.forbid_tier_reads.store(false, Ordering::Relaxed);
+        faults.forbid_ann_writes.store(false, Ordering::Relaxed);
+        let after = manifest(&store).await;
+        assert_eq!(tier_dirs(&before), tier_dirs(&after));
+        assert_eq!(after.segments.len(), 2);
+        for target in after.lineage.iter().flat_map(|entry| &entry.parts) {
+            let seg = after
+                .segments
+                .iter()
+                .find(|s| s.id == target.target)
+                .unwrap();
+            assert!(!seg.files.keys().any(|name| name.starts_with("ann")));
+        }
+        let fresh = Engine::with_config(store.clone(), config());
+        for (request, expected) in requests.iter().zip(expected) {
+            let actual = fresh
+                .query("t", serde_json::from_value(request.clone()).unwrap())
+                .await
+                .unwrap()
+                .result;
+            let score_bits = |rows: &Option<Vec<bf_types::Document>>| {
+                rows.as_ref().map(|rows| {
+                    rows.iter()
+                        .map(|row| row.get("$dist").and_then(Value::as_f64).map(f64::to_bits))
+                        .collect::<Vec<_>>()
+                })
+            };
+            assert_eq!(score_bits(&actual.rows), score_bits(&expected.0));
+            assert_eq!(
+                (actual.rows, actual.aggregations),
+                expected,
+                "maps ready: {ready}"
+            );
         }
     }
 }

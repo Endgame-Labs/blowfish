@@ -887,8 +887,36 @@ pub(crate) fn dense_type(
 /// (and `docs` need not carry it); any other is packed from the documents. Vectors stay at their
 /// stored precision from here on: the ANN build, which runs on a blocking worker, owns the packed
 /// bytes (4 KB per row less than a decoded f32 copy), with no duplicate vector column in the document object.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
+    store: &Storage,
+    ns: &str,
+    schema: &Schema,
+    metric: bf_types::DistanceMetric,
+    docs: &BTreeMap<Id, D>,
+    vectors: BTreeMap<String, PackedColumn>,
+    start: u64,
+    end: u64,
+) -> Result<Segment, ApiError> {
+    build_with_delegation(
+        store,
+        ns,
+        schema,
+        metric,
+        docs,
+        vectors,
+        start,
+        end,
+        &Default::default(),
+    )
+    .await
+}
+
+/// The same segment build, with fully tier-owned vector attributes delegated through lineage.
+/// Document shape and filter values remain intact; no replacement ANN index is created.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_with_delegation<D: std::borrow::Borrow<Document>>(
     store: &Storage,
     ns: &str,
     schema: &Schema,
@@ -897,6 +925,7 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
     mut vectors: BTreeMap<String, PackedColumn>,
     start: u64,
     end: u64,
+    delegated: &std::collections::BTreeSet<String>,
 ) -> Result<Segment, ApiError> {
     let row_count =
         u32::try_from(docs.len()).map_err(|_| ApiError::bad("segment exceeds u32 rows"))?;
@@ -906,6 +935,7 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
     let rows: Vec<&Document> = docs.values().map(|d| d.borrow()).collect();
     for (name, config) in schema {
         if let Some((dims, dtype)) = dense_type(config)
+            && !delegated.contains(name)
             && !vectors.contains_key(name)
         {
             let mut column = PackedColumn::new(dims, dtype);
@@ -921,6 +951,9 @@ pub(crate) async fn build_with<D: std::borrow::Borrow<Document>>(
     // are written, so they overlap with document encoding and uploads below.
     let mut ann_jobs = Vec::new();
     for (column, (name, config)) in schema.iter().enumerate() {
+        if delegated.contains(name) {
+            continue;
+        }
         let Some((dimensions, dtype)) = dense_type(config) else {
             continue;
         };
@@ -1494,6 +1527,7 @@ pub(crate) async fn compaction_rows(
     segment: &Segment,
     rows: &RoaringBitmap,
     strip: &std::collections::BTreeSet<String>,
+    delegated: &std::collections::BTreeSet<String>,
 ) -> Result<(BTreeMap<Id, Document>, SegmentVectors), ApiError> {
     if rows.is_empty() {
         return Ok((BTreeMap::new(), BTreeMap::new()));
@@ -1516,7 +1550,9 @@ pub(crate) async fn compaction_rows(
     let mut vectors = SegmentVectors::new();
     let ids = ids(store, segment).await?;
     for name in strip {
-        if !segment.schema.contains_key(name) {
+        if !segment.schema.contains_key(name) || delegated.contains(name) {
+            // The immutable tier remains the vector source through the published lineage.
+            // Rehydrating these vectors would rebuild an index retired in the same publication.
             continue;
         }
         let (present, data) = read_packed(store, segment, rows, name).await?;

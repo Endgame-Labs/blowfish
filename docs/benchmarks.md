@@ -16873,3 +16873,168 @@ One client at 10 percent: 291 against IVF's 145 (hash) and 359 against 154 (id),
 
 - Graviton3 only, `k` 10 only, as in G15. Allowed-row collection (`RoaringBitmap` iteration and the node lookup) is still serial, about 1 ms at 10 percent.
 - Costs: one on-demand c7g.4xlarge for about 2 hours (about $1.2 plus the 120 GB gp3 root volume), deleted with its key pair and security group.
+
+## Round CS1: larger vector-free segments for cold queries
+
+Measured 2026-11-27 against v0.1.65 (`07d6782`) on one on-demand
+c7gn.4xlarge in us-west-2. Both arms use the same read-only HTTP benchmark
+binary on the same host. Server and clients share CPUs 0–7, with eight Rayon
+workers. The control is a private, repaired copy of the retained C5 10M
+checkpoint, with 61 source segments and 55 published slab row maps. The
+retained fixture is never written. The candidate consolidates a copy of that
+repaired control through the engine's fenced compaction, preserving the ANN
+tier, its slabs, its codes, and its exact vectors through lineage.
+
+The prototype raises the existing output cap to two million rows, allows
+sixteen inputs per merge, relaxes the small-input selection floor, and raises
+the persisted-input byte cap. The latter otherwise counts legacy document
+vector payloads that compaction does not read. Fully covered vector attributes
+are omitted from compaction's packed-vector inputs; the immutable tier remains
+their source. These are experimental preparation changes, not a production
+sizing policy.
+
+Preparation initially stopped at 61 segments before all 55 slab row maps were
+published. That control was aborted because queries rebuilt missing maps. The
+valid control starts only after all maps exist and redundant segment ANN
+descriptors have retired. Forty byte-identical A/A cold ID pairs give
+367.402/370.339 ms p50 and 402.787/400.532 ms p90. The second/first p50 ratio is
+1.00799 (paired-bootstrap 95% interval 0.98243–1.05059). All forty pairs preserve
+ordered IDs and f64 bits, with zero membership rebuilds and zero local reads.
+
+The cold protocol follows C30: fresh processes per arm and case, one untimed
+q199 warm-up, complete engine-cache drops before each measured request, and
+alternating AB/BA order over eighty matched query IDs. Settings are 64 probes,
+top ten, strong consistency, IDs only, 8 GiB raw cache, 512 MiB decoded cache,
+zero disk cache, 256 KiB blocks, 32-block coalescing, and fetch concurrency 512.
+Release builds use Rust 1.100.0, Clang 19, Clang 22/compiler-rt linking,
+`neoverse-v1`, and frame pointers. Compilation and timing do not overlap.
+
+The concurrent protocol has four balanced AB/BA rounds per predicate, sixteen
+clients, 128 measured requests per arm and round, and four untimed warm-ups.
+Each arm uses 64 MiB raw cache, 512 MiB decoded cache, no disk cache, and the
+same remaining geometry. Throughput and counters are arithmetic means of round
+values. Confidence intervals use 50,000 paired resamples and RNG seed 31;
+cold intervals resample matched queries, and concurrent intervals resample
+matched rounds. Four rounds give limited precision.
+
+The ID acceptance gate fails: the six-segment layout takes 475.689 ms p50
+versus 361.799 ms for the 61-segment control, a 31.5% regression instead of
+the required 1.2× speedup. All eighty ordered-ID and f64-bit comparisons match.
+Completed payload falls from 144.639 to 101.694 MB/request, and completed GETs
+fall from 1,047 to 847. Lower object count does not establish lower latency.
+The production sizing remains unchanged; the independent compaction optimization
+below is evaluated separately.
+
+The absent-title case also fails: 211.005/275.651 ms p50 and
+295.903/311.179 ms p90, control/candidate. Its p50 ratio is 1.30637
+(95% interval 1.25056–1.35737). All eighty pairs are exact, with zero rebuilds
+and zero local reads. The coordinator then stopped the remaining large-cap
+protocol. The partial title series is not an acceptance result; length,
+unfiltered, and concurrent runs were not started.
+
+One preserved ID acceptance trace locates the added dependency. The control's
+slow predicate reads its document directory and three dependent 256 KiB ID
+ranges. The candidate's matching 1,346,196-row segment reads the bounds header,
+its larger document directory, and six dependent 256 KiB ID ranges, at roughly
+5 MiB, 2.5 MiB, 1.25 MiB, 0.5 MiB, 0.25 MiB, and zero. Document blocks remain
+256 rows; the existing binary seek traverses a wider sorted ID column.
+The first positive predicate consequently arrives later, so membership warming
+can no longer overlap most of the predicate wave.
+
+| Named warm endpoint in that trace | Control, ms | Six segments, ms |
+| --- | ---: | ---: |
+| All predicates done | 221.589 | 301.305 |
+| Memberships start | 96.447 | 301.314 |
+| Memberships done | 211.151 | 410.709 |
+| Snapshot done | 221.598 | 410.788 |
+| Lineage done | 40.661 | 51.361 |
+
+Lineage finishes early in this trace. Its object count grows from 17 to 70,
+and its encoded bytes from 1.955 to 12.007 MB, but it does not explain this
+particular critical path. Across all eighty ID pairs, median predicate,
+membership, and snapshot endpoints are 222.189/258.943, 203.248/322.419, and
+222.470/322.466 ms. These stage endpoints are not additive durations. The
+selected candidate request takes 696.286 ms overall; all samples remain in the
+aggregate. ID's paired p50 ratio is 1.31479 (95% interval 1.27810–1.35236).
+The trace locates an added chain without establishing that a different seek
+would make the larger cap pass.
+
+The six final segment sizes are 1,388,000, 1,522,000, 1,926,000, 1,975,804,
+1,842,000, and 1,346,196 rows. Successful merge calls total 476.233 seconds.
+Actual compaction-process wall time is 537.59 seconds, including 60.61 seconds
+of an interrupted initial byte-cap attempt and excluding compilation. Peak RSS
+is 7,349,012 KiB (7.009 GiB). No production row-cap change is adopted; the
+streaming implementation and MS MARCO shipment gate are not pursued after this
+failed prerequisite.
+
+### Independent optimization at the existing cap
+
+The coordinator authorized measuring vector delegation separately after rejecting
+larger segments. This experiment uses the original 70 source segments, the same
+10 million rows and ANN tier, and all 55 row maps. Preparation restores those
+original segment descriptors into an owned copy through a fenced manifest,
+then lets the baseline engine finish upgrades and retire redundant segment ANN
+files with compaction disabled. Two byte-identical copies of that prepared
+input are measured on the same c7gn host, with the existing 200,000-row cap,
+2 GiB input-byte cap, and default merge selection. The retained fixture remains
+read-only.
+
+One process per arm runs forced index passes until there is no work. Every
+pass records wall time and process-wide completed GET bytes and requests,
+including operations from spawned workers. `/usr/bin/time -v` records peak RSS.
+The arms run sequentially, control first, with eight Rayon workers, CPUs 0–7,
+512 MiB decoded cache, no raw cache, no disk cache, and no overlapping builds.
+The same compiler, flags, and input objects are used for both arms.
+
+Delegation of non-filterable dense vectors is computed for the complete selected
+merge: every input row must have a covering tier for that attribute. The document reader then skips
+its packed vectors, and the segment builder omits its replacement ANN index
+while preserving dense-vector shape metadata. Lineage remains the vector source.
+The row cap, merge selection, WAL ordering, and storage format are unchanged.
+
+| Complete 70 → 61 traversal | Control | Delegation | Change |
+| --- | ---: | ---: | ---: |
+| Forced-index wall time, s | 955.667 | 97.565 | **9.795× faster** |
+| Completed read payload, bytes | 59,161,232,154 | 1,121,338,527 | **98.105% lower** |
+| Completed GETs | 363,291 | 1,253 | **99.655% lower** |
+| Peak RSS, KiB | 1,693,360 | 939,252 | **44.533% lower** |
+| Whole-process wall time, s | 956.89 | 98.88 | 9.677× faster |
+
+Each arm performs eight compactions and a final no-work pass. The original
+source groups merged together are identical, both outputs have 61 segments,
+and both retain the exact original ANN tier descriptors. The timing is one
+paired traversal, rather than a repeated throughput distribution; no confidence
+interval is claimed for this table. Read counters cover completed payload,
+including reads from workers, rather than logical vector bytes alone.
+
+Result checks use 250 queries on each of the prepared input, control output,
+and candidate output: forty frozen ANN queries for each of ID, absent title,
+title, length, and unfiltered; forty BM25 queries; five bounded counts; and five
+ANN queries including vectors, titles, and text. Count cases use a selective
+ID window or an empty predicate: an earlier unbounded count check was stopped
+because the existing aggregate path scans scalar columns across the namespace.
+No performance numbers are taken from that check.
+
+All **500 output-versus-input comparisons** match exactly. The comparison keeps
+ordered rows, attributes, aggregations, and every float's f64 bits, while
+excluding telemetry and billing. All three result matrices have SHA-256
+`565464239ef7ec9343f6d14b27658c39fc678110322ac68b9d6c9f98470197f6`.
+The query server is the same binary for all three layouts; this validates the
+compaction outputs, not a query-runtime optimization.
+
+The new regression test forbids slab-vector reads and segment ANN uploads during
+a fully covered merge, then compares scalar projections, filtered ANN, exact
+kNN, and counts after a fresh restart. It repeats with missing slab row-map
+descriptors, allowing necessary membership reconstruction while still forbidding
+ANN uploads. This catches the incomplete-backfill case: omitting packed reads
+alone could leave an empty ANN descriptor until retirement becomes eligible.
+Existing tests cover sparse vectors, composed lineage, WAL rewrites and deletes,
+multi-tier ownership, publication failures, and reclamation.
+
+Formatting, scoped all-target Clippy with warnings denied, and scoped default-debug
+tests pass. The first debug attempt exposed the existing G12 graph/IVF test
+assumption; the coordinator's upstream fix `059e24a` is included before the final
+gates. Its G12 checks now use the same near-row contract as G8, while document
+versus ID-table comparisons remain exact. The new kNN fixture uses the required
+explicit filter. Final-commit workspace validation is recorded in the worker
+handoff; overflow checks remain enabled.
