@@ -132,6 +132,50 @@ enum Verdict {
     Straggler,
 }
 
+/// Reads up to this size are judged against, and paid for by, other small reads only (Round C34):
+/// a rerank wave of 16 KB reads must not be compared with the scan's multi-megabyte GETs, and the
+/// scan's duplicates must not spend the budget the wave needs.
+const SMALL_READ_BYTES: u64 = 64 << 10;
+/// Extra-request share for small reads: a duplicate costs a request, not bytes.
+const SMALL_BUDGET: f64 = 0.5;
+
+/// Hedging for one store: one [`Hedger`] for small reads and one for the rest.
+pub(crate) struct Hedges {
+    small: Hedger,
+    large: Hedger,
+}
+impl Hedges {
+    /// `budget` is the extra-request fraction of large reads; zero disables hedging.
+    pub(crate) fn new(budget: f64) -> Self {
+        let small = if budget > 0.0 {
+            std::env::var("BF_HEDGE_SMALL_BUDGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SMALL_BUDGET)
+        } else {
+            0.0
+        };
+        Self {
+            small: Hedger::new(small),
+            large: Hedger::new(budget),
+        }
+    }
+    /// A ranged GET, hedged by the lane of its size.
+    pub(crate) async fn get_range(
+        &self,
+        backend: &Arc<dyn ObjectStore>,
+        path: &Path,
+        range: Range<u64>,
+    ) -> object_store::Result<Bytes> {
+        let lane = if range.end - range.start <= SMALL_READ_BYTES {
+            &self.small
+        } else {
+            &self.large
+        };
+        lane.get_range(backend, path, range).await
+    }
+}
+
 /// Adaptive hedging policy shared by every reader of one store.
 pub(crate) struct Hedger {
     budget: f64,
