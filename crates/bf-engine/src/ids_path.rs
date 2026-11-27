@@ -6,7 +6,7 @@
 //! produces the same answer by the long way (the tests compare the two byte for byte).
 use crate::{Engine, NamespaceState, lineage, query_worker, storage_error, warm_graph};
 use bf_types::{
-    ApiError, Consistency, DistanceMetric, IncludeAttributes, QueryPerformance, QueryRequest,
+    ApiError, Consistency, DistanceMetric, Id, IncludeAttributes, QueryPerformance, QueryRequest,
     RankBy, VectorEncoding,
 };
 use std::{sync::Arc, time::Instant};
@@ -67,6 +67,48 @@ fn plain_shape(request: &QueryRequest) -> Option<(&str, &[f32], usize)> {
     .then_some((attribute.as_str(), vector.as_slice(), k))
 }
 
+/// The best `k` of the graph's rows and the state's tail documents, as the general path's
+/// `merge_tail` and result evaluator order them (distance, then ID). `None` when the answer is
+/// not plain: a tail error (the general path reports it), a winner with a string ID, or an ID
+/// twice.
+fn merge_tail(
+    state: &NamespaceState,
+    attribute: &str,
+    vector: &[f32],
+    k: usize,
+    hits: Vec<(u64, f64)>,
+    tail: &crate::tail::VectorCache,
+) -> Option<Vec<(u64, f64)>> {
+    let mut heap = std::collections::BinaryHeap::new();
+    for (id, distance) in hits {
+        crate::indexed::offer(&mut heap, &Id::Uint(id), distance, false, k);
+    }
+    crate::indexed::score_tail(
+        state,
+        None,
+        attribute,
+        vector,
+        false,
+        k,
+        Some((tail, true)),
+        &mut heap,
+        &mut std::collections::BTreeMap::new(),
+    )
+    .ok()?;
+    let mut winners = heap.into_vec();
+    winners.sort_unstable();
+    let merged = winners
+        .into_iter()
+        .map(|hit| match hit.id {
+            Id::Uint(id) => Some((id, hit.score)),
+            Id::String(_) => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut ids: Vec<u64> = merged.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    (!ids.windows(2).any(|w| w[0] == w[1])).then_some(merged)
+}
+
 /// `last_included_write_at` for a state, formatted once per timestamp on each thread.
 fn write_stamp(at: chrono::DateTime<chrono::Utc>) -> String {
     thread_local! {
@@ -120,8 +162,6 @@ impl Engine {
         };
         if !fresh(&state)
             || state.metric != DistanceMetric::CosineDistance
-            || !state.docs.is_empty()
-            || !state.shadowed.is_empty()
             || state.segments.is_empty()
         {
             return Ok(None);
@@ -132,12 +172,8 @@ impl Engine {
         // The WAL-next check runs while the search does, as in the general path: the search is
         // valid only if the namespace did not move meanwhile.
         let probe = async {
-            let wal = bf_wal::Wal::new(self.0.store.clone(), ns).map_err(crate::log_error)?;
-            match handle
-                .wal_probe
-                .exists(&self.0.store, &wal.key(state.seq + 1))
-                .await
-            {
+            let key = handle.wal_key(&self.0.store, ns, state.seq + 1)?;
+            match handle.wal_probe.exists(&self.0.store, &key).await {
                 Ok(false) => {
                     let current = handle.state.load();
                     Ok(current.seq == state.seq
@@ -164,6 +200,12 @@ impl Engine {
                     let mask = crate::ann::tier_mask(&self.0.store, state, set, &at)
                         .await
                         .ok()?;
+                    // The walk hides the rows the unindexed tail shadows (overwritten or deleted
+                    // IDs) while still navigating through them, as the general path's does.
+                    let navigate =
+                        crate::ann::graph_mask(&self.0.store, state, set, &at, mask.as_ref())
+                            .await
+                            .ok()?;
                     warm_graph::search_ids(
                         &self.0.hot_graph,
                         ns,
@@ -173,6 +215,7 @@ impl Engine {
                         &at,
                         vector,
                         mask.as_ref(),
+                        navigate.as_ref(),
                         k,
                     )
                     .await
@@ -186,6 +229,21 @@ impl Engine {
         let (probed, found) = tokio::join!(probe, search);
         let (true, Some(hits)) = (probed?, found) else {
             return Ok(None);
+        };
+        let hits: Vec<(u64, f64)> = hits
+            .into_iter()
+            .map(|(id, distance)| (id, f64::from(distance)))
+            .collect();
+        // The unindexed tail: every live tail document is scored with the general path's
+        // kernel and competes with the graph's rows, in the evaluator's order.
+        let hits = if state.docs.is_empty() {
+            hits
+        } else {
+            let tail = self.0.read_cache.tail_vectors.clone();
+            let Some(merged) = merge_tail(&state, attribute, vector, k, hits, &tail) else {
+                return Ok(None);
+            };
+            merged
         };
         metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "inline").increment(1);
         warm_graph::Cache::observe(
@@ -205,19 +263,13 @@ impl Engine {
             cache_temperature: stats.temperature().into(),
             server_total_ms: elapsed,
             query_execution_ms: elapsed,
-            exhaustive_search_count: 0,
-            approx_namespace_size: state.stats.rows,
+            exhaustive_search_count: state.docs.len() as u64,
+            approx_namespace_size: state.stats.rows + state.docs.len() as u64,
             last_included_write_at: Some(write_stamp(state.updated_at)),
             embedding_tokens: None,
             embedding_ms: None,
             rerank_ms: None,
         };
-        Ok(Some(IdsAnswer {
-            hits: hits
-                .into_iter()
-                .map(|(id, distance)| (id, f64::from(distance)))
-                .collect(),
-            performance,
-        }))
+        Ok(Some(IdsAnswer { hits, performance }))
     }
 }

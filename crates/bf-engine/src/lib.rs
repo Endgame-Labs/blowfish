@@ -373,6 +373,26 @@ struct Handle {
     row_map_probe: std::sync::atomic::AtomicUsize,
     /// Shares the strong-read "is the next WAL entry there" probe among concurrent queries.
     wal_probe: wal_probe::WalProbe,
+    /// The object key of the WAL slot after the last one a query probed, kept while the
+    /// namespace's sequence does not move, so a probe formats and validates it once per write.
+    wal_next: std::sync::Mutex<Option<(u64, Arc<str>)>>,
+}
+impl Handle {
+    /// The key of WAL slot `seq`, as [`Wal::key`] names it.
+    fn wal_key(&self, store: &Storage, ns: &str, seq: u64) -> Result<Arc<str>, ApiError> {
+        let mut last = self.wal_next.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, key)) = last.as_ref()
+            && *at == seq
+        {
+            return Ok(key.clone());
+        }
+        let key: Arc<str> = Wal::new(store.clone(), ns)
+            .map_err(log_error)?
+            .key(seq)
+            .into();
+        *last = Some((seq, key.clone()));
+        Ok(key)
+    }
 }
 struct Inner {
     store: Storage,
@@ -694,6 +714,7 @@ impl Engine {
             backpressure: backpressure.clone(),
             row_map_probe: std::sync::atomic::AtomicUsize::new(0),
             wal_probe: wal_probe::WalProbe::default(),
+            wal_next: std::sync::Mutex::new(None),
         });
         handles.insert(ns.into(), handle.clone());
         let context = read_cache::ReadContext::new(self.0.read_cache.clone());
@@ -827,12 +848,8 @@ impl Engine {
                 && state.seq > 0
                 && state.checkpoint_refreshed.elapsed() < self.0.config.retention.div_f64(2.0)
             {
-                let wal = Wal::new(self.0.store.clone(), ns).map_err(log_error)?;
-                match handle
-                    .wal_probe
-                    .exists(&self.0.store, &wal.key(state.seq + 1))
-                    .await
-                {
+                let key = handle.wal_key(&self.0.store, ns, state.seq + 1)?;
+                match handle.wal_probe.exists(&self.0.store, &key).await {
                     Ok(false) => {
                         let current = handle.state.load();
                         if current.seq == state.seq

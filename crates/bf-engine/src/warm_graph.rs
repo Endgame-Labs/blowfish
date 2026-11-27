@@ -81,7 +81,76 @@ struct Key {
     attribute: String,
     tier: String,
 }
+/// A cache key's four parts, borrowed. [`Key`] stays the owned map key; a lookup builds a
+/// [`KeyRef`] on the stack and the map compares through this trait, so the per-query lookups
+/// allocate nothing. Its order is [`Key`]'s derived order (namespace, generation, attribute,
+/// tier), which `BTreeMap` needs for the two forms to agree.
+trait KeyView {
+    fn parts(&self) -> (&str, chrono::DateTime<chrono::Utc>, &str, &str);
+}
+impl KeyView for Key {
+    fn parts(&self) -> (&str, chrono::DateTime<chrono::Utc>, &str, &str) {
+        (
+            &self.namespace,
+            self.generation,
+            &self.attribute,
+            &self.tier,
+        )
+    }
+}
+#[derive(Clone, Copy)]
+struct KeyRef<'a> {
+    namespace: &'a str,
+    generation: chrono::DateTime<chrono::Utc>,
+    attribute: &'a str,
+    tier: &'a str,
+}
+impl<'a> KeyRef<'a> {
+    fn new(ns: &'a str, state: &NamespaceState, attribute: &'a str, set: &'a SlabSet) -> Self {
+        Self {
+            namespace: ns,
+            generation: state.created_at,
+            attribute,
+            tier: &set.dir.key,
+        }
+    }
+    fn owned(&self) -> Key {
+        Key {
+            namespace: self.namespace.into(),
+            generation: self.generation,
+            attribute: self.attribute.into(),
+            tier: self.tier.into(),
+        }
+    }
+}
+impl KeyView for KeyRef<'_> {
+    fn parts(&self) -> (&str, chrono::DateTime<chrono::Utc>, &str, &str) {
+        (self.namespace, self.generation, self.attribute, self.tier)
+    }
+}
+impl<'a> std::borrow::Borrow<dyn KeyView + 'a> for Key {
+    fn borrow(&self) -> &(dyn KeyView + 'a) {
+        self
+    }
+}
+impl PartialEq for dyn KeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+impl Eq for dyn KeyView + '_ {}
+impl PartialOrd for dyn KeyView + '_ {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for dyn KeyView + '_ {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.parts().cmp(&other.parts())
+    }
+}
 impl Key {
+    #[cfg(test)]
     fn new(ns: &str, state: &NamespaceState, attribute: &str, set: &SlabSet) -> Self {
         Self {
             namespace: ns.into(),
@@ -294,7 +363,7 @@ impl Drop for Job {
 #[derive(Clone)]
 pub(crate) struct Scope {
     cache: Arc<Cache>,
-    namespace: String,
+    namespace: Arc<str>,
     trial: bool,
     used: Arc<Mutex<Option<Vec<Key>>>>,
 }
@@ -399,6 +468,21 @@ fn current() -> Option<Scope> {
     read_cache::context()?.hot_graph
 }
 impl Cache {
+    /// The ready graph for a tier, if any: one lock, no allocation.
+    fn ready(
+        &self,
+        ns: &str,
+        state: &NamespaceState,
+        attribute: &str,
+        set: &SlabSet,
+    ) -> Option<Arc<Entry>> {
+        let key = KeyRef::new(ns, state, attribute, set);
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key as &dyn KeyView)
+            .and_then(|h| h.ready.clone())
+    }
     pub(crate) fn new(foreground: u64) -> Self {
         Self {
             entries: Default::default(),
@@ -438,23 +522,31 @@ impl Cache {
                 }
             });
     }
+    #[cfg(test)]
     fn prune(&self, ns: &str, state: &NamespaceState, now: Instant) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|k, h| {
-                let stale = now.duration_since(h.last) > IDLE
-                    || (k.namespace == ns
-                        && (k.generation != state.created_at
-                            || !state
-                                .ann_tiers
-                                .get(&k.attribute)
-                                .is_some_and(|sets| sets.iter().any(|s| s.dir.key == k.tier))));
-                if stale && let Some(c) = &h.building {
-                    c.cancel();
-                }
-                !stale
-            });
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_locked(&mut entries, ns, state, now);
+    }
+    /// Drop the heat of idle tiers and of this namespace's replaced ones.
+    fn prune_locked(
+        entries: &mut BTreeMap<Key, Heat>,
+        ns: &str,
+        state: &NamespaceState,
+        now: Instant,
+    ) {
+        entries.retain(|k, h| {
+            let stale = now.duration_since(h.last) > IDLE
+                || (k.namespace == ns
+                    && (k.generation != state.created_at
+                        || !state
+                            .ann_tiers
+                            .get(&k.attribute)
+                            .is_some_and(|sets| sets.iter().any(|s| s.dir.key == k.tier))));
+            if stale && let Some(c) = &h.building {
+                c.cancel();
+            }
+            !stale
+        });
     }
     /// Whether a ready, usable graph would answer this plain vector query. Used to let a query
     /// larger than the usual inline limit stay on the HTTP reactor.
@@ -472,20 +564,16 @@ impl Cache {
         if overcommitted() {
             return false;
         }
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries
-            .get(&Key::new(ns, state, attribute, set))
-            .and_then(|h| h.ready.as_ref())
-            .is_some_and(|e| {
-                k > 0
-                    && k <= MAX_K
-                    && e.graph.len() >= k
-                    && vector.len() == e.graph.dims()
-                    && e.calibration
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .usable
-            })
+        self.ready(ns, state, attribute, set).is_some_and(|e| {
+            k > 0
+                && k <= MAX_K
+                && e.graph.len() >= k
+                && vector.len() == e.graph.dims()
+                && e.calibration
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .usable
+        })
     }
     pub(crate) fn observe(
         engine: &Engine,
@@ -497,40 +585,53 @@ impl Cache {
         trim();
         let cache = &engine.0.hot_graph;
         let now = Instant::now();
-        cache.prune(ns, state, now);
-        let Some(RankBy::Vector {
-            attribute,
-            vector,
-            exact: false,
-            ..
-        }) = &q.rank_by
-        else {
-            return;
+        let eligible = 'eligible: {
+            let Some(RankBy::Vector {
+                attribute,
+                vector,
+                exact: false,
+                ..
+            }) = &q.rank_by
+            else {
+                break 'eligible None;
+            };
+            if q.filters.is_some()
+                || q.total().unwrap_or(10) == 0
+                || q.total().unwrap_or(10).saturating_add(q.offset) > MAX_K
+                || vector.iter().all(|x| *x == 0.)
+                || state.metric != DistanceMetric::CosineDistance
+            {
+                break 'eligible None;
+            }
+            let Some((_, VectorType::F16)) =
+                state.schema.get(attribute).and_then(segment::dense_type)
+            else {
+                break 'eligible None;
+            };
+            state.ann_tiers.get(attribute).map(|sets| (attribute, sets))
         };
-        if q.filters.is_some()
-            || q.total().unwrap_or(10) == 0
-            || q.total().unwrap_or(10).saturating_add(q.offset) > MAX_K
-            || vector.iter().all(|x| *x == 0.)
-            || state.metric != DistanceMetric::CosineDistance
+        // One lock for the whole query: prune, then record the heat of each tier. The keys are
+        // borrowed, so nothing allocates under the lock unless a tier is new.
+        let mut launches = Vec::new();
         {
-            return;
-        }
-        let Some((_, VectorType::F16)) = state.schema.get(attribute).and_then(segment::dense_type)
-        else {
-            return;
-        };
-        let Some(sets) = state.ann_tiers.get(attribute) else {
-            return;
-        };
-        for set in sets {
-            let key = Key::new(ns, state, attribute, set);
-            let launch = {
-                let mut entries = cache.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let mut entries = cache.entries.lock().unwrap_or_else(|e| e.into_inner());
+            Self::prune_locked(&mut entries, ns, state, now);
+            let Some((attribute, sets)) = eligible else {
+                return;
+            };
+            for set in sets {
+                let key = KeyRef::new(ns, state, attribute, set);
+                let present = entries.contains_key(&key as &dyn KeyView);
                 // A fixed metadata cap prevents one-query namespaces from growing an unbounded heat map.
-                if entries.len() >= 256 && !entries.contains_key(&key) {
+                if entries.len() >= 256 && !present {
                     continue;
                 }
-                let h = entries.entry(key.clone()).or_insert_with(|| Heat::new(now));
+                if !present {
+                    entries.insert(key.owned(), Heat::new(now));
+                }
+                let h = entries
+                    .get_mut(&key as &dyn KeyView)
+                    .expect("heat entry present");
                 let baseline = if h.ready.is_none() {
                     seconds
                 } else {
@@ -542,68 +643,65 @@ impl Cache {
                     || now < h.retry
                     || now.duration_since(h.first) < DWELL
                 {
-                    None
-                } else {
-                    // Initial scheduling is an estimate. Installation and calibration use the
-                    // actual measured construction cost and namespace query costs below.
-                    let forecast = h.rate * 86400. * h.ivf_seconds * 0.5;
-                    let estimate = set.rows() as f64 * 0.001;
-                    if forecast < 2. * estimate {
-                        None
-                    } else {
-                        let c = HotCancellation::default();
-                        h.building = Some(c.clone());
-                        Some(c)
+                    continue;
+                }
+                // Initial scheduling is an estimate. Installation and calibration use the
+                // actual measured construction cost and namespace query costs below.
+                let forecast = h.rate * 86400. * h.ivf_seconds * 0.5;
+                let estimate = set.rows() as f64 * 0.001;
+                if forecast >= 2. * estimate {
+                    let c = HotCancellation::default();
+                    h.building = Some(c.clone());
+                    launches.push((key.owned(), set, c));
+                }
+            }
+        }
+        for (key, set, cancel) in launches {
+            let attribute = key.attribute.clone();
+            let engine = engine.clone();
+            let set = set.clone();
+            let ns = ns.to_string();
+            let running = engine.0.stop.track();
+            tokio::spawn(async move {
+                let _running = running;
+                let _job = Job {
+                    cache: Arc::downgrade(&engine.0.hot_graph),
+                    key: key.clone(),
+                    cancel: cancel.clone(),
+                };
+                let build = engine.construct_hot_graph(&ns, &attribute, &set, &cancel);
+                tokio::pin!(build);
+                let mut check_source = tokio::time::interval(Duration::from_secs(30));
+                let result = loop {
+                    tokio::select! {
+                        result = &mut build => break result,
+                        _ = check_source.tick() => {
+                            if engine.0.stop.stopping() { cancel.cancel(); }
+                            if let Ok(wal) = Wal::new(engine.0.store.clone(), &ns)
+                                && let Ok(Some((_, manifest))) = wal.latest_manifest().await
+                                && (manifest.deleted || manifest.created_at != key.generation
+                                    || !manifest.ann_tiers.get(&attribute).is_some_and(|sets| sets.iter().any(|s| s.dir.key == set.dir.key))) { cancel.cancel(); }
+                        }
+                    }
+                };
+                let mut entries = engine
+                    .0
+                    .hot_graph
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(h) = entries.get_mut(&key) {
+                    h.building = None;
+                    h.retry = Instant::now() + RETRY;
+                    match result {
+                        Ok(Some(entry)) if !cancel.cancelled() => {
+                            h.ready = Some(Arc::new(entry));
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::debug!(%error,"warm graph build deferred"),
                     }
                 }
-            };
-            if let Some(cancel) = launch {
-                let engine = engine.clone();
-                let set = set.clone();
-                let attribute = attribute.clone();
-                let ns = ns.to_string();
-                let running = engine.0.stop.track();
-                tokio::spawn(async move {
-                    let _running = running;
-                    let _job = Job {
-                        cache: Arc::downgrade(&engine.0.hot_graph),
-                        key: key.clone(),
-                        cancel: cancel.clone(),
-                    };
-                    let build = engine.construct_hot_graph(&ns, &attribute, &set, &cancel);
-                    tokio::pin!(build);
-                    let mut check_source = tokio::time::interval(Duration::from_secs(30));
-                    let result = loop {
-                        tokio::select! {
-                            result = &mut build => break result,
-                            _ = check_source.tick() => {
-                                if engine.0.stop.stopping() { cancel.cancel(); }
-                                if let Ok(wal) = Wal::new(engine.0.store.clone(), &ns)
-                                    && let Ok(Some((_, manifest))) = wal.latest_manifest().await
-                                    && (manifest.deleted || manifest.created_at != key.generation
-                                        || !manifest.ann_tiers.get(&attribute).is_some_and(|sets| sets.iter().any(|s| s.dir.key == set.dir.key))) { cancel.cancel(); }
-                            }
-                        }
-                    };
-                    let mut entries = engine
-                        .0
-                        .hot_graph
-                        .entries
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Some(h) = entries.get_mut(&key) {
-                        h.building = None;
-                        h.retry = Instant::now() + RETRY;
-                        match result {
-                            Ok(Some(entry)) if !cancel.cancelled() => {
-                                h.ready = Some(Arc::new(entry));
-                            }
-                            Ok(_) => {}
-                            Err(error) => tracing::debug!(%error,"warm graph build deferred"),
-                        }
-                    }
-                });
-            }
+            });
         }
     }
 }
@@ -957,14 +1055,9 @@ pub(crate) fn available(
     let Some(scope) = current() else {
         return false;
     };
-    let entries = scope
+    scope
         .cache
-        .entries
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    entries
-        .get(&Key::new(&scope.namespace, state, attribute, set))
-        .and_then(|h| h.ready.as_ref())
+        .ready(&scope.namespace, state, attribute, set)
         .is_some_and(|e| {
             k > 0
                 && k <= MAX_K
@@ -1013,13 +1106,7 @@ fn mask_eligible_in(
     let Some(mask) = mask else {
         return true;
     };
-    let key = Key::new(namespace, state, attribute, set);
-    let entry = cache
-        .entries
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        .and_then(|h| h.ready.clone());
+    let entry = cache.ready(namespace, state, attribute, set);
     let Some(entry) = entry else {
         return false;
     };
@@ -1038,8 +1125,9 @@ fn mask_eligible_in(
     if live >= k && live.saturating_mul(10) >= entry.graph.len().saturating_mul(9) {
         return true;
     }
+    let key = KeyRef::new(namespace, state, attribute, set);
     let mut entries = cache.entries.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(h) = entries.get_mut(&key) {
+    if let Some(h) = entries.get_mut(&key as &dyn KeyView) {
         h.ready = None;
         h.first = Instant::now();
         h.retry = Instant::now() + RETRY;
@@ -1095,14 +1183,9 @@ pub(crate) fn scan_eligible(
     let Some(scope) = current() else {
         return false;
     };
-    let entries = scope
+    scope
         .cache
-        .entries
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    entries
-        .get(&Key::new(&scope.namespace, state, attribute, set))
-        .and_then(|h| h.ready.as_ref())
+        .ready(&scope.namespace, state, attribute, set)
         .is_some_and(|e| {
             k > 0
                 && k <= MAX_K
@@ -1133,13 +1216,7 @@ pub(crate) async fn scan(
     let Some(scope) = current() else {
         return Ok(None);
     };
-    let entry = scope
-        .cache
-        .entries
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&Key::new(&scope.namespace, state, attribute, set))
-        .and_then(|h| h.ready.clone());
+    let entry = scope.cache.ready(&scope.namespace, state, attribute, set);
     let Some(entry) = entry else {
         return Ok(None);
     };
@@ -1187,15 +1264,7 @@ pub(crate) async fn search(
     let Some(scope) = current() else {
         return Ok(None);
     };
-    let key = Key::new(&scope.namespace, state, attribute, set);
-    let entry = {
-        let entries = scope
-            .cache
-            .entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        entries.get(&key).and_then(|h| h.ready.clone())
-    };
+    let entry = scope.cache.ready(&scope.namespace, state, attribute, set);
     let Some(entry) = entry else {
         return Ok(None);
     };
@@ -1248,7 +1317,7 @@ pub(crate) async fn search(
                 .unwrap_or_else(|e| e.into_inner())
                 .as_mut()
             {
-                used.push(key);
+                used.push(KeyRef::new(&scope.namespace, state, attribute, set).owned());
             }
             scope.cache.answers.fetch_add(1, Ordering::Relaxed);
             Ok(Some(found))
@@ -1473,7 +1542,9 @@ fn typed_ids(
 /// not serve this query for any reason (no usable graph, no ID table yet, a row without a live
 /// home, fewer than `k` live rows), so the caller takes the general path, which also starts
 /// anything this path waits for. The hits are ordered as the general path orders them: nearest
-/// first, equal distances by ID.
+/// first, equal distances by ID. `mask` is the tier's live rows (it decides whether the graph
+/// may serve), and `navigate` those minus the rows the unindexed tail shadows: the rows the
+/// walk may return, as in [`search`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search_ids(
     cache: &Cache,
@@ -1484,19 +1555,14 @@ pub(crate) async fn search_ids(
     at: &Placement,
     vector: &[f32],
     mask: Option<&Arc<RoaringBitmap>>,
+    navigate: Option<&Arc<RoaringBitmap>>,
     k: usize,
 ) -> Option<Vec<(u64, f32)>> {
     if overcommitted() {
         trim();
         return None;
     }
-    let key = Key::new(namespace, state, attribute, set);
-    let entry = cache
-        .entries
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        .and_then(|h| h.ready.clone())?;
+    let entry = cache.ready(namespace, state, attribute, set)?;
     let ef = {
         let c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
         if !c.usable {
@@ -1515,10 +1581,10 @@ pub(crate) async fn search_ids(
     }
     let table = entry.ids.get()?;
     let _permit = entry.slots.try_acquire().ok()?;
-    let exact = ranked_rows(vector, mask.map(|m| &**m), k, &entry, ef, false)
+    let exact = ranked_rows(vector, navigate.map(|m| &**m), k, &entry, ef, false)
         .await
         .ok()??;
-    let mut hits = typed_ids(table, &exact, mask.map(|m| &**m), set, at)??;
+    let mut hits = typed_ids(table, &exact, navigate.map(|m| &**m), set, at)??;
     if hits.len() < k {
         return None;
     }
