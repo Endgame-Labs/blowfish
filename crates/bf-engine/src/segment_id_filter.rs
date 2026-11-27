@@ -12,6 +12,11 @@ pub(super) async fn evaluate(
     schema: &Schema,
     live: &RoaringBitmap,
 ) -> Result<Option<RoaringBitmap>, ApiError> {
+    if op == FilterOp::In {
+        return Ok(lookup_in(store, segment, value, schema, live.is_empty())
+            .await?
+            .map(|rows| rows & live));
+    }
     let Some(range) = row_range(store, segment, op, value, schema, live.is_empty()).await? else {
         return Ok(None);
     };
@@ -36,7 +41,11 @@ pub(super) async fn prefetch(store: &Storage, segment: &Segment, f: &Filter, sch
     } = f
         && attribute == "id"
     {
-        let _ = Box::pin(row_range(store, segment, *op, value, schema, false)).await;
+        if *op == FilterOp::In {
+            let _ = Box::pin(lookup_in(store, segment, value, schema, false)).await;
+        } else {
+            let _ = Box::pin(row_range(store, segment, *op, value, schema, false)).await;
+        }
     }
 }
 
@@ -167,6 +176,19 @@ impl Seeker {
         })
     }
 
+    /// The first block of each probe region. The probes divide the column into regions of about
+    /// REGION_BYTES. At least two probes keep a region from being the whole column; a column of
+    /// one block has one probe.
+    fn starts(&self) -> Vec<usize> {
+        let nb = self.blocks();
+        let column_bytes: u64 = self.dir.columns["id"].blocks.iter().map(|b| b.length).sum();
+        let k = usize::try_from(column_bytes.div_ceil(REGION_BYTES))
+            .unwrap_or(MAX_PROBES)
+            .clamp(2, MAX_PROBES)
+            .min(nb);
+        (0..k).map(|t| t * nb / k).collect()
+    }
+
     fn blocks(&self) -> usize {
         self.dir.columns["id"].blocks.len()
     }
@@ -262,18 +284,8 @@ async fn boundary(
     }
     let trace = crate::ann::trace_stages().then(std::time::Instant::now);
     let nb = seeker.blocks();
-    let column_bytes: u64 = seeker.dir.columns["id"]
-        .blocks
-        .iter()
-        .map(|b| b.length)
-        .sum();
-    // The probes divide the column into regions of about REGION_BYTES. At least two probes
-    // keep a region from being the whole column; a column of one block has one probe.
-    let k = usize::try_from(column_bytes.div_ceil(REGION_BYTES))
-        .unwrap_or(MAX_PROBES)
-        .clamp(2, MAX_PROBES)
-        .min(nb);
-    let starts: Vec<usize> = (0..k).map(|t| t * nb / k).collect();
+    let starts = seeker.starts();
+    let k = starts.len();
     // Wave one: the first ID of every probe block, and the last ID of the column's last
     // block. Probe 0 is included, since without the ID-bounds header nothing says that the
     // column's first ID precedes the boundary; the last block settles a segment whose every
@@ -326,6 +338,145 @@ async fn boundary(
         return Ok((i * BLOCK_ROWS + within.partition_point(|b| *b)) as u32);
     }
     Ok((end * BLOCK_ROWS).min(segment.row_count as usize) as u32)
+}
+
+/// The rows holding the IDs of an `In` list, or `None` when the dictionary path is cheaper (or the
+/// operand is not a plain list). All IDs share one probe wave and one fetch of the regions they
+/// land in, so a short list costs about what one `Eq` does. The planner compares the bytes the
+/// second wave would read with the bytes of the segment's ID dictionary, which is what the
+/// general path would load, and keeps the dictionary path when the seek would read more or when
+/// the dictionary is already decoded in the cache. Live rows are not consulted.
+async fn lookup_in(
+    store: &Storage,
+    segment: &Segment,
+    value: &Value,
+    schema: &Schema,
+    no_live_rows: bool,
+) -> Result<Option<RoaringBitmap>, ApiError> {
+    let Some(items) = value.as_array() else {
+        return Ok(None);
+    };
+    let t = schema.get("id").and_then(|s| s.data_type.as_ref());
+    let mut operands = Vec::with_capacity(items.len());
+    for item in items {
+        operands.push(match t {
+            Some(t) => crate::write::normalize_value(item, t)?,
+            None => item.clone(),
+        });
+    }
+    if no_live_rows {
+        return Ok(Some(RoaringBitmap::new()));
+    }
+    operands.sort_by(filter::compare);
+    operands.dedup_by(|a, b| filter::compare(a, b).is_eq());
+    // Segments whose ID range excludes every listed ID read nothing beyond the range header.
+    if let Some((min, max)) = bounds(store, segment).await? {
+        operands.retain(|v| filter::compare(v, &min).is_ge() && filter::compare(v, &max).is_le());
+    }
+    let mut rows = RoaringBitmap::new();
+    if operands.is_empty() {
+        return Ok(Some(rows));
+    }
+    let filters = segment.files.get("filters");
+    if let Some(file) = filters
+        && read_cache::get::<Vec<(Value, RoaringBitmap)>>(&format!("{}:id", file.key), 0).is_some()
+    {
+        return Ok(None);
+    }
+    let seeker = Seeker::open(store, segment).await?;
+    if seeker.staged {
+        for operand in &operands {
+            let lt = |v: &Value| filter::compare(v, operand).is_lt();
+            let le = |v: &Value| filter::compare(v, operand).is_le();
+            let low = staged_boundary(store, segment, &lt).await?;
+            if staged_boundary(store, segment, &le).await? > low {
+                rows.insert(low);
+            }
+        }
+        return Ok(Some(rows));
+    }
+    let nb = seeker.blocks();
+    let starts = seeker.starts();
+    let k = starts.len();
+    let mut wanted = starts.clone();
+    if starts.last() != Some(&(nb - 1)) {
+        wanted.push(nb - 1);
+    }
+    // Wave one, with the dictionary's size, which the cost model needs: the first ID of every
+    // probe block and the last ID of the column.
+    let dictionary = async {
+        let Some(file) = filters else {
+            return u64::MAX;
+        };
+        match directory(&ObjectReader::new(store, file)).await {
+            Ok(dir) => dir
+                .columns
+                .get("id")
+                .and_then(|c| c.blocks.first())
+                .map_or(u64::MAX, |b| b.length),
+            Err(_) => u64::MAX,
+        }
+    };
+    let (probes, dictionary_bytes) = futures::future::join(seeker.fetch(&wanted), dictionary).await;
+    let probes = probes?;
+    let last = probes.last().ok_or_else(corrupt)?;
+    let last_id = id_at(last, last.len() - 1)?;
+    let firsts: Vec<&Value> = probes[..k]
+        .iter()
+        .map(|values| id_at(values, 0))
+        .collect::<Result<_, _>>()?;
+    let mut regions: BTreeMap<usize, Vec<&Value>> = BTreeMap::new();
+    for operand in &operands {
+        if filter::compare(last_id, operand).is_lt() {
+            continue;
+        }
+        // The last probe whose first ID is not after the operand brackets it.
+        let after = firsts.partition_point(|f| filter::compare(f, operand).is_le());
+        if after > 0 {
+            regions.entry(after - 1).or_default().push(operand);
+        }
+    }
+    let span = |s: usize| starts[s]..starts.get(s + 1).copied().unwrap_or(nb);
+    let col = &seeker.dir.columns["id"];
+    let seek_bytes: u64 = regions
+        .keys()
+        .map(|&s| col.blocks[span(s)].iter().map(|b| b.length).sum::<u64>())
+        .sum();
+    if seek_bytes > dictionary_bytes {
+        return Ok(None);
+    }
+    // Wave two: every needed region in one batch, searched in memory.
+    let indices: Vec<usize> = regions.keys().flat_map(|&s| span(s)).collect();
+    let blocks = seeker.fetch(&indices).await?;
+    let mut at = 0;
+    for (&s, operands) in &regions {
+        let range = span(s);
+        let region = &blocks[at..at + range.len()];
+        at += range.len();
+        for operand in operands {
+            let n = region.partition_point(|values| {
+                values
+                    .last()
+                    .and_then(Option::as_ref)
+                    .is_some_and(|v| filter::compare(v, operand).is_lt())
+            });
+            let Some(values) = region.get(n) else {
+                continue;
+            };
+            let p = values.partition_point(|v| {
+                v.as_ref()
+                    .is_some_and(|v| filter::compare(v, operand).is_lt())
+            });
+            if values
+                .get(p)
+                .and_then(Option::as_ref)
+                .is_some_and(|v| filter::compare(v, operand).is_eq())
+            {
+                rows.insert(((range.start + n) * BLOCK_ROWS + p) as u32);
+            }
+        }
+    }
+    Ok(Some(rows))
 }
 
 /// The row-by-row binary search, for segments whose row IDs are staged locally (no reads).
@@ -433,6 +584,49 @@ mod tests {
                         assert_eq!(got, expected, "{kind} {op} {operand} legacy={legacy}");
                     }
                 }
+                // `In` lists: duplicates, absent IDs between and beyond the range, a null, and
+                // IDs on live holes and block edges, all through the seek (no dictionary here).
+                let absent = match kind {
+                    "uint" => json!(u64::MAX - 4000 + 1),
+                    "string" => json!("doc-0001-é"),
+                    _ => json!(uuid::Uuid::from_u128(1).to_string()),
+                };
+                let lists = [
+                    vec![],
+                    vec![values[0].clone()],
+                    vec![
+                        values[1099].clone(),
+                        values[1099].clone(),
+                        values[7].clone(),
+                    ],
+                    vec![absent.clone()],
+                    vec![
+                        values[255].clone(),
+                        values[256].clone(),
+                        values[512].clone(),
+                        absent.clone(),
+                        values[0].clone(),
+                        values[3].clone(),
+                        values[600].clone(),
+                    ],
+                    values.clone(),
+                ];
+                for list in lists {
+                    let f: Filter = serde_json::from_value(json!(["id", "In", list])).unwrap();
+                    let got = filter_rows(&store, &segment, &f, &schema, &live)
+                        .await
+                        .unwrap();
+                    let expected: RoaringBitmap = docs
+                        .values()
+                        .enumerate()
+                        .filter_map(|(i, doc)| {
+                            (live.contains(i as u32)
+                                && filter::matches(&f, Some(doc), None, &schema).unwrap())
+                            .then_some(i as u32)
+                        })
+                        .collect();
+                    assert_eq!(got, expected, "{kind} In {} legacy={legacy}", list.len());
+                }
             }
         }
     }
@@ -523,6 +717,36 @@ mod tests {
                 }
             }
         }
+        for legacy in [false, true] {
+            let target = if legacy { &whole } else { &segment };
+            let edges = [0usize, 255, 256, 511, 512, 2047, 2048, 3743, 3744, 3999];
+            let lists: Vec<Vec<Value>> = vec![
+                vec![values[3743].clone(), values[3743].clone()],
+                edges.iter().map(|&r| values[r].clone()).collect(),
+                edges
+                    .iter()
+                    .map(|&r| json!(format!("{}~", &values[r].as_str().unwrap()[..5])))
+                    .collect(),
+                values.iter().step_by(3).cloned().collect(),
+                vec![json!("zzzzz"), json!(""), values[1].clone()],
+            ];
+            for list in lists {
+                let f: Filter = serde_json::from_value(json!(["id", "In", list])).unwrap();
+                let got = filter_rows(&store, target, &f, &schema, &live)
+                    .await
+                    .unwrap();
+                let expected: RoaringBitmap = docs
+                    .values()
+                    .enumerate()
+                    .filter_map(|(i, doc)| {
+                        (live.contains(i as u32)
+                            && filter::matches(&f, Some(doc), None, &schema).unwrap())
+                        .then_some(i as u32)
+                    })
+                    .collect();
+                assert_eq!(got, expected, "In {} whole={legacy}", list.len());
+            }
+        }
         let list: Vec<&Value> = vec![&values[0], &values[777], &values[3999], &operands[3]];
         let f: Filter = serde_json::from_value(json!(["id", "In", list])).unwrap();
         let got = filter_rows(&store, &whole, &f, &schema, &live)
@@ -537,5 +761,95 @@ mod tests {
             })
             .collect();
         assert_eq!(got, expected);
+    }
+
+    /// Through the whole engine: an indexed segment plus WAL deletes, overwrites, and new rows.
+    /// `id In` (alone, duplicated, absent, deleted, overwritten, and under `And`/`Or`/`Not` with
+    /// another filter) must return the reference evaluator's ordered IDs and distances.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn id_in_matches_the_reference_with_deletes_and_overwrites() {
+        use crate::*;
+        let store = Storage::open(&bf_storage::StorageConfig {
+            url: "memory://".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let config = EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        };
+        let engine = Engine::with_config(store.clone(), config.clone());
+        let row = |id: u64, step: u64| {
+            let vector: Vec<f32> = (0..16)
+                .map(|d| ((id * 31 + d * 7 + step * 13) % 97) as f32 / 97.0 - 0.4)
+                .collect();
+            json!({"id":id,"group":(id + step) % 5,"vector":vector})
+        };
+        engine
+            .write(
+                "idin",
+                serde_json::from_value(json!({"distance_metric":"cosine_distance","schema":{"vector":{"type":"[16]f32"}},
+                    "upsert_rows":(0..2300).map(|id| row(id, 0)).collect::<Vec<_>>()}))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine.index_namespace("idin", true).await.unwrap();
+        for step in 0..2u64 {
+            if step == 1 {
+                // WAL changes on top of the segment: overwrite 10 and 11 with new groups,
+                // delete 12 and 2299, and add 5000.
+                engine
+                    .write(
+                        "idin",
+                        serde_json::from_value(json!({
+                            "upsert_rows":[row(10, 7), row(11, 8), row(5000, 1)],
+                            "deletes":[12, 2299]}))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let (state, _) = engine.snapshot("idin", &Consistency::Strong).await.unwrap();
+            let full = snapshot::materialize(&store, &state).await.unwrap();
+            let context = read_cache::ReadContext::new(engine.0.read_cache.clone());
+            read_cache::scope(context, async {
+                let lists = [
+                    json!([5]),
+                    json!([5, 5, 5]),
+                    json!([9, 10, 11, 12, 13]),
+                    json!([2298, 2299, 2300, 5000, 123456]),
+                    json!([100000, 100001]),
+                    json!((0..300).map(|i| i * 7).collect::<Vec<_>>()),
+                    json!([]),
+                ];
+                for list in lists {
+                    for filters in [
+                        json!(["id", "In", list]),
+                        json!(["And", [["id", "In", list], ["group", "In", [0, 1]]]]),
+                        json!(["Or", [["id", "In", list], ["group", "Eq", 4]]]),
+                        json!(["Not", ["id", "In", list]]),
+                        json!(["And", [["id", "In", list], ["id", "Lt", 1000]]]),
+                    ] {
+                        let request: QueryRequest = serde_json::from_value(json!({
+                            "rank_by":["vector","ANN",[0.3,0.1,0.2,0.0,0.4,0.1,0.2,0.3,0.1,0.0,0.2,0.2,0.1,0.3,0.0,0.1]],
+                            "limit":{"total":40},"include_attributes":["group"],"filters":filters}))
+                        .unwrap();
+                        let expected = query::execute(&full, &request).unwrap().result.rows;
+                        for _ in 0..2 {
+                            let got = indexed::execute(&store, &state, &request, &config, false)
+                                .await
+                                .unwrap()
+                                .result
+                                .rows;
+                            assert_eq!(got, expected, "step {step} {request:?}");
+                        }
+                    }
+                }
+            })
+            .await;
+        }
     }
 }
