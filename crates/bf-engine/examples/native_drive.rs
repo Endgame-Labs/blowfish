@@ -20,6 +20,19 @@ use std::time::{Duration, Instant};
 
 const CLIENTS: usize = 16;
 
+/// The corpus row of a UUID ID written by `bench/nq/load.py --uuid-ids`: its text is
+/// `(row + 1) * M mod 2^128`, so the row is that times M's inverse, less one.
+fn row_of_uuid(text: &str) -> Option<i64> {
+    const M: u128 = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835;
+    let value = u128::from_str_radix(&text.replace('-', ""), 16).ok()?;
+    // Newton's iteration doubles the correct low bits of the inverse of an odd number.
+    let mut inverse: u128 = 1;
+    for _ in 0..7 {
+        inverse = inverse.wrapping_mul(2u128.wrapping_sub(M.wrapping_mul(inverse)));
+    }
+    Some(value.wrapping_mul(inverse).wrapping_sub(1) as i64)
+}
+
 fn npy(path: &str, dtype: &str) -> (Vec<usize>, Vec<u8>) {
     let raw = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
     assert_eq!(&raw[..6], b"\x93NUMPY", "{path}: not npy");
@@ -216,6 +229,7 @@ fn main() {
                 let id = r["id"]
                     .as_i64()
                     .or_else(|| r["id"].as_str().and_then(|s| s.parse().ok()))
+                    .or_else(|| r["id"].as_str().and_then(row_of_uuid))
                     .unwrap();
                 want.contains(&(id as i32))
             })
