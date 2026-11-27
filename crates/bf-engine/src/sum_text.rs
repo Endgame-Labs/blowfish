@@ -852,7 +852,9 @@ pub(crate) fn accept(totals: &mut [f64], k: usize, bound: f64, exhaustive: bool)
         // Fewer than k positive rows in the union: all of them win only when nothing is outside.
         return exhaustive.then_some(0.0);
     }
-    let kth = *totals.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a)).1;
+    let kth = *totals
+        .select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a))
+        .1;
     (exhaustive || kth > bound).then_some(kth)
 }
 
@@ -901,6 +903,68 @@ mod tests {
             scaled(&[Step::Mul(3.0), Step::Mul(2.0)], s),
             2.0 * (3.0 * f64::from(s))
         );
+    }
+    #[test]
+    fn shapes_are_accepted_only_when_every_node_is_monotone_and_bounded() {
+        let shape = |v: serde_json::Value| {
+            let rank: RankBy = serde_json::from_value(v).unwrap();
+            shape_of(Some(&rank)).map(|s| (s.texts, s.bonuses.len(), s.docs.len(), s.decreasing))
+        };
+        let bm = || serde_json::json!(["t", "BM25", "x"]);
+        let recency = serde_json::json!(["Product", 2.0,
+            ["Decay", ["Dist", ["Attribute", "ts"], "2026-01-01T00:00:00Z"], {"midpoint": "30d"}]]);
+        // Constants and nesting.
+        assert_eq!(
+            shape(serde_json::json!(["Sum", [bm(), 0.1]])),
+            Some((1, 0, 0, false))
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Max", [bm(), 0.1]])),
+            Some((1, 0, 0, false))
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Product", 2.0, ["Sum", [bm(), bm()]]])),
+            Some((2, 0, 0, false))
+        );
+        // A bounded row-wise term is one doc term; a negative constant has no bound.
+        assert_eq!(
+            shape(serde_json::json!(["Sum", [bm(), recency]])),
+            Some((1, 0, 1, false))
+        );
+        assert_eq!(shape(serde_json::json!(["Sum", [bm(), -1.0]])), None);
+        // An attribute on its own is unbounded.
+        assert_eq!(
+            shape(serde_json::json!([
+                "Sum",
+                [bm(), ["Max", [["Attribute", "n"], 0]]]
+            ])),
+            None
+        );
+        // Predicates: two are classes, a third is a row-wise term.
+        let pred = |n: i64| serde_json::json!(["Product", 2.0, ["n", "Eq", n]]);
+        assert_eq!(
+            shape(serde_json::json!([
+                "Sum",
+                [bm(), pred(1), pred(2), pred(3)]
+            ])),
+            Some((1, 2, 1, false))
+        );
+        // Only the root may decay, and only text alone.
+        assert_eq!(
+            shape(serde_json::json!(["Decay", bm(), {"midpoint": 10}])),
+            Some((1, 0, 0, true))
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Sum", [["Decay", bm(), {}], bm()]])),
+            None
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Decay", ["Sum", [bm(), pred(1)]], {}])),
+            None
+        );
+        assert_eq!(shape(serde_json::json!(["Dist", bm(), 5.0])), None);
+        // No text at all is not a text rank.
+        assert_eq!(shape(serde_json::json!(["Sum", [1.0, 2.0]])), None);
     }
     #[test]
     fn saturate_never_reverses_the_order_of_adjacent_scores() {
