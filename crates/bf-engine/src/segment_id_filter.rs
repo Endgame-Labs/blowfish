@@ -199,7 +199,7 @@ fn id_at(values: &[Option<Value>], i: usize) -> Result<&Value, ApiError> {
 
 /// First row >= operand (or > operand for an inclusive upper boundary), in at most two waves
 /// of reads after the directory. The first wave reads the first ID of up to [`MAX_PROBES`]
-/// evenly spaced blocks, all at once, which brackets the boundary in one region of the
+/// evenly spaced blocks, plus the last block, all at once, which brackets the boundary in one region of the
 /// column. The second wave reads that region's blocks as one coalesced range and searches it
 /// in memory. A block already in the decoded cache costs no read in either wave.
 async fn boundary(
@@ -240,18 +240,29 @@ async fn boundary(
         .clamp(2, MAX_PROBES)
         .min(nb);
     let starts: Vec<usize> = (0..k).map(|t| t * nb / k).collect();
-    // Wave one: the first ID of every probe block. Probe 0 is included, since without the
-    // ID-bounds header nothing says that the column's first ID precedes the boundary.
-    let probes = seeker.fetch(&starts).await?;
+    // Wave one: the first ID of every probe block, and the last ID of the column's last
+    // block. Probe 0 is included, since without the ID-bounds header nothing says that the
+    // column's first ID precedes the boundary; the last block settles a segment whose every
+    // ID precedes it without a second wave.
+    let mut wanted = starts.clone();
+    if starts.last() != Some(&(nb - 1)) {
+        wanted.push(nb - 1);
+    }
+    let probes = seeker.fetch(&wanted).await?;
     if let Some(t) = trace {
         eprintln!(
-            "ID_SEEK {} wave1 {k} {}",
+            "ID_SEEK {} wave1 {} {}",
             seeker.docs_key,
+            wanted.len(),
             t.elapsed().as_micros()
         );
     }
+    let last = probes.last().ok_or_else(corrupt)?;
+    if before(id_at(last, last.len() - 1)?) {
+        return Ok(segment.row_count);
+    }
     let mut firsts = Vec::with_capacity(k);
-    for values in &probes {
+    for values in &probes[..k] {
         firsts.push(before(id_at(values, 0)?));
     }
     let Some(s) = firsts.iter().rposition(|b| *b) else {
