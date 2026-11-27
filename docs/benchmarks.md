@@ -16343,3 +16343,68 @@ The bandwidth finding and the rejected experiments remain useful evidence, but
 C29 does not claim the requested 1.3× title improvement or a runtime performance
 pass. The complete full-format prototype remains on local branch
 `c29-global-rows` at `cc6b7a7`, for a later investigation.
+
+## Round TL1: the unindexed tail under a write stream
+
+**Before.** Under 50 upserts per second, about 80 percent of the server's CPU (perf, `top_k` 10, indexing off) was in
+`merge_tail`. The decoded tail vectors were already cached, so decode was about 0 percent. The cost was per row, per
+query: the reference kernel (`Metric::distance`) validated the query and the row (two passes over 1,024 floats),
+recomputed both norms and the dot in one three-sum pass, and scanned for zeros, which was 60.5 percent of server CPU. A
+shard mutex, a hash lookup, and three reference-count updates per row (cache `get`) were another 19 percent
+(`__aarch64_ldadd8`, `cas4`, `memcmp`, and the closure's own time).
+
+**After.** Each tail vector is prepared once, when the cache first decodes it: validity, an all-zero flag, and its squared
+norm in the kernel's own accumulation order (`bf_vector::CosineNorm`). A query does one dot product per row
+(`CosineQuery::distance`, or the Euclidean kernel without its validation pass). Each snapshot also gets one block of
+prepared rows in document order, built by the first query that needs it (single flight, keyed by namespace and `seq`).
+A row is used only when the document at that position is the same allocation (checked by pointer, and the cache's weak
+reference pins the allocation), so a stale or foreign block costs speed, never correctness. Rows without a block fall
+back to the cache path. No setting. Results are bit-identical: ordered IDs and distance values.
+`bf-vector` needed two visibility changes: `CosineQuery::distance` and `Metric::distance_unchecked` are now `pub`.
+
+**Protocol.** G13's: one on-demand c7g.4xlarge, NQ 2,681,468 x 1,024 f16 cosine, the warm graph promoted, 16 clients,
+90 seconds per phase, 50 upserts per second of existing IDs (`examples/g13_writes.py`; `T1_INDEXING=1` turns the indexer
+on at its default interval). Baseline is main `b9cf21e`, candidate is this round's final commit, on the same host and in
+the same order. With indexing off the tail grows linearly, to about 4,550 rows after the first write phase (and about
+9,100 after the second). With indexing on, it flushes and stays at 50 to 250 rows.
+
+| top_k | writes | indexing | Baseline q/s | Candidate q/s | Ratio |
+|---|---|---|---:|---:|---:|
+| 10 | no | off | 14,950 | 13,638 | 0.91 (noise: G13's range was 14,408 to 16,463; recall differs by a separate graph build) |
+| 100 | no | off | 5,527 | 5,441 | 0.98 |
+| 10 | yes | off | 2,730 | **4,760** | **1.74** |
+| 100 | yes | off | 992 | **2,046** | **2.06** |
+| 10 | yes | on | 2,719 | 2,869 | 1.06 |
+| 100 | yes | on | 1,177 | 1,195 | 1.02 |
+
+Latency under writes, p50 / p99 ms, indexing off: top_k 10, 4.3 / 21.4 to 2.7 / 12.6; top_k 100, 13.7 / 32.9 to 6.2 /
+20.4. Write latency p50 / p99 ms, baseline to candidate: top_k 10 off 8.2 / 21.7 to 7.8 / 17.7; top_k 100 off 9.8 / 25.3 to
+10.3 / 22.3; indexing on 7.05 / 21.2 to 7.08 / 20.8 (top_k 10) and 8.1 / 23.8 to 8.2 / 24.2 (top_k 100). No write
+failed. Recall was 0.953 to 0.961 in every phase (the graph is built per run).
+
+Candidate profile, top_k 10 under writes, indexing off: `CosineQuery::distance` 38.6 percent, the scorer's own match
+6.2 percent, `merge_tail` 1.2 percent, reference-count updates 1.3 percent. The remaining tail cost is the dot product
+over 4 KB of memory per row, so the next lever is fewer bytes per row (for example f16 storage), not bookkeeping.
+With indexing on, the tail is small and the cost sits elsewhere (uncovered segments from flushes), which is why that
+row barely moves.
+
+### Pass criteria
+
+| Criterion | Result |
+|---|---|
+| top_k 10 under writes at least 1.5 times with indexing off | **1.74 times** (4,760 against 2,730) |
+| Not slower with indexing on | **Yes** (2,869 against 2,719; top_k 100 1,195 against 1,177) |
+| Write latency not slower | **Yes** (within noise, lower beside top_k 10 with indexing off) |
+| Bit-identical results | **Yes**, see the tests |
+
+### Tests
+
+`tail::tests::prepared_scorer_is_bit_identical_to_the_reference_distance` (both metrics, dimensions 1 to 1,024, ordinary,
+zero, denormal, huge, and mismatched-length vectors, bits compared). `tail::tests::prepared_block_matches_the_reference_across_tail_changes`
+(2,300-row tails, f32 and f16, both metrics; overwrites, deletes, patches, and new rows between queries; vector,
+filtered, `top_k` 10 and 100, zero query; each query run twice so the second reuses the block; compared with the
+reference evaluator on the same snapshot). The existing concurrent test compares the same against a writer and an
+indexer.
+
+Resources: one on-demand c7g.4xlarge, 23:51 to 02:10 UTC (about 2.3 hours, about $1.4 compute plus a 150 GB gp3
+volume). Instance, volume, key pair, and security group deleted and verified. No bucket prefix was created.
