@@ -173,10 +173,17 @@ pub(crate) fn first_list(k: usize) -> Option<usize> {
     (1..=MAX_LIST).contains(&k).then(|| k.max(MIN_LIST))
 }
 
-/// The next list length after `n`, or `None` once lists stop paying for themselves.
+/// The list length that asks for every matching row: the last round before the full scorer.
+pub(crate) const ALL_MATCHES: usize = usize::MAX;
+
+/// The next list length after `n`: four times as long up to `MAX_LIST`, then every matching row
+/// (which scores only the rows that match some clause, and needs no bound), then `None`.
 pub(crate) fn next_list(n: usize) -> Option<usize> {
-    let next = n * 4;
-    (next <= MAX_LIST).then_some(next)
+    match n {
+        ALL_MATCHES => None,
+        n if n * 4 <= MAX_LIST => Some(n * 4),
+        _ => Some(ALL_MATCHES),
+    }
 }
 
 /// One clause with its tokens, parameters, and corpus statistics.
@@ -269,6 +276,11 @@ fn bounded_params(params: &serde_json::Value) -> Option<(f64, f64)> {
 fn upper_of(x: &RankBy, columns: &mut std::collections::BTreeSet<String>) -> Option<f64> {
     match x {
         RankBy::Constant(n) => n.as_f64().filter(|v| v.is_finite() && *v >= 0.0),
+        // A predicate beyond the classes' limit: 1 where it matches, 0 elsewhere.
+        RankBy::Filter(f) => {
+            filter_columns(f, columns);
+            Some(1.0)
+        }
         RankBy::Saturate { expr, params } | RankBy::Decay { expr, params } => {
             bounded_params(params)?;
             // The inner value must be computable per row; its own bound is not needed.
@@ -289,6 +301,19 @@ fn upper_of(x: &RankBy, columns: &mut std::collections::BTreeSet<String>) -> Opt
             .collect::<Option<Vec<_>>>()
             .map(|v| v.into_iter().fold(0.0, f64::max)),
         _ => None,
+    }
+}
+
+/// The attributes a predicate reads (`id` is always in a row's document).
+fn filter_columns(f: &Filter, columns: &mut std::collections::BTreeSet<String>) {
+    match f {
+        Filter::And(fs) | Filter::Or(fs) => fs.iter().for_each(|f| filter_columns(f, columns)),
+        Filter::Not(f) => filter_columns(f, columns),
+        Filter::Compare { attribute, .. } => {
+            if attribute != "id" {
+                columns.insert(attribute.clone());
+            }
+        }
     }
 }
 
@@ -354,10 +379,10 @@ impl<'a> Build<'a> {
                 .filter(|v| v.is_finite() && *v >= 0.0)
                 .map(Expr::Const);
         }
-        if let Some((filter, chain)) = bonus_of(x) {
-            if self.bonuses.len() >= MAX_BONUSES {
-                return None;
-            }
+        // The first predicates split rows into classes (exact); later ones are row-wise terms.
+        if self.bonuses.len() < MAX_BONUSES
+            && let Some((filter, chain)) = bonus_of(x)
+        {
             self.bonuses.push((filter, chain));
             return Some(Expr::Bonus(self.bonuses.len() - 1));
         }
@@ -604,6 +629,12 @@ impl SegmentSum {
         k: usize,
     ) -> Result<Option<Candidates>, ApiError> {
         let clauses = &plan.clauses;
+        // One more than the rows there are, so no list is ever full and none needs a bound.
+        let n = if n == ALL_MATCHES {
+            class.rows.len() as usize + 1
+        } else {
+            n
+        };
         let mut union = RoaringBitmap::new();
         let mut cutoffs = Vec::with_capacity(clauses.len());
         let mut lists = Vec::with_capacity(clauses.len());
@@ -777,6 +808,12 @@ impl SegmentSum {
         Ok(out)
     }
 
+    /// Proves that row order is ID order in this segment (loads and validates its ID list, cached).
+    /// Among rows that tie, the lowest rows are then the lowest IDs.
+    pub(crate) async fn ensure_id_order(&self) -> Result<(), ApiError> {
+        segment::ids(&self.store, &self.seg).await.map(|_| ())
+    }
+
     /// Per-clause hits for exactly `rows`, for hydration of the winners.
     pub(crate) async fn winners(
         &self,
@@ -815,8 +852,7 @@ pub(crate) fn accept(totals: &mut [f64], k: usize, bound: f64, exhaustive: bool)
         // Fewer than k positive rows in the union: all of them win only when nothing is outside.
         return exhaustive.then_some(0.0);
     }
-    totals.sort_unstable_by(|a, b| b.total_cmp(a));
-    let kth = totals[k - 1];
+    let kth = *totals.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a)).1;
     (exhaustive || kth > bound).then_some(kth)
 }
 
@@ -899,6 +935,7 @@ mod tests {
         assert_eq!(first_list(4097), None);
         assert_eq!(next_list(64), Some(256));
         assert_eq!(next_list(1024), Some(4096));
-        assert_eq!(next_list(4096), None);
+        assert_eq!(next_list(4096), Some(ALL_MATCHES));
+        assert_eq!(next_list(ALL_MATCHES), None);
     }
 }

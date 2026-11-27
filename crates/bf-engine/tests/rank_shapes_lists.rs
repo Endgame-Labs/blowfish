@@ -24,6 +24,7 @@ async fn bounded_shapes_are_accepted_from_lists() {
             "recency+popularity",
             "recency+bonus",
             "bonus+const",
+            "three predicates",
             "decay of text",
             "decay small midpoint",
             "decay tiny midpoint",

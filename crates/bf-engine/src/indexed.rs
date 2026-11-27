@@ -1410,14 +1410,31 @@ async fn sum_finish(
             sum_text::record(Some(round));
             let presets =
                 futures::future::try_join_all(segments.iter().zip(&rounds).map(|(s, r)| {
-                    let rows: RoaringBitmap = r
-                        .rows
-                        .iter()
-                        .filter(|(_, t)| *t > 0.0 && *t >= floor)
-                        .map(|(row, _)| *row)
-                        .collect();
                     let plan = &plan;
-                    async move { Ok::<_, ApiError>((s.winners(plan, &rows).await?, rows)) }
+                    async move {
+                        // Rows above the floor win. Rows that tie at it compete on ID, and a
+                        // segment's `k` lowest IDs among them are all it can contribute, so a huge
+                        // tie (every matching row scoring alike) never hydrates every row.
+                        let mut rows: RoaringBitmap = r
+                            .rows
+                            .iter()
+                            .filter(|(_, t)| *t > floor)
+                            .map(|(row, _)| *row)
+                            .collect();
+                        let mut tied: Vec<u32> = r
+                            .rows
+                            .iter()
+                            .filter(|(_, t)| *t > 0.0 && *t == floor)
+                            .map(|(row, _)| *row)
+                            .collect();
+                        if tied.len() > k {
+                            s.ensure_id_order().await?;
+                            tied.sort_unstable();
+                            tied.truncate(k);
+                        }
+                        rows.extend(tied);
+                        Ok::<_, ApiError>((s.winners(plan, &rows).await?, rows))
+                    }
                 }))
                 .await?;
             return hydrate_segments(
