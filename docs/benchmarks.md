@@ -17154,3 +17154,136 @@ Qdrant's collection came up green with all 2,681,468 vectors indexed in two segm
 - **Not measured:** other hosts, remote object stores (the 2 ms rule is the only protection there; its test is a unit test), string-ID namespaces, filtered queries, and a mixed `top_k` load.
 
 Costs: no EC2 and no bucket writes. The 26.8 GB NQ fixture was copied to the M4 through presigned URLs (about $2.4 of S3 transfer) and deleted with the run directory, with the Qdrant store.
+
+## Round C31: a cold ID-range seek in one wave instead of a binary search
+
+A cold `id < 1000` query on the repaired 10M fixture is **1.27× faster** (p50 405.4 → 319.7 ms),
+and a cold single-ID `Eq` is 1.10× faster, with identical ordered IDs and f64 bits in every pair.
+Cold ID reads fall from about 145 MB to 110 MB per query. Requests rise 6%. The cases that do
+not touch the ID path stay within noise. No file format or setting changed.
+
+Measured 2026-11-27 on one on-demand c7gn.4xlarge in us-west-2, baseline v0.1.65 (`07d6782`)
+against the candidate on a private copy of the retained C5 checkpoint, repaired with the baseline
+writer (`compact_copy`, 200,000-row cap, 61 segments, 5.3 minutes, 1.5 GiB peak RSS). The retained
+fixture was never written. Servers run read-only, CPUs 0-7 for server and client, 64 probes, strong
+consistency, top ten, IDs only. Cache geometry follows C29/C30: 256 KiB blocks, 32-block
+coalescing, zero disk cache, and a complete engine-cache drop before every cold request. Release
+builds target `neoverse-v1` with frame pointers.
+
+### What was resident, and the old chain
+
+The docs directory (one tail read of 290-500 KB) lists every block's offset, length, and CRC, but
+not its first key, and the ID-bounds header holds only the column's min and max. No segment in this
+fixture short-circuited on the bounds, so every segment sought. No block can be located for free.
+
+In the baseline, the slowest of 61 chains reads the segment's live rows, then the docs directory,
+then three sequential 256 KiB reads of the ID column at offsets 524312, 262168, and 24 (halving,
+because most segments hold no ID below 1000, so the search walks left every time), each 40-90 ms.
+Over 12 profiled cold queries, the critical path from the live read has p50 298 ms, of which
+**65.6%** is the sequential ID reads (the stop threshold was 30%).
+
+### The seek
+
+One path, no setting (SPEC 25). After the directory, wave one reads, in a single batch and through
+the 16 KiB sparse cache blocks, the first ID of `k` evenly spaced ID blocks and the last ID of the
+column's last block. The probes alone settle a segment whose first ID is already past the operand
+(boundary 0) or whose last ID is before it (boundary = all rows), which is nearly every segment of a
+range query. Otherwise the probes bracket the boundary in one region of the column. Wave two reads
+that region as one coalesced range, decodes it, and searches it in memory. Two waves at most, each
+block CRC-checked and cached in the decoded cache that hydration shares, so a warm seek reads
+nothing. `Eq` and `NotEq` seek both ends at once. Segments with staged local row IDs keep the
+in-memory row search (no reads).
+
+Rule for `k`: the probes divide the ID column into regions of about 512 KiB (one coalesced GET, 32
+sparse blocks), `k = ceil(column bytes / 512 KiB)` clamped to 2..16. On this fixture's 1.4 MB ID
+columns, that is 3 probes plus the last block: four small requests then at most one region GET,
+against three sequential 256 KiB GETs.
+
+The seek does not need the segment's live rows, so the filter task now runs it while the live rows
+load (the predicate cache is unchanged). The directory read starts with the live read rather than
+after it. Only ID comparisons do this.
+
+### Design iterations, each against the baseline in the same session
+
+Cold sessions drifted (baseline `id` p50 ranged 386-554 ms across sessions on this host), so every
+design choice below compares arms rotated within one session, 80-90 queries per arm.
+
+| Variant | `id < 1000` vs baseline p50 (95% interval) | `Eq` vs baseline p50 | GETs `id` / `Eq` (baseline 1,130 / 419) |
+| --- | ---: | ---: | ---: |
+| First wave only, 8 probes, region read second | 0.853 (0.817-0.893) | 1.161 (1.140-1.184) | 1,399 / 733 |
+| Plus the last block in wave one | 0.835 (0.804-0.875) | 0.973 (0.957-0.991) | 1,450 / 739 |
+| Plus overlap with the live load | 0.817 (0.789-0.859) | 0.951 (0.908-1.003) | 1,461 / 742 |
+| At most 4 probes | 0.803 (0.776-0.838) | 0.880 (0.846-0.941) | 1,245 / 518 |
+| At most 2 probes | 0.780 (0.753-0.809) | 0.922 (0.894-0.963) | 1,137 / 403 |
+| At most 3 probes (shipped on this fixture) | 0.797 (0.768-0.822) | 0.885 (0.858-0.922) | 1,192 / 457 |
+
+Probe count matters because a wave waits for its slowest request: with 8 probes and 61 chains, the
+tail of the maximum, plus 30% more requests, ate most of the gain. Three or four requests per
+segment is the floor of the sensible range, and 2, 3, and 4 are indistinguishable on `id`. The
+last-block probe fixed `Eq`, whose segments entirely below the operand needed a second wave.
+
+### Acceptance on the final commit
+
+Eighty cold pairs per case, one untimed warm-up per process, arms alternating AB/BA with the same
+query IDs, intervals from 50,000 paired-query resamples (seed 30).
+
+| Cold case | Baseline p50 / p90, ms | Candidate p50 / p90, ms | Candidate/base p50 (95% interval) | GETs base / cand | MB base / cand |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `id < 1000` | 405.4 / 497.3 | 319.7 / 389.9 | **0.789** (0.754-0.828) | 1,130 / 1,200 | 145.3 / 109.8 |
+| Single ID `Eq` | 366.1 / 466.5 | 332.2 / 407.9 | 0.907 (0.866-0.943) | 420 / 472 | 140.3 / 100.1 |
+| ID `In` list (4 IDs) | 3,681 / 3,801 | 3,630 / 3,746 | 0.986 (0.977-0.999) | 355 / 355 | 638.6 / 638.6 |
+| Absent title | 223.4 / 317.4 | 228.2 / 309.8 | 1.022 (0.968-1.085) | 230 / 230 | 85.6 / 85.6 |
+| Unfiltered | 298.0 / 433.5 | 293.3 / 420.5 | 0.984 (0.863-1.143) | 308 / 312 | 98.1 / 98.6 |
+
+All 400 pairs match exactly (ordered IDs and f64 bits), with zero row-map rebuilds and zero local
+reads. `In` does not use the seek (it reads the ID dictionary), and the absent-title and unfiltered
+queries run no ID predicate. Their movements are the noise floor of this host: absent title read
++4-5% in three earlier sessions, then 0.981-0.991 when the same two binaries ran in one rotated
+session, and the swapped-arm control below shows arm position matters as much as the binary.
+Absent title and unfiltered intervals include parity.
+
+**Controls.** Byte-identical A/A runs (the baseline binary in both arms) read 1.109 (1.012-1.163,
+40 pairs) for `id`, 1.007 (0.954-1.051) for `Eq`, and 1.015 (0.956-1.095) for absent title: the
+second arm is slower by up to 10% on this host, which works against the candidate in every
+two-arm table above. Swapping the binaries between arms (80 pairs) gives `id` 1.255 (1.200-1.291)
+with the baseline in the second arm, and absent title 0.960 (0.932-0.995), so the `id` gain
+survives an arm swap and the absent-title difference follows arm position and session, not the
+binary.
+
+### Sixteen clients
+
+Four balanced AB/BA rounds, sixteen clients, 128 measured `id < 1000` queries per arm and round
+after four warm-ups, 64 MiB raw and 512 MiB decoded caches, C30's harness.
+
+| Build | q/s | Mean round p50 / p90, ms | CPU ms/request | Object GETs/request |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 646.6 | 20.68 / 29.24 | 6.19 | 0 |
+| Candidate | 618.5 | 20.58 / 37.45 | 6.17 | 0 |
+
+Candidate/base throughput is 0.957 (paired-round interval 0.882-1.030, rounds 1.037, 0.902, 1.023,
+0.861), which includes parity. This workload does not exercise the seek at all: after the first
+request, the per-segment predicate cache answers every query (zero GETs), and CPU per request is
+equal, 6.17 versus 6.19 ms. The throughput and p90 gap is the harness's second-arm penalty: a
+byte-identical A/A run read 0.963 (0.820-1.124) with the same p90 split (29.6 versus 35.5 ms), and
+swapping the binaries between arms puts the slower numbers on the baseline binary (649.7 q/s for
+the candidate in the first arm, 579.2 for the baseline in the second, p90 28.8 versus 37.0 ms).
+All 512 pairs match exactly. A 12-round control (1,536 pairs) read 1.075 (0.982-1.212) for the
+first 8-probe variant, and its A/A control read 1.039 (0.899-1.217). Because the warm path never runs the
+seek, a cold-seeking 16-client load was not measured. Its cost per request is the cold
+`id < 1000` row above: fewer sequential reads, 24% fewer bytes, and 6% more requests.
+
+### Tests
+
+`kary_seek_matches_document_evaluation_at_every_block_edge` builds a 16-block column of 4,000
+string IDs with live holes and compares every operator (`Eq`, `NotEq`, `Lt`, `Lte`, `Gt`, `Gte`)
+against document evaluation, at the first and last rows, around every block edge and the
+region edges, between rows, before the first and after the last ID, and for an empty operand, with
+and without the ID-bounds header. It also checks an `In` list. The existing test keeps covering
+unsigned integer, string, and UUID IDs with live holes. Workspace Clippy and the default debug
+`cargo test --workspace` pass: 653 passed, zero failed, 27 ignored, across 82 suites.
+
+### Cost
+
+One c7gn.4xlarge on demand from 07:54:37 to 10:14:51 UTC (2.34 hours), with a 120 GB root volume.
+The estimate is $3, below the $6 cap. The instance, its key pair, and its security group are gone, and
+the owned S3 prefix (1,041 objects, 77 GB) was deleted, with no multipart uploads left.
