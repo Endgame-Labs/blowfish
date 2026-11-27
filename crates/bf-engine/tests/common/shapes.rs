@@ -86,6 +86,8 @@ pub fn popularity(w: f64) -> Value {
 pub fn shapes(a: &str, b: &str) -> Vec<(&'static str, Value)> {
     let (ca, cb) = (clause(a), clause(b));
     vec![
+        // A bare clause keeps its own path.
+        ("plain", ca.clone()),
         ("sum+const", json!(["Sum", [ca, 0.1]])),
         ("const+sum", json!(["Sum", [0.25, ca, cb]])),
         ("sum+zero", json!(["Sum", [ca, 0]])),

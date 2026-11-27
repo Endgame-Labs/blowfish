@@ -55,7 +55,7 @@ pub(crate) fn record(round: Option<usize>) {
     };
     counter.fetch_add(1, Ordering::Relaxed);
     if crate::ann::trace_stages() {
-        eprintln!("STAGE sum outcome {name}");
+        eprintln!("STAGE sum outcome {name} round {}", round.map_or(-1, |r| r as i64));
     }
 }
 
@@ -400,6 +400,10 @@ impl<'a> Build<'a> {
 /// The expression of a rank the list paths can answer, or `None` for another shape.
 pub(crate) fn shape_of(rank: Option<&RankBy>) -> Option<Shape<'_>> {
     let rank = rank?;
+    // A bare clause has its own, faster path.
+    if matches!(rank, RankBy::Bm25 { .. }) {
+        return None;
+    }
     let mut build = Build {
         texts: 0,
         bonuses: vec![],
@@ -577,6 +581,34 @@ pub(crate) async fn open(
     }))
 }
 
+/// A clause's exact scores by row: a map for a short list, a dense array for a long one (the
+/// last round holds every matching row, and hashing each one would cost more than scoring it).
+enum Scores {
+    Map(HashMap<u32, f32>),
+    Dense(Vec<f32>),
+}
+/// Lists longer than this use a dense array.
+const DENSE_AT: usize = 2048;
+impl Scores {
+    fn new(hits: Vec<bf_text::SearchHit>, rows: u32) -> Self {
+        if hits.len() <= DENSE_AT {
+            return Scores::Map(hits.into_iter().map(|h| (h.row, h.score)).collect());
+        }
+        let mut dense = vec![0.0; rows as usize];
+        for h in hits {
+            dense[h.row as usize] = h.score;
+        }
+        Scores::Dense(dense)
+    }
+    /// The row's score, 0 when it is not in the list.
+    fn get(&self, row: u32) -> f32 {
+        match self {
+            Scores::Map(m) => m.get(&row).copied().unwrap_or(0.0),
+            Scores::Dense(d) => d.get(row as usize).copied().unwrap_or(0.0),
+        }
+    }
+}
+
 /// One segment's union rows with exact totals, and the bound for rows outside every list.
 pub(crate) struct Candidates {
     /// `(row, total)` for each row in some clause's list (and fill rows, see `candidates`).
@@ -651,8 +683,14 @@ impl SegmentSum {
                 .map_err(segment::index_error)?;
             let full = hits.len() >= n;
             cutoffs.push(if full { hits[n - 1].score } else { 0.0 });
-            for hit in &hits {
-                union.insert(hit.row);
+            if hits.len() > DENSE_AT {
+                let mut rows: Vec<u32> = hits.iter().map(|h| h.row).collect();
+                rows.sort_unstable();
+                union |= RoaringBitmap::from_sorted_iter(rows).expect("sorted rows");
+            } else {
+                for hit in &hits {
+                    union.insert(hit.row);
+                }
             }
             lists.push((full, hits));
         }
@@ -660,10 +698,10 @@ impl SegmentSum {
         // Row-wise terms give rows that match no text a total of their own (not one shared value),
         // so only the bound can prove that nothing outside the lists wins.
         let exhaustive = plan.docs.is_empty() && lists.iter().all(|(full, _)| !full);
-        let mut exact: Vec<HashMap<u32, f32>> = Vec::with_capacity(clauses.len());
+        let mut exact: Vec<Scores> = Vec::with_capacity(clauses.len());
         for ((clause, reader), (full, hits)) in clauses.iter().zip(&self.readers).zip(lists) {
             if !full {
-                exact.push(hits.into_iter().map(|h| (h.row, h.score)).collect());
+                exact.push(Scores::new(hits, reader.num_docs()));
                 continue;
             }
             let all = reader
@@ -676,14 +714,14 @@ impl SegmentSum {
                 )
                 .await
                 .map_err(segment::index_error)?;
-            exact.push(all.into_iter().map(|h| (h.row, h.score)).collect());
+            exact.push(Scores::new(all, reader.num_docs()));
         }
         let docs = self.row_terms(state, plan, &union).await?;
         let mut rows: Vec<(u32, f64)> = union
             .iter()
             .map(|row| {
                 let t = plan.total(
-                    &|i| f64::from(exact[i].get(&row).copied().unwrap_or(0.0)),
+                    &|i| f64::from(exact[i].get(row)),
                     &class.bonus,
                     &|j| docs[&row][j],
                 );
