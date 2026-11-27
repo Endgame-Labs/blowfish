@@ -29,6 +29,13 @@ async fn bounded_shapes_are_accepted_from_lists() {
             "decay small midpoint",
             "decay tiny midpoint",
             "decay of sum",
+            "popularity dominates",
+            "dist of text",
+            "dist small",
+            "dist huge",
+            "bare attribute",
+            "weighted bare attribute",
+            "bare float guarded by max",
         ];
         if !accepted.contains(&name) {
             continue;

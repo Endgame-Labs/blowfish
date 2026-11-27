@@ -636,7 +636,6 @@ pub(crate) fn score(
     rank: &RankBy,
 ) -> Result<f64, ApiError> {
     Ok(match rank {
-        RankBy::Constant(n) => n.as_f64().expect("JSON number fits f64"),
         RankBy::SparseVector {
             attribute, vector, ..
         } => {
@@ -684,19 +683,6 @@ pub(crate) fn score(
                 ) as f64
             }
         }
-        RankBy::Sum(xs) => xs
-            .iter()
-            .map(|x| score(state, doc, x))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .sum(),
-        RankBy::Max(xs) => xs
-            .iter()
-            .map(|x| score(state, doc, x))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .fold(0.0, f64::max),
-        RankBy::Product { weight, expr, .. } => weight * score(state, doc, expr)?,
         RankBy::Filter(f) => {
             if let Some(scores) = state.scores.get(&crate::indexed::rank_key(rank)) {
                 let id: Id = serde_json::from_value(doc["id"].clone()).expect("validated ID");
@@ -710,9 +696,40 @@ pub(crate) fn score(
                 )?))
             }
         }
+        _ => {
+            return arithmetic(&state.schema, doc, rank, &|x| score(state, doc, x))?
+                .ok_or_else(|| ApiError::bad("expected a score expression"));
+        }
+    })
+}
+/// The score of a node that only combines its children (`Sum`, `Max`, `Product`, `Saturate`,
+/// `Decay`, `Dist`) or reads the row's own attributes (`Attribute`), with `child` scoring each
+/// child. `None` for any other node (text, predicates, vectors). Shared by the full scorer and the
+/// segment scorers that never build whole documents, so every path computes the same bits.
+pub(crate) fn arithmetic(
+    schema: &Schema,
+    doc: &Document,
+    rank: &RankBy,
+    child: &dyn Fn(&RankBy) -> Result<f64, ApiError>,
+) -> Result<Option<f64>, ApiError> {
+    Ok(Some(match rank {
+        RankBy::Constant(n) => n.as_f64().expect("JSON number fits f64"),
+        RankBy::Sum(xs) => xs
+            .iter()
+            .map(child)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum(),
+        RankBy::Max(xs) => xs
+            .iter()
+            .map(child)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .fold(0.0, f64::max),
+        RankBy::Product { weight, expr, .. } => weight * child(expr)?,
         RankBy::Attribute(name) => doc.get(name).and_then(Value::as_f64).unwrap_or(0.0),
         RankBy::Saturate { expr, params } | RankBy::Decay { expr, params } => {
-            let x = score(state, doc, expr)?.max(0.0);
+            let x = child(expr)?.max(0.0);
             let m = parameter(params, "midpoint", 1.0)?;
             let e = parameter(params, "exponent", 1.0)?;
             let ratio = 1.0 / (1.0 + (x / m).powf(e));
@@ -724,7 +741,7 @@ pub(crate) fn score(
         }
         RankBy::Dist { expr, origin } => {
             if let RankBy::Attribute(name) = &**expr
-                && state.schema[name].data_type == Some(AttributeType::Scalar(ScalarType::Datetime))
+                && schema[name].data_type == Some(AttributeType::Scalar(ScalarType::Datetime))
             {
                 let value = doc
                     .get(name)
@@ -735,11 +752,11 @@ pub(crate) fn score(
                 (value as f64 - datetime_millis(origin.as_str().expect("validated origin"))? as f64)
                     .abs()
             } else {
-                (score(state, doc, expr)? - origin.as_f64().expect("validated origin")).abs()
+                (child(expr)? - origin.as_f64().expect("validated origin")).abs()
             }
         }
-        _ => return Err(ApiError::bad("expected a score expression")),
-    })
+        _ => return Ok(None),
+    }))
 }
 pub(crate) fn distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f64 {
     if metric == DistanceMetric::CosineDistance

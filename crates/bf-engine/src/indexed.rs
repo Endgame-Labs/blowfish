@@ -1038,7 +1038,14 @@ async fn prepare_segment(
         vec![]
     };
     let mut bm25_hits = Vec::new();
-    let mut selected = if all {
+    // An all-rows rank over clauses, constants, and numeric attributes picks its contenders by row
+    // ordinal (see `ordinal_scan`) and hydrates only them.
+    let streaming = all
+        && preset.is_none()
+        && q.rank_by
+            .as_ref()
+            .is_some_and(crate::ordinal_scan::eligible);
+    let mut selected = if all && !streaming {
         allowed.clone()
     } else {
         RoaringBitmap::new()
@@ -1150,6 +1157,14 @@ async fn prepare_segment(
         }
         bm25_hits.push((rank_key(clause), hits));
     }
+    if streaming {
+        selected =
+            crate::ordinal_scan::select(store, state, q, seg, clauses, &bm25_hits, &allowed, k)
+                .await?;
+        for (_, hits) in &mut bm25_hits {
+            hits.retain(|h| selected.contains(h.row));
+        }
+    }
     if let (true, true, Some(floors)) = (clause_top, id_ordered, threshold) {
         // Each listed row's best scaled clause score: a lower bound on its true maximum.
         let weights = sum_text::clause_weights(q.rank_by.as_ref()).expect("weighted clauses");
@@ -1260,6 +1275,7 @@ fn sum_clauses<'a>(
         docs: shape.docs,
         expr: shape.expr,
         decreasing: shape.decreasing,
+        dist: shape.dist,
     };
     for clause in clauses {
         let RankBy::Bm25 {
@@ -1400,13 +1416,15 @@ async fn sum_finish(
         };
         let mut totals: Vec<f64> = tail.iter().map(|(_, t)| *t).collect();
         let mut bound = 0f64;
+        let mut at_least = 0f64;
         let mut exhaustive = true;
         for r in &rounds {
             totals.extend(r.rows.iter().map(|(_, t)| *t));
             bound = bound.max(r.bound);
+            at_least = at_least.max(r.at_least);
             exhaustive &= r.exhaustive;
         }
-        if let Some(floor) = sum_text::accept(&mut totals, k, bound, exhaustive) {
+        if let Some(floor) = sum_text::accept(&mut totals, k, bound, at_least, exhaustive) {
             sum_text::record(Some(round));
             let presets =
                 futures::future::try_join_all(segments.iter().zip(&rounds).map(|(s, r)| {
@@ -1453,6 +1471,11 @@ async fn sum_finish(
             .await;
         }
         n = sum_text::next_list(list);
+        // Scoring every matching row cannot prove a row-wise term's rows (they differ from each
+        // other), and a streamed term has just failed to at every list length.
+        if n == Some(sum_text::ALL_MATCHES) && plan.docs.iter().any(|d| d.stream.is_some()) {
+            n = None;
+        }
         round += 1;
     }
     sum_text::record(None);

@@ -1830,6 +1830,42 @@ pub(crate) async fn filter_live(
 }
 
 /// Evaluate scalar, array, range, and boolean filters over sorted value dictionaries.
+/// A filterable attribute's sorted value dictionary: each distinct value with the rows holding it.
+/// `None` when the segment has no filter column for the attribute. Cached like filter reads.
+pub(crate) async fn filter_values(
+    store: &Storage,
+    segment: &Segment,
+    attribute: &str,
+) -> Result<Option<Arc<Vec<(Value, RoaringBitmap)>>>, ApiError> {
+    let Some(file) = segment.files.get("filters") else {
+        return Ok(None);
+    };
+    let reader = ObjectReader::new(store, file);
+    let dir = directory(&reader).await?;
+    match dir.columns.get(attribute) {
+        Some(col) => dictionary(&reader, col, attribute).await.map(Some),
+        None => Ok(None),
+    }
+}
+async fn dictionary(
+    reader: &ObjectReader,
+    col: &Column,
+    attribute: &str,
+) -> Result<Arc<Vec<(Value, RoaringBitmap)>>, ApiError> {
+    let key = format!("{}:{attribute}", reader.file.key);
+    if let Some(values) = read_cache::get(&key, col.blocks[0].length) {
+        return Ok(values);
+    }
+    let bytes = read_block(reader, &col.blocks[0]).await?;
+    // Keep reads concurrent, and bound only their CPU-heavy dictionary
+    // decodes. Busy queries perform their own work without a handoff.
+    let value = crate::ann_dir::on_worker(async move { decode(&bytes) }).await?;
+    Ok(read_cache::insert(
+        &key,
+        col.blocks[0].length.saturating_mul(32),
+        value,
+    ))
+}
 pub(crate) fn filter_rows<'a>(
     store: &'a Storage,
     segment: &'a Segment,
@@ -1942,18 +1978,7 @@ pub(crate) fn filter_rows<'a>(
                     }
                     return Ok(out);
                 };
-                let key = format!("{}:{attribute}", reader.file.key);
-                let values: Arc<Vec<(Value, RoaringBitmap)>> = if let Some(values) =
-                    read_cache::get(&key, col.blocks[0].length)
-                {
-                    values
-                } else {
-                    let bytes = read_block(&reader, &col.blocks[0]).await?;
-                    // Keep reads concurrent, and bound only their CPU-heavy dictionary
-                    // decodes. Busy queries perform their own work without a handoff.
-                    let value = crate::ann_dir::on_worker(async move { decode(&bytes) }).await?;
-                    read_cache::insert(&key, col.blocks[0].length.saturating_mul(32), value)
-                };
+                let values = dictionary(&reader, col, attribute).await?;
                 let mut out = RoaringBitmap::new();
                 // Sorted dictionary runs permit binary seeks for scalar ranges.
                 // Canonicalization preserves datetime, UUID, and exact integer ordering.

@@ -15,6 +15,7 @@ mod ingest_benchmark;
 mod lineage;
 mod local_ann;
 mod local_ann_codec;
+mod ordinal_scan;
 mod pattern;
 mod plan;
 mod read_cache;
