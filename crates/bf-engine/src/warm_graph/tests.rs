@@ -1309,3 +1309,188 @@ async fn filtered_scan_hides_shadowed_rows_inside_the_allowed_set() {
     e.shutdown(Duration::from_secs(3)).await;
     control.shutdown(Duration::from_secs(3)).await;
 }
+/// Round G18: the typed ID-only path writes the same JSON bytes as the general path (rows,
+/// `$dist` bits, performance fields except the two timings, billing), for every `top_k` from 1 to
+/// 100, and declines (so the general path runs) for every request shape it does not take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_ids_path_is_byte_identical_to_the_general_path() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.scratch")
+        .join(format!("g18-ids-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        cache: CacheConfig {
+            memory_bytes: 32 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let e = Engine::with_config(
+        store,
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.,
+            decoded_cache_bytes: 64 << 20,
+            ..Default::default()
+        },
+    );
+    let mut seed = 11u64;
+    let vectors = (0..2500)
+        .map(|_| {
+            (0..16)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 40) as f32 / 16777216. * 2. - 1.
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // IDs that repeat distances would hide an ordering bug: rows 1000 to 1049 copy rows 0 to 49.
+    let rows = vectors
+        .iter()
+        .enumerate()
+        .map(|(id, v)| {
+            let v = if (1000..1050).contains(&id) {
+                &vectors[id - 1000]
+            } else {
+                v
+            };
+            json!({"id":id,"vector":v,"group":id%3})
+        })
+        .collect::<Vec<_>>();
+    e.write("hot",serde_json::from_value::<WriteRequest>(json!({"distance_metric":"cosine_distance","schema":{"vector":{"type":"[16]f16","ann":true}},"upsert_rows":rows})).unwrap()).await.unwrap();
+    e.index_namespace("hot", true).await.unwrap();
+    let opts = ReclusterOptions {
+        attribute: "vector".into(),
+        cells: 2,
+        cluster_rows: 32,
+        max_slab_rows: 5000,
+        scratch: root.clone(),
+    };
+    e.run_recluster_job("hot", &opts).await.unwrap();
+    let (state, _) = e
+        .snapshot("hot", &bf_types::Consistency::Strong)
+        .await
+        .unwrap();
+    let set = &state.ann_tiers["vector"][0];
+    let key = Key::new("hot", &state, "vector", set);
+    let held = Arc::new(admitted_entry(&e, set).await);
+    let mut heat = Heat::new(Instant::now());
+    heat.rate = 100.;
+    heat.ivf_seconds = 1.;
+    heat.ready = Some(held.clone());
+    e.0.hot_graph.entries.lock().unwrap().insert(key, heat);
+    {
+        let mut calibration = held.calibration.lock().unwrap();
+        calibration.quality = effort::Effort::new();
+        calibration.usable = true;
+    }
+    let ids_only = |i: usize, k: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k});
+    // The first ID-only query starts the ID table; wait for it.
+    query(&e, "hot", ids_only(3, 10)).await;
+    let started = Instant::now();
+    while held.ids.get().is_none() && started.elapsed() < Duration::from_secs(30) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(held.ids.get().is_some(), "the ID table was never built");
+    // Everything below runs on a reactor, as `query_ids` requires.
+    let io = tokio::runtime::Handle::current();
+    let engine = e.clone();
+    let queries = vectors.clone();
+    let reactor = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::query_worker::on_query_reactor(io, async move {
+                let general = |request: Value| {
+                    let engine = engine.clone();
+                    async move {
+                        let request: QueryRequest = serde_json::from_value(request).unwrap();
+                        let mut response = engine.query("hot", request).await.unwrap();
+                        response.performance.server_total_ms = 0;
+                        response.performance.query_execution_ms = 0;
+                        serde_json::to_vec(&response).unwrap()
+                    }
+                };
+                let typed = |request: Value| {
+                    let engine = engine.clone();
+                    async move {
+                        let request: QueryRequest = serde_json::from_value(request).unwrap();
+                        engine.query_ids("hot", &request).await.unwrap().map(|answer| {
+                            let mut answer = answer;
+                            let mut performance = answer.performance().clone();
+                            performance.server_total_ms = 0;
+                            performance.query_execution_ms = 0;
+                            answer.performance = performance;
+                            let mut out = Vec::new();
+                            assert!(answer.write_json(&mut out));
+                            out
+                        })
+                    }
+                };
+                let mut taken = 0;
+                for i in [0, 17, 400, 1003, 1999, 2499] {
+                    for k in (1..=100).chain([37, 64]) {
+                        let body = json!({"rank_by":["vector","ANN",queries[i]],"top_k":k});
+                        let got = typed(body.clone()).await.expect("the typed path serves it");
+                        assert_eq!(got, general(body).await, "query {i} top_k {k}");
+                        taken += 1;
+                    }
+                }
+                // `include_attributes: false` and a query that only names no attribute are the same.
+                let body = json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"include_attributes":false});
+                assert_eq!(typed(body.clone()).await.unwrap(), general(body).await);
+                // Shapes the typed path must not take.
+                for body in [
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":101}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":0}),
+                    json!({"rank_by":["vector","ANN",queries[5]]}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"offset":1}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"include_attributes":["group"]}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"include_attributes":true}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"filters":["group","Eq",1]}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"consistency":{"level":"eventual"}}),
+                    json!({"rank_by":["vector","kNN",queries[5]],"top_k":10,"filters":["group","Eq",1]}),
+                    json!({"rank_by":["vector","ANN",vec![0.;16]],"top_k":10}),
+                    json!({"rank_by":["vector","ANN",vec![1.;3]],"top_k":10}),
+                    json!({"rank_by":["id","asc"],"top_k":10}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"vector_encoding":"base64"}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"limit":10}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"distance_metric":"cosine_distance"}),
+                ] {
+                    assert!(typed(body.clone()).await.is_none(), "must decline {body}");
+                }
+                // Errors come from the general path.
+                let bad: QueryRequest = serde_json::from_value(
+                    json!({"rank_by":["vector","ANN",vec![1.;3]],"top_k":10}),
+                )
+                .unwrap();
+                assert!(engine.query_ids("hot", &bad).await.unwrap().is_none());
+                assert!(engine.query("hot", bad).await.is_err());
+                // A namespace that does not exist declines.
+                let request: QueryRequest = serde_json::from_value(ids_only_json(&queries[5])).unwrap();
+                assert!(engine.query_ids("nope", &request).await.unwrap().is_none());
+                // Without a ready graph (the entry's usable flag off) it declines too.
+                taken
+            }))
+    });
+    let taken = reactor.await.unwrap();
+    assert_eq!(taken, 6 * 102);
+    // Off the reactor it never applies.
+    let request: QueryRequest = serde_json::from_value(ids_only(5, 10)).unwrap();
+    assert!(e.query_ids("hot", &request).await.unwrap().is_none());
+    e.delete_namespace("hot").await.unwrap();
+    drop(held);
+    assert!(e.shutdown(Duration::from_secs(5)).await);
+}
+fn ids_only_json(vector: &[f32]) -> Value {
+    json!({"rank_by":["vector","ANN",vector],"top_k":10})
+}

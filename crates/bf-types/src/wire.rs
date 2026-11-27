@@ -211,6 +211,41 @@ pub struct QueryResponse {
     pub performance: QueryPerformance,
     pub billing: QueryBilling,
 }
+impl QueryResponse {
+    /// Append the JSON body of an ID-only ranked response to `out`: the same bytes as serializing
+    /// a [`QueryResponse`] whose rows are `{"id": id, "$dist": distance}` (keys in map order,
+    /// numbers written by `serde_json`) and whose billing is zero, without building the rows as
+    /// documents first. A non-finite distance has no JSON number, so it returns `false` with
+    /// `out` truncated back; the general path reports that case as an error.
+    pub fn write_id_rows(
+        out: &mut Vec<u8>,
+        rows: &[(u64, f64)],
+        performance: &QueryPerformance,
+    ) -> bool {
+        let start = out.len();
+        out.extend_from_slice(b"{\"rows\":[");
+        for (i, (id, distance)) in rows.iter().enumerate() {
+            if !distance.is_finite() {
+                out.truncate(start);
+                return false;
+            }
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(b"{\"$dist\":");
+            serde_json::to_writer(&mut *out, distance).expect("a number serializes");
+            out.extend_from_slice(b",\"id\":");
+            serde_json::to_writer(&mut *out, id).expect("a number serializes");
+            out.push(b'}');
+        }
+        out.extend_from_slice(b"],\"performance\":");
+        serde_json::to_writer(&mut *out, performance).expect("performance serializes");
+        out.extend_from_slice(b",\"billing\":");
+        serde_json::to_writer(&mut *out, &QueryBilling::default()).expect("billing serializes");
+        out.push(b'}');
+        true
+    }
+}
 /// Write billing, optionally including conditional-write scans.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WriteBilling {

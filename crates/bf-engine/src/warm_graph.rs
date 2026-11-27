@@ -985,15 +985,36 @@ pub(crate) fn mask_eligible(
     mask: Option<&Arc<RoaringBitmap>>,
     k: usize,
 ) -> bool {
-    let Some(mask) = mask else {
+    if mask.is_none() {
         return true;
-    };
+    }
     let Some(scope) = current() else {
         return false;
     };
-    let key = Key::new(&scope.namespace, state, attribute, set);
-    let entry = scope
-        .cache
+    mask_eligible_in(
+        &scope.cache,
+        &scope.namespace,
+        state,
+        attribute,
+        set,
+        mask,
+        k,
+    )
+}
+fn mask_eligible_in(
+    cache: &Cache,
+    namespace: &str,
+    state: &NamespaceState,
+    attribute: &str,
+    set: &SlabSet,
+    mask: Option<&Arc<RoaringBitmap>>,
+    k: usize,
+) -> bool {
+    let Some(mask) = mask else {
+        return true;
+    };
+    let key = Key::new(namespace, state, attribute, set);
+    let entry = cache
         .entries
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1017,11 +1038,7 @@ pub(crate) fn mask_eligible(
     if live >= k && live.saturating_mul(10) >= entry.graph.len().saturating_mul(9) {
         return true;
     }
-    let mut entries = scope
-        .cache
-        .entries
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut entries = cache.entries.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = entries.get_mut(&key) {
         h.ready = None;
         h.first = Instant::now();
@@ -1243,20 +1260,16 @@ pub(crate) async fn search(
         }
     }
 }
-#[allow(clippy::too_many_arguments)]
-async fn search_entry(
-    store: &Storage,
-    state: &NamespaceState,
-    set: &SlabSet,
-    at: &Placement,
+/// The graph's exactly reranked top `k` as `(row, distance)`, nearest first, or `None` when the
+/// graph cannot supply `k` rows. Shared by the document path and the typed ID-only path.
+async fn ranked_rows(
     vector: &[f32],
-    mask: Option<Arc<RoaringBitmap>>,
+    mask: Option<&RoaringBitmap>,
     k: usize,
-    columns: &BTreeSet<String>,
     entry: &Entry,
     ef: usize,
     scan: bool,
-) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+) -> Result<Option<Vec<(u32, f32)>>, ApiError> {
     entry.searches.fetch_add(1, Ordering::Relaxed);
     let navigation_started = thread_cpu();
     #[cfg(all(test, target_os = "macos"))]
@@ -1272,7 +1285,7 @@ async fn search_entry(
         scratch: Some(scratch),
     };
     let (ef, shortlist) = plan(k, ef);
-    let (hits, evaluations) = match (scan, mask.as_deref()) {
+    let (hits, evaluations) = match (scan, mask) {
         (true, Some(allowed)) => entry
             .graph
             .scan(
@@ -1286,13 +1299,7 @@ async fn search_entry(
         (true, None) => return Ok(None),
         (false, _) => entry
             .graph
-            .candidates_with_norms(
-                vector,
-                ef,
-                shortlist,
-                mask.as_deref(),
-                loan.scratch.as_mut().unwrap(),
-            )
+            .candidates_with_norms(vector, ef, shortlist, mask, loan.scratch.as_mut().unwrap())
             .map_err(segment::index_error)?,
     };
     drop(loan);
@@ -1338,13 +1345,36 @@ async fn search_entry(
     exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     exact.truncate(k);
     // A scan sees every allowed row, so fewer than `k` answers is the complete answer.
-    let need = match (scan, mask.as_deref()) {
+    let need = match (scan, mask) {
         (true, Some(allowed)) => k.min(allowed.len() as usize),
         _ => k,
     };
     if exact.len() < need {
         return Ok(None);
     }
+    Ok(Some(exact))
+}
+#[allow(clippy::too_many_arguments)]
+async fn search_entry(
+    store: &Storage,
+    state: &NamespaceState,
+    set: &SlabSet,
+    at: &Placement,
+    vector: &[f32],
+    mask: Option<Arc<RoaringBitmap>>,
+    k: usize,
+    columns: &BTreeSet<String>,
+    entry: &Entry,
+    ef: usize,
+    scan: bool,
+) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+    let Some(exact) = ranked_rows(vector, mask.as_deref(), k, entry, ef, scan).await? else {
+        return Ok(None);
+    };
+    let need = match (scan, mask.as_deref()) {
+        (true, Some(allowed)) => k.min(allowed.len() as usize),
+        _ => k,
+    };
     if columns.is_empty()
         && let Some(table) = entry.ids.get()
         && let Some(found) = ids_from_table(table, &exact, mask.as_deref(), set, at, k)
@@ -1400,8 +1430,32 @@ fn ids_from_table(
     at: &Placement,
     k: usize,
 ) -> Option<Option<Found>> {
+    let hits = match typed_ids(table, exact, mask, set, at) {
+        Some(Some(hits)) => hits,
+        Some(None) => return Some(None),
+        None => return None,
+    };
     let mut scores = BTreeMap::new();
     let mut documents = BTreeMap::new();
+    for (id, distance) in hits {
+        let mut doc = Document::new();
+        doc.insert("id".into(), serde_json::Value::from(id));
+        scores.insert(Id::Uint(id), f64::from(distance));
+        documents.insert(Id::Uint(id), doc);
+    }
+    Some((scores.len() >= k).then_some((scores, documents)))
+}
+/// The `(ID, distance)` of each reranked row that is live, from the resident table. The outer
+/// `None` means the table cannot answer (a row without an ID); `Some(None)` means a row has no
+/// live home, which declines the graph's answer.
+fn typed_ids(
+    table: &[u64],
+    exact: &[(u32, f32)],
+    mask: Option<&RoaringBitmap>,
+    set: &SlabSet,
+    at: &Placement,
+) -> Option<Option<Vec<(u64, f32)>>> {
+    let mut hits = Vec::with_capacity(exact.len());
     for &(row, distance) in exact {
         if mask.is_some_and(|m| !m.contains(row)) {
             continue;
@@ -1410,12 +1464,75 @@ fn ids_from_table(
             return Some(None);
         }
         let id = *table.get(row as usize).filter(|id| **id != u64::MAX)?;
-        let mut doc = Document::new();
-        doc.insert("id".into(), serde_json::Value::from(id));
-        scores.insert(Id::Uint(id), f64::from(distance));
-        documents.insert(Id::Uint(id), doc);
+        hits.push((id, distance));
     }
-    Some((scores.len() >= k).then_some((scores, documents)))
+    Some(Some(hits))
+}
+/// The typed ID-only answer of the warm graph: `(ID, distance)` of the `k` nearest live rows,
+/// from the resident ID table, with no `Document` or attribute map. `None` when the graph does
+/// not serve this query for any reason (no usable graph, no ID table yet, a row without a live
+/// home, fewer than `k` live rows), so the caller takes the general path, which also starts
+/// anything this path waits for. The hits are ordered as the general path orders them: nearest
+/// first, equal distances by ID.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_ids(
+    cache: &Cache,
+    namespace: &str,
+    state: &NamespaceState,
+    attribute: &str,
+    set: &SlabSet,
+    at: &Placement,
+    vector: &[f32],
+    mask: Option<&Arc<RoaringBitmap>>,
+    k: usize,
+) -> Option<Vec<(u64, f32)>> {
+    if overcommitted() {
+        trim();
+        return None;
+    }
+    let key = Key::new(namespace, state, attribute, set);
+    let entry = cache
+        .entries
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .and_then(|h| h.ready.clone())?;
+    let ef = {
+        let c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        if !c.usable {
+            return None;
+        }
+        c.quality.serving.unwrap_or(c.quality.trial)
+    };
+    if k == 0
+        || k > MAX_K
+        || entry.graph.len() < k
+        || vector.len() != entry.graph.dims()
+        || vector.iter().all(|x| *x == 0.)
+        || !mask_eligible_in(cache, namespace, state, attribute, set, mask, k)
+    {
+        return None;
+    }
+    let table = entry.ids.get()?;
+    let _permit = entry.slots.try_acquire().ok()?;
+    let exact = ranked_rows(vector, mask.map(|m| &**m), k, &entry, ef, false)
+        .await
+        .ok()??;
+    let mut hits = typed_ids(table, &exact, mask.map(|m| &**m), set, at)??;
+    if hits.len() < k {
+        return None;
+    }
+    // The general path keys its candidates by ID: an ID on two rows would collapse to one.
+    hits.sort_unstable_by(|a, b| {
+        f64::from(a.1)
+            .total_cmp(&f64::from(b.1))
+            .then(a.0.cmp(&b.0))
+    });
+    if hits.windows(2).any(|w| w[0].0 == w[1].0) {
+        return None;
+    }
+    cache.answers.fetch_add(1, Ordering::Relaxed);
+    Some(hits)
 }
 /// Read every tier row's unsigned ID once, from the same documents the query path hydrates, and
 /// publish the table on the entry. Any failure or non-numeric ID leaves the entry without one.
