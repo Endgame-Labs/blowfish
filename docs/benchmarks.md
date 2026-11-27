@@ -16704,3 +16704,138 @@ The benchmark lockfile updates ten workspace-package version records to v0.1.60,
 with registry packages unchanged. Final handoff is gated by full debug workspace
 tests and workspace all-target Clippy with warnings denied, using `nice -n 19` and
 three build jobs. Debug symbols are disabled to bound disk use; overflow checks remain on.
+
+## Round G16: one-bit screening inside graph navigation: the walk is 28 to 30 percent cheaper, the server 5 to 9 percent faster
+
+**Setup:** Apple M4 (10 cores, 16 GB, shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries, exact top-100 truth), the frozen v0.1.19 fixture
+(copied from the measurement bucket to the M4), 16 client processes with one keep-alive connection each, IDs only (`include_attributes: false`), release binaries with
+production defaults, and the graph promoted the ordinary way (`g15_promote.py`: 23.5 minutes, graph visible after 16.0, build 350 s wall, settled beam 100). Qdrant is the
+official 1.20.0 macOS arm64 binary (f16 in RAM, M=16, ef_construct=100, one indexed segment), loaded once and queried without a restart. The arms below ran on **one promoted
+server**, so the graph, the beam, and the data are the same for both: "off" is the v0.1.62 walk, and "on" is this round's walk. A temporary switch file (read every half
+second, in a candidate binary only, now deleted) selected the arm. Order: off, on, on, off, off, on, on, off.
+
+### Profile: how many SQ8-scored neighbors enter the beam
+
+In-process over all 3,452 queries on the full NQ graph, with the v0.1.62 walk (every unseen neighbor is scored once the beam is full):
+
+| | SQ8 scorings with the beam full, per query | enter the beam |
+|---|---:|---:|
+| `top_k` 10, beam 80 | 1,763 | 356 (20.2%) |
+| `top_k` 10, beam 100 | 2,070 | 391 (18.9%) |
+| `top_k` 100, beam 256 | 4,330 | 614 (14.2%) |
+
+Far below the 50 percent kill line. The screen needs a rule that rejects neighbors the beam will refuse without losing the ones it keeps. Counterfactual on the same walks
+(Hamming distance of the one-bit code to the query's signs against the Hamming distance of the beam's single worst member plus a margin):
+
+| margin (bits of 1,024) | 0 | 8 | 16 | 24 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| scored neighbors that pass | 23.1% | 29.0% | 35.9% | 43.6% | 51.9% | 68.1% | 81.1% |
+| entrants that would be dropped | 13.9% | 7.4% | 3.4% | 1.3% | 0.43% | 0.03% | 0.00% |
+
+The worst member's Hamming distance is a noisy reference (one code's Hamming distance varies by about 16 bits). Averaging the Hamming distances of the **eight worst** members
+removes most of that noise, so the same margin keeps more entrants (the in-process sweep below).
+
+### The rule
+
+Once the beam holds `ef` nodes, a neighbor is scored with its SQ8 code only if its one-bit code's Hamming distance to the query's signs is at most **the mean Hamming
+distance of the beam's eight worst members plus `sqrt(n) / 2` bits**, for codes of `n` bits (16 bits for NQ's 1,024). `sqrt(n) / 2` is the standard deviation of the Hamming
+distance between two unrelated codes, so a neighbor must look about one deviation worse than the beam's tail to be dropped. The rule reads only the codes and the beam: no
+per-dataset constant. A rejected neighbor is still marked visited and never scored. The beam keeps SQ8 distances, so its order and the shortlist are SQ8-exact as before.
+Both the margin and the eight-member tail were chosen from the sweep below (the smallest margin whose recall loss at `top_k` 100 stays near 0.001), then fixed as the rule.
+
+### In-process sweep (full NQ, 8 threads, navigation plus exact rerank of the shortlist, medians of 2 to 3 paired rounds of 3 to 4 s)
+
+Recall differs by up to 0.002 between builds of the same graph (the build is parallel and not deterministic), so each row compares within one process.
+
+| beam, k, shortlist | screen | recall (screened vs unscreened in the same process) | SQ8 scorings per query | q/s | vs unscreened |
+|---|---|---:|---:|---:|---:|
+| 80, 10, 30 | none | 0.96060 | 1,837 | 24,161 | |
+| | worst member + 24 | 0.96388 vs 0.96376 (same build) | 825 | 33,506 | 1.39x |
+| | mean of 8 worst + 24 | 0.96275 vs 0.96295 | 821 | 34,631 | 1.44x |
+| | mean of 8 worst + 16 (**shipped**) | 0.96052 vs 0.96060 | 673 | 37,657 | **1.56x** |
+| | mean of 8 worst + 12 | 0.96086 vs 0.96060 | 603 | 38,824 | 1.61x |
+| 256, 100, 150 | none | 0.95814 | 4,580 | 8,836 | |
+| | mean of 8 worst + 24 | 0.95820 vs 0.95837 | 1,991 | 12,404 | 1.40x |
+| | mean of 8 worst + 16 (**shipped**) | 0.95713 vs 0.95814 | 1,554 | 13,572 | **1.54x** |
+| | mean of 8 worst + 12 | 0.95536 vs 0.95814 | 1,356 | 14,021 | 1.59x |
+
+At `top_k` 10 a margin of 12 costs nothing measurable, and 8 costs 0.0006; at `top_k` 100 a margin of 12 loses 0.0028 and 16 loses 0.0010, so 16 (half of `sqrt(1,024)`) is the
+rule. A NEON Hamming kernel (`vcntq_u8`, eight codes' worth of lanes) did not change the numbers: the screen is bound by the 128-byte row fetch, not the popcount.
+
+### Over HTTP at 16 clients, paired on one server (the pass test)
+
+| | recall | q/s (4 runs, median) | p50 / p90 / p99 (ms) | server CPU per query | instructions per query |
+|---|---:|---:|---|---:|---:|
+| `top_k` 10, off (v0.1.62 walk) | 0.9597 | 9,430 | 1.36 / 2.48 / 3.54 | 785 to 801 us | 2.94M |
+| `top_k` 10, on | 0.9598 | 10,248 | 1.25 / 2.40 / 3.43 | 731 to 736 us | 2.72M |
+| `top_k` 100, off | 0.9553 | 4,630 | 2.91 / 4.93 / 8.14 | 1,696 us | 6.96M |
+| `top_k` 100, on | 0.9540 | 4,870 | 2.87 / 4.86 / 7.52 | 1,651 us | 6.52M |
+
+**`top_k` 10 is 1.087 times faster (the bar was 1.25 times), with recall within 0.0001; `top_k` 100 is 1.05 times faster (the bar was "not slower") with recall 0.0013 lower
+(the bar for `top_k` 10 was 0.002).** p99 is 3% and 8% lower. The `top_k` 10 bar is not met.
+
+Why the in-process 1.56 times does not carry over: the server's thread CPU counters (graph phases, microseconds per search over 41,440 searches per arm) show the walk itself
+did get cheaper by the amount the sweep says, but it is a third of the CPU of a query:
+
+| | navigation | rerank | everything else (parse, plan, JSON, HTTP, sampler) |
+|---|---:|---:|---:|
+| `top_k` 10, off | 355.5 and 359.5 | 84.9 and 85.4 | about 345 (of 790 total) |
+| `top_k` 10, on | 257.1 and 256.3 | 97.7 and 97.0 | about 380 (of 733 total) |
+| `top_k` 100, off | 789.4 and 779.4 | 283.2 and 281.3 | about 630 |
+| `top_k` 100, on | 556.2 and 544.0 | 312.4 and 308.3 | about 790 |
+
+Navigation is **28 percent cheaper at `top_k` 10 and 30 percent at `top_k` 100**, and the exact rerank got 10 to 14 percent more expensive (a guess: the rows the walk no
+longer pulls through the cache). The ten cores are saturated (about 7.5 for the server and the rest for sixteen Python clients), so total CPU per query sets the q/s. With navigation
+at 257 us of 733, even a walk that cost nothing would give 1.5 times, and reaching 1.25 times over v0.1.62 needs the walk at about 155 us. The screen shaves the SQ8 reads (673 scorings
+per query against about 356 that truly enter, so at most about a third fewer scorings remain to be saved) but is bound by one 128-byte code fetch per unseen neighbor (about 1,800 per query).
+
+### Against Qdrant 1.20.0 (same setup, matched recall by linear interpolation between ef points)
+
+| Engine, `top_k` 10 | recall@10 | q/s | p50 | p90 | p99 (ms) |
+|---|---:|---:|---:|---:|---:|
+| **blowfish, one-bit screen (beam 100)** | **0.9598** | **10,248** | **1.25** | **2.40** | **3.43** |
+| blowfish, v0.1.62 walk (same server) | 0.9597 | 9,430 | 1.36 | 2.48 | 3.54 |
+| Qdrant ef 64 | 0.9506 | 8,931 | 1.43 | 2.82 | 5.29 |
+| Qdrant ef 80 | 0.9591 | 8,056 | 1.54 | 3.16 | 5.83 |
+| Qdrant ef 96 | 0.9646 | 7,252 | 1.68 | 3.60 | 7.40 |
+| Qdrant ef 112 | 0.9670 | 6,585 | 1.89 | 3.93 | 7.37 |
+| Qdrant default (no `hnsw_ef`) | 0.9655 | 7,086 | 1.79 | 3.60 | 7.15 |
+| **Qdrant interpolated to 0.9598** | 0.9598 | **about 7,950** | 1.56 | 3.22 | 6.03 |
+
+At matched recall blowfish serves **1.29 times** Qdrant's q/s at `top_k` 10 (v0.1.62's walk: 1.19 times) with p99 43 percent lower.
+
+| Engine, `top_k` 100 | recall@100 | q/s | p50 | p90 | p99 (ms) |
+|---|---:|---:|---:|---:|---:|
+| **blowfish, one-bit screen (beam 256, shortlist 150)** | **0.9540** | **4,870** | **2.87** | **4.86** | **7.52** |
+| blowfish, v0.1.62 walk (same server, beam 256) | 0.9553 | 4,630 | 2.91 | 4.93 | 8.14 |
+| Qdrant ef 192 | 0.9379 | 4,479 | 2.61 | 6.06 | 13.97 |
+| Qdrant ef 256 | 0.9525 | 3,667 | 3.14 | 7.82 | 16.48 |
+| Qdrant ef 320 | 0.9617 | 3,098 | 3.70 | 9.31 | 18.72 |
+| Qdrant default (ef 100) | 0.8842 | 6,781 | 1.88 | 3.75 | 7.29 |
+| **Qdrant interpolated to 0.9540** | 0.9540 | **about 3,570** | 3.23 | 8.06 | 16.9 |
+
+At matched recall blowfish serves **1.36 times** Qdrant's q/s at `top_k` 100 (v0.1.62's walk: 1.30 times), with p50 11 percent, p90 40 percent, and p99 55 percent lower.
+Qdrant's numbers match Round G12's within 1 percent. Each point is one run on a shared machine; the paired medians spread at most 4 percent.
+
+### What changed in the code
+
+- `bf-vector` `warm_graph/navigation.rs`: `search_with` takes an optional `Screen`. After the visited test, the batch's one-bit rows are prefetched, their Hamming distances are
+  computed, and once the beam is full each neighbor over the threshold is skipped. Full SQ8 rows are prefetched only for survivors. Each beam member carries its Hamming distance,
+  and the threshold is recomputed only when the beam changes. Graph construction passes no screen (its score already is the Hamming distance). Nothing about the graph, the codes,
+  the bucket format, or memory changed (the one-bit codes were already resident).
+- `warm_graph/binary.rs`: one Hamming kernel for the build, the filtered scan, and navigation (NEON `vcntq_u8` on aarch64, a `popcnt` build on x86-64 with runtime detection).
+- Tests: `screened_beam_returns_the_unscreened_top_k_when_the_screen_is_exact` (random codes scored by their own Hamming distance: a screen that never rejects equals the plain walk
+  for every pass, and the default screen returns the same top 10 while scoring fewer nodes), `screened_navigation_keeps_recall_and_scores_fewer_neighbors` (8,000 clustered
+  synthetic rows: recall within 0.01 of the unscreened walk at the same beam, with fewer than 0.8 times the scorings), and a Hamming kernel test for every length.
+- Example `bf-vector/examples/g16_nav.rs` builds the graph from an NQ corpus and measures recall and in-process throughput of the shipped walk.
+
+### Notes
+
+- **The settled beam was not widened.** The paired runs hold the beam fixed at the calibrated value, and recall moved by 0.0001 and -0.0013. The production effort controller samples
+  recall on the live path, so with the screen on it would settle where the screened walk meets its target; this round did not run that comparison.
+- **The "off" arm is v0.1.62's walk in the candidate binary, not the v0.1.62 binary.** One promotion costs 23 minutes and a rebuilt graph differs in recall by up to 0.002, so the arms
+  share a graph. The only other difference between the binaries is the Hamming kernel used while building the graph (same values, so the same graph).
+- **Not measured:** other hosts, filtered queries (they use the scan, not the walk), `top_k` above 100, and a mixed `top_k` load.
+- **The numbers above come from a temporary switch.** The shipped code has no switch and no unscreened walk.
+
+Costs: no EC2 and no bucket writes. The NQ corpus and store (about 25 GB) were copied to the M4 through short-lived presigned URLs and are deleted with the run directory.
