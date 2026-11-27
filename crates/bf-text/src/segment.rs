@@ -300,6 +300,8 @@ struct DecodedPostings {
     dense_bytes: usize,
     /// Bytes of the reader's frequency arrays, charged with the memo.
     arrays: usize,
+    /// Bytes of the resident subword index, charged with the memo.
+    subword_bytes: usize,
 }
 impl Default for DecodedPostings {
     fn default() -> Self {
@@ -312,6 +314,7 @@ impl Default for DecodedPostings {
             dense_order: Default::default(),
             dense_bytes: 0,
             arrays: 0,
+            subword_bytes: 0,
         }
     }
 }
@@ -320,7 +323,11 @@ impl DecodedPostings {
     /// allocation header, and window table).
     fn charge(&self) -> u64 {
         const PER_BLOCK: usize = 200;
-        (self.bytes + self.dense_bytes + self.arrays + self.blocks.len() * PER_BLOCK) as u64
+        (self.bytes
+            + self.dense_bytes
+            + self.arrays
+            + self.subword_bytes
+            + self.blocks.len() * PER_BLOCK) as u64
     }
     /// The charge to report to the cache if it moved enough since the last report.
     fn report(&mut self) -> Option<u64> {
@@ -1070,6 +1077,34 @@ struct ChunkEntry {
 }
 /// The term dictionary: one FST read whole (versions 1 and 2), or an index of small FST chunks
 /// read on demand (version 3).
+/// Terms with punctuation inside (`a-b`, `3.5`, `foo_bar!x`), keyed by each subword they contain. The
+/// default tokenizers keep such a term whole, but boolean token filters also match its subwords, which
+/// the dictionary's sort order cannot find. The index holds only those terms (a few percent of the
+/// vocabulary), so a query never scans the whole dictionary.
+#[derive(Default)]
+struct SubwordIndex {
+    /// `(subword, term handle)`, sorted and unique.
+    built: std::sync::OnceLock<Vec<(Box<str>, u64)>>,
+    /// Serializes the one-time build, so concurrent first queries scan the dictionary once.
+    gate: futures::lock::Mutex<()>,
+}
+impl SubwordIndex {
+    /// Handles of compound terms having a subword equal to `text`, or starting with it.
+    fn lookup(pairs: &[(Box<str>, u64)], text: &str, prefix: bool) -> impl Iterator<Item = u64> {
+        let start = pairs.partition_point(|(w, _)| &**w < text);
+        pairs[start..]
+            .iter()
+            .take_while(move |(w, _)| {
+                if prefix {
+                    w.starts_with(text)
+                } else {
+                    &**w == text
+                }
+            })
+            .map(|&(_, id)| id)
+    }
+}
+
 enum Dictionary {
     Whole(fst::Map<Bytes>),
     Chunked {
@@ -1196,6 +1231,8 @@ pub struct SegmentReader {
     decoded: std::sync::Mutex<DecodedPostings>,
     /// Told the memo's charge as it grows and shrinks (set once by the owning cache).
     memo_charge: std::sync::OnceLock<Arc<dyn Fn(u64) + Send + Sync>>,
+    /// Compound terms by subword, built on the first boolean token query (memory-only).
+    subwords: SubwordIndex,
     saturation: std::sync::Mutex<Option<Arc<Saturation>>>,
     /// Directly addressable frequencies of the dense terms this reader has seen often (memory-only).
     dense: std::sync::RwLock<BTreeMap<u64, Arc<DenseFrequencies>>>,
@@ -1441,6 +1478,7 @@ impl SegmentReader {
                 compact: version >= VERSION_COMPACT,
                 decoded: Default::default(),
                 memo_charge: Default::default(),
+                subwords: Default::default(),
                 dense: Default::default(),
                 dense_select: Default::default(),
                 saturation: Default::default(),
@@ -1470,6 +1508,7 @@ impl SegmentReader {
                 compact: false,
                 decoded: Default::default(),
                 memo_charge: Default::default(),
+                subwords: Default::default(),
                 dense: Default::default(),
                 dense_select: Default::default(),
                 saturation: Default::default(),
@@ -1534,6 +1573,7 @@ impl SegmentReader {
             compact: false,
             decoded: Default::default(),
             memo_charge: Default::default(),
+            subwords: Default::default(),
             dense: Default::default(),
             dense_select: Default::default(),
             saturation: Default::default(),
@@ -1917,6 +1957,7 @@ impl SegmentReader {
             compact: version >= VERSION_COMPACT,
             decoded: Default::default(),
             memo_charge: Default::default(),
+            subwords: Default::default(),
             dense: Default::default(),
             dense_select: Default::default(),
             saturation: Default::default(),
@@ -2155,10 +2196,16 @@ impl SegmentReader {
     /// Every term and handle (a scan: fetches every chunk of a version 3 dictionary).
     async fn all_terms(&self) -> io::Result<Vec<(Vec<u8>, u64)>> {
         let mut out = Vec::new();
+        self.for_each_term(|term, id| out.push((term.to_vec(), id)))
+            .await?;
+        Ok(out)
+    }
+    /// Visit every term and handle without copying terms (the same scan as `all_terms`).
+    async fn for_each_term(&self, mut visit: impl FnMut(&[u8], u64)) -> io::Result<()> {
         let mut collect = |map: &fst::Map<Bytes>| {
             let mut stream = map.stream();
             while let Some((term, id)) = stream.next() {
-                out.push((term.to_vec(), id));
+                visit(term, id);
             }
         };
         match &self.dictionary {
@@ -2170,7 +2217,7 @@ impl SegmentReader {
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
     fn sparse_term(&self, df: u32) -> bool {
         df as usize
@@ -3152,18 +3199,70 @@ impl SegmentReader {
                 self.term(text).await?.into_iter().collect()
             });
         }
-        let mut ids = Vec::new();
-        for (term, id) in self.all_terms().await? {
-            if crate::analysis::boolean_term_matches(
-                std::str::from_utf8(&term).unwrap(),
-                text,
-                prefix,
-                self.tokenizer,
-            ) {
-                ids.push(id);
-            }
-        }
+        let mut ids: Vec<u64> = if prefix {
+            self.prefix_terms(text).await?
+        } else {
+            self.term(text).await?.into_iter().collect()
+        };
+        ids.extend(SubwordIndex::lookup(
+            self.subword_pairs().await?,
+            text,
+            prefix,
+        ));
+        ids.sort_unstable();
+        ids.dedup();
         Ok(ids)
+    }
+    /// The subword index, built by one dictionary scan the first time a boolean token query needs it.
+    async fn subword_pairs(&self) -> io::Result<&[(Box<str>, u64)]> {
+        if let Some(pairs) = self.subwords.built.get() {
+            return Ok(pairs);
+        }
+        let _gate = self.subwords.gate.lock().await;
+        if let Some(pairs) = self.subwords.built.get() {
+            return Ok(pairs);
+        }
+        let mut pairs: Vec<(Box<str>, u64)> = Vec::new();
+        let mut invalid_term = false;
+        self.for_each_term(|term, id| {
+            // Plain ASCII words are the vast majority and have no other subword.
+            if term.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_') {
+                return;
+            }
+            let Ok(term) = std::str::from_utf8(term) else {
+                invalid_term = true;
+                return;
+            };
+            let words: Vec<&str> = crate::analysis::subwords(term).collect();
+            // A term that is one subword equal to itself is found by the dictionary directly.
+            if words.len() == 1 && words[0] == term {
+                return;
+            }
+            pairs.extend(words.into_iter().map(|w| (Box::<str>::from(w), id)));
+        })
+        .await?;
+        if invalid_term {
+            return Err(invalid("dictionary term is not UTF-8"));
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs.shrink_to_fit();
+        let bytes: usize = pairs
+            .iter()
+            .map(|(w, _)| w.len() + std::mem::size_of::<(Box<str>, u64)>() + 16)
+            .sum();
+        let pairs = self.subwords.built.get_or_init(|| pairs);
+        let charge = {
+            let mut memo = self.decoded.lock().unwrap();
+            memo.subword_bytes = bytes;
+            let charge = memo.charge();
+            memo.reported = charge;
+            charge
+        };
+        if let Some(hook) = self.memo_charge.get() {
+            hook(charge);
+        }
+        Ok(pairs)
     }
     /// Rows containing every query token. Empty queries match every row, including
     /// null fields. Boolean UAX #29 matching also recognizes punctuation-delimited

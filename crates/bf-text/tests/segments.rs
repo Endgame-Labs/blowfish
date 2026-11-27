@@ -1304,3 +1304,80 @@ fn selective_masks_score_allowed_rows_with_the_same_bits_as_the_unfiltered_ranki
         }
     }
 }
+
+/// Boolean token filters answer from the resident subword index, never a dictionary scan: they
+/// must equal the per-document matcher for plain terms, punctuated terms and their subwords,
+/// every prefix of each, mixed queries, CJK, and unmatched text, under both word tokenizers.
+#[test]
+fn boolean_filters_match_the_document_matcher_for_punctuated_terms() {
+    let lines = [
+        "state-of-the-art search engine",
+        "version 3.14.159 released, e-mail me at a.b@c.org",
+        "foo_bar baz-qux _lead trail_ -dash +plus $5.00 #tag",
+        "naïve-café Ünïcode_mix 東京-大阪 日本語のテキスト 你好世界",
+        "plain words only here",
+        "a--b c..d e__f 1-2-3 x",
+        "don't stop-believing o'neil's it's",
+        "",
+    ];
+    for tokenizer in [Tokenizer::WordV4, Tokenizer::WordV3] {
+        let p = FtsParams {
+            tokenizer,
+            ..FtsParams::default()
+        };
+        let docs: Vec<_> = lines.iter().map(|l| tokenize(l, &p)).collect();
+        let reader = open(build(&docs, false, tokenizer));
+        let mut texts = std::collections::BTreeSet::new();
+        for doc in &docs {
+            for token in doc {
+                let word = token.text.as_str();
+                texts.insert(word.to_string());
+                for part in word.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    texts.insert(part.to_string());
+                }
+                for end in word.char_indices().map(|(i, _)| i).skip(1) {
+                    texts.insert(word[..end].to_string());
+                }
+            }
+        }
+        texts.extend(["zzz", "-", "a-b", "3.", "e-"].map(String::from));
+        let texts: Vec<_> = texts.into_iter().collect();
+        let mut queries: Vec<Vec<&str>> = texts.iter().map(|t| vec![t.as_str()]).collect();
+        for pair in texts.chunks(2) {
+            queries.push(pair.iter().map(String::as_str).collect());
+        }
+        let mut checked = 0;
+        for prefix in [false, true] {
+            for words in &queries {
+                let tokens: Vec<_> = words
+                    .iter()
+                    .enumerate()
+                    .map(|(position, w)| Token {
+                        text: (*w).to_string(),
+                        position: position as u32,
+                        element: 0,
+                    })
+                    .collect();
+                let q = Query::new(tokens, prefix);
+                let all: RoaringBitmap = (0..docs.len() as u32)
+                    .filter(|&i| matches_all_tokens(&docs[i as usize], &q, tokenizer))
+                    .collect();
+                let any: RoaringBitmap = (0..docs.len() as u32)
+                    .filter(|&i| matches_any_token(&docs[i as usize], &q, tokenizer))
+                    .collect();
+                assert_eq!(
+                    block_on(reader.contains_all_tokens(&q)).unwrap(),
+                    all,
+                    "all {words:?} prefix={prefix} {tokenizer:?}"
+                );
+                assert_eq!(
+                    block_on(reader.contains_any_token(&q)).unwrap(),
+                    any,
+                    "any {words:?} prefix={prefix} {tokenizer:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 400, "{checked}");
+    }
+}
