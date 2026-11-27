@@ -1134,6 +1134,13 @@ pub(crate) async fn set_live(
     .await?;
     Ok(())
 }
+/// True when this segment's ID list is already in the cache, which only validated lists enter:
+/// strictly ascending, so row order is ID order. Reads nothing.
+pub(crate) fn ids_validated(segment: &Segment) -> bool {
+    segment.files.get("ids").is_some_and(|file| {
+        read_cache::get::<IdIndex>(&format!("validated:{}", file.key), file.size).is_some()
+    })
+}
 pub(crate) async fn ids(store: &Storage, segment: &Segment) -> Result<Arc<IdIndex>, ApiError> {
     let file = segment.files.get("ids").ok_or_else(corrupt)?;
     let key = format!("validated:{}", file.key);

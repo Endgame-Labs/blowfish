@@ -12,21 +12,28 @@ const MAGIC: &[u8; 8] = b"BFTKEY01";
 const MAX_BYTES: usize = 128 << 10;
 
 pub(crate) enum Keys {
-    Numeric(Vec<u64>),
-    Strings(Vec<String>),
+    /// IDs, and whether they are strictly ascending (checked once, when decoded).
+    Numeric(Vec<u64>, bool),
+    Strings(Vec<String>, bool),
 }
 impl Keys {
+    /// Rows are in strictly ascending ID order, which is the order that breaks score ties.
+    pub(crate) fn ascending(&self) -> bool {
+        match self {
+            Self::Numeric(_, ascending) | Self::Strings(_, ascending) => *ascending,
+        }
+    }
     pub(crate) fn id(&self, row: u32) -> Result<Id, ApiError> {
         match self {
-            Self::Numeric(ids) => ids.get(row as usize).copied().map(Id::Uint),
-            Self::Strings(ids) => ids.get(row as usize).cloned().map(Id::String),
+            Self::Numeric(ids, _) => ids.get(row as usize).copied().map(Id::Uint),
+            Self::Strings(ids, _) => ids.get(row as usize).cloned().map(Id::String),
         }
         .ok_or_else(segment::corrupt)
     }
     fn resident(&self) -> u64 {
         (64 + match self {
-            Self::Numeric(ids) => ids.capacity() * 8,
-            Self::Strings(ids) => {
+            Self::Numeric(ids, _) => ids.capacity() * 8,
+            Self::Strings(ids, _) => {
                 ids.capacity() * std::mem::size_of::<String>()
                     + ids.iter().map(String::capacity).sum::<usize>()
             }
@@ -138,7 +145,8 @@ fn decode(bytes: &[u8], rows: u32) -> Result<Option<Keys>, ApiError> {
                     ids.push(ids.last().unwrap().wrapping_add(delta));
                 }
             }
-            Keys::Numeric(ids)
+            let ascending = ids.windows(2).all(|w| w[0] < w[1]);
+            Keys::Numeric(ids, ascending)
         }
         1 => {
             let mut ids: Vec<String> = Vec::new();
@@ -156,7 +164,8 @@ fn decode(bytes: &[u8], rows: u32) -> Result<Option<Keys>, ApiError> {
                 body = &body[suffix..];
                 ids.push(String::from_utf8(id).map_err(segment::index_error)?);
             }
-            Keys::Strings(ids)
+            let ascending = ids.windows(2).all(|w| w[0] < w[1]);
+            Keys::Strings(ids, ascending)
         }
         2 if body.is_empty() => return Ok(None),
         _ => return Err(segment::corrupt()),
@@ -231,6 +240,7 @@ mod tests {
             let (bytes, inline) = encode(&ids).unwrap();
             assert!(inline);
             let decoded = decode(&bytes, ids.len() as u32).unwrap().unwrap();
+            assert_eq!(decoded.ascending(), ids.windows(2).all(|w| w[0] < w[1]));
             for (row, id) in ids.iter().enumerate() {
                 assert_eq!(&decoded.id(row as u32).unwrap(), id);
             }

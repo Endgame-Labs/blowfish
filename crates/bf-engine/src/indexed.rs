@@ -312,13 +312,20 @@ async fn prepare(
     force_exact: bool,
     narrow_columns: bool,
 ) -> Result<NamespaceState, ApiError> {
-    let threshold = (matches!(q.rank_by, Some(RankBy::Bm25 { .. }))
-        && q.limit.as_ref().and_then(Limit::per).is_none())
-    .then(|| {
-        std::sync::Arc::new(bf_text::SearchThreshold::new(
+    let no_per = q.limit.as_ref().and_then(Limit::per).is_none();
+    let threshold = if matches!(q.rank_by, Some(RankBy::Bm25 { .. })) && no_per {
+        Some(std::sync::Arc::new(Floors::new(
             q.total().unwrap_or(10) + q.offset,
-        ))
-    });
+            vec![vec![]],
+        )))
+    } else if max_of_text(q.rank_by.as_ref()) && no_per {
+        // The same `k` as `prepare_scalar` uses for its lists.
+        sum_text::clause_weights(q.rank_by.as_ref()).map(|weights| {
+            std::sync::Arc::new(Floors::new(q.total().unwrap_or(10000) + q.offset, weights))
+        })
+    } else {
+        None
+    };
     if matches!(q.rank_by, Some(RankBy::MultiVector { .. })) {
         return snapshot::materialize(store, state).await;
     }
@@ -498,7 +505,7 @@ async fn prepare_one(
     config: &EngineConfig,
     force_exact: bool,
     narrow_columns: bool,
-    threshold: Option<&bf_text::SearchThreshold>,
+    threshold: Option<&Floors>,
 ) -> Result<NamespaceState, ApiError> {
     let Some(
         rank @ RankBy::Vector {
@@ -829,6 +836,63 @@ pub(crate) fn union_truth(answers: &[&QueryResponse]) -> Option<QueryResponse> {
     Some(out)
 }
 
+/// Score floors shared by the segments of one top-k query, so a segment that finishes early
+/// (or runs ahead) lets the others skip rows that cannot enter the answer.
+///
+/// Each clause has a floor on its raw BM25 score. A plain BM25 query publishes its own `k`th
+/// scores. A `Max` of weighted clauses also keeps the `k` best combined scores found so far
+/// (each row's best scaled clause score among the lists seen, never above its true maximum):
+/// a row whose every scaled clause score is strictly below the `k`th of those has `k` rows
+/// ahead of it, so each clause may skip rows below that score divided by its weight.
+pub(crate) struct Floors {
+    clauses: Vec<bf_text::SearchThreshold>,
+    weights: Vec<Vec<f64>>,
+    best: std::sync::Mutex<BinaryHeap<std::cmp::Reverse<ScoreBits>>>,
+}
+/// A nonnegative finite `f64` ordered by its bits.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ScoreBits(u64);
+impl Floors {
+    fn new(k: usize, weights: Vec<Vec<f64>>) -> Self {
+        Self {
+            clauses: weights
+                .iter()
+                .map(|_| bf_text::SearchThreshold::new(k))
+                .collect(),
+            weights,
+            best: Default::default(),
+        }
+    }
+    fn clause(&self, i: usize) -> &bf_text::SearchThreshold {
+        &self.clauses[i]
+    }
+    /// Offer a segment's rows' best scaled scores; raise every clause's floor once `k` are known.
+    fn offer(&self, scores: impl Iterator<Item = f64>) {
+        let k = self.clauses[0].k();
+        if k == 0 {
+            return;
+        }
+        let kth = {
+            let mut best = self.best.lock().expect("floors lock");
+            for score in scores.filter(|s| s.is_finite() && *s > 0.0) {
+                if best.len() < k {
+                    best.push(std::cmp::Reverse(ScoreBits(score.to_bits())));
+                } else if best.peek().is_some_and(|m| score.to_bits() > m.0.0) {
+                    best.pop();
+                    best.push(std::cmp::Reverse(ScoreBits(score.to_bits())));
+                }
+            }
+            (best.len() == k).then(|| f64::from_bits(best.peek().expect("full").0.0))
+        };
+        let Some(kth) = kth else { return };
+        for (clause, weights) in self.clauses.iter().zip(&self.weights) {
+            // Undo the weights outermost first, then back off two f32 steps so rounding can
+            // never skip a row whose scaled score reaches the `k`th.
+            let raw = weights.iter().rev().fold(kth, |s, w| s / w) as f32;
+            clause.raise(f32::from_bits(raw.to_bits().saturating_sub(2)));
+        }
+    }
+}
 /// ID indexes above this size are not read whole by BM25 queries.
 pub(crate) const RANGED_IDS_BYTES: u64 = 128 << 10;
 /// A plain BM25 query whose response needs only IDs and scores.
@@ -845,12 +909,12 @@ pub(crate) fn text_ids_only(q: &QueryRequest) -> bool {
         && q.compute_attributes.is_none()
         && q.limit.as_ref().and_then(Limit::per).is_none()
 }
-/// `["Max", [...]]` whose clauses are all plain BM25. Each clause then needs only its own top
+/// `["Max", [...]]` whose clauses are all plain BM25, each under constant positive weights (a
+/// strictly increasing map, so each clause's order and ties are kept). Each clause then needs only its own top
 /// `k + offset` rows (plus ties at the cutoff): a row outside every clause's top list has a
 /// maximum below at least `k + offset` other rows' maxima. `Sum` has no such bound.
 pub(crate) fn max_of_text(rank: Option<&RankBy>) -> bool {
-    matches!(rank, Some(RankBy::Max(xs)) if !xs.is_empty()
-        && xs.iter().all(|x| matches!(x, RankBy::Bm25 { .. })))
+    matches!(rank, Some(RankBy::Max(_))) && sum_text::clause_weights(rank).is_some()
 }
 /// True when `hits` (best first, from a search for `top > k` rows) hold every row scoring at
 /// least the `k`th hit's score: the list is the whole result, or ends strictly below that score.
@@ -889,7 +953,7 @@ async fn prepare_segment(
     clause_top: bool,
     k: usize,
     columns: &BTreeSet<String>,
-    threshold: Option<&bf_text::SearchThreshold>,
+    threshold: Option<&Floors>,
     preset: Option<Preset>,
     mut out: NamespaceState,
 ) -> Result<NamespaceState, ApiError> {
@@ -940,6 +1004,12 @@ async fn prepare_segment(
     if allowed.is_empty() {
         return Ok(out);
     }
+    // Row order is ID order when this segment's ID list was just validated as strictly
+    // ascending (loaded whole or already cached) or its inline keys are. A ranged-ID segment that
+    // was never loaded has no such proof, and keeps the tie widening.
+    let id_ordered = whole_ids.is_some()
+        || keys.as_ref().is_some_and(|k| k.ascending())
+        || segment::ids_validated(seg);
     let ids = if whole_ids.is_none()
         && clauses.iter().any(
             |c| matches!(c, RankBy::Bm25 { attribute, .. } if !indexes.contains_key(attribute)),
@@ -964,7 +1034,7 @@ async fn prepare_segment(
         }
         bm25_hits = preset;
     }
-    for &clause in searched {
+    for (clause_index, &clause) in searched.iter().enumerate() {
         let RankBy::Bm25 {
             attribute,
             query,
@@ -984,7 +1054,28 @@ async fn prepare_segment(
         let stats = state.corpus.get(attribute).unwrap_or(&fallback);
         let top = if all { allowed.len() as usize } else { k };
         let hits = if let Some(reader) = indexes.get(attribute) {
-            if clause_top {
+            if clause_top && id_ordered && k > 0 {
+                // Rows are in ID order here, and a list keeps the lower row among equal scores:
+                // every row it drops loses the final ID tie-break to `k` rows in the list.
+                match threshold {
+                    Some(floors) => {
+                        reader
+                            .search_prefetched_shared(
+                                &query,
+                                stats,
+                                &cfg,
+                                Some(&allowed),
+                                floors.clause(clause_index),
+                            )
+                            .await
+                    }
+                    None => {
+                        reader
+                            .search_prefetched(&query, stats, &cfg, k, Some(&allowed))
+                            .await
+                    }
+                }
+            } else if clause_top {
                 // Exact cutoff ties: widen until the list ends strictly below the kth score,
                 // so a tied row that wins the final ID tie-break is never dropped.
                 let mut top = top + 1;
@@ -1002,7 +1093,13 @@ async fn prepare_segment(
                 }
             } else if let Some(threshold) = threshold {
                 reader
-                    .search_prefetched_shared(&query, stats, &cfg, Some(&allowed), threshold)
+                    .search_prefetched_shared(
+                        &query,
+                        stats,
+                        &cfg,
+                        Some(&allowed),
+                        threshold.clause(0),
+                    )
                     .await
             } else {
                 reader
@@ -1034,6 +1131,19 @@ async fn prepare_segment(
             selected.insert(hit.row);
         }
         bm25_hits.push((rank_key(clause), hits));
+    }
+    if let (true, true, Some(floors)) = (clause_top, id_ordered, threshold) {
+        // Each listed row's best scaled clause score: a lower bound on its true maximum.
+        let weights = sum_text::clause_weights(q.rank_by.as_ref()).expect("weighted clauses");
+        let mut best: std::collections::HashMap<u32, f64> = Default::default();
+        for ((_, hits), weights) in bm25_hits.iter().zip(&weights) {
+            for hit in hits {
+                let scaled = sum_text::scaled(weights, hit.score);
+                let entry = best.entry(hit.row).or_insert(0.0);
+                *entry = entry.max(scaled);
+            }
+        }
+        floors.offer(best.into_values());
     }
     if let Some(rows) =
         crate::pattern::segment_scores(store, seg, q.rank_by.as_ref(), &allowed, &mut out).await?
@@ -1093,7 +1203,7 @@ async fn sum_prepare(
     q: &QueryRequest,
     clauses: &[&RankBy],
 ) -> Result<Option<Vec<sum_text::SegmentSum>>, ApiError> {
-    let prepared = sum_clauses(state, clauses);
+    let prepared = sum_clauses(state, q, clauses);
     let opened = futures::future::try_join_all(
         state
             .segments
@@ -1103,12 +1213,18 @@ async fn sum_prepare(
     .await?;
     Ok(opened.into_iter().collect())
 }
-fn sum_clauses<'a>(state: &'a NamespaceState, clauses: &[&'a RankBy]) -> Vec<sum_text::Clause<'a>> {
+fn sum_clauses<'a>(
+    state: &'a NamespaceState,
+    q: &QueryRequest,
+    clauses: &[&'a RankBy],
+) -> Vec<sum_text::Clause<'a>> {
     static FALLBACK: std::sync::LazyLock<bf_text::CorpusStats> =
         std::sync::LazyLock::new(Default::default);
+    let weights = sum_text::clause_weights(q.rank_by.as_ref()).expect("weighted BM25 clauses");
     clauses
         .iter()
-        .map(|clause| {
+        .zip(weights)
+        .map(|(clause, weights)| {
             let RankBy::Bm25 {
                 attribute,
                 query,
@@ -1128,6 +1244,7 @@ fn sum_clauses<'a>(state: &'a NamespaceState, clauses: &[&'a RankBy]) -> Vec<sum
                     crate::text::prefix(params.as_ref()),
                 ),
                 cfg,
+                weights,
                 stats: state.corpus.get(attribute).unwrap_or(&FALLBACK),
             }
         })
@@ -1146,7 +1263,7 @@ async fn hydrate_segments(
     clause_top: bool,
     k: usize,
     columns: &BTreeSet<String>,
-    threshold: Option<&bf_text::SearchThreshold>,
+    threshold: Option<&Floors>,
     mut out: NamespaceState,
     mut preset: Option<Vec<Preset>>,
 ) -> Result<NamespaceState, ApiError> {
@@ -1191,10 +1308,10 @@ async fn sum_finish(
     segments: Vec<sum_text::SegmentSum>,
     k: usize,
     columns: &BTreeSet<String>,
-    threshold: Option<&bf_text::SearchThreshold>,
+    threshold: Option<&Floors>,
     out: NamespaceState,
 ) -> Result<NamespaceState, ApiError> {
-    let prepared = sum_clauses(state, clauses);
+    let prepared = sum_clauses(state, q, clauses);
     // Tail documents are already scored (every clause, in `out`); their totals take part too.
     let tail: Vec<(Id, f64)> = clauses
         .first()
@@ -1203,12 +1320,14 @@ async fn sum_finish(
             first
                 .keys()
                 .map(|id| {
-                    let t = sum_text::total(clauses.iter().map(|c| {
-                        out.scores
+                    let t = sum_text::total(clauses.iter().zip(&prepared).map(|(c, p)| {
+                        let raw = out
+                            .scores
                             .get(&rank_key(c))
                             .and_then(|m| m.get(id))
                             .copied()
-                            .unwrap_or(0.0) as f32
+                            .unwrap_or(0.0);
+                        sum_text::scaled(&p.weights, raw as f32)
                     }));
                     (id.clone(), t)
                 })
@@ -1216,6 +1335,7 @@ async fn sum_finish(
         })
         .unwrap_or_default();
     let mut n = sum_text::first_list(k);
+    let mut round = 0;
     while let Some(list) = n {
         let rounds =
             futures::future::try_join_all(segments.iter().map(|s| s.candidates(&prepared, list)))
@@ -1229,6 +1349,7 @@ async fn sum_finish(
             exhaustive &= r.exhaustive;
         }
         if let Some(floor) = sum_text::accept(&mut totals, k, bound, exhaustive) {
+            sum_text::record(Some(round));
             let presets =
                 futures::future::try_join_all(segments.iter().zip(&rounds).map(|(s, r)| {
                     let rows: RoaringBitmap = r
@@ -1257,7 +1378,9 @@ async fn sum_finish(
             .await;
         }
         n = sum_text::next_list(list);
+        round += 1;
     }
+    sum_text::record(None);
     hydrate_segments(
         store, state, q, clauses, true, false, k, columns, threshold, out, None,
     )
@@ -1267,7 +1390,7 @@ async fn prepare_scalar(
     store: &Storage,
     state: &NamespaceState,
     q: &QueryRequest,
-    threshold: Option<&bf_text::SearchThreshold>,
+    threshold: Option<&Floors>,
 ) -> Result<NamespaceState, ApiError> {
     let mut clauses = vec![];
     if let Some(rank) = &q.rank_by {
@@ -1441,6 +1564,32 @@ async fn prepare_scalar(
     crate::sparse::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out);
     crate::pattern::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod floors_tests {
+    use super::*;
+
+    #[test]
+    fn combined_kth_raises_every_clause_floor_divided_by_its_weights_and_never_overshoots() {
+        // Clause 0 is weighted 2 then 3 (scaled = 3 * (2 * s)), clause 1 is plain.
+        let floors = Floors::new(2, vec![vec![2.0, 3.0], vec![]]);
+        floors.offer([9.0, 7.0].into_iter());
+        assert!(floors.clause(1).floor() <= 7.0 && floors.clause(1).floor() > 6.99);
+        assert!(floors.clause(0).floor() <= 7.0 / 6.0 && floors.clause(0).floor() > 1.16);
+        // Fewer than k rows known: nothing is raised.
+        let early = Floors::new(3, vec![vec![]]);
+        early.offer([9.0, 7.0].into_iter());
+        assert_eq!(early.clause(0).floor(), 0.0);
+        // A later, lower batch never lowers a floor; a higher one raises it.
+        floors.offer([1.0, 2.0].into_iter());
+        assert!(floors.clause(1).floor() > 6.99);
+        floors.offer([20.0, 30.0].into_iter());
+        assert!(floors.clause(1).floor() > 19.9);
+        // Every score that reaches the kth survives the floor (ties included).
+        let f = floors.clause(0).floor();
+        assert!(sum_text::scaled(&[2.0, 3.0], f) <= 20.0);
+    }
 }
 
 #[cfg(test)]

@@ -9,17 +9,96 @@ use crate::{NamespaceState, segment, snapshot};
 use bf_storage::Storage;
 use bf_types::*;
 use roaring::RoaringBitmap;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+/// How `Sum` queries have been decided since the process started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SumOutcomes {
+    /// The bound held at the first list length.
+    pub first: u64,
+    /// The bound held after the lists grew.
+    pub grown: u64,
+    /// No list length proved the answer, and the full scorer ran.
+    pub fallback: u64,
+}
+static FIRST: AtomicU64 = AtomicU64::new(0);
+static GROWN: AtomicU64 = AtomicU64::new(0);
+static FALLBACK: AtomicU64 = AtomicU64::new(0);
+/// Counts of `Sum` queries accepted at the first list length, accepted after growing, and sent
+/// to the full scorer, for benchmarks that report how often the bound holds.
+pub fn sum_outcomes() -> SumOutcomes {
+    SumOutcomes {
+        first: FIRST.load(Ordering::Relaxed),
+        grown: GROWN.load(Ordering::Relaxed),
+        fallback: FALLBACK.load(Ordering::Relaxed),
+    }
+}
+/// Record one query's outcome: `Some(round)` for the round (0 first) that accepted, `None` for
+/// the fallback. Also traced as a stage line when stage tracing is on.
+pub(crate) fn record(round: Option<usize>) {
+    let (counter, name) = match round {
+        Some(0) => (&FIRST, "first"),
+        Some(_) => (&GROWN, "grown"),
+        None => (&FALLBACK, "fallback"),
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    if crate::ann::trace_stages() {
+        eprintln!("STAGE sum outcome {name}");
+    }
+}
 
 /// Largest per-clause list a `Sum` query will try before it scores everything.
 const MAX_LIST: usize = 4096;
 /// Smallest per-clause list.
 const MIN_LIST: usize = 64;
 
-/// `["Sum", [...]]` whose clauses are all plain BM25.
+/// Weights outside this range could overflow or underflow the scaled scores, and then two
+/// different BM25 scores could map to one value, so such clauses keep the full scorer.
+const WEIGHT_RANGE: std::ops::RangeInclusive<f64> = 1e-9..=1e9;
+/// Deepest nest of `Product` constants around one clause that still takes the list paths.
+const MAX_NEST: usize = 4;
+
+/// The constant weights around a plain BM25 clause, innermost first, or `None` when `x` is
+/// anything else (including a weight of 0 or one outside `WEIGHT_RANGE`). A positive weight
+/// scales every score by a strictly increasing map, so the clause keeps its order and ties.
+pub(crate) fn weights_of(x: &RankBy) -> Option<Vec<f64>> {
+    match x {
+        RankBy::Bm25 { .. } => Some(vec![]),
+        RankBy::Product { weight, expr, .. } if WEIGHT_RANGE.contains(weight) => {
+            let mut inner = weights_of(expr)?;
+            inner.push(*weight);
+            (inner.len() <= MAX_NEST).then_some(inner)
+        }
+        _ => None,
+    }
+}
+
+/// A clause's score after its weights, multiplying innermost first in `f64` exactly as
+/// `query::score` does (`weight * score`), so the result has the full scorer's bits.
+pub(crate) fn scaled(weights: &[f64], score: f32) -> f64 {
+    weights.iter().fold(f64::from(score), |s, w| w * s)
+}
+
+/// Each clause of a flat `Sum` or `Max` of weighted BM25 clauses, as its weights; `None` when
+/// the rank is another shape.
+pub(crate) fn clause_weights(rank: Option<&RankBy>) -> Option<Vec<Vec<f64>>> {
+    match rank {
+        Some(RankBy::Sum(xs) | RankBy::Max(xs)) if !xs.is_empty() => {
+            xs.iter().map(weights_of).collect()
+        }
+        _ => None,
+    }
+}
+
+/// `["Sum", [...]]` whose clauses are all plain BM25, each under constant positive weights.
 pub(crate) fn sum_of_text(rank: Option<&RankBy>) -> bool {
-    matches!(rank, Some(RankBy::Sum(xs)) if !xs.is_empty()
-        && xs.iter().all(|x| matches!(x, RankBy::Bm25 { .. })))
+    matches!(rank, Some(RankBy::Sum(_))) && clause_weights(rank).is_some()
 }
 
 /// First list length for a query that needs `k` rows, or `None` when the lists would be too long
@@ -40,6 +119,8 @@ pub(crate) struct Clause<'a> {
     pub key: Vec<u8>,
     pub query: bf_text::Query,
     pub cfg: FullTextConfig,
+    /// Constant weights around the clause, innermost first (empty for a plain clause).
+    pub weights: Vec<f64>,
     pub stats: &'a bf_text::CorpusStats,
 }
 
@@ -89,9 +170,9 @@ pub(crate) struct Candidates {
     pub exhaustive: bool,
 }
 
-/// Sum scores in clause order, as `query::score` does, so totals are bit-identical.
-pub(crate) fn total(scores: impl Iterator<Item = f32>) -> f64 {
-    scores.map(f64::from).sum()
+/// Sum scaled scores in clause order, as `query::score` does, so totals are bit-identical.
+pub(crate) fn total(scores: impl Iterator<Item = f64>) -> f64 {
+    scores.sum()
 }
 
 impl SegmentSum {
@@ -122,7 +203,12 @@ impl SegmentSum {
             }
             lists.push((full, hits));
         }
-        let bound = total(cutoffs.iter().copied());
+        let bound = total(
+            cutoffs
+                .iter()
+                .zip(clauses)
+                .map(|(c, clause)| scaled(&clause.weights, *c)),
+        );
         let exhaustive = lists.iter().all(|(full, _)| !full);
         let mut exact: Vec<HashMap<u32, f32>> = Vec::with_capacity(clauses.len());
         for ((clause, reader), (full, hits)) in clauses.iter().zip(&self.readers).zip(lists) {
@@ -145,7 +231,9 @@ impl SegmentSum {
         let rows = union
             .iter()
             .map(|row| {
-                let t = total(exact.iter().map(|m| m.get(&row).copied().unwrap_or(0.0)));
+                let t = total(exact.iter().zip(clauses).map(|(m, clause)| {
+                    scaled(&clause.weights, m.get(&row).copied().unwrap_or(0.0))
+                }));
                 (row, t)
             })
             .collect();
@@ -214,6 +302,33 @@ mod tests {
         assert_eq!(accept(&mut [9.0, 0.0], 2, 0.0, true), Some(0.0));
         // Complete lists need no bound at all.
         assert_eq!(accept(&mut [2.0, 1.0], 1, 0.0, true), Some(2.0));
+    }
+    #[test]
+    fn weights_nest_innermost_first_and_zero_or_extreme_weights_are_refused() {
+        let rank = |v: serde_json::Value| -> RankBy { serde_json::from_value(v).unwrap() };
+        let bm = || serde_json::json!(["t", "BM25", "x"]);
+        assert_eq!(weights_of(&rank(bm())), Some(vec![]));
+        assert_eq!(
+            weights_of(&rank(serde_json::json!(["Product", 2.0, bm()]))),
+            Some(vec![2.0])
+        );
+        assert_eq!(
+            weights_of(&rank(serde_json::json!([
+                "Product",
+                ["Product", bm(), 3.0],
+                2.0
+            ]))),
+            Some(vec![3.0, 2.0])
+        );
+        for w in [0.0, 1e-12, 1e12] {
+            assert_eq!(
+                weights_of(&rank(serde_json::json!(["Product", w, bm()]))),
+                None
+            );
+        }
+        // 2 * (3 * s) and (2 * 3) * s can differ in the last bit; the nest keeps the first.
+        let s = 0.7f32;
+        assert_eq!(scaled(&[3.0, 2.0], s), 2.0 * (3.0 * f64::from(s)));
     }
     #[test]
     fn list_lengths_grow_to_a_cap() {

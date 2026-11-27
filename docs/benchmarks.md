@@ -17585,3 +17585,104 @@ cgroup, and `admitted_entry` waited on that, so any other build or test run on t
 `memory_available` now answers from a fixed headroom (`TEST_HOST_HEADROOM`), so admission depends only on the engine's own
 reservations; production reads the cgroup as before (`cgroup_headroom` keeps its own unit test). With a parallel release
 build of the whole workspace running, all 22 `warm_graph` tests passed.
+
+## Round BW24: weighted BM25 clauses, shared floors for `Max`, and `Sum` outcome counters
+
+BW22 and BW23 covered `Max` and `Sum` of plain BM25 clauses. A clause wrapped in a constant weight, `["Product", 2.0,
+["text","BM25",q]]`, still took the all-rows path: about 2.1 to 2.9 s per query at one client on the 1M MS MARCO fixture.
+
+### What changed
+
+1. **Weighted clauses.** A clause may be plain BM25 under up to four nested `Product`s of constants (either operand order),
+   each weight in `1e-9..=1e9` (`weights_of` in `sum_text.rs`). A positive weight is a strictly increasing map of the
+   score, so each clause keeps its order and its ties, and the lists, bounds, and hydration stay in raw BM25 scores.
+   Scaled values appear only where scores are combined: the `Sum` totals, the strict bound, and the `Max` floors. They
+   are computed as the full scorer does, `weight * score` in `f64`, **innermost first** (`2 * (3 * s)` and `(2 * 3) * s`
+   can differ in the last bit, so nests are not folded). A weight of 0 (or one outside the range, which could overflow
+   or collapse two scores into one) keeps the old path for the whole query; negative weights are already rejected at
+   parse time. The tail, filters, deletes, and offsets work as before.
+2. **Shared floors for `Max`** (`Floors` in `indexed.rs`). The segments of one query share, per clause, a floor on its raw
+   score, and a min-heap of the `k` best combined scores found so far (each listed row's best scaled clause score,
+   which never exceeds its true maximum). Once `k` are known, every clause raises its floor to the `k`th score divided by
+   its weights (backed off two `f32` steps so rounding cannot skip a row). A segment then skips rows strictly below the
+   floor in every clause, ties kept. Readers also publish their own `k`th clause scores, as plain BM25 already did.
+   `bf-text` gained `SearchThreshold::raise`, `floor`, and `k`.
+3. **No tie widening when row order is ID order.** Rows are in strictly ascending ID order in every segment, and a list
+   keeps the lower row among equal scores, so every row a `k`-row list drops loses the final ID tie-break to `k` rows in
+   that same segment. The check is per segment and from validated data, not assumed: the segment's ID list was
+   validated as strictly ascending (loaded whole, or already in the cache, which only validated lists enter), or its
+   inline text keys were checked as ascending when decoded (new). A ranged-ID segment that was never loaded has no
+   proof and keeps the widening loop (the `k + 1` search that doubles until the list ends strictly below the `k`th
+   score). The manifest has no field that records ID order, so a large cold segment cannot qualify without a read.
+4. **Counters.** `bf_engine::sum_outcomes()` counts, per decision, whether `Sum` accepted at the first list length,
+   accepted after the lists grew, or fell back to the full scorer; with `BF_TRACE_STAGES=1` each decision also prints
+   `STAGE sum outcome first|grown|fallback`.
+
+### Tests
+
+`tests/sum_text.rs` now compares whole responses (IDs and score bits) with `query_exhaustive` for `Sum` and `Max` under four
+weightings (one weight on either side, nested weights, and a zero weight that keeps the old path), over the same segments,
+WAL tail (overwrites, deletes, new rows), filters, and offsets as before. The fallback test asserts the fallback counter
+moved. Unit tests cover weight extraction (nesting order, zero and extreme weights), the first-bit order of nested
+products, floor raising (weights divided out, no early raise, never lowered, ties survive), and the ascending flag of
+decoded keys.
+
+### Measurement
+
+Local, no EC2: this VM (8 vCPU, load about 2 at the start), fixture `tmp/msmarco-1m-v021/` (eight text segments) copied to
+local disk, 2 GiB raw cache, 4,000-byte blocks, server on CPUs 0 to 5 with two Rayon workers, `concurrent_bm25` on CPUs 6
+and 7, `top_k` 10, strong consistency, IDs only. Workloads from the checked-in 1,000-query file: 500 two-clause and 200
+three-clause `Max`, the same for `Sum` (BW22 and BW23's sets), and **300 weighted queries**: 100 two-clause `Sum` of
+`["Product", 2.0, a]` and `["Product", b, 0.5]` (`wsum2`), 100 three-clause `Sum` with `2.0`, a nested `0.5 * (3.0 * b)`,
+and a plain clause (`wsum3`), and 100 two-clause `Max` with one `Product 2.0` clause (`wmax2`). Baseline v0.1.70
+(`7691c9a`) recorded the truth for all 1,900 queries; the candidate (`d498906`) matches it in ordered IDs and f32 score
+bits on every query of every pass (the driver asserts it). Candidate: a prewarm, two 1-client passes, and three 16-client
+passes. The baselines ran one pass per client count for weighted workloads (the first 48 queries at 16 clients, each
+query takes seconds), and the plain workloads were bracketed (baseline, candidate, candidate, baseline) with medians
+reported.
+
+| Workload | v0.1.70 1 client q/s (p50 ms) | candidate 1 client q/s (p50 / p99 ms) | v0.1.70 16 clients q/s (p50 ms) | candidate 16 clients q/s (p50 / p99 ms) |
+| --- | ---: | ---: | ---: | ---: |
+| weighted two-clause `Sum` (`wsum2`) | 0.44 (2,331) | 124 to 150 (5.5 to 6.4 / 20 to 46) | 1.2 (12,508; 48 queries) | 184 to 217 (71 to 81 / 93 to 155) |
+| weighted three-clause `Sum` (`wsum3`) | 0.38 (2,710) | 44 to 48 (20 to 21 / 45 to 88) | 1.0 (15,830; 48 queries) | 67 to 70 (226 to 232 / 270 to 299) |
+| weighted two-clause `Max` (`wmax2`) | 0.49 (2,085) | 423 to 450 (2.0 to 2.2 / 6.0) | 1.3 (11,064; 48 queries) | 1,200 to 1,362 (9.5 to 11.7 / 22 to 25) |
+| two-clause `Max` | 289 (3.0) | 410 to 413 (2.1 / 6.6 to 7.5) | 348 (37.9) | 1,389 to 1,405 (10.4 to 10.5 / 23 to 24) |
+| three-clause `Max` | 203 (4.3) | 298 to 309 (3.0 / 7.8) | 312 (47.8) | 1,013 to 1,105 (13.5 to 14.7 / 25 to 31) |
+| two-clause `Sum` | 76 (11.5) | 92 (9.7 / 29) | 129 (123) | 133 (119 / 163) |
+| three-clause `Sum` | 39 (24.1) | 43 (22.1 / 50) | 57 (270) | 57 (270 / 384) |
+
+**Weighted queries are 115 to 920 times faster at one client and 70 to 1,030 times at 16** (the bar was 10x), with IDs and
+score bits identical. A weighted query now costs about what its plain counterpart does (the weighted sets are 100 queries
+each and not the same queries as the 500 and 200 plain ones, so their rates differ a little). Plain `Sum` is not slower (equal at 16 clients, 10 to 20
+percent faster at one). The plain `Max` is **1.4x at one client and about 4x at 16 clients**.
+
+Where the `Max` gain comes from, on the same box (candidate versus the weights-only commit `2fe3d08`, which has none of
+items 2 and 3; two passes each, 16 clients, q/s): two-clause 1,389 to 1,405 versus 493 to 524, three-clause 1,013 to 1,105
+versus 367 to 388. So the shared floors and the dropped widening are about 2.7x of it at 16 clients and 1.4x at one. (The
+weights-only commit's own gain over v0.1.70, 348 to about 500 at 16 clients, is within this box's run-to-run drift: the
+commit changes nothing for plain `Max`.) I did not separate items 2 and 3.
+
+### `Sum` outcomes on MS MARCO
+
+Counters from the candidate's server log over the six passes of each workload (`BF_TRACE_STAGES=1`; the extra printing
+makes that arm's timings unusable, so they are excluded above). One decision is taken per segment (the eight text segments
+and the WAL tail run as separate sub-queries), nine per query; the tail has no segments, so it always accepts at the
+first length, which is about 11 percent of the "first" column and removed in the second line:
+
+| Workload | accepted at first list (all 9) | grown (all 9) | fallback | per segment only: first / grown |
+| --- | ---: | ---: | ---: | ---: |
+| two-clause `Sum` | 22.9% | 77.1% | 0% | 13.2% / 86.8% |
+| three-clause `Sum` | 23.8% | 76.2% | 0% | 14.3% / 85.7% |
+| weighted two-clause `Sum` | 24.7% | 75.3% | 0% | 15.9% / 84.1% |
+| weighted three-clause `Sum` | 25.3% | 74.7% | 0% | 16.9% / 83.1% |
+
+Only about one segment decision in seven is settled by the first list (`max(64, k + offset)` rows per clause), the rest
+need one 4x growth (256 rows), and **none fell back to the full scorer** on any of the 1,900 queries per pass. The
+growth round is therefore the common case, and starting at 256 rows would save the first round for most segments (not
+tried here).
+
+### Not measured
+
+Cold reads; whether a ranged-ID segment on object storage could prove its ID order without a read (needs a manifest or
+marker field, a format change); `Max` and `Sum` under `limit.per`, nested expressions, or non-BM25 clauses (old path);
+separate gains of items 2 and 3; weights outside `1e-9..=1e9` or more than four nested (old path).
