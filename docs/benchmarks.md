@@ -18075,3 +18075,50 @@ shadowed ID, and that it equals the answer after indexing the tail.
 
 One c7gn.4xlarge on demand, 17:55 to 18:44 UTC (0.8 hours), 160 GB root volume: about $1. The instance, key pair, security group, and
 the owned S3 prefix (693 objects, 77 GB) are deleted.
+
+## Round G21: the typed ID path serves UUID IDs (3.68 times at `top_k` 100) and engines with disk staging (item 3 not attempted)
+
+**Setup:** Round G18's machine (the Apple M4, shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), but **loaded with UUID IDs**: `bench/nq/load.py --vectors-only --uuid-ids` writes
+`id` as `uuid(((row + 1) * 0x9E3779B97F4A7C15F39CC0605CEDC835) mod 2^128)` (schema `id: uuid`; 81 seconds for the load, then the automatic recluster and compaction, 17 GB of store). Release binary with production defaults, indexing off,
+graph promoted the ordinary way (`g15_promote.py`, 28 minutes). One promoted server, native driver (16 keep-alive connections), IDs only. The two arms are the same binary with a temporary switch file (a candidate only, not in the tree):
+"old" is v0.1.73's behavior (a UUID tier has no ID table, so the general path hydrates every ID from the documents), "new" is this round. Each arm is 20 seconds after one serial quality pass; order O N N O O N N O.
+
+### 1. UUIDs on the typed path
+
+The resident table is now `IdTable::Uint(Vec<u64>)` or `IdTable::Uuid(Vec<u128>)`, chosen by the first row's ID (a tier of mixed or any other kinds has no table, as before). A UUID is accepted only in its canonical form (36 lowercase hexadecimal
+characters and hyphens), because only then does it format back to the same bytes; big-endian `u128` order is the canonical text's order, so ties break as the general path breaks them. `bf_types::IdRef` (new) carries either kind through
+the graph's hits, the tail merge (`merge_tail` converts to the general path's `Id` only for the tail's heap), and `QueryResponse::write_id_rows`, which formats the 36 bytes of each winner only. The general document path also reads the table now
+(it turns a hit into a `Document` with the formatted ID), so a filtered or attribute query on a UUID namespace skips the per-row hydration of IDs as well.
+
+**Memory.** The table is 16 bytes a row: **42,903,488 bytes** on NQ (shown as `id_table_bytes` in the hot-graph status, and added to its `resident_bytes`). The graph's reservation now sets aside 16 bytes a row for it (8 before), whatever the ID kind, so the
+retained reservation of a 2.68 million-row graph rose by 21 MB (3,939,191,235 bytes held on this run).
+
+| UUID IDs, NQ, 16 clients | q/s (range of 4) | p50 / p99 (ms) | server CPU per query | recall |
+|---|---:|---|---:|---:|
+| `top_k` 10, v0.1.73 | 10,212 (10,197 to 10,216) | 1.50 / 2.78 | 720 us | 0.9601 |
+| `top_k` 10, **this round** | **16,189** (16,100 to 16,333) | 0.94 / 2.03 | 476 us | 0.9601 |
+| `top_k` 100, v0.1.73 | 2,316 (2,302 to 2,321) | 6.64 / 13.31 | 3,179 us | 0.9545 |
+| `top_k` 100, **this round** | **8,530** (8,478 to 8,565) | 1.75 / 3.74 | 977 us | 0.9545 |
+
+**1.59 times at `top_k` 10 and 3.68 times at `top_k` 100** (bar: 1.3 times at `top_k` 100). The SHA-256 of every response's rows over all 3,452 queries (IDs and distances) is identical in all eight arms of each `top_k`. UUID IDs cost v0.1.73 more than integers at
+`top_k` 100 because every one of the shortlist's rows hydrates a document to read its ID (3.2 ms of CPU a query); with the table, UUID IDs run at the integer path's speed (8,530 q/s against the integer path's 9,207 to 9,219 in G20, the difference
+being a different corpus layout and this run's recall of 0.9545).
+
+**Tests.** `typed_ids_path_serves_uuid_ids_byte_identically` writes whole response bodies of both paths for 18 `top_k` values on six queries, with no tail, with inserts that tie with base rows, and with overwrites and deletes among the top `k`, and requires equal bytes;
+`bf-types/tests/id_rows.rs` checks the UUID text against the `uuid` crate, round trips, rejects non-canonical text, and checks the order.
+
+### 2. Disk staging
+
+`query_ids` declined whenever `read_cache.staging` was set. The condition came in with the typed path in G18 (6fcb375) without a stated reason; its only effect was to leave the general path as the answer on any server that has a disk cache. The general path
+uses staging in two places: `Engine::query_inner` adopts a staged snapshot (`staged`) only when the namespace's state is not loaded yet (`seq == 0`), and it drains startup adoption (`manager.recover`) first. The typed path serves only when the state is loaded
+(`seq > 0` and fresh) and a ready, usable warm graph is in memory, so neither applies, and the staging manager never feeds the warm graph's hits. **The condition is removed.** `typed_ids_path_serves_a_staged_engine_byte_identically` builds an engine
+with a disk cache directory (so `read_cache.staging` is set), integer and UUID IDs, and requires the typed path to serve and write the general path's bytes.
+
+### Item 3 (I8MM `SMMLA` for the SQ8 dot)
+
+Not attempted, and the bar cannot be met: G20 bounded all SQ8 work at 23 percent of a `top_k` 10 query's CPU and the dot at 8 percent of the profile, so a free dot gives about 1.08 times, under the 1.15 times bar.
+
+### Notes
+
+- Cleanup: the M4 run directory (data, store, binaries) is deleted and nothing of mine is running there; about $0.5 of S3 transfer for the corpus; no EC2; no bucket writes.
+- `native_drive` reads UUID IDs back to corpus rows for its recall check (the multiplier is odd, so the mapping inverts).

@@ -16,6 +16,7 @@ import http.client
 import json
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
@@ -59,6 +60,11 @@ def post(base: str, path: str, body: bytes):
         return json.loads(data)
 
 
+def uuid_of(row: int) -> str:
+    """The deterministic UUID of a corpus row (the same function the engine's UUID tests use)."""
+    return str(uuid.UUID(int=((row + 1) * 0x9E3779B97F4A7C15F39CC0605CEDC835) % (1 << 128)))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("data", type=Path)
@@ -76,6 +82,11 @@ def main():
         default="",
         help="append this to every title, so rewritten rows differ (identical upserts are no-ops)",
     )
+    p.add_argument(
+        "--uuid-ids",
+        action="store_true",
+        help="write each ID as a UUID derived from the row number (schema id type uuid), for UUID-ID benchmarks",
+    )
     a = p.parse_args()
     path = f"/v2/namespaces/{a.namespace}"
     vecs = np.load(a.data / "corpus.f16", mmap_mode="r")
@@ -84,7 +95,9 @@ def main():
         files = [None]
     else:
         files = sorted((a.data / "raw" / "corpus").glob("*.parquet"))
-    schema = {"vector": SCHEMA["vector"]} if a.vectors_only else SCHEMA
+    schema = {"vector": SCHEMA["vector"]} if a.vectors_only else dict(SCHEMA)
+    if a.uuid_ids:
+        schema["id"] = {"type": "uuid"}
 
     def batches(f):
         if f is None:
@@ -112,7 +125,8 @@ def main():
             if n <= 0:
                 break
             v = np.asarray(vecs[row : row + n], dtype="<f4")
-            cols = {"id": list(range(row, row + n)), "vector": [base64.b64encode(x.tobytes()).decode() for x in v]}
+            ids = [uuid_of(i) for i in range(row, row + n)] if a.uuid_ids else list(range(row, row + n))
+            cols = {"id": ids, "vector": [base64.b64encode(x.tobytes()).decode() for x in v]}
             if f is not None:
                 cols["title"] = [t + a.title_suffix for t in batch.column("title").to_pylist()[:n]]
                 cols["text"] = batch.column("text").to_pylist()[:n]
