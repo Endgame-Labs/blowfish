@@ -1299,7 +1299,11 @@ async fn c35_dump(
         }
     }
     let line = serde_json::json!({"k": k, "width": width, "leaves": leaves, "cands": cands});
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
