@@ -327,16 +327,21 @@ impl Storage {
         if sizer.fixed == Some(0) {
             return;
         }
+        // The warmer never holds the store itself, only a weak reference to check that it is
+        // still alive: if it upgraded, the store's last drop could land in this task, and the
+        // caches (and their byte gauges) would be released after the owner's drop returned.
         let weak = Arc::downgrade(&self.0);
+        let backend = self.0.backend.clone();
+        let activity = self.0.activity.clone();
+        let path = Path::from(format!("{}/.warm", self.0.prefix));
         tokio::spawn(async move {
             let mut warmed = 0usize;
             let mut last_refresh: Option<std::time::Instant> = None;
             loop {
-                let Some(inner) = weak.upgrade() else { break };
-                let path = Path::from(format!("{}/.warm", inner.prefix));
-                let backend = inner.backend.clone();
-                let peak = inner.activity.take_peak();
-                drop(inner);
+                if weak.strong_count() == 0 {
+                    break;
+                }
+                let peak = activity.take_peak();
                 let now = std::time::Instant::now();
                 let target = sizer.observe(peak, now);
                 let due = last_refresh.is_none_or(|t| now.duration_since(t) >= WARM_REFRESH);
