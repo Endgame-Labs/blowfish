@@ -1233,6 +1233,77 @@ struct Probed {
     exact: bool,
 }
 
+/// Whether `BF_C35_DUMP` names a file for the Round C35 candidate dump (read once).
+fn c35_dump_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BF_C35_DUMP").is_some())
+}
+
+/// Round C35 diagnostic: append one JSON line for this query holding every probed leaf (in
+/// plan order with its center distance and byte ranges) and every candidate of an unbounded
+/// scan with its estimate, error bound, and exact distance. Scans run without the running
+/// bound under this flag, so the offline simulation sees every row of every probed leaf.
+async fn c35_dump(
+    results: &[(Probed, Found)],
+    chosen: &BTreeMap<usize, Vec<usize>>,
+    distances: &[f32],
+    entries: &[bf_vector::DirEntry],
+    vector: &[f32],
+    k: usize,
+    width: usize,
+) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("BF_C35_DUMP") else {
+        return;
+    };
+    let mut leaves = Vec::new();
+    for (&seg, cs) in chosen {
+        for &n in cs {
+            let e = &entries[n];
+            leaves.push(serde_json::json!([
+                seg,
+                e.cluster,
+                distances[n],
+                e.rows,
+                e.blob_range().end - e.blob_range().start,
+                e.codes_range().end - e.codes_range().start,
+                e.vectors_range().start,
+                e.vectors_range().end - e.vectors_range().start,
+            ]));
+        }
+    }
+    let mut cands = Vec::new();
+    for (probed, (_, found)) in results {
+        if found.is_empty() {
+            continue;
+        }
+        let locations: Vec<(u32, u32)> = found.iter().map(|c| (c.cluster, c.ordinal)).collect();
+        let Ok(exact) = probed
+            .index
+            .rerank_candidates(vector, found.len(), locations)
+            .await
+        else {
+            continue;
+        };
+        let exact: std::collections::HashMap<u32, f32> = exact.into_iter().collect();
+        for c in found {
+            cands.push(serde_json::json!([
+                probed.segment,
+                c.cluster,
+                c.ordinal,
+                c.row,
+                c.distance,
+                c.error,
+                exact.get(&c.row)
+            ]));
+        }
+    }
+    let line = serde_json::json!({"k": k, "width": width, "leaves": leaves, "cands": cands});
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// Answer an unfiltered ANN query from the directory. The caller has checked that the
 /// directory covers `state.segments` and that no tail ID shadows a segment row. Segments marked
 /// in `skip` (rows a recluster tier answers for) are left out entirely: of the probe plan, its
@@ -1655,7 +1726,7 @@ pub(crate) async fn search(
             .ok_or_else(|| segment::index_error("segment lost its ANN index"))?;
         let reader = Reader::new(store, &file);
         let object_key = file.key.clone();
-        let memo_hit = layout == Layout::Slabs && !exact;
+        let memo_hit = layout == Layout::Slabs && !exact && !c35_dump_on();
         let frag_file = state.segments[i]
             .files
             .values()
@@ -1788,7 +1859,7 @@ pub(crate) async fn search(
                             &wanted,
                             codes,
                             live.as_deref(),
-                            k,
+                            if c35_dump_on() { 0 } else { k },
                             f32::from_bits(scan_upper.load(std::sync::atomic::Ordering::Relaxed)),
                         )
                         .map_err(segment::index_error)?;
@@ -1994,6 +2065,9 @@ pub(crate) async fn search(
         run_parallel(tasks).await?
     };
     crate::ann::stage(t0, "scan");
+    if c35_dump_on() && !filtered {
+        c35_dump(&results, &chosen, &distances, entries, &vector, k, width).await;
+    }
     let mut winners: Vec<(f32, usize, u32)> = Vec::new(); // (exact distance, segment, row)
     let mut pool: Vec<(usize, Candidate)> = Vec::new();
     let mut indexes: BTreeMap<usize, Arc<Index<Reader>>> = BTreeMap::new();
