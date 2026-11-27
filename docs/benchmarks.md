@@ -17154,3 +17154,102 @@ Qdrant's collection came up green with all 2,681,468 vectors indexed in two segm
 - **Not measured:** other hosts, remote object stores (the 2 ms rule is the only protection there; its test is a unit test), string-ID namespaces, filtered queries, and a mixed `top_k` load.
 
 Costs: no EC2 and no bucket writes. The 26.8 GB NQ fixture was copied to the M4 through presigned URLs (about $2.4 of S3 transfer) and deleted with the run directory, with the Qdrant store.
+
+## Round G18: a typed ID-only path from graph hits to response bytes, top_k 10 is 1.41 times faster at 16 clients with byte-identical responses
+
+**Setup:** the Round G17 setup on the Apple M4 (shared Mac mini): full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture, 16 client processes with one keep-alive connection each,
+IDs only (`include_attributes: false`), release binaries with production defaults, and the graph promoted the ordinary way (`g15_promote.py`, 18 minutes both times). The client is `g18_drive.py` (new in this round; request bodies encoded
+before the clock starts, one serial quality pass over all 3,452 queries that gives recall and a SHA-256 of every response's rows, then a timed pass of 20 seconds). The two arms ran on **one promoted server**: "off" is the general path
+and "on" is the typed path, selected by a temporary switch file (read every 500 ms, in a candidate binary only, not in the tree). Order: on, off, off, on, on, off, off, on. Qdrant is the official 1.20.0 macOS arm64 binary (f16 in RAM, M=16, ef_construct=100,
+green with all 2,681,468 vectors indexed in two segments), driven by the same client.
+
+### Profile: v0.1.66 (macOS `sample`, 1 ms, 15 s, 16 clients, release with frame pointers, idle threads excluded)
+
+Shares of active samples, `top_k` 10 | `top_k` 100. The sampler slows the server (8,332 and 3,358 q/s sampled, against 12,650 and 5,300 unsampled).
+
+| Share of active samples | `top_k` 10 | `top_k` 100 |
+|---|---:|---:|
+| graph walk (`candidates_with_norms`; the SQ8 `dot_neon` is 8.0 and 8.0) | 38.2 | 39.7 |
+| rerank (`rerank_with_norms`, row CRC, memmove); `search_entry` in all | about 16 (54.8) | 16.4 (63.3) |
+| HTTP handler outside the engine (body collect, `serde_json` parse of the query, response serialization) | 8.7 | about 5.5 |
+| hyper and axum above the handler (`writev` 2.5, `recvfrom` 1.7, connection task) | about 10 | about 3 |
+| `query_inner` outside the search (snapshot join, `Cache::observe`, recall coin) | 11.6, of which 6.8 is an artifact (below) | about 9, 7.2 artifact |
+| result assembly after the graph (`execute_inner` minus `prepare`: `query::execute` run twice, `Document` and `BTreeMap` rows, `serde_json::Map` rebuild) | 4.1 | about 7 |
+| `from_tiers` and `prepare` bookkeeping outside `search_entry` (`BTreeMap<Id, ...>` merges, `merge_tail`, placement) | 5.0 | about 6 |
+| per-query global `Cache.entries` mutex (`serves` twice, `available` twice, `observe`): `psynch_mutexwait` | 2.0 | 4.7 |
+| jemalloc (`malloc`, `sdallocx`, mutex slow path, `malloc_init_hard`) | about 6 | about 6 |
+
+The 6.8 and 7.2 percent in `swtch_pri` under `Storage::head` (the WAL-next probe's `spawn_blocking` spinning on tokio's blocking-pool mutex) is the sampler's doing: it stalls the server, so Round G17's probe sharing turns itself
+off by its 2 ms rule. The clean runs do not show it. Top self frames at `top_k` 10 (percent of active samples): `candidates_with_norms` navigation 25.6, `swtch_pri` 10.7 (the artifact), `dot_neon` 8.0, `memmove` 5.1,
+`serde_json parse_number` 3.4, `rerank_with_norms` 3.3, `writev` 2.5, CRC 2.2, the `bf_types` AST `Element` deserialize 2.1, jemalloc `malloc` 2.1, `psynch_mutexwait` 2.0, `recvfrom` 1.7, RaBitQ transform 1.3, `sdallocx` 1.2,
+`CosineQuery::distance` 1.1. Top inclusive frames: the axum `query` handler 87.1, `Engine::query` 78.4, `query_inner` 77.2, `search_snapshot` 65.6, `indexed::execute_inner` 63.9, `prepare` 59.8, `from_tiers` 57.5,
+`from_slabs` 55.8, `search_entry` 54.8, `candidates_with_norms` 38.2. At `top_k` 100: handler 94.0, `Engine::query` 88.9, `search_snapshot` 78.3, `execute_inner` 76.8, `prepare` 69.8, `from_tiers` 67.3, `search_entry` 63.3,
+`candidates_with_norms` 39.7, `rerank_with_norms` 16.4. Items outside the graph that are over 5 percent on their own, so the round went ahead: HTTP parse and response, result assembly with the tier bookkeeping, and the cache mutex with allocation.
+
+### What changed
+
+1. **`Engine::query_ids`** (`bf-engine` `ids_path.rs`) answers a plain ID-only approximate vector query from the warm graph's `(row, distance)` hits straight to `(ID, distance)` pairs. It takes a query only when
+   every condition of the general path is plainly met: a single `rank_by` ANN vector (not `exact`), `top_k` 1 to 100, no `limit`, `offset`, filters, attributes (`include_attributes` absent or `false`), computed attributes, aggregates,
+   groups, subqueries, or `rerank_by`, a strong consistency level, float encoding, an empty unindexed tail with nothing shadowed, one recluster tier covering every segment, a ready and usable graph with its ID table built, and a
+   reactor thread. Anything else, and any decline (a row without a live home, fewer than `k` live rows, an ID on two rows, a changed snapshot), returns `None` and the general path runs, which produces the same answer by the long way.
+   The WAL-next check runs concurrently with the search, as before, and the search counts only if the snapshot did not move.
+2. **No `Document` or `BTreeMap` on the way**, no second `query::execute` (the general path validates on an empty state, then evaluates again), no request clone (the handler used to clone the request, with its 1,024 floats, and `search_snapshot`
+   cloned it again), and no `Uuid`. `Cache::observe` and the recall sampler still run for every query; the sampler clones the request only when it samples.
+3. **The response is written straight into one buffer** (`QueryResponse::write_id_rows` in `bf-types`): `{"rows":[{"$dist":d,"id":n},...],"performance":{...},"billing":{...}}` with numbers written by `serde_json`, the same bytes as
+   serializing the general response. `last_included_write_at` is formatted once per timestamp per thread.
+4. Refactors that keep one copy of the logic: `warm_graph::ranked_rows` (walk plus exact rerank, shared by the document and typed paths), `typed_ids` (the ID table lookup both paths use), `mask_eligible_in`,
+   `Placement::covers_all` (computed once per placement), and `Engine::sample_recall`.
+
+### Results
+
+Same server, 16 clients, 4 runs per arm (median; range in parentheses). CPU per query is the server's process CPU over the timed pass divided by its queries.
+
+| | q/s | p50 / p99 (ms) | server CPU per query | recall (both arms) |
+|---|---:|---|---:|---:|
+| `top_k` 10, off (general path) | 12,271 (12,238 to 12,444) | 1.22 / 2.68 | 602 us | 0.9485 |
+| `top_k` 10, on | **17,266** (17,250 to 17,309) | **0.87 / 1.85** | 393 us | 0.9485 |
+| `top_k` 100, off | 4,994 (4,990 to 5,002) | 3.01 / 6.61 | 1,766 us | 0.9544 |
+| `top_k` 100, on | **8,088** (8,060 to 8,137) | **1.84 / 4.05** | 985 us | 0.9544 |
+
+**`top_k` 10 is 1.41 times the general path's q/s (the bar was 1.15 times) and `top_k` 100 is 1.62 times,** with p99 31 and 39 percent lower. The responses are identical: the SHA-256 of every response's rows (IDs and distances, all 3,452 queries)
+is the same in every on and off run, at both `top_k`. The unit test below compares whole bodies. A separate v0.1.66 server (its own graph, the Round G17 measurement) read 12,633 and 12,678 q/s at `top_k` 10 and 5,308 and 5,296 at `top_k` 100,
+in line with the off arm. Server CPU fell 35 and 44 percent, and q/s rose more than that implies at `top_k` 10 because the sixteen Python clients share the ten cores.
+
+### Against Qdrant 1.20.0 (same client, matched recall by linear interpolation between `ef` points; three 20-second passes per point)
+
+| Engine, `top_k` 10 | recall@10 | q/s | p50 | p99 (ms) |
+|---|---:|---:|---:|---:|
+| **blowfish, this round** | **0.9485** | **17,266** | **0.87** | **1.85** |
+| blowfish, general path (same server) | 0.9485 | 12,271 | 1.22 | 2.68 |
+| Qdrant ef 64 | 0.9462 | 8,824 | 1.76 | 3.39 |
+| Qdrant ef 80 | 0.9542 | 7,899 | 1.97 | 3.84 |
+| Qdrant ef 96 | 0.9585 | 7,126 | 2.17 | 4.37 |
+| **Qdrant interpolated to 0.9485** | 0.9485 | **about 8,570** | 1.82 | 3.5 |
+
+| Engine, `top_k` 100 | recall@100 | q/s | p50 | p99 (ms) |
+|---|---:|---:|---:|---:|
+| **blowfish, this round** | **0.9544** | **8,088** | **1.84** | **4.05** |
+| blowfish, general path (same server) | 0.9544 | 4,994 | 3.01 | 6.61 |
+| Qdrant ef 192 | 0.9370 | 4,528 | 2.93 | 14.53 |
+| Qdrant ef 256 | 0.9516 | 3,741 | 3.54 | 16.92 |
+| Qdrant ef 320 | 0.9608 | 3,203 | 4.14 | 19.94 |
+| **Qdrant interpolated to 0.9544** | 0.9544 | **about 3,580** | 3.45 | 17.8 |
+
+At matched recall blowfish serves **2.01 times** Qdrant's q/s at `top_k` 10 (Round G17: 1.39 times) with p99 47 percent lower, and **2.26 times** at `top_k` 100 (G17: 1.53 times) with p99 77 percent lower.
+Qdrant's default `hnsw_ef` was not run (the driver passes `hnsw_ef`, and 0 is invalid), so there is no default-ef row. Qdrant's recall at a given `ef` matches Round G17's to within 0.001 to 0.002 at `top_k` 10 and is identical at `top_k` 100.
+
+### Tests
+
+- `warm_graph::tests::typed_ids_path_is_byte_identical_to_the_general_path`: a 2,500-row namespace with a promoted graph (50 rows are copies of others, so equal distances exercise the tie order), six queries at every `top_k` from 1 to 100 (612 queries) plus
+  `include_attributes: false`: the typed body equals `serde_json::to_vec` of `Engine::query`'s response byte for byte, with the two timing fields equalized. 15 request shapes (`top_k` 0 and 101, no `top_k`, `offset`, named or all attributes,
+  filters, eventual consistency, kNN, a zero vector, wrong dimensions, order-by, base64, `limit`, a distance metric) must decline, a wrong-dimension error comes from the general path, an unknown namespace and a non-reactor caller decline.
+- `bf-types/tests/id_rows.rs`: the writer against `serde_json` for 0 to 11 rows with signed zero, `f32` limits, exponents, and `u64::MAX`, and a non-finite distance writes nothing.
+- Both pass on the M4 (aarch64) as well, and `cargo clippy --workspace --all-targets -- -D warnings` is clean there.
+
+### Notes
+
+- **The "off" arm is the general path in the candidate binary, not the v0.1.66 binary,** and the switch costs one relaxed load. The measured binary is the committed code plus that switch; the switch is not in the tree.
+- The typed path declines to the general path when the namespace has an unindexed tail, deleted rows (a shadowed set), more than one recluster tier, or a graph without its ID table, so such namespaces keep today's speed, not the new one. Widening it to a tail merge is the obvious next step.
+- Not measured: other hosts, remote object stores, string-ID namespaces, filtered queries, attributes requested, a mixed `top_k` load. Each point is one server and 20-second runs on a shared machine.
+
+Costs: no EC2 and no bucket writes. The 26.8 GB NQ fixture was copied to the M4 through presigned URLs (about $2.4 of S3 transfer) and deleted with the run directory, with the Qdrant store.

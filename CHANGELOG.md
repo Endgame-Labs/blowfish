@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **Plain ID-only vector queries skip the document path, 41 percent more `top_k` 10 queries at 16 clients and 62 percent more at `top_k` 100, with byte-identical responses and the lead over Qdrant at 2.0x:** A profile of v0.1.66 on the M4 showed an ID-only query that the warm graph serves still built `Document` and `BTreeMap` rows, ran the general result evaluator twice, cloned the request (with its 1,024 floats) twice, and serialized through `serde_json::Value`. A new typed path (`Engine::query_ids`) takes the graph's `(row, distance)` hits to `(ID, distance)` pairs and writes the response body straight into one buffer. It applies only when every condition of the general path is plainly met (a single approximate vector rank, `top_k` 1 to 100, no filters or attributes, an empty unindexed tail, one tier, a ready graph with its ID table); anything else takes the general path as before. On one promoted server with the path switched on and off, `top_k` 10 went from 12,271 to 17,266 q/s (p99 2.68 to 1.85 ms) and `top_k` 100 from 4,994 to 8,088 q/s (p99 6.61 to 4.05 ms); server CPU per query fell from 602 to 393 us and from 1,766 to 985 us. The rows of all 3,452 queries are identical, and a test compares whole response bodies for every `top_k` from 1 to 100. At matched recall that is 2.01x Qdrant 1.20.0's q/s at `top_k` 10 and 2.26x at `top_k` 100. See [docs/benchmarks.md](docs/benchmarks.md), Round G18.
+
 ## [0.1.66] - 2026-11-27
 
 ### Changed
