@@ -1763,8 +1763,15 @@ pub(crate) async fn filter_live(
     if let Some(rows) = read_cache::predicate(&key) {
         return Ok(rows);
     }
+    let trace = crate::ann::trace_stages().then(std::time::Instant::now);
     let live = live(store, segment).await?;
+    if let Some(trace) = trace {
+        crate::ann::task_stage(trace, "filter_live_loaded", &segment.id);
+    }
     let rows = filter_rows(store, segment, f, schema, &live).await?;
+    if let Some(trace) = trace {
+        crate::ann::task_stage(trace, "filter_evaluated", &segment.id);
+    }
     Ok(read_cache::insert_predicate(&key, rows))
 }
 

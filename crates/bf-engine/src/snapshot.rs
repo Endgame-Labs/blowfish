@@ -209,7 +209,9 @@ impl OpenHint {
                 let positive = &positive;
                 let rows = futures::future::try_join_all(segments.iter().flat_map(|seg| {
                     self.filters.iter().map(move |f| async move {
+                        crate::ann::task_stage(trace_t0, "warm_filter_start", &seg.id);
                         let result = segment::filter_live(store, seg, f, schema).await;
+                        crate::ann::task_stage(trace_t0, "warm_filter_done", &seg.id);
                         crate::ann::stage(trace_t0, "warm_filter");
                         if result.as_ref().is_ok_and(|rows| !rows.is_empty()) {
                             positive.send_if_modified(|present| {
@@ -225,6 +227,7 @@ impl OpenHint {
                 for rows in rows {
                     matching |= !rows.is_empty();
                 }
+                crate::ann::stage(trace_t0, "warm_predicates_done");
                 Ok::<_, ApiError>(matching)
             }
             .boxed()
@@ -251,13 +254,19 @@ impl OpenHint {
                         async move {
                             if filtered || scan.is_none() {
                                 let (dir, _) = tokio::try_join!(
-                                    crate::ann_dir::load(store, &set.dir, None),
+                                    async {
+                                        let dir =
+                                            crate::ann_dir::load(store, &set.dir, None).await?;
+                                        crate::ann::stage(trace_t0, "warm_slab_directory_loaded");
+                                        Ok::<_, ApiError>(dir)
+                                    },
                                     async {
                                         if filtered {
                                             // Translation needs these immutable maps too. Open
                                             // them alongside the directory and predicates.
                                             crate::lineage::place(store, segments, lineage, set)
                                                 .await?;
+                                            crate::ann::stage(trace_t0, "warm_slab_lineage_done");
                                         }
                                         Ok::<_, ApiError>(())
                                     }
@@ -275,6 +284,7 @@ impl OpenHint {
                                     false
                                 };
                                 if matching {
+                                    crate::ann::stage(trace_t0, "warm_slab_memberships_start");
                                     let members = crate::ann_dir::memberships(
                                         store, &set.slabs, &dir, attribute,
                                     )
@@ -357,6 +367,7 @@ impl OpenHint {
                                     attribute,
                                 )
                                 .await?;
+                                crate::ann::stage(trace_t0, "warm_segment_memberships_done");
                             } else if let Some((_, vector, k)) = scan {
                                 crate::ann_dir::prefetch_scan(
                                     store, segments, &dir, attribute, layout, vector, *k, config,

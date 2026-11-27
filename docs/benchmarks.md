@@ -16343,3 +16343,55 @@ The bandwidth finding and the rejected experiments remain useful evidence, but
 C29 does not claim the requested 1.3× title improvement or a runtime performance
 pass. The complete full-format prototype remains on local branch
 `c29-global-rows` at `cc6b7a7`, for a later investigation.
+
+## Round C30: membership construction and the cold warm phase
+
+Measured 2026-11-27 on one on-demand c7gn.4xlarge in us-west-2, against
+v0.1.60 (`df449f9`). A private copy of the retained C5 checkpoint was repaired
+by the baseline writer, reaching 61 source segments and 55 published row maps.
+The retained fixture was never written. Timing uses read-only servers, CPUs
+0–7 for server and client, eight Rayon workers, 64 probes, strong consistency,
+top ten, and IDs only. Cache geometry follows C29: 8 GiB raw, 512 MiB decoded,
+zero disk, 256 KiB blocks, 32-block coalescing, and fetch concurrency 512.
+Release builds target `neoverse-v1`, retain frame pointers for profiling, and
+use Clang 19 with Clang 22/compiler-rt linking. Builds and timing do not overlap.
+
+### Initial control and profile
+
+Forty cache-cold ID pairs use byte-identical baseline binaries at the two arm
+paths, with one untimed q199 warm-up per process and alternating AB/BA order.
+P50 is 390.905 versus 389.956 ms, candidate/control ratio 0.99757 (paired-bootstrap
+95% interval 0.96912–1.01727; 50,000 resamples, seed 30). Every pair retains
+identical ordered IDs and f64 distance bits, with zero membership rebuilds and
+zero local reads. The initial control does not show an ordering or binary-path bias.
+
+Each following profile samples twelve cold queries and the untimed warm-up at
+499 Hz, using hardware cycles and frame-pointer call stacks. These diagnostic
+queries are separate from acceptance measurements. No perf samples were lost.
+The construction share counts each sampled cycle once when its stack contains
+Roaring insertion or sorted append, including inlined construction work.
+
+| Workload | Sampled cycles, billions | Roaring construction, % |
+| --- | ---: | ---: |
+| ID < 1000 | 27.922 | 24.351 |
+| Title initial = z | 133.850 | 5.179 |
+| Text length >= 300 | 59.329 | 12.091 |
+| Unfiltered | 9.705 | 0.184 |
+
+Every sampled ID and title insertion stack comes through
+`slab_rows::load` → `Membership::decode_sparse` → `from_sparse_rows` → generic
+Roaring collection → `Store::insert`, mostly on the bounded blocking workers.
+`Store::insert` alone has 22.841% self cycles in ID. Length spends 11.567% in
+that membership path and 0.524% in already sorted tier-mask builders. The tiny
+unfiltered construction stack comes through `ann::from_slabs`. The ID and
+length shares exceed the 10% stop threshold, so the bulk-build experiment proceeds.
+
+The initial ID control locates the snapshot's critical path in the predicate
+wave: last filter, memberships ready, and snapshot done have p50 endpoints
+245.541, 184.829, and 245.553 ms after warming starts. Profiled length shows the
+same ordering: 256.636, 173.485, and 256.655 ms. An earlier membership endpoint
+therefore does not establish an earlier snapshot. Additional trace markers name
+each filter task, separate its live-row load from evaluation, distinguish lineage
+from directory completion, and separate map fetch, decode dispatch, decode, and
+join completion. They use the existing `BF_TRACE_STAGES` diagnostics and add no
+setting or query mode. The historical C29 delay is not yet attributed to a cause.
