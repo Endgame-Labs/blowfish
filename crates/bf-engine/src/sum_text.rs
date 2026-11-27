@@ -63,6 +63,8 @@ pub(crate) fn record(round: Option<usize>) {
 const MAX_LIST: usize = 4096;
 /// Smallest per-clause list.
 const MIN_LIST: usize = 64;
+/// Most rows a `Decay` search scores exactly per segment while it looks for rows matching no text.
+const MAX_WINDOW: usize = 1 << 18;
 
 /// Weights outside this range could overflow or underflow the scaled scores, and then two
 /// different BM25 scores could map to one value, so such clauses keep the full scorer.
@@ -212,6 +214,12 @@ pub(crate) enum Expr {
         exponent: f64,
         expr: Box<Expr>,
     },
+    /// `Decay`: non-increasing in its child, so only the root may be one (see `Shape::decreasing`).
+    Decay {
+        midpoint: f64,
+        exponent: f64,
+        expr: Box<Expr>,
+    },
 }
 
 /// A term with no BM25 whose value depends on the row (attributes), with a static upper bound.
@@ -230,6 +238,9 @@ pub(crate) struct Shape<'a> {
     pub docs: Vec<DocTerm<'a>>,
     /// Text clauses, in `text_clauses` order.
     pub texts: usize,
+    /// The root is a `Decay` of an expression over text alone: the best rows are the ones that
+    /// match least, so the rows that match no text win and the bound-and-list search does not apply.
+    pub decreasing: bool,
 }
 
 fn has_text(x: &RankBy) -> bool {
@@ -369,12 +380,30 @@ pub(crate) fn shape_of(rank: Option<&RankBy>) -> Option<Shape<'_>> {
         bonuses: vec![],
         docs: vec![],
     };
-    let expr = build.expr(rank)?;
+    let mut decreasing = false;
+    let expr = match rank {
+        RankBy::Decay { expr, params } => {
+            let (midpoint, exponent) = bounded_params(params)?;
+            let inner = build.expr(expr)?;
+            // Bonuses and row-wise terms make rows that match no text differ from each other.
+            if !build.bonuses.is_empty() || !build.docs.is_empty() {
+                return None;
+            }
+            decreasing = true;
+            Expr::Decay {
+                midpoint,
+                exponent,
+                expr: Box::new(inner),
+            }
+        }
+        _ => build.expr(rank)?,
+    };
     (build.texts > 0).then_some(Shape {
         expr,
         bonuses: build.bonuses,
         docs: build.docs,
         texts: build.texts,
+        decreasing,
     })
 }
 
@@ -384,6 +413,8 @@ pub(crate) struct SumPlan<'a> {
     pub bonuses: Vec<Bonus<'a>>,
     pub docs: Vec<DocTerm<'a>>,
     pub expr: Expr,
+    /// See `Shape::decreasing`.
+    pub decreasing: bool,
 }
 
 impl SumPlan<'_> {
@@ -412,6 +443,14 @@ impl SumPlan<'_> {
                     let x = go(expr, t, b, d).max(0.0);
                     let ratio = 1.0 / (1.0 + (x / midpoint).powf(*exponent));
                     1.0 - ratio
+                }
+                Expr::Decay {
+                    midpoint,
+                    exponent,
+                    expr,
+                } => {
+                    let x = go(expr, t, b, d).max(0.0);
+                    1.0 / (1.0 + (x / midpoint).powf(*exponent))
                 }
             }
         }
@@ -468,7 +507,7 @@ pub(crate) async fn open(
             .map(|b| segment::filter_live(store, seg, b.filter, &state.schema)),
     );
     let ordered = async {
-        if plan.bonuses.is_empty() {
+        if plan.bonuses.is_empty() && !plan.decreasing {
             Ok(false)
         } else {
             segment::ids(store, seg).await.map(|_| true)
@@ -541,7 +580,12 @@ impl SegmentSum {
             exhaustive: true,
         };
         for class in &self.classes {
-            let Some(c) = self.class_candidates(state, plan, class, n, k).await? else {
+            let c = if plan.decreasing {
+                self.least_matching(plan, class, k).await?
+            } else {
+                self.class_candidates(state, plan, class, n, k).await?
+            };
+            let Some(c) = c else {
                 return Ok(None);
             };
             out.rows.extend(c.rows);
@@ -637,6 +681,71 @@ impl SegmentSum {
             bound,
             exhaustive,
         }))
+    }
+
+    /// A `Decay` of text: every row that matches no text totals the same maximum, so the answer is
+    /// the first `k` rows (in ID order) among those, plus any matching row that ties or beats
+    /// them. Scores the first `w` allowed rows exactly, growing `w` until `k` of them match no
+    /// text (or they are all the allowed rows), and keeps the best `k`. Rows past the window
+    /// total no more than the unmatched ones in it, which have lower IDs. `None` when row order
+    /// is not ID order here, or the window would grow past `MAX_WINDOW`.
+    async fn least_matching(
+        &self,
+        plan: &SumPlan<'_>,
+        class: &Class,
+        k: usize,
+    ) -> Result<Option<Candidates>, ApiError> {
+        if !self.id_ordered {
+            return Ok(None);
+        }
+        let allowed = &class.rows;
+        let mut w = (k * 4).max(MIN_LIST);
+        loop {
+            let window: RoaringBitmap = allowed.iter().take(w).collect();
+            let all = window.len() == allowed.len();
+            let mut exact: Vec<HashMap<u32, f32>> = Vec::with_capacity(plan.clauses.len());
+            for (clause, reader) in plan.clauses.iter().zip(&self.readers) {
+                let hits = reader
+                    .search_prefetched(
+                        &clause.query,
+                        clause.stats,
+                        &clause.cfg,
+                        window.len() as usize,
+                        Some(&window),
+                    )
+                    .await
+                    .map_err(segment::index_error)?;
+                exact.push(hits.into_iter().map(|h| (h.row, h.score)).collect());
+            }
+            let mut rows: Vec<(u32, f64)> = window
+                .iter()
+                .map(|row| {
+                    let t = plan.total(
+                        &|i| f64::from(exact[i].get(&row).copied().unwrap_or(0.0)),
+                        &class.bonus,
+                        &|_| 0.0,
+                    );
+                    (row, t)
+                })
+                .collect();
+            let unmatched = window
+                .iter()
+                .filter(|row| exact.iter().all(|e| !e.contains_key(row)))
+                .count();
+            if all || unmatched >= k {
+                rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                rows.truncate(k);
+                return Ok(Some(Candidates {
+                    rows,
+                    bound: 0.0,
+                    exhaustive: true,
+                }));
+            }
+            w *= 4;
+            if w > MAX_WINDOW {
+                return Ok(None);
+            }
+        }
     }
 
     /// Each row's row-wise terms, evaluated exactly as the full scorer would on the row's document.

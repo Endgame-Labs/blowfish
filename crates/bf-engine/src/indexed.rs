@@ -1259,6 +1259,7 @@ fn sum_clauses<'a>(
             .collect(),
         docs: shape.docs,
         expr: shape.expr,
+        decreasing: shape.decreasing,
     };
     for clause in clauses {
         let RankBy::Bm25 {

@@ -3,8 +3,6 @@
 //! lists when a strict bound proves them. These tests hold every shape to the full-scoring
 //! answer (`query_exhaustive`, scores included) across segments, a WAL tail with overwrites and
 //! deletes, a reindex, filters, and offsets, on a tie-heavy corpus and a varied one.
-use bf_engine::Engine;
-use serde_json::json;
 #[path = "common/shapes.rs"]
 mod common;
 use common::*;

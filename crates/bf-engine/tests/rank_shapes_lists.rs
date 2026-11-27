@@ -24,6 +24,10 @@ async fn bounded_shapes_are_accepted_from_lists() {
             "recency+popularity",
             "recency+bonus",
             "bonus+const",
+            "decay of text",
+            "decay small midpoint",
+            "decay tiny midpoint",
+            "decay of sum",
         ];
         if !accepted.contains(&name) {
             continue;
