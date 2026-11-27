@@ -290,3 +290,6 @@ S3 until the run is cleaned up.
     builds a segment ANN index (Round CS1). Segment row caps stay as they are: fewer, larger segments were measured
     1.31 times slower on cold ID filters, because the cost is the depth of each segment's ID seek, not the number
     of segments.
+32. 2026-11-27: The typed ID-only query path serves UUID IDs (a 16-byte resident table, canonical lowercase UUIDs only)
+    as well as integers, and no longer declines when disk staging is configured (Round G21: 3.68 times at `top_k` 100 on
+    NQ with UUID IDs, byte-identical responses). Strings that are not canonical UUIDs still take the general path.
