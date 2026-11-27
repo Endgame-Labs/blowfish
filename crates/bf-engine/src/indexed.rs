@@ -633,6 +633,7 @@ fn merge_tail(
             offer(&mut heap, id, *score, false, k);
         }
     }
+    let scorer = crate::tail::Scorer::new(state.metric, vector);
     let score = |doc: &std::sync::Arc<Document>,
                  key: &std::sync::Arc<str>|
      -> Result<Option<f64>, ApiError> {
@@ -642,7 +643,7 @@ fn merge_tail(
                     Some(context) => context.cache.tail_vectors.get(doc, key, admit)?,
                     None => crate::tail::Values::Transient(decode_vector(v)?),
                 };
-                Ok(query::distance(values.as_ref(), vector, state.metric))
+                Ok(scorer.distance(&values))
             })
             .transpose()
     };

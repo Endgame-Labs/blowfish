@@ -57,7 +57,10 @@ impl Metric {
         }
     }
 
-    pub(crate) fn distance_unchecked(self, a: &[f32], b: &[f32]) -> f32 {
+    /// Exactly [`Metric::distance`] without its validation pass. The caller guarantees that both
+    /// vectors are nonempty, finite, and of equal length (for example, because it validated them
+    /// once when it cached them).
+    pub fn distance_unchecked(self, a: &[f32], b: &[f32]) -> f32 {
         match self {
             Self::EuclideanSquared => l2_squared_f32(a, b),
             Self::CosineDistance => {
@@ -108,7 +111,9 @@ impl<'a> CosineQuery<'a> {
     pub(crate) fn vector(&self) -> &[f32] {
         self.vector
     }
-    pub(crate) fn distance(&self, vector: &[f32], norm: CosineNorm) -> f32 {
+    /// Cosine distance to one candidate whose squared norm was computed once with
+    /// [`CosineNorm::new`]. Bit-identical to [`Metric::distance`] on the same two vectors.
+    pub fn distance(&self, vector: &[f32], norm: CosineNorm) -> f32 {
         let (aa, bb, ab) = (
             self.norm.0 as f64,
             norm.0 as f64,

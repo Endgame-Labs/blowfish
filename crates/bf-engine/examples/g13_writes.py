@@ -35,7 +35,7 @@ WRITE_RATE = 50
 data = run / "fixture/data"
 (run / "tmp").mkdir(exist_ok=True)
 (run / "server.toml").write_text("\n".join([
-    f'listen = "127.0.0.1:{PORT}"', "require_auth = false", "[engine]", "indexing = false",
+    f'listen = "127.0.0.1:{PORT}"', "require_auth = false", "[engine]", f"indexing = {'true' if os.environ.get('T1_INDEXING') else 'false'}",
     "ann_nprobe = 64", "[storage]", f'url = "{(run / "store").as_uri()}"', "[storage.cache]",
     f"memory_bytes = {4 * 2**30}", "disk_bytes = 0", "block_size = 4000",
     "max_coalesce_blocks = 512", "fetch_concurrency = 512"]) + "\n")
@@ -58,6 +58,13 @@ def get(path):
 
 def status():
     return json.loads(get("/_blowfish/v1/status"))["hot_graphs"].get("nq", {"graphs": []})
+
+
+def tail_rows():
+    try:
+        return json.loads(get("/v2/namespaces/nq/metadata")).get("index", {}).get("unindexed_rows")
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def client(index, k, bodies, truth, stop_at, out):
@@ -122,6 +129,13 @@ def phase(k, writes, queries, truth, corpus, perf_seconds=0):
         time.sleep(1)
     t0 = time.monotonic()
     stop_at = t0 + seconds
+    tails = []
+
+    def sample():
+        while time.monotonic() < stop_at:
+            tails.append((round(time.monotonic() - t0), tail_rows()))
+            time.sleep(5)
+    threading.Thread(target=sample, daemon=True).start()
     if perf_seconds and writes:
         # G13_PERF: profile the server in the middle of the phase (diagnostics only).
         threading.Timer(seconds / 3, lambda: subprocess.run(
@@ -143,7 +157,7 @@ def phase(k, writes, queries, truth, corpus, perf_seconds=0):
     out = {"k": k, "writes": writes, "queries": n, "qps": n / elapsed,
            "recall": sum(r[1] for r in res) / (n * k), "p50_ms": float(lat[len(lat) // 2] * 1e3),
            "p99_ms": float(lat[int(len(lat) * .99)] * 1e3),
-           "graph_answers": s["answered"] - before,
+           "tail_rows": tails, "graph_answers": s["answered"] - before,
            "graph_share": (s["answered"] - before) / n,
            "usable": bool(s["graphs"] and s["graphs"][0]["calibration"] and s["graphs"][0]["calibration"]["usable"])}
     if writes:
@@ -197,7 +211,8 @@ try:
         dims = queries.shape[1]
         rows = (data / "corpus.f16").stat().st_size // (2 * dims)
         corpus = np.memmap(data / "corpus.f16", dtype=np.float16, mode="r", shape=(rows, dims))
-        for k, writes in ((10, False), (100, False), (10, True), (100, True)):
+        phases = [(10, True), (100, True)] if os.environ.get("T1_WRITES_ONLY") else [(10, False), (100, False), (10, True), (100, True)]
+        for k, writes in phases:
             r = phase(k, writes, queries, truth, corpus, int(os.environ.get("G13_PERF", "0")))
             print(json.dumps(r), flush=True)
             result["phases"].append(r)

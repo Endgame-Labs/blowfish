@@ -1,19 +1,81 @@
 //! Exact scoring of resident WAL documents, with byte-bounded decoded vector reuse.
-use bf_types::{ApiError, Document, decode_vector};
+use bf_types::{ApiError, DistanceMetric, Document, decode_vector};
+use bf_vector::{CosineNorm, CosineQuery};
 use std::sync::{Arc, Weak};
 
 type Key = (usize, Arc<str>);
 
-/// A cached allocation or a query-local decode when admission is disabled.
+/// An immutable decoded tail vector with everything a query would otherwise recompute for
+/// every row: whether it is a valid vector (nonempty and finite), whether it is all zeros, and
+/// its squared norm in the exact distance kernel's accumulation order.
+pub(crate) struct Prepared {
+    values: Arc<[f32]>,
+    valid: bool,
+    zero: bool,
+    norm: Option<CosineNorm>,
+}
+impl Prepared {
+    fn new(values: Vec<f32>) -> Self {
+        let valid = !values.is_empty() && values.iter().all(|x| x.is_finite());
+        Self {
+            zero: values.iter().all(|x| *x == 0.0),
+            norm: valid.then(|| CosineNorm::new(&values).ok()).flatten(),
+            valid,
+            values: values.into(),
+        }
+    }
+}
+
+/// A cached prepared vector or a query-local decode when admission is disabled.
 pub(crate) enum Values {
-    Resident(Arc<[f32]>),
+    Resident(Arc<Prepared>),
     Transient(Vec<f32>),
 }
 impl AsRef<[f32]> for Values {
     fn as_ref(&self) -> &[f32] {
         match self {
-            Self::Resident(v) => v,
+            Self::Resident(v) => &v.values,
             Self::Transient(v) => v,
+        }
+    }
+}
+
+/// One query's scorer over tail vectors: bit-identical to `query::distance`, but a resident
+/// vector costs one dot product (cosine) or one squared-distance pass (Euclidean) instead of
+/// two validation passes and a three-sum pass.
+pub(crate) struct Scorer<'a> {
+    metric: DistanceMetric,
+    query: &'a [f32],
+    cosine: Option<CosineQuery<'a>>,
+    query_zero: bool,
+}
+impl<'a> Scorer<'a> {
+    pub(crate) fn new(metric: DistanceMetric, query: &'a [f32]) -> Self {
+        Self {
+            metric,
+            query,
+            cosine: (metric == DistanceMetric::CosineDistance)
+                .then(|| CosineQuery::new(query).ok())
+                .flatten(),
+            query_zero: query.iter().all(|x| *x == 0.0),
+        }
+    }
+    pub(crate) fn distance(&self, values: &Values) -> f64 {
+        let Values::Resident(p) = values else {
+            return crate::query::distance(values.as_ref(), self.query, self.metric);
+        };
+        let comparable = p.valid && p.values.len() == self.query.len();
+        match (self.metric, &self.cosine, p.norm) {
+            (DistanceMetric::CosineDistance, _, _) if self.query_zero || p.zero => 1.0,
+            (DistanceMetric::CosineDistance, Some(query), Some(norm)) if comparable => {
+                query.distance(&p.values, norm) as f64
+            }
+            (DistanceMetric::EuclideanSquared, _, _)
+                if comparable && self.query.iter().all(|x| x.is_finite()) =>
+            {
+                bf_vector::Metric::EuclideanSquared.distance_unchecked(&p.values, self.query) as f64
+            }
+            _ => crate::query::distance(&p.values, self.query, self.metric),
         }
     }
 }
@@ -22,7 +84,7 @@ impl AsRef<[f32]> for Values {
 /// documents alive. It prevents pointer reuse from aliasing a newer document's vector.
 struct Vector {
     _source: Weak<Document>,
-    values: Arc<[f32]>,
+    prepared: Arc<Prepared>,
     attribute_bytes: usize,
 }
 
@@ -37,7 +99,8 @@ impl VectorCache {
             Arc::new(crate::read_cache::ClockCache::new(
                 bytes,
                 |value: &Arc<Vector>| {
-                    (value.values.len() * size_of::<f32>() + value.attribute_bytes + 256) as u64
+                    (value.prepared.values.len() * size_of::<f32>() + value.attribute_bytes + 256)
+                        as u64
                 },
             )),
             bytes,
@@ -69,18 +132,18 @@ impl VectorCache {
         let key = (Arc::as_ptr(doc) as usize, attribute.clone());
         if !admit {
             if let Some(vector) = self.0.get(&key) {
-                return Ok(Values::Resident(vector.values.clone()));
+                return Ok(Values::Resident(vector.prepared.clone()));
             }
             return Ok(Values::Transient(decode_vector(&doc[attribute.as_ref()])?));
         }
         let vector = self.0.get_or_try_insert(key, || -> Result<_, ApiError> {
             Ok(Arc::new(Vector {
                 _source: Arc::downgrade(doc),
-                values: decode_vector(&doc[attribute.as_ref()])?.into(),
+                prepared: Arc::new(Prepared::new(decode_vector(&doc[attribute.as_ref()])?)),
                 attribute_bytes: attribute.len(),
             }))
         })?;
-        Ok(Values::Resident(vector.values.clone()))
+        Ok(Values::Resident(vector.prepared.clone()))
     }
 }
 
@@ -128,6 +191,62 @@ mod tests {
             cache.get(&doc, &attribute, true).unwrap().as_ref(),
             &[7.0, 8.0]
         );
+    }
+
+    /// The prepared scorer must return the reference distance's exact bits for ordinary,
+    /// zero, denormal, huge, and mismatched-length vectors, for both metrics.
+    #[test]
+    fn prepared_scorer_is_bit_identical_to_the_reference_distance() {
+        let cache = VectorCache::new(8 << 20);
+        let attribute: Arc<str> = "vector".into();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        for dims in [1usize, 3, 15, 16, 17, 64, 100, 1024] {
+            let shaped = |scale: f32, zero: bool, next: &mut dyn FnMut() -> f32| -> Vec<f32> {
+                (0..dims)
+                    .map(|_| if zero { 0.0 } else { next() * scale })
+                    .collect()
+            };
+            let mut vectors = vec![];
+            for (scale, zero) in [
+                (1.0, false),
+                (1.0, true),
+                (f32::MAX, false),
+                (f32::from_bits(1), false),
+                (1e-20, false),
+                (3e19, false),
+            ] {
+                for _ in 0..4 {
+                    vectors.push(shaped(scale, zero, &mut next));
+                }
+            }
+            vectors.push(vec![1.0; dims + 1]);
+            for metric in [
+                DistanceMetric::CosineDistance,
+                DistanceMetric::EuclideanSquared,
+            ] {
+                for query in vectors.iter().filter(|q| q.len() == dims) {
+                    let scorer = Scorer::new(metric, query);
+                    for candidate in &vectors {
+                        if candidate.len() != dims {
+                            continue;
+                        }
+                        let doc: Arc<Document> = Arc::new(
+                            serde_json::from_value(json!({"id":1,"vector":candidate})).unwrap(),
+                        );
+                        let values = cache.get(&doc, &attribute, true).unwrap();
+                        let expected = crate::query::distance(candidate, query, metric);
+                        let got = scorer.distance(&values);
+                        assert_eq!(got.to_bits(), expected.to_bits(), "{metric:?} d={dims}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
