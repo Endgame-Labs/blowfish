@@ -17686,3 +17686,63 @@ tried here).
 Cold reads; whether a ranged-ID segment on object storage could prove its ID order without a read (needs a manifest or
 marker field, a format change); `Max` and `Sum` under `limit.per`, nested expressions, or non-BM25 clauses (old path);
 separate gains of items 2 and 3; weights outside `1e-9..=1e9` or more than four nested (old path).
+
+## Round DF1: filtered deletes and patches load only the rows they change
+
+`delete_by_filter` and `patch_by_filter` used to call `materialize`: every document of the namespace, vectors
+included, was loaded to test the predicate, however few rows matched. Upserts and patches by ID already loaded only
+the rows they name.
+
+### What changed
+
+`for_writes` (`crates/bf-engine/src/snapshot.rs`) now resolves each filter to the IDs of the matching live rows with
+the query engine's own filter evaluation: `allowed` per segment (the filter indexes, the live-row mask, and exclusion
+of tail-shadowed rows) and a direct evaluation of the WAL-tail documents. Only those rows are added to `wanted` and
+`hydrate`, as an ID-based patch or delete does. `write::prepare` is unchanged: it still evaluates the filter on the
+loaded rows, in the same order, with the same limits (5,000,000 deletes and 50,000 patches without `allow_partial`),
+so the response counts and the rows touched are identical.
+
+Why it is exact: a row can match during `prepare` only if it matches now, or an earlier write in the same request
+changed it, and those rows are already named in `wanted`. Every other row keeps its stored values. Filtered writes
+are commit barriers, so each runs alone against a drained pipeline; the filter is resolved inside the commit loop,
+so after a lost WAL slot the retry re-resolves it against the caught-up state and never reuses a stale set. If the
+filter cannot be resolved (for example it names an unknown attribute), the old full scan runs and produces the same
+error as before.
+
+### Measurements
+
+Local file store, 1,000,000 rows, a 128-dimension `f32` vector, filterable `b1000`, `b100`, and `b10` (`id % 1000`,
+`% 100`, and `% 10`, so `== 0` matches 0.1, 1, and 10 percent), a one-row WAL tail, indexed. Each case runs in a fresh
+process on a fresh copy of the store, release build, `nice -n 19`; v0.1.71 is the baseline (`df1_bench` example).
+Idle RSS was 42 MB in every run.
+
+| Case (rows matched) | v0.1.71 wall | new wall | v0.1.71 peak RSS | new peak RSS | wall | RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| delete 0.1% (1,000) | 4,451 ms | 175 ms | 2,503 MB | 166 MB | 25x | 15.1x |
+| patch 0.1% (1,000) | 4,650 ms | 233 ms | 2,505 MB | 173 MB | 20x | 14.5x |
+| patch 0.1% changing the filtered attribute | 4,575 ms | 228 ms | 2,506 MB | 171 MB | 20x | 14.7x |
+| delete 1% (10,000) | 5,295 ms | 489 ms | 2,501 MB | 357 MB | 10.8x | 7.0x |
+| patch 1% (10,000) | 5,061 ms | 567 ms | 2,536 MB | 409 MB | 8.9x | 6.2x |
+| delete 10% (100,000) | 4,660 ms | 886 ms | 2,507 MB | 718 MB | 5.3x | 3.5x |
+
+A 10 percent `patch_by_filter` is rejected before and after (over 50,000 rows without `allow_partial`). Passing: at
+0.1 percent, peak RSS is far more than 5x lower and wall time far more than 1.3x lower. The baseline loads the whole
+namespace, so its RSS scales with the vector dimension (about 8x at 1,024 dimensions); the new path scales with the
+rows matched. I did not run 1,024 dimensions.
+
+**Bytes read:** not measured. The harness read `/proc/self/io`, but the segment files are memory-mapped, so it
+reported about 1.3 KB in every run. The baseline reads every segment's document and vector columns; the new path reads
+the filter index, live mask, and ID index, plus the document and vector bytes of the matched rows.
+
+### Tests
+
+`crates/bf-engine/tests/filtered_writes.rs` runs 18 cases against a namespace of indexed segments plus a WAL tail and
+against the same data held only in the tail (every row evaluated document by document, the old scan's semantics), and
+requires identical responses (counts and affected IDs) and identical final contents. The cases cover equality, `In`,
+range, array, and `And`/`Or`/`Not` filters, ID filters, rows moved between filters by tail upserts, deleted and
+re-upserted IDs, tail-only rows, a patch that changes the filtered attribute, a patch followed by a delete on the
+patched attribute, a request that mixes a filtered delete with upserts of matching IDs (and a filtered patch with
+patches and deletes), a new attribute filtered on, an unknown attribute, and a patch of every row. The
+`rows_remaining` limits (5,000,000 and 50,000 rows) are unchanged code and are not exercised here. A second test submits five dependent writes together, and a third has a second engine commit
+between this engine's snapshot and its filtered delete (a real lost slot): the other writer's matching row is
+deleted, and a row it moved out of the filter is not.
