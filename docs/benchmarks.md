@@ -18009,3 +18009,69 @@ queries with `{midpoint 10}` even at 4,096 rows, and those fall back to the full
 Cold reads; `limit.per`; `Saturate` over a `Sum` or `Max` (old path); predicates other than `id` ranges (the fixture has no scalar
 attribute; correctness is covered by the tests, which use an integer attribute); three or more predicates (old path); starting
 `Sum` lists at 256 rows; separate gains per class split; EC2.
+
+## Round C33: leaf reads start before the WAL check on remote streams
+
+A cold unfiltered `top_k` 10 query on the repaired 10M fixture, pure S3, is **1.24x faster** (p50 258.7 -> 209.4 ms, ratio 0.809,
+95% interval 0.750-0.885), and `top_k` 100 is 1.13x faster (0.887, 0.807-0.954). A 7.9 percent filter (`title_initial = s`) and C31's
+`id < 1000` are at parity (1.001 and 1.005). All 400 pairs return identical ordered IDs and f64 distance bits. No file format or
+setting changed.
+
+Measured 2026-11-27 on one on-demand c7gn.4xlarge (us-west-2), baseline v0.1.73 (`7ba49d7`) against the candidate, on a private
+copy of the retained C5 checkpoint repaired by the baseline writer (55 row maps). Protocol as C31: read-only servers, CPUs 0-7, 8
+Rayon workers, 64 probes, strong consistency, IDs only, 256 KiB blocks, 32-block coalescing, zero disk cache, a full engine-cache drop
+before every request, arms alternating AB/BA, one untimed warm-up, 80 pairs per case, 20,000 paired resamples (seed 32).
+
+### Trace (19 cold queries, p50 ms from request start)
+
+Manifest 14.6; the 3.3 MB slab directory hint known at 53.6; WAL tail check 51-62; membership reads 62-89; plan 87; first leaf GET
+87.3; scan ends 209; last rerank byte 361; response 364. The window from the directory being known to the first leaf GET was 34 ms
+(the WAL check is 8 of them; row-map reads are the rest), above the 15 ms kill line.
+
+Why speculation was off for remote streams: before e3f0eff, `prefetch_scan` returned early for every streamed layout so that the query
+consumed arriving scan batches instead of waiting for a whole speculative scan ahead of query execution. e3f0eff kept that for remote
+streams and added a local-stage path. The reason was about not awaiting the speculative scan. A detached, single-flight batch does not
+wait, so it no longer holds. Separately, the paged-directory speculation (`speculate_slab_scan`) can never fire on this fixture:
+paged hints are built only at 100,000 or more clusters (`BF_ANN_PAGED_MIN_ENTRIES`), and this directory has 15,611. The warm task's own
+`prefetch_scan` call, after it loads the unpaged directory, is the live path.
+
+### The change
+
+One path, no setting (SPEC 25). For a streamed layout with a cache budget and no mapped reads, `prefetch_scan` (called from the
+snapshot's warm task while the WAL tail is read) now spawns the same per-file `read_batch_notifying` batches that the query's streaming
+scan submits for its picked clusters, nearest segment first. The query's own batches attach to those flights in the range cache, so no
+range is transferred twice. The set equals the query's own plan (not a subset), so a tail that shadows rows or a manifest that
+replaced the slabs wastes only those bytes. First leaf GET moves from 87 to 45 ms. The staged-local path is unchanged.
+
+### Rolling early rerank: tried, not kept
+
+`early_rerank` re-run on every batch from 20 percent of batches (and a second variant from 10 percent with a cap of 160), each
+batch launching rerank reads only for contenders not yet launched, capped at the one-shot cap. Against the speculation-only build in
+one rotated session (60 queries): 0.971 (0.794-1.118) for the first variant and 0.960 (0.816-1.151) for the second, with GETs +2 and
++12 percent. Neither helps on its own, so it is not in the tree. The rerank wave (about 35 small 16 KB reads whose slowest take 100 ms or
+more) is now the largest block after the scan, and is the next target.
+
+### Acceptance (80 cold pairs per case)
+
+| Case | Base p50 / p90, ms | Candidate p50 / p90, ms | Candidate/base p50 (95%) | GETs base / cand | MB base / cand |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A/A control (base twice) | 266.7 / 359.5 | 273.2 / 353.9 | 1.025 (0.921-1.137) | 309 / 306 | 98.5 / 98.2 |
+| Unfiltered `top_k` 10 | 258.7 / 319.4 | 209.4 / 250.1 | **0.809** (0.750-0.885) | 303 / 281 | 97.9 / 95.6 |
+| Unfiltered `top_k` 100 | 289.8 / 427.0 | 257.0 / 347.7 | 0.887 (0.807-0.954) | 778 / 763 | 150.9 / 150.9 |
+| 7.9% filter (`title_initial = s`) | 712.5 / 803.7 | 713.1 / 807.3 | 1.001 (0.966-1.026) | 1,151 / 1,152 | 1,111.9 / 1,111.9 |
+| Control `id < 1000` | 293.1 / 329.2 | 294.5 / 317.2 | 1.005 (0.975-1.022) | 1,196 / 1,199 | 109.8 / 109.8 |
+
+Pass criteria: `top_k` 10 p50 at least 1.2x lower (1.24x), identical results (all 400 pairs), no control slower (both within
+parity). GETs fall 7 percent and bytes 2 percent on `top_k` 10: fewer than the baseline (the cause was not traced; the A/A control reads 1 percent fewer). The A/A control's interval includes parity.
+
+### Tests
+
+`speculative_leaf_reads_never_duplicate_and_tail_shadowing_keeps_results` builds a 100,000-row namespace (recluster to slabs), queries it
+cold with no tail and with a tail that overwrites the nearest row with a far vector, deletes the second, and adds a row exactly on the
+query. It asserts that no ANN object range is read twice in either query, that the tail case ranks the new row first and returns neither
+shadowed ID, and that it equals the answer after indexing the tail.
+
+### Cost
+
+One c7gn.4xlarge on demand, 17:55 to 18:44 UTC (0.8 hours), 160 GB root volume: about $1. The instance, key pair, security group, and
+the owned S3 prefix (693 objects, 77 GB) are deleted.
