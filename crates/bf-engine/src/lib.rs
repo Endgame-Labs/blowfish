@@ -1662,10 +1662,11 @@ async fn commit_sync(
             );
         }
         let stage = Instant::now();
-        let mut working = match snapshot::for_writes(store, &current, pending, &[]).await {
-            Ok(s) => s,
-            Err(e) => break Err(e),
-        };
+        let (mut working, mut resolved) =
+            match snapshot::for_writes(store, &current, pending, &[]).await {
+                Ok(w) => (w.state, w.resolved_deletes),
+                Err(e) => break Err(e),
+            };
         record_stage("for_writes", stage);
         let stage = Instant::now();
         let mut batches = vec![];
@@ -1674,7 +1675,7 @@ async fn commit_sync(
             let Operation::Write(req, copy, _activity) = &p.request else {
                 unreachable!()
             };
-            match write::prepare(&working, req, copy.as_deref()) {
+            match write::prepare(&working, req, copy.as_deref(), resolved.take()) {
                 Ok((batch, result)) => {
                     working.apply(&batch, 0);
                     if let Some(source) = copy {
@@ -2052,14 +2053,15 @@ async fn commit_worker(
         }
         let overlay: Vec<Arc<WalEntry>> = flights.iter().map(|f| f.entry.clone()).collect();
         let stage = Instant::now();
-        let mut working = match snapshot::for_writes(&store, &current, &pending, &overlay).await {
-            Ok(s) => s,
-            Err(e) => {
-                drop(current);
-                reply_all(pending, Err(e), start);
-                continue;
-            }
-        };
+        let (mut working, mut resolved) =
+            match snapshot::for_writes(&store, &current, &pending, &overlay).await {
+                Ok(w) => (w.state, w.resolved_deletes),
+                Err(e) => {
+                    drop(current);
+                    reply_all(pending, Err(e), start);
+                    continue;
+                }
+            };
         record_stage("for_writes", stage);
         let stage = Instant::now();
         let mut batches = vec![];
@@ -2068,7 +2070,7 @@ async fn commit_worker(
             let Operation::Write(req, None, _activity) = &p.request else {
                 unreachable!("barriers never reach the pipeline")
             };
-            match write::prepare(&working, req, None) {
+            match write::prepare(&working, req, None, resolved.take()) {
                 Ok((batch, result)) => {
                     let stage = Instant::now();
                     working.apply(&batch, 0);

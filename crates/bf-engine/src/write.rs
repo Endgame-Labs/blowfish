@@ -5,10 +5,14 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+/// Evaluate one write request against `current`, optionally with the validated, sorted IDs of
+/// the rows a pure `delete_by_filter` matches (see `snapshot::for_writes`). Those rows were not loaded, so the filter is not
+/// evaluated again: the ID set is the delete batch.
 pub(crate) fn prepare(
     current: &NamespaceState,
     request: &WriteRequest,
     copy: Option<&crate::branch::Source>,
+    resolved: Option<Vec<Id>>,
 ) -> Result<(WriteBatch, WriteResponse), ApiError> {
     for name in request.extra.keys() {
         if matches!(
@@ -305,9 +309,14 @@ pub(crate) fn prepare(
     let mut patched = vec![];
     let mut deleted = vec![];
     let mut remaining = false;
+    let mut resolved_deletes = None;
     // Explicit write phases follow turbopuffer's ordering.
     if let Some(f) = &request.delete_by_filter {
-        let ids = matching_ids(&state, f)?;
+        let pure = resolved.is_some();
+        let ids = match resolved {
+            Some(ids) => ids,
+            None => matching_ids(&state, f)?,
+        };
         if ids.len() > 5_000_000 && !request.delete_by_filter_allow_partial {
             return Err(ApiError::bad(
                 "delete_by_filter exceeds five million rows; allow_partial is required",
@@ -317,6 +326,9 @@ pub(crate) fn prepare(
         for id in ids.into_iter().take(5_000_000) {
             state.docs.remove(&id);
             deleted.push(id);
+        }
+        if pure {
+            resolved_deletes = Some(deleted.clone());
         }
     }
     if let Some((patch, f)) = patch_by_filter {
@@ -416,12 +428,14 @@ pub(crate) fn prepare(
             })
             .map(|(_, doc)| (**doc).clone())
             .collect(),
-        deletes: current
-            .docs
-            .keys()
-            .filter(|id| !state.docs.contains_key(id))
-            .cloned()
-            .collect(),
+        deletes: resolved_deletes.unwrap_or_else(|| {
+            current
+                .docs
+                .keys()
+                .filter(|id| !state.docs.contains_key(id))
+                .cloned()
+                .collect()
+        }),
         schema: state.schema,
         distance_metric: state.metric,
         created_at: if current.exists {

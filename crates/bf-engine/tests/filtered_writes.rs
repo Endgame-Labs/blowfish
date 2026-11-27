@@ -173,6 +173,33 @@ fn cases() -> Vec<(&'static str, Vec<Value>)> {
             ],
         ),
         (
+            "pure delete with a partial-delete flag",
+            vec![
+                json!({"delete_by_filter": ["k", "Eq", 3], "delete_by_filter_allow_partial": true}),
+            ],
+        ),
+        (
+            "pure delete matching tail-only, deleted, and re-upserted rows",
+            vec![json!({"delete_by_filter": ["id", "In", [5000, 5001, 23, 33, 43, 53]]})],
+        ),
+        (
+            "one request: filtered delete, filtered patch, and an upsert",
+            vec![json!({"delete_by_filter": ["k", "Eq", 3],
+                "patch_by_filter": {"filters": ["k", "Eq", 5], "patch": {"s": "p"}},
+                "upsert_rows": [{"id": 5, "vector": [1.0, 1.0], "k": 3, "s": "x", "tags": []}]})],
+        ),
+        (
+            "one request: filtered delete plus an ID delete of a matching row",
+            vec![json!({"delete_by_filter": ["k", "Eq", 3], "deletes": [13, 3, 4]})],
+        ),
+        (
+            "two pure deletes in a row, the second matching nothing",
+            vec![
+                json!({"delete_by_filter": ["s", "Eq", "b"]}),
+                json!({"delete_by_filter": ["s", "Eq", "b"]}),
+            ],
+        ),
+        (
             "unknown attribute",
             vec![json!({"delete_by_filter": ["nope", "Eq", 1]})],
         ),
@@ -336,4 +363,115 @@ async fn filtered_delete_sees_a_commit_from_another_writer() {
     let rows = dump(&a).await;
     assert!(rows.iter().all(|r| r["k"] != json!(3)));
     assert!(rows.iter().any(|r| r["id"] == json!(3)));
+}
+
+/// A pure filtered delete commits its validated ID set, and a lost WAL slot makes it resolve the
+/// filter again: a row the other writer deleted is not reported, rows it added are, and rows it
+/// moved out of the filter survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pure_filtered_delete_resolves_again_after_a_lost_slot() {
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let config = || EngineConfig {
+        indexing: false,
+        recall_sample_rate: 0.0,
+        ..Default::default()
+    };
+    let a = Engine::with_config(store.clone(), config());
+    let b = Engine::with_config(store, config());
+    a.write(
+        "t",
+        serde_json::from_value(json!({"distance_metric": "euclidean_squared",
+            "schema": {"vector": {"type": "[2]f32"}}, "upsert_rows": base_rows()}))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    a.index_namespace("t", true).await.unwrap();
+    // `a` trusts its fresh view, so `b`'s commit is discovered only when `a`'s append loses.
+    a.write(
+        "t",
+        serde_json::from_value(
+            json!({"upsert_rows": [{"id": 1, "vector": [1.0, 1.0], "k": 1, "s": "a", "tags": []}]}),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    b.write(
+        "t",
+        serde_json::from_value(json!({
+            "upsert_rows": [
+                {"id": 6000, "vector": [1.0, 1.0], "k": 3, "s": "a", "tags": []},
+                {"id": 3, "vector": [3.0, 1.0], "k": 31, "s": "a", "tags": []}],
+            "deletes": [13, 23]}))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let response = write(&a, json!({"delete_by_filter": ["k", "Eq", 3]}))
+        .await
+        .unwrap();
+    let deleted: std::collections::BTreeSet<u64> = response["deleted_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    let expected: std::collections::BTreeSet<u64> = (0..3000u64)
+        .filter(|id| id % 10 == 3 && *id != 3 && *id != 13 && *id != 23)
+        .chain([6000])
+        .collect();
+    assert_eq!(deleted, expected);
+    assert_eq!(response["rows_deleted"], json!(expected.len()));
+    let rows = dump(&a).await;
+    assert!(rows.iter().all(|r| r["k"] != json!(3)));
+    assert!(rows.iter().any(|r| r["id"] == json!(3)));
+    assert!(rows.iter().all(|r| r["id"] != json!(13)));
+    assert_eq!(rows.len(), 2999 - expected.len());
+}
+
+/// A patch over enough rows to hydrate in parallel chunks gives the tail-only reference's result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_filtered_patch_hydrates_in_chunks_exactly() {
+    let rows: Vec<Value> = (0..20_000u64)
+        .map(|id| json!({"id": id, "vector": [id as f32, 1.0], "k": (id % 2) as i64, "s": "a"}))
+        .collect();
+    let mut results = vec![];
+    for indexed in [true, false] {
+        let e = engine().await;
+        for chunk in rows.chunks(5_000) {
+            e.write(
+                "t",
+                serde_json::from_value(json!({"distance_metric": "euclidean_squared",
+                    "schema": {"vector": {"type": "[2]f32"}}, "upsert_rows": chunk}))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        if indexed {
+            e.index_namespace("t", true).await.unwrap();
+        }
+        write(
+            &e,
+            json!({"upsert_rows": [{"id": 4, "vector": [4.0, 1.0], "k": 1, "s": "t"}]}),
+        )
+        .await
+        .unwrap();
+        let response = write(
+            &e,
+            json!({"patch_by_filter": {"filters": ["k", "Eq", 0], "patch": {"s": "patched"}}}),
+        )
+        .await
+        .unwrap();
+        results.push((response, dump(&e).await));
+        assert!(e.shutdown(std::time::Duration::from_secs(5)).await);
+    }
+    assert_eq!(results[0].0["rows_patched"], json!(9_999));
+    assert_eq!(results[0], results[1]);
 }
