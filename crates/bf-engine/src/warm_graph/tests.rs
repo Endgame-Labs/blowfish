@@ -225,16 +225,38 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     assert_eq!(query(&e, "hot", request(17)).await[0]["id"], 17);
     assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
     // Round G8: requests up to 100 rows (k plus offset) are served by the graph with an automatic
-    // beam and shortlist, and return the same rows as the IVF control.
+    // beam and shortlist, and return the IVF control's rows. Since Round G16 the walk screens
+    // neighbors with one-bit codes, so it is approximate: beyond the first rows it may swap a
+    // near-tie for its neighbor, as on NQ (recall@100 -0.0013). The first ten must match
+    // exactly; the deep pages share at least 95 percent of their rows with the control, in
+    // distance order and without repeats.
     for body in [
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":100}),
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":40,"offset":50}),
     ] {
         let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
-        same_rows(
-            query(&e, "hot", body.clone()).await,
-            query(&control, "hot", body).await,
+        let got = query(&e, "hot", body.clone()).await;
+        let want = query(&control, "hot", body.clone()).await;
+        let (got, want) = (got.as_array().unwrap(), want.as_array().unwrap());
+        assert_eq!(got.len(), want.len());
+        if body.get("offset").is_none() {
+            assert_eq!(got[..10], want[..10]);
+        }
+        let ids = |rows: &[Value]| {
+            rows.iter()
+                .map(|r| r["id"].as_u64().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let (g, w) = (ids(got), ids(want));
+        assert_eq!(g.len(), got.len(), "repeated rows");
+        assert!(
+            g.intersection(&w).count() * 100 >= want.len() * 95,
+            "graph shares {} of {} rows with IVF",
+            g.intersection(&w).count(),
+            want.len()
         );
+        let dist = |r: &Value| r["$dist"].as_f64().unwrap();
+        assert!(got.windows(2).all(|p| dist(&p[0]) <= dist(&p[1])));
         assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
     }
     // Round G12: an ID-only query is answered from the resident row-to-ID table once the
@@ -897,9 +919,9 @@ async fn selective_filters_scan_the_graph_and_match_the_ivf_control() {
         // A filter that matches nothing needs no graph answer; the others must have used it.
         assert_eq!(answers() > before, rows > 0, "rows={rows} k={k}");
     }
-    // Above the crossover (1 row in 16), the IVF tier answers: 10% of the rows.
+    // Above the crossover (1 row in 8), the IVF tier answers: 20% of the rows.
     let before = answers();
-    let wide = json!(["bucket", "Lt", 10]);
+    let wide = json!(["bucket", "Lt", 20]);
     same_rows(
         query(&e, "hot", ask(7, wide.clone(), 10)).await,
         query(&control, "hot", ask(7, wide, 10)).await,

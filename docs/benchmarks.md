@@ -16839,3 +16839,37 @@ Qdrant's numbers match Round G12's within 1 percent. Each point is one run on a 
 - **The numbers above come from a temporary switch.** The shipped code has no switch and no unscreened walk.
 
 Costs: no EC2 and no bucket writes. The NQ corpus and store (about 25 GB) were copied to the M4 through short-lived presigned URLs and are deleted with the run directory.
+
+
+## Round G15b: the filtered screen across cores, one client 2 to 3 times faster than v0.1.62's scan
+
+Round G15's screen ran one query on one core, so one client matched IVF at about 7 percent and was 1.4 times slower at 10 percent, and the rule was lowered to 1 in 16. `HotGraph::scan` now takes a `parallel` flag. When set, the allowed rows are split into chunks of at least 8,192 rows (two chunks per pool thread) and run on the current rayon pool, which is the query worker pool (`bf-query`) for a warm query. Stage one computes each chunk's Hamming distances and histogram. The histograms merge into one cutoff, and ties at the cutoff go to the earliest rows, so each chunk gets its share of ties by row order. Stage two filters, rescores with SQ8, and keeps a local best `count` per chunk, and the local lists merge under the same total order (score, then tier row). The shortlist and the answer are therefore identical to the single-chunk scan (test `one_bit_screen_keeps_the_nearest_rows_and_the_exact_shortlist_size` compares chunk sizes 1 to 1,499 against one chunk, at several `keep` values). The engine passes `crate::fan_out()`, the rule the IVF probes use: fan out only while at most half as many queries as cores are in flight.
+
+**Forced fan-out loses under load.** The first measurement forced the split always. One client was 2 to 3 times faster, but 16 clients lost throughput (hash 5 percent 1,649 against 1,947 q/s, p99 47 against 13 ms; id 5 percent 2,051 against 2,563), because a worker waiting on its chunks steals whole queries from the pool. Gating on `fan_out()` fixed it: under load every query runs serially, as in v0.1.62. I did not try leaf pruning (idea 1 of the brief's step 2): one client already beats IVF at every share tested.
+
+### Method
+
+Same host and harness as Round G15: one on-demand c7g.4xlarge (16 Graviton3 vCPU), Ubuntu 24.04, Rust 1.100.0, Clang 19, full NQ built fresh with the `bucket` column, 32 cells, 64 probes, a promoted graph, `g15_http.py` with 64 queries per case. Arms ran in one server on one graph, switched through a file (a temporary measurement patch, not shipped): `ivf`, `serial` (v0.1.62's scan), `gated` (the shipped rule), `gated`, `serial`, `ivf`; pairs are averaged. 1 client is a serial connection; 16 clients are eight processes of two threads.
+
+### Results (q/s, 1 client p50 in ms, 16-client q/s and p99 in ms; recall@10)
+
+| Filter | IVF | v0.1.62 scan (serial) | G15b (gated) |
+|---|---|---|---|
+| hash 0.5% | 184, 5.3; 528, 40; 1.000 | 423, 2.3; 4,477, 6 | 541, 1.8; 4,501, 6; 1.000 |
+| hash 1% | 152, 6.5; 405, 51; 1.000 | 331, 3.0; 3,497, 8 | 551, 1.8; 3,540, 8; 1.000 |
+| hash 2% | 129, 7.6; 320, 66; 1.000 | 250, 4.0; 2,808, 9 | 463, 2.1; 2,735, 11; 1.000 |
+| hash 5% | 109, 9.1; 241, 85; 1.000 | 158, 6.3; 1,952, 12 | 339, 2.9; 1,937, 13; 1.000 |
+| hash 10% | 145, 6.8; 374, 55; 1.000 | 103, 9.7; 1,370, 16 | 291, 3.4; 1,370, 16; 1.000 |
+| hash 20% | 210, 4.7; 667, 30; 0.998 | 60, 16.5; 835, 25 | 207, 4.8; 836, 26; 1.000 |
+| id 1% | 228, 4.3; 750, 31; 1.000 | 475, 2.1; 5,017, 6 | 766, 1.3; 4,987, 6; 1.000 |
+| id 5% | 141, 7.0; 342, 66; 1.000 | 209, 4.7; 2,645, 10 | 501, 2.0; 2,595, 13; 1.000 |
+| id 10% | 154, 6.4; 380, 53; 1.000 | 129, 7.7; 1,707, 14 | 359, 2.8; 1,704, 14; 1.000 |
+
+One client at 10 percent: 291 against IVF's 145 (hash) and 359 against 154 (id), so the one-client crossover moved from about 7 percent to about 20 percent (207 against 210 q/s, a tie). At 16 clients the gated scan equals the serial scan within noise (the worst case is 2.6 percent, hash 2 percent) and beats IVF 3.4 to 9 times up to 10 percent, and 1.25 times at 20 percent. Recall@10 is 1.000 everywhere the scan answers.
+
+**The rule is now 1 in 8** (`SCAN_SHARE = 8`, 12.5 percent), the largest share I can show is no slower than IVF at one client and at 16 with margin: 10 percent has 2 times margin, and 20 percent is a tie for one client, so I left the rule below it rather than at 1 in 5. Shares between 12.5 and 20 percent were not measured separately.
+
+### Notes
+
+- Graviton3 only, `k` 10 only, as in G15. Allowed-row collection (`RoaringBitmap` iteration and the node lookup) is still serial, about 1 ms at 10 percent.
+- Costs: one on-demand c7g.4xlarge for about 2 hours (about $1.2 plus the 120 GB gp3 root volume), deleted with its key pair and security group.

@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.65] - 2026-11-27
+
+### Changed
+
+- **Filtered vector queries up to 12.5 percent of the rows use the warm graph, and one client is up to 2.3 times faster than IVF there:** The scan of a filtered query's allowed rows now splits into chunks over the query worker pool while few queries are in flight, which is the rule the IVF probes already use. Under load it runs on one core. The merged shortlist is identical to the single-core one. On an on-demand Graviton3 host with full BEIR NQ, v0.1.62 sent hash 10 percent to IVF (one client: 145 q/s, 6.8 ms p50), and it now runs on the graph at 291 q/s (3.4 ms). Hash 5 percent went from 158 to 339 q/s for one client. At 16 clients, throughput matches v0.1.62 at every filter, and is 3.4 times IVF at 10 percent. Recall@10 stays 1.000. The cutoff moves from 1 row in 16 to 1 in 8. See Round G15b in `docs/benchmarks.md`.
+
 ## [0.1.64] - 2026-11-27
 
 ### Changed
@@ -476,7 +482,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.64...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.65...HEAD
+[0.1.65]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.65
 [0.1.64]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.64
 [0.1.63]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.63
 [0.1.62]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.62
