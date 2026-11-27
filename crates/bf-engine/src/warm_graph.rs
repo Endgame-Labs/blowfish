@@ -1156,6 +1156,7 @@ pub(crate) async fn search(
     at: &Placement,
     vector: &[f32],
     mask: Option<Arc<RoaringBitmap>>,
+    navigate: Option<Arc<RoaringBitmap>>,
     k: usize,
     columns: &BTreeSet<String>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
@@ -1212,7 +1213,7 @@ pub(crate) async fn search(
         ));
     }
     let result = search_entry(
-        store, state, set, at, vector, mask, k, columns, &entry, ef, false,
+        store, state, set, at, vector, navigate, k, columns, &entry, ef, false,
     )
     .await;
     match result {
