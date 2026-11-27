@@ -897,7 +897,7 @@ async fn selective_filters_scan_the_graph_and_match_the_ivf_control() {
         // A filter that matches nothing needs no graph answer; the others must have used it.
         assert_eq!(answers() > before, rows > 0, "rows={rows} k={k}");
     }
-    // Above the crossover (1 row in 64), the IVF tier answers.
+    // Above the crossover (1 row in 16), the IVF tier answers: 10% of the rows.
     let before = answers();
     let wide = json!(["bucket", "Lt", 10]);
     same_rows(

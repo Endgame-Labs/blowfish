@@ -1,9 +1,43 @@
-//! One-bit navigation codes for graph construction. Each row keeps the signs of its rotated,
+//! One-bit codes: graph construction steers with them, and filtered scans screen with them. Each row keeps the signs of its rotated,
 //! mean-centered coordinates. Hamming distance orders neighbors well enough to steer a beam,
 //! and it reads 128 bytes per row instead of 1,024; construction scores only the nodes it
-//! expands, and those the pruner needs, with the exact SQ8 kernel.
+//! expands, and those the pruner needs, with the exact SQ8 kernel. The graph keeps the codes.
 use super::quant::Codes;
 use rayon::prelude::*;
+
+/// Mean of the dequantized rows. Checks cancellation between row blocks.
+pub(super) fn mean(
+    codes: &Codes,
+    cancelled: &(impl Fn() -> bool + Sync),
+) -> crate::Result<Vec<f32>> {
+    let dims = codes.dims;
+    let n = codes.scales.len();
+    let sums = codes
+        .values
+        .par_chunks(dims * 4096)
+        .zip(codes.scales.par_chunks(4096))
+        .map(|(rows, scales)| {
+            let mut sum = vec![0f64; dims];
+            if cancelled() {
+                return sum;
+            }
+            for (row, &scale) in rows.chunks_exact(dims).zip(scales) {
+                for (s, &x) in sum.iter_mut().zip(row) {
+                    *s += f64::from(x) * f64::from(scale);
+                }
+            }
+            sum
+        })
+        .reduce(
+            || vec![0f64; dims],
+            |mut a, b| {
+                a.iter_mut().zip(b).for_each(|(a, b)| *a += b);
+                a
+            },
+        );
+    super::check(cancelled)?;
+    Ok(sums.iter().map(|s| (s / n as f64) as f32).collect())
+}
 
 pub(super) struct Bits {
     words: Vec<u64>,
@@ -19,34 +53,7 @@ impl Bits {
         let dims = codes.dims;
         let per = dims.div_ceil(64);
         let n = codes.scales.len();
-        let sums = codes
-            .values
-            .par_chunks(dims * 4096)
-            .zip(codes.scales.par_chunks(4096))
-            .map(|(rows, scales)| {
-                let mut sum = vec![0f64; dims];
-                if cancelled() {
-                    return sum;
-                }
-                for (row, &scale) in rows.chunks_exact(dims).zip(scales) {
-                    for (s, &x) in sum.iter_mut().zip(row) {
-                        *s += f64::from(x) * f64::from(scale);
-                    }
-                }
-                sum
-            })
-            .reduce(
-                || vec![0f64; dims],
-                |mut a, b| {
-                    a.iter_mut().zip(b).for_each(|(a, b)| *a += b);
-                    a
-                },
-            );
-        super::check(cancelled)?;
-        let mean = sums
-            .iter()
-            .map(|s| (s / n as f64) as f32)
-            .collect::<Vec<_>>();
+        let mean = mean(codes, cancelled)?;
         let mut words = vec![0u64; n * per];
         words
             .par_chunks_mut(per)
@@ -65,6 +72,22 @@ impl Bits {
         super::check(cancelled)?;
         Ok(Self { words, per })
     }
+    /// Sign bits of a rotated query, in the layout of a row. The rows were centered on their
+    /// mean, and a query's dot product with the mean is the same for every row, so the query is
+    /// not centered.
+    pub(super) fn query(&self, rotated: &[f64]) -> Vec<u64> {
+        let mut out = vec![0u64; self.per];
+        for (i, x) in rotated.iter().enumerate().take(self.per * 64) {
+            if *x > 0. {
+                out[i / 64] |= 1 << (i % 64);
+            }
+        }
+        out
+    }
+    /// Bytes retained.
+    pub(super) fn bytes(&self) -> usize {
+        self.words.capacity() * 8
+    }
     pub(super) fn row(&self, id: u32) -> &[u64] {
         let start = id as usize * self.per;
         &self.words[start..start + self.per]
@@ -74,6 +97,14 @@ impl Bits {
             .zip(self.row(id))
             .map(|(a, b)| (a ^ b).count_ones())
             .sum::<u32>() as f32
+    }
+    /// Hamming distance between a query's signs and a row.
+    pub(super) fn hamming(&self, query: &[u64], id: u32) -> u16 {
+        query
+            .iter()
+            .zip(self.row(id))
+            .map(|(a, b)| (a ^ b).count_ones() as u16)
+            .sum()
     }
     pub(super) fn prefetch(&self, id: u32) {
         let row = self.row(id);

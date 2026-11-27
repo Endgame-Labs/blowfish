@@ -141,7 +141,8 @@ impl HotGraphBuilder {
                 best = (id, distance);
             }
         }
-        let nodes = vamana::build(&codes, best.0, cancelled)?;
+        let bits = super::binary::Bits::new(&codes, cancelled)?;
+        let nodes = vamana::build(&codes, &bits, best.0, cancelled)?;
         let mut links = Vec::with_capacity(self.count);
         let mut degrees = Vec::with_capacity(self.count);
         for (id, neighbors) in nodes.into_iter().enumerate() {
@@ -177,6 +178,7 @@ impl HotGraphBuilder {
             degrees,
             entries: vec![best.0],
             codes,
+            bits,
             norms: std::mem::take(&mut self.norms),
         })
     }

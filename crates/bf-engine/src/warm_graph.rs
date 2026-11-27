@@ -1048,14 +1048,21 @@ impl Drop for ScratchLoan<'_> {
 fn scan_shortlist(k: usize) -> usize {
     (k * 3).max(30)
 }
+/// Rows the one-bit screen keeps for the SQ8 rescore of a filtered scan, for `k` wanted rows.
+/// Round G15 measured full NQ (2.68M rows): for `k` 10 a screen of 5,000 rows keeps recall@10 at
+/// 1.000 for filters from 0.5 to 20 percent of the rows, where 1,000 to 2,000 lose 0.002 to 0.003.
+/// The rescore of the kept rows costs about a tenth of the screen at 10 percent.
+fn scan_screen(k: usize) -> usize {
+    5000 + 100 * k
+}
 /// The most allowed rows a filtered query scans, as a share of the graph's rows (1 in
-/// `SCAN_SHARE`, 1.56%). Round G14 measured the scan against the IVF tier on full NQ with hash
-/// filters: with 16 clients it is 5.9x, 4.6x, 3.7x, and 2.4x faster at 0.5%, 1%, 2%, and 5%, and equal
-/// at about 10%; with one client it matches IVF at about 1% and is slower beyond. The scan reads each
-/// allowed row's 1 KiB code from memory, so its cost grows with the allowed rows while IVF's stays
-/// nearly flat. Below this share the scan wins everywhere that matters (throughput by 4x or more, with
-/// serial latency within 10%); above it the IVF tier answers.
-const SCAN_SHARE: usize = 64;
+/// `SCAN_SHARE`, 6.25%). The scan screens each allowed row's 128-byte one-bit code, rescores the
+/// best few thousand with SQ8, and reranks the best few exactly. Round G15 measured it against the
+/// IVF tier on full NQ with hash and id filters: with 16 clients it is 7.6x to 8.0x faster from 0.5%
+/// to 5% and 3.5x at 10%, but with one client it matches IVF at about 7% and is 1.4x slower at 10%,
+/// because IVF spreads one query over every core while the scan runs on one. The share is set so
+/// that neither one client nor many is slower than IVF; above it the IVF tier answers.
+const SCAN_SHARE: usize = 16;
 /// Whether a ready graph answers a filtered query by scanning the codes of its `allowed` rows.
 pub(crate) fn scan_eligible(
     state: &NamespaceState,
@@ -1268,7 +1275,7 @@ async fn search_entry(
     let (hits, evaluations) = match (scan, mask.as_deref()) {
         (true, Some(allowed)) => entry
             .graph
-            .scan(vector, scan_shortlist(k), allowed)
+            .scan(vector, scan_shortlist(k), scan_screen(k), allowed)
             .map_err(segment::index_error)?,
         (true, None) => return Ok(None),
         (false, _) => entry

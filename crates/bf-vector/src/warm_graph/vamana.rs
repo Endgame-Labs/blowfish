@@ -83,8 +83,8 @@ const MARGIN_DIVISOR: u64 = 16;
 
 /// Exact bytes per row at the construction peak. While `build` runs the graph holds the SQ8 codes
 /// and scale, the tier row coordinate and cosine norm, the build-time adjacency (`RwLock<Neighbors>`),
-/// the one-bit navigation codes, and the insertion permutation. The one-bit codes are freed before
-/// `finish` converts the adjacency, so the publication peak (build adjacency and the flat links
+/// the one-bit codes, and the insertion permutation. The one-bit codes stay resident (filtered scans
+/// screen with them), so the publication peak (build adjacency, flat links, and one-bit codes
 /// together) is the other candidate; the larger of the two is the peak.
 pub(super) fn peak_bytes_per_row(padded: u64) -> Option<u64> {
     let lock = std::mem::size_of::<RwLock<Neighbors>>() as u64;
@@ -94,13 +94,20 @@ pub(super) fn peak_bytes_per_row(padded: u64) -> Option<u64> {
         .checked_add(lock)?
         .checked_add(padded.div_ceil(8).next_multiple_of(8))?
         .checked_add(4)?;
-    // Flat links (34 ids of 4 bytes) and the degree byte, while the build adjacency still exists.
-    let publication = base.checked_add(lock)?.checked_add(34 * 4 + 1)?;
+    // Flat links (34 ids of 4 bytes) and the degree byte, while the build adjacency still exists,
+    // plus the one-bit codes, which stay resident for filtered scans.
+    let publication = base
+        .checked_add(lock)?
+        .checked_add(34 * 4 + 1)?
+        .checked_add(padded.div_ceil(8).next_multiple_of(8))?;
     Some(building.max(publication))
 }
 /// Bytes per row that the finished graph retains, as `HotGraph::resident_bytes` counts them.
 fn retained_bytes_per_row(padded: u64) -> Option<u64> {
-    padded.checked_add(4 + 4 + 4 + 34 * 4 + 1)
+    // Codes, scale, tier row, norm, flat links and degree, and the resident one-bit codes.
+    padded
+        .checked_add(4 + 4 + 4 + 34 * 4 + 1)?
+        .checked_add(padded.div_ceil(8).next_multiple_of(8))
 }
 /// Reservation for building and then serving a graph: the construction peak with a stated 1/16
 /// margin, or the retained graph with `queries` simultaneous visitation arrays, whichever is
@@ -125,6 +132,7 @@ pub(super) fn with_margin(bytes: u64) -> u64 {
 }
 pub fn build(
     v: &Codes,
+    bits: &super::binary::Bits,
     entry: u32,
     cancelled: &(impl Fn() -> bool + Sync),
 ) -> crate::Result<Vec<RwLock<Neighbors>>> {
@@ -157,7 +165,6 @@ pub fn build(
         seed ^= seed << 17;
         ids.swap(i, seed as usize % (i + 1));
     }
-    let bits = super::binary::Bits::new(v, cancelled)?;
     for alpha in [1., 1.2] {
         ids.par_iter().for_each_init(
             || Work::new(n),
@@ -284,8 +291,9 @@ mod tests {
             .build()
             .unwrap();
         let checks = AtomicUsize::new(0);
+        let bits = super::super::binary::Bits::new(&codes, &|| false).unwrap();
         let result = pool.install(|| {
-            build(&codes, 0, &|| {
+            build(&codes, &bits, 0, &|| {
                 checks.fetch_add(1, Ordering::Relaxed) >= 2000
             })
         });
@@ -293,7 +301,7 @@ mod tests {
             matches!(result, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted)
         );
         assert!(checks.load(Ordering::Relaxed) >= 2000);
-        let nodes = pool.install(|| build(&codes, 0, &|| false)).unwrap();
+        let nodes = pool.install(|| build(&codes, &bits, 0, &|| false)).unwrap();
         assert_eq!(nodes.len(), n);
         assert!(std::mem::size_of::<RwLock<Neighbors>>() <= 280);
         for (id, row) in nodes.into_iter().enumerate() {
