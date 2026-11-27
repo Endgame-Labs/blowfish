@@ -55,7 +55,10 @@ pub(crate) fn record(round: Option<usize>) {
     };
     counter.fetch_add(1, Ordering::Relaxed);
     if crate::ann::trace_stages() {
-        eprintln!("STAGE sum outcome {name} round {}", round.map_or(-1, |r| r as i64));
+        eprintln!(
+            "STAGE sum outcome {name} round {}",
+            round.map_or(-1, |r| r as i64)
+        );
     }
 }
 
@@ -167,10 +170,16 @@ pub(crate) fn sum_of_text(rank: Option<&RankBy>) -> bool {
     !flat_max && shape_of(rank).is_some()
 }
 
+/// Smallest first list for a plan whose bound is loose (a `Saturate` compresses the scores, and
+/// a row-wise term adds slack): it rarely proves the answer at 64 rows, and each wasted round
+/// costs as much as the next, so these plans start here.
+const LOOSE_LIST: usize = 256;
+
 /// First list length for a query that needs `k` rows, or `None` when the lists would be too long
 /// to beat scoring everything.
-pub(crate) fn first_list(k: usize) -> Option<usize> {
-    (1..=MAX_LIST).contains(&k).then(|| k.max(MIN_LIST))
+pub(crate) fn first_list(k: usize, loose: bool) -> Option<usize> {
+    let start = if loose { LOOSE_LIST } else { MIN_LIST };
+    (1..=MAX_LIST).contains(&k).then(|| k.max(start))
 }
 
 /// The list length that asks for every matching row: the last round before the full scorer.
@@ -485,6 +494,19 @@ impl SumPlan<'_> {
         }
         go(&self.expr, text, bonus, doc)
     }
+    /// True when the strict bound is usually loose: a `Saturate` over text compresses scores, and a
+    /// row-wise term adds its whole upper bound to every row outside the lists.
+    pub(crate) fn loose(&self) -> bool {
+        fn saturates(e: &Expr) -> bool {
+            match e {
+                Expr::Saturate { .. } => true,
+                Expr::Sum(xs) | Expr::Max(xs) => xs.iter().any(saturates),
+                Expr::Mul(_, x) | Expr::Decay { expr: x, .. } => saturates(x),
+                _ => false,
+            }
+        }
+        !self.docs.is_empty() || saturates(&self.expr)
+    }
     /// The largest total a row can reach when no text clause scores above `cutoffs`.
     pub(crate) fn bound(&self, cutoffs: &[f32], bonus: &[f64]) -> f64 {
         self.total(&|i| f64::from(cutoffs[i]), bonus, &|j| self.docs[j].upper)
@@ -720,11 +742,9 @@ impl SegmentSum {
         let mut rows: Vec<(u32, f64)> = union
             .iter()
             .map(|row| {
-                let t = plan.total(
-                    &|i| f64::from(exact[i].get(row)),
-                    &class.bonus,
-                    &|j| docs[&row][j],
-                );
+                let t = plan.total(&|i| f64::from(exact[i].get(row)), &class.bonus, &|j| {
+                    docs[&row][j]
+                });
                 (row, t)
             })
             .collect();
@@ -1031,10 +1051,12 @@ mod tests {
     }
     #[test]
     fn list_lengths_grow_to_a_cap() {
-        assert_eq!(first_list(0), None);
-        assert_eq!(first_list(10), Some(64));
-        assert_eq!(first_list(100), Some(100));
-        assert_eq!(first_list(4097), None);
+        assert_eq!(first_list(0, false), None);
+        assert_eq!(first_list(10, false), Some(64));
+        assert_eq!(first_list(10, true), Some(256));
+        assert_eq!(first_list(100, false), Some(100));
+        assert_eq!(first_list(1000, true), Some(1000));
+        assert_eq!(first_list(4097, false), None);
         assert_eq!(next_list(64), Some(256));
         assert_eq!(next_list(1024), Some(4096));
         assert_eq!(next_list(4096), Some(ALL_MATCHES));

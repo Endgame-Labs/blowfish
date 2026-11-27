@@ -1387,7 +1387,7 @@ async fn sum_finish(
             tail.push((id.clone(), t));
         }
     }
-    let mut n = sum_text::first_list(k);
+    let mut n = sum_text::first_list(k, plan.loose());
     let mut round = 0;
     while let Some(list) = n {
         let rounds = futures::future::try_join_all(
@@ -1507,11 +1507,12 @@ async fn prepare_scalar(
     let segment_started = std::time::Instant::now();
     // A `Sum` of BM25 clauses is decided from short per-clause lists when they prove the answer
     // (see `sum_text`); the segments are hydrated after the tail has scored its documents.
-    let sum_plan = if sum_of_text(q.rank_by.as_ref()) && !per && sum_text::first_list(k).is_some() {
-        sum_prepare(store, state, q, &clauses).await?
-    } else {
-        None
-    };
+    let sum_plan =
+        if sum_of_text(q.rank_by.as_ref()) && !per && sum_text::first_list(k, false).is_some() {
+            sum_prepare(store, state, q, &clauses).await?
+        } else {
+            None
+        };
     if sum_plan.is_none() {
         out = hydrate_segments(
             store, state, q, &clauses, all, clause_top, k, &columns, threshold, out, None,
