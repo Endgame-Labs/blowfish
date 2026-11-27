@@ -54,6 +54,15 @@ P.add_argument("--label", required=True)
 P.add_argument("--binary", required=True)
 P.add_argument("--config", type=Path, required=True)
 P.add_argument("--filters", type=json.loads, help="JSON filter applied to every measured query")
+P.add_argument(
+    "--id-in",
+    type=int,
+    help="per-query filter [id, In, N IDs] drawn from [0, --id-max) (Round C32); exclusive with --filters",
+)
+P.add_argument("--id-mode", choices=["random", "clustered"], default="random")
+P.add_argument("--id-max", type=int, default=10_000_000)
+P.add_argument("--id-span", type=int, default=0, help="clustered: width of the ID range (default 8 per ID, at least 4096)")
+P.add_argument("--id-seed", type=int, default=32)
 P.add_argument("--truth-key", help="oracle array containing exact IDs for this filter")
 P.add_argument("--scratch", type=Path, required=True)
 P.add_argument("--port", type=int, default=8400)
@@ -128,7 +137,23 @@ if a.nq_data:
     }
 else:
     truth = np.load(ROOT / f"bench/scale/data/oracle-{a.oracle}.npz")
-truth_key = a.truth_key or ("ann_ids" if a.filters is None else None)
+if a.id_in and a.filters is not None:
+    P.error("--id-in and --filters are exclusive")
+
+
+def id_in_filter(i):
+    """The same N IDs for both arms of query i; random or inside one ID range."""
+    rng = np.random.default_rng(a.id_seed * 1_000_003 + i)
+    if a.id_mode == "random":
+        ids = rng.choice(a.id_max, size=a.id_in, replace=False)
+    else:
+        span = a.id_span or max(8 * a.id_in, 4096)
+        base = int(rng.integers(0, a.id_max - span))
+        ids = base + rng.choice(span, size=a.id_in, replace=False)
+    return ["id", "In", [int(x) for x in ids]]
+
+
+truth_key = a.truth_key or ("ann_ids" if a.filters is None and not a.id_in else None)
 if truth_key is not None and truth_key not in truth:
     P.error(f"oracle has no {truth_key!r} truth array")
 items = [
@@ -140,6 +165,7 @@ items = [
             "top_k": 10,
             "consistency": {"level": "strong"},
             **({"filters": a.filters} if a.filters is not None else {}),
+            **({"filters": id_in_filter(i)} if a.id_in else {}),
             **({"include_attributes": ["id"]} if a.nq_data else {}),
             **({"include_attributes": a.include_attributes} if a.include_attributes is not None else {}),
         },
