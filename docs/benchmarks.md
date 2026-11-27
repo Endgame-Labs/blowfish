@@ -15791,6 +15791,9 @@ cache, zero disk cache, 256 KiB blocks, 32-block coalescing, fetch concurrency 5
 64 probes, top ten, strong consistency, and IDs only. Release builds target
 `neoverse-v1` with Rust 1.100.0, Clang 19, and Clang 22/compiler-rt linking.
 Compilation and timing never overlap on a measurement reader.
+The standalone benchmark lockfile is refreshed from stale v0.1.15 path-package
+records to v0.1.57 and the current path dependency edges. Registry package entries
+are unchanged. Both arms used the same generated lockfile during measurement.
 
 ### The title case reaches a receive-bandwidth ceiling
 
