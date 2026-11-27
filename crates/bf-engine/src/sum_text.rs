@@ -600,11 +600,8 @@ pub(crate) struct SegmentSum {
     /// among boosted rows that match no text.
     pub id_ordered: bool,
     /// For each row-wise term with a stream attribute, the attribute's sorted value dictionary here.
-    streams: Vec<Option<Dictionary>>,
+    streams: Vec<Option<Arc<segment::TopValues>>>,
 }
-
-/// A filterable attribute's sorted values, each with its rows.
-type Dictionary = Arc<Vec<(serde_json::Value, RoaringBitmap)>>;
 
 /// Open a segment for `Sum` list searches. `None` when a clause has no usable text index in this
 /// segment, in which case the caller scores everything the old way.
@@ -652,7 +649,7 @@ pub(crate) async fn open(
                     ))
                 ) =>
             {
-                segment::filter_values(store, seg, attribute).await
+                segment::filter_top(store, seg, attribute).await
             }
             _ => Ok(None),
         }
@@ -757,6 +754,14 @@ struct Drawn {
     rows: Vec<u32>,
     cut: Option<f64>,
 }
+/// How a draw ended.
+enum Draw {
+    Done(Drawn),
+    /// It looked at `MAX_SCAN` values without finding enough rows.
+    TooLong,
+    /// It ran past the kept top values, and the full dictionary is needed.
+    NeedFull,
+}
 
 /// Lists up to `n` allowed rows from the largest attribute value down, a whole value at a time (the
 /// last one may be split, lowest rows first, and then bounds the rest). `None` when it looked at
@@ -765,9 +770,10 @@ fn draw(
     state: &NamespaceState,
     term: &DocTerm<'_>,
     values: &[(serde_json::Value, RoaringBitmap)],
+    truncated: bool,
     allowed: &RoaringBitmap,
     n: usize,
-) -> Result<Option<Drawn>, ApiError> {
+) -> Result<Draw, ApiError> {
     let attribute = term.stream.as_deref().expect("stream attribute");
     let at = |v: &serde_json::Value| -> Result<f64, ApiError> {
         let doc = Document::from_iter([(attribute.to_string(), v.clone())]);
@@ -787,12 +793,14 @@ fn draw(
         } else if top > lo {
             top -= 1;
             &values[top]
+        } else if truncated {
+            return Ok(Draw::NeedFull);
         } else {
-            return Ok(Some(Drawn { rows, cut: None }));
+            return Ok(Draw::Done(Drawn { rows, cut: None }));
         };
         scanned += 1;
         if scanned > MAX_SCAN {
-            return Ok(None);
+            return Ok(Draw::TooLong);
         }
         let (value, bitmap) = entry;
         let hits: Vec<u32> = if bitmap.len() <= 256 {
@@ -804,7 +812,7 @@ fn draw(
             continue;
         }
         if rows.len() >= n {
-            return Ok(Some(Drawn {
+            return Ok(Draw::Done(Drawn {
                 rows,
                 cut: Some(at(value)?),
             }));
@@ -812,7 +820,7 @@ fn draw(
         let room = n - rows.len();
         if hits.len() > room {
             rows.extend(&hits[..room]);
-            return Ok(Some(Drawn {
+            return Ok(Draw::Done(Drawn {
                 rows,
                 cut: Some(at(value)?),
             }));
@@ -916,7 +924,20 @@ impl SegmentSum {
             let drawn = if all_matches {
                 None
             } else {
-                draw(state, doc, values, &class.rows, n)?
+                match draw(state, doc, &values.values, values.truncated, &class.rows, n)? {
+                    Draw::Done(d) => Some(d),
+                    Draw::TooLong => None,
+                    Draw::NeedFull => {
+                        let attribute = doc.stream.as_deref().expect("stream attribute");
+                        let full = segment::filter_values(&self.store, &self.seg, attribute)
+                            .await?
+                            .ok_or_else(segment::corrupt)?;
+                        match draw(state, doc, &full, false, &class.rows, n)? {
+                            Draw::Done(d) => Some(d),
+                            _ => None,
+                        }
+                    }
+                }
             };
             let Some(drawn) = drawn else {
                 // No usable stream: the static bound must do, and a bare attribute has none.
@@ -1032,18 +1053,32 @@ impl SegmentSum {
             if !self.id_ordered {
                 return Ok(None);
             }
-            let matching = reader
-                .contains_any_token(&clause.query)
-                .await
-                .map_err(segment::index_error)?;
-            rows.extend(
-                class
-                    .rows
-                    .iter()
-                    .filter(|row| !matching.contains(*row))
-                    .take(k)
-                    .map(|row| (row, t.abs())),
-            );
+            // The `k` lowest-ID allowed rows that score 0: score a window of the lowest rows and
+            // grow it until `k` of them match nothing (or it holds every allowed row).
+            let mut w = (k * 4).max(MIN_LIST);
+            loop {
+                let window: RoaringBitmap = class.rows.iter().take(w).collect();
+                let scored = reader
+                    .search_prefetched(
+                        &clause.query,
+                        clause.stats,
+                        &clause.cfg,
+                        window.len() as usize,
+                        Some(&window),
+                    )
+                    .await
+                    .map_err(segment::index_error)?;
+                let matched: RoaringBitmap = scored.iter().map(|h| h.row).collect();
+                let zeros: Vec<u32> = (&window - &matched).iter().take(k).collect();
+                if zeros.len() >= k || window.len() == class.rows.len() {
+                    rows.extend(zeros.into_iter().map(|row| (row, t.abs())));
+                    break;
+                }
+                w *= 4;
+                if w > MAX_WINDOW {
+                    return Ok(None);
+                }
+            }
         }
         Ok(Some(Candidates {
             rows,

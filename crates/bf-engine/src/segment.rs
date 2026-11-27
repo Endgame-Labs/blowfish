@@ -1847,6 +1847,47 @@ pub(crate) async fn filter_values(
         None => Ok(None),
     }
 }
+/// The largest values of a filterable attribute with their rows, for streams that list rows from the
+/// top. `values` keeps the dictionary's layout (a null entry first, then numbers ascending) but only
+/// the last `TOP_VALUES` numbers, so a large dictionary does not have to stay decoded in memory.
+pub(crate) struct TopValues {
+    pub values: Vec<(Value, RoaringBitmap)>,
+    /// Smaller numbers exist beyond `values`.
+    pub truncated: bool,
+}
+/// Numbers kept per attribute and segment by [`filter_top`].
+const TOP_VALUES: usize = 2048;
+/// [`TopValues`] of an attribute, cached under a small charge. `None` when the segment has no
+/// filter column for it.
+pub(crate) async fn filter_top(
+    store: &Storage,
+    segment: &Segment,
+    attribute: &str,
+) -> Result<Option<Arc<TopValues>>, ApiError> {
+    let Some(file) = segment.files.get("filters") else {
+        return Ok(None);
+    };
+    let key = format!("{}:{attribute}:top", file.key);
+    if let Some(top) = read_cache::get(&key, 0) {
+        return Ok(Some(top));
+    }
+    let Some(full) = filter_values(store, segment, attribute).await? else {
+        return Ok(None);
+    };
+    let nulls = usize::from(full.first().is_some_and(|(v, _)| v.is_null()));
+    let from = full.len().saturating_sub(TOP_VALUES).max(nulls);
+    let mut values: Vec<(Value, RoaringBitmap)> = full[..nulls].to_vec();
+    values.extend(full[from..].iter().cloned());
+    let bytes: usize = values.iter().map(|(_, b)| 64 + b.serialized_size()).sum();
+    Ok(Some(read_cache::insert(
+        &key,
+        bytes as u64,
+        TopValues {
+            values,
+            truncated: from > nulls,
+        },
+    )))
+}
 async fn dictionary(
     reader: &ObjectReader,
     col: &Column,
