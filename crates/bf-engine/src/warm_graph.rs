@@ -1275,7 +1275,13 @@ async fn search_entry(
     let (hits, evaluations) = match (scan, mask.as_deref()) {
         (true, Some(allowed)) => entry
             .graph
-            .scan(vector, scan_shortlist(k), scan_screen(k), allowed)
+            .scan(
+                vector,
+                scan_shortlist(k),
+                scan_screen(k),
+                allowed,
+                crate::fan_out(),
+            )
             .map_err(segment::index_error)?,
         (true, None) => return Ok(None),
         (false, _) => entry

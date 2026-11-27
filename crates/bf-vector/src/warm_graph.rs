@@ -104,12 +104,17 @@ impl HotGraph {
         count: usize,
         keep: usize,
         allowed: &RoaringBitmap,
+        parallel: bool,
     ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
         crate::distance::validate(query, self.dims)?;
         if count == 0 || self.nodes.is_empty() || query.iter().all(|x| *x == 0.) {
             return Err(Error::InvalidInput("unsupported graph query shape".into()));
         }
-        let chunk = scan_chunk(allowed.len() as usize, rayon::current_num_threads());
+        let chunk = if parallel {
+            scan_chunk(allowed.len() as usize, rayon::current_num_threads())
+        } else {
+            usize::MAX
+        };
         self.scan_chunked(query, count, keep, allowed, chunk)
     }
     /// [`Self::scan`] with the allowed rows split into chunks of `chunk` rows, screened and
@@ -443,13 +448,13 @@ mod tests {
         let outside = RoaringBitmap::from_iter([0, 1, 100_000]);
         let all = (0..n).map(row).collect::<RoaringBitmap>();
         for allowed in [&thirds, &one, &outside, &all] {
-            let (hits, scanned) = graph.scan(query, 12, usize::MAX, allowed).unwrap();
+            let (hits, scanned) = graph.scan(query, 12, usize::MAX, allowed, true).unwrap();
             let inside = allowed.iter().filter(|r| ids.contains(r)).count();
             assert_eq!(scanned, inside);
             assert_eq!(hits.len(), inside.min(12));
             assert!(hits.iter().all(|(r, _)| allowed.contains(*r)));
             // With the whole allowed set shortlisted, the scan equals a full ranking.
-            let (full, _) = graph.scan(query, n, usize::MAX, allowed).unwrap();
+            let (full, _) = graph.scan(query, n, usize::MAX, allowed, true).unwrap();
             assert_eq!(
                 full[..hits.len()].iter().map(|h| h.0).collect::<Vec<_>>(),
                 hits.iter().map(|h| h.0).collect::<Vec<_>>()
@@ -457,12 +462,16 @@ mod tests {
         }
         // The nearest allowed row to a stored vector is that row when it is allowed.
         assert_eq!(
-            graph.scan(query, 3, usize::MAX, &all).unwrap().0[0].0,
+            graph.scan(query, 3, usize::MAX, &all, true).unwrap().0[0].0,
             row(41)
         );
         // Zero queries and zero counts are refused like graph navigation.
-        assert!(graph.scan(&vec![0.; dims], 3, usize::MAX, &all).is_err());
-        assert!(graph.scan(query, 0, usize::MAX, &all).is_err());
+        assert!(
+            graph
+                .scan(&vec![0.; dims], 3, usize::MAX, &all, true)
+                .is_err()
+        );
+        assert!(graph.scan(query, 0, usize::MAX, &all, true).is_err());
     }
     #[test]
     fn one_bit_screen_keeps_the_nearest_rows_and_the_exact_shortlist_size() {
@@ -499,9 +508,9 @@ mod tests {
             .collect::<RoaringBitmap>();
         let mut hit = 0;
         for q in (0..40).map(|i| &source[i * 37]) {
-            let (full, scanned) = graph.scan(q, 10, usize::MAX, &allowed).unwrap();
+            let (full, scanned) = graph.scan(q, 10, usize::MAX, &allowed, true).unwrap();
             assert_eq!(scanned, 1500);
-            let (screened, _) = graph.scan(q, 10, 600, &allowed).unwrap();
+            let (screened, _) = graph.scan(q, 10, 600, &allowed, true).unwrap();
             assert_eq!(screened.len(), 10);
             assert!(screened.iter().all(|(r, _)| allowed.contains(*r)));
             hit += screened
@@ -528,7 +537,7 @@ mod tests {
             }
         }
         // A shortlist as large as the request returns exactly that many distinct rows.
-        let (hits, _) = graph.scan(&source[0], 50, 50, &allowed).unwrap();
+        let (hits, _) = graph.scan(&source[0], 50, 50, &allowed, true).unwrap();
         let mut rows = hits.iter().map(|h| h.0).collect::<Vec<_>>();
         rows.sort_unstable();
         rows.dedup();

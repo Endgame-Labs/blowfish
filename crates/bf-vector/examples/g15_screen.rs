@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let run =
         |g: &bf_vector::warm_graph::HotGraph, v: &(String, usize), q: &[f32], m: &RoaringBitmap| {
-            g.scan(q, 30, if v.1 == 0 { usize::MAX } else { v.1 }, m)
+            g.scan(q, 30, if v.1 == 0 { usize::MAX } else { v.1 }, m, false)
                 .unwrap()
                 .0
         };
