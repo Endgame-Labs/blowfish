@@ -17452,3 +17452,77 @@ rate because each query hydrates about a million documents.
 String IDs and a multi-segment corpus with row order different from ID order (row order is ID order in every segment
 the engine builds today, so the tie widening is not exercised by the engine tests), `Max` under `limit.per` (keeps the old
 path), cold reads, and the p99 (the driver reports p90).
+
+
+## Round BW23: `Sum` of BM25 clauses decided from short lists, about 110 times faster at 16 clients
+
+`["Sum", [clauses...]]` over plain BM25 clauses set `all`, so every clause scored and every segment hydrated **every allowed
+row**. On the 1M MS MARCO fixture a two-clause `Sum` took about 1.9 s and a three-clause `Sum` about 2.5 s per query at one
+client, against 5 ms for one clause (the `bw23-check` message: six queries each, v0.1.69, warm).
+
+### What changed
+
+For a `Sum` whose clauses are all plain BM25, and no `limit.per`, and `k + offset` of at most 4,096 (`sum_text.rs`):
+
+1. Each segment asks each clause for its best `N` rows, `N = max(64, k + offset)`, with the normal block-max pruning, and
+   records each clause's `N`th score (0 when the list ended short: the clause is then exhaustive).
+2. The union of those rows is scored exactly under every clause by a second search masked to just the union (the engine's
+   existing selective-mask path), so each union row's total is the same f64 sum, in clause order, that full scoring computes.
+3. **Accept** when the global `k + offset`th total (union rows and every WAL tail document) is **strictly** greater than the
+   largest per-segment sum of cutoffs. A row outside every list scores at most each clause's cutoff, and rounded addition is
+   monotone, so its total cannot exceed that sum: it cannot reach the top, not even on a tie. When every list ended short
+   the answer is complete and no bound is needed.
+4. Otherwise `N` grows 4x (at most to 4,096) and the round repeats, and after that the full scorer runs as before.
+5. **Only the winners are hydrated:** the rows with total at least the `k + offset`th (every tie at the floor, so the ID
+   tie-break sees them all) are the only rows whose documents or keys are read. IDs-only responses take the keys-only
+   hydration. The old path (and the fallback) is unchanged.
+
+Anything else keeps the old path: nested expressions, attribute ranks, `limit.per`, a segment without a usable text index.
+Filters, deletes, and shadowed rows are already out of each segment's allowed bitmap, and tail documents are scored under
+every clause as before, then take part in the bound.
+
+### Tests
+
+`crates/bf-engine/tests/sum_text.rs` compares whole responses (IDs and score bits) with `query_exhaustive` for five clause
+sets (two and three clauses, a repeated clause), k of 1, 10, and 100, offsets of 0, 3, and 70, and no filter, an equality
+filter, and a not-equal filter, over three states each (two segments, then a WAL tail that rewrites, deletes, and adds rows,
+then the tail indexed), on a tie-heavy corpus (identical texts, so totals tie at the bound) and on a varied one (scores
+rarely tie, so the bound holds). Further tests: a 5,230-row tie-heavy corpus with a tail where no list length proves the
+answer and the fallback runs; pages of 1,200 to 9,000 rows (past the 4,096 cap); and a tail-only namespace. Unit tests cover
+the strict-versus-tie bound, short lists, and the growth schedule. A counter check showed the accept path run with lists that
+did and did not cover the corpus, and the fallback run on the large corpus.
+
+### Measurement
+
+Local, no EC2: this VM (load under 1 at the start), fixture `tmp/msmarco-1m-v021/` (eight text segments) copied to local
+disk, 2 GiB raw cache, 4,000-byte blocks, server on CPUs 0 to 5 with two Rayon workers, `concurrent_bm25` on CPUs 6 and 7.
+Workloads from the checked-in 1,000-query file: 500 two-clause `Sum` queries (queries 2i and 2i+1) and 200 three-clause (3i
+to 3i+2), `top_k` 10, strong consistency, IDs only. The baseline (v0.1.69, `29a1fbc`) recorded the truth for all 700
+queries; the candidate's replies match it in **ordered IDs and f32 score bits on every query of every pass** (the driver
+asserts it). The baseline is too slow for the full protocol, so it ran the first 48 queries of each workload once per
+client count; the candidate ran a prewarm pass, then two 1-client and three 16-client passes (ranges below).
+
+| Workload | Arm | 1 client q/s | p50 / p99 ms | 16 clients q/s | p50 / p99 ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| two-clause `Sum` (baseline 48 queries) | v0.1.69 | 0.52 | 1,958 / 2,478 | 1.30 | 11,363 / 15,578 |
+| two-clause `Sum` (500) | candidate | 79 and 81 | 10.5 and 11.0 / 38.0 and 39.1 | 146 to 147 | 105 to 108 / 153 to 170 |
+| three-clause `Sum` (baseline 48 queries) | v0.1.69 | 0.37 | 2,695 / 3,563 | 0.81 | 18,885 / 26,297 |
+| three-clause `Sum` (200) | candidate | 33 and 34 | 27.0 and 27.4 / 68.7 and 75.0 | 47 to 58 | 270 to 314 / 363 to 598 |
+
+**Two-clause `Sum` is about 150 times faster at 1 client and 113 times at 16 clients; three clauses about 90 and 65 times**
+(the bar was 3x at 16 clients). A two-clause query costs about twice one clause at one client, as expected.
+
+### Not measured
+
+How often the bound holds versus the fallback runs on MS MARCO (no counters were kept; every query passed identically
+either way), cold reads, `Sum` under `limit.per` (old path), `Sum` mixed with non-BM25 clauses (old path), and string IDs.
+Baseline timings use 48 queries per workload, the way BW22 did.
+
+### Also in this round: the `warm_graph` test flake
+
+Several `warm_graph` tests failed with "graph was never admitted" when the VM was busy. Root cause: admission
+(`construct_hot_graph`) refuses a build unless `memory_available` finds enough unreclaimable memory in the host's real
+cgroup, and `admitted_entry` waited on that, so any other build or test run on the machine starved it. In unit tests,
+`memory_available` now answers from a fixed headroom (`TEST_HOST_HEADROOM`), so admission depends only on the engine's own
+reservations; production reads the cgroup as before (`cgroup_headroom` keeps its own unit test). With a parallel release
+build of the whole workspace running, all 22 `warm_graph` tests passed.

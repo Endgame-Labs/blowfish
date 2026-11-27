@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **`Sum` of BM25 clauses is decided from short per-clause lists, about 110 times faster at 16 clients:** `["Sum", [["text","BM25",a],["text","BM25",b]]]` scored and hydrated every matching row of every clause, about 1.9 seconds per two-clause query on a million-passage corpus. Each segment now returns each clause's best `max(64, k + offset)` rows, the union is scored exactly under every clause, and the answer is accepted when the `k + offset`th total is strictly above the sum of the clauses' cutoffs (no row outside the lists can reach the top, not even on a tie). Otherwise the lists grow 4x up to 4,096 rows and then the full scorer runs. Only the winning rows are hydrated. Two-clause queries went from 0.52 to 80 q/s at one client and from 1.3 to 147 q/s at 16 clients, three-clause from 0.37 to 34 and from 0.81 to about 50, and every reply (IDs and score bits) matches v0.1.69's. See [docs/benchmarks.md](docs/benchmarks.md), Round BW23.
+
 ## [0.1.69] - 2026-11-27
 
 ### Changed
