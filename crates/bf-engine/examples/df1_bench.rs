@@ -1,6 +1,6 @@
 //! Round DF1: time filtered deletes and patches on a local namespace with vectors.
 //! Usage: df1_bench build STORE_DIR ROWS DIMS | run STORE_DIR CASE
-//! CASE: delete:ATTR | patch:ATTR | mix (ATTR is b1000, b100, or b10: rows where ATTR == 0).
+//! CASE: delete:ATTR | patch:ATTR | patchp:ATTR (allow_partial) | mix (ATTR is b1000, b100, or b10: rows where ATTR == 0).
 //! Prints one JSON line: wall time, VmHWM before and after (KiB), and bytes read (rchar).
 use bf_engine::{Engine, EngineConfig};
 use bf_storage::{Storage, StorageConfig};
@@ -101,6 +101,11 @@ async fn main() {
     let out = match kind {
         "delete" => req(json!({"delete_by_filter": [attr, "Eq", 0]})),
         "patch" => req(json!({"patch_by_filter": {"filters": [attr, "Eq", 0], "patch": {"n": 7}}})),
+        // Round DF2: a 10 percent patch exceeds 50,000 rows, so it needs allow_partial.
+        "patchp" => req(
+            json!({"patch_by_filter": {"filters": [attr, "Eq", 0], "patch": {"n": 7}},
+            "patch_by_filter_allow_partial": true}),
+        ),
         "patchself" => {
             req(json!({"patch_by_filter": {"filters": [attr, "Eq", 0], "patch": {attr: 5}}}))
         }

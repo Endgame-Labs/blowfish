@@ -1025,35 +1025,150 @@ async fn materialize_inner(
     }
     Ok(full)
 }
-/// IDs of the live rows matching any of `filters` in `state`: tail documents by direct evaluation
-/// and segment rows through the query engine's filter evaluation (indexes and live-row masks),
-/// with tail-shadowed rows excluded. No document is read.
+/// The live rows matching any of a write's filters, as the query engine's filter evaluation finds
+/// them: tail documents by ID and segment rows by ordinal (`rows[i]` belongs to `state.segments[i]`).
+/// Tail-shadowed rows are excluded. No document is read.
+struct Candidates {
+    tail: BTreeSet<Id>,
+    rows: Vec<RoaringBitmap>,
+}
+
+/// Parallel segment passes per filtered write.
+const SEGMENT_WAVE: usize = 4;
+
+async fn segment_candidates(
+    store: &Storage,
+    state: &NamespaceState,
+    seg: &bf_wal::Segment,
+    filters: &[&Filter],
+) -> Result<RoaringBitmap, ApiError> {
+    let mut rows = RoaringBitmap::new();
+    for f in filters {
+        rows |= allowed(store, state, seg, Some(f)).await?;
+    }
+    Ok(rows)
+}
+
+/// Documents of the rows a write hydrates in one segment: the named IDs that are live there,
+/// plus the filter matches (already row ordinals).
+async fn segment_documents(
+    store: &Storage,
+    seg: &bf_wal::Segment,
+    named: &BTreeSet<Id>,
+    matched: Option<&RoaringBitmap>,
+) -> Result<std::collections::BTreeMap<Id, Document>, ApiError> {
+    let mut rows = RoaringBitmap::new();
+    if !named.is_empty() {
+        let live = segment::live(store, seg).await?;
+        rows = segment::lookup_many(store, seg, named).await? & live;
+    }
+    if let Some(matched) = matched {
+        rows |= matched;
+    }
+    hydrate_rows(store, seg, &rows).await
+}
+
+/// Row ordinals per hydration task (2,048, a multiple of the 256-row column block), and the rows below
+/// which one task does all the work.
+const HYDRATE_CHUNK_BITS: u32 = 11;
+const HYDRATE_PARALLEL_MIN: u64 = 4096;
+/// Hydration tasks in flight per segment.
+const HYDRATE_TASKS: usize = 8;
+
+/// [`segment::documents`], with the decoding of a large row set spread over runtime tasks (each
+/// in this write's read context) in chunks of whole column blocks. A lone small write, or a
+/// busy server (`fan_out`), reads on this task.
+async fn hydrate_rows(
+    store: &Storage,
+    seg: &bf_wal::Segment,
+    rows: &RoaringBitmap,
+) -> Result<std::collections::BTreeMap<Id, Document>, ApiError> {
+    if rows.len() < HYDRATE_PARALLEL_MIN || !crate::fan_out() {
+        return segment::documents(store, seg, rows).await;
+    }
+    let mut chunks: std::collections::BTreeMap<u32, RoaringBitmap> = Default::default();
+    for row in rows {
+        chunks
+            .entry(row >> HYDRATE_CHUNK_BITS)
+            .or_default()
+            .insert(row);
+    }
+    let context = crate::read_cache::context();
+    let mut waiting = chunks.into_values();
+    let mut set = tokio::task::JoinSet::new();
+    let mut out = std::collections::BTreeMap::new();
+    loop {
+        while set.len() < HYDRATE_TASKS
+            && let Some(chunk) = waiting.next()
+        {
+            let (store, seg, context) = (store.clone(), seg.clone(), context.clone());
+            set.spawn(async move {
+                let job = async { segment::documents(&store, &seg, &chunk).await };
+                match context {
+                    Some(context) => crate::read_cache::scope(context, job).await,
+                    None => job.await,
+                }
+            });
+        }
+        let Some(joined) = set.join_next().await else {
+            break;
+        };
+        out.extend(joined.map_err(segment::index_error)??);
+    }
+    Ok(out)
+}
+
 async fn filter_candidates(
     store: &Storage,
     state: &NamespaceState,
     filters: &[&Filter],
-) -> Result<BTreeSet<Id>, ApiError> {
-    let mut out = BTreeSet::new();
+) -> Result<Candidates, ApiError> {
+    let mut tail = BTreeSet::new();
     for f in filters {
         filter::validate(f, &state.schema, false)?;
         for (id, doc) in &state.docs {
             if filter::matches(f, Some(doc), None, &state.schema)? {
-                out.insert(id.clone());
-            }
-        }
-        for seg in &state.segments {
-            let rows = allowed(store, state, seg, Some(f)).await?;
-            if rows.is_empty() {
-                continue;
-            }
-            let ids = segment::ids(store, seg).await?;
-            for row in rows {
-                out.insert(ids.get(row as usize).ok_or_else(segment::corrupt)?.clone());
+                tail.insert(id.clone());
             }
         }
     }
-    Ok(out)
+    let mut rows = Vec::with_capacity(state.segments.len());
+    for wave in state.segments.chunks(SEGMENT_WAVE) {
+        let mut jobs = Vec::with_capacity(wave.len());
+        for seg in wave {
+            jobs.push(segment_candidates(store, state, seg, filters));
+        }
+        rows.extend(futures::future::try_join_all(jobs).await?);
+    }
+    rows.shrink_to_fit();
+    Ok(Candidates { tail, rows })
 }
+
+/// A write group's evaluation state, and for a pure `delete_by_filter` the sorted IDs it deletes.
+pub(crate) struct ForWrites {
+    pub state: NamespaceState,
+    /// Set only for a group that is exactly one `delete_by_filter`: no row was loaded, and the
+    /// validated ID set is the delete batch (`write::prepare_resolved`).
+    pub resolved_deletes: Option<Vec<Id>>,
+}
+
+/// A request that only deletes by filter: nothing else in it reads or writes a document.
+fn is_pure_delete(req: &WriteRequest) -> bool {
+    req.delete_by_filter.is_some()
+        && req.upsert_rows.is_none()
+        && req.upsert_columns.is_none()
+        && req.patch_rows.is_none()
+        && req.patch_columns.is_none()
+        && req.deletes.is_none()
+        && req.patch_by_filter.is_none()
+        && req.upsert_condition.is_none()
+        && req.patch_condition.is_none()
+        && req.delete_condition.is_none()
+        && req.schema.is_none()
+        && req.copy_from_namespace.is_none()
+        && req.branch_from_namespace.is_none()
+}
+
 /// Patches, conditions, and filtered writes hydrate only the rows they name or match;
 /// unconditional replacements need no old documents.
 pub(crate) async fn for_writes(
@@ -1061,7 +1176,7 @@ pub(crate) async fn for_writes(
     state: &NamespaceState,
     pending: &[Pending<Operation, Result<WriteResponse, ApiError>>],
     overlay: &[std::sync::Arc<bf_wal::WalEntry>],
-) -> Result<NamespaceState, ApiError> {
+) -> Result<ForWrites, ApiError> {
     crate::vector_locator::scope(state, for_writes_inner(store, state, pending, overlay)).await
 }
 
@@ -1070,7 +1185,7 @@ async fn for_writes_inner(
     state: &NamespaceState,
     pending: &[Pending<Operation, Result<WriteResponse, ApiError>>],
     overlay: &[std::sync::Arc<bf_wal::WalEntry>],
-) -> Result<NamespaceState, ApiError> {
+) -> Result<ForWrites, ApiError> {
     let mut wanted = BTreeSet::new();
     let mut hydrate = BTreeSet::new();
     let mut filters: Vec<&Filter> = vec![];
@@ -1151,6 +1266,7 @@ async fn for_writes_inner(
         hydrate.extend(req.deletes.iter().flatten().cloned());
         wanted.extend(req.deletes.iter().flatten().cloned());
     }
+    let mut found = None;
     if !filters.is_empty() {
         // A filtered write may touch any row that matches in the committed state, plus any row an
         // earlier write in this group names (already in `wanted`): every other row keeps its
@@ -1158,12 +1274,43 @@ async fn for_writes_inner(
         // barriers (`is_barrier`), so no in-flight group (overlay) exists and the group is a single
         // request, but the state is still re-read on every commit retry, so the filter is never
         // resolved against a stale state. If the filter cannot be resolved, the full scan decides.
+        debug_assert!(overlay.is_empty() && pending.len() == 1);
         match filter_candidates(store, state, &filters).await {
-            Ok(ids) => {
-                wanted.extend(ids.iter().cloned());
-                hydrate.extend(ids);
+            Ok(c) => {
+                let pure = overlay.is_empty()
+                    && matches!(pending, [p] if matches!(&p.request,
+                        Operation::Write(req, None, _) if is_pure_delete(req)));
+                if pure {
+                    // The validated ID set is the delete batch: load nothing.
+                    let mut ids = c.tail;
+                    for (seg, rows) in state.segments.iter().zip(&c.rows) {
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        let seg_ids = segment::ids(store, seg).await?;
+                        for row in rows {
+                            ids.insert(
+                                seg_ids
+                                    .get(row as usize)
+                                    .ok_or_else(segment::corrupt)?
+                                    .clone(),
+                            );
+                        }
+                    }
+                    return Ok(ForWrites {
+                        state: state.without_docs(),
+                        resolved_deletes: Some(ids.into_iter().collect()),
+                    });
+                }
+                wanted.extend(c.tail.iter().cloned());
+                found = Some(c);
             }
-            Err(_) => return materialize(store, state).await,
+            Err(_) => {
+                return Ok(ForWrites {
+                    state: materialize(store, state).await?,
+                    resolved_deletes: None,
+                });
+            }
         }
     }
     if state.schema.get("id").and_then(|s| s.data_type.as_ref())
@@ -1192,12 +1339,24 @@ async fn for_writes_inner(
         .difference(&state.shadowed)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if !hydrate.is_empty() {
-        for seg in &state.segments {
-            let live = segment::live(store, seg).await?;
-            let rows = segment::lookup_many(store, seg, &hydrate).await? & live;
-            full.docs
-                .extend(crate::shared(segment::documents(store, seg, &rows).await?));
+    let found_rows = found.as_ref().map(|c| c.rows.as_slice());
+    if !hydrate.is_empty() || found_rows.is_some() {
+        // Named rows are found by ID; filter matches already carry their segment and ordinal.
+        let mut loaded = Vec::new();
+        for (wave, base) in state
+            .segments
+            .chunks(SEGMENT_WAVE)
+            .zip((0..).step_by(SEGMENT_WAVE))
+        {
+            let mut jobs = Vec::with_capacity(wave.len());
+            for (i, seg) in wave.iter().enumerate() {
+                let matched = found_rows.map(|rows| &rows[base + i]);
+                jobs.push(segment_documents(store, seg, &hydrate, matched));
+            }
+            loaded.extend(futures::future::try_join_all(jobs).await?);
+        }
+        for docs in loaded {
+            full.docs.extend(crate::shared(docs));
         }
     }
     // Groups that are staged but not yet committed come first in the log: a write must see their
@@ -1210,7 +1369,10 @@ async fn for_writes_inner(
     for doc in full.docs.values_mut() {
         std::sync::Arc::make_mut(doc).retain(|name, _| state.schema.contains_key(name));
     }
-    Ok(full)
+    Ok(ForWrites {
+        state: full,
+        resolved_deletes: None,
+    })
 }
 
 /// Exact row and logical-byte totals without materializing unaffected segment rows.

@@ -17925,6 +17925,58 @@ patches and deletes), a new attribute filtered on, an unknown attribute, and a p
 between this engine's snapshot and its filtered delete (a real lost slot): the other writer's matching row is
 deleted, and a row it moved out of the filter is not.
 
+## Round DF2: pure filtered deletes commit their ID set, and patches hydrate matched rows directly
+
+DF1 resolved a filter to IDs, then loaded those rows so `write::prepare` could test the filter again, and found each
+ID again with a serial loop over segments.
+
+### What changed
+
+1. **Pure deletes.** A group that is exactly one `delete_by_filter` (no upserts, patches, ID deletes, conditions,
+   schema change, or copy) loads no document. `for_writes` (`crates/bf-engine/src/snapshot.rs`) returns the sorted IDs
+   the query engine's filter evaluation validated (live rows of every segment, tail-shadowed rows excluded, plus the
+   matching tail documents), and `write::prepare` takes that set as the delete batch: same 5,000,000 limit and
+   `rows_remaining`, same response counts and `deleted_ids`. The set is rebuilt inside the commit loop, so after a lost
+   WAL slot the retry re-resolves it against the caught-up state and never reuses a stale one. Any group that mixes a
+   filtered delete with another operation keeps the DF1 logic unchanged.
+2. **Patches.** The filter pass keeps each match's segment and row ordinal (a bitmap per segment) and hydrates those
+   rows directly, instead of turning them into IDs and looking them up again. Segments run in waves of four, and a
+   segment with 4,096 or more rows to load splits them into chunks of 2,048 row ordinals (whole column blocks) decoded
+   on up to eight runtime tasks inside the write's read context, unless the server is busy (`fan_out`).
+
+### Measurements
+
+Same fixture and harness as DF1 (1,000,000 rows, 128-dimension `f32` vectors, local file store, one-row WAL tail,
+indexed; fresh process and fresh store copy per run, release build, `nice -n 19`), with v0.1.74 as the paired baseline
+(`df1_bench`; the new `patchp` case adds `patch_by_filter_allow_partial`, because a 10 percent patch exceeds 50,000
+rows and patches the first 50,000). Median of three alternating pairs, while BW26 ran on the same VM; idle RSS 41 to 43 MB.
+
+| Case (rows) | v0.1.74 wall | DF2 wall | v0.1.74 peak RSS | DF2 peak RSS | wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| delete 0.1% (1,000) | 213 ms | 56 ms | 162 MB | 83 MB | 3.8x |
+| delete 1% (10,000) | 534 ms | 81 ms | 351 MB | 81 MB | 6.6x |
+| delete 10% (100,000) | 948 ms | 107 ms | 704 MB | 95 MB | 8.9x |
+| patch 0.1% (1,000) | 238 ms | 158 ms | 167 MB | 143 MB | 1.5x |
+| patch 1% (10,000) | 656 ms | 576 ms | 399 MB | 389 MB | 1.1x |
+| patch 10% (50,000 of 100,000) | 1,354 ms | 700 ms | 887 MB | 928 MB | 1.9x |
+
+Pass: pure deletes at 10 percent are 8.9x faster (needed 3x), and patches at 10 percent 1.9x (needed 1.5x), with the
+same `rows_affected` in every pair. A 10 percent patch's peak RSS is about the same (its 50,000 patched rows, with their
+vectors, still go through `prepare` and the WAL entry). The 1 percent patch gained nothing: the rest of its time is
+`prepare`, the WAL append, and replay, not row loading, and chunked hydration only pays above about 5,000 rows.
+The delete 0.1 percent, delete 1 percent, and patch 0.1 percent rows come from an earlier three-pair run with 4,096-row
+chunks and an 8,192-row threshold, which those cases are below; the other rows are from the final build.
+
+### Tests
+
+`crates/bf-engine/tests/filtered_writes.rs` keeps DF1's 18 cases and adds five (a pure delete with `allow_partial`, a
+pure delete of tail-only, deleted, and re-upserted rows, a request mixing a filtered delete, a filtered patch, and an
+upsert, a filtered delete beside an ID delete of matching rows, and two pure deletes in a row), plus two tests: a pure
+delete after a forced lost slot (another writer deletes one matching row, moves another out of the filter, and adds a
+new match; the response and contents must reflect the caught-up state), and a 20,000-row patch that hydrates in chunks
+and must equal the tail-only reference. The existing cases already cover a group mixing an upsert with a filtered
+delete (`one request: filtered delete plus upsert of a matching id`).
+
 ## Round BW25: `Saturate` of BM25 and weighted predicate bonuses
 
 At v0.1.71 two common expression shapes still scored and hydrated every allowed row: a `Saturate` of a BM25 clause (alone, or
