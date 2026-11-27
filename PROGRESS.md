@@ -4,6 +4,7 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-27
 
+- **v0.1.62: G15 merged.** Filtered queries up to 1 in 16 of the graph's rows screen its resident one-bit codes (Hamming histogram cutoff), rescore 5,000 + 100k with SQ8, rerank exactly. c7g.4xlarge NQ, 16 clients, recall 1.000: hash 2% 323 -> 2,577 q/s, 5% 244 -> 1,872. The rule was lowered from G15's 1 in 8 to 1 in 16 at merge because one client was 1.4x slower than IVF at 10% (single-core scan). The one-bit codes are now charged in the build peak and the retained bytes. Next: split the screen across cores (G15b) to lift the one-client crossover.
 - **v0.1.61: TL1 merged.** Prepared tail vectors (validity, zero flag, norm in kernel order) and a per-snapshot prepared block; one dot per tail row per query, bit-identical. c7g.4xlarge NQ, 50 upserts/s, indexer off: top_k 10 2,730 -> 4,760 q/s, top_k 100 992 -> 2,046; indexer on within noise. Remaining tail cost is the dot over 4 KB per row (f16 storage is the next lever). C29 recorded (tests and docs only; the global row-location format was rejected).
 - **v0.1.60: G13 merged (via M13).** `ann::graph_mask` hides tail-shadowed rows from the warm graph's shortlist (per snapshot, incremental, single-flight), so `graph_k == k`; the G14 filtered scan takes the same mask. c7g.4xlarge NQ, 50 upserts/s, 16 clients: top_k 100 494 (IVF) -> 1,038 q/s on the graph, top_k 10 unchanged 2,825. Next bound: tail scoring (`merge_tail`) is ~80% of CPU under writes (Round T1).
 
