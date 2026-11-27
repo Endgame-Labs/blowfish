@@ -1035,32 +1035,22 @@ impl Drop for ScratchLoan<'_> {
 fn scan_shortlist(k: usize) -> usize {
     (k * 3).max(30)
 }
-/// The most allowed rows a filtered query scans, as a share of the graph's rows (1 in
-/// `SCAN_SHARE`, 1.56%). Round G14 measured the scan against the IVF tier on full NQ with hash
-/// filters: with 16 clients it is 5.9x, 4.6x, 3.7x, and 2.4x faster at 0.5%, 1%, 2%, and 5%, and equal
-/// at about 10%; with one client it matches IVF at about 1% and is slower beyond. The scan reads each
-/// allowed row's 1 KiB code from memory, so its cost grows with the allowed rows while IVF's stays
-/// nearly flat. Below this share the scan wins everywhere that matters (throughput by 4x or more, with
-/// serial latency within 10%); above it the IVF tier answers.
-const SCAN_SHARE: usize = 64;
-/// G15 EXPERIMENT SWITCH (temporary): the file named by `BF_G15_SWITCH` holds "ivf", "sq8 N", or
-/// "screen N KEEP_PER_K", for a 1-in-N share. Returns (mode, share, keep per k); mode 0 = screen.
-fn switch() -> (u8, usize, usize) {
-    let mut out = (0, SCAN_SHARE, 100);
-    if let Ok(path) = std::env::var("BF_G15_SWITCH") {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let mut words = text.split_whitespace();
-        let mode = words.next();
-        out.1 = words.next().and_then(|n| n.parse().ok()).unwrap_or(out.1);
-        out.2 = words.next().and_then(|n| n.parse().ok()).unwrap_or(out.2);
-        out.0 = match mode {
-            Some("ivf") => 2,
-            Some("sq8") => 1,
-            _ => 0,
-        };
-    }
-    out
+/// Rows the one-bit screen keeps for the SQ8 rescore of a filtered scan, for `k` wanted rows.
+/// Round G15 measured full NQ (2.68M rows): for `k` 10 a screen of 5,000 rows keeps recall@10 at
+/// 1.000 for filters from 0.5 to 20 percent of the rows, where 1,000 to 2,000 lose 0.002 to 0.003.
+/// The rescore of the kept rows costs about a tenth of the screen at 10 percent.
+fn scan_screen(k: usize) -> usize {
+    5000 + 100 * k
 }
+/// The most allowed rows a filtered query scans, as a share of the graph's rows (1 in
+/// `SCAN_SHARE`, 12.5%). The scan screens each allowed row's 128-byte one-bit code, rescores the
+/// best few thousand with SQ8, and reranks the best few exactly. Round G15 measured it against the
+/// IVF tier on full NQ with hash and id filters. With 16 clients it is 7.6x to 8.0x faster from 0.5% to
+/// 5%, 3.5x at 10%, and still 1.1x at 20%; with one client it matches IVF
+/// at about 7% and is 1.4x slower at 10%, because IVF spreads one query over every core while the
+/// scan runs on one. Up to this share the scan wins throughput by 3x or more; above it the IVF tier
+/// answers, and the scan's cost, proportional to the allowed rows, would soon pass IVF's flat one.
+const SCAN_SHARE: usize = 8;
 /// Whether a ready graph answers a filtered query by scanning the codes of its `allowed` rows.
 pub(crate) fn scan_eligible(
     state: &NamespaceState,
@@ -1071,10 +1061,6 @@ pub(crate) fn scan_eligible(
     allowed: &RoaringBitmap,
 ) -> bool {
     if overcommitted() {
-        return false;
-    }
-    let (mode, share, _) = switch();
-    if mode == 2 {
         return false;
     }
     let Some(scope) = current() else {
@@ -1095,7 +1081,7 @@ pub(crate) fn scan_eligible(
                 && vector.len() == e.graph.dims()
                 && vector.iter().any(|x| *x != 0.)
                 && !allowed.is_empty()
-                && allowed.len().saturating_mul(share as u64) <= e.graph.len() as u64
+                && allowed.len().saturating_mul(SCAN_SHARE as u64) <= e.graph.len() as u64
         })
 }
 /// Answer a filtered query from the ready graph's codes: score only the `mask` rows, keep the
@@ -1274,18 +1260,10 @@ async fn search_entry(
     };
     let (ef, shortlist) = plan(k, ef);
     let (hits, evaluations) = match (scan, mask.as_deref()) {
-        (true, Some(allowed)) => {
-            let (mode, _, per) = switch();
-            let keep = if mode == 1 {
-                usize::MAX
-            } else {
-                5000 + per * k
-            };
-            entry
-                .graph
-                .scan(vector, scan_shortlist(k), keep, allowed)
-                .map_err(segment::index_error)?
-        }
+        (true, Some(allowed)) => entry
+            .graph
+            .scan(vector, scan_shortlist(k), scan_screen(k), allowed)
+            .map_err(segment::index_error)?,
         (true, None) => return Ok(None),
         (false, _) => entry
             .graph
