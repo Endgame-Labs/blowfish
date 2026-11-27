@@ -128,7 +128,9 @@ def run(name, binary, rnd, port, perf):
                     with lock:
                         lat.append(elapsed)
                         results.append({"query": i, "ids": [r["id"] for r in rows],
-                                        "distances": [r.get("$dist") for r in rows]})
+                                        "distances": [r.get("$dist") for r in rows],
+                                        "ms": elapsed, "start_ms": (t - t0) * 1000,
+                                        "finish_ms": (t - t0) * 1000 + elapsed})
         pp = None
         if perf:
             pp = subprocess.Popen(["sudo", "perf", "record", "-F", "499", "-g", "-p", str(proc.pid), "-o", str(RUN / f"{name}.perf.data")],
@@ -154,6 +156,10 @@ names = list(builds)
 rows = []
 for rnd in range(a.rounds):
     order = names[rnd % len(names):] + names[:rnd % len(names)]
+    # Reverse alternate complete rotations: three builds occupy all six permutations,
+    # balancing every pair's order while retaining the two-build AB/BA protocol.
+    if len(names) > 2 and (rnd // len(names)) % 2:
+        order.reverse()
     for k, name in enumerate(order):
         r = run(name, builds[name], rnd, a.port + k, a.perf and rnd == 0)
         rows.append(r); print(json.dumps(r), flush=True)

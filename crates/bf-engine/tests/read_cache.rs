@@ -24,6 +24,8 @@ struct Counting {
     calls: AtomicUsize,
     ranges: Mutex<Vec<Range<u64>>>,
     paths: Mutex<Vec<(String, Option<Range<u64>>)>>,
+    /// All object classes, without changing segment-only wave gates used by older tests.
+    all_paths: Mutex<Vec<(String, Option<Range<u64>>)>>,
     /// Optional explicit read batches for fixtures with a known cold-read plan.
     read_rounds: Mutex<Option<Arc<ReadRounds>>>,
     /// Waves of dependent segment reads (see [`Counting::wave`]).
@@ -202,6 +204,13 @@ impl ObjectStore for Counting {
         self.inner.put_multipart_opts(path, opts).await
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> StoreResult<GetResult> {
+        self.all_paths.lock().unwrap().push((
+            path.to_string(),
+            match &opts.range {
+                Some(object_store::GetRange::Bounded(r)) => Some(r.clone()),
+                _ => None,
+            },
+        ));
         self.calls.fetch_add(1, Ordering::SeqCst);
         if !opts.head && path.as_ref().contains("/wal-data/") {
             self.payload_reads.fetch_add(1, Ordering::SeqCst);
@@ -1591,7 +1600,7 @@ async fn filtered_slab_streaming_preserves_results_and_empty_filters_skip_member
         )
         .await
         .unwrap();
-    let (_, manifest) = bf_wal::Wal::new(writable, "filtered-stream")
+    let (_, manifest) = bf_wal::Wal::new(writable.clone(), "filtered-stream")
         .unwrap()
         .latest_manifest()
         .await
@@ -1608,7 +1617,7 @@ async fn filtered_slab_streaming_preserves_results_and_empty_filters_skip_member
         ..config()
     };
     let reader = Engine::with_config(store(backend.clone()).await, tune.clone());
-    backend.paths.lock().unwrap().clear();
+    backend.all_paths.lock().unwrap().clear();
     let empty = reader
         .query(
             "filtered-stream",
@@ -1620,19 +1629,20 @@ async fn filtered_slab_streaming_preserves_results_and_empty_filters_skip_member
         .await
         .unwrap();
     assert!(empty.result.rows.unwrap().is_empty());
-    let paths = backend.paths.lock().unwrap().clone();
+    let paths = backend.all_paths.lock().unwrap().clone();
     assert!(
         !paths
             .iter()
             .any(|(p, _)| maps.iter().any(|m| p.ends_with(m))),
         "{paths:?}"
     );
+    let mut references = Vec::new();
     for filter in [
         json!(["tag", "Eq", 7]),
         json!(["tag", "Lt", 10]),
         json!(["id", "Lt", 1000]),
     ] {
-        let request = json!({"rank_by":["vector","ANN",vector(123)],"top_k":10,"filters":filter});
+        let request = json!({"rank_by":["vector","ANN",vector(123)],"top_k":10,"filters":filter,"include_attributes":["id"]});
         let mut results = Vec::new();
         for memory_bytes in [64 << 20, 0] {
             let storage = Storage::from_backend_with_cache(
@@ -1650,6 +1660,7 @@ async fn filtered_slab_streaming_preserves_results_and_empty_filters_skip_member
             .await
             .unwrap();
             let e = Engine::with_config(storage, tune.clone());
+            backend.all_paths.lock().unwrap().clear();
             let rows = e
                 .query(
                     "filtered-stream",
@@ -1661,6 +1672,28 @@ async fn filtered_slab_streaming_preserves_results_and_empty_filters_skip_member
                 .rows
                 .unwrap();
             assert_eq!(rows.len(), 10);
+            {
+                let reads = backend.all_paths.lock().unwrap();
+                assert!(
+                    reads
+                        .iter()
+                        .any(|(p, _)| maps.iter().any(|k| p.ends_with(k))),
+                    "nonempty filter did not open row maps: {reads:?}"
+                );
+            }
+            if memory_bytes > 0 && filter == json!(["tag", "Lt", 10]) {
+                let warm = e
+                    .query(
+                        "filtered-stream",
+                        serde_json::from_value(request.clone()).unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .result
+                    .rows
+                    .unwrap();
+                assert_eq!(rows, warm);
+            }
             results.push(
                 rows.into_iter()
                     .map(|r| (r["id"].clone(), r["$dist"].as_f64().unwrap().to_bits()))
@@ -1668,5 +1701,63 @@ async fn filtered_slab_streaming_preserves_results_and_empty_filters_skip_member
             );
         }
         assert_eq!(results[0], results[1], "{filter}");
+        references.push((request, results.remove(0)));
+    }
+
+    // A bare older index and an older blocked fragment keep serving the same filters.
+    // They have no published row maps, and the stale directory is rebuilt in memory.
+    let wal = bf_wal::Wal::new(writable.clone(), "filtered-stream").unwrap();
+    for blocks in [false, true] {
+        let (sequence, previous) = wal.latest_manifest().await.unwrap().unwrap();
+        let mut older = manifest.clone();
+        older.indexer_epoch = previous.indexer_epoch;
+        for slab in &mut older.ann_tiers.get_mut("vector").unwrap()[0].slabs {
+            let current = slab.files.remove("annv2:vector").unwrap();
+            slab.files.remove("annrows:vector");
+            let bytes = writable.get(&current.key).await.unwrap();
+            let legacy = bf_vector::downgrade_layout(&bytes).unwrap().unwrap();
+            let metadata = bf_vector::metadata_len(&legacy).unwrap();
+            let mut parts = Vec::new();
+            if blocks {
+                let (fragment, resident) =
+                    bf_vector::Fragment::legacy_fragment(&legacy, true).unwrap();
+                parts.push(("annfrag2:vector", fragment, resident));
+            }
+            parts.push(("ann:vector", legacy, metadata));
+            for (role, bytes, metadata_len) in parts {
+                let key = format!("ns/filtered-stream/legacy/{blocks}/{}/{role}", slab.id);
+                let file = bf_wal::SegmentFile {
+                    key: key.clone(),
+                    size: bytes.len() as u64,
+                    metadata_len,
+                    stats_index: None,
+                    text_header: None,
+                };
+                writable.create_unique(&key, bytes).await.unwrap();
+                slab.files.insert(role.into(), file);
+            }
+        }
+        wal.publish_fenced(sequence, previous.indexer_epoch, &older)
+            .await
+            .unwrap();
+        let legacy = Engine::with_config(store(backend.clone()).await, tune.clone());
+        for (request, expected) in &references {
+            legacy.drop_caches().await;
+            let rows = legacy
+                .query(
+                    "filtered-stream",
+                    serde_json::from_value(request.clone()).unwrap(),
+                )
+                .await
+                .unwrap()
+                .result
+                .rows
+                .unwrap();
+            let actual: Vec<_> = rows
+                .into_iter()
+                .map(|r| (r["id"].clone(), r["$dist"].as_f64().unwrap().to_bits()))
+                .collect();
+            assert_eq!(&actual, expected, "legacy blocks={blocks}: {request}");
+        }
     }
 }

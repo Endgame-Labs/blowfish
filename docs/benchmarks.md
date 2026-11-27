@@ -15766,3 +15766,383 @@ run after the final documentation commit, separately from timing, using
 `nice -n 19 cargo clippy --workspace --all-targets -j 3 -- -D warnings`.
 All tracked source files are compared by SHA-256 with the committed local tree
 before and after those remote checks.
+
+## Round C29: bandwidth, global row locations, and filtered code runs
+
+The frozen full prototype does **not** meet the C29 acceptance gate. Cache-cold title
+improves 1.20× against the requested 1.3×, while length and unfiltered p50 point
+estimates are 4.6% and 4.3% slower. The location format and code runs reduce bytes
+and improve localized-ID latency, but those gains do not establish a performance pass.
+
+The mergeable revision contains measurement and compatibility-test improvements.
+All production runtime code and the storage format remain at baseline. The global
+location object, its writer/backfill, its reader, and direct runs are **not shipped**;
+the complete experiment is preserved separately on `c29-global-rows`. The tables below first
+record that full prototype, followed by the runtime ablation and final rejection controls.
+
+Measured 2026-11-26–27 against v0.1.57 (`645d489`) on on-demand Graviton readers in
+us-west-2. Each reader has sixteen vCPUs; server and client share CPUs 0–7, with
+eight Rayon workers. A server-side copy of the retained 693-object, 77.34 GB C5
+fixture was repaired by the baseline writer, producing 55 resident row maps and
+61 source segments, as in C27/C28. All timing uses read-only servers. The retained
+fixture was never written. The newer writer subsequently published the optional
+global location object into the owned copy, retaining the older row maps so that
+both binaries query the same immutable vectors, codes, and source documents.
+
+Unless a table says fresh process per request, the single-client protocol is
+C28's cache-cold series: fresh processes per build and case, one untimed q199
+warm-up, and a complete engine-cache drop before each measured request. The two
+arms alternate A/B, then B/A. Settings remain 8 GiB raw cache, 512 MiB decoded
+cache, zero disk cache, 256 KiB blocks, 32-block coalescing, fetch concurrency 512,
+64 probes, top ten, strong consistency, and IDs only. Release builds target
+`neoverse-v1` with Rust 1.100.0, Clang 19, and Clang 22/compiler-rt linking.
+Compilation and timing never overlap on a measurement reader.
+The standalone benchmark lockfile is refreshed from stale v0.1.15 path-package
+records to v0.1.57 and the current path dependency edges. Registry package entries
+are unchanged. Both arms used the same generated lockfile during measurement.
+
+### The title case reaches a receive-bandwidth ceiling
+
+The same frozen baseline binary ran twenty matched queries per case on a
+c7gd.4xlarge and a c7gn.4xlarge. Blocks ran c7gd queries 0–9, c7gn 0–9, c7gn
+10–19, and c7gd 10–19, preserving the query pairing across hardware.
+
+| Predicate | c7gd p50 / p90, ms | c7gn p50 / p90, ms | p50 reduction | Completed MB/request, c7gd / c7gn |
+| --- | ---: | ---: | ---: | ---: |
+| Title | 1,525 / 1,745 | 890 / 971 | 41.6% | 1,644.7 / 1,644.8 |
+| Length | 912 / 1,024 | 674 / 820 | 26.0% | 390.7 / 390.7 |
+
+All forty query pairs retain identical ordered IDs and f64 distance bits, with
+zero local reads and zero membership rebuilds. Cross-host differences alone do
+not isolate bandwidth, particularly because the CPU and network platforms differ.
+A second comparison therefore shaped the c7gn's receive traffic to 15 Gbit/s
+through an IFB and TBF, alternating unshaped/shaped/shaped/unshaped blocks, with
+twenty matched queries per case:
+
+| Predicate | Unshaped p50, ms | 15 Gbit/s p50, ms |
+| --- | ---: | ---: |
+| Title | 905 | 1,420 |
+| Length | 685 | 697 |
+
+The same IFB path at 50 Gbit/s gives title 899/1,010 ms p50/p90 over twenty
+queries, with zero packet drops. Thus shaping overhead does not explain the
+15 Gbit/s title result. Receive bandwidth explains most of the title difference;
+the length cross-host difference does not reproduce under the cap. Neither result
+justifies a broad CPU scheduling change. Traffic shaping was removed afterward.
+
+### The shared C28 dispatch changes do not show a confirmed regression
+
+Sixty interleaved unfiltered pairs on the c7gn used a fresh process for every
+request, with no untimed query. The control restores inline generic-value decoding
+and the earlier worker-permit acquisition; the other arm is unchanged v0.1.57.
+This control is only used for unfiltered queries, where it cannot introduce the
+nested filtered-decoding permit deadlock that C28 fixed.
+
+| Statistic | v0.1.57, ms | Earlier dispatch control, ms | Current / control | Paired bootstrap 95% interval |
+| --- | ---: | ---: | ---: | ---: |
+| p50 | 329.66 | 342.74 | 0.962 | 0.914–1.017 |
+| p90 | 431.41 | 417.91 | 1.032 | 0.894–1.133 |
+
+The bootstrap resamples sixty paired indices 50,000 times, with RNG seed 29,
+and computes ratios of arm percentiles. These intervals establish neither a
+regression nor equivalence. All sixty pairs preserve ordered IDs and distance
+bits; mean recall is 0.9717 in both arms, with zero local reads and membership
+rebuilds. The shared C28 dispatch behavior remains unchanged.
+
+### Format and I/O experiments
+
+The optional global location object is indexed by global row, with 1,024-row
+checksummed pages. A record contains slab, cluster, and original cluster ordinal,
+using six bytes when those addresses fit, and twelve otherwise. Holes use an
+explicit sentinel. The repaired 10M layout produces one object with 60,039,096 logical bytes.
+A localized `id Lt 1000` query reads 8 KiB instead of all 60,000,880 bytes of the
+55 older row maps. Selected ordinals retain their positions in the full cluster;
+projecting rows never renumbers exact-vector addresses.
+
+Recluster writes the object before installing its tier. The indexer backfills
+older tiers and repairs a missing object under the existing manifest fence.
+The optional descriptor lives with the tier's first slab and includes an immutable
+ANN-generation hash in its object key. Readers reject stale descriptors, fall
+back to old maps when the object is absent, and never repair storage themselves.
+Old map objects remain published for older readers and vector-locator paths, so
+this revision adds about 60 MB of metadata storage per dense 10M tier. Tiers whose
+global address extent exceeds twice their present vector count retain the older
+layout to avoid a large sparse address array.
+
+The code-run prototype reads exact, unaligned runs of selected cold leaves,
+bypassing block-cache padding. It preserves the existing blob checksums, code
+checksums, masks, probe coverage, exact reranking, and hydration. Older split and
+flat layouts retain their ordinary reader. Warm and busy queries retain shared
+cache-backed reads. A byte semaphore holds response buffers through scoring.
+
+Exploratory eight-pair comparisons, before the final integration, show why bytes
+alone are insufficient:
+
+| Prototype | Title control / candidate p50, ms | Title MB/request | Length control / candidate p50, ms |
+| --- | ---: | ---: | ---: |
+| 16 KiB run gaps, 64 MiB response window | 1,367 / 1,232 | 1,644 / 1,253 | 891 / 809 |
+| 64 KiB run gaps, 128 MiB response window | 1,451 / 1,279 | 1,644 / 1,279 | 842 / 892 |
+| 512 KiB run gaps, 256 MiB response window | 1,370 / 1,366 | 1,644 / 1,622 | 860 / 838 |
+
+The smallest-gap title prototype increases GET attempts from about 915 to 3,250.
+The large-gap version gives back nearly all byte savings. The initial global-only
+integration improves the ID case, but regresses length: delayed metadata waves
+and projection work extend the critical path. Fetching the whole location table
+at the first positive predicate does not fix title latency and wastes 60 MB on
+the localized ID case; that reference is rejected. These exploratory results
+are not a claim that the round's acceptance criteria passed.
+
+### Full prototype: paired single-client results
+
+The final runtime is `77b2c50`, on the same c7gd reader and repaired copy as the
+baseline. The integrated reader projects disjoint completed predicate waves while
+other source filters finish, merges slabs in parallel on the existing pool, and
+retains the resulting union for the request. Cached predicates retain their
+original ownership, allowing later requests to reuse a projection after raw-cache
+eviction. This removes most of the initial dense-filter regression, but not all.
+Direct cold runs use 16 KiB gaps, an 8 MiB normal range limit, and a 64 MiB response
+window held through scoring. A single late vector-only shortlist overlaps their
+last scans; busy filtered queries retain their ordinary reads and issue no early
+reranks. There is no new setting.
+
+Each of the five original C28 cases ran twenty paired cache-cold queries:
+
+| Predicate | v0.1.57 p50 / p90, ms | Full prototype p50 / p90, ms | p50 speedup |
+| --- | ---: | ---: | ---: |
+| `title_initial Eq z` | 1,406.6 / 1,532.5 | 1,175.5 / 1,258.2 | 1.20× |
+| `text_length Gte 300` | 850.3 / 959.1 | 889.5 / 956.3 | 0.96× |
+| `id Lt 1000` | 389.2 / 417.3 | 321.8 / 345.1 | 1.21× |
+| `title_initial Eq __c26_no_match__` | 198.3 / 229.8 | 195.8 / 211.1 | 1.01× |
+| Unfiltered | 258.4 / 302.0 | 269.6 / 310.1 | 0.96× |
+
+Title completed bytes fall from 1,644.711 to 1,254.694 MB/request, but GET attempts
+rise from 929.10 to 3,235.30. Length falls from 390.681 to 297.597 MB, with
+762.00 versus 871.15 GET attempts. The ID case falls from 145.728 to 85.735 MB;
+its location metadata is one 8 KiB read rather than all 55 row maps. The empty
+case reads zero location or row-map bytes. Counters count completed payloads,
+excluding protocol overhead and partially received canceled responses.
+
+A second series uses a fresh process for every request, without an untimed query:
+forty processes per case, alternating A/B, then B/A, for the same twenty vectors.
+Process readiness waits are outside the timed HTTP request. Other settings match
+the cache-cold series. These colder measurements must be compared within their
+own table:
+
+| Predicate | v0.1.57 p50 / p90, ms | Full prototype p50 / p90, ms | p50 speedup |
+| --- | ---: | ---: | ---: |
+| `title_initial Eq z` | 1,417.2 / 1,540.5 | 1,154.6 / 1,336.9 | 1.23× |
+| `text_length Gte 300` | 851.7 / 923.4 | 891.4 / 960.6 | 0.96× |
+| `id Lt 1000` | 432.3 / 477.8 | 366.6 / 402.8 | 1.18× |
+| `title_initial Eq __c26_no_match__` | 203.9 / 289.7 | 207.3 / 306.7 | 0.98× |
+| Unfiltered | 335.9 / 374.3 | 341.6 / 391.9 | 0.98× |
+
+All 200 pairs across these two five-case series preserve ordered IDs and exact
+f64 distance bits, with zero local reads and zero membership rebuilds. Mean
+recall is 1.000 for title, 0.995 for length, and 0.965 unfiltered, in both builds
+and protocols. ID and empty have no separate truth array; their claim is parity.
+An additional `id Lt 0` empty control ran twenty pairs in each protocol. It is
+kept separate from the original C28 absent-title control above, and is not used
+to claim that case's acceptance.
+
+### Six-round concurrent controls
+
+Each predicate ran six alternating A/B and B/A rounds, with sixteen clients and
+128 measured requests per build per round, following four untimed warm-ups.
+That is 768 requests per build and predicate. Every round starts fresh processes,
+uses 64 MiB raw cache, 512 MiB decoded cache, zero disk cache, 256 KiB blocks,
+32-block coalescing, and eight Rayon workers on CPUs 0–7. Values below are the
+arithmetic means of round rates, percentiles, and per-request counters, rather
+than pooled latency percentiles.
+
+| Predicate | Build | q/s | p50 / p90, ms | MB/request | GET attempts/request | CPU seconds/request |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Title | v0.1.57 | 4.893 | 3,124 / 3,891 | 237.860 | 249.268 | 1.377 |
+| Title | Full prototype | 6.334 | 2,254 / 4,510 | 202.016 | 245.082 | 1.055 |
+| Length | v0.1.57 | 6.371 | 2,174 / 4,697 | 99.874 | 287.177 | 0.776 |
+| Length | Full prototype | 9.775 | 1,532 / 2,522 | 95.376 | 276.432 | 0.642 |
+
+Full-prototype/baseline throughput is 1.294× for title, with paired-round bootstrap
+95% interval 1.071–1.497, and 1.534× for length, interval 1.392–1.677. The
+bootstrap resamples the same six round indices 50,000 times, with RNG seed 29,
+and takes the ratio of arithmetic mean round rates. Six rounds still provide
+limited precision, and these gains do not establish improvements for other
+workloads. Title's mean round p90 worsens from 3,891 to 4,510 ms despite its
+higher throughput; length p90 improves from 4,697 to 2,522 ms.
+
+All 1,536 concurrent candidate/baseline pairs preserve ordered IDs and f64
+distance bits. Retained membership-rebuild counters remain zero; disk caching
+and automatic staging are disabled. The canonical ordered-result digest for
+all 1,736 main final pairs, including both single-client protocols, is
+`960950f617ddec8373df95a2f7bf85a7f3e4388e79337b0d50be22de4f298e38`.
+
+The title target is missed in both single-client protocols. Length p50 is about
+4.6% slower in both, while unfiltered p50 is 4.3% slower cache-cold and 1.7%
+slower fresh. These are point estimates, not an equivalence test. The positive
+concurrent throughput results therefore do **not** turn this candidate into a
+C29 acceptance pass. No further runtime tuning was selected after this frozen
+comparison.
+
+### Full-prototype validation checkpoint
+
+The three changed packages pass 482 tests, with zero failures and 19 ignored,
+plus all-target Clippy with warnings denied and formatting. Coverage includes
+checksummed sparse and wide addresses, original ordinals across disjoint waves,
+missing-object fallback and repair, stale manifest fences, bare and blocked older
+layouts, composed lineage, warm projection reuse after raw-cache eviction,
+localized metadata I/O, and GC retaining the new object outside the slab prefix.
+Current and uncached readers return identical scores.
+
+The full prototype at `729a92b` passed the full default-debug workspace gate:
+642 passed, zero failed, and 27 ignored, across 81 suites, plus workspace all-target
+Clippy with warnings denied. All 577 tracked files matched the committed tree
+before and after that checkpoint. These counts include the rejected format tests;
+the final test-and-harness revision receives independent final gates.
+
+### Runtime versus format ablation
+
+A further six-round control compares baseline, the full prototype, and a runtime
+reference using only old maps. All three binaries use identical release flags and
+the same repaired fixture. The optional location object remains present but is
+ignored by baseline and the runtime reference. The runtime reference retains fused
+old-map materialization, direct code runs, and late vector-only prefetch, while
+restoring the original snapshot, indexer, recluster, and old-map reader. Projection
+merging requires the new format and is part of the format-dependent arm.
+
+The three builds occupy all six ordering permutations, balancing each pair's
+order and each position. Each round uses the same sixteen-client, 128-query
+protocol as above, with fresh processes and four untimed warm-ups. Request start,
+finish, and HTTP duration are now retained. The two-build AB/BA protocol is unchanged.
+
+| Predicate | Build | q/s | p50 / p90, ms | CPU seconds/request | MB/request |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Title | Baseline | 4.954 | 3,167 / 3,928 | 1.305 | 216.026 |
+| Title | Full prototype | 6.515 | 2,238 / 3,739 | 1.053 | 200.164 |
+| Title | Runtime reference | 5.721 | 2,579 / 4,623 | 1.162 | 211.001 |
+| Length | Baseline | 6.912 | 2,008 / 4,333 | 0.779 | 99.812 |
+| Length | Full prototype | 9.722 | 1,559 / 2,510 | 0.652 | 95.202 |
+| Length | Runtime reference | 9.809 | 1,575 / 1,963 | 0.641 | 103.660 |
+
+For title, full/baseline is 1.315× (paired-round bootstrap 95% interval
+1.169–1.451), runtime/baseline is 1.155× (0.956–1.300), and full/runtime is
+1.139× (1.010–1.300). The runtime reference retains 49% of the measured
+incremental throughput gain. For length, full/baseline is 1.407× (1.236–1.597),
+runtime/baseline is 1.419× (1.295–1.580), and full/runtime is 0.991×
+(0.885–1.076): the runtime reference retains all of that gain. Intervals use
+50,000 paired-round resamples, seed 29. All 1,536 matched three-arm query groups
+retain identical ordered IDs and f64 bits, giving 4,608 pairwise comparisons.
+
+Measured concurrent requests have a warm namespace after the four warm-ups.
+`ReadContext.cold` is false, so direct runs and their late vector prefetch are
+not entered. The independent fused old-map materializer accounts for the runtime
+reference's meaningful execution change in this control. The format supplies an
+additional title gain through projected memberships, but no length gain. That
+increment does not justify the new object kind, publication/backfill, and second
+format reader in this revision; the format experiment is not shipped.
+
+### Why the original concurrent title p90 rose
+
+The original full-prototype mean round p90 of 4,510 ms includes one round at
+12,315 ms. Its other five round p90s are 2,306–3,505 ms. That slow round has
+normal CPU work (1.076 seconds/request) and bytes (200.9 MB/request), but process
+CPU utilization falls to 4.07 cores, versus 7.05–7.23 in its other rounds. The
+maximum observed backend range-read duration rises from 0.956 seconds before
+measurement to 4.899 seconds after. This identifies a wait episode rather than
+an increase in CPU work; the original harness did not retain individual timings
+or that round's server log, so the precise wait chain cannot be reconstructed.
+
+The balanced repeat does not reproduce a mean-p90 regression for the full arm:
+3,739 ms versus baseline 3,928 ms. Instead, the runtime reference reaches 4,623 ms,
+driven by one 13,650 ms round. Its thirteen slowest requests start at positions
+112–124, in the last burst, excluding a startup-only explanation. The same episode
+has a 5.021-second maximum backend range read and only 4.25 cores utilized. These
+wait episodes occur without the new format, and the direct path is disabled for
+the measured warm requests. Every round remains in the reported statistics.
+
+A one-second ENA sampler on CPU 8, outside the measured CPUs 0–7, records repeated
+inbound bandwidth-allowance exceedances during the latter part of the repeat.
+The counter counts packets queued or dropped when the instance exceeds its
+inbound allowance. This confirms network allowance pressure on the reader, but
+normal rounds also have exceedances, and the original slow round was not sampled.
+A transport-wait explanation is consistent with the evidence; attributing that
+original episode specifically to S3, client pooling, or instance shaping would
+exceed the retained data.
+
+### Deployment note: sustained object-store bandwidth
+
+At measurement time, `DescribeInstanceTypes` reports c7gd.4xlarge at 7.5 Gbit/s
+baseline and 15 Gbit/s peak, versus c7gn.4xlarge at 50 Gbit/s baseline and peak.
+AWS documents a credit mechanism for smaller instances advertising an "up to"
+rate; sustained bandwidth can return to the baseline after burst credits are
+consumed. The earlier same-binary comparison and receive-cap control establish
+that network-optimized readers are a useful deployment option for this same-region,
+pure-S3 title workload. Size sustained readers using baseline bandwidth, and
+monitor ENA allowance counters alongside completed-byte counters and latency.
+
+AWS bandwidth and ENA references (short convenience links expire after ten days):
+
+https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-network-bandwidth.html
+
+https://hop.rip/7xxw2
+
+https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-network-performance-ena.html
+
+https://hop.rip/nksb3
+
+### Final no-format control and rejection
+
+The unconditional fused decoder did not pass the cold localized-ID gate. Across
+80 matched requests, ID p50 rose from 396.177 to 409.512 ms (candidate/baseline
+1.034, paired bootstrap 95% interval 1.008–1.050). Membership warming finished
+earlier, but overall snapshot warming finished later. A subsequent caller-mode
+split also failed its independent 40-pair ID gate (1.070, 1.007–1.115). The split
+is rejected rather than adding a heuristic to the format reader.
+
+The final reduced control restores both row-map files exactly to baseline and
+retains only direct code runs and one late vector-only prefetch. It uses forty
+matched cache-cold requests per case, with the same source path, release flags,
+query IDs, immutable fixture, cache geometry, and alternating order as before.
+
+| Predicate | Baseline p50 / p90, ms | Reduced p50 / p90, ms | Reduced/base p50 (95% interval) | Baseline / reduced MB |
+| --- | ---: | ---: | ---: | ---: |
+| Title | 1,495.1 / 1,606.6 | 1,269.8 / 1,438.4 | 0.849 (0.823–0.901) | 1644.442 / 1254.174 |
+| Length | 891.2 / 994.9 | 838.5 / 982.1 | 0.941 (0.904–0.988) | 388.079 / 295.894 |
+| ID < 1000 | 412.6 / 526.4 | 440.5 / 549.5 | 1.068 (1.009–1.124) | 145.728 / 145.728 |
+| Empty title | 211.0 / 250.6 | 207.4 / 254.5 | 0.983 (0.929–1.035) | 85.650 / 85.650 |
+| Unfiltered | 276.5 / 345.0 | 275.5 / 372.9 | 0.997 (0.911–1.130) | 98.659 / 98.818 |
+
+All 200 pairs retain identical ordered IDs and f64 distance bits, with no local
+reads or row-map rebuilds. Intervals use 50,000 paired resamples, seed 29. Title
+improves 1.18× and reads 23.7% fewer bytes, but ID is 6.8% slower and fails the
+no-regression gate. The direct path and late prefetch do not execute in that
+exact-ID case. Restoring the decoder therefore does not establish it as the cause
+of the earlier regression. The reduced control is also rejected; its failed gate
+prevents the planned reduced-revision concurrent controls from starting.
+
+A requested A/A control places byte-identical baseline binaries at both binary
+paths. Forty matched cold-ID pairs give 418.728 versus 417.801 ms p50, a ratio of
+0.998 (0.968–1.034). This does not demonstrate a path or ordering bias of the
+observed magnitude. Twenty further CPU-profiled pairs reproduce later snapshot
+warming, while scan/rerank timing remains similar. These diagnostic runs are not
+acceptance samples. The largest CPU shares remain Roaring insertion (19.13% and
+18.17%), followed by copying, AES, and the same sparse decoder (3.25% and 3.18%).
+Aggregate sampled cycles are 43.87 and 45.59 billion. No new hot function supplies
+a demonstrated fix. Both sparse-decoder symbols are 4,604 bytes, with 1,151
+instructions and identical opcode sequences; this comparison does not prove
+identical relocation targets or cache behavior. The ANN search poll functions
+grow with the added direct-read state, but that does not explain conclusively why
+the earlier snapshot phase finishes later. The remaining cause is unresolved.
+
+The shipped revision therefore changes no production runtime code, public API,
+storage format, or setting. It fixes the test counter to observe ANN and row-map
+objects, while retaining the existing segment-only wave gates. Exact cold/warm
+results, uncached-reader parity, empty-filter map avoidance, older bare indexes,
+and older blocked fragments are covered. The harness retains individual request
+timing and balances three-arm ordering across all six permutations. The independent
+scale-server lockfile reflects workspace version 0.1.57, with all 356 registry
+package entries unchanged. Full workspace debug tests and all-target Clippy are
+required on this final revision before handoff.
+
+The bandwidth finding and the rejected experiments remain useful evidence, but
+C29 does not claim the requested 1.3× title improvement or a runtime performance
+pass. The complete full-format prototype remains on local branch
+`c29-global-rows` at `cc6b7a7`, for a later investigation.
