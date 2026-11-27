@@ -925,6 +925,11 @@ impl SearchThreshold {
         self.k
     }
 
+    /// The current floor: rows scoring strictly below it are skipped (0 before any is known).
+    pub fn floor(&self) -> f32 {
+        f32::from_bits(self.score.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Raise the floor to `score` when the caller knows `k` rows elsewhere that outrank any row
     /// scoring strictly below it. Lower, negative, and non-finite values are ignored.
     pub fn raise(&self, score: f32) {

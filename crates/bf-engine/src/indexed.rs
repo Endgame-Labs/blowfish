@@ -1522,6 +1522,32 @@ async fn prepare_scalar(
 }
 
 #[cfg(test)]
+mod floors_tests {
+    use super::*;
+
+    #[test]
+    fn combined_kth_raises_every_clause_floor_divided_by_its_weights_and_never_overshoots() {
+        // Clause 0 is weighted 2 then 3 (scaled = 3 * (2 * s)), clause 1 is plain.
+        let floors = Floors::new(2, vec![vec![2.0, 3.0], vec![]]);
+        floors.offer([9.0, 7.0].into_iter());
+        assert!(floors.clause(1).floor() <= 7.0 && floors.clause(1).floor() > 6.99);
+        assert!(floors.clause(0).floor() <= 7.0 / 6.0 && floors.clause(0).floor() > 1.16);
+        // Fewer than k rows known: nothing is raised.
+        let early = Floors::new(3, vec![vec![]]);
+        early.offer([9.0, 7.0].into_iter());
+        assert_eq!(early.clause(0).floor(), 0.0);
+        // A later, lower batch never lowers a floor; a higher one raises it.
+        floors.offer([1.0, 2.0].into_iter());
+        assert!(floors.clause(1).floor() > 6.99);
+        floors.offer([20.0, 30.0].into_iter());
+        assert!(floors.clause(1).floor() > 19.9);
+        // Every score that reaches the kth survives the floor (ties included).
+        let f = floors.clause(0).floor();
+        assert!(sum_text::scaled(&[2.0, 3.0], f) <= 20.0);
+    }
+}
+
+#[cfg(test)]
 mod ties_tests {
     use super::*;
     fn hits(scores: &[f32]) -> Vec<bf_text::SearchHit> {

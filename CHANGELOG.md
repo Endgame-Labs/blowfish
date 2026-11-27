@@ -4,6 +4,11 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **`Max` and `Sum` of weighted BM25 clauses take the fast paths, over 100 times faster:** a clause wrapped in a positive constant, `["Product", 2.0, ["text","BM25",q]]` (either operand order, nested constants too), made the whole query score and hydrate every matching row, 2 to 3 seconds on a million-passage corpus. Weights keep each clause's order and ties, so the per-clause lists and the strict `Sum` bound work on raw scores and the weights apply where scores combine, multiplied innermost first in `f64` exactly as the full scorer does. Weighted `Sum` went from 0.4 to 124 to 150 q/s at one client (two clauses), weighted `Max` from 0.5 to about 440 (over 100 times faster in every case), and every reply (IDs and score bits) matches v0.1.70's. A weight of 0, outside `1e-9` to `1e9`, or nested more than four deep keeps the old path. See [docs/benchmarks.md](docs/benchmarks.md), Round BW24.
+- **`Max` of BM25 clauses is about 4 times faster at 16 clients:** the segments of a query now share a score floor per clause and the `k` best combined scores found so far, so a segment skips rows that cannot enter the answer, and a segment whose rows are verified to be in ID order no longer widens its lists for cutoff ties. Two-clause `Max` went from 348 to about 1,400 q/s at 16 clients.
+
 ## [0.1.70] - 2026-11-27
 
 ### Changed
