@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **BM25 plus a weighted predicate, and `Saturate` of BM25, take the list paths:** `["Sum", [BM25, ["Product", 5, ["field","Lt",x]]]]` scored and hydrated every allowed row (1.6 to 2.3 s on a million passages). Rows are now split by whether they match the predicate, each side is searched with the same statistics under its constant bonus, and the strict bound decides the answer, including boosted rows that match no text (lowest IDs first). 57 to 215 times faster at 16 clients. `Saturate` of a BM25 clause (alone, in `Max`, or in `Sum`) keeps each clause's order, so its top lists are trusted where the transformed scores are strictly separated, widening on rounding ties: 160 to 460 times faster for `Saturate` alone and in `Max` (12 to 15 times with 4 percent forced-tie queries, which still use the full scorer), but only about 6 times for `Sum` of `Saturate` clauses, where the compressed scores loosen the bound and about 40 percent of queries fall back. IDs and score bits match v0.1.71. See Round BW25 in [docs/benchmarks.md](docs/benchmarks.md).
+
 ## [0.1.71] - 2026-11-27
 
 ### Changed
