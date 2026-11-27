@@ -452,7 +452,7 @@ mod tests {
             let id = values[row].as_str().unwrap();
             operands.push(values[row].clone());
             // Absent IDs between rows: just before and just after this one.
-            operands.push(json!(format!("{}", &id[..5])));
+            operands.push(json!(id[..5].to_string()));
             operands.push(json!(format!("{}~", &id[..5])));
         }
         for legacy in [false, true] {
