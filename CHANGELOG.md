@@ -4,6 +4,10 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+### Changed
+
+- **`Max` of BM25 clauses no longer scores and hydrates every matching row:** `["Max", [["text","BM25",a],["text","BM25",b]]]` made each segment return every allowed row of every clause and read each row's document, about 3.5 CPU seconds per two-clause query on a million-passage corpus. Each clause now returns its own top `k + offset` rows (plus any rows tied with the cutoff) and the merge takes the per-row maximum, which is exact: a row outside every clause's list cannot reach the combined top. Two-clause queries went from 2.0 seconds to 2 ms at one client and from 1.4 to 680 q/s at 16 clients, three-clause from 2.7 seconds to 3 ms, and every reply (IDs and score bits) matches v0.1.66's. `Sum` and nested expressions are unchanged. See [docs/benchmarks.md](docs/benchmarks.md), Round BW22.
+
 ## [0.1.66] - 2026-11-27
 
 ### Changed

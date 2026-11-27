@@ -17154,3 +17154,69 @@ Qdrant's collection came up green with all 2,681,468 vectors indexed in two segm
 - **Not measured:** other hosts, remote object stores (the 2 ms rule is the only protection there; its test is a unit test), string-ID namespaces, filtered queries, and a mixed `top_k` load.
 
 Costs: no EC2 and no bucket writes. The 26.8 GB NQ fixture was copied to the M4 through presigned URLs (about $2.4 of S3 transfer) and deleted with the run directory, with the Qdrant store.
+
+## Round BW22: `Max` of BM25 clauses takes each clause's top `k + offset`, about 490 times faster at 16 clients
+
+`["Max", [clauses...]]` over plain BM25 clauses scored and hydrated **every allowed row of every clause** before the
+merge (`prepare_scalar` set `all = !plain_text`, so each segment search asked for `allowed.len()` hits and the engine then
+read the documents of all of them). On the 1M MS MARCO fixture that is every passage that contains any query term: a
+two-clause `Max` cost about 3.5 CPU seconds per query against 5 ms for one clause (the `bw22-check` message).
+
+### What changed
+
+For a `Max` whose clauses are all plain BM25, and no `limit.per`, each segment asks each clause for its top `k + offset`
+rows, with the normal block-max pruning. The merge keeps taking the per-row maximum with the ID tie-break. Why it is exact:
+
+- A row outside every clause's top list has its maximum (reached in some clause `c`) strictly below at least `k + offset`
+  rows' `c` scores, and each of those rows' maximum is at least its `c` score. So it cannot reach the combined top
+  `k + offset`.
+- A row that is in one clause's list but not another's is scored by the clause it is in only, which can understate its
+  maximum. It is then beaten, strictly, by the `k + offset` rows ahead of it in the other clause, so it still misses the top.
+- **Ties at the cutoff:** each clause searches for `k + offset + 1` rows and widens (doubling) until the list is the whole
+  result or ends strictly below the `k + offset`th score, so every row tied with the cutoff is present and the final ID
+  tie-break sees them all. (Segments are built in ID order, so row order and ID order agree and the widening is a
+  safeguard that costs one extra hit per clause.)
+- **WAL tail, shadowed and deleted rows, filters:** unchanged. The allowed bitmap already excludes shadowed, deleted, and
+  filtered rows before any clause searches, and tail documents are all scored under every clause as before.
+- `Sum`, nested expressions, and attribute ranks keep the old path. A `Max` of BM25 clauses with an IDs-only response now
+  also takes the keys-only hydration that a single BM25 clause already had.
+
+### Tests
+
+`crates/bf-engine/tests/max_text.rs` compares the new path with `query_exhaustive` (full scoring) for 4 clause sets (two and
+three clauses), k of 1, 10, and 100, offsets of 0, 3, and 25, and no filter, an equality filter, and a not-equal filter,
+over three states: two segments of tied texts with descending IDs per batch, a WAL tail that rewrites rows of a clause's top
+list (to a non-match and to a stronger match), deletes others, and adds rows tied with indexed ones, and the same namespace
+after the tail is indexed. A second test keeps `Sum`, nested `Max`, `Max` with an attribute clause, and `Product` equal to
+full scoring. A unit test covers the tie-completeness rule. Breaking the clause search (a fixed top of 2) fails the test.
+
+### Measurement
+
+Local, no EC2: this VM (shared, load 1 to 3), fixture `tmp/msmarco-1m-v021/` (eight text segments) copied to local disk
+for every arm, a 2 GiB raw cache, 4,000-byte blocks, server on CPUs 0 to 5 with two Rayon workers, `concurrent_bm25`
+on CPUs 6 and 7. Workloads from the checked-in 1,000-query file: 500 two-clause `Max` queries (queries 2i and 2i+1), 200
+three-clause (3i to 3i+2), and 500 single-clause for reference, `top_k` 10, strong consistency, IDs only. The baseline (v0.1.66
+`de72e7d`) recorded the truth for all 700 `Max` queries (about 50 minutes of CPU); the candidate's replies match it in
+**ordered IDs and f32 score bits on every query of every pass** (the driver asserts it). Candidate: two 1-client and three
+16-client passes per workload after a prewarm, per-query CPU from `/proc`. The baseline is too slow for that protocol, so it ran
+the first 48 queries of each workload, once per client count (RSS reaches 12 GB at 16 clients). The driver reports p50 and p90, not p99.
+
+| Workload | Arm | 1 client q/s | 1 client p50 ms | CPU ms/query | 16 clients q/s | 16 clients p50 / p90 ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| one clause (500) | v0.1.66 | 686 | 1.19 | 3.0 | 2,566 and 3,164 | 5.1 / 9.2 and 4.2 / 7.3 |
+| one clause (500) | candidate | 601 and 678 | 1.23 and 1.17 | 2.9 to 3.1 | 2,294 to 2,703 | 5.2 to 5.7 / 8.5 to 10.9 |
+| two-clause `Max` (500; baseline 48) | v0.1.66 | 0.51 | 1,995 | 3,641 | 1.39 | 10,812 / 12,768 |
+| two-clause `Max` (500) | candidate | 395 and 406 | 2.04 and 2.17 | 5.7 to 6.0 | 665 to 682 | 22.9 to 23.4 / 29.4 to 29.8 |
+| three-clause `Max` (200; baseline 48) | v0.1.66 | 0.38 | 2,661 | 4,646 | 1.02 | 14,963 / 18,141 |
+| three-clause `Max` (200) | candidate | 265 and 268 | 3.23 and 3.27 | 8.9 to 9.5 | 487 to 507 | 29.9 to 32.6 / 37.8 to 39.1 |
+
+**Two-clause `Max` is 780 times faster at 1 client and 490 times at 16 clients; three clauses 700 and 490 times** (the bar was
+1.3x at 16 clients). A two-clause query now costs about twice one clause, as it should. The single-clause rows are unchanged
+within the noise of the shared VM, as they should be (the path is not taken). The 16-client baseline barely beats its 1-client
+rate because each query hydrates about a million documents.
+
+### Not measured
+
+String IDs and a multi-segment corpus with row order different from ID order (row order is ID order in every segment
+the engine builds today, so the tie widening is not exercised by the engine tests), `Max` under `limit.per` (keeps the old
+path), cold reads, and the p99 (the driver reports p90).

@@ -792,12 +792,28 @@ pub(crate) fn text_ids_only(q: &QueryRequest) -> bool {
         Some(IncludeAttributes::Names(names)) => names.iter().all(|name| name == "id"),
         _ => false,
     };
-    matches!(q.rank_by, Some(RankBy::Bm25 { .. }))
+    (matches!(q.rank_by, Some(RankBy::Bm25 { .. })) || max_of_text(q.rank_by.as_ref()))
         && ids
         && q.filters.is_none()
         && q.exclude_attributes.is_none()
         && q.compute_attributes.is_none()
         && q.limit.as_ref().and_then(Limit::per).is_none()
+}
+/// `["Max", [...]]` whose clauses are all plain BM25. Each clause then needs only its own top
+/// `k + offset` rows (plus ties at the cutoff): a row outside every clause's top list has a
+/// maximum below at least `k + offset` other rows' maxima. `Sum` has no such bound.
+pub(crate) fn max_of_text(rank: Option<&RankBy>) -> bool {
+    matches!(rank, Some(RankBy::Max(xs)) if !xs.is_empty()
+        && xs.iter().all(|x| matches!(x, RankBy::Bm25 { .. })))
+}
+/// True when `hits` (best first, from a search for `top > k` rows) hold every row scoring at
+/// least the `k`th hit's score: the list is the whole result, or ends strictly below that score.
+fn ties_complete(hits: &[bf_text::SearchHit], k: usize, top: usize) -> bool {
+    k == 0
+        || hits.len() < top
+        || hits
+            .last()
+            .is_some_and(|last| last.score < hits[k - 1].score)
 }
 pub(crate) fn text_clauses<'a>(rank: &'a RankBy, clauses: &mut Vec<&'a RankBy>) {
     match rank {
@@ -824,6 +840,7 @@ async fn prepare_segment(
     seg: &bf_wal::Segment,
     clauses: &[&RankBy],
     all: bool,
+    clause_top: bool,
     k: usize,
     columns: &BTreeSet<String>,
     threshold: Option<&bf_text::SearchThreshold>,
@@ -910,7 +927,23 @@ async fn prepare_segment(
         let stats = state.corpus.get(attribute).unwrap_or(&fallback);
         let top = if all { allowed.len() as usize } else { k };
         let hits = if let Some(reader) = indexes.get(attribute) {
-            if let Some(threshold) = threshold {
+            if clause_top {
+                // Exact cutoff ties: widen until the list ends strictly below the kth score,
+                // so a tied row that wins the final ID tie-break is never dropped.
+                let mut top = top + 1;
+                loop {
+                    let hits = reader
+                        .search_prefetched(&query, stats, &cfg, top, Some(&allowed))
+                        .await;
+                    if hits
+                        .as_ref()
+                        .map_or(true, |hits| ties_complete(hits, k, top))
+                    {
+                        break hits;
+                    }
+                    top = top.saturating_mul(2);
+                }
+            } else if let Some(threshold) = threshold {
                 reader
                     .search_prefetched_shared(&query, stats, &cfg, Some(&allowed), threshold)
                     .await
@@ -935,7 +968,9 @@ async fn prepare_segment(
                 }
             }
             hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.row.cmp(&b.row)));
-            hits.truncate(top);
+            if !clause_top {
+                hits.truncate(top);
+            }
             hits
         };
         for hit in &hits {
@@ -1006,7 +1041,11 @@ async fn prepare_scalar(
     }
     let plain_text = matches!(q.rank_by, Some(RankBy::Bm25 { .. }));
     let k = q.total().unwrap_or(10000) + q.offset;
-    let all = !plain_text || q.limit.as_ref().and_then(Limit::per).is_some();
+    let per = q.limit.as_ref().and_then(Limit::per).is_some();
+    let all = !plain_text || per;
+    // The segments of a `Max` of BM25 clauses return each clause's top list, not every row.
+    // The WAL tail still scores every live tail document under every clause.
+    let clause_top = max_of_text(q.rank_by.as_ref()) && !per;
     let mut out = result_state(state);
     let mut columns: BTreeSet<_> = state
         .schema
@@ -1041,7 +1080,8 @@ async fn prepare_scalar(
             q,
             seg,
             &clauses,
-            all,
+            all && !clause_top,
+            clause_top,
             k,
             &columns,
             threshold,
@@ -1171,6 +1211,35 @@ async fn prepare_scalar(
     crate::sparse::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out);
     crate::pattern::tail_scores(q.rank_by.as_ref(), &state.docs, &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod ties_tests {
+    use super::*;
+    fn hits(scores: &[f32]) -> Vec<bf_text::SearchHit> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(row, &score)| bf_text::SearchHit {
+                row: row as u32,
+                score,
+            })
+            .collect()
+    }
+    #[test]
+    fn cutoff_ties_are_complete_only_when_the_list_ends_below_the_kth_score() {
+        // k = 2, asked for 3: the third hit ties the second, so more rows may tie too.
+        assert!(!ties_complete(&hits(&[5.0, 4.0, 4.0]), 2, 3));
+        // The third hit is strictly lower: every row tied with the second is already present.
+        assert!(ties_complete(&hits(&[5.0, 4.0, 3.0]), 2, 3));
+        // Fewer hits than asked for: the clause is exhausted.
+        assert!(ties_complete(&hits(&[5.0, 4.0, 4.0]), 2, 4));
+        assert!(ties_complete(&hits(&[]), 2, 3));
+        // A widened list that ends below the tie is complete, and one that ends on it is not.
+        assert!(ties_complete(&hits(&[5.0, 4.0, 4.0, 4.0, 1.0, 1.0]), 2, 6));
+        assert!(!ties_complete(&hits(&[4.0; 6]), 2, 6));
+        assert!(ties_complete(&hits(&[4.0]), 0, 1));
+    }
 }
 
 #[cfg(test)]
