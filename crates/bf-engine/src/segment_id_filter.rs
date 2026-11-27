@@ -12,6 +12,44 @@ pub(super) async fn evaluate(
     schema: &Schema,
     live: &RoaringBitmap,
 ) -> Result<Option<RoaringBitmap>, ApiError> {
+    let Some(range) = row_range(store, segment, op, value, schema, live.is_empty()).await? else {
+        return Ok(None);
+    };
+    let mut rows = RoaringBitmap::new();
+    rows.insert_range(range);
+    Ok(Some(if op == FilterOp::NotEq {
+        live - rows
+    } else {
+        rows & live
+    }))
+}
+
+/// Start seeking an ID predicate's rows while the caller loads the segment's live rows, which
+/// the seek does not need: the directory and ID blocks it reads stay in the caches, so the
+/// evaluation after the live load costs no reads. Failures are left for the evaluation to report.
+pub(super) async fn prefetch(store: &Storage, segment: &Segment, f: &Filter, schema: &Schema) {
+    if let Filter::Compare {
+        attribute,
+        op,
+        value,
+        ..
+    } = f
+        && attribute == "id"
+    {
+        let _ = Box::pin(row_range(store, segment, *op, value, schema, false)).await;
+    }
+}
+
+/// The interval of rows an ID comparison selects (for `NotEq`, the rows it excludes), or `None`
+/// when the operator is not a scalar comparison. With no live rows, nothing is read.
+async fn row_range(
+    store: &Storage,
+    segment: &Segment,
+    op: FilterOp,
+    value: &Value,
+    schema: &Schema,
+    no_live_rows: bool,
+) -> Result<Option<std::ops::Range<u32>>, ApiError> {
     use FilterOp::*;
     if !matches!(op, Eq | NotEq | Lt | Lte | Gt | Gte) {
         return Ok(None);
@@ -21,8 +59,8 @@ pub(super) async fn evaluate(
     } else {
         value.clone()
     };
-    if live.is_empty() {
-        return Ok(Some(RoaringBitmap::new()));
+    if no_live_rows {
+        return Ok(Some(0..0));
     }
     let bounds = bounds(store, segment).await?;
     let seeker = tokio::sync::OnceCell::new();
@@ -46,20 +84,13 @@ pub(super) async fn evaluate(
             boundary(store, segment, &seeker, &operand, true, bounds.as_ref()).await?,
         ),
     };
-    let range = match op {
+    Ok(Some(match op {
         Eq | NotEq => low..high,
         Lt => 0..low,
         Lte => 0..high,
         Gt => high..segment.row_count,
         Gte => low..segment.row_count,
         _ => unreachable!(),
-    };
-    let mut rows = RoaringBitmap::new();
-    rows.insert_range(range);
-    Ok(Some(if op == NotEq {
-        live - rows
-    } else {
-        rows & live
     }))
 }
 

@@ -1764,7 +1764,13 @@ pub(crate) async fn filter_live(
         return Ok(rows);
     }
     let trace = crate::ann::trace_stages().then(std::time::Instant::now);
-    let live = live(store, segment).await?;
+    // An ID predicate's seek needs no live rows, so it overlaps their load.
+    let (live, ()) = futures::future::join(
+        live(store, segment),
+        Box::pin(id_predicate::prefetch(store, segment, f, schema)),
+    )
+    .await;
+    let live = live?;
     if let Some(trace) = trace {
         crate::ann::task_stage(trace, "filter_live_loaded", &segment.id);
     }
