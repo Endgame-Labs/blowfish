@@ -173,7 +173,7 @@ impl HotGraph {
     pub fn scratch(&self) -> HotScratch {
         HotScratch(navigation::Scratch::new(self.len()))
     }
-    /// Navigate SQ8 codes, returning original tier rows and the number of distance evaluations.
+    /// Navigate SQ8 codes (screening each full-beam hop's neighbors with the one-bit codes first), returning original tier rows and the number of distance evaluations.
     /// Dead rows remain traversable and are removed before the exact-rerank pool is selected.
     pub fn candidates(
         &self,
@@ -201,7 +201,10 @@ impl HotGraph {
             return Err(Error::InvalidInput("unsupported graph query shape".into()));
         }
         let q = vectors::normalized(query);
-        let (code, scale) = self.codes.prepare(&q);
+        let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
+        let (code, scale) = quant::encode(&rotated);
+        let signs = self.bits.query(&rotated);
+        let screen = navigation::Screen::new(&self.bits, &signs);
         let entry = self
             .entries
             .iter()
@@ -216,6 +219,7 @@ impl HotGraph {
             ef.max(count).min(self.len()),
             |id| self.codes.score(&code, scale, id),
             |id| self.codes.prefetch(id),
+            Some(screen),
         );
         hits.retain(|h| live.is_none_or(|m| m.contains(self.rows[h.id as usize])));
         hits.truncate(count);
@@ -445,6 +449,109 @@ mod tests {
         rows.sort_unstable();
         rows.dedup();
         assert_eq!(rows.len(), 50);
+    }
+    /// Clustered synthetic rows: screening each full-beam hop with the one-bit codes must keep
+    /// the recall of the unscreened walk at the same `ef` while scoring far fewer neighbors.
+    #[test]
+    fn screened_navigation_keeps_recall_and_scores_fewer_neighbors() {
+        let (dims, n, clusters, ef, queries) = (128, 8000, 40, 48, 150);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+        };
+        let centers = (0..clusters)
+            .map(|_| (0..dims).map(|_| next() * 2.).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut point = |c: usize| {
+            (0..dims)
+                .map(|d| centers[c][d] + (next() + next() + next()) * 0.5)
+                .collect::<Vec<_>>()
+        };
+        let source = (0..n).map(|i| point(i % clusters)).collect::<Vec<_>>();
+        let held_out = (0..queries)
+            .map(|i| point(i * 7 % clusters))
+            .collect::<Vec<_>>();
+        let mut b = HotGraphBuilder::new(dims, n).unwrap();
+        for (part, rows) in source.chunks(1000).enumerate() {
+            let ids = (part * 1000..part * 1000 + rows.len())
+                .map(|i| i as u32)
+                .collect::<Vec<_>>();
+            let packed = rows
+                .iter()
+                .flatten()
+                .flat_map(|x| f16::from_f32(*x).to_le_bytes())
+                .collect::<Vec<_>>();
+            b.append(&ids, &packed, &|| false).unwrap();
+        }
+        let graph = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| b.finish(&|| false))
+            .unwrap();
+        let unit = |v: &[f32]| vectors::normalized(v);
+        let rows = source.iter().map(|r| unit(r)).collect::<Vec<_>>();
+        let (mut scratch, mut plain) = (graph.scratch(), graph.scratch());
+        let (mut found, mut found_plain, mut scored, mut scored_plain) = (0, 0, 0, 0);
+        for q in &held_out {
+            let qn = unit(q);
+            let mut truth = (0..n as u32)
+                .map(|i| {
+                    let d = rows[i as usize]
+                        .iter()
+                        .zip(&qn)
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>();
+                    (-d, i)
+                })
+                .collect::<Vec<_>>();
+            truth.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth = truth.iter().take(10).map(|t| t.1).collect::<Vec<_>>();
+            let (hits, evaluations) = graph.candidates(q, ef, 30, None, &mut scratch).unwrap();
+            found += hits.iter().filter(|h| truth.contains(h)).count();
+            scored += evaluations;
+            // The same walk with no screen: the previous navigation path.
+            let rotated = rabitq::RaBitQ::new(dims, 42).unwrap().rotate(&qn);
+            let (code, scale) = quant::encode(&rotated);
+            let entry = graph
+                .entries
+                .iter()
+                .map(|&id| (id, graph.codes.score(&code, scale, id)))
+                .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+                .unwrap()
+                .0;
+            let (hits, evaluations) = plain.0.search_prefetched(
+                &graph.links,
+                &graph.degrees,
+                entry,
+                ef,
+                |id| graph.codes.score(&code, scale, id),
+                |id| graph.codes.prefetch(id),
+                None,
+            );
+            found_plain += hits
+                .iter()
+                .take(30)
+                .filter(|h| truth.contains(&graph.rows[h.id as usize]))
+                .count();
+            scored_plain += evaluations;
+        }
+        let (recall, recall_plain) = (
+            found as f64 / (queries * 10) as f64,
+            found_plain as f64 / (queries * 10) as f64,
+        );
+        assert!(recall_plain > 0.9, "unscreened recall {recall_plain}");
+        assert!(
+            recall >= recall_plain - 0.01,
+            "screened recall {recall} against unscreened {recall_plain}"
+        );
+        assert!(
+            (scored as f64) < 0.8 * scored_plain as f64,
+            "screened scored {scored} of {scored_plain}"
+        );
     }
     #[test]
     fn cancellation_and_invalid_input_leave_no_spills() {

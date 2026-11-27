@@ -39,6 +39,58 @@ pub(super) fn mean(
     Ok(sums.iter().map(|s| (s / n as f64) as f32).collect())
 }
 
+/// Hamming distance between two equal-length word slices (at most 4,096 bits each).
+pub(super) fn hamming(a: &[u64], b: &[u64]) -> u16 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64, and every load stays inside the slices.
+        unsafe { hamming_neon(a, b) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("popcnt") {
+        // SAFETY: the feature was detected on this CPU.
+        return unsafe { hamming_popcnt(a, b) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    hamming_generic(a, b)
+}
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn hamming_generic(a: &[u64], b: &[u64]) -> u16 {
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| (a ^ b).count_ones() as u16)
+        .sum()
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+unsafe fn hamming_popcnt(a: &[u64], b: &[u64]) -> u16 {
+    hamming_generic(a, b)
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn hamming_neon(a: &[u64], b: &[u64]) -> u16 {
+    use std::arch::aarch64::*;
+    // SAFETY: each 16-byte load is inside both slices; the pairwise add widens bytes to u16 lanes, so
+    // no lane overflows for rows of any supported length.
+    unsafe {
+        let mut sum = vdupq_n_u16(0);
+        let mut i = 0;
+        while i + 2 <= a.len() {
+            let x = veorq_u8(
+                vld1q_u8(a.as_ptr().add(i).cast()),
+                vld1q_u8(b.as_ptr().add(i).cast()),
+            );
+            sum = vpadalq_u8(sum, vcntq_u8(x));
+            i += 2;
+        }
+        let mut total = vaddvq_u16(sum);
+        if i < a.len() {
+            total += (a[i] ^ b[i]).count_ones() as u16;
+        }
+        total
+    }
+}
+
 pub(super) struct Bits {
     words: Vec<u64>,
     per: usize,
@@ -88,23 +140,20 @@ impl Bits {
     pub(super) fn bytes(&self) -> usize {
         self.words.capacity() * 8
     }
+    #[cfg(test)]
+    pub(super) fn from_words(words: Vec<u64>, per: usize) -> Self {
+        Self { words, per }
+    }
     pub(super) fn row(&self, id: u32) -> &[u64] {
         let start = id as usize * self.per;
         &self.words[start..start + self.per]
     }
     pub(super) fn distance(&self, a: &[u64], id: u32) -> f32 {
-        a.iter()
-            .zip(self.row(id))
-            .map(|(a, b)| (a ^ b).count_ones())
-            .sum::<u32>() as f32
+        f32::from(hamming(a, self.row(id)))
     }
     /// Hamming distance between a query's signs and a row.
     pub(super) fn hamming(&self, query: &[u64], id: u32) -> u16 {
-        query
-            .iter()
-            .zip(self.row(id))
-            .map(|(a, b)| (a ^ b).count_ones() as u16)
-            .sum()
+        hamming(query, self.row(id))
     }
     pub(super) fn prefetch(&self, id: u32) {
         let row = self.row(id);
@@ -115,6 +164,22 @@ impl Bits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hamming_kernels_match_the_scalar_count_for_every_length() {
+        let mut seed = 7u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in 0..=64 {
+            let a = (0..len).map(|_| next()).collect::<Vec<_>>();
+            let b = (0..len).map(|_| next()).collect::<Vec<_>>();
+            assert_eq!(hamming(&a, &b), hamming_generic(&a, &b), "len {len}");
+        }
+        assert_eq!(hamming(&[u64::MAX; 64], &[0; 64]), 4096);
+    }
     #[test]
     fn hamming_distance_tracks_cosine_on_centered_codes() {
         let dims = 256;
