@@ -18243,8 +18243,8 @@ The top 10 equals the exact top 10 over all probed candidates in all 201 queries
 The exact k-th distance is barely tighter than the engine's k-th upper bound (D over U is 0.96 at the median for M from 8 to 20), because the k-th upper bound is
 already close to the true k-th distance. What survives is the rows whose lower bound is within the quantization error band of that distance, and they sit in
 leaves all over the probe list: scoring more near leaves exactly resolves only the contenders that happen to be in them. The surviving rows (7 to 16) land in
-different leaves and slabs, so they are 7 to 13 separate reads, and each wave's time is its slowest read. Quadrupling M from 8 to 20 buys 10 ms
-and costs 18 MB more per query (+30 percent of today's 97 MB at M of 16: +24 percent). The idea needs the survivors to be 0 to 2 reads, and the error band
+different leaves and slabs, so they are 7 to 13 separate reads, and each wave's time is its slowest read. Going from M of 8 to 20 buys 10 ms
+and costs 17 MB more per query (M of 16 alone adds 24 percent to today's 97 MB). The idea needs the survivors to be 0 to 2 reads, and the error band
 makes that unreachable at any affordable M.
 
 ### Not built
