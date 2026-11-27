@@ -4,6 +4,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.75] - 2026-11-27
+
 ### Changed
 
 - **Most remaining BM25 rank expressions take the list paths, 113 to 595 times faster at 16 clients:** `Decay` of BM25, constants (`Sum(BM25, 0.1)`, `Max(BM25, 5)`), nested `Sum`, `Max`, `Product`, and `Saturate` (`Saturate(Sum(...))`, `Sum(Max(...), ...)`), a recency or popularity boost (`Sum(BM25, w * Decay(Dist(ts, now)))`, `Sum(BM25, w * Saturate(Attribute(pop)))`), and a third predicate scored and hydrated every allowed row (1.7 to 2.7 s on a million passages). One expression evaluator now bounds the whole tree (every node is non-decreasing in its children), row-wise terms get a static upper bound and are evaluated exactly for the listed rows, and `Decay` of text takes the first `k` rows that match no text. The last round scores only the rows that match some clause, so a `Sum` that no bound can prove (a tie-heavy corpus, or a `Saturate` that compresses the scores) no longer reaches the full scorer: two-clause `Sum` went from 37 to 72 q/s at one client. `Sum` of two `Saturate` clauses is 9x (against BW25's 16-client rate) to 14x faster. IDs and score bits match v0.1.74. A boost that dominates the text, `Dist` of BM25, a bare `Attribute`, and `limit.per` keep the old path. See Round BW26 in [docs/benchmarks.md](docs/benchmarks.md).
@@ -545,7 +547,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.74...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.75...HEAD
+[0.1.75]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.75
 [0.1.74]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.74
 [0.1.73]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.73
 [0.1.72]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.72
