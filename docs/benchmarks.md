@@ -18390,4 +18390,73 @@ on the conservative reading of the baseline I could run. The remaining shapes ke
 
 **What a profile says** (`sample` of the held server, 8 seconds under 16 connections, switch 0): of the non-idle samples, the graph walk (`search_prefetched`, 2,340) and the SQ8 dot kernel (1,033) lead by far; request parsing follows (`serde_json` number parsing, 482, plus the request AST, 319), then `memmove` (451), the CRC (232), and the RaBitQ transform (169). Lock frames are tiny: `__psynch_mutexwait` 42, `os_unfair_lock_trylock` 40, and the allocator's `malloc_mutex_lock_slow` 34, together about 1.5 percent of active samples. Most threads sit in `__psynch_cvwait` (parked pool threads) and `kevent`. There is no spinning lock to remove; the 16 percent CPU-per-query rise at the 8th core in G20 is more likely the efficiency cores and memory bandwidth on the walk and the rerank row reads than shared-state contention.
 
-Nothing shipped. Cleanup: gizmo run directory deleted (about 26 GB), nothing of mine running, `.scratch/g22` removed.
+Nothing shipped. Cleanup: the M4 run directory was deleted (about 26 GB), no processes were left running, and `.scratch/g22` was removed.
+
+## Round BW27: token-set filters answer from a resident subword index, 10 to 64 times faster on unseen tokens
+
+At v0.1.74 (HEAD 8a52add), `ContainsAllTokens` and `ContainsAnyToken` on the default tokenizers (`WordV3`, `WordV4`) scanned each
+segment's whole term dictionary for every query token, because a stored term with punctuation inside (`state-of-the-art`, `3.14`)
+also matches a query for one of its subwords. The scan ran once per token, per segment, per query.
+
+### What changed
+
+`SegmentReader` builds, once per reader and on the first boolean token query, a resident sorted list of `(subword, term handle)`
+for the stored terms that have punctuation inside (or a leading or trailing separator). Plain terms, about 90 percent of a
+dictionary, are skipped with a byte check and never copied. A query token is now answered by one dictionary lookup (or one prefix
+range for `last_as_prefix`) plus a binary search of that list, and the two handle sets are merged. The one-time build is a single
+dictionary scan, the same cost as one old query. Its size is charged to the reader's cache entry through the existing memo-charge
+hook. The text format is unchanged, so old segments work as they are, and `stats()` and BM25 are untouched (corpus statistics
+are bit-identical, since the BM25 path never reads the new list). Neon's format-change option (reverse keys in the dictionary) was
+not needed.
+
+Measured size on the 1M MS MARCO fixture (eight segments of 25,000 to 200,000 rows): 0.81M pairs and 29 MB resident in total
+(0.9 to 5.8 MB per segment, about 44 bytes per pair), charged to the cache.
+
+### Tests
+
+`boolean_filters_match_the_document_matcher_for_punctuated_terms` (in `crates/bf-text/tests/segments.rs`) builds a corpus with
+hyphenated, dotted, underscored, leading and trailing punctuation, accented, CJK, and empty rows, then checks `contains_all_tokens`
+and `contains_any_token` against the per-document matcher for every term, every subword, every prefix of each, two-token queries,
+and unmatched text, with and without `last_as_prefix`, under `WordV4` and `WordV3` (the old path is the same matcher). Every generated query
+(the test asserts there are more than 400 per tokenizer) matches. On the fixture, the ordered IDs of every measured query match the baseline (a hash per shape, see below).
+
+### Measurement
+
+Local, this VM, fixture `tmp/msmarco-1m-v021/` copied to local disk (read-only store), server (`blowfish-scale-server`) on CPUs 0 to 5
+with two Rayon workers, driver (`bench/scale/bw27_filters.py`) on CPUs 6 and 7, `top_k` 10, strong consistency, IDs only. Baseline
+is the v0.1.74 build, the candidate this round's commit. Filter-only shapes rank by `id` ascending; the `+bm25` shape adds the
+query as a BM25 rank. Each query uses three MS MARCO words that no other measured query uses.
+
+**Finding: a repeated token is cached.** A pass over queries that repeat tokens shows no gain (`all1` 59 ms against 55 ms), and a
+token seen once answers in about 1 ms, so a driver that replays queries hides the scan. Every number below uses a token no query has
+used before, after a prewarm on another slice (45 queries per shape and client count). A zero-match token cost about 275 ms
+on the baseline.
+
+Warm (server prewarmed; p50 / p90 ms):
+
+| Shape (45 unseen queries) | v0.1.74, 1 client | candidate, 1 client | gain | v0.1.74, 16 clients | candidate, 16 clients | gain |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ContainsAllTokens`, 1 token | 229 / 259 | 14.1 / 37.2 | **16x** | 777 / 931 | 61.1 / 86.9 | 12.7x |
+| `ContainsAllTokens`, 1 token, prefix | 241 / 283 | 24.7 / 85.5 | 9.8x | 881 / 986 | 69.1 / 101 | 12.8x |
+| `ContainsAllTokens`, 3 tokens | 604 / 669 | 9.4 / 14.3 | 64x | 1,729 / 2,102 | 31.6 / 58.8 | 55x |
+| `ContainsAnyToken`, 3 tokens | 629 / 680 | 13.6 / 32.4 | 46x | 2,065 / 2,603 | 40.4 / 70.0 | 51x |
+| `ContainsAllTokens`, 3 tokens, with BM25 | 157 / 215 | 5.7 / 8.9 | 27x | 1,496 / 1,877 | 28.2 / 47.8 | 53x |
+
+The scan was about 93 percent of the 1-token time. The remaining candidate time is mostly the postings reads and decodes for the
+matching terms. Ordered IDs matched the baseline on all five shapes.
+
+Cold (fresh process each, the same local files in the page cache, 30 queries, 1 client; p50 / p90 ms):
+
+| Shape | v0.1.74 | candidate |
+| --- | ---: | ---: |
+| `ContainsAllTokens`, 1 token | 262 to 276 / 349 to 401 | 19 to 28 / 137 to 139 |
+| `ContainsAnyToken`, 3 tokens | 666 to 734 / 985 to 1,164 | 35 to 37 / 365 to 488 |
+| `ContainsAllTokens`, 3 tokens | 664 / 1,756 | 12 to 13 / 72 to 85 |
+| `ContainsAllTokens`, 3 tokens, with BM25 | 211 / 324 | 7 to 9 / 17 to 40 |
+
+The first query of a fresh process pays the one-time build for each segment it touches, about the same as one old query (first
+query 0.3 to 0.4 s on both builds; single runs vary with disk state). Cold S3 was not measured (local only), so
+the cold-S3 gain from the dictionary-read count is untested; the first query per segment still reads every dictionary chunk, once.
+
+No other text query changes: BM25, phrase, and the exact-term paths do not touch the new list, and the reader gains one empty
+`OnceLock` and a mutex until a boolean token query runs.

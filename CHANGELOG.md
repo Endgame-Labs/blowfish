@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.77] - 2026-11-27
+
+### Changed
+
+- **Token-set filters on the default tokenizer are 16 to 55 times faster:** `ContainsAllTokens` and `ContainsAnyToken` (and their prefix forms) with `word_v3` or `word_v4` read and scanned every segment's whole term dictionary on each query, because a stored term with internal punctuation can contain the query token as a subword. On a million MS MARCO passages, a one-token filter took 229 ms at p50 even when nothing matched. Each segment now keeps a small resident index from subwords to the punctuated terms that contain them (29 MB per million rows, counted in the cache's memory budget), so the filter looks its tokens up directly: one token went from 229 to 14 ms, three tokens from 604 to 9 ms, and `ContainsAnyToken` with three tokens from 629 to 14 ms, 12.7 to 55 times faster at 16 clients, and 10 to 50 times faster cold. Results are identical, and there is no format change. See Round BW27 in `docs/benchmarks.md`.
+
 ## [0.1.76] - 2026-11-27
 
 ### Changed
@@ -553,7 +559,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.76...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.77...HEAD
+[0.1.77]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.77
 [0.1.76]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.76
 [0.1.75]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.75
 [0.1.74]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.74

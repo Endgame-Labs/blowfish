@@ -458,6 +458,12 @@ pub fn matches_token_sequence(document: &[Token], query: &crate::Query) -> bool 
     })
 }
 
+/// The punctuation-delimited subwords of a stored term that boolean token filters also match.
+pub(crate) fn subwords(term: &str) -> impl Iterator<Item = &str> {
+    term.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|s| !s.is_empty())
+}
+
 pub(crate) fn boolean_term_matches(
     term: &str,
     query: &str,
@@ -473,10 +479,7 @@ pub(crate) fn boolean_term_matches(
     };
     matches(term)
         || (matches!(tokenizer, Tokenizer::WordV3 | Tokenizer::WordV4)
-            && term
-                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                .filter(|s| !s.is_empty())
-                .any(matches))
+            && subwords(term).any(matches))
 }
 
 /// Analyze a scalar string while retaining original, half-open UTF-8 byte ranges.
