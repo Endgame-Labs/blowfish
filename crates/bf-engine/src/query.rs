@@ -10,6 +10,20 @@ pub(crate) fn execute(
     state: &NamespaceState,
     request: &QueryRequest,
 ) -> Result<QueryResponse, ApiError> {
+    run(state, request, false)
+}
+/// Check a request exactly as [`execute`] would, with the same errors in the same order, but
+/// visit no document: the answer is discarded, so `state` may hold any documents and scores.
+/// Callers use it to reject a bad request before touching index files without building a
+/// second, empty state to execute against.
+pub(crate) fn validate(state: &NamespaceState, request: &QueryRequest) -> Result<(), ApiError> {
+    run(state, request, true).map(drop)
+}
+fn run(
+    state: &NamespaceState,
+    request: &QueryRequest,
+    validate_only: bool,
+) -> Result<QueryResponse, ApiError> {
     if request.rerank_by.as_ref().is_some_and(Value::is_object) {
         return Err(ApiError::bad(
             "model rerank_by is not supported by blowfish yet",
@@ -38,7 +52,7 @@ pub(crate) fn execute(
                     "nested multi-query and subquery reranking are not supported",
                 ));
             }
-            results.push(single(state, q, request.vector_encoding)?);
+            results.push(single(state, q, request.vector_encoding, validate_only)?);
         }
         if let Some(rerank) = &request.rerank_by {
             results = vec![rrf(state, request, rerank, results)?];
@@ -54,7 +68,10 @@ pub(crate) fn execute(
                 "model rerank_by is not supported by blowfish yet",
             ));
         }
-        (single(state, request, request.vector_encoding)?, None)
+        (
+            single(state, request, request.vector_encoding, validate_only)?,
+            None,
+        )
     };
     Ok(QueryResponse {
         result,
@@ -119,6 +136,7 @@ fn single(
     state: &NamespaceState,
     q: &QueryRequest,
     encoding: VectorEncoding,
+    validate_only: bool,
 ) -> Result<SingleQueryResult, ApiError> {
     if !q.extra.is_empty() {
         return Err(ApiError::bad(format!(
@@ -168,7 +186,7 @@ fn single(
     }
     crate::highlight::validate(state, q)?;
     let mut docs = vec![];
-    for (id, doc) in &state.docs {
+    for (id, doc) in state.docs.iter().filter(|_| !validate_only) {
         if q.filters
             .as_ref()
             .map(|f| filter::matches(f, Some(doc), None, &state.schema))
@@ -277,9 +295,10 @@ fn single(
     let total = limits(q, true)?;
     let rank = q.rank_by.as_ref().expect("validated rank");
     // Precomputed vector scores, looked up once: the key preserves every query-vector bit.
-    let vector_scores = (matches!(rank, RankBy::Vector { .. }) && !state.scores.is_empty())
-        .then(|| state.scores.get(&crate::indexed::rank_key(rank)))
-        .flatten();
+    let vector_scores =
+        (!validate_only && matches!(rank, RankBy::Vector { .. }) && !state.scores.is_empty())
+            .then(|| state.scores.get(&crate::indexed::rank_key(rank)))
+            .flatten();
     let mut ranked = vec![];
     for (id, doc) in docs {
         let score = match rank {

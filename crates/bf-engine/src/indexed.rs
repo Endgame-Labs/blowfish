@@ -71,8 +71,7 @@ async fn execute_inner(
     force_exact: bool,
 ) -> Result<QueryResponse, ApiError> {
     // Validate the complete request before touching index files, preserving M1 errors.
-    let empty = result_state(state);
-    query::execute(&empty, request)?;
+    query::validate(state, request)?;
     if crate::streaming::supports(request) {
         return crate::streaming::execute(store, state, request).await;
     }
@@ -223,9 +222,9 @@ fn result_state(state: &NamespaceState) -> NamespaceState {
     }
 }
 #[derive(Clone)]
-struct HitKey {
-    score: f64,
-    id: Id,
+pub(crate) struct HitKey {
+    pub(crate) score: f64,
+    pub(crate) id: Id,
     descending: bool,
 }
 impl PartialEq for HitKey {
@@ -246,7 +245,13 @@ impl Ord for HitKey {
     }
 }
 /// Offer one exact score without cloning the ID of a noncompetitive row.
-fn offer(heap: &mut BinaryHeap<HitKey>, id: &Id, score: f64, descending: bool, k: usize) {
+pub(crate) fn offer(
+    heap: &mut BinaryHeap<HitKey>,
+    id: &Id,
+    score: f64,
+    descending: bool,
+    k: usize,
+) {
     let competitive = heap.len() < k
         || heap
             .peek()
@@ -619,15 +624,6 @@ fn merge_tail(
     out: &mut NamespaceState,
 ) -> Result<BTreeMap<Id, f64>, ApiError> {
     let start = std::time::Instant::now();
-    let context = crate::read_cache::context();
-    let attribute_key: std::sync::Arc<str> = attribute.into();
-    let admit = context.as_ref().is_some_and(|context| {
-        context.admit
-            && context
-                .cache
-                .tail_vectors
-                .fits(state.docs.len(), vector.len(), attribute.len())
-    });
     let k = q.total().unwrap_or(10) + q.offset;
     let mut heap = BinaryHeap::new();
     if !all {
@@ -635,31 +631,80 @@ fn merge_tail(
             offer(&mut heap, id, *score, false, k);
         }
     }
+    let context = crate::read_cache::context();
+    let tail = context.as_ref().map(|c| (&c.cache.tail_vectors, c.admit));
+    score_tail(
+        state,
+        q.filters.as_ref(),
+        attribute,
+        vector,
+        all,
+        k,
+        tail,
+        &mut heap,
+        &mut scores,
+    )?;
+    if !all {
+        scores = heap.into_iter().map(|hit| (hit.id, hit.score)).collect();
+    }
+    out.docs.retain(|id, _| scores.contains_key(id));
+    for id in scores.keys() {
+        if let Some(doc) = state.docs.get(id) {
+            out.docs.insert(id.clone(), doc.clone());
+        }
+    }
+    crate::ann::stage(start, "tail score+merge");
+    Ok(scores)
+}
+
+/// Score every live tail document against `vector` and offer it to `heap`, which keeps the best
+/// `k` under the evaluator's order (distance, then ID); with `all`, every score goes to `scores`
+/// instead. `tail` is the decoded-vector cache and whether this work may admit into it
+/// (without one, each vector is decoded for this query only). Shared by the document path's
+/// [`merge_tail`] and the typed ID-only path, so both score the tail with the same kernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn score_tail(
+    state: &NamespaceState,
+    filters: Option<&Filter>,
+    attribute: &str,
+    vector: &[f32],
+    all: bool,
+    k: usize,
+    tail: Option<(&crate::tail::VectorCache, bool)>,
+    heap: &mut BinaryHeap<HitKey>,
+    scores: &mut BTreeMap<Id, f64>,
+) -> Result<(), ApiError> {
+    let attribute_key: std::sync::Arc<str> = attribute.into();
+    let admit = tail.is_some_and(|(cache, admit)| {
+        admit && cache.fits(state.docs.len(), vector.len(), attribute.len())
+    });
     let scorer = crate::tail::Scorer::new(state.metric, vector);
     // One prepared block per snapshot (built by the first query that needs it), so each row
     // below costs a pointer comparison and a dot product instead of a cache lookup.
-    let block = context
-        .as_ref()
+    let block = tail
         .filter(|_| admit && !state.docs.is_empty())
-        .and_then(|context| {
-            context.cache.tail_vectors.block(
+        .and_then(|(cache, _)| {
+            cache.block(
                 std::sync::Arc::as_ptr(&state.stats) as usize,
                 state.seq,
                 &attribute_key,
                 state.docs.values(),
             )
         });
+    // `worst` is the distance the top `k` must beat. A row the eight-bit screen proves is
+    // farther than that is not scored exactly and is not offered, as it could not enter.
     let score = |index: usize,
                  doc: &std::sync::Arc<Document>,
-                 key: &std::sync::Arc<str>|
+                 key: &std::sync::Arc<str>,
+                 worst: Option<f64>|
      -> Result<Option<f64>, ApiError> {
         if let Some(row) = block.as_ref().and_then(|block| block.row(index, doc)) {
-            return Ok(row.map(|vector| scorer.resident(vector)));
+            return Ok(row.and_then(|vector| scorer.resident_below(vector, worst)));
         }
         doc.get(attribute)
             .map(|v| {
-                let values = match &context {
-                    Some(context) => context.cache.tail_vectors.get(doc, key, admit)?,
+                let values = match tail {
+                    Some((cache, _)) => cache.get(doc, key, admit)?,
                     None => crate::tail::Values::Transient(decode_vector(v)?),
                 };
                 Ok(scorer.distance(&values))
@@ -667,7 +712,7 @@ fn merge_tail(
             .transpose()
     };
     if !all
-        && q.filters.is_none()
+        && filters.is_none()
         && state.docs.len() >= 2048
         && vector.len() >= 64
         && crate::fan_out()
@@ -684,9 +729,16 @@ fn merge_tail(
             .map(|(chunk, rows)| {
                 // Separate key allocations avoid a contended Arc counter on cache lookups.
                 let key = std::sync::Arc::<str>::from(attribute);
-                let mut local = BinaryHeap::new();
+                let mut local: BinaryHeap<HitKey> = BinaryHeap::new();
                 for (offset, (id, doc)) in rows.iter().enumerate() {
-                    if let Some(distance) = score(chunk * 512 + offset, doc, &key)?
+                    let local_worst = local.peek().filter(|_| local.len() == k);
+                    let worst = match (bound, local_worst) {
+                        (Some(a), Some(b)) => Some(a.score.min(b.score)),
+                        (Some(a), None) => Some(a.score),
+                        (None, Some(b)) => Some(b.score),
+                        (None, None) => None,
+                    };
+                    if let Some(distance) = score(chunk * 512 + offset, doc, &key, worst)?
                         && bound.is_none_or(|worst| improves(id, distance, false, worst))
                     {
                         offer(&mut local, id, distance, false, k);
@@ -697,37 +749,30 @@ fn merge_tail(
             .collect();
         for chunk in chunks? {
             for hit in chunk {
-                offer(&mut heap, &hit.id, hit.score, false, k);
+                offer(heap, &hit.id, hit.score, false, k);
             }
         }
     } else {
         for (index, (id, doc)) in state.docs.iter().enumerate() {
-            if q.filters
-                .as_ref()
+            let worst = (!all)
+                .then(|| heap.peek().filter(|_| heap.len() == k))
+                .flatten()
+                .map(|hit| hit.score);
+            if filters
                 .map(|f| filter::matches(f, Some(doc), None, &state.schema))
                 .transpose()?
                 .unwrap_or(true)
-                && let Some(distance) = score(index, doc, &attribute_key)?
+                && let Some(distance) = score(index, doc, &attribute_key, worst)?
             {
                 if all {
                     scores.insert(id.clone(), distance);
                 } else {
-                    offer(&mut heap, id, distance, false, k);
+                    offer(heap, id, distance, false, k);
                 }
             }
         }
     }
-    if !all {
-        scores = heap.into_iter().map(|hit| (hit.id, hit.score)).collect();
-    }
-    out.docs.retain(|id, _| scores.contains_key(id));
-    for id in scores.keys() {
-        if let Some(doc) = state.docs.get(id) {
-            out.docs.insert(id.clone(), doc.clone());
-        }
-    }
-    crate::ann::stage(start, "tail score+merge");
-    Ok(scores)
+    Ok(())
 }
 
 pub(crate) fn recall(ann: &QueryResponse, exact: &QueryResponse) -> f64 {

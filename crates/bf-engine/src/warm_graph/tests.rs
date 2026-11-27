@@ -1309,17 +1309,14 @@ async fn filtered_scan_hides_shadowed_rows_inside_the_allowed_set() {
     e.shutdown(Duration::from_secs(3)).await;
     control.shutdown(Duration::from_secs(3)).await;
 }
-/// Round G18: the typed ID-only path writes the same JSON bytes as the general path (rows,
-/// `$dist` bits, performance fields except the two timings, billing), for every `top_k` from 1 to
-/// 100, and declines (so the general path runs) for every request shape it does not take.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn typed_ids_path_is_byte_identical_to_the_general_path() {
-    let _exclusive = ADMISSION_GATE.write().await;
+/// A 2,500-row, 16-d namespace with a recluster tier, a ready and usable graph, and its ID table
+/// built; the unindexed tail is empty. Rows 1000 to 1049 copy rows 0 to 49, so equal distances
+/// exercise the tie order. The guard holds the admission gate and removes the scratch directory.
+async fn typed_fixture() -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.scratch")
         .join(format!("g18-ids-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
-    let _cleanup = Cleanup(root.clone());
     let store = Storage::open(&StorageConfig {
         url: "memory://".into(),
         cache: CacheConfig {
@@ -1400,6 +1397,16 @@ async fn typed_ids_path_is_byte_identical_to_the_general_path() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(held.ids.get().is_some(), "the ID table was never built");
+    (e, vectors, held, Cleanup(root))
+}
+/// Round G18: the typed ID-only path writes the same JSON bytes as the general path (rows,
+/// `$dist` bits, performance fields except the two timings, billing), for every `top_k` from 1 to
+/// 100, and declines (so the general path runs) for every request shape it does not take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_ids_path_is_byte_identical_to_the_general_path() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let (e, vectors, held, _cleanup) = typed_fixture().await;
+    let ids_only = |i: usize, k: usize| json!({"rank_by":["vector","ANN",vectors[i]],"top_k":k});
     // Everything below runs on a reactor, as `query_ids` requires.
     let io = tokio::runtime::Handle::current();
     let engine = e.clone();
@@ -1487,6 +1494,143 @@ async fn typed_ids_path_is_byte_identical_to_the_general_path() {
     // Off the reactor it never applies.
     let request: QueryRequest = serde_json::from_value(ids_only(5, 10)).unwrap();
     assert!(e.query_ids("hot", &request).await.unwrap().is_none());
+    e.delete_namespace("hot").await.unwrap();
+    drop(held);
+    assert!(e.shutdown(Duration::from_secs(5)).await);
+}
+/// Round G19: with an unindexed tail (inserts, overwrites that move a row away, overwrites that
+/// bring one in, and deletes, all among the top `k`), the typed path still serves and writes the
+/// same bytes as the general path, and a write acknowledged before a strong query is visible to
+/// the typed answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_ids_path_merges_the_tail_like_the_general_path() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let (e, vectors, held, _cleanup) = typed_fixture().await;
+    let io = tokio::runtime::Handle::current();
+    let engine = e.clone();
+    let queries = vectors.clone();
+    let reactor = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::query_worker::on_query_reactor(io, async move {
+                let general = |request: Value| {
+                    let engine = engine.clone();
+                    async move {
+                        let request: QueryRequest = serde_json::from_value(request).unwrap();
+                        let mut response = engine.query("hot", request).await.unwrap();
+                        response.performance.server_total_ms = 0;
+                        response.performance.query_execution_ms = 0;
+                        serde_json::to_vec(&response).unwrap()
+                    }
+                };
+                let typed = |request: Value| {
+                    let engine = engine.clone();
+                    async move {
+                        let request: QueryRequest = serde_json::from_value(request).unwrap();
+                        engine
+                            .query_ids("hot", &request)
+                            .await
+                            .unwrap()
+                            .map(|answer| {
+                                let mut answer = answer;
+                                let mut performance = answer.performance().clone();
+                                performance.server_total_ms = 0;
+                                performance.query_execution_ms = 0;
+                                answer.performance = performance;
+                                let mut out = Vec::new();
+                                assert!(answer.write_json(&mut out));
+                                out
+                            })
+                    }
+                };
+                let rows = |body: &Vec<u8>| -> Vec<u64> {
+                    serde_json::from_slice::<Value>(body).unwrap()["rows"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row["id"].as_u64().unwrap())
+                        .collect()
+                };
+                let write = |body: Value| {
+                    let engine = engine.clone();
+                    async move {
+                        engine
+                            .write("hot", serde_json::from_value::<WriteRequest>(body).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                };
+                let mut compared = 0;
+                let check = |label: &'static str| {
+                    let queries = queries.clone();
+                    let (typed, general) = (typed, general);
+                    async move {
+                        let mut n = 0;
+                        for i in [0, 17, 400, 1003, 1999, 2499] {
+                            for k in [1, 2, 10, 33, 64, 100] {
+                                let body = json!({"rank_by":["vector","ANN",queries[i]],"top_k":k});
+                                let got = typed(body.clone()).await.unwrap_or_else(|| {
+                                    panic!("{label}: typed path declined query {i} top_k {k}")
+                                });
+                                assert_eq!(
+                                    got,
+                                    general(body).await,
+                                    "{label}: query {i} top_k {k}"
+                                );
+                                n += 1;
+                            }
+                        }
+                        n
+                    }
+                };
+                // Inserts that land among the top k of queries 0 and 17: copies of their vectors
+                // (distance 0, ties with the base row broken by ID) and nearby points.
+                let near =
+                    |v: &Vec<f32>, shift: f32| v.iter().map(|x| x + shift).collect::<Vec<_>>();
+                write(json!({"upsert_rows":[
+                    {"id":9000,"vector":queries[0],"group":0},
+                    {"id":9001,"vector":near(&queries[0], 0.01),"group":1},
+                    {"id":9002,"vector":near(&queries[17], 0.01),"group":2},
+                    {"id":2,"vector":queries[17],"group":2},
+                ]}))
+                .await;
+                compared += check("inserts").await;
+                // The first read sees the write it follows: row 9000 copies row 0's vector (and so
+                // does base row 1000), so the three tie at the front.
+                let body = json!({"rank_by":["vector","ANN",queries[0]],"top_k":3});
+                let got = typed(body).await.expect("typed path serves under a tail");
+                let mut lead = rows(&got);
+                lead.sort_unstable();
+                assert_eq!(lead, vec![0, 1000, 9000]);
+                // Overwrites that move rows away from, and delete rows among, the top k.
+                let far = queries[400].iter().map(|x| -x).collect::<Vec<_>>();
+                write(json!({"upsert_rows":[
+                    {"id":0,"vector":far,"group":0},
+                    {"id":1003,"vector":queries[1999],"group":1},
+                ],"deletes":[3,4,1000]}))
+                .await;
+                compared += check("overwrites and deletes").await;
+                let body = json!({"rank_by":["vector","ANN",queries[0]],"top_k":2});
+                let got = typed(body).await.expect("typed path serves under a tail");
+                assert!(
+                    !rows(&got).contains(&0),
+                    "the overwritten row 0 must not answer for query 0"
+                );
+                // A delete acknowledged before the query hides the row it removed.
+                write(json!({"deletes":[9000]})).await;
+                let body = json!({"rank_by":["vector","ANN",queries[0]],"top_k":5});
+                let got = typed(body.clone())
+                    .await
+                    .expect("typed path serves under a tail");
+                assert!(!rows(&got).contains(&9000), "a deleted row came back");
+                assert_eq!(got, general(body).await);
+                compared
+            }))
+    });
+    let compared = reactor.await.unwrap();
+    assert_eq!(compared, 72);
     e.delete_namespace("hot").await.unwrap();
     drop(held);
     assert!(e.shutdown(Duration::from_secs(5)).await);

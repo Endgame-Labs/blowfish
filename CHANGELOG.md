@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.71] - 2026-11-27
+
+### Changed
+
+- **Warm vector queries keep the fast path while the namespace is being written to, 2.0 to 2.4 times faster under steady writes:** Since v0.1.68, plain ID-only vector queries go from graph hits straight to response bytes, but any unindexed WAL tail sent them back to the general path. They now merge the tail and shadowed rows themselves. The tail scan, shared with the general path, screens each row with an eight-bit dot product and a certified error bound, and computes the exact distance only for rows that could reach the top k. On the M4 with full NQ, 16 clients, and 50 writes per second (a 3,000- to 12,000-row tail), `top_k` 10 and 100 were 2.0 to 2.4 times v0.1.68's throughput. Frozen-tail answers are identical, and none of 1,320 read-your-writes probes missed a write. The general query path also validates a request without a second evaluation, builds cache and WAL keys without allocating, and takes the cache lock once per query: about 5 percent more throughput for queries that return attributes. See Round G19 in `docs/benchmarks.md`.
+
 ## [0.1.70] - 2026-11-27
 
 ### Changed
@@ -513,7 +519,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.70...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.71...HEAD
+[0.1.71]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.71
 [0.1.70]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.70
 [0.1.69]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.69
 [0.1.68]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.68

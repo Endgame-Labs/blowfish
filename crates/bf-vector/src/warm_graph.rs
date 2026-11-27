@@ -11,6 +11,7 @@ mod vamana;
 mod vectors;
 use crate::{Error, Result, RoaringBitmap, rabitq};
 pub use builder::HotGraphBuilder;
+pub use quant::dot_i8;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
