@@ -131,9 +131,10 @@ async fn bounds(store: &Storage, segment: &Segment) -> Result<Option<(Value, Val
 }
 
 /// Probes in the first wave are at most this many: each is one small request.
-const MAX_PROBES: usize = 8;
-/// A probe reads one ID block through the sparse cache's blocks of this size.
-const PROBE_BYTES: u64 = 16 << 10;
+const MAX_PROBES: usize = 16;
+/// The second wave reads one region of about this many bytes of the ID column, which the
+/// cache coalesces into a single GET (32 sparse blocks of 16 KiB).
+const REGION_BYTES: u64 = 512 << 10;
 
 /// A segment's sorted ID column, read through the document directory.
 struct Seeker {
@@ -266,8 +267,10 @@ async fn boundary(
         .iter()
         .map(|b| b.length)
         .sum();
-    // Probes cost PROBE_BYTES each and the region costs the column over the probe count.
-    let k = (((column_bytes / PROBE_BYTES) as f64).sqrt().ceil() as usize)
+    // The probes divide the column into regions of about REGION_BYTES. At least two probes
+    // keep a region from being the whole column; a column of one block has one probe.
+    let k = usize::try_from(column_bytes.div_ceil(REGION_BYTES))
+        .unwrap_or(MAX_PROBES)
         .clamp(2, MAX_PROBES)
         .min(nb);
     let starts: Vec<usize> = (0..k).map(|t| t * nb / k).collect();
