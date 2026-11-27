@@ -1249,47 +1249,41 @@ fn sum_clauses<'a>(
 ) -> sum_text::SumPlan<'a> {
     static FALLBACK: std::sync::LazyLock<bf_text::CorpusStats> =
         std::sync::LazyLock::new(Default::default);
-    let terms = sum_text::terms_of(q.rank_by.as_ref()).expect("list-path terms");
-    let mut text = clauses.iter();
+    let shape = sum_text::shape_of(q.rank_by.as_ref()).expect("list-path shape");
     let mut plan = sum_text::SumPlan {
         clauses: vec![],
-        bonuses: vec![],
-        slots: vec![],
+        bonuses: shape
+            .bonuses
+            .into_iter()
+            .map(|(filter, weights)| sum_text::Bonus { filter, weights })
+            .collect(),
+        docs: shape.docs,
+        expr: shape.expr,
     };
-    for term in terms {
-        match term {
-            sum_text::Term::Text(weights) => {
-                let clause = text.next().expect("one clause per text term");
-                let RankBy::Bm25 {
-                    attribute,
-                    query,
-                    params,
-                } = clause
-                else {
-                    unreachable!()
-                };
-                let cfg = state.schema[attribute]
-                    .text_config()
-                    .expect("validated FTS");
-                plan.slots.push(sum_text::Slot::Text(plan.clauses.len()));
-                plan.clauses.push(sum_text::Clause {
-                    attribute,
-                    key: rank_key(clause),
-                    query: bf_text::Query::new(
-                        crate::text::tokens(query, &cfg),
-                        crate::text::prefix(params.as_ref()),
-                    ),
-                    cfg,
-                    weights,
-                    stats: state.corpus.get(attribute).unwrap_or(&FALLBACK),
-                });
-            }
-            sum_text::Term::Bonus(filter, weights) => {
-                plan.slots.push(sum_text::Slot::Bonus(plan.bonuses.len()));
-                plan.bonuses.push(sum_text::Bonus { filter, weights });
-            }
-        }
+    for clause in clauses {
+        let RankBy::Bm25 {
+            attribute,
+            query,
+            params,
+        } = clause
+        else {
+            unreachable!()
+        };
+        let cfg = state.schema[attribute]
+            .text_config()
+            .expect("validated FTS");
+        plan.clauses.push(sum_text::Clause {
+            attribute,
+            key: rank_key(clause),
+            query: bf_text::Query::new(
+                crate::text::tokens(query, &cfg),
+                crate::text::prefix(params.as_ref()),
+            ),
+            cfg,
+            stats: state.corpus.get(attribute).unwrap_or(&FALLBACK),
+        });
     }
+    debug_assert_eq!(plan.clauses.len(), shape.texts);
     plan
 }
 /// A segment's chosen winners: per clause, its rank key and the winning rows' hits.
@@ -1368,17 +1362,26 @@ async fn sum_finish(
                     Ok::<_, ApiError>(sum_text::scaled(&b.weights, f32::from(u8::from(hit))))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let doc_values = plan
+                .docs
+                .iter()
+                .map(|d| {
+                    state
+                        .docs
+                        .get(id)
+                        .map_or(Ok(0.0), |doc| crate::query::score(state, doc, d.rank))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let t = plan.total(
-                |i| {
-                    let raw = out
-                        .scores
+                &|i| {
+                    out.scores
                         .get(&rank_key(clauses[i]))
                         .and_then(|m| m.get(id))
                         .copied()
-                        .unwrap_or(0.0);
-                    sum_text::scaled(&plan.clauses[i].weights, raw as f32)
+                        .unwrap_or(0.0)
                 },
                 &bonus,
+                &|j| doc_values[j],
             );
             tail.push((id.clone(), t));
         }
@@ -1386,9 +1389,10 @@ async fn sum_finish(
     let mut n = sum_text::first_list(k);
     let mut round = 0;
     while let Some(list) = n {
-        let rounds =
-            futures::future::try_join_all(segments.iter().map(|s| s.candidates(&plan, list, k)))
-                .await?;
+        let rounds = futures::future::try_join_all(
+            segments.iter().map(|s| s.candidates(state, &plan, list, k)),
+        )
+        .await?;
         // A segment that cannot prove its boosted rows needs the full scorer.
         let Some(rounds) = rounds.into_iter().collect::<Option<Vec<_>>>() else {
             break;
