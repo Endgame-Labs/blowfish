@@ -1386,10 +1386,9 @@ async fn sum_finish(
     let mut n = sum_text::first_list(k);
     let mut round = 0;
     while let Some(list) = n {
-        let rounds = futures::future::try_join_all(
-            segments.iter().map(|s| s.candidates(&plan, list, k)),
-        )
-        .await?;
+        let rounds =
+            futures::future::try_join_all(segments.iter().map(|s| s.candidates(&plan, list, k)))
+                .await?;
         // A segment that cannot prove its boosted rows needs the full scorer.
         let Some(rounds) = rounds.into_iter().collect::<Option<Vec<_>>>() else {
             break;
@@ -1670,7 +1669,12 @@ mod ties_tests {
         assert!(ties_complete(&hits(&[5.0, 4.0, 4.0]), 2, 4, &[]));
         assert!(ties_complete(&hits(&[]), 2, 3, &[]));
         // A widened list that ends below the tie is complete, and one that ends on it is not.
-        assert!(ties_complete(&hits(&[5.0, 4.0, 4.0, 4.0, 1.0, 1.0]), 2, 6, &[]));
+        assert!(ties_complete(
+            &hits(&[5.0, 4.0, 4.0, 4.0, 1.0, 1.0]),
+            2,
+            6,
+            &[]
+        ));
         assert!(!ties_complete(&hits(&[4.0; 6]), 2, 6, &[]));
         assert!(ties_complete(&hits(&[4.0]), 0, 1, &[]));
     }

@@ -275,7 +275,12 @@ async fn compare_saturate(e: &Engine, tag: &str, sets: &[&[&str]]) {
                     if k == 10 {
                         q["filters"] = json!(["n", "NotEq", 0]);
                     }
-                    identical(e, q, &format!("{tag} sat{scheme} {rank} k={k} off={offset}")).await;
+                    identical(
+                        e,
+                        q,
+                        &format!("{tag} sat{scheme} {rank} k={k} off={offset}"),
+                    )
+                    .await;
                 }
             }
         }
@@ -367,9 +372,17 @@ async fn saturate_and_bonus_queries_are_accepted_from_lists() {
     assert!(ok > 0 && fb == 0, "saturate alone {ok} {fb}");
     let (ok, fb) = run(json!(["Sum", [sat(0, "w3 w9"), sat(2, "w1 w40")]])).await;
     assert!(ok > 0 && fb == 0, "saturate sum {ok} {fb}");
-    let (ok, fb) = run(json!(["Sum", [clause("w3 w9"), ["Product", 2.0, ["n", "Eq", 2]]]])).await;
+    let (ok, fb) = run(json!([
+        "Sum",
+        [clause("w3 w9"), ["Product", 2.0, ["n", "Eq", 2]]]
+    ]))
+    .await;
     assert!(ok > 0 && fb == 0, "bonus {ok} {fb}");
     // A rare term: most boosted rows match no text, and still answer from fill rows.
-    let (ok, fb) = run(json!(["Sum", [clause("w600"), ["Product", 2.0, ["n", "Eq", 2]]]])).await;
+    let (ok, fb) = run(json!([
+        "Sum",
+        [clause("w600"), ["Product", 2.0, ["n", "Eq", 2]]]
+    ]))
+    .await;
     assert!(ok > 0 && fb == 0, "rare bonus {ok} {fb}");
 }

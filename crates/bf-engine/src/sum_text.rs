@@ -137,9 +137,7 @@ fn bonus_of(x: &RankBy) -> Option<(&Filter, Chain)> {
 /// A clause's score after its transforms, applied innermost first in `f64` exactly as
 /// `query::score` does, so the result has the full scorer's bits.
 pub(crate) fn scaled(chain: &[Step], score: f32) -> f64 {
-    chain
-        .iter()
-        .fold(f64::from(score), |s, step| step.apply(s))
+    chain.iter().fold(f64::from(score), |s, step| step.apply(s))
 }
 
 /// One term of a `Sum`, in rank order.
@@ -169,10 +167,9 @@ pub(crate) fn terms_of(rank: Option<&RankBy>) -> Option<Vec<Term<'_>>> {
             (bonuses <= MAX_BONUSES && terms.iter().any(|t| matches!(t, Term::Text(_))))
                 .then_some(terms)
         }
-        RankBy::Max(xs) if !xs.is_empty() => xs
-            .iter()
-            .map(|x| weights_of(x).map(Term::Text))
-            .collect(),
+        RankBy::Max(xs) if !xs.is_empty() => {
+            xs.iter().map(|x| weights_of(x).map(Term::Text)).collect()
+        }
         x @ (RankBy::Product { .. } | RankBy::Saturate { .. }) => {
             weights_of(x).map(|c| vec![Term::Text(c)])
         }
@@ -397,7 +394,13 @@ impl SegmentSum {
         let mut lists = Vec::with_capacity(clauses.len());
         for (clause, reader) in clauses.iter().zip(&self.readers) {
             let hits = reader
-                .search_prefetched(&clause.query, clause.stats, &clause.cfg, n, Some(&class.rows))
+                .search_prefetched(
+                    &clause.query,
+                    clause.stats,
+                    &clause.cfg,
+                    n,
+                    Some(&class.rows),
+                )
                 .await
                 .map_err(segment::index_error)?;
             let full = hits.len() >= n;
@@ -407,10 +410,7 @@ impl SegmentSum {
             }
             lists.push((full, hits));
         }
-        let bound = plan.total(
-            |i| scaled(&clauses[i].weights, cutoffs[i]),
-            &class.bonus,
-        );
+        let bound = plan.total(|i| scaled(&clauses[i].weights, cutoffs[i]), &class.bonus);
         let exhaustive = lists.iter().all(|(full, _)| !full);
         let mut exact: Vec<HashMap<u32, f32>> = Vec::with_capacity(clauses.len());
         for ((clause, reader), (full, hits)) in clauses.iter().zip(&self.readers).zip(lists) {
@@ -434,7 +434,12 @@ impl SegmentSum {
             .iter()
             .map(|row| {
                 let t = plan.total(
-                    |i| scaled(&clauses[i].weights, exact[i].get(&row).copied().unwrap_or(0.0)),
+                    |i| {
+                        scaled(
+                            &clauses[i].weights,
+                            exact[i].get(&row).copied().unwrap_or(0.0),
+                        )
+                    },
                     &class.bonus,
                 );
                 (row, t)
@@ -556,7 +561,13 @@ mod tests {
     #[test]
     fn saturate_never_reverses_the_order_of_adjacent_scores() {
         // The list paths rely on the transform being non-decreasing; sweep neighbors of f32 scores.
-        for (midpoint, exponent) in [(3.0, 1.0), (1e-6, 20.0), (2.5, 0.3), (1e12, 0.05), (7.0, 2.0)] {
+        for (midpoint, exponent) in [
+            (3.0, 1.0),
+            (1e-6, 20.0),
+            (2.5, 0.3),
+            (1e12, 0.05),
+            (7.0, 2.0),
+        ] {
             let chain = [Step::Saturate { midpoint, exponent }];
             let mut x = 1e-3f32;
             while x < 500.0 {
