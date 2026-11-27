@@ -17155,6 +17155,114 @@ Qdrant's collection came up green with all 2,681,468 vectors indexed in two segm
 
 Costs: no EC2 and no bucket writes. The 26.8 GB NQ fixture was copied to the M4 through presigned URLs (about $2.4 of S3 transfer) and deleted with the run directory, with the Qdrant store.
 
+## Round G20: the load generator is not the ceiling, and a length-weighted one-bit screen saves 8 to 15 percent of SQ8 scores but no time (both items fail their bars)
+
+**Setup:** Round G18's: the Apple M4 (shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture, 16 persistent keep-alive connections, IDs only,
+release binaries with production defaults, indexing off, and the graph promoted the ordinary way (`g15_promote.py`, 28 minutes this time). The server is the tree at b1103b0 (what v0.1.71 is, plus the temporary A/B switch
+below), and Qdrant is the official 1.20.0 macOS arm64 binary (f16 in RAM, M=16, ef_construct=100, green with all 2,681,468 vectors in two segments). Every arm is 20 seconds after one serial quality pass over all 3,452 queries.
+The production effort controller moved the graph's `ef` from 100 to 90 during the run (its recall sampler keeps running), so recall reads 0.9605 for the first three arms and 0.9576 after at `top_k` 10; the arms are interleaved,
+so each pair straddles the change evenly.
+
+### 1. The load generator
+
+**`native_drive`** (`crates/bf-engine/examples/native_drive.rs`, new) is the benchmark driver for M4 rounds from now on: 16 threads, one persistent `TcpStream` each, hand-written HTTP/1.1, request bodies encoded before the clock
+starts (floats as the shortest `f64` text of the `f32`, the digits Python's `tolist()` writes), one serial quality pass (recall and a SHA-256 of the response rows), then the timed pass. It reports q/s, p50, p99, its own CPU, and
+(given the server's PID) the server's CPU over the same window. `g18_drive.py` gained the same two CPU numbers and stays for this round only. `g20_arms.py` runs a list of arms against a held server. The two drivers' row hashes
+differ (Python hashes `json.dumps` of the rows in key order, Rust hashes `serde_json`'s sorted keys); recall agrees to the last digit.
+
+Same promoted server, `top_k` 10 and 100, order P N N P P N N P (P is Python, N is native), median of four (range in parentheses). CPU is per second of wall time, in cores of the ten.
+
+| | q/s | p50 / p99 (ms) | client CPU | server CPU | server CPU per query |
+|---|---:|---|---:|---:|---:|
+| blowfish `top_k` 10, Python | 16,613 (16,129 to 16,630) | 0.90 / 1.92 | 2.11 cores | 6.77 | 407 us |
+| blowfish `top_k` 10, **native** | **16,610** (16,337 to 16,818) | 0.92 / 1.97 | **0.41** | 7.83 | 471 us |
+| blowfish `top_k` 100, Python | 8,567 (8,532 to 8,635) | 1.74 / 3.79 | 1.34 | 7.49 | 872 us |
+| blowfish `top_k` 100, **native** | **9,207** (9,127 to 9,229) | 1.63 / 3.43 | **0.24** | 8.27 | 897 us |
+
+The Python clients took 2.1 cores at `top_k` 10 (1.3 at `top_k` 100), the native ones 0.4 (0.24). Moving 1.7 cores from the clients to the server **did not move `top_k` 10 at all (1.00 times)** and gave `top_k` 100 1.07 times. The
+server filled the cores it was given (6.8 to 7.8 cores, and CPU per query rose 16 percent as it did): at `top_k` 10 it is bounded by its own thread pools and the ten cores' mix (4 performance and 6 efficiency), not by the generator.
+**The 22,446 q/s that Sol's idea needed was not reached: 16,610.** (G18's 17,266 on the Python driver was a better moment on the same machine; this round's Python number is 16,613.)
+
+Qdrant 1.20.0, same arms (P N N P, two runs each, median), matched to blowfish's recall by linear interpolation between `ef` points (0.9576 at `top_k` 10 and 0.9551 at `top_k` 100):
+
+| Qdrant | recall | Python q/s | native q/s | native p50 / p99 (ms) | client CPU (Python, native) | server CPU |
+|---|---:|---:|---:|---|---|---:|
+| `top_k` 10, ef 80 | 0.9561 | 7,806 | 8,639 | 1.42 / 8.96 | 1.44, 0.24 cores | 7.8, 9.0 cores |
+| `top_k` 10, ef 96 | 0.9623 | 7,071 | 7,741 | 1.56 / 10.14 | 1.31, 0.22 | 8.0, 9.0 |
+| `top_k` 100, ef 256 | 0.9528 | 3,716 | 3,896 | 3.00 / 16.26 | 0.69, 0.13 | 8.7, 9.2 |
+| `top_k` 100, ef 320 | 0.9621 | 3,174 | 3,304 | 3.52 / 18.74 | 0.62, 0.12 | 8.7, 9.2 |
+
+| Matched recall | blowfish | Qdrant | blowfish lead |
+|---|---:|---:|---:|
+| `top_k` 10, Python driver | 16,613 | about 7,630 | **2.18 times** |
+| `top_k` 10, native driver | 16,610 | about 8,423 | **1.97 times** |
+| `top_k` 100, Python driver | 8,567 | about 3,582 | **2.39 times** |
+| `top_k` 100, native driver | 9,207 | about 3,750 | **2.46 times** |
+
+Qdrant gained 10 percent from the native driver at `top_k` 10 and blowfish gained none, so the lead at `top_k` 10 **shrank** (2.18 to 1.97 times; the bar was a rise to 2.61 times); at `top_k` 100 it grew slightly (2.39 to 2.46 times).
+Qdrant's p99 is 8 to 10 ms at `top_k` 10 under the native driver (4.5 to 4.9 ms under Python), which fits its server oversubscribing the cores. **Item 1 fails its bar, and the lead over Qdrant is 2.0 to 2.5 times on either driver.**
+(The Python-driver lead at `top_k` 10 reads 2.18 times here against G18's 2.01 times because this machine's Qdrant measured 7,630 against G18's 8,570, a 11 percent difference between days.)
+
+### 2. A length-weighted one-bit screen
+
+**What I built.** Each row's code keeps the signs of `x - m` (as before) and now also `||x - m||` (an f16, 2 bytes per row, counted in `retained_bytes_per_row` and `peak_bytes_per_row`); the query's signs stay those of `q`. A row's `<q, x - m>`
+is estimated by `||x - m|| * cos(pi * h / D)` from a 1,025-entry table, and the rank is `<q, x> = <q, x - m> + <q, m>` with `<q, m>` the same for every row. The walk's rule became: skip a neighbor when its estimate plus `z` standard
+deviations of the angle estimator (`z * pi / (2 sqrt(D))`, scaled by the row's own length) is below what the beam's last member has, whose exact `<q, x - m>` is `1 - distance - <q, m>` (an exact threshold, where the old rule compares
+Hamming distances to the mean of the beam's 8 worst members, plus 16 bits). The length is prefetched with the code. A unit test checked the estimate against the true centered dot to 5 deviations.
+
+**Offline, in process** (the whole NQ graph, 8 threads, a new graph build per run, so recall varies by about 0.001 between runs; `g20_screen`, a variant of `g16_nav`, not in the tree). SQ8 scores per query ("evals", including the entry points) and in-process q/s:
+
+| `top_k` 10, `ef` 100, shortlist 30 | recall@10 | SQ8 scores per query | q/s |
+|---|---:|---:|---:|
+| no screen (margin never rejects) | 0.9696 | 2,172 | 18,429 |
+| production screen (margin 16 bits) | 0.9690 to 0.9707 | 780 | 32,300 to 32,600 |
+| plain Hamming, margin 12 | 0.9686 to 0.9701 | 696 | 32,500 to 33,600 |
+| plain Hamming, margin 8 | 0.9686 | 620 | 34,900 |
+| weighted, z 0.25 | 0.9690 | 599 | 32,800 |
+| weighted, z 0.5 | 0.9705 to 0.9712 | 661 | 31,500 (no length prefetch), 33,800 (prefetch) |
+| weighted, z 0.75 | 0.9704 to 0.9709 | 733 | 30,700, 32,300 |
+| weighted, z 1.0 | 0.9702 | 815 | 29,500 |
+
+| `top_k` 100, `ef` 256, shortlist 150 | recall@100 | SQ8 scores per query | q/s |
+|---|---:|---:|---:|
+| no screen | 0.9578 | 4,586 | 7,972 |
+| production screen | 0.9566 to 0.9572 | 1,557 | 13,250 to 13,400 |
+| weighted, z 0.5 | 0.9548 | 1,265 | 13,260 |
+| weighted, z 0.75 | 0.9564 to 0.9569 | 1,427 | 13,040, 13,530 |
+| weighted, z 1.0 | 0.9572 to 0.9578 | 1,613 | 12,430, 13,080 |
+
+**Pass-through.** The production screen lets 36 percent of the unseen neighbors through to the SQ8 kernel at `top_k` 10 (780 of 2,172) and 34 percent at `top_k` 100 (1,557 of 4,586): not the 48 percent Neon's idea assumed.
+At equal recall the weighted screen scores **15 percent fewer** rows at `top_k` 10 (661 against 780, recall 0.9712 against 0.9702 in the paired run) and **8 percent fewer** at `top_k` 100 (1,427 against 1,557), against a target of 2.5 times fewer.
+Row lengths vary little (the corpus is normalized, so `||x - m||^2 = 1 - 2<x, m> + ||m||^2` moves within a narrow band), so most of what the length buys, Hamming distance had already.
+
+**Over HTTP**, native driver, the same promoted server with the screen selected by a temporary switch file (a candidate binary only, not in the tree), O W W O O W W O (O is the production screen):
+
+| | q/s | p50 / p99 (ms) | server CPU per query | recall |
+|---|---:|---|---:|---:|
+| `top_k` 10, production screen | 16,913 (16,849 to 16,979) | 0.90 / 1.93 | 456 us | 0.9576 |
+| `top_k` 10, weighted z 0.5 | 17,201 (17,090 to 17,414) | 0.89 / 1.90 | 449 us | 0.9566 |
+| `top_k` 100, production screen | 9,219 (9,207 to 9,235) | 1.62 / 3.41 | 897 us | 0.9551 |
+| `top_k` 100, weighted z 0.75 | 9,252 (9,233 to 9,276) | 1.62 / 3.40 | 892 us | 0.9548 |
+
+**1.02 times at `top_k` 10 with recall 0.001 lower, and 1.00 times at `top_k` 100.** The bar was 1.15 times with recall not lower. **Item 2 fails, and the code is not in the tree** (one way per thing).
+
+**Why it cannot pass.** The offline pair gives the price of a SQ8 score: going from 2,172 scores to 780 saved 186 us of the 434 us a query takes per thread, so 0.13 us per score, and the 780 scores cost about 105 us of the 454 us the
+server spends per query (23 percent). Even a perfect screen that scored only the rows that enter the beam (an estimate: a few hundred) would save 40 to 50 us, or about 1.10 times at most; the 15 percent fewer scores that the weighted screen
+does reach save 14 us, and its own work (the length read, the table lookup, the comparison) takes most of it back (before the length was prefetched it cost about 14 ns per neighbor, which made the weighted screen 6 percent slower than the old one). The remaining 77 percent of the query is the
+rerank, the HTTP and JSON, and the walk's memory traffic, none of which a better screen touches.
+
+### Item 3 (I8MM `SMMLA` for the SQ8 dot)
+
+Not attempted. The SQ8 dot is 8 percent of the sampled profile (Round G18) and the 105 us above bounds all SQ8 work at 23 percent of the query; even a free dot would be 1.08 times, and the rows are fetched from memory either way.
+
+### Notes
+
+- The server arm is the production code with the temporary switch (one relaxed load per query); "production screen" and "v0.1.71" are the same code. The screen's extra memory (2 bytes per row, 5.4 MB at 2.68 million rows) was counted in the retained
+  and peak accounting in the candidate and reverted with the rest.
+- Not measured: other hosts, a remote driver (the network ceiling Sol's idea warned about), a mixed `top_k` load. Each point is one server and 20-second runs on a shared machine.
+
+Costs: no EC2 and no bucket writes. The 26.8 GB NQ fixture was copied to the M4 through presigned URLs (about $2.4 of S3 transfer) and deleted with the run directory, with the Qdrant store.
+
 ## Round G19: the general path's waste, and an ID-only path that keeps its speed under writes (2.0 to 2.4 times v0.1.68 with a 3,000 to 12,000 row tail)
 
 **Setup:** Round G18's: the Apple M4 (shared Mac mini), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture copied to a writable APFS clone, 16 client processes with one keep-alive connection each, release binaries with production defaults, indexing off (so writes stay in the unindexed tail and shadow base rows), and the graph promoted the ordinary way (`g19_run.py`, 22 minutes). Every comparison ran on **one promoted server**, with the arms selected by a temporary switch file (read every 500 ms, in a candidate binary only, not in the tree). The "v0.1.68" arm is the pre-round code kept alongside the new code in that binary: the empty-state validation, owned cache keys with separate prune and observe locks, `Wal::new` and key formatting per WAL probe, the typed path declining on any tail or shadowed row, and a tail scan with no screen. Each arm is 25 seconds (20 for item 1), after a serial pass over all 3,452 queries that hashes every response's rows.
