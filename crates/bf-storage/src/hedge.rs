@@ -281,6 +281,36 @@ impl Hedger {
         // Counts raced a slot's reuse: nothing to compare with yet.
         (Verdict::Waiting, TICK_MIN)
     }
+    /// (siblings, finished siblings, the quantile a straggler must exceed in microseconds) for a
+    /// read that started at `start_us`: diagnostics for `BF_TRACE_READS`.
+    fn snapshot(&self, start_us: u64) -> (u64, u64, u64) {
+        let abs = start_us / SLOT_US;
+        let slots: Vec<&Slot> = (abs.saturating_sub(SPAN)..=abs + SPAN)
+            .filter_map(|a| self.slot(a))
+            .collect();
+        let total: u64 = slots
+            .iter()
+            .map(|s| s.started.load(Ordering::Acquire) as u64)
+            .sum();
+        let done: u64 = slots
+            .iter()
+            .map(|s| s.finished.load(Ordering::Acquire) as u64)
+            .sum();
+        let want = ((done as f64 * WAVE_DONE).ceil() as u64).clamp(1, done.max(1));
+        let mut seen = 0u64;
+        let mut top = 0u64;
+        for b in 0..BUCKETS {
+            seen += slots
+                .iter()
+                .map(|s| s.hist[b].load(Ordering::Acquire) as u64)
+                .sum::<u64>();
+            if seen >= want && done > 0 {
+                top = bucket_top(b) as u64;
+                break;
+            }
+        }
+        (total, done, top)
+    }
     fn spend(&self) -> bool {
         let mut s = self.state.lock().unwrap();
         if s.tokens >= 1.0 {
@@ -303,6 +333,8 @@ impl Hedger {
         }
         let mut member = self.join();
         let start = Instant::now();
+        let trace = std::env::var_os("BF_TRACE_READS").is_some();
+        let mut hedged_at: Option<(u128, (u64, u64, u64), bool)> = None;
         let mut primary = Box::pin(backend.get_range(path, range.clone()));
         let len = range.end - range.start;
         loop {
@@ -314,27 +346,74 @@ impl Hedger {
                 wait = left.clamp(TICK_MIN, TICK_MAX);
             }
             if (verdict == Verdict::Straggler || timer) && self.spend() {
+                if trace {
+                    hedged_at = Some((
+                        start.elapsed().as_millis(),
+                        self.snapshot(member.start_us),
+                        timer,
+                    ));
+                }
                 break;
             }
             tokio::select! {
                 r = &mut primary => {
                     self.record(start.elapsed());
                     member.finish();
+                    if trace {
+                        trace_line(path, &range, start, None, self.snapshot(member.start_us));
+                    }
                     return r;
                 }
                 _ = tokio::time::sleep(wait) => {}
             }
         }
         metrics::counter!("blowfish_object_store_hedges_total", "outcome" => "issued").increment(1);
-        let second = Box::pin(backend.get_range(path, range));
+        let second = Box::pin(backend.get_range(path, range.clone()));
         let r = match futures::future::select_ok([primary, second]).await {
             Ok((bytes, _loser)) => Ok(bytes),
             Err(e) => Err(e),
         };
         self.record(start.elapsed());
         member.finish();
+        if trace {
+            trace_line(
+                path,
+                &range,
+                start,
+                hedged_at,
+                self.snapshot(member.start_us),
+            );
+        }
         r
     }
+}
+
+/// `TRACE_HEDGE path from len end_ms elapsed_ms hedge_after_ms(-1 none) siblings done p70_us timer`
+fn trace_line(
+    path: &Path,
+    range: &Range<u64>,
+    start: Instant,
+    hedged: Option<(u128, (u64, u64, u64), bool)>,
+    now: (u64, u64, u64),
+) {
+    let end = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let (after, (t, d, q), timer) =
+        hedged.map_or((-1i128, now, false), |(a, s, tm)| (a as i128, s, tm));
+    eprintln!(
+        "TRACE_HEDGE {} {} {} {} {} {} {} {} {} {}",
+        path,
+        range.start,
+        range.end - range.start,
+        end,
+        start.elapsed().as_millis(),
+        after,
+        t,
+        d,
+        q,
+        timer as u8
+    );
 }
 
 #[cfg(test)]
