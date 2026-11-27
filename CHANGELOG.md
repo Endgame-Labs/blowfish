@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.60] - 2026-11-27
+
+### Changed
+
+- **`top_k` 100 stays on the warm graph under writes, 2.1x faster:** While unindexed writes shadowed indexed rows, the graph was asked for `k + max(2k, 20)` rows, and the shadowed ones were dropped afterwards. The graph returns at most 100 rows, so `top_k` above 33 fell back to IVF whenever a write was pending. The shadowed rows are now removed from the rows the graph may return. This is computed once per snapshot and shared by concurrent queries, and each newer snapshot resolves only the IDs added since the previous one. The graph still walks through those rows, so navigation is unchanged, and it is asked for exactly `k`. The filtered graph scan from v0.1.58 takes the same mask. On BEIR NQ (2.68M x 1024-d) on a 16-vCPU Graviton host, with 50 upserts per second, 16 clients at `top_k` 100 went from 494 q/s (IVF) to 1,038 q/s on the graph. p50/p99 went from 28.0/67.1 ms to 13.0/32.1 ms, and recall@100 from 0.9507 to 0.9545. `top_k` 10 and write latency are unchanged. See Round G13 in `docs/benchmarks.md`.
+
 ## [0.1.59] - 2026-11-26
 
 ### Fixed
@@ -446,7 +452,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.59...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.60...HEAD
+[0.1.60]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.60
 [0.1.59]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.59
 [0.1.58]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.58
 [0.1.57]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.57
