@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.83] - 2026-11-28
+
+### Changed
+
+- **Cold BM25 is 1.26 times faster on object storage:** A cold search's first posting read now covers every window whose score bound is at least 0.3 of the segment's best (at least 24 windows, capped at about 4 MiB) instead of a fixed 24, so most queries no longer wait for a second, refining read; that read stays as the exact fallback. On a million MS MARCO passages on S3, cold p50 falls from 144 to 114 ms and p90 from 174 to 136 ms, with 40 percent fewer GETs, 3 percent more bytes, and identical results. Warm searches are unchanged. See Round C42 in `docs/benchmarks.md`.
+
 ## [0.1.82] - 2026-11-28
 
 ### Changed
@@ -599,7 +605,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.82...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.83...HEAD
+[0.1.83]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.83
 [0.1.82]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.82
 [0.1.81]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.81
 [0.1.80]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.80

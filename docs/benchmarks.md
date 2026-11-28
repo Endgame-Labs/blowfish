@@ -19397,3 +19397,75 @@ format already does for small ones) and cutting the straggler tail of wide waves
 
 Resources: one on-demand c7gn.4xlarge for 0.25 hours (about $0.25 with the root volume), terminated; its key pair and security group are deleted; the
 `tmp/c41/` prefix (a 551 MB private copy of the fixture) is deleted. The retained fixture was only read.
+
+## Round C42: cold BM25 reads every competitive window in its first posting batch (one fewer serial wave)
+
+Round C41 left four serial reads in a cold BM25 query on 1M MS MARCO: the manifest, the bundle wave, the first posting batch, and the window refinement. This
+round removes the last one for most queries, with the same results and scores, no format change, and no setting.
+
+### Step 1: which dependencies are real
+
+Each segment runs `manifest -> bundle wave -> first posting batch (24 windows) -> refinement batch`. What each wave needs from the one before it:
+
+| Wave | Needs | Can it move earlier? |
+| --- | --- | --- |
+| Bundle wave | The manifest (segment list and keys) | No (C41: a hint arrives with the manifest) |
+| First posting batch | The terms' records, which sit in the bundles, and the window bounds computed from them | (b) No, without a format change: a bundle already carries the record and the postings of every short term (up to 32 blocks), and a long term's blocks lie outside its bundle at offsets that only the record gives |
+| Refinement batch | The top-k floor, from the first batch's scores, to decide which windows are still competitive | (a) Yes, mostly: read a bounded superset in the first batch |
+
+Measured offline on a local copy of the fixture, with a temporary trace in `search_internal` (window bounds and floor per segment, blocks and bytes per batch; not
+committed), 200 queries (`bm25-msmarco.json` items 100 to 299), caches dropped before every query. At 24 first windows, **883 of 1,099 segment-queries (80 percent) run a
+refinement batch, and only 29 of 200 queries (14.5 percent) run none in any segment.** The refinement is large (median about 1,200 of 1,500 windows) because the bounds
+are loose: the floor the first batch establishes is about 0.55 of the segment's best window bound (p5 0.34, p10 0.40, p90 0.68). So the first batch can be every window
+whose bound is at least a fraction c of the segment's best bound (never fewer than 24). The refinement stays as the exact fallback, so a miss costs a wave and
+nothing else.
+
+| First batch | Queries with no refinement in any segment | Posting bytes per query (exact ranges) |
+| --- | ---: | ---: |
+| 24 windows (main) | 29 of 200 (14.5%) | 510 KB |
+| bound at least 0.5 of best | 117 of 200 (58.5%) | 591 KB (1.16x) |
+| bound at least 0.4 of best | 177 of 200 (88.5%) | 684 KB (1.34x) |
+| bound at least 0.3 of best | 195 of 200 (97.5%) | 762 KB (1.49x) |
+
+The brief's bar to build (60 percent of queries at under 2x the bytes) is met at 0.4 and 0.3. (b) was not pursued.
+
+### What was built
+
+`SegmentReader::first_windows` in `bf-text` (the one cold prefetching search path, used by every BM25 and filtered BM25 query):
+
+- **Only when cold.** If every block of the default 24 windows is already decoded in the reader's memo, the search keeps 24 windows, so a warm query runs the code it ran
+  before. A cold search widens.
+- **Width** is every window whose bound is at least `WIDE_FIRST_BOUND` = 0.3 of the segment's best, capped so that the added bytes, estimated from the block sizes of the
+  segment's non-dense, non-short terms per window, stay under `WIDE_FIRST_BYTES` = 4 MiB (and never below 24 windows). The cap only matters for much larger segments.
+- Exactness does not depend on the choice: the loop after the first batch is unchanged, and fetches whatever the floor leaves competitive. The new test
+  `cold_wide_first_batch_matches_reference_for_every_shape` runs 60,000 documents, long terms, two filters, and three values of k, on a cold and then a warm reader, against
+  the reference scorer; the wide path ran in 24 of its searches.
+
+### Measurement (EC2, paired and alternating)
+
+One on-demand c7gn.4xlarge (Ubuntu 24.04 arm64, Clang 19, Rust 1.100.0, NumKong SME targets off), us-west-2, the `scale-server` example, `tmp/msmarco-1m-v021/` read only on
+S3, no disk cache, 2 GiB memory cache, 4,000-byte blocks, instance-profile credentials, top 10, strong consistency. `examples/c42_pairs.py`: per round, a fresh process
+for each arm, one throwaway query, then queries 100 to 159 with the arm that goes first alternating by query; every arm's query is cold (`/_bench/drop_caches` first, connections
+warm), followed by two warm repeats with no drop. GETs and bytes are `/metrics` deltas (`blowfish_object_store_attempts_total`, `blowfish_object_store_bytes_total`). Base is
+`6dc43e6` (v0.1.82); the candidate is the same tree plus the change. Five rounds, **300 cold pairs**.
+
+| | Base | Candidate | Ratio |
+| --- | ---: | ---: | ---: |
+| Cold p50, ms | 144.2 | **114.4** | **1.261x** |
+| Cold p90, ms | 173.6 | 136.4 | 1.273x |
+| Cold mean, ms | 141.4 | 114.2 | 1.238x |
+| Object-store GETs per query | 161.5 | 93.6 | 0.58x |
+| Bytes per query, KB | 3,129 | 3,218 | 1.03x |
+| Warm p50, ms (repeat 2) | 9.80 | 9.50 | 0.969x (not slower) |
+| Warm p90, ms | 22.85 | 12.38 | |
+| Identical responses | | 300 of 300 | |
+
+The candidate was faster in 261 of 300 pairs (paired ratio median 1.25). Tuning on the same box, three rounds of 60 each: bound fraction 0.4 gave 1.228x cold p50 (180 of
+180 identical, warm 0.944x), and 0.3 gave 1.274x (180 of 180, warm 0.926x), at nearly the same bytes (3,208 and 3,218 KB against 3,130 KB), so 0.3 shipped. The wave removed is
+the refinement: GETs drop by 68 per query and p50 by 30 ms, about one 24 ms floor plus its wave tail. **Pass: p50 at least 1.2x faster, identical results, warm not slower.**
+
+What is left is the chain manifest, bundle wave, and one posting batch, plus the refinement for the few queries (about 2.5 percent in the offline count) where a segment's floor is under 0.3 of
+its best bound. The remaining lever is the wave tails (the bundle wave's 62 reads finish about 20 ms after their median), not more waves.
+
+Resources: one on-demand c7gn.4xlarge for 0.4 hours (about $0.4 with the root volume), terminated; its key pair and security group are deleted; nothing was written to the
+bucket (the fixture was only read). Offline sizing ran on this VM.
