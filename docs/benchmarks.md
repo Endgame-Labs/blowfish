@@ -19235,3 +19235,85 @@ Same rows' recall to four digits and the same CPU per query: the code path for `
 - The 128-sample acceptance cap was a G10 choice made for promotion speed (4.5 minutes); G26 trades that speed for the recall bound.
 
 Cleanup: the M4 run directory (fixture, store, binaries; about 27 GB) is deleted and nothing of mine is running there; the fixture was fetched through this VM (about $2.4 of S3 transfer); no EC2; no bucket writes; `.scratch/g26` removed.
+
+## Round C41: a text hint cannot cut a wave from cold BM25 (killed at the split, no engine change)
+
+Hypothesis (Neon, `briefs/ideas/0725-neon.md` #3): write an advisory object at a fixed key at each text checkpoint, fetch it beside the manifest, and start the
+snapshot warm and the posting reads without waiting for the manifest, taking cold BM25 on 1M MS MARCO from about 145 ms to 85 to 95 ms (1.5 to 1.7 times).
+The brief said to split first and stop if the chain did not support building. It does not, so nothing was built and no engine code changed.
+
+### Method
+
+One on-demand c7gn.4xlarge (Ubuntu 24.04 arm64, Clang 19, NumKong `__arm_get_current_vg` link stub, Rust 1.100.1) in us-west-2, the `scale-server`
+example at v0.1.81 (`3fff6bd`) plus an uncommitted eight-line patch that adds the first-byte time to each `TRACE_READ` line (`examples/c41_firstbyte.patch`).
+A private copy of `tmp/msmarco-1m-v021/store/` (eight text segments, 1M passages), pure S3 with no disk cache, a 2 GiB memory cache, 4,000-byte blocks, strong
+consistency. One fresh server process, one throwaway query, then queries 100 to 299 of `bm25-msmarco.json` (200 queries, top 10): `POST /_bench/drop_caches`
+before each, connections warm, `BF_TRACE_READS=1`. `examples/c41_drive.py` drives it and `examples/c41_analyze.py` builds the chains: a read's level is one more
+than the deepest read that finished before it started, and the critical path walks back from the last read to finish through the latest-finishing earlier read.
+`examples/c41_footers.py` reads each segment's footer so that `fts` reads are classed by where they fall (posting blocks below `metadata_offset`, dictionary
+bundles up to `lengths_offset`, document lengths after). Tracing slows queries: client p50 is 150.6 ms here (p90 186.0 ms), against 145 ms in BC1.
+
+### The serial chain (200 cold queries, p50 unless noted)
+
+| Level | What starts it | Reads | MB | Starts to ends, ms | First byte / total per read, ms | Kinds (mean reads per query) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| L1 | request | 1 | 0.19 | 0 to 26 | 23.6 / 26.0 | manifest 1 |
+| L2 | manifest | 62 | 1.93 | 29 to 73 | 23.7 / 24.5 (slowest 40) | dictionary bundles 49.6, text keys 7.6, text-stats chunks 2.9, WAL 2 |
+| L3 | bundles | 16 | 0.33 | 59 to 87 | 23.9 / 24.0 | posting blocks 15.4, bundles 4.9, stats 2.7 |
+| L4 | first postings | 33 | 0.36 | 88 to 125 | 23.5 / 23.0 | posting windows 42 |
+| L5 | scores so far | 32 | 0.21 | 110 to 150 | 23.1 / 23.0 | posting windows 42 |
+| L6 to L9 | scores so far | 1 to 37 | about 0.1 | to 223 | 23 / 23 | posting windows (61, 17, 4, and 2 queries reach them) |
+
+Dependency depth p50 5 and p90 6. The critical path of a typical query is four reads: manifest (26 ms), bundle wave (43 ms), first postings (36 ms), and
+one window refinement (38 ms). **Every read is a latency floor**: first byte and total are the same to within a millisecond at every level (23 to 24 ms
+p50), and a 194 KB manifest takes as long as a 16 KB bundle. The chain is serial dependency, not bandwidth or CPU, so this part of the idea's premise holds.
+
+### Why a hint cannot remove a wave
+
+1. **The hint's own read costs what the manifest costs.** A fixed-key hint fetched beside the manifest lands at the same time (about 26 ms), because the floor
+   is the round trip and not the size. It removes only the gap between the manifest's end and the bundle reads' start (3 to 5 ms here), about 3 percent.
+2. **The second wave needs the terms' own bundles, which cannot ride in a hint.** The bundle wave (L2, about 44 ms with 50 reads) reads the dictionary bundle of
+   every query term in every segment (about 6 terms times 8 segments). Posting reads can start earlier only for terms whose record the hint holds. Over the 200
+   queries (6.0 terms each, a `\w+` lowercase approximation of the analyzer, `examples/c41_coverage.py`):
+
+   | Top terms by document frequency | Query terms covered | Queries with every term covered |
+   | ---: | ---: | ---: |
+   | 1,024 | 65.0% | 3.0% |
+   | 4,096 | 79.2% | **14.0%** |
+   | 16,384 | 90.7% | 53.0% |
+   | 65,536 | 97.1% | 84.0% |
+
+   With the top 4,096 terms, 86 percent of queries still have a term the hint lacks, so they still pay the bundle wave and the posting waves behind it. The p50 query
+   gains the 3 to 5 ms of point 1 and nothing else. Only the 14 percent of fully covered queries could skip the bundle wave (about 40 ms, 150 to about 110 ms),
+   and a hint big enough to cover half the queries (16,384 terms times eight segments of records and bundles) is megabytes, which adds transfer time to the
+   one read every query now waits on.
+3. **The remaining depth is score-dependent.** Levels L4 to L9 are window refinements that depend on the scores so far. No hint written at checkpoint time can know
+   them. A p50 query still pays at least the hint, one bundle or posting read, and one refinement.
+
+Bar from the brief: p50 at least 1.25 times faster. Upper bound from the split for the median query: about 1.03 times. **Killed at the split.**
+
+### Side measurement (Sol 06:25 #4): ranges inside one large object against whole small objects
+
+From the same instance, 200 reads each, interleaved in random order, fresh keys written 60 seconds earlier: 16 KiB ranges inside one 256 MiB object, and 16 KiB
+whole objects (separate keys). One connection pool, sequential requests, boto3. Two runs:
+
+| Run | Read | First byte p50 / p90, ms | Total p50 / p90, ms |
+| ---: | --- | ---: | ---: |
+| 1 | 16 KiB range in a 256 MiB object | 26.7 / 65.6 | 27.0 / 67.5 |
+| 1 | whole 16 KiB object | 24.3 / 30.6 | 24.4 / 30.6 |
+| 2 | 16 KiB range in a 256 MiB object | 25.4 / 62.4 | 25.9 / 65.8 |
+| 2 | whole 16 KiB object | 24.0 / 29.9 | 24.1 / 30.0 |
+
+The medians are within 1 to 2.5 ms. The **p90 of a range read in a large, freshly written object is twice as long** (62 to 66 ms against 30 ms), in both runs, with
+a single client and no load. Fresh large objects seem to have a slow tail on first reads of cold ranges (I did not test it on an object that had aged). If it holds
+for the retained layouts, it is a tail cost of putting many reads in one big object, and a reason to look at the wave tails (L2 spends 44 ms to finish a wave whose
+median read takes 24 ms) before looking for fewer waves. The objects were deleted.
+
+### What would move cold BM25
+
+The chain is about 4 reads at a 24 ms floor, plus the wave tails: the bundle wave's 62 reads finish 20 ms after the median read does. The real levers are fewer
+dependent levels in the posting search (L4 and later: fetch the first two windows at once, or read the whole of short terms' postings with their records, which the
+format already does for small ones) and cutting the straggler tail of wide waves. Both are separate rounds and need their own profile.
+
+Resources: one on-demand c7gn.4xlarge for 0.25 hours (about $0.25 with the root volume), terminated; its key pair and security group are deleted; the
+`tmp/c41/` prefix (a 551 MB private copy of the fixture) is deleted. The retained fixture was only read.
