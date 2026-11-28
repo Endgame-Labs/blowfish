@@ -20028,3 +20028,54 @@ a 60 to 85 ms read (this round). What is left is smaller reads inside the bundle
 
 Two on-demand c7gn.4xlarge hosts for 0.6 and 0.15 hours (about $1 in all with the root volumes), about 400 GB of in-region GET traffic from the fixture and the copies (no transfer charge; about 250,000 GETs) and 209 MB of server-side copies under `tmp/c45/` (twice, deleted). Both instances are terminated and their key pairs,
 security groups, and the prefix are deleted; the retained fixture was only read. Scripts: `c45_sections.py`, `c45-fetch/`, `c45_fetch_runs.py`, `c45_paired.py`, `c45_fetch_summary.py`, `c45_cpu.py`, `c45_model.py` (with the existing `c41_drive.py`).
+
+## Round G29: the warm graph's wide filtered walk stays as it is; an adaptive beam, predicate-gated transit, and a lower degree all missed their bars
+
+**Setup:** Round G27's and G28's (the Apple M4, shared Mac mini, 10 cores, 16 GB; full BEIR NQ, 2,681,468 rows, 1,024-d f16 cosine; the frozen v0.1.19 fixture; release binaries, indexing off; the graph promoted the ordinary way with `g15_promote.py`; the native driver, 16 connections, 8 seconds per arm after a serial quality pass over 1,000 queries; `top_k` 10, IDs only; recall@10 against the exact filtered top 10, `g27_truth.py`). Every arm ran on one promoted server through a temporary switch file the server re-read every 250 ms (`g29_arms.py`; the switch is not in the tree, and the measurement build is the commit reverted right after it). Two servers were promoted (`ef` 100 and 157), so compare arms within a server only. The candidate code is `2153e8f` in the branch history. With the survivor count set past the beam, the new walk returns responses identical (SHA-256) to v0.1.85's.
+
+### 1. Adaptive beam: killed (best case 1.57 times at recall 0.9929, under today's 0.9941 and IVF's 0.9943)
+
+**Measured first.** The v0.1.85 walk at 20 percent (`id-20`, beam 4,000) spends **4,006 expansions** per query, and the last of its final top 10 survivors was first scored at **expansion 179** on average, so 96 percent of the expansions come after the answer's nearest rows were in hand. That is the headroom Neon's idea names, but it is not the headroom a stop rule can take: what the extra expansions buy is recall in the minority of queries that start in a thin pocket of allowed rows.
+
+**Built.** The beam is bounded by survivors (rows that pass the filter) instead of its length: it keeps every node up to its `s`-th survivor, so the walk ends once `s` survivors are held and every nearer node is expanded, with the old width (80 k / p) as the cap and the IVF fallback unchanged. Also a patience stop (no new nearest-10 or nearest-30 survivor for `p` expansions).
+
+| Server (`ef` 157), `id-20` | q/s | Recall@10 | CPU per query | Expansions |
+|---|---:|---:|---:|---:|
+| v0.1.85 | 1,019 to 1,030 | 0.9941 | 8.9 ms | 4,006 |
+| survivors 600 | 1,602 (1.57x) | 0.9929 | 5.7 ms | 2,537 |
+| survivors 800 | 1,208 (1.18x) | 0.9935 | 7.6 ms | 3,323 |
+| survivors 1,000 | 1,047 | 0.9938 | 8.7 ms | 3,779 |
+| patience 400, nearest 10 | 2,421 | 0.9838 | 3.8 ms | 470 |
+| patience 800, nearest 30 | 1,662 | 0.9907 | 5.5 ms | 1,085 |
+
+On the first server (`ef` 100, `id-20`, today 1,111 q/s at 0.9953): survivors 100, 200, 400, and 800 gave 8,065 (0.9836), 4,642 (0.9888), 2,650 (0.9927), and 1,303 (0.9946). At `id-50` (today 2,589 to 2,850 at 0.9925 to 0.9936): survivors 100 to 400 gave 9,701 (0.9732), 8,174 (0.9837), and 5,278 (0.9907), and on the second server 500, 600, and 800 gave 4,060 (0.9897), 3,474 (0.9907), and 2,716 (0.9921).
+
+The cost is a smooth curve in recall, so there is no setting with at least 1.4 times at today's recall: the first point that holds IVF's recall at 20 percent (about survivors 800) is 1.17 to 1.18 times. A patience stop is worse than a fixed survivor count at equal cost (every row of the patience arms sits under the survivors curve). **Pass: at least 1.4x at 20 percent at recall at least today's and IVF's, nothing slower at 50 percent. Not met. Killed.** A rule that tells a thin-pocket query from an ordinary one before it walks (the only way to keep recall while stopping early) was not found with the signals the walk has.
+
+### 2. Predicate-gated transit: killed (no gain at equal recall)
+
+Rows outside the filter were placed in the beam from a per-query least-squares estimate of the SQ8 distance from the one-bit Hamming distance (fitted on the first 48 scored rows and kept running), with no SQ8 score. `id-20`, first server:
+
+| Arm | q/s | Recall@10 | Expansions | SQ8 scores |
+|---|---:|---:|---:|---:|
+| survivors 200, ungated | 4,642 | 0.9888 | 797 | 4,117 |
+| survivors 200, gated | 3,658 | 0.9913 | 1,655 | 1,494 |
+| survivors 400, ungated | 2,650 | 0.9927 | 1,661 | 7,983 |
+| survivors 400, gated, slack 1 | 1,880 | 0.9938 | 3,210 | 2,752 |
+| survivors 400, gated, slack 0 | 3,351 | 0.9912 | 1,624 | 1,756 |
+| survivors 800, gated, slack 0 | 1,617 | 0.9941 | 3,291 | 3,263 |
+
+Gating cuts SQ8 scores by 2 to 3 times, but estimated distances order the beam worse, so the walk expands about twice as many nodes for the same recall, and the one-bit screen already skips most SQ8 scores. Interpolating the ungated curve to the gated arms' recall gives the same q/s (survivors 400, slack 0 at 0.9912 sits on the ungated line between 4,642 at 0.9888 and 2,650 at 0.9927). **Pass: at least 1.3x at equal recall. Not met. Killed.**
+
+### 3. Lower degree: killed by the model (at most 1.08 times even if recall were free)
+
+Replay on the unfiltered walk, `ef` 100, today's recall 0.9608 at 20,546 q/s and 445 µs per query: truncating each expansion's links to the nearest 24 gave 21,529 q/s at 0.9482 (426 µs), 16 gave 22,191 at 0.8874 (411 µs), and six short links plus ten spread over the rest gave 22,163 at 0.9219 (414 µs). Halving the neighbors per expansion removes only about 8 percent of the CPU, because the one-bit screen already skips most SQ8 scores, and it costs 4 to 7 points of recall that a larger `ef` would have to buy back. The modeled ceiling is **1.08x, under the 1.25x bar**, so nothing was built. (The `ef` override of the replay did not reach the typed-ID path, so the rows at `ef` 150 and 200 repeat the `ef` 100 result and are not used.)
+
+### Not shipped
+
+Nothing in the tree changed except the `g29_arms.py` driver. The measurement switch, the survivor-bounded walk, the patience stop, and the gate are in `2153e8f` and reverted in `f112c2e`.
+
+### Notes
+
+- A 20 percent filter's cost is the recall in thin pockets, not the typical query: the typical query has its answer after 179 expansions and the beam is sized for the tail. Cutting the walk for the typical query needs a per-query signal of difficulty (a pocket detector), which is the next thing to try; fixed widths, survivor counts, patience, and gating do not do it.
+- The M4 run directory is deleted, and nothing of mine is running there.
