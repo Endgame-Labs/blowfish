@@ -576,6 +576,20 @@ impl SumPlan<'_> {
         }
         !self.docs.is_empty() || saturates(&self.expr)
     }
+    /// The largest total of a row that matches no text, in the best bonus class.
+    pub(crate) fn unmatched_bound(&self) -> f64 {
+        let bonus: Vec<f64> = self
+            .bonuses
+            .iter()
+            .map(|b| scaled(&b.weights, 1.0))
+            .collect();
+        let docs: Vec<f64> = self
+            .docs
+            .iter()
+            .map(|d| d.upper.unwrap_or(f64::INFINITY))
+            .collect();
+        self.bound(&vec![0.0; self.clauses.len()], &bonus, &docs)
+    }
     /// The largest total a row can reach when no text clause scores above `cutoffs`.
     pub(crate) fn bound(&self, cutoffs: &[f32], bonus: &[f64], docs: &[f64]) -> f64 {
         self.total(&|i| f64::from(cutoffs[i]), bonus, &|j| docs[j])
@@ -751,7 +765,8 @@ const MAX_SCAN: usize = 1 << 16;
 /// The rows a stream listed, and the term's value bounding every allowed row it did not list
 /// (`None` when it listed them all).
 struct Drawn {
-    rows: Vec<u32>,
+    /// Each listed row with its attribute value (read from the dictionary, not the column).
+    rows: Vec<(u32, serde_json::Value)>,
     cut: Option<f64>,
 }
 /// How a draw ended.
@@ -783,7 +798,7 @@ fn draw(
     let lo = usize::from(values.first().is_some_and(|(v, _)| v.is_null()));
     let mut top = values.len();
     let mut null_pending = lo == 1;
-    let mut rows: Vec<u32> = vec![];
+    let mut rows: Vec<(u32, serde_json::Value)> = vec![];
     let mut scanned = 0;
     loop {
         let next_number = (top > lo).then(|| values[top - 1].0.as_f64().unwrap_or(0.0));
@@ -819,18 +834,19 @@ fn draw(
         }
         let room = n - rows.len();
         if hits.len() > room {
-            rows.extend(&hits[..room]);
+            rows.extend(hits[..room].iter().map(|r| (*r, value.clone())));
             return Ok(Draw::Done(Drawn {
                 rows,
                 cut: Some(at(value)?),
             }));
         }
-        rows.extend(hits);
+        rows.extend(hits.into_iter().map(|r| (r, value.clone())));
     }
 }
 
 impl SegmentSum {
-    /// Each clause's best `n` rows per class, then the union scored exactly under every clause.
+    /// Each clause's best `n` rows per class (and, when `streams` is set, each streamed term's best
+    /// `n` rows), then the union scored exactly under every clause.
     /// A class whose bonus is positive also gets `k` fill rows when every list ended short: rows
     /// that match no text still total the bonus, and the lowest IDs among them are the ones that
     /// can win. `None` when that needs an ID order this segment cannot prove.
@@ -840,6 +856,7 @@ impl SegmentSum {
         plan: &SumPlan<'_>,
         n: usize,
         k: usize,
+        streams: bool,
     ) -> Result<Option<Candidates>, ApiError> {
         let mut out = Candidates {
             rows: vec![],
@@ -853,7 +870,8 @@ impl SegmentSum {
             } else if plan.dist.is_some() {
                 self.dist_candidates(plan, class, n, k).await?
             } else {
-                self.class_candidates(state, plan, class, n, k).await?
+                self.class_candidates(state, plan, class, n, k, streams)
+                    .await?
             };
             let Some(c) = c else {
                 return Ok(None);
@@ -873,6 +891,7 @@ impl SegmentSum {
         class: &Class,
         n: usize,
         k: usize,
+        streams: bool,
     ) -> Result<Option<Candidates>, ApiError> {
         let clauses = &plan.clauses;
         let all_matches = n == ALL_MATCHES;
@@ -917,26 +936,26 @@ impl SegmentSum {
             .map(|d| d.upper.unwrap_or(f64::INFINITY))
             .collect();
         let mut covered = false;
+        let mut known: Vec<HashMap<u32, serde_json::Value>> = vec![HashMap::new(); plan.docs.len()];
         for (j, doc) in plan.docs.iter().enumerate() {
             let Some(values) = &self.streams[j] else {
                 continue;
             };
+            // A term with a static bound streams only after a round without it failed to decide:
+            // most queries are decided by the lists alone, and the stream rows add work.
+            if !streams && doc.upper.is_some() {
+                continue;
+            }
             let drawn = if all_matches {
                 None
             } else {
                 match draw(state, doc, &values.values, values.truncated, &class.rows, n)? {
                     Draw::Done(d) => Some(d),
                     Draw::TooLong => None,
-                    Draw::NeedFull => {
-                        let attribute = doc.stream.as_deref().expect("stream attribute");
-                        let full = segment::filter_values(&self.store, &self.seg, attribute)
-                            .await?
-                            .ok_or_else(segment::corrupt)?;
-                        match draw(state, doc, &full, false, &class.rows, n)? {
-                            Draw::Done(d) => Some(d),
-                            _ => None,
-                        }
-                    }
+                    // The allowed rows hold none of the largest values (a selective filter):
+                    // a stream would have to decode the whole dictionary, which costs more
+                    // than the rows it could save.
+                    Draw::NeedFull => None,
                 }
             };
             let Some(drawn) = drawn else {
@@ -950,7 +969,8 @@ impl SegmentSum {
                 Some(cut) => doc_bounds[j] = doc_bounds[j].min(cut),
                 None => covered = true,
             }
-            union.extend(drawn.rows);
+            union.extend(drawn.rows.iter().map(|(row, _)| *row));
+            known[j].extend(drawn.rows);
         }
         // A stream that listed every allowed row leaves nothing outside the union.
         let bound = if covered {
@@ -979,7 +999,7 @@ impl SegmentSum {
                 .map_err(segment::index_error)?;
             exact.push(Scores::new(all, reader.num_docs()));
         }
-        let docs = self.row_terms(state, plan, &union).await?;
+        let docs = self.row_terms(state, plan, &union, &known).await?;
         let mut rows: Vec<(u32, f64)> = union
             .iter()
             .map(|row| {
@@ -1155,11 +1175,14 @@ impl SegmentSum {
     }
 
     /// Each row's row-wise terms, evaluated exactly as the full scorer would on the row's document.
+    /// `known[j]` holds the attribute value of term `j` for rows a stream listed (read from the
+    /// dictionary), so a row whose every term is known needs no column read.
     async fn row_terms(
         &self,
         state: &NamespaceState,
         plan: &SumPlan<'_>,
         rows: &RoaringBitmap,
+        known: &[HashMap<u32, serde_json::Value>],
     ) -> Result<HashMap<u32, Vec<f64>>, ApiError> {
         if plan.docs.is_empty() || rows.is_empty() {
             return Ok(HashMap::new());
@@ -1169,14 +1192,29 @@ impl SegmentSum {
             .iter()
             .flat_map(|d| d.columns.iter().cloned())
             .collect();
-        let docs = segment::projected_rows(&self.store, &self.seg, rows, Some(&columns)).await?;
-        let mut out = HashMap::with_capacity(docs.len());
+        let unread: RoaringBitmap = rows
+            .iter()
+            .filter(|row| known.iter().any(|k| !k.contains_key(row)))
+            .collect();
+        let docs = segment::projected_rows(&self.store, &self.seg, &unread, Some(&columns)).await?;
+        let mut out = HashMap::with_capacity(rows.len() as usize);
         for row in rows {
-            let doc = docs.get(&row).ok_or_else(segment::corrupt)?;
             let values = plan
                 .docs
                 .iter()
-                .map(|d| crate::query::score(state, doc, d.rank))
+                .enumerate()
+                .map(|(j, d)| match known[j].get(&row) {
+                    // A streamed term reads one attribute, and the dictionary holds its value.
+                    Some(v) => {
+                        let attribute = d.stream.as_deref().expect("stream attribute");
+                        let doc = Document::from_iter([(attribute.to_string(), v.clone())]);
+                        crate::query::score(state, &doc, d.rank)
+                    }
+                    _ => {
+                        let doc = docs.get(&row).ok_or_else(segment::corrupt)?;
+                        crate::query::score(state, doc, d.rank)
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             out.insert(row, values);
         }
@@ -1238,6 +1276,16 @@ pub(crate) fn accept(
         .select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a))
         .1;
     (exhaustive || (kth > bound && kth >= at_least)).then_some(kth)
+}
+
+/// The `k`th largest positive total, or `None` when fewer than `k` totals are positive.
+pub(crate) fn kth_total(totals: &mut [f64], k: usize) -> Option<f64> {
+    let count = totals.iter().filter(|t| **t > 0.0).count();
+    (count >= k && k > 0).then(|| {
+        *totals
+            .select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a))
+            .1
+    })
 }
 
 #[cfg(test)]

@@ -1407,7 +1407,9 @@ async fn sum_finish(
     let mut round = 0;
     while let Some(list) = n {
         let rounds = futures::future::try_join_all(
-            segments.iter().map(|s| s.candidates(state, &plan, list, k)),
+            segments
+                .iter()
+                .map(|s| s.candidates(state, &plan, list, k, round > 0)),
         )
         .await?;
         // A segment that cannot prove its boosted rows needs the full scorer.
@@ -1471,9 +1473,13 @@ async fn sum_finish(
             .await;
         }
         n = sum_text::next_list(list);
-        // Scoring every matching row cannot prove a row-wise term's rows (they differ from each
-        // other), and a streamed term has just failed to at every list length.
-        if n == Some(sum_text::ALL_MATCHES) && plan.docs.iter().any(|d| d.stream.is_some()) {
+        // Scoring every matching row proves a row-wise term's rows only when the bound for rows
+        // that match no text stays under the `k`th total already found, which it cannot when a
+        // boost dominates the text (then the all-rows scorer is cheaper).
+        if n == Some(sum_text::ALL_MATCHES)
+            && plan.docs.iter().any(|d| d.stream.is_some())
+            && sum_text::kth_total(&mut totals, k).is_none_or(|kth| kth <= plan.unmatched_bound())
+        {
             n = None;
         }
         round += 1;

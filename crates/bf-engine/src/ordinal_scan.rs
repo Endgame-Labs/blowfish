@@ -129,7 +129,9 @@ pub(crate) async fn select(
     k: usize,
 ) -> Result<RoaringBitmap, ApiError> {
     let rank = q.rank_by.as_ref().expect("eligible rank");
+    let started = std::time::Instant::now();
     let ids = segment::ids(store, seg).await?;
+    crate::ann::stage(started, "ordinal ids");
     let per = q.limit.as_ref().and_then(Limit::per);
     let mut columns = BTreeSet::new();
     attributes(rank, &mut columns);
@@ -155,6 +157,9 @@ pub(crate) async fn select(
         .collect();
     let mut best: BinaryHeap<Contender> = BinaryHeap::new();
     let mut groups: HashMap<String, BinaryHeap<Contender>> = HashMap::new();
+    if crate::ann::trace_stages() {
+        eprintln!("STAGE ordinal rows {} of {}", rows.len(), allowed.len());
+    }
     let all: Vec<u32> = rows.iter().collect();
     for chunk in all.chunks(CHUNK) {
         let docs = if columns.is_empty() {
@@ -202,6 +207,7 @@ pub(crate) async fn select(
             }
         }
     }
+    crate::ann::stage(started, "ordinal total");
     let mut selected = RoaringBitmap::new();
     for c in best.iter().chain(groups.values().flat_map(|h| h.iter())) {
         selected.insert(c.row);
