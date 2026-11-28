@@ -18187,3 +18187,58 @@ Not attempted, and the bar cannot be met: G20 bounded all SQ8 work at 23 percent
 
 - Cleanup: the M4 run directory (data, store, binaries) is deleted and nothing of mine is running there; about $0.5 of S3 transfer for the corpus; no EC2; no bucket writes.
 - `native_drive` reads UUID IDs back to corpus rows for its recall check (the multiplier is odd, so the mapping inverts).
+
+## Round G23: sixteen reactors spun on tokio's blocking-pool mutex; one stat instead of a `spawn_blocking` and resolved metric handles give 1.22 times at `top_k` 10 and 1.15 times at `top_k` 100
+
+**Setup:** Round G20's and G22's: the Apple M4 (shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture, release binaries, indexing off, the graph promoted the ordinary way
+(`g15_promote.py`, 40 minutes; the effort controller ended at a higher `ef` than in G22 (125 on the profile server), so this machine's v0.1.74 reads 14,769 q/s on the measurement server against G22's 17,021: compare arms within a server only), IDs only, the native driver
+(`native_drive`, 16 connections, 20 seconds per arm after one serial quality pass). Every pair of arms ran on **one promoted server**: a binary of this round's tree (03cca45) plus a temporary switch file read every 250 ms, not in the tree (bit 4: metric handles
+resolved once, bit 8: a local store's `head` as one `stat`; bits 1 and 2 are the two experiments below that were dropped). Switch 0 is v0.1.74's code path.
+
+### 1. Profile (v0.1.74 plus temporary counters, `top_k` 10, 16 connections, `ef` 125: 15,373 q/s, 509 us of server CPU per query, recall 0.9674)
+
+Walk counts per query: **136** nodes expanded, 4,478 neighbor IDs read, 2,573 unseen after the visited check (57 percent), **913** SQ8 scores after the one-bit screen (35 percent of the unseen ones). `sample` of the server (8 seconds under load), busy samples only
+(about 8,500): the walk (`search_prefetched`, with the screen, visited set, beam, and neighbor reads) 4,155 (49 percent); the SQ8 dot 1,283 (15); the rerank futures 497 (6); `memmove` 412 (5); JSON number parsing 377 and the vector element visitor 354 (9);
+response `writev` 285; CRC32 of the rerank rows 218 (2.6); the RaBitQ transform 111. Per query the metrics registry was hit about 20 times: four calls for each of 3.5 mapped reads, the labeled HTTP counter and histogram (four `String` allocations and a four-label key each),
+the in-flight gauge twice, and two counters.
+
+**`swtch_pri`, 2,071 samples**, is the frame G22's list of lock frames did not name. Of those, **1,515 sit under `tokio::runtime::blocking::pool::Spawner::spawn_task` and its `parking_lot` `lock_slow` (a `thread_yield` spin)**, called from
+`WalProbe::run`, `Storage::head`, and `object_store`'s `LocalFileSystem::get_opts`: the strong-read WAL probe is a `head` for the next WAL entry, and on a local store `object_store` runs each one as a `spawn_blocking`. Probe sharing (an earlier round) cut the
+heads to 23 percent of queries, but each one still contended the pool's one mutex among the 16 reactors: about 18 percent of the server's busy samples were yield spinning, not work. (G22's lock total of 1.5 percent counted only `psynch_mutexwait`,
+`os_unfair_lock_trylock`, and the allocator's lock.)
+
+### 2. Sol's idea 4 (skip expanding nodes that reveal nothing): killed by its own gate
+
+An expansion that discovers no unseen neighbor is **0.2 of 136 per query** (the walk reads 33 neighbors a node and 19 are new). Skipping all of them for free saves about 0 percent of CPU, under the idea's 23 percent kill line, so it was not built.
+
+Two walk and setup changes were built and measured on the promoted server (results identical to v0.1.74 by construction) and **dropped, because neither moved q/s**: a one-ahead prefetch (the next expansion's adjacency row at once, its neighbors' one-bit codes after the third score of the current node;
+17,221 and 17,103 q/s against 17,155 for switch 0 on the first server), and a per-thread cache of the RaBitQ transform in place of its global mutex (17,089 and 17,215). The walk is not waiting on its adjacency rows or one-bit codes.
+
+### 3. What shipped
+
+- **`Storage::head` on a mapped local store is one `stat` on the calling thread** (`Mapped::head`) instead of the object store's `spawn_blocking`. A stat takes microseconds. It still writes the same `op="head"` series (`attempts`, `requests` by status, `bytes`, `request_seconds`, and the task-scoped
+  diagnostics), with their handles resolved once. A missing object and a directory both answer `NotFound`, as the object store does (a test covers both).
+- **Metric handles are resolved once** on the typed ID query path: the four mapped-read series, the cache hit and miss counters, `blowfish_query_cpu_dispatch_total{path="inline"}`, `blowfish_query_requests_total{kind="ann"}`, and the in-flight gauge are `OnceLock` handles. The HTTP counter and histogram
+  look their handles up per thread by one reused key buffer (no allocation on a hit), creating the series on first use. No metric was removed or renamed; statuses that never happen still export no series.
+
+### 4. Measurement (one promoted server, switch 0 against switch 12 (bits 4 and 8, the tree's code), same `ef`, identical row SHA-256 in every arm)
+
+| `top_k` | arm | q/s (runs) | median | server CPU per query | p50 / p99 (ms) | recall |
+|---:|---|---|---:|---:|---|---:|
+| 10 | v0.1.74 (switch 0) | 14,716; 14,804; 14,809; 14,778; 14,707; 14,769; 14,768; 14,751 | **14,769** | 546 us | 1.03 / 2.20 | 0.9684 |
+| 10 | **this round** (switch 12) | 18,018; 17,956; 18,008; 17,964; 18,015; 17,995 | **18,002** (**1.22x**) | 514 us | 0.76 / 1.81 | 0.9684 |
+| 100 | v0.1.74 (switch 0) | 8,304 (first arm, cold); 9,037; 9,027; 9,055 | **9,032** | 917 us | 1.66 / 3.52 | 0.9550 |
+| 100 | **this round** (switch 12) | 10,344; 10,351; 10,334; 10,370 | **10,348** (**1.15x**) | 882 us | 1.33 / 3.31 | 0.9550 |
+
+**Passed:** `top_k` 10 is 1.22 times v0.1.74 (bar 1.15) with identical result IDs and rows (the same SHA-256 for all 3,452 queries), and `top_k` 100 is faster (1.15 times, not slower). The server now fills 9.25 cores of the ten instead of 8.07, and CPU per query falls
+6 percent (546 to 514 us): the throughput gain is larger than the CPU saving because the yield spin is gone. Ablation on the same server at `top_k` 10 (one run each): `head` as a stat alone (switch 8) 17,235 (1.17x), metric handles alone (switch 4) 15,332 (1.04x), both 17,942.
+On the earlier promoted server (`ef` lower, 17,155 for switch 0, bit 8 not yet built) the metric handles alone gave 18,240 (1.07x), so their share depends on how loaded the registry's lookups are; the stat is the larger part.
+
+**`/metrics` names before and after:** the same 25 metric names, and the same series with the same label sets (`blowfish_http_requests_total{route,method,status,key_name}`, `blowfish_object_store_{attempts,requests,bytes}_total` and `_request_seconds` for `op="head"` and `op="mapped_read"`,
+`blowfish_query_cpu_dispatch_total`, `blowfish_query_requests_total{kind="ann"}`, and the cache counters), each counting every query: 47,710 and 56,161 queries moved the matching HTTP, dispatch, and `kind="ann"` counters by the same amounts under switch 0 and 12, and `op="head"` counted every probe
+(a stat per probe now: 93 percent of queries probe, because probes are too fast to share).
+
+**Not done / notes:** `native_drive`'s first arm of each `top_k` is slow (8,304 above); I kept it in the table. The rayon pool shows 542 `swtch_pri` samples (idle workers spinning, unrelated to a query), left alone. One full debug `cargo test --workspace` run had
+`warm_graph::tests::filtered_scan_hides_shadowed_rows_inside_the_allowed_set` fail with "test graph was never admitted" (memory admission under the full parallel run); it passes alone and on the rerun.
+
+Cleanup: the M4 run directory (fixture, store, binaries; about 26 GB) is deleted and nothing of mine is running there; the corpus fixture was fetched through this VM (about $2.4 of S3 transfer); no EC2; no bucket writes; `.scratch/g23` removed.
