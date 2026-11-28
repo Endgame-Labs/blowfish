@@ -190,7 +190,6 @@ pub fn build(
                     |id| bits.prefetch(id),
                     |hit| expanded.push(hit),
                     None,
-                    None,
                 );
                 // Steering used Hamming distance; the prune test needs true distances. Only the
                 // expanded nodes are measured, a small fraction of everything the search scored.

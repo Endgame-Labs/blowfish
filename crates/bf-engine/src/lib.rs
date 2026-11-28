@@ -6,7 +6,6 @@ mod auto_recluster;
 mod branch;
 mod drain;
 mod filter;
-mod g29_switch;
 mod highlight;
 mod ids_path;
 mod indexed;

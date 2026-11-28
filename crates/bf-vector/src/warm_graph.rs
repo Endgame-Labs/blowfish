@@ -6,8 +6,6 @@
 mod binary;
 mod builder;
 mod navigation;
-/// G29-TEMP
-pub use navigation::{DEGREE_CAP, DEGREE_SPREAD};
 mod quant;
 mod vamana;
 mod vectors;
@@ -32,34 +30,6 @@ fn check(cancelled: &(impl Fn() -> bool + Sync)) -> Result<()> {
     } else {
         Ok(())
     }
-}
-/// How a filtered walk is shaped; see [`HotGraph::candidates_filtered`].
-#[derive(Clone, Copy, Debug)]
-pub struct FilteredWalk {
-    /// Survivors the beam keeps.
-    pub survivors: usize,
-    /// Place rows outside the filter from their one-bit code alone.
-    pub gate: bool,
-    /// Residual deviations below the one-bit estimate a placed row enters at.
-    pub slack: f32,
-    /// Stop after this many expansions without a new nearest-10 survivor (0: never).
-    pub patience: u32,
-    /// How many nearest survivors the patience watches.
-    pub top: usize,
-    /// Record when each of the final survivors was first scored (`WalkStats::last_seen`).
-    pub log: bool,
-}
-/// What a filtered walk spent.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct WalkStats {
-    /// Nodes expanded.
-    pub expansions: u32,
-    /// Nodes scored with SQ8.
-    pub evaluations: u32,
-    /// Rows outside the filter placed from their one-bit code.
-    pub transit: u32,
-    /// The expansion count when the last of the final top 10 survivors was first scored.
-    pub last_seen: u32,
 }
 /// Immutable graph, rotated SQ8 codes, and original tier-row coordinates.
 pub struct HotGraph {
@@ -293,84 +263,6 @@ impl HotGraph {
     ) -> Result<(Vec<u32>, usize)> {
         let (hits, evaluations) = self.candidates_with_norms(query, ef, count, live, scratch)?;
         Ok((hits.into_iter().map(|(row, _)| row).collect(), evaluations))
-    }
-    /// A filtered walk: the beam keeps the `walk.survivors` nearest rows of `allowed`, widened at
-    /// most to `ef` nodes. Rows outside `allowed` stay stepping stones. Returns the `count`
-    /// nearest survivors by SQ8 distance with their norms, and what the walk spent.
-    pub fn candidates_filtered(
-        &self,
-        query: &[f32],
-        ef: usize,
-        count: usize,
-        walk: &FilteredWalk,
-        allowed: &RoaringBitmap,
-        scratch: &mut HotScratch,
-    ) -> Result<(Vec<(u32, crate::CosineNorm)>, WalkStats)> {
-        crate::distance::validate(query, self.dims)?;
-        if ef == 0 || count == 0 || query.iter().all(|x| *x == 0.) {
-            return Err(Error::InvalidInput("unsupported graph query shape".into()));
-        }
-        let q = vectors::normalized(query);
-        let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
-        let (code, scale) = quant::encode(&rotated);
-        let signs = self.bits.query(&rotated);
-        let screen = navigation::Screen::new(&self.bits, &signs);
-        let entry = self
-            .entries
-            .iter()
-            .map(|&id| (id, self.codes.score(&code, scale, id)))
-            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
-            .unwrap()
-            .0;
-        let allow = |id: u32| allowed.contains(self.rows[id as usize]);
-        let mut filter = navigation::Filtered::new(&allow, walk.survivors);
-        filter.gate = walk.gate;
-        filter.slack = walk.slack;
-        filter.patience = walk.patience;
-        filter.top = walk.top;
-        if walk.log {
-            filter.log = Some(Vec::new());
-        }
-        let ef = ef.max(count).min(self.len());
-        let evaluations = scratch.0.search_with(
-            |id, out| {
-                let degree = self.degrees[id as usize] as usize;
-                out[..degree].copy_from_slice(&self.links[id as usize][..degree]);
-                degree
-            },
-            entry,
-            ef,
-            |id| self.codes.score(&code, scale, id),
-            |id| self.codes.prefetch(id),
-            |_| {},
-            Some(screen),
-            Some(&mut filter),
-        );
-        let hits = scratch.0.survivors(count);
-        let mut stats = WalkStats {
-            expansions: filter.expansions,
-            evaluations: evaluations as u32,
-            transit: filter.transit,
-            last_seen: 0,
-        };
-        if let Some(log) = &filter.log {
-            let at = log
-                .iter()
-                .map(|&(id, at)| (id, at))
-                .collect::<std::collections::HashMap<_, _>>();
-            stats.last_seen = hits
-                .iter()
-                .take(10)
-                .filter_map(|id| at.get(id).copied())
-                .max()
-                .unwrap_or(0);
-        }
-        Ok((
-            hits.into_iter()
-                .map(|id| (self.rows[id as usize], self.norms[id as usize]))
-                .collect(),
-            stats,
-        ))
     }
     /// Navigate identically to [`Self::candidates`], carrying each immutable row's cached norm
     /// for exact reranking. Norms describe original stored f16 values, before normalization.

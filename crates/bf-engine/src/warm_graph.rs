@@ -4,7 +4,7 @@ use bf_storage::Storage;
 use bf_types::{ApiError, DistanceMetric, Document, Id, IdRef, QueryRequest, RankBy};
 use bf_vector::{
     CosineQuery, Index, RoaringBitmap, VectorType,
-    warm_graph::{FilteredWalk, HotCancellation, HotGraph, HotGraphBuilder, HotScratch},
+    warm_graph::{HotCancellation, HotGraph, HotGraphBuilder, HotScratch},
 };
 use bf_wal::{SlabSet, Wal};
 use std::{
@@ -1358,22 +1358,6 @@ pub(crate) async fn walk(
     let Ok(_permit) = entry.slots.try_acquire() else {
         return Ok(None);
     };
-    let arm = crate::g29_switch::arm();
-    let (ef, shape) = if arm.new {
-        (
-            ((ef as f64 * arm.cap) as usize).max(1),
-            Some(FilteredWalk {
-                survivors: arm.survivors,
-                gate: arm.gate,
-                slack: arm.slack,
-                patience: arm.patience,
-                top: arm.top,
-                log: arm.stats,
-            }),
-        )
-    } else {
-        (ef, None)
-    };
     match search_entry(
         store,
         state,
@@ -1386,15 +1370,12 @@ pub(crate) async fn walk(
         &entry,
         ef,
         false,
-        shape,
     )
     .await
     {
         Ok(found) => {
             if found.is_some() {
                 scope.cache.answers.fetch_add(1, Ordering::Relaxed);
-            } else {
-                crate::g29_switch::DECLINED.fetch_add(1, Ordering::Relaxed);
             }
             Ok(found)
         }
@@ -1440,7 +1421,6 @@ pub(crate) async fn scan(
         &entry,
         0,
         true,
-        None,
     )
     .await
     {
@@ -1488,12 +1468,6 @@ pub(crate) async fn search(
             c.quality.serving.unwrap_or(c.quality.trial)
         }
     };
-    let g29 = crate::g29_switch::arm();
-    let ef = if g29.ef > 0 && !scope.trial {
-        g29.ef
-    } else {
-        ef
-    }; // G29-TEMP
     if k == 0
         || k > MAX_K
         || entry.graph.len() < k
@@ -1521,7 +1495,7 @@ pub(crate) async fn search(
         ));
     }
     let result = search_entry(
-        store, state, set, at, vector, navigate, k, columns, &entry, ef, false, None,
+        store, state, set, at, vector, navigate, k, columns, &entry, ef, false,
     )
     .await;
     match result {
@@ -1553,7 +1527,6 @@ async fn ranked_rows(
     entry: &Entry,
     ef: usize,
     scan: bool,
-    shape: Option<FilteredWalk>,
 ) -> Result<Option<Vec<(u32, f32)>>, ApiError> {
     entry.searches.fetch_add(1, Ordering::Relaxed);
     let navigation_started = thread_cpu();
@@ -1582,26 +1555,6 @@ async fn ranked_rows(
             )
             .map_err(segment::index_error)?,
         (true, None) => return Ok(None),
-        (false, Some(allowed)) if shape.is_some() => {
-            let (hits, w) = entry
-                .graph
-                .candidates_filtered(
-                    vector,
-                    ef,
-                    shortlist,
-                    &shape.unwrap(),
-                    allowed,
-                    loan.scratch.as_mut().unwrap(),
-                )
-                .map_err(segment::index_error)?;
-            use crate::g29_switch::*;
-            QUERIES.fetch_add(1, Ordering::Relaxed);
-            EXPANSIONS.fetch_add(u64::from(w.expansions), Ordering::Relaxed);
-            EVALUATIONS.fetch_add(u64::from(w.evaluations), Ordering::Relaxed);
-            TRANSIT.fetch_add(u64::from(w.transit), Ordering::Relaxed);
-            LAST_SEEN.fetch_add(u64::from(w.last_seen), Ordering::Relaxed);
-            (hits, w.evaluations as usize)
-        }
         (false, _) => entry
             .graph
             .candidates_with_norms(vector, ef, shortlist, mask, loan.scratch.as_mut().unwrap())
@@ -1672,9 +1625,8 @@ async fn search_entry(
     entry: &Entry,
     ef: usize,
     scan: bool,
-    shape: Option<FilteredWalk>,
 ) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
-    let Some(exact) = ranked_rows(vector, mask.as_deref(), k, entry, ef, scan, shape).await? else {
+    let Some(exact) = ranked_rows(vector, mask.as_deref(), k, entry, ef, scan).await? else {
         return Ok(None);
     };
     let need = match (scan, mask.as_deref()) {
@@ -1819,7 +1771,7 @@ pub(crate) async fn search_ids(
     }
     let table = entry.ids.get()?;
     let _permit = entry.slots.try_acquire().ok()?;
-    let exact = ranked_rows(vector, navigate.map(|m| &**m), k, &entry, ef, false, None)
+    let exact = ranked_rows(vector, navigate.map(|m| &**m), k, &entry, ef, false)
         .await
         .ok()??;
     let mut hits = typed_ids(table, &exact, navigate.map(|m| &**m), set, at)??;
