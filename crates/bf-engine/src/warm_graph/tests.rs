@@ -1979,3 +1979,95 @@ fn walk_beam_widens_with_the_filter_and_leaves_narrow_filters_to_the_scan() {
     assert_eq!(walk_beam(11, 500_000, rows, 100), None);
     assert_eq!(walk_beam(0, 500_000, rows, 100), None);
 }
+
+/// Round G28: a filter's per-segment masks are one cached entry. A repeat of the filter returns the
+/// same masks (the same allocations, so the tier masks keyed by them stay cached), a different
+/// filter returns different ones, and a delete that retires a segment's live object is seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filter_masks_are_one_cached_entry_that_follows_the_segments() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        cache: CacheConfig {
+            memory_bytes: 32 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let e = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.,
+            decoded_cache_bytes: 64 << 20,
+            ..Default::default()
+        },
+    );
+    for part in 0..2 {
+        let rows = (part * 600..(part + 1) * 600)
+            .map(|id| json!({"id":id,"vector":[id as f32 + 1.,1.],"bucket":id % 10}))
+            .collect::<Vec<_>>();
+        let mut body = json!({"upsert_rows":rows});
+        if part == 0 {
+            body["distance_metric"] = json!("cosine_distance");
+            body["schema"] = json!({"vector":{"type":"[2]f16","ann":true}});
+        }
+        e.write("hot", serde_json::from_value::<WriteRequest>(body).unwrap())
+            .await
+            .unwrap();
+        e.index_namespace("hot", true).await.unwrap();
+    }
+    let masks = |filter: Value| {
+        let e = e.clone();
+        async move {
+            let (state, _) = e
+                .snapshot("hot", &bf_types::Consistency::Strong)
+                .await
+                .unwrap();
+            let filter: bf_types::Filter = serde_json::from_value(filter).unwrap();
+            let context = read_cache::ReadContext::new(e.0.read_cache.clone());
+            let found = read_cache::scope(
+                context,
+                crate::ann_dir::live_masks(&e.0.store, &state, Some(&filter)),
+            )
+            .await
+            .unwrap();
+            (state.segments.len(), found)
+        }
+    };
+    let (segments, first) = masks(json!(["bucket", "Eq", 3])).await;
+    assert!(segments >= 2, "the test needs two segments");
+    let (_, again) = masks(json!(["bucket", "Eq", 3])).await;
+    let (_, other) = masks(json!(["bucket", "Eq", 4])).await;
+    let total =
+        |m: &Vec<Option<Arc<RoaringBitmap>>>| m.iter().flatten().map(|b| b.len()).sum::<u64>();
+    assert_eq!(total(&first), 120, "a tenth of 1,200 rows");
+    assert_eq!(total(&other), 120);
+    for (a, b) in first.iter().zip(&again) {
+        assert!(Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()));
+    }
+    assert!(
+        first
+            .iter()
+            .zip(&other)
+            .all(|(a, b)| !Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()))
+    );
+    // Deleting rows 3, 13, and 603 retires the live objects of both segments.
+    e.write(
+        "hot",
+        serde_json::from_value::<WriteRequest>(json!({"deletes":[3, 13, 603]})).unwrap(),
+    )
+    .await
+    .unwrap();
+    e.index_namespace("hot", true).await.unwrap();
+    let (_, after) = masks(json!(["bucket", "Eq", 3])).await;
+    assert_eq!(total(&after), 120 - 3);
+    assert!(
+        after
+            .iter()
+            .flatten()
+            .all(|b| !b.contains(3) || b.len() < 60)
+    );
+}
