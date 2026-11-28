@@ -19701,3 +19701,58 @@ bounds read, and a vectorized non-zero check would each be a smaller change than
 
 Cold (no change to measure), and a memory-capped reader where the pool budget, not the cap, limits the arrays (the 1M fixture's
 segments fit 32 arrays in the 8 MiB floor budget; a much larger segment with a 64 MiB pool is where a budget rule could matter).
+
+## Round C44: small objects do not shorten the cold rerank wave (modeled 0.93 to 1.27 times, no layout change proposed)
+
+Question: if the rerank pages were separate small objects (or small groups), would the wave's tail shrink, as C41's side measurement suggested (16 KiB range in a fresh 256 MiB object p90 62 to 66 ms, whole 16 KiB objects 30 ms)?
+Answer: the small-object advantage belongs to **freshly written** objects and fades within an hour. On aged objects whole small objects cost 43 to 85 ms at p50 and 73 to 113 ms at p90, and the rerank wave is a maximum over 47 to 133 reads, which sits near each layout's p99. Replayed on the 10M cold trace, the layouts model at **0.93 to 1.04 times the traced p50 when fresh and 1.03 to 1.27 times when aged**, so none is faster than today's wave (115 ms p50, 147 ms p90). No engine change; scripts are `c44_s3lat.py` and `c44_model.py`.
+
+Measured 2026-11-28 on one on-demand c7gn.4xlarge (Ubuntu 24.04 arm64, us-west-2, about 1.2 h), boto3 1.40, instance-profile credentials. Test objects under a private prefix (deleted); the fixtures were only read. The 10M trace is `scale-server` at v0.1.84 on a private server-side copy of the C5 fixture, repaired by the baseline writer (55 row maps, about 13 minutes), read-only, `cold_ab.py` protocol as C33 (8 Rayon workers, 64 probes, strong consistency, IDs only, 256 KiB blocks, 32-block coalescing, no disk cache, caches dropped before every query), 200 queries each unfiltered and with the 7.9 percent filter (`title_initial = s`).
+
+### c44-latency: first-byte and last-byte latency by layout and age
+
+Each set holds 96 objects of 64 MiB (16 KiB ranges on 64 of them, a 4 GiB span), 50,000 whole 16 KiB objects, 12,500 whole 64 KiB objects, and 3,200 whole 256 KiB objects (each small layout spans 800 MB). Reads come in waves of 35 at once (the rerank fan-out), the layouts rotated wave by wave, 15 waves (525 reads) per layout, every offset or object never read before in its set (one set per age, so earlier reads do not warm later ones). Last-byte ("total") p50 / p90 / p99, ms; first-byte times are 0 to 12 ms lower for 64 KiB and 256 KiB:
+
+| Layout (read) | Written 1 min earlier | Written 1 h earlier | 4 days (fixture objects, read only) |
+| --- | --- | --- | --- |
+| 16 KiB range in 64 MiB objects (4 GiB span) | 97 / 177 / 720 | 96 / 166 / 857 | 102 / 148 / 806 (the 224 big C5 objects, 77 GB span) |
+| whole 16 KiB object | **35 / 50 / 102** | 43 / 74 / 111 | 43 / 73 / 117 (objects of 8 to 32 KiB, n 70) |
+| whole 64 KiB object | **38 / 49 / 58** | 67 / 89 / 139 | 60 / 87 / 101 (32 to 128 KiB, n 175) |
+| whole 256 KiB object | **45 / 60 / 98** | 73 / 99 / 215 | 95 / 126 / 173 (128 KiB to 1 MiB, n 245) |
+
+- **Fresh small objects are fast, and it does not last.** C41's result reproduces (35 against 97 ms at p50), but one hour later the small layouts have slid to 43 to 73 ms, and the 4-day-old fixture objects match them. Rerank pages are written by the indexer long before a cold query, so the aged columns are the ones that apply. (The fixture rows are a different population: sizes vary within each bin, and earlier rounds may have read some of them.)
+- **The big-object range rows do not age**: about 95 to 100 ms at p50 whether written a minute ago or four days ago, and the same as C14 and C34 (reads over a span of GiBs). Their p99 here (700 to 860 ms, about 1 read in 100) is a slow tail this client sees only on ranges in big objects; the production client hedges reads and C34's 60-read samples saw none.
+- **A second read near a first is fast, and a first is not.** On a separate 2 GiB span of the big objects, a range read costs 31 / 75 to 101 ms at p50 / p90 (a narrower span, as C14 found), and a second 16 KiB range 64 KiB or 1 MiB away in the same object costs 29 to 30 / 36 to 42 ms, at one minute and one hour alike. In a 256 KiB object, the first 16 KiB range costs 33 / 49 ms fresh and 64 / 87 ms after an hour, then a second range 128 KiB further costs 29 / 36 to 39 ms. The warmth is local and lasts: it helps pages that are read in the same query's neighborhood (the nearest-cluster pages), not the scattered first reads that set the wave's end.
+
+### c44-model: replay of the 10M rerank wave
+
+`c44_model.py`: per query, the rerank wave is the `slabs` reads that start after the `scan` stage and end by the `rerank vectors` stage (47 reads at the median unfiltered, 94 filtered; the 7.9 percent filter reads the same pages as the unfiltered query plus its scan, so the wave is the same size class). Each layout turns those reads into GETs (ranges as traced; one GET per 16 KiB page; one per distinct 64 KiB or 256 KiB group touched), draws each GET's last-byte time by resampling whole measured waves of 35 for that layout and age, and takes the wave's maximum from the read's traced start. Modeled query = traced time with the wave replaced. 20 resamples per query. Per-million-row cost: 1,024-d f16 is 2 KiB per row, 8 rows per 16 KiB page, PUT $0.005 per 1,000.
+
+Unfiltered `top_k` 10 (traced p50 233 / p90 290 ms, wave 115 / 147 ms):
+
+| Age | Layout | Modeled wave p50 / p90, ms | Modeled query p50 / p90, ms | Ratio to traced (p50 / p90) | GETs | MB | Objects per M rows | PUT cost per M rows |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 min | 16 KiB objects | 124 / 159 | 242 / 305 | 1.04 / 1.05 | 133 | 2.2 | 125,000 | $0.625 |
+| 1 min | 64 KiB objects | 95 / 157 | 217 / 290 | 0.93 / 1.00 | 68 | 4.5 | 31,250 | $0.156 |
+| 1 min | 256 KiB objects | 107 / 139 | 225 / 284 | 0.97 / 0.98 | 45 | 11.9 | 7,812 | $0.039 |
+| 1 h | 16 KiB objects | 133 / 169 | 251 / 312 | 1.08 / 1.08 | 133 | 2.2 | 125,000 | $0.625 |
+| 1 h | 64 KiB objects | 145 / 232 | 271 / 351 | 1.16 / 1.21 | 68 | 4.5 | 31,250 | $0.156 |
+| 1 h | 256 KiB objects | 140 / 271 | 261 / 383 | 1.12 / 1.32 | 45 | 11.9 | 7,812 | $0.039 |
+| 4 days | 16 KiB objects | 122 / 171 | 248 / 311 | 1.07 / 1.07 | 133 | 2.2 | 125,000 | $0.625 |
+| 4 days | 64 KiB objects | 134 / 167 | 253 / 310 | 1.09 / 1.07 | 68 | 4.5 | 31,250 | $0.156 |
+| 4 days | 256 KiB objects | 175 / 207 | 295 / 353 | 1.27 / 1.22 | 45 | 11.9 | 7,812 | $0.039 |
+| any | ranges in 64 MiB objects (today's layout) | 174 to 202 / 762 to 902 (model; see below) | 296 to 323 / 867 to 1,006 | 1.27 to 1.39 / 2.99 to 3.47 | 47 | 1.4 | 31 | $0.0002 |
+
+7.9 percent filter (traced p50 605 / p90 746 ms, wave 119 / 153 ms): the aged small layouts model at 625 to 674 / 755 to 808 ms (1.03 to 1.11 / 1.01 to 1.08 times), the fresh ones at 605 to 623 / 737 to 755 ms (1.00 to 1.03 / 0.99 to 1.01), because the wave is about 120 ms of a 600 ms query, and the scan is the rest. GETs per query 230 (16 KiB), 128 (64 KiB), and 93 (256 KiB) against 94 today.
+
+- **The today row overshoots the trace and is not the comparison.** My unhedged boto3 client draws the ranges layout's 700 to 860 ms p99 into a 47-read maximum (wave p90 760 to 900 ms), while the trace's hedged Rust client finishes the same wave at 147 ms p90. Compare each small layout with the **traced** numbers: the table's last two columns are against the trace, so the ranges row is shown only to say the model does not reproduce today's hedged tail. The boto3 client also costs about 10 ms more per read than the Rust one (C13), so the small-layout rows run 5 to 12 ms high; subtracting that still leaves the aged rows at 1.0 to 1.2 times the trace.
+- **Why a lower median does not shorten the wave.** The wave ends at its slowest read, and with 45 to 133 reads that is each layout's p98 to p99 (100 to 215 ms here), not its median (43 to 95 ms). The small layouts cut the median by half and the tail by almost nothing, and the 16 KiB layout adds 2.8 times the GETs (133 against 47) to do it.
+- **Cost.** The 16 KiB layout is 125,000 objects and $0.63 of PUTs per million rows (1.25 billion objects and $6,250 per 10 billion rows) against 31 objects today; 64 KiB is $0.16 and 256 KiB is $0.04 per million rows. GET cost per query is $0.00002 to $0.00005 more for the 16 KiB layout (the GETs are 133 against 47), and the 256 KiB layout reads 8 times the bytes (11.9 against 1.4 MB).
+
+### Decision
+
+No layout change pays: aged small objects model at or slower than today's traced wave. The one case that wins at p50 (64 KiB objects, fresh, 0.93 times) is the first minutes of an object's life, and it costs 125 times the objects per row of the next-cheaper option. The measurement that would change this is a layout where the **scattered first reads** land in already-warm bytes (reads within about 1 MiB of a recent read stay near 30 ms): cluster-local placement of exact vectors with the scan's own reads priming them, which C14 already named. I did not model it. I did not run the two-hour age; the one-hour and four-day columns bracket it.
+
+### Cost
+
+One on-demand c7gn.4xlarge for about 1.2 hours (about $1.2), about 200,000 PUTs for three test sets (about $1), and the 77 GB server-side copy for under an hour (cents). The instance, key pair, security group, and the `tmp/c44/` prefix are deleted; the retained fixtures were only read.
