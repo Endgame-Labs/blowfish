@@ -1362,6 +1362,10 @@ async fn typed_fixture_with(
 /// A string ID of the kind a real corpus has: a prefix, a zero-padded number, and characters that
 /// need JSON escapes (a quote, a backslash, and non-ASCII text).
 fn string_of(id: usize) -> String {
+    // The first rows look like UUIDs, so the table starts as one and must turn into text.
+    if id < 3 {
+        return uuid_of(id);
+    }
     format!("nq/train/{id:07}\"\\é-{}", id % 7)
 }
 /// [`typed_fixture_with`] with `strings` making the IDs strings that are not UUIDs.
@@ -1917,8 +1921,13 @@ async fn typed_ids_path_serves_string_ids_byte_identically() {
         compared += check("overwrites and deletes").await;
         let body = json!({"rank_by":["vector","ANN",queries[0]],"top_k":2});
         let got = typed(body).await.expect("typed path serves under a tail");
+        let got: Value = serde_json::from_slice(&got).unwrap();
         assert!(
-            !String::from_utf8(got).unwrap().contains("0000000"),
+            got["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["id"] != json!(string_of(0))),
             "the overwritten row 0 must not answer for query 0"
         );
         compared

@@ -661,18 +661,10 @@ pub(crate) async fn live_masks(
     state: &NamespaceState,
     filter: Option<&Filter>,
 ) -> Result<Vec<Option<Arc<RoaringBitmap>>>, ApiError> {
-    if let Some(f) = filter
-        && !crate::warm_graph::g28_switch_has("maskold")
-    {
+    if let Some(f) = filter {
         return filtered_live_masks(store, state, f).await;
     }
     futures::future::try_join_all(state.segments.iter().map(|seg| async move {
-        if let Some(f) = filter {
-            crate::filter::validate(f, &state.schema, false)?;
-            return Ok(Some(
-                segment::filter_live(store, seg, f, &state.schema).await?,
-            ));
-        }
         if seg.live_generation == 0 {
             return Ok(None);
         }

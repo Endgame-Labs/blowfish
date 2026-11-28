@@ -158,68 +158,6 @@ impl Scratch {
         );
         (self.beam.iter().map(|b| b.hit).collect(), evaluations)
     }
-    /// A beam search for a wide beam (`ef` in the hundreds or more): the nearest unexpanded node
-    /// comes from a min-heap and the `ef` nearest scored nodes live in a max-heap, so each of the
-    /// search's scores costs `O(log ef)`, where a sorted beam moves up to `ef` entries to insert
-    /// one. It expands the same nodes in the same order and returns the same nearest `ef` nodes
-    /// as [`Self::search_prefetched`] without a screen (a screen reads the beam's tail, which a
-    /// heap does not keep). Returns the nodes nearest first and the number of scores.
-    pub fn search_wide(
-        &mut self,
-        links: &[[u32; 34]],
-        degrees: &[u8],
-        entry: u32,
-        ef: usize,
-        mut score: impl FnMut(u32) -> f32,
-        mut prefetch: impl FnMut(u32),
-    ) -> (Vec<Hit>, usize) {
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
-        self.visited.begin();
-        self.visited.insert(entry);
-        let start = Hit {
-            id: entry,
-            distance: score(entry),
-        };
-        let mut frontier: BinaryHeap<Reverse<Hit>> = BinaryHeap::with_capacity(ef.min(1 << 16));
-        let mut found: BinaryHeap<Hit> = BinaryHeap::with_capacity(ef.min(1 << 16) + 1);
-        frontier.push(Reverse(start));
-        found.push(start);
-        let mut evaluations = 1;
-        let mut pending = [0u32; MAX_LINKS];
-        while let Some(Reverse(current)) = frontier.pop() {
-            if found.len() >= ef && current > *found.peek().unwrap() {
-                break;
-            }
-            let degree = degrees[current.id as usize] as usize;
-            let mut count = 0;
-            for &id in &links[current.id as usize][..degree] {
-                if self.visited.insert(id) {
-                    pending[count] = id;
-                    count += 1;
-                }
-            }
-            for position in 0..count {
-                if let Some(&next) = pending[..count].get(position + 3) {
-                    prefetch(next);
-                }
-                let id = pending[position];
-                let hit = Hit {
-                    id,
-                    distance: score(id),
-                };
-                evaluations += 1;
-                if found.len() < ef || hit < *found.peek().unwrap() {
-                    frontier.push(Reverse(hit));
-                    found.push(hit);
-                    if found.len() > ef {
-                        found.pop();
-                    }
-                }
-            }
-        }
-        (found.into_sorted_vec(), evaluations)
-    }
     /// The shared beam search, for serving and for graph construction. `adjacent` copies one
     /// node's neighbors into the buffer and returns their count (at most [`MAX_LINKS`]).
     /// `expanded` sees every node in the order the search expands it, with its score. Returns

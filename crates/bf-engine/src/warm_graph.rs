@@ -1220,35 +1220,6 @@ impl Drop for ScratchLoan<'_> {
         }
     }
 }
-/// TEMPORARY (Round G28, removed before the round ends): the measurement switch. `BF_G28_SWITCH`
-/// names a file whose text selects the arm each query takes (re-read every 300 ms), so two arms
-/// run on one promoted server.
-fn g28_switch() -> Arc<str> {
-    static CELL: std::sync::LazyLock<Mutex<(Option<Instant>, Arc<str>)>> =
-        std::sync::LazyLock::new(|| Mutex::new((None, Arc::from(""))));
-    let mut cell = CELL.lock().unwrap_or_else(|e| e.into_inner());
-    if cell
-        .0
-        .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(300))
-    {
-        let text = std::env::var_os("BF_G28_SWITCH")
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
-        *cell = (Some(Instant::now()), Arc::from(text.trim()));
-    }
-    cell.1.clone()
-}
-/// TEMPORARY (Round G28): whether the switch text names `word`.
-pub(crate) fn g28_switch_has(word: &str) -> bool {
-    g28_switch().contains(word)
-}
-/// TEMPORARY (Round G28): a `name=value` number in the switch text.
-fn g28_param(switch: &str, name: &str, default: u64) -> u64 {
-    switch
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .find_map(|t| t.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
-        .unwrap_or(default)
-}
 /// Rows kept by SQ8 distance for the exact rerank of a filtered scan, for `k` wanted rows.
 fn scan_shortlist(k: usize) -> usize {
     (k * 3).max(30)
@@ -1584,32 +1555,10 @@ async fn ranked_rows(
             )
             .map_err(segment::index_error)?,
         (true, None) => return Ok(None),
-        (false, _) => {
-            let switch = g28_switch();
-            if switch.contains("heap") && ef >= g28_param(&switch, "wide", 512) as usize {
-                entry
-                    .graph
-                    .candidates_wide_with_norms(
-                        vector,
-                        ef,
-                        shortlist,
-                        mask,
-                        loan.scratch.as_mut().unwrap(),
-                    )
-                    .map_err(segment::index_error)?
-            } else {
-                entry
-                    .graph
-                    .candidates_with_norms(
-                        vector,
-                        ef,
-                        shortlist,
-                        mask,
-                        loan.scratch.as_mut().unwrap(),
-                    )
-                    .map_err(segment::index_error)?
-            }
-        }
+        (false, _) => entry
+            .graph
+            .candidates_with_norms(vector, ef, shortlist, mask, loan.scratch.as_mut().unwrap())
+            .map_err(segment::index_error)?,
     };
     drop(loan);
     #[cfg(all(test, target_os = "macos"))]
@@ -1686,7 +1635,6 @@ async fn search_entry(
     };
     if columns.is_empty()
         && let Some(table) = entry.ids.get()
-        && !(matches!(table, IdTable::Str { .. }) && g28_switch().contains("strold"))
         && let Some(found) = ids_from_table(table, &exact, mask.as_deref(), set, at, k)
     {
         return Ok(found);
@@ -1822,9 +1770,6 @@ pub(crate) async fn search_ids(
         return None;
     }
     let table = entry.ids.get()?;
-    if matches!(table, IdTable::Str { .. }) && g28_switch().contains("strold") {
-        return None;
-    }
     let _permit = entry.slots.try_acquire().ok()?;
     let exact = ranked_rows(vector, navigate.map(|m| &**m), k, &entry, ef, false)
         .await
@@ -1867,8 +1812,11 @@ async fn build_id_table(
         }
     }
     let mut uints: Vec<u64> = Vec::new();
-    // String IDs are collected as text and packed once every row is known.
+    // String IDs are collected as UUIDs while every one is a canonical UUID, and as text from the
+    // first that is not; text is packed once every row is known.
+    let mut uuids: Vec<(u32, u128)> = Vec::new();
     let mut texts: Vec<(u32, Box<str>)> = Vec::new();
+    let mut uuid_only = true;
     // The first row's ID decides the table's family (integer or string); a row of the other
     // family abandons the table.
     let mut strings: Option<bool> = None;
@@ -1900,44 +1848,51 @@ async fn build_id_table(
                 }
                 (serde_json::Value::String(text), None | Some(true)) if !text.is_empty() => {
                     strings = Some(true);
-                    texts.push((row, text.as_str().into()));
+                    match IdRef::parse_uuid(text).filter(|_| uuid_only) {
+                        Some(id) => uuids.push((row, id)),
+                        None => {
+                            if uuid_only {
+                                uuid_only = false;
+                                texts.extend(uuids.drain(..).map(|(row, id)| {
+                                    let text = IdRef::uuid_text(id);
+                                    (row, String::from_utf8_lossy(&text).into())
+                                }));
+                            }
+                            texts.push((row, text.as_str().into()));
+                        }
+                    }
                 }
                 _ => return,
             }
         }
     }
-    let table = if strings == Some(true) {
+    let table = if strings == Some(true) && uuid_only {
+        let mut table = vec![u128::MAX; total];
+        for (row, id) in uuids {
+            table[row as usize] = id;
+        }
+        IdTable::Uuid(table)
+    } else if strings == Some(true) {
         let bytes: usize = texts.iter().map(|(_, t)| t.len()).sum();
         if (bytes + total * 4) as u64 > total as u64 * IdTable::MAX_STR_ROW_BYTES
             || bytes >= u32::MAX as usize
         {
             return;
         }
-        if texts
-            .iter()
-            .all(|(_, text)| IdRef::parse_uuid(text).is_some())
-        {
-            let mut uuids = vec![u128::MAX; total];
-            for (row, text) in &texts {
-                uuids[*row as usize] = IdRef::parse_uuid(text).expect("checked above");
-            }
-            IdTable::Uuid(uuids)
-        } else {
-            texts.sort_unstable_by_key(|(row, _)| *row);
-            let mut packed = Vec::with_capacity(bytes);
-            let mut offsets = Vec::with_capacity(total + 1);
-            let mut next = texts.iter().peekable();
-            for row in 0..total as u32 {
-                offsets.push(packed.len() as u32);
-                if let Some((_, text)) = next.next_if(|(r, _)| *r == row) {
-                    packed.extend_from_slice(text.as_bytes());
-                }
-            }
+        texts.sort_unstable_by_key(|(row, _)| *row);
+        let mut packed = Vec::with_capacity(bytes);
+        let mut offsets = Vec::with_capacity(total + 1);
+        let mut next = texts.iter().peekable();
+        for row in 0..total as u32 {
             offsets.push(packed.len() as u32);
-            IdTable::Str {
-                bytes: packed,
-                offsets,
+            if let Some((_, text)) = next.next_if(|(r, _)| *r == row) {
+                packed.extend_from_slice(text.as_bytes());
             }
+        }
+        offsets.push(packed.len() as u32);
+        IdTable::Str {
+            bytes: packed,
+            offsets,
         }
     } else {
         IdTable::Uint(uints)

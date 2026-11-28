@@ -264,48 +264,6 @@ impl HotGraph {
         let (hits, evaluations) = self.candidates_with_norms(query, ef, count, live, scratch)?;
         Ok((hits.into_iter().map(|(row, _)| row).collect(), evaluations))
     }
-    /// [`Self::candidates_with_norms`] with the wide-beam search (see
-    /// [`navigation::Scratch::search_wide`]): no one-bit screen, and a heap beam, which is much
-    /// cheaper for a beam in the thousands.
-    pub fn candidates_wide_with_norms(
-        &self,
-        query: &[f32],
-        ef: usize,
-        count: usize,
-        live: Option<&RoaringBitmap>,
-        scratch: &mut HotScratch,
-    ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
-        crate::distance::validate(query, self.dims)?;
-        if ef == 0 || count == 0 || query.iter().all(|x| *x == 0.) {
-            return Err(Error::InvalidInput("unsupported graph query shape".into()));
-        }
-        let q = vectors::normalized(query);
-        let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
-        let (code, scale) = quant::encode(&rotated);
-        let entry = self
-            .entries
-            .iter()
-            .map(|&id| (id, self.codes.score(&code, scale, id)))
-            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
-            .unwrap()
-            .0;
-        let (mut hits, evaluations) = scratch.0.search_wide(
-            &self.links,
-            &self.degrees,
-            entry,
-            ef.max(count).min(self.len()),
-            |id| self.codes.score(&code, scale, id),
-            |id| self.codes.prefetch(id),
-        );
-        hits.retain(|h| live.is_none_or(|m| m.contains(self.rows[h.id as usize])));
-        hits.truncate(count);
-        Ok((
-            hits.into_iter()
-                .map(|h| (self.rows[h.id as usize], self.norms[h.id as usize]))
-                .collect(),
-            evaluations + self.entries.len(),
-        ))
-    }
     /// Navigate identically to [`Self::candidates`], carrying each immutable row's cached norm
     /// for exact reranking. Norms describe original stored f16 values, before normalization.
     pub fn candidates_with_norms(
@@ -519,72 +477,6 @@ mod tests {
                 .is_err()
         );
         assert!(graph.scan(query, 0, usize::MAX, &all, true).is_err());
-    }
-    #[test]
-    fn wide_search_returns_the_same_nodes_as_the_sorted_beam() {
-        let (dims, n) = (16, 900);
-        let mut seed = 21u64;
-        let source = (0..n)
-            .map(|_| {
-                (0..dims)
-                    .map(|_| {
-                        seed ^= seed << 13;
-                        seed ^= seed >> 7;
-                        seed ^= seed << 17;
-                        (seed >> 40) as f32 / 16777216. * 2. - 1.
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let mut b = HotGraphBuilder::new(dims, n).unwrap();
-        let ids = (0..n as u32).map(|i| i + 10).collect::<Vec<_>>();
-        let packed = source
-            .iter()
-            .flatten()
-            .flat_map(|x| f16::from_f32(*x).to_le_bytes())
-            .collect::<Vec<_>>();
-        b.append(&ids, &packed, &|| false).unwrap();
-        let graph = b.finish(&|| false).unwrap();
-        let mut beam = graph.scratch();
-        let mut wide = graph.scratch();
-        for q in [0, 5, 77, 300, 899] {
-            let (code, scale) = quant::encode(
-                &rabitq::RaBitQ::new(dims, 42)
-                    .unwrap()
-                    .rotate(&vectors::normalized(&source[q])),
-            );
-            let entry = graph.entries[0];
-            for ef in [1, 10, 64, 300, 900] {
-                let (a, _) = beam
-                    .0
-                    .search(&graph.links, &graph.degrees, entry, ef, |id| {
-                        graph.codes.score(&code, scale, id)
-                    });
-                let (w, _) = wide.0.search_wide(
-                    &graph.links,
-                    &graph.degrees,
-                    entry,
-                    ef,
-                    |id| graph.codes.score(&code, scale, id),
-                    |_| {},
-                );
-                assert_eq!(
-                    a.iter().map(|h| h.id).collect::<Vec<_>>(),
-                    w.iter().map(|h| h.id).collect::<Vec<_>>(),
-                    "query {q} ef {ef}"
-                );
-            }
-            // And through the public method with a mask.
-            let live = (0..n as u32)
-                .map(|i| i + 10)
-                .filter(|r| r % 3 != 0)
-                .collect::<RoaringBitmap>();
-            let (hits, _) = graph
-                .candidates_wide_with_norms(&source[q], 300, 20, Some(&live), &mut wide)
-                .unwrap();
-            assert_eq!(hits.len(), 20);
-            assert!(hits.iter().all(|(r, _)| live.contains(*r)));
-        }
     }
     #[test]
     fn one_bit_screen_keeps_the_nearest_rows_and_the_exact_shortlist_size() {
