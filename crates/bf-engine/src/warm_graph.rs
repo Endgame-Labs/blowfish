@@ -21,7 +21,9 @@ const RETRY: Duration = Duration::from_secs(1800);
 /// Exact-rerank shortlist for the largest request the original graph path served.
 const RERANK: usize = 30;
 /// The largest `k + offset` the graph serves; larger requests use the IVF tier.
-const MAX_K: usize = 100;
+const MAX_K: usize = 256;
+/// The largest `k` the filtered code scan serves (its shortlist and screen were measured to 100).
+const SCAN_MAX_K: usize = 100;
 
 /// Beam width and exact-rerank shortlist for a request of `k` rows, given the calibrated beam.
 ///
@@ -1217,7 +1219,7 @@ pub(crate) fn scan_eligible(
         .ready(&scope.namespace, state, attribute, set)
         .is_some_and(|e| {
             k > 0
-                && k <= MAX_K
+                && k <= SCAN_MAX_K
                 && e.graph.can_scan()
                 && vector.len() == e.graph.dims()
                 && vector.iter().any(|x| *x != 0.)
@@ -2023,6 +2025,7 @@ mod plan_tests {
         assert_eq!(plan(100, 64), (256, 150));
         assert_eq!(plan(31, 64), (80, 47));
         assert_eq!(plan(100, 400), (400, 150));
+        assert_eq!(plan(256, 64), (656, 384));
         let mut last = plan(RERANK + 1, 64);
         for k in RERANK + 2..=MAX_K {
             let now = plan(k, 64);

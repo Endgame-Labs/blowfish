@@ -4,6 +4,16 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.81] - 2026-11-28
+
+### Fixed
+
+- **The warm graph no longer serves below IVF's recall:** The paired recall check that picks the graph's serving effort accepted a trial when the mean of 128 sampled queries showed no deficit, but at that size the interval is about plus or minus 0.022, so it accepted the lowest effort by chance. On BEIR NQ (2.7M rows) the graph served recall@10 of 0.943 to 0.949 against IVF's 0.961. A trial is now accepted only on a positive lower bound or a full 512-query window with no deficit: the graph settles at a higher effort and serves 0.965, at about 18,400 queries per second at `top_k` 10 on the M4 (the earlier, faster figures were below IVF's recall). Promotion takes about 19 minutes instead of 2.
+
+### Changed
+
+- **Deep pages stay on the warm graph:** The graph now serves `top_k` plus `offset` up to 256 instead of 100: `top_k` 128 is 7.9 times faster than IVF and 256 is 6.7 times, and the offset forms 4.4 to 5.2 times, all at higher recall. See Round G26 in `docs/benchmarks.md`.
+
 ## [0.1.80] - 2026-11-27
 
 ### Changed
@@ -579,7 +589,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.80...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.81...HEAD
+[0.1.81]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.81
 [0.1.80]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.80
 [0.1.79]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.79
 [0.1.78]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.78

@@ -50,7 +50,7 @@ fn plain_shape(request: &QueryRequest) -> Option<(&str, &[f32], usize)> {
         None | Some(IncludeAttributes::All(false))
     );
     (ids_only
-        && (1..=100).contains(&k)
+        && (1..=256).contains(&k)
         && request.limit.is_none()
         && request.offset == 0
         && request.filters.is_none()

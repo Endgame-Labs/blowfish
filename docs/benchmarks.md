@@ -19176,3 +19176,62 @@ code path on a uint group (`n`) in four page shapes and passed.
 Cold S3 and EC2 were not measured (local only, as briefed). A `limit.per` over two attributes, an array group, and a non-filterable group
 keep the column path (about 130 to 210 ms here). Each `cat` code array is 2 bytes a row (2 MB per 1M rows) and is charged to the decoded
 cache, so it can be evicted and rebuilt from the cached dictionary.
+
+## Round G26: the graph's serving effort sat at the floor and served 0.012 to 0.018 below IVF's recall; acceptance now needs a full window or a positive bound, and the graph serves pages to 256 rows
+
+**Setup:** Round G23's and G24's: the Apple M4 (shared Mac mini, 10 cores, 16 GB), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture, release binaries, indexing off, the graph promoted the ordinary way (`g15_promote.py` with the production sampler and 800 q/s of heat), IDs only, the native driver (`native_drive`, 16 connections). The driver gained `NATIVE_DRIVE_OFFSET` and `NATIVE_DRIVE_TRUTH`; the exact top-256 truth for the 3,452 queries was computed in numpy from the fixture's corpus (its first 100 columns match `truth.npy` as sets). Two servers ran at a time with a 2 GiB cache each, so a promotion here is about 10 minutes of build and a few minutes of samples.
+
+### 1. Effort calibration (v0.1.79's controller, three fresh servers)
+
+| Run | Chosen `ef` | Paired check, graph / IVF (query units) | 95 percent interval of the gap | Queries used | Real recall@10, graph | Real recall@10, IVF |
+|---|---:|---|---|---:|---:|---:|
+| A | 64 | 0.9580 / 0.9527 | -0.018 to +0.028 | 150 | 0.9487 | 0.9611 |
+| B | 64 | 0.9696 / 0.9690 | -0.021 to +0.022 | 158 | 0.9462 | 0.9611 |
+| N0 (G26 code, unchanged controller) | 64 | 0.9666 / 0.9638 | -0.018 to +0.024 | 138 | 0.9431 | 0.9611 |
+
+**Does the chosen `ef` keep the graph's recall at or above IVF's, as SPEC requires? No.** All three served at `ef` 64 with real recall 0.012 to 0.018 below IVF's, while the paired check said the graph was level with or above it. The accept rule was `lower bound > 0` or `at least 128 samples and graph mean >= IVF mean`. At 138 to 158 queries the interval is about plus or minus 0.022 (the per-query gap has a standard deviation near 0.14), so a graph that is 0.015 short passes by luck, and 64 is the first trial, so nothing ever moved it up.
+
+**Is the choice stable? Here yes, at the floor: 64 three times.** G23's 125 and G24's 64 and 80 fit the same rule landing on different trials: it accepts on the sign of a 128-query mean, and rejects only on `upper < 0` or a full window, so where the walk stops is chance. I did not rerun G23's and G24's binaries. **Did G23's change move it? No, and it should not:** the controller reads only recall, and G23 changed CPU per query, so it can alter only how fast samples arrive, not their values. 
+
+**Fix (`warm_graph/effort.rs`, no new setting):** a trial is accepted only on a positive lower bound (strong evidence, as before) or on a full 512-query window whose mean gap is not negative. The 128-sample mean rule is gone. Rejection is unchanged (`upper < 0`, or a full window below IVF).
+
+| Run (fixed controller) | Trials (queries until each decision) | Chosen `ef` | Queries to promote | Time from graph ready to promoted | Real recall@10, graph | IVF |
+|---|---|---:|---:|---:|---:|---:|
+| F0 | 64 (186), 80 (134), 100 (about 512), 125 accepted | 125 | 1,150 | 19 min | **0.9647** | 0.9611 |
+| F1 (a one-standard-error margin, dropped) | 64, 80, 100, 125 (rejected at the full window, gap -0.001), 157 (120 queries in when stopped) | not reached | n/a | n/a | n/a | n/a |
+
+The fixed check serves **0.0036 above IVF's recall at `ef` 125** (18,100 to 18,700 q/s at `top_k` 10, G23's 18,002 at the same `ef`) instead of 0.012 to 0.018 below it at `ef` 64 (about 21,100 to 22,600 q/s). **Cost: promotion took 19 minutes after the build, against 2 minutes, because each rejected trial needs its own evidence and the sample rate is about 75 a minute here.** The requirement trades throughput (about 17 percent at `top_k` 10) for the recall SPEC asks for; the old rule's extra speed came from serving a worse answer than IVF. A margin of one standard error was tried on F1 and left out: it rejected `ef` 125 (the paired gap was -0.001 over 512 queries, while F0's real recall at 125 is 0.0036 above IVF's) and was climbing past 157, which costs more throughput for no recall the SPEC asks for. The check reads low against exact truth because its truth is the union of the graph, IVF, and IVF at twice the probes, which favors IVF.
+
+### 2. Deep pages (the graph serves `top_k` plus `offset` up to 256)
+
+`MAX_K` 100 to 256 in `warm_graph.rs` and the typed ID path's `top_k` bound in `ids_path.rs`. The existing `plan` (beam 2.56 times `k`, shortlist 1.5 times `k`) gives beam 328 and shortlist 192 at 128, and beam 656 and shortlist 384 at 256, with the usual exact rerank, so no `bf-vector` change was needed; calibration samples any request the graph serves, so deep requests feed the same check. The filtered code scan keeps its own bound of 100 (`SCAN_MAX_K`; its shortlist was never measured beyond that).
+
+Clean measurement (N0, a promoted server at `ef` 64 running the new code, against B, the v0.1.79 binary on the same fixture before it promoted, so it served IVF; one second server was building at the time):
+
+| Request | IVF q/s | Graph q/s | Ratio | IVF recall | Graph recall |
+|---|---:|---:|---:|---:|---:|
+| `top_k` 128 | 972 | 7,632 | **7.9x** | 0.9515 | **0.9573** |
+| `top_k` 256 | 665 | 4,425 | **6.7x** | 0.9471 | **0.9652** |
+| `top_k` 10, `offset` 118 (ranks 119 to 128) | 1,016 | 5,285 | 5.2x | 0.5748 | 0.6332 |
+| `top_k` 10, `offset` 246 (ranks 247 to 256) | 718 | 3,154 | 4.4x | 0.3559 | 0.5103 |
+
+(The page rows' recall is of ten ranks that sit among near-ties, so both tiers are low; the graph is higher.) Pass: 128 and 256 at least 2x IVF's rate at recall at least IVF's, for both the plain `top_k` and the offset form.
+
+### 3. `top_k` 10 and 100 against v0.1.79's path, on one promoted server (F0, `ef` 125, a temporary switch file, not in the tree)
+
+The switch set the largest `k` the graph serves: 100 is v0.1.79's behavior, 256 the new one. Arms alternated three times, 15 seconds each, with a second promotion calibrating on the same machine (so absolute q/s is noisy).
+
+| `top_k` | v0.1.79 path q/s (runs) | New q/s (runs) | Medians | Recall, both | Server CPU per query |
+|---:|---|---|---|---:|---|
+| 10 | 18,694; 18,428; 18,156 | 18,385; 18,216; 18,288 | 18,428 and 18,288 (0.99x) | 0.9647 | 444 and 445 us |
+| 100 | 9,709; 9,666; 9,929 | 9,038; 9,927; 9,436 | 9,709 and 9,436 (0.97x, within the run spread) | 0.9543 | 807 and 808 us |
+
+Same rows' recall to four digits and the same CPU per query: the code path for `k` up to 100 is unchanged. Under that load the deep pages read: `top_k` 128 405 q/s (IVF) against 7,006 to 8,355 (17 to 21x), `top_k` 256 227 against 1,302 to 1,683 (5.7 to 7.4x).
+
+### 4. Notes
+
+- `top_k` 256 costs about 2.4 ms of CPU, 3 times `top_k` 128 and about 3 times `top_k` 100: the beam of 656 is where the time goes. A tighter beam for deep pages was not tried.
+- B's `top_k` 100 pass, made minutes after its `top_k` 10 pass, ran at 1,694 q/s (IVF's rate), so the graph had stopped serving by then; I did not find why and the table does not use it. The F0 pairs were checked arm by arm against `top_k` 100's rate (9,000 to 9,900).
+- The 128-sample acceptance cap was a G10 choice made for promotion speed (4.5 minutes); G26 trades that speed for the recall bound.
+
+Cleanup: the M4 run directory (fixture, store, binaries; about 27 GB) is deleted and nothing of mine is running there; the fixture was fetched through this VM (about $2.4 of S3 transfer); no EC2; no bucket writes; `.scratch/g26` removed.
