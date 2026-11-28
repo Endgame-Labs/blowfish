@@ -802,7 +802,12 @@ async fn exact_ranges_fetch_only_their_bytes_merge_small_gaps_and_repeat_from_ca
     assert_eq!(fetched, vec![600..650, 660..680]);
     assert!(
         reader
-            .read_exact_batch_with_stats(&[0..data.len() as u64 + 1], 0, 1, &stats)
+            .read_exact_batch_with_stats(
+                std::slice::from_ref(&(0..data.len() as u64 + 1)),
+                0,
+                1,
+                &stats
+            )
             .await
             .is_err()
     );
@@ -819,7 +824,12 @@ async fn exact_ranges_use_blocks_that_are_already_in_memory() {
     reader.read(0..256).await.unwrap();
     backend.ranges.lock().unwrap().clear();
     let got = reader
-        .read_exact_batch_with_stats(&[10..200], 0, 1 << 20, &CacheStats::default())
+        .read_exact_batch_with_stats(
+            std::slice::from_ref(&(10..200)),
+            0,
+            1 << 20,
+            &CacheStats::default(),
+        )
         .await
         .unwrap();
     assert_eq!(got[0], data.slice(10..200));
