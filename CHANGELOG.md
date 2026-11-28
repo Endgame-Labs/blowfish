@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.85] - 2026-11-28
+
+### Changed
+
+- **Recluster is 1.27 times faster:** After refining its leaf centers, recluster assigned every row to a leaf a second time from scratch. Rows that move land only in nearby leaves, so the second pass now scores each leaf's rows against its 80 nearest leaves. On BEIR NQ (2.7M rows, 1,024-dimensional) on an 8-core instance, installing a tier takes 128 s instead of 163 s, recall@10 is within 0.0003, and query latency is unchanged. About 12 percent of rows land in a different leaf than before, which changes no format. See Round RR9 in `docs/benchmarks.md`.
+
 ## [0.1.84] - 2026-11-28
 
 ### Changed
@@ -612,7 +618,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.84...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.85...HEAD
+[0.1.85]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.85
 [0.1.84]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.84
 [0.1.83]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.83
 [0.1.82]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.82

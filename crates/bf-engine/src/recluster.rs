@@ -859,6 +859,114 @@ const GROUP_PROBES: usize = 12;
 /// 80% of the time with each cell clustered on its own. Each cell's leaves (and the rows that
 /// chose them) make one slab, or several when they hold more than `max` rows. `None` once
 /// `stopping` says so (checked between cells and rows).
+/// Leaves each row is compared with in the second assignment: its leaf's nearest neighbors, by
+/// the refined centers. Rows move to leaves near their old one, so on BEIR NQ 80 neighbors keep
+/// recall@10 within 0.0003 of a full second assignment at about a fifth of its time. A full pass
+/// also evens out leaf sizes a little more (the row-weighted mean leaf size, which sets how many
+/// rows a query scans, is 2 percent larger here), and each doubling of this count closes less of
+/// that gap for more time.
+const REASSIGN_NEIGHBORS: usize = 80;
+
+/// For each leaf, the `k` leaves whose centers are nearest to it (itself first), looked for among
+/// the leaves of its `NEAR_CELLS` nearest coarse cells.
+fn leaf_neighbors(
+    leaves: &[Vec<f32>],
+    coarse: &[Vec<f32>],
+    ranges: &[std::ops::Range<usize>],
+    k: usize,
+) -> Vec<Vec<u32>> {
+    let near = NEAR_CELLS.min(coarse.len()).max(1);
+    leaves
+        .par_iter()
+        .enumerate()
+        .map(|(l, center)| {
+            let mut cells: Vec<(f32, usize)> = coarse
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (bf_vector::squared_distance(center, c), i))
+                .collect();
+            cells.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            cells.truncate(near);
+            let mut found: Vec<(f32, u32)> = Vec::new();
+            for (_, cell) in cells {
+                for j in ranges[cell].clone() {
+                    let d = if j == l {
+                        0.0
+                    } else {
+                        bf_vector::squared_distance(center, &leaves[j])
+                    };
+                    found.push((d, j as u32));
+                }
+            }
+            let by_distance =
+                |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+            if found.len() > k {
+                found.select_nth_unstable_by(k - 1, by_distance);
+                found.truncate(k);
+            }
+            found.sort_unstable_by(by_distance);
+            found.into_iter().map(|(_, j)| j).collect()
+        })
+        .collect()
+}
+
+/// Assigns again every row of each leaf, among that leaf's `neighbors` only. Rows of one leaf
+/// share one short candidate list, so a leaf's rows are scored together against centers that stay
+/// in cache. `leaf_of` is updated in place.
+fn reassign_nearby(
+    present: &[u32],
+    read_row: &(dyn Fn(u32, &mut Vec<u8>) -> Vec<f32> + Sync),
+    leaves: &[Vec<f32>],
+    neighbors: &[Vec<u32>],
+    leaf_of: &mut [u32],
+    stopping: &(dyn Fn() -> bool + Sync),
+) -> Option<usize> {
+    let mut by_leaf: Vec<Vec<u32>> = vec![Vec::new(); leaves.len()];
+    for (p, l) in leaf_of.iter().enumerate() {
+        by_leaf[*l as usize].push(p as u32);
+    }
+    let norms: Vec<f32> = leaves.par_iter().map(|l| norm2(l)).collect();
+    let moved: Vec<Vec<(u32, u32)>> = by_leaf
+        .par_iter()
+        .zip(neighbors.par_iter())
+        .enumerate()
+        .map_init(Vec::new, |buf, (leaf, (rows, near))| {
+            if stopping() {
+                return None;
+            }
+            let vectors: Vec<Vec<f32>> = rows
+                .iter()
+                .map(|p| read_row(present[*p as usize], buf))
+                .collect();
+            let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            let row_norms: Vec<f32> = vectors.iter().map(|v| norm2(v)).collect();
+            let d = block_distances(&refs, &row_norms, near.len(), |n| {
+                let j = near[n] as usize;
+                (leaves[j].as_slice(), norms[j])
+            });
+            let mut out = Vec::new();
+            for (row, ds) in rows.iter().zip(d) {
+                let mut best = (f32::INFINITY, u32::MAX);
+                for (x, j) in ds.iter().zip(near) {
+                    if *x < best.0 || (*x == best.0 && *j < best.1) {
+                        best = (*x, *j);
+                    }
+                }
+                if best.1 != leaf as u32 {
+                    out.push((*row, best.1));
+                }
+            }
+            Some(out)
+        })
+        .collect::<Option<_>>()?;
+    let mut count = 0;
+    for (p, l) in moved.into_iter().flatten() {
+        leaf_of[p as usize] = l;
+        count += 1;
+    }
+    Some(count)
+}
+
 fn assign_leaves(
     present: &[u32],
     read_row: &(dyn Fn(u32, &mut Vec<u8>) -> Vec<f32> + Sync),
@@ -945,8 +1053,6 @@ fn assign_leaves(
     let near = NEAR_CELLS.min(coarse.len()).max(1);
     let probes = GROUP_PROBES;
     let by_distance = |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
-    #[cfg(test)]
-    let mut drift = experiment::Drift::new(present.len(), &leaves);
     // Native BF16 matrix throughput amortizes packing for large center tables. Other CPUs
     // and small layouts retain the existing four-row kernel.
     let native = bf_vector::bf16_matrix_accelerated()
@@ -980,9 +1086,7 @@ fn assign_leaves(
     #[cfg(not(test))]
     let batch_rows: usize = 2048;
     assert!(batch_rows > 0 && batch_rows.is_multiple_of(ASSIGN_BLOCK));
-    let assign = |leaves: &[Vec<f32>],
-                  #[cfg(test)] drift: Option<&experiment::Drift>|
-     -> Option<Vec<u32>> {
+    let assign = |leaves: &[Vec<f32>]| -> Option<Vec<u32>> {
         let _assignment = Stage::new("leaf_assignment");
         // Each cell's leaves under about sqrt(leaves) group centers (the means of their leaves),
         // so a row compares against the groups of its near cells and the leaves of its nearest
@@ -1208,8 +1312,6 @@ fn assign_leaves(
                 rows,
                 norms,
                 wanted,
-                #[cfg(test)]
-                positions: block.to_vec(),
             })
         };
         #[cfg(test)]
@@ -1244,16 +1346,6 @@ fn assign_leaves(
                         let l = candidates[n] as usize;
                         (leaves[l].as_slice(), leaf_norms[l])
                     });
-                    #[cfg(test)]
-                    if let Some(drift) = drift {
-                        drift.observe(
-                            &block.positions,
-                            &block.wanted,
-                            &block.norms,
-                            &candidates,
-                            &ds,
-                        );
-                    }
                     for row in ds {
                         let mut best = (f32::INFINITY, u32::MAX);
                         for (d, &l) in row.iter().zip(&candidates) {
@@ -1322,17 +1414,16 @@ fn assign_leaves(
         experiment::record_assignments(&leaf_of);
         Some(leaf_of)
     };
-    let mut leaf_of = assign(
-        &leaves,
-        #[cfg(test)]
-        drift.as_ref(),
-    )?;
+    let mut leaf_of = assign(&leaves)?;
     tracing::info!(
         "recluster: rows assigned at {:.0}s",
         t0.elapsed().as_secs_f64()
     );
-    // One refinement: recompute every leaf center from its rows, and assign again. (Stopping at
-    // the recomputed centers, without the second assignment, cost 0.003 of recall@10 on NQ.)
+    // One refinement: recompute every leaf center from its rows, and assign again. The second
+    // assignment compares a row with its leaf's nearest leaves only, since a refined center moves
+    // little and a row changes leaf to a nearby one. (Stopping at the recomputed centers, without
+    // it, cost 0.002 to 0.003 of recall@10 on NQ; a full second assignment costs five times the
+    // time of this one, for 0.0003.)
     {
         let refinement = Stage::new("refine_centers");
         let mut members: Vec<Vec<u32>> = vec![Vec::new(); leaves.len()];
@@ -1358,18 +1449,49 @@ fn assign_leaves(
                     .collect()
             })
             .collect();
-        #[cfg(test)]
-        if let Some(drift) = &mut drift {
-            drift.advance(&centers);
-        }
+        drop(members);
         leaves = centers;
         drop(refinement);
-        leaf_of = assign(
-            &leaves,
-            #[cfg(test)]
-            drift.as_ref(),
-        )?;
-        tracing::info!("recluster: refined at {:.0}s", t0.elapsed().as_secs_f64());
+        let stage = Stage::new("neighbor_lists");
+        let lists = leaf_neighbors(&leaves, coarse, &ranges, REASSIGN_NEIGHBORS);
+        drop(stage);
+        let _stage = Stage::new("leaf_reassignment");
+        let moved = reassign_nearby(present, read_row, &leaves, &lists, &mut leaf_of, stopping)?;
+        tracing::info!(
+            moved,
+            rows = present.len(),
+            "recluster: refined at {:.0}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    {
+        // Leaf size spread, to see what a pass does to query scan cost: the row-weighted mean leaf
+        // size is the expected size of the leaf a random row sits in.
+        let mut counts = vec![0u64; leaves.len()];
+        for l in &leaf_of {
+            counts[*l as usize] += 1;
+        }
+        let total: u64 = counts.iter().sum();
+        let weighted = counts.iter().map(|n| n * n).sum::<u64>() as f64 / total.max(1) as f64;
+        counts.sort_unstable();
+        let at = |q: f64| counts[((counts.len() as f64 * q) as usize).min(counts.len() - 1)];
+        tracing::info!(
+            leaves = counts.len(),
+            empty = counts.iter().filter(|n| **n == 0).count(),
+            p50 = at(0.5),
+            p99 = at(0.99),
+            max = counts[counts.len() - 1],
+            row_weighted_mean = weighted,
+            "recluster: leaf sizes"
+        );
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            eprintln!(
+                "RR9 leaf_sizes p50={} p99={} max={} row_weighted_mean={weighted:.2}",
+                at(0.5),
+                at(0.99),
+                counts[counts.len() - 1]
+            );
+        }
     }
     // Each cell's leaves, with the rows that chose them, in ascending row order.
     let cell_of: Vec<usize> = ranges
@@ -1554,5 +1676,53 @@ mod leaf_policy_tests {
             assert!(leaf == 200 || leaf.is_multiple_of(32));
             previous = leaf;
         }
+    }
+}
+
+#[cfg(test)]
+mod second_pass_tests {
+    use super::*;
+
+    fn unit(axis: usize, tilt: f32) -> Vec<f32> {
+        let mut v = vec![0f32; 8];
+        v[axis] = 1.0;
+        v[(axis + 1) % 8] = tilt;
+        v
+    }
+
+    #[test]
+    fn neighbors_start_with_the_leaf_and_follow_center_distance() {
+        // Six leaves along a line in one cell; leaf 0's nearest are 0, 1, 2 in that order.
+        let leaves: Vec<Vec<f32>> = (0..6).map(|i| unit(0, i as f32 * 0.1)).collect();
+        let coarse = vec![vec![0f32; 8], unit(4, 0.0)];
+        let ranges = vec![0..6, 6..6];
+        let lists = leaf_neighbors(&leaves, &coarse, &ranges, 3);
+        assert_eq!(lists[0], vec![0, 1, 2]);
+        assert_eq!(lists[3][0], 3);
+        assert_eq!(lists[5], vec![5, 4, 3]);
+        // More neighbors than leaves returns every leaf once.
+        let all = leaf_neighbors(&leaves, &coarse, &ranges, 99);
+        assert_eq!(all[2].len(), 6);
+    }
+
+    #[test]
+    fn a_row_moves_to_a_listed_leaf_only_when_it_is_nearer() {
+        let leaves = vec![unit(0, 0.0), unit(0, 1.0), unit(4, 0.0)];
+        // Rows 0 and 1 sit on leaf 0; row 1 is really nearest leaf 1. Row 2 is nearest leaf 2,
+        // which leaf 0 does not list, so it stays.
+        let rows = [unit(0, 0.0), unit(0, 0.9), unit(4, 0.0)];
+        let present: Vec<u32> = vec![0, 1, 2];
+        let read = |g: u32, _: &mut Vec<u8>| rows[g as usize].clone();
+        let neighbors = vec![vec![0, 1], vec![1, 0], vec![2, 1]];
+        let mut leaf_of = vec![0, 0, 0];
+        let moved = reassign_nearby(&present, &read, &leaves, &neighbors, &mut leaf_of, &|| {
+            false
+        })
+        .unwrap();
+        assert_eq!(moved, 1);
+        assert_eq!(leaf_of, vec![0, 1, 0]);
+        assert!(
+            reassign_nearby(&present, &read, &leaves, &neighbors, &mut leaf_of, &|| true).is_none()
+        );
     }
 }
