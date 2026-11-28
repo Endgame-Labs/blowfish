@@ -668,6 +668,9 @@ impl<'de> Deserialize<'de> for VectorArg {
                 d.deserialize_str(Text)
             }
         }
+        if crate::fastvec::G24_SWITCH.load(std::sync::atomic::Ordering::Relaxed) & 4 != 0 {
+            return VectorArg::generic(d);
+        }
         d.deserialize_newtype_struct("$serde_json::private::RawValue", Raw)
     }
 }

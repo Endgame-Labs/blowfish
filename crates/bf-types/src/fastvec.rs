@@ -55,29 +55,46 @@ fn skip(bytes: &[u8], mut i: usize) -> usize {
     i
 }
 
+/// Add one digit to `significand`. Leading zeros are not significant digits, and the `u64`
+/// cannot overflow below 19 of them.
+fn digit(c: u8, significand: &mut u64, digits: &mut u32) -> Option<()> {
+    if *significand != 0 || c != b'0' {
+        *digits += 1;
+        if *digits > 18 {
+            return None;
+        }
+    }
+    *significand = *significand * 10 + u64::from(c - b'0');
+    Some(())
+}
+/// Whether all eight bytes of `v` (eight text bytes, first in the low byte) are ASCII digits.
+fn digits8(v: u64) -> bool {
+    (v & 0xF0F0_F0F0_F0F0_F0F0)
+        | (((v.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0) >> 4)
+        == 0x3333_3333_3333_3333
+}
+/// The value of eight ASCII digits, the first in the low byte of `v`.
+fn value8(v: u64) -> u64 {
+    let v = v.wrapping_sub(0x3030_3030_3030_3030);
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    let mask = 0x0000_00FF_0000_00FF;
+    (((v & mask).wrapping_mul(0x000F_4240_0000_0064))
+        .wrapping_add(((v >> 16) & mask).wrapping_mul(0x0000_2710_0000_0001)))
+        >> 32
+}
+
 /// One JSON number starting at `i`: its value as `serde_json` reads it, and the index after it.
 fn number(b: &[u8], mut i: usize) -> Option<(f64, usize)> {
     let negative = b.get(i) == Some(&b'-');
     i += usize::from(negative);
     let (mut significand, mut digits, mut exponent) = (0u64, 0u32, 0i32);
-    let mut digit = |c: u8, significand: &mut u64| -> Option<()> {
-        // Leading zeros are not significant digits, and the u64 cannot overflow below 19.
-        if *significand != 0 || c != b'0' {
-            digits += 1;
-            if digits > 18 {
-                return None;
-            }
-        }
-        *significand = *significand * 10 + u64::from(c - b'0');
-        Some(())
-    };
     match b.get(i)? {
         b'0' => i += 1,
         c @ b'1'..=b'9' => {
-            digit(*c, &mut significand)?;
+            digit(*c, &mut significand, &mut digits)?;
             i += 1;
             while let Some(c @ b'0'..=b'9') = b.get(i) {
-                digit(*c, &mut significand)?;
+                digit(*c, &mut significand, &mut digits)?;
                 i += 1;
             }
         }
@@ -88,10 +105,28 @@ fn number(b: &[u8], mut i: usize) -> Option<(f64, usize)> {
         decimal = true;
         i += 1;
         let start = i;
-        while let Some(c @ b'0'..=b'9') = b.get(i) {
-            digit(*c, &mut significand)?;
-            exponent -= 1;
-            i += 1;
+        loop {
+            // Eight digits at once once the significand has begun and cannot pass 18 digits.
+            if significand != 0 && digits <= 10 {
+                if let Some(chunk) = b.get(i..i + 8) {
+                    let v = u64::from_le_bytes(chunk.try_into().unwrap());
+                    if digits8(v) {
+                        significand = significand * 100_000_000 + value8(v);
+                        digits += 8;
+                        exponent -= 8;
+                        i += 8;
+                        continue;
+                    }
+                }
+            }
+            match b.get(i) {
+                Some(c @ b'0'..=b'9') => {
+                    digit(*c, &mut significand, &mut digits)?;
+                    exponent -= 1;
+                    i += 1;
+                }
+                _ => break,
+            }
         }
         if i == start {
             return None;
@@ -290,5 +325,46 @@ mod tests {
                 .join(",")
         );
         same(&text);
+    }
+}
+
+#[cfg(test)]
+mod timing {
+    #[test]
+    #[ignore]
+    fn parse_speed() {
+        let mut seed = 99u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let body = format!(
+            "{{\"rank_by\":[\"vector\",\"ANN\",[{}]],\"top_k\":10}}",
+            (0..1024)
+                .map(|_| format!(
+                    "{:?}",
+                    f64::from(((next() % 20_001) as f32 - 10_000.) / 100_000.)
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for (name, bit) in [("main", 4u32), ("twice", 2u32), ("new", 0)] {
+            super::G24_SWITCH.store(bit, std::sync::atomic::Ordering::Relaxed);
+            let t = std::time::Instant::now();
+            for _ in 0..20_000 {
+                let v: crate::QueryRequest = serde_json::from_slice(body.as_bytes()).unwrap();
+                std::hint::black_box(v);
+            }
+            println!("{name}: {:?} per request", t.elapsed() / 20_000);
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..20_000 {
+            std::hint::black_box(
+                serde_json::from_slice::<serde_json::Value>(body.as_bytes()).unwrap(),
+            );
+        }
+        println!("Value: {:?}", t.elapsed() / 20_000);
     }
 }

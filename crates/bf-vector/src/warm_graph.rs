@@ -304,29 +304,14 @@ impl HotGraph {
         let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
         let (code, scale) = quant::encode(&rotated);
         let signs = self.bits.query(&rotated);
+        let screen = navigation::Screen::new(&self.bits, &signs);
         let walk = options.unwrap_or_else(WalkOptions::production);
-        let mut screen = navigation::Screen::new(&self.bits, &signs);
-        let margin = screen.margin();
-        if walk.full != 1. {
-            screen = navigation::Screen::with_margin(
-                &self.bits,
-                &signs,
-                (f32::from(margin) * walk.full).ceil() as u16,
-            );
-        }
         let seeds = if walk.seeds == 0 || self.entries.len() < 2 {
             // The global medoid alone: the walk before multi-entry seeding.
             vec![self.entries[0]]
         } else {
             self.nearest_entries(&signs, walk.seeds)
         };
-        if walk.seeds > 0 {
-            screen = screen.with_early(navigation::Early {
-                k: count,
-                wide: (f32::from(margin) * walk.wide).ceil() as u16,
-                tight: (f32::from(margin) * walk.tight).ceil() as u16,
-            });
-        }
         let (mut hits, evaluations) = scratch.0.search_prefetched(
             &self.links,
             &self.degrees,
@@ -362,36 +347,23 @@ impl HotGraph {
         ranked.into_iter().map(|(_, id)| id).collect()
     }
 }
-/// How a walk starts and screens before its beam is full.
+/// How a walk starts.
 #[derive(Clone, Copy, Debug)]
 pub struct WalkOptions {
     /// Nearest region medoids that seed the beam (0 starts from the global medoid alone).
     pub seeds: usize,
-    /// Margin before the beam holds `count` nodes, in multiples of the full-beam margin.
-    pub wide: f32,
-    /// Margin from `count` nodes to a full beam, in multiples of the full-beam margin.
-    pub tight: f32,
-    /// Margin of a full beam, in multiples of the usual one.
-    pub full: f32,
 }
 /// TEMPORARY (Round G24 A/B): bit 1 walks from the global medoid alone.
 pub static G24_SWITCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 impl WalkOptions {
-    /// What serving uses.
+    /// What serving uses: the four nearest of about 256 region medoids.
     pub fn production() -> Self {
-        if G24_SWITCH.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0 {
-            return Self {
-                seeds: 0,
-                wide: 2.,
-                tight: 1.5,
-                full: 1.,
-            };
-        }
         Self {
-            seeds: 4,
-            wide: 0.5,
-            tight: 0.5,
-            full: 0.5,
+            seeds: if G24_SWITCH.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0 {
+                0
+            } else {
+                4
+            },
         }
     }
 }
@@ -540,12 +512,7 @@ mod tests {
         assert!(graph.entries.iter().all(|&e| (e as usize) < n));
         let (mut scratch, mut found, mut found_old, mut scored, mut scored_old) =
             (graph.scratch(), 0, 0, 0, 0);
-        let old = WalkOptions {
-            seeds: 0,
-            wide: 2.,
-            tight: 1.5,
-            full: 1.,
-        };
+        let old = WalkOptions { seeds: 0 };
         for q in (0..200).map(|i| &source[(i * 23) % n]) {
             let unit = vectors::normalized(q);
             let mut truth = (0..n)
@@ -776,12 +743,7 @@ mod tests {
             truth.sort_by(|a, b| a.0.total_cmp(&b.0));
             let truth = truth.iter().take(10).map(|t| t.1).collect::<Vec<_>>();
             // The one-bit screen of a full beam alone: the walk before multi-entry seeding.
-            let old = WalkOptions {
-                seeds: 0,
-                wide: 2.,
-                tight: 1.5,
-                full: 1.,
-            };
+            let old = WalkOptions { seeds: 0 };
             let (hits, evaluations) = graph
                 .candidates_with_options(q, ef, 30, None, &mut scratch, Some(old))
                 .unwrap();

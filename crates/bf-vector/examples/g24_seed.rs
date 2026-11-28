@@ -2,7 +2,8 @@
 //! sweeps walk options at several beam widths, reporting recall of the rerank shortlist against the
 //! exact top 10, SQ8 scores, expansions, and single-thread walk time per query.
 //! Usage: g24_seed DATA_DIR [ROWS] [THREADS]   (DATA_DIR holds corpus.f16, queries.npy, truth.npy)
-//! Walk configs come from the SEEDS env var: `seeds:wide:tight:ef:count,...` (seeds 0 = old walk).
+//! Walk configs come from the SEEDS env var: `seeds:-:-:ef:count,...` (seeds 0 = the old walk; the
+//! two middle fields are unused).
 #[allow(dead_code)]
 #[path = "g3/data.rs"]
 mod data;
@@ -68,20 +69,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spec = std::env::var("SEEDS").unwrap_or("0:2:1.5:125:30,4:2:1.5:125:30".into());
     for cfg in spec.split(',') {
         let f = cfg.split(':').collect::<Vec<_>>();
-        let (seeds, wide, tight, ef, count): (usize, f32, f32, usize, usize) = (
+        let (seeds, _wide, _tight, ef, count): (usize, f32, f32, usize, usize) = (
             f[0].parse()?,
             f[1].parse()?,
             f[2].parse()?,
             f[3].parse()?,
             f[4].parse()?,
         );
-        let full: f32 = f.get(5).map(|s| s.parse()).transpose()?.unwrap_or(1.);
-        let o = Some(WalkOptions {
-            seeds,
-            wide,
-            tight,
-            full,
-        });
+        let o = Some(WalkOptions { seeds });
         // Quality (parallel).
         use rayon::prelude::*;
         let (found, evals, exps) = pool.install(|| {
