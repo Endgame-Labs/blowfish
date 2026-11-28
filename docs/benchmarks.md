@@ -20069,3 +20069,97 @@ What would change this: a prime that is itself free (a read the scan already mak
 ### Cost
 
 One on-demand c7gn.4xlarge for about 0.4 hours (about $0.4). The instance is terminated, and the key pair and security group are deleted; no S3 prefix was written, and the fixtures were only read.
+
+## Round BW32: attribute-boosted BM25 opens only the windows that can reach the kth total (7.4 to 19 times at 1 client warm, 3.3 to 4.3 times cold, identical answers)
+
+`Sum(BM25, weight * attribute)` over a numeric attribute with **no filter dictionary** (`filterable: false`) had no stream to draw from (BW28 streams need the dictionary), so it
+fell back to the ordinal scorer: 175 to 200 ms per query on 1M rows, and 2.5 to 2.8 s of queueing at 16 clients. It now takes a window-bounded path. No file format and no
+setting changed (SPEC 25).
+
+### Measure first (`bw32-measure`)
+
+Fixture: a fresh load of the first 1M MS MARCO passages (6 text segments, 7,813 windows of 128 rows) with `pop` (float, `1000*u^4`, skewed) and `pr` (uint 0 to 100, uniform), both
+non-filterable (`bench/scale/msmarco_load.py --attrs plain`; BW28's own loader and driver were not kept, so `bench/scale/bw32_shapes.py` is a new driver over the same MS MARCO queries).
+Share of windows whose bound (the text bound plus the boost at the window's maximum) is below the final `k`th total, so they never need opening (windows that match no text count, since
+a boost alone bounds them): `pr` times 0.05: 72 percent; times 0.2: 66; times 1: 45; times 5: 44; `pop` times 0.002: 86; times 0.02: 49; times 0.1: 45. All clear the 40 percent bar. Where the
+baseline's time went: **97 percent of a segment's 259 ms was projecting the attribute column for every allowed row and scoring it** (the BM25 hits for all matching rows were about 4 percent),
+so the window work itself was never the cost. A first version that kept the window maxima but still projected each opened row's column ran at 1.06 times; the gain came from reading the
+column once.
+
+### What changed
+
+1. **`bf_text::SegmentReader::window_bounds`** returns the upper bound on a row's BM25 score for every 128-row window of a segment: the bounds a search already prunes by, computed by the same
+   code (a `SearchMode::Windows` that stops once they are known). It is the only change to the text search, and the search paths are unchanged.
+2. **`boosted.rs`** (`crates/bf-engine`): `Sum` of one BM25 clause and one term that reads a single numeric attribute and never decreases as it grows (a non-negative weight, `Max`, `Saturate`, and
+   their nests; `Boost::of`). Per segment it reads the attribute column straight into `f64`s once (`segment::numeric_column`: no per-row document, nothing added to the decoded block cache) and keeps
+   the values and one maximum per window in the read cache. Windows are ordered by `text bound + boost(maximum)` (with a `1e-9` relative allowance for the order of the additions), opened in batches
+   of 16, then 64, then 256, then 512, and scored exactly (the clause's masked search plus `f64::from(score) + boost(value)`, the full scorer's arithmetic) until the next window's bound is
+   **strictly below** the `k`th total. Windows that can only tie stay open, so a tied row with a lower ID is never lost.
+3. **Fallbacks keep today's path** (the ordinal scorer): a row with no numeric value, a non-numeric attribute, a segment whose column would take more than an eighth of the read cache, a `limit.per`,
+   and every other shape. A negative weight never reaches the engine (the API rejects it).
+4. **Cache charge:** 8 bytes per row (the values) plus 8 per window (the maxima): **8.06 MB per million rows per attribute**, charged to the read cache's budget (`read_cache::insert`).
+   The key names the segment's `docs` object, which is immutable, so a rewrite or compaction (a new object) never sees a stale entry, and an old one ages out of the LRU. Deletes and patches do not change a
+   segment's column; their rows leave the allowed set, and the bound over all rows stays valid.
+
+### Measurement (2026-11-28, this VM carrying a load of 3 to 6 from other workers)
+
+One read-only server at a time (6 Rayon workers), local file store, 100 queries per shape per slice (the checked-in MS MARCO queries; three disjoint slices: prewarm, 1 client, 16 clients), `top_k` 10,
+IDs only. Arms alternated base, candidate, candidate, base (two rounds), and the tables show the mean of the two. The baseline is `71fe5cb` (v0.1.84 plus 8 commits, before v0.1.85). **Every ordered ID
+list and `f64` score matched on all 4,000 warm queries and all 800 cold queries** (compared as parsed JSON, so the score bits are equal).
+
+Warm (p50 / p90 ms; 16-client p50 is mostly queueing for the baseline, which serves 6 q/s):
+
+| Shape | v0.1.84+8 1 client p50 / p90 | candidate 1 client p50 / p90 | gain at 1 client (p50) | 16 clients p50: base, candidate | q/s at 16: base, candidate | gain at 16 (p50) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| plain BM25 (control) | 2.8 / 5.0 | 2.6 / 4.9 | 1.1x | 26, 26 | 463, 497 | 1.0x |
+| `Sum(BM25, 0.05*pr)` (uniform uint 0 to 100) | 175.4 / 196.1 | 11.1 / 24.7 | 15.8x | 2,554, 140 | 6, 107 | 18.3x |
+| `Sum(BM25, 0.2*pr)` | 177.8 / 203.3 | 16.7 / 32.6 | 10.7x | 2,567, 187 | 6, 80 | 13.7x |
+| `Sum(BM25, pr)` (bare) | 172.5 / 197.0 | 23.3 / 37.2 | 7.4x | 2,568, 258 | 6, 59 | 10.0x |
+| `Sum(BM25, 5*pr)` | 178.9 / 214.0 | 23.0 / 34.3 | 7.8x | 2,617, 264 | 6, 58 | 9.9x |
+| `Sum(BM25, 0.002*Max(pop,0))` (skewed float 0 to 1,000) | 189.6 / 219.4 | 9.9 / 24.1 | 19.2x | 2,687, 130 | 6, 116 | 20.7x |
+| `Sum(BM25, 0.02*Max(pop,0))` | 195.0 / 229.6 | 24.5 / 42.5 | 7.9x | 2,807, 264 | 6, 58 | 10.6x |
+| `Sum(BM25, 0.1*Max(pop,0))` | 182.4 / 207.0 | 24.5 / 39.9 | 7.4x | 2,730, 267 | 6, 57 | 10.2x |
+| `Sum(BM25, 200*Saturate(pop, 300))` | 216.2 / 248.5 | 58.1 / 82.9 | 3.7x | 3,243, 664 | 5, 23 | 4.9x |
+| `Sum(BM25, 0.2*pr)`, `id >= 200000` | 154.9 / 191.3 | 16.9 / 31.9 | 9.2x | 2,227, 166 | 7, 93 | 13.4x |
+
+Cold means every engine cache is dropped (`/_bench/drop_caches`) before each query (40 queries per shape, 1 client; the OS page cache stays warm, so this is not S3 latency). Each candidate query then
+re-reads the column once per segment (about 10 ms of the 55):
+
+| Shape | v0.1.84+8 p50 / p90 | candidate p50 / p90 | gain (p50) |
+| --- | ---: | ---: | ---: |
+| plain BM25 (control) | 13.8 / 24.0 | 14.2 / 25.2 | 0.97x |
+| `Sum(BM25, 0.05*pr)` (uniform uint 0 to 100) | 227.1 / 255.7 | 52.3 / 76.7 | 4.34x |
+| `Sum(BM25, 0.2*pr)` | 219.1 / 243.8 | 55.1 / 75.3 | 3.98x |
+| `Sum(BM25, pr)` (bare) | 211.1 / 243.3 | 60.9 / 77.6 | 3.47x |
+| `Sum(BM25, 5*pr)` | 218.3 / 259.2 | 56.8 / 74.4 | 3.85x |
+| `Sum(BM25, 0.002*Max(pop,0))` (skewed float 0 to 1,000) | 223.3 / 262.9 | 57.2 / 79.5 | 3.90x |
+| `Sum(BM25, 0.02*Max(pop,0))` | 232.0 / 266.3 | 69.0 / 84.7 | 3.36x |
+| `Sum(BM25, 0.1*Max(pop,0))` | 231.9 / 264.3 | 63.8 / 84.0 | 3.64x |
+| `Sum(BM25, 200*Saturate(pop, 300))` | 264.1 / 297.6 | 116.3 / 151.0 | 2.27x |
+| `Sum(BM25, 0.2*pr)`, `id >= 200000` | 187.8 / 207.2 | 56.7 / 74.9 | 3.31x |
+
+
+Control: plain BM25 on the same servers, four alternating pairs of 200 queries each: p50 2.51 against 2.56 ms at 1 client, 21.1 against 22.5 at 16 clients, and cold 15.3 against 15.4. The runs scatter
+by 15 to 20 percent (the candidate's 16-client p50 ranged from 19.0 to 27.9 ms), so this is noise, not a cost: the plain path runs no new code. Peak RSS: baseline 2.1 GB (1 and 16 clients warm) and 1.0 GB
+(cold); candidate 1.4 and 0.36 GB.
+
+An ablation before the direct column read (40 queries, 1 client, warm): opening every window in one batch (cached values, no pruning) ran `pr` times 0.2 at 24.9 ms and `pop` times 0.02 at 27.7, against 15.4
+and 20.0 with the walk, so pruning is worth another 1.6 and 1.4 times on top of the cache.
+
+### Where the windows stay open
+
+The walk opens a window unless its bound is strictly below the `k`th total, so it cannot skip when many windows can reach it: a large weight on a uniform attribute (`pr` times 5 opens about 59 percent,
+because nearly every window holds a value near 100), and a boost that dominates a rare word (a test with `w600` and weight 0.02 opens 312 of 313 windows: the `k`th total ties the boost of every window that holds the
+maximum value, and each could hold a lower ID). Exploiting row order for those ties (as the stream path does for unmatched rows) is not done. The `k`th total is per segment; sharing it across segments would skip more windows
+and is not done either.
+
+### Tests
+
+`tests/rank_boosted.rs`: eleven shapes (bare attribute in either order, small, ordinary, and large weights, zero weight, a float under `Max`, two clauses, `Saturate`, `Max` with a constant, and a `Product` of the whole
+`Sum`) over non-filterable `m` (uint) and `q` (float) against `query_exhaustive` (scores included), at `k` of 1, 10 with a filter and an offset of 3, 100, and 10 with an offset of 70, across two segments, a WAL tail
+with overwrites and deletes, and a reindex, on a tie-heavy corpus and a varied one; a missing value keeps the ordinal scorer. `tests/rank_boosted_windows.rs` runs 40,000 rows and checks that fewer than half of the windows
+are opened for a weak boost, with exact answers throughout. `window_bounds` is covered by those tests through the answers (a bound below a row's score would drop a winner).
+
+### Not done
+
+Cold on S3 (the cold arm here is a local store with cleared caches), EC2, a 100M-row segment (its column would exceed the cache cap and keep the ordinal scorer), and sharing the `k`th total across segments.
