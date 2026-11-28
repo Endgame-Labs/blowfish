@@ -13,6 +13,9 @@ before in this process, and the conditions rotate wave by wave so drift hits all
   adj8m    an 8 MB GET (32 coalesced blocks) of [p, p+8M); the read is [p+8M, +16K)
   gap1m    a 256 KB GET of [p, p+256K); the read is 1 MB past its end
   same     a 256 KB GET of [p, p+256K); the read is inside it (positive control: about 28 ms)
+  gap4m    as gap1m, 4 MB past the prime's end; gap16m, 16 MB past
+  farsame  a 256 KB GET of [p, p+256K); the read is at a fresh offset of the same object, over 32 MB away
+  otherobj a 256 KB GET on one object; the read is at a fresh offset of a different object
 
 Usage: c36_s3warm.py [--waves 20] [--fanout 35]. Prints one JSON line per condition and a verdict.
 """
@@ -43,7 +46,7 @@ objs = []
 for pg in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
     objs += [(o["Key"], o["Size"]) for o in pg.get("Contents", []) if o["Key"].endswith((".bfa", ".bfb"))]
 objs.sort(key=lambda x: -x[1])
-objs = objs[: a.objects]
+objs = [o for o in objs if o[1] >= 300 * MB][: a.objects]
 print(len(objs), "objects, smallest", objs[-1][1] // MB, "MB", flush=True)
 rng = random.Random(a.seed)
 used = {k: [] for k, _ in objs}  # [lo, hi) windows already touched
@@ -55,14 +58,19 @@ def get(key, off, n):
     return (time.perf_counter() - t) * 1000
 
 
-def fresh(span):
-    """A random (key, offset) whose whole [offset, offset+span) window nothing has touched yet."""
+def fresh(span, key=None, away=None, avoid=None):
+    """A random (key, offset) whose whole [offset, offset+span) window nothing has touched yet.
+    `key` pins the object, `away` is an offset the window must stay 32 MB from, `avoid` a key to skip."""
     while True:
-        key, size = rng.choice(objs)
+        k, size = (key, dict(objs)[key]) if key else rng.choice(objs)
+        if k == avoid:
+            continue
         off = rng.randrange(0, size - span - 1)
-        if all(off + span <= lo or off >= hi for lo, hi in used[key]):
-            used[key].append((off, off + span))
-            return key, off
+        if away is not None and abs(off - away) < 32 * MB:
+            continue
+        if all(off + span <= lo or off >= hi for lo, hi in used[k]):
+            used[k].append((off, off + span))
+            return k, off
 
 
 with ThreadPoolExecutor(a.fanout) as ex:  # warm connections
@@ -74,6 +82,10 @@ SPEC = {
     "adj8m": (8 * MB, 8 * MB, 8 * MB + 16 * KB),
     "gap1m": (256 * KB, 256 * KB + MB, 256 * KB + MB + 16 * KB),
     "same": (256 * KB, 100 * KB, 256 * KB),
+    "gap4m": (256 * KB, 256 * KB + 4 * MB, 256 * KB + 4 * MB + 16 * KB),
+    "gap16m": (256 * KB, 256 * KB + 16 * MB, 256 * KB + 16 * MB + 16 * KB),
+    "farsame": (256 * KB, "farsame", 256 * KB),
+    "otherobj": (256 * KB, "otherobj", 256 * KB),
 }
 res = {c: [] for c in SPEC}
 wave_medians = {c: [] for c in SPEC}
@@ -88,7 +100,13 @@ with ThreadPoolExecutor(a.fanout) as ex:
             picks = [fresh(span) for _ in range(a.fanout)]
             if prime:
                 list(ex.map(lambda p: get(p[0], p[1], prime), picks))
-            lat = list(ex.map(lambda p: get(p[0], p[1] + (read_at if read_at is not None else 0), 16 * KB), picks))
+            if read_at == "farsame":
+                targets = [fresh(16 * KB, key=k, away=o) for k, o in picks]
+            elif read_at == "otherobj":
+                targets = [fresh(16 * KB, avoid=k) for k, _ in picks]
+            else:
+                targets = [(k, o + (read_at or 0)) for k, o in picks]
+            lat = list(ex.map(lambda p: get(p[0], p[1], 16 * KB), targets))
             res[c] += lat
             wave_medians[c].append(st.median(lat))
         print("wave", w, flush=True)
@@ -99,7 +117,7 @@ for c, lat in res.items():
               "wave_median_mean": round(float(np.mean(wave_medians[c])), 1)}
     print(json.dumps({c: out[c]}), flush=True)
 rg = np.random.default_rng(36)
-for c in ("adj256k", "adj8m", "gap1m", "same"):
+for c in ("adj256k", "adj8m", "gap1m", "gap4m", "gap16m", "same", "farsame", "otherobj"):
     d = np.array(wave_medians["far"]) - np.array(wave_medians[c])  # positive: the primed read is faster
     boot = [np.median(rg.choice(d, len(d))) for _ in range(5000)]
     lo, hi = np.percentile(boot, [2.5, 97.5])

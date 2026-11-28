@@ -8,9 +8,8 @@ Usage: c36_trace.py ARM run-dir [run-dir ...]
 Reads the rows.jsonl a cold_ab.py run wrote (BF_TRACE_READS=1). For every query it counts the
 GETs of `live.*.bfl` objects, the filter objects (`filter.bfx`), and every other read, and
 places them in ms from the request start. Prints medians over queries: how many live GETs,
-when the last one ended, when the first filter read started, and how much of the filter's
-first read waited behind the live wave (the live set is on the critical path when the filter's
-first read starts after the last live GET ends).
+when the last one ended, when the first filter read started, and for how many segments the filter read started only after
+that segment's own live GET ended (a serial chain: the live set is on the critical path).
 """
 
 import json
@@ -23,7 +22,7 @@ arm, *runs = sys.argv[1:]
 for run in runs:
     rows = [json.loads(line) for line in (Path(run) / "rows.jsonl").read_text().splitlines()]
     rows = [r for r in rows if r["arm"] == arm]
-    stats = {k: [] for k in ("ms", "gets", "live_gets", "live_last_end", "filter_gets", "filter_first_start", "filter_after_live", "all_reads")}
+    stats = {k: [] for k in ("ms", "gets", "live_gets", "live_last_end", "filter_gets", "filter_first_start", "filter_after_live", "all_reads", "serial_segments", "median_live_to_filter_gap", "live_first_start")}
     for r in rows:
         t0 = r["request_start_us"]
         tl = r["read_timeline"]
@@ -38,6 +37,18 @@ for run in runs:
             stats["live_last_end"].append((max(e["end_us"] for e in live) - t0) / 1000)
         if filt:
             stats["filter_first_start"].append((min(e["start_us"] for e in filt) - t0) / 1000)
+        if live:
+            stats["live_first_start"].append((min(e["start_us"] for e in live) - t0) / 1000)
+        # Per segment: did its filter read start only after its own live GET ended?
+        seg = lambda e: e["object"].rsplit("/", 2)[-2]  # noqa: E731
+        ends = {seg(e): e["end_us"] for e in live}
+        firsts = {}
+        for e in filt:
+            firsts[seg(e)] = min(firsts.get(seg(e), e["start_us"]), e["start_us"])
+        both = [k for k in ends if k in firsts]
+        if both:
+            stats["serial_segments"].append(sum(firsts[k] >= ends[k] - 500 for k in both))
+            stats["median_live_to_filter_gap"].append(float(np.median([(firsts[k] - ends[k]) / 1000 for k in both])))
         if live and filt:
             stats["filter_after_live"].append(
                 float(min(e["start_us"] for e in filt) >= max(e["end_us"] for e in live) - 1000)

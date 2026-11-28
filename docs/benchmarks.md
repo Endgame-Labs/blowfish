@@ -18496,8 +18496,7 @@ segment's `filter.bfx` read, as Neon read it. The prediction that this would als
 | Extra: `text_length >= 300` | 616.9 / 780.1 | 611.5 / 767.0 | 0.991 (0.946-1.027) | 721 / 651 | 385.1 / 379.5 | yes |
 
 Pass criteria: filtered shapes at least 1.15 times lower p50 and fewer GETs (GETs fell, p50 did not: **fails**); identical results (passes); no control slower (the `id < 1000` control is 4 percent
-faster, passes). The A/A control's interval includes parity. The unfiltered row moved +6 GETs and +0.7 MB with an interval that includes parity (it runs no live read on either build; the
-difference is noise in the A/A sense: the control reads 1 GET fewer).
+faster, passes). The A/A control's interval includes parity. The unfiltered row's GETs (282 against 288) differ by run-to-run noise: neither build reads a live set there, and the interval includes parity.
 
 ### Why the filtered shapes barely move
 
