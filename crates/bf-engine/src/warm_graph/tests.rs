@@ -1357,6 +1357,23 @@ async fn typed_fixture_with(
     uuids: bool,
     staged: bool,
 ) -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
+    typed_fixture_kind(uuids, false, staged).await
+}
+/// A string ID of the kind a real corpus has: a prefix, a zero-padded number, and characters that
+/// need JSON escapes (a quote, a backslash, and non-ASCII text).
+fn string_of(id: usize) -> String {
+    // The first rows look like UUIDs, so the table starts as one and must turn into text.
+    if id < 3 {
+        return uuid_of(id);
+    }
+    format!("nq/train/{id:07}\"\\é-{}", id % 7)
+}
+/// [`typed_fixture_with`] with `strings` making the IDs strings that are not UUIDs.
+async fn typed_fixture_kind(
+    uuids: bool,
+    strings: bool,
+    staged: bool,
+) -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.scratch")
         .join(format!("g18-ids-{}", uuid::Uuid::new_v4()));
@@ -1406,7 +1423,9 @@ async fn typed_fixture_with(
             } else {
                 v
             };
-            if uuids {
+            if strings {
+                json!({"id":string_of(id),"vector":v,"group":id%3})
+            } else if uuids {
                 json!({"id":uuid_of(id),"vector":v,"group":id%3})
             } else {
                 json!({"id":id,"vector":v,"group":id%3})
@@ -1462,7 +1481,8 @@ async fn typed_fixture_with(
     }
     assert!(held.ids.get().is_some(), "the ID table was never built");
     assert!(
-        matches!(held.ids.get(), Some(IdTable::Uuid(_))) == uuids,
+        matches!(held.ids.get(), Some(IdTable::Uuid(_))) == uuids
+            && matches!(held.ids.get(), Some(IdTable::Str { .. })) == strings,
         "the table has the kind of the IDs"
     );
     (e, vectors, held, Cleanup(root))
@@ -1839,6 +1859,85 @@ async fn typed_ids_path_serves_uuid_ids_byte_identically() {
     drop(held);
     assert!(e.shutdown(Duration::from_secs(5)).await);
 }
+/// Round G28: string IDs that are not UUIDs are served from a packed table (bytes and row offsets),
+/// escaped as the general path escapes them, with the same order and ties, with and without an
+/// unindexed tail (inserts with string and canonical-UUID IDs, overwrites, and deletes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_ids_path_serves_string_ids_byte_identically() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let (e, vectors, held, _cleanup) = typed_fixture_kind(false, true, false).await;
+    let table_bytes = held.ids.get().unwrap().resident_bytes();
+    assert!(table_bytes >= 2500 * 20, "the table's bytes are counted");
+    let queries = vectors.clone();
+    let compared = on_reactor_typed_and_general(&e, move |engine, typed, general| async move {
+        let check = |label: &'static str| {
+            let (typed, general, queries) = (typed.clone(), general.clone(), queries.clone());
+            async move {
+                let mut n = 0;
+                for i in [0, 17, 400, 1003, 1999, 2499] {
+                    for k in (1..=100).step_by(9).chain([1, 2, 10, 37, 64, 100]) {
+                        let body = json!({"rank_by":["vector","ANN",queries[i]],"top_k":k});
+                        let got = typed(body.clone()).await.unwrap_or_else(|| {
+                            panic!("{label}: typed path declined query {i} top_k {k}")
+                        });
+                        assert_eq!(got, general(body).await, "{label}: query {i} top_k {k}");
+                        n += 1;
+                    }
+                }
+                n
+            }
+        };
+        let mut compared = check("no tail").await;
+        let body = json!({"rank_by":["vector","ANN",queries[17]],"top_k":3});
+        let got: Value = serde_json::from_slice(&typed(body).await.unwrap()).unwrap();
+        assert_eq!(got["rows"][0]["id"], json!(string_of(17)));
+        let near = |v: &Vec<f32>, shift: f32| v.iter().map(|x| x + shift).collect::<Vec<_>>();
+        let write = |body: Value| {
+            let engine = engine.clone();
+            async move {
+                engine
+                    .write("hot", serde_json::from_value::<WriteRequest>(body).unwrap())
+                    .await
+                    .unwrap();
+            }
+        };
+        // Tail rows tie with base rows (distance 0) and carry a string, and a canonical UUID text (which
+        // must stay text beside its string neighbors).
+        write(json!({"upsert_rows":[
+            {"id":string_of(9000),"vector":queries[0],"group":0},
+            {"id":uuid_of(9001),"vector":queries[0],"group":1},
+            {"id":string_of(9002),"vector":queries[0],"group":2},
+            {"id":string_of(9003),"vector":near(&queries[17], 0.01),"group":2},
+            {"id":string_of(2),"vector":queries[17],"group":2},
+        ]}))
+        .await;
+        compared += check("inserts").await;
+        let far = queries[400].iter().map(|x| -x).collect::<Vec<_>>();
+        write(json!({"upsert_rows":[
+            {"id":string_of(0),"vector":far,"group":0},
+            {"id":string_of(1003),"vector":queries[1999],"group":1},
+        ],"deletes":[string_of(3),string_of(4),string_of(1000)]}))
+        .await;
+        compared += check("overwrites and deletes").await;
+        let body = json!({"rank_by":["vector","ANN",queries[0]],"top_k":2});
+        let got = typed(body).await.expect("typed path serves under a tail");
+        let got: Value = serde_json::from_slice(&got).unwrap();
+        assert!(
+            got["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["id"] != json!(string_of(0))),
+            "the overwritten row 0 must not answer for query 0"
+        );
+        compared
+    })
+    .await;
+    assert_eq!(compared, 3 * 6 * 18);
+    e.delete_namespace("hot").await.unwrap();
+    drop(held);
+    assert!(e.shutdown(Duration::from_secs(5)).await);
+}
 /// Round G21: an engine with disk staging configured takes the typed path and answers the same
 /// bytes as the general path, with integer IDs and with UUIDs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1888,4 +1987,92 @@ fn walk_beam_widens_with_the_filter_and_leaves_narrow_filters_to_the_scan() {
     // Larger pages and empty requests are not measured.
     assert_eq!(walk_beam(11, 500_000, rows, 100), None);
     assert_eq!(walk_beam(0, 500_000, rows, 100), None);
+}
+
+/// Round G28: a filter's per-segment masks are one cached entry. A repeat of the filter returns the
+/// same masks (the same allocations, so the tier masks keyed by them stay cached), a different
+/// filter returns different ones, and a delete that retires a segment's live object is seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filter_masks_are_one_cached_entry_that_follows_the_segments() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let store = Storage::open(&StorageConfig {
+        url: "memory://".into(),
+        cache: CacheConfig {
+            memory_bytes: 32 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let e = Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.,
+            decoded_cache_bytes: 64 << 20,
+            ..Default::default()
+        },
+    );
+    for part in 0..2 {
+        let rows = (part * 600..(part + 1) * 600)
+            .map(|id| json!({"id":id,"vector":[id as f32 + 1.,1.],"bucket":id % 10}))
+            .collect::<Vec<_>>();
+        let mut body = json!({"upsert_rows":rows});
+        if part == 0 {
+            body["distance_metric"] = json!("cosine_distance");
+            body["schema"] = json!({"vector":{"type":"[2]f16","ann":true}});
+        }
+        e.write("hot", serde_json::from_value::<WriteRequest>(body).unwrap())
+            .await
+            .unwrap();
+        e.index_namespace("hot", true).await.unwrap();
+    }
+    let masks = |filter: Value| {
+        let e = e.clone();
+        async move {
+            let (state, _) = e
+                .snapshot("hot", &bf_types::Consistency::Strong)
+                .await
+                .unwrap();
+            let filter: bf_types::Filter = serde_json::from_value(filter).unwrap();
+            let context = read_cache::ReadContext::new(e.0.read_cache.clone());
+            let found = read_cache::scope(
+                context,
+                crate::ann_dir::live_masks(&e.0.store, &state, Some(&filter)),
+            )
+            .await
+            .unwrap();
+            (state.segments.len(), found)
+        }
+    };
+    let (segments, first) = masks(json!(["bucket", "Eq", 3])).await;
+    assert!(segments >= 2, "the test needs two segments");
+    let (_, again) = masks(json!(["bucket", "Eq", 3])).await;
+    let (_, other) = masks(json!(["bucket", "Eq", 4])).await;
+    let total =
+        |m: &Vec<Option<Arc<RoaringBitmap>>>| m.iter().flatten().map(|b| b.len()).sum::<u64>();
+    assert_eq!(total(&first), 120, "a tenth of 1,200 rows");
+    assert_eq!(total(&other), 120);
+    for (a, b) in first.iter().zip(&again) {
+        assert!(Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()));
+    }
+    assert!(
+        first
+            .iter()
+            .zip(&other)
+            .all(|(a, b)| !Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()))
+    );
+    // Deleting rows 3, 13, and 603 retires the live objects of both segments.
+    e.write(
+        "hot",
+        serde_json::from_value::<WriteRequest>(json!({"deletes":[3, 13, 603]})).unwrap(),
+    )
+    .await
+    .unwrap();
+    e.index_namespace("hot", true).await.unwrap();
+    let (_, after) = masks(json!(["bucket", "Eq", 3])).await;
+    assert_eq!(total(&after), 120 - 3);
+    let segment = |i: usize| after[i].as_ref().unwrap();
+    assert!(!segment(0).contains(3) && !segment(0).contains(13) && !segment(1).contains(3));
 }

@@ -12296,6 +12296,80 @@ The instance is terminated, and independent checks found zero owned active
 instances, volumes, security groups, key pairs, S3 objects, and multipart uploads.
 Shared fixtures were untouched.
 
+## Round RR9: the second assignment pass scores each leaf's rows against its nearest leaves
+
+Recluster assigns every row to a leaf, recomputes each leaf's center from its rows, and assigns every row again. RR7 put 96.7 of
+179.5 s in those two passes. Measured 2026-11-28 on one on-demand c7gd.2xlarge (RR7's setup: eight Graviton3 cores, 16 GiB, local
+NVMe, four recluster and Rayon workers, release thin LTO, Clang 19 and a Clang 22 linker), on a fresh untiered NQ checkpoint
+(2,681,468 rows, 1,024-d f16 cosine, 32 slabs, 13,392 leaves) built with `examples/rr7_prepare.rs` and copied for every arm. Install
+time runs from the foreground recluster call through fenced publication (the `rr7_install` clock). Recall@10 is
+`rr7_quality`: all 3,452 NQ queries against exact truth, top-k 10, rerank factor 32, concurrency 4, explicit probes, fresh engine.
+The control is v0.1.84 (commit `6e33e87`); both binaries carry the same quality and timing test code.
+
+### Measure first
+
+| Arm | Install s | Second pass s | Recall@10, 48 / 64 probes |
+| --- | ---: | ---: | ---: |
+| Control, two full passes | 164.4 | 46.5 (ordering 12.2, scoring 34.3), plus 3.0 refine | 0.95070 / 0.96089 |
+| One pass, centers never refined | 114.6 | 0 | 0.94760 / 0.95944 (-0.0031 / -0.0014) |
+| One pass, refined centers over first-pass membership | 117.8 | 0 | 0.94887 / 0.95907 (-0.0018 / -0.0018) |
+| Second pass for only the 30% of leaves whose centers move most | 122.8 | 5.7 | 0.94765 / 0.95889 (-0.0030 / -0.0020) |
+
+The first pass takes 50.3 s. In the full second pass **457,389 rows (17.06%) change leaf.** They are not concentrated in the leaves
+whose centers drift most (Sol 09:25 #3's selector): the top 20% of leaves by drift hold 5.8% of the rows and 4.4% of the movers,
+because tiny leaves drift most, and the top 50% hold 27.9% of the rows and 24.7% of the movers. Limiting the pass by drift therefore
+saves little and loses recall. Skipping the pass costs 0.0031 at 48 probes, just over the 0.003 stop bar, but the stop rule did not
+need a second key: movers go to a leaf near their old one, so the pass can stay and look only there.
+
+### The option built
+
+After refining all centers, each leaf gets a list of its 80 nearest leaves by refined center, among the leaves of its four nearest
+coarse cells. A leaf's rows are then scored together against that one list (the rows of a leaf share it, so its centers stay in
+cache), and each row takes the nearest. No format change, no setting, and no second routing key: the first-pass membership is
+only a starting point. The code is `leaf_neighbors` and `reassign_nearby` in `recluster.rs`; the dead RR4 drift diagnostic and the
+second full pass are removed.
+
+Neighbor count, install-only runs (second pass seconds include 1.4 s of neighbor lists):
+
+| Neighbors | Install s | Second pass s | Moved rows | Row-weighted mean leaf size |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 (first-pass membership) | 122.1 | 0 | 0 | 289.4 |
+| 32 | 122.3 to 124.2 | 5.3 to 5.5 | 332,093 (12.4%) | 275.6 |
+| 64 | 126.2 to 126.4 | 7.7 | 366,079 (13.7%) | 273.4 |
+| 80 | 127.4 to 128.6 | about 8.5 | n/a | 272.9 |
+| 96 | 128.8 to 130.8 | about 10 | n/a | 272.5 |
+| 128 | 132.3 | 13.0 | n/a | 271.9 |
+| 256 | 141.0 | 21.6 | n/a | 270.8 |
+| Control, full second pass | 162.1 to 164.4 | 46.5 | 457,389 (17.1%) | 267.4 |
+
+The row-weighted mean leaf size is the expected size of the leaf a row sits in, so it sets how many rows a query scans. The full
+pass evens sizes out a little more than any neighbor count does (it is also free to send a nearly-tied row to a distant leaf).
+At 32 neighbors a first paired run showed cold p50 about 4% slower, which matched the 3% larger leaves; 80 neighbors cost
+about 3.7 s more and brought latency back to the control's within run-to-run noise (about 2%).
+
+### Paired result (80 neighbors, same host, interleaved)
+
+| Run | Install s | Recall@10, 48 / 64 | Cold p50 / p90 ms, 48 probes | Warm p50 / p90 ms, 48 | Cold p50 / p90 ms, 64 | Warm p50 / p90 ms, 64 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Control A | 162.13 | 0.95070 / 0.96089 | 9.24 / 10.87 | 3.85 / 4.30 | 10.35 / 11.93 | 4.41 / 4.88 |
+| Control B | 162.12 | same | 8.97 / 10.52 | 3.81 / 4.27 | 10.03 / 11.63 | 4.37 / 4.79 |
+| Control C | 164.30 | same | 9.06 / 10.66 | 3.94 / 4.39 | 10.07 / 11.70 | 4.67 / 5.11 |
+| 80 neighbors A | 127.36 | 0.95043 / 0.96060 | 9.02 / 10.55 | 3.87 / 4.32 | 10.10 / 11.74 | 4.42 / 4.86 |
+| 80 neighbors B | 128.64 | same | 9.07 / 10.68 | 3.90 / 4.35 | 10.14 / 11.76 | 4.50 / 4.94 |
+
+Means: install **162.85 s to 128.00 s, 1.272x** (pass: 1.25x). Recall@10 **-0.00026 at 48 probes and -0.00029 at 64** (pass:
+within 0.002; both runs of each arm are deterministic and identical). Query latency, 80 neighbors against the control means: cold
+p50 -0.5% and -0.3% (48 and 64 probes), warm p50 +0.4% and -0.5%, cold p90 -0.6% and 0.0%, warm p90 +0.1% and -0.1%, all inside
+the 3% bar. Latency is a replay at concurrency 4 on local files on one host, so cold means a fresh engine, not empty OS caches.
+The 32-neighbor and 64/96-neighbor arms above are from the same box and binary family, and are a sweep, not the shipped setting.
+
+The measured binaries read the neighbor count from a test-only environment variable and log the leaf-size line; the shipped code
+fixes it at 80 and is otherwise the same algorithm. A bit-for-bit comparison with the control is not possible (this changes
+membership by design): 12 to 13% of rows sit in a different leaf than the control's.
+
+Cost: one c7gd.2xlarge for about 1.7 hours, about $0.6 at RR4's historical $0.3629 per hour, below the $6 cap. The instance, key
+pair, and security group are deleted; the round wrote nothing to the bucket (NQ inputs were copied from the read-only fixture).
+
 ## Round C18: fit the 10M exact vectors with lossless exponent packing
 
 The current-format 10M tier requires **22,095,496,715 bytes** for its complete
@@ -19756,3 +19830,242 @@ No layout change pays: aged small objects model at or slower than today's traced
 ### Cost
 
 One on-demand c7gn.4xlarge for about 1.2 hours (about $1.2), about 200,000 PUTs for three test sets (about $1), and the 77 GB server-side copy for under an hour (cents). The instance, key pair, security group, and the `tmp/c44/` prefix are deleted; the retained fixtures were only read.
+
+## Round G28: a filter's per-segment masks are one cached lookup (6 times the rate on a scattered 1 percent filter), and strings and the middle selectivities are measured
+
+**Setup:** Round G27's, except where item 3 says otherwise (the Apple M4, shared Mac mini, 10 cores, 16 GB; full BEIR NQ, 2,681,468 rows, 1,024-d f16 cosine; the frozen v0.1.19 fixture; release binaries, indexing off; the graph promoted the ordinary way with `g15_promote.py`; the native driver, 16 connections, 15 seconds per arm after a serial quality pass over 1,000 queries; `top_k` 10, IDs only; recall@10 against the exact filtered top 10 over the stored f16 values). The filters are G27's (`id-P` is `id < P percent`; `sc-P` is an Or of id ranges at random places: `sc-50` is 10 ranges of 5 percent, `sc-20` 4, `sc-5` 5 of 1 percent, `sc-1` 5 of 0.2 percent), plus two new ones for item 2 (`id-10`, and `sc-10`: 5 ranges of 2 percent; `g28_truth.py`). Each item ran on one promoted server, as arms of one temporary switch file the server re-read every 300 ms (`g28_arms.py`; the switch is not in the tree), the arms alternated (O N N O), and every pair's responses were compared by SHA-256. The baseline arm of each pair is v0.1.84's behavior. Four servers were promoted (three on the integer store at `ef` 64, 100, and 80, and one on the string store at `ef` 100; graph ready at 12 to 17 minutes, usable at 16 to 30), because a build with a change needs a new promotion.
+
+### 1. The Or-of-ID-ranges mask: the cost was never the arms, it was the lookup
+
+**Profile first** (v0.1.84, `sample` of the promoted server under the driver at 16 connections, 4 seconds, `sc-1` against `id-1`, which scan the same 26,815 rows): `sc-1` ran 891 q/s and `id-1` 3,715 q/s. Of the samples under `segment::filter_live`, 2,415 (sc-1, for 3,560 queries) against 668 (id-1, for 14,800 queries): about 0.68 against 0.05 ms of sampled stack time per query. The largest single stack in the server that is not idle was jemalloc's `malloc_mutex_lock_slow`, 927 samples in `sc-1` and none in the top of `id-1`, and 1,184 of its samples sit under `filter_live`. `filter_rows` was not on any stack: the predicate cache answers every segment's mask after the first query. What costs is everything around the cache hit, per segment (29 on this fixture) per query: `filter_live` serialized the whole filter and the schema to JSON, and each segment's files, to build the cache key, and each lookup took the decoded cache's one lock. With an Or of 5 `And`s (20 comparisons) that is 29 allocation-heavy serializations and 29 lock trips per query, which at 16 clients contends the allocator and the lock. A single `Lt` is small enough to hide it.
+
+**Fix** (`ann_dir::live_masks`, the one path every filtered ANN query takes): the filter and the schema are serialized once per query, the segments' IDs, live generations, live objects, and row counts are appended, and the whole vector of per-segment masks is one decoded-cache entry (charged for the bitmaps it pins, so an evicted predicate is not pinned for free). A miss resolves the segments as before and inserts the vector. The merge of ID intervals that the idea proposed would only change a miss, so it was not built; I did make the one cold-path piece that scaled with the block: after a seek finds the block holding the boundary, the position inside it is a binary search (about 12 comparisons) where it classified all 4,096 rows. That change is covered by the existing seek tests and was not measured separately (the measured filters repeat, so they hit the cache).
+
+| Case | v0.1.84 q/s (CPU per query) | This round q/s (CPU per query) | Ratio | Recall@10 | Responses |
+|---|---|---|---:|---:|---|
+| sc-1 | 845 (11.2 ms) | **5,363** (1.70 ms) | **6.3x** | 1.0000 | identical |
+| sc-50 | 537 (17.5 ms) | **2,718** (3.34 ms) | **5.1x** | 0.9931 | identical |
+| id-1 | 5,631 (1.62 ms) | 6,513 (1.38 ms) | 1.16x | 1.0000 | identical |
+| id-50 | 2,804 (3.26 ms) | 2,878 (3.19 ms) | 1.03x | 0.9936 | identical |
+| id-20 | 1,110 (8.2 ms) | 1,120 (8.1 ms) | 1.01x | 0.9946 | identical |
+| sc-20 | 1,079 (8.4 ms) | 1,105 (8.2 ms) | **1.02x** | 0.9962 | identical |
+
+(Server with `ef` 100, except `id-1`, which ran on the `ef` 64 server. That server gave the same shape: sc-1 850 to 5,504 (6.5x), sc-50 518 to 3,090 (6.0x), sc-20 1,162 to 1,234 (1.06x), id-1 5,631 to 6,513.) The old arm's cost is the same in every case that has a long filter (11 to 18 ms), and the new arm's is the case's own work: `sc-1` now costs what `id-1` does (1.70 and 1.38 ms), so a scattered filter and a prefix filter at the same share are the same price.
+
+**Pass: at least 1.4x on `sc-1` and `sc-20`, identical results.** `sc-1`: **met** (6.3x). `sc-20`: **not met** (1.02x to 1.06x). `sc-20` runs G27's widened walk (a beam of 4,000), and its 8.2 ms is that walk: `id-20`, a one-comparison filter, costs the same 8.1 ms, and G27's own `sc-20` (1,178) already sat at its `id-20` (1,226). The mask never was its cost. I tried to make that walk cheaper without changing its answer, and neither attempt ships:
+
+| Try (`sc-20`, same server, alternated) | q/s | CPU per query | Responses |
+|---|---:|---:|---|
+| the walk as it is | 1,028 | 8.85 ms | |
+| a max-heap beam and a min-heap frontier, no one-bit screen (the standard algorithm) | 795 vs 1,097 | 11.4 vs 8.2 ms | different (recall 0.9963 against 0.9962) |
+| the same beam kept in sorted chunks of 256 (the sample showed a third of the walk in `memmove`), screen and all | 1,124 vs 1,028 | 8.1 vs 8.85 ms | **identical to the bit** (tested against the sorted array for 5 queries and 8 widths, with and without the screen) |
+
+The heap loses because the screen is what makes the walk cheap (it skips the SQ8 score of most neighbors once the beam is full), and a heap has no cheap tail to read it from. The chunked beam is exact but gives 1.09x at 20 percent and nothing at 50 percent (a beam of 1,600 moves little), well short of the bar, so it is removed: a second search routine for 9 percent is not worth keeping. Where `sc-20`'s 8 ms goes is the screened walk itself (scoring about 4,000 nodes), the beam G27 sized for recall at or above IVF's.
+
+### 2. Middle selectivity (5 to 12 percent): the seeded walk is faster and not as good; killed
+
+Built and measured on the first server (`ef` 64): from a sample of every 128th allowed row ranked by one-bit code, the nearest 8 seed a walk over the whole graph in which every node is a stepping stone but only allowed nodes enter the `ef` results; it stops when its frontier passes the farthest of them or after an evaluation cap, and falls back to the scan when the cap ends it with fewer than 30 rows. Today's scan screens every allowed row's one-bit code, rescoring the best 5,100 (recall 1.0000 on `id-5`, since it sees every allowed row).
+
+| Case | Scan (today) q/s, recall | Seeded walk, cap 3,000 | cap 6,000 | cap 12,000 | cap 24,000 | cap 48,000 |
+|---|---|---|---|---|---|---|
+| id-5 | 2,816, 1.0000 (3.2 ms) | **7,370** (2.6x), **0.9483** | 5,029, 0.9701 | 2,914, 0.9810 | 1,548, 0.9883 | 780, 0.9928 |
+| sc-5 | 2,737, 0.9999 | 6,340 (2.3x), 0.8588 | 4,772, 0.9313 | 2,831, 0.9685 | 1,528, 0.9852 | 771, 0.9935 |
+| id-10 | 1,605, 1.0000 (5.7 ms) | 6,100 (3.8x), 0.9577 | | | | |
+| sc-10 | 1,573, 0.9999 | 5,500 (3.5x), 0.8728 | | | | |
+
+The result width `ef` (64, 96, and 160 in the cap 3,000 column) changed nothing: the cap ends every walk, so the answer is the same bits. The curve is the answer: **the walk is 2.3x to 3.8x faster at recall 0.86 to 0.96, and by the time it reaches 0.98 it costs what the scan does** (cap 12,000: 2,914 q/s against 2,816 at recall 0.9810), and it does not reach 1.0000 at any cap I tried. The pass was at least 1.3x at recall at least today's, which is the scan's exact 1.0000 (0.9999), so **it is killed** and the scan stays. The scattered filters do worst: with five regions the nearest seeds land in one and the others are reached late. Neon's in-walk predicate (no bitmap built first) was not tried separately: after item 1 the allowed bitmap is a cached lookup, so there is no per-query bitmap to avoid, and a walk that tests rows against the cached bitmap is what ran above. Where the scan's 3.2 ms goes (a `sample` at 16 connections on `id-5`): the one-bit Hamming screen over 134,000 codes is about half of the busy samples, the SQ8 rescore of the survivors about a fifth, and building the allowed row list about a tenth, so the next gain there is the screen's bandwidth (17 MB of codes per query), not the walk.
+
+### 3. String IDs: a packed table puts them on the resident path, 2.5 to 6.6 times at `top_k` 100 and 10
+
+**What was slow.** The resident row-to-ID table held integers and canonical UUIDs only; any other string ID left the tier with no table, so every ID-only query hydrated each winner's ID from the documents (a document projection that decodes the ID column's blocks, then a `Document` per winner). **Now** (`IdTable::Str`, `bf_types::IdRef::Str`): the IDs of a tier whose IDs are strings that are not all canonical UUIDs are packed in one byte array with a `u32` offset per row (4 bytes plus the ID's length, 19 bytes a row for `nq:doc:00000123`), and only the `top_k` winners' text is copied out (`IdRef::Str(Box<str>)`, which is why `IdRef` stopped being `Copy`). A table is built only up to 48 bytes a row (longer IDs keep the document path), and the bytes beyond the 16 a row the graph's reservation already holds are charged to the reservation when the table is published. A UUID tier still gets its 16-byte table (a tier whose first rows are UUIDs and a later row is not turns into a string table). The tail merge keeps every string as text in a string tier, so a tail ID that looks like a UUID orders and compares with its neighbors by bytes, as the general path does. The JSON writer escapes the text the way the general path's serializer does.
+
+**Measured** on the M4 (one promoted server, `ef` 100, the native driver, 16 connections, 15 seconds per arm, order O N N O O N). The store is the **first 1,000,000 NQ rows** with the ID `nq:doc:` and the row number to 8 digits, loaded with `g28_load_ids.py`, a copy of `bench/nq/load.py` with an ID-kind option (vectors and IDs only; its recall is of this subset against the full corpus's truth, so it is low and only the pairs' equality matters), reclustered, and promoted the ordinary way. The full 2,681,468 rows did not fit the time box (a load, a recluster, and a 30-minute promotion for each of the string and UUID stores). "Old" is v0.1.84's path: the resident table exists but the arm ignores it, so every ID is hydrated from the documents.
+
+| `top_k` | Old q/s (CPU per query, p50) | New q/s (CPU per query, p50) | Ratio | Responses |
+|---|---|---|---:|---|
+| 10 | 8,246 (1.12 ms, 1.76 ms) | **20,770** (0.44 ms, 0.69 ms) | **2.5x** | identical (SHA-256 of every response's IDs and distances over 1,000 queries) |
+| 100 | 1,638 (5.86 ms, 9.9 ms) | **10,790** (0.84 ms, 1.27 ms) | **6.6x** | identical |
+
+Pass: at least 1.3x with identical ordered IDs and distances: **met** at both. The brief's trigger was "strings at least 1.5x slower than UUIDs": the UUID control was not run on the M4 (it needs a second store and a 30-minute promotion that did not fit), so I applied the fix on the strength of the old path's measured cost instead. The new rates are the G21 UUID rates' size (16,189 and 8,530 q/s on the full 2.68M rows at G21's 16-connection run on this machine, at `top_k` 10 and 100). A run on this VM (shared and busy, load average 7 to 12, so only the pairs mean anything) agrees in direction at a much smaller size: strings old 9,200 q/s and new 11,500 q/s at `top_k` 10 (1.25x), 3,420 and 4,330 at `top_k` 100 (1.26x), and one UUID arm of the same 1M rows at 12,189 q/s, so on that machine the new string path is within 6 percent of the UUID path at `top_k` 10 and the old one 24 percent below it. (The VM's UUID server stopped answering from the graph after that one arm (1,298 of 17,500 requests in the next arm, none after), cause not found, so its `top_k` 100 control was lost.)
+
+**Tests.** `typed_ids_path_serves_string_ids_byte_identically` writes whole response bodies of the typed path and the general path for 18 `top_k` values on six queries, with IDs that need JSON escapes (a quote, a backslash, and non-ASCII text), whose first rows are UUIDs, with no tail, with inserts that tie with base rows (a string and a canonical UUID text among the strings), and with overwrites and deletes among the top `k`, and requires equal bytes. `filter_masks_are_one_cached_entry_that_follows_the_segments` (item 1) checks that a repeat of a filter returns the same masks, another filter different ones, and a delete that retires the live objects is seen.
+
+### Not shipped
+
+- The seeded filtered walk (item 2): killed on recall (above). The measurement switch and the walk are not in the tree.
+- A heap beam without the screen, and a beam in sorted chunks (item 1): the first is slower, the second 1.09x at 20 percent (see item 1).
+- The Or-interval merge: the profile showed the arms are not the cost, and a miss is not what the measured queries pay.
+
+### Notes
+
+- The measurement switch (`BF_G28_SWITCH`, a file the server re-read every 300 ms) paired the arms on one server; it is not in the tree. `g28_arms.py` is the driver that wrote the lines and needs a build that has such a switch.
+- `native_drive` now reads a string ID that ends in `:` and the row number back to its corpus row for the recall check.
+- Cost: about 19 GB of S3 transfer to this VM (the fixture and the corpus) and 20 GB of rsync to the M4 (about $2). The run directories on both machines are deleted and nothing of mine is running.
+
+## Round C45: one scoring pack per text segment does not clear 1.25 times on cold BM25 (modeled 0.9 to 1.2 times for the pack the format gives, killed at the model, no engine change)
+
+Hypothesis (Sol, `briefs/ideas/1225-sol.md` #4): store one scoring-only pack per text segment (postings, term records, document lengths) and read each whole, in parallel, right after the manifest, so the
+bundle wave and the posting wave become one. Sol's model was 26 ms manifest, 24 ms first byte, 30 ms transfer of an 80 MB budget at 2.7 GB/s, and 5 ms scoring, about 85 ms, or 1.35 times C42's 114.4 ms.
+The brief said to model it from real numbers and stop if the best design is under 1.25 times at p50. It is. Nothing was built, and there is no design note.
+
+Two inputs of that model do not hold on the fixture: the pack is **114 MB, not 80 MB** (92 MB at a hypothetical minimum), and the wall time of reading it is set by the slowest of 60 to 110 parts (about 60 to 85 ms at p50),
+not by bytes over 2.7 GB/s.
+
+### Method
+
+Two on-demand c7gn.4xlarge hosts in a row (Ubuntu 24.04 arm64, Rust 1.100.1; the first with Clang 19 and NumKong SME targets off for the server) in us-west-2. `scale-server` at v0.1.84 on `tmp/msmarco-1m-v021/store/` (eight text segments, 1M passages),
+pure S3 with no disk cache, a 2 GiB memory cache, 4,000-byte blocks, strong consistency, queries 100 to 299 of `bm25-msmarco.json`.
+
+- **Sizes** (`c45_sections.py`): parses each `fts.1.bft` (the fixture is **format 7**, not 4) into long postings, phrase positions, dictionary bundles (FST, FST padding, term records, short-term postings), lengths, and the chunk index.
+  Footer and index offsets are 24 bytes short of the stored object (the create header).
+- **Fetch time** (`c45-fetch`, a stand-alone Rust tool on `object_store` 0.14.2 with the server's pool settings; `c45_fetch_runs.py` and `c45_paired.py` drive it): a plan's bytes (the first N bytes of each segment's object, so the sizes are real and
+  the content is irrelevant) as ranged GETs of one part size, all issued at once, 256 warm connections, the time to the last byte of the whole set. Two sources: the **retained fixture** (days old, read only) and a **fresh** server-side copy under `tmp/c45/`
+  made minutes earlier. A second arm duplicates a part still unfinished after 45 ms (the server hedges reads). Two passes: a first grid (16 to 30 reps per cell, one plan per process, two passes in both orders), then a **paired** run
+  (40 reps, every plan once per rep back to back in a rotating order, so plans see the same seconds of S3; this is the one to trust for comparisons, and it came out slower for the aged fixture).
+- **Today's chain** (`c41_drive.py`, `BF_TRACE_READS`): 200 cold queries, caches dropped before each: traced client p50 115.3 ms and p90 137.3 ms (C42's untraced numbers are 114.4 and 136.4), the manifest read ends at 25.1 ms p50 (31.7 p90),
+  **3.31 MB and 94.6 GETs a query**.
+- **CPU** (`c45_cpu.py`): the same queries against a local copy (`file://`), every cache dropped before each: **cold p50 15.1 ms, p90 19.5 ms** (client time, no object-store wait, unchanged by 1, 2, or 16 Rayon threads), 29.4 ms of process CPU across
+  all threads, and **warm p50 0.95 ms**. The cold figure holds today's per-read overheads, so it is an upper bound for scoring from memory. Against S3 the process uses 72 ms of CPU per cold query (TLS included).
+- **Model** (`c45_model.py`): per query, `manifest end (traced) + pack wall (drawn from the measured reps) + CPU`, 5 draws per query. Two CPU readings: **flat** (the local cold time, after the last byte) and **pipelined** (each segment is scored when its own pack
+  arrives, a segment's CPU is its document share of 29 ms, segments run in parallel, 3 ms for merge and response; the three 200K segments arrive together, so this is about 8 to 10 ms after the last byte). A segment-subset design replays the trace's per-segment read ends instead.
+
+### Result 1: the pack is 114 MB
+
+Eight text segments, 1M documents, 208.8 MB of `fts.1.bft`:
+
+| Section | MB | Needed to score? |
+| --- | ---: | --- |
+| Long-term postings (more than 32 blocks) | 16.9 | yes |
+| Short-term postings (inside the dictionary bundles) | 48.1 | yes (postings payload 64.9 MB in all, Sol's 64.5) |
+| Term records (1.24M terms, 1.48M blocks) | 54.6 | the bounds, not the CRCs: 31.1 MB without the position offset, the position size, and the two CRCs per block (23.4 MB dropped) |
+| FST | 16.8 | yes (plus 13.1 MB of padding that is not) |
+| Document lengths, chunk index | 1.2 | yes |
+| Phrase positions | 58.2 | no |
+| Live bitmaps (separate objects) | 0.4 | yes |
+
+| Pack | MB | Per segment (25K to 200K documents) |
+| --- | ---: | --- |
+| Trimmed (postings, trimmed records, FST, lengths, live) | **114.4** | 3.9 to 21.8 |
+| The same, records untrimmed | 137.8 | 5.0 to 26.0 |
+| Hypothetical minimum (6 bytes per block, the term's fields inside the FST value) | 92.1 | |
+| Sol's budget | 80 | not reachable with this content |
+
+Today's query reads 3.31 MB, so the pack reads **35 times the bytes** (about 115 MB, and 125 to 135 MB with hedging).
+
+### Result 2: fetching it takes 60 to 85 ms at p50 and the tail sets the wall
+
+The first byte of every part is 24 to 26 ms. A stream then moves about 100 MB/s, so a 2 MiB part takes 45 to 50 ms, and a set of 59 to 104 parts ends at the slowest of them.
+
+Whole-set wall time, ms, p50 / p90, paired run, no hedging (40 reps, 39 kept):
+
+| Plan | Parts | Fixture (aged) | Fresh |
+| --- | ---: | ---: | ---: |
+| trimmed, 114 MB, 1.5 MiB parts | 76 | 129 / 281 | 64 / 91 |
+| trimmed, 2 MiB | 59 | 85 / 242 | 61 / 71 |
+| trimmed, 3 MiB | 40 | 108 / 275 | 70 / 117 |
+| trimmed, 4 MiB | 32 | 103 / 284 | 70 / 101 |
+| minimum, 92 MB, 2 MiB | 48 | 91 / 263 | 60 / 125 |
+| 80 MB, 2 MiB | 43 | 87 / 270 | 54 / 81 |
+| whole objects, 209 MB, 4 MiB | 53 | 121 / 318 | 81 / 194 |
+| whole objects, 209 MB, 2 MiB | 104 | 251 / 276 | 248 / 273 |
+
+With a 45 ms hedge (7 to 10 duplicate parts, 14 to 20 MB, at 2 MiB parts, and 19 at 3 or 4 MiB; 38 to 50 for the whole objects): trimmed 2 MiB **79 / 90** (fixture) and **76 / 93** (fresh), 1.5 MiB 81 / 86 and 74 / 95, 4 MiB 80 / 98 and 84 / 105, 92 MB 73 / 91 and
+70 / 86, 80 MB 73 / 89 and 64 / 87, whole objects 88 / 97 and 88 / 99 (2.2 to 2.4 GB/s, with 40 to 57 percent of the parts duplicated). The first, unpaired grid gave 58 to 63 ms for the trimmed pack at 2 MiB (74 to 133 at p90), and a 209 MB whole-object plan at 4 MiB parts
+reached 2.7 GB/s once, so the wall moves by about 25 ms with S3 conditions and aged against fresh objects (C44's age effect again).
+
+- Bytes are not what sets the wall below 115 MB: 80, 92, and 114 MB finish within 10 to 15 ms of each other. Parts of 8 MiB and up are limited by one connection each (a 16 MiB part takes about 175 ms), and below 1 MiB the GET count and the tail grow.
+- An unhedged set is a maximum over 59 to 104 parts: stragglers of 250 to 300 ms land in at least 10 percent of reps for the aged fixture, and hedging at 45 ms removes them at the price of the duplicate bytes.
+- Per segment the pack is done at 39 to 49 ms p50 (25K to 200K documents) and 48 to 60 ms hedged, so the three 200K segments set the wall. A never-read object's first rep took 45 to 360 ms.
+
+### Result 3: the model
+
+Cold p50 / p90, ratio to today's 115.3 / 137.3 ms, paired run, 2 MiB parts, CPU flat / pipelined:
+
+| Design | Source | Hedge | Wall p50 / p90 | Flat | Pipelined |
+| --- | --- | --- | ---: | --- | --- |
+| trimmed pack, 114 MB | fixture | no | 85 / 242 | 126.7 / 280.7 (0.91 / 0.49) | 117.9 / 271.9 (0.98 / 0.51) |
+| | fixture | 45 ms | 79 / 90 | 116.2 / 130.7 (0.99 / 1.05) | 108.0 / 122.1 (1.07 / 1.12) |
+| | fresh | no | 61 / 71 | 101.3 / 115.9 (**1.14** / 1.19) | 93.5 / 107.1 (**1.23** / 1.28) |
+| | fresh | 45 ms | 76 / 93 | 117.5 / 139.7 (0.98 / 0.98) | 108.3 / 129.9 (1.07 / 1.06) |
+| minimum pack, 92 MB (not buildable as is) | fixture, hedged | 45 ms | 73 / 91 | 112.9 / 133.5 (1.02 / 1.03) | 104.3 / 124.0 (1.11 / 1.11) |
+| | fresh | no | 60 / 125 | 101.4 / 158.7 (1.14 / 0.87) | 93.5 / 153.4 (1.23 / 0.90) |
+| Sol's 80 MB (not reachable) | fixture, hedged | 45 ms | 73 / 89 | 114.5 / 131.7 (1.01 / 1.04) | 105.8 / 123.5 (1.09 / 1.11) |
+| | fresh | no | 54 / 81 | 95.5 / 126.2 (1.21 / 1.09) | 87.6 / 115.6 (**1.32** / 1.19) |
+| | fresh | 45 ms | 64 / 87 | 106.9 / 128.6 (1.08 / 1.07) | 98.2 / 120.2 (1.17 / 1.14) |
+| packs for the 3 / 4 / 5 smallest segments only (first grid) | both | no | 61 to 90 | 118 to 125 (**0.92 to 0.98**) | |
+
+The first, unpaired grid (best cell, trimmed 114 MB, fixture, 2 MiB, no hedge, wall 59 / 86) gave 100.8 / 133.2 flat (1.14 / 1.03) and 92.7 / 122.8 pipelined (1.24 / 1.12). The segment-subset rows keep today's path for the three 200K segments, which set
+the critical path, so the pack changes nothing there and the extra bytes buy nothing.
+
+**The pack the format gives (114 MB) models at 0.9 to 1.14 times at p50 with the measured CPU floor and at most 1.24 times with pipelined scoring, and only on fresh objects without hedging. Its p90 is 0.5 to 1.19 times (1.28 in one cell).
+With the 45 ms hedge the server uses, it is 0.98 to 1.07 times at p50 and 0.98 to 1.12 at p90.** Only a pack that cannot be built from this content (80 to 92 MB) reaches 1.23 to 1.32 times, in one or two cells of nine, on fresh objects, unhedged, with
+pipelined scoring. Cells move by about 0.1 times between runs. **Bar: 1.25 times at p50. Killed at the model.**
+
+### Why the saving is so small
+
+- Today's cold chain is three floors (manifest, bundles, postings) of 24 to 25 ms plus waits and CPU. The pack replaces two floors with one, but the one read is a maximum over 60 to 100 parts that each take 45 to 50 ms (25 ms to the first byte, then
+  2 MiB at about 100 MB/s), plus a tail. It ends at about 60 to 85 ms against about 90 ms for the two floors it replaces, and the CPU, which today hides inside the waits (about 15 ms), comes after it.
+- The size of the pack is not the lever: 80, 92, and 114 MB took within 10 to 15 ms of each other. The lever would be fewer, faster parts, which the per-connection rate (about 100 MB/s) and the tail rule out below about 1 MiB.
+- The pack is the whole index and a query needs 3 MB of it (3 percent).
+
+### What it would cost, if it were built anyway
+
+| | Today | Whole trimmed packs |
+| --- | ---: | ---: |
+| Bytes per cold query | 3.3 MB | 115 MB (125 to 135 MB hedged), 35 to 40 times |
+| GETs per cold query | 94.6 | 87 to 105 (59 to 90 parts, 14 others, 7 to 10 hedges at 2 MiB) |
+| Cold queries per second one host can serve | no limit seen | 11 to 20 (115 MB at 1.3 to 2.3 GB/s; not run under load) |
+| Extra bucket bytes | | +114 MB (+55 percent of the 208.8 MB of text segments, +22 percent of the 527 MB store) as a separate pack; **+0** if it is the front of the segment object with positions moved behind (a new text segment format version), and then 23.4 MB (records) plus 13.1 MB (FST padding) could be dropped |
+
+A cold query would also move 115 MB through memory and TLS; the process already spends 72 ms of CPU per cold query on S3 (29 ms of it without TLS), and the extra TLS was not measured.
+
+### What would move cold BM25 instead
+
+The remaining chain is manifest, bundle wave, one posting batch, each a 24 ms floor. A hint cannot remove a wave (C41), refinement is gone for most queries (C42), early cancelling has nothing to cancel (C43), and one whole pack replaces two floors with
+a 60 to 85 ms read (this round). What is left is smaller reads inside the bundle wave (the larger segments' term lookups), or fewer segments in a cold query; neither was measured here.
+
+### Resources
+
+Two on-demand c7gn.4xlarge hosts for 0.6 and 0.15 hours (about $1 in all with the root volumes), about 400 GB of in-region GET traffic from the fixture and the copies (no transfer charge; about 250,000 GETs) and 209 MB of server-side copies under `tmp/c45/` (twice, deleted). Both instances are terminated and their key pairs,
+security groups, and the prefix are deleted; the retained fixture was only read. Scripts: `c45_sections.py`, `c45-fetch/`, `c45_fetch_runs.py`, `c45_paired.py`, `c45_fetch_summary.py`, `c45_cpu.py`, `c45_model.py` (with the existing `c41_drive.py`).
+
+## Round C46: a priming GET warms a leaf's span to 34 ms at p50 but not under 50 ms at p90, and the wave bound is 1.0 to 1.2 times (stopped at the physics gate, no engine change)
+
+Question: can small priming GETs, issued while the scan runs near the likely rerank pages, make the cold rerank wave's reads land on warm bytes (Neon, 13:25 idea 2)?
+Answer: the warmth is real and holds across a leaf's span, but the brief's gate (a prime of 16 KiB or less bringing the follow-up p90 under 50 ms) fails in all 36 cells, and the wave
+bound from these reads alone is about 1.0 to 1.2 times at p50, at or under the 1.2 bar before any coverage loss or added GETs. **Stopped after step 1; no model, no build, no engine change.**
+The script is `c46_physics.py` (reads only).
+
+Measured 2026-11-28 on one on-demand c7gn.4xlarge (Ubuntu 24.04 arm64, us-west-2, about 0.4 h), boto3 1.40, instance-profile credentials, in the 138 objects of 64 MiB or more of the retained C5 10M
+fixture (aged, written 4 days earlier; read only). Each condition is 6 waves of 35 concurrent 16 KiB reads (210 reads), at offsets at least 3 MiB from every other point of the run, rotated wave by wave. A prime is a ranged GET of
+1 byte, 4 KiB, or 16 KiB at offset p, finished and then followed after the delay by a 16 KiB read at p plus the offset in the table.
+
+Control (a 16 KiB read at an offset nothing touched, 175 reads, first wave dropped): **77 ms p50, 101.5 ms p90** (C34: 72 and 110). The first wave of the control (877 ms p50) paid TLS setup on 35 fresh connections, so I dropped it;
+the primed conditions ran after warm-up and are unaffected. An earlier aborted pass (a slow offset picker) touched about 5,000 reads' offsets at random, so up to a tenth of the later offsets may have started warm: it can only lower the control.
+
+Follow-up 16 KiB read, p50 / p90 in ms:
+
+| Prime | Follow-up at | 50 ms delay p50 / p90 | 150 ms p50 / p90 | 300 ms p50 / p90 |
+| --- | --- | --- | --- | --- |
+| 1 byte | -512 KiB | 35 / 59 | 32 / 53 | 34 / 61 |
+| 1 byte | +512 KiB | 32 / 54 | 34 / 68 | 35 / 54 |
+| 1 byte | +1 MiB | 34 / 65 | 33 / 63 | 33 / 66 |
+| 1 byte | +2 MiB | 33 / 66 | 34 / 67 | 36 / 64 |
+| 4 KiB | -512 KiB | 34 / 62 | 35 / 69 | 33 / 59 |
+| 4 KiB | +512 KiB | 33 / 63 | 33 / 60 | 33 / 60 |
+| 4 KiB | +1 MiB | 33 / 59 | 34 / 61 | 34 / 64 |
+| 4 KiB | +2 MiB | 35 / 74 | 33 / 63 | 34 / 69 |
+| 16 KiB | -512 KiB | 34 / 70 | 34 / 60 | 35 / 68 |
+| 16 KiB | +512 KiB | 34 / 60 | 34 / 64 | 32 / 52 |
+| 16 KiB | +1 MiB | 32 / 61 | 33 / 57 | 33 / 59 |
+| 16 KiB | +2 MiB | 34 / 72 | 33 / 64 | 34 / 61 |
+
+- **Every cell is 32 to 36 ms at p50 and 52 to 74 ms at p90.** The prime's size (1 byte to 16 KiB), the side (before or after), the distance (512 KiB to 2 MiB), and the delay (50 to 300 ms) make no visible difference: the best p90 is 52 to 53 ms (16 KiB prime then +512 KiB at 300 ms, and 1 byte then -512 KiB at 150 ms), the worst 74. **No cell is under 50 ms**, so the stop rule fires. Pooled over all 7,560 primed reads: p50 34, p90 62, p95 78, p99 112 (control p95 117, p99 138).
+- **The tail, not the median, sets the wave.** A wave of 47 reads ends at about its p98. Drawing 47 reads at random from the pooled samples gives a wave maximum at p50 of 88 to 103 ms primed (1 byte at plus or minus 512 KiB: 88; all primes: 102) against 132 ms for the control, a saving of 30 to 44 ms; for 94 reads (the 7.9 percent filter) the saving is 3 to 35 ms. Against a traced query p50 of 233 ms (C44) that is at most 1.15 to 1.23 times for unfiltered queries, **and it assumes every rerank page has a prime within 2 MiB that finished before the scan ended**, which a prime issued after scoring cannot do for the last leaves scored, and which costs one extra GET per primed leaf (48 to 128 primes on 283 GETs is 17 to 45 percent).
+- **Why the model was not run.** The 10M trace needs a 77 GB server-side copy and about 13 minutes of writable repair for the row maps (C27, C34, C44) plus a release build on the instance, for a bound that already sits at the bar and before coverage and GET costs. The measured physics gives an upper bound, so the decision does not need the trace.
+
+What would change this: a prime that is itself free (a read the scan already makes landing within 2 MiB of the rerank pages, which is C14's cluster-local placement of exact vectors beside the codes: a format change, C44 left it unmodeled), or a measured hedge-free wave tail that is much longer than C34's 110 to 150 ms, which would raise the saving.
+
+### Cost
+
+One on-demand c7gn.4xlarge for about 0.4 hours (about $0.4). The instance is terminated, and the key pair and security group are deleted; no S3 prefix was written, and the fixtures were only read.
