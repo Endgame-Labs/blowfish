@@ -2044,6 +2044,7 @@ mod plan_tests {
         assert_eq!(plan(100, 64), (256, 150));
         assert_eq!(plan(31, 64), (80, 47));
         assert_eq!(plan(100, 400), (400, 150));
+        assert_eq!(plan(256, 64), (656, 384));
         let mut last = plan(RERANK + 1, 64);
         for k in RERANK + 2..=MAX_K {
             let now = plan(k, 64);

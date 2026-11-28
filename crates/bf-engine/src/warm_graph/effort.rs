@@ -4,8 +4,15 @@ use std::collections::VecDeque;
 const MIN: usize = 64; // Twice the graph's maximum construction degree.
 const MAX: usize = 4096;
 const FIRST: usize = 32;
-const MATCHED: usize = 128;
 const WINDOW: usize = 512;
+
+// G26 TEMPORARY: standard errors of margin required (env G26_MARGIN), removed before done.
+fn margin() -> f64 {
+    std::env::var("G26_MARGIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.)
+}
 
 pub(super) struct Effort {
     pub trial: usize,
@@ -49,6 +56,10 @@ impl Effort {
             / n.saturating_sub(1).max(1) as f64;
         let radius = 1.96 * ((variance + 0.25 / n as f64) / n as f64).sqrt();
         (graph, ivf, gap - radius, gap + radius)
+    }
+    fn standard_error(&self) -> f64 {
+        let (_, _, lower, upper) = self.statistics();
+        (upper - lower) / (2. * 1.96)
     }
     pub fn settled(&self) -> bool {
         self.serving == Some(self.trial)
@@ -95,7 +106,9 @@ impl Effort {
                 } else {
                     self.trial = (self.trial * 5).div_ceil(4).min(MAX);
                 }
-            } else if lower > 0. || (self.len() >= MATCHED && g >= i) {
+            } else if lower > 0.
+                || (self.len() == WINDOW && g - i >= margin() * self.standard_error())
+            {
                 // Preserve a validated serving effort while cheaper trials explore below it.
                 self.serving = Some(self.trial);
                 if self.len() == WINDOW && lower > 0. {
@@ -173,7 +186,7 @@ mod tests {
         assert!(e.serving.is_none());
         e.trial = 128;
         e.samples.clear();
-        for _ in 0..MATCHED {
+        for _ in 0..128 {
             e.observe(1., 0.9);
             if e.trial != 128 {
                 break;

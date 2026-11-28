@@ -250,7 +250,7 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
     assert_eq!(query(&e, "hot", request(17)).await[0]["id"], 17);
     assert!(e.0.hot_graph.answers.load(Ordering::Relaxed) > before);
-    // Round G8: requests up to 100 rows (k plus offset) are served by the graph with an automatic
+    // Round G8 (raised to 256 in Round G26): requests up to 256 rows (k plus offset) are served by the graph with an automatic
     // beam and shortlist, and return the IVF control's rows. Since Round G16 the walk screens
     // neighbors with one-bit codes, so it is approximate: beyond the first rows it may swap a
     // near-tie for its neighbor, as on NQ (recall@100 -0.0013). The first ten must match
@@ -259,6 +259,9 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     for body in [
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":100}),
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":40,"offset":50}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":128}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":256}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":100,"offset":156}),
     ] {
         let before = e.0.hot_graph.answers.load(Ordering::Relaxed);
         let got = query(&e, "hot", body.clone()).await;
@@ -311,8 +314,8 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
     }
     for body in [
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
-        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":101}),
-        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":1,"offset":100}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":257}),
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":1,"offset":256}),
         json!({"rank_by":["vector","ANN",vec![0.;16]],"top_k":10}),
         json!({"rank_by":["vector","kNN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
     ] {
@@ -1438,7 +1441,7 @@ async fn typed_fixture_with(
 }
 /// Round G18: the typed ID-only path writes the same JSON bytes as the general path (rows,
 /// `$dist` bits, performance fields except the two timings, billing), for every `top_k` from 1 to
-/// 100, and declines (so the general path runs) for every request shape it does not take.
+/// 100 (and 128 and 256, Round G26), and declines (so the general path runs) for every request shape it does not take.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typed_ids_path_is_byte_identical_to_the_general_path() {
     let _exclusive = ADMISSION_GATE.write().await;
@@ -1482,7 +1485,7 @@ async fn typed_ids_path_is_byte_identical_to_the_general_path() {
                 };
                 let mut taken = 0;
                 for i in [0, 17, 400, 1003, 1999, 2499] {
-                    for k in (1..=100).chain([37, 64]) {
+                    for k in (1..=100).chain([37, 64, 128, 256]) {
                         let body = json!({"rank_by":["vector","ANN",queries[i]],"top_k":k});
                         let got = typed(body.clone()).await.expect("the typed path serves it");
                         assert_eq!(got, general(body).await, "query {i} top_k {k}");
@@ -1494,7 +1497,7 @@ async fn typed_ids_path_is_byte_identical_to_the_general_path() {
                 assert_eq!(typed(body.clone()).await.unwrap(), general(body).await);
                 // Shapes the typed path must not take.
                 for body in [
-                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":101}),
+                    json!({"rank_by":["vector","ANN",queries[5]],"top_k":257}),
                     json!({"rank_by":["vector","ANN",queries[5]],"top_k":0}),
                     json!({"rank_by":["vector","ANN",queries[5]]}),
                     json!({"rank_by":["vector","ANN",queries[5]],"top_k":10,"offset":1}),
@@ -1527,7 +1530,7 @@ async fn typed_ids_path_is_byte_identical_to_the_general_path() {
             }))
     });
     let taken = reactor.await.unwrap();
-    assert_eq!(taken, 6 * 102);
+    assert_eq!(taken, 6 * 104);
     // Off the reactor it never applies.
     let request: QueryRequest = serde_json::from_value(ids_only(5, 10)).unwrap();
     assert!(e.query_ids("hot", &request).await.unwrap().is_none());
