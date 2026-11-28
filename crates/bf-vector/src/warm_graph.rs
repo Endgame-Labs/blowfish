@@ -247,6 +247,78 @@ impl HotGraph {
             scanned,
         ))
     }
+    /// Answer a filtered query from a walk over the whole graph that returns only `allowed` rows,
+    /// seeded from a sample of them. Every `stride`th allowed row is ranked by the Hamming
+    /// distance of its one-bit code to the query's signs, and the nearest `seeds` begin the walk,
+    /// which keeps the `ef` nearest allowed nodes and stops after `max_evaluations` scores.
+    /// Returns the `count` nearest of them (row and cached norm) with the scores computed, or
+    /// `None` when the evaluation cap ended the walk before `count` rows were found.
+    #[allow(clippy::too_many_arguments)]
+    pub fn filtered_walk(
+        &self,
+        query: &[f32],
+        ef: usize,
+        count: usize,
+        allowed: &RoaringBitmap,
+        stride: usize,
+        seeds: usize,
+        max_evaluations: usize,
+        scratch: &mut HotScratch,
+    ) -> Result<Option<(Vec<(u32, crate::CosineNorm)>, usize)>> {
+        crate::distance::validate(query, self.dims)?;
+        if ef == 0 || count == 0 || self.nodes.is_empty() || query.iter().all(|x| *x == 0.) {
+            return Err(Error::InvalidInput("unsupported graph query shape".into()));
+        }
+        let q = vectors::normalized(query);
+        let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
+        let (code, scale) = quant::encode(&rotated);
+        let signs = self.bits.query(&rotated);
+        // The sample: evenly spaced allowed rows, ranked by their one-bit codes.
+        let stride = stride.max(1);
+        let mut sample: Vec<(u16, u32)> = Vec::with_capacity(allowed.len() as usize / stride + 1);
+        let mut i = 0;
+        while let Some(row) = allowed.select(i) {
+            if let Some(&node) = self.nodes.get(row as usize)
+                && node != u32::MAX
+            {
+                sample.push((self.bits.hamming(&signs, node), node));
+            }
+            i = i.saturating_add(stride as u32);
+            if u64::from(i) >= allowed.len() {
+                break;
+            }
+        }
+        if sample.is_empty() {
+            return Ok(None);
+        }
+        let seeds = seeds.max(1).min(sample.len());
+        if sample.len() > seeds {
+            sample.select_nth_unstable(seeds - 1);
+            sample.truncate(seeds);
+        }
+        let seeds: Vec<u32> = sample.into_iter().map(|(_, node)| node).collect();
+        let found = scratch.0.filtered_search(
+            &self.links,
+            &self.degrees,
+            &seeds,
+            ef.max(count),
+            max_evaluations,
+            |id| self.codes.score(&code, scale, id),
+            |id| self.codes.prefetch(id),
+            |id| allowed.contains(self.rows[id as usize]),
+        );
+        if found.hits.len() < count && found.capped {
+            return Ok(None);
+        }
+        let mut hits = found.hits;
+        hits.truncate(count);
+        Ok(Some((
+            hits.into_iter()
+                .map(|h| (self.rows[h.id as usize], self.norms[h.id as usize]))
+                .collect(),
+            found.evaluations,
+        )))
+    }
     /// Allocate cache-sized visitation state. Callers bound and reserve the number retained.
     pub fn scratch(&self) -> HotScratch {
         HotScratch(navigation::Scratch::new(self.len()))

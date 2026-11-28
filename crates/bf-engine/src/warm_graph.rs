@@ -264,22 +264,34 @@ impl Locations {
         }
     }
 }
-/// The resident row-to-ID table: unsigned integers (8 bytes a row) or canonical UUIDs kept as
-/// their 16 bytes. A tier whose IDs are of any other kind, or of mixed kinds, has no table.
+/// The resident row-to-ID table: unsigned integers (8 bytes a row), canonical UUIDs kept as their
+/// 16 bytes, or any other strings packed in one byte array with a row's start offsets. A tier of
+/// mixed integer and string IDs has no table.
 pub(crate) enum IdTable {
     Uint(Vec<u64>),
     Uuid(Vec<u128>),
+    /// `offsets[row]..offsets[row + 1]` bounds a row's bytes in `bytes`; an empty range is a row
+    /// without an ID (an ID is never empty).
+    Str {
+        bytes: Vec<u8>,
+        offsets: Vec<u32>,
+    },
 }
 impl IdTable {
-    /// Bytes a row costs in the table's larger form: what a graph's reservation sets aside.
+    /// Bytes a row costs in the table's larger fixed forms: what a graph's reservation sets aside.
     const MAX_ROW_BYTES: u64 = 16;
+    /// The most a packed string table may average per row (bytes and offset together): a longer
+    /// table is not built, and the tier's IDs come from its documents as before.
+    const MAX_STR_ROW_BYTES: u64 = 48;
     fn resident_bytes(&self) -> u64 {
         match self {
             Self::Uint(ids) => ids.capacity() as u64 * 8,
             Self::Uuid(ids) => ids.capacity() as u64 * 16,
+            Self::Str { bytes, offsets } => bytes.capacity() as u64 + offsets.capacity() as u64 * 4,
         }
     }
-    /// The ID of `row`, or `None` for a row without one.
+    /// The ID of `row`, or `None` for a row without one. A string is copied out here, for the
+    /// winners only.
     fn get(&self, row: u32) -> Option<IdRef> {
         match self {
             Self::Uint(ids) => ids
@@ -290,6 +302,14 @@ impl IdTable {
                 .get(row as usize)
                 .filter(|id| **id != u128::MAX)
                 .map(|id| IdRef::Uuid(*id)),
+            Self::Str { bytes, offsets } => {
+                let row = row as usize;
+                let (start, end) = (*offsets.get(row)? as usize, *offsets.get(row + 1)? as usize);
+                (start < end)
+                    .then(|| std::str::from_utf8(&bytes[start..end]).ok())
+                    .flatten()
+                    .map(|text| IdRef::Str(text.into()))
+            }
         }
     }
 }
@@ -1191,6 +1211,31 @@ impl Drop for ScratchLoan<'_> {
         }
     }
 }
+/// TEMPORARY (Round G28, removed before the round ends): the measurement switch. `BF_G28_SWITCH`
+/// names a file whose text selects the arm each query takes (re-read every 300 ms), so two arms
+/// run on one promoted server.
+fn g28_switch() -> Arc<str> {
+    static CELL: std::sync::LazyLock<Mutex<(Option<Instant>, Arc<str>)>> =
+        std::sync::LazyLock::new(|| Mutex::new((None, Arc::from(""))));
+    let mut cell = CELL.lock().unwrap_or_else(|e| e.into_inner());
+    if cell
+        .0
+        .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(300))
+    {
+        let text = std::env::var_os("BF_G28_SWITCH")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        *cell = (Some(Instant::now()), Arc::from(text.trim()));
+    }
+    cell.1.clone()
+}
+/// TEMPORARY (Round G28): a `name=value` number in the switch text.
+fn g28_param(switch: &str, name: &str, default: u64) -> u64 {
+    switch
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .find_map(|t| t.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+        .unwrap_or(default)
+}
 /// Rows kept by SQ8 distance for the exact rerank of a filtered scan, for `k` wanted rows.
 fn scan_shortlist(k: usize) -> usize {
     (k * 3).max(30)
@@ -1515,16 +1560,41 @@ async fn ranked_rows(
     };
     let (ef, shortlist) = plan(k, ef);
     let (hits, evaluations) = match (scan, mask) {
-        (true, Some(allowed)) => entry
-            .graph
-            .scan(
-                vector,
-                scan_shortlist(k),
-                scan_screen(k),
-                allowed,
-                crate::fan_out(),
-            )
-            .map_err(segment::index_error)?,
+        (true, Some(allowed)) => {
+            let switch = g28_switch();
+            let seeded = if switch.contains("seed")
+                && allowed.len() * 1000 >= entry.graph.len() as u64 * g28_param(&switch, "min", 30)
+            {
+                entry
+                    .graph
+                    .filtered_walk(
+                        vector,
+                        g28_param(&switch, "ef", 96) as usize,
+                        scan_shortlist(k),
+                        allowed,
+                        g28_param(&switch, "stride", 128) as usize,
+                        g28_param(&switch, "seeds", 8) as usize,
+                        g28_param(&switch, "cap", 3000) as usize,
+                        loan.scratch.as_mut().unwrap(),
+                    )
+                    .map_err(segment::index_error)?
+            } else {
+                None
+            };
+            match seeded {
+                Some(found) => found,
+                None => entry
+                    .graph
+                    .scan(
+                        vector,
+                        scan_shortlist(k),
+                        scan_screen(k),
+                        allowed,
+                        crate::fan_out(),
+                    )
+                    .map_err(segment::index_error)?,
+            }
+        }
         (true, None) => return Ok(None),
         (false, _) => entry
             .graph
@@ -1606,6 +1676,7 @@ async fn search_entry(
     };
     if columns.is_empty()
         && let Some(table) = entry.ids.get()
+        && !(matches!(table, IdTable::Str { .. }) && g28_switch().contains("strold"))
         && let Some(found) = ids_from_table(table, &exact, mask.as_deref(), set, at, k)
     {
         return Ok(found);
@@ -1741,6 +1812,9 @@ pub(crate) async fn search_ids(
         return None;
     }
     let table = entry.ids.get()?;
+    if matches!(table, IdTable::Str { .. }) && g28_switch().contains("strold") {
+        return None;
+    }
     let _permit = entry.slots.try_acquire().ok()?;
     let exact = ranked_rows(vector, navigate.map(|m| &**m), k, &entry, ef, false)
         .await
@@ -1783,9 +1857,11 @@ async fn build_id_table(
         }
     }
     let mut uints: Vec<u64> = Vec::new();
-    let mut uuids: Vec<u128> = Vec::new();
-    // The first row's ID decides the table's kind; a row of another kind abandons the table.
-    let mut kind: Option<bool> = None;
+    // String IDs are collected as text and packed once every row is known.
+    let mut texts: Vec<(u32, Box<str>)> = Vec::new();
+    // The first row's ID decides the table's family (integer or string); a row of the other
+    // family abandons the table.
+    let mut strings: Option<bool> = None;
     let none = BTreeSet::new();
     for (segment, pairs) in wanted {
         let rows: RoaringBitmap = pairs.iter().map(|(local, _)| *local).collect();
@@ -1801,29 +1877,58 @@ async fn build_id_table(
             let Some(id) = docs.get(&local).and_then(|d| d.get("id")) else {
                 return;
             };
-            let id = match (id, kind) {
-                (serde_json::Value::Number(n), None | Some(false)) => n.as_u64().map(IdRef::Uint),
-                (serde_json::Value::String(text), None | Some(true)) => {
-                    IdRef::parse_uuid(text).map(IdRef::Uuid)
+            match (id, strings) {
+                (serde_json::Value::Number(n), None | Some(false)) => {
+                    let Some(id) = n.as_u64() else {
+                        return;
+                    };
+                    if strings.is_none() {
+                        strings = Some(false);
+                        uints = vec![u64::MAX; total];
+                    }
+                    uints[row as usize] = id;
                 }
-                _ => None,
-            };
-            let Some(id) = id else {
-                return;
-            };
-            if kind.is_none() {
-                kind = Some(matches!(id, IdRef::Uuid(_)));
-                uints = vec![u64::MAX; if kind == Some(false) { total } else { 0 }];
-                uuids = vec![u128::MAX; if kind == Some(true) { total } else { 0 }];
-            }
-            match id {
-                IdRef::Uint(id) => uints[row as usize] = id,
-                IdRef::Uuid(id) => uuids[row as usize] = id,
+                (serde_json::Value::String(text), None | Some(true)) if !text.is_empty() => {
+                    strings = Some(true);
+                    texts.push((row, text.as_str().into()));
+                }
+                _ => return,
             }
         }
     }
-    let table = if kind == Some(true) {
-        IdTable::Uuid(uuids)
+    let table = if strings == Some(true) {
+        let bytes: usize = texts.iter().map(|(_, t)| t.len()).sum();
+        if (bytes + total * 4) as u64 > total as u64 * IdTable::MAX_STR_ROW_BYTES
+            || bytes >= u32::MAX as usize
+        {
+            return;
+        }
+        if texts
+            .iter()
+            .all(|(_, text)| IdRef::parse_uuid(text).is_some())
+        {
+            let mut uuids = vec![u128::MAX; total];
+            for (row, text) in &texts {
+                uuids[*row as usize] = IdRef::parse_uuid(text).expect("checked above");
+            }
+            IdTable::Uuid(uuids)
+        } else {
+            texts.sort_unstable_by_key(|(row, _)| *row);
+            let mut packed = Vec::with_capacity(bytes);
+            let mut offsets = Vec::with_capacity(total + 1);
+            let mut next = texts.iter().peekable();
+            for row in 0..total as u32 {
+                offsets.push(packed.len() as u32);
+                if let Some((_, text)) = next.next_if(|(r, _)| *r == row) {
+                    packed.extend_from_slice(text.as_bytes());
+                }
+            }
+            offsets.push(packed.len() as u32);
+            IdTable::Str {
+                bytes: packed,
+                offsets,
+            }
+        }
     } else {
         IdTable::Uint(uints)
     };

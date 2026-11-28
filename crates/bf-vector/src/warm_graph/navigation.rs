@@ -100,6 +100,15 @@ impl<'a> Screen<'a> {
         h > tail.saturating_add(self.margin)
     }
 }
+/// What a [`Scratch::filtered_search`] found.
+pub struct Filtered {
+    /// The nearest matching nodes, nearest first (at most `ef`).
+    pub hits: Vec<Hit>,
+    /// Scores computed.
+    pub evaluations: usize,
+    /// Whether the evaluation cap ended the search before its frontier was exhausted.
+    pub capped: bool,
+}
 /// Reusable, exact visitation and one sorted beam. Its owner reserves retained capacity.
 pub struct Scratch {
     visited: Visited,
@@ -157,6 +166,91 @@ impl Scratch {
             screen,
         );
         (self.beam.iter().map(|b| b.hit).collect(), evaluations)
+    }
+    /// A beam search that returns only nodes `matches` accepts. Every node is a stepping stone,
+    /// so the walk keeps its connectivity under any filter, but only matching nodes enter the
+    /// `ef` results. It starts from `seeds` (scored here) and stops when the nearest unexpanded
+    /// node is farther than the farthest of `ef` matching results, or after `max_evaluations`
+    /// scores.
+    #[allow(clippy::too_many_arguments)]
+    pub fn filtered_search(
+        &mut self,
+        links: &[[u32; 34]],
+        degrees: &[u8],
+        seeds: &[u32],
+        ef: usize,
+        max_evaluations: usize,
+        mut score: impl FnMut(u32) -> f32,
+        mut prefetch: impl FnMut(u32),
+        mut matches: impl FnMut(u32) -> bool,
+    ) -> Filtered {
+        use std::cmp::Reverse;
+        self.visited.begin();
+        let mut frontier: std::collections::BinaryHeap<Reverse<Hit>> = Default::default();
+        let mut found: Vec<Hit> = Vec::with_capacity(ef + 1);
+        let mut evaluations = 0;
+        let offer = |hit: Hit, found: &mut Vec<Hit>| {
+            if found.len() < ef || hit < *found.last().unwrap() {
+                let at = found.partition_point(|h| *h < hit);
+                found.insert(at, hit);
+                found.truncate(ef);
+            }
+        };
+        for &id in seeds {
+            if self.visited.insert(id) {
+                let hit = Hit {
+                    id,
+                    distance: score(id),
+                };
+                evaluations += 1;
+                frontier.push(Reverse(hit));
+                if matches(id) {
+                    offer(hit, &mut found);
+                }
+            }
+        }
+        let mut pending = [0u32; MAX_LINKS];
+        let mut capped = false;
+        while let Some(Reverse(current)) = frontier.pop() {
+            if found.len() >= ef && current > *found.last().unwrap() {
+                break;
+            }
+            if evaluations >= max_evaluations {
+                capped = true;
+                break;
+            }
+            let degree = degrees[current.id as usize] as usize;
+            let mut count = 0;
+            for &id in &links[current.id as usize][..degree] {
+                if self.visited.insert(id) {
+                    pending[count] = id;
+                    count += 1;
+                }
+            }
+            for position in 0..count {
+                if let Some(&next) = pending[..count].get(position + 2) {
+                    prefetch(next);
+                }
+                let id = pending[position];
+                let hit = Hit {
+                    id,
+                    distance: score(id),
+                };
+                evaluations += 1;
+                // A node farther than every kept result and the frontier's nearest can still lead
+                // somewhere, so it joins the frontier unless the results are full and it is worse
+                // than their farthest by the time it would be expanded (the pop test).
+                frontier.push(Reverse(hit));
+                if matches(id) {
+                    offer(hit, &mut found);
+                }
+            }
+        }
+        Filtered {
+            hits: found,
+            evaluations,
+            capped,
+        }
     }
     /// The shared beam search, for serving and for graph construction. `adjacent` copies one
     /// node's neighbors into the buffer and returns their count (at most [`MAX_LINKS`]).

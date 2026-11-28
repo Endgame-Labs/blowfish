@@ -32,15 +32,18 @@ impl Id {
         serde_json::to_value(self).expect("ID serializes")
     }
 }
-/// A document ID in the typed ID-only answer: an unsigned integer, or a canonical UUID kept as its
-/// 16 bytes (big-endian, so the numeric order is the order of the canonical lowercase text).
-/// Orders as [`Id`] does: integers first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A document ID in the typed ID-only answer: an unsigned integer, a canonical UUID kept as its
+/// 16 bytes (big-endian, so the numeric order is the order of the canonical lowercase text), or
+/// any other string. Orders as [`Id`] does: integers first. Within one answer the strings are
+/// either all `Uuid` or all `Str`, which [`IdRef::from_id_text`] keeps true.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IdRef {
     /// Unsigned integer ID.
     Uint(u64),
     /// UUID ID, formatted as 36 lowercase hexadecimal characters with hyphens.
     Uuid(u128),
+    /// Any other string ID, ordered by its bytes as the general path orders it.
+    Str(Box<str>),
 }
 impl IdRef {
     /// Parse a canonical (lowercase, hyphenated, 36 characters) UUID. Any other text is `None`,
@@ -82,12 +85,13 @@ impl IdRef {
         out
     }
     /// The general path's [`Id`] for this ID.
-    pub fn to_id(self) -> Id {
+    pub fn to_id(&self) -> Id {
         match self {
-            Self::Uint(id) => Id::Uint(id),
+            Self::Uint(id) => Id::Uint(*id),
             Self::Uuid(id) => Id::String(
-                String::from_utf8(Self::uuid_text(id).to_vec()).expect("UUID text is ASCII"),
+                String::from_utf8(Self::uuid_text(*id).to_vec()).expect("UUID text is ASCII"),
             ),
+            Self::Str(text) => Id::String(text.to_string()),
         }
     }
     /// The typed ID of a general [`Id`], or `None` for a string that is not a canonical UUID.
@@ -95,6 +99,14 @@ impl IdRef {
         match id {
             Id::Uint(id) => Some(Self::Uint(*id)),
             Id::String(text) => Self::parse_uuid(text).map(Self::Uuid),
+        }
+    }
+    /// The typed ID of a general [`Id`] in an answer whose strings are all `Str`: every string
+    /// stays text, even a canonical UUID, so that it orders with its neighbors.
+    pub fn from_id_text(id: &Id) -> Self {
+        match id {
+            Id::Uint(id) => Self::Uint(*id),
+            Id::String(text) => Self::Str(text.as_str().into()),
         }
     }
 }

@@ -1357,6 +1357,19 @@ async fn typed_fixture_with(
     uuids: bool,
     staged: bool,
 ) -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
+    typed_fixture_kind(uuids, false, staged).await
+}
+/// A string ID of the kind a real corpus has: a prefix, a zero-padded number, and characters that
+/// need JSON escapes (a quote, a backslash, and non-ASCII text).
+fn string_of(id: usize) -> String {
+    format!("nq/train/{id:07}\"\\é-{}", id % 7)
+}
+/// [`typed_fixture_with`] with `strings` making the IDs strings that are not UUIDs.
+async fn typed_fixture_kind(
+    uuids: bool,
+    strings: bool,
+    staged: bool,
+) -> (Engine, Vec<Vec<f32>>, Arc<Entry>, Cleanup) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.scratch")
         .join(format!("g18-ids-{}", uuid::Uuid::new_v4()));
@@ -1406,7 +1419,9 @@ async fn typed_fixture_with(
             } else {
                 v
             };
-            if uuids {
+            if strings {
+                json!({"id":string_of(id),"vector":v,"group":id%3})
+            } else if uuids {
                 json!({"id":uuid_of(id),"vector":v,"group":id%3})
             } else {
                 json!({"id":id,"vector":v,"group":id%3})
@@ -1462,7 +1477,8 @@ async fn typed_fixture_with(
     }
     assert!(held.ids.get().is_some(), "the ID table was never built");
     assert!(
-        matches!(held.ids.get(), Some(IdTable::Uuid(_))) == uuids,
+        matches!(held.ids.get(), Some(IdTable::Uuid(_))) == uuids
+            && matches!(held.ids.get(), Some(IdTable::Str { .. })) == strings,
         "the table has the kind of the IDs"
     );
     (e, vectors, held, Cleanup(root))
@@ -1829,6 +1845,80 @@ async fn typed_ids_path_serves_uuid_ids_byte_identically() {
         let got = typed(body).await.expect("typed path serves under a tail");
         assert!(
             !String::from_utf8(got).unwrap().contains(&uuid_of(0)),
+            "the overwritten row 0 must not answer for query 0"
+        );
+        compared
+    })
+    .await;
+    assert_eq!(compared, 3 * 6 * 18);
+    e.delete_namespace("hot").await.unwrap();
+    drop(held);
+    assert!(e.shutdown(Duration::from_secs(5)).await);
+}
+/// Round G28: string IDs that are not UUIDs are served from a packed table (bytes and row offsets),
+/// escaped as the general path escapes them, with the same order and ties, with and without an
+/// unindexed tail (inserts with string and canonical-UUID IDs, overwrites, and deletes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_ids_path_serves_string_ids_byte_identically() {
+    let _exclusive = ADMISSION_GATE.write().await;
+    let (e, vectors, held, _cleanup) = typed_fixture_kind(false, true, false).await;
+    let table_bytes = held.ids.get().unwrap().resident_bytes();
+    assert!(table_bytes >= 2500 * 20, "the table's bytes are counted");
+    let queries = vectors.clone();
+    let compared = on_reactor_typed_and_general(&e, move |engine, typed, general| async move {
+        let check = |label: &'static str| {
+            let (typed, general, queries) = (typed.clone(), general.clone(), queries.clone());
+            async move {
+                let mut n = 0;
+                for i in [0, 17, 400, 1003, 1999, 2499] {
+                    for k in (1..=100).step_by(9).chain([1, 2, 10, 37, 64, 100]) {
+                        let body = json!({"rank_by":["vector","ANN",queries[i]],"top_k":k});
+                        let got = typed(body.clone()).await.unwrap_or_else(|| {
+                            panic!("{label}: typed path declined query {i} top_k {k}")
+                        });
+                        assert_eq!(got, general(body).await, "{label}: query {i} top_k {k}");
+                        n += 1;
+                    }
+                }
+                n
+            }
+        };
+        let mut compared = check("no tail").await;
+        let body = json!({"rank_by":["vector","ANN",queries[17]],"top_k":3});
+        let got: Value = serde_json::from_slice(&typed(body).await.unwrap()).unwrap();
+        assert_eq!(got["rows"][0]["id"], json!(string_of(17)));
+        let near = |v: &Vec<f32>, shift: f32| v.iter().map(|x| x + shift).collect::<Vec<_>>();
+        let write = |body: Value| {
+            let engine = engine.clone();
+            async move {
+                engine
+                    .write("hot", serde_json::from_value::<WriteRequest>(body).unwrap())
+                    .await
+                    .unwrap();
+            }
+        };
+        // Tail rows tie with base rows (distance 0) and carry a string, and a canonical UUID text (which
+        // must stay text beside its string neighbors).
+        write(json!({"upsert_rows":[
+            {"id":string_of(9000),"vector":queries[0],"group":0},
+            {"id":uuid_of(9001),"vector":queries[0],"group":1},
+            {"id":string_of(9002),"vector":queries[0],"group":2},
+            {"id":string_of(9003),"vector":near(&queries[17], 0.01),"group":2},
+            {"id":string_of(2),"vector":queries[17],"group":2},
+        ]}))
+        .await;
+        compared += check("inserts").await;
+        let far = queries[400].iter().map(|x| -x).collect::<Vec<_>>();
+        write(json!({"upsert_rows":[
+            {"id":string_of(0),"vector":far,"group":0},
+            {"id":string_of(1003),"vector":queries[1999],"group":1},
+        ],"deletes":[string_of(3),string_of(4),string_of(1000)]}))
+        .await;
+        compared += check("overwrites and deletes").await;
+        let body = json!({"rank_by":["vector","ANN",queries[0]],"top_k":2});
+        let got = typed(body).await.expect("typed path serves under a tail");
+        assert!(
+            !String::from_utf8(got).unwrap().contains("0000000"),
             "the overwritten row 0 must not answer for query 0"
         );
         compared

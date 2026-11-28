@@ -244,6 +244,9 @@ impl QueryResponse {
                     out.extend_from_slice(&crate::IdRef::uuid_text(*id));
                     out.push(b'"');
                 }
+                crate::IdRef::Str(text) => {
+                    serde_json::to_writer(&mut *out, &**text).expect("a string serializes")
+                }
             }
             out.push(b'}');
         }
