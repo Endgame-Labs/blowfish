@@ -21,7 +21,28 @@ const RETRY: Duration = Duration::from_secs(1800);
 /// Exact-rerank shortlist for the largest request the original graph path served.
 const RERANK: usize = 30;
 /// The largest `k + offset` the graph serves; larger requests use the IVF tier.
-const MAX_K: usize = 100;
+const MAX_K: usize = 256;
+/// The largest `k` the filtered code scan serves (its shortlist and screen were measured to 100).
+const SCAN_MAX_K: usize = 100;
+// G26 TEMPORARY SWITCH (removed before done): a file named by G26_SWITCH holds the largest k.
+fn max_k() -> usize {
+    static LAST: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
+    let Some(path) = std::env::var_os("G26_SWITCH") else {
+        return MAX_K;
+    };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, v)) = *last
+        && at.elapsed() < Duration::from_millis(250)
+    {
+        return v;
+    }
+    let v = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(MAX_K);
+    *last = Some((Instant::now(), v));
+    v
+}
 
 /// Beam width and exact-rerank shortlist for a request of `k` rows, given the calibrated beam.
 ///
@@ -595,7 +616,7 @@ impl Cache {
         }
         self.ready(ns, state, attribute, set).is_some_and(|e| {
             k > 0
-                && k <= MAX_K
+                && k <= max_k()
                 && e.graph.len() >= k
                 && vector.len() == e.graph.dims()
                 && e.calibration
@@ -626,7 +647,7 @@ impl Cache {
             };
             if q.filters.is_some()
                 || q.total().unwrap_or(10) == 0
-                || q.total().unwrap_or(10).saturating_add(q.offset) > MAX_K
+                || q.total().unwrap_or(10).saturating_add(q.offset) > max_k()
                 || vector.iter().all(|x| *x == 0.)
                 || state.metric != DistanceMetric::CosineDistance
             {
@@ -1089,7 +1110,7 @@ pub(crate) fn available(
         .ready(&scope.namespace, state, attribute, set)
         .is_some_and(|e| {
             k > 0
-                && k <= MAX_K
+                && k <= max_k()
                 && e.graph.len() >= k
                 && vector.len() == e.graph.dims()
                 && vector.iter().any(|x| *x != 0.)
@@ -1217,7 +1238,7 @@ pub(crate) fn scan_eligible(
         .ready(&scope.namespace, state, attribute, set)
         .is_some_and(|e| {
             k > 0
-                && k <= MAX_K
+                && k <= SCAN_MAX_K
                 && e.graph.can_scan()
                 && vector.len() == e.graph.dims()
                 && vector.iter().any(|x| *x != 0.)
@@ -1309,7 +1330,7 @@ pub(crate) async fn search(
         }
     };
     if k == 0
-        || k > MAX_K
+        || k > max_k()
         || entry.graph.len() < k
         || vector.len() != entry.graph.dims()
         || vector.iter().all(|x| *x == 0.)
@@ -1601,7 +1622,7 @@ pub(crate) async fn search_ids(
         c.quality.serving.unwrap_or(c.quality.trial)
     };
     if k == 0
-        || k > MAX_K
+        || k > max_k()
         || entry.graph.len() < k
         || vector.len() != entry.graph.dims()
         || vector.iter().all(|x| *x == 0.)

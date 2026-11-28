@@ -3,7 +3,7 @@
 //!
 //! Usage: `native_drive DATA PORT bf|qdrant K SECONDS [EF] [OUT_JSON] [SERVER_PID]`
 //!
-//! `DATA` holds `queries.npy` (`<f4`) and `truth.npy` (`<i4`). It opens 16 persistent keep-alive
+//! `DATA` holds `queries.npy` (`<f4`) and `truth.npy` (`<i4`; `NATIVE_DRIVE_TRUTH` names another file, `NATIVE_DRIVE_OFFSET` pages). It opens 16 persistent keep-alive
 //! connections (one thread each), encodes every request body before the clock starts (floats
 //! written as the shortest `f64` text of the `f32` value, the same digits as Python's `tolist()`),
 //! runs one serial quality pass over all queries on its own connection (recall and a SHA-256 of every
@@ -154,14 +154,14 @@ fn process_cpu(pid: u32) -> f64 {
             .fold(0.0, |acc, p| acc * 60.0 + p.parse::<f64>().unwrap())
 }
 
-fn encode(engine: &str, k: usize, ef: u64, q: &[f32]) -> Vec<u8> {
+fn encode(engine: &str, k: usize, ef: u64, offset: usize, q: &[f32]) -> Vec<u8> {
     let vector = q
         .iter()
         .map(|x| serde_json::to_string(&f64::from(*x)).unwrap())
         .collect::<Vec<_>>()
         .join(",");
     if engine == "bf" {
-        format!(r#"{{"rank_by":["vector","ANN",[{vector}]],"top_k":{k},"include_attributes":false}}"#)
+        format!(r#"{{"rank_by":["vector","ANN",[{vector}]],"top_k":{k},"offset":{offset},"include_attributes":false}}"#)
     } else {
         format!(r#"{{"vector":[{vector}],"limit":{k},"with_payload":false,"with_vector":false,"params":{{"hnsw_ef":{ef}}}}}"#)
     }
@@ -182,6 +182,9 @@ fn main() {
     let ef: u64 = args.get(6).map_or(0, |s| s.parse().unwrap());
     let out_path = args.get(7).filter(|s| !s.is_empty());
     let server_pid: Option<u32> = args.get(8).map(|s| s.parse().unwrap());
+    // NATIVE_DRIVE_OFFSET pages: the request skips this many rows, and recall is of ranks
+    // OFFSET..OFFSET+K against the truth file's columns (which must be at least that wide).
+    let offset: usize = std::env::var("NATIVE_DRIVE_OFFSET").map_or(0, |s| s.parse().unwrap());
     let (shape, raw) = npy(&format!("{data}/queries.npy"), "<f4");
     let (rows, dims) = (shape[0], shape[1]);
     let queries: Vec<f32> = raw
@@ -190,7 +193,13 @@ fn main() {
         .iter()
         .map(|b| f32::from_le_bytes(*b))
         .collect();
-    let (tshape, traw) = npy(&format!("{data}/truth.npy"), "<i4");
+    let (tshape, traw) = npy(
+        &format!(
+            "{data}/{}",
+            std::env::var("NATIVE_DRIVE_TRUTH").unwrap_or_else(|_| "truth.npy".into())
+        ),
+        "<i4",
+    );
     let truth: Vec<i32> = traw
         .as_chunks::<4>()
         .0
@@ -205,7 +214,7 @@ fn main() {
     };
     let bodies: Arc<Vec<Vec<u8>>> = Arc::new(
         (0..rows)
-            .map(|i| encode(&engine, k, ef, &queries[i * dims..(i + 1) * dims]))
+            .map(|i| encode(&engine, k, ef, offset, &queries[i * dims..(i + 1) * dims]))
             .collect(),
     );
 
@@ -220,7 +229,7 @@ fn main() {
             &answer["result"]
         };
         digest.update(serde_json::to_vec(found).unwrap());
-        let want = &truth[i * width..i * width + k];
+        let want = &truth[i * width + offset..i * width + offset + k];
         overlap += found
             .as_array()
             .unwrap()
