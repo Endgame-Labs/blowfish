@@ -19470,6 +19470,55 @@ its best bound. The remaining lever is the wave tails (the bundle wave's 62 read
 Resources: one on-demand c7gn.4xlarge for 0.4 hours (about $0.4 with the root volume), terminated; its key pair and security group are deleted; nothing was written to the
 bucket (the fixture was only read). Offline sizing ran on this VM.
 
+## Round C43: scoring windows as their postings arrive cannot speed up cold BM25 (killed at the model, no engine change)
+
+Hypothesis (Sol, `briefs/ideas/1125-sol.md` #2): C42 scores its wide first posting batch only after every read arrives, so the slowest read sets the time. Score each window
+as soon as its postings arrive, raise the shared top-k floor, and cancel outstanding reads whose windows' bounds are strictly below it, taking C42's 136.4 ms p90 to about
+101 ms. The brief said to model first and stop if the modeled p90 gain was under 1.15x. It is 1.007x, and even an oracle that cancels every read but the first
+reaches only 1.03x on the trace (about 1.10x on untraced latency), so nothing was built.
+
+### Method
+
+One on-demand c7gn.4xlarge (Ubuntu 24.04 arm64, Clang 19, Rust 1.100.1, NumKong SME targets off) in us-west-2, `scale-server` at v0.1.84 plus a temporary trace patch
+(a temporary trace hook on the round's branch, not in the tree), `tmp/msmarco-1m-v021/store/` read only on S3, no disk cache, 2 GiB memory cache, 4,000-byte blocks. `examples/c43_trace.py`: one
+fresh process, one throwaway query, then queries 100 to 299 of `bm25-msmarco.json` (200 queries, top 10), `POST /_bench/drop_caches` before each, `BF_TRACE_READS` and
+`BF_TRACE_C43` set. The patch prints, per segment, the first posting batch (each window's bound and the posting blocks it still needs), the time it was issued and done, the
+top scores of every window scored, and, per coalesced backend GET, its range and its start and end time. `examples/c43_model.py` replays it:
+
+- A window completes when the last GET covering its blocks has arrived, and its scores count from then.
+- The floor at time t is the largest k-th best score, over the segments, of the windows completed by t (the shared threshold does the same).
+- A window is resolved at the earlier of its completion and the first time the floor is strictly above its bound. A segment's batch ends when every window is resolved,
+  and a query's latency drops by the gap between its slowest segment as measured and as modeled.
+
+Tracing is expensive (8 segments print thousands of lines): traced p50 is 258 ms, p90 459 ms, against 114 and 136 ms untraced. 189 of 200 queries had a first batch (the
+rest were answered without a posting batch).
+
+### Result
+
+| | p50, ms | p90, ms | Mean, ms |
+| --- | ---: | ---: | ---: |
+| Traced, as measured | 258.2 | 459.4 | 276.0 |
+| Modeled, with cancel on the floor | 254.0 | 456.0 | 273.3 |
+| Ratio | 1.017 | **1.007** | 1.010 |
+| Oracle (each segment's batch ends at its first GET) | 245.8 | 447.1 | |
+| Oracle ratio | 1.050 | 1.027 | |
+
+The modeled saving per query is 2.2 ms at p50, 5.6 ms at p90, and 10.6 ms at most. Scaled to untraced latency, even the oracle's saving (12 ms at p90) would give 136.4 to
+about 124 ms, or 1.10x, under the 1.15x bar, and the real model's 5.6 ms gives about 1.04x.
+
+### Why there is little to cancel
+
+The first batch is wide (median 782 windows a segment) but not many reads: a text segment's first batch is **a median of 2 coalesced GETs** (the posting blocks of the
+query's few terms are contiguous, and the cache merges adjacent blocks into one GET). The arrival spread inside a segment's batch is 5.8 ms at the median and 14.1 ms at p90,
+which is all that cancelling the late reads could ever recover. And each GET covers a run of windows that includes the best ones, so it stays competitive until it arrives.
+Finishing windows early does not help either, because their scores are not needed before the last needed read arrives. The wait is the single S3 round trip, not a tail of
+many reads. Splitting the GETs so that useless windows get their own reads would add GETs (C42 cut them from 161 to 94 a query) to save a few milliseconds at p90.
+
+What is left of cold BM25 is the chain manifest, bundle wave, and one posting batch, each one S3 round trip of about 24 ms.
+
+Resources: one on-demand c7gn.4xlarge for about 0.25 hours (under $0.5 with the root volume), terminated; its key pair and security group are deleted; nothing was written to
+the bucket. The scratch files (trace log, binaries) went with the instance.
+
 ## Round BW30: `limit.per` over two columns groups by a tuple of codes (about 5 times), and a bounded search stops scoring rows that cannot place (4 to 6 times CPU on one column)
 
 ### What shipped
