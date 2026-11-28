@@ -161,3 +161,31 @@ async fn cached_mapping_rejects_a_larger_declared_length() {
         Error::Config(_)
     ));
 }
+
+#[tokio::test]
+async fn head_on_a_mapped_store_stats_on_the_calling_thread_and_matches_the_object() {
+    let dir = directory();
+    let store = store(dir.path()).await;
+    let data = Bytes::from_static(b"twenty-two bytes here");
+    store.create("nested/object", data.clone()).await.unwrap();
+    let info = store.head("nested/object").await.unwrap();
+    assert_eq!(info.key, "nested/object");
+    assert!(info.size >= data.len() as u64);
+    assert!(
+        (chrono::Utc::now() - info.last_modified)
+            .num_seconds()
+            .abs()
+            < 60
+    );
+    // A missing object and a directory are both "not found", as the object store says.
+    assert!(matches!(
+        store.head("nested/missing").await,
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(store.head("nested").await, Err(Error::NotFound)));
+    store.delete("nested/object").await.unwrap();
+    assert!(matches!(
+        store.head("nested/object").await,
+        Err(Error::NotFound)
+    ));
+}

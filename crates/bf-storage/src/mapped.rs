@@ -48,6 +48,23 @@ impl Mapped {
         });
         Ok(value)
     }
+    /// The size and modification time of the object at `path`, from one `stat` on the calling
+    /// thread. A stat takes microseconds, and the object store's own `head` would hand it to the
+    /// blocking pool, where thousands of queries a second spin on the pool's one mutex.
+    pub(crate) fn head(&self, path: &Path) -> Result<(u64, chrono::DateTime<chrono::Utc>), Error> {
+        let metadata =
+            std::fs::metadata(self.backend.path_to_filesystem(path)?).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Error::NotFound
+                } else {
+                    Error::Io(error)
+                }
+            })?;
+        if metadata.is_dir() {
+            return Err(Error::NotFound);
+        }
+        Ok((metadata.len(), metadata.modified()?.into()))
+    }
     fn open(&self, path: &Path, random: bool) -> Result<Arc<Mapping>, Error> {
         let file = File::open(self.backend.path_to_filesystem(path)?).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -87,8 +104,7 @@ impl Mapped {
             return Ok(ranges.iter().map(|_| Bytes::new()).collect());
         }
         let now = Instant::now();
-        metrics::counter!("blowfish_object_store_attempts_total", "op" => "mapped_read")
-            .increment(1);
+        read_metrics().attempts.increment(1);
         let result = (|| {
             // Large directory and ID reads need bulk I/O on a cold disk; small reads and
             // sparse vector batches must not trigger read-ahead. Both views share OS pages.
@@ -129,11 +145,18 @@ impl Mapped {
             Err(_) => "error",
         };
         diagnostics::record("mapped_read", bytes, elapsed);
-        metrics::counter!("blowfish_object_store_requests_total", "op" => "mapped_read", "status" => status).increment(1);
-        metrics::counter!("blowfish_object_store_bytes_total", "op" => "mapped_read")
-            .increment(bytes);
-        metrics::histogram!("blowfish_object_store_request_seconds", "op" => "mapped_read")
-            .record(elapsed.as_secs_f64());
+        let m = read_metrics();
+        let (cell, status) = match status {
+            "ok" => (&m.ok, "ok"),
+            "not_found" => (&m.not_found, "not_found"),
+            _ => (&m.error, "error"),
+        };
+        cell.get_or_init(|| {
+            metrics::counter!("blowfish_object_store_requests_total", "op" => "mapped_read", "status" => status)
+        })
+        .increment(1);
+        m.bytes.increment(bytes);
+        m.seconds.record(elapsed.as_secs_f64());
         result
     }
     pub(crate) fn remove(&self, path: &Path) {
@@ -146,4 +169,29 @@ impl Mapped {
         self.files.invalidate_all();
         self.files.run_pending_tasks();
     }
+}
+
+/// The metric handles of a mapped read, resolved once: the recorder's key construction and
+/// registry lookup stay off the query path.
+struct ReadMetrics {
+    attempts: metrics::Counter,
+    // Registered on first use, so a status that never happens exports no series.
+    ok: std::sync::OnceLock<metrics::Counter>,
+    not_found: std::sync::OnceLock<metrics::Counter>,
+    error: std::sync::OnceLock<metrics::Counter>,
+    bytes: metrics::Counter,
+    seconds: metrics::Histogram,
+}
+fn read_metrics() -> &'static ReadMetrics {
+    static HANDLES: std::sync::OnceLock<ReadMetrics> = std::sync::OnceLock::new();
+    HANDLES.get_or_init(|| {
+        ReadMetrics {
+            attempts: metrics::counter!("blowfish_object_store_attempts_total", "op" => "mapped_read"),
+            ok: Default::default(),
+            not_found: Default::default(),
+            error: Default::default(),
+            bytes: metrics::counter!("blowfish_object_store_bytes_total", "op" => "mapped_read"),
+            seconds: metrics::histogram!("blowfish_object_store_request_seconds", "op" => "mapped_read"),
+        }
+    })
 }

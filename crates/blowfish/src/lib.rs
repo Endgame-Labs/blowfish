@@ -376,12 +376,17 @@ fn body<T>(result: Result<Json<T>, JsonRejection>) -> Result<T, HttpError> {
 struct InFlight;
 impl Drop for InFlight {
     fn drop(&mut self) {
-        metrics::gauge!("blowfish_http_requests_in_flight").decrement(1.0);
+        in_flight().decrement(1.0);
     }
+}
+/// The in-flight gauge's handle, resolved once.
+fn in_flight() -> &'static metrics::Gauge {
+    static GAUGE: OnceLock<metrics::Gauge> = OnceLock::new();
+    GAUGE.get_or_init(|| metrics::gauge!("blowfish_http_requests_in_flight"))
 }
 async fn authorize(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let started = Instant::now();
-    metrics::gauge!("blowfish_http_requests_in_flight").increment(1.0);
+    in_flight().increment(1.0);
     let _guard = InFlight;
     let route = request
         .extensions()
@@ -506,15 +511,47 @@ fn finish(
     key_name: String,
     started: Instant,
 ) -> Response {
-    let labels = [
-        ("route", route),
-        ("method", method),
-        ("status", response.status().as_u16().to_string()),
-        ("key_name", key_name),
-    ];
-    metrics::counter!("blowfish_http_requests_total", &labels).increment(1);
-    metrics::histogram!("blowfish_http_request_duration_seconds", &labels)
-        .record(started.elapsed().as_secs_f64());
+    let status = response.status().as_u16();
+    // The handles of each label set are resolved once per thread. A hit allocates nothing:
+    // the lookup key is built in a reused buffer.
+    #[derive(Default)]
+    struct Handles {
+        key: String,
+        by_labels: std::collections::HashMap<String, (metrics::Counter, metrics::Histogram)>,
+    }
+    thread_local! {
+        static HANDLES: std::cell::RefCell<Handles> = std::cell::RefCell::new(Handles::default());
+    }
+    HANDLES.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let Handles { key, by_labels } = &mut *cell;
+        key.clear();
+        let _ = std::fmt::Write::write_fmt(
+            key,
+            format_args!("{route}\0{method}\0{status}\0{key_name}"),
+        );
+        if by_labels.len() >= 4096 {
+            by_labels.clear();
+        }
+        if !by_labels.contains_key(key.as_str()) {
+            let labels = [
+                ("route", route),
+                ("method", method),
+                ("status", status.to_string()),
+                ("key_name", key_name),
+            ];
+            by_labels.insert(
+                key.clone(),
+                (
+                    metrics::counter!("blowfish_http_requests_total", &labels),
+                    metrics::histogram!("blowfish_http_request_duration_seconds", &labels),
+                ),
+            );
+        }
+        let (counter, histogram) = &by_labels[key.as_str()];
+        counter.increment(1);
+        histogram.record(started.elapsed().as_secs_f64());
+    });
     response
 }
 async fn json_errors(request: Request, next: Next) -> Response {
@@ -632,7 +669,9 @@ async fn query(
         let mut out = Vec::with_capacity(512 + 40 * answer.rows().len());
         if answer.write_json(&mut out) {
             // The typed path takes only plain approximate vector queries.
-            metrics::counter!("blowfish_query_requests_total", "kind" => "ann").increment(1);
+            static ANN: OnceLock<metrics::Counter> = OnceLock::new();
+            ANN.get_or_init(|| metrics::counter!("blowfish_query_requests_total", "kind" => "ann"))
+                .increment(1);
             return Ok((
                 [(
                     axum::http::header::CONTENT_TYPE,
