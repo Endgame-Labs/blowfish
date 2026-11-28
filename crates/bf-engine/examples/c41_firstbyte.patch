@@ -1,0 +1,35 @@
+diff --git a/crates/bf-storage/src/observed.rs b/crates/bf-storage/src/observed.rs
+index c4aa308..4bf720b 100644
+--- a/crates/bf-storage/src/observed.rs
++++ b/crates/bf-storage/src/observed.rs
+@@ -148,8 +148,11 @@ impl ObjectStore for Observed {
+         };
+         let start = Instant::now();
+         let _guard = (!head).then(|| self.1.enter());
++        let first_byte = std::sync::atomic::AtomicU64::new(0);
++        let first_byte = &first_byte;
+         let result = async {
+             let result = self.0.get_opts(path, opts).await?;
++            first_byte.store(start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+             if head {
+                 return Ok((result, 0));
+             }
+@@ -176,7 +179,7 @@ impl ObjectStore for Observed {
+         if op != "head" && trace_reads() {
+             let (a, b) = range_dbg.unwrap_or((0, 0));
+             eprintln!(
+-                "TRACE_READ {} {} {} {} {} {}",
++                "TRACE_READ {} {} {} {} {} {} {}",
+                 path,
+                 a,
+                 b,
+@@ -184,7 +187,8 @@ impl ObjectStore for Observed {
+                 std::time::SystemTime::now()
+                     .duration_since(std::time::UNIX_EPOCH)
+                     .map_or(0, |d| d.as_millis()),
+-                start.elapsed().as_millis()
++                start.elapsed().as_millis(),
++                first_byte.load(std::sync::atomic::Ordering::Relaxed)
+             );
+         }
+         record(
