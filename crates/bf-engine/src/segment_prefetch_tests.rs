@@ -25,7 +25,49 @@ struct Delayed {
     canceled: AtomicUsize,
     active: AtomicUsize,
     delay_docs: AtomicBool,
+    /// Round T2: when set to a docs file's footer offset, ranged reads of that file before the
+    /// footer (column blocks, winners' and speculation's alike) wait until `gate_open`. Speculation
+    /// is best-effort: a query that finishes its winners before the speculative task is first
+    /// polled aborts it without issuing the read, so a test that needs a speculative read to start
+    /// holds the winners back with this gate until that read has started.
+    gate: Mutex<Option<(Path, u64)>>,
+    gate_open: AtomicBool,
+    gate_wake: tokio::sync::Notify,
 }
+impl Delayed {
+    fn open_gate(&self) {
+        self.gate_open.store(true, Ordering::SeqCst);
+        self.gate_wake.notify_waiters();
+    }
+    fn close_gate(&self, path: Path, footer: u64) {
+        self.gate_open.store(false, Ordering::SeqCst);
+        *self.gate.lock().unwrap() = Some((path, footer));
+    }
+    /// Waits at the gate (at most `GATE_LIMIT`, so a missing opener fails the test, not hangs it).
+    async fn pass_gate(&self, p: &Path, range: &Range<u64>) {
+        let held = self
+            .gate
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(path, footer)| path == p && range.end <= *footer);
+        if !held {
+            return;
+        }
+        let limit = tokio::time::Instant::now() + GATE_LIMIT;
+        loop {
+            let wake = self.gate_wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            if self.gate_open.load(Ordering::SeqCst)
+                || tokio::time::timeout_at(limit, wake).await.is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+const GATE_LIMIT: Duration = Duration::from_secs(10);
 impl fmt::Display for Delayed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("delayed columns")
@@ -42,6 +84,7 @@ struct Release(Arc<Delayed>);
 impl Drop for Release {
     fn drop(&mut self) {
         *self.0.blocked.lock().unwrap() = None;
+        self.0.open_gate();
         self.0.resume.notify_waiters();
     }
 }
@@ -81,9 +124,12 @@ impl ObjectStore for Delayed {
                 self.active.fetch_add(1, Ordering::SeqCst);
                 let _pending = Pending(self);
                 self.started.notify_one();
+                self.open_gate();
                 if self.blocked.lock().unwrap().is_some() {
                     resumed.await;
                 }
+            } else {
+                self.pass_gate(p, range).await;
             }
             // Let the speculative tasks start while the query awaits its exact vectors.
             if armed && p.as_ref().ends_with(".bfa") {
@@ -574,9 +620,18 @@ async fn stalled_nonwinning_projection_is_canceled_after_winner_hydration() {
     let path = Path::from(docs.key.as_str());
 
     let mut chosen = None;
+    // Winners' block reads wait at the gate while speculation issues its own (opened below after a
+    // head start), so the log shows what the planner speculates even on a loaded machine.
+    let footer = docs.size.saturating_sub(65536);
     for q in [0, 1007, 2049, 3011] {
         engine.drop_caches().await;
         backend.reads.lock().unwrap().clear();
+        backend.close_gate(path.clone(), footer);
+        let opener = backend.clone();
+        let head_start = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            opener.open_gate();
+        });
         let request: bf_types::QueryRequest = serde_json::from_value(serde_json::json!({
             "rank_by":["vector","ANN",vector(q)],"top_k":10,"include_attributes":["title"]
         }))
@@ -588,6 +643,8 @@ async fn stalled_nonwinning_projection_is_canceled_after_winner_hydration() {
             .result
             .rows
             .unwrap();
+        head_start.abort();
+        backend.open_gate();
         let winners: std::collections::BTreeSet<_> = expected
             .iter()
             .map(|r| r["id"].as_u64().unwrap() as usize / BLOCK_ROWS)
@@ -620,6 +677,10 @@ async fn stalled_nonwinning_projection_is_canceled_after_winner_hydration() {
     }
     let (request, expected, range) = chosen.expect("fixture must exercise nonwinning speculation");
     engine.drop_caches().await;
+    // The winners' reads wait until the blocked speculative read has started, so the query cannot
+    // finish and abort speculation before it gets there; the test still asserts that, once the
+    // winners are hydrated, the response does not wait for the stalled read.
+    backend.close_gate(path.clone(), footer);
     *backend.blocked.lock().unwrap() = Some((path, range));
     let _release = Release(backend.clone());
     let reader = engine.clone();
