@@ -4,6 +4,16 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.82] - 2026-11-28
+
+### Changed
+
+- **Cold filtered vector queries are up to 1.18 times faster:** Leaf scans read each probed leaf's exact byte ranges, merging only gaps under 64 KiB, instead of whole 256 KiB cache blocks, and cache those ranges in memory and on disk, so a warm repeat still reads nothing. On 10M rows on S3, a 7.9 percent filter reads 802 MB instead of 1,106 MB, and its cold p50 falls from 695 to 590 ms, with identical results. See Round C40 in `docs/benchmarks.md`.
+
+### Fixed
+
+- **Four load-sensitive test failures:** Unit-test engines each charged a quarter of memory to the shared admission budget, so under load no test graph could be admitted; read-only test engines ran a background indexer that raced the forced index pass; a speculative-read test could cancel the read before it started; and a bulk-load test depended on a wall-clock write rate. See `docs/testing.md` (Round T2).
+
 ## [0.1.81] - 2026-11-28
 
 ### Fixed
@@ -589,7 +599,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.81...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.82...HEAD
+[0.1.82]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.82
 [0.1.81]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.81
 [0.1.80]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.80
 [0.1.79]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.79

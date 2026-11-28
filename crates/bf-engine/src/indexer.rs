@@ -31,6 +31,9 @@ pub struct EngineConfig {
     pub bulk_flush_rows: usize,
     /// Longest a tail keeps accumulating under `bulk_flush_rows`.
     pub bulk_flush_age: Duration,
+    /// Rows a second a tail must arrive at for its flush to count as a bulk load's (see
+    /// `BULK_LOAD_ROWS_PER_SEC`; tests that load on a busy machine lower it).
+    pub bulk_load_rows_per_sec: f64,
     /// Logical tail bytes at which a bulk load stops accumulating and flushes (`BF_BULK_FLUSH_BYTES`).
     /// Under `max_unindexed_bytes`, so writes keep arriving while the flush builds.
     pub bulk_flush_bytes: u64,
@@ -125,6 +128,7 @@ impl Default for EngineConfig {
             index_age: Duration::from_secs(5),
             bulk_flush_rows: default_max_segment_rows().min(100_000),
             bulk_flush_age: Duration::from_secs(60),
+            bulk_load_rows_per_sec: BULK_LOAD_ROWS_PER_SEC,
             bulk_flush_bytes: bulk_flush_bytes_for(default_max_unindexed_bytes()),
             defer_compaction_segments: 1024,
             index_interval: Duration::from_millis(250),
@@ -1112,7 +1116,8 @@ impl Engine {
         // loads continue, across restarts too. A steady stream of writes is not a load: its rows
         // go into delta tiers as they come.
         if state.docs.len() >= self.0.config.bulk_flush_rows.max(4) / 4
-            && state.docs.len() as f64 / age.as_secs_f64().max(1.0) >= BULK_LOAD_ROWS_PER_SEC
+            && state.docs.len() as f64 / age.as_secs_f64().max(1.0)
+                >= self.0.config.bulk_load_rows_per_sec
         {
             manifest.bulk_load_at = Some(Utc::now());
         }
@@ -1330,7 +1335,8 @@ const BULK_LOAD_ROWS_PER_SEC: f64 = 2_000.0;
 fn bulk_wait(state: &NamespaceState, config: &EngineConfig, tail_age: Duration) -> bool {
     config.index_age >= Duration::from_secs(1)
         && (tail_age < config.index_age
-            || state.docs.len() as f64 / tail_age.as_secs_f64().max(1.0) >= BULK_LOAD_ROWS_PER_SEC)
+            || state.docs.len() as f64 / tail_age.as_secs_f64().max(1.0)
+                >= config.bulk_load_rows_per_sec)
         && state.shadowed.len() < config.bulk_flush_rows
         && tail_age < config.bulk_flush_age
         && state.tail_bytes < config.bulk_flush_bytes.min(config.max_unindexed_bytes)

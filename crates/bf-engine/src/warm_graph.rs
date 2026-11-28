@@ -42,6 +42,9 @@ mod effort;
 #[cfg(all(test, target_os = "macos"))]
 mod nav_probe;
 static RESERVED: AtomicU64 = AtomicU64::new(0);
+/// What one unit-test engine charges against the process-wide foreground share.
+#[cfg(test)]
+const TEST_ENGINE_FOREGROUND: u64 = 256 << 20;
 static FOREGROUND: AtomicU64 = AtomicU64::new(0);
 static CACHES: std::sync::LazyLock<Mutex<Vec<std::sync::Weak<Cache>>>> =
     std::sync::LazyLock::new(Default::default);
@@ -49,6 +52,14 @@ struct Foreground(u64);
 impl Foreground {
     fn new(bytes: u64) -> Self {
         let bytes = bytes.min(bf_alloc::memory_limit_bytes());
+        // Round T2. A server has one engine, so its caches' nominal budgets are what it can
+        // really hold. The unit tests of one process each build their own engines, mostly with
+        // the default budgets (a quarter of memory each), and under load many are alive at once:
+        // the sum reached 47 to 59 GB against a 33.6 GB limit, so `cap - foreground` was zero and
+        // no test graph could ever be admitted (`test graph was never admitted`). A test engine
+        // holds a few megabytes, so charge it a small fixed share instead.
+        #[cfg(test)]
+        let bytes = bytes.min(TEST_ENGINE_FOREGROUND);
         FOREGROUND.fetch_add(bytes, Ordering::AcqRel);
         Self(bytes)
     }

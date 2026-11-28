@@ -204,6 +204,21 @@ async fn setup() -> (Arc<Faults>, Storage, Engine) {
     }
     (faults, store, engine)
 }
+/// An engine that only reads, as a restarted server would for these checks. It must not index:
+/// `Engine::new` starts a background indexer (every 250 ms), and one left alive beside the engine
+/// under test races its forced index passes for the same namespace. When it publishes first, the
+/// forced pass returns `Ok(false)` without flushing the rows just written, so the next recluster
+/// reads a manifest without them (and, seeing no rows outside the tiers, builds a base).
+fn reader(store: &Storage) -> Engine {
+    Engine::with_config(
+        store.clone(),
+        EngineConfig {
+            indexing: false,
+            recall_sample_rate: 0.0,
+            ..Default::default()
+        },
+    )
+}
 fn options(scratch: &std::path::Path) -> ReclusterOptions {
     ReclusterOptions {
         attribute: "vector".into(),
@@ -290,7 +305,7 @@ async fn a_build_that_dies_midway_leaves_the_layout_and_its_objects_become_orpha
     }
     engine.collect_garbage("t").await.unwrap();
     assert_eq!(keys(&store, "ns/t/slabs/").await, installed);
-    assert_eq!(top(&Engine::new(store.clone()), 4321).await, json!(4321));
+    assert_eq!(top(&reader(&store), 4321).await, json!(4321));
     assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
 }
 
@@ -314,7 +329,7 @@ async fn a_failed_or_ambiguous_install_publication_is_retried_and_keeps_every_re
         for key in &referenced {
             assert!(store.get(key).await.is_ok(), "{key} survives GC");
         }
-        let fresh = Engine::new(store.clone());
+        let fresh = reader(&store);
         for q in [17usize, 2500, 5999] {
             assert_eq!(top(&fresh, q).await, json!(q));
         }
@@ -415,7 +430,7 @@ async fn writes_after_a_base_get_a_delta_on_its_cells_and_then_merge_into_a_new_
             assert!(store.get(key).await.is_ok(), "{key} survives GC");
         }
     }
-    let fresh = Engine::new(store.clone());
+    let fresh = reader(&store);
     for q in [17usize, 6500, 6150] {
         assert_eq!(top(&fresh, q).await, json!(q));
     }
@@ -498,7 +513,7 @@ async fn a_delta_builds_beside_a_base_rebuild_and_the_base_keeps_it() {
     assert_ne!(after[0].dir.key, before[0].dir.key);
     assert_eq!(after[1].dir.key, during[2].dir.key);
     engine.collect_garbage("t").await.unwrap();
-    let fresh = Engine::new(store.clone());
+    let fresh = reader(&store);
     for e in [&engine, &fresh] {
         for q in [17usize, 6100, 6500, 8999, 9000, 9299] {
             assert_eq!(top(e, q).await, json!(q));
@@ -532,6 +547,10 @@ async fn a_bulk_load_flush_is_kept_in_the_manifest_so_a_restart_still_waits() {
             indexing: false,
             recall_sample_rate: 0.0,
             bulk_flush_rows: 400,
+            // The flush counts as a load when its rows arrived faster than this. The default
+            // (2,000 a second) is a wall-clock rate, and the 4,950-row write takes longer than
+            // 2.5 seconds when the machine is busy; the test is about the record, not the rate.
+            bulk_load_rows_per_sec: 1.0,
             ..Default::default()
         },
     );
