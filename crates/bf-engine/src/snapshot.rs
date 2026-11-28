@@ -253,7 +253,12 @@ impl OpenHint {
                     tasks.push(
                         async move {
                             if filtered || scan.is_none() {
-                                let (dir, _) = tokio::try_join!(
+                                // The row maps need only the slabs, not the directory or the
+                                // lineage: read them beside both. One positive segment proves
+                                // the query is nonempty, so they start then, while the other
+                                // predicates finish; only an empty query must wait for every
+                                // segment before deciding.
+                                let (dir, _, early) = tokio::try_join!(
                                     async {
                                         let dir =
                                             crate::ann_dir::load(store, &set.dir, None).await?;
@@ -269,24 +274,32 @@ impl OpenHint {
                                             crate::ann::stage(trace_t0, "warm_slab_lineage_done");
                                         }
                                         Ok::<_, ApiError>(())
+                                    },
+                                    async {
+                                        let matching = if filtered {
+                                            tokio::select! {
+                                                all = predicates => all?,
+                                                first = present.wait_for(|found| *found) => first.is_ok(),
+                                            }
+                                        } else {
+                                            false
+                                        };
+                                        if !matching {
+                                            return Ok(None);
+                                        }
+                                        crate::ann::stage(trace_t0, "warm_slab_memberships_start");
+                                        let loaded = crate::ann_dir::slab_memberships(
+                                            store, &set.slabs, attribute,
+                                        )
+                                        .await?;
+                                        crate::ann::stage(trace_t0, "warm_slab_maps_loaded");
+                                        Ok::<_, ApiError>(Some(loaded))
                                     }
                                 )?;
                                 crate::ann::stage(trace_t0, "warm_slab_directory");
-                                // One positive segment proves the query is nonempty. Start
-                                // memberships then, while the other predicates finish; only
-                                // an empty query must wait for every segment before deciding.
-                                let matching = if filtered {
-                                    tokio::select! {
-                                        all = predicates => all?,
-                                        first = present.wait_for(|found| *found) => first.is_ok(),
-                                    }
-                                } else {
-                                    false
-                                };
-                                if matching {
-                                    crate::ann::stage(trace_t0, "warm_slab_memberships_start");
-                                    let members = crate::ann_dir::memberships(
-                                        store, &set.slabs, &dir, attribute,
+                                if let Some(loaded) = early {
+                                    let members = crate::ann_dir::checked_memberships(
+                                        store, &set.slabs, &dir, attribute, loaded,
                                     )
                                     .await?;
                                     if crate::ann_dir::covers(

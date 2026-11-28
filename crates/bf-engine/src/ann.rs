@@ -1006,41 +1006,57 @@ fn filtered_tier_mask(
     if let Some(cached) = crate::read_cache::get::<PredicateMask>(&key, 0) {
         return cached.rows.clone();
     }
-    let mut mask = RoaringBitmap::new();
-    for (cover, place) in set.covered.iter().zip(&at.places) {
-        match place {
-            crate::lineage::Place::Here(i) => {
-                if let Some(rows) = &allowed[*i] {
-                    mask |= RoaringBitmap::from_sorted_iter(rows.iter().map(|r| cover.base + r))
-                        .expect("translated segment rows stay sorted");
-                } else {
-                    mask.insert_range(cover.base..cover.base + cover.rows);
-                }
-            }
-            crate::lineage::Place::Moved(parts) => {
-                for (i, map) in parts {
-                    if let Some(rows) = &allowed[*i]
-                        && rows.len().saturating_mul(64) < map.to.len()
-                    {
-                        // A sparse predicate should visit its matching target rows, rather
-                        // than every source row of a compaction. Both sides of a lineage map
-                        // are ascending, so reverse translation preserves this order.
-                        let selected = rows.as_ref() & &map.to;
-                        mask |= RoaringBitmap::from_sorted_iter(selected.iter().map(|to| {
-                            cover.base + map.back(to).expect("intersected lineage target")
-                        }))
-                        .expect("reverse lineage rows stay sorted");
-                        continue;
+    // Each covered segment translates its own rows, in parallel (a broad predicate is millions of
+    // rows, and this runs once on the query's critical path). Their ranges are disjoint.
+    use rayon::prelude::*;
+    let parts: Vec<RoaringBitmap> = set
+        .covered
+        .par_iter()
+        .zip(&at.places)
+        .map(|(cover, place)| {
+            let mut mask = RoaringBitmap::new();
+            match place {
+                crate::lineage::Place::Here(i) => {
+                    if let Some(rows) = &allowed[*i] {
+                        mask |=
+                            RoaringBitmap::from_sorted_iter(rows.iter().map(|r| cover.base + r))
+                                .expect("translated segment rows stay sorted");
+                    } else {
+                        mask.insert_range(cover.base..cover.base + cover.rows);
                     }
-                    mask |= RoaringBitmap::from_sorted_iter(
-                        map.pairs()
-                            .filter(|(_, to)| allowed[*i].as_ref().is_none_or(|a| a.contains(*to)))
-                            .map(|(from, _)| cover.base + from),
-                    )
-                    .expect("lineage source rows stay sorted");
+                }
+                crate::lineage::Place::Moved(parts) => {
+                    for (i, map) in parts {
+                        if let Some(rows) = &allowed[*i]
+                            && rows.len().saturating_mul(64) < map.to.len()
+                        {
+                            // A sparse predicate should visit its matching target rows, rather
+                            // than every source row of a compaction. Both sides of a lineage map
+                            // are ascending, so reverse translation preserves this order.
+                            let selected = rows.as_ref() & &map.to;
+                            mask |= RoaringBitmap::from_sorted_iter(selected.iter().map(|to| {
+                                cover.base + map.back(to).expect("intersected lineage target")
+                            }))
+                            .expect("reverse lineage rows stay sorted");
+                            continue;
+                        }
+                        mask |= RoaringBitmap::from_sorted_iter(
+                            map.pairs()
+                                .filter(|(_, to)| {
+                                    allowed[*i].as_ref().is_none_or(|a| a.contains(*to))
+                                })
+                                .map(|(from, _)| cover.base + from),
+                        )
+                        .expect("lineage source rows stay sorted");
+                    }
                 }
             }
-        }
+            mask
+        })
+        .collect();
+    let mut mask = RoaringBitmap::new();
+    for part in parts {
+        mask |= part;
     }
     cache_predicate(&key, inputs, mask)
 }
