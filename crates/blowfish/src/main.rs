@@ -167,19 +167,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(path) = std::env::var("BF_G24_SWITCH") {
-        std::thread::spawn(move || {
-            loop {
-                let v = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .unwrap_or(0);
-                bf_vector::warm_graph::G24_SWITCH.store(v, std::sync::atomic::Ordering::Relaxed);
-                bf_types::fastvec::G24_SWITCH.store(v, std::sync::atomic::Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        });
-    }
     crash::install();
     blowfish::start_alloc_monitor();
     tracing_subscriber::fmt()

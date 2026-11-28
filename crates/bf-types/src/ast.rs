@@ -622,61 +622,7 @@ enum VectorArg {
     Other(Value),
 }
 impl<'de> Deserialize<'de> for VectorArg {
-    /// With `serde_json` reading JSON text, the argument's raw text goes to [`fastvec::parse`]; any
-    /// other deserializer, and any text that is not a plain number array it can read exactly,
-    /// takes [`VectorArg::generic`].
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Raw;
-        impl<'de> serde::de::Visitor<'de> for Raw {
-            type Value = VectorArg;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a vector")
-            }
-            // `serde_json`'s raw value: one entry holding the value's text.
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<VectorArg, A::Error> {
-                map.next_key::<serde::de::IgnoredAny>()?;
-                map.next_value_seed(RawText)
-            }
-            fn visit_newtype_struct<D2: serde::Deserializer<'de>>(
-                self,
-                d: D2,
-            ) -> Result<VectorArg, D2::Error> {
-                VectorArg::generic(d)
-            }
-        }
-        struct RawText;
-        impl<'de> serde::de::DeserializeSeed<'de> for RawText {
-            type Value = VectorArg;
-            fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<VectorArg, D::Error> {
-                struct Text;
-                impl serde::de::Visitor<'_> for Text {
-                    type Value = VectorArg;
-                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        f.write_str("a vector")
-                    }
-                    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<VectorArg, E> {
-                        if let Some(floats) = crate::fastvec::parse(text) {
-                            return Ok(VectorArg::Floats(floats));
-                        }
-                        VectorArg::generic(&mut serde_json::Deserializer::from_str(text))
-                            .map_err(E::custom)
-                    }
-                }
-                d.deserialize_str(Text)
-            }
-        }
-        if crate::fastvec::G24_SWITCH.load(std::sync::atomic::Ordering::Relaxed) & 4 != 0 {
-            return VectorArg::generic(d);
-        }
-        d.deserialize_newtype_struct("$serde_json::private::RawValue", Raw)
-    }
-}
-impl VectorArg {
-    /// Read any JSON value, numbers as `f32` through `f64`.
-    fn generic<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = VectorArg;

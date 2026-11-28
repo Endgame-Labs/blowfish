@@ -10,8 +10,6 @@
 //! a power of ten beyond `1e308`, a result that overflows) makes [`parse`] answer `None`, and the
 //! caller reads the same text with `serde_json` as before.
 use std::sync::OnceLock;
-/// TEMPORARY (Round G24 A/B): bit 2 reads vectors the old way.
-pub static G24_SWITCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// `1e0` through `1e308`, as `serde_json` tabulates them: `str::parse` rounds correctly, as a
 /// literal does.
@@ -22,10 +20,7 @@ fn pow10() -> &'static [f64; 309] {
 
 /// The elements of `text`, a JSON array of plain numbers, as `f32` (through `f64`, as
 /// `decode_vector` reads them). `None` if `text` is anything else or a number needs `serde_json`.
-pub fn parse(text: &str) -> Option<Vec<f32>> {
-    if G24_SWITCH.load(std::sync::atomic::Ordering::Relaxed) & 2 != 0 {
-        return None;
-    }
+pub(crate) fn parse(text: &str) -> Option<Vec<f32>> {
     let bytes = text.as_bytes();
     let mut i = skip(bytes, 0);
     if bytes.get(i) != Some(&b'[') {
@@ -325,46 +320,5 @@ mod tests {
                 .join(",")
         );
         same(&text);
-    }
-}
-
-#[cfg(test)]
-mod timing {
-    #[test]
-    #[ignore]
-    fn parse_speed() {
-        let mut seed = 99u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        let body = format!(
-            "{{\"rank_by\":[\"vector\",\"ANN\",[{}]],\"top_k\":10}}",
-            (0..1024)
-                .map(|_| format!(
-                    "{:?}",
-                    f64::from(((next() % 20_001) as f32 - 10_000.) / 100_000.)
-                ))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        for (name, bit) in [("main", 4u32), ("twice", 2u32), ("new", 0)] {
-            super::G24_SWITCH.store(bit, std::sync::atomic::Ordering::Relaxed);
-            let t = std::time::Instant::now();
-            for _ in 0..20_000 {
-                let v: crate::QueryRequest = serde_json::from_slice(body.as_bytes()).unwrap();
-                std::hint::black_box(v);
-            }
-            println!("{name}: {:?} per request", t.elapsed() / 20_000);
-        }
-        let t = std::time::Instant::now();
-        for _ in 0..20_000 {
-            std::hint::black_box(
-                serde_json::from_slice::<serde_json::Value>(body.as_bytes()).unwrap(),
-            );
-        }
-        println!("Value: {:?}", t.elapsed() / 20_000);
     }
 }

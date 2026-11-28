@@ -2,9 +2,6 @@ use super::{HotGraph, check, quant, vamana};
 use crate::{Error, Result, rabitq::RaBitQ};
 use half::f16;
 use numkong::Dot;
-/// Coarse regions whose medoids seed a walk, and the fewest nodes a graph needs to have them.
-const REGIONS: usize = 256;
-const MIN_SEEDED: usize = 4_096;
 /// Streaming SQ8 collector for a disposable, whole-tier row graph.
 /// Final code arrays are filled directly under the caller's memory reservation. Run collection
 /// and `finish` on a bounded CPU pool. Original f16 rows are never retained or reread.
@@ -146,16 +143,6 @@ impl HotGraphBuilder {
         }
         let bits = super::binary::Bits::new(&codes, cancelled)?;
         let nodes = vamana::build(&codes, &bits, best.0, cancelled)?;
-        // The global medoid first, then the coarse regions' medoids, for seeding a walk near its query.
-        let mut entries = vec![best.0];
-        if self.count >= MIN_SEEDED {
-            entries.extend(
-                bits.region_medoids(REGIONS.min(self.count / 16), cancelled)?
-                    .into_iter()
-                    .filter(|&id| id != best.0),
-            );
-        }
-        let entry_bits = bits.gather(&entries);
         let mut links = Vec::with_capacity(self.count);
         let mut degrees = Vec::with_capacity(self.count);
         for (id, neighbors) in nodes.into_iter().enumerate() {
@@ -189,8 +176,7 @@ impl HotGraphBuilder {
             nodes,
             links,
             degrees,
-            entries,
-            entry_bits,
+            entries: vec![best.0],
             codes,
             bits,
             norms: std::mem::take(&mut self.norms),

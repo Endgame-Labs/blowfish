@@ -24,7 +24,6 @@ bf-engine = { path = "../bf-engine" }
 bf-models = { path = "../bf-models" }
 bf-storage = { path = "../bf-storage" }
 bf-types = { path = "../bf-types" }
-bf-vector = { path = "../bf-vector" }
 clap = { version = "4.6.0", features = ["derive", "env"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

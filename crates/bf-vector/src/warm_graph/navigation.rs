@@ -104,15 +104,12 @@ impl<'a> Screen<'a> {
 pub struct Scratch {
     visited: Visited,
     beam: Vec<BeamHit>,
-    /// Nodes the last search expanded.
-    pub(super) expansions: usize,
 }
 impl Scratch {
     pub fn new(n: usize) -> Self {
         Self {
             visited: Visited::new(n),
             beam: Vec::new(),
-            expansions: 0,
         }
     }
     /// Mean Hamming distance (rounded up) of the beam's [`TAIL`] worst members.
@@ -133,14 +130,14 @@ impl Scratch {
         ef: usize,
         score: impl FnMut(u32) -> f32,
     ) -> (Vec<Hit>, usize) {
-        self.search_prefetched(links, degrees, &[entry], ef, score, |_| {}, None)
+        self.search_prefetched(links, degrees, entry, ef, score, |_| {}, None)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn search_prefetched(
         &mut self,
         links: &[[u32; 34]],
         degrees: &[u8],
-        entries: &[u32],
+        entry: u32,
         ef: usize,
         score: impl FnMut(u32) -> f32,
         prefetch: impl FnMut(u32),
@@ -152,7 +149,7 @@ impl Scratch {
                 out[..degree].copy_from_slice(&links[id as usize][..degree]);
                 degree
             },
-            entries,
+            entry,
             ef,
             score,
             prefetch,
@@ -170,7 +167,7 @@ impl Scratch {
     pub fn search_with(
         &mut self,
         mut adjacent: impl FnMut(u32, &mut [u32; MAX_LINKS]) -> usize,
-        entries: &[u32],
+        entry: u32,
         ef: usize,
         mut score: impl FnMut(u32) -> f32,
         mut prefetch: impl FnMut(u32),
@@ -179,28 +176,16 @@ impl Scratch {
     ) -> usize {
         self.visited.begin();
         self.beam.clear();
-        self.expansions = 0;
-        let mut evaluations = 0;
-        for &entry in entries {
-            if !self.visited.insert(entry) {
-                continue;
-            }
-            evaluations += 1;
-            let hit = Hit {
+        self.visited.insert(entry);
+        self.beam.push(BeamHit {
+            hit: Hit {
                 id: entry,
                 distance: score(entry),
-            };
-            let pos = self.beam.partition_point(|b| b.hit < hit);
-            self.beam.insert(
-                pos,
-                BeamHit {
-                    hit,
-                    h: screen.map_or(0, |sc| sc.bits.hamming(sc.query, entry)),
-                    expanded: false,
-                },
-            );
-        }
-        self.beam.truncate(ef);
+            },
+            h: screen.map_or(0, |sc| sc.bits.hamming(sc.query, entry)),
+            expanded: false,
+        });
+        let mut evaluations = 1;
         let mut next = 0;
         let mut pending = [0u32; MAX_LINKS];
         loop {
@@ -213,7 +198,6 @@ impl Scratch {
             let current = self.beam[next].hit;
             self.beam[next].expanded = true;
             next += 1;
-            self.expansions += 1;
             expanded(current);
             // Every unseen neighbor is scored before selecting another expansion. Collecting
             // that same ordered batch lets future code rows arrive while scoring this one.
@@ -392,7 +376,7 @@ mod tests {
                 let a = actual.search_prefetched(
                     &links,
                     &degrees,
-                    &[entry],
+                    entry,
                     ef,
                     |id| {
                         va.push(id);
@@ -441,13 +425,13 @@ mod tests {
             let a = screened.search_prefetched(
                 &links,
                 &degrees,
-                &[entry],
+                entry,
                 32,
                 score,
                 |_| {},
                 Some(screen),
             );
-            let b = plain.search_prefetched(&links, &degrees, &[entry], 32, score, |_| {}, None);
+            let b = plain.search_prefetched(&links, &degrees, entry, 32, score, |_| {}, None);
             // A screen that never rejects is the plain walk.
             assert_eq!(a, b, "pass {pass}");
             let screen = Screen::new(&bits, &query);
@@ -455,7 +439,7 @@ mod tests {
             let c = screened.search_prefetched(
                 &links,
                 &degrees,
-                &[entry],
+                entry,
                 32,
                 score,
                 |_| {},

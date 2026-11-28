@@ -91,10 +91,6 @@ unsafe fn hamming_neon(a: &[u64], b: &[u64]) -> u16 {
     }
 }
 
-/// Rows the region medoids are found from, and k-modes passes over them.
-const SAMPLE: usize = 65_536;
-const ITERATIONS: usize = 6;
-
 pub(super) struct Bits {
     words: Vec<u64>,
     per: usize,
@@ -143,108 +139,6 @@ impl Bits {
     /// Bytes retained.
     pub(super) fn bytes(&self) -> usize {
         self.words.capacity() * 8
-    }
-    /// Medoid nodes of about `regions` coarse regions of the rows, found by k-modes over the
-    /// one-bit codes of an even sample: assignment by Hamming distance, each center the
-    /// per-bit majority of its members, and each region's medoid the sample row nearest its
-    /// center. Deterministic. Duplicates and empty regions are dropped, so fewer may return.
-    pub(super) fn region_medoids(
-        &self,
-        regions: usize,
-        cancelled: &(impl Fn() -> bool + Sync),
-    ) -> crate::Result<Vec<u32>> {
-        let n = self.words.len() / self.per.max(1);
-        let sample_len = n.min(SAMPLE);
-        let regions = regions.min(sample_len);
-        if regions < 2 {
-            return Ok(Vec::new());
-        }
-        let sample = (0..sample_len)
-            .map(|i| (i as u64 * n as u64 / sample_len as u64) as u32)
-            .collect::<Vec<_>>();
-        let per = self.per;
-        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-        let mut centers = Vec::with_capacity(regions * per);
-        for r in 0..regions {
-            // Even picks, shifted a little so regions do not start on adjacent rows.
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            let pick = (r * sample_len / regions + (seed % 7) as usize).min(sample_len - 1);
-            centers.extend_from_slice(self.row(sample[pick]));
-        }
-        let nearest = |centers: &[u64], id: u32| {
-            let row = self.row(id);
-            centers
-                .chunks_exact(per)
-                .enumerate()
-                .map(|(r, c)| (hamming(row, c), r))
-                .min()
-                .unwrap()
-        };
-        for _ in 0..ITERATIONS {
-            super::check(cancelled)?;
-            let owner = sample
-                .par_iter()
-                .map(|&id| nearest(&centers, id).1)
-                .collect::<Vec<_>>();
-            let mut votes = vec![0u32; regions * per * 64];
-            let mut sizes = vec![0u32; regions];
-            for (&id, &r) in sample.iter().zip(&owner) {
-                sizes[r] += 1;
-                let row = self.row(id);
-                let votes = &mut votes[r * per * 64..(r + 1) * per * 64];
-                for (w, &word) in row.iter().enumerate() {
-                    let mut bits = word;
-                    while bits != 0 {
-                        votes[w * 64 + bits.trailing_zeros() as usize] += 1;
-                        bits &= bits - 1;
-                    }
-                }
-            }
-            for r in 0..regions {
-                if sizes[r] == 0 {
-                    continue;
-                }
-                let center = &mut centers[r * per..(r + 1) * per];
-                center.fill(0);
-                for (b, &v) in votes[r * per * 64..(r + 1) * per * 64].iter().enumerate() {
-                    if v * 2 > sizes[r] {
-                        center[b / 64] |= 1 << (b % 64);
-                    }
-                }
-            }
-        }
-        // Each region's medoid: the sample row nearest its center, among that region's rows.
-        let mut best = vec![(u16::MAX, u32::MAX); regions];
-        let owners = sample
-            .par_iter()
-            .map(|&id| {
-                let (h, r) = nearest(&centers, id);
-                (r, h, id)
-            })
-            .collect::<Vec<_>>();
-        for (r, h, id) in owners {
-            if (h, id) < best[r] {
-                best[r] = (h, id);
-            }
-        }
-        let mut ids = best
-            .into_iter()
-            .filter(|b| b.1 != u32::MAX)
-            .map(|b| b.1)
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids.dedup();
-        Ok(ids)
-    }
-    /// The packed rows of `ids`, back to back, for a pass over contiguous memory.
-    pub(super) fn gather(&self, ids: &[u32]) -> Vec<u64> {
-        ids.iter().flat_map(|&id| self.row(id)).copied().collect()
-    }
-    /// Words per row.
-    pub(super) fn per(&self) -> usize {
-        self.per
     }
     #[cfg(test)]
     pub(super) fn from_words(words: Vec<u64>, per: usize) -> Self {
