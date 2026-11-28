@@ -12370,6 +12370,52 @@ membership by design): 12 to 13% of rows sit in a different leaf than the contro
 Cost: one c7gd.2xlarge for about 1.7 hours, about $0.6 at RR4's historical $0.3629 per hour, below the $6 cap. The instance, key
 pair, and security group are deleted; the round wrote nothing to the bucket (NQ inputs were copied from the read-only fixture).
 
+## Round RR10: a cheaper first assignment, healed by RR9's pass (rejected at the measure-first gate)
+
+RR9 left about 50 s of a 128 s NQ install in the first assignment (every row against the leaf centers) and 22 s in leaf training.
+Three advisor ideas replace both with a cheaper partition for RR9's refine-and-reassign pass to heal: Sol 16:25 #5 (Hilbert sort over
+projections), Neon 16:25 #2 (recursive median bisection along the top principal axis), and Sol 15:25 #1 (group rows by their old segment
+leaves). Measured 2026-11-28 offline on one on-demand c7gd.2xlarge (RR7's setup: eight Graviton3 cores, 16 GiB, four Rayon workers,
+release thin LTO) on RR4's frozen flat NQ input (2,681,468 rows, 1,024-d f16 cosine, 32 coarse cells, 200-row target leaves, 13,390
+leaves). Every arm runs the same `finish_leaves` (refine all centers, RR9's 80-neighbor reassignment, repeated for the stated rounds).
+The control is v0.1.85's leaf training and assignment through the same replay.
+
+Quality here is a proxy, not the engine's recall@10: the share of each query's exact top-10 (3,452 NQ queries) whose leaf is among the
+query's 48 or 64 nearest leaves by center, as if the probed leaves were reranked exactly. It leaves out RaBitQ and the group routing, so
+its absolute values sit below the engine's 0.9507 and 0.9609, but it ranks layouts the same way and also reports the rows a query scans.
+
+| Arm | Leaf stage s | Seed s | Proxy recall, 48 / 64 probes | Rows scanned, 48 / 64 | Row-weighted leaf size |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Control (k-means, two passes) | 120.6 | n/a | 0.8313 / 0.8534 | 10,981 / 14,489 | 273.2 |
+| Median bisection, 1 round | 33.3 | 20.2 | 0.7441 / 0.7744 | 9,432 / 12,574 | 209.8 |
+| Median bisection, 2 rounds | 46.6 | 20.2 | 0.7768 / 0.8038 | 9,451 / 12,578 | 213.7 |
+| Median bisection, 4 rounds | 74.9 | 20.3 | 0.8035 / 0.8271 | 9,708 / 12,915 | 216.4 |
+| Median bisection, 6 rounds | 100.5 | 20.3 | 0.8105 / 0.8335 | 9,935 / 13,222 | 218.1 |
+| Hilbert over 4 axes, 2 rounds | 38.5 | 10.7 | 0.7306 / 0.7627 | 9,595 / 12,715 | 237.4 |
+| Hilbert over 8 axes, 4 rounds | 71.4 | 15.8 | 0.7878 / 0.8152 | 9,567 / 12,696 | 224.6 |
+
+Result: **no seeding comes within 0.002.** Raw recall at equal probes trails the control by 0.02 to 0.09. Balanced seeds make smaller
+leaves (a query scans 10 to 14 percent fewer rows), so that overstates the gap; against the control's own recall at the same rows scanned
+(a straight line through its two points, 6.3e-6 per row), the best arm is still 0.014 behind at 48 probes and 0.012 at 64. Each healing
+round buys less (+0.033, +0.026 over two, +0.007 over two more) and costs about 13 s, so the arm that heals to a plateau saves only
+about 20 s of the 128 s install (1.19x), below the 1.2x bar, at a recall loss 7 times the allowed 0.002. Equal-size cuts along one axis are
+poor Voronoi cells in 1,024 dimensions, and nearest-neighbor Lloyd steps repair them slowly. Hilbert over a few projections is worse than
+bisection at every round count.
+
+Old segment leaves (Sol 15:25 #1) cannot be tested as a real input offline, because the frozen flat input has no segments, so the
+study stood in for them: k-means per 200,000-row segment at 430 rows a leaf (RR6's leaf size), untimed. Grouping rows by old leaf within
+each coarse cell then gave **86,369 pieces for 13,390 leaves' worth of rows**: an old leaf spreads over many coarse cells (fuzzy clusters
+in 1,024 dimensions), so most groups are a handful of rows and "assign whole groups" has nothing to keep whole. This is RR6's overlap
+problem measured another way, and the arm (0.7196 / 0.7534 after one round, 5,744 rows scanned, a median leaf of 4 rows) is not a valid
+layout. A weighted cut of the group centroids would inherit bisection's plateau, so it was not built.
+
+**Stopped at the measure-first gate**: none reached 1.2x install at recall within 0.002. No engine change ships, and steps 2 and 3
+(build and paired install, latency, and RSS) did not run. Peak RSS of the offline seeding was 0.68 GiB for bisection (one cell resident
+at a time) against 0.43 GiB for the control. Nothing stays in the tree: the harness (a `finish_leaves` split, the seedings, and an ignored measure test) is kept outside it for any later seeding idea. No SPEC change is needed.
+
+Cost: one c7gd.2xlarge for about 0.4 hours, about $0.15 at RR4's historical $0.3629 per hour, below the $6 cap. The instance, key pair,
+and security group are deleted, and the round wrote nothing to the bucket (the NQ inputs were copied from the read-only fixture).
+
 ## Round C18: fit the 10M exact vectors with lossless exponent packing
 
 The current-format 10M tier requires **22,095,496,715 bytes** for its complete
