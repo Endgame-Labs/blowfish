@@ -1,0 +1,113 @@
+diff --git a/crates/bf-storage/src/cache.rs b/crates/bf-storage/src/cache.rs
+index 9ae24d6..6a9c961 100644
+--- a/crates/bf-storage/src/cache.rs
++++ b/crates/bf-storage/src/cache.rs
+@@ -975,6 +975,7 @@ impl RangeReader {
+                     }
+                     let from = first * size;
+                     let to = (last * size).saturating_add(size).min(reader.len());
++                    let c43_start = std::time::SystemTime::now();
+                     let bytes = cache
+                         .hedge
+                         .get_range(
+@@ -987,6 +988,18 @@ impl RangeReader {
+                     if bytes.len() as u64 != to - from {
+                         return Err(Arc::new(Error::Config("short object-store range response")));
+                     }
++                    if crate::observed::trace_reads() {
++                        eprintln!(
++                            "C43 GET len={} from={from} to={to} start_us={} end_us={}",
++                            reader.len(),
++                            c43_start
++                                .duration_since(std::time::UNIX_EPOCH)
++                                .map_or(0, |d| d.as_micros()),
++                            std::time::SystemTime::now()
++                                .duration_since(std::time::UNIX_EPOCH)
++                                .map_or(0, |d| d.as_micros())
++                        );
++                    }
+                     let mut values = Vec::with_capacity(indices.len());
+                     // At most MAX_SPILLS disk writes wait at once (see `spill_has_room`).
+                     let spilling = admit && cache.spill_has_room();
+diff --git a/crates/bf-text/src/segment.rs b/crates/bf-text/src/segment.rs
+index f63c8b0..3372478 100644
+--- a/crates/bf-text/src/segment.rs
++++ b/crates/bf-text/src/segment.rs
+@@ -406,6 +406,11 @@ const FIRST_WINDOWS: usize = 24;
+ /// least this fraction of the segment's best window bound. The top-k floor that the first
+ /// windows establish is typically half of that best bound, so the wide batch usually covers every
+ /// window the floor leaves competitive and the refinement wave (still the exact fallback) is empty.
++fn c43_now() -> u128 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |d| d.as_micros())
++}
+ const WIDE_FIRST_BOUND: f64 = 0.3;
+ /// Most posting bytes (estimated from block sizes) that the widened first batch may add.
+ const WIDE_FIRST_BYTES: u64 = 4 << 20;
+@@ -2828,8 +2833,33 @@ impl SegmentReader {
+                         after = after.max(span.end);
+                     }
+                 }
++                let trace43 = std::env::var_os("BF_TRACE_C43").is_some();
++                let seg43 = self as *const _ as usize;
++                if trace43 {
++                    eprintln!(
++                        "C43 BATCH seg={seg43} len={} t_us={} k={k} windows={}",
++                        self.source.len(),
++                        c43_now(),
++                        batch.len()
++                    );
++                    for &(w, bound) in &batch.items {
++                        let mut need = String::new();
++                        for term in terms.iter().filter(|t| t.dense.is_none()) {
++                            for b in term.span(w) {
++                                if term.postings[b].is_none() {
++                                    let m = &term.meta.blocks[b];
++                                    need += &format!("{}:{};", m.offset, m.size);
++                                }
++                            }
++                        }
++                        eprintln!("C43 W seg={seg43} w={w} bound={bound} need={need}");
++                    }
++                }
+                 self.read_search_blocks(&mut terms, wanted, &saturation, &mut metrics)
+                     .await?;
++                if trace43 {
++                    eprintln!("C43 DONE seg={seg43} t_us={}", c43_now());
++                }
+             }
+             let mut taken = 0;
+             while taken < batch.len() {
+@@ -3007,6 +3037,21 @@ impl SegmentReader {
+                         }
+                     }
+                 }
++                if std::env::var_os("BF_TRACE_C43").is_some() {
++                    let mut top: Vec<f32> = competitive
++                        .iter()
++                        .map(|&row| {
++                            let i = (row - start) as usize;
++                            scores[i] + f32::from(prefix_matches[i])
++                        })
++                        .collect();
++                    top.sort_by(|a, b| b.total_cmp(a));
++                    top.truncate(16);
++                    eprintln!(
++                        "C43 S seg={} w={window} scores={top:?}",
++                        self as *const _ as usize
++                    );
++                }
+                 for &row in competitive {
+                     let i = (row - start) as usize;
+                     let score = scores[i] + f32::from(prefix_matches[i]);
+@@ -3028,6 +3073,9 @@ impl SegmentReader {
+         }
+         let mut hits: Vec<_> = heap.into_iter().map(|r| r.0).collect();
+         hits.sort_unstable_by(|a, b| b.cmp(a));
++        if std::env::var_os("BF_TRACE_C43").is_some() {
++            eprintln!("C43 END seg={} t_us={}", self as *const _ as usize, c43_now());
++        }
+         Ok((hits, metrics))
+     }
+ 
