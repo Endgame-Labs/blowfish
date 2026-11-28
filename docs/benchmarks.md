@@ -19756,3 +19756,130 @@ No layout change pays: aged small objects model at or slower than today's traced
 ### Cost
 
 One on-demand c7gn.4xlarge for about 1.2 hours (about $1.2), about 200,000 PUTs for three test sets (about $1), and the 77 GB server-side copy for under an hour (cents). The instance, key pair, security group, and the `tmp/c44/` prefix are deleted; the retained fixtures were only read.
+
+## Round C45: one scoring pack per text segment does not clear 1.25 times on cold BM25 (modeled 0.9 to 1.2 times for the pack the format gives, killed at the model, no engine change)
+
+Hypothesis (Sol, `briefs/ideas/1225-sol.md` #4): store one scoring-only pack per text segment (postings, term records, document lengths) and read each whole, in parallel, right after the manifest, so the
+bundle wave and the posting wave become one. Sol's model was 26 ms manifest, 24 ms first byte, 30 ms transfer of an 80 MB budget at 2.7 GB/s, and 5 ms scoring, about 85 ms, or 1.35 times C42's 114.4 ms.
+The brief said to model it from real numbers and stop if the best design is under 1.25 times at p50. It is. Nothing was built, and there is no design note.
+
+Two inputs of that model do not hold on the fixture: the pack is **114 MB, not 80 MB** (92 MB at a hypothetical minimum), and the wall time of reading it is set by the slowest of 60 to 110 parts (about 60 to 85 ms at p50),
+not by bytes over 2.7 GB/s.
+
+### Method
+
+Two on-demand c7gn.4xlarge hosts in a row (Ubuntu 24.04 arm64, Rust 1.100.1; the first with Clang 19 and NumKong SME targets off for the server) in us-west-2. `scale-server` at v0.1.84 on `tmp/msmarco-1m-v021/store/` (eight text segments, 1M passages),
+pure S3 with no disk cache, a 2 GiB memory cache, 4,000-byte blocks, strong consistency, queries 100 to 299 of `bm25-msmarco.json`.
+
+- **Sizes** (`c45_sections.py`): parses each `fts.1.bft` (the fixture is **format 7**, not 4) into long postings, phrase positions, dictionary bundles (FST, FST padding, term records, short-term postings), lengths, and the chunk index.
+  Footer and index offsets are 24 bytes short of the stored object (the create header).
+- **Fetch time** (`c45-fetch`, a stand-alone Rust tool on `object_store` 0.14.2 with the server's pool settings; `c45_fetch_runs.py` and `c45_paired.py` drive it): a plan's bytes (the first N bytes of each segment's object, so the sizes are real and
+  the content is irrelevant) as ranged GETs of one part size, all issued at once, 256 warm connections, the time to the last byte of the whole set. Two sources: the **retained fixture** (days old, read only) and a **fresh** server-side copy under `tmp/c45/`
+  made minutes earlier. A second arm duplicates a part still unfinished after 45 ms (the server hedges reads). Two passes: a first grid (16 to 30 reps per cell, one plan per process, two passes in both orders), then a **paired** run
+  (40 reps, every plan once per rep back to back in a rotating order, so plans see the same seconds of S3; this is the one to trust for comparisons, and it came out slower for the aged fixture).
+- **Today's chain** (`c41_drive.py`, `BF_TRACE_READS`): 200 cold queries, caches dropped before each: traced client p50 115.3 ms and p90 137.3 ms (C42's untraced numbers are 114.4 and 136.4), the manifest read ends at 25.1 ms p50 (31.7 p90),
+  **3.31 MB and 94.6 GETs a query**.
+- **CPU** (`c45_cpu.py`): the same queries against a local copy (`file://`), every cache dropped before each: **cold p50 15.1 ms, p90 19.5 ms** (client time, no object-store wait, unchanged by 1, 2, or 16 Rayon threads), 29.4 ms of process CPU across
+  all threads, and **warm p50 0.95 ms**. The cold figure holds today's per-read overheads, so it is an upper bound for scoring from memory. Against S3 the process uses 72 ms of CPU per cold query (TLS included).
+- **Model** (`c45_model.py`): per query, `manifest end (traced) + pack wall (drawn from the measured reps) + CPU`, 5 draws per query. Two CPU readings: **flat** (the local cold time, after the last byte) and **pipelined** (each segment is scored when its own pack
+  arrives, a segment's CPU is its document share of 29 ms, segments run in parallel, 3 ms for merge and response; the three 200K segments arrive together, so this is about 8 to 10 ms after the last byte). A segment-subset design replays the trace's per-segment read ends instead.
+
+### Result 1: the pack is 114 MB
+
+Eight text segments, 1M documents, 208.8 MB of `fts.1.bft`:
+
+| Section | MB | Needed to score? |
+| --- | ---: | --- |
+| Long-term postings (more than 32 blocks) | 16.9 | yes |
+| Short-term postings (inside the dictionary bundles) | 48.1 | yes (postings payload 64.9 MB in all, Sol's 64.5) |
+| Term records (1.24M terms, 1.48M blocks) | 54.6 | the bounds, not the CRCs: 31.1 MB without the position offset, the position size, and the two CRCs per block (23.4 MB dropped) |
+| FST | 16.8 | yes (plus 13.1 MB of padding that is not) |
+| Document lengths, chunk index | 1.2 | yes |
+| Phrase positions | 58.2 | no |
+| Live bitmaps (separate objects) | 0.4 | yes |
+
+| Pack | MB | Per segment (25K to 200K documents) |
+| --- | ---: | --- |
+| Trimmed (postings, trimmed records, FST, lengths, live) | **114.4** | 3.9 to 21.8 |
+| The same, records untrimmed | 137.8 | 5.0 to 26.0 |
+| Hypothetical minimum (6 bytes per block, the term's fields inside the FST value) | 92.1 | |
+| Sol's budget | 80 | not reachable with this content |
+
+Today's query reads 3.31 MB, so the pack reads **35 times the bytes** (about 115 MB, and 125 to 135 MB with hedging).
+
+### Result 2: fetching it takes 60 to 85 ms at p50 and the tail sets the wall
+
+The first byte of every part is 24 to 26 ms. A stream then moves about 100 MB/s, so a 2 MiB part takes 45 to 50 ms, and a set of 59 to 104 parts ends at the slowest of them.
+
+Whole-set wall time, ms, p50 / p90, paired run, no hedging (40 reps, 39 kept):
+
+| Plan | Parts | Fixture (aged) | Fresh |
+| --- | ---: | ---: | ---: |
+| trimmed, 114 MB, 1.5 MiB parts | 76 | 129 / 281 | 64 / 91 |
+| trimmed, 2 MiB | 59 | 85 / 242 | 61 / 71 |
+| trimmed, 3 MiB | 40 | 108 / 275 | 70 / 117 |
+| trimmed, 4 MiB | 32 | 103 / 284 | 70 / 101 |
+| minimum, 92 MB, 2 MiB | 48 | 91 / 263 | 60 / 125 |
+| 80 MB, 2 MiB | 43 | 87 / 270 | 54 / 81 |
+| whole objects, 209 MB, 4 MiB | 53 | 121 / 318 | 81 / 194 |
+| whole objects, 209 MB, 2 MiB | 104 | 251 / 276 | 248 / 273 |
+
+With a 45 ms hedge (7 to 10 duplicate parts, 14 to 20 MB, at 2 MiB parts, and 19 at 3 or 4 MiB; 38 to 50 for the whole objects): trimmed 2 MiB **79 / 90** (fixture) and **76 / 93** (fresh), 1.5 MiB 81 / 86 and 74 / 95, 4 MiB 80 / 98 and 84 / 105, 92 MB 73 / 91 and
+70 / 86, 80 MB 73 / 89 and 64 / 87, whole objects 88 / 97 and 88 / 99 (2.2 to 2.4 GB/s, with 40 to 57 percent of the parts duplicated). The first, unpaired grid gave 58 to 63 ms for the trimmed pack at 2 MiB (74 to 133 at p90), and a 209 MB whole-object plan at 4 MiB parts
+reached 2.7 GB/s once, so the wall moves by about 25 ms with S3 conditions and aged against fresh objects (C44's age effect again).
+
+- Bytes are not what sets the wall below 115 MB: 80, 92, and 114 MB finish within 10 to 15 ms of each other. Parts of 8 MiB and up are limited by one connection each (a 16 MiB part takes about 175 ms), and below 1 MiB the GET count and the tail grow.
+- An unhedged set is a maximum over 59 to 104 parts: stragglers of 250 to 300 ms land in at least 10 percent of reps for the aged fixture, and hedging at 45 ms removes them at the price of the duplicate bytes.
+- Per segment the pack is done at 39 to 49 ms p50 (25K to 200K documents) and 48 to 60 ms hedged, so the three 200K segments set the wall. A never-read object's first rep took 45 to 360 ms.
+
+### Result 3: the model
+
+Cold p50 / p90, ratio to today's 115.3 / 137.3 ms, paired run, 2 MiB parts, CPU flat / pipelined:
+
+| Design | Source | Hedge | Wall p50 / p90 | Flat | Pipelined |
+| --- | --- | --- | ---: | --- | --- |
+| trimmed pack, 114 MB | fixture | no | 85 / 242 | 126.7 / 280.7 (0.91 / 0.49) | 117.9 / 271.9 (0.98 / 0.51) |
+| | fixture | 45 ms | 79 / 90 | 116.2 / 130.7 (0.99 / 1.05) | 108.0 / 122.1 (1.07 / 1.12) |
+| | fresh | no | 61 / 71 | 101.3 / 115.9 (**1.14** / 1.19) | 93.5 / 107.1 (**1.23** / 1.28) |
+| | fresh | 45 ms | 76 / 93 | 117.5 / 139.7 (0.98 / 0.98) | 108.3 / 129.9 (1.07 / 1.06) |
+| minimum pack, 92 MB (not buildable as is) | fixture, hedged | 45 ms | 73 / 91 | 112.9 / 133.5 (1.02 / 1.03) | 104.3 / 124.0 (1.11 / 1.11) |
+| | fresh | no | 60 / 125 | 101.4 / 158.7 (1.14 / 0.87) | 93.5 / 153.4 (1.23 / 0.90) |
+| Sol's 80 MB (not reachable) | fixture, hedged | 45 ms | 73 / 89 | 114.5 / 131.7 (1.01 / 1.04) | 105.8 / 123.5 (1.09 / 1.11) |
+| | fresh | no | 54 / 81 | 95.5 / 126.2 (1.21 / 1.09) | 87.6 / 115.6 (**1.32** / 1.19) |
+| | fresh | 45 ms | 64 / 87 | 106.9 / 128.6 (1.08 / 1.07) | 98.2 / 120.2 (1.17 / 1.14) |
+| packs for the 3 / 4 / 5 smallest segments only (first grid) | both | no | 61 to 90 | 118 to 125 (**0.92 to 0.98**) | |
+
+The first, unpaired grid (best cell, trimmed 114 MB, fixture, 2 MiB, no hedge, wall 59 / 86) gave 100.8 / 133.2 flat (1.14 / 1.03) and 92.7 / 122.8 pipelined (1.24 / 1.12). The segment-subset rows keep today's path for the three 200K segments, which set
+the critical path, so the pack changes nothing there and the extra bytes buy nothing.
+
+**The pack the format gives (114 MB) models at 0.9 to 1.14 times at p50 with the measured CPU floor and at most 1.24 times with pipelined scoring, and only on fresh objects without hedging. Its p90 is 0.5 to 1.19 times (1.28 in one cell).
+With the 45 ms hedge the server uses, it is 0.98 to 1.07 times at p50 and 0.98 to 1.12 at p90.** Only a pack that cannot be built from this content (80 to 92 MB) reaches 1.23 to 1.32 times, in one or two cells of nine, on fresh objects, unhedged, with
+pipelined scoring. Cells move by about 0.1 times between runs. **Bar: 1.25 times at p50. Killed at the model.**
+
+### Why the saving is so small
+
+- Today's cold chain is three floors (manifest, bundles, postings) of 24 to 25 ms plus waits and CPU. The pack replaces two floors with one, but the one read is a maximum over 60 to 100 parts that each take 45 to 50 ms (25 ms to the first byte, then
+  2 MiB at about 100 MB/s), plus a tail. It ends at about 60 to 85 ms against about 90 ms for the two floors it replaces, and the CPU, which today hides inside the waits (about 15 ms), comes after it.
+- The size of the pack is not the lever: 80, 92, and 114 MB took within 10 to 15 ms of each other. The lever would be fewer, faster parts, which the per-connection rate (about 100 MB/s) and the tail rule out below about 1 MiB.
+- The pack is the whole index and a query needs 3 MB of it (3 percent).
+
+### What it would cost, if it were built anyway
+
+| | Today | Whole trimmed packs |
+| --- | ---: | ---: |
+| Bytes per cold query | 3.3 MB | 115 MB (125 to 135 MB hedged), 35 to 40 times |
+| GETs per cold query | 94.6 | 87 to 105 (59 to 90 parts, 14 others, 7 to 10 hedges at 2 MiB) |
+| Cold queries per second one host can serve | no limit seen | 11 to 20 (115 MB at 1.3 to 2.3 GB/s; not run under load) |
+| Extra bucket bytes | | +114 MB (+55 percent of the 208.8 MB of text segments, +22 percent of the 527 MB store) as a separate pack; **+0** if it is the front of the segment object with positions moved behind (a new text segment format version), and then 23.4 MB (records) plus 13.1 MB (FST padding) could be dropped |
+
+A cold query would also move 115 MB through memory and TLS; the process already spends 72 ms of CPU per cold query on S3 (29 ms of it without TLS), and the extra TLS was not measured.
+
+### What would move cold BM25 instead
+
+The remaining chain is manifest, bundle wave, one posting batch, each a 24 ms floor. A hint cannot remove a wave (C41), refinement is gone for most queries (C42), early cancelling has nothing to cancel (C43), and one whole pack replaces two floors with
+a 60 to 85 ms read (this round). What is left is smaller reads inside the bundle wave (the larger segments' term lookups), or fewer segments in a cold query; neither was measured here.
+
+### Resources
+
+Two on-demand c7gn.4xlarge hosts for 0.6 and 0.15 hours (about $1 in all with the root volumes), about 400 GB of in-region GET traffic from the fixture and the copies (no transfer charge; about 250,000 GETs) and 209 MB of server-side copies under `tmp/c45/` (twice, deleted). Both instances are terminated and their key pairs,
+security groups, and the prefix are deleted; the retained fixture was only read. Scripts: `c45_sections.py`, `c45-fetch/`, `c45_fetch_runs.py`, `c45_paired.py`, `c45_fetch_summary.py`, `c45_cpu.py`, `c45_model.py` (with the existing `c41_drive.py`).
