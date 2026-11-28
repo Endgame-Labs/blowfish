@@ -406,7 +406,7 @@ const FIRST_WINDOWS: usize = 24;
 /// least this fraction of the segment's best window bound. The top-k floor that the first
 /// windows establish is typically half of that best bound, so the wide batch usually covers every
 /// window the floor leaves competitive and the refinement wave (still the exact fallback) is empty.
-const WIDE_FIRST_BOUND: f64 = 0.4;
+const WIDE_FIRST_BOUND: f64 = 0.3;
 /// Most posting bytes (estimated from block sizes) that the widened first batch may add.
 const WIDE_FIRST_BYTES: u64 = 4 << 20;
 
