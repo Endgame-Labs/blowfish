@@ -125,124 +125,6 @@ fn replay_leaf_assignment() {
     println!("RR4 leaf seconds={elapsed:.6} threads={threads}");
 }
 
-struct Bound {
-    groups: std::sync::Arc<[usize]>,
-    best: u32,
-    upper: f64,
-    lower: f64,
-}
-
-/// Quantify the safe drift skip before deciding whether to retain its per-row memory.
-pub(super) struct Drift {
-    bounds: std::sync::Mutex<Vec<Option<Bound>>>,
-    centers: Vec<Vec<f32>>,
-    drift: Vec<f64>,
-    max_drift: f64,
-    error_factor: f64,
-    max_norm: f64,
-    rows: std::sync::atomic::AtomicU64,
-    subset: std::sync::atomic::AtomicU64,
-    skipped: std::sync::atomic::AtomicU64,
-}
-impl Drift {
-    pub fn new(rows: usize, centers: &[Vec<f32>]) -> Option<Self> {
-        std::env::var_os("RR4_DRIFT")?;
-        let ne = (centers[0].len() as f64 + 32.) * f64::from(f32::EPSILON);
-        Some(Self {
-            bounds: std::sync::Mutex::new((0..rows).map(|_| None).collect()),
-            centers: centers.to_vec(),
-            drift: Vec::new(),
-            max_drift: 0.,
-            error_factor: 4. * ne / (1. - ne),
-            max_norm: centers
-                .iter()
-                .map(|c| f64::from(norm2(c)))
-                .fold(0., f64::max),
-            rows: 0.into(),
-            subset: 0.into(),
-            skipped: 0.into(),
-        })
-    }
-    pub fn advance(&mut self, centers: &[Vec<f32>]) {
-        self.drift = self
-            .centers
-            .iter()
-            .zip(centers)
-            .map(|(old, new)| {
-                old.iter()
-                    .zip(new)
-                    .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
-                    .sum::<f64>()
-                    .sqrt()
-                    * (1. + 4. * old.len() as f64 * f64::EPSILON)
-            })
-            .collect();
-        self.max_drift = self.drift.iter().copied().fold(0., f64::max);
-        self.max_norm = centers
-            .iter()
-            .map(|c| f64::from(norm2(c)))
-            .fold(0., f64::max);
-        eprintln!("RR4 maximum_center_drift={:.8}", self.max_drift);
-    }
-    pub fn observe(
-        &self,
-        positions: &[u32],
-        wanted: &[usize],
-        norms: &[f32],
-        candidates: &[u32],
-        distances: &[Vec<f32>],
-    ) {
-        let groups: std::sync::Arc<[usize]> = wanted.into();
-        let mut bounds = self.bounds.lock().unwrap();
-        for ((position, norm), ds) in positions.iter().zip(norms).zip(distances) {
-            let mut sorted: Vec<_> = ds.iter().copied().zip(candidates.iter().copied()).collect();
-            sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            let error = self.error_factor * (f64::from(*norm) + self.max_norm);
-            if self.drift.is_empty() {
-                bounds[*position as usize] = Some(Bound {
-                    groups: groups.clone(),
-                    best: sorted[0].1,
-                    upper: (f64::from(sorted[0].0) + error).max(0.).sqrt(),
-                    lower: sorted
-                        .get(1)
-                        .map_or(f64::INFINITY, |x| (f64::from(x.0) - error).max(0.).sqrt()),
-                });
-            } else {
-                self.rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let old = bounds[*position as usize].as_ref().unwrap();
-                if wanted.iter().all(|g| old.groups.binary_search(g).is_ok())
-                    && candidates.contains(&old.best)
-                {
-                    self.subset
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let upper = old.upper + self.drift[old.best as usize];
-                    let other_drift = candidates
-                        .iter()
-                        .filter(|l| **l != old.best)
-                        .map(|l| self.drift[*l as usize])
-                        .fold(0., f64::max);
-                    let lower = (old.lower - other_drift).max(0.);
-                    if upper * upper + error < lower * lower - error {
-                        assert_eq!(old.best, sorted[0].1, "drift bound changed winner");
-                        self.skipped
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    }
-}
-impl Drop for Drift {
-    fn drop(&mut self) {
-        eprintln!(
-            "RR4 drift_rows={} candidate_subset_rows={} certified_skips={}",
-            self.rows.load(std::sync::atomic::Ordering::Relaxed),
-            self.subset.load(std::sync::atomic::Ordering::Relaxed),
-            self.skipped.load(std::sync::atomic::Ordering::Relaxed)
-        );
-    }
-}
-
 pub(super) fn perf_control(enable: bool) {
     static PASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let Some(path) = std::env::var_os("RR4_PERF_CONTROL") else {
@@ -469,25 +351,41 @@ async fn rr7_quality() {
                 ..Default::default()
             },
         );
-        let results: Vec<_> = futures::stream::iter(queries.iter().map(|q| {
-            let engine = &engine;
-            async move {
-                let request = serde_json::from_value(serde_json::json!({
-                    "rank_by":["vector", "ANN", q], "top_k":10, "include_attributes":false
-                }))
-                .unwrap();
-                engine
-                    .query("nq", request)
-                    .await
-                    .unwrap()
-                    .result
-                    .rows
-                    .unwrap()
-            }
-        }))
-        .buffered(4)
-        .collect()
-        .await;
+        // Two replays on one engine: the first starts with empty process caches, the second is warm.
+        let mut results = Vec::new();
+        for replay in ["cold", "warm"] {
+            let timed: Vec<_> = futures::stream::iter(queries.iter().map(|q| {
+                let engine = &engine;
+                async move {
+                    let request = serde_json::from_value(serde_json::json!({
+                        "rank_by":["vector", "ANN", q], "top_k":10, "include_attributes":false
+                    }))
+                    .unwrap();
+                    let started = std::time::Instant::now();
+                    let rows = engine
+                        .query("nq", request)
+                        .await
+                        .unwrap()
+                        .result
+                        .rows
+                        .unwrap();
+                    (rows, started.elapsed().as_secs_f64() * 1e3)
+                }
+            }))
+            .buffered(4)
+            .collect()
+            .await;
+            let mut millis: Vec<f64> = timed.iter().map(|(_, ms)| *ms).collect();
+            millis.sort_by(f64::total_cmp);
+            let at = |p: f64| millis[((millis.len() as f64 * p) as usize).min(millis.len() - 1)];
+            println!(
+                "RR9 latency probes={probes} replay={replay} p50_ms={:.3} p90_ms={:.3} mean_ms={:.3}",
+                at(0.5),
+                at(0.9),
+                millis.iter().sum::<f64>() / millis.len() as f64
+            );
+            results = timed.into_iter().map(|(rows, _)| rows).collect::<Vec<_>>();
+        }
         let hits: usize = results
             .iter()
             .zip(&truth)

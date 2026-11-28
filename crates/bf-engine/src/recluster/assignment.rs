@@ -3,8 +3,6 @@ use super::{LeafGroups, math};
 use std::collections::BTreeMap;
 
 pub(super) struct Block {
-    #[cfg(test)]
-    pub positions: Vec<u32>,
     pub rows: Vec<Vec<f32>>,
     pub norms: Vec<f32>,
     pub wanted: Vec<usize>,
@@ -261,7 +259,6 @@ mod tests {
                             .collect();
                         let norms = rows.iter().map(|v| norm2(v)).collect();
                         Block {
-                            positions: Vec::new(),
                             rows,
                             norms,
                             wanted: if b % 2 == 0 { vec![0, 2] } else { vec![0, 1] },
@@ -348,7 +345,6 @@ mod tests {
                         .collect();
                     let norms = rows.iter().map(|v| norm2(v)).collect();
                     Block {
-                        positions: Vec::new(),
                         rows,
                         norms,
                         wanted: vec![0, 1, 2, 3],
@@ -412,7 +408,6 @@ mod tests {
             .collect();
         let row_norms = rows.iter().map(|r| norm2(r)).collect();
         let blocks = vec![Block {
-            positions: Vec::new(),
             rows,
             norms: row_norms,
             wanted: vec![0, 1],
